@@ -1,0 +1,514 @@
+import { create } from 'zustand'
+import type { WireType } from '../theme/tokens'
+import type {
+  CanvasDoc, CanvasEdge, CanvasNode, NodeConfig, NodeData, NodeStatus, NodeVersion,
+} from '../types/graph'
+import type {
+  CatalogTable, KernelInfo, ProcessorDescriptor, RunEstimate, RunStatus, SampleResult,
+} from '../types/api'
+import { getSpec } from '../nodes/registry'
+import { registerGenericNodes } from '../nodes/generic'
+import { api, KernelError } from '../api/client'
+
+export type PanelKind = 'data' | 'run' | 'history' | 'code' | 'lineage'
+
+const LS_KEY = 'dp-canvas'
+
+let _seq = 0
+let _cfgEdit = { id: '', t: 0 } // coalesces param-edit undo checkpoints
+export function newId(kind: string): string {
+  _seq += 1
+  return `${kind}-${_seq}-${Math.floor(performance.now() % 100000)}`
+}
+
+interface PreviewState { loading?: boolean; result?: SampleResult; error?: string }
+interface RunState {
+  estimate?: RunEstimate
+  status?: RunStatus
+  phase: 'idle' | 'estimating' | 'estimated' | 'confirm' | 'running' | 'done' | 'failed'
+  error?: string
+}
+
+export interface AgentMsg { role: 'user' | 'agent'; text: string; plan?: string[] }
+
+interface Store {
+  doc: CanvasDoc
+  kernelInfo: KernelInfo | null
+  kernelUp: boolean
+  catalog: CatalogTable[]
+  processors: ProcessorDescriptor[]
+  specsVersion: number
+
+  selectedId: string | null        // primary selection (drives panels)
+  selectedIds: string[]            // full multi-selection (box/shift-select)
+  openPanels: Record<string, PanelKind>
+  previews: Record<string, PreviewState>
+  runs: Record<string, RunState>
+  past: CanvasDoc[]
+  future: CanvasDoc[]
+
+  agentOpen: boolean
+  agentMode: 'plan' | 'build'
+  agentLog: AgentMsg[]
+
+  // -- graph mutation --
+  setNodes: (nodes: CanvasNode[]) => void
+  setEdges: (edges: CanvasEdge[]) => void
+  addNode: (kind: string, position: { x: number; y: number }, config?: Partial<NodeConfig>, title?: string) => CanvasNode | null
+  updateConfig: (id: string, patch: Partial<NodeConfig>) => void
+  updateData: (id: string, patch: Partial<NodeData>) => void
+  removeNode: (id: string) => void
+  connect: (edge: CanvasEdge) => void
+  removeEdge: (id: string) => void
+  select: (id: string | null) => void
+  setSelection: (ids: string[]) => void
+  removeSelected: () => void
+
+  bypass: (id: string) => void
+  mute: (id: string) => void
+  rename: (id: string, title: string) => void
+  duplicate: (id: string) => void
+
+  commit: () => void
+  undo: () => void
+  redo: () => void
+
+  togglePanel: (id: string, kind: PanelKind) => void
+  openPanel: (id: string, kind: PanelKind) => void
+  closePanel: (id: string) => void
+
+  // -- execution --
+  runPreview: (id: string) => Promise<void>
+  requestRun: (id: string) => Promise<void>
+  estimate: (id: string) => Promise<void>
+  run: (id: string, confirmed?: boolean) => Promise<void>
+  cancelRun: (id: string) => Promise<void>
+  clearRun: (id: string) => void
+  promote: (id: string) => Promise<void>
+  restoreVersion: (id: string, versionId: string) => void
+
+  // -- kernel + catalog --
+  bootstrap: () => Promise<void>
+  refreshCatalog: () => Promise<void>
+
+  // -- agent --
+  setAgentOpen: (v: boolean) => void
+  setAgentMode: (m: 'plan' | 'build') => void
+  pushAgent: (m: AgentMsg) => void
+
+  // -- persistence --
+  save: () => Promise<void>
+  loadDoc: (doc: CanvasDoc) => void
+}
+
+function emptyDoc(): CanvasDoc {
+  return { id: `canvas_${Math.floor(performance.now())}`, name: 'untitled', version: 1, nodes: [], edges: [] }
+}
+
+// downstream node ids (BFS over edges)
+function downstream(doc: CanvasDoc, id: string): Set<string> {
+  const out = new Set<string>()
+  const q = [id]
+  while (q.length) {
+    const cur = q.shift()!
+    for (const e of doc.edges) {
+      if (e.source === cur && !out.has(e.target)) {
+        out.add(e.target)
+        q.push(e.target)
+      }
+    }
+  }
+  return out
+}
+
+export const useStore = create<Store>((set, get) => ({
+  doc: emptyDoc(),
+  kernelInfo: null,
+  kernelUp: false,
+  catalog: [],
+  processors: [],
+  specsVersion: 0,
+  selectedId: null,
+  selectedIds: [],
+  openPanels: {},
+  previews: {},
+  runs: {},
+  past: [],
+  future: [],
+  agentOpen: false,
+  agentMode: 'build',
+  agentLog: [],
+
+  setNodes: (nodes) => set((s) => ({ doc: { ...s.doc, nodes } })),
+  setEdges: (edges) => set((s) => ({ doc: { ...s.doc, edges } })),
+
+  // push the current doc onto the undo stack (called before a structural mutation)
+  commit: () => set((s) => ({ past: [...s.past, s.doc].slice(-50), future: [] })),
+
+  undo: () =>
+    set((s) => {
+      if (s.past.length === 0) return {}
+      const prev = s.past[s.past.length - 1]
+      return { doc: prev, past: s.past.slice(0, -1), future: [s.doc, ...s.future].slice(0, 50), openPanels: {} }
+    }),
+
+  redo: () =>
+    set((s) => {
+      if (s.future.length === 0) return {}
+      const next = s.future[0]
+      return { doc: next, future: s.future.slice(1), past: [...s.past, s.doc].slice(-50), openPanels: {} }
+    }),
+
+  addNode: (kind, position, config, title) => {
+    const spec = getSpec(kind)
+    if (!spec) return null
+    get().commit()
+    const base = spec.defaultData()
+    const node: CanvasNode = {
+      id: newId(kind),
+      type: kind,
+      position,
+      data: {
+        ...base,
+        title: title ?? base.title,
+        config: { ...base.config, ...(config ?? {}) },
+      },
+    }
+    set((s) => ({ doc: { ...s.doc, nodes: [...s.doc.nodes, node] }, selectedId: node.id }))
+    return node
+  },
+
+  updateConfig: (id, patch) => {
+    // coalesced undo checkpoint: one per editing burst (new node, or >700ms idle) so a param
+    // edit is its own undo step instead of discarding an unrelated earlier change.
+    const now = performance.now()
+    if (_cfgEdit.id !== id || now - _cfgEdit.t > 700) get().commit()
+    _cfgEdit = { id, t: now }
+    set((s) => {
+      const stale = downstream(s.doc, id)
+      return {
+        doc: {
+          ...s.doc,
+          nodes: s.doc.nodes.map((n) => {
+            if (n.id === id) {
+              const status: NodeStatus = n.data.status === 'draft' ? 'draft' : 'stale'
+              return { ...n, data: { ...n.data, config: { ...n.data.config, ...patch }, status } }
+            }
+            if (stale.has(n.id) && n.data.status === 'latest') {
+              return { ...n, data: { ...n.data, status: 'stale' } }
+            }
+            return n
+          }),
+        },
+      }
+    })
+  },
+
+  updateData: (id, patch) =>
+    set((s) => ({
+      doc: { ...s.doc, nodes: s.doc.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, ...patch } } : n)) },
+    })),
+
+  removeNode: (id) => {
+    get().commit()
+    set((s) => ({
+      doc: {
+        ...s.doc,
+        nodes: s.doc.nodes.filter((n) => n.id !== id),
+        edges: s.doc.edges.filter((e) => e.source !== id && e.target !== id),
+      },
+      selectedId: s.selectedId === id ? null : s.selectedId,
+      openPanels: Object.fromEntries(Object.entries(s.openPanels).filter(([k]) => k !== id)),
+    }))
+  },
+
+  connect: (edge) => {
+    get().commit()
+    set((s) => {
+      // one edge per (target, targetHandle) for single-input ports; joins allow two.
+      const stale = downstream(s.doc, edge.target)
+      const nodes = s.doc.nodes.map((n) =>
+        (n.id === edge.target || stale.has(n.id)) && n.data.status === 'latest'
+          ? { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
+          : n,
+      )
+      return { doc: { ...s.doc, edges: [...s.doc.edges, edge], nodes } }
+    })
+  },
+
+  removeEdge: (id) => { get().commit(); set((s) => ({ doc: { ...s.doc, edges: s.doc.edges.filter((e) => e.id !== id) } })) },
+
+  select: (id) => set({ selectedId: id, selectedIds: id ? [id] : [] }),
+
+  setSelection: (ids) => set({ selectedIds: ids, selectedId: ids[ids.length - 1] ?? null }),
+
+  removeSelected: () => {
+    const ids = get().selectedIds.length ? get().selectedIds : (get().selectedId ? [get().selectedId!] : [])
+    if (!ids.length) return
+    get().commit()
+    const kill = new Set(ids)
+    set((s) => ({
+      doc: {
+        ...s.doc,
+        nodes: s.doc.nodes.filter((n) => !kill.has(n.id)),
+        edges: s.doc.edges.filter((e) => !kill.has(e.source) && !kill.has(e.target)),
+      },
+      selectedId: null, selectedIds: [],
+      openPanels: Object.fromEntries(Object.entries(s.openPanels).filter(([k]) => !kill.has(k))),
+    }))
+  },
+
+  bypass: (id) => {
+    get().commit()
+    set((s) => ({
+      doc: {
+        ...s.doc,
+        nodes: s.doc.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, bypassed: !n.data.bypassed, muted: false } } : n)),
+      },
+    }))
+  },
+
+  mute: (id) => {
+    get().commit()
+    set((s) => ({
+      doc: {
+        ...s.doc,
+        nodes: s.doc.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, muted: !n.data.muted, bypassed: false } } : n)),
+      },
+    }))
+  },
+
+  rename: (id, title) => { get().commit(); get().updateData(id, { title }) },
+
+  duplicate: (id) => {
+    const n = get().doc.nodes.find((x) => x.id === id)
+    if (!n) return
+    get().commit()
+    const copy: CanvasNode = {
+      ...n,
+      id: newId(n.type),
+      position: { x: n.position.x + 40, y: n.position.y + 40 },
+      data: { ...n.data, status: 'draft', history: [] },
+    }
+    set((s) => ({ doc: { ...s.doc, nodes: [...s.doc.nodes, copy] }, selectedId: copy.id }))
+  },
+
+  // one panel open at a time across the whole canvas — never overlapping
+  togglePanel: (id, kind) =>
+    set((s) => (s.openPanels[id] === kind ? { openPanels: {} } : { openPanels: { [id]: kind }, selectedId: id })),
+
+  openPanel: (id, kind) => set({ openPanels: { [id]: kind }, selectedId: id }),
+
+  closePanel: (id) =>
+    set((s) => (s.openPanels[id] ? { openPanels: {} } : {})),
+
+  runPreview: async (id: string) => {
+    set((s) => ({ previews: { ...s.previews, [id]: { loading: true } }, openPanels: { [id]: 'data' } }))
+    try {
+      const result = await api.preview(get().doc, id, 50)
+      set((s) => ({ previews: { ...s.previews, [id]: { result } } }))
+      if (!result.notPreviewable) {
+        set((s) => ({
+          doc: { ...s.doc, nodes: s.doc.nodes.map((n) => (n.id === id && n.data.status !== 'latest' ? { ...n, data: { ...n.data, status: 'latest' } } : n)) },
+        }))
+      }
+    } catch (e) {
+      set((s) => ({ previews: { ...s.previews, [id]: { error: (e as Error).message } } }))
+    }
+  },
+
+  // The play action: estimate, then start immediately for cheap work; only gate on expensive
+  // runs (FR-E3). No pointless confirm box for a small run.
+  requestRun: async (id) => {
+    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } }, openPanels: { [id]: 'run' } }))
+    let estimate
+    try {
+      estimate = await api.estimate(get().doc, id)
+    } catch (e) {
+      set((s) => ({ runs: { ...s.runs, [id]: { phase: 'failed', error: (e as Error).message } } }))
+      return
+    }
+    if (estimate.needsConfirm) {
+      set((s) => ({ runs: { ...s.runs, [id]: { estimate, phase: 'confirm' } } }))
+    } else {
+      set((s) => ({ runs: { ...s.runs, [id]: { estimate, phase: 'running' } } }))
+      await get().run(id, false)
+    }
+  },
+
+  estimate: async (id) => {
+    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } }, openPanels: { [id]: 'run' } }))
+    try {
+      const estimate = await api.estimate(get().doc, id)
+      set((s) => ({
+        runs: { ...s.runs, [id]: { estimate, phase: estimate.needsConfirm ? 'confirm' : 'estimated' } },
+      }))
+    } catch (e) {
+      set((s) => ({ runs: { ...s.runs, [id]: { phase: 'failed', error: (e as Error).message } } }))
+    }
+  },
+
+  run: async (id, confirmed = false) => {
+    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'running' } }, openPanels: { [id]: 'run' } }))
+    get().updateData(id, { status: 'running' })
+    try {
+      const status = await api.run(get().doc, id, confirmed)
+      set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), status, phase: 'running' } } }))
+      pollRun(get, set, id, status.runId)
+    } catch (e) {
+      if (e instanceof KernelError && e.status === 409) {
+        set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'confirm' } } }))
+        get().updateData(id, { status: 'stale' })
+        return
+      }
+      set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message } } }))
+      get().updateData(id, { status: 'failed' })
+    }
+  },
+
+  cancelRun: async (id) => {
+    const st = get().runs[id]?.status
+    if (!st) return
+    await api.cancelRun(st.runId).catch(() => {})
+    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'idle' } } }))
+    get().updateData(id, { status: 'stale' })
+  },
+
+  clearRun: (id) =>
+    set((s) => {
+      const next = { ...s.runs }
+      delete next[id]
+      return { runs: next }
+    }),
+
+  promote: async (id) => {
+    const n = get().doc.nodes.find((x) => x.id === id)
+    if (!n) return
+    const cfg = n.data.config
+    const pid = `user.${(n.data.title || 'op').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
+    const desc = await api.promote({
+      id: pid,
+      title: n.data.title,
+      mode: (cfg.mode as string) ?? 'map',
+      code: (cfg.code as string) ?? '',
+      inputColumns: [],
+      outputSchema: (cfg.outputSchema as any) ?? [],
+      blurb: 'promoted from an ad-hoc cell',
+    })
+    get().updateConfig(id, { source: 'library', processor: desc.id, version: desc.version, code: null })
+    // refresh ONLY the processor list for the library picker — do NOT call bootstrap(), which
+    // would re-hydrate the doc from (debounced, still-stale) localStorage and revert this node.
+    try {
+      set({ processors: await api.processors() })
+    } catch { /* offline */ }
+  },
+
+  restoreVersion: (id, versionId) =>
+    set((s) => ({
+      doc: {
+        ...s.doc,
+        nodes: s.doc.nodes.map((n) => {
+          if (n.id !== id) return n
+          const v = (n.data.history ?? []).find((h) => h.id === versionId)
+          if (!v) return n
+          return { ...n, data: { ...n.data, config: { ...v.config }, status: 'latest' } }
+        }),
+      },
+    })),
+
+  bootstrap: async () => {
+    // restore the last canvas from localStorage so work survives a refresh (real product, not demo)
+    try {
+      const saved = localStorage.getItem(LS_KEY)
+      if (saved) {
+        const doc = JSON.parse(saved) as CanvasDoc
+        if (doc?.nodes?.length) set({ doc })
+      }
+    } catch { /* ignore corrupt state */ }
+    try {
+      const [kernelInfo, catalog, processors, nodes] = await Promise.all([
+        api.kernel(), api.tables(), api.processors(), api.nodes(),
+      ])
+      const added = registerGenericNodes(nodes)
+      set((s) => ({ kernelInfo, kernelUp: true, catalog, processors,
+        specsVersion: added ? s.specsVersion + 1 : s.specsVersion }))
+    } catch {
+      set({ kernelUp: false })
+    }
+  },
+
+  refreshCatalog: async () => {
+    try {
+      const catalog = await api.tables()
+      set({ catalog })
+    } catch { /* noop */ }
+  },
+
+  setAgentOpen: (v) => set({ agentOpen: v }),
+  setAgentMode: (m) => set({ agentMode: m }),
+  pushAgent: (m) => set((s) => ({ agentLog: [...s.agentLog, m] })),
+
+  save: async () => {
+    try {
+      await api.saveCanvas(get().doc)
+    } catch { /* offline: keep in memory */ }
+  },
+
+  loadDoc: (doc) => set({ doc, previews: {}, runs: {}, openPanels: {}, selectedId: null, past: [], future: [] }),
+}))
+
+// Auto-persist the canvas to localStorage (debounced) so a refresh keeps your work.
+let _saveTimer: ReturnType<typeof setTimeout> | undefined
+let _lastDoc: CanvasDoc | undefined
+useStore.subscribe((s) => {
+  if (s.doc === _lastDoc) return
+  _lastDoc = s.doc
+  clearTimeout(_saveTimer)
+  _saveTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(s.doc))
+    } catch { /* quota / disabled */ }
+  }, 400)
+})
+
+function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void, nodeId: string, runId: string) {
+  const tick = async () => {
+    let status: RunStatus
+    try {
+      status = await api.runStatus(runId)
+    } catch {
+      return
+    }
+    set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase: 'running' as const }), status } } }))
+    if (status.status === 'done' || status.status === 'failed' || status.status === 'cancelled') {
+      const phase = status.status === 'done' ? 'done' : status.status === 'failed' ? 'failed' : 'idle'
+      set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase } as any), status, phase } } }))
+      const g = get()
+      g.updateData(nodeId, {
+        status: status.status === 'done' ? 'latest' : status.status === 'failed' ? 'failed' : 'stale',
+        lastRun: status.status === 'done'
+          ? { rows: status.totalRows ?? status.rowsProcessed, ms: status.ms, cost: status.costUsd, placement: status.placement }
+          : undefined,
+      })
+      if (status.status === 'done') {
+        // snapshot a version (time-travel, FR-C5)
+        const node = g.doc.nodes.find((n) => n.id === nodeId)
+        if (node) {
+          const version: NodeVersion = {
+            id: `v_${Math.floor(performance.now())}`,
+            ts: Date.now(),
+            rows: status.totalRows ?? undefined,
+            cost: status.costUsd,
+            label: `run · ${status.totalRows ?? status.rowsProcessed} rows`,
+            config: { ...node.data.config },
+          }
+          g.updateData(nodeId, { history: [...(node.data.history ?? []), version] })
+        }
+        void g.refreshCatalog()
+      }
+      return
+    }
+    setTimeout(tick, 300)
+  }
+  setTimeout(tick, 200)
+}

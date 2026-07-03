@@ -1,0 +1,35 @@
+[project]
+name = "data-playground"
+version = "0.1.0"
+description = "An open-source, node-based canvas for data — like ComfyUI, but for typed columnar dataflow. Works offline on real Parquet/CSV/JSON/Arrow/Lance, out-of-core."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "duckdb>=1.1",
+    "pyarrow>=17",
+    "polars>=1.9",
+    "pydantic>=2.9",
+]
+
+[project.optional-dependencies]
+lance = ["pylance>=0.19"]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+dataplay = "kernel.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kernel"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"../web/dist" = "kernel/_web"
+
+[tool.pytest.ini_options]
+testpaths = ["kernel/tests"]

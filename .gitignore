@@ -1,0 +1,28 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# node
+node_modules/
+web/dist/
+*.tsbuildinfo
+
+# generated / runtime (regenerate with `make seed`)
+kernel/data/*.parquet
+kernel/data/*.csv
+kernel/data/*.json
+kernel/data/*.arrow
+kernel/data/**/*.lance
+kernel/outputs/
+kernel/canvases/
+kernel/data/outputs/
+kernel/_web/
+
+# editor (machine-specific)
+.vscode/
+
+# os
+.DS_Store
