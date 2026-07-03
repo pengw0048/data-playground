@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 
-from kernel import graph as g
+from kernel import db, graph as g
 from kernel.executors.engine import LoweringEngine
 from kernel.models import (
     CompilePlan,
@@ -34,6 +34,7 @@ _OP_SECONDS_PER_1K = {
 _COST_PER_SEC = 0.0008
 _DISTRIBUTED_ROWS = 20_000_000
 _CONFIRM_COST = 5.0
+_MAX_RUNS = 100          # cap retained run history / cache so a long-lived kernel doesn't grow forever
 
 
 class LocalRunner:
@@ -91,8 +92,18 @@ class LocalRunner:
         with self._lock:
             self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()
+            self._evict()
         threading.Thread(target=self._execute, args=(run_id, plan, graph, target_node_id), daemon=True).start()
         return status
+
+    def _evict(self) -> None:
+        """Bound retained run/cancel/cache state (called under self._lock). Dicts keep insertion order."""
+        while len(self.runs) > _MAX_RUNS:
+            old = next(iter(self.runs))
+            self.runs.pop(old, None)
+            self._cancel.pop(old, None)
+        while len(self._cache) > _MAX_RUNS:
+            self._cache.pop(next(iter(self._cache)), None)
 
     def _execute(self, run_id: str, plan: CompilePlan, graph: Graph, target: str | None) -> None:
         status = self.runs[run_id]
@@ -100,11 +111,13 @@ class LocalRunner:
         started = time.time()
         status.status = "running"
         phash = self._plan_hash(graph, target)
-        cached = self._cache.get(phash)
+        with self._lock:
+            cached = self._cache.get(phash)
         engine = LoweringEngine(graph, self.resolve_adapter, self.registry, full=True,
                                 node_lowerings=self.node_lowerings, node_specs=self.node_specs)
         nm = g.node_map(graph)
         rows_seen = 0
+        db.lock().acquire()  # serialize all DuckDB access for the whole run
         try:
             for step in plan.steps:
                 if cancel.is_set():
@@ -132,7 +145,8 @@ class LocalRunner:
                 status.rows_processed = rows_seen
 
             status.status = "done"
-            self._cache[phash] = {"rows": rows_seen, "uri": status.output_uri, "table": status.output_table}
+            with self._lock:
+                self._cache[phash] = {"rows": rows_seen, "uri": status.output_uri, "table": status.output_table}
         except Exception as e:  # noqa: BLE001
             status.status = "failed"
             status.error = f"{type(e).__name__}: {e}"
@@ -140,9 +154,12 @@ class LocalRunner:
                 if p.status == "running":
                     p.status = "failed"
         finally:
+            db.drop_created_views()
+            db.lock().release()
             status.ms = int((time.time() - started) * 1000)
             status.total_rows = rows_seen
             status.cost_usd = round(status.ms / 1000 * _COST_PER_SEC, 4)
+            self._cancel.pop(run_id, None)  # done/failed/cancelled → drop the cancel Event
 
     def _count(self, engine: LoweringEngine, node_id: str, cached: dict | None) -> int:
         if cached and cached.get("rows") is not None:
@@ -154,6 +171,10 @@ class LocalRunner:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         name = cfg.get("name") or node.data.get("title") or "output"
         name = "".join(c if c.isalnum() or c in "_-" else "_" for c in name)
+        # content-addressed skip: identical plan (same configs + source fingerprint) already wrote this
+        if cached and cached.get("table") and cached.get("uri") and os.path.exists(cached["uri"]):
+            status.output_uri, status.output_table = cached["uri"], cached["table"]
+            return int(cached.get("rows") or 0)
         fmt = (cfg.get("format") or "parquet").lower()
         ext = {"parquet": ".parquet", "csv": ".csv", "lance": ".lance"}.get(fmt, ".parquet")
         out_dir = os.path.join(self.workspace, "outputs")

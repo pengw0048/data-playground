@@ -7,7 +7,7 @@ and distinguishes an honest "needs a full pass" from a real error (bad cell/quer
 
 from __future__ import annotations
 
-from kernel import graph as g
+from kernel import db, graph as g
 from kernel.executors.engine import LoweringEngine, NotPreviewable
 from kernel.models import Graph, SampleResult
 from kernel.sandbox import run_with_timeout
@@ -30,7 +30,12 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                             node_lowerings=node_lowerings, node_specs=node_specs)
 
     def work() -> SampleResult:
-        rows, cols = engine.rows(node_id, k)
+        # serialize all DuckDB access; drop the temp views this eval minted
+        with db.lock():
+            try:
+                rows, cols = engine.rows(node_id, k)
+            finally:
+                db.drop_created_views()
         return SampleResult(columns=cols, rows=rows, row_count=len(rows), truncated=True)
 
     try:

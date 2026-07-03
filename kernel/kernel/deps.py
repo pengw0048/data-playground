@@ -31,9 +31,13 @@ class Registry:
         self.deps = deps
 
     def add_node(self, spec: NodeSpec, lower=None) -> None:
-        # refuse to shadow a built-in kind — silently overwriting corrupts the /api/nodes contract
+        # refuse to shadow a built-in OR an already-registered plugin kind — overwriting would
+        # corrupt the /api/nodes contract and leave the original's lower() as dead code
         if spec.kind in self.deps.builtin_kinds:
             print(f"[deps] plugin node '{spec.kind}' collides with a built-in kind — refused")
+            return
+        if spec.kind in self.deps.node_specs:
+            print(f"[deps] plugin node '{spec.kind}' already registered by another plugin — refused")
             return
         self.deps.node_specs[spec.kind] = spec
         if lower is not None:
@@ -76,6 +80,7 @@ class Deps:
         self.runner = LocalRunner(self.resolve_adapter, self.registry, self.catalog, workspace,
                                   node_lowerings=self.node_lowerings, node_specs=self.node_specs)
         self.runners = [self.runner]
+        self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self._load_plugins()
 
     def resolve_adapter(self, uri: str):
@@ -161,12 +166,15 @@ class Deps:
 
 
 _deps: Deps | None = None
+_deps_lock = __import__("threading").Lock()
 
 
 def get_deps() -> Deps:
     global _deps
     if _deps is None:
-        _deps = Deps(settings.workspace, settings.data_dir)
+        with _deps_lock:  # double-checked: concurrent first requests must not build Deps twice
+            if _deps is None:
+                _deps = Deps(settings.workspace, settings.data_dir)
     return _deps
 
 

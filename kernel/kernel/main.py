@@ -95,7 +95,9 @@ class RegisterRequest(BaseModel):
 def catalog_register(req: RegisterRequest) -> CatalogTable:
     deps = get_deps()
     import os
-    uri = os.path.abspath(os.path.expanduser(req.uri)) if not req.uri.startswith(("http", "s3", "mem")) else req.uri
+    import re
+    has_scheme = bool(re.match(r"^[a-z][a-z0-9+.-]*://", req.uri))
+    uri = req.uri if has_scheme else os.path.abspath(os.path.expanduser(req.uri))
     name = req.name or os.path.splitext(os.path.basename(uri.rstrip("/")))[0]
     try:
         deps.resolve_adapter(uri).schema(uri)  # validate readable
@@ -113,14 +115,17 @@ def data_sample(req: SampleRequest) -> SampleResult:
     if req.k is not None and req.k < 0:
         raise HTTPException(400, "k must be >= 0")
     try:
+        from kernel import db
         from kernel.executors.engine import _table_to_rows
         from kernel.plugins.adapters import relation_columns
         adapter = deps.resolve_adapter(req.uri)
-        rel = adapter.scan(req.uri, req.columns, limit=req.k)
-        total = adapter.count(req.uri)
-        rows = _table_to_rows(rel.to_arrow_table())
-        return SampleResult(columns=relation_columns(adapter.scan(req.uri, req.columns, limit=0)),
-                            rows=rows, row_count=total, truncated=(total is None or total > len(rows)))
+        with db.lock():  # serialize DuckDB access
+            rel = adapter.scan(req.uri, req.columns, limit=req.k)
+            cols = relation_columns(rel)          # schema is metadata — no second scan needed
+            rows = _table_to_rows(rel.to_arrow_table())
+            total = adapter.count(req.uri)
+        return SampleResult(columns=cols, rows=rows, row_count=total,
+                            truncated=(total is None or total > len(rows)))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"{type(e).__name__}: {e}")
 
@@ -189,7 +194,8 @@ def compile_graph(req: CompileRequest) -> CompilePlan:
 @api.post("/run/preview", response_model=SampleResult)
 def run_preview(req: PreviewRequest) -> SampleResult:
     deps = get_deps()
-    return preview_node(req.graph, req.node_id, req.k or settings.preview_k,
+    k = req.k if req.k is not None else settings.preview_k
+    return preview_node(req.graph, req.node_id, k,
                         deps.resolve_adapter, deps.registry, deps.node_lowerings, deps.node_specs)
 
 
@@ -232,13 +238,20 @@ def run(req: RunRequest) -> RunStatus:
     est = runner.estimate(plan, rows)
     if est.needs_confirm and not req.confirmed:
         raise HTTPException(409, "run needs confirmation (cost/placement over threshold)")
-    return runner.run(plan, req.graph, req.target_node_id, est.placement)
+    status = runner.run(plan, req.graph, req.target_node_id, est.placement)
+    deps.run_index[status.run_id] = runner  # so status/cancel/ws reach the right runner
+    return status
+
+
+def _runner_for(run_id: str):
+    deps = get_deps()
+    return deps.run_index.get(run_id, deps.runner)
 
 
 @api.get("/run/{run_id}", response_model=RunStatus)
 def run_status(run_id: str) -> RunStatus:
     try:
-        return get_deps().runner.status(run_id)
+        return _runner_for(run_id).status(run_id)
     except KeyError:
         raise HTTPException(404, f"run '{run_id}' not found")
 
@@ -246,7 +259,7 @@ def run_status(run_id: str) -> RunStatus:
 @api.post("/run/{run_id}/cancel", response_model=RunStatus)
 def run_cancel(run_id: str) -> RunStatus:
     try:
-        return get_deps().runner.cancel(run_id)
+        return _runner_for(run_id).cancel(run_id)
     except KeyError:
         raise HTTPException(404, f"run '{run_id}' not found")
 
@@ -296,8 +309,13 @@ def put_canvas(canvas_id: str, doc: dict) -> dict:
 # App
 # --------------------------------------------------------------------------- #
 app = FastAPI(title="Data Playground kernel", version="0.1.0")
+# Restrict CORS to localhost origins only. The kernel binds to 127.0.0.1 and serves the SPA
+# same-origin (and the Vite dev server proxies /api), so a wildcard is unnecessary — and a
+# wildcard would let any site the user visits read this local API cross-origin (data exfiltration).
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_methods=["*"], allow_headers=["*"],
 )
 app.include_router(api)
 
@@ -305,11 +323,10 @@ app.include_router(api)
 @app.websocket("/ws/run/{run_id}")
 async def ws_run(ws: WebSocket, run_id: str):
     await ws.accept()
-    deps = get_deps()
     try:
         while True:
             try:
-                st = deps.runner.status(run_id)
+                st = _runner_for(run_id).status(run_id)
             except KeyError:
                 await ws.send_json({"error": "run not found"})
                 break

@@ -55,8 +55,28 @@ def _namespace() -> dict:
     return ns
 
 
+def _reject_dunder(code: str) -> None:
+    """Block the classic `().__class__.__mro__[-1].__subclasses__()` sandbox escape.
+
+    This is a *soft* guard, not a real boundary: it rejects access to dunder attributes/names at
+    the AST level so a cell can't walk up to `object` and reach os/subprocess. Untrusted input
+    still needs OS-level isolation (a subprocess sandbox); this only closes the obvious hole.
+    """
+    import ast
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return  # the compile() below will surface the syntax error
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
+            raise SandboxError(f"access to '{node.attr}' is not allowed in an ad-hoc cell")
+        if isinstance(node, ast.Name) and node.id.startswith("__") and node.id.endswith("__"):
+            raise SandboxError(f"access to '{node.id}' is not allowed in an ad-hoc cell")
+
+
 def compile_operator(code: str, mode: str) -> Callable:
     """Compile a cell body into an operator callable for the given mode."""
+    _reject_dunder(code)
     ns = _namespace()
     try:
         compiled = compile(code, "<adhoc-cell>", "exec")

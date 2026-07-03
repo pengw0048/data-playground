@@ -52,7 +52,6 @@ class LoweringEngine:
         self.node_lowerings = node_lowerings or {}
         self.node_specs = node_specs or {}
         self._cache: dict[str, Relation] = {}
-        self._view_seq = 0
 
     # -- public ------------------------------------------------------------ #
     def relation(self, node_id: str) -> Relation:
@@ -62,9 +61,6 @@ class LoweringEngine:
         rel = self._lower(node)
         self._cache[node_id] = rel
         return rel
-
-    def columns(self, node_id: str) -> list[ColumnSchema]:
-        return relation_columns(self.relation(node_id))
 
     def rows(self, node_id: str, k: int) -> tuple[list[dict], list[ColumnSchema]]:
         tbl = self.relation(node_id).limit(k).to_arrow_table()
@@ -88,9 +84,9 @@ class LoweringEngine:
             out.append(rel)
         return out
 
-    def _view(self, rel: Relation, base: str) -> str:
-        self._view_seq += 1
-        name = f"{base}_{self._view_seq}"
+    def _view(self, rel: Relation, base: str = "v") -> str:
+        # process-globally-unique name so concurrent engines never clobber each other's views
+        name = db.unique_view(base)
         rel.create_view(name, replace=True)
         return name
 
@@ -158,23 +154,29 @@ class LoweringEngine:
             return parent.aggregate(f"{group}, {aggs}", group) if group else parent.aggregate(aggs)
 
         if t == "sql":
-            query = (cfg.get("sql") or "").strip()
-            if not query:
+            q = (cfg.get("sql") or "").strip()
+            if not q:
                 return parent
-            for i, rel in enumerate(inputs):
-                rel.create_view("input" if i == 0 else f"input{i + 1}", replace=True)
-            return db.conn().sql(query)
+            # Expose inputs as query-scoped CTEs named input/input2/... backed by UNIQUE views,
+            # so two sql nodes in one graph never clobber a shared literal 'input' view.
+            aliases = ["input"] + [f"input{i + 1}" for i in range(1, len(inputs))]
+            ctes = [f"{a} AS (SELECT * FROM {self._view(rel)})" for a, rel in zip(aliases, inputs)]
+            cte = "WITH " + ", ".join(ctes)
+            wrapped = f"{cte}, {q[4:].lstrip()}" if q[:4].upper() == "WITH" else f"{cte} {q}"
+            return db.conn().sql(wrapped)
 
         if t == "join":
             if len(inputs) < 2:
                 return parent
             on = (cfg.get("on") or "").strip()
-            how = (cfg.get("how") or "inner").upper()
+            how = (cfg.get("how") or "inner").lower()
+            how = how if how in ("inner", "left", "right", "full", "outer", "cross") else "inner"
+            how = "full" if how == "outer" else how
             a, b = self._view(inputs[0], "ja"), self._view(inputs[1], "jb")
-            if not on:
+            if how == "cross" or not on:
                 return db.conn().sql(f"SELECT * FROM {a} CROSS JOIN {b}")
             cols = ", ".join(f'"{c.strip()}"' for c in on.split(","))
-            return db.conn().sql(f"SELECT * FROM {a} {how} JOIN {b} USING ({cols})")
+            return db.conn().sql(f"SELECT * FROM {a} {how.upper()} JOIN {b} USING ({cols})")
 
         if t in _TRANSFORM_KINDS:
             return self._transform(node, parent)
@@ -186,6 +188,12 @@ class LoweringEngine:
             # preview — never a truncated sample value. (Relational upstream is cheap out-of-core.)
             base = parent
             if not self.full:
+                # computing the true value means a full pass over the upstream. That is cheap for
+                # relational ops (DuckDB), but a Python transform upstream would spill EVERY row
+                # inside a "preview" — refuse honestly in that case (P8) rather than run away.
+                chain = g.upstream_chain(self.graph, node.id)
+                if any(n.type in ("transform", "notebook", "opaque", "loop") for n in chain):
+                    raise NotPreviewable(node, "metric over a transformed input — needs a full pass")
                 pids = g.parents(self.graph, node.id)
                 if pids:
                     full = LoweringEngine(self.graph, self.resolve_adapter, self.registry,
@@ -266,8 +274,7 @@ class LoweringEngine:
         import pyarrow.parquet as pq
         spill_dir = os.path.join(_spill_root(), "transform")
         os.makedirs(spill_dir, exist_ok=True)
-        self._view_seq += 1
-        path = os.path.join(spill_dir, f"xf_{abs(hash(node.id))%10**8}_{self._view_seq}.parquet")
+        path = os.path.join(spill_dir, f"{db.unique_view('xf')}.parquet")
         writer: "pq.ParquetWriter | None" = None
         buf: list[dict] = []
         FLUSH = 50_000
@@ -287,11 +294,24 @@ class LoweringEngine:
                     tbl = tbl.cast(writer.schema, safe=False)
             writer.write_table(tbl)
 
-        for batch in parent.to_arrow_reader(batch_size=8192):
-            buf.extend(_apply_fn(fn, batch, mode, on_error, node))
-            if len(buf) >= FLUSH:
-                flush()
-        flush()
+        try:
+            for batch in parent.to_arrow_reader(batch_size=8192):
+                buf.extend(_apply_fn(fn, batch, mode, on_error, node))
+                if len(buf) >= FLUSH:
+                    flush()
+            flush()
+        except BaseException:
+            # close + delete the partial spill so we never leak a handle or a truncated file
+            if writer is not None:
+                try:
+                    writer.close()
+                finally:
+                    writer = None
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise
         if writer is None:
             return parent.limit(0)
         writer.close()
@@ -328,7 +348,7 @@ def _apply_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node) -> li
             return list(fn(rows))
         except Exception as e:  # noqa: BLE001
             if on_error == "skip":
-                return rows
+                return []  # drop the failed batch (returning the untransformed input would lie)
             raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
     for r in rows:
         try:
@@ -378,7 +398,9 @@ _AGG_ALLOWED = {"count", "sum", "mean", "avg", "min", "max", "median", "stddev"}
 
 def _agg_name(agg: str) -> str:
     a = (agg or "count").lower()
-    return {"mean": "avg"}.get(a, a) if a in _AGG_ALLOWED else "count"
+    if a not in _AGG_ALLOWED:
+        raise ValueError(f"unsupported aggregate '{agg}' (allowed: {', '.join(sorted(_AGG_ALLOWED))})")
+    return {"mean": "avg"}.get(a, a)
 
 
 def _ident(col: str) -> str:

@@ -46,9 +46,17 @@ export function Popover({
       onClose()
     }
     const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    // canvas pan/zoom (wheel) moves the anchor but not this fixed portal — close instead of detaching
+    const onWheel = () => onClose()
     const id = setTimeout(() => window.addEventListener('mousedown', onDown), 0)
     window.addEventListener('keydown', onEsc)
-    return () => { clearTimeout(id); window.removeEventListener('mousedown', onDown); window.removeEventListener('keydown', onEsc) }
+    window.addEventListener('wheel', onWheel, { passive: true })
+    return () => {
+      clearTimeout(id)
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onEsc)
+      window.removeEventListener('wheel', onWheel)
+    }
   }, [open, onClose, anchorRef])
 
   if (!open || !pos) return null

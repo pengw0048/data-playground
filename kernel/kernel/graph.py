@@ -29,16 +29,26 @@ def parents(graph: Graph, node_id: str) -> list[str]:
 
 
 def _visit(node_id: str, graph: Graph, state: dict[str, int], order: list[str]) -> None:
-    color = state.get(node_id, 0)  # 0=white 1=gray 2=black
-    if color == 1:
-        raise CycleError(f"cycle through node {node_id}")
-    if color == 2:
-        return
-    state[node_id] = 1
-    for p in parents(graph, node_id):
-        _visit(p, graph, state, order)
-    state[node_id] = 2
-    order.append(node_id)
+    # iterative post-order DFS (0=white 1=gray 2=black) — no recursion, so a long node chain
+    # can't blow Python's recursion limit.
+    stack: list[tuple[str, bool]] = [(node_id, False)]
+    while stack:
+        nid, done = stack.pop()
+        if done:
+            if state.get(nid, 0) != 2:
+                state[nid] = 2
+                order.append(nid)
+            continue
+        if state.get(nid, 0) != 0:  # already gray/black — skip (handles diamonds)
+            continue
+        state[nid] = 1
+        stack.append((nid, True))   # finalize after all ancestors
+        for p in parents(graph, nid):
+            pc = state.get(p, 0)
+            if pc == 1:
+                raise CycleError(f"cycle through node {p}")
+            if pc == 0:
+                stack.append((p, False))
 
 
 def upstream_chain(graph: Graph, node_id: str) -> list[GraphNode]:

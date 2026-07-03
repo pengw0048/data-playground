@@ -133,8 +133,11 @@ export function Canvas() {
     const sw = portWire(doc.nodes, c.source!, c.sourceHandle, 'source')
     const tgt = doc.nodes.find((n) => n.id === c.target)
     if (!tgt) return false
-    return canConnect(sw, tgt.type, c.targetHandle)
-  }, [doc.nodes])
+    if (!canConnect(sw, tgt.type, c.targetHandle)) return false
+    // one edge per input port (each handle is single-input; join has separate a/b handles)
+    const occupied = doc.edges.some((e) => e.target === c.target && (e.targetHandle ?? null) === (c.targetHandle ?? null))
+    return !occupied
+  }, [doc.nodes, doc.edges])
 
   const onConnect = useCallback((c: Connection) => {
     if (!isValidConnection(c)) return

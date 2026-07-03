@@ -35,7 +35,15 @@ function GenericNode({ id, data }: NodeComponentProps) {
                   </button>
                 ) : (
                   <MiniInput mono={p.type !== 'string'} value={String(val)}
-                    onChange={(v) => updateConfig(id, { [p.name]: p.type === 'int' || p.type === 'float' ? Number(v) : v })} />
+                    onChange={(v) => {
+                      if (p.type === 'int' || p.type === 'float') {
+                        if (v.trim() === '') return  // don't coerce an empty field to 0
+                        const n = p.type === 'int' ? parseInt(v, 10) : parseFloat(v)
+                        if (!Number.isNaN(n)) updateConfig(id, { [p.name]: n })  // skip partial/NaN
+                      } else {
+                        updateConfig(id, { [p.name]: v })
+                      }
+                    }} />
                 )}
               </Field>
             )

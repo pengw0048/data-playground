@@ -247,6 +247,89 @@ def test_plugin_run_applies_lowering(tmp_path):
     assert all(row["c"] == 42 for row in out["rows"])           # transformed, not passthrough
 
 
+# --------------------------------------------------------------------------- #
+# Regression tests for code-review findings (concurrency / correctness / security)
+# --------------------------------------------------------------------------- #
+def test_two_sql_nodes_no_view_collision():
+    # two sql nodes in one graph both use `FROM input` — must not clobber each other (finding #1)
+    g = {"id": "c", "version": 1, "nodes": [
+        N("a", "source", {"uri": _uri("images")}),
+        N("qa", "sql", {"sql": "SELECT id FROM input"}),
+        N("b", "source", {"uri": _uri("events")}),
+        N("qb", "sql", {"sql": "SELECT id FROM input"}),
+    ], "edges": [E("a", "qa"), E("b", "qb")]}
+    ra = client.post("/api/run/preview", json={"graph": g, "nodeId": "qa", "k": 5}).json()
+    rb = client.post("/api/run/preview", json={"graph": g, "nodeId": "qb", "k": 5}).json()
+    assert not ra["notPreviewable"] and not rb["notPreviewable"]
+    assert [c["name"] for c in ra["columns"]] == ["id"]  # both resolve their OWN input
+
+
+def test_concurrent_previews_do_not_corrupt():
+    # the shared DuckDB connection + unique views must survive concurrent evaluation (findings #2/#3)
+    import concurrent.futures as cf
+    from kernel.deps import get_deps
+    from kernel.executors.preview import preview_node
+    deps = get_deps()
+
+    def graph_for(uri, pred):
+        return __import__("kernel.models", fromlist=["Graph"]).Graph(**{
+            "id": "c", "version": 1,
+            "nodes": [N("src", "source", {"uri": uri}), N("f", "filter", {"predicate": pred}),
+                      N("d", "dedup", {})],
+            "edges": [E("src", "f"), E("f", "d")],
+        })
+
+    imgs, evs = _uri("images"), _uri("events")
+
+    def run(i):
+        if i % 2 == 0:
+            r = preview_node(graph_for(imgs, "is_valid = true"), "d", 20,
+                             deps.resolve_adapter, deps.registry, deps.node_lowerings, deps.node_specs)
+            return "images", all(row.get("is_valid") for row in r.rows), r.not_previewable
+        r = preview_node(graph_for(evs, "amount > 1"), "d", 20,
+                         deps.resolve_adapter, deps.registry, deps.node_lowerings, deps.node_specs)
+        return "events", all(row.get("amount", 0) > 1 for row in r.rows), r.not_previewable
+
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(run, range(24)))
+    assert all(ok and not npv for _, ok, npv in results)  # no cross-contamination, no crash
+
+
+def test_sandbox_blocks_dunder_escape():
+    # the classic ().__class__.__mro__ escape must be rejected (finding #4)
+    code = "def fn(row):\n    row['x'] = ().__class__.__mro__[-1].__subclasses__()\n    return row"
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("images")}),
+        N("xf", "transform", {"source": "adhoc", "mode": "map", "code": code}),
+    ], "edges": [E("src", "xf")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "xf", "k": 5}).json()
+    assert r["error"] or r["notPreviewable"]  # blocked, not executed
+    assert "__" in (r.get("reason") or "") or "allowed" in (r.get("reason") or "")
+
+
+def test_write_mode_append_rejected_not_silent_overwrite():
+    # append/merge must error rather than silently overwrite (finding #7)
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("images")}),
+        N("wr", "write", {"name": "append_test", "writeMode": "append"}),
+    ], "edges": [E("src", "wr")]}
+    r = client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()
+    st = _poll(r["runId"])
+    assert st["status"] == "failed" and "append" in (st.get("error") or "").lower()
+
+
+def test_metric_over_transform_upstream_not_previewable():
+    # a metric whose upstream has a Python transform must refuse preview, not spill all rows (finding #6)
+    code = "def fn(row):\n    row['w2'] = row['width'] * 2\n    return row"
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("images")}),
+        N("xf", "transform", {"source": "adhoc", "mode": "map", "code": code}),
+        N("m", "metric", {"agg": "count"}),
+    ], "edges": [E("src", "xf"), E("xf", "m")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "m", "k": 5}).json()
+    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+
+
 def test_plugin_node_lowering():
     # simulate a plugin registering a typed node via the SDK contract
     from kernel.sdk import NodeSpec, PortSpec, ParamSpec, ctx

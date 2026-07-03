@@ -62,10 +62,10 @@ def _fingerprint_path(p: str) -> str:
                 for f in sorted(files):
                     fp = os.path.join(root, f)
                     st = os.stat(fp)
-                    parts.append(f"{fp}:{st.st_size}:{int(st.st_mtime)}")
+                    parts.append(f"{fp}:{st.st_size}:{st.st_mtime_ns}")
             return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         st = os.stat(p)
-        return hashlib.sha256(f"{p}:{st.st_size}:{int(st.st_mtime)}".encode()).hexdigest()[:16]
+        return hashlib.sha256(f"{p}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:16]
     except OSError:
         return "unknown"
 
@@ -133,6 +133,9 @@ class DuckDBAdapter:
         return _fingerprint_path(path_of(uri))
 
     def write(self, uri: str, rel: Relation, mode: str = "overwrite") -> dict:
+        if mode not in ("overwrite", None):
+            # append/merge aren't implemented for files yet — refuse rather than silently overwrite
+            raise NotImplementedError(f"write mode '{mode}' is not supported for {os.path.splitext(uri)[1] or 'this'} output yet — use overwrite")
         p = path_of(uri)
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
         low = p.lower()

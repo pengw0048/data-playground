@@ -1,17 +1,27 @@
 """Shared DuckDB connection — the default local data engine.
 
-DuckDB is the one heavyweight dependency of the default bundle: it reads Parquet/CSV,
-samples, counts, runs SQL views, and writes Parquet outputs. No external service.
+DuckDB reads Parquet/CSV, samples, counts, runs SQL views, and writes outputs. No external
+service. A `DuckDBPyConnection` is NOT safe for concurrent use, so all execution is serialized
+under one reentrant lock (`with db.lock(): ...`) and temporary view names are process-globally
+unique (concurrent evaluations would otherwise clobber each other's views).
 """
 
 from __future__ import annotations
 
+import itertools
 import threading
 
 import duckdb
 
-_lock = threading.RLock()  # reentrant: query()/execute() hold it while calling conn()
+_lock = threading.RLock()  # reentrant: serializes ALL DuckDB access; query()/execute() nest under it
 _conn: duckdb.DuckDBPyConnection | None = None
+_view_seq = itertools.count(1)
+_created_views: set[str] = set()
+
+
+def lock() -> threading.RLock:
+    """Acquire around a whole preview/run evaluation: `with db.lock(): ...`."""
+    return _lock
 
 
 def conn() -> duckdb.DuckDBPyConnection:
@@ -24,8 +34,26 @@ def conn() -> duckdb.DuckDBPyConnection:
     return _conn
 
 
+def unique_view(prefix: str = "v") -> str:
+    """A process-globally-unique temp view name (never collides across engines/threads)."""
+    with _lock:
+        name = f"dp_{prefix}_{next(_view_seq)}"
+        _created_views.add(name)
+        return name
+
+
+def drop_created_views() -> None:
+    """Drop the temp views minted during an evaluation (call in a finally, under the lock)."""
+    with _lock:
+        for n in list(_created_views):
+            try:
+                conn().execute(f'DROP VIEW IF EXISTS "{n}"')
+            except Exception:  # noqa: BLE001
+                pass
+        _created_views.clear()
+
+
 def query(sql: str, params: list | None = None) -> list[dict]:
-    """Run a query, return rows as list[dict]."""
     with _lock:
         cur = conn().execute(sql, params or [])
         cols = [d[0] for d in cur.description]
@@ -33,7 +61,6 @@ def query(sql: str, params: list | None = None) -> list[dict]:
 
 
 def query_columns(sql: str, params: list | None = None) -> list[tuple[str, str]]:
-    """Return (name, duckdb_type) for the columns a query would produce."""
     with _lock:
         cur = conn().execute(f"DESCRIBE {sql}", params or [])
         return [(r[0], r[1]) for r in cur.fetchall()]

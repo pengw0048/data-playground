@@ -26,6 +26,8 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const caps = capabilitiesFor(columns as ColumnSchema[])
   const isMetric = columns.length === 2 && columns.some((c) => c.name === 'value') && columns.some((c) => c.name === 'metric')
   const tabs = [{ id: 'rows', label: 'Rows' }, ...caps.map((c) => ({ id: c.id, label: c.label }))]
+  // a refresh may drop the capability whose tab was selected — fall back to Rows
+  const activeTab = tab === 'rows' || caps.some((c) => c.id === tab) ? tab : 'rows'
 
   return (
     <div className="dp-dark" style={{ color: 'var(--viewer-text)' }}>
@@ -37,8 +39,8 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
             onClick={() => setTab(t.id)}
             style={{
               fontSize: 11.5, fontWeight: 600, padding: '4px 10px', border: 'none', borderRadius: 6,
-              background: tab === t.id ? '#e7ebf5' : 'transparent',
-              color: tab === t.id ? '#3355c6' : 'var(--viewer-text-2)',
+              background: activeTab === t.id ? '#e7ebf5' : 'transparent',
+              color: activeTab === t.id ? '#3355c6' : 'var(--viewer-text-2)',
             }}
           >
             {t.label}
@@ -55,11 +57,11 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
 
       {isMetric ? (
         <MetricValue rows={res.rows} />
-      ) : tab === 'rows' ? (
+      ) : activeTab === 'rows' ? (
         <RowsTable columns={columns as ColumnSchema[]} rows={res.rows} />
       ) : (
         (() => {
-          const cap = caps.find((c) => c.id === tab)
+          const cap = caps.find((c) => c.id === activeTab)
           const Tab = cap?.viewerTab
           return Tab ? <Tab columns={columns as ColumnSchema[]} rows={res.rows} /> : null
         })()

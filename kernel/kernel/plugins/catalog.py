@@ -42,7 +42,11 @@ class InMemoryCatalog:
             self._add(name=name, uri=path, version="v1")
 
     def _add(self, name: str, uri: str, version: str, meta: str | None = None) -> CatalogTable:
-        tid = f"tbl_{name}"
+        # id from the uri (names collide across different files); fall back to name if uri is reused
+        import hashlib as _h
+        tid = f"tbl_{name}" if uri not in self._by_uri else self._by_uri[uri]
+        if any(t.id == f"tbl_{name}" and t.uri != uri for t in self.tables.values()):
+            tid = f"tbl_{name}_{_h.sha1(uri.encode()).hexdigest()[:6]}"
         try:
             adapter = self.resolve(uri)
             columns = adapter.schema(uri)

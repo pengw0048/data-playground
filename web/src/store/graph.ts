@@ -145,19 +145,23 @@ export const useStore = create<Store>((set, get) => ({
   // push the current doc onto the undo stack (called before a structural mutation)
   commit: () => set((s) => ({ past: [...s.past, s.doc].slice(-50), future: [] })),
 
-  undo: () =>
+  undo: () => {
+    _cfgEdit = { id: '', t: 0 }  // a following edit starts a fresh undo checkpoint
     set((s) => {
       if (s.past.length === 0) return {}
       const prev = s.past[s.past.length - 1]
       return { doc: prev, past: s.past.slice(0, -1), future: [s.doc, ...s.future].slice(0, 50), openPanels: {} }
-    }),
+    })
+  },
 
-  redo: () =>
+  redo: () => {
+    _cfgEdit = { id: '', t: 0 }
     set((s) => {
       if (s.future.length === 0) return {}
       const next = s.future[0]
       return { doc: next, future: s.future.slice(1), past: [...s.past, s.doc].slice(-50), openPanels: {} }
-    }),
+    })
+  },
 
   addNode: (kind, position, config, title) => {
     const spec = getSpec(kind)
@@ -174,7 +178,7 @@ export const useStore = create<Store>((set, get) => ({
         config: { ...base.config, ...(config ?? {}) },
       },
     }
-    set((s) => ({ doc: { ...s.doc, nodes: [...s.doc.nodes, node] }, selectedId: node.id }))
+    set((s) => ({ doc: { ...s.doc, nodes: [...s.doc.nodes, node] }, selectedId: node.id, selectedIds: [node.id] }))
     return node
   },
 
@@ -211,15 +215,21 @@ export const useStore = create<Store>((set, get) => ({
 
   removeNode: (id) => {
     get().commit()
-    set((s) => ({
-      doc: {
-        ...s.doc,
-        nodes: s.doc.nodes.filter((n) => n.id !== id),
-        edges: s.doc.edges.filter((e) => e.source !== id && e.target !== id),
-      },
-      selectedId: s.selectedId === id ? null : s.selectedId,
-      openPanels: Object.fromEntries(Object.entries(s.openPanels).filter(([k]) => k !== id)),
-    }))
+    set((s) => {
+      const previews = { ...s.previews }; delete previews[id]
+      const runs = { ...s.runs }; delete runs[id]
+      return {
+        doc: {
+          ...s.doc,
+          nodes: s.doc.nodes.filter((n) => n.id !== id),
+          edges: s.doc.edges.filter((e) => e.source !== id && e.target !== id),
+        },
+        selectedId: s.selectedId === id ? null : s.selectedId,
+        selectedIds: s.selectedIds.filter((x) => x !== id),
+        openPanels: Object.fromEntries(Object.entries(s.openPanels).filter(([k]) => k !== id)),
+        previews, runs,
+      }
+    })
   },
 
   connect: (edge) => {
@@ -247,15 +257,20 @@ export const useStore = create<Store>((set, get) => ({
     if (!ids.length) return
     get().commit()
     const kill = new Set(ids)
-    set((s) => ({
-      doc: {
-        ...s.doc,
-        nodes: s.doc.nodes.filter((n) => !kill.has(n.id)),
-        edges: s.doc.edges.filter((e) => !kill.has(e.source) && !kill.has(e.target)),
-      },
-      selectedId: null, selectedIds: [],
-      openPanels: Object.fromEntries(Object.entries(s.openPanels).filter(([k]) => !kill.has(k))),
-    }))
+    set((s) => {
+      const previews = Object.fromEntries(Object.entries(s.previews).filter(([k]) => !kill.has(k)))
+      const runs = Object.fromEntries(Object.entries(s.runs).filter(([k]) => !kill.has(k)))
+      return {
+        doc: {
+          ...s.doc,
+          nodes: s.doc.nodes.filter((n) => !kill.has(n.id)),
+          edges: s.doc.edges.filter((e) => !kill.has(e.source) && !kill.has(e.target)),
+        },
+        selectedId: null, selectedIds: [],
+        openPanels: Object.fromEntries(Object.entries(s.openPanels).filter(([k]) => !kill.has(k))),
+        previews, runs,
+      }
+    })
   },
 
   bypass: (id) => {
@@ -290,7 +305,7 @@ export const useStore = create<Store>((set, get) => ({
       position: { x: n.position.x + 40, y: n.position.y + 40 },
       data: { ...n.data, status: 'draft', history: [] },
     }
-    set((s) => ({ doc: { ...s.doc, nodes: [...s.doc.nodes, copy] }, selectedId: copy.id }))
+    set((s) => ({ doc: { ...s.doc, nodes: [...s.doc.nodes, copy] }, selectedId: copy.id, selectedIds: [copy.id] }))
   },
 
   // one panel open at a time across the whole canvas — never overlapping
@@ -403,18 +418,28 @@ export const useStore = create<Store>((set, get) => ({
     } catch { /* offline */ }
   },
 
-  restoreVersion: (id, versionId) =>
-    set((s) => ({
-      doc: {
-        ...s.doc,
-        nodes: s.doc.nodes.map((n) => {
-          if (n.id !== id) return n
-          const v = (n.data.history ?? []).find((h) => h.id === versionId)
-          if (!v) return n
-          return { ...n, data: { ...n.data, config: { ...v.config }, status: 'latest' } }
-        }),
-      },
-    })),
+  restoreVersion: (id, versionId) => {
+    get().commit()  // Restore is undoable
+    set((s) => {
+      const stale = downstream(s.doc, id)
+      return {
+        doc: {
+          ...s.doc,
+          nodes: s.doc.nodes.map((n) => {
+            if (n.id === id) {
+              const v = (n.data.history ?? []).find((h) => h.id === versionId)
+              return v ? { ...n, data: { ...n.data, config: { ...v.config }, status: 'latest' } } : n
+            }
+            // restoring a node's config invalidates its dependents
+            if (stale.has(n.id) && n.data.status === 'latest') {
+              return { ...n, data: { ...n.data, status: 'stale' } }
+            }
+            return n
+          }),
+        },
+      }
+    })
+  },
 
   bootstrap: async () => {
     // restore the last canvas from localStorage so work survives a refresh (real product, not demo)
@@ -454,7 +479,7 @@ export const useStore = create<Store>((set, get) => ({
     } catch { /* offline: keep in memory */ }
   },
 
-  loadDoc: (doc) => set({ doc, previews: {}, runs: {}, openPanels: {}, selectedId: null, past: [], future: [] }),
+  loadDoc: (doc) => { _cfgEdit = { id: '', t: 0 }; set({ doc, previews: {}, runs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [] }) },
 }))
 
 // Auto-persist the canvas to localStorage (debounced) so a refresh keeps your work.
@@ -473,6 +498,8 @@ useStore.subscribe((s) => {
 
 function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void, nodeId: string, runId: string) {
   const tick = async () => {
+    // stop polling if the node was deleted mid-run (don't re-insert a runs entry for it)
+    if (!get().doc.nodes.some((n) => n.id === nodeId)) return
     let status: RunStatus
     try {
       status = await api.runStatus(runId)

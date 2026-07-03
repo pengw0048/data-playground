@@ -32,8 +32,6 @@ from kernel.nodespecs import NodeSpec, ParamSpec, PortSpec, WireType  # re-expor
 
 __all__ = ["NodeSpec", "ParamSpec", "PortSpec", "WireType", "ctx"]
 
-_view_seq = [0]
-
 
 class _Ctx:
     """Safe builders that turn relations into relations without forcing materialization."""
@@ -44,8 +42,7 @@ class _Ctx:
         (``{input}`` can't occur in valid SQL, so unlike a bare ``_`` it never rewrites an
         underscore inside a string literal or LIKE pattern.)
         """
-        _view_seq[0] += 1
-        name = f"_sdk_{_view_seq[0]}"
+        name = db.unique_view("sdk")  # process-globally-unique + tracked for cleanup
         rel.create_view(name, replace=True)
         return db.conn().sql(query.replace("{input}", name))
 
