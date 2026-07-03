@@ -199,6 +199,34 @@ def run_preview(req: PreviewRequest) -> SampleResult:
                         deps.resolve_adapter, deps.registry, deps.node_lowerings, deps.node_specs)
 
 
+# --------------------------------------------------------------------------- #
+# Agent (optional LLM planner — key stays in the kernel, never the browser)
+# --------------------------------------------------------------------------- #
+class AgentRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    outcome: str
+    graph: dict = {}
+
+
+@api.get("/agent")
+def agent_get_status() -> dict:
+    from kernel.agent import agent_status
+    return agent_status()
+
+
+@api.post("/agent")
+def agent_act(req: AgentRequest) -> dict:
+    from kernel.agent import agent_status, run_agent
+    st = agent_status()
+    if not st["available"]:
+        return {"available": False, "reason": st["reason"]}
+    try:
+        out = run_agent(req.outcome, req.graph, get_deps())
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"agent error: {type(e).__name__}: {e}")
+    return {"available": True, **out}
+
+
 def _row_estimate(req_graph, target_node_id, deps) -> int:
     chain = upstream_chain(req_graph, target_node_id) if target_node_id else req_graph.nodes
     for n in chain:

@@ -63,6 +63,16 @@ export interface BackendNodeSpec {
   canBypass: boolean; previewable: boolean; blurb: string
 }
 
+export interface AgentBackendNode { id: string; type: string; position: { x: number; y: number }; data: { title?: string; config?: Record<string, unknown> } }
+export interface AgentBackendEdge { id: string; source: string; target: string; sourceHandle?: string | null; targetHandle?: string | null; data?: { wire: string } }
+export interface AgentResult {
+  available: boolean
+  reason?: string
+  summary?: string
+  transcript?: { tool: string; input: Record<string, unknown>; result: Record<string, unknown> }[]
+  graph?: { nodes: AgentBackendNode[]; edges: AgentBackendEdge[] }
+}
+
 export const api = {
   kernel: () => req<KernelInfo>('/kernel'),
   health: () => req<{ ok: boolean }>('/health'),
@@ -100,6 +110,10 @@ export const api = {
 
   runStatus: (runId: string) => req<RunStatus>(`/run/${runId}`),
   cancelRun: (runId: string) => req<RunStatus>(`/run/${runId}/cancel`, { method: 'POST' }),
+
+  agentStatus: () => req<{ available: boolean; reason: string; model?: string }>('/agent'),
+  agentAct: (doc: CanvasDoc, outcome: string) =>
+    req<AgentResult>('/agent', { method: 'POST', body: JSON.stringify({ outcome, graph: toGraph(doc) }) }),
 
   listCanvases: () => req<{ id: string; name: string; version: number }[]>('/canvas'),
   getCanvas: (id: string) => req<CanvasDoc>(`/canvas/${id}`),

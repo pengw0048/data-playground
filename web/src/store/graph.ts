@@ -8,7 +8,7 @@ import type {
 } from '../types/api'
 import { getSpec } from '../nodes/registry'
 import { registerGenericNodes } from '../nodes/generic'
-import { api, KernelError } from '../api/client'
+import { api, KernelError, type AgentBackendNode, type AgentBackendEdge } from '../api/client'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'code' | 'lineage'
 
@@ -16,6 +16,36 @@ const LS_KEY = 'dp-canvas'
 
 let _seq = 0
 let _cfgEdit = { id: '', t: 0 } // coalesces param-edit undo checkpoints
+
+/** A canvas position near `base` that doesn't overlap any existing node (so added nodes never stack). */
+export function freePosition(nodes: CanvasNode[], base: { x: number; y: number }): { x: number; y: number } {
+  const W = 280, H = 180
+  const clash = (x: number, y: number) => nodes.some((n) => Math.abs(n.position.x - x) < W && Math.abs(n.position.y - y) < H)
+  if (!clash(base.x, base.y)) return base
+  const dirs = [[1, 0], [0, 1], [1, 1], [-1, 0], [-1, 1], [0, -1], [1, -1], [-1, -1]]
+  for (let r = 1; r < 50; r++) {
+    for (const [dx, dy] of dirs) {
+      const x = base.x + dx * W * r * 0.75, y = base.y + dy * H * r * 0.9
+      if (!clash(x, y)) return { x, y }
+    }
+  }
+  return base
+}
+
+/** Whether a node can run/preview: it (or some ancestor) is a source with a configured uri. */
+export function nodeRunnable(doc: CanvasDoc, id: string): boolean {
+  const seen = new Set<string>()
+  const walk = (nid: string): boolean => {
+    if (seen.has(nid)) return false
+    seen.add(nid)
+    const n = doc.nodes.find((x) => x.id === nid)
+    if (!n) return false
+    if (n.type === 'source') return !!(n.data.config.uri || n.data.config.table)
+    return doc.edges.filter((e) => e.target === nid).map((e) => e.source).some(walk)
+  }
+  return walk(id)
+}
+
 export function newId(kind: string): string {
   _seq += 1
   return `${kind}-${_seq}-${Math.floor(performance.now() % 100000)}`
@@ -46,6 +76,7 @@ interface Store {
   runs: Record<string, RunState>
   past: CanvasDoc[]
   future: CanvasDoc[]
+  saved: boolean          // auto-save state (localStorage), shown subtly in the top bar
 
   agentOpen: boolean
   agentMode: 'plan' | 'build'
@@ -99,6 +130,7 @@ interface Store {
   // -- persistence --
   save: () => Promise<void>
   loadDoc: (doc: CanvasDoc) => void
+  applyAgentGraph: (graph: { nodes: AgentBackendNode[]; edges: AgentBackendEdge[] }) => void
 }
 
 function emptyDoc(): CanvasDoc {
@@ -135,6 +167,7 @@ export const useStore = create<Store>((set, get) => ({
   runs: {},
   past: [],
   future: [],
+  saved: true,
   agentOpen: false,
   agentMode: 'build',
   agentLog: [],
@@ -333,9 +366,10 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   // The play action: estimate, then start immediately for cheap work; only gate on expensive
-  // runs (FR-E3). No pointless confirm box for a small run.
+  // runs (FR-E3). Do NOT auto-open the run panel — the card shows status; the user opens details
+  // if interested. A confirm gate is the one exception (it needs the panel to show the button).
   requestRun: async (id) => {
-    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } }, openPanels: { [id]: 'run' } }))
+    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } } }))
     let estimate
     try {
       estimate = await api.estimate(get().doc, id)
@@ -344,7 +378,7 @@ export const useStore = create<Store>((set, get) => ({
       return
     }
     if (estimate.needsConfirm) {
-      set((s) => ({ runs: { ...s.runs, [id]: { estimate, phase: 'confirm' } } }))
+      set((s) => ({ runs: { ...s.runs, [id]: { estimate, phase: 'confirm' } }, openPanels: { [id]: 'run' } }))
     } else {
       set((s) => ({ runs: { ...s.runs, [id]: { estimate, phase: 'running' } } }))
       await get().run(id, false)
@@ -364,7 +398,8 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   run: async (id, confirmed = false) => {
-    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'running' } }, openPanels: { [id]: 'run' } }))
+    // no openPanels here — status shows on the card; the user opens the run panel if they want detail
+    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'running' } } }))
     get().updateData(id, { status: 'running' })
     try {
       const status = await api.run(get().doc, id, confirmed)
@@ -480,6 +515,22 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   loadDoc: (doc) => { _cfgEdit = { id: '', t: 0 }; set({ doc, previews: {}, runs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [] }) },
+
+  // Apply a graph the LLM agent built (extends the canvas). Undoable; preserves UI state of nodes
+  // whose ids already exist, and marks touched nodes stale so the user can preview/run them.
+  applyAgentGraph: (bg) => {
+    get().commit()
+    set((s) => {
+      const existing = new Map(s.doc.nodes.map((n) => [n.id, n]))
+      const nodes: CanvasNode[] = bg.nodes.map((n) => {
+        const prev = existing.get(n.id)
+        if (prev) return { ...prev, position: n.position, data: { ...prev.data, title: n.data.title ?? prev.data.title, config: { ...(n.data.config ?? {}) } as CanvasNode['data']['config'], status: 'stale' } }
+        return { id: n.id, type: n.type, position: n.position, data: { title: n.data.title ?? n.type, config: (n.data.config ?? {}) as CanvasNode['data']['config'], status: 'stale', history: [] } }
+      })
+      const edges: CanvasEdge[] = bg.edges.map((e) => ({ id: e.id, source: e.source, target: e.target, sourceHandle: e.sourceHandle ?? null, targetHandle: e.targetHandle ?? null, data: { wire: (e.data?.wire ?? 'dataset') as WireType } }))
+      return { doc: { ...s.doc, nodes, edges } }
+    })
+  },
 }))
 
 // Auto-persist the canvas to localStorage (debounced) so a refresh keeps your work.
@@ -488,10 +539,12 @@ let _lastDoc: CanvasDoc | undefined
 useStore.subscribe((s) => {
   if (s.doc === _lastDoc) return
   _lastDoc = s.doc
+  if (s.saved) useStore.setState({ saved: false })  // dirty → "saving…"
   clearTimeout(_saveTimer)
   _saveTimer = setTimeout(() => {
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify(s.doc))
+      localStorage.setItem(LS_KEY, JSON.stringify(useStore.getState().doc))
+      useStore.setState({ saved: true })
     } catch { /* quota / disabled */ }
   }, 400)
 })

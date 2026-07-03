@@ -18,7 +18,7 @@ export function Popover({
   maxHeight?: number
 }) {
   const popRef = useRef<HTMLDivElement>(null)
-  const [pos, setPos] = useState<{ left: number; top: number; width: number } | null>(null)
+  const [pos, setPos] = useState<{ left: number; top?: number; bottom?: number; width: number } | null>(null)
 
   useLayoutEffect(() => {
     if (!open || !anchorRef.current) return
@@ -29,11 +29,13 @@ export function Popover({
       const w = width ?? r.width
       let left = align === 'right' ? r.right - w : r.left
       left = Math.max(8, Math.min(left, window.innerWidth - w - 8))
-      const top = placement === 'bottom' ? r.bottom + 6 : Math.max(8, r.top - 6 - maxHeight)
-      setPos({ left, top, width: w })
+      // 'top' placement grows UPWARD from just above the anchor (anchor its bottom edge), so it
+      // sits flush regardless of content height — no guessed offset, no jump.
+      if (placement === 'top') setPos({ left, bottom: window.innerHeight - r.top + 6, width: w })
+      else setPos({ left, top: r.bottom + 6, width: w })
     }
     update()
-    // reposition while open (window resize); canvas pan/zoom closes via outside-mousedown
+    // reposition while open (window resize); canvas pan/zoom closes via outside-mousedown/wheel
     window.addEventListener('resize', update)
     return () => window.removeEventListener('resize', update)
   }, [open, anchorRef, width, align, placement, maxHeight])
@@ -67,7 +69,7 @@ export function Popover({
       className="dp-panel"
       onMouseDown={(e) => e.stopPropagation()}
       style={{
-        position: 'fixed', left: pos.left, top: pos.top, width: pos.width, zIndex: 1000,
+        position: 'fixed', left: pos.left, top: pos.top, bottom: pos.bottom, width: pos.width, zIndex: 1000,
         background: '#fff', border: `1px solid ${color.border}`, borderRadius: radius.panel,
         boxShadow: shadow.panel, padding: 5, maxHeight, overflowY: 'auto',
       }}

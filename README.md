@@ -105,7 +105,21 @@ make setup     # kernel deps (uv) + sample data + web deps (npm)
 make run       # dataplay: build SPA + serve SPA+API on :8471, open browser
 make dev-web   # optional: Vite hot-reload on :5173 (proxies /api -> the kernel)
 make test      # kernel end-to-end tests (real engine on real files)
+make e2e       # browser end-to-end tests (Playwright on the real UI) — see docs/TESTING.md
 ```
+
+## The agent
+
+The agent is an actor: describe an outcome and it **builds real, inspectable, typed nodes** on the
+canvas. Install the extra and set a key to run the LLM-backed agent (a server-side Claude tool-use
+loop — the key lives in the kernel, never the browser):
+
+```bash
+pip install 'data-playground[agent]'
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Without a key it falls back to a built-in offline keyword planner, so the feature degrades cleanly.
 
 ## License
 

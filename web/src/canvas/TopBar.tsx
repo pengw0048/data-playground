@@ -1,6 +1,5 @@
-import { useState } from 'react'
 import { useStore } from '../store/graph'
-import { color, radius, shadow } from '../theme/tokens'
+import { color, shadow } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { exportCanvas } from '../lib/exporters'
 
@@ -8,14 +7,7 @@ export function TopBar() {
   const doc = useStore((s) => s.doc)
   const kernelUp = useStore((s) => s.kernelUp)
   const kernelInfo = useStore((s) => s.kernelInfo)
-  const save = useStore((s) => s.save)
-  const [saved, setSaved] = useState(false)
-
-  const onSave = async () => {
-    await save()
-    setSaved(true)
-    setTimeout(() => setSaved(false), 1400)
-  }
+  const saved = useStore((s) => s.saved)
 
   return (
     <>
@@ -24,7 +16,8 @@ export function TopBar() {
         <span style={{ fontSize: 13.5, color: color.text3 }}>Data Playground</span>
         <span style={{ fontSize: 13.5, color: color.text3 }}>/</span>
         <span style={{ fontSize: 13.5, fontWeight: 600, color: color.ink }}>{doc.name ?? 'untitled'}</span>
-        <Icon name="chevronDown" size={13} style={{ color: color.text3 }} />
+        {/* auto-save: no button — just a quiet status */}
+        <span data-testid="autosave" style={{ fontSize: 11, color: color.text3, marginLeft: 2 }}>· {saved ? 'saved' : 'saving…'}</span>
       </div>
 
       <div style={{ position: 'absolute', top: 16, right: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -38,9 +31,6 @@ export function TopBar() {
           <span style={{ width: 8, height: 8, borderRadius: '50%', background: kernelUp ? color.latest : color.failed }} />
           kernel · {kernelUp ? 'warm' : 'offline'}
         </div>
-        <button onClick={onSave} title="Save canvas" style={{ ...pill, color: saved ? color.latest : color.text2 }}>
-          {saved ? <><Icon name="check" size={13} /> saved</> : <><Icon name="db" size={13} /> save</>}
-        </button>
         <button onClick={exportCanvas} title="Export canvas as JSON" style={{ ...pill, background: color.ink, color: '#fff', border: 'none' }}>
           <Icon name="export" size={13} /> Export
         </button>

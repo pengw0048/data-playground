@@ -10,6 +10,12 @@ node_modules/
 web/dist/
 *.tsbuildinfo
 
+# playwright (e2e artifacts)
+web/test-results/
+web/playwright-report/
+web/blob-report/
+web/.last-run.json
+
 # generated / runtime (regenerate with `make seed`)
 kernel/data/*.parquet
 kernel/data/*.csv

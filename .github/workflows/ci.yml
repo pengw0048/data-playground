@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  kernel-tests:
+    name: kernel (pytest — engine, plugins, agent)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install kernel (dev extra)
+        run: cd kernel && uv sync --extra dev
+      - name: Run tests
+        run: cd kernel && uv run pytest -q
+
+  e2e:
+    name: e2e (Playwright — real UI on the real kernel)
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # kernel: the Playwright webServer boots `dataplay` (needs uv + deps incl. anthropic via dev)
+      - name: Install kernel
+        run: cd kernel && uv sync --extra dev
+      # web: install, build the SPA (the kernel serves web/dist), install the browser
+      - name: Install web deps
+        run: cd web && npm install
+      - name: Build SPA
+        run: cd web && npm run build
+      - name: Install Playwright browser
+        run: cd web && npx playwright install --with-deps chromium
+      - name: Run E2E
+        run: cd web && npm run e2e
+      - name: Upload report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: web/playwright-report/
+          retention-days: 7

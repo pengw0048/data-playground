@@ -1,0 +1,25 @@
+import { defineConfig, devices } from '@playwright/test'
+
+// End-to-end tests drive the REAL app: the kernel (FastAPI + engine) serving the built SPA.
+// `npm run build` must run first (the kernel serves web/dist). The webServer block boots the
+// kernel on a test port and waits for /api/health before the specs run.
+const PORT = process.env.DP_E2E_PORT ?? '8899'
+
+export default defineConfig({
+  testDir: './e2e',
+  timeout: 30_000,
+  expect: { timeout: 8_000 },
+  retries: process.env.CI ? 1 : 0,
+  reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
+  use: {
+    baseURL: `http://127.0.0.1:${PORT}`,
+    trace: 'on-first-retry',
+  },
+  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  webServer: {
+    command: `cd ../kernel && uv run dataplay --workspace "$PWD" --port ${PORT} --no-open`,
+    url: `http://127.0.0.1:${PORT}/api/health`,
+    reuseExistingServer: !process.env.CI,
+    timeout: 120_000,
+  },
+})

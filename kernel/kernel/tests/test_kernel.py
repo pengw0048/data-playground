@@ -330,6 +330,61 @@ def test_metric_over_transform_upstream_not_previewable():
     assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
 
 
+def test_agent_status_and_fallback_without_key(monkeypatch):
+    # with no key the endpoint reports unavailable and POST returns available:false (frontend
+    # then falls back to the offline planner) — never a 500
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    st = client.get("/api/agent").json()
+    assert st["available"] is False and st["reason"]
+    act = client.post("/api/agent", json={"outcome": "sample images", "graph": {"nodes": [], "edges": []}}).json()
+    assert act["available"] is False
+
+
+def test_agent_builds_graph_via_tool_loop(monkeypatch):
+    # Drive run_agent with a scripted fake Claude client — exercises the REAL add_node/connect/
+    # finish dispatch + layout, no network. Ids are deterministic (source_a1, filter_a2).
+    import anthropic
+    from kernel.agent import run_agent
+
+    class B:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class R:
+        def __init__(self, content, stop_reason="tool_use"):
+            self.content, self.stop_reason = content, stop_reason
+
+    script = [
+        R([B(type="tool_use", name="add_node", id="a", input={"kind": "source", "config": {"uri": _uri("images")}})]),
+        R([B(type="tool_use", name="add_node", id="b", input={"kind": "filter", "config": {"predicate": "is_valid = true"}})]),
+        R([B(type="tool_use", name="connect", id="c", input={"source_id": "source_a1", "target_id": "filter_a2"})]),
+        R([B(type="tool_use", name="finish", id="d", input={"summary": "Built source -> filter."})]),
+    ]
+
+    class FakeMsgs:
+        def __init__(self):
+            self.i = 0
+
+        def create(self, **kw):
+            r = script[self.i]
+            self.i += 1
+            return r
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            self.messages = FakeMsgs()
+
+    monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
+    out = run_agent("filter images where valid", {"nodes": [], "edges": []}, get_deps())
+    kinds = [n["type"] for n in out["graph"]["nodes"]]
+    assert kinds == ["source", "filter"]
+    assert len(out["graph"]["edges"]) == 1
+    assert out["summary"] == "Built source -> filter."
+    xs = [n["position"]["x"] for n in out["graph"]["nodes"]]
+    assert xs[0] != xs[1]  # layout gave distinct columns (source col 0, filter col 1)
+    assert [t["tool"] for t in out["transcript"]] == ["add_node", "add_node", "connect"]
+
+
 def test_plugin_node_lowering():
     # simulate a plugin registering a typed node via the SDK contract
     from kernel.sdk import NodeSpec, PortSpec, ParamSpec, ctx

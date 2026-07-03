@@ -5,7 +5,7 @@ import { Tooltip } from '../ui/Tooltip'
 import { Popover } from '../ui/Popover'
 import { Port } from './Port'
 import { getSpec, type NodeSpec } from './registry'
-import { useStore, type PanelKind } from '../store/graph'
+import { useStore, nodeRunnable, type PanelKind } from '../store/graph'
 import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
 
@@ -27,6 +27,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const togglePanel = useStore((s) => s.togglePanel)
   const rename = useStore((s) => s.rename)
   const runState = useStore((s) => s.runs[id]?.phase)
+  const runnable = useStore((s) => nodeRunnable(s.doc, id))
 
   const kind = node?.type ?? 'transform'
   const accent = kindAccent[kind] ?? '#8a8f98'
@@ -106,12 +107,22 @@ export function NodeCard({ id, data, children, metaOverride }: {
                 borderTop: `1px solid ${color.hairline}`, background: '#f7f8fa',
               }}
             >
-              <ActionIcon name="eye" label="View data" active={openPanel === 'data'} onClick={() => runPreview(id)} />
+              <ActionIcon
+                name="eye" label={runnable ? 'View data' : 'Connect a source to preview'}
+                active={openPanel === 'data'} disabled={!runnable}
+                onClick={() => runPreview(id)}
+              />
               <ActionIcon
                 name={runState === 'running' ? 'stop' : 'play'}
-                label={runState === 'running' ? 'Stop' : 'Run'}
+                label={!runnable ? 'Connect a source to run' : runState === 'running' ? 'Stop' : (runState && runState !== 'idle' && runState !== 'estimating') ? 'Run details' : 'Run'}
                 active={openPanel === 'run'}
-                onClick={() => (runState === 'running' ? cancelRun(id) : requestRun(id))}
+                disabled={!runnable}
+                onClick={() => {
+                  if (runState === 'running') cancelRun(id)
+                  // finished/confirm/estimated → open the run panel for detail; else start a run
+                  else if (runState && ['confirm', 'estimated', 'done', 'failed'].includes(runState)) togglePanel(id, 'run')
+                  else requestRun(id)
+                }}
               />
               <ActionIcon name="clock" label="History" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
               {hasCode && <ActionIcon name="code" label="Code" active={openPanel === 'code'} onClick={() => togglePanel(id, 'code')} />}
@@ -125,21 +136,24 @@ export function NodeCard({ id, data, children, metaOverride }: {
   )
 }
 
-function ActionIcon({ name, label, active, onClick }: {
-  name: IconName; label: string; active?: boolean; onClick: () => void
+function ActionIcon({ name, label, active, onClick, disabled }: {
+  name: IconName; label: string; active?: boolean; onClick: () => void; disabled?: boolean
 }) {
   const [hover, setHover] = useState(false)
   return (
     <Tooltip label={label}>
       <button
         aria-label={label}
+        aria-disabled={disabled}
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
-        onClick={(e) => { e.stopPropagation(); onClick() }}
+        onClick={(e) => { e.stopPropagation(); if (!disabled) onClick() }}
         style={{
           width: 26, height: 24, display: 'grid', placeItems: 'center', border: 'none',
-          borderRadius: 6, background: active ? '#e7ebf5' : hover ? '#eceef1' : 'transparent',
-          color: active ? color.focus : hover ? color.ink : color.text3,
+          borderRadius: 6,
+          background: disabled ? 'transparent' : active ? '#e7ebf5' : hover ? '#eceef1' : 'transparent',
+          color: disabled ? '#c8ccd2' : active ? color.focus : hover ? color.ink : color.text3,
+          cursor: disabled ? 'not-allowed' : 'pointer',
           transition: 'background .1s, color .1s',
         }}
       >

@@ -70,7 +70,7 @@ export function Canvas() {
   const removeSelected = useStore((s) => s.removeSelected)
   const bypass = useStore((s) => s.bypass)
   const mute = useStore((s) => s.mute)
-  const { screenToFlowPosition } = useReactFlow()
+  const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
 
   const connectStart = useRef<OnConnectStartParams | null>(null)
   const [menu, setMenu] = useState<{ x: number; y: number; wire: WireType; source: OnConnectStartParams } | null>(null)
@@ -224,15 +224,16 @@ export function Canvas() {
         deleteKeyCode={null}
       >
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="#d6d9df" />
-        <Controls showInteractive={false} position="bottom-left" style={{ marginBottom: 84 }} />
+        {/* zoom controls sit ABOVE the minimap so they never overlap */}
+        <Controls showInteractive={false} position="bottom-left" style={{ marginBottom: 132, marginLeft: 12 }} />
         <MiniMap
           pannable
-          zoomable
           position="bottom-left"
-          style={{ marginBottom: 140, width: 168, height: 108 }}
+          style={{ marginBottom: 12, marginLeft: 12, width: 168, height: 108 }}
           maskColor="rgba(244,245,247,0.7)"
           nodeColor={(n) => kindAccent[n.type ?? ''] ?? color.text3}
           nodeStrokeWidth={0}
+          onClick={(_, pos) => setCenter(pos.x, pos.y, { zoom: getZoom(), duration: 350 })}
         />
       </ReactFlow>
 
