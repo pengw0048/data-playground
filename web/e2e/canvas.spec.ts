@@ -59,6 +59,17 @@ test.describe('Data Playground canvas', () => {
     expect(overlaps(a, b), 'two freshly added nodes overlap').toBe(false)
   })
 
+  test('duplicating a node does not stack it on the original', async ({ page }) => {
+    await page.goto('/')
+    await addNode(page, 'Query', 'sql')
+    const nodes = page.locator('.react-flow__node')
+    await expect(nodes).toHaveCount(1)
+    await page.getByRole('button', { name: 'More' }).click()
+    await page.getByRole('button', { name: 'Duplicate' }).click()
+    await expect(nodes).toHaveCount(2)
+    expect(overlaps(await boxOf(nodes.nth(0)), await boxOf(nodes.nth(1))), 'duplicated node overlaps the original').toBe(false)
+  })
+
   test('a node with no upstream source has Run disabled', async ({ page }) => {
     await page.goto('/')
     await addNode(page, 'Query', 'sql')
@@ -85,7 +96,7 @@ test.describe('Data Playground canvas', () => {
   test('agent dock shows its mode and builds real nodes (offline planner in CI)', async ({ page }) => {
     await page.goto('/')
     await page.getByRole('button', { name: 'Agent', exact: true }).click()
-    // no ANTHROPIC_API_KEY in CI → the dock advertises the offline planner
+    // no provider key configured in CI → the dock advertises the offline planner
     await expect(page.getByText('offline planner')).toBeVisible()
     await page.getByPlaceholder('Describe an outcome…').fill('sample images then write a table')
     await page.getByTestId('agent-submit').click() // Build (mode is Build by default)

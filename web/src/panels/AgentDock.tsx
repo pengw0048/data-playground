@@ -9,9 +9,9 @@ import { Icon } from '../ui/Icon'
 import { Segmented } from '../ui/controls'
 
 // The agent is an actor (§5.8): you describe an outcome; it BUILDS real, inspectable typed nodes.
-// When ANTHROPIC_API_KEY is set on the kernel it runs a real Claude tool-use loop server-side;
-// otherwise it falls back to the built-in offline keyword planner. The API key never touches the
-// browser (NFR-4).
+// When a model is configured on the kernel (any provider, via LiteLLM — DP_AGENT_MODEL + the
+// matching API key) it runs a real tool-use loop server-side; otherwise it falls back to the
+// built-in offline keyword planner. The API key never touches the browser (NFR-4).
 export function AgentDock() {
   const open = useStore((s) => s.agentOpen)
   const setOpen = useStore((s) => s.setAgentOpen)
@@ -89,7 +89,7 @@ export function AgentDock() {
           {log.length === 0 && (
             <div style={{ fontSize: 11.5, color: color.text3, lineHeight: 1.6 }}>
               Describe an outcome — e.g. <i>“sample images, filter where is_valid, write a table”</i>. Build creates real, inspectable nodes.
-              {llm && !llm.available && <><br />Set <code>ANTHROPIC_API_KEY</code> on the kernel for the full LLM agent; the offline planner is active now.</>}
+              {llm && !llm.available && <><br />Configure a model on the kernel (<code>DP_AGENT_MODEL</code> + a provider key like <code>ANTHROPIC_API_KEY</code> / <code>OPENAI_API_KEY</code>) for the full LLM agent; the offline planner is active now.</>}
             </div>
           )}
           {log.map((m, i) => (

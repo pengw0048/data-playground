@@ -111,15 +111,21 @@ make e2e       # browser end-to-end tests (Playwright on the real UI) — see do
 ## The agent
 
 The agent is an actor: describe an outcome and it **builds real, inspectable, typed nodes** on the
-canvas. Install the extra and set a key to run the LLM-backed agent (a server-side Claude tool-use
-loop — the key lives in the kernel, never the browser):
+canvas. It is **provider-agnostic** — a server-side tool-use loop via [LiteLLM](https://docs.litellm.ai),
+so you point it at whatever model you have (the key lives in the kernel, never the browser):
 
 ```bash
 pip install 'data-playground[agent]'
-export ANTHROPIC_API_KEY=sk-ant-...
+
+# pick any provider LiteLLM supports via DP_AGENT_MODEL + its key:
+export DP_AGENT_MODEL=anthropic/claude-opus-4-8   && export ANTHROPIC_API_KEY=sk-ant-...   # default
+# export DP_AGENT_MODEL=openai/gpt-4o             && export OPENAI_API_KEY=sk-...
+# export DP_AGENT_MODEL=gemini/gemini-1.5-pro     && export GEMINI_API_KEY=...
+# export DP_AGENT_MODEL=ollama/llama3             && export DP_AGENT_BASE_URL=http://localhost:11434  # local, no key
 ```
 
-Without a key it falls back to a built-in offline keyword planner, so the feature degrades cleanly.
+Without a configured model it falls back to a built-in offline keyword planner, so the feature
+degrades cleanly. The dock shows which is active.
 
 ## License
 

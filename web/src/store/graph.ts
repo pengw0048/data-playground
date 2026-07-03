@@ -335,7 +335,8 @@ export const useStore = create<Store>((set, get) => ({
     const copy: CanvasNode = {
       ...n,
       id: newId(n.type),
-      position: { x: n.position.x + 40, y: n.position.y + 40 },
+      // land in a clear spot near the original, never stacked on top of it
+      position: freePosition(get().doc.nodes, { x: n.position.x + 40, y: n.position.y + 40 }),
       data: { ...n.data, status: 'draft', history: [] },
     }
     set((s) => ({ doc: { ...s.doc, nodes: [...s.doc.nodes, copy] }, selectedId: copy.id, selectedIds: [copy.id] }))

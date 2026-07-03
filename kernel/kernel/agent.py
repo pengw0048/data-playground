@@ -1,16 +1,17 @@
 """LLM-backed agent — an actor that BUILDS a real, typed dataflow graph on the canvas.
 
-This is the optional "real LLM" planner (PRD §5.8 / FR-A3): it activates when `anthropic` is
-installed and ANTHROPIC_API_KEY is set. It runs a Claude tool-use loop server-side (the API key
-stays in the kernel, never the browser — NFR-4) with tools that add/connect/configure/preview
-nodes on a working copy of the graph, then returns the finished graph + a transcript of what it
-did. When no key is present the frontend falls back to the built-in offline keyword planner.
+This is the optional "real LLM" planner (PRD §5.8 / FR-A3). It is **provider-agnostic**: it runs a
+tool-use loop server-side through LiteLLM, so the model is chosen with DP_AGENT_MODEL — any provider
+LiteLLM supports (anthropic/claude-*, openai/gpt-*, gemini/*, openrouter/*, bedrock/*, azure/*, or a
+local ollama/* + DP_AGENT_BASE_URL). The matching provider key is read from the environment
+(ANTHROPIC_API_KEY / OPENAI_API_KEY / …) and stays in the kernel, never the browser (NFR-4). Tools
+add/connect/configure/preview nodes on a working copy of the graph; run_agent returns the finished
+graph + a transcript. When no provider is configured the frontend falls back to the offline planner.
 """
 
 from __future__ import annotations
 
 import json
-import os
 
 from kernel import graph as g
 from kernel.executors.preview import preview_node
@@ -19,21 +20,27 @@ from kernel.settings import settings
 
 
 def agent_status() -> dict:
-    """Whether the LLM agent is usable, and why not if not."""
+    """Whether the LLM agent is usable, and why not if not (provider-agnostic via LiteLLM)."""
+    model = settings.agent_model
     try:
-        import anthropic  # noqa: F401
+        import litellm
         installed = True
     except Exception:  # noqa: BLE001
         installed = False
-    has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    available = installed and has_key
-    if available:
-        reason = ""
-    elif not installed:
-        reason = "install the agent extra: pip install 'data-playground[agent]', then set ANTHROPIC_API_KEY"
-    else:
-        reason = "set ANTHROPIC_API_KEY to enable the LLM agent"
-    return {"available": available, "reason": reason, "model": settings.agent_model}
+    if not installed:
+        return {"available": False, "model": model,
+                "reason": "install the agent extra: pip install 'data-playground[agent]'"}
+    # a local/self-hosted endpoint OR an explicit key override needs no env-var provider key
+    preconfigured = bool(settings.agent_base_url) or bool(settings.agent_api_key)
+    missing: list[str] = []
+    if not preconfigured:
+        try:
+            missing = litellm.validate_environment(model).get("missing_keys") or []
+        except Exception:  # noqa: BLE001
+            missing = []
+    available = preconfigured or not missing
+    reason = "" if available else f"set {' or '.join(missing) or 'a provider API key'} to use model '{model}'"
+    return {"available": available, "reason": reason, "model": model}
 
 
 _SYSTEM = """\
@@ -75,38 +82,42 @@ def _node_kinds(deps) -> list[dict]:
     return out
 
 
+def _fn(name: str, description: str, params: dict) -> dict:
+    # OpenAI-style function tool (the shape LiteLLM expects and normalizes across all providers)
+    return {"type": "function", "function": {"name": name, "description": description, "parameters": params}}
+
+
 def _tool_defs() -> list[dict]:
     return [
-        {"name": "list_catalog", "description": "List the datasets registered in the local catalog (name, uri, columns).",
-         "input_schema": {"type": "object", "properties": {}}},
-        {"name": "list_node_kinds", "description": "List available node kinds with their params and input/output ports.",
-         "input_schema": {"type": "object", "properties": {}}},
-        {"name": "add_node", "description": "Add a node to the canvas. Returns its node_id and port handles.",
-         "input_schema": {"type": "object", "properties": {
-             "kind": {"type": "string"}, "title": {"type": "string"},
-             "config": {"type": "object", "description": "param name -> value"}},
-             "required": ["kind"]}},
-        {"name": "connect", "description": "Connect one node's output to another node's input.",
-         "input_schema": {"type": "object", "properties": {
-             "source_id": {"type": "string"}, "target_id": {"type": "string"},
-             "target_handle": {"type": "string", "description": "input handle id for multi-input nodes (e.g. join 'a'/'b')"}},
-             "required": ["source_id", "target_id"]}},
-        {"name": "set_config", "description": "Merge config values into an existing node.",
-         "input_schema": {"type": "object", "properties": {
-             "node_id": {"type": "string"}, "config": {"type": "object"}},
-             "required": ["node_id", "config"]}},
-        {"name": "preview", "description": "Preview a node over a small sample. Returns columns and up to 8 rows.",
-         "input_schema": {"type": "object", "properties": {"node_id": {"type": "string"}}, "required": ["node_id"]}},
-        {"name": "finish", "description": "Finish and summarize what you built.",
-         "input_schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}},
+        _fn("list_catalog", "List the datasets registered in the local catalog (name, uri, columns).",
+            {"type": "object", "properties": {}}),
+        _fn("list_node_kinds", "List available node kinds with their params and input/output ports.",
+            {"type": "object", "properties": {}}),
+        _fn("add_node", "Add a node to the canvas. Returns its node_id and port handles.",
+            {"type": "object", "properties": {
+                "kind": {"type": "string"}, "title": {"type": "string"},
+                "config": {"type": "object", "description": "param name -> value"}},
+                "required": ["kind"]}),
+        _fn("connect", "Connect one node's output to another node's input.",
+            {"type": "object", "properties": {
+                "source_id": {"type": "string"}, "target_id": {"type": "string"},
+                "target_handle": {"type": "string", "description": "input handle id for multi-input nodes (e.g. join 'a'/'b')"}},
+                "required": ["source_id", "target_id"]}),
+        _fn("set_config", "Merge config values into an existing node.",
+            {"type": "object", "properties": {
+                "node_id": {"type": "string"}, "config": {"type": "object"}},
+                "required": ["node_id", "config"]}),
+        _fn("preview", "Preview a node over a small sample. Returns columns and up to 8 rows.",
+            {"type": "object", "properties": {"node_id": {"type": "string"}}, "required": ["node_id"]}),
+        _fn("finish", "Finish and summarize what you built.",
+            {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}),
     ]
 
 
 def run_agent(outcome: str, graph: dict, deps) -> dict:
     """Run the tool-use loop; return {graph, transcript, summary}. Raises if the SDK/key is absent."""
-    import anthropic
+    import litellm
 
-    client = anthropic.Anthropic()
     wg = {
         "id": graph.get("id", "canvas"), "version": graph.get("version", 1),
         "nodes": [dict(n) for n in graph.get("nodes", [])],
@@ -181,32 +192,46 @@ def run_agent(outcome: str, graph: dict, deps) -> dict:
     ctx = (f"Outcome: {outcome}\n\nCurrent canvas has {len(wg['nodes'])} node(s) and "
            f"{len(wg['edges'])} edge(s). Build (or extend) a pipeline to achieve the outcome. "
            "Start by listing the catalog and node kinds.")
-    messages: list[dict] = [{"role": "user", "content": ctx}]
+    # OpenAI-style message list (LiteLLM normalizes it for every provider): system prompt goes in
+    # the list, not a separate kwarg.
+    messages: list = [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": ctx}]
     tools = _tool_defs()
     summary = "Done."
+    extra: dict = {"drop_params": True}  # silently drop params a given provider doesn't accept
+    if settings.agent_base_url:
+        extra["api_base"] = settings.agent_base_url  # local / self-hosted OpenAI-compatible endpoint
+    if settings.agent_api_key:
+        extra["api_key"] = settings.agent_api_key
 
     for _ in range(settings.agent_max_steps):
-        resp = client.messages.create(model=settings.agent_model, max_tokens=4096,
-                                      system=_SYSTEM, tools=tools, messages=messages)
-        messages.append({"role": "assistant", "content": resp.content})
-        if resp.stop_reason != "tool_use":
-            txt = " ".join(b.text for b in resp.content if b.type == "text").strip()
-            if txt:
-                summary = txt
+        resp = litellm.completion(model=settings.agent_model, max_tokens=4096,
+                                  messages=messages, tools=tools, tool_choice="auto", **extra)
+        msg = resp.choices[0].message
+        calls = msg.tool_calls or []
+        if not calls:  # no tool calls → the model is done
+            summary = (msg.content or "").strip() or summary
             break
-        results, finished = [], False
-        for block in resp.content:
-            if block.type != "tool_use":
-                continue
-            if block.name == "finish":
-                summary = (block.input or {}).get("summary", summary)
+        messages.append(msg)  # carry the assistant turn (with its tool_calls) back into history
+        finished = False
+        for tc in calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}")  # arguments is a JSON string
+            except Exception:  # noqa: BLE001
+                args = {}
+            if not isinstance(args, dict):  # a weaker model may emit non-object JSON — don't crash
+                args = {}
+            if name == "finish":
+                summary = args.get("summary", summary)
                 finished = True
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": "ok"})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "name": name, "content": "ok"})
                 continue
-            out = dispatch.get(block.name, lambda _: {"error": "unknown tool"})(block.input or {})
-            transcript.append({"tool": block.name, "input": block.input or {}, "result": out})
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(out)[:4000]})
-        messages.append({"role": "user", "content": results})
+            out = dispatch.get(name, lambda _: {"error": "unknown tool"})(args)
+            transcript.append({"tool": name, "input": args, "result": out})
+            # OpenAI turn structure: one tool message per tool_call, keyed by tool_call_id.
+            # default=str guards against odd nested cell types leaking into a tool result.
+            messages.append({"role": "tool", "tool_call_id": tc.id, "name": name,
+                             "content": json.dumps(out, default=str)[:4000]})
         if finished:
             break
 

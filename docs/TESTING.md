@@ -43,7 +43,8 @@ Each maps to a bug that was previously found by hand:
 5. **There is no Save button; an autosave indicator is present** — asserts absence + the indicator.
 6. **Minimap and zoom controls are both visible and do not overlap** — asserts disjoint boxes.
 7. **The agent builds real nodes** — opens the dock, confirms the mode indicator, runs a build,
-   asserts real nodes appear (offline planner in CI, LLM when `ANTHROPIC_API_KEY` is set).
+   asserts real nodes appear (offline planner in CI, LLM when a provider is configured via
+   `DP_AGENT_MODEL` + its key).
 
 ## The rule that keeps it working
 

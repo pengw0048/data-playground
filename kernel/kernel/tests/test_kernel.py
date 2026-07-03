@@ -331,8 +331,8 @@ def test_metric_over_transform_upstream_not_previewable():
 
 
 def test_agent_status_and_fallback_without_key(monkeypatch):
-    # with no key the endpoint reports unavailable and POST returns available:false (frontend
-    # then falls back to the offline planner) — never a 500
+    # with no provider key (agent_model defaults to anthropic/*) the endpoint reports unavailable
+    # and POST returns available:false (frontend then falls back to the offline planner) — never 500
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     st = client.get("/api/agent").json()
     assert st["available"] is False and st["reason"]
@@ -341,40 +341,48 @@ def test_agent_status_and_fallback_without_key(monkeypatch):
 
 
 def test_agent_builds_graph_via_tool_loop(monkeypatch):
-    # Drive run_agent with a scripted fake Claude client — exercises the REAL add_node/connect/
-    # finish dispatch + layout, no network. Ids are deterministic (source_a1, filter_a2).
-    import anthropic
+    # Drive run_agent with a scripted fake LiteLLM `completion` — provider-agnostic, so this covers
+    # the REAL add_node/connect/finish dispatch + layout for ANY backend, no network. Ids are
+    # deterministic (source_a1, filter_a2). Responses are OpenAI/LiteLLM-shaped.
+    import json as _json
+
+    import litellm
     from kernel.agent import run_agent
 
-    class B:
-        def __init__(self, **kw):
-            self.__dict__.update(kw)
+    class Fn:
+        def __init__(self, name, args):
+            self.name, self.arguments = name, _json.dumps(args)
 
-    class R:
-        def __init__(self, content, stop_reason="tool_use"):
-            self.content, self.stop_reason = content, stop_reason
+    class TC:
+        def __init__(self, tid, name, args):
+            self.id, self.type, self.function = tid, "function", Fn(name, args)
+
+    class Msg:
+        def __init__(self, calls, content=None):
+            self.content, self.tool_calls = content, calls
+
+    class Choice:
+        def __init__(self, msg, finish_reason="tool_calls"):
+            self.message, self.finish_reason = msg, finish_reason
+
+    class Resp:
+        def __init__(self, msg):
+            self.choices = [Choice(msg)]
 
     script = [
-        R([B(type="tool_use", name="add_node", id="a", input={"kind": "source", "config": {"uri": _uri("images")}})]),
-        R([B(type="tool_use", name="add_node", id="b", input={"kind": "filter", "config": {"predicate": "is_valid = true"}})]),
-        R([B(type="tool_use", name="connect", id="c", input={"source_id": "source_a1", "target_id": "filter_a2"})]),
-        R([B(type="tool_use", name="finish", id="d", input={"summary": "Built source -> filter."})]),
+        Resp(Msg([TC("t1", "add_node", {"kind": "source", "config": {"uri": _uri("images")}})])),
+        Resp(Msg([TC("t2", "add_node", {"kind": "filter", "config": {"predicate": "is_valid = true"}})])),
+        Resp(Msg([TC("t3", "connect", {"source_id": "source_a1", "target_id": "filter_a2"})])),
+        Resp(Msg([TC("t4", "finish", {"summary": "Built source -> filter."})])),
     ]
+    calls = {"i": 0}
 
-    class FakeMsgs:
-        def __init__(self):
-            self.i = 0
+    def fake_completion(**kw):
+        r = script[calls["i"]]
+        calls["i"] += 1
+        return r
 
-        def create(self, **kw):
-            r = script[self.i]
-            self.i += 1
-            return r
-
-    class FakeClient:
-        def __init__(self, *a, **k):
-            self.messages = FakeMsgs()
-
-    monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
+    monkeypatch.setattr(litellm, "completion", fake_completion)
     out = run_agent("filter images where valid", {"nodes": [], "edges": []}, get_deps())
     kinds = [n["type"] for n in out["graph"]["nodes"]]
     assert kinds == ["source", "filter"]
@@ -383,6 +391,57 @@ def test_agent_builds_graph_via_tool_loop(monkeypatch):
     xs = [n["position"]["x"] for n in out["graph"]["nodes"]]
     assert xs[0] != xs[1]  # layout gave distinct columns (source col 0, filter col 1)
     assert [t["tool"] for t in out["transcript"]] == ["add_node", "add_node", "connect"]
+
+
+def test_agent_status_honors_explicit_api_key(monkeypatch):
+    # an explicit DP_AGENT_API_KEY override must make the agent available even with no env-var key
+    # (regression: status previously only checked agent_base_url and mis-reported unavailable)
+    from kernel.agent import agent_status
+    from kernel.settings import settings
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(settings, "agent_api_key", "sk-explicit-override")
+    assert agent_status()["available"] is True
+
+
+def test_agent_tolerates_non_object_tool_arguments(monkeypatch):
+    # a weaker model can emit valid-but-non-object JSON args ("null"); the loop must coerce to {}
+    # and not crash into a 502 (regression: json.loads succeeded then .get() blew up)
+    import json as _json
+
+    import litellm
+    from kernel.agent import run_agent
+
+    class Fn:
+        def __init__(self, name, raw):
+            self.name, self.arguments = name, raw  # raw is a JSON string, possibly non-object
+
+    class TC:
+        def __init__(self, tid, name, raw):
+            self.id, self.type, self.function = tid, "function", Fn(name, raw)
+
+    class Msg:
+        def __init__(self, calls):
+            self.content, self.tool_calls = None, calls
+
+    class Resp:
+        def __init__(self, msg):
+            self.choices = [type("C", (), {"message": msg, "finish_reason": "tool_calls"})()]
+
+    script = [
+        Resp(Msg([TC("t1", "add_node", _json.dumps({"kind": "source", "config": {"uri": _uri("images")}}))])),
+        Resp(Msg([TC("t2", "finish", "null")])),  # non-object args — must not crash
+    ]
+    calls = {"i": 0}
+
+    def fake_completion(**kw):
+        r = script[calls["i"]]
+        calls["i"] += 1
+        return r
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    out = run_agent("build something", {"nodes": [], "edges": []}, get_deps())
+    assert [n["type"] for n in out["graph"]["nodes"]] == ["source"]
+    assert out["summary"] == "Done."  # non-object finish args fell back to {} → default summary
 
 
 def test_plugin_node_lowering():
