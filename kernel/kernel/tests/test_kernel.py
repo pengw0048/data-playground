@@ -200,12 +200,12 @@ def test_cancel_finished_run_stays_done():
 
 
 def test_typecheck_rejects_incompatible_connection():
-    # sql outputs sql-view; aggregate input accepts only dataset → must be rejected server-side
+    # metric outputs `metric`; aggregate's input accepts only `dataset` → must be rejected server-side
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
-        N("q", "sql", {"sql": "SELECT * FROM input"}),
+        N("m", "metric", {"agg": "count"}),
         N("agg", "aggregate", {"aggs": "count(*) AS n"}),
-    ], "edges": [E("src", "q"), {"id": "bad", "source": "q", "target": "agg", "data": {"wire": "sql-view"}}]}
+    ], "edges": [E("src", "m"), {"id": "bad", "source": "m", "target": "agg", "data": {"wire": "metric"}}]}
     assert client.post("/api/run", json={"graph": g, "targetNodeId": "agg", "confirmed": True}).status_code == 400
 
 

@@ -70,6 +70,40 @@ test.describe('Data Playground canvas', () => {
     expect(overlaps(await boxOf(nodes.nth(0)), await boxOf(nodes.nth(1))), 'duplicated node overlaps the original').toBe(false)
   })
 
+  test('action tooltips escape the card (not clipped by overflow:hidden)', async ({ page }) => {
+    await page.goto('/')
+    await addNode(page, 'Query', 'sql')
+    await page.getByRole('button', { name: 'Connect a source to preview' }).hover()
+    const tip = page.getByText('Connect a source to preview', { exact: true })
+    await expect(tip).toBeVisible()
+    // the fix: the tooltip is portaled to <body>, not rendered inside the (clipping) node card
+    const insideCard = await tip.evaluate((el) => !!el.closest('.react-flow__node'))
+    expect(insideCard, 'tooltip is still inside the node card and gets clipped').toBe(false)
+  })
+
+  test('clicking an output port opens the node menu; sql can connect out', async ({ page }) => {
+    await page.goto('/')
+    await addNode(page, 'Query', 'sql')
+    // a plain click (no drag) on the sql output handle opens the connect-from-port menu…
+    await page.locator('.react-flow__node .react-flow__handle-right').first().click()
+    await expect(page.getByText('accepts dataset')).toBeVisible()
+    // …and it is NOT empty — proves sql (a SQL view) can feed downstream dataset nodes
+    await expect(page.locator('.dp-panel').getByText('filter', { exact: true })).toBeVisible()
+    await expect(page.getByText('no compatible node')).toHaveCount(0)
+  })
+
+  test('dragging from an output port and releasing shows no menu', async ({ page }) => {
+    await page.goto('/')
+    await addNode(page, 'Query', 'sql')
+    const handle = page.locator('.react-flow__node .react-flow__handle-right').first()
+    const b = await boxOf(handle)
+    await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(b.x + 160, b.y + 120, { steps: 8 }) // a real drag onto empty pane
+    await page.mouse.up()
+    await expect(page.getByText('accepts dataset')).toHaveCount(0) // drag-release must not pop the picker
+  })
+
   test('a node with no upstream source has Run disabled', async ({ page }) => {
     await page.goto('/')
     await addNode(page, 'Query', 'sql')

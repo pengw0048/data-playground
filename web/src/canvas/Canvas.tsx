@@ -1,13 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   ReactFlow, Background, BackgroundVariant, Controls, MiniMap,
   applyNodeChanges, applyEdgeChanges, useReactFlow,
-  type Node, type Edge, type Connection, type NodeChange, type EdgeChange, type OnConnectStartParams,
+  type Node, type Edge, type Connection, type NodeChange, type EdgeChange,
 } from '@xyflow/react'
 import { buildNodeTypes } from '../nodes'
 import { WireEdge } from '../wires/WireEdge'
 import { canConnect, portWire, getSpec } from '../nodes/registry'
-import { useStore, newId } from '../store/graph'
+import { useStore, newId, freePosition } from '../store/graph'
 import { kindAccent, color } from '../theme/tokens'
 import type { WireType } from '../theme/tokens'
 import { ConnectMenu } from './ConnectMenu'
@@ -72,8 +72,7 @@ export function Canvas() {
   const mute = useStore((s) => s.mute)
   const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
 
-  const connectStart = useRef<OnConnectStartParams | null>(null)
-  const [menu, setMenu] = useState<{ x: number; y: number; wire: WireType; source: OnConnectStartParams } | null>(null)
+  const [menu, setMenu] = useState<{ x: number; y: number; wire: WireType; source: { nodeId: string | null; handleId: string | null } } | null>(null)
 
   // React Flow needs to own node measurements (`measured`/width/height): if we rebuilt node
   // objects from the store every render we'd drop them, and RF keeps unmeasured nodes hidden.
@@ -148,21 +147,17 @@ export function Canvas() {
     })
   }, [isValidConnection, connect, doc.nodes])
 
-  const onConnectStart = useCallback((_: any, params: OnConnectStartParams) => {
-    connectStart.current = params
-  }, [])
-
-  const onConnectEnd = useCallback((event: MouseEvent | TouchEvent) => {
-    const params = connectStart.current
-    connectStart.current = null
-    if (!params || params.handleType !== 'source') return
-    const target = event.target as HTMLElement
-    const droppedOnPane = target?.classList?.contains('react-flow__pane')
-    if (!droppedOnPane) return
-    const wire = portWire(doc.nodes, params.nodeId!, params.handleId, 'source')
-    if (!wire) return
-    const pt = 'clientX' in event ? { x: event.clientX, y: event.clientY } : { x: 0, y: 0 }
-    setMenu({ x: pt.x, y: pt.y, wire: wire as WireType, source: params })
+  // A CLICK on an output port opens the add-node menu (Port dispatches this event). A drag to
+  // connect never fires a click on the origin handle, so pulling a wire never pops the picker.
+  useEffect(() => {
+    const onPortClick = (ev: Event) => {
+      const { nodeId, handleId, x, y } = (ev as CustomEvent).detail as { nodeId: string; handleId: string; x: number; y: number }
+      const wire = portWire(doc.nodes, nodeId, handleId, 'source')
+      if (!wire) return
+      setMenu({ x, y, wire: wire as WireType, source: { nodeId, handleId } })
+    }
+    window.addEventListener('dp-port-click', onPortClick)
+    return () => window.removeEventListener('dp-port-click', onPortClick)
   }, [doc.nodes])
 
   // keyboard: Delete / Backspace remove selection; B bypass; M mute
@@ -205,8 +200,6 @@ export function Canvas() {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
-        onConnectStart={onConnectStart}
-        onConnectEnd={onConnectEnd}
         isValidConnection={isValidConnection}
         onPaneClick={() => { select(null); setMenu(null) }}
         onNodeClick={(e, n) => { if (!e.shiftKey && !e.metaKey && !e.ctrlKey) select(n.id) }}
@@ -217,6 +210,7 @@ export function Canvas() {
         fitView
         fitViewOptions={{ padding: 0.3, maxZoom: 1 }}
         panOnScroll
+        connectOnClick={false}
         selectionOnDrag
         panOnDrag={[1, 2]}
         selectionKeyCode={null}
@@ -248,7 +242,9 @@ export function Canvas() {
           wire={menu.wire}
           onClose={() => setMenu(null)}
           onPick={(kind) => {
-            const pos = screenToFlowPosition({ x: menu.x, y: menu.y })
+            const p = screenToFlowPosition({ x: menu.x, y: menu.y })
+            // place to the right of the port, in a clear spot (never on top of the source)
+            const pos = freePosition(useStore.getState().doc.nodes, { x: p.x + 60, y: p.y - 20 })
             const node = useStore.getState().addNode(kind, { x: pos.x, y: pos.y })
             if (node) {
               const wire = menu.wire

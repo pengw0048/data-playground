@@ -52,7 +52,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
       ))}
       {/* output ports */}
       {(spec?.outputs ?? []).map((p, i) => (
-        <Port key={p.id} spec={p} side="output" index={i} count={spec!.outputs.length} />
+        <Port key={p.id} spec={p} side="output" index={i} count={spec!.outputs.length} nodeId={id} />
       ))}
 
       <div
