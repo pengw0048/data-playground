@@ -210,12 +210,13 @@ def test_typecheck_rejects_incompatible_connection():
 
 
 def test_metric_edge_wire_does_not_422():
-    # an edge carrying wire='metric' (metric→variable is a valid connection) must not 422 the graph
+    # models.WireType must include 'metric'/'value' so an edge tagged with them parses (not a 422);
+    # the tag is cosmetic (type-checking recomputes from specs), so source→metric stays valid.
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
         N("m", "metric", {"agg": "count"}),
-        N("v", "variable", {}),
-    ], "edges": [E("src", "m"), {"id": "mv", "source": "m", "target": "v", "data": {"wire": "metric"}}]}
+    ], "edges": [{"id": "sm", "source": "src", "target": "m", "sourceHandle": None,
+                  "targetHandle": None, "data": {"wire": "metric"}}]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "m", "k": 5})
     assert r.status_code == 200  # not 422
 

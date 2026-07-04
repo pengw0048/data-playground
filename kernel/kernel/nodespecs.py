@@ -120,20 +120,7 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              inputs=[_in(("sample", "dataset"), wire="sample")], outputs=[_out("sample")], can_bypass=True,
              params=[ParamSpec(name="code", type="code", lang="python"), ParamSpec(name="mode", type="select", options=["map", "map_batches", "filter", "flat_map"], default="map")],
              blurb="embedded cell over a sample"),
-    NodeSpec(kind="branch", title="branch", category="control", tag="branch",
-             inputs=[_in(("dataset", "sample", "metric"))],
-             outputs=[_out(id="true", label="true"), _out(id="false", label="false")],
-             params=[ParamSpec(name="predicate", type="string")],
-             blurb="route by predicate / metric — no cycle"),
-    NodeSpec(kind="loop", title="loop", category="control", tag="loop",
-             inputs=[_in()], outputs=[_out()], previewable=False,
-             params=[ParamSpec(name="maxIters", type="int", default=5), ParamSpec(name="budgetUsd", type="float", default=20)],
-             blurb="bounded iterate over a subgraph body"),
-    NodeSpec(kind="variable", title="variable", category="control", tag="variable",
-             inputs=[_in(("metric", "sample", "dataset"), wire="metric")], outputs=[_out("value")],
-             params=[ParamSpec(name="column", type="string", label="drives param")],
-             blurb="a node output drives another node's param"),
-    NodeSpec(kind="opaque", title="opaque", category="control", tag="opaque",
-             inputs=[_in()], outputs=[_out()], previewable=False,
-             params=[], blurb="an op that can't be sampled — needs full pass"),
+    # NOTE: control-flow nodes (branch/loop/variable/opaque) were removed pending a proper design.
+    # Row-split "branch" was redundant with two filters; real control flow (conditional/iterative
+    # execution of subgraphs on the driver) needs a considered model — see docs/CONTROL_FLOW.md.
 ]
