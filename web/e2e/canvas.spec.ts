@@ -408,4 +408,43 @@ test.describe('Data Playground canvas', () => {
     await page.locator('.dp-panel').getByText('Disable (+ downstream)').click()
     await expect(page.locator('.react-flow__node').getByText('DISABLED', { exact: true })).toBeVisible()
   })
+
+  test('the URL reflects the open canvas + view (deep-linkable; back button works)', async ({ page }) => {
+    await page.goto('/')
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/#\/canvas\//) // editor URL is a canvas deep link
+    const canvasHash = await page.evaluate(() => location.hash)
+    // navigate to the files home → URL updates
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to files').click()
+    await expect(page.getByRole('heading', { name: 'Recents' })).toBeVisible()
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/files')
+    // browser Back returns to the canvas editor
+    await page.goBack()
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    // a deep link opens straight into that specific canvas
+    await page.goto('/' + canvasHash)
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe(canvasHash)
+  })
+
+  test('the Share dialog offers a copyable canvas link', async ({ page }) => {
+    await fresh(page)
+    await page.getByTestId('share-btn').click()
+    await expect(page.getByTestId('copy-link')).toBeVisible()
+    await expect(page.locator('input[readonly]').first()).toHaveValue(/#\/canvas\//)
+  })
+
+  test('a table is registered and added to the canvas from the Tables view', async ({ page }) => {
+    await fresh(page) // empty new canvas is the current doc
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to files').click()
+    await page.getByTestId('rail-tables').click()
+    await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
+    await expect(page.getByTestId('register-dataset')).toBeVisible() // register lives here, not only in Settings
+    // clicking the seeded dataset row drops a source onto the canvas and navigates to it
+    await page.getByText('images', { exact: true }).click()
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+  })
 })

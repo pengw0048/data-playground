@@ -11,6 +11,7 @@ import { Login } from './views/Login'
 import { Toaster } from './ui/Toaster'
 import { api } from './api/client'
 import { useStore } from './store/graph'
+import { initRouter } from './router'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 
 export default function App() {
@@ -24,7 +25,10 @@ export default function App() {
     api.authStatus().then(setAuth).catch(() => setAuth({ authEnabled: false, userId: 'local' }))
   }, [])
   useEffect(() => {
-    if (auth && (!auth.authEnabled || auth.userId) && !booted) { setBooted(true); bootstrap() }
+    if (auth && (!auth.authEnabled || auth.userId) && !booted) {
+      setBooted(true)
+      bootstrap().then(() => initRouter(useStore))  // wire URL ↔ state once the initial canvas is settled
+    }
   }, [auth, booted, bootstrap])
 
   if (!auth) return <div style={{ position: 'absolute', inset: 0 }} />  // brief splash while checking auth

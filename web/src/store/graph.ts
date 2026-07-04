@@ -9,6 +9,7 @@ import type {
 import { getSpec } from '../nodes/registry'
 import { registerGenericNodes, nodeInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
+import { parseHash } from '../router'
 import { api, KernelError, setApiUser, type AgentBackendNode, type AgentBackendEdge, type DpUser, type CanvasFile } from '../api/client'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
@@ -159,6 +160,8 @@ interface Store {
   // -- app shell (Figma-style views) --
   view: DpView
   setView: (v: DpView) => void
+  // drop a catalog dataset / library transform onto the open canvas and navigate to it (Tables/Transforms)
+  addToCanvas: (kind: string, config: Partial<NodeConfig>, title?: string) => void
   // a full-viewport Monaco editor for one node's code param (opened from the Inspector)
   fullscreenCode: { nodeId: string; param: string; lang?: string } | null
   openCodeFullscreen: (nodeId: string, param: string, lang?: string) => void
@@ -250,6 +253,11 @@ export const useStore = create<Store>((set, get) => ({
   doc: emptyDoc(),
   view: 'canvas',
   setView: (view) => set({ view }),
+  addToCanvas: (kind, config, title) => {
+    const pos = freePosition(get().doc.nodes, { x: 160, y: 160 })
+    get().addNode(kind, pos, config, title)  // commits + selects the new node
+    set({ view: 'canvas' })
+  },
   fullscreenCode: null,
   openCodeFullscreen: (nodeId, param, lang) => set({ fullscreenCode: { nodeId, param, lang } }),
   closeCodeFullscreen: () => set({ fullscreenCode: null }),
@@ -649,10 +657,17 @@ export const useStore = create<Store>((set, get) => ({
       set({ currentUser: me, users })
       await get().refreshFiles()
       const files = get().files
+      // honor a deep link (#/canvas/<id>, incl. a shared canvas resolved server-side); else the
+      // last-opened / newest / a fresh file. A #/tables|#/transforms|#/files link still loads a
+      // current canvas underneath, then switches to that shell view below.
+      const route = parseHash()
       const last = localStorage.getItem(OPEN_KEY(me.id))
-      const openId = last && files.some((f) => f.id === last) ? last : files[0]?.id
+      const openId = (route.view === 'canvas' && route.canvasId)
+        ? route.canvasId
+        : (last && files.some((f) => f.id === last) ? last : files[0]?.id)
       if (openId) await get().openFile(openId)
       else await get().newFile()
+      if (route.view !== 'canvas') get().setView(route.view)
     } catch {
       // offline / no kernel: fall back to the local cached doc so work survives a refresh
       try {

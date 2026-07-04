@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useStore, type DpView } from '../store/graph'
+import { api } from '../api/client'
 import { color, radius, shadow } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { SettingsModal } from '../panels/SettingsModal'
@@ -126,12 +127,30 @@ function FilesContent() {
 
 function TablesContent() {
   const catalog = useStore((s) => s.catalog)
+  const refreshCatalog = useStore((s) => s.refreshCatalog)
+  const addToCanvas = useStore((s) => s.addToCanvas)
+  const [uri, setUri] = useState('')
+  const [err, setErr] = useState('')
+  const register = async () => {
+    const u = uri.trim(); if (!u) return; setErr('')
+    try { await api.registerFile(u); await refreshCatalog(); setUri('') } catch (e) { setErr((e as Error).message) }
+  }
   return (
     <>
       <ViewHeader title="Tables" />
       <div style={{ padding: '4px 28px 28px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {/* register a dataset right here — view and manage in one place, not split into Settings */}
+        <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
+          <input value={uri} onChange={(e) => setUri(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') register() }} data-testid="register-dataset"
+            placeholder="Register a dataset — path or uri to Parquet/CSV/JSON/Arrow/Lance"
+            style={{ flex: 1, fontSize: 12.5, border: `1px solid ${color.border}`, borderRadius: 9, padding: '9px 12px', outline: 'none' }} />
+          <button onClick={register} style={{ border: 'none', borderRadius: 9, background: color.ink, color: '#fff', fontSize: 12.5, fontWeight: 600, padding: '0 16px', cursor: 'pointer' }}>Register</button>
+        </div>
+        {err && <div style={{ fontSize: 11, color: color.failed }}>{err}</div>}
         {catalog.map((t) => (
-          <div key={t.uri} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', border: `1px solid ${color.border}`, borderRadius: 10, background: '#fff' }}>
+          <button key={t.uri} onClick={() => addToCanvas('source', { uri: t.uri, tableId: t.id }, t.name)} title="Add as a source on the canvas"
+            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', border: `1px solid ${color.border}`, borderRadius: 10, background: '#fff', cursor: 'pointer', textAlign: 'left' }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = '#f7f8fa')} onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}>
             <Icon name="db" size={16} style={{ color: color.text3 }} />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: color.ink }}>{t.name}</div>
@@ -139,9 +158,10 @@ function TablesContent() {
             </div>
             <span style={{ fontSize: 11.5, color: color.text2 }}>{t.columns?.length ?? 0} cols</span>
             {t.rowCount != null && <span style={{ fontSize: 11.5, color: color.text3 }}>· {t.rowCount.toLocaleString()} rows</span>}
-          </div>
+            <span style={{ fontSize: 11, color: color.focus, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="plus" size={12} /> Use</span>
+          </button>
         ))}
-        {catalog.length === 0 && <div style={{ color: color.text3, fontSize: 13, padding: 20 }}>No datasets registered. Add one in Settings → Datasets.</div>}
+        {catalog.length === 0 && <div style={{ color: color.text3, fontSize: 13, padding: 20 }}>No datasets registered — add one above.</div>}
       </div>
     </>
   )
@@ -149,21 +169,25 @@ function TablesContent() {
 
 function TransformsContent() {
   const processors = useStore((s) => s.processors)
+  const addToCanvas = useStore((s) => s.addToCanvas)
   return (
     <>
       <ViewHeader title="Transforms" />
       <div style={{ padding: '4px 28px 28px', display: 'flex', flexDirection: 'column', gap: 8 }}>
         {processors.map((p) => (
-          <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', border: `1px solid ${color.border}`, borderRadius: 10, background: '#fff' }}>
+          <button key={p.id} onClick={() => addToCanvas('transform', { source: 'library', processor: p.id, version: p.version, mode: p.mode }, p.title || p.id)} title="Add to the canvas"
+            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', border: `1px solid ${color.border}`, borderRadius: 10, background: '#fff', cursor: 'pointer', textAlign: 'left' }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = '#f7f8fa')} onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}>
             <Icon name="fx" size={16} style={{ color: color.text3 }} />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: color.ink }}>{p.title || p.id}</div>
               <div style={{ fontSize: 11, color: color.text3 }}>{p.category}</div>
             </div>
             {p.mode && <span style={{ fontSize: 10.5, color: color.text3, background: '#f1f2f4', padding: '2px 7px', borderRadius: radius.chip }}>{p.mode}</span>}
-          </div>
+            <span style={{ fontSize: 11, color: color.focus, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="plus" size={12} /> Use</span>
+          </button>
         ))}
-        {processors.length === 0 && <div style={{ color: color.text3, fontSize: 13, padding: 20 }}>No transform processors registered.</div>}
+        {processors.length === 0 && <div style={{ color: color.text3, fontSize: 13, padding: 20, lineHeight: 1.6 }}>No transform processors yet. Write an ad-hoc code node on a canvas and “Promote to library” to add one here.</div>}
       </div>
     </>
   )

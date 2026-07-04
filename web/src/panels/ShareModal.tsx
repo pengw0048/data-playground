@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, type ShareInfo } from '../api/client'
 import { useStore } from '../store/graph'
+import { canvasLink } from '../router'
 import { color, radius, shadow } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 
@@ -39,6 +40,16 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
           <button onClick={onClose} aria-label="Close" style={{ border: 'none', background: 'transparent', color: color.text2, cursor: 'pointer' }}><Icon name="close" size={16} /></button>
         </div>
         <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div>
+            <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, marginBottom: 6 }}>Link</div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <input readOnly value={canvasLink(canvasId)} onClick={(e) => (e.target as HTMLInputElement).select()}
+                style={{ flex: 1, fontSize: 11.5, border: `1px solid ${color.border}`, borderRadius: 6, padding: '6px 8px', color: color.text2, background: '#f7f8fa', outline: 'none' }} />
+              <button data-testid="copy-link" onClick={() => { navigator.clipboard?.writeText(canvasLink(canvasId)).then(() => pushToast('Link copied', 'success'), () => {}) }}
+                style={{ border: `1px solid ${color.border}`, borderRadius: 6, background: '#fff', color: color.ink, fontSize: 12, fontWeight: 600, padding: '0 12px', cursor: 'pointer' }}>Copy</button>
+            </div>
+            <div style={{ fontSize: 10.5, color: color.text3, marginTop: 5 }}>Opens this canvas directly. People need at least workspace access (or an explicit invite below).</div>
+          </div>
           <div>
             <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, marginBottom: 6 }}>Visibility</div>
             <div style={{ display: 'inline-flex', gap: 3, background: '#f1f2f4', padding: 2, borderRadius: radius.button }}>
