@@ -39,3 +39,5 @@ kernel/_web/
 
 # kernel e2e/pytest artifacts
 kernel/test-results/
+
+kernel/data/canvases/
