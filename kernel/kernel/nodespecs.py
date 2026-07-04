@@ -33,6 +33,7 @@ class ParamSpec(_M):
     options: list[str] | None = None
     label: str | None = None
     lang: str | None = None  # for code params: 'python' | 'sql'
+    required: bool = False   # empty → the node is invalid and can't run (frontend gates Run + reason)
 
 
 class NodeSpec(_M):
@@ -89,7 +90,7 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
     NodeSpec(kind="join", title="join", category="compute", tag="join",
              inputs=[_in(("dataset", "sample"), id="a", label="left"), _in(("dataset", "sample"), id="b", label="right")],
              outputs=[_out()],
-             params=[ParamSpec(name="on", type="string", label="key(s)"),
+             params=[ParamSpec(name="on", type="string", label="key(s)", required=True),
                      ParamSpec(name="how", type="select", options=["inner", "left", "right", "outer"], default="inner")],
              blurb="out-of-core hash join on a key"),
     NodeSpec(kind="aggregate", title="aggregate", category="compute", tag="aggregate",
@@ -99,7 +100,7 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              blurb="group-by aggregation (out-of-core, needs full pass)"),
     NodeSpec(kind="sort", title="sort", category="shape", tag="sort",
              inputs=[_in()], outputs=[_out()], can_bypass=True,
-             params=[ParamSpec(name="by", type="string", label="order by")],
+             params=[ParamSpec(name="by", type="string", label="order by", required=True)],
              blurb="streaming sort (spills)"),
     NodeSpec(kind="dedup", title="dedup", category="shape", tag="dedup",
              inputs=[_in()], outputs=[_out()], can_bypass=True,

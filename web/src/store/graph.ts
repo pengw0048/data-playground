@@ -478,13 +478,10 @@ export const useStore = create<Store>((set, get) => ({
   runPreview: async (id: string) => {
     set((s) => ({ previews: { ...s.previews, [id]: { loading: true } }, openPanels: { [id]: 'data' } }))
     try {
+      // A preview is a bounded 50-row peek — the card shows it as "sampled", NOT as a full run.
+      // (We deliberately do NOT flip status to 'latest': that green state means a real materialized run.)
       const result = await api.preview(get().doc, id, 50)
       set((s) => ({ previews: { ...s.previews, [id]: { result } } }))
-      if (!result.notPreviewable) {
-        set((s) => ({
-          doc: { ...s.doc, nodes: s.doc.nodes.map((n) => (n.id === id && n.data.status !== 'latest' ? { ...n, data: { ...n.data, status: 'latest' } } : n)) },
-        }))
-      }
     } catch (e) {
       set((s) => ({ previews: { ...s.previews, [id]: { error: (e as Error).message } } }))
     }

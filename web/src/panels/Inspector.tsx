@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useStore, nodeRunnable } from '../store/graph'
 import { getSpec } from '../nodes/registry'
-import { getBackendSpec, NodeParamFields } from '../nodes/generic'
+import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
 import { color, radius, status as statusTok, kindAccent } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 
@@ -55,6 +55,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const st = statusTok[node.data.status] ?? statusTok.draft
   const codeParams = (bspec?.params ?? []).filter((p) => p.type === 'code')
   const cfg = node.data.config as Record<string, unknown>
+  const invalid = nodeInvalidReason(node)
 
   return (
     <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
@@ -125,9 +126,10 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
 
       {/* actions */}
       <Section title="Actions">
+        {invalid && <div style={{ fontSize: 11, color: '#a2731a', marginBottom: 6 }}>⚠ {invalid}</div>}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-          <Action icon="eye" label="View data" disabled={!runnable} onClick={() => runPreview(nodeId)} />
-          <Action icon={runState === 'running' ? 'stop' : 'play'} label={runState === 'running' ? 'Stop' : 'Run'} disabled={!runnable && runState !== 'running'}
+          <Action icon="eye" label="View data" disabled={!runnable || !!invalid} onClick={() => runPreview(nodeId)} />
+          <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : 'Run'} disabled={(!runnable || !!invalid) && runState !== 'running'}
             onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
           {spec?.canBypass && <Action icon="power" label="Bypass" onClick={() => bypass(nodeId)} />}
           <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} onClick={() => disable(nodeId)} />

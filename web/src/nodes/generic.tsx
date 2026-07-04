@@ -17,6 +17,20 @@ export function getBackendSpec(kind: string): BackendNodeSpec | undefined {
   return backendSpecs[kind]
 }
 
+/** Why a node can't run yet (a required param is empty), or null if it's valid. Drives the
+ * disabled Run affordance + its reason, from the backend param schema (works for any kind/plugin). */
+export function nodeInvalidReason(node: { type: string; data: { config: Record<string, unknown> } }): string | null {
+  const spec = backendSpecs[node.type]
+  if (!spec) return null
+  for (const p of spec.params) {
+    if (p.required) {
+      const v = node.data.config[p.name]
+      if (v == null || String(v).trim() === '') return `${p.label ?? p.name} is required`
+    }
+  }
+  return null
+}
+
 /** Editable form fields for a node's non-code params (from the backend schema). Reused by the
  * generic node card and the Inspector so param editing stays in one place. */
 export function NodeParamFields({ nodeId }: { nodeId: string }) {
