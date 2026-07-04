@@ -49,7 +49,7 @@ function toGraph(doc: CanvasDoc) {
       type: n.type,
       position: n.position,
       parentId: n.parentId ?? null, // section containment — the backend runs parentId children
-      data: { title: n.data.title, config: n.data.config, bypassed: n.data.bypassed },
+      data: { title: n.data.title, config: n.data.config, bypassed: n.data.bypassed, disabled: n.data.disabled },
     })),
     edges: doc.edges.filter((e) => dataIds.has(e.source) && dataIds.has(e.target)).map((e) => ({
       id: e.id,

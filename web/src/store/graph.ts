@@ -10,7 +10,7 @@ import { getSpec } from '../nodes/registry'
 import { registerGenericNodes } from '../nodes/generic'
 import { api, KernelError, setApiUser, type AgentBackendNode, type AgentBackendEdge, type DpUser, type CanvasFile } from '../api/client'
 
-export type PanelKind = 'data' | 'run' | 'history' | 'code' | 'lineage' | 'section'
+export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 
 const LS_KEY = 'dp-canvas'       // offline cache of the open doc
 const USER_KEY = 'dp-user'       // last-selected user id
@@ -34,15 +34,32 @@ export function freePosition(nodes: CanvasNode[], base: { x: number; y: number }
   return base
 }
 
-/** Whether a node can run/preview: it (or some ancestor) is a source with a configured uri. */
+/** Whether a node can run/preview: it (or some ancestor) is a source with a configured uri —
+ * AND nothing in its upstream chain (including itself) is disabled (disable turns off downstream). */
 export function nodeRunnable(doc: CanvasDoc, id: string): boolean {
+  if (isDisabled(doc, id)) return false
   const seen = new Set<string>()
   const walk = (nid: string): boolean => {
     if (seen.has(nid)) return false
     seen.add(nid)
     const n = doc.nodes.find((x) => x.id === nid)
     if (!n) return false
-    if (n.type === 'source') return !!(n.data.config.uri || n.data.config.table)
+    if (n.type === 'source') return !!n.data.config.uri
+    return doc.edges.filter((e) => e.target === nid).map((e) => e.source).some(walk)
+  }
+  return walk(id)
+}
+
+/** A node is disabled if it, or ANY of its upstream ancestors, is flagged disabled — disabling a
+ * node turns off everything downstream of it (the whole branch stops), mirroring ComfyUI. */
+export function isDisabled(doc: CanvasDoc, id: string): boolean {
+  const seen = new Set<string>()
+  const walk = (nid: string): boolean => {
+    if (seen.has(nid)) return false
+    seen.add(nid)
+    const n = doc.nodes.find((x) => x.id === nid)
+    if (!n) return false
+    if (n.data.disabled) return true
     return doc.edges.filter((e) => e.target === nid).map((e) => e.source).some(walk)
   }
   return walk(id)
@@ -99,7 +116,7 @@ interface Store {
   removeSelected: () => void
 
   bypass: (id: string) => void
-  mute: (id: string) => void
+  disable: (id: string) => void
   rename: (id: string, title: string) => void
   duplicate: (id: string) => void
 
@@ -171,6 +188,28 @@ export type DpView = 'canvas' | 'files' | 'tables' | 'transforms'
 
 function emptyDoc(): CanvasDoc {
   return { id: `canvas_${Math.floor(performance.now())}`, name: 'untitled', version: 1, nodes: [], edges: [] }
+}
+
+// Fold legacy documents into the current node model on load:
+//  - the old `notebook` kind is now just a `transform` scoped to a sample (they ran identically).
+//  - the old `muted` flag was purely visual (never affected execution); drop it so it doesn't get
+//    mistaken for the new `disabled` semantics.
+function migrateDoc(doc: CanvasDoc): CanvasDoc {
+  let changed = false
+  const nodes = doc.nodes.map((n) => {
+    let node = n
+    if (n.type === 'notebook') {
+      changed = true
+      node = { ...node, type: 'transform', data: { ...node.data, config: { source: 'adhoc', scope: 'sample', ...node.data.config } } }
+    }
+    if ((node.data as { muted?: boolean }).muted !== undefined) {
+      changed = true
+      const { muted: _drop, ...rest } = node.data as NodeData & { muted?: boolean }
+      node = { ...node, data: rest }
+    }
+    return node
+  })
+  return changed ? { ...doc, nodes } : doc
 }
 
 // downstream node ids (BFS over edges)
@@ -391,17 +430,17 @@ export const useStore = create<Store>((set, get) => ({
     set((s) => ({
       doc: {
         ...s.doc,
-        nodes: s.doc.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, bypassed: !n.data.bypassed, muted: false } } : n)),
+        nodes: s.doc.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, bypassed: !n.data.bypassed, disabled: false } } : n)),
       },
     }))
   },
 
-  mute: (id) => {
+  disable: (id) => {
     get().commit()
     set((s) => ({
       doc: {
         ...s.doc,
-        nodes: s.doc.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, muted: !n.data.muted, bypassed: false } } : n)),
+        nodes: s.doc.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, disabled: !n.data.disabled, bypassed: false } } : n)),
       },
     }))
   },
@@ -677,7 +716,7 @@ export const useStore = create<Store>((set, get) => ({
     } catch { /* offline: keep in memory */ }
   },
 
-  loadDoc: (doc) => { _cfgEdit = { id: '', t: 0 }; set({ doc, previews: {}, runs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [] }) },
+  loadDoc: (doc) => { _cfgEdit = { id: '', t: 0 }; set({ doc: migrateDoc(doc), previews: {}, runs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [] }) },
 
   // Apply a graph the LLM agent built (extends the canvas). Undoable; preserves UI state of nodes
   // whose ids already exist, and marks touched nodes stale so the user can preview/run them.

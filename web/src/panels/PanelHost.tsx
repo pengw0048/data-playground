@@ -6,7 +6,6 @@ import { Icon } from '../ui/Icon'
 import { DataPanel } from './DataPanel'
 import { RunPanel } from './RunPanel'
 import { HistoryPanel } from './HistoryPanel'
-import { CodePanel } from './CodePanel'
 import { LineagePanel } from './LineagePanel'
 import { SectionPanel } from './SectionPanel'
 import { ErrorBoundary } from '../ui/ErrorBoundary'
@@ -39,7 +38,7 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
   const close = useStore((s) => s.closePanel)
 
   if (!rect) return null
-  const width = kind === 'data' ? 460 : kind === 'run' ? 340 : kind === 'code' ? 420 : kind === 'section' ? 460 : 300
+  const width = kind === 'data' ? 460 : kind === 'run' ? 340 : kind === 'section' ? 460 : 300
   // Prefer to the RIGHT of the node so the panel never covers it; fall back to below-left.
   const gap = 12
   let left: number
@@ -73,7 +72,6 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
             {kind === 'data' && <DataPanel nodeId={nodeId} />}
             {kind === 'run' && <RunPanel nodeId={nodeId} />}
             {kind === 'history' && <HistoryPanel nodeId={nodeId} />}
-            {kind === 'code' && <CodePanel nodeId={nodeId} />}
             {kind === 'section' && <SectionPanel nodeId={nodeId} />}
             {kind === 'lineage' && <LineagePanel nodeId={nodeId} />}
           </ErrorBoundary>
@@ -86,7 +84,7 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
 function PanelTitle({ nodeId, title, kind, dark, onClose }: {
   nodeId: string; title: string; kind: PanelKind; dark?: boolean; onClose: () => void
 }) {
-  const label = { data: 'data', run: 'run', history: 'history', code: 'code', lineage: 'lineage', section: 'section' }[kind]
+  const label = { data: 'data', run: 'run', history: 'history', lineage: 'lineage', section: 'section' }[kind]
   const runPreview = useStore((s) => s.runPreview)
   return (
     <div

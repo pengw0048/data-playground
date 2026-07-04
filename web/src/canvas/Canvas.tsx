@@ -73,7 +73,7 @@ export function Canvas() {
   const select = useStore((s) => s.select)
   const removeSelected = useStore((s) => s.removeSelected)
   const bypass = useStore((s) => s.bypass)
-  const mute = useStore((s) => s.mute)
+  const disable = useStore((s) => s.disable)
   const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
 
   // realtime collaboration: join this canvas's presence room; leave on switch/unmount
@@ -204,7 +204,7 @@ export function Canvas() {
   // keyboard: Delete / Backspace remove selection; B bypass; M mute
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      // a fullscreen code editor is a modal over the canvas — don't let Delete/b/m act on the node beneath it
+      // a fullscreen code editor is a modal over the canvas — don't let Delete/b/d act on the node beneath it
       if (useStore.getState().fullscreenCode) return
       const tag = (e.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
@@ -226,11 +226,11 @@ export function Canvas() {
           if (n && getSpec(n.type)?.canBypass) bypass(id)
         })
       }
-      if (e.key === 'm' || e.key === 'M') ids.forEach((id) => mute(id))
+      if (e.key === 'd' || e.key === 'D') ids.forEach((id) => disable(id))
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [removeSelected, bypass, mute])
+  }, [removeSelected, bypass, disable])
 
   return (
     <div style={{ position: 'absolute', inset: 0 }}

@@ -7,12 +7,12 @@ import { CodeSnippet } from '../../ui/CodeSnippet'
 const DEFAULT_SQL = 'SELECT * FROM input LIMIT 100'
 
 function Sql({ id, data }: NodeComponentProps) {
-  const togglePanel = useStore((s) => s.togglePanel)
+  const openFullscreen = useStore((s) => s.openCodeFullscreen)
   const sql = String(data.config.sql ?? DEFAULT_SQL)
   return (
     <NodeCard id={id} data={data} metaOverride="SQL → view · DuckDB on the sample">
       <button
-        onClick={(e) => { e.stopPropagation(); togglePanel(id, 'code') }}
+        onClick={(e) => { e.stopPropagation(); openFullscreen(id, 'sql', 'sql') }}
         style={{
           display: 'block', width: '100%', textAlign: 'left', background: 'var(--code-bg)',
           border: `1px solid ${color.border}`, borderRadius: 8, padding: '8px 10px', fontSize: 10.5, lineHeight: 1.4,

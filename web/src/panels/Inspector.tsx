@@ -43,7 +43,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const runnable = useStore((s) => nodeRunnable(s.doc, nodeId))
   const runState = useStore((s) => s.runs[nodeId]?.phase)
-  const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, mute, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
+  const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
   useEffect(() => setName(node?.data.title ?? ''), [node?.data.title])
   if (!node) return null
@@ -122,7 +122,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           <Action icon={runState === 'running' ? 'stop' : 'play'} label={runState === 'running' ? 'Stop' : 'Run'} disabled={!runnable && runState !== 'running'}
             onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
           {spec?.canBypass && <Action icon="power" label="Bypass" onClick={() => bypass(nodeId)} />}
-          <Action icon="mute" label="Mute" onClick={() => mute(nodeId)} />
+          <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} onClick={() => disable(nodeId)} />
           <Action icon="duplicate" label="Duplicate" onClick={() => duplicate(nodeId)} />
           <Action icon="trash" label="Delete" danger onClick={() => removeNode(nodeId)} />
         </div>

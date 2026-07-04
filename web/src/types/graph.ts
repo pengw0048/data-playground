@@ -35,6 +35,7 @@ export interface NodeConfig {
   io?: { inputs: PortSpec[]; outputs: PortSpec[] } | null
   mode?: ProcessorMode
   onError?: 'raise' | 'skip'
+  scope?: 'dataset' | 'sample'  // code node: label for whether it works over the full dataset or a sample
   outputSchema?: ColumnSchema[]
   // join
   on?: string
@@ -75,8 +76,8 @@ export interface NodeData {
   status: NodeStatus
   config: NodeConfig
   meta?: string
-  bypassed?: boolean
-  muted?: boolean
+  bypassed?: boolean   // skip this node — its input flows straight through to its output
+  disabled?: boolean   // turn this node (and everything downstream of it) OFF — nothing runs
   lastRun?: LastRun
   needsFullPass?: boolean
   history?: NodeVersion[]

@@ -6,11 +6,11 @@ import { Tooltip } from '../ui/Tooltip'
 import { Popover } from '../ui/Popover'
 import { Port } from './Port'
 import { getSpec, nodeOutputs, type NodeSpec } from './registry'
-import { useStore, nodeRunnable, type PanelKind } from '../store/graph'
+import { useStore, nodeRunnable, isDisabled, type PanelKind } from '../store/graph'
 import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
 
-const KINDS_WITH_CODE = new Set(['transform', 'sql', 'notebook'])
+const KINDS_WITH_CODE = new Set(['transform', 'sql'])
 
 export function NodeCard({ id, data, children, metaOverride }: {
   id: string
@@ -26,9 +26,12 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const requestRun = useStore((s) => s.requestRun)
   const cancelRun = useStore((s) => s.cancelRun)
   const togglePanel = useStore((s) => s.togglePanel)
+  const openCodeFullscreen = useStore((s) => s.openCodeFullscreen)
   const rename = useStore((s) => s.rename)
   const runState = useStore((s) => s.runs[id]?.phase)
   const runnable = useStore((s) => nodeRunnable(s.doc, id))
+  // disabled = this node is turned off; offDownstream = an upstream node is off, so this one is off too
+  const offDownstream = useStore((s) => !s.doc.nodes.find((n) => n.id === id)?.data.disabled && isDisabled(s.doc, id))
 
   // Output ports can change at runtime (a section declaring named ports). React Flow caches each
   // node's handle geometry, so a newly-added handle is invisible to edge routing until we tell it
@@ -41,7 +44,8 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const accent = kindAccent[kind] ?? '#8a8f98'
   const st = statusTok[data.status] ?? statusTok.draft
   const bypassed = !!data.bypassed
-  const muted = !!data.muted
+  const disabled = !!data.disabled
+  const off = disabled || offDownstream  // dimmed either way; only self-disabled shows the badge
   const hasCode = KINDS_WITH_CODE.has(kind)
 
   const tag = (spec?.tag ?? kind).toUpperCase()
@@ -53,7 +57,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
       : `1px solid ${color.border}`
 
   return (
-    <div style={{ position: 'relative', width: 232, opacity: muted ? 0.5 : 1 }} className="dp-no-select">
+    <div style={{ position: 'relative', width: 232, opacity: off ? 0.45 : 1 }} className="dp-no-select">
       {/* input ports */}
       {(spec?.inputs ?? []).map((p, i) => (
         <Port key={p.id} spec={p} side="input" index={i} count={spec!.inputs.length} />
@@ -70,7 +74,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
           borderRadius: radius.node,
           boxShadow: selected ? shadow.focus : shadow.card,
           overflow: 'hidden',
-          filter: muted ? 'grayscale(0.6)' : undefined,
+          filter: off ? 'grayscale(0.7)' : undefined,
           transition: 'box-shadow .12s, border-color .12s',
         }}
       >
@@ -89,6 +93,11 @@ export function NodeCard({ id, data, children, metaOverride }: {
               </span>
               <EditableTitle id={id} title={data.title} onRename={rename} selected={selected} />
               <span style={{ flex: 1 }} />
+              {disabled && (
+                <span style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: 0.5, color: '#8a6d0b', background: '#fbf1dc', padding: '2px 6px', borderRadius: radius.chip, flex: '0 0 auto' }}>
+                  DISABLED
+                </span>
+              )}
               <span
                 style={{
                   fontSize: 8.5, fontWeight: 600, letterSpacing: 0.6, color: color.text3,
@@ -129,7 +138,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
                 onClick={() => (runState === 'running' ? cancelRun(id) : requestRun(id))}
               />
               <ActionIcon name="clock" label="History" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
-              {hasCode && <ActionIcon name="code" label="Code" active={openPanel === 'code'} onClick={() => togglePanel(id, 'code')} />}
+              {hasCode && <ActionIcon name="code" label="Edit code" onClick={() => openCodeFullscreen(id, kind === 'sql' ? 'sql' : 'code', kind === 'sql' ? 'sql' : 'python')} />}
               <span style={{ flex: 1 }} />
               <MoreMenu id={id} kind={kind} />
             </div>
@@ -206,7 +215,7 @@ function EditableTitle({ id, title, onRename, selected }: { id: string; title: s
 function MoreMenu({ id, kind }: { id: string; kind: string }) {
   const [open, setOpen] = useState(false)
   const btnRef = useRef<HTMLButtonElement>(null)
-  const { bypass, mute, duplicate, removeNode, openPanel } = useStore.getState()
+  const { bypass, disable, duplicate, removeNode, openPanel } = useStore.getState()
   const canBypass = getSpec(kind)?.canBypass
 
   const item = (icon: IconName, label: string, fn: () => void, danger = false) => (
@@ -243,8 +252,8 @@ function MoreMenu({ id, kind }: { id: string; kind: string }) {
         {item('rename', 'Rename', () => window.dispatchEvent(new CustomEvent('dp-rename', { detail: { id } })))}
         {item('play', 'Run details', () => openPanel(id, 'run'))}
         {item('duplicate', 'Duplicate', () => duplicate(id))}
-        {canBypass && item('power', 'Bypass', () => bypass(id))}
-        {item('mute', 'Mute', () => mute(id))}
+        {canBypass && item('power', 'Bypass (pass data through)', () => bypass(id))}
+        {item('mute', 'Disable (+ downstream)', () => disable(id))}
         {item('export', 'Export data', () => exportNode(id))}
         {item('lineage', 'Lineage', () => openPanel(id, 'lineage'))}
         <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />

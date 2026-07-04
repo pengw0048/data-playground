@@ -72,9 +72,13 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              inputs=[_in()], outputs=[_out()], can_bypass=True,
              params=[ParamSpec(name="select", type="string", label="columns / expressions")],
              blurb="project / rename / derive columns"),
-    NodeSpec(kind="transform", title="transform", category="compute", tag="transform",
+    # The single Python-code compute node (the old `notebook` kind folded in here; both ran the
+    # SAME per-batch operator). `scope` labels whether it's exploring a sample or producing a
+    # dataset — execution is identical, the tag just guides the mental model.
+    NodeSpec(kind="transform", title="transform", category="compute", tag="code",
              inputs=[_in(("dataset", "sample", "selection"))], outputs=[_out()], can_bypass=True,
              params=[ParamSpec(name="source", type="select", options=["adhoc", "library"], default="adhoc"),
+                     ParamSpec(name="scope", type="select", options=["dataset", "sample"], default="dataset", label="runs over"),
                      ParamSpec(name="mode", type="select", options=["map", "map_batches", "filter", "flat_map"], default="map"),
                      ParamSpec(name="code", type="code", lang="python")],
              blurb="Python over Arrow batches — library preset or ad-hoc cell"),
@@ -116,10 +120,6 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              inputs=[_in(("dataset",))], outputs=[_out()],
              params=[ParamSpec(name="column", type="string", default="embedding"), ParamSpec(name="k", type="int", default=10)],
              blurb="top-K nearest by cosine similarity (Lance ANN / brute-force)"),
-    NodeSpec(kind="notebook", title="notebook", category="inspect", tag="notebook",
-             inputs=[_in(("sample", "dataset"), wire="sample")], outputs=[_out("sample")], can_bypass=True,
-             params=[ParamSpec(name="code", type="code", lang="python"), ParamSpec(name="mode", type="select", options=["map", "map_batches", "filter", "flat_map"], default="map")],
-             blurb="embedded cell over a sample"),
     # Meta-programming primitive (see docs/meta-programming.zh.md): a composite node whose
     # implementation is a driver script (Python) over contained nodes, with real control flow
     # (for/while/if), bounded. Not sample-previewable. The nested-frame UI to manage its contained

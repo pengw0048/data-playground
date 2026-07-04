@@ -41,6 +41,10 @@ def _bypassed(node: GraphNode) -> bool:
     return bool(node.data.get("bypassed")) if isinstance(node.data, dict) else False
 
 
+def _disabled(node: GraphNode) -> bool:
+    return bool(node.data.get("disabled")) if isinstance(node.data, dict) else False
+
+
 class LoweringEngine:
     def __init__(self, graph: Graph, resolve_adapter, registry, sample_k: int | None = None,
                  full: bool = False, node_lowerings: dict | None = None, node_specs: dict | None = None,
@@ -116,6 +120,10 @@ class LoweringEngine:
     def _lower(self, node: GraphNode) -> Relation:  # noqa: C901
         t = node.type
         cfg = _cfg(node)
+
+        # a disabled node (and, since inputs pull through it, everything downstream) produces nothing
+        if _disabled(node):
+            raise NotPreviewable(node, "node is disabled")
 
         if t == "source":
             uri = cfg.get("uri") or cfg.get("table")
