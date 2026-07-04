@@ -55,16 +55,26 @@ class LoweringEngine:
         # a node id -> Relation to inject as that node's input (used to run a section's sub-node
         # against a script-provided handle instead of a wired upstream edge)
         self.bound_inputs = bound_inputs or {}
-        self._cache: dict[str, Relation] = {}
+        # a node lowers to either one Relation (single output) or a dict of named output ports
+        # (multi-output — e.g. a section that emit()s several named result sets)
+        self._cache: dict[str, "Relation | dict[str, Relation]"] = {}
 
     # -- public ------------------------------------------------------------ #
-    def relation(self, node_id: str) -> Relation:
-        if node_id in self._cache:
-            return self._cache[node_id]
-        node = g.node_map(self.graph)[node_id]
-        rel = self._lower(node)
-        self._cache[node_id] = rel
-        return rel
+    def relation(self, node_id: str, handle: str | None = None) -> Relation:
+        if node_id not in self._cache:
+            self._cache[node_id] = self._lower(g.node_map(self.graph)[node_id])
+        return self._pick(node_id, self._cache[node_id], handle)
+
+    def _pick(self, node_id: str, lowered, handle: str | None) -> Relation:
+        # single-output nodes lower to a bare Relation and ignore the handle; multi-output nodes
+        # lower to {port -> Relation}, so route by the edge's source_handle (default port = "out").
+        if not isinstance(lowered, dict):
+            return lowered
+        if handle is not None and handle in lowered:
+            return lowered[handle]
+        if handle is None:
+            return lowered.get("out") or next(iter(lowered.values()))
+        raise NotPreviewable(g.node_map(self.graph)[node_id], f"output port '{handle}' was not produced")
 
     def rows(self, node_id: str, k: int) -> tuple[list[dict], list[ColumnSchema]]:
         tbl = self.relation(node_id).limit(k).to_arrow_table()
@@ -83,7 +93,7 @@ class LoweringEngine:
             return [self.bound_inputs[node.id]]
         out: list[Relation] = []
         for e in g.incoming(self.graph, node.id):
-            rel = self.relation(e.source)
+            rel = self.relation(e.source, e.source_handle)  # route by the source port (multi-output)
             parent = g.node_map(self.graph)[e.source]
             if parent.type == "branch":
                 rel = self._route_branch(parent, rel, e.source_handle)
@@ -122,7 +132,7 @@ class LoweringEngine:
             if not self.full:  # runs real work over its nodes — not faithful on a sample (P8)
                 raise NotPreviewable(node, "a section runs real work over its nodes — needs a full pass")
             from kernel.section import run_section
-            return run_section(self, node, inputs)
+            return run_section(self, node, inputs)  # {port -> Relation}: routed by _pick per edge
 
         if not inputs and t not in ("source",):
             raise NotPreviewable(node, "not connected to a source")
@@ -206,12 +216,12 @@ class LoweringEngine:
                 chain = g.upstream_chain(self.graph, node.id)
                 if any(n.type in ("transform", "notebook", "opaque", "loop") for n in chain):
                     raise NotPreviewable(node, "metric over a transformed input — needs a full pass")
-                pids = g.parents(self.graph, node.id)
-                if pids:
+                inc = g.incoming(self.graph, node.id)
+                if inc:
                     full = LoweringEngine(self.graph, self.resolve_adapter, self.registry,
                                           sample_k=None, full=True, node_lowerings=self.node_lowerings,
                                           node_specs=self.node_specs)
-                    base = full.relation(pids[0])
+                    base = full.relation(inc[0].source, inc[0].source_handle)
             expr = "count(*)" if agg == "count" or not col else f'{_agg_name(agg)}("{_ident(col)}")'
             v = self._view(base, "m")
             title = (node.data.get("title") if isinstance(node.data, dict) else None) or "metric"

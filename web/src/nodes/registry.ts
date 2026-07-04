@@ -46,6 +46,19 @@ export function getComponent(kind: string): ComponentType<NodeComponentProps> | 
   return components.get(kind)
 }
 
+/**
+ * A node's output ports. Usually the static spec, but a node may declare instance-specific
+ * output ports via `config.outputs` (a multi-output node — e.g. a section that emit()s several
+ * named result sets). All instance ports carry the `dataset` wire.
+ */
+export function nodeOutputs(node: CanvasNode): PortSpec[] {
+  const declared = (node.data?.config as Record<string, unknown> | undefined)?.outputs
+  if (Array.isArray(declared) && declared.length > 0) {
+    return declared.map((h) => ({ id: String(h), label: String(h), wire: 'dataset' as WireType }))
+  }
+  return specs.get(node.type)?.outputs ?? []
+}
+
 /** Drives connection validity (§5.3): the wire type of one port on a node. */
 export function portWire(
   nodes: CanvasNode[],
@@ -57,7 +70,7 @@ export function portWire(
   if (!node) return null
   const spec = specs.get(node.type)
   if (!spec) return null
-  const ports = side === 'source' ? spec.outputs : spec.inputs
+  const ports = side === 'source' ? nodeOutputs(node) : spec.inputs
   if (ports.length === 0) return null
   const port = handleId ? ports.find((p) => p.id === handleId) : ports[0]
   return (port ?? ports[0])?.wire ?? null

@@ -16,17 +16,23 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
   if (!node) return null
   const cfg = node.data.config
   const subnodes = (Array.isArray(cfg.subnodes) ? cfg.subnodes : []) as SubNode[]
+  const outputs = (Array.isArray(cfg.outputs) && cfg.outputs.length ? cfg.outputs : ['out']) as string[]
   const kinds = allSpecs().map((s) => s.kind).filter((k) => k !== 'section' && k !== 'note')
 
   const setSubs = (next: SubNode[]) => updateConfig(nodeId, { subnodes: next })
   const patchSub = (i: number, patch: Partial<SubNode>) => setSubs(subnodes.map((s, j) => (j === i ? { ...s, ...patch } : s)))
+  // outputs: the section's output ports. `emit(rel)` fills "out"; `emit("name", rel)` a named port.
+  const setOutputs = (v: string) => {
+    const ports = v.split(',').map((s) => s.trim()).filter(Boolean)
+    updateConfig(nodeId, { outputs: ports.length ? ports : ['out'] })
+  }
 
   return (
     <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
       <div style={{ fontSize: 11, color: color.text3, lineHeight: 1.5 }}>
         A driver script over the contained nodes. Call a node by alias: <code>run(alias, data=inputs['in'], **cfg)</code>;
-        read a scalar with <code>value(...)</code>; <code>concat([...])</code>; return with <code>emit(...)</code>.
-        Loops are bounded by maxRuns. Not sample-previewable — runs on a full pass.
+        read a scalar with <code>value(...)</code>; <code>concat([...])</code>; return results with <code>emit(rel)</code> or,
+        for multiple output ports, <code>emit("port", rel)</code>. Loops are bounded by maxRuns. Not sample-previewable — runs on a full pass.
       </div>
 
       <Field label="driver script (Python)">
@@ -58,6 +64,12 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
             <Icon name="plus" size={12} /> <span>add node</span>
           </button>
         </div>
+      </Field>
+
+      <Field label="output ports (comma-separated)">
+        <input defaultValue={outputs.join(', ')} onChange={(e) => setOutputs(e.target.value)} placeholder="out"
+          className="dp-mono"
+          style={{ width: '100%', fontSize: 11.5, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', outline: 'none' }} />
       </Field>
 
       <div style={{ display: 'flex', gap: 12 }}>

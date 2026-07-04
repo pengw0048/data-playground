@@ -579,6 +579,26 @@ def test_section_iterate_until_condition(tmp_path):
     assert out["rowCount"] == 200
 
 
+def test_section_multi_output_routes_by_port(tmp_path):
+    # a section can emit several named output ports; each downstream node is wired to one port
+    # (source_handle) and must receive exactly that port's rows — ComfyUI/Weave-style multi-output.
+    p = _seq_parquet(tmp_path)  # v = 0..999
+    script = ("emit('low', run(f, data=inputs['in'], predicate='v < 100'))\n"    # 100 rows
+              "emit('high', run(f, data=inputs['in'], predicate='v >= 900'))\n")  # 100 rows
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": p}),
+        _section("sec", script, [{"alias": "f", "type": "filter", "config": {}}]),
+        N("wl", "write", {"name": "sec_low"}),
+        N("wh", "write", {"name": "sec_high"}),
+    ], "edges": [E("src", "sec"), E("sec", "wl", sh="low"), E("sec", "wh", sh="high")]}
+    _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wl", "confirmed": True}).json()["runId"])
+    st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wh", "confirmed": True}).json()["runId"])
+    assert st["status"] == "done"
+    low = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_sec_low").uri, "k": 5}).json()
+    high = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_sec_high").uri, "k": 5}).json()
+    assert low["rowCount"] == 100 and high["rowCount"] == 100  # each port carried only its own rows
+
+
 def test_section_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),

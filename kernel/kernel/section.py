@@ -43,7 +43,11 @@ def _materialize(rel):
 
 
 def run_section(engine, node, inputs):
-    """Execute a section node's driver script; return the emitted relation."""
+    """Execute a section node's driver script; return {output port -> emitted relation}.
+
+    A single-output section emit(rel)s to the default "out" port; a multi-output section
+    emit("name", rel)s to named ports that the outer graph wires by source_handle.
+    """
     from kernel.executors.engine import LoweringEngine
 
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
@@ -55,7 +59,7 @@ def run_section(engine, node, inputs):
         raise SectionError("section has no driver script")
 
     calls = {"n": 0}
-    out: dict = {"rel": None}
+    outs: dict = {}  # output port name -> emitted relation (multi-output; default port is "out")
 
     def run(ref, **kw):
         calls["n"] += 1
@@ -90,8 +94,12 @@ def run_section(engine, node, inputs):
             rel = rel.union(h)
         return _materialize(rel)
 
-    def emit(handle):
-        out["rel"] = handle
+    def emit(handle, data=None):
+        # emit(rel) -> the default "out" port; emit("name", rel) -> a named output port.
+        if data is None:
+            outs["out"] = handle
+        else:
+            outs[str(handle)] = data
 
     ns = sandbox._namespace()
     ns.update({
@@ -105,6 +113,6 @@ def run_section(engine, node, inputs):
     sandbox._reject_dunder(script)
     exec(compile(script, "<section>", "exec"), ns)  # noqa: S102 — soft sandbox, full pass only
 
-    if out["rel"] is None:
+    if not outs:
         raise SectionError("section script did not emit() an output")
-    return out["rel"]
+    return outs

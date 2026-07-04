@@ -4,7 +4,7 @@ import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
 import { Popover } from '../ui/Popover'
 import { Port } from './Port'
-import { getSpec, type NodeSpec } from './registry'
+import { getSpec, nodeOutputs, type NodeSpec } from './registry'
 import { useStore, nodeRunnable, type PanelKind } from '../store/graph'
 import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
@@ -50,9 +50,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
       {(spec?.inputs ?? []).map((p, i) => (
         <Port key={p.id} spec={p} side="input" index={i} count={spec!.inputs.length} />
       ))}
-      {/* output ports */}
-      {(spec?.outputs ?? []).map((p, i) => (
-        <Port key={p.id} spec={p} side="output" index={i} count={spec!.outputs.length} nodeId={id} />
+      {/* output ports — instance-declared (multi-output) or the static spec */}
+      {(node ? nodeOutputs(node) : spec?.outputs ?? []).map((p, i, arr) => (
+        <Port key={p.id} spec={p} side="output" index={i} count={arr.length} nodeId={id} />
       ))}
 
       <div

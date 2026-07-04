@@ -229,6 +229,16 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByPlaceholder('alias')).toBeVisible() // a contained-node row appeared
   })
 
+  test('a section can declare multiple output ports (multi-output)', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Compute', 'section')
+    const node = page.locator('.react-flow__node')
+    await expect(node.locator('.react-flow__handle-right')).toHaveCount(1) // default: one "out" port
+    await page.getByText('Edit →').click()
+    await page.getByPlaceholder('out').fill('passed, failed') // declare two named output ports
+    await expect(node.locator('.react-flow__handle-right')).toHaveCount(2) // card now shows both ports
+  })
+
   test('the user switcher creates and switches users', async ({ page }) => {
     await page.goto('/')
     const chip = page.getByTitle('Switch user')
