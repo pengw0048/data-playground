@@ -17,9 +17,14 @@ dependencies = [
 
 [project.optional-dependencies]
 lance = ["pylance>=0.19"]
-agent = ["litellm>=1.50"]            # provider-agnostic LLM agent (OpenAI/Anthropic/Gemini/Ollama/…)
+# provider-agnostic LLM agent: Pydantic AI runs the tool-use loop in-process (no CLI, no proxy);
+# LiteLLM stays for provider key-detection + model-string parsing. Native providers cover the rest.
+agent = [
+    "pydantic-ai-slim[openai,anthropic,google,groq,mistral,cohere,bedrock]>=2.5",
+    "litellm>=1.50",
+]
 postgres = ["psycopg[binary]>=3.1"]  # metadata DB on Postgres for deployment (dev uses bundled SQLite)
-dev = ["pytest>=8.0", "httpx>=0.27", "litellm>=1.50"]
+dev = ["pytest>=8.0", "httpx>=0.27", "data-playground[agent]"]
 
 [project.scripts]
 dataplay = "kernel.cli:main"

@@ -341,50 +341,30 @@ def test_agent_status_and_fallback_without_key(monkeypatch):
     assert act["available"] is False
 
 
-def test_agent_builds_graph_via_tool_loop(monkeypatch):
-    # Drive run_agent with a scripted fake LiteLLM `completion` — provider-agnostic, so this covers
-    # the REAL add_node/connect/finish dispatch + layout for ANY backend, no network. Ids are
-    # deterministic (source_a1, filter_a2). Responses are OpenAI/LiteLLM-shaped.
-    import json as _json
+def test_agent_builds_graph_via_tool_loop():
+    # Drive run_agent with a Pydantic AI FunctionModel — no network, fully offline, and it exercises
+    # the REAL add_node/connect dispatch + layout through pydantic-ai's actual tool loop. Ids are
+    # deterministic (source_a1, filter_a2); the final text output becomes the summary (no finish tool).
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-    import litellm
     from kernel.agent import run_agent
 
-    class Fn:
-        def __init__(self, name, args):
-            self.name, self.arguments = name, _json.dumps(args)
-
-    class TC:
-        def __init__(self, tid, name, args):
-            self.id, self.type, self.function = tid, "function", Fn(name, args)
-
-    class Msg:
-        def __init__(self, calls, content=None):
-            self.content, self.tool_calls = content, calls
-
-    class Choice:
-        def __init__(self, msg, finish_reason="tool_calls"):
-            self.message, self.finish_reason = msg, finish_reason
-
-    class Resp:
-        def __init__(self, msg):
-            self.choices = [Choice(msg)]
-
-    script = [
-        Resp(Msg([TC("t1", "add_node", {"kind": "source", "config": {"uri": _uri("images")}})])),
-        Resp(Msg([TC("t2", "add_node", {"kind": "filter", "config": {"predicate": "is_valid = true"}})])),
-        Resp(Msg([TC("t3", "connect", {"source_id": "source_a1", "target_id": "filter_a2"})])),
-        Resp(Msg([TC("t4", "finish", {"summary": "Built source -> filter."})])),
+    steps = [
+        ToolCallPart(tool_name="add_node", args={"kind": "source", "config": {"uri": _uri("images")}}),
+        ToolCallPart(tool_name="add_node", args={"kind": "filter", "config": {"predicate": "is_valid = true"}}),
+        ToolCallPart(tool_name="connect", args={"source_id": "source_a1", "target_id": "filter_a2"}),
+        TextPart("Built source -> filter."),
     ]
     calls = {"i": 0}
 
-    def fake_completion(**kw):
-        r = script[calls["i"]]
+    def fn(messages, info: AgentInfo) -> ModelResponse:
+        part = steps[calls["i"]]
         calls["i"] += 1
-        return r
+        return ModelResponse(parts=[part])
 
-    monkeypatch.setattr(litellm, "completion", fake_completion)
-    out = run_agent("filter images where valid", {"nodes": [], "edges": []}, get_deps())
+    out = run_agent("filter images where valid", {"nodes": [], "edges": []}, get_deps(),
+                    model=FunctionModel(fn))
     kinds = [n["type"] for n in out["graph"]["nodes"]]
     assert kinds == ["source", "filter"]
     assert len(out["graph"]["edges"]) == 1
@@ -404,45 +384,32 @@ def test_agent_status_honors_explicit_api_key(monkeypatch):
     assert agent_status()["available"] is True
 
 
-def test_agent_tolerates_non_object_tool_arguments(monkeypatch):
-    # a weaker model can emit valid-but-non-object JSON args ("null"); the loop must coerce to {}
-    # and not crash into a 502 (regression: json.loads succeeded then .get() blew up)
-    import json as _json
+def test_agent_recovers_from_tool_error_and_summarizes():
+    # A tool that returns an {"error": ...} dict (here: connect before any node exists) must NOT crash
+    # the run — the model sees the error, recovers, and finishes with a plain-text summary. Also proves
+    # the failed connect left no dangling edge and was recorded in the transcript.
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-    import litellm
     from kernel.agent import run_agent
 
-    class Fn:
-        def __init__(self, name, raw):
-            self.name, self.arguments = name, raw  # raw is a JSON string, possibly non-object
-
-    class TC:
-        def __init__(self, tid, name, raw):
-            self.id, self.type, self.function = tid, "function", Fn(name, raw)
-
-    class Msg:
-        def __init__(self, calls):
-            self.content, self.tool_calls = None, calls
-
-    class Resp:
-        def __init__(self, msg):
-            self.choices = [type("C", (), {"message": msg, "finish_reason": "tool_calls"})()]
-
-    script = [
-        Resp(Msg([TC("t1", "add_node", _json.dumps({"kind": "source", "config": {"uri": _uri("images")}}))])),
-        Resp(Msg([TC("t2", "finish", "null")])),  # non-object args — must not crash
+    steps = [
+        ToolCallPart(tool_name="connect", args={"source_id": "nope", "target_id": "nah"}),  # error, no crash
+        ToolCallPart(tool_name="add_node", args={"kind": "source", "config": {"uri": _uri("images")}}),
+        TextPart("Recovered and added a source."),
     ]
     calls = {"i": 0}
 
-    def fake_completion(**kw):
-        r = script[calls["i"]]
+    def fn(messages, info: AgentInfo) -> ModelResponse:
+        part = steps[calls["i"]]
         calls["i"] += 1
-        return r
+        return ModelResponse(parts=[part])
 
-    monkeypatch.setattr(litellm, "completion", fake_completion)
-    out = run_agent("build something", {"nodes": [], "edges": []}, get_deps())
+    out = run_agent("build something", {"nodes": [], "edges": []}, get_deps(), model=FunctionModel(fn))
     assert [n["type"] for n in out["graph"]["nodes"]] == ["source"]
-    assert out["summary"] == "Done."  # non-object finish args fell back to {} → default summary
+    assert out["graph"]["edges"] == []  # the failed connect added no dangling edge
+    assert out["summary"] == "Recovered and added a source."
+    assert any(t["tool"] == "connect" and "error" in t["result"] for t in out["transcript"])
 
 
 def test_plugin_node_lowering():
