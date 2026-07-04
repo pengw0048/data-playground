@@ -30,8 +30,11 @@ interface RouterStore {
   subscribe: (fn: (s: { view: DpView; doc: { id: string } }) => void) => void
 }
 
+let _inited = false
 /** Wire the store ↔ the URL hash (two-way, loop-guarded). Call once at startup, after bootstrap. */
 export function initRouter(store: RouterStore): void {
+  if (_inited) return  // idempotent (React StrictMode double-invokes effects in dev)
+  _inited = true
   let applying = false
   const apply = () => {
     const r = parseHash()
