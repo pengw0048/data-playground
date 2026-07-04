@@ -223,7 +223,7 @@ test.describe('Data Playground canvas', () => {
     await fresh(page)
     await addNode(page, 'Compute', 'section')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
-    await page.getByText('Edit →').click()
+    await page.getByText('Edit script →').click()
     await expect(page.getByText('driver script (Python)')).toBeVisible()
     await page.getByText('add node').click()
     await expect(page.getByPlaceholder('alias')).toBeVisible() // a contained-node row appeared
@@ -234,7 +234,7 @@ test.describe('Data Playground canvas', () => {
     await addNode(page, 'Compute', 'section')
     const node = page.locator('.react-flow__node')
     await expect(node.locator('.react-flow__handle-right')).toHaveCount(1) // default: one "out" port
-    await page.getByText('Edit →').click()
+    await page.getByText('Edit script →').click()
     await page.getByPlaceholder('out').fill('passed, failed') // declare two named output ports
     await expect(node.locator('.react-flow__handle-right')).toHaveCount(2) // card now shows both ports
   })
@@ -243,19 +243,31 @@ test.describe('Data Playground canvas', () => {
     await fresh(page)
     await addNode(page, 'Compute', 'section')
     const sec = page.locator('.react-flow__node').first()
-    await sec.getByText('Edit →').click()
+    await sec.getByText('Edit script →').click()
     await page.getByPlaceholder('out').fill('passed, failed')
     await expect(sec.locator('.react-flow__handle-right')).toHaveCount(2)
-    await sec.getByText('Edit →').click() // close the panel so it doesn't cover the output handles
+    await sec.getByText('Edit script →').click() // close the panel so it doesn't cover the output handles
     // wire a downstream filter off the SECOND port ("failed") via the click-from-port add menu
     await sec.locator('.react-flow__handle-right').nth(1).click()
     await page.locator('.dp-panel').getByText('filter', { exact: true }).click()
     await expect(page.locator('.react-flow__edge')).toHaveCount(1)
     // drop "failed" — the edge that left it must be pruned, not left as an unselectable orphan
-    await sec.getByText('Edit →').click()
+    await sec.getByText('Edit script →').click()
     await page.getByPlaceholder('out').fill('passed')
     await expect(sec.locator('.react-flow__handle-right')).toHaveCount(1)
     await expect(page.locator('.react-flow__edge')).toHaveCount(0)
+  })
+
+  test('a section renders as a container frame that invites dropping nodes in', async ({ page }) => {
+    // The visual-containment UI: a section is a titled frame with a drop zone. Dragging a node onto
+    // it makes it a parentId child (run by the section) — the drag interaction is exercised by hand;
+    // the backend running parentId children is covered by the kernel suite.
+    await fresh(page)
+    await addNode(page, 'Compute', 'section')
+    const section = page.locator('.react-flow__node').filter({ hasText: 'SECTION' })
+    await expect(section).toBeVisible()
+    await expect(section.getByText(/Drop nodes here/)).toBeVisible() // empty frame invites containment
+    await expect(section.getByText('Edit script →')).toBeVisible()
   })
 
   test('the user switcher creates and switches users', async ({ page }) => {

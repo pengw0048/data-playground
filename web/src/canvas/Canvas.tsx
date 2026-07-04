@@ -5,6 +5,7 @@ import {
   type Node, type Edge, type Connection, type NodeChange, type EdgeChange,
 } from '@xyflow/react'
 import { buildNodeTypes } from '../nodes'
+import { SECTION_W, SECTION_H } from '../nodes/kinds/section'
 import { WireEdge } from '../wires/WireEdge'
 import { canConnect, portWire, getSpec } from '../nodes/registry'
 import { useStore, newId, freePosition } from '../store/graph'
@@ -66,6 +67,7 @@ export function Canvas() {
   const setNodes = useStore((s) => s.setNodes)
   const setEdges = useStore((s) => s.setEdges)
   const connect = useStore((s) => s.connect)
+  const setParent = useStore((s) => s.setParent)
   const select = useStore((s) => s.select)
   const removeSelected = useStore((s) => s.removeSelected)
   const bypass = useStore((s) => s.bypass)
@@ -82,16 +84,21 @@ export function Canvas() {
     setRfNodes((prev) => {
       const prevById = new Map(prev.map((n) => [n.id, n]))
       const sel = new Set(selectedIds)
-      return doc.nodes.map((n) => {
+      const mapped = doc.nodes.map((n) => {
         const p = prevById.get(n.id)
         return {
           id: n.id, type: n.type, position: n.position, data: n.data as any,
+          // a section is a sized container; its contained nodes render inside it (parentId), clamped
+          ...(n.type === 'section' ? { style: { width: SECTION_W, height: SECTION_H } } : {}),
+          ...(n.parentId ? { parentId: n.parentId } : {}), // no extent:'parent' so a child can be dragged back out to detach
           // React Flow owns `selected` while it drives selection (click/shift/box); preserve it
           // across rebuilds so a mid-drag rubber-band isn't reset. New nodes seed from the store.
           selected: p ? p.selected : sel.has(n.id),
           ...(p ? { measured: p.measured, width: p.width, height: p.height } : {}),
         }
       })
+      // React Flow requires a parent to precede its children in the array
+      return [...mapped.filter((n) => !n.parentId), ...mapped.filter((n) => n.parentId)]
     })
   }, [doc.nodes, selectedIds])
 
@@ -147,6 +154,31 @@ export function Canvas() {
     })
   }, [isValidConnection, connect, doc.nodes])
 
+  // Dropping a node onto a section makes it a contained child (parentId); dragging it out detaches
+  // it. Coordinates convert between absolute (top-level) and relative-to-section on the boundary.
+  const onNodeDragStop = useCallback((e: MouseEvent | TouchEvent, dragged: Node) => {
+    if (dragged.type === 'section') return // don't nest sections (one level for now)
+    const nodes = useStore.getState().doc.nodes
+    const cur = nodes.find((n) => n.id === dragged.id)
+    const curParent = cur?.parentId ?? null
+    // contained if the dragged node's rendered box overlaps a section's rendered box (both read
+    // fresh at drop time in screen space) — robust to zoom/pan and to nodes re-laying-out mid-drag.
+    const dr = document.querySelector(`.react-flow__node[data-id="${dragged.id}"]`)?.getBoundingClientRect()
+    const hit = dr && nodes.find((n) => {
+      if (n.type !== 'section' || n.id === dragged.id) return false
+      const r = document.querySelector(`.react-flow__node[data-id="${n.id}"]`)?.getBoundingClientRect()
+      return !!r && dr.left < r.right && dr.right > r.left && dr.top < r.bottom && dr.bottom > r.top
+    })
+    // the dragged node's absolute position (its stored position is relative if currently parented)
+    const parent = curParent ? nodes.find((n) => n.id === curParent) : null
+    const abs = parent ? { x: parent.position.x + dragged.position.x, y: parent.position.y + dragged.position.y } : { x: dragged.position.x, y: dragged.position.y }
+    if (hit) {
+      if (curParent !== hit.id) setParent(dragged.id, hit.id, { x: abs.x - hit.position.x, y: abs.y - hit.position.y })
+    } else if (curParent) {
+      setParent(dragged.id, null, abs) // dragged out → back to absolute top-level coords
+    }
+  }, [setParent])
+
   // A CLICK on an output port opens the add-node menu (Port dispatches this event). A drag to
   // connect never fires a click on the origin handle, so pulling a wire never pops the picker.
   useEffect(() => {
@@ -200,6 +232,7 @@ export function Canvas() {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
+        onNodeDragStop={onNodeDragStop}
         isValidConnection={isValidConnection}
         onPaneClick={() => { select(null); setMenu(null) }}
         onNodeClick={(e, n) => { if (!e.shiftKey && !e.metaKey && !e.ctrlKey) select(n.id) }}

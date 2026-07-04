@@ -88,6 +88,7 @@ export interface CanvasNode {
   type: string
   position: { x: number; y: number }
   data: NodeData
+  parentId?: string | null // visual containment: lives inside a section (position is then relative to it)
 }
 
 export interface CanvasEdge {

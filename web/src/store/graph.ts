@@ -88,6 +88,7 @@ interface Store {
   setNodes: (nodes: CanvasNode[]) => void
   setEdges: (edges: CanvasEdge[]) => void
   addNode: (kind: string, position: { x: number; y: number }, config?: Partial<NodeConfig>, title?: string) => CanvasNode | null
+  setParent: (id: string, parentId: string | null, position: { x: number; y: number }) => void
   updateConfig: (id: string, patch: Partial<NodeConfig>) => void
   updateData: (id: string, patch: Partial<NodeData>) => void
   removeNode: (id: string) => void
@@ -303,6 +304,27 @@ export const useStore = create<Store>((set, get) => ({
 
   removeEdge: (id) => { get().commit(); set((s) => ({ doc: { ...s.doc, edges: s.doc.edges.filter((e) => e.id !== id) } })) },
 
+  // Move a node into a section (parentId set, position now relative to the section) or back out to
+  // the top-level canvas (parentId null, position absolute). Marks the section + downstream stale.
+  setParent: (id, parentId, position) => {
+    get().commit()
+    set((s) => {
+      const stale = parentId ? downstream(s.doc, parentId) : new Set<string>()
+      return {
+        doc: {
+          ...s.doc,
+          nodes: s.doc.nodes.map((n) => {
+            if (n.id === id) return { ...n, parentId: parentId ?? null, position }
+            if (parentId && (n.id === parentId || stale.has(n.id)) && n.data.status === 'latest') {
+              return { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
+            }
+            return n
+          }),
+        },
+      }
+    })
+  },
+
   select: (id) => set({ selectedId: id, selectedIds: id ? [id] : [] }),
 
   setSelection: (ids) => set({ selectedIds: ids, selectedId: ids[ids.length - 1] ?? null }),
@@ -357,6 +379,7 @@ export const useStore = create<Store>((set, get) => ({
     const copy: CanvasNode = {
       ...n,
       id: newId(n.type),
+      parentId: null, // a duplicate lands on the top-level canvas (absolute coords below)
       // land in a clear spot near the original, never stacked on top of it
       position: freePosition(get().doc.nodes, { x: n.position.x + 40, y: n.position.y + 40 }),
       data: { ...n.data, status: 'draft', history: [] },
@@ -445,7 +468,8 @@ export const useStore = create<Store>((set, get) => ({
     const { doc } = get()
     const hasOutgoing = new Set(doc.edges.map((e) => e.source))
     doc.nodes
-      .filter((n) => !hasOutgoing.has(n.id) && nodeRunnable(doc, n.id))
+      // a section's contained children are run by the section, not as top-level sinks
+      .filter((n) => !n.parentId && !hasOutgoing.has(n.id) && nodeRunnable(doc, n.id))
       .forEach((n) => get().requestRun(n.id))
   },
 

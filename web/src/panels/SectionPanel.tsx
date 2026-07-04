@@ -11,7 +11,9 @@ interface SubNode { alias: string; type: string; config: Record<string, unknown>
 // Editor for a `section` node: the driver script + the nodes it contains (alias/type/config) +
 // params + a maxRuns bound. The script calls the sub-nodes by alias: run(alias, data=…, **cfg).
 export function SectionPanel({ nodeId }: { nodeId: string }) {
-  const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
+  const nodes = useStore((s) => s.doc.nodes) // stable ref; filter in-body (a filtering selector returns a new array each render → infinite loop)
+  const node = nodes.find((n) => n.id === nodeId)
+  const children = nodes.filter((n) => n.parentId === nodeId)
   const updateConfig = useStore((s) => s.updateConfig)
   if (!node) return null
   const cfg = node.data.config
@@ -41,7 +43,23 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
         </Suspense>
       </Field>
 
-      <Field label="contained nodes">
+      {children.length > 0 ? (
+        <Field label="contained nodes (on the canvas)">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ fontSize: 11, color: color.text3, lineHeight: 1.5 }}>
+              Drop nodes onto the section frame to contain them. The script calls each by its title:
+            </div>
+            {children.map((c) => (
+              <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: 8, border: `1px solid ${color.border}`, borderRadius: 8, padding: '6px 9px', fontSize: 12 }}>
+                <code>run(&apos;{c.data.title}&apos;, …)</code>
+                <span style={{ flex: 1 }} />
+                <span style={{ fontSize: 10, color: color.text3 }}>{c.type}</span>
+              </div>
+            ))}
+          </div>
+        </Field>
+      ) : (
+      <Field label="contained nodes (inline — used when nothing is on the canvas)">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           {subnodes.map((s, i) => (
             <div key={i} style={{ border: `1px solid ${color.border}`, borderRadius: 8, padding: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -65,6 +83,7 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
           </button>
         </div>
       </Field>
+      )}
 
       <Field label="output ports (comma-separated)">
         <input defaultValue={outputs.join(', ')} onChange={(e) => setOutputs(e.target.value)} placeholder="out"
