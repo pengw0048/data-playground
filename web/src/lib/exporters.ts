@@ -43,6 +43,8 @@ export async function exportNode(id: string) {
   const cols = res.columns.map((c) => c.name)
   download(`${name}.json`, JSON.stringify(res.rows, null, 2))
   download(`${name}.csv`, toCsv(cols, res.rows), 'text/csv')
+  // be honest that this is a sampled export, not the full dataset — and that two files downloaded
+  useStore.getState().pushToast(`Exported ${name} — sampled ${res.rows.length} rows (JSON + CSV). For the full dataset, add a write node.`, 'info')
 }
 
 // Export the whole canvas as a portable JSON document (NFR-7).

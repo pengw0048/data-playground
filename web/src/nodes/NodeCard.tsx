@@ -128,6 +128,15 @@ export function NodeCard({ id, data, children, metaOverride }: {
               {metaOverride ?? data.meta ?? ''}
             </div>
 
+            {/* a run awaiting confirmation stays visible ON the card (so a rerun-all of several
+                sinks doesn't hide all-but-one behind the single floating panel) */}
+            {runState === 'confirm' && (
+              <button className="nodrag" onClick={(e) => { e.stopPropagation(); useStore.getState().openPanel(id, 'run') }}
+                style={{ marginTop: 6, display: 'inline-flex', alignItems: 'center', gap: 5, border: '1px solid #e7c66b', background: '#fbf1dc', color: '#8a6d0b', fontSize: 11, fontWeight: 600, padding: '4px 9px', borderRadius: 7, cursor: 'pointer' }}>
+                <Icon name="power" size={11} /> Confirm run…
+              </button>
+            )}
+
             {/* compact body (kind-specific, kept small — P5) */}
             {children && <div style={{ marginTop: 8 }}>{children}</div>}
 

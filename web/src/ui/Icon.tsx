@@ -7,7 +7,7 @@ export type IconName =
   | 'chevronDown' | 'chevronRight' | 'chevronLeft' | 'lineage' | 'power' | 'mute' | 'rename'
   | 'duplicate' | 'export' | 'trash' | 'search' | 'sparkle' | 'grid' | 'branch' | 'loop'
   | 'fx' | 'sample' | 'arrow' | 'external' | 'check' | 'db' | 'sigma' | 'sql' | 'note'
-  | 'minus' | 'link' | 'settings'
+  | 'minus' | 'link' | 'settings' | 'undo' | 'redo'
 
 const P: Record<IconName, JSX.Element> = {
   eye: <><path d="M1 8s2.7-5 7-5 7 5 7 5-2.7 5-7 5-7-5-7-5Z" /><circle cx="8" cy="8" r="2.2" /></>,
@@ -17,6 +17,8 @@ const P: Record<IconName, JSX.Element> = {
   code: <path d="M5.5 4 2 8l3.5 4M10.5 4 14 8l-3.5 4" />,
   more: <><circle cx="3" cy="8" r="1" /><circle cx="8" cy="8" r="1" /><circle cx="13" cy="8" r="1" /></>,
   refresh: <><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" /><path d="M13.8 3.2v2.6h-2.6" /></>,
+  undo: <><path d="M6 5.5 3 8l3 2.5" /><path d="M3 8h6.2a3.3 3.3 0 0 1 0 6.6H6" /></>,
+  redo: <><path d="M10 5.5 13 8l-3 2.5" /><path d="M13 8H6.8a3.3 3.3 0 0 0 0 6.6H10" /></>,
   stop: <rect x="4" y="4" width="8" height="8" rx="1.2" />,
   plus: <path d="M8 3v10M3 8h10" />,
   minus: <path d="M3 8h10" />,

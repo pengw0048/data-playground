@@ -670,6 +670,9 @@ export const useStore = create<Store>((set, get) => ({
   renameFile: (name) => set((s) => ({ doc: { ...s.doc, name } })),  // autosave PUTs + refreshes the list
 
   deleteFile: async (id) => {
+    // permanent + not undoable → confirm first (guards both the file menu and the Recents trash)
+    const f = get().files.find((x) => x.id === id)
+    if (typeof window !== 'undefined' && !window.confirm(`Delete "${f?.name || 'this canvas'}"? This can't be undone.`)) return
     try { await api.deleteCanvas(id); await get().refreshFiles() } catch { /* offline */ }
     // only load a replacement (which navigates to the editor) if the deleted file was the one open
     // IN the editor; deleting from the Recents grid should just drop the card and stay in the shell.

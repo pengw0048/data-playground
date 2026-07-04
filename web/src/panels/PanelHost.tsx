@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { useViewport } from '@xyflow/react'
 import { useStore, type PanelKind } from '../store/graph'
+import { INSPECTOR_W } from './Inspector'
 import { color, radius, shadow } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { DataPanel } from './DataPanel'
@@ -39,15 +40,18 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
 
   if (!rect) return null
   const width = kind === 'data' ? 460 : kind === 'run' ? 340 : kind === 'section' ? 460 : 300
+  // the persistent right Inspector occupies the rightmost INSPECTOR_W px — panels must not slide
+  // under it, so the usable right edge stops before it.
+  const rightEdge = window.innerWidth - INSPECTOR_W
   // Prefer to the RIGHT of the node so the panel never covers it; fall back to below-left.
   const gap = 12
   let left: number
   let top: number
-  if (rect.right + gap + width <= window.innerWidth - 12) {
+  if (rect.right + gap + width <= rightEdge - 12) {
     left = rect.right + gap
     top = rect.top
   } else {
-    left = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12))
+    left = Math.max(12, Math.min(rect.left, rightEdge - width - 12))
     top = rect.bottom + gap
   }
   // keep the WHOLE panel on-screen: clamp top, then cap the panel's height to the space below it

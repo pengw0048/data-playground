@@ -4,6 +4,7 @@ import { color, shadow } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Popover } from '../ui/Popover'
 import { SettingsModal } from '../panels/SettingsModal'
+import { CanvasSettingsModal } from '../panels/CanvasSettingsModal'
 import { RunHistoryModal } from '../panels/RunHistoryModal'
 import { ShareModal } from '../panels/ShareModal'
 
@@ -13,7 +14,10 @@ export function TopBar() {
   const kernelInfo = useStore((s) => s.kernelInfo)
   const saved = useStore((s) => s.saved)
   const rerunAll = useStore((s) => s.rerunAll)
+  const canUndo = useStore((s) => s.past.length > 0)
+  const canRedo = useStore((s) => s.future.length > 0)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [canvasSettingsOpen, setCanvasSettingsOpen] = useState(false)
   const [runsOpen, setRunsOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
 
@@ -29,8 +33,12 @@ export function TopBar() {
       <div style={{ position: 'absolute', top: 16, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
         <AppMenu onSettings={() => setSettingsOpen(true)} onRunHistory={() => setRunsOpen(true)} />
         <span style={{ fontSize: 13.5, color: color.text3 }}>/</span>
-        <FileMenu />
-        <span data-testid="autosave" style={{ fontSize: 11, color: color.text3, marginLeft: 2 }}>· {saved ? 'saved' : 'saving…'}</span>
+        <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
+        <span data-testid="autosave" title={!kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined} style={{ fontSize: 11, color: color.text3, marginLeft: 2 }}>· {saved ? (kernelUp ? 'saved' : 'saved locally') : 'saving…'}</span>
+        <span style={{ display: 'inline-flex', gap: 2, marginLeft: 6 }}>
+          <IconBtn name="undo" label="Undo" disabled={!canUndo} onClick={() => useStore.getState().undo()} />
+          <IconBtn name="redo" label="Redo" disabled={!canRedo} onClick={() => useStore.getState().redo()} />
+        </span>
       </div>
 
       <div style={{ position: 'absolute', top: 16, right: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -59,6 +67,7 @@ export function TopBar() {
         <AccountMenu />
       </div>
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      {canvasSettingsOpen && <CanvasSettingsModal onClose={() => setCanvasSettingsOpen(false)} />}
       {runsOpen && <RunHistoryModal onClose={() => setRunsOpen(false)} />}
       {shareOpen && <ShareModal onClose={() => setShareOpen(false)} />}
     </>
@@ -105,7 +114,7 @@ function AppMenu({ onSettings, onRunHistory }: { onSettings: () => void; onRunHi
   )
 }
 
-function FileMenu() {
+function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
   const ref = useRef<HTMLButtonElement>(null)
   const [open, setOpen] = useState(false)
   const doc = useStore((s) => s.doc)
@@ -151,6 +160,7 @@ function FileMenu() {
           {files.length === 0 && <div style={{ padding: 10, fontSize: 11.5, color: color.text3 }}>No files yet.</div>}
         </div>
         <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />
+        <MenuItem icon="settings" label="Canvas settings…" onClick={() => { onCanvasSettings(); setOpen(false) }} />
         <MenuItem icon="plus" label="New file" onClick={() => { newFile(); setOpen(false) }} />
         <MenuItem icon="trash" label="Delete this file" danger onClick={() => { deleteFile(doc.id); setOpen(false) }} />
       </Popover>
@@ -209,6 +219,15 @@ function AccountMenu() {
         </div>
       </Popover>
     </>
+  )
+}
+
+function IconBtn({ name, label, onClick, disabled }: { name: IconName; label: string; onClick: () => void; disabled?: boolean }) {
+  return (
+    <button aria-label={label} title={label} onClick={onClick} disabled={disabled}
+      style={{ width: 26, height: 26, display: 'grid', placeItems: 'center', border: 'none', borderRadius: 6, background: 'transparent', color: disabled ? '#c8ccd2' : color.text3, cursor: disabled ? 'default' : 'pointer' }}>
+      <Icon name={name} size={14} />
+    </button>
   )
 }
 

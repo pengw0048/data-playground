@@ -216,6 +216,12 @@ export function Canvas() {
         return
       }
       if ((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y')) { e.preventDefault(); useStore.getState().redo(); return }
+      // Escape closes any open floating panel (data viewer / run / …) and clears the selection
+      if (e.key === 'Escape') {
+        if (Object.keys(useStore.getState().openPanels).length) useStore.setState({ openPanels: {} })
+        else useStore.getState().select(null)
+        return
+      }
       const ids = useStore.getState().selectedIds
       if (!ids.length) return
       if (e.key === 'Delete' || e.key === 'Backspace') { removeSelected(); e.preventDefault() }
@@ -247,7 +253,7 @@ export function Canvas() {
         onConnect={onConnect}
         onNodeDragStop={onNodeDragStop}
         isValidConnection={isValidConnection}
-        onPaneClick={() => { select(null); setMenu(null) }}
+        onPaneClick={() => { select(null); setMenu(null); useStore.setState({ openPanels: {} }) }}
         onNodeClick={(e, n) => { if (!e.shiftKey && !e.metaKey && !e.ctrlKey) select(n.id) }}
         defaultEdgeOptions={{ type: 'wire' }}
         proOptions={{ hideAttribution: true }}
