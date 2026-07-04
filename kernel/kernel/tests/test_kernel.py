@@ -575,6 +575,7 @@ def test_run_history_persisted_with_canvas(tmp_path):
     # a finished run is recorded under its canvas (survives restart) + exposed at /canvas/{id}/runs
     from kernel import metadb
     p = _seq_parquet(tmp_path)
+    client.put("/api/canvas/hist_canvas", json={"id": "hist_canvas", "name": "h", "version": 1, "nodes": [], "edges": []})  # persist the canvas
     g = {"id": "hist_canvas", "version": 1, "nodes": [
         N("src", "source", {"uri": p}), N("wr", "write", {"name": "hist_out"}),
     ], "edges": [E("src", "wr")]}
@@ -599,6 +600,20 @@ def test_collab_relay_broadcasts_and_leave():
             assert got["clientId"] == "A" and got["type"] == "presence"
         leave = b.receive_json()  # a disconnected → b is told to drop A
         assert leave == {"type": "leave", "clientId": "A"}
+
+
+def test_collab_ws_requires_auth_when_enabled(monkeypatch):
+    # with auth enabled, the collab channel is gated like the HTTP routes — no session → rejected
+    import pytest
+    from starlette.websockets import WebSocketDisconnect
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    client.cookies.clear()
+    try:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws/collab/some_canvas"):
+                pass
+    finally:
+        client.cookies.clear()
 
 
 def test_execution_backend_plugin_contract(tmp_path):

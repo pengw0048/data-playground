@@ -602,6 +602,7 @@ export const useStore = create<Store>((set, get) => ({
         if (saved) { const doc = JSON.parse(saved) as CanvasDoc; if (doc?.nodes) set({ doc }) }
       } catch { /* ignore corrupt state */ }
     }
+    _bootstrapped = true  // now the real doc is loaded → autosave may persist edits (not the throwaway empty doc)
   },
 
   refreshFiles: async () => { try { set({ files: await api.listCanvases() }) } catch { /* offline */ } },
@@ -698,9 +699,11 @@ export const useStore = create<Store>((set, get) => ({
 // Auto-persist the canvas to localStorage (debounced) so a refresh keeps your work.
 let _saveTimer: ReturnType<typeof setTimeout> | undefined
 let _lastDoc: CanvasDoc | undefined
+let _bootstrapped = false  // don't autosave the throwaway initial empty doc before the real one loads
 useStore.subscribe((s) => {
   if (s.doc === _lastDoc) return
   _lastDoc = s.doc
+  if (!_bootstrapped) return  // bootstrap will load & set the real doc; skip persisting anything before that
   if (s.saved) useStore.setState({ saved: false })  // dirty → "saving…"
   clearTimeout(_saveTimer)
   _saveTimer = setTimeout(async () => {

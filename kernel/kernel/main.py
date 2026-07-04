@@ -338,7 +338,9 @@ def auth_login(body: dict, response: Response) -> dict:
     if not auth.check_password(body.get("password", "")):
         raise HTTPException(401, "invalid password")
     uid = metadb.resolve_user(body.get("userId"))
-    response.set_cookie("dp_session", auth.sign(uid), httponly=True, samesite="lax")
+    # Secure flag opt-in for HTTPS deployments (default off so internal http installs still work)
+    response.set_cookie("dp_session", auth.sign(uid), httponly=True, samesite="lax",
+                        secure=bool(os.environ.get("DP_AUTH_SECURE_COOKIE")))
     return {"ok": True, "userId": uid}
 
 
@@ -427,10 +429,7 @@ def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> d
 @api.delete("/canvas/{canvas_id}")
 def delete_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
     if metadb.canvas_role(canvas_id, uid) == "owner":  # only the owner can delete
-        with metadb.session() as s:
-            c = s.get(metadb.Canvas, canvas_id)
-            if c:
-                s.delete(c)
+        metadb.delete_canvas_cascade(canvas_id)  # also drop shares + run history (no FK cascade)
     return {"ok": True}
 
 
@@ -466,6 +465,8 @@ def remove_share(canvas_id: str, user_id: str, uid: str = Depends(current_user))
 @api.get("/canvas/{canvas_id}/runs")
 def canvas_runs(canvas_id: str, uid: str = Depends(current_user)) -> list[dict]:
     """Run history for a canvas (persisted, survives restarts)."""
+    if metadb.canvas_role(canvas_id, uid) is None:  # same authz as the other canvas endpoints
+        raise HTTPException(404, "not found")
     return metadb.list_runs(canvas_id)
 
 
@@ -539,6 +540,14 @@ _collab_ids: dict[WebSocket, str] = {}  # socket -> its clientId (for leave noti
 
 @app.websocket("/ws/collab/{canvas_id}")
 async def ws_collab(ws: WebSocket, canvas_id: str):
+    # when auth is enabled, the collab channel is gated exactly like the HTTP canvas routes: a valid
+    # signed session cookie + some role on this canvas. (Open mode: unauthenticated, like the rest.)
+    from kernel import auth
+    if auth.auth_enabled():
+        uid = auth.verify(ws.cookies.get("dp_session"))
+        if not uid or metadb.canvas_role(canvas_id, uid) is None:
+            await ws.close(code=1008)  # policy violation
+            return
     await ws.accept()
     room = _collab_rooms.setdefault(canvas_id, set())
     room.add(ws)

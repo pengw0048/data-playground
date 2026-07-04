@@ -237,8 +237,23 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
     if not canvas_id:
         return
     with session() as s:
+        if s.get(Canvas, canvas_id) is None:
+            return  # ad-hoc / unsaved-canvas run → don't write a run row dangling off a missing canvas
         s.add(RunRecord(canvas_id=canvas_id, target_node_id=target_node_id, status=status,
                         rows=rows, ms=ms, error=error, output_table=output_table))
+
+
+def delete_canvas_cascade(canvas_id: str) -> None:
+    """Delete a canvas and its children (shares, run history) — FKs don't cascade (SQLite FK off,
+    Postgres would error), so clean them explicitly."""
+    with session() as s:
+        for sh in s.scalars(select(CanvasShare).where(CanvasShare.canvas_id == canvas_id)):
+            s.delete(sh)
+        for r in s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id)):
+            s.delete(r)
+        c = s.get(Canvas, canvas_id)
+        if c:
+            s.delete(c)
 
 
 def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
