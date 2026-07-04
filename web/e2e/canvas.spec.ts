@@ -337,6 +337,19 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
   })
 
+  test('two clients on the same canvas see each other (realtime presence)', async ({ page }) => {
+    await page.goto('/')
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    // a second client in the same session opens the same (last-active) canvas → same collab room
+    const b = await page.context().newPage()
+    await b.goto('/')
+    await expect(b.getByTestId('toolbar')).toBeVisible()
+    await page.mouse.move(420, 320) // A broadcasts presence/cursor
+    // B shows A as a present collaborator (avatar stack titled "… other(s) here")
+    await expect(b.locator('[title*="other"]')).toBeVisible({ timeout: 12_000 })
+    await b.close()
+  })
+
   test('the Share dialog sets visibility and adds a collaborator', async ({ page }) => {
     await fresh(page)
     // add a user so there's someone to share with

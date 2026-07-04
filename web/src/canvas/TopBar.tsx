@@ -27,6 +27,7 @@ export function TopBar() {
       </div>
 
       <div style={{ position: 'absolute', top: 16, right: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 10 }}>
+        <PeerAvatars />
         <div
           title={kernelInfo ? `${kernelInfo.backend} · ${kernelInfo.runners.join(', ')}` : 'kernel offline'}
           style={{
@@ -58,6 +59,22 @@ export function TopBar() {
 }
 
 // The app menu (Figma-style hamburger): Back to files, New file, Settings.
+// Live presence: avatars of other people currently on this canvas (realtime collab).
+function PeerAvatars() {
+  const peers = useStore((s) => s.peers)
+  const list = Object.entries(peers)
+  if (list.length === 0) return null
+  return (
+    <div style={{ display: 'flex', alignItems: 'center' }} title={`${list.length} other${list.length > 1 ? 's' : ''} here`}>
+      {list.slice(0, 5).map(([id, p], i) => (
+        <span key={id} style={{ width: 26, height: 26, borderRadius: '50%', background: p.color, color: '#fff', display: 'grid', placeItems: 'center', fontSize: 11, fontWeight: 700, border: '2px solid #fff', marginLeft: i === 0 ? 0 : -8, boxShadow: shadow.card }}>
+          {(p.name || '?').slice(0, 1).toUpperCase()}
+        </span>
+      ))}
+    </div>
+  )
+}
+
 function AppMenu({ onSettings, onRunHistory }: { onSettings: () => void; onRunHistory: () => void }) {
   const ref = useRef<HTMLButtonElement>(null)
   const [open, setOpen] = useState(false)

@@ -147,6 +147,11 @@ interface Store {
   toasts: { id: string; kind: 'error' | 'info' | 'success'; msg: string }[]
   pushToast: (msg: string, kind?: 'error' | 'info' | 'success') => void
   dismissToast: (id: string) => void
+  // realtime collaboration presence: other people currently on this canvas (live cursors + avatars)
+  peers: Record<string, { name: string; color: string; cursor?: { x: number; y: number } }>
+  setPeer: (id: string, p: { name: string; color: string; cursor?: { x: number; y: number } }) => void
+  dropPeer: (id: string) => void
+  clearPeers: () => void
 
   // -- users + files (per-user, multi-file) --
   currentUser: DpUser | null
@@ -191,6 +196,10 @@ export const useStore = create<Store>((set, get) => ({
   fullscreenCode: null,
   openCodeFullscreen: (nodeId, param, lang) => set({ fullscreenCode: { nodeId, param, lang } }),
   closeCodeFullscreen: () => set({ fullscreenCode: null }),
+  peers: {},
+  setPeer: (id, p) => set((s) => ({ peers: { ...s.peers, [id]: p } })),
+  dropPeer: (id) => set((s) => { const peers = { ...s.peers }; delete peers[id]; return { peers } }),
+  clearPeers: () => set({ peers: {} }),
   toasts: [],
   pushToast: (msg, kind = 'info') => {
     const id = `t_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 6)}`

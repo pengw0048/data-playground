@@ -590,6 +590,17 @@ def test_run_history_persisted_with_canvas(tmp_path):
     assert any(r["status"] == "done" for r in client.get("/api/canvas/hist_canvas/runs").json())
 
 
+def test_collab_relay_broadcasts_and_leave():
+    # the collab room relays a peer's message to others and tells them when a peer leaves
+    with client.websocket_connect("/ws/collab/room1") as b:
+        with client.websocket_connect("/ws/collab/room1") as a:
+            a.send_json({"clientId": "A", "type": "presence", "name": "Ann"})
+            got = b.receive_json()
+            assert got["clientId"] == "A" and got["type"] == "presence"
+        leave = b.receive_json()  # a disconnected → b is told to drop A
+        assert leave == {"type": "leave", "clientId": "A"}
+
+
 def test_execution_backend_plugin_contract(tmp_path):
     # a plugin can register an alternate execution backend (pod/Ray/the pipeline runtime/…); the kernel routes runs
     # to the first backend whose can_run(plan) is true. This proves the ExecutionBackend extension point.

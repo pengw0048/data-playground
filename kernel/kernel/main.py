@@ -529,6 +529,45 @@ async def ws_run(ws: WebSocket, run_id: str):
         pass
 
 
+# --- realtime collaboration: a broadcast room per canvas (presence + live doc updates) ---------- #
+# A dumb relay: clients hold the canvas; the server fans out each message (presence/cursor or a doc
+# update) to the room's other peers, and tells peers when someone leaves. This is a usable first
+# version (last-write-wins on the doc); a CRDT (Yjs) is the conflict-free hardening.
+_collab_rooms: dict[str, set[WebSocket]] = {}
+_collab_ids: dict[WebSocket, str] = {}  # socket -> its clientId (for leave notifications)
+
+
+@app.websocket("/ws/collab/{canvas_id}")
+async def ws_collab(ws: WebSocket, canvas_id: str):
+    await ws.accept()
+    room = _collab_rooms.setdefault(canvas_id, set())
+    room.add(ws)
+    try:
+        while True:
+            msg = await ws.receive_json()
+            if isinstance(msg, dict) and msg.get("clientId"):
+                _collab_ids[ws] = msg["clientId"]
+            for peer in list(room):
+                if peer is not ws:
+                    try:
+                        await peer.send_json(msg)
+                    except Exception:  # noqa: BLE001
+                        room.discard(peer)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        room.discard(ws)
+        cid = _collab_ids.pop(ws, None)
+        if cid:  # let peers drop this collaborator's cursor/avatar
+            for peer in list(room):
+                try:
+                    await peer.send_json({"type": "leave", "clientId": cid})
+                except Exception:  # noqa: BLE001
+                    room.discard(peer)
+        if not room:
+            _collab_rooms.pop(canvas_id, None)
+
+
 @app.get("/api/health")
 def health() -> dict:
     return {"ok": True}

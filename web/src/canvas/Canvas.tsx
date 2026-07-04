@@ -13,6 +13,8 @@ import { kindAccent, color } from '../theme/tokens'
 import type { WireType } from '../theme/tokens'
 import { ConnectMenu } from './ConnectMenu'
 import { PanelHost } from '../panels/PanelHost'
+import { PeerCursors } from './PeerCursors'
+import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
 
 const edgeTypes = { wire: WireEdge }
 
@@ -73,6 +75,13 @@ export function Canvas() {
   const bypass = useStore((s) => s.bypass)
   const mute = useStore((s) => s.mute)
   const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
+
+  // realtime collaboration: join this canvas's presence room; leave on switch/unmount
+  const docId = doc.id
+  useEffect(() => {
+    connectCollab(docId)
+    return () => disconnectCollab()
+  }, [docId])
 
   const [menu, setMenu] = useState<{ x: number; y: number; wire: WireType; source: { nodeId: string | null; handleId: string | null } } | null>(null)
 
@@ -224,8 +233,10 @@ export function Canvas() {
   }, [removeSelected, bypass, mute])
 
   return (
-    <div style={{ position: 'absolute', inset: 0 }}>
+    <div style={{ position: 'absolute', inset: 0 }}
+      onMouseMove={(e) => { const p = screenToFlowPosition({ x: e.clientX, y: e.clientY }); sendCursor(p.x, p.y) }}>
       <ArrowDefs />
+      <PeerCursors />
       <ReactFlow
         nodes={rfNodes}
         edges={rfEdges}
