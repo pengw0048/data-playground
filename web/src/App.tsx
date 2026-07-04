@@ -7,6 +7,7 @@ import { AgentDock } from './panels/AgentDock'
 import { Inspector } from './panels/Inspector'
 import { CodeFullscreen } from './panels/CodeFullscreen'
 import { Shell } from './views/Shell'
+import { Toaster } from './ui/Toaster'
 import { useStore } from './store/graph'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 
@@ -37,6 +38,7 @@ export default function App() {
           <Shell />
         )}
         <CodeFullscreen />
+        <Toaster />
       </ErrorBoundary>
     </ReactFlowProvider>
   )

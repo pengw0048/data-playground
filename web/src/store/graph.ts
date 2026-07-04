@@ -143,6 +143,10 @@ interface Store {
   fullscreenCode: { nodeId: string; param: string; lang?: string } | null
   openCodeFullscreen: (nodeId: string, param: string, lang?: string) => void
   closeCodeFullscreen: () => void
+  // transient notifications surfaced as toasts (errors/info) — so failures aren't silent
+  toasts: { id: string; kind: 'error' | 'info' | 'success'; msg: string }[]
+  pushToast: (msg: string, kind?: 'error' | 'info' | 'success') => void
+  dismissToast: (id: string) => void
 
   // -- users + files (per-user, multi-file) --
   currentUser: DpUser | null
@@ -187,6 +191,13 @@ export const useStore = create<Store>((set, get) => ({
   fullscreenCode: null,
   openCodeFullscreen: (nodeId, param, lang) => set({ fullscreenCode: { nodeId, param, lang } }),
   closeCodeFullscreen: () => set({ fullscreenCode: null }),
+  toasts: [],
+  pushToast: (msg, kind = 'info') => {
+    const id = `t_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 6)}`
+    set((s) => ({ toasts: [...s.toasts, { id, kind, msg }] }))
+    setTimeout(() => get().dismissToast(id), kind === 'error' ? 7000 : 4000)
+  },
+  dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
   currentUser: null,
   users: [],
   files: [],
@@ -437,6 +448,7 @@ export const useStore = create<Store>((set, get) => ({
       estimate = await api.estimate(get().doc, id)
     } catch (e) {
       set((s) => ({ runs: { ...s.runs, [id]: { phase: 'failed', error: (e as Error).message } } }))
+      get().pushToast((e as Error).message || 'Could not estimate the run', 'error')
       return
     }
     if (estimate.needsConfirm) {
@@ -475,6 +487,7 @@ export const useStore = create<Store>((set, get) => ({
       }
       set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message } } }))
       get().updateData(id, { status: 'failed' })
+      get().pushToast((e as Error).message || 'Run failed to start', 'error')
     }
   },
 
@@ -688,10 +701,12 @@ useStore.subscribe((s) => {
       await api.saveCanvas(doc)  // PUT to the metadata DB (per-user, upsert)
       useStore.setState((st) => ({
         saved: true,
+        kernelUp: true,  // a successful save confirms the kernel is reachable (clears the offline banner)
         files: st.files.map((f) => (f.id === doc.id ? { ...f, name: doc.name ?? f.name, version: doc.version } : f)),
       }))
     } catch {
-      useStore.setState({ saved: true })  // offline: the localStorage cache still holds it
+      // offline: the localStorage cache still holds it; flag the kernel down so the banner shows
+      useStore.setState({ saved: true, kernelUp: false })
     }
   }, 400)
 })
@@ -710,6 +725,7 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
     if (status.status === 'done' || status.status === 'failed' || status.status === 'cancelled') {
       const phase = status.status === 'done' ? 'done' : status.status === 'failed' ? 'failed' : 'idle'
       set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase } as any), status, phase } } }))
+      if (status.status === 'failed') get().pushToast(status.error ?? 'Run failed', 'error')
       const g = get()
       g.updateData(nodeId, {
         status: status.status === 'done' ? 'latest' : status.status === 'failed' ? 'failed' : 'stale',

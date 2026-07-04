@@ -327,6 +327,16 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('toolbar')).toBeVisible()
   })
 
+  test('a failing run surfaces an error toast (not a silent failure)', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Sources & sinks', 'source') // auto-selected → editable in the inspector
+    const inspector = page.getByTestId('inspector')
+    // point the source at a dataset that doesn't exist → the run fails and must surface a toast
+    await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
+    await inspector.getByRole('button', { name: 'Run' }).click()
+    await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
+  })
+
   test('the app menu opens persisted run history', async ({ page }) => {
     await fresh(page)
     await page.getByTestId('app-menu').click()
