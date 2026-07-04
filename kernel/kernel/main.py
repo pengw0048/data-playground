@@ -11,7 +11,7 @@ import asyncio
 import json
 import os
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import APIRouter, Cookie, Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -308,9 +308,44 @@ def run_cancel(run_id: str) -> RunStatus:
 from sqlalchemy import select as _sa_select  # noqa: E402
 
 
-def current_user(x_dp_user: str | None = Header(default=None)) -> str:
-    """Resolve the request's user id (X-DP-User header) to a valid user, defaulting to local."""
+def current_user(x_dp_user: str | None = Header(default=None),
+                 dp_session: str | None = Cookie(default=None)) -> str:
+    """Resolve the request's user. With auth enabled (DP_AUTH_SECRET), identity comes ONLY from a
+    valid signed session cookie (a raw header is not trusted); otherwise it's the X-DP-User header
+    (open internal-tool mode), defaulting to the local user."""
+    from kernel import auth
+    if auth.auth_enabled():
+        uid = auth.verify(dp_session)
+        if not uid:
+            raise HTTPException(401, "authentication required")
+        return metadb.resolve_user(uid)
     return metadb.resolve_user(x_dp_user)
+
+
+@api.get("/auth/status")
+def auth_status(dp_session: str | None = Cookie(default=None)) -> dict:
+    from kernel import auth
+    if not auth.auth_enabled():
+        return {"authEnabled": False, "userId": metadb.DEFAULT_USER_ID}
+    return {"authEnabled": True, "userId": auth.verify(dp_session)}
+
+
+@api.post("/auth/login")
+def auth_login(body: dict, response: Response) -> dict:
+    from kernel import auth
+    if not auth.auth_enabled():
+        return {"ok": True, "userId": metadb.resolve_user(body.get("userId"))}
+    if not auth.check_password(body.get("password", "")):
+        raise HTTPException(401, "invalid password")
+    uid = metadb.resolve_user(body.get("userId"))
+    response.set_cookie("dp_session", auth.sign(uid), httponly=True, samesite="lax")
+    return {"ok": True, "userId": uid}
+
+
+@api.post("/auth/logout")
+def auth_logout(response: Response) -> dict:
+    response.delete_cookie("dp_session")
+    return {"ok": True}
 
 
 class UserBody(BaseModel):

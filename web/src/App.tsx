@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { Canvas } from './canvas/Canvas'
 import { TopBar } from './canvas/TopBar'
@@ -7,17 +7,28 @@ import { AgentDock } from './panels/AgentDock'
 import { Inspector } from './panels/Inspector'
 import { CodeFullscreen } from './panels/CodeFullscreen'
 import { Shell } from './views/Shell'
+import { Login } from './views/Login'
 import { Toaster } from './ui/Toaster'
+import { api } from './api/client'
 import { useStore } from './store/graph'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 
 export default function App() {
   const bootstrap = useStore((s) => s.bootstrap)
   const view = useStore((s) => s.view)
+  // gate on auth: null = checking; then either the login screen (auth on, no session) or the app.
+  const [auth, setAuth] = useState<{ authEnabled: boolean; userId: string | null } | null>(null)
+  const [booted, setBooted] = useState(false)
 
   useEffect(() => {
-    bootstrap()
-  }, [bootstrap])
+    api.authStatus().then(setAuth).catch(() => setAuth({ authEnabled: false, userId: 'local' }))
+  }, [])
+  useEffect(() => {
+    if (auth && (!auth.authEnabled || auth.userId) && !booted) { setBooted(true); bootstrap() }
+  }, [auth, booted, bootstrap])
+
+  if (!auth) return <div style={{ position: 'absolute', inset: 0 }} />  // brief splash while checking auth
+  if (auth.authEnabled && !auth.userId) return <Login onLoggedIn={(uid) => setAuth({ authEnabled: true, userId: uid })} />
 
   return (
     <ReactFlowProvider>

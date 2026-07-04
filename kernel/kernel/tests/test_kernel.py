@@ -590,6 +590,24 @@ def test_run_history_persisted_with_canvas(tmp_path):
     assert any(r["status"] == "done" for r in client.get("/api/canvas/hist_canvas/runs").json())
 
 
+def test_signed_session_auth(monkeypatch):
+    # with auth enabled, identity must come from a valid signed session cookie — a raw header is not
+    # trusted, protected endpoints 401 without a session, and login requires the shared password.
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    monkeypatch.setenv("DP_AUTH_PASSWORD", "hunter2")
+    client.cookies.clear()
+    try:
+        assert client.get("/api/auth/status").json() == {"authEnabled": True, "userId": None}
+        assert client.get("/api/canvas").status_code == 401                                   # no session
+        assert client.get("/api/canvas", headers={"X-DP-User": "local"}).status_code == 401   # header not trusted
+        assert client.post("/api/auth/login", json={"password": "wrong"}).status_code == 401   # bad password
+        assert client.post("/api/auth/login", json={"userId": "local", "password": "hunter2"}).status_code == 200
+        assert client.get("/api/canvas").status_code == 200                                    # signed cookie carried
+        assert client.get("/api/auth/status").json()["userId"] == "local"
+    finally:
+        client.cookies.clear()
+
+
 def test_canvas_sharing_access_and_authz():
     # sharing: a canvas is private to its owner until explicitly shared; shared editors can read/write
     # but not delete (owner-only); workspace visibility opens it to everyone.
