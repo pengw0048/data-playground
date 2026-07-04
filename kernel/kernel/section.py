@@ -54,6 +54,24 @@ def _materialize(engine, rel):
     return db.conn().read_parquet(path)
 
 
+def _collect_subnodes(engine, node) -> dict:
+    """The callable nodes of a section, as {alias -> {type, config}}.
+
+    Preferred model (visual containment): the canvas nodes whose parent_id is this section — the
+    alias is each node's title, so the driver calls run("clean rows", …). Falls back to the legacy
+    form-declared config.subnodes when the section has no contained canvas nodes (back-compat)."""
+    kids = [n for n in engine.graph.nodes if getattr(n, "parent_id", None) == node.id]
+    if kids:
+        out: dict = {}
+        for k in kids:
+            data = k.data if isinstance(k.data, dict) else {}
+            alias = str(data.get("title") or k.id).strip()
+            out[alias] = {"alias": alias, "type": k.type, "config": data.get("config", {}) or {}}
+        return out
+    cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+    return {s["alias"]: s for s in (cfg.get("subnodes") or []) if s.get("alias")}
+
+
 def run_section(engine, node, inputs):
     """Execute a section node's driver script; return {output port -> emitted relation}.
 
@@ -64,7 +82,7 @@ def run_section(engine, node, inputs):
 
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
     script = (cfg.get("script") or "").strip()
-    subnodes = {s["alias"]: s for s in (cfg.get("subnodes") or []) if s.get("alias")}
+    subnodes = _collect_subnodes(engine, node)
     params = cfg.get("params") or {}
     max_runs = int(cfg.get("maxRuns", 200))
     if not script:
@@ -128,7 +146,8 @@ def run_section(engine, node, inputs):
         "run": run, "value": value, "concat": concat, "emit": emit,
     })
     for alias in subnodes:
-        ns[alias] = _Ref(alias)  # alias objects: write run(caption, ...)
+        if alias.isidentifier():  # bare alias object: run(caption, …); other titles use run("my title", …)
+            ns[alias] = _Ref(alias)
 
     sandbox._reject_dunder(script)
     exec(compile(script, "<section>", "exec"), ns)  # noqa: S102 — soft sandbox, full pass only

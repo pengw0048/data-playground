@@ -205,6 +205,7 @@ class GraphNode(Wire):
     type: str
     position: Position = Position(x=0, y=0)
     data: dict[str, Any] = {}
+    parent_id: str | None = None  # visual containment: this node lives inside a section (its parent)
 
 
 class GraphEdgeData(Wire):

@@ -571,6 +571,24 @@ def test_section_multi_output_routes_by_port(tmp_path):
     assert stats("sec_high") == (100, 900, 999)  # the "high" port: v >= 900
 
 
+def test_section_runs_its_parentid_children(tmp_path):
+    # visual containment: a canvas node whose parentId is the section is a callable child — its
+    # alias is its title, so the driver calls run("keep", …). No form-declared subnodes needed.
+    p = _seq_parquet(tmp_path)  # v = 0..999
+    child = {"id": "child1", "type": "filter", "parentId": "sec", "position": {"x": 0, "y": 0},
+             "data": {"title": "keep", "config": {"predicate": "v < 300"}}}
+    sec = {"id": "sec", "type": "section", "position": {"x": 0, "y": 0},
+           "data": {"title": "sec", "config": {"script": "emit(run('keep', data=inputs['in']))\n",
+                                               "subnodes": [], "params": {}, "maxRuns": 50}}}
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": p}), sec, child, N("wr", "write", {"name": "sec_parent"}),
+    ], "edges": [E("src", "sec"), E("sec", "wr")]}
+    st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
+    assert st["status"] == "done"
+    out = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_sec_parent").uri, "k": 5}).json()
+    assert out["rowCount"] == 300  # the contained 'keep' filter kept v < 300
+
+
 def test_section_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
