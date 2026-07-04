@@ -138,7 +138,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('agent dock shows its mode and builds real nodes (offline planner in CI)', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page) // build on a clean new file so it doesn't pollute the default canvas (shared DB in CI)
     await page.getByRole('button', { name: 'Agent', exact: true }).click()
     // no provider key configured in CI → the dock advertises the offline planner
     await expect(page.getByText('offline planner')).toBeVisible()
@@ -188,10 +188,10 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('the file menu opens a fresh (empty) canvas as a new file', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page) // start on a known-empty new file (shared DB persists canvases across tests)
     await addNode(page, 'Shape', 'filter')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
-    await page.getByRole('button', { name: /untitled/ }).click()
+    await page.getByTestId('file-menu').click()
     await expect(page.getByText('New file')).toBeVisible()
     await page.getByText('New file').click()
     await expect(page.locator('.react-flow__node')).toHaveCount(0) // a new file is a fresh canvas
