@@ -590,6 +590,27 @@ def test_run_history_persisted_with_canvas(tmp_path):
     assert any(r["status"] == "done" for r in client.get("/api/canvas/hist_canvas/runs").json())
 
 
+def test_execution_backend_plugin_contract(tmp_path):
+    # a plugin can register an alternate execution backend (pod/Ray/the pipeline runtime/…); the kernel routes runs
+    # to the first backend whose can_run(plan) is true. This proves the ExecutionBackend extension point.
+    from kernel.backends import ExecutionBackend
+    from kernel.deps import Deps
+
+    class FakeBackend:
+        name = "fake-pod"
+        def can_run(self, plan): return True
+        def estimate(self, plan, rows): return None
+        def run(self, plan, graph, target_node_id, placement): return None
+        def status(self, run_id): return None
+        def cancel(self, run_id): return None
+
+    fake = FakeBackend()
+    assert isinstance(fake, ExecutionBackend)  # structural conformance to the contract
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    d.runners.insert(0, fake)
+    assert d.pick_runner(object()) is fake  # selected over the local runner because can_run is true
+
+
 def test_signed_session_auth(monkeypatch):
     # with auth enabled, identity must come from a valid signed session cookie — a raw header is not
     # trusted, protected endpoints 401 without a session, and login requires the shared password.

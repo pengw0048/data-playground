@@ -47,6 +47,7 @@ class Registry:
         self.deps.adapters.insert(0, adapter)  # plugins claim uris before defaults
 
     def add_runner(self, runner) -> None:
+        # runner should satisfy kernel.backends.ExecutionBackend; inserted first so it wins pick_runner
         self.deps.runners.insert(0, runner)
 
     def add_capability(self, cap) -> None:
