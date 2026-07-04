@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import json
+import os
 import uuid
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
@@ -78,9 +79,30 @@ def engine():
     return _engine
 
 
+_MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "migrations")
+
+
+def _alembic_cfg():
+    from alembic.config import Config
+    cfg = Config()
+    cfg.set_main_option("script_location", _MIGRATIONS_DIR)
+    return cfg
+
+
 def init_db() -> None:
-    """Create tables (idempotent) and seed the default local user. Called at startup."""
-    Base.metadata.create_all(engine())
+    """Bring the metadata schema to head via Alembic, then seed the default local user.
+
+    Alembic is the source of truth for schema. A pre-Alembic DB (tables created by the old
+    create_all) is adopted by stamping the baseline before upgrading, so existing installs migrate
+    cleanly instead of erroring on already-present tables."""
+    from alembic import command
+    from sqlalchemy import inspect
+
+    names = set(inspect(engine()).get_table_names())
+    cfg = _alembic_cfg()
+    if "users" in names and "alembic_version" not in names:
+        command.stamp(cfg, "0001_baseline")  # legacy DB → adopt the baseline without recreating tables
+    command.upgrade(cfg, "head")
     with session() as s:
         if s.get(User, DEFAULT_USER_ID) is None:
             s.add(User(id=DEFAULT_USER_ID, name="Local"))
