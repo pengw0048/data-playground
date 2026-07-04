@@ -2,6 +2,7 @@ import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useStore } from '../../store/graph'
 import { color } from '../../theme/tokens'
+import { CodeSnippet } from '../../ui/CodeSnippet'
 
 const DEFAULT_SQL = 'SELECT * FROM input LIMIT 100'
 
@@ -12,14 +13,13 @@ function Sql({ id, data }: NodeComponentProps) {
     <NodeCard id={id} data={data} metaOverride="SQL → view · DuckDB on the sample">
       <button
         onClick={(e) => { e.stopPropagation(); togglePanel(id, 'code') }}
-        className="dp-mono"
         style={{
-          display: 'block', width: '100%', textAlign: 'left', background: 'var(--code-bg)', color: 'var(--code-sql)',
+          display: 'block', width: '100%', textAlign: 'left', background: 'var(--code-bg)',
           border: `1px solid ${color.border}`, borderRadius: 8, padding: '8px 10px', fontSize: 10.5, lineHeight: 1.4,
           whiteSpace: 'pre-wrap', cursor: 'text', maxHeight: 54, overflow: 'hidden',
         }}
       >
-        {sql}
+        <CodeSnippet code={sql} language="sql" />
       </button>
     </NodeCard>
   )

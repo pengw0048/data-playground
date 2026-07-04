@@ -79,7 +79,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
               >
                 {st.glyph}
               </span>
-              <EditableTitle id={id} title={data.title} onRename={rename} />
+              <EditableTitle id={id} title={data.title} onRename={rename} selected={selected} />
               <span style={{ flex: 1 }} />
               <span
                 style={{
@@ -114,15 +114,11 @@ export function NodeCard({ id, data, children, metaOverride }: {
               />
               <ActionIcon
                 name={runState === 'running' ? 'stop' : 'play'}
-                label={!runnable ? 'Connect a source to run' : runState === 'running' ? 'Stop' : (runState && runState !== 'idle' && runState !== 'estimating') ? 'Run details' : 'Run'}
+                label={!runnable ? 'Connect a source to run' : runState === 'running' ? 'Stop' : 'Run up to here'}
                 active={openPanel === 'run'}
                 disabled={!runnable}
-                onClick={() => {
-                  if (runState === 'running') cancelRun(id)
-                  // finished/confirm/estimated → open the run panel for detail; else start a run
-                  else if (runState && ['confirm', 'estimated', 'done', 'failed'].includes(runState)) togglePanel(id, 'run')
-                  else requestRun(id)
-                }}
+                // ▶ always runs THIS node (up to & including it); ⏹ cancels. Run details live in the ⋯ menu.
+                onClick={() => (runState === 'running' ? cancelRun(id) : requestRun(id))}
               />
               <ActionIcon name="clock" label="History" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
               {hasCode && <ActionIcon name="code" label="Code" active={openPanel === 'code'} onClick={() => togglePanel(id, 'code')} />}
@@ -163,10 +159,16 @@ function ActionIcon({ name, label, active, onClick, disabled }: {
   )
 }
 
-function EditableTitle({ id, title, onRename }: { id: string; title: string; onRename: (id: string, t: string) => void }) {
+function EditableTitle({ id, title, onRename, selected }: { id: string; title: string; onRename: (id: string, t: string) => void; selected?: boolean }) {
   const [editing, setEditing] = useState(false)
   const [val, setVal] = useState(title)
   useEffect(() => setVal(title), [title])
+  // let the ⋯-menu "Rename" (and any external trigger) enter edit mode for this node
+  useEffect(() => {
+    const onRenameEvt = (e: Event) => { if ((e as CustomEvent).detail?.id === id) setEditing(true) }
+    window.addEventListener('dp-rename', onRenameEvt)
+    return () => window.removeEventListener('dp-rename', onRenameEvt)
+  }, [id])
   if (editing) {
     return (
       <input
@@ -182,8 +184,10 @@ function EditableTitle({ id, title, onRename }: { id: string; title: string; onR
   }
   return (
     <span
+      // click the name of an already-selected node to rename (Figma-style); double-click always works
+      onClick={(e) => { if (selected) { e.stopPropagation(); setEditing(true) } }}
       onDoubleClick={(e) => { e.stopPropagation(); setEditing(true) }}
-      title="Double-click to rename"
+      title="Click (when selected) or double-click to rename"
       style={{ fontSize: 13.5, fontWeight: 600, color: color.ink, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', cursor: 'text' }}
     >
       {title}
@@ -228,6 +232,8 @@ function MoreMenu({ id, kind }: { id: string; kind: string }) {
         </button>
       </Tooltip>
       <Popover anchorRef={btnRef} open={open} onClose={() => setOpen(false)} width={184} align="right">
+        {item('rename', 'Rename', () => window.dispatchEvent(new CustomEvent('dp-rename', { detail: { id } })))}
+        {item('play', 'Run details', () => openPanel(id, 'run'))}
         {item('duplicate', 'Duplicate', () => duplicate(id))}
         {canBypass && item('power', 'Bypass', () => bypass(id))}
         {item('mute', 'Mute', () => mute(id))}

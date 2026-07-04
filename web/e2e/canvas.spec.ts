@@ -156,6 +156,18 @@ test.describe('Data Playground canvas', () => {
     await expect(node.locator('textarea')).toBeVisible()
   })
 
+  test('a node can be renamed (⋯ menu → Rename)', async ({ page }) => {
+    await page.goto('/')
+    await addNode(page, 'Query', 'sql')
+    await page.getByRole('button', { name: 'More' }).click()
+    await page.getByRole('button', { name: 'Rename' }).click()
+    const input = page.locator('.react-flow__node input')
+    await expect(input).toBeVisible()
+    await input.fill('my query')
+    await input.press('Enter')
+    await expect(page.locator('.react-flow__node').getByText('my query', { exact: true })).toBeVisible()
+  })
+
   test('code cells use the Monaco editor (highlighting + the SQL text)', async ({ page }) => {
     await page.goto('/')
     await addNode(page, 'Query', 'sql')

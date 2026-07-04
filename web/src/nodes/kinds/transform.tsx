@@ -6,6 +6,7 @@ import { color } from '../../theme/tokens'
 import { Segmented, Chip, MiniSelect } from '../../ui/controls'
 import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
+import { CodeSnippet } from '../../ui/CodeSnippet'
 import type { ProcessorMode, TransformSource } from '../../types/graph'
 
 const DEFAULT_CODE = `def fn(row):
@@ -85,14 +86,13 @@ function Transform({ id, data }: NodeComponentProps) {
           <div>
             <button
               onClick={(e) => { e.stopPropagation(); togglePanel(id, 'code') }}
-              className="dp-mono"
               style={{
-                display: 'block', width: '100%', textAlign: 'left', background: 'var(--code-bg)', color: 'var(--code-text)',
+                display: 'block', width: '100%', textAlign: 'left', background: 'var(--code-bg)',
                 border: `1px solid ${color.border}`, borderRadius: 8, padding: '8px 10px', fontSize: 10.5, lineHeight: 1.4,
                 whiteSpace: 'pre', overflow: 'hidden', textOverflow: 'ellipsis', cursor: 'text',
               }}
             >
-              {String(data.config.code ?? DEFAULT_CODE).split('\n').slice(0, 3).join('\n')}
+              <CodeSnippet code={String(data.config.code ?? DEFAULT_CODE).split('\n').slice(0, 3).join('\n')} language="python" />
             </button>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
               <MiniSelect<ProcessorMode>

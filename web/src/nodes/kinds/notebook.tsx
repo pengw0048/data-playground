@@ -2,6 +2,7 @@ import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useStore } from '../../store/graph'
 import { color } from '../../theme/tokens'
+import { CodeSnippet } from '../../ui/CodeSnippet'
 
 const DEFAULT_CODE = `def fn(row):
     # an embedded cell over the sample
@@ -9,14 +10,14 @@ const DEFAULT_CODE = `def fn(row):
 
 function Notebook({ id, data }: NodeComponentProps) {
   const togglePanel = useStore((s) => s.togglePanel)
+  const snippet = String(data.config.code ?? DEFAULT_CODE).split('\n').slice(0, 3).join('\n')
   return (
     <NodeCard id={id} data={data} metaOverride="cells · run in session · sample → sample">
       <button
         onClick={(e) => { e.stopPropagation(); togglePanel(id, 'code') }}
-        className="dp-mono"
-        style={{ display: 'block', width: '100%', textAlign: 'left', background: 'var(--code-bg)', color: 'var(--code-text)', border: `1px solid ${color.border}`, borderRadius: 8, padding: '8px 10px', fontSize: 10.5, lineHeight: 1.4, whiteSpace: 'pre', overflow: 'hidden', cursor: 'text' }}
+        style={{ display: 'block', width: '100%', textAlign: 'left', background: 'var(--code-bg)', border: `1px solid ${color.border}`, borderRadius: 8, padding: '8px 10px', fontSize: 10.5, lineHeight: 1.4, whiteSpace: 'pre', overflow: 'hidden', cursor: 'text' }}
       >
-        {String(data.config.code ?? DEFAULT_CODE).split('\n').slice(0, 3).join('\n')}
+        <CodeSnippet code={snippet} language="python" />
       </button>
     </NodeCard>
   )
