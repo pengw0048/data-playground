@@ -285,6 +285,18 @@ test.describe('Data Playground canvas', () => {
     await expect(pred).toHaveValue('amount > 0')
   })
 
+  test('a code block lives on the canvas and opens the fullscreen editor on double-click', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Inspect', 'code')
+    const node = page.locator('.react-flow__node')
+    await expect(node).toHaveCount(1)
+    await expect(node.getByText('python', { exact: true })).toBeVisible() // language chip
+    await node.dblclick()
+    await expect(page.locator('.monaco-editor').first()).toBeVisible({ timeout: 15_000 })
+    await page.keyboard.press('Escape')
+    await expect(page.locator('.monaco-editor')).toHaveCount(0)
+  })
+
   test('a code node opens a fullscreen editor from the inspector', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Query', 'sql') // auto-selected → inspector shows it
