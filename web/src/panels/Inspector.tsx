@@ -43,7 +43,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const runnable = useStore((s) => nodeRunnable(s.doc, nodeId))
   const runState = useStore((s) => s.runs[nodeId]?.phase)
-  const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, mute, duplicate, removeNode } = useStore.getState()
+  const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, mute, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
   useEffect(() => setName(node?.data.title ?? ''), [node?.data.title])
   if (!node) return null
@@ -95,11 +95,13 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
             <pre className="dp-mono" style={{ margin: 0, maxHeight: 120, overflow: 'auto', fontSize: 10.5, lineHeight: 1.5, color: color.text2, background: 'var(--code-bg, #f7f8fa)', border: `1px solid ${color.border}`, borderRadius: 8, padding: 8, whiteSpace: 'pre' }}>
               {codeText || '(empty)'}
             </pre>
-            <button
-              onClick={() => togglePanel(nodeId, kind === 'section' ? 'section' : 'code')}
-              style={{ marginTop: 6, display: 'inline-flex', alignItems: 'center', gap: 5, border: `1px solid ${color.border}`, borderRadius: 7, background: '#fff', color: color.focus, fontSize: 11.5, padding: '5px 10px', cursor: 'pointer' }}>
-              <Icon name="code" size={12} /> Open editor →
-            </button>
+            <div style={{ marginTop: 6, display: 'flex', gap: 6 }}>
+              {kind === 'section' ? (
+                <CodeBtn icon="code" label="Open section editor →" onClick={() => togglePanel(nodeId, 'section')} />
+              ) : (
+                <CodeBtn icon="external" label="Open fullscreen editor" onClick={() => openCodeFullscreen(nodeId, p.name, p.lang)} />
+              )}
+            </div>
           </Section>
         )
       })}
@@ -126,6 +128,15 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         </div>
       </Section>
     </div>
+  )
+}
+
+function CodeBtn({ icon, label, onClick }: { icon: IconName; label: string; onClick: () => void }) {
+  return (
+    <button onClick={onClick}
+      style={{ display: 'inline-flex', alignItems: 'center', gap: 5, border: `1px solid ${color.border}`, borderRadius: 7, background: '#fff', color: color.focus, fontSize: 11.5, padding: '5px 10px', cursor: 'pointer' }}>
+      <Icon name={icon} size={12} /> {label}
+    </button>
   )
 }
 

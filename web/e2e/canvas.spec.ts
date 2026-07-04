@@ -285,6 +285,17 @@ test.describe('Data Playground canvas', () => {
     await expect(pred).toHaveValue('amount > 0')
   })
 
+  test('a code node opens a fullscreen editor from the inspector', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Query', 'sql') // auto-selected → inspector shows it
+    await page.getByTestId('inspector').getByText('Open fullscreen editor').click()
+    const editor = page.locator('.monaco-editor').first()
+    await expect(editor).toBeVisible({ timeout: 15_000 })
+    await expect(editor).toContainText('SELECT') // the node's default SQL, editable full-screen
+    await page.keyboard.press('Escape')
+    await expect(page.locator('.monaco-editor')).toHaveCount(0) // Esc closes it
+  })
+
   test('the app menu goes to the files home; the rail navigates; new file returns to the canvas', async ({ page }) => {
     await fresh(page)
     await page.getByTestId('app-menu').click()

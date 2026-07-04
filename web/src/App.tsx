@@ -5,6 +5,7 @@ import { TopBar } from './canvas/TopBar'
 import { Toolbar } from './canvas/Toolbar'
 import { AgentDock } from './panels/AgentDock'
 import { Inspector } from './panels/Inspector'
+import { CodeFullscreen } from './panels/CodeFullscreen'
 import { Shell } from './views/Shell'
 import { useStore } from './store/graph'
 import { ErrorBoundary } from './ui/ErrorBoundary'
@@ -35,6 +36,7 @@ export default function App() {
         ) : (
           <Shell />
         )}
+        <CodeFullscreen />
       </ErrorBoundary>
     </ReactFlowProvider>
   )

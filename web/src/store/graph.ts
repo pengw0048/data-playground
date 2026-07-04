@@ -139,6 +139,10 @@ interface Store {
   // -- app shell (Figma-style views) --
   view: DpView
   setView: (v: DpView) => void
+  // a full-viewport Monaco editor for one node's code param (opened from the Inspector)
+  fullscreenCode: { nodeId: string; param: string; lang?: string } | null
+  openCodeFullscreen: (nodeId: string, param: string, lang?: string) => void
+  closeCodeFullscreen: () => void
 
   // -- users + files (per-user, multi-file) --
   currentUser: DpUser | null
@@ -180,6 +184,9 @@ export const useStore = create<Store>((set, get) => ({
   doc: emptyDoc(),
   view: 'canvas',
   setView: (view) => set({ view }),
+  fullscreenCode: null,
+  openCodeFullscreen: (nodeId, param, lang) => set({ fullscreenCode: { nodeId, param, lang } }),
+  closeCodeFullscreen: () => set({ fullscreenCode: null }),
   currentUser: null,
   users: [],
   files: [],

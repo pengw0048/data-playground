@@ -8,7 +8,7 @@ export function CodeEditor({ value, onChange, language, readOnly, height = 200, 
   onChange: (v: string) => void
   language: 'sql' | 'python'
   readOnly?: boolean
-  height?: number
+  height?: number | string // px number, or a CSS length like "100%" to fill a flex container
   completions?: string[]
 }) {
   columnStore.columns = completions ?? []
