@@ -140,10 +140,16 @@ export const api = {
     req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc) }),
   deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),
   listRuns: (canvasId: string) => req<RunRecordDto[]>(`/canvas/${canvasId}/runs`),
+  getShares: (canvasId: string) => req<{ visibility: string; shares: ShareInfo[] }>(`/canvas/${canvasId}/shares`),
+  addShare: (canvasId: string, body: { userId?: string; role?: string; visibility?: string }) =>
+    req<{ ok: boolean }>(`/canvas/${canvasId}/share`, { method: 'POST', body: JSON.stringify(body) }),
+  removeShare: (canvasId: string, userId: string) =>
+    req<{ ok: boolean }>(`/canvas/${canvasId}/share/${userId}`, { method: 'DELETE' }),
 }
 
 export interface RunRecordDto { id: string; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputTable?: string | null; createdAt?: string | null }
+export interface ShareInfo { userId: string; name: string; role: string }
 export interface DpUser { id: string; name: string; email?: string | null }
-export interface CanvasFile { id: string; name: string; version: number; updatedAt?: string }
+export interface CanvasFile { id: string; name: string; version: number; updatedAt?: string; role?: string; shared?: boolean; visibility?: string }
 
 export { toGraph }

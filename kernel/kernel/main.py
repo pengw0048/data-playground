@@ -350,39 +350,38 @@ def whoami(uid: str = Depends(current_user)) -> dict:
 
 @api.get("/canvas")
 def list_canvases(uid: str = Depends(current_user)) -> list[dict]:
-    with metadb.session() as s:
-        rows = s.scalars(_sa_select(metadb.Canvas).where(metadb.Canvas.owner_id == uid)
-                         .order_by(metadb.Canvas.updated_at.desc()))
-        return [{"id": c.id, "name": c.name, "version": c.version, "updatedAt": c.updated_at.isoformat()} for c in rows]
+    return metadb.list_canvases_for(uid)  # owned + shared + workspace-visible
 
 
 @api.post("/canvas")
 def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
     with metadb.session() as s:
-        c = metadb.Canvas(owner_id=uid, name=doc.get("name") or "untitled",
-                          version=doc.get("version", 1), doc=json.dumps(doc))
-        s.add(c)
-        s.flush()
-        return {"ok": True, "id": c.id}
+        # honor the client's id so the canvas exists under it immediately (no orphan row, and
+        # sharing/opening works without waiting for the first autosave to PUT it).
+        cid = doc.get("id") or metadb._uid()
+        if s.get(metadb.Canvas, cid) is None:
+            s.add(metadb.Canvas(id=cid, owner_id=uid, name=doc.get("name") or "untitled",
+                                version=doc.get("version", 1), doc=json.dumps(doc)))
+        return {"ok": True, "id": cid}
 
 
 @api.get("/canvas/{canvas_id}")
 def get_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
+    if metadb.canvas_role(canvas_id, uid) is None:  # owner, shared, or workspace-visible
+        raise HTTPException(404, f"canvas '{canvas_id}' not found")
     with metadb.session() as s:
-        c = s.get(metadb.Canvas, canvas_id)
-        if not c or c.owner_id != uid:
-            raise HTTPException(404, f"canvas '{canvas_id}' not found")
-        return json.loads(c.doc)
+        return json.loads(s.get(metadb.Canvas, canvas_id).doc)
 
 
 @api.put("/canvas/{canvas_id}")
 def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> dict:
+    role = metadb.canvas_role(canvas_id, uid)  # None if the canvas doesn't exist yet
     with metadb.session() as s:
         c = s.get(metadb.Canvas, canvas_id)
-        if c and c.owner_id != uid:
-            raise HTTPException(403, "not your canvas")
+        if c and role not in ("owner", "editor"):
+            raise HTTPException(403, "you don't have edit access to this canvas")
         if not c:
-            c = metadb.Canvas(id=canvas_id, owner_id=uid)
+            c = metadb.Canvas(id=canvas_id, owner_id=uid)  # first save → the creator owns it
             s.add(c)
         c.name = doc.get("name") or c.name or "untitled"
         c.version = doc.get("version", c.version)
@@ -392,11 +391,41 @@ def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> d
 
 @api.delete("/canvas/{canvas_id}")
 def delete_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
+    if metadb.canvas_role(canvas_id, uid) == "owner":  # only the owner can delete
+        with metadb.session() as s:
+            c = s.get(metadb.Canvas, canvas_id)
+            if c:
+                s.delete(c)
+    return {"ok": True}
+
+
+@api.get("/canvas/{canvas_id}/shares")
+def get_shares(canvas_id: str, uid: str = Depends(current_user)) -> dict:
+    if metadb.canvas_role(canvas_id, uid) is None:
+        raise HTTPException(404, "not found")
     with metadb.session() as s:
         c = s.get(metadb.Canvas, canvas_id)
-        if c and c.owner_id == uid:
-            s.delete(c)
-        return {"ok": True}
+        vis = c.visibility if c else "private"
+    return {"visibility": vis, "shares": metadb.list_shares(canvas_id)}
+
+
+@api.post("/canvas/{canvas_id}/share")
+def add_share(canvas_id: str, body: dict, uid: str = Depends(current_user)) -> dict:
+    if metadb.canvas_role(canvas_id, uid) != "owner":
+        raise HTTPException(403, "only the owner can share")
+    if "visibility" in body:
+        metadb.set_visibility(canvas_id, body["visibility"])
+    if body.get("userId"):
+        metadb.share_canvas(canvas_id, body["userId"], body.get("role", "editor"))
+    return {"ok": True}
+
+
+@api.delete("/canvas/{canvas_id}/share/{user_id}")
+def remove_share(canvas_id: str, user_id: str, uid: str = Depends(current_user)) -> dict:
+    if metadb.canvas_role(canvas_id, uid) != "owner":
+        raise HTTPException(403, "only the owner can unshare")
+    metadb.unshare_canvas(canvas_id, user_id)
+    return {"ok": True}
 
 
 @api.get("/canvas/{canvas_id}/runs")

@@ -50,8 +50,19 @@ class Canvas(Base):
     name: Mapped[str] = mapped_column(String, default="untitled")
     version: Mapped[int] = mapped_column(Integer, default=1)
     doc: Mapped[str] = mapped_column(Text, default="{}")  # the full CanvasDoc as JSON
+    visibility: Mapped[str] = mapped_column(String, default="private")  # 'private' | 'workspace'
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class CanvasShare(Base):
+    """An explicit collaborator on a canvas (beyond the owner)."""
+    __tablename__ = "canvas_shares"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), index=True)
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), index=True)
+    role: Mapped[str] = mapped_column(String, default="editor")  # 'editor' | 'viewer'
+    __table_args__ = (UniqueConstraint("canvas_id", "user_id", name="uq_share"),)
 
 
 class RunRecord(Base):
@@ -151,6 +162,72 @@ def get_setting(key: str, scope: str = "global", scope_id: str = "", default=Non
     with session() as s:
         row = s.scalar(select(Setting).where(Setting.scope == scope, Setting.scope_id == scope_id, Setting.key == key))
         return json.loads(row.value) if row else default
+
+
+def canvas_role(canvas_id: str, uid: str) -> str | None:
+    """The user's access to a canvas: 'owner' | 'editor' | 'viewer' | None."""
+    with session() as s:
+        c = s.get(Canvas, canvas_id)
+        if c is None:
+            return None
+        if c.owner_id == uid:
+            return "owner"
+        if c.visibility == "workspace":
+            return "editor"  # any user of this instance can edit a workspace-visible canvas
+        sh = s.scalar(select(CanvasShare).where(CanvasShare.canvas_id == canvas_id, CanvasShare.user_id == uid))
+        return sh.role if sh else None
+
+
+def share_canvas(canvas_id: str, user_id: str, role: str = "editor") -> None:
+    with session() as s:
+        sh = s.scalar(select(CanvasShare).where(CanvasShare.canvas_id == canvas_id, CanvasShare.user_id == user_id))
+        if sh:
+            sh.role = role
+        else:
+            s.add(CanvasShare(canvas_id=canvas_id, user_id=user_id, role=role))
+
+
+def unshare_canvas(canvas_id: str, user_id: str) -> None:
+    with session() as s:
+        sh = s.scalar(select(CanvasShare).where(CanvasShare.canvas_id == canvas_id, CanvasShare.user_id == user_id))
+        if sh:
+            s.delete(sh)
+
+
+def list_shares(canvas_id: str) -> list[dict]:
+    with session() as s:
+        rows = s.execute(
+            select(CanvasShare, User.name).join(User, User.id == CanvasShare.user_id)
+            .where(CanvasShare.canvas_id == canvas_id)
+        ).all()
+        return [{"userId": sh.user_id, "name": name, "role": sh.role} for sh, name in rows]
+
+
+def set_visibility(canvas_id: str, visibility: str) -> None:
+    with session() as s:
+        c = s.get(Canvas, canvas_id)
+        if c:
+            c.visibility = visibility
+
+
+def _canvas_row(c: "Canvas", role: str, shared: bool) -> dict:
+    return {"id": c.id, "name": c.name, "version": c.version, "role": role, "shared": shared,
+            "visibility": c.visibility, "updatedAt": c.updated_at.isoformat() if c.updated_at else None}
+
+
+def list_canvases_for(uid: str) -> list[dict]:
+    """Canvases a user can see: owned + explicitly shared + workspace-visible (deduped)."""
+    with session() as s:
+        out: dict[str, dict] = {}
+        for c in s.scalars(select(Canvas).where(Canvas.owner_id == uid)):
+            out[c.id] = _canvas_row(c, "owner", False)
+        for c, role in s.execute(select(Canvas, CanvasShare.role)
+                                 .join(CanvasShare, CanvasShare.canvas_id == Canvas.id)
+                                 .where(CanvasShare.user_id == uid)).all():
+            out.setdefault(c.id, _canvas_row(c, role, True))
+        for c in s.scalars(select(Canvas).where(Canvas.visibility == "workspace", Canvas.owner_id != uid)):
+            out.setdefault(c.id, _canvas_row(c, "editor", True))
+        return sorted(out.values(), key=lambda r: r["updatedAt"] or "", reverse=True)
 
 
 def record_run(canvas_id: str | None, target_node_id: str | None, status: str,

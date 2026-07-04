@@ -5,6 +5,7 @@ import { Icon, type IconName } from '../ui/Icon'
 import { Popover } from '../ui/Popover'
 import { SettingsModal } from '../panels/SettingsModal'
 import { RunHistoryModal } from '../panels/RunHistoryModal'
+import { ShareModal } from '../panels/ShareModal'
 
 export function TopBar() {
   const doc = useStore((s) => s.doc)
@@ -14,6 +15,7 @@ export function TopBar() {
   const rerunAll = useStore((s) => s.rerunAll)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [runsOpen, setRunsOpen] = useState(false)
+  const [shareOpen, setShareOpen] = useState(false)
 
   return (
     <>
@@ -38,6 +40,10 @@ export function TopBar() {
         <button onClick={rerunAll} title="Re-run the whole graph" style={{ ...pill, background: color.ink, color: '#fff', border: 'none' }}>
           <Icon name="refresh" size={13} /> Rerun all
         </button>
+        <button data-testid="share-btn" onClick={() => setShareOpen(true)} title="Share this canvas"
+          style={{ ...pill, background: '#2f6ef0', color: '#fff', border: 'none' }}>
+          <Icon name="link" size={13} /> Share
+        </button>
         <button aria-label="Settings" title="Settings" onClick={() => setSettingsOpen(true)}
           style={{ width: 34, height: 34, display: 'grid', placeItems: 'center', background: '#fff', border: `1px solid ${color.border}`, borderRadius: 20, boxShadow: shadow.card, color: color.text2, cursor: 'pointer' }}>
           <Icon name="settings" size={15} />
@@ -46,6 +52,7 @@ export function TopBar() {
       </div>
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
       {runsOpen && <RunHistoryModal onClose={() => setRunsOpen(false)} />}
+      {shareOpen && <ShareModal onClose={() => setShareOpen(false)} />}
     </>
   )
 }

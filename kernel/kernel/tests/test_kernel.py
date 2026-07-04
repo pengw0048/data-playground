@@ -590,6 +590,25 @@ def test_run_history_persisted_with_canvas(tmp_path):
     assert any(r["status"] == "done" for r in client.get("/api/canvas/hist_canvas/runs").json())
 
 
+def test_canvas_sharing_access_and_authz():
+    # sharing: a canvas is private to its owner until explicitly shared; shared editors can read/write
+    # but not delete (owner-only); workspace visibility opens it to everyone.
+    bob = client.post("/api/users", json={"name": "Bob"}).json()["id"]
+    cid = "share_cv"
+    client.put(f"/api/canvas/{cid}", json={"id": cid, "name": "shared", "version": 1, "nodes": [], "edges": []})
+    hb = {"X-DP-User": bob}
+    assert client.get(f"/api/canvas/{cid}", headers=hb).status_code == 404  # not shared yet
+    client.post(f"/api/canvas/{cid}/share", json={"userId": bob, "role": "editor"})  # owner shares
+    assert client.get(f"/api/canvas/{cid}", headers=hb).status_code == 200
+    assert client.put(f"/api/canvas/{cid}", json={"id": cid, "name": "x", "version": 2, "nodes": [], "edges": []}, headers=hb).status_code == 200
+    client.delete(f"/api/canvas/{cid}", headers=hb)  # editor delete is a no-op (owner-only)
+    assert client.get(f"/api/canvas/{cid}").status_code == 200  # still there
+    assert any(f["id"] == cid and f["shared"] for f in client.get("/api/canvas", headers=hb).json())
+    assert any(sh["userId"] == bob for sh in client.get(f"/api/canvas/{cid}/shares").json()["shares"])
+    # Bob (editor) cannot share it further (owner-only)
+    assert client.post(f"/api/canvas/{cid}/share", json={"userId": "local", "role": "editor"}, headers=hb).status_code == 403
+
+
 def test_written_outputs_reregister_on_restart(tmp_path):
     # durability: an output written to storage must reappear in the catalog after a kernel restart
     # (a fresh Deps), not vanish because the seeded data_dir doesn't include the outputs location.

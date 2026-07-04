@@ -337,6 +337,26 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
   })
 
+  test('the Share dialog sets visibility and adds a collaborator', async ({ page }) => {
+    await fresh(page)
+    // add a user so there's someone to share with
+    await page.getByTitle('Switch user').click()
+    await page.getByPlaceholder('new user…').fill('Dana')
+    await page.getByRole('button', { name: 'Add', exact: true }).click()
+    await expect(page.getByTitle('Switch user')).toContainText('Dana')
+    await page.getByTestId('share-btn').click()
+    await expect(page.getByText('Share this canvas')).toBeVisible()
+    // flip visibility to workspace
+    await page.getByRole('button', { name: 'Everyone in workspace' }).click()
+    // add a collaborator (the seeded 'Local' user, now that we're acting as Dana)
+    const select = page.getByRole('combobox')
+    await select.selectOption({ label: 'Local' })
+    const addBtn = page.locator('button', { hasText: 'Add' }).last()
+    await expect(addBtn).toBeEnabled()
+    await addBtn.click()
+    await expect(page.getByText('Local', { exact: false }).filter({ hasText: 'editor' })).toBeVisible()
+  })
+
   test('the app menu opens persisted run history', async ({ page }) => {
     await fresh(page)
     await page.getByTestId('app-menu').click()
