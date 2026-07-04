@@ -19,9 +19,18 @@ from kernel.models import Graph
 from kernel.settings import settings
 
 
+def _agent_config() -> tuple[str, str | None, str | None]:
+    """Resolve (model, api_key, base_url): global DB settings (set in the UI) override env/defaults."""
+    from kernel import metadb
+    model = metadb.get_setting("agentModel", "global") or settings.agent_model
+    api_key = metadb.get_setting("agentApiKey", "global") or settings.agent_api_key
+    base_url = metadb.get_setting("agentBaseUrl", "global") or settings.agent_base_url
+    return model, api_key, base_url
+
+
 def agent_status() -> dict:
     """Whether the LLM agent is usable, and why not if not (provider-agnostic via LiteLLM)."""
-    model = settings.agent_model
+    model, api_key, base_url = _agent_config()
     try:
         import litellm
         installed = True
@@ -30,8 +39,8 @@ def agent_status() -> dict:
     if not installed:
         return {"available": False, "model": model,
                 "reason": "install the agent extra: pip install 'data-playground[agent]'"}
-    # a local/self-hosted endpoint OR an explicit key override needs no env-var provider key
-    preconfigured = bool(settings.agent_base_url) or bool(settings.agent_api_key)
+    # a local/self-hosted endpoint OR an explicit key (env or UI setting) needs no env-var provider key
+    preconfigured = bool(base_url) or bool(api_key)
     missing: list[str] = []
     if not preconfigured:
         try:
@@ -118,6 +127,7 @@ def run_agent(outcome: str, graph: dict, deps) -> dict:
     """Run the tool-use loop; return {graph, transcript, summary}. Raises if the SDK/key is absent."""
     import litellm
 
+    model, api_key, base_url = _agent_config()
     wg = {
         "id": graph.get("id", "canvas"), "version": graph.get("version", 1),
         "nodes": [dict(n) for n in graph.get("nodes", [])],
@@ -198,13 +208,13 @@ def run_agent(outcome: str, graph: dict, deps) -> dict:
     tools = _tool_defs()
     summary = "Done."
     extra: dict = {"drop_params": True}  # silently drop params a given provider doesn't accept
-    if settings.agent_base_url:
-        extra["api_base"] = settings.agent_base_url  # local / self-hosted OpenAI-compatible endpoint
-    if settings.agent_api_key:
-        extra["api_key"] = settings.agent_api_key
+    if base_url:
+        extra["api_base"] = base_url  # local / self-hosted OpenAI-compatible endpoint
+    if api_key:
+        extra["api_key"] = api_key
 
     for _ in range(settings.agent_max_steps):
-        resp = litellm.completion(model=settings.agent_model, max_tokens=4096,
+        resp = litellm.completion(model=model, max_tokens=4096,
                                   messages=messages, tools=tools, tool_choice="auto", **extra)
         msg = resp.choices[0].message
         calls = msg.tool_calls or []

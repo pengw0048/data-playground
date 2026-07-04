@@ -508,3 +508,14 @@ def test_settings_global_and_user_scope():
     # Carol sees her user setting; the default user does not
     assert client.get("/api/settings", headers={"X-DP-User": u}).json()["user"].get("theme") == "dark"
     assert client.get("/api/settings").json()["user"].get("theme") is None
+
+
+def test_agent_activates_from_settings_key(monkeypatch):
+    # setting a provider key via /settings (the UI path) must make the agent available — no env var
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert client.get("/api/agent").json()["available"] is False
+    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "sk-from-ui"})
+    try:
+        assert client.get("/api/agent").json()["available"] is True
+    finally:
+        client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": ""})

@@ -7,10 +7,11 @@ export type IconName =
   | 'chevronDown' | 'chevronRight' | 'chevronLeft' | 'lineage' | 'power' | 'mute' | 'rename'
   | 'duplicate' | 'export' | 'trash' | 'search' | 'sparkle' | 'grid' | 'branch' | 'loop'
   | 'fx' | 'sample' | 'arrow' | 'external' | 'check' | 'db' | 'sigma' | 'sql' | 'note'
-  | 'minus' | 'link'
+  | 'minus' | 'link' | 'settings'
 
 const P: Record<IconName, JSX.Element> = {
   eye: <><path d="M1 8s2.7-5 7-5 7 5 7 5-2.7 5-7 5-7-5-7-5Z" /><circle cx="8" cy="8" r="2.2" /></>,
+  settings: <><circle cx="8" cy="8" r="2.3" /><path d="M8 1v2.2M8 12.8V15M15 8h-2.2M3.2 8H1M12.9 3.1l-1.6 1.6M4.7 11.3l-1.6 1.6M12.9 12.9l-1.6-1.6M4.7 4.7 3.1 3.1" /></>,
   play: <path d="M4.5 3.2v9.6l7.5-4.8-7.5-4.8Z" />,
   clock: <><circle cx="8" cy="8" r="6.2" /><path d="M8 4.5V8l2.6 1.6" /></>,
   code: <path d="M5.5 4 2 8l3.5 4M10.5 4 14 8l-3.5 4" />,

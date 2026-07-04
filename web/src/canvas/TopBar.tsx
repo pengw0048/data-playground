@@ -3,6 +3,7 @@ import { useStore } from '../store/graph'
 import { color, shadow } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Popover } from '../ui/Popover'
+import { SettingsModal } from '../panels/SettingsModal'
 
 export function TopBar() {
   const doc = useStore((s) => s.doc)
@@ -10,6 +11,7 @@ export function TopBar() {
   const kernelInfo = useStore((s) => s.kernelInfo)
   const saved = useStore((s) => s.saved)
   const rerunAll = useStore((s) => s.rerunAll)
+  const [settingsOpen, setSettingsOpen] = useState(false)
 
   return (
     <>
@@ -34,8 +36,13 @@ export function TopBar() {
         <button onClick={rerunAll} title="Re-run the whole graph" style={{ ...pill, background: color.ink, color: '#fff', border: 'none' }}>
           <Icon name="refresh" size={13} /> Rerun all
         </button>
+        <button aria-label="Settings" title="Settings" onClick={() => setSettingsOpen(true)}
+          style={{ width: 34, height: 34, display: 'grid', placeItems: 'center', background: '#fff', border: `1px solid ${color.border}`, borderRadius: 20, boxShadow: shadow.card, color: color.text2, cursor: 'pointer' }}>
+          <Icon name="settings" size={15} />
+        </button>
         <UserMenu />
       </div>
+      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
     </>
   )
 }

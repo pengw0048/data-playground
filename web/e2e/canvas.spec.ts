@@ -187,6 +187,17 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.react-flow__node')).toHaveCount(0) // a new file is a fresh canvas
   })
 
+  test('settings modal edits and saves the agent config', async ({ page }) => {
+    await page.goto('/')
+    await page.getByLabel('Settings').click()
+    await expect(page.getByRole('heading', { name: 'Settings' }).or(page.getByText('Settings', { exact: true }).first())).toBeVisible()
+    const model = page.getByPlaceholder('anthropic/claude-opus-4-8')
+    await expect(model).toBeVisible()
+    await model.fill('openai/gpt-4o')
+    await page.getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(page.getByText('Saved', { exact: true })).toBeVisible()
+  })
+
   test('the user switcher creates and switches users', async ({ page }) => {
     await page.goto('/')
     const chip = page.getByTitle('Switch user')
