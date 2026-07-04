@@ -41,11 +41,14 @@ class LocalRunner:
     name = "local-out-of-core"
 
     def __init__(self, resolve_adapter, registry, catalog, workspace: str, node_lowerings=None,
-                 node_specs=None):
+                 node_specs=None, storage=None):
         self.resolve_adapter = resolve_adapter
         self.registry = registry
         self.catalog = catalog
         self.workspace = workspace
+        # where committed outputs go (pluggable; local dir by default). Falls back to workspace/outputs.
+        from kernel.storage import make_storage
+        self.storage = storage if storage is not None else make_storage(workspace)
         # keep the SAME dict object deps passes (plugins fill it AFTER construction) — an
         # empty {} is falsy, so `or {}` would rebind a new dict and drop plugin lowerings.
         self.node_lowerings = node_lowerings if node_lowerings is not None else {}
@@ -187,9 +190,7 @@ class LocalRunner:
             return int(cached.get("rows") or 0)
         fmt = (cfg.get("format") or "parquet").lower()
         ext = {"parquet": ".parquet", "csv": ".csv", "lance": ".lance"}.get(fmt, ".parquet")
-        out_dir = os.path.join(self.workspace, "outputs")
-        os.makedirs(out_dir, exist_ok=True)
-        uri = os.path.join(out_dir, f"{name}{ext}")
+        uri = self.storage.output_uri(name, ext)
 
         inc = g.incoming(graph, node.id)
         if not inc:

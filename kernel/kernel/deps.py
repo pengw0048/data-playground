@@ -76,9 +76,17 @@ class Deps:
         self.planner = None
         self.plugins: list[dict] = []
         self._manifests: dict[str, dict] = {}
+        from kernel.storage import make_storage
+        self.storage = make_storage(workspace)
         self.catalog = InMemoryCatalog(data_dir, self.resolve_adapter)
+        # re-register previously written outputs so committed tables survive a kernel restart
+        # (they live in storage, separate from the seeded data_dir).
+        for uri in self.storage.list_outputs():
+            name = os.path.splitext(os.path.basename(uri.rstrip("/")))[0]
+            self.catalog.register_output(name=name, uri=uri, version="v1", parents=[], pipeline="canvas")
         self.runner = LocalRunner(self.resolve_adapter, self.registry, self.catalog, workspace,
-                                  node_lowerings=self.node_lowerings, node_specs=self.node_specs)
+                                  node_lowerings=self.node_lowerings, node_specs=self.node_specs,
+                                  storage=self.storage)
         self.runners = [self.runner]
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self._load_plugins()

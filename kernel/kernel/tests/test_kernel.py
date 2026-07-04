@@ -571,6 +571,19 @@ def test_section_multi_output_routes_by_port(tmp_path):
     assert stats("sec_high") == (100, 900, 999)  # the "high" port: v >= 900
 
 
+def test_written_outputs_reregister_on_restart(tmp_path):
+    # durability: an output written to storage must reappear in the catalog after a kernel restart
+    # (a fresh Deps), not vanish because the seeded data_dir doesn't include the outputs location.
+    import duckdb
+    from kernel.deps import Deps
+    ws, data = str(tmp_path / "ws"), str(tmp_path / "data")
+    d1 = Deps(ws, data)
+    uri = d1.storage.output_uri("myout", ".parquet")
+    duckdb.connect(":memory:").execute(f"COPY (SELECT 1 AS x) TO '{uri}' (FORMAT PARQUET)")
+    d2 = Deps(ws, data)  # simulate restart
+    assert "myout" in [t.name for t in d2.catalog.list_tables(None)]
+
+
 def test_section_runs_its_parentid_children(tmp_path):
     # visual containment: a canvas node whose parentId is the section is a callable child — its
     # alias is its title, so the driver calls run("keep", …). No form-declared subnodes needed.
