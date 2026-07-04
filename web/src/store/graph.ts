@@ -10,7 +10,7 @@ import { getSpec } from '../nodes/registry'
 import { registerGenericNodes } from '../nodes/generic'
 import { api, KernelError, setApiUser, type AgentBackendNode, type AgentBackendEdge, type DpUser, type CanvasFile } from '../api/client'
 
-export type PanelKind = 'data' | 'run' | 'history' | 'code' | 'lineage'
+export type PanelKind = 'data' | 'run' | 'history' | 'code' | 'lineage' | 'section'
 
 const LS_KEY = 'dp-canvas'       // offline cache of the open doc
 const USER_KEY = 'dp-user'       // last-selected user id

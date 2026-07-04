@@ -17,7 +17,8 @@ export default defineConfig({
   },
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
   webServer: {
-    command: `cd ../kernel && uv run dataplay --workspace "$PWD" --port ${PORT} --no-open`,
+    // fresh metadata DB per run (the dev DB persists canvases; tests need a clean slate)
+    command: `cd ../kernel && rm -f e2e-test.db && DP_DATABASE_URL=sqlite:///e2e-test.db uv run dataplay --workspace "$PWD" --port ${PORT} --no-open`,
     url: `http://127.0.0.1:${PORT}/api/health`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

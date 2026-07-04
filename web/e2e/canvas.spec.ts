@@ -21,6 +21,15 @@ async function addNode(page: Page, category: string, kindTitle: string) {
   await menu.getByText(kindTitle, { exact: true }).click()
 }
 
+// Start each node-touching test on a FRESH empty canvas — the metadata DB persists canvases, so
+// without this a prior test's nodes would leak in and break count assertions.
+async function fresh(page: Page) {
+  await page.goto('/')
+  await page.getByTestId('file-menu').click()
+  await page.getByText('New file').click()
+  await expect(page.locator('.react-flow__node')).toHaveCount(0)
+}
+
 test.describe('Data Playground canvas', () => {
   test('loads with no console errors', async ({ page }) => {
     const errors: string[] = []
@@ -49,7 +58,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('added nodes do not overlap each other', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await addNode(page, 'Shape', 'filter')
     await addNode(page, 'Shape', 'filter')
     const nodes = page.locator('.react-flow__node')
@@ -60,7 +69,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('duplicating a node does not stack it on the original', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await addNode(page, 'Query', 'sql')
     const nodes = page.locator('.react-flow__node')
     await expect(nodes).toHaveCount(1)
@@ -71,7 +80,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('action tooltips escape the card (not clipped by overflow:hidden)', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await addNode(page, 'Query', 'sql')
     await page.getByRole('button', { name: 'Connect a source to preview' }).hover()
     const tip = page.getByText('Connect a source to preview', { exact: true })
@@ -82,7 +91,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('clicking an output port opens the node menu; sql can connect out', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await addNode(page, 'Query', 'sql')
     // a plain click (no drag) on the sql output handle opens the connect-from-port menu…
     await page.locator('.react-flow__node .react-flow__handle-right').first().click()
@@ -93,7 +102,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('dragging from an output port and releasing shows no menu', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await addNode(page, 'Query', 'sql')
     const handle = page.locator('.react-flow__node .react-flow__handle-right').first()
     const b = await boxOf(handle)
@@ -105,7 +114,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('a node with no upstream source has Run disabled', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await addNode(page, 'Query', 'sql')
     const run = page.getByRole('button', { name: 'Connect a source to run' })
     await expect(run).toBeVisible()
@@ -146,7 +155,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('a markdown note node renders markdown on the canvas', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await addNode(page, 'Inspect', 'note')
     const node = page.locator('.react-flow__node')
     await expect(node).toHaveCount(1)
@@ -157,7 +166,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('a node can be renamed (⋯ menu → Rename)', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await addNode(page, 'Query', 'sql')
     await page.getByRole('button', { name: 'More' }).click()
     await page.getByRole('button', { name: 'Rename' }).click()
@@ -169,7 +178,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('code cells use the Monaco editor (highlighting + the SQL text)', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await addNode(page, 'Query', 'sql')
     await page.getByRole('button', { name: 'Code' }).click()
     const editor = page.locator('.monaco-editor').first()
@@ -208,6 +217,16 @@ test.describe('Data Playground canvas', () => {
     await page.getByPlaceholder('https://github.com/org/repo').fill('https://github.com/acme/tools')
     await page.getByPlaceholder('https://github.com/org/repo').press('Enter')
     await expect(page.getByText('acme-tools', { exact: true })).toBeVisible() // repo added to the list
+  })
+
+  test('a section node opens its editor and adds a contained node', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Compute', 'section')
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await page.getByText('Edit →').click()
+    await expect(page.getByText('driver script (Python)')).toBeVisible()
+    await page.getByText('add node').click()
+    await expect(page.getByPlaceholder('alias')).toBeVisible() // a contained-node row appeared
   })
 
   test('the user switcher creates and switches users', async ({ page }) => {

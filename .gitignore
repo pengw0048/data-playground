@@ -33,6 +33,6 @@ kernel/_web/
 # os
 .DS_Store
 
-# metadata DB (dev)
-dataplay.db
+# metadata DB (dev + e2e)
+*.db
 *.db-journal

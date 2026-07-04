@@ -61,6 +61,7 @@ function FileMenu() {
     <>
       <button
         ref={ref}
+        data-testid="file-menu"
         onClick={() => setOpen((v) => !v)}
         style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 13.5, fontWeight: 600, color: color.ink, background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px 4px', borderRadius: 6 }}
       >
