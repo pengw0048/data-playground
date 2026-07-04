@@ -1,13 +1,13 @@
 import { useStore } from '../store/graph'
 import { color, shadow } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
-import { exportCanvas } from '../lib/exporters'
 
 export function TopBar() {
   const doc = useStore((s) => s.doc)
   const kernelUp = useStore((s) => s.kernelUp)
   const kernelInfo = useStore((s) => s.kernelInfo)
   const saved = useStore((s) => s.saved)
+  const rerunAll = useStore((s) => s.rerunAll)
 
   return (
     <>
@@ -31,8 +31,8 @@ export function TopBar() {
           <span style={{ width: 8, height: 8, borderRadius: '50%', background: kernelUp ? color.latest : color.failed }} />
           kernel · {kernelUp ? 'warm' : 'offline'}
         </div>
-        <button onClick={exportCanvas} title="Export canvas as JSON" style={{ ...pill, background: color.ink, color: '#fff', border: 'none' }}>
-          <Icon name="export" size={13} /> Export
+        <button onClick={rerunAll} title="Re-run the whole graph" style={{ ...pill, background: color.ink, color: '#fff', border: 'none' }}>
+          <Icon name="refresh" size={13} /> Rerun all
         </button>
       </div>
     </>

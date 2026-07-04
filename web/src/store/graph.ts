@@ -113,6 +113,7 @@ interface Store {
   requestRun: (id: string) => Promise<void>
   estimate: (id: string) => Promise<void>
   run: (id: string, confirmed?: boolean) => Promise<void>
+  rerunAll: () => void
   cancelRun: (id: string) => Promise<void>
   clearRun: (id: string) => void
   promote: (id: string) => Promise<void>
@@ -415,6 +416,16 @@ export const useStore = create<Store>((set, get) => ({
       set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message } } }))
       get().updateData(id, { status: 'failed' })
     }
+  },
+
+  // Re-run the whole graph: kick every runnable sink (a node with no outgoing edge); each pulls
+  // its upstream, so the full pipeline re-executes. Notes/unconnected nodes aren't runnable → skipped.
+  rerunAll: () => {
+    const { doc } = get()
+    const hasOutgoing = new Set(doc.edges.map((e) => e.source))
+    doc.nodes
+      .filter((n) => !hasOutgoing.has(n.id) && nodeRunnable(doc, n.id))
+      .forEach((n) => get().requestRun(n.id))
   },
 
   cancelRun: async (id) => {

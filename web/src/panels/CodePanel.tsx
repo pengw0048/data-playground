@@ -1,8 +1,12 @@
+import { Suspense, lazy } from 'react'
 import { useStore } from '../store/graph'
-import { color, radius } from '../theme/tokens'
+import { color } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { MiniSelect } from '../ui/controls'
 import type { ProcessorMode } from '../types/graph'
+
+// Monaco is heavy — code-split it so it loads only when a code panel is opened.
+const CodeEditor = lazy(() => import('../ui/CodeEditor').then((m) => ({ default: m.CodeEditor })))
 
 // The {} panel: edit the operator body / SQL. Library form is read-only ("view source");
 // ad-hoc form is an editable cell that declares its I/O and can be promoted (§ transform forms).
@@ -21,6 +25,10 @@ export function CodePanel({ nodeId }: { nodeId: string }) {
   const value = isSql ? String(cfg.sql ?? '') : String(cfg.code ?? '')
   const readOnly = isLibrary
 
+  // columns seen in previews → Monaco's SQL/Python autocomplete
+  const previews = useStore((s) => s.previews)
+  const completions = [...new Set(Object.values(previews).flatMap((p) => (p.result?.columns ?? []).map((c) => c.name)))]
+
   return (
     <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
       {isLibrary && (
@@ -28,18 +36,16 @@ export function CodePanel({ nodeId }: { nodeId: string }) {
           <Icon name="code" size={12} /> read-only · {proc?.title} {proc?.version} · lives in the registry
         </div>
       )}
-      <textarea
-        value={value}
-        readOnly={readOnly}
-        onChange={(e) => updateConfig(nodeId, isSql ? { sql: e.target.value } : { code: e.target.value })}
-        spellCheck={false}
-        className="dp-mono"
-        style={{
-          width: '100%', minHeight: 150, resize: 'vertical', background: 'var(--code-bg)',
-          color: isSql ? 'var(--code-sql)' : 'var(--code-text)', border: `1px solid ${color.border}`, borderRadius: 8,
-          padding: 11, fontSize: 11.5, lineHeight: 1.5, outline: 'none', opacity: readOnly ? 0.85 : 1,
-        }}
-      />
+      <Suspense fallback={<div style={{ height: 220, border: `1px solid ${color.border}`, borderRadius: 8, display: 'grid', placeItems: 'center', color: color.text3, fontSize: 12 }}>loading editor…</div>}>
+        <CodeEditor
+          language={isSql ? 'sql' : 'python'}
+          value={value}
+          readOnly={readOnly}
+          height={220}
+          completions={completions}
+          onChange={(v) => updateConfig(nodeId, isSql ? { sql: v } : { code: v })}
+        />
+      </Suspense>
 
       {node.type === 'transform' && !isLibrary && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

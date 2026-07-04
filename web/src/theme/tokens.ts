@@ -42,6 +42,7 @@ export const kindAccent: Record<string, string> = {
   write: '#64748b',
   metric: '#c39a4b',
   notebook: '#4f8ba8',
+  note: '#eab308',  // annotation — sticky-note amber
   // control-flow: graphite, not data-colored
   branch: '#566173',
   loop: '#566173',

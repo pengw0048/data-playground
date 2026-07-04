@@ -138,4 +138,30 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.react-flow__node').first()).toBeVisible({ timeout: 12_000 })
     expect(await page.locator('.react-flow__node').count()).toBeGreaterThan(0)
   })
+
+  test('the top bar has Rerun all, not Export', async ({ page }) => {
+    await page.goto('/')
+    await expect(page.getByRole('button', { name: /rerun all/i })).toBeVisible()
+    await expect(page.getByRole('button', { name: /^export$/i })).toHaveCount(0)
+  })
+
+  test('a markdown note node renders markdown on the canvas', async ({ page }) => {
+    await page.goto('/')
+    await addNode(page, 'Inspect', 'note')
+    const node = page.locator('.react-flow__node')
+    await expect(node).toHaveCount(1)
+    // default content renders a "Note" heading (react-markdown), and double-click edits it
+    await expect(node.getByText('Note', { exact: true })).toBeVisible()
+    await node.dblclick()
+    await expect(node.locator('textarea')).toBeVisible()
+  })
+
+  test('code cells use the Monaco editor (highlighting + the SQL text)', async ({ page }) => {
+    await page.goto('/')
+    await addNode(page, 'Query', 'sql')
+    await page.getByRole('button', { name: 'Code' }).click()
+    const editor = page.locator('.monaco-editor').first()
+    await expect(editor).toBeVisible({ timeout: 15_000 }) // Monaco lazy-loads + its worker boots
+    await expect(editor).toContainText('SELECT')
+  })
 })
