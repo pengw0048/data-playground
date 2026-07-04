@@ -519,3 +519,82 @@ def test_agent_activates_from_settings_key(monkeypatch):
         assert client.get("/api/agent").json()["available"] is True
     finally:
         client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": ""})
+
+
+# --------------------------------------------------------------------------- #
+# Meta-programming: a `section` = a driver script over contained nodes (bounded control flow)
+# --------------------------------------------------------------------------- #
+def _section(nid, script, subnodes, params=None, max_runs=200):
+    return N(nid, "section", {"script": script, "subnodes": subnodes,
+                              "params": params or {}, "maxRuns": max_runs})
+
+
+def _seq_parquet(tmp_path, n=1000):
+    import duckdb
+    p = str(tmp_path / "seq.parquet")
+    duckdb.connect(":memory:").execute(f"COPY (SELECT i AS v FROM range(0,{n}) t(i)) TO '{p}' (FORMAT PARQUET)")
+    return p
+
+
+def test_section_for_each_over_a_list(tmp_path):
+    # for-each: run a filter per predicate in a list, concat the results (graph isn't fixed — a `for`)
+    p = _seq_parquet(tmp_path)  # v = 0..999
+    script = ("parts = []\n"
+              "for pred in params['preds']:\n"
+              "    parts.append(run(f, data=inputs['in'], predicate=pred))\n"
+              "emit(concat(parts))\n")
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": p}),
+        _section("sec", script, [{"alias": "f", "type": "filter", "config": {}}],
+                 {"preds": ["v >= 0 AND v < 100", "v >= 900"]}),  # 100 + 100 rows, disjoint
+        N("wr", "write", {"name": "sec_foreach"}),
+    ], "edges": [E("src", "sec"), E("sec", "wr")]}
+    st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
+    assert st["status"] == "done" and st["outputTable"] == "sec_foreach"
+    out = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_sec_foreach").uri, "k": 5}).json()
+    assert out["rowCount"] == 200  # concat of the two per-predicate runs
+
+
+def test_section_iterate_until_condition(tmp_path):
+    # iterate-until: shrink the dataset each pass; stop when a metric crosses a threshold (a while+if)
+    p = _seq_parquet(tmp_path)  # v = 0..999
+    script = ("state = inputs['in']\n"
+              "for i in range(params['max_iters']):\n"
+              "    state = run(shrink, data=state, predicate='v >= %d' % (i * 200))\n"
+              "    if value(run(cnt, data=state)) < params['target']:\n"
+              "        break\n"
+              "emit(state)\n")
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": p}),
+        _section("sec", script, [
+            {"alias": "shrink", "type": "filter", "config": {}},
+            {"alias": "cnt", "type": "metric", "config": {"agg": "count"}},
+        ], {"max_iters": 10, "target": 300}),
+        N("wr", "write", {"name": "sec_iter"}),
+    ], "edges": [E("src", "sec"), E("sec", "wr")]}
+    st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
+    assert st["status"] == "done"
+    out = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_sec_iter").uri, "k": 5}).json()
+    # v>=0(1000) v>=200(800) v>=400(600) v>=600(400) v>=800(200 < 300 → break) → 200 rows
+    assert out["rowCount"] == 200
+
+
+def test_section_not_previewable():
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        _section("sec", "emit(inputs['in'])", []),
+    ], "edges": [E("src", "sec")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "sec", "k": 5}).json()
+    assert r["notPreviewable"] is True
+
+
+def test_section_maxruns_is_bounded():
+    # an unbounded-looking loop must fail closed at maxRuns, not run away
+    script = "while True:\n    run(f, data=inputs['in'], predicate='amount > 0')\n"
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        _section("sec", script, [{"alias": "f", "type": "filter", "config": {}}], max_runs=3),
+        N("wr", "write", {"name": "sec_runaway"}),
+    ], "edges": [E("src", "sec"), E("sec", "wr")]}
+    st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
+    assert st["status"] == "failed" and "maxRuns" in (st.get("error") or "")

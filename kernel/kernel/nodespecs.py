@@ -120,7 +120,15 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              inputs=[_in(("sample", "dataset"), wire="sample")], outputs=[_out("sample")], can_bypass=True,
              params=[ParamSpec(name="code", type="code", lang="python"), ParamSpec(name="mode", type="select", options=["map", "map_batches", "filter", "flat_map"], default="map")],
              blurb="embedded cell over a sample"),
-    # NOTE: control-flow nodes (branch/loop/variable/opaque) were removed pending a proper design.
-    # Row-split "branch" was redundant with two filters; real control flow (conditional/iterative
-    # execution of subgraphs on the driver) needs a considered model — see docs/CONTROL_FLOW.md.
+    # Meta-programming primitive (see docs/meta-programming.zh.md): a composite node whose
+    # implementation is a driver script (Python) over contained nodes, with real control flow
+    # (for/while/if), bounded. Not sample-previewable. The nested-frame UI to manage its contained
+    # nodes is a later phase; the execution core is in kernel/section.py.
+    NodeSpec(kind="section", title="section", category="compute", tag="section",
+             inputs=[_in(("dataset", "sample"))], outputs=[_out()], previewable=False,
+             params=[ParamSpec(name="script", type="code", lang="python",
+                               default="# driver script — call contained nodes by alias\nemit(inputs['in'])")],
+             blurb="composite node: a driver script over contained nodes (loops / branches)"),
+    # NOTE: the old control-flow nodes (branch/loop/variable/opaque) were removed; branch was
+    # redundant with two filters, and real control flow now lives in `section` above.
 ]

@@ -22,7 +22,7 @@ from kernel.plugins.capabilities import tag_columns
 Relation = duckdb.DuckDBPyRelation
 
 # Node kinds whose result cannot be faithfully computed on a truncated sample (P8).
-NOT_PREVIEWABLE_KINDS = {"aggregate", "write", "opaque", "loop"}
+NOT_PREVIEWABLE_KINDS = {"aggregate", "write", "opaque", "loop", "section"}
 _TRANSFORM_KINDS = {"transform", "notebook"}
 
 
@@ -43,7 +43,8 @@ def _bypassed(node: GraphNode) -> bool:
 
 class LoweringEngine:
     def __init__(self, graph: Graph, resolve_adapter, registry, sample_k: int | None = None,
-                 full: bool = False, node_lowerings: dict | None = None, node_specs: dict | None = None):
+                 full: bool = False, node_lowerings: dict | None = None, node_specs: dict | None = None,
+                 bound_inputs: dict | None = None):
         self.graph = graph
         self.resolve_adapter = resolve_adapter
         self.registry = registry
@@ -51,6 +52,9 @@ class LoweringEngine:
         self.full = full
         self.node_lowerings = node_lowerings or {}
         self.node_specs = node_specs or {}
+        # a node id -> Relation to inject as that node's input (used to run a section's sub-node
+        # against a script-provided handle instead of a wired upstream edge)
+        self.bound_inputs = bound_inputs or {}
         self._cache: dict[str, Relation] = {}
 
     # -- public ------------------------------------------------------------ #
@@ -75,6 +79,8 @@ class LoweringEngine:
 
     # -- inputs (honors branch routing) ------------------------------------ #
     def _inputs(self, node: GraphNode) -> list[Relation]:
+        if node.id in self.bound_inputs:  # section sub-node: input injected by the driver script
+            return [self.bound_inputs[node.id]]
         out: list[Relation] = []
         for e in g.incoming(self.graph, node.id):
             rel = self.relation(e.source)
@@ -111,6 +117,12 @@ class LoweringEngine:
             if not self.full and not self._spec_previewable(t):
                 raise NotPreviewable(node, f"'{t}' is not sample-previewable — needs a full pass")
             return self.node_lowerings[t](self, node, inputs)
+
+        if t == "section":  # composite node implemented by a driver script over contained nodes
+            if not self.full:  # runs real work over its nodes — not faithful on a sample (P8)
+                raise NotPreviewable(node, "a section runs real work over its nodes — needs a full pass")
+            from kernel.section import run_section
+            return run_section(self, node, inputs)
 
         if not inputs and t not in ("source",):
             raise NotPreviewable(node, "not connected to a source")
