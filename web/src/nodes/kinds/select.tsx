@@ -1,15 +1,17 @@
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useStore } from '../../store/graph'
-import { Field, MiniInput } from '../../ui/controls'
+import { Field } from '../../ui/controls'
+import { ColumnCombo, useInputColumns } from '../fields'
 
 function Select({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
   const expr = String(data.config.select ?? '')
+  const columns = useInputColumns(id)
   return (
     <NodeCard id={id} data={data} metaOverride={expr ? 'project / derive' : 'all columns'}>
       <Field label="columns / expressions">
-        <MiniInput mono value={expr} placeholder="id, lower(name) AS name, a*b AS area" onChange={(v) => updateConfig(id, { select: v })} />
+        <ColumnCombo value={expr} columns={columns} placeholder="id, lower(name) AS name, a*b AS area" onChange={(v) => updateConfig(id, { select: v })} />
       </Field>
     </NodeCard>
   )

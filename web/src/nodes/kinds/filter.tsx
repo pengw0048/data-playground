@@ -1,15 +1,14 @@
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
-import { useStore } from '../../store/graph'
-import { Field, MiniInput } from '../../ui/controls'
+import { Field } from '../../ui/controls'
+import { FilterBuilder } from '../fields'
 
 function Filter({ id, data }: NodeComponentProps) {
-  const updateConfig = useStore((s) => s.updateConfig)
   const pred = String(data.config.predicate ?? '')
   return (
     <NodeCard id={id} data={data} metaOverride={pred ? `where ${pred}` : 'row predicate'}>
       <Field label="predicate">
-        <MiniInput mono value={pred} placeholder="is_valid == True" onChange={(v) => updateConfig(id, { predicate: v })} />
+        <FilterBuilder nodeId={id} />
       </Field>
     </NodeCard>
   )

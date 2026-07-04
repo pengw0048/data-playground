@@ -43,6 +43,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const runnable = useStore((s) => nodeRunnable(s.doc, nodeId))
   const runState = useStore((s) => s.runs[nodeId]?.phase)
+  const outSchema = useStore((s) => s.schemas[nodeId])  // ColumnSchema[] = typed · null = untyped
   const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
   useEffect(() => setName(node?.data.title ?? ''), [node?.data.title])
@@ -106,13 +107,20 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         )
       })}
 
-      {/* ports */}
+      {/* ports — a real port label (join left/right, metric value) shows as a name; the default
+          in/out ports just show their wire type. Outputs carry a typed/untyped schema badge. */}
       <Section title="Ports">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11.5, color: color.text2 }}>
-          {(spec?.inputs ?? []).map((p) => <PortRow key={`in-${p.id}`} dir="in" label={p.label ?? p.id} wire={p.wire} />)}
-          {(spec?.outputs ?? []).map((p) => <PortRow key={`out-${p.id}`} dir="out" label={p.label ?? p.id} wire={p.wire} />)}
+          {(spec?.inputs ?? []).map((p) => <PortRow key={`in-${p.id}`} dir="in" name={portName(p)} wire={p.wire} />)}
+          {(spec?.outputs ?? []).map((p, i) => (
+            <PortRow key={`out-${p.id}`} dir="out" name={portName(p)} wire={p.wire}
+              schema={i === 0 ? (outSchema === undefined ? undefined : outSchema) : undefined} />
+          ))}
           {(spec?.inputs ?? []).length === 0 && (spec?.outputs ?? []).length === 0 && <span style={{ color: color.text3 }}>—</span>}
         </div>
+        {/* editable output ports: only on the section (its driver script emit()s to named ports) —
+            fixed-port ops (filter/sort/join) keep their ports as a type contract the wires rely on */}
+        {kind === 'section' && <OutputPortsEditor nodeId={nodeId} />}
       </Section>
 
       {/* actions */}
@@ -127,6 +135,36 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           <Action icon="trash" label="Delete" danger onClick={() => removeNode(nodeId)} />
         </div>
       </Section>
+    </div>
+  )
+}
+
+// Add / rename / remove a section's named output ports (config.outputs). The store drops edges
+// leaving a port that no longer exists, so a rename/remove can't strand an invisible wire.
+function OutputPortsEditor({ nodeId }: { nodeId: string }) {
+  const outputs = useStore((s) => {
+    const o = (s.doc.nodes.find((n) => n.id === nodeId)?.data.config as { outputs?: unknown }).outputs
+    return Array.isArray(o) && o.length ? o.map(String) : ['out']
+  })
+  const updateConfig = useStore((s) => s.updateConfig)
+  const commit = (next: string[]) => updateConfig(nodeId, { outputs: next })
+  return (
+    <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.4, color: color.text3 }}>OUTPUT PORTS (emit)</div>
+      {outputs.map((name, i) => (
+        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <input value={name} onChange={(e) => commit(outputs.map((x, j) => (j === i ? e.target.value.replace(/\s+/g, '_') : x)))}
+            className="dp-mono" style={{ flex: 1, fontSize: 11, border: `1px solid ${color.border}`, borderRadius: 6, padding: '4px 7px', outline: 'none' }} />
+          {outputs.length > 1 && (
+            <button onClick={() => commit(outputs.filter((_, j) => j !== i))} title="Remove port"
+              style={{ border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer', display: 'grid', placeItems: 'center', width: 20, height: 20 }}><Icon name="close" size={11} /></button>
+          )}
+        </div>
+      ))}
+      <button onClick={() => commit([...outputs, `out${outputs.length + 1}`])}
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 4, alignSelf: 'flex-start', border: `1px dashed ${color.border}`, background: 'transparent', color: color.text3, fontSize: 10.5, padding: '4px 8px', borderRadius: radius.chip, cursor: 'pointer' }}>
+        <Icon name="plus" size={11} /> add port
+      </button>
     </div>
   )
 }
@@ -149,12 +187,23 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   )
 }
 
-function PortRow({ dir, label, wire }: { dir: 'in' | 'out'; label: string; wire: string }) {
+// a port's display name: only real labels (join left/right, metric value) are named; the plain
+// default in/out ports are nameless — their wire type is the meaningful label.
+function portName(p: { id: string; label?: string }): string | null {
+  if (p.label && p.label !== p.id) return p.label
+  return p.id === 'in' || p.id === 'out' ? null : p.id
+}
+
+function PortRow({ dir, name, wire, schema }: {
+  dir: 'in' | 'out'; name: string | null; wire: string; schema?: { name: string }[] | null
+}) {
+  const badge = schema === undefined ? null : schema === null ? 'untyped' : `${schema.length} cols`
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
       <span style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: 0.4, color: color.text3, width: 26 }}>{dir === 'in' ? 'IN' : 'OUT'}</span>
-      <span style={{ flex: 1 }}>{label}</span>
-      <span style={{ fontSize: 10, color: color.text3 }}>{wire}</span>
+      {name && <span style={{ color: color.text2 }}>{name}</span>}
+      <span style={{ flex: 1, fontSize: 10.5, color: color.text3 }}>{wire}</span>
+      {badge && <span style={{ fontSize: 9.5, color: schema === null ? '#a2731a' : '#1f7a45', background: schema === null ? '#fbf1dc' : '#e3f3ea', padding: '1px 6px', borderRadius: radius.chip }}>{badge}</span>}
     </div>
   )
 }

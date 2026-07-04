@@ -8,6 +8,7 @@ import type {
 } from '../types/api'
 import { getSpec } from '../nodes/registry'
 import { registerGenericNodes } from '../nodes/generic'
+import type { SchemaMap } from '../nodes/schema'
 import { api, KernelError, setApiUser, type AgentBackendNode, type AgentBackendEdge, type DpUser, type CanvasFile } from '../api/client'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
@@ -87,6 +88,7 @@ interface Store {
   catalog: CatalogTable[]
   processors: ProcessorDescriptor[]
   specsVersion: number
+  schemas: SchemaMap               // per-node output columns (typed ports); null entry = untyped
 
   selectedId: string | null        // primary selection (drives panels)
   selectedIds: string[]            // full multi-selection (box/shift-select)
@@ -142,6 +144,7 @@ interface Store {
   // -- kernel + catalog --
   bootstrap: () => Promise<void>
   refreshCatalog: () => Promise<void>
+  refreshSchemas: () => Promise<void>
 
   // -- agent --
   setAgentOpen: (v: boolean) => void
@@ -254,6 +257,7 @@ export const useStore = create<Store>((set, get) => ({
   catalog: [],
   processors: [],
   specsVersion: 0,
+  schemas: {},
   selectedId: null,
   selectedIds: [],
   openPanels: {},
@@ -642,6 +646,7 @@ export const useStore = create<Store>((set, get) => ({
       } catch { /* ignore corrupt state */ }
     }
     _bootstrapped = true  // now the real doc is loaded → autosave may persist edits (not the throwaway empty doc)
+    void get().refreshSchemas()
   },
 
   refreshFiles: async () => { try { set({ files: await api.listCanvases() }) } catch { /* offline */ } },
@@ -706,6 +711,10 @@ export const useStore = create<Store>((set, get) => ({
     } catch { /* noop */ }
   },
 
+  refreshSchemas: async () => {
+    try { set({ schemas: await api.schema(get().doc) }) } catch { /* offline: keep last-known */ }
+  },
+
   setAgentOpen: (v) => set({ agentOpen: v }),
   setAgentMode: (m) => set({ agentMode: m }),
   pushAgent: (m) => set((s) => ({ agentLog: [...s.agentLog, m] })),
@@ -760,6 +769,19 @@ useStore.subscribe((s) => {
       useStore.setState({ saved: true, kernelUp: false })
     }
   }, 400)
+})
+
+// Refresh per-node output schema (column suggestions) a beat after the graph — or any node's
+// config — changes. Debounced; a config edit (e.g. a `select` projection) changes columns too.
+let _schemaTimer: ReturnType<typeof setTimeout> | undefined
+let _lastNodesRef: CanvasNode[] | undefined
+let _lastEdgesRef: CanvasEdge[] | undefined
+useStore.subscribe((s) => {
+  if (s.doc.nodes === _lastNodesRef && s.doc.edges === _lastEdgesRef) return
+  _lastNodesRef = s.doc.nodes; _lastEdgesRef = s.doc.edges
+  if (!_bootstrapped) return
+  clearTimeout(_schemaTimer)
+  _schemaTimer = setTimeout(() => { if (useStore.getState().kernelUp) void useStore.getState().refreshSchemas() }, 500)
 })
 
 function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void, nodeId: string, runId: string) {

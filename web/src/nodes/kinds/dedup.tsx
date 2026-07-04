@@ -1,15 +1,17 @@
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useStore } from '../../store/graph'
-import { Field, MiniInput } from '../../ui/controls'
+import { Field } from '../../ui/controls'
+import { ColumnCombo, useInputColumns } from '../fields'
 
 function Dedup({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
   const on = String(data.config.on ?? '')
+  const columns = useInputColumns(id)
   return (
     <NodeCard id={id} data={data} metaOverride={on ? `distinct on ${on}` : 'distinct rows'}>
       <Field label="on columns (blank = all)">
-        <MiniInput mono value={on} placeholder="user_id" onChange={(v) => updateConfig(id, { on: v })} />
+        <ColumnCombo value={on} columns={columns} placeholder="user_id" onChange={(v) => updateConfig(id, { on: v })} />
       </Field>
     </NodeCard>
   )

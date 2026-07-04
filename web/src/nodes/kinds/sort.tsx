@@ -1,15 +1,14 @@
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
-import { useStore } from '../../store/graph'
-import { Field, MiniInput } from '../../ui/controls'
+import { Field } from '../../ui/controls'
+import { SortBuilder } from '../fields'
 
 function Sort({ id, data }: NodeComponentProps) {
-  const updateConfig = useStore((s) => s.updateConfig)
   const by = String(data.config.by ?? '')
   return (
     <NodeCard id={id} data={data} metaOverride={by ? `order by ${by}` : 'streaming sort'}>
       <Field label="order by">
-        <MiniInput mono value={by} placeholder="score DESC, id" onChange={(v) => updateConfig(id, { by: v })} />
+        <SortBuilder nodeId={id} />
       </Field>
     </NodeCard>
   )

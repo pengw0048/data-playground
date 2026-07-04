@@ -209,6 +209,15 @@ def run_preview(req: PreviewRequest) -> SampleResult:
                         deps.resolve_adapter, deps.registry, deps.node_lowerings, deps.node_specs)
 
 
+@api.post("/graph/schema")
+def graph_schema(req: CompileRequest) -> dict:
+    """Per-node output columns (metadata-only) for editor column suggestions — see executors/schema."""
+    deps = get_deps()
+    from kernel.executors.schema import schema_for_graph
+    return schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
+                            deps.node_lowerings, deps.node_specs)
+
+
 # --------------------------------------------------------------------------- #
 # Agent (optional LLM planner — key stays in the kernel, never the browser)
 # --------------------------------------------------------------------------- #

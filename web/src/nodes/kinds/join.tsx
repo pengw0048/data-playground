@@ -1,17 +1,19 @@
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useStore } from '../../store/graph'
-import { Field, MiniInput, MiniSelect } from '../../ui/controls'
+import { Field, MiniSelect } from '../../ui/controls'
+import { ColumnCombo, useInputColumns } from '../fields'
 
 function Join({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
   const on = String(data.config.on ?? '')
   const how = (data.config.how as 'inner' | 'left') ?? 'inner'
+  const columns = useInputColumns(id)  // union of left + right port columns
   return (
     <NodeCard id={id} data={data} metaOverride={`${how}${on ? ` · on ${on}` : ''}`}>
       <div style={{ display: 'flex', gap: 8 }}>
         <Field label="on" style={{ flex: 1.4 }}>
-          <MiniInput mono value={on} placeholder="key" onChange={(v) => updateConfig(id, { on: v })} />
+          <ColumnCombo value={on} columns={columns} placeholder="key" onChange={(v) => updateConfig(id, { on: v })} />
         </Field>
         <Field label="how" style={{ flex: 1 }}>
           <MiniSelect value={how} onChange={(v) => updateConfig(id, { how: v })} options={[{ value: 'inner', label: 'inner' }, { value: 'left', label: 'left' }]} />

@@ -109,6 +109,10 @@ export const api = {
   preview: (doc: CanvasDoc, nodeId: string, k = 50) =>
     req<SampleResult>('/run/preview', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, k }) }),
 
+  // per-node output columns (metadata only) → editor column suggestions; null = untyped port
+  schema: (doc: CanvasDoc) =>
+    req<Record<string, ColumnSchema[] | null>>('/graph/schema', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }) }),
+
   estimate: (doc: CanvasDoc, targetNodeId?: string) =>
     req<RunEstimate>('/run/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
 
