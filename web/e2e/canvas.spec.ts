@@ -137,16 +137,15 @@ test.describe('Data Playground canvas', () => {
     expect(overlaps(await boxOf(minimap), await boxOf(controls)), 'minimap overlaps zoom controls').toBe(false)
   })
 
-  test('agent dock shows its mode and builds real nodes (offline planner in CI)', async ({ page }) => {
-    await fresh(page) // build on a clean new file so it doesn't pollute the default canvas (shared DB in CI)
+  test('agent is unavailable without a configured model (no rule-based stand-in)', async ({ page }) => {
+    await fresh(page)
     await page.getByRole('button', { name: 'Agent', exact: true }).click()
-    // no provider key configured in CI → the dock advertises the offline planner
-    await expect(page.getByText('offline planner')).toBeVisible()
-    await page.getByPlaceholder('Describe an outcome…').fill('sample images then write a table')
-    await page.getByTestId('agent-submit').click() // Build (mode is Build by default)
-    // offline planner materializes real, inspectable nodes on the canvas
-    await expect(page.locator('.react-flow__node').first()).toBeVisible({ timeout: 12_000 })
-    expect(await page.locator('.react-flow__node').count()).toBeGreaterThan(0)
+    // no provider key configured in CI → the agent is clearly unavailable, not a fake offline planner
+    await expect(page.getByText('unavailable', { exact: true })).toBeVisible()
+    await expect(page.getByText('Agent unavailable')).toBeVisible()
+    await expect(page.getByTestId('agent-submit')).toBeDisabled()
+    // and it offers a way to fix it rather than silently building junk
+    await expect(page.getByTestId('agent-configure')).toBeVisible()
   })
 
   test('the top bar has Rerun all, not Export', async ({ page }) => {
@@ -181,7 +180,7 @@ test.describe('Data Playground canvas', () => {
   test('code cells use the Monaco editor (highlighting + the SQL text)', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Query', 'sql')
-    await page.getByRole('button', { name: 'Code' }).click()
+    await page.getByRole('button', { name: 'Edit code' }).click() // opens the single (fullscreen) editor
     const editor = page.locator('.monaco-editor').first()
     await expect(editor).toBeVisible({ timeout: 15_000 }) // Monaco lazy-loads + its worker boots
     await expect(editor).toContainText('SELECT')
@@ -333,7 +332,8 @@ test.describe('Data Playground canvas', () => {
     const inspector = page.getByTestId('inspector')
     // point the source at a dataset that doesn't exist → the run fails and must surface a toast
     await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
-    await inspector.getByRole('button', { name: 'Run' }).click()
+    // a source's run is a full count/scan — the Inspector labels it "Count rows"
+    await inspector.getByRole('button', { name: 'Count rows' }).click()
     await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
   })
 
@@ -352,11 +352,13 @@ test.describe('Data Playground canvas', () => {
 
   test('the Share dialog sets visibility and adds a collaborator', async ({ page }) => {
     await fresh(page)
-    // add a user so there's someone to share with
-    await page.getByTitle('Switch user').click()
+    // add a user so there's someone to share with (account menu — dev switch)
+    await page.getByTitle('Account').click()
     await page.getByPlaceholder('new user…').fill('Dana')
     await page.getByRole('button', { name: 'Add', exact: true }).click()
-    await expect(page.getByTitle('Switch user')).toContainText('Dana')
+    await page.getByTitle('Account').click()
+    await expect(page.getByText('Signed in as')).toContainText('Dana')
+    await page.keyboard.press('Escape')
     await page.getByTestId('share-btn').click()
     await expect(page.getByText('Share this canvas')).toBeVisible()
     // flip visibility to workspace
@@ -379,13 +381,30 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText(/No runs yet/)).toBeVisible()
   })
 
-  test('the user switcher creates and switches users', async ({ page }) => {
+  test('the account menu creates and switches users', async ({ page }) => {
     await page.goto('/')
-    const chip = page.getByTitle('Switch user')
-    await expect(chip).toContainText('local') // default seeded user
-    await chip.click()
+    await page.getByTitle('Account').click()
+    await expect(page.getByText('Signed in as')).toContainText('Local') // default seeded user
     await page.getByPlaceholder('new user…').fill('Alice')
     await page.getByRole('button', { name: 'Add', exact: true }).click()
-    await expect(page.getByTitle('Switch user')).toContainText('Alice') // now acting as Alice
+    await page.getByTitle('Account').click()
+    await expect(page.getByText('Signed in as')).toContainText('Alice') // now acting as Alice
+  })
+
+  test('a sort node needs an order-by before it can run (required-param validation)', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Shape', 'sort')
+    // empty required param → the Inspector explains why it can't run
+    await expect(page.getByTestId('inspector').getByText('order by is required')).toBeVisible()
+    // and the structured sort builder offers to add a key (Phase-3 field, not a blind text box)
+    await expect(page.locator('.react-flow__node').getByText('add sort key')).toBeVisible()
+  })
+
+  test('disabling a node marks it DISABLED (Bypass vs Disable)', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Query', 'sql') // auto-selected → its ⋯ menu is reachable
+    await page.getByRole('button', { name: 'More' }).click()
+    await page.locator('.dp-panel').getByText('Disable (+ downstream)').click()
+    await expect(page.locator('.react-flow__node').getByText('DISABLED', { exact: true })).toBeVisible()
   })
 })

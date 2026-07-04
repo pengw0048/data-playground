@@ -144,10 +144,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
 // Add / rename / remove a section's named output ports (config.outputs). The store drops edges
 // leaving a port that no longer exists, so a rename/remove can't strand an invisible wire.
 function OutputPortsEditor({ nodeId }: { nodeId: string }) {
-  const outputs = useStore((s) => {
-    const o = (s.doc.nodes.find((n) => n.id === nodeId)?.data.config as { outputs?: unknown }).outputs
-    return Array.isArray(o) && o.length ? o.map(String) : ['out']
-  })
+  // select the stored value (stable ref) — NOT a freshly-built array, which would loop forever
+  const raw = useStore((s) => (s.doc.nodes.find((n) => n.id === nodeId)?.data.config as { outputs?: unknown } | undefined)?.outputs)
+  const outputs = Array.isArray(raw) && raw.length ? raw.map(String) : ['out']
   const updateConfig = useStore((s) => s.updateConfig)
   const commit = (next: string[]) => updateConfig(nodeId, { outputs: next })
   return (
