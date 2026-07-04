@@ -12,6 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      # The kernel wheel force-includes ../web/dist as kernel/_web; hatchling errors if that path
+      # is missing at install time. The pytest job doesn't serve the SPA, so an empty dir suffices.
+      - name: Placeholder web build (kernel doesn't serve the SPA in tests)
+        run: mkdir -p web/dist
       - name: Install kernel (dev extra)
         run: cd kernel && uv sync --extra dev
       - name: Run tests
@@ -28,14 +32,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      # kernel: the Playwright webServer boots `dataplay` (needs uv + deps incl. anthropic via dev)
-      - name: Install kernel
-        run: cd kernel && uv sync --extra dev
-      # web: install, build the SPA (the kernel serves web/dist), install the browser
+      # web FIRST: the kernel wheel force-includes ../web/dist as kernel/_web, so the SPA must be
+      # built before `uv sync` or hatchling errors ("Forced include not found").
       - name: Install web deps
         run: cd web && npm install
       - name: Build SPA
         run: cd web && npm run build
+      # kernel: the Playwright webServer boots `dataplay` (needs uv + deps incl. anthropic via dev)
+      - name: Install kernel
+        run: cd kernel && uv sync --extra dev
       - name: Install Playwright browser
         run: cd web && npx playwright install --with-deps chromium
       - name: Run E2E
