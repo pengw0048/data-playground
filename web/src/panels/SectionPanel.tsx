@@ -23,7 +23,7 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
   const patchSub = (i: number, patch: Partial<SubNode>) => setSubs(subnodes.map((s, j) => (j === i ? { ...s, ...patch } : s)))
   // outputs: the section's output ports. `emit(rel)` fills "out"; `emit("name", rel)` a named port.
   const setOutputs = (v: string) => {
-    const ports = v.split(',').map((s) => s.trim()).filter(Boolean)
+    const ports = [...new Set(v.split(',').map((s) => s.trim()).filter(Boolean))]  // de-dup: unique handles
     updateConfig(nodeId, { outputs: ports.length ? ports : ['out'] })
   }
 

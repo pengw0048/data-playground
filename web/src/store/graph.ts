@@ -241,21 +241,25 @@ export const useStore = create<Store>((set, get) => ({
     _cfgEdit = { id, t: now }
     set((s) => {
       const stale = downstream(s.doc, id)
-      return {
-        doc: {
-          ...s.doc,
-          nodes: s.doc.nodes.map((n) => {
-            if (n.id === id) {
-              const status: NodeStatus = n.data.status === 'draft' ? 'draft' : 'stale'
-              return { ...n, data: { ...n.data, config: { ...n.data.config, ...patch }, status } }
-            }
-            if (stale.has(n.id) && n.data.status === 'latest') {
-              return { ...n, data: { ...n.data, status: 'stale' } }
-            }
-            return n
-          }),
-        },
+      const nodes: CanvasNode[] = s.doc.nodes.map((n) => {
+        if (n.id === id) {
+          const status: NodeStatus = n.data.status === 'draft' ? 'draft' : 'stale'
+          return { ...n, data: { ...n.data, config: { ...n.data.config, ...patch }, status } }
+        }
+        if (stale.has(n.id) && n.data.status === 'latest') {
+          return { ...n, data: { ...n.data, status: 'stale' } }
+        }
+        return n
+      })
+      // If this edit shrinks/renames the node's declared output ports, drop edges leaving a port
+      // that no longer exists — otherwise they become invisible orphans (no handle to select) and
+      // fail the run with "output port not produced". A null sourceHandle maps to the default port.
+      let edges = s.doc.edges
+      if (Array.isArray(patch.outputs)) {
+        const ports = new Set((patch.outputs as unknown[]).map((h) => String(h)))
+        edges = edges.filter((e) => e.source !== id || e.sourceHandle == null || ports.has(e.sourceHandle))
       }
+      return { doc: { ...s.doc, nodes, edges } }
     })
   },
 

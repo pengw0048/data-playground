@@ -81,6 +81,11 @@ class LocalRunner:
                         parts.append(f"fp:{self.resolve_adapter(uri).fingerprint(uri)}")
                     except Exception:  # noqa: BLE001
                         pass
+        # edges + their handles are part of the plan: re-routing an edge to a different output port
+        # (same node configs) must invalidate the cache, else it returns the old port's result.
+        ids = {n.id for n in chain}
+        parts += sorted(f"e:{e.source}:{e.source_handle}:{e.target}:{e.target_handle}"
+                        for e in graph.edges if e.source in ids and e.target in ids)
         return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
     # -- run --------------------------------------------------------------- #
@@ -155,6 +160,11 @@ class LocalRunner:
                     p.status = "failed"
         finally:
             db.drop_created_views()
+            for pth in engine.spill_files:  # GC temp parquet spilled this run (outputs already committed)
+                try:
+                    os.remove(pth)
+                except OSError:
+                    pass
             db.lock().release()
             status.ms = int((time.time() - started) * 1000)
             status.total_rows = rows_seen
@@ -181,15 +191,17 @@ class LocalRunner:
         os.makedirs(out_dir, exist_ok=True)
         uri = os.path.join(out_dir, f"{name}{ext}")
 
-        parents = g.parents(graph, node.id)
-        parent_rel = engine.relation(parents[0]) if parents else None
-        if parent_rel is None:
+        inc = g.incoming(graph, node.id)
+        if not inc:
             return 0
+        # route by the wired output PORT (source_handle) — a write off a multi-output node must
+        # persist that port's data, not the default/first one. Mirrors LoweringEngine._inputs.
+        parent_rel = engine.relation(inc[0].source, inc[0].source_handle)
         adapter = self.resolve_adapter(uri)
         res = adapter.write(uri, parent_rel, cfg.get("writeMode", "overwrite"))
         rows = int(res.get("rows") or 0)
 
-        parent_uris = [u for pid in parents for u in [self._source_uri(nm_node=pid, graph=graph)] if u]
+        parent_uris = [u for e in inc for u in [self._source_uri(nm_node=e.source, graph=graph)] if u]
         self.catalog.register_output(name=name, uri=uri, version="v1", parents=parent_uris, pipeline="canvas")
         status.output_uri = uri
         status.output_table = name

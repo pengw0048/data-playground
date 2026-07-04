@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useUpdateNodeInternals } from '@xyflow/react'
 import { color, kindAccent, radius, shadow, status as statusTok } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
@@ -28,6 +29,13 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const rename = useStore((s) => s.rename)
   const runState = useStore((s) => s.runs[id]?.phase)
   const runnable = useStore((s) => nodeRunnable(s.doc, id))
+
+  // Output ports can change at runtime (a section declaring named ports). React Flow caches each
+  // node's handle geometry, so a newly-added handle is invisible to edge routing until we tell it
+  // to re-measure — without this, wiring a freshly-declared port silently drops the edge.
+  const updateNodeInternals = useUpdateNodeInternals()
+  const outSig = (node ? nodeOutputs(node) : []).map((p) => p.id).join(',')
+  useEffect(() => { updateNodeInternals(id) }, [id, outSig, updateNodeInternals])
 
   const kind = node?.type ?? 'transform'
   const accent = kindAccent[kind] ?? '#8a8f98'

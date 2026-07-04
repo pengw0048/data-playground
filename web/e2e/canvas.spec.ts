@@ -239,6 +239,25 @@ test.describe('Data Playground canvas', () => {
     await expect(node.locator('.react-flow__handle-right')).toHaveCount(2) // card now shows both ports
   })
 
+  test('removing an output port prunes edges that left it (no dangling orphan)', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Compute', 'section')
+    const sec = page.locator('.react-flow__node').first()
+    await sec.getByText('Edit →').click()
+    await page.getByPlaceholder('out').fill('passed, failed')
+    await expect(sec.locator('.react-flow__handle-right')).toHaveCount(2)
+    await sec.getByText('Edit →').click() // close the panel so it doesn't cover the output handles
+    // wire a downstream filter off the SECOND port ("failed") via the click-from-port add menu
+    await sec.locator('.react-flow__handle-right').nth(1).click()
+    await page.locator('.dp-panel').getByText('filter', { exact: true }).click()
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1)
+    // drop "failed" — the edge that left it must be pruned, not left as an unselectable orphan
+    await sec.getByText('Edit →').click()
+    await page.getByPlaceholder('out').fill('passed')
+    await expect(sec.locator('.react-flow__handle-right')).toHaveCount(1)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(0)
+  })
+
   test('the user switcher creates and switches users', async ({ page }) => {
     await page.goto('/')
     const chip = page.getByTitle('Switch user')

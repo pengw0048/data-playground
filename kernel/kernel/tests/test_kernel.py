@@ -594,9 +594,14 @@ def test_section_multi_output_routes_by_port(tmp_path):
     _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wl", "confirmed": True}).json()["runId"])
     st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wh", "confirmed": True}).json()["runId"])
     assert st["status"] == "done"
-    low = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_sec_low").uri, "k": 5}).json()
-    high = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_sec_high").uri, "k": 5}).json()
-    assert low["rowCount"] == 100 and high["rowCount"] == 100  # each port carried only its own rows
+    import duckdb
+    def stats(name):
+        uri = get_deps().catalog.get_table(f"tbl_{name}").uri
+        return duckdb.connect(":memory:").execute(f"SELECT count(*), min(v), max(v) FROM read_parquet('{uri}')").fetchone()
+    # assert CONTENT, not just row count — both ports are 100 rows, so a handle-routing bug that
+    # writes the wrong port's data would pass a count-only check but fail here (min/max differ).
+    assert stats("sec_low") == (100, 0, 99)      # the "low" port: v < 100
+    assert stats("sec_high") == (100, 900, 999)  # the "high" port: v >= 900
 
 
 def test_section_not_previewable():

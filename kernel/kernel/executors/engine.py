@@ -44,7 +44,7 @@ def _bypassed(node: GraphNode) -> bool:
 class LoweringEngine:
     def __init__(self, graph: Graph, resolve_adapter, registry, sample_k: int | None = None,
                  full: bool = False, node_lowerings: dict | None = None, node_specs: dict | None = None,
-                 bound_inputs: dict | None = None):
+                 bound_inputs: dict | None = None, spill_files: list | None = None):
         self.graph = graph
         self.resolve_adapter = resolve_adapter
         self.registry = registry
@@ -55,6 +55,10 @@ class LoweringEngine:
         # a node id -> Relation to inject as that node's input (used to run a section's sub-node
         # against a script-provided handle instead of a wired upstream edge)
         self.bound_inputs = bound_inputs or {}
+        # temp parquet files spilled during this run (transform spill, section _materialize); the
+        # runner deletes them in its finally so they don't accumulate across the kernel's lifetime.
+        # Shared with sub-engines (sections) so a contained transform's spill is GC'd too.
+        self.spill_files = spill_files if spill_files is not None else []
         # a node lowers to either one Relation (single output) or a dict of named output ports
         # (multi-output — e.g. a section that emit()s several named result sets)
         self._cache: dict[str, "Relation | dict[str, Relation]"] = {}
@@ -73,7 +77,9 @@ class LoweringEngine:
         if handle is not None and handle in lowered:
             return lowered[handle]
         if handle is None:
-            return lowered.get("out") or next(iter(lowered.values()))
+            # explicit key check — a DuckDB relation is falsy when it has 0 rows (defines __len__),
+            # so `lowered.get("out") or …` would wrongly skip an empty default port (and force a count).
+            return lowered["out"] if "out" in lowered else next(iter(lowered.values()))
         raise NotPreviewable(g.node_map(self.graph)[node_id], f"output port '{handle}' was not produced")
 
     def rows(self, node_id: str, k: int) -> tuple[list[dict], list[ColumnSchema]]:
@@ -337,6 +343,7 @@ class LoweringEngine:
         if writer is None:
             return parent.limit(0)
         writer.close()
+        self.spill_files.append(path)  # GC'd at end-of-run by the runner
         return db.conn().read_parquet(path)
 
     # -- vector search (Lance / brute-force cosine) ------------------------ #
