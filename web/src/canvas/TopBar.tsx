@@ -1,4 +1,4 @@
-import { useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { useStore } from '../store/graph'
 import { color, shadow } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
@@ -16,6 +16,13 @@ export function TopBar() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [runsOpen, setRunsOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
+
+  // let anything (e.g. the agent's "Configure a model" CTA) open Settings
+  useEffect(() => {
+    const onOpen = () => setSettingsOpen(true)
+    window.addEventListener('dp-open-settings', onOpen)
+    return () => window.removeEventListener('dp-open-settings', onOpen)
+  }, [])
 
   return (
     <>
@@ -49,7 +56,7 @@ export function TopBar() {
           style={{ width: 34, height: 34, display: 'grid', placeItems: 'center', background: '#fff', border: `1px solid ${color.border}`, borderRadius: 20, boxShadow: shadow.card, color: color.text2, cursor: 'pointer' }}>
           <Icon name="settings" size={15} />
         </button>
-        <UserMenu />
+        <AccountMenu />
       </div>
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
       {runsOpen && <RunHistoryModal onClose={() => setRunsOpen(false)} />}
@@ -151,7 +158,10 @@ function FileMenu() {
   )
 }
 
-function UserMenu() {
+// A compact account avatar (Figma-style), not a prominent "switch user" pill — real users don't
+// switch identity. It shows who you are; switching/adding stays available (dev / multi-seat) but
+// tucked behind the avatar. In an auth deployment, identity comes from login, not from here.
+function AccountMenu() {
   const ref = useRef<HTMLButtonElement>(null)
   const [open, setOpen] = useState(false)
   const [name, setName] = useState('')
@@ -164,14 +174,16 @@ function UserMenu() {
 
   return (
     <>
-      <button ref={ref} onClick={() => setOpen((v) => !v)} title="Switch user" style={{ ...pill }}>
-        <span style={{ width: 18, height: 18, borderRadius: '50%', background: '#e7e0fb', color: '#6b4bd6', display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700 }}>
+      <button ref={ref} onClick={() => setOpen((v) => !v)} title="Account"
+        style={{ width: 34, height: 34, display: 'grid', placeItems: 'center', background: '#fff', border: `1px solid ${color.border}`, borderRadius: '50%', boxShadow: shadow.card, cursor: 'pointer', padding: 0 }}>
+        <span style={{ width: 24, height: 24, borderRadius: '50%', background: '#e7e0fb', color: '#6b4bd6', display: 'grid', placeItems: 'center', fontSize: 11, fontWeight: 700 }}>
           {(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}
         </span>
-        {currentUser?.name ?? 'local'} <Icon name="chevronDown" size={12} style={{ color: color.text3 }} />
       </button>
       <Popover anchorRef={ref} open={open} onClose={() => setOpen(false)} width={220} align="right">
-        <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, padding: '5px 10px' }}>Users</div>
+        <div style={{ fontSize: 11, color: color.text2, padding: '6px 10px' }}>Signed in as <b>{currentUser?.name ?? 'local'}</b></div>
+        <div style={{ height: 1, background: color.hairline, margin: '2px 0' }} />
+        <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, padding: '5px 10px' }}>Switch user (dev)</div>
         {users.map((u) => (
           <button
             key={u.id}
