@@ -74,7 +74,8 @@ test.describe('Data Playground canvas', () => {
     const nodes = page.locator('.react-flow__node')
     await expect(nodes).toHaveCount(1)
     await page.getByRole('button', { name: 'More' }).click()
-    await page.getByRole('button', { name: 'Duplicate' }).click()
+    // scope to the ⋯ menu popover — the inspector also has a Duplicate action for the selected node
+    await page.locator('.dp-panel').getByRole('button', { name: 'Duplicate' }).click()
     await expect(nodes).toHaveCount(2)
     expect(overlaps(await boxOf(nodes.nth(0)), await boxOf(nodes.nth(1))), 'duplicated node overlaps the original').toBe(false)
   })
@@ -268,6 +269,20 @@ test.describe('Data Playground canvas', () => {
     await expect(section).toBeVisible()
     await expect(section.getByText(/Drop nodes here/)).toBeVisible() // empty frame invites containment
     await expect(section.getByText('Edit script →')).toBeVisible()
+  })
+
+  test('the right inspector shows and edits the selected node', async ({ page }) => {
+    await fresh(page)
+    const inspector = page.getByTestId('inspector')
+    await expect(inspector).toBeVisible()
+    await expect(inspector.getByText(/Select a node/)).toBeVisible() // empty state
+    await addNode(page, 'Shape', 'filter') // a newly added node is auto-selected
+    await expect(inspector.getByText('FILTER')).toBeVisible()
+    await expect(inspector.getByText('Properties')).toBeVisible()
+    // the node's param is editable from the inspector (reused generic param editor)
+    const pred = inspector.locator('label').filter({ hasText: 'predicate' }).locator('input')
+    await pred.fill('amount > 0')
+    await expect(pred).toHaveValue('amount > 0')
   })
 
   test('the user switcher creates and switches users', async ({ page }) => {
