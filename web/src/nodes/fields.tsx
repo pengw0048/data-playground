@@ -9,13 +9,17 @@ import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import type { ColumnSchema } from '../types/graph'
 
-/** Columns available to a node's expression fields = its upstream output columns (typed ports). */
+/** Columns available to a node's expression fields = its upstream output columns (typed ports).
+ * Subscribes only to the things that affect columns (edges / schemas / previews / catalog) — NOT to
+ * node positions, so dragging a node doesn't re-render every relational card. Node identity/config
+ * is read non-reactively (a config change re-triggers a schema fetch, which updates `schemas`). */
 export function useInputColumns(nodeId: string): ColumnSchema[] {
-  const doc = useStore((s) => s.doc)
+  const edges = useStore((s) => s.doc.edges)
   const schemas = useStore((s) => s.schemas)
   const previews = useStore((s) => s.previews)
   const catalog = useStore((s) => s.catalog)
-  return inputColumns(doc, schemas, previews, catalog, nodeId)
+  const nodes = useStore.getState().doc.nodes
+  return inputColumns({ nodes, edges } as never, schemas, previews, catalog, nodeId)
 }
 
 const inputStyle = {
@@ -67,8 +71,24 @@ export function SortBuilder({ nodeId }: { nodeId: string }) {
   const by = String(useStore((s) => s.doc.nodes.find((n) => n.id === nodeId)?.data.config.by) ?? '')
   const updateConfig = useStore((s) => s.updateConfig)
   const columns = useInputColumns(nodeId)
+  // a function expression can contain commas the chip-splitter would wrongly tear apart → free text
+  const complex = by.includes('(')
+  const [advanced, setAdvanced] = useState(complex)
   const keys = parseSort(by)
   const commit = (next: SortKey[]) => updateConfig(nodeId, { by: serializeSort(next) })
+
+  if (advanced || complex) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <ColumnCombo value={by} columns={columns} placeholder="score DESC, id"
+          onChange={(v) => updateConfig(nodeId, { by: v })} />
+        <button className="nodrag" onClick={(e) => { e.stopPropagation(); if (!by.includes('(')) setAdvanced(false) }}
+          style={{ ...addBtn, opacity: by.includes('(') ? 0.5 : 1 }} title={by.includes('(') ? 'Contains an expression — edit as text' : 'Switch to the builder'}>
+          <Icon name="fx" size={11} /> builder
+        </button>
+      </div>
+    )
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
@@ -84,8 +104,12 @@ export function SortBuilder({ nodeId }: { nodeId: string }) {
             title="Remove" style={xBtn}><Icon name="close" size={11} /></button>
         </div>
       ))}
-      <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit([...keys, { col: columns[0]?.name ?? '', dir: 'ASC' }]) }}
-        style={addBtn}><Icon name="plus" size={11} /> add sort key</button>
+      <div style={{ display: 'flex', gap: 6 }}>
+        <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit([...keys, { col: columns[0]?.name ?? '', dir: 'ASC' }]) }}
+          style={addBtn}><Icon name="plus" size={11} /> add sort key</button>
+        <button className="nodrag" onClick={(e) => { e.stopPropagation(); setAdvanced(true) }}
+          style={addBtn} title="Edit order-by as text">raw</button>
+      </div>
     </div>
   )
 }
@@ -112,18 +136,22 @@ function parseFilter(pred: string): Cond[] | null {
   }
   return conds
 }
-function literal(val: string, colType?: string): string {
+function literal(val: string, colType: string | undefined, columns: ColumnSchema[]): string {
   const v = val.trim()
   if (v === '') return "''"
+  // already a literal we shouldn't touch: number, bool/null, or an explicitly-quoted string
   if (/^-?\d+(\.\d+)?$/.test(v) || /^(true|false|null)$/i.test(v) || /^'.*'$/.test(v)) return v
-  const stringy = !colType || /string|json|struct|list|bytes/.test(colType)
+  // the value datalist suggests column names — if the RHS IS a known column, it's a column ref, not a string
+  if (columns.some((c) => c.name === v)) return v
+  // date/time/timestamp columns need quoted literals too (unquoted 2024-01-01 = integer arithmetic)
+  const stringy = !colType || /string|json|struct|list|bytes|date|time|timestamp/.test(colType)
   return stringy ? `'${v.replace(/'/g, "''")}'` : v
 }
 function serializeFilter(conds: Cond[], columns: ColumnSchema[]): string {
   return conds.filter((c) => c.col.trim()).map((c) => {
     if (c.op === 'IS NULL' || c.op === 'IS NOT NULL') return `${c.col} ${c.op}`
     const t = columns.find((x) => x.name === c.col)?.type
-    return `${c.col} ${c.op} ${literal(c.val, t)}`
+    return `${c.col} ${c.op} ${literal(c.val, t, columns)}`
   }).join(' AND ')
 }
 

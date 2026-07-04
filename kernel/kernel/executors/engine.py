@@ -48,12 +48,16 @@ def _disabled(node: GraphNode) -> bool:
 class LoweringEngine:
     def __init__(self, graph: Graph, resolve_adapter, registry, sample_k: int | None = None,
                  full: bool = False, node_lowerings: dict | None = None, node_specs: dict | None = None,
-                 bound_inputs: dict | None = None, spill_files: list | None = None):
+                 bound_inputs: dict | None = None, spill_files: list | None = None,
+                 schema_only: bool = False):
         self.graph = graph
         self.resolve_adapter = resolve_adapter
         self.registry = registry
         self.sample_k = sample_k
         self.full = full
+        # schema_only: we only want column names/types, never rows — scan sources with limit=0 so
+        # even an eager adapter (Lance materializes on to_table) touches no data. See executors/schema.
+        self.schema_only = schema_only
         self.node_lowerings = node_lowerings or {}
         self.node_specs = node_specs or {}
         # a node id -> Relation to inject as that node's input (used to run a section's sub-node
@@ -129,6 +133,8 @@ class LoweringEngine:
             uri = cfg.get("uri") or cfg.get("table")
             if not uri:
                 raise NotPreviewable(node, "no dataset selected")
+            if self.schema_only:
+                return self.resolve_adapter(uri).scan(uri, limit=0)  # metadata only — never materialize
             rel = self.resolve_adapter(uri).scan(uri)
             if self.sample_k and not self.full:
                 rel = rel.limit(self.sample_k)

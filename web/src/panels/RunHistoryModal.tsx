@@ -15,7 +15,7 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
   }, [canvasId])
 
   return createPortal(
-    <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(16,20,30,0.4)', display: 'grid', placeItems: 'center' }}>
+    <div className="dp-modal-overlay" onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(16,20,30,0.4)', display: 'grid', placeItems: 'center' }}>
       <div onClick={(e) => e.stopPropagation()} style={{ width: 560, maxHeight: '76vh', display: 'flex', flexDirection: 'column', background: '#fff', borderRadius: radius.panel, boxShadow: shadow.panel, overflow: 'hidden' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '13px 16px', borderBottom: `1px solid ${color.hairline}` }}>
           <Icon name="clock" size={15} style={{ color: color.text3 }} />

@@ -30,7 +30,7 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
   const addable = users.filter((u) => !sharedIds.has(u.id))
 
   return createPortal(
-    <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(16,20,30,0.4)', display: 'grid', placeItems: 'center' }}>
+    <div className="dp-modal-overlay" onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(16,20,30,0.4)', display: 'grid', placeItems: 'center' }}>
       <div onClick={(e) => e.stopPropagation()} style={{ width: 460, background: '#fff', borderRadius: radius.panel, boxShadow: shadow.panel, overflow: 'hidden' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '13px 16px', borderBottom: `1px solid ${color.hairline}` }}>
           <Icon name="link" size={15} style={{ color: color.text3 }} />

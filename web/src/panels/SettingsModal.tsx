@@ -32,6 +32,11 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     api.getSettings().then((s) => setG(s.global)).catch(() => {}).finally(() => setLoading(false))
   }, [])
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
 
   const val = (k: string) => (g[k] == null ? '' : String(g[k]))
   const set = (k: string, v: string) => setG((prev) => ({ ...prev, [k]: v }))
@@ -58,7 +63,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const runners = kernelInfo?.runners ?? ['local-out-of-core']
 
   return createPortal(
-    <div onMouseDown={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(20,22,28,.35)', zIndex: 2000, display: 'grid', placeItems: 'center' }}>
+    <div className="dp-modal-overlay" onMouseDown={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(20,22,28,.35)', zIndex: 2000, display: 'grid', placeItems: 'center' }}>
       <div onMouseDown={(e) => e.stopPropagation()}
         style={{ width: 'min(940px, 94vw)', height: 'min(680px, 90vh)', background: '#fff', border: `1px solid ${color.border}`, borderRadius: radius.panel, boxShadow: shadow.panel, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 18px', borderBottom: `1px solid ${color.hairline}` }}>

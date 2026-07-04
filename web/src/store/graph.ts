@@ -7,7 +7,7 @@ import type {
   CatalogTable, KernelInfo, ProcessorDescriptor, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
 import { getSpec } from '../nodes/registry'
-import { registerGenericNodes } from '../nodes/generic'
+import { registerGenericNodes, nodeInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
 import { api, KernelError, setApiUser, type AgentBackendNode, type AgentBackendEdge, type DpUser, type CanvasFile } from '../api/client'
 
@@ -213,6 +213,21 @@ function migrateDoc(doc: CanvasDoc): CanvasDoc {
     return node
   })
   return changed ? { ...doc, nodes } : doc
+}
+
+// true if the node, or anything feeding it, has an unmet required param — so running the pipeline
+// through it would fail. Keeps rerun-all consistent with the disabled ▶ on the cards.
+function hasInvalidUpstream(doc: CanvasDoc, id: string): boolean {
+  const seen = new Set<string>()
+  const walk = (nid: string): boolean => {
+    if (seen.has(nid)) return false
+    seen.add(nid)
+    const n = doc.nodes.find((x) => x.id === nid)
+    if (!n) return false
+    if (nodeInvalidReason(n)) return true
+    return doc.edges.filter((e) => e.target === nid).map((e) => e.source).some(walk)
+  }
+  return walk(id)
 }
 
 // downstream node ids (BFS over edges)
@@ -545,10 +560,13 @@ export const useStore = create<Store>((set, get) => ({
   rerunAll: () => {
     const { doc } = get()
     const hasOutgoing = new Set(doc.edges.map((e) => e.source))
-    doc.nodes
-      // a section's contained children are run by the section, not as top-level sinks
-      .filter((n) => !n.parentId && !hasOutgoing.has(n.id) && nodeRunnable(doc, n.id))
-      .forEach((n) => get().requestRun(n.id))
+    // a section's contained children are run by the section, not as top-level sinks
+    const sinks = doc.nodes.filter((n) => !n.parentId && !hasOutgoing.has(n.id) && nodeRunnable(doc, n.id))
+    // don't kick off pipelines that would fail on a missing required field (matches the disabled ▶)
+    const runnable = sinks.filter((n) => !hasInvalidUpstream(doc, n.id))
+    runnable.forEach((n) => get().requestRun(n.id))
+    const skipped = sinks.length - runnable.length
+    if (skipped) get().pushToast(`Skipped ${skipped} pipeline${skipped > 1 ? 's' : ''} with a required field still empty`, 'info')
   },
 
   cancelRun: async (id) => {
@@ -639,7 +657,7 @@ export const useStore = create<Store>((set, get) => ({
       // offline / no kernel: fall back to the local cached doc so work survives a refresh
       try {
         const saved = localStorage.getItem(LS_KEY)
-        if (saved) { const doc = JSON.parse(saved) as CanvasDoc; if (doc?.nodes) set({ doc }) }
+        if (saved) { const doc = JSON.parse(saved) as CanvasDoc; if (doc?.nodes) set({ doc: migrateDoc(doc) }) }
       } catch { /* ignore corrupt state */ }
     }
     _bootstrapped = true  // now the real doc is loaded → autosave may persist edits (not the throwaway empty doc)
@@ -712,7 +730,10 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   refreshSchemas: async () => {
-    try { set({ schemas: await api.schema(get().doc) }) } catch { /* offline: keep last-known */ }
+    // guard against out-of-order responses: only the latest request may write the schema map
+    const seq = ++_schemaSeq
+    try { const schemas = await api.schema(get().doc); if (seq === _schemaSeq) set({ schemas }) }
+    catch { /* offline: keep last-known */ }
   },
 
   setAgentOpen: (v) => set({ agentOpen: v }),
@@ -771,15 +792,27 @@ useStore.subscribe((s) => {
   }, 400)
 })
 
-// Refresh per-node output schema (column suggestions) a beat after the graph — or any node's
-// config — changes. Debounced; a config edit (e.g. a `select` projection) changes columns too.
+// Refresh per-node output schema (column suggestions) a beat after a SCHEMA-RELEVANT change — the
+// wiring or any node's config/kind/on-off. Node positions never affect columns, so dragging must
+// NOT trigger a fetch: we compare a structure signature (positions excluded) after the cheap ref
+// check. Debounced; the fetch itself is guarded against out-of-order responses (refreshSchemas).
+let _schemaSeq = 0
 let _schemaTimer: ReturnType<typeof setTimeout> | undefined
 let _lastNodesRef: CanvasNode[] | undefined
 let _lastEdgesRef: CanvasEdge[] | undefined
+let _schemaSig: string | undefined
+function structSig(doc: CanvasDoc): string {
+  const nodes = doc.nodes.map((n) => `${n.id}:${n.type}:${n.data.disabled ? 1 : 0}${n.data.bypassed ? 1 : 0}:${JSON.stringify(n.data.config)}`).join('|')
+  const edges = doc.edges.map((e) => `${e.source}>${e.sourceHandle ?? ''}>${e.target}>${e.targetHandle ?? ''}`).sort().join(',')
+  return `${nodes}#${edges}`
+}
 useStore.subscribe((s) => {
-  if (s.doc.nodes === _lastNodesRef && s.doc.edges === _lastEdgesRef) return
+  if (s.doc.nodes === _lastNodesRef && s.doc.edges === _lastEdgesRef) return  // cheap: nothing changed
   _lastNodesRef = s.doc.nodes; _lastEdgesRef = s.doc.edges
   if (!_bootstrapped) return
+  const sig = structSig(s.doc)
+  if (sig === _schemaSig) return  // refs changed but structure didn't (e.g. a drag) → no schema fetch
+  _schemaSig = sig
   clearTimeout(_schemaTimer)
   _schemaTimer = setTimeout(() => { if (useStore.getState().kernelUp) void useStore.getState().refreshSchemas() }, 500)
 })

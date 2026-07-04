@@ -16,6 +16,11 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     api.getShares(doc.id).then((s) => setVisibility(s.visibility === 'workspace' ? 'workspace' : 'private')).catch(() => {})
   }, [doc.id])
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
 
   const setVis = (v: 'private' | 'workspace') => {
     setVisibility(v)
@@ -23,7 +28,7 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
   }
 
   return createPortal(
-    <div onMouseDown={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(20,22,28,.28)', zIndex: 2000, display: 'grid', placeItems: 'center' }}>
+    <div className="dp-modal-overlay" onMouseDown={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(20,22,28,.28)', zIndex: 2000, display: 'grid', placeItems: 'center' }}>
       <div onMouseDown={(e) => e.stopPropagation()}
         style={{ width: 420, maxWidth: '92vw', background: '#fff', border: `1px solid ${color.border}`, borderRadius: radius.panel, boxShadow: shadow.panel }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 16px', borderBottom: `1px solid ${color.hairline}` }}>
