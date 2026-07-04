@@ -104,7 +104,16 @@ def catalog_register(req: RegisterRequest) -> CatalogTable:
         deps.resolve_adapter(uri).schema(uri)  # validate readable
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"cannot read '{uri}': {e}")
-    return deps.catalog.register_output(name=name, uri=uri, version="v1", parents=[])
+    t = deps.catalog.register_output(name=name, uri=uri, version="v1", parents=[])
+    # persist so user-added datasets survive a kernel restart (re-registered on startup)
+    try:
+        ds = metadb.get_setting("datasets", "global", default=[]) or []
+        if not any(d.get("uri") == uri for d in ds):
+            ds.append({"uri": uri, "name": name})
+            metadb.set_setting("datasets", ds, "global")
+    except Exception:  # noqa: BLE001
+        pass
+    return t
 
 
 # --------------------------------------------------------------------------- #
@@ -424,6 +433,12 @@ app.add_middleware(
 )
 app.include_router(api)
 metadb.init_db()  # create metadata tables (idempotent) + seed the default local user
+# re-register user-added datasets (from settings) so they survive a restart
+for _d in (metadb.get_setting("datasets", "global", default=[]) or []):
+    try:
+        catalog_register(RegisterRequest(uri=_d["uri"], name=_d.get("name")))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @app.websocket("/ws/run/{run_id}")

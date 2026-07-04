@@ -198,6 +198,18 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('Saved', { exact: true })).toBeVisible()
   })
 
+  test('settings manages datasets and connected repos', async ({ page }) => {
+    await page.goto('/')
+    await page.getByLabel('Settings').click()
+    await expect(page.getByText('Datasets', { exact: true })).toBeVisible()
+    await expect(page.getByText('Connected repositories')).toBeVisible()
+    await expect(page.getByText('images', { exact: true })).toBeVisible() // seeded dataset is listed
+    await page.getByPlaceholder('name').fill('acme-tools')
+    await page.getByPlaceholder('https://github.com/org/repo').fill('https://github.com/acme/tools')
+    await page.getByPlaceholder('https://github.com/org/repo').press('Enter')
+    await expect(page.getByText('acme-tools', { exact: true })).toBeVisible() // repo added to the list
+  })
+
   test('the user switcher creates and switches users', async ({ page }) => {
     await page.goto('/')
     const chip = page.getByTitle('Switch user')
