@@ -1,6 +1,8 @@
+import { useRef, useState, type CSSProperties } from 'react'
 import { useStore } from '../store/graph'
 import { color, shadow } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
+import { Popover } from '../ui/Popover'
 
 export function TopBar() {
   const doc = useStore((s) => s.doc)
@@ -11,12 +13,10 @@ export function TopBar() {
 
   return (
     <>
-      <div style={{ position: 'absolute', top: 16, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 10 }}>
-        <button style={iconGhost}><Icon name="chevronLeft" size={15} /></button>
+      <div style={{ position: 'absolute', top: 16, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
         <span style={{ fontSize: 13.5, color: color.text3 }}>Data Playground</span>
         <span style={{ fontSize: 13.5, color: color.text3 }}>/</span>
-        <span style={{ fontSize: 13.5, fontWeight: 600, color: color.ink }}>{doc.name ?? 'untitled'}</span>
-        {/* auto-save: no button — just a quiet status */}
+        <FileMenu />
         <span data-testid="autosave" style={{ fontSize: 11, color: color.text3, marginLeft: 2 }}>· {saved ? 'saved' : 'saving…'}</span>
       </div>
 
@@ -34,16 +34,128 @@ export function TopBar() {
         <button onClick={rerunAll} title="Re-run the whole graph" style={{ ...pill, background: color.ink, color: '#fff', border: 'none' }}>
           <Icon name="refresh" size={13} /> Rerun all
         </button>
+        <UserMenu />
       </div>
     </>
   )
 }
 
-const iconGhost: React.CSSProperties = {
-  width: 28, height: 28, display: 'grid', placeItems: 'center', border: 'none',
-  borderRadius: 8, background: 'transparent', color: color.text3,
+function FileMenu() {
+  const ref = useRef<HTMLButtonElement>(null)
+  const [open, setOpen] = useState(false)
+  const doc = useStore((s) => s.doc)
+  const files = useStore((s) => s.files)
+  const openFile = useStore((s) => s.openFile)
+  const newFile = useStore((s) => s.newFile)
+  const renameFile = useStore((s) => s.renameFile)
+  const deleteFile = useStore((s) => s.deleteFile)
+
+  return (
+    <>
+      <button
+        ref={ref}
+        onClick={() => setOpen((v) => !v)}
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 13.5, fontWeight: 600, color: color.ink, background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px 4px', borderRadius: 6 }}
+      >
+        {doc.name ?? 'untitled'} <Icon name="chevronDown" size={12} style={{ color: color.text3 }} />
+      </button>
+      <Popover anchorRef={ref} open={open} onClose={() => setOpen(false)} width={240} align="left">
+        <div style={{ padding: '6px 8px' }}>
+          <input
+            value={doc.name ?? ''}
+            onChange={(e) => renameFile(e.target.value)}
+            placeholder="untitled"
+            style={{ width: '100%', fontSize: 12.5, fontWeight: 600, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', outline: 'none' }}
+          />
+        </div>
+        <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, padding: '4px 10px' }}>Files</div>
+        <div style={{ maxHeight: 220, overflowY: 'auto' }}>
+          {files.map((f) => (
+            <button
+              key={f.id}
+              onClick={() => { openFile(f.id); setOpen(false) }}
+              style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', padding: '7px 10px', border: 'none', background: f.id === doc.id ? '#eef0f3' : 'transparent', borderRadius: 7, fontSize: 12.5, color: color.ink }}
+              onMouseEnter={(e) => { if (f.id !== doc.id) e.currentTarget.style.background = '#f2f3f5' }}
+              onMouseLeave={(e) => { if (f.id !== doc.id) e.currentTarget.style.background = 'transparent' }}
+            >
+              <Icon name="grid" size={12} style={{ color: color.text3 }} />
+              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name || 'untitled'}</span>
+            </button>
+          ))}
+          {files.length === 0 && <div style={{ padding: 10, fontSize: 11.5, color: color.text3 }}>No files yet.</div>}
+        </div>
+        <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />
+        <MenuItem icon="plus" label="New file" onClick={() => { newFile(); setOpen(false) }} />
+        <MenuItem icon="trash" label="Delete this file" danger onClick={() => { deleteFile(doc.id); setOpen(false) }} />
+      </Popover>
+    </>
+  )
 }
-const pill: React.CSSProperties = {
+
+function UserMenu() {
+  const ref = useRef<HTMLButtonElement>(null)
+  const [open, setOpen] = useState(false)
+  const [name, setName] = useState('')
+  const currentUser = useStore((s) => s.currentUser)
+  const users = useStore((s) => s.users)
+  const switchUser = useStore((s) => s.switchUser)
+  const createUser = useStore((s) => s.createUser)
+
+  const add = () => { const n = name.trim(); if (n) { createUser(n); setName(''); setOpen(false) } }
+
+  return (
+    <>
+      <button ref={ref} onClick={() => setOpen((v) => !v)} title="Switch user" style={{ ...pill }}>
+        <span style={{ width: 18, height: 18, borderRadius: '50%', background: '#e7e0fb', color: '#6b4bd6', display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700 }}>
+          {(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}
+        </span>
+        {currentUser?.name ?? 'local'} <Icon name="chevronDown" size={12} style={{ color: color.text3 }} />
+      </button>
+      <Popover anchorRef={ref} open={open} onClose={() => setOpen(false)} width={220} align="right">
+        <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, padding: '5px 10px' }}>Users</div>
+        {users.map((u) => (
+          <button
+            key={u.id}
+            onClick={() => { switchUser(u.id); setOpen(false) }}
+            style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', padding: '7px 10px', border: 'none', background: u.id === currentUser?.id ? '#eef0f3' : 'transparent', borderRadius: 7, fontSize: 12.5, color: color.ink }}
+            onMouseEnter={(e) => { if (u.id !== currentUser?.id) e.currentTarget.style.background = '#f2f3f5' }}
+            onMouseLeave={(e) => { if (u.id !== currentUser?.id) e.currentTarget.style.background = 'transparent' }}
+          >
+            <span style={{ flex: 1 }}>{u.name}</span>
+            {u.id === currentUser?.id && <Icon name="check" size={13} style={{ color: color.latest }} />}
+          </button>
+        ))}
+        <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />
+        <div style={{ display: 'flex', gap: 6, padding: '4px 8px 6px' }}>
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') add() }}
+            placeholder="new user…"
+            style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', outline: 'none' }}
+          />
+          <button onClick={add} style={{ border: 'none', borderRadius: 6, background: color.ink, color: '#fff', fontSize: 12, fontWeight: 600, padding: '0 10px' }}>Add</button>
+        </div>
+      </Popover>
+    </>
+  )
+}
+
+function MenuItem({ icon, label, onClick, danger }: { icon: 'plus' | 'trash'; label: string; onClick: () => void; danger?: boolean }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', padding: '7px 10px', border: 'none', background: 'transparent', color: danger ? color.failed : color.text2, fontSize: 12, textAlign: 'left', borderRadius: 6 }}
+      onMouseEnter={(e) => (e.currentTarget.style.background = '#f2f3f5')}
+      onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+    >
+      <Icon name={icon} size={13} /> {label}
+    </button>
+  )
+}
+
+const pill: CSSProperties = {
   display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 14px', background: '#fff',
   border: `1px solid ${color.border}`, borderRadius: 20, boxShadow: shadow.card, fontSize: 12.5, fontWeight: 600,
+  color: color.text2, cursor: 'pointer',
 }

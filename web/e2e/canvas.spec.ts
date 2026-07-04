@@ -176,4 +176,24 @@ test.describe('Data Playground canvas', () => {
     await expect(editor).toBeVisible({ timeout: 15_000 }) // Monaco lazy-loads + its worker boots
     await expect(editor).toContainText('SELECT')
   })
+
+  test('the file menu opens a fresh (empty) canvas as a new file', async ({ page }) => {
+    await page.goto('/')
+    await addNode(page, 'Shape', 'filter')
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await page.getByRole('button', { name: /untitled/ }).click()
+    await expect(page.getByText('New file')).toBeVisible()
+    await page.getByText('New file').click()
+    await expect(page.locator('.react-flow__node')).toHaveCount(0) // a new file is a fresh canvas
+  })
+
+  test('the user switcher creates and switches users', async ({ page }) => {
+    await page.goto('/')
+    const chip = page.getByTitle('Switch user')
+    await expect(chip).toContainText('local') // default seeded user
+    await chip.click()
+    await page.getByPlaceholder('new user…').fill('Alice')
+    await page.getByRole('button', { name: 'Add', exact: true }).click()
+    await expect(page.getByTitle('Switch user')).toContainText('Alice') // now acting as Alice
+  })
 })

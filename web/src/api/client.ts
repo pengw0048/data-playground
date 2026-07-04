@@ -7,6 +7,10 @@ import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
 const BASE = '/api'
 
+// The current user id, carried on every request as X-DP-User (internal-tool-grade identity).
+let _userId: string | null = null
+export function setApiUser(id: string | null) { _userId = id }
+
 export class KernelError extends Error {
   status: number
   constructor(status: number, message: string) {
@@ -16,10 +20,9 @@ export class KernelError extends Error {
 }
 
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  })
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(opts?.headers as Record<string, string>) }
+  if (_userId) headers['X-DP-User'] = _userId
+  const res = await fetch(`${BASE}${path}`, { ...opts, headers })
   if (!res.ok) {
     let detail = res.statusText
     try {
@@ -118,10 +121,26 @@ export const api = {
   agentAct: (doc: CanvasDoc, outcome: string) =>
     req<AgentResult>('/agent', { method: 'POST', body: JSON.stringify({ outcome, graph: toGraph(doc) }) }),
 
-  listCanvases: () => req<{ id: string; name: string; version: number }[]>('/canvas'),
+  // users (internal-tool identity) + settings
+  me: () => req<DpUser>('/me'),
+  users: () => req<DpUser[]>('/users'),
+  createUser: (name: string, email?: string) =>
+    req<DpUser>('/users', { method: 'POST', body: JSON.stringify({ name, email }) }),
+  getSettings: () => req<{ global: Record<string, unknown>; user: Record<string, unknown> }>('/settings'),
+  putSetting: (scope: 'global' | 'user', key: string, value: unknown) =>
+    req<{ ok: boolean }>('/settings', { method: 'PUT', body: JSON.stringify({ scope, key, value }) }),
+
+  // per-user canvases (multi-file)
+  listCanvases: () => req<CanvasFile[]>('/canvas'),
   getCanvas: (id: string) => req<CanvasDoc>(`/canvas/${id}`),
+  createCanvas: (doc: CanvasDoc) =>
+    req<{ ok: boolean; id: string }>('/canvas', { method: 'POST', body: JSON.stringify(doc) }),
   saveCanvas: (doc: CanvasDoc) =>
     req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc) }),
+  deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),
 }
+
+export interface DpUser { id: string; name: string; email?: string | null }
+export interface CanvasFile { id: string; name: string; version: number; updatedAt?: string }
 
 export { toGraph }

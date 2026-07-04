@@ -8,11 +8,13 @@ import type {
 } from '../types/api'
 import { getSpec } from '../nodes/registry'
 import { registerGenericNodes } from '../nodes/generic'
-import { api, KernelError, type AgentBackendNode, type AgentBackendEdge } from '../api/client'
+import { api, KernelError, setApiUser, type AgentBackendNode, type AgentBackendEdge, type DpUser, type CanvasFile } from '../api/client'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'code' | 'lineage'
 
-const LS_KEY = 'dp-canvas'
+const LS_KEY = 'dp-canvas'       // offline cache of the open doc
+const USER_KEY = 'dp-user'       // last-selected user id
+const OPEN_KEY = (uid: string) => `dp-open-${uid}`  // last-opened file per user
 
 let _seq = 0
 let _cfgEdit = { id: '', t: 0 } // coalesces param-edit undo checkpoints
@@ -132,6 +134,18 @@ interface Store {
   save: () => Promise<void>
   loadDoc: (doc: CanvasDoc) => void
   applyAgentGraph: (graph: { nodes: AgentBackendNode[]; edges: AgentBackendEdge[] }) => void
+
+  // -- users + files (per-user, multi-file) --
+  currentUser: DpUser | null
+  users: DpUser[]
+  files: CanvasFile[]
+  refreshFiles: () => Promise<void>
+  openFile: (id: string) => Promise<void>
+  newFile: () => Promise<void>
+  renameFile: (name: string) => void
+  deleteFile: (id: string) => Promise<void>
+  switchUser: (id: string) => Promise<void>
+  createUser: (name: string) => Promise<void>
 }
 
 function emptyDoc(): CanvasDoc {
@@ -156,6 +170,9 @@ function downstream(doc: CanvasDoc, id: string): Set<string> {
 
 export const useStore = create<Store>((set, get) => ({
   doc: emptyDoc(),
+  currentUser: null,
+  users: [],
+  files: [],
   kernelInfo: null,
   kernelUp: false,
   catalog: [],
@@ -489,14 +506,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   bootstrap: async () => {
-    // restore the last canvas from localStorage so work survives a refresh (real product, not demo)
-    try {
-      const saved = localStorage.getItem(LS_KEY)
-      if (saved) {
-        const doc = JSON.parse(saved) as CanvasDoc
-        if (doc?.nodes?.length) set({ doc })
-      }
-    } catch { /* ignore corrupt state */ }
+    setApiUser(localStorage.getItem(USER_KEY))  // restore chosen user (server defaults to 'local')
     try {
       const [kernelInfo, catalog, processors, nodes] = await Promise.all([
         api.kernel(), api.tables(), api.processors(), api.nodes(),
@@ -507,6 +517,73 @@ export const useStore = create<Store>((set, get) => ({
     } catch {
       set({ kernelUp: false })
     }
+    try {
+      // resolve identity, load this user's files, open the last-opened (or newest, or a fresh one)
+      const me = await api.me()
+      setApiUser(me.id); localStorage.setItem(USER_KEY, me.id)
+      const users = await api.users()
+      set({ currentUser: me, users })
+      await get().refreshFiles()
+      const files = get().files
+      const last = localStorage.getItem(OPEN_KEY(me.id))
+      const openId = last && files.some((f) => f.id === last) ? last : files[0]?.id
+      if (openId) await get().openFile(openId)
+      else await get().newFile()
+    } catch {
+      // offline / no kernel: fall back to the local cached doc so work survives a refresh
+      try {
+        const saved = localStorage.getItem(LS_KEY)
+        if (saved) { const doc = JSON.parse(saved) as CanvasDoc; if (doc?.nodes) set({ doc }) }
+      } catch { /* ignore corrupt state */ }
+    }
+  },
+
+  refreshFiles: async () => { try { set({ files: await api.listCanvases() }) } catch { /* offline */ } },
+
+  openFile: async (id) => {
+    try {
+      const doc = await api.getCanvas(id)
+      get().loadDoc(doc)
+      const uid = get().currentUser?.id
+      if (uid) localStorage.setItem(OPEN_KEY(uid), id)
+    } catch { /* not found / offline */ }
+  },
+
+  newFile: async () => {
+    const doc = emptyDoc()
+    try { await api.createCanvas(doc); await get().refreshFiles() } catch { /* offline: PUT will create it */ }
+    get().loadDoc(doc)
+    const uid = get().currentUser?.id
+    if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
+  },
+
+  renameFile: (name) => set((s) => ({ doc: { ...s.doc, name } })),  // autosave PUTs + refreshes the list
+
+  deleteFile: async (id) => {
+    try { await api.deleteCanvas(id); await get().refreshFiles() } catch { /* offline */ }
+    if (get().doc.id === id) {
+      const next = get().files[0]?.id
+      if (next) await get().openFile(next)
+      else await get().newFile()
+    }
+  },
+
+  switchUser: async (id) => {
+    setApiUser(id); localStorage.setItem(USER_KEY, id)
+    const me = get().users.find((u) => u.id === id) ?? await api.me()
+    set({ currentUser: me })
+    await get().refreshFiles()
+    const files = get().files
+    const last = localStorage.getItem(OPEN_KEY(id))
+    const openId = last && files.some((f) => f.id === last) ? last : files[0]?.id
+    if (openId) await get().openFile(openId)
+    else await get().newFile()
+  },
+
+  createUser: async (name) => {
+    const u = await api.createUser(name)
+    set((s) => ({ users: [...s.users, u] }))
+    await get().switchUser(u.id)
   },
 
   refreshCatalog: async () => {
@@ -553,11 +630,18 @@ useStore.subscribe((s) => {
   _lastDoc = s.doc
   if (s.saved) useStore.setState({ saved: false })  // dirty → "saving…"
   clearTimeout(_saveTimer)
-  _saveTimer = setTimeout(() => {
+  _saveTimer = setTimeout(async () => {
+    const doc = useStore.getState().doc
+    try { localStorage.setItem(LS_KEY, JSON.stringify(doc)) } catch { /* quota */ }
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify(useStore.getState().doc))
-      useStore.setState({ saved: true })
-    } catch { /* quota / disabled */ }
+      await api.saveCanvas(doc)  // PUT to the metadata DB (per-user, upsert)
+      useStore.setState((st) => ({
+        saved: true,
+        files: st.files.map((f) => (f.id === doc.id ? { ...f, name: doc.name ?? f.name, version: doc.version } : f)),
+      }))
+    } catch {
+      useStore.setState({ saved: true })  // offline: the localStorage cache still holds it
+    }
   }, 400)
 })
 
