@@ -210,7 +210,8 @@ test.describe('Data Playground canvas', () => {
   test('settings manages datasets and connected repos', async ({ page }) => {
     await page.goto('/')
     await page.getByLabel('Settings').click()
-    await expect(page.getByText('Datasets', { exact: true })).toBeVisible()
+    // "Datasets" appears in both the left nav and the section title — scope to the register input
+    await expect(page.getByPlaceholder(/Parquet\/CSV\/JSON/)).toBeVisible()
     await expect(page.getByText('Connected repositories')).toBeVisible()
     await expect(page.getByText('images', { exact: true })).toBeVisible() // seeded dataset is listed
     await page.getByPlaceholder('name').fill('acme-tools')
