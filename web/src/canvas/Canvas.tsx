@@ -195,6 +195,8 @@ export function Canvas() {
   // keyboard: Delete / Backspace remove selection; B bypass; M mute
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // a fullscreen code editor is a modal over the canvas — don't let Delete/b/m act on the node beneath it
+      if (useStore.getState().fullscreenCode) return
       const tag = (e.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
       // undo / redo work regardless of selection

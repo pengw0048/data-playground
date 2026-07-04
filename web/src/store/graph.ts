@@ -591,7 +591,7 @@ export const useStore = create<Store>((set, get) => ({
       const uid = get().currentUser?.id
       if (uid) localStorage.setItem(OPEN_KEY(uid), id)
       set({ view: 'canvas' })  // opening a file navigates to the editor
-    } catch { /* not found / offline */ }
+    } catch { await get().refreshFiles() }  // stale card (deleted elsewhere) → prune it from the list
   },
 
   newFile: async () => {
@@ -607,7 +607,9 @@ export const useStore = create<Store>((set, get) => ({
 
   deleteFile: async (id) => {
     try { await api.deleteCanvas(id); await get().refreshFiles() } catch { /* offline */ }
-    if (get().doc.id === id) {
+    // only load a replacement (which navigates to the editor) if the deleted file was the one open
+    // IN the editor; deleting from the Recents grid should just drop the card and stay in the shell.
+    if (get().doc.id === id && get().view === 'canvas') {
       const next = get().files[0]?.id
       if (next) await get().openFile(next)
       else await get().newFile()
@@ -619,6 +621,9 @@ export const useStore = create<Store>((set, get) => ({
     const me = get().users.find((u) => u.id === id) ?? await api.me()
     set({ currentUser: me })
     await get().refreshFiles()
+    // if switching from a shell view (Recents/Tables/…), stay there and show the new user's files;
+    // only auto-open a file (→ editor) when the switch happened from the canvas.
+    if (get().view !== 'canvas') return
     const files = get().files
     const last = localStorage.getItem(OPEN_KEY(id))
     const openId = last && files.some((f) => f.id === last) ? last : files[0]?.id

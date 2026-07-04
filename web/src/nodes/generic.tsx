@@ -1,6 +1,7 @@
 // Generic node rendering (PRD §4.2, §8.7): any node the frontend doesn't have a hand-built
 // card for — including plugin nodes — is rendered from its /api/nodes schema. A plugin that
 // registers a typed node therefore appears in the canvas, typed and wired, with NO frontend code.
+import { useEffect, useState } from 'react'
 import { register, getSpec, type NodeComponentProps } from './registry'
 import { NodeCard } from './NodeCard'
 import { useStore } from '../store/graph'
@@ -37,22 +38,35 @@ export function NodeParamFields({ nodeId }: { nodeId: string }) {
                 style={{ fontSize: 11.5, textAlign: 'left', padding: '5px 7px', border: `1px solid ${color.border}`, borderRadius: 6, background: '#fff', color: color.ink }}>
                 {val ? 'true' : 'false'}
               </button>
+            ) : p.type === 'int' || p.type === 'float' ? (
+              <NumberField value={val} isInt={p.type === 'int'} onCommit={(n) => updateConfig(nodeId, { [p.name]: n })} />
             ) : (
-              <MiniInput mono={p.type !== 'string'} value={String(val)}
-                onChange={(v) => {
-                  if (p.type === 'int' || p.type === 'float') {
-                    if (v.trim() === '') return  // don't coerce an empty field to 0
-                    const n = p.type === 'int' ? parseInt(v, 10) : parseFloat(v)
-                    if (!Number.isNaN(n)) updateConfig(nodeId, { [p.name]: n })  // skip partial/NaN
-                  } else {
-                    updateConfig(nodeId, { [p.name]: v })
-                  }
-                }} />
+              <MiniInput value={String(val)} onChange={(v) => updateConfig(nodeId, { [p.name]: v })} />
             )}
           </Field>
         )
       })}
     </div>
+  )
+}
+
+// A numeric field that keeps its own text (so you can type "0.", "-", or clear it) and commits only
+// valid parsed numbers — a fully-controlled value={String(n)} reverts partial input mid-keystroke.
+function NumberField({ value, isInt, onCommit }: { value: unknown; isInt: boolean; onCommit: (n: number) => void }) {
+  const [text, setText] = useState(value == null ? '' : String(value))
+  useEffect(() => {
+    // resync only on an EXTERNAL change (e.g. a different node selected), not our own commit
+    const cur = isInt ? parseInt(text, 10) : parseFloat(text)
+    if (cur !== value) setText(value == null ? '' : String(value))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value])
+  return (
+    <MiniInput mono value={text} onChange={(v) => {
+      setText(v)
+      if (v.trim() === '') return
+      const n = isInt ? parseInt(v, 10) : parseFloat(v)
+      if (!Number.isNaN(n)) onCommit(n)
+    }} />
   )
 }
 
