@@ -399,6 +399,12 @@ def delete_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
         return {"ok": True}
 
 
+@api.get("/canvas/{canvas_id}/runs")
+def canvas_runs(canvas_id: str, uid: str = Depends(current_user)) -> list[dict]:
+    """Run history for a canvas (persisted, survives restarts)."""
+    return metadb.list_runs(canvas_id)
+
+
 @api.get("/settings")
 def get_settings(uid: str = Depends(current_user)) -> dict:
     with metadb.session() as s:

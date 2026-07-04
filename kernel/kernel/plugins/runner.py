@@ -49,6 +49,7 @@ class LocalRunner:
         # where committed outputs go (pluggable; local dir by default). Falls back to workspace/outputs.
         from kernel.storage import make_storage
         self.storage = storage if storage is not None else make_storage(workspace)
+        self.on_complete = None  # optional (graph, target, status) hook — Deps wires it to run-history persistence
         # keep the SAME dict object deps passes (plugins fill it AFTER construction) — an
         # empty {} is falsy, so `or {}` would rebind a new dict and drop plugin lowerings.
         self.node_lowerings = node_lowerings if node_lowerings is not None else {}
@@ -173,6 +174,11 @@ class LocalRunner:
             status.total_rows = rows_seen
             status.cost_usd = round(status.ms / 1000 * _COST_PER_SEC, 4)
             self._cancel.pop(run_id, None)  # done/failed/cancelled → drop the cancel Event
+            if self.on_complete:  # persist the finished run (run history); never let it break the run
+                try:
+                    self.on_complete(graph, target, status)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _count(self, engine: LoweringEngine, node_id: str, cached: dict | None) -> int:
         if cached and cached.get("rows") is not None:

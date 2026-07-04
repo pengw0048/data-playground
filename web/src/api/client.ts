@@ -139,8 +139,10 @@ export const api = {
   saveCanvas: (doc: CanvasDoc) =>
     req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc) }),
   deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),
+  listRuns: (canvasId: string) => req<RunRecordDto[]>(`/canvas/${canvasId}/runs`),
 }
 
+export interface RunRecordDto { id: string; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputTable?: string | null; createdAt?: string | null }
 export interface DpUser { id: string; name: string; email?: string | null }
 export interface CanvasFile { id: string; name: string; version: number; updatedAt?: string }
 

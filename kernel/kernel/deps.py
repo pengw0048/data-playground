@@ -62,6 +62,13 @@ class Registry:
         self.deps.planner = planner
 
 
+def _persist_run(graph, target, status) -> None:
+    """Runner on_complete hook: keep a finished run with its canvas (canvas id == graph.id)."""
+    from kernel import metadb
+    metadb.record_run(canvas_id=getattr(graph, "id", None), target_node_id=target, status=status.status,
+                      rows=status.total_rows, ms=status.ms, error=status.error, output_table=status.output_table)
+
+
 class Deps:
     def __init__(self, workspace: str, data_dir: str):
         self.workspace = workspace
@@ -87,6 +94,7 @@ class Deps:
         self.runner = LocalRunner(self.resolve_adapter, self.registry, self.catalog, workspace,
                                   node_lowerings=self.node_lowerings, node_specs=self.node_specs,
                                   storage=self.storage)
+        self.runner.on_complete = _persist_run  # keep finished runs with their canvas (run history)
         self.runners = [self.runner]
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self._load_plugins()

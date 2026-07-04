@@ -4,6 +4,7 @@ import { color, shadow } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Popover } from '../ui/Popover'
 import { SettingsModal } from '../panels/SettingsModal'
+import { RunHistoryModal } from '../panels/RunHistoryModal'
 
 export function TopBar() {
   const doc = useStore((s) => s.doc)
@@ -12,11 +13,12 @@ export function TopBar() {
   const saved = useStore((s) => s.saved)
   const rerunAll = useStore((s) => s.rerunAll)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [runsOpen, setRunsOpen] = useState(false)
 
   return (
     <>
       <div style={{ position: 'absolute', top: 16, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <AppMenu onSettings={() => setSettingsOpen(true)} />
+        <AppMenu onSettings={() => setSettingsOpen(true)} onRunHistory={() => setRunsOpen(true)} />
         <span style={{ fontSize: 13.5, color: color.text3 }}>/</span>
         <FileMenu />
         <span data-testid="autosave" style={{ fontSize: 11, color: color.text3, marginLeft: 2 }}>· {saved ? 'saved' : 'saving…'}</span>
@@ -43,12 +45,13 @@ export function TopBar() {
         <UserMenu />
       </div>
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      {runsOpen && <RunHistoryModal onClose={() => setRunsOpen(false)} />}
     </>
   )
 }
 
 // The app menu (Figma-style hamburger): Back to files, New file, Settings.
-function AppMenu({ onSettings }: { onSettings: () => void }) {
+function AppMenu({ onSettings, onRunHistory }: { onSettings: () => void; onRunHistory: () => void }) {
   const ref = useRef<HTMLButtonElement>(null)
   const [open, setOpen] = useState(false)
   const setView = useStore((s) => s.setView)
@@ -63,6 +66,7 @@ function AppMenu({ onSettings }: { onSettings: () => void }) {
       <Popover anchorRef={ref} open={open} onClose={() => setOpen(false)} width={210} align="left">
         <MenuItem icon="chevronLeft" label="Back to files" onClick={() => { setView('files'); setOpen(false) }} />
         <MenuItem icon="plus" label="New file" onClick={() => { newFile(); setOpen(false) }} />
+        <MenuItem icon="clock" label="Run history" onClick={() => { onRunHistory(); setOpen(false) }} />
         <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />
         <MenuItem icon="settings" label="Settings" onClick={() => { onSettings(); setOpen(false) }} />
       </Popover>

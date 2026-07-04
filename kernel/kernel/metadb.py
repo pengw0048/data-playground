@@ -54,6 +54,20 @@ class Canvas(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
+class RunRecord(Base):
+    """A finished run, kept with its canvas (run history survives restarts). One row per run."""
+    __tablename__ = "run_records"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), index=True)
+    target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String)
+    rows: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_table: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class Setting(Base):
     __tablename__ = "settings"
     # scope 'global' (scope_id='') for system settings; scope 'user' (scope_id=user id) for prefs
@@ -137,6 +151,26 @@ def get_setting(key: str, scope: str = "global", scope_id: str = "", default=Non
     with session() as s:
         row = s.scalar(select(Setting).where(Setting.scope == scope, Setting.scope_id == scope_id, Setting.key == key))
         return json.loads(row.value) if row else default
+
+
+def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
+               rows: int | None = None, ms: int | None = None, error: str | None = None,
+               output_table: str | None = None) -> None:
+    """Persist a finished run under its canvas. No-op without a canvas id (e.g. ad-hoc API runs)."""
+    if not canvas_id:
+        return
+    with session() as s:
+        s.add(RunRecord(canvas_id=canvas_id, target_node_id=target_node_id, status=status,
+                        rows=rows, ms=ms, error=error, output_table=output_table))
+
+
+def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
+    with session() as s:
+        rows = s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id)
+                         .order_by(RunRecord.created_at.desc()).limit(limit)).all()
+        return [{"id": r.id, "status": r.status, "targetNodeId": r.target_node_id, "rows": r.rows,
+                 "ms": r.ms, "error": r.error, "outputTable": r.output_table,
+                 "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
 
 
 def set_setting(key: str, value, scope: str = "global", scope_id: str = "") -> None:

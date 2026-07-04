@@ -571,6 +571,25 @@ def test_section_multi_output_routes_by_port(tmp_path):
     assert stats("sec_high") == (100, 900, 999)  # the "high" port: v >= 900
 
 
+def test_run_history_persisted_with_canvas(tmp_path):
+    # a finished run is recorded under its canvas (survives restart) + exposed at /canvas/{id}/runs
+    from kernel import metadb
+    p = _seq_parquet(tmp_path)
+    g = {"id": "hist_canvas", "version": 1, "nodes": [
+        N("src", "source", {"uri": p}), N("wr", "write", {"name": "hist_out"}),
+    ], "edges": [E("src", "wr")]}
+    st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
+    assert st["status"] == "done"
+    runs = []
+    for _ in range(40):  # on_complete persists in the run's finally, a beat after status flips to done
+        runs = metadb.list_runs("hist_canvas")
+        if runs:
+            break
+        time.sleep(0.05)
+    assert runs and runs[0]["status"] == "done" and runs[0]["outputTable"] == "hist_out"
+    assert any(r["status"] == "done" for r in client.get("/api/canvas/hist_canvas/runs").json())
+
+
 def test_written_outputs_reregister_on_restart(tmp_path):
     # durability: an output written to storage must reappear in the catalog after a kernel restart
     # (a fresh Deps), not vanish because the seeded data_dir doesn't include the outputs location.

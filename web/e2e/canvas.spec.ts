@@ -327,6 +327,15 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('toolbar')).toBeVisible()
   })
 
+  test('the app menu opens persisted run history', async ({ page }) => {
+    await fresh(page)
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Run history').click()
+    await expect(page.getByRole('heading', { name: 'Run history' }).or(page.getByText('Run history', { exact: true }).first())).toBeVisible()
+    // a brand-new file has no runs yet — the empty state renders (proves the modal + API wired)
+    await expect(page.getByText(/No runs yet/)).toBeVisible()
+  })
+
   test('the user switcher creates and switches users', async ({ page }) => {
     await page.goto('/')
     const chip = page.getByTitle('Switch user')
