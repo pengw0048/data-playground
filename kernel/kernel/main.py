@@ -11,7 +11,7 @@ import asyncio
 import json
 import os
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +21,7 @@ from pydantic.alias_generators import to_camel
 
 from kernel import compiler
 from kernel import graph as graph_mod
+from kernel import metadb
 from kernel.deps import get_deps
 from kernel.executors.preview import preview_node
 from kernel.graph import upstream_chain
@@ -293,44 +294,120 @@ def run_cancel(run_id: str) -> RunStatus:
 
 
 # --------------------------------------------------------------------------- #
-# Canvas persistence (portable JSON document, NFR-7)
+# Users + canvases + settings (metadata DB — per-user multi-file, internal-tool-grade auth)
 # --------------------------------------------------------------------------- #
-def _canvas_dir() -> str:
-    d = os.path.join(settings.data_dir, "canvases")
-    os.makedirs(d, exist_ok=True)
-    return d
+from sqlalchemy import select as _sa_select  # noqa: E402
+
+
+def current_user(x_dp_user: str | None = Header(default=None)) -> str:
+    """Resolve the request's user id (X-DP-User header) to a valid user, defaulting to local."""
+    return metadb.resolve_user(x_dp_user)
+
+
+class UserBody(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    name: str
+    email: str | None = None
+
+
+class SettingBody(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    scope: str = "global"   # 'global' | 'user'
+    key: str
+    value: object = None
+
+
+@api.get("/users")
+def list_users() -> list[dict]:
+    with metadb.session() as s:
+        return [{"id": u.id, "name": u.name, "email": u.email} for u in s.scalars(_sa_select(metadb.User))]
+
+
+@api.post("/users")
+def create_user(body: UserBody) -> dict:
+    with metadb.session() as s:
+        u = metadb.User(name=body.name, email=body.email)
+        s.add(u)
+        s.flush()
+        return {"id": u.id, "name": u.name, "email": u.email}
+
+
+@api.get("/me")
+def whoami(uid: str = Depends(current_user)) -> dict:
+    with metadb.session() as s:
+        u = s.get(metadb.User, uid)
+        return {"id": u.id, "name": u.name, "email": u.email}
 
 
 @api.get("/canvas")
-def list_canvases() -> list[dict]:
-    out = []
-    for fn in sorted(os.listdir(_canvas_dir())):
-        if fn.endswith(".json"):
-            try:
-                with open(os.path.join(_canvas_dir(), fn)) as f:
-                    doc = json.load(f)
-                out.append({"id": doc.get("id", fn[:-5]), "name": doc.get("name", fn[:-5]),
-                            "version": doc.get("version", 1)})
-            except Exception:  # noqa: BLE001
-                continue
-    return out
+def list_canvases(uid: str = Depends(current_user)) -> list[dict]:
+    with metadb.session() as s:
+        rows = s.scalars(_sa_select(metadb.Canvas).where(metadb.Canvas.owner_id == uid)
+                         .order_by(metadb.Canvas.updated_at.desc()))
+        return [{"id": c.id, "name": c.name, "version": c.version, "updatedAt": c.updated_at.isoformat()} for c in rows]
+
+
+@api.post("/canvas")
+def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
+    with metadb.session() as s:
+        c = metadb.Canvas(owner_id=uid, name=doc.get("name") or "untitled",
+                          version=doc.get("version", 1), doc=json.dumps(doc))
+        s.add(c)
+        s.flush()
+        return {"ok": True, "id": c.id}
 
 
 @api.get("/canvas/{canvas_id}")
-def get_canvas(canvas_id: str) -> dict:
-    path = os.path.join(_canvas_dir(), f"{canvas_id}.json")
-    if not os.path.exists(path):
-        raise HTTPException(404, f"canvas '{canvas_id}' not found")
-    with open(path) as f:
-        return json.load(f)
+def get_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
+    with metadb.session() as s:
+        c = s.get(metadb.Canvas, canvas_id)
+        if not c or c.owner_id != uid:
+            raise HTTPException(404, f"canvas '{canvas_id}' not found")
+        return json.loads(c.doc)
 
 
 @api.put("/canvas/{canvas_id}")
-def put_canvas(canvas_id: str, doc: dict) -> dict:
-    path = os.path.join(_canvas_dir(), f"{canvas_id}.json")
-    with open(path, "w") as f:
-        json.dump(doc, f, indent=2)
-    return {"ok": True, "id": canvas_id}
+def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> dict:
+    with metadb.session() as s:
+        c = s.get(metadb.Canvas, canvas_id)
+        if c and c.owner_id != uid:
+            raise HTTPException(403, "not your canvas")
+        if not c:
+            c = metadb.Canvas(id=canvas_id, owner_id=uid)
+            s.add(c)
+        c.name = doc.get("name") or c.name or "untitled"
+        c.version = doc.get("version", c.version)
+        c.doc = json.dumps(doc)
+        return {"ok": True, "id": canvas_id}
+
+
+@api.delete("/canvas/{canvas_id}")
+def delete_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
+    with metadb.session() as s:
+        c = s.get(metadb.Canvas, canvas_id)
+        if c and c.owner_id == uid:
+            s.delete(c)
+        return {"ok": True}
+
+
+@api.get("/settings")
+def get_settings(uid: str = Depends(current_user)) -> dict:
+    with metadb.session() as s:
+        rows = s.scalars(_sa_select(metadb.Setting))
+        out: dict = {"global": {}, "user": {}}
+        for r in rows:
+            if r.scope == "global":
+                out["global"][r.key] = json.loads(r.value)
+            elif r.scope == "user" and r.scope_id == uid:
+                out["user"][r.key] = json.loads(r.value)
+        return out
+
+
+@api.put("/settings")
+def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
+    scope_id = uid if body.scope == "user" else ""
+    metadb.set_setting(body.key, body.value, scope=body.scope, scope_id=scope_id)
+    return {"ok": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -346,6 +423,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 app.include_router(api)
+metadb.init_db()  # create metadata tables (idempotent) + seed the default local user
 
 
 @app.websocket("/ws/run/{run_id}")

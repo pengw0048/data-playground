@@ -465,3 +465,46 @@ def test_plugin_node_lowering():
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "up", "k": 5}).json()
     assert not r["notPreviewable"]
     assert all(row["format"] in ("PNG", "JPG") for row in r["rows"])
+
+
+# --------------------------------------------------------------------------- #
+# Metadata DB: users, per-user canvases (multi-file), settings
+# --------------------------------------------------------------------------- #
+def test_me_defaults_to_local_user():
+    me = client.get("/api/me").json()
+    assert me["id"] == "local"
+
+
+def test_users_create_and_list():
+    before = {u["id"] for u in client.get("/api/users").json()}
+    created = client.post("/api/users", json={"name": "Alice", "email": "a@x.io"}).json()
+    assert created["name"] == "Alice"
+    ids = {u["id"] for u in client.get("/api/users").json()}
+    assert created["id"] in ids and "local" in ids and created["id"] not in before
+
+
+def test_canvas_crud_is_per_user():
+    doc = {"id": "cv1", "name": "My Canvas", "version": 3, "nodes": [], "edges": []}
+    r = client.put("/api/canvas/cv1", json=doc).json()
+    assert r["ok"]
+    listing = client.get("/api/canvas").json()
+    assert any(c["id"] == "cv1" and c["name"] == "My Canvas" and c["version"] == 3 for c in listing)
+    assert client.get("/api/canvas/cv1").json()["name"] == "My Canvas"
+    # a different user cannot see it
+    other = client.post("/api/users", json={"name": "Bob"}).json()["id"]
+    assert client.get("/api/canvas", headers={"X-DP-User": other}).json() == []
+    assert client.get("/api/canvas/cv1", headers={"X-DP-User": other}).status_code == 404
+    # delete
+    client.delete("/api/canvas/cv1")
+    assert client.get("/api/canvas/cv1").status_code == 404
+
+
+def test_settings_global_and_user_scope():
+    client.put("/api/settings", json={"scope": "global", "key": "agentModel", "value": "openai/gpt-4o"})
+    u = client.post("/api/users", json={"name": "Carol"}).json()["id"]
+    client.put("/api/settings", json={"scope": "user", "key": "theme", "value": "dark"}, headers={"X-DP-User": u})
+    g = client.get("/api/settings").json()
+    assert g["global"]["agentModel"] == "openai/gpt-4o"
+    # Carol sees her user setting; the default user does not
+    assert client.get("/api/settings", headers={"X-DP-User": u}).json()["user"].get("theme") == "dark"
+    assert client.get("/api/settings").json()["user"].get("theme") is None
