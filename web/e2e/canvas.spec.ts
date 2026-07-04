@@ -285,6 +285,25 @@ test.describe('Data Playground canvas', () => {
     await expect(pred).toHaveValue('amount > 0')
   })
 
+  test('the app menu goes to the files home; the rail navigates; new file returns to the canvas', async ({ page }) => {
+    await fresh(page)
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to files').click()
+    // files home
+    await expect(page.getByRole('heading', { name: 'Recents' })).toBeVisible()
+    await expect(page.getByTestId('new-file')).toBeVisible()
+    // rail → Tables (shows the seeded catalog) and Transforms
+    await page.getByTestId('rail-tables').click()
+    await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
+    await expect(page.getByText('images', { exact: true })).toBeVisible()
+    await page.getByTestId('rail-transforms').click()
+    await expect(page.getByRole('heading', { name: 'Transforms' })).toBeVisible()
+    // back to recents → New file returns to the canvas editor
+    await page.getByTestId('rail-files').click()
+    await page.getByTestId('new-file').click()
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+  })
+
   test('the user switcher creates and switches users', async ({ page }) => {
     await page.goto('/')
     const chip = page.getByTitle('Switch user')

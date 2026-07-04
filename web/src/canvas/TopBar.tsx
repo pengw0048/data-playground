@@ -1,7 +1,7 @@
 import { useRef, useState, type CSSProperties } from 'react'
 import { useStore } from '../store/graph'
 import { color, shadow } from '../theme/tokens'
-import { Icon } from '../ui/Icon'
+import { Icon, type IconName } from '../ui/Icon'
 import { Popover } from '../ui/Popover'
 import { SettingsModal } from '../panels/SettingsModal'
 
@@ -16,7 +16,7 @@ export function TopBar() {
   return (
     <>
       <div style={{ position: 'absolute', top: 16, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontSize: 13.5, color: color.text3 }}>Data Playground</span>
+        <AppMenu onSettings={() => setSettingsOpen(true)} />
         <span style={{ fontSize: 13.5, color: color.text3 }}>/</span>
         <FileMenu />
         <span data-testid="autosave" style={{ fontSize: 11, color: color.text3, marginLeft: 2 }}>· {saved ? 'saved' : 'saving…'}</span>
@@ -43,6 +43,29 @@ export function TopBar() {
         <UserMenu />
       </div>
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+    </>
+  )
+}
+
+// The app menu (Figma-style hamburger): Back to files, New file, Settings.
+function AppMenu({ onSettings }: { onSettings: () => void }) {
+  const ref = useRef<HTMLButtonElement>(null)
+  const [open, setOpen] = useState(false)
+  const setView = useStore((s) => s.setView)
+  const newFile = useStore((s) => s.newFile)
+  return (
+    <>
+      <button ref={ref} data-testid="app-menu" onClick={() => setOpen((v) => !v)} title="Menu"
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13.5, fontWeight: 700, color: color.ink, background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px 4px', borderRadius: 6 }}>
+        <span style={{ width: 20, height: 20, borderRadius: 5, background: color.ink, color: '#fff', display: 'grid', placeItems: 'center', fontSize: 12, fontWeight: 700 }}>D</span>
+        <Icon name="chevronDown" size={12} style={{ color: color.text3 }} />
+      </button>
+      <Popover anchorRef={ref} open={open} onClose={() => setOpen(false)} width={210} align="left">
+        <MenuItem icon="chevronLeft" label="Back to files" onClick={() => { setView('files'); setOpen(false) }} />
+        <MenuItem icon="plus" label="New file" onClick={() => { newFile(); setOpen(false) }} />
+        <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />
+        <MenuItem icon="settings" label="Settings" onClick={() => { onSettings(); setOpen(false) }} />
+      </Popover>
     </>
   )
 }
@@ -149,7 +172,7 @@ function UserMenu() {
   )
 }
 
-function MenuItem({ icon, label, onClick, danger }: { icon: 'plus' | 'trash'; label: string; onClick: () => void; danger?: boolean }) {
+function MenuItem({ icon, label, onClick, danger }: { icon: IconName; label: string; onClick: () => void; danger?: boolean }) {
   return (
     <button
       onClick={onClick}

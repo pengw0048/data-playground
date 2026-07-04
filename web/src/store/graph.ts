@@ -136,6 +136,10 @@ interface Store {
   loadDoc: (doc: CanvasDoc) => void
   applyAgentGraph: (graph: { nodes: AgentBackendNode[]; edges: AgentBackendEdge[] }) => void
 
+  // -- app shell (Figma-style views) --
+  view: DpView
+  setView: (v: DpView) => void
+
   // -- users + files (per-user, multi-file) --
   currentUser: DpUser | null
   users: DpUser[]
@@ -148,6 +152,9 @@ interface Store {
   switchUser: (id: string) => Promise<void>
   createUser: (name: string) => Promise<void>
 }
+
+// Top-level views (like Figma's Recents / Design surfaces). 'canvas' is the editor; settings is a modal.
+export type DpView = 'canvas' | 'files' | 'tables' | 'transforms'
 
 function emptyDoc(): CanvasDoc {
   return { id: `canvas_${Math.floor(performance.now())}`, name: 'untitled', version: 1, nodes: [], edges: [] }
@@ -171,6 +178,8 @@ function downstream(doc: CanvasDoc, id: string): Set<string> {
 
 export const useStore = create<Store>((set, get) => ({
   doc: emptyDoc(),
+  view: 'canvas',
+  setView: (view) => set({ view }),
   currentUser: null,
   users: [],
   files: [],
@@ -574,6 +583,7 @@ export const useStore = create<Store>((set, get) => ({
       get().loadDoc(doc)
       const uid = get().currentUser?.id
       if (uid) localStorage.setItem(OPEN_KEY(uid), id)
+      set({ view: 'canvas' })  // opening a file navigates to the editor
     } catch { /* not found / offline */ }
   },
 
@@ -583,6 +593,7 @@ export const useStore = create<Store>((set, get) => ({
     get().loadDoc(doc)
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
+    set({ view: 'canvas' })
   },
 
   renameFile: (name) => set((s) => ({ doc: { ...s.doc, name } })),  // autosave PUTs + refreshes the list
