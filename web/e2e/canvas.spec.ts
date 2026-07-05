@@ -200,7 +200,7 @@ test.describe('Data Playground canvas', () => {
     await page.goto('/')
     await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
     await page.getByText('Settings', { exact: true }).click()
-    await expect(page.getByRole('heading', { name: 'Settings' }).or(page.getByText('Settings', { exact: true }).first())).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     const model = page.getByPlaceholder('anthropic/claude-opus-4-8')
     await expect(model).toBeVisible()
     await model.fill('openai/gpt-4o')
@@ -212,7 +212,7 @@ test.describe('Data Playground canvas', () => {
     await page.goto('/')
     await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
     await page.getByText('Settings', { exact: true }).click()
-    await expect(page.getByRole('heading', { name: 'Settings' }).or(page.getByText('Settings', { exact: true }).first())).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     // datasets live on the Tables page now, not in Settings — add an output destination (a real, consumed setting)
     await page.getByPlaceholder('e.g. S3 exports').fill('scratch')
     await page.getByPlaceholder('/path/to/dir').fill('/tmp/dp-scratch')
@@ -421,7 +421,7 @@ test.describe('Data Playground canvas', () => {
     await page.waitForTimeout(700)  // let the autosave (~400ms) persist server-side
     await page.getByTestId('app-menu').click()
     await page.getByText('Version history').click()
-    await expect(page.getByRole('heading', { name: 'Version history' }).or(page.getByText('Version history', { exact: true }).first())).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Version history' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Restore' }).first()).toBeVisible({ timeout: 8000 }) // a snapshot to restore
   })
 
@@ -429,7 +429,7 @@ test.describe('Data Playground canvas', () => {
     await fresh(page)
     await page.getByTestId('app-menu').click()
     await page.getByText('Run history').click()
-    await expect(page.getByRole('heading', { name: 'Run history' }).or(page.getByText('Run history', { exact: true }).first())).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Run history' })).toBeVisible()
     // a brand-new file has no runs yet — the empty state renders (proves the modal + API wired)
     await expect(page.getByText(/No runs yet/)).toBeVisible()
   })

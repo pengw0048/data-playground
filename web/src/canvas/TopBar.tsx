@@ -1,8 +1,16 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useState } from 'react'
 import { useStore } from '../store/graph'
-import { color, shadow } from '../theme/tokens'
+import { color } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
-import { Popover } from '../ui/Popover'
+import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from '@/components/ui/dropdown-menu'
+import { cn } from '@/lib/utils'
 import { SettingsModal } from '../panels/SettingsModal'
 import { CanvasSettingsModal } from '../panels/CanvasSettingsModal'
 import { RunHistoryModal } from '../panels/RunHistoryModal'
@@ -11,7 +19,6 @@ import { ShareModal } from '../panels/ShareModal'
 import { crdtUndoActive } from '../collab/undo'
 
 export function TopBar() {
-  const doc = useStore((s) => s.doc)
   const kernelUp = useStore((s) => s.kernelUp)
   const kernelInfo = useStore((s) => s.kernelInfo)
   const saved = useStore((s) => s.saved)
@@ -37,10 +44,10 @@ export function TopBar() {
     <>
       <div style={{ position: 'absolute', top: 16, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
         <AppMenu onSettings={() => setSettingsOpen(true)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} />
-        <span style={{ fontSize: 13.5, color: color.text3 }}>/</span>
+        <span className="text-[13.5px] text-muted-foreground">/</span>
         <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
-        <span data-testid="autosave" title={!kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined} style={{ fontSize: 11, color: color.text3, marginLeft: 2 }}>· {saved ? (kernelUp ? 'saved' : 'saved locally') : 'saving…'}</span>
-        <span style={{ display: 'inline-flex', gap: 2, marginLeft: 6 }}>
+        <span data-testid="autosave" title={!kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined} className="ml-0.5 text-[11px] text-muted-foreground">· {saved ? (kernelUp ? 'saved' : 'saved locally') : 'saving…'}</span>
+        <span className="ml-1.5 inline-flex gap-0.5">
           <IconBtn name="undo" label="Undo" disabled={!canUndo} onClick={() => useStore.getState().undo()} />
           <IconBtn name="redo" label="Redo" disabled={!canRedo} onClick={() => useStore.getState().redo()} />
         </span>
@@ -50,21 +57,17 @@ export function TopBar() {
         <PeerAvatars />
         <div
           title={kernelInfo ? `${kernelInfo.backend} · ${kernelInfo.runners.join(', ')}` : 'kernel offline'}
-          style={{
-            display: 'flex', alignItems: 'center', gap: 7, padding: '6px 12px', background: '#fff',
-            border: `1px solid ${color.border}`, borderRadius: 20, boxShadow: shadow.card, fontSize: 12, color: color.text2,
-          }}
+          className="flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground shadow-sm"
         >
-          <span style={{ width: 8, height: 8, borderRadius: '50%', background: kernelUp ? color.latest : color.failed }} />
+          <span className="h-2 w-2 rounded-full" style={{ background: kernelUp ? color.latest : color.failed }} />
           kernel · {kernelUp ? 'warm' : 'offline'}
         </div>
-        <button onClick={rerunAll} title="Re-run the whole graph" style={{ ...pill, background: color.ink, color: '#fff', border: 'none' }}>
+        <Button onClick={rerunAll} title="Re-run the whole graph" size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
           <Icon name="refresh" size={13} /> Rerun all
-        </button>
-        <button data-testid="share-btn" onClick={() => setShareOpen(true)} title="Share this canvas"
-          style={{ ...pill, background: color.focus, color: '#fff', border: 'none' }}>
+        </Button>
+        <Button data-testid="share-btn" onClick={() => setShareOpen(true)} title="Share this canvas" size="sm" className="rounded-full">
           <Icon name="link" size={13} /> Share
-        </button>
+        </Button>
         {/* Settings lives in the app menu (top-left); identity + log out live on the files shell —
             no redundant Settings button / account avatar here. */}
       </div>
@@ -77,16 +80,19 @@ export function TopBar() {
   )
 }
 
-// The app menu (Figma-style hamburger): Back to files, New file, Settings.
 // Live presence: avatars of other people currently on this canvas (realtime collab).
 function PeerAvatars() {
   const peers = useStore((s) => s.peers)
   const list = Object.entries(peers)
   if (list.length === 0) return null
   return (
-    <div style={{ display: 'flex', alignItems: 'center' }} title={`${list.length} other${list.length > 1 ? 's' : ''} here`}>
+    <div className="flex items-center" title={`${list.length} other${list.length > 1 ? 's' : ''} here`}>
       {list.slice(0, 5).map(([id, p], i) => (
-        <span key={id} style={{ width: 26, height: 26, borderRadius: '50%', background: p.color, color: '#fff', display: 'grid', placeItems: 'center', fontSize: 11, fontWeight: 700, border: '2px solid #fff', marginLeft: i === 0 ? 0 : -8, boxShadow: shadow.card }}>
+        <span
+          key={id}
+          className="grid h-[26px] w-[26px] place-items-center rounded-full border-2 border-background text-[11px] font-bold text-white shadow-sm"
+          style={{ background: p.color, marginLeft: i === 0 ? 0 : -8 }}
+        >
           {(p.name || '?').slice(0, 1).toUpperCase()}
         </span>
       ))}
@@ -94,32 +100,34 @@ function PeerAvatars() {
   )
 }
 
+// The app menu (Figma-style hamburger): Back to files, New file, Run history, Version history, Settings.
 function AppMenu({ onSettings, onRunHistory, onVersionHistory }: { onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void }) {
-  const ref = useRef<HTMLButtonElement>(null)
-  const [open, setOpen] = useState(false)
   const setView = useStore((s) => s.setView)
   const newFile = useStore((s) => s.newFile)
   return (
-    <>
-      <button ref={ref} data-testid="app-menu" onClick={() => setOpen((v) => !v)} title="Menu"
-        style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13.5, fontWeight: 700, color: color.ink, background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px 4px', borderRadius: 6 }}>
-        <span style={{ width: 20, height: 20, borderRadius: 5, background: color.ink, color: '#fff', display: 'grid', placeItems: 'center', fontSize: 12, fontWeight: 700 }}>D</span>
-        <Icon name="chevronDown" size={12} style={{ color: color.text3 }} />
-      </button>
-      <Popover anchorRef={ref} open={open} onClose={() => setOpen(false)} width={210} align="left">
-        <MenuItem icon="chevronLeft" label="Back to files" onClick={() => { setView('files'); setOpen(false) }} />
-        <MenuItem icon="plus" label="New file" onClick={() => { newFile(); setOpen(false) }} />
-        <MenuItem icon="clock" label="Run history" onClick={() => { onRunHistory(); setOpen(false) }} />
-        <MenuItem icon="refresh" label="Version history" onClick={() => { onVersionHistory(); setOpen(false) }} />
-        <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />
-        <MenuItem icon="settings" label="Settings" onClick={() => { onSettings(); setOpen(false) }} />
-      </Popover>
-    </>
+    <DropdownMenu modal={false}>
+      <DropdownMenuTrigger asChild>
+        <button data-testid="app-menu" title="Menu"
+          className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border-0 bg-transparent px-1 py-0.5 text-[13.5px] font-bold text-foreground">
+          <span className="grid h-5 w-5 place-items-center rounded-[5px] bg-foreground text-xs font-bold text-background">D</span>
+          <span className="text-muted-foreground"><Icon name="chevronDown" size={12} /></span>
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="w-[210px]">
+        <DropdownMenuItem onSelect={() => setView('files')}><Icon name="chevronLeft" size={14} /> Back to files</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
+        {/* defer modal opens to the next tick — otherwise the menu-item pointerup that's still
+            propagating is caught by the just-mounted dialog's dismiss layer and closes it instantly */}
+        <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> Run history</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => setTimeout(onSettings)}><Icon name="settings" size={14} /> Settings</DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 
 function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
-  const ref = useRef<HTMLButtonElement>(null)
   const [open, setOpen] = useState(false)
   const doc = useStore((s) => s.doc)
   const files = useStore((s) => s.files)
@@ -129,75 +137,55 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
   const deleteFile = useStore((s) => s.deleteFile)
 
   return (
-    <>
-      <button
-        ref={ref}
-        data-testid="file-menu"
-        onClick={() => setOpen((v) => !v)}
-        style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 13.5, fontWeight: 600, color: color.ink, background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px 4px', borderRadius: 6 }}
-      >
-        {doc.name ?? 'untitled'} <Icon name="chevronDown" size={12} style={{ color: color.text3 }} />
-      </button>
-      <Popover anchorRef={ref} open={open} onClose={() => setOpen(false)} width={240} align="left">
-        <div style={{ padding: '6px 8px' }}>
+    <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
+      <DropdownMenuTrigger asChild>
+        <button
+          data-testid="file-menu"
+          className="inline-flex cursor-pointer items-center gap-1 rounded-md border-0 bg-transparent px-1 py-0.5 text-[13.5px] font-semibold text-foreground"
+        >
+          {doc.name ?? 'untitled'} <span className="text-muted-foreground"><Icon name="chevronDown" size={12} /></span>
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="w-[240px]">
+        {/* stop keydown here so the menu's typeahead / arrow-nav doesn't steal focus from the rename box */}
+        <div className="px-2 py-1.5" onKeyDown={(e) => e.stopPropagation()}>
           <input
             value={doc.name ?? ''}
             onChange={(e) => renameFile(e.target.value)}
             placeholder="untitled"
-            style={{ width: '100%', fontSize: 12.5, fontWeight: 600, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', outline: 'none' }}
+            className="w-full rounded-md border border-border bg-background px-2 py-1 text-[12.5px] font-semibold text-foreground outline-none"
           />
         </div>
-        <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, padding: '4px 10px' }}>Files</div>
-        <div style={{ maxHeight: 220, overflowY: 'auto' }}>
+        <div className="px-2.5 py-1 text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">Files</div>
+        <div className="max-h-[220px] overflow-y-auto">
           {files.map((f) => (
             <button
               key={f.id}
               onClick={() => { openFile(f.id); setOpen(false) }}
-              style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', padding: '7px 10px', border: 'none', background: f.id === doc.id ? '#eef0f3' : 'transparent', borderRadius: 7, fontSize: 12.5, color: color.ink }}
-              onMouseEnter={(e) => { if (f.id !== doc.id) e.currentTarget.style.background = '#f2f3f5' }}
-              onMouseLeave={(e) => { if (f.id !== doc.id) e.currentTarget.style.background = 'transparent' }}
+              className={cn(
+                'flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-foreground hover:bg-accent',
+                f.id === doc.id && 'bg-accent',
+              )}
             >
-              <Icon name="grid" size={12} style={{ color: color.text3 }} />
-              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name || 'untitled'}</span>
+              <span className="text-muted-foreground"><Icon name="grid" size={12} /></span>
+              <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{f.name || 'untitled'}</span>
             </button>
           ))}
-          {files.length === 0 && <div style={{ padding: 10, fontSize: 11.5, color: color.text3 }}>No files yet.</div>}
+          {files.length === 0 && <div className="p-2.5 text-[11.5px] text-muted-foreground">No files yet.</div>}
         </div>
-        <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />
-        <MenuItem icon="settings" label="Canvas settings…" onClick={() => { onCanvasSettings(); setOpen(false) }} />
-        <MenuItem icon="plus" label="New file" onClick={() => { newFile(); setOpen(false) }} />
-        <MenuItem icon="trash" label="Delete this file" danger onClick={() => { deleteFile(doc.id); setOpen(false) }} />
-      </Popover>
-    </>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => setTimeout(onCanvasSettings)}><Icon name="settings" size={14} /> Canvas settings…</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> Delete this file</DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 
-// A pure identity indicator — who you are, nothing to switch. (Real users don't switch identity;
-// in an auth deployment it comes from login. Logout lives on the files home.)
 function IconBtn({ name, label, onClick, disabled }: { name: IconName; label: string; onClick: () => void; disabled?: boolean }) {
   return (
-    <button aria-label={label} title={label} onClick={onClick} disabled={disabled}
-      style={{ width: 26, height: 26, display: 'grid', placeItems: 'center', border: 'none', borderRadius: 6, background: 'transparent', color: disabled ? '#c8ccd2' : color.text3, cursor: disabled ? 'default' : 'pointer' }}>
+    <Button variant="ghost" size="icon" aria-label={label} title={label} onClick={onClick} disabled={disabled} className="h-7 w-7 text-muted-foreground">
       <Icon name={name} size={14} />
-    </button>
+    </Button>
   )
-}
-
-function MenuItem({ icon, label, onClick, danger }: { icon: IconName; label: string; onClick: () => void; danger?: boolean }) {
-  return (
-    <button
-      onClick={onClick}
-      style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', padding: '7px 10px', border: 'none', background: 'transparent', color: danger ? color.failed : color.text2, fontSize: 12, textAlign: 'left', borderRadius: 6 }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = '#f2f3f5')}
-      onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-    >
-      <Icon name={icon} size={13} /> {label}
-    </button>
-  )
-}
-
-const pill: CSSProperties = {
-  display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 14px', background: '#fff',
-  border: `1px solid ${color.border}`, borderRadius: 20, boxShadow: shadow.card, fontSize: 12.5, fontWeight: 600,
-  color: color.text2, cursor: 'pointer',
 }

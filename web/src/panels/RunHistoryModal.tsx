@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
-import { createPortal } from 'react-dom'
 import { api, type RunRecordDto } from '../api/client'
 import { useStore } from '../store/graph'
-import { color, radius, shadow, status as statusTok } from '../theme/tokens'
+import { status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
+import { Badge } from '@/components/ui/badge'
 
 // Persisted run history for the current canvas (survives restarts) — /canvas/{id}/runs.
 export function RunHistoryModal({ onClose }: { onClose: () => void }) {
@@ -14,38 +15,37 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
     api.listRuns(canvasId).then(setRuns).catch((e) => setErr((e as Error).message))
   }, [canvasId])
 
-  return createPortal(
-    <div className="dp-modal-overlay" onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(16,20,30,0.4)', display: 'grid', placeItems: 'center' }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: 560, maxHeight: '76vh', display: 'flex', flexDirection: 'column', background: '#fff', borderRadius: radius.panel, boxShadow: shadow.panel, overflow: 'hidden' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '13px 16px', borderBottom: `1px solid ${color.hairline}` }}>
-          <Icon name="clock" size={15} style={{ color: color.text3 }} />
-          <span style={{ fontSize: 14, fontWeight: 600, color: color.ink }}>Run history</span>
-          <span style={{ flex: 1 }} />
-          <button onClick={onClose} aria-label="Close" style={{ border: 'none', background: 'transparent', color: color.text2, cursor: 'pointer' }}><Icon name="close" size={16} /></button>
+  return (
+    <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
+      <DialogContent className="dp-modal-overlay flex max-h-[76vh] w-[560px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 [&>button]:hidden">
+        <div className="flex items-center gap-2 border-b border-border px-4 py-3">
+          <span className="text-muted-foreground"><Icon name="clock" size={15} /></span>
+          <DialogTitle className="text-sm font-semibold text-foreground">Run history</DialogTitle>
+          <span className="flex-1" />
+          <button onClick={onClose} aria-label="Close" className="cursor-pointer border-0 bg-transparent p-0 text-muted-foreground hover:text-foreground"><Icon name="close" size={16} /></button>
         </div>
-        <div style={{ overflowY: 'auto', padding: 8 }}>
-          {err && <div style={{ padding: 16, color: color.failed, fontSize: 12.5 }}>Couldn’t load run history: {err}</div>}
-          {!err && runs === null && <div style={{ padding: 16, color: color.text3, fontSize: 12.5 }}>Loading…</div>}
-          {!err && runs?.length === 0 && <div style={{ padding: 16, color: color.text3, fontSize: 12.5 }}>No runs yet — run a pipeline and it’ll show here.</div>}
+        <div className="overflow-y-auto p-2">
+          {err && <div className="p-4 text-[12.5px] text-destructive">Couldn’t load run history: {err}</div>}
+          {!err && runs === null && <div className="p-4 text-[12.5px] text-muted-foreground">Loading…</div>}
+          {!err && runs?.length === 0 && <div className="p-4 text-[12.5px] text-muted-foreground">No runs yet — run a pipeline and it’ll show here.</div>}
           {runs?.map((r) => {
             const st = statusTok[r.status as keyof typeof statusTok] ?? statusTok.draft
             return (
-              <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 10px', borderBottom: `1px solid ${color.hairline}`, fontSize: 12.5 }}>
-                <span style={{ color: st.color, width: 12, textAlign: 'center' }}>{st.glyph}</span>
-                <span style={{ width: 70, color: color.text2 }}>{r.status}</span>
-                <span style={{ flex: 1, minWidth: 0, color: color.ink, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              <div key={r.id} className="flex items-center gap-2.5 border-b border-border px-2.5 py-2 text-[12.5px]">
+                <span className="w-3 text-center" style={{ color: st.color }}>{st.glyph}</span>
+                <Badge variant="secondary" className="w-[70px] justify-center">{r.status}</Badge>
+                <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-foreground">
                   {r.outputTable ? `→ ${r.outputTable}` : r.targetNodeId ?? '—'}
-                  {r.error && <span style={{ color: color.failed }}> · {r.error}</span>}
+                  {r.error && <span className="text-destructive"> · {r.error}</span>}
                 </span>
-                {r.rows != null && <span style={{ color: color.text3 }}>{r.rows.toLocaleString()} rows</span>}
-                {r.ms != null && <span style={{ color: color.text3, width: 56, textAlign: 'right' }}>{r.ms} ms</span>}
-                <span style={{ color: color.text3, width: 128, textAlign: 'right', fontSize: 11 }}>{r.createdAt ? new Date(r.createdAt).toLocaleString() : ''}</span>
+                {r.rows != null && <span className="text-muted-foreground">{r.rows.toLocaleString()} rows</span>}
+                {r.ms != null && <span className="w-14 text-right text-muted-foreground">{r.ms} ms</span>}
+                <span className="w-32 text-right text-[11px] text-muted-foreground">{r.createdAt ? new Date(r.createdAt).toLocaleString() : ''}</span>
               </div>
             )
           })}
         </div>
-      </div>
-    </div>,
-    document.body,
+      </DialogContent>
+    </Dialog>
   )
 }

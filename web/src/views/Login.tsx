@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
 import { api, type DpUser } from '../api/client'
-import { color, radius, shadow } from '../theme/tokens'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 
 // Shown only when auth is enabled (DP_AUTH_SECRET) and there's no valid session. Pick who you are +
 // your own password → a signed session cookie (verified against your per-user credential).
@@ -20,29 +23,34 @@ export function Login({ onLoggedIn }: { onLoggedIn: (userId: string) => void }) 
   }
 
   return (
-    <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: color.canvas }}>
-      <div style={{ width: 320, background: '#fff', border: `1px solid ${color.border}`, borderRadius: radius.panel, boxShadow: shadow.panel, padding: 22 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
-          <span style={{ width: 22, height: 22, borderRadius: 6, background: color.ink, color: '#fff', display: 'grid', placeItems: 'center', fontSize: 13, fontWeight: 700 }}>D</span>
-          <span style={{ fontSize: 14, fontWeight: 700, color: color.ink }}>Data Playground</span>
+    <div className="absolute inset-0 grid place-items-center bg-background">
+      <div className="w-80 rounded-lg border border-border bg-card p-6 shadow-lg">
+        <div className="mb-4 flex items-center gap-2">
+          <span className="grid h-[22px] w-[22px] place-items-center rounded-md bg-primary text-[13px] font-bold text-primary-foreground">D</span>
+          <span className="text-sm font-bold text-foreground">Data Playground</span>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          <label style={{ fontSize: 11, color: color.text2 }}>User
-            <select value={userId} onChange={(e) => setUserId(e.target.value)}
-              style={{ width: '100%', marginTop: 4, fontSize: 13, border: `1px solid ${color.border}`, borderRadius: 8, padding: '8px 10px', background: '#fff' }}>
-              {users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-            </select>
-          </label>
-          <label style={{ fontSize: 11, color: color.text2 }}>Password
-            <input type="password" value={password} autoFocus onChange={(e) => setPassword(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') submit() }}
-              style={{ width: '100%', marginTop: 4, fontSize: 13, border: `1px solid ${color.border}`, borderRadius: 8, padding: '8px 10px', outline: 'none' }} />
-          </label>
-          {err && <div style={{ fontSize: 12, color: color.failed }}>{err}</div>}
-          <button onClick={submit} disabled={busy}
-            style={{ marginTop: 4, border: 'none', borderRadius: 8, background: color.ink, color: '#fff', fontSize: 13, fontWeight: 600, padding: '9px 0', cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.6 : 1 }}>
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="login-user" className="text-xs font-normal text-muted-foreground">User</Label>
+            <Select value={userId} onValueChange={setUserId}>
+              <SelectTrigger id="login-user">
+                <SelectValue placeholder="User" />
+              </SelectTrigger>
+              <SelectContent>
+                {users.map((u) => <SelectItem key={u.id} value={u.id}>{u.name}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="login-password" className="text-xs font-normal text-muted-foreground">Password</Label>
+            <Input id="login-password" type="password" value={password} autoFocus
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') submit() }} />
+          </div>
+          {err && <div className="text-xs text-destructive">{err}</div>}
+          <Button onClick={submit} disabled={busy} className="mt-1 w-full">
             {busy ? 'Signing in…' : 'Sign in'}
-          </button>
+          </Button>
         </div>
       </div>
     </div>

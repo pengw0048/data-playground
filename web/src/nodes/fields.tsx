@@ -7,6 +7,9 @@ import { useStore } from '../store/graph'
 import { inputColumns } from './schema'
 import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
+import { Input } from '@/components/ui/input'
+import { miniInputClass, miniSelectClass } from '../ui/controls'
+import { cn } from '@/lib/utils'
 import type { ColumnSchema } from '../types/graph'
 
 /** Columns available to a node's expression fields = its upstream output columns (typed ports).
@@ -22,11 +25,6 @@ export function useInputColumns(nodeId: string): ColumnSchema[] {
   return inputColumns({ nodes, edges } as never, schemas, previews, catalog, nodeId)
 }
 
-const inputStyle = {
-  fontSize: 11, color: color.ink, background: '#fff', border: `1px solid ${color.border}`,
-  borderRadius: 6, padding: '5px 7px', width: '100%', outline: 'none',
-} as const
-
 let _dl = 0
 /** A text input backed by a <datalist> of column names — autocomplete that still accepts free
  * expressions. When the upstream port is untyped (no columns known yet) it's just a text box. */
@@ -36,14 +34,13 @@ export function ColumnCombo({ value, columns, placeholder, onChange, mono = true
   const [id] = useState(() => `dp-cols-${++_dl}`)
   return (
     <>
-      <input
+      <Input
         list={columns.length ? id : undefined}
         value={value}
         placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
         onClick={(e) => e.stopPropagation()}
-        className={mono ? 'dp-mono' : undefined}
-        style={inputStyle}
+        className={cn(miniInputClass, 'text-[11px] md:text-[11px]', mono && 'dp-mono')}
       />
       {columns.length > 0 && (
         <datalist id={id}>
@@ -186,9 +183,8 @@ export function FilterBuilder({ nodeId }: { nodeId: string }) {
             <ColumnCombo value={c.col} columns={columns} placeholder="column"
               onChange={(v) => commit(conds.map((x, j) => (j === i ? { ...x, col: v } : x)))} />
           </div>
-          <select className="nodrag" value={c.op} onClick={(e) => e.stopPropagation()}
-            onChange={(e) => commit(conds.map((x, j) => (j === i ? { ...x, op: e.target.value as Op } : x)))}
-            style={{ ...inputStyle, width: 'auto', cursor: 'pointer', flex: '0 0 auto' }}>
+          <select className={cn('nodrag', miniSelectClass, 'w-auto flex-none')} value={c.op} onClick={(e) => e.stopPropagation()}
+            onChange={(e) => commit(conds.map((x, j) => (j === i ? { ...x, op: e.target.value as Op } : x)))}>
             {OPS.map((o) => <option key={o} value={o}>{o}</option>)}
           </select>
           {c.op !== 'IS NULL' && c.op !== 'IS NOT NULL' && (

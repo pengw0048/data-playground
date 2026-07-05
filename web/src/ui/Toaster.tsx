@@ -1,5 +1,6 @@
 import { useStore } from '../store/graph'
-import { color, radius, shadow } from '../theme/tokens'
+import { cn } from '@/lib/utils'
+import { Button } from '@/components/ui/button'
 import { Icon } from '../ui/Icon'
 
 // Bottom-right toasts for errors/info so failures aren't silent, plus a slim top banner when the
@@ -11,31 +12,41 @@ export function Toaster() {
   const accessDenied = useStore((s) => s.accessDenied)
   const bootstrap = useStore((s) => s.bootstrap)
 
-  const tone = { error: { bg: '#fdecec', fg: '#b3261e', icon: 'close' as const }, success: { bg: '#e6f6ec', fg: '#1f7a45', icon: 'check' as const }, info: { bg: '#eef1f6', fg: color.ink, icon: 'note' as const } }
+  // Token-based tones: error reads as destructive; success/info share the neutral popover surface
+  // (the check/note icon distinguishes them). No hardcoded hex — see index.css design tokens.
+  const tone = {
+    error: { cls: 'border-destructive/40 bg-destructive/10 text-destructive', icon: 'close' as const },
+    success: { cls: 'border-border bg-popover text-popover-foreground', icon: 'check' as const },
+    info: { cls: 'border-border bg-popover text-popover-foreground', icon: 'note' as const },
+  }
 
   return (
     <>
       {!kernelUp && (
-        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 70, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12, padding: '7px 12px', background: '#3a3f4b', color: '#fff', fontSize: 12.5 }}>
-          <span style={{ width: 8, height: 8, borderRadius: '50%', background: color.failed }} />
+        <div className="fixed left-0 right-0 top-0 z-[70] flex items-center justify-center gap-3 bg-foreground px-3 py-[7px] text-xs text-background">
+          <span className="h-2 w-2 rounded-full bg-destructive" />
           Kernel offline — your work is cached locally.
-          <button onClick={() => bootstrap()} style={{ border: '1px solid rgba(255,255,255,0.3)', background: 'transparent', color: '#fff', borderRadius: 6, padding: '2px 10px', fontSize: 12, cursor: 'pointer' }}>Retry</button>
+          <Button variant="outline" size="sm" className="h-6 px-2.5 text-foreground" onClick={() => bootstrap()}>Retry</Button>
         </div>
       )}
       {kernelUp && accessDenied && (
-        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 70, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, padding: '7px 12px', background: '#8a6d0b', color: '#fff', fontSize: 12.5 }}>
+        <div className="fixed left-0 right-0 top-0 z-[70] flex items-center justify-center gap-2.5 border-b border-destructive/20 bg-destructive/10 px-3 py-[7px] text-xs text-destructive">
           <Icon name="mute" size={13} />
           View-only access — your edits are kept in this browser but aren’t being saved to the server.
         </div>
       )}
-      <div style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 70, display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 380 }}>
+      <div className="fixed bottom-4 right-4 z-[70] flex max-w-[380px] flex-col gap-2">
         {toasts.map((t) => {
           const s = tone[t.kind]
           return (
-            <div key={t.id} data-testid="toast" style={{ display: 'flex', alignItems: 'flex-start', gap: 9, background: s.bg, color: s.fg, border: `1px solid ${color.border}`, borderRadius: radius.button, boxShadow: shadow.panel, padding: '9px 11px', fontSize: 12.5, lineHeight: 1.4 }}>
-              <Icon name={s.icon} size={13} style={{ marginTop: 1, flex: '0 0 auto' }} />
-              <span style={{ flex: 1, wordBreak: 'break-word' }}>{t.msg}</span>
-              <button onClick={() => dismiss(t.id)} aria-label="Dismiss" style={{ border: 'none', background: 'transparent', color: s.fg, opacity: 0.7, cursor: 'pointer', flex: '0 0 auto' }}><Icon name="close" size={12} /></button>
+            <div key={t.id} data-testid="toast"
+              className={cn('flex items-start gap-2.5 rounded-md border px-3 py-2.5 text-xs leading-snug shadow-lg', s.cls)}>
+              <Icon name={s.icon} size={13} style={{ marginTop: 1, flexShrink: 0 }} />
+              <span className="flex-1 break-words">{t.msg}</span>
+              <button onClick={() => dismiss(t.id)} aria-label="Dismiss"
+                className="shrink-0 border-0 bg-transparent text-inherit opacity-70 transition-opacity hover:opacity-100">
+                <Icon name="close" size={12} />
+              </button>
             </div>
           )
         })}

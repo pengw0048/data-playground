@@ -4,6 +4,11 @@ import { api } from '../api/client'
 import { color, radius, shadow } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { SettingsModal } from '../panels/SettingsModal'
+import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { cn } from '@/lib/utils'
 
 // The non-canvas app shell (Figma-style): a left rail with destinations + a content area. Renders
 // the Files home, the Tables catalog, or the Transforms catalog based on the store's `view`.
@@ -32,45 +37,44 @@ function Rail({ onSettings }: { onSettings: () => void }) {
   const logout = async () => { await api.logout().catch(() => {}); location.reload() }
 
   const item = (v: DpView, icon: IconName, label: string) => (
-    <button onClick={() => setView(v)} data-testid={`rail-${v}`}
-      style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', textAlign: 'left', padding: '8px 10px', border: 'none', borderRadius: 8, cursor: 'pointer', fontSize: 13, fontWeight: 500,
-        background: view === v ? '#e9ecf2' : 'transparent', color: view === v ? color.ink : color.text2 }}>
+    <Button variant="ghost" onClick={() => setView(v)} data-testid={`rail-${v}`}
+      className={cn('h-auto w-full justify-start gap-2.5 px-2.5 py-2 text-[13px] font-medium text-muted-foreground',
+        view === v && 'bg-accent text-accent-foreground')}>
       <Icon name={icon} size={15} /> {label}
-    </button>
+    </Button>
   )
 
   return (
-    <aside style={{ width: 232, flex: '0 0 232px', height: '100%', background: '#fff', borderRight: `1px solid ${color.border}`, display: 'flex', flexDirection: 'column', padding: 12 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px 12px' }}>
-        <span style={{ width: 22, height: 22, borderRadius: 6, background: color.ink, color: '#fff', display: 'grid', placeItems: 'center', fontSize: 13, fontWeight: 700 }}>D</span>
-        <span style={{ fontSize: 13.5, fontWeight: 700, color: color.ink }}>Data Playground</span>
+    <aside className="flex h-full w-[232px] flex-[0_0_232px] flex-col border-r border-border bg-card p-3">
+      <div className="flex items-center gap-2 px-2 pb-3 pt-1">
+        <span className="grid h-[22px] w-[22px] place-items-center rounded-md bg-foreground text-[13px] font-bold text-background">D</span>
+        <span className="text-[13.5px] font-bold text-foreground">Data Playground</span>
       </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <div className="flex flex-col gap-0.5">
         {item('files', 'clock', 'Recents')}
         {item('tables', 'db', 'Tables')}
         {item('transforms', 'fx', 'Transforms')}
-        <button onClick={onSettings} style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', textAlign: 'left', padding: '8px 10px', border: 'none', borderRadius: 8, cursor: 'pointer', fontSize: 13, fontWeight: 500, background: 'transparent', color: color.text2 }}>
+        <Button variant="ghost" onClick={onSettings}
+          className="h-auto w-full justify-start gap-2.5 px-2.5 py-2 text-[13px] font-medium text-muted-foreground">
           <Icon name="settings" size={15} /> Settings
-        </button>
+        </Button>
       </div>
-      <div style={{ flex: 1 }} />
+      <div className="flex-1" />
       {/* who you are — identity only. Switching users is gone; logout shows when a login is in force. */}
-      <div style={{ borderTop: `1px solid ${color.hairline}`, paddingTop: 10, display: 'flex', alignItems: 'center', gap: 8, padding: '10px 8px 4px' }}>
-        <span style={{ width: 24, height: 24, borderRadius: '50%', background: '#e7e0fb', color: '#6b4bd6', display: 'grid', placeItems: 'center', fontSize: 11, fontWeight: 700 }}>{(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}</span>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 12.5, fontWeight: 600, color: color.ink, overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentUser?.name ?? 'local'}</div>
-          <div style={{ fontSize: 10, color: color.text3 }}>signed in</div>
+      <div className="flex items-center gap-2 border-t border-border px-2 pb-1 pt-2.5">
+        <span className="grid h-6 w-6 place-items-center rounded-full bg-primary/10 text-[11px] font-bold text-primary">{(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}</span>
+        <div className="min-w-0 flex-1">
+          <div className="overflow-hidden text-ellipsis whitespace-nowrap text-[12.5px] font-semibold text-foreground">{currentUser?.name ?? 'local'}</div>
+          <div className="text-[10px] text-muted-foreground">signed in</div>
         </div>
         {authEnabled && (
           <>
-            <button onClick={() => setPwOpen(true)} title="Change password" data-testid="change-password"
-              style={{ border: `1px solid ${color.border}`, background: '#fff', color: color.text2, fontSize: 11.5, fontWeight: 600, padding: '5px 10px', borderRadius: 7, cursor: 'pointer' }}>
+            <Button variant="outline" size="sm" onClick={() => setPwOpen(true)} title="Change password" data-testid="change-password" className="px-2.5 text-[11.5px]">
               Password
-            </button>
-            <button onClick={logout} title="Log out" data-testid="logout"
-              style={{ border: `1px solid ${color.border}`, background: '#fff', color: color.text2, fontSize: 11.5, fontWeight: 600, padding: '5px 10px', borderRadius: 7, cursor: 'pointer' }}>
+            </Button>
+            <Button variant="outline" size="sm" onClick={logout} title="Log out" data-testid="logout" className="px-2.5 text-[11.5px]">
               Log out
-            </button>
+            </Button>
           </>
         )}
       </div>
@@ -92,27 +96,32 @@ function ChangePasswordModal({ onClose }: { onClose: () => void }) {
     catch (e) { setErr((e as Error).message || 'Could not change password') }
     finally { setBusy(false) }
   }
-  const field = { width: '100%', marginTop: 4, fontSize: 13, border: `1px solid ${color.border}`, borderRadius: 8, padding: '8px 10px', outline: 'none' } as const
   return (
-    <div className="dp-modal-overlay" onMouseDown={onClose} style={{ position: 'fixed', inset: 0, zIndex: 2000, background: 'rgba(16,20,30,0.4)', display: 'grid', placeItems: 'center' }}>
-      <div onMouseDown={(e) => e.stopPropagation()} style={{ width: 320, background: '#fff', border: `1px solid ${color.border}`, borderRadius: radius.panel, boxShadow: shadow.panel, padding: 20 }}>
-        <div style={{ fontSize: 14, fontWeight: 700, color: color.ink, marginBottom: 12 }}>Change password</div>
-        <label style={{ fontSize: 11, color: color.text2 }}>Current password
-          <input type="password" value={oldPw} autoFocus onChange={(e) => setOldPw(e.target.value)} style={field} />
-        </label>
-        <label style={{ fontSize: 11, color: color.text2, display: 'block', marginTop: 10 }}>New password
-          <input type="password" value={newPw} onChange={(e) => setNewPw(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') submit() }} style={field} />
-        </label>
-        {err && <div style={{ fontSize: 12, color: color.failed, marginTop: 8 }}>{err}</div>}
-        <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
-          <button onClick={submit} disabled={busy} style={{ flex: 1, border: 'none', borderRadius: 8, background: color.ink, color: '#fff', fontSize: 13, fontWeight: 600, padding: '9px 0', cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.6 : 1 }}>
-            {busy ? 'Saving…' : 'Change password'}
-          </button>
-          <button onClick={onClose} style={{ border: `1px solid ${color.border}`, borderRadius: 8, background: '#fff', color: color.text2, fontSize: 13, fontWeight: 600, padding: '9px 14px', cursor: 'pointer' }}>Cancel</button>
+    <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
+      <DialogContent aria-describedby={undefined} className="dp-modal-overlay max-w-[320px]">
+        <DialogHeader>
+          <DialogTitle>Change password</DialogTitle>
+        </DialogHeader>
+        <div className="grid gap-2.5">
+          <div className="grid gap-1">
+            <Label htmlFor="dp-current-pw" className="text-[11px] font-normal text-muted-foreground">Current password</Label>
+            <Input id="dp-current-pw" type="password" value={oldPw} autoFocus onChange={(e) => setOldPw(e.target.value)} />
+          </div>
+          <div className="grid gap-1">
+            <Label htmlFor="dp-new-pw" className="text-[11px] font-normal text-muted-foreground">New password</Label>
+            <Input id="dp-new-pw" type="password" value={newPw} onChange={(e) => setNewPw(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') submit() }} />
+          </div>
+          {err && <div className="text-xs text-destructive">{err}</div>}
         </div>
-      </div>
-    </div>
+        <div className="flex gap-2">
+          <Button onClick={submit} disabled={busy} className="flex-1">
+            {busy ? 'Saving…' : 'Change password'}
+          </Button>
+          <Button variant="outline" onClick={onClose}>Cancel</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   )
 }
 

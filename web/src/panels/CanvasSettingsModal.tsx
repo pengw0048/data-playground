@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
-import { createPortal } from 'react-dom'
 import { api } from '../api/client'
 import { useStore } from '../store/graph'
-import { color, radius, shadow } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
+import { cn } from '@/lib/utils'
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 
 // Settings scoped to THIS canvas (not the app/workspace ones). Kept deliberately separate from the
 // global SettingsModal — this is about the open file: its name and who can see it.
@@ -16,51 +18,44 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     api.getShares(doc.id).then((s) => setVisibility(s.visibility === 'workspace' ? 'workspace' : 'private')).catch(() => {})
   }, [doc.id])
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
 
   const setVis = (v: 'private' | 'workspace') => {
     setVisibility(v)
     api.addShare(doc.id, { visibility: v }).catch(() => {})
   }
 
-  return createPortal(
-    <div className="dp-modal-overlay" onMouseDown={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(20,22,28,.28)', zIndex: 2000, display: 'grid', placeItems: 'center' }}>
-      <div onMouseDown={(e) => e.stopPropagation()}
-        style={{ width: 420, maxWidth: '92vw', background: '#fff', border: `1px solid ${color.border}`, borderRadius: radius.panel, boxShadow: shadow.panel }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 16px', borderBottom: `1px solid ${color.hairline}` }}>
-          <Icon name="grid" size={14} style={{ color: color.text2 }} />
-          <span style={{ fontSize: 14, fontWeight: 600 }}>Canvas settings</span>
-          <span style={{ flex: 1 }} />
-          <button aria-label="Close" onClick={onClose} style={{ width: 26, height: 24, border: 'none', background: 'transparent', color: color.text3, display: 'grid', placeItems: 'center' }}><Icon name="close" size={13} /></button>
+  return (
+    <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
+      <DialogContent className="dp-modal-overlay gap-0 overflow-hidden p-0 w-[420px] max-w-[92vw] rounded-xl">
+        <div className="flex items-center gap-2 border-b border-border py-3 pl-4 pr-12">
+          <span className="flex items-center text-muted-foreground"><Icon name="grid" size={14} /></span>
+          <DialogTitle className="text-sm font-semibold">Canvas settings</DialogTitle>
         </div>
-        <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <label style={{ display: 'block' }}>
-            <div style={{ fontSize: 11.5, color: color.text2, marginBottom: 4 }}>Name</div>
-            <input value={name} onChange={(e) => { setName(e.target.value); renameFile(e.target.value) }}
-              placeholder="untitled" style={{ width: '100%', fontSize: 12.5, border: `1px solid ${color.border}`, borderRadius: 7, padding: '7px 9px', outline: 'none' }} />
-          </label>
+        <DialogDescription className="sr-only">Settings for the current canvas: its name and visibility.</DialogDescription>
+
+        <div className="flex flex-col gap-4 p-4">
           <div>
-            <div style={{ fontSize: 11.5, color: color.text2, marginBottom: 6 }}>Visibility</div>
-            <div style={{ display: 'flex', gap: 8 }}>
+            <Label className="mb-1 block text-[11.5px] font-normal text-muted-foreground">Name</Label>
+            <Input value={name} onChange={(e) => { setName(e.target.value); renameFile(e.target.value) }} placeholder="untitled" />
+          </div>
+          <div>
+            <div className="mb-1.5 text-[11.5px] text-muted-foreground">Visibility</div>
+            <div className="flex gap-2">
               {(['private', 'workspace'] as const).map((v) => (
                 <button key={v} onClick={() => setVis(v)}
-                  style={{ flex: 1, padding: '9px 10px', border: `1px solid ${visibility === v ? color.focus : color.border}`, borderRadius: 8, background: visibility === v ? '#eef2fe' : '#fff', color: color.ink, fontSize: 12, fontWeight: 600, cursor: 'pointer', textAlign: 'left' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  className={cn('flex-1 rounded-lg border px-2.5 py-2.5 text-left transition-colors',
+                    visibility === v ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent/50')}>
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
                     <Icon name={v === 'private' ? 'grid' : 'link'} size={12} /> {v === 'private' ? 'Private' : 'Workspace'}
                   </div>
-                  <div style={{ fontSize: 10.5, fontWeight: 400, color: color.text3, marginTop: 3 }}>{v === 'private' ? 'Only you and people you invite' : 'Everyone in the workspace can edit'}</div>
+                  <div className="mt-0.5 text-[10.5px] font-normal text-muted-foreground">{v === 'private' ? 'Only you and people you invite' : 'Everyone in the workspace can edit'}</div>
                 </button>
               ))}
             </div>
-            <div style={{ fontSize: 10.5, color: color.text3, marginTop: 8 }}>Invite specific people from the <b>Share</b> button.</div>
+            <div className="mt-2 text-[10.5px] text-muted-foreground">Invite specific people from the <b>Share</b> button.</div>
           </div>
         </div>
-      </div>
-    </div>,
-    document.body,
+      </DialogContent>
+    </Dialog>
   )
 }

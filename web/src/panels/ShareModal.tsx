@@ -1,10 +1,18 @@
 import { useEffect, useState } from 'react'
-import { createPortal } from 'react-dom'
 import { api, type ShareInfo } from '../api/client'
 import { useStore } from '../store/graph'
 import { canvasLink } from '../router'
-import { color, radius, shadow } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { cn } from '@/lib/utils'
+
+const sectionLabel = 'text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground mb-1.5'
+// The role/collaborator pickers stay native <select> on purpose: the E2E suite drives them with
+// selectOption() and asserts on <option value="viewer">, which Radix's Select does not produce.
+const nativeSelect =
+  'h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-ring'
 
 // Share a canvas: workspace visibility + explicit collaborators (owner-only). Mirrors Figma's Share.
 export function ShareModal({ onClose }: { onClose: () => void }) {
@@ -32,76 +40,72 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
   const sharedIds = new Set([currentUser?.id, ...shares.map((s) => s.userId)])
   const addable = users.filter((u) => !sharedIds.has(u.id))
 
-  return createPortal(
-    <div className="dp-modal-overlay" onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(16,20,30,0.4)', display: 'grid', placeItems: 'center' }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: 460, background: '#fff', borderRadius: radius.panel, boxShadow: shadow.panel, overflow: 'hidden' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '13px 16px', borderBottom: `1px solid ${color.hairline}` }}>
-          <Icon name="link" size={15} style={{ color: color.text3 }} />
-          <span style={{ fontSize: 14, fontWeight: 600, color: color.ink }}>Share this canvas</span>
-          <span style={{ flex: 1 }} />
-          <button onClick={onClose} aria-label="Close" style={{ border: 'none', background: 'transparent', color: color.text2, cursor: 'pointer' }}><Icon name="close" size={16} /></button>
+  return (
+    <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
+      <DialogContent className="dp-modal-overlay flex w-[460px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 [&>button]:hidden">
+        <div className="flex items-center gap-2 border-b border-border px-4 py-3">
+          <span className="text-muted-foreground"><Icon name="link" size={15} /></span>
+          <DialogTitle className="text-sm font-semibold text-foreground">Share this canvas</DialogTitle>
+          <span className="flex-1" />
+          <button onClick={onClose} aria-label="Close" className="cursor-pointer border-0 bg-transparent p-0 text-muted-foreground hover:text-foreground"><Icon name="close" size={16} /></button>
         </div>
-        <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <div className="flex flex-col gap-3.5 p-4">
           <div>
-            <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, marginBottom: 6 }}>Link</div>
-            <div style={{ display: 'flex', gap: 6 }}>
-              <input readOnly value={canvasLink(canvasId)} onClick={(e) => (e.target as HTMLInputElement).select()}
-                style={{ flex: 1, fontSize: 11.5, border: `1px solid ${color.border}`, borderRadius: 6, padding: '6px 8px', color: color.text2, background: '#f7f8fa', outline: 'none' }} />
-              <button data-testid="copy-link" onClick={() => { navigator.clipboard?.writeText(canvasLink(canvasId)).then(() => pushToast('Link copied', 'success'), () => {}) }}
-                style={{ border: `1px solid ${color.border}`, borderRadius: 6, background: '#fff', color: color.ink, fontSize: 12, fontWeight: 600, padding: '0 12px', cursor: 'pointer' }}>Copy</button>
+            <div className={sectionLabel}>Link</div>
+            <div className="flex gap-1.5">
+              <Input readOnly value={canvasLink(canvasId)} onClick={(e) => (e.target as HTMLInputElement).select()}
+                className="h-8 flex-1 bg-muted text-[11.5px] text-muted-foreground" />
+              <Button data-testid="copy-link" type="button" variant="outline" size="sm"
+                onClick={() => { navigator.clipboard?.writeText(canvasLink(canvasId)).then(() => pushToast('Link copied', 'success'), () => {}) }}>Copy</Button>
             </div>
-            <div style={{ fontSize: 10.5, color: color.text3, marginTop: 5 }}>Opens this canvas directly. People need at least workspace access (or an explicit invite below).</div>
+            <div className="mt-1.5 text-[10.5px] text-muted-foreground">Opens this canvas directly. People need at least workspace access (or an explicit invite below).</div>
           </div>
           <div>
-            <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, marginBottom: 6 }}>Visibility</div>
-            <div style={{ display: 'inline-flex', gap: 3, background: '#f1f2f4', padding: 2, borderRadius: radius.button }}>
+            <div className={sectionLabel}>Visibility</div>
+            <div className="inline-flex gap-[3px] rounded-md bg-muted p-0.5">
               {(['private', 'workspace'] as const).map((v) => (
-                <button key={v} onClick={() => setVis(v)}
-                  style={{ fontSize: 11.5, fontWeight: 600, padding: '4px 12px', border: 'none', borderRadius: 6, cursor: 'pointer', background: visibility === v ? color.ink : 'transparent', color: visibility === v ? '#fff' : color.text2 }}>
+                <Button key={v} type="button" size="sm" variant={visibility === v ? 'default' : 'ghost'} onClick={() => setVis(v)}
+                  className="h-7 px-3 text-[11.5px]">
                   {v === 'private' ? 'Private' : 'Everyone in workspace'}
-                </button>
+                </Button>
               ))}
             </div>
           </div>
           <div>
-            <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, marginBottom: 6 }}>Collaborators</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, color: color.text2 }}>
-                <span style={{ width: 22, height: 22, borderRadius: '50%', background: '#e7e0fb', color: '#6b4bd6', display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700 }}>{(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}</span>
-                {currentUser?.name ?? 'you'} <span style={{ color: color.text3 }}>· owner</span>
+            <div className={sectionLabel}>Collaborators</div>
+            <div className="flex flex-col gap-1.5">
+              <div className="flex items-center gap-2 text-[12.5px] text-muted-foreground">
+                <span className="grid h-[22px] w-[22px] place-items-center rounded-full bg-primary/10 text-[10px] font-bold text-primary">{(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}</span>
+                {currentUser?.name ?? 'you'} <span className="text-muted-foreground">· owner</span>
               </div>
               {shares.map((sh) => (
-                <div key={sh.userId} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, color: color.ink }}>
-                  <span style={{ width: 22, height: 22, borderRadius: '50%', background: '#eef0f3', color: color.text2, display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700 }}>{sh.name.slice(0, 1).toUpperCase()}</span>
-                  <span style={{ flex: 1 }}>{sh.name}</span>
-                  <select value={sh.role} onChange={(e) => changeRole(sh.userId, e.target.value)} title="Access level"
-                    style={{ fontSize: 11, border: `1px solid ${color.border}`, borderRadius: 6, padding: '3px 6px', background: '#fff', color: color.text2 }}>
+                <div key={sh.userId} className="flex items-center gap-2 text-[12.5px] text-foreground">
+                  <span className="grid h-[22px] w-[22px] place-items-center rounded-full bg-muted text-[10px] font-bold text-muted-foreground">{sh.name.slice(0, 1).toUpperCase()}</span>
+                  <span className="flex-1">{sh.name}</span>
+                  <select value={sh.role} onChange={(e) => changeRole(sh.userId, e.target.value)} title="Access level" className={nativeSelect}>
                     <option value="editor">can edit</option>
                     <option value="viewer">can view</option>
                   </select>
-                  <button onClick={() => remove(sh.userId)} title="Remove" style={{ border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer' }}><Icon name="close" size={13} /></button>
+                  <button onClick={() => remove(sh.userId)} title="Remove" className="cursor-pointer border-0 bg-transparent p-0 text-muted-foreground hover:text-foreground"><Icon name="close" size={13} /></button>
                 </div>
               ))}
             </div>
             {addable.length > 0 && (
-              <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
-                <select value={pick} onChange={(e) => setPick(e.target.value)}
-                  style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '6px 8px', background: '#fff' }}>
+              <div className="mt-2.5 flex gap-1.5">
+                <select value={pick} onChange={(e) => setPick(e.target.value)} className={cn(nativeSelect, 'flex-1')}>
                   <option value="">Add a collaborator…</option>
                   {addable.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
                 </select>
-                <select value={role} onChange={(e) => setRole(e.target.value as 'editor' | 'viewer')} title="Access level"
-                  style={{ fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '6px 8px', background: '#fff' }}>
+                <select value={role} onChange={(e) => setRole(e.target.value as 'editor' | 'viewer')} title="Access level" className={nativeSelect}>
                   <option value="editor">can edit</option>
                   <option value="viewer">can view</option>
                 </select>
-                <button onClick={add} disabled={!pick} style={{ border: 'none', borderRadius: 6, background: color.ink, color: '#fff', fontSize: 12, fontWeight: 600, padding: '0 14px', cursor: pick ? 'pointer' : 'not-allowed', opacity: pick ? 1 : 0.5 }}>Add</button>
+                <Button type="button" size="sm" onClick={add} disabled={!pick}>Add</Button>
               </div>
             )}
           </div>
         </div>
-      </div>
-    </div>,
-    document.body,
+      </DialogContent>
+    </Dialog>
   )
 }

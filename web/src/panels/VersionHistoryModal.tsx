@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
-import { createPortal } from 'react-dom'
 import { api, type CanvasVersionDto } from '../api/client'
 import { useStore } from '../store/graph'
-import { color, radius, shadow } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
 
 // Server-side snapshot history for the current canvas (/canvas/{id}/versions) with one-click restore.
 // Snapshots are captured (throttled) on every save, so a bad edit is recoverable after the fact.
@@ -32,35 +33,34 @@ export function VersionHistoryModal({ onClose }: { onClose: () => void }) {
     }
   }
 
-  return createPortal(
-    <div className="dp-modal-overlay" onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(16,20,30,0.4)', display: 'grid', placeItems: 'center' }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: 560, maxHeight: '76vh', display: 'flex', flexDirection: 'column', background: '#fff', borderRadius: radius.panel, boxShadow: shadow.panel, overflow: 'hidden' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '13px 16px', borderBottom: `1px solid ${color.hairline}` }}>
-          <Icon name="clock" size={15} style={{ color: color.text3 }} />
-          <span style={{ fontSize: 14, fontWeight: 600, color: color.ink }}>Version history</span>
-          <span style={{ flex: 1 }} />
-          <button onClick={onClose} aria-label="Close" style={{ border: 'none', background: 'transparent', color: color.text2, cursor: 'pointer' }}><Icon name="close" size={16} /></button>
+  return (
+    <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
+      <DialogContent className="dp-modal-overlay flex max-h-[76vh] w-[560px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 [&>button]:hidden">
+        <div className="flex items-center gap-2 border-b border-border px-4 py-3">
+          <span className="text-muted-foreground"><Icon name="clock" size={15} /></span>
+          <DialogTitle className="text-sm font-semibold text-foreground">Version history</DialogTitle>
+          <span className="flex-1" />
+          <button onClick={onClose} aria-label="Close" className="cursor-pointer border-0 bg-transparent p-0 text-muted-foreground hover:text-foreground"><Icon name="close" size={16} /></button>
         </div>
-        <div style={{ overflowY: 'auto', padding: 8 }}>
-          {err && <div style={{ padding: 16, color: color.failed, fontSize: 12.5 }}>Couldn’t load history: {err}</div>}
-          {!err && versions === null && <div style={{ padding: 16, color: color.text3, fontSize: 12.5 }}>Loading…</div>}
-          {!err && versions?.length === 0 && <div style={{ padding: 16, color: color.text3, fontSize: 12.5 }}>No snapshots yet — they’re captured as you edit.</div>}
+        <div className="overflow-y-auto p-2">
+          {err && <div className="p-4 text-[12.5px] text-destructive">Couldn’t load history: {err}</div>}
+          {!err && versions === null && <div className="p-4 text-[12.5px] text-muted-foreground">Loading…</div>}
+          {!err && versions?.length === 0 && <div className="p-4 text-[12.5px] text-muted-foreground">No snapshots yet — they’re captured as you edit.</div>}
           {versions?.map((v) => (
-            <div key={v.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 10px', borderBottom: `1px solid ${color.hairline}`, fontSize: 12.5 }}>
-              <Icon name={v.label ? 'refresh' : 'clock'} size={13} style={{ color: v.label ? color.focus : color.text3 }} />
-              <span style={{ flex: 1, minWidth: 0, color: color.ink, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div key={v.id} className="flex items-center gap-2.5 border-b border-border px-2.5 py-2 text-[12.5px]">
+              <span className={v.label ? 'text-primary' : 'text-muted-foreground'}><Icon name={v.label ? 'refresh' : 'clock'} size={13} /></span>
+              <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-foreground">
                 {v.label ?? `Snapshot · v${v.version}`}
               </span>
-              <span style={{ color: color.text3, fontSize: 11 }}>{v.createdAt ? new Date(v.createdAt).toLocaleString() : ''}</span>
-              <button onClick={() => restore(v)} disabled={!!busy}
-                style={{ border: `1px solid ${color.border}`, borderRadius: 6, background: '#fff', color: color.ink, fontSize: 11.5, fontWeight: 600, padding: '4px 10px', cursor: busy ? 'default' : 'pointer', opacity: busy && busy !== v.id ? 0.5 : 1 }}>
+              <span className="text-[11px] text-muted-foreground">{v.createdAt ? new Date(v.createdAt).toLocaleString() : ''}</span>
+              <Button type="button" variant="outline" size="sm" onClick={() => restore(v)} disabled={!!busy}
+                className={cn('text-[11.5px]', busy === v.id && 'disabled:opacity-100')}>
                 {busy === v.id ? 'Restoring…' : 'Restore'}
-              </button>
+              </Button>
             </div>
           ))}
         </div>
-      </div>
-    </div>,
-    document.body,
+      </DialogContent>
+    </Dialog>
   )
 }

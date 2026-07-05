@@ -1,5 +1,7 @@
 import type { CSSProperties, ReactNode } from 'react'
 import { color, radius } from '../theme/tokens'
+import { cn } from '@/lib/utils'
+import { Input } from '@/components/ui/input'
 
 export function Segmented<T extends string>({ options, value, onChange, accent = color.focus }: {
   options: { value: T; label: string }[]
@@ -31,30 +33,32 @@ export function Segmented<T extends string>({ options, value, onChange, accent =
 
 export function Field({ label, children, style }: { label: string; children: ReactNode; style?: CSSProperties }) {
   return (
-    <label style={{ display: 'flex', flexDirection: 'column', gap: 3, ...style }}>
-      <span style={{ fontSize: 9.5, fontWeight: 600, letterSpacing: 0.4, textTransform: 'uppercase', color: color.text3 }}>{label}</span>
+    <label className="flex flex-col gap-[3px]" style={style}>
+      <span className="text-[9.5px] font-semibold uppercase tracking-[0.4px] text-muted-foreground">{label}</span>
       {children}
     </label>
   )
 }
 
-const inputBase: CSSProperties = {
-  fontSize: 11.5, color: color.ink, background: '#fff', border: `1px solid ${color.border}`,
-  borderRadius: 6, padding: '5px 7px', width: '100%', outline: 'none',
-}
+// Compact overrides for the shadcn <Input> so it fits inside 232px node cards (the primitive's
+// default h-9/px-3/text-sm is too tall). Also reused by ColumnCombo in nodes/fields.tsx.
+export const miniInputClass = 'h-7 px-2 py-1 text-[11.5px] md:text-[11.5px] text-foreground shadow-none'
+// A native <select> styled to match the shadcn Input look (Radix Select would change the DOM the
+// E2E suite selects on). Kept as a plain <select> so behavior/emitted values are unchanged.
+export const miniSelectClass =
+  'h-7 w-full cursor-pointer rounded-md border border-input bg-transparent px-2 text-[11.5px] text-foreground outline-none focus:ring-1 focus:ring-ring focus:ring-offset-0'
 
 export function MiniInput({ value, onChange, placeholder, mono, onBlur }: {
   value: string; onChange: (v: string) => void; placeholder?: string; mono?: boolean; onBlur?: () => void
 }) {
   return (
-    <input
+    <Input
       value={value}
       placeholder={placeholder}
       onChange={(e) => onChange(e.target.value)}
       onBlur={onBlur}
       onClick={(e) => e.stopPropagation()}
-      className={mono ? 'dp-mono' : undefined}
-      style={{ ...inputBase, fontSize: mono ? 11 : 11.5 }}
+      className={cn(miniInputClass, mono && 'dp-mono text-[11px] md:text-[11px]')}
     />
   )
 }
@@ -67,7 +71,7 @@ export function MiniSelect<T extends string>({ value, options, onChange }: {
       value={value}
       onChange={(e) => onChange(e.target.value as T)}
       onClick={(e) => e.stopPropagation()}
-      style={{ ...inputBase, appearance: 'none', cursor: 'pointer' }}
+      className={cn(miniSelectClass, 'appearance-none')}
     >
       {options.map((o) => (
         <option key={o.value} value={o.value}>{o.label}</option>

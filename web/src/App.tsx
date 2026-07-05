@@ -9,6 +9,7 @@ import { CodeFullscreen } from './panels/CodeFullscreen'
 import { Shell } from './views/Shell'
 import { Login } from './views/Login'
 import { Toaster } from './ui/Toaster'
+import { TooltipProvider } from '@/components/ui/tooltip'
 import { api } from './api/client'
 import { useStore } from './store/graph'
 import { initRouter } from './router'
@@ -37,6 +38,7 @@ export default function App() {
   if (auth.authEnabled && !auth.userId) return <Login onLoggedIn={(uid) => setAuth({ authEnabled: true, userId: uid })} />
 
   return (
+    <TooltipProvider delayDuration={300}>
     <ReactFlowProvider>
       <ErrorBoundary>
         {view === 'canvas' ? (
@@ -58,5 +60,6 @@ export default function App() {
         <Toaster />
       </ErrorBoundary>
     </ReactFlowProvider>
+    </TooltipProvider>
   )
 }
