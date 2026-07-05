@@ -22,7 +22,9 @@ export default function App() {
   const [booted, setBooted] = useState(false)
 
   useEffect(() => {
-    api.authStatus().then(setAuth).catch(() => setAuth({ authEnabled: false, userId: 'local' }))
+    api.authStatus()
+      .then((a) => { setAuth(a); useStore.getState().setAuthEnabled(a.authEnabled) })
+      .catch(() => setAuth({ authEnabled: false, userId: 'local' }))
   }, [])
   useEffect(() => {
     if (auth && (!auth.authEnabled || auth.userId) && !booted) {

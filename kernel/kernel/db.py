@@ -43,8 +43,18 @@ def unique_view(prefix: str = "v") -> str:
 
 
 def drop_created_views() -> None:
-    """Drop the temp views minted during an evaluation (call in a finally, under the lock)."""
+    """Cleanup after an evaluation (call in a finally, under the lock): first roll back any aborted
+    transaction, then drop the temp views minted during the eval.
+
+    A failed statement (e.g. scanning a missing file) leaves the shared connection's implicit
+    transaction ABORTED — DuckDB then rejects every later query with "current transaction is aborted
+    (please ROLLBACK)". Since one connection is reused across all previews/runs, that would wedge the
+    whole engine until restart. ROLLBACK clears it; it's a harmless no-op when nothing is aborted."""
     with _lock:
+        try:
+            conn().execute("ROLLBACK")
+        except Exception:  # noqa: BLE001 — no active transaction to roll back
+            pass
         for n in list(_created_views):
             try:
                 conn().execute(f'DROP VIEW IF EXISTS "{n}"')

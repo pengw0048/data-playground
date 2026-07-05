@@ -48,8 +48,9 @@ export function Popover({
       onClose()
     }
     const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    // canvas pan/zoom (wheel) moves the anchor but not this fixed portal — close instead of detaching
-    const onWheel = () => onClose()
+    // canvas pan/zoom (wheel) moves the anchor but not this fixed portal — close instead of detaching.
+    // BUT scrolling INSIDE the popover (a long list) must not close it.
+    const onWheel = (e: WheelEvent) => { if (!popRef.current?.contains(e.target as Node)) onClose() }
     const id = setTimeout(() => window.addEventListener('mousedown', onDown), 0)
     window.addEventListener('keydown', onEsc)
     window.addEventListener('wheel', onWheel, { passive: true })

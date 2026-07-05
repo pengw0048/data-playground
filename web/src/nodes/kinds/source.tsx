@@ -20,21 +20,30 @@ function Source({ id, data }: NodeComponentProps) {
 
   return (
     <NodeCard id={id} data={data} metaOverride={meta}>
-      <button
-        ref={btnRef}
-        onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}
-        style={{
-          display: 'flex', alignItems: 'center', gap: 6, width: '100%', padding: '6px 8px',
-          border: `1px solid ${color.border}`, borderRadius: 7, background: '#fff',
-          color: table ? color.ink : color.text3, fontSize: 11.5,
-        }}
-      >
-        <Icon name="db" size={13} />
-        <span style={{ flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {table?.name ?? 'select dataset'}
-        </span>
-        <Icon name="chevronDown" size={12} />
-      </button>
+      {table ? (
+        // a dataset is chosen (its name is the node title) — a quiet "change" affordance, not a
+        // form dropdown that looks half-filled-in
+        <button
+          ref={btnRef}
+          onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 4px', border: 'none', background: 'transparent', color: color.text3, fontSize: 11, cursor: 'pointer' }}
+        >
+          <Icon name="db" size={12} /> Change dataset
+        </button>
+      ) : (
+        <button
+          ref={btnRef}
+          onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6, width: '100%', padding: '6px 8px',
+            border: `1px solid ${color.border}`, borderRadius: 7, background: '#fff', color: color.text3, fontSize: 11.5,
+          }}
+        >
+          <Icon name="db" size={13} />
+          <span style={{ flex: 1, textAlign: 'left' }}>Select dataset</span>
+          <Icon name="chevronDown" size={12} />
+        </button>
+      )}
 
       <Popover anchorRef={btnRef} open={open} onClose={() => setOpen(false)} width={230}>
         {catalog.length === 0 && (

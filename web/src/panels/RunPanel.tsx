@@ -81,8 +81,13 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           <div style={{ fontSize: 12, color: color.ink, marginTop: 10 }}>
             {st.outputTable ? <>wrote <b>{st.outputTable}</b> · {(st.totalRows ?? st.rowsProcessed).toLocaleString()} rows</> : <>{(st.totalRows ?? st.rowsProcessed).toLocaleString()} rows processed</>}
           </div>
+          {st.outputUri && (
+            <div title={st.outputUri} className="dp-mono" style={{ fontSize: 10.5, color: color.text2, marginTop: 6, background: '#f7f8fa', border: `1px solid ${color.hairline}`, borderRadius: 6, padding: '5px 8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              → {st.outputUri}
+            </div>
+          )}
           <div style={{ fontSize: 10.5, color: color.text3, marginTop: 6 }}>
-            {st.placement === 'distributed' ? 'ran on the cluster' : 'ran in your pod'} · the output is now a durable, catalog-registered dataset
+            {st.placement === 'distributed' ? 'ran on the cluster' : 'ran in your pod'} · registered in the catalog
           </div>
           <PerNode st={st} compact />
         </>

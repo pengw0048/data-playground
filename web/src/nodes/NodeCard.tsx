@@ -27,11 +27,11 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const requestRun = useStore((s) => s.requestRun)
   const cancelRun = useStore((s) => s.cancelRun)
   const togglePanel = useStore((s) => s.togglePanel)
+  const closePanel = useStore((s) => s.closePanel)
   const openCodeFullscreen = useStore((s) => s.openCodeFullscreen)
   const rename = useStore((s) => s.rename)
   const runState = useStore((s) => s.runs[id]?.phase)
   const runnable = useStore((s) => nodeRunnable(s.doc, id))
-  const previewed = useStore((s) => !!s.previews[id]?.result && !s.previews[id]?.result?.notPreviewable)
   const [hover, setHover] = useState(false)
   // disabled = this node is turned off; offDownstream = an upstream node is off, so this one is off too
   const offDownstream = useStore((s) => !s.doc.nodes.find((n) => n.id === id)?.data.disabled && isDisabled(s.doc, id))
@@ -54,8 +54,6 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const invalid = node ? nodeInvalidReason(node) : null   // e.g. "order by is required"
   // the action shelf is revealed on hover / selection / while running, so a resting card is clean
   const showShelf = selected || hover || busy
-  // a preview is a 50-row peek, NOT a full materialized run — show it as "sampled", not latest-green
-  const sampled = previewed && data.status !== 'latest' && data.status !== 'running'
 
   const tag = (spec?.tag ?? kind).toUpperCase()
 
@@ -103,11 +101,6 @@ export function NodeCard({ id, data, children, metaOverride }: {
               </span>
               <EditableTitle id={id} title={data.title} onRename={rename} selected={selected} />
               <span style={{ flex: 1 }} />
-              {sampled && (
-                <span title="Showing a sampled preview — not a full run" style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: 0.5, color: '#3355c6', background: '#e7ecfb', padding: '2px 6px', borderRadius: radius.chip, flex: '0 0 auto' }}>
-                  SAMPLED
-                </span>
-              )}
               {disabled && (
                 <span style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: 0.5, color: '#8a6d0b', background: '#fbf1dc', padding: '2px 6px', borderRadius: radius.chip, flex: '0 0 auto' }}>
                   DISABLED
@@ -140,41 +133,43 @@ export function NodeCard({ id, data, children, metaOverride }: {
             {/* compact body (kind-specific, kept small — P5) */}
             {children && <div style={{ marginTop: 8 }}>{children}</div>}
 
-            {/* action shelf — revealed on hover / selection / run (a resting card stays clean) */}
-            {showShelf && (
-              <div
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 2, marginTop: 10,
-                  marginLeft: -10, marginRight: -12, padding: '5px 8px',
-                  borderTop: `1px solid ${color.hairline}`, background: '#f7f8fa',
-                }}
-              >
-                <ActionIcon
-                  name="eye" label={invalid ?? (runnable ? 'View data' : 'Connect a source to preview')}
-                  active={openPanel === 'data'} disabled={!runnable || !!invalid}
-                  onClick={() => runPreview(id)}
-                />
-                {/* a source has no compute — its ▶ (a full COUNT/scan) is deliberately not a quick
-                    action here; preview (eye) is. Run/materialize stays available in the Inspector. */}
-                {kind !== 'source' && (
-                  <ActionIcon
-                    name={busy ? 'stop' : 'play'}
-                    label={invalid ?? (!runnable ? 'Connect a source to run' : busy ? 'Stop' : 'Run up to here')}
-                    active={openPanel === 'run'}
-                    disabled={(!runnable || !!invalid) && !busy}
-                    // ▶ runs THIS node (up to & including it); ⏹ cancels. Run details live in the ⋯ menu.
-                    onClick={() => (busy ? cancelRun(id) : requestRun(id))}
-                  />
-                )}
-                <ActionIcon name="clock" label="History" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
-                {hasCode && <ActionIcon name="code" label="Edit code" onClick={() => openCodeFullscreen(id, kind === 'sql' ? 'sql' : 'code', kind === 'sql' ? 'sql' : 'python')} />}
-                <span style={{ flex: 1 }} />
-                <MoreMenu id={id} kind={kind} />
-              </div>
-            )}
           </div>
         </div>
       </div>
+
+      {/* action shelf — revealed on hover / selection / run. It floats BELOW the card (absolute), so
+          appearing/disappearing never changes the card's height and the side ports never shift. */}
+      {showShelf && (
+        <div
+          className="nodrag"
+          style={{
+            position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 4, zIndex: 4,
+            display: 'flex', alignItems: 'center', gap: 2, padding: '4px 6px',
+            background: '#fff', border: `1px solid ${color.border}`, borderRadius: 9, boxShadow: shadow.card,
+          }}
+        >
+          <ActionIcon
+            name="eye" label={invalid ?? (runnable ? (openPanel === 'data' ? 'Hide data' : 'View data') : 'Connect a source to preview')}
+            active={openPanel === 'data'} disabled={!runnable || !!invalid}
+            onClick={() => (openPanel === 'data' ? closePanel(id) : runPreview(id))}
+          />
+          {/* a source has no compute — its ▶ (a full COUNT/scan) is deliberately not a quick action
+              here; preview (eye) is. Run/materialize stays available in the Inspector. */}
+          {kind !== 'source' && (
+            <ActionIcon
+              name={busy ? 'stop' : 'play'}
+              label={invalid ?? (!runnable ? 'Connect a source to run' : busy ? 'Stop' : 'Run up to here')}
+              active={openPanel === 'run'}
+              disabled={(!runnable || !!invalid) && !busy}
+              onClick={() => (busy ? cancelRun(id) : requestRun(id))}
+            />
+          )}
+          <ActionIcon name="clock" label="History" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
+          {hasCode && <ActionIcon name="code" label="Edit code" onClick={() => openCodeFullscreen(id, kind === 'sql' ? 'sql' : 'code', kind === 'sql' ? 'sql' : 'python')} />}
+          <span style={{ flex: 1 }} />
+          <MoreMenu id={id} kind={kind} />
+        </div>
+      )}
     </div>
   )
 }

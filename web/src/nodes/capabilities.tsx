@@ -2,12 +2,10 @@
 // viewer tabs — they never change a node's ports. Reference-bundle capabilities (e.g.
 // column-mirror) would register the same way from a plugin.
 import { registerCapability } from './registry'
-import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import type { ColumnSchema } from '../types/graph'
 
 function mediaCols(cols: ColumnSchema[]) { return cols.filter((c) => c.capabilities.includes('media')) }
-function vectorCols(cols: ColumnSchema[]) { return cols.filter((c) => c.capabilities.includes('vector')) }
 
 function MediaGrid({ columns, rows }: { columns: ColumnSchema[]; rows: Record<string, unknown>[] }) {
   const mcols = mediaCols(columns)
@@ -41,32 +39,6 @@ function MediaGrid({ columns, rows }: { columns: ColumnSchema[]; rows: Record<st
   )
 }
 
-function VectorInspector({ columns, rows }: { columns: ColumnSchema[]; rows: Record<string, unknown>[] }) {
-  const vcols = vectorCols(columns)
-  const col = vcols[0]?.name
-  if (!col) return null
-  return (
-    <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
-      {rows.slice(0, 40).map((r, i) => {
-        const vec = Array.isArray(r[col]) ? (r[col] as number[]) : []
-        const dim = vec.length
-        const max = Math.max(1e-6, ...vec.map((x) => Math.abs(x)))
-        return (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span style={{ fontSize: 10, color: 'var(--viewer-text-2)', width: 48 }} className="dp-mono">#{i}</span>
-            <span style={{ fontSize: 10, fontWeight: 600, color: '#3355c6', background: '#e7ecfb', padding: '2px 7px', borderRadius: radius.chip }}>{dim}-dim</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 1, height: 22, flex: 1 }}>
-              {vec.slice(0, 48).map((x, j) => (
-                <div key={j} title={String(x)} style={{ flex: 1, height: `${(Math.abs(x) / max) * 100}%`, background: x >= 0 ? '#5b8def' : '#c56b8a', borderRadius: 1, minHeight: 1 }} />
-              ))}
-            </div>
-          </div>
-        )
-      })}
-    </div>
-  )
-}
-
 registerCapability({
   id: 'media',
   label: 'Media',
@@ -74,9 +46,5 @@ registerCapability({
   viewerTab: MediaGrid,
 })
 
-registerCapability({
-  id: 'vector',
-  label: 'Vectors',
-  predicate: (cols) => vectorCols(cols).length > 0,
-  viewerTab: VectorInspector,
-})
+// (A dedicated "Vectors" tab was removed — it wasn't useful; the Rows table shows a [dim] chip and
+// clicking a row shows the full vector. Vector columns are still detected for that cell rendering.)

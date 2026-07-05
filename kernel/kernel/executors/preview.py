@@ -17,7 +17,7 @@ PREVIEW_BUDGET_S = 8.0
 
 
 def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
-                 node_lowerings=None, node_specs=None) -> SampleResult:
+                 node_lowerings=None, node_specs=None, offset: int = 0) -> SampleResult:
     # clean, up-front graph checks (don't rely on a Python RecursionError for cycles)
     if not g.is_acyclic(graph):
         return SampleResult(error=True, reason="graph has a cycle — control flow must be encapsulated (§5.7)")
@@ -33,7 +33,7 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
         # serialize all DuckDB access; drop the temp views this eval minted
         with db.lock():
             try:
-                rows, cols = engine.rows(node_id, k)
+                rows, cols = engine.rows(node_id, k, offset)
             finally:
                 db.drop_created_views()
         return SampleResult(columns=cols, rows=rows, row_count=len(rows), truncated=True)

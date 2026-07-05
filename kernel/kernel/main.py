@@ -206,7 +206,8 @@ def run_preview(req: PreviewRequest) -> SampleResult:
     deps = get_deps()
     k = req.k if req.k is not None else settings.preview_k
     return preview_node(req.graph, req.node_id, k,
-                        deps.resolve_adapter, deps.registry, deps.node_lowerings, deps.node_specs)
+                        deps.resolve_adapter, deps.registry, deps.node_lowerings, deps.node_specs,
+                        offset=max(0, req.offset))
 
 
 @api.post("/graph/schema")

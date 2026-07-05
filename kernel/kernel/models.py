@@ -251,6 +251,7 @@ class PreviewRequest(Wire):
     graph: Graph
     node_id: str
     k: int = 50
+    offset: int = 0
 
 
 class EstimateRequest(Wire):

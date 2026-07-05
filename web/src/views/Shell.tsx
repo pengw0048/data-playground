@@ -27,11 +27,8 @@ function Rail({ onSettings }: { onSettings: () => void }) {
   const view = useStore((s) => s.view)
   const setView = useStore((s) => s.setView)
   const currentUser = useStore((s) => s.currentUser)
-  const users = useStore((s) => s.users)
-  const switchUser = useStore((s) => s.switchUser)
-  const createUser = useStore((s) => s.createUser)
-  const [adding, setAdding] = useState(false)
-  const [name, setName] = useState('')
+  const authEnabled = useStore((s) => s.authEnabled)
+  const logout = async () => { await api.logout().catch(() => {}); location.reload() }
 
   const item = (v: DpView, icon: IconName, label: string) => (
     <button onClick={() => setView(v)} data-testid={`rail-${v}`}
@@ -56,26 +53,17 @@ function Rail({ onSettings }: { onSettings: () => void }) {
         </button>
       </div>
       <div style={{ flex: 1 }} />
-      {/* user switcher */}
-      <div style={{ borderTop: `1px solid ${color.hairline}`, paddingTop: 10 }}>
-        {users.map((u) => (
-          <button key={u.id} onClick={() => switchUser(u.id)}
-            style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', padding: '6px 8px', border: 'none', borderRadius: 7, cursor: 'pointer', fontSize: 12.5,
-              background: u.id === currentUser?.id ? '#eef0f3' : 'transparent', color: color.ink }}>
-            <span style={{ width: 20, height: 20, borderRadius: '50%', background: '#e7e0fb', color: '#6b4bd6', display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700 }}>{(u.name ?? '?').slice(0, 1).toUpperCase()}</span>
-            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>{u.name}</span>
-            {u.id === currentUser?.id && <Icon name="check" size={13} style={{ color: color.latest }} />}
-          </button>
-        ))}
-        {adding ? (
-          <div style={{ display: 'flex', gap: 6, padding: '6px 4px 0' }}>
-            <input autoFocus value={name} onChange={(e) => setName(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter' && name.trim()) { createUser(name.trim()); setName(''); setAdding(false) } if (e.key === 'Escape') setAdding(false) }}
-              placeholder="new user…" style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', outline: 'none' }} />
-          </div>
-        ) : (
-          <button onClick={() => setAdding(true)} style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '6px 8px', border: 'none', background: 'transparent', color: color.text3, fontSize: 12, cursor: 'pointer' }}>
-            <Icon name="plus" size={13} /> Add user
+      {/* who you are — identity only. Switching users is gone; logout shows when a login is in force. */}
+      <div style={{ borderTop: `1px solid ${color.hairline}`, paddingTop: 10, display: 'flex', alignItems: 'center', gap: 8, padding: '10px 8px 4px' }}>
+        <span style={{ width: 24, height: 24, borderRadius: '50%', background: '#e7e0fb', color: '#6b4bd6', display: 'grid', placeItems: 'center', fontSize: 11, fontWeight: 700 }}>{(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}</span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: color.ink, overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentUser?.name ?? 'local'}</div>
+          <div style={{ fontSize: 10, color: color.text3 }}>signed in</div>
+        </div>
+        {authEnabled && (
+          <button onClick={logout} title="Log out" data-testid="logout"
+            style={{ border: `1px solid ${color.border}`, background: '#fff', color: color.text2, fontSize: 11.5, fontWeight: 600, padding: '5px 10px', borderRadius: 7, cursor: 'pointer' }}>
+            Log out
           </button>
         )}
       </div>

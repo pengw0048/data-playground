@@ -168,57 +168,17 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
   )
 }
 
-// A compact account avatar (Figma-style), not a prominent "switch user" pill — real users don't
-// switch identity. It shows who you are; switching/adding stays available (dev / multi-seat) but
-// tucked behind the avatar. In an auth deployment, identity comes from login, not from here.
+// A pure identity indicator — who you are, nothing to switch. (Real users don't switch identity;
+// in an auth deployment it comes from login. Logout lives on the files home.)
 function AccountMenu() {
-  const ref = useRef<HTMLButtonElement>(null)
-  const [open, setOpen] = useState(false)
-  const [name, setName] = useState('')
   const currentUser = useStore((s) => s.currentUser)
-  const users = useStore((s) => s.users)
-  const switchUser = useStore((s) => s.switchUser)
-  const createUser = useStore((s) => s.createUser)
-
-  const add = () => { const n = name.trim(); if (n) { createUser(n); setName(''); setOpen(false) } }
-
   return (
-    <>
-      <button ref={ref} onClick={() => setOpen((v) => !v)} title="Account"
-        style={{ width: 34, height: 34, display: 'grid', placeItems: 'center', background: '#fff', border: `1px solid ${color.border}`, borderRadius: '50%', boxShadow: shadow.card, cursor: 'pointer', padding: 0 }}>
-        <span style={{ width: 24, height: 24, borderRadius: '50%', background: '#e7e0fb', color: '#6b4bd6', display: 'grid', placeItems: 'center', fontSize: 11, fontWeight: 700 }}>
-          {(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}
-        </span>
-      </button>
-      <Popover anchorRef={ref} open={open} onClose={() => setOpen(false)} width={220} align="right">
-        <div style={{ fontSize: 11, color: color.text2, padding: '6px 10px' }}>Signed in as <b>{currentUser?.name ?? 'local'}</b></div>
-        <div style={{ height: 1, background: color.hairline, margin: '2px 0' }} />
-        <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, padding: '5px 10px' }}>Switch user (dev)</div>
-        {users.map((u) => (
-          <button
-            key={u.id}
-            onClick={() => { switchUser(u.id); setOpen(false) }}
-            style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', padding: '7px 10px', border: 'none', background: u.id === currentUser?.id ? '#eef0f3' : 'transparent', borderRadius: 7, fontSize: 12.5, color: color.ink }}
-            onMouseEnter={(e) => { if (u.id !== currentUser?.id) e.currentTarget.style.background = '#f2f3f5' }}
-            onMouseLeave={(e) => { if (u.id !== currentUser?.id) e.currentTarget.style.background = 'transparent' }}
-          >
-            <span style={{ flex: 1 }}>{u.name}</span>
-            {u.id === currentUser?.id && <Icon name="check" size={13} style={{ color: color.latest }} />}
-          </button>
-        ))}
-        <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />
-        <div style={{ display: 'flex', gap: 6, padding: '4px 8px 6px' }}>
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') add() }}
-            placeholder="new user…"
-            style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', outline: 'none' }}
-          />
-          <button onClick={add} style={{ border: 'none', borderRadius: 6, background: color.ink, color: '#fff', fontSize: 12, fontWeight: 600, padding: '0 10px' }}>Add</button>
-        </div>
-      </Popover>
-    </>
+    <div title={`Signed in as ${currentUser?.name ?? 'local'}`}
+      style={{ width: 34, height: 34, display: 'grid', placeItems: 'center', background: '#fff', border: `1px solid ${color.border}`, borderRadius: '50%', boxShadow: shadow.card }}>
+      <span style={{ width: 24, height: 24, borderRadius: '50%', background: '#e7e0fb', color: '#6b4bd6', display: 'grid', placeItems: 'center', fontSize: 11, fontWeight: 700 }}>
+        {(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}
+      </span>
+    </div>
   )
 }
 

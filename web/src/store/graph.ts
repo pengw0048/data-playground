@@ -132,7 +132,7 @@ interface Store {
   closePanel: (id: string) => void
 
   // -- execution --
-  runPreview: (id: string) => Promise<void>
+  runPreview: (id: string, offset?: number) => Promise<void>
   requestRun: (id: string) => Promise<void>
   estimate: (id: string) => Promise<void>
   run: (id: string, confirmed?: boolean) => Promise<void>
@@ -177,6 +177,8 @@ interface Store {
   clearPeers: () => void
 
   // -- users + files (per-user, multi-file) --
+  authEnabled: boolean            // whether a real login/session is in force (→ show Log out)
+  setAuthEnabled: (v: boolean) => void
   currentUser: DpUser | null
   users: DpUser[]
   files: CanvasFile[]
@@ -272,6 +274,8 @@ export const useStore = create<Store>((set, get) => ({
     setTimeout(() => get().dismissToast(id), kind === 'error' ? 7000 : 4000)
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+  authEnabled: false,
+  setAuthEnabled: (v) => set({ authEnabled: v }),
   currentUser: null,
   users: [],
   files: [],
@@ -498,12 +502,12 @@ export const useStore = create<Store>((set, get) => ({
   closePanel: (id) =>
     set((s) => (s.openPanels[id] ? { openPanels: {} } : {})),
 
-  runPreview: async (id: string) => {
+  runPreview: async (id: string, offset = 0) => {
     set((s) => ({ previews: { ...s.previews, [id]: { loading: true } }, openPanels: { [id]: 'data' } }))
     try {
-      // A preview is a bounded 50-row peek — the card shows it as "sampled", NOT as a full run.
-      // (We deliberately do NOT flip status to 'latest': that green state means a real materialized run.)
-      const result = await api.preview(get().doc, id, 50)
+      // A preview is a bounded peek (a page of rows), NOT a full materialized run — we deliberately
+      // do NOT flip status to 'latest' (that green state means a real run). Paginated via `offset`.
+      const result = await api.preview(get().doc, id, 50, offset)
       set((s) => ({ previews: { ...s.previews, [id]: { result } } }))
     } catch (e) {
       set((s) => ({ previews: { ...s.previews, [id]: { error: (e as Error).message } } }))

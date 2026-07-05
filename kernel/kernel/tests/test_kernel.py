@@ -491,6 +491,29 @@ def test_agent_activates_from_settings_key(monkeypatch):
 # --------------------------------------------------------------------------- #
 # Meta-programming: a `section` = a driver script over contained nodes (bounded control flow)
 # --------------------------------------------------------------------------- #
+def test_failed_run_does_not_wedge_later_previews(tmp_path):
+    # a run against a missing file fails and aborts DuckDB's implicit transaction; if that's not
+    # rolled back, EVERY later query on the shared connection errors ("transaction is aborted").
+    bad = {"id": "c1", "version": 1, "nodes": [N("s", "source", {"uri": "does-not-exist.parquet"})], "edges": []}
+    r = client.post("/api/run", json={"graph": bad, "targetNodeId": "s"}).json()
+    assert _poll(r["runId"])["status"] == "failed"
+    # a subsequent preview of a GOOD source must still work (the aborted transaction was cleared)
+    p = _seq_parquet(tmp_path)
+    good = {"id": "c1", "version": 1, "nodes": [N("s", "source", {"uri": p})], "edges": []}
+    pv = client.post("/api/run/preview", json={"graph": good, "nodeId": "s", "k": 10}).json()
+    assert not pv.get("error"), pv.get("reason")
+    assert len(pv["rows"]) == 10
+
+
+def test_preview_paginates_with_offset(tmp_path):
+    p = _seq_parquet(tmp_path, n=500)  # column v = 0..499
+    g = {"id": "c1", "version": 1, "nodes": [N("s", "source", {"uri": p})], "edges": []}
+    pg0 = client.post("/api/run/preview", json={"graph": g, "nodeId": "s", "k": 10, "offset": 0}).json()
+    pg1 = client.post("/api/run/preview", json={"graph": g, "nodeId": "s", "k": 10, "offset": 10}).json()
+    assert [r["v"] for r in pg0["rows"]] == list(range(0, 10))
+    assert [r["v"] for r in pg1["rows"]] == list(range(10, 20))  # offset advances the window
+
+
 def _section(nid, script, subnodes, params=None, max_runs=200):
     return N(nid, "section", {"script": script, "subnodes": subnodes,
                               "params": params or {}, "maxRuns": max_runs})

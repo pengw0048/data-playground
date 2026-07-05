@@ -97,7 +97,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     never the browser. Leave the key blank to use an env var instead.
                   </p>
                   <Field label="Model"><Input value={val('agentModel')} placeholder="anthropic/claude-opus-4-8" onChange={(v) => set('agentModel', v)} /></Field>
-                  <div style={{ fontSize: 10.5, color: color.text3, margin: '-4px 0 8px' }}>e.g. anthropic/claude-opus-4-8 · openai/gpt-4o · gemini/gemini-1.5-pro · ollama/llama3</div>
+                  <div style={{ fontSize: 10.5, color: color.text3, margin: '-4px 0 8px' }}>e.g. anthropic/claude-opus-4-8 · anthropic/claude-sonnet-5 · openai/gpt-5 · google/gemini-2.5-pro · ollama/llama3.3</div>
                   <Field label="API key"><Input type="password" value={val('agentApiKey')} placeholder="sk-… (or leave blank for env)" onChange={(v) => set('agentApiKey', v)} /></Field>
                   <Field label="Base URL (local / self-hosted)"><Input value={val('agentBaseUrl')} placeholder="http://localhost:11434 (ollama, optional)" onChange={(v) => set('agentBaseUrl', v)} /></Field>
                 </Section>

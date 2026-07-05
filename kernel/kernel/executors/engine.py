@@ -90,8 +90,8 @@ class LoweringEngine:
             return lowered["out"] if "out" in lowered else next(iter(lowered.values()))
         raise NotPreviewable(g.node_map(self.graph)[node_id], f"output port '{handle}' was not produced")
 
-    def rows(self, node_id: str, k: int) -> tuple[list[dict], list[ColumnSchema]]:
-        tbl = self.relation(node_id).limit(k).to_arrow_table()
+    def rows(self, node_id: str, k: int, offset: int = 0) -> tuple[list[dict], list[ColumnSchema]]:
+        tbl = self.relation(node_id).limit(k, offset).to_arrow_table()
         # a join over columns that share a name (e.g. both inputs have `id`) yields duplicate
         # column names; de-dup so no column is silently dropped when rows become dicts.
         names = _dedupe_names(tbl.column_names)

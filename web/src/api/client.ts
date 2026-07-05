@@ -106,8 +106,8 @@ export const api = {
   compile: (doc: CanvasDoc, targetNodeId?: string) =>
     req<CompilePlan>('/graph/compile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
 
-  preview: (doc: CanvasDoc, nodeId: string, k = 50) =>
-    req<SampleResult>('/run/preview', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, k }) }),
+  preview: (doc: CanvasDoc, nodeId: string, k = 50, offset = 0) =>
+    req<SampleResult>('/run/preview', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, k, offset }) }),
 
   // per-node output columns (metadata only) → editor column suggestions; null = untyped port
   schema: (doc: CanvasDoc) =>

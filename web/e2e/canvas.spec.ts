@@ -352,25 +352,20 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('the Share dialog sets visibility and adds a collaborator', async ({ page }) => {
+    // seed a collaborator via the API (there's no in-app user switching anymore) — bootstrap picks it up
+    await page.request.post('/api/users', { data: { name: 'Dana' }, headers: { 'X-DP-User': 'local' } })
     await fresh(page)
-    // add a user so there's someone to share with (account menu — dev switch)
-    await page.getByTitle('Account').click()
-    await page.getByPlaceholder('new user…').fill('Dana')
-    await page.getByRole('button', { name: 'Add', exact: true }).click()
-    await page.getByTitle('Account').click()
-    await expect(page.getByText('Signed in as')).toContainText('Dana')
-    await page.keyboard.press('Escape')
     await page.getByTestId('share-btn').click()
     await expect(page.getByText('Share this canvas')).toBeVisible()
     // flip visibility to workspace
     await page.getByRole('button', { name: 'Everyone in workspace' }).click()
-    // add a collaborator (the seeded 'Local' user, now that we're acting as Dana)
+    // add Dana as a collaborator
     const select = page.getByRole('combobox')
-    await select.selectOption({ label: 'Local' })
+    await select.selectOption({ label: 'Dana' })
     const addBtn = page.locator('button', { hasText: 'Add' }).last()
     await expect(addBtn).toBeEnabled()
     await addBtn.click()
-    await expect(page.getByText('Local', { exact: false }).filter({ hasText: 'editor' })).toBeVisible()
+    await expect(page.getByText('Dana', { exact: false }).filter({ hasText: 'editor' })).toBeVisible()
   })
 
   test('the app menu opens persisted run history', async ({ page }) => {
@@ -382,14 +377,11 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText(/No runs yet/)).toBeVisible()
   })
 
-  test('the account menu creates and switches users', async ({ page }) => {
+  test('the top bar shows identity only — no user switching', async ({ page }) => {
     await page.goto('/')
-    await page.getByTitle('Account').click()
-    await expect(page.getByText('Signed in as')).toContainText('Local') // default seeded user
-    await page.getByPlaceholder('new user…').fill('Alice')
-    await page.getByRole('button', { name: 'Add', exact: true }).click()
-    await page.getByTitle('Account').click()
-    await expect(page.getByText('Signed in as')).toContainText('Alice') // now acting as Alice
+    await expect(page.getByTitle(/Signed in as/)).toBeVisible() // identity indicator
+    await expect(page.getByText('Switch user (dev)')).toHaveCount(0) // the switcher is gone
+    await expect(page.getByPlaceholder('new user…')).toHaveCount(0)
   })
 
   test('a sort node needs an order-by before it can run (required-param validation)', async ({ page }) => {
@@ -433,6 +425,25 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('share-btn').click()
     await expect(page.getByTestId('copy-link')).toBeVisible()
     await expect(page.locator('input[readonly]').first()).toHaveValue(/#\/canvas\//)
+  })
+
+  test('the data viewer opens a row detail and paginates', async ({ page }) => {
+    await fresh(page)
+    // start a pipeline from the seeded 'events' dataset via the Tables view
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to files').click()
+    await page.getByTestId('rail-tables').click()
+    await page.getByText('events', { exact: true }).click()
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect(page.locator('.react-flow__node')).toHaveCount(1) // the events source landed
+    // preview via the Inspector's View data (always visible for the selected node — no hover needed)
+    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    // the data viewer shows rows, then Next paginates, then clicking a row opens its detail
+    await expect(page.getByText(/^rows /)).toBeVisible({ timeout: 15_000 })
+    await page.getByRole('button', { name: 'Next page' }).click()
+    await expect(page.getByRole('button', { name: 'Previous page' })).toBeEnabled()
+    await page.locator('.dp-panel table tbody tr').first().click()
+    await expect(page.getByRole('button', { name: /^Row / })).toBeVisible() // detail back-button
   })
 
   test('a table is registered and added to the canvas from the Tables view', async ({ page }) => {
