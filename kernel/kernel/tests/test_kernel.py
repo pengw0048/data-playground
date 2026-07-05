@@ -39,7 +39,7 @@ def test_kernel_info():
     info = client.get("/api/kernel").json()
     assert info["backend"] == "duckdb+polars+arrow"
     assert "duckdb" in info["adapters"] and "lance" in info["adapters"]
-    assert info["runners"] == ["local-out-of-core"]
+    assert info["runners"] == ["local-out-of-core", "local-subprocess"]
     assert {"media", "vector"} <= set(info["capabilities"])
 
 
@@ -530,6 +530,25 @@ def test_preview_has_more_marks_the_last_page(tmp_path):
     b = client.post("/api/run/preview", json={"graph": g, "nodeId": "s", "k": 50, "offset": 50}).json()
     assert len(a["rows"]) == 50 and a["hasMore"] is True     # page 0 → there IS a next page
     assert len(b["rows"]) == 50 and b["hasMore"] is False    # page 1 is the last — no phantom empty page
+
+
+def test_subprocess_runner_executes_in_isolation(tmp_path):
+    # the "local-subprocess" backend runs the job in a separate OS process (real isolation)
+    from kernel import metadb
+    metadb.set_setting("backend", "local-subprocess", "global")
+    try:
+        p = _seq_parquet(tmp_path, n=40)
+        g = {"id": "c", "version": 1, "nodes": [
+            N("src", "source", {"uri": p}),
+            N("wr", "write", {"name": "subproc_out", "writeMode": "overwrite"}),
+        ], "edges": [E("src", "wr")]}
+        r = client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()
+        st = _poll(r["runId"], tries=400)
+        assert st["status"] == "done", st.get("error")
+        assert st["outputTable"] == "subproc_out"
+        assert (st["totalRows"] or st["rowsProcessed"]) == 40
+    finally:
+        metadb.set_setting("backend", "", "global")  # restore the default in-process runner
 
 
 def test_object_store_s3_roundtrip_and_browse(tmp_path):

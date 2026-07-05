@@ -133,7 +133,7 @@ class RunEstimate(Wire):
 
 class PerNodeStatus(Wire):
     node_id: str
-    status: NodeStatus
+    status: str  # per-step run state: queued | running | done | failed (not a NodeStatus)
     rows: int | None = None
     ms: int | None = None
     label: str | None = None
