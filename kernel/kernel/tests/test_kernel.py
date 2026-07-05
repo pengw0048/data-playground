@@ -607,6 +607,24 @@ def test_canvas_crud_is_per_user():
     assert client.get("/api/canvas/cv1").status_code == 404
 
 
+def test_canvas_version_history_and_restore():
+    # every save keeps a (throttled) snapshot; a bad edit is recoverable by restoring an earlier one.
+    a = {"id": "cvh", "name": "V", "version": 1, "nodes": [{"id": "n1", "type": "source",
+         "position": {"x": 0, "y": 0}, "data": {"title": "n1", "config": {}}}], "edges": []}
+    assert client.put("/api/canvas/cvh", json=a).json()["ok"]  # first save → snapshot A
+    b = {**a, "version": 2, "nodes": []}                        # a "bad edit" that deletes the node
+    assert client.put("/api/canvas/cvh", json=b).json()["ok"]  # doc now empty (auto-snapshot throttled)
+    assert client.get("/api/canvas/cvh").json()["nodes"] == []  # confirm the bad state persisted
+    versions = client.get("/api/canvas/cvh/versions").json()
+    assert len(versions) >= 1  # snapshot A is there to restore
+    restored = client.post("/api/canvas/cvh/restore", json={"version_id": versions[-1]["id"]}).json()
+    assert [n["id"] for n in restored["doc"]["nodes"]] == ["n1"]  # node is back
+    assert [n["id"] for n in client.get("/api/canvas/cvh").json()["nodes"]] == ["n1"]  # persisted
+    # the restore itself snapshotted the pre-restore (empty) state, so it's undoable too
+    assert any(v["label"] == "before restore" for v in client.get("/api/canvas/cvh/versions").json())
+    client.delete("/api/canvas/cvh")
+
+
 def test_settings_global_and_user_scope():
     client.put("/api/settings", json={"scope": "global", "key": "agentModel", "value": "openai/gpt-4o"})
     u = client.post("/api/users", json={"name": "Carol"}).json()["id"]
@@ -718,6 +736,47 @@ def test_subprocess_run_is_recorded_in_history(tmp_path):
         assert runs[0]["status"] == "done"
     finally:
         metadb.set_setting("backend", "", "global")
+
+
+def test_lance_scan_streams_with_pushdown(tmp_path):
+    # Lance scans stream into DuckDB via a scanner→RecordBatchReader (out-of-core) instead of loading
+    # the whole dataset with ds.to_table(); column/limit/predicate pushdown still work.
+    pytest.importorskip("lance")
+    import lance
+    import pyarrow as pa
+
+    from kernel import db
+    from kernel.plugins.adapters import LanceAdapter
+    p = str(tmp_path / "t.lance")
+    lance.write_dataset(pa.table({"id": list(range(300)), "v": [i * 2 for i in range(300)]}), p)
+    a = LanceAdapter()
+    with db.lock():
+        assert a.scan(p).aggregate("count(*)").fetchone()[0] == 300           # streamed full scan
+        lim = a.scan(p, columns=["id"], limit=5)
+        assert lim.columns == ["id"] and lim.fetchall() == [(0,), (1,), (2,), (3,), (4,)]  # pushdown
+        assert a.scan(p, predicate="v >= 596").fetchall() == [(298, 596), (299, 598)]
+
+
+def test_vector_search_lance_ann_and_external_query(tmp_path):
+    # vector-search uses Lance's native nearest (its index if present) when the input is a bare Lance
+    # source, and can query by an arbitrary external vector — not only an existing row.
+    pytest.importorskip("lance")
+    import lance
+    import pyarrow as pa
+    p = str(tmp_path / "vec.lance")
+    vecs = [[1.0, 0, 0, 0], [0.9, 0.1, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]
+    lance.write_dataset(pa.table({"id": list(range(5)), "embedding": pa.array(vecs, type=pa.list_(pa.float32(), 4))}), p)
+    # query = row 0's vector [1,0,0,0] → itself is nearest, and a cosine _score column is exposed
+    g = {"id": "cv", "version": 1, "nodes": [N("s", "source", {"uri": p}),
+         N("vs", "vector-search", {"column": "embedding", "queryRow": 0, "k": 3})], "edges": [E("s", "vs")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "vs", "k": 10}).json()
+    assert not r["notPreviewable"], r.get("reason")
+    assert "_score" in [c["name"] for c in r["columns"]] and r["rows"][0]["id"] == 0
+    # an external query vector [0,1,0,0] → row 2 is nearest (no such row was the query)
+    g2 = {"id": "cv2", "version": 1, "nodes": [N("s", "source", {"uri": p}),
+          N("vs", "vector-search", {"column": "embedding", "queryVector": "[0,1,0,0]", "k": 2})], "edges": [E("s", "vs")]}
+    r2 = client.post("/api/run/preview", json={"graph": g2, "nodeId": "vs", "k": 10}).json()
+    assert r2["rows"][0]["id"] == 2
 
 
 def test_object_store_s3_roundtrip_and_browse(tmp_path):

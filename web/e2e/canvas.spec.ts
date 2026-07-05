@@ -414,6 +414,15 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('option[value="viewer"]').first()).toBeAttached() // viewer role is assignable end-to-end
   })
 
+  test('the app menu opens canvas version history with a restore action', async ({ page }) => {
+    await fresh(page)               // creating the file autosaves it → a first snapshot is captured
+    await page.waitForTimeout(700)  // let the autosave (~400ms) persist server-side
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Version history').click()
+    await expect(page.getByRole('heading', { name: 'Version history' }).or(page.getByText('Version history', { exact: true }).first())).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Restore' }).first()).toBeVisible({ timeout: 8000 }) // a snapshot to restore
+  })
+
   test('the app menu opens persisted run history', async ({ page }) => {
     await fresh(page)
     await page.getByTestId('app-menu').click()

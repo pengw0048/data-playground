@@ -149,6 +149,9 @@ export const api = {
     req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc) }),
   deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),
   listRuns: (canvasId: string) => req<RunRecordDto[]>(`/canvas/${canvasId}/runs`),
+  listVersions: (canvasId: string) => req<CanvasVersionDto[]>(`/canvas/${canvasId}/versions`),
+  restoreCanvas: (canvasId: string, versionId: string) =>
+    req<{ ok: boolean; id: string; doc: CanvasDoc }>(`/canvas/${canvasId}/restore`, { method: 'POST', body: JSON.stringify({ version_id: versionId }) }),
   authStatus: () => req<{ authEnabled: boolean; userId: string | null }>('/auth/status'),
   login: (userId: string, password: string) => req<{ ok: boolean; userId: string }>('/auth/login', { method: 'POST', body: JSON.stringify({ userId, password }) }),
   logout: () => req<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
@@ -163,6 +166,7 @@ export interface DestinationPreset { id: string; name: string; backend: string; 
 export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export interface RunRecordDto { id: string; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputTable?: string | null; createdAt?: string | null }
+export interface CanvasVersionDto { id: string; version: number; label?: string | null; authorId?: string | null; createdAt?: string | null }
 export interface ShareInfo { userId: string; name: string; role: string }
 export interface DpUser { id: string; name: string; email?: string | null }
 export interface CanvasFile { id: string; name: string; version: number; updatedAt?: string; role?: string; shared?: boolean; visibility?: string }

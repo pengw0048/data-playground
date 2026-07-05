@@ -79,6 +79,19 @@ class RunRecord(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class CanvasVersion(Base):
+    """A point-in-time snapshot of a canvas doc, for restore-after-a-bad-edit. Auto-captured (throttled)
+    on save, plus explicit named snapshots. One row per snapshot; oldest auto-snapshots are pruned."""
+    __tablename__ = "canvas_versions"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    doc: Mapped[str] = mapped_column(Text)
+    label: Mapped[str | None] = mapped_column(String, nullable=True)  # set for explicit named snapshots
+    author_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class Setting(Base):
     __tablename__ = "settings"
     # scope 'global' (scope_id='') for system settings; scope 'user' (scope_id=user id) for prefs
@@ -251,6 +264,8 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             s.delete(sh)
         for r in s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id)):
             s.delete(r)
+        for v in s.scalars(select(CanvasVersion).where(CanvasVersion.canvas_id == canvas_id)):
+            s.delete(v)
         c = s.get(Canvas, canvas_id)
         if c:
             s.delete(c)
@@ -263,6 +278,48 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
         return [{"id": r.id, "status": r.status, "targetNodeId": r.target_node_id, "rows": r.rows,
                  "ms": r.ms, "error": r.error, "outputTable": r.output_table,
                  "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
+
+
+def snapshot_canvas(canvas_id: str, doc_json: str, version: int, author_id: str | None = None,
+                    label: str | None = None, throttle_seconds: int = 90, keep: int = 30) -> bool:
+    """Save a snapshot of a canvas doc for later restore. Auto-snapshots (label=None) are throttled —
+    skipped if a recent one exists or the doc is unchanged — and pruned to the newest `keep`; named
+    snapshots are always kept. Returns True if a row was written."""
+    with session() as s:
+        if s.get(Canvas, canvas_id) is None:
+            return False
+        if label is None:
+            last = s.scalars(select(CanvasVersion).where(CanvasVersion.canvas_id == canvas_id, CanvasVersion.label.is_(None))
+                             .order_by(CanvasVersion.created_at.desc()).limit(1)).first()
+            if last:
+                if last.doc == doc_json:
+                    return False  # nothing changed since the last auto-snapshot
+                lc = last.created_at
+                if lc is not None and lc.tzinfo is None:
+                    lc = lc.replace(tzinfo=datetime.timezone.utc)  # SQLite may hand back naive
+                if lc is not None and (_now() - lc).total_seconds() < throttle_seconds:
+                    return False  # too soon — don't snapshot every 400ms autosave
+        s.add(CanvasVersion(canvas_id=canvas_id, version=version, doc=doc_json, label=label, author_id=author_id))
+        s.flush()
+        autos = s.scalars(select(CanvasVersion).where(CanvasVersion.canvas_id == canvas_id, CanvasVersion.label.is_(None))
+                          .order_by(CanvasVersion.created_at.desc())).all()
+        for old in autos[keep:]:  # prune the oldest auto-snapshots; named ones are retained
+            s.delete(old)
+    return True
+
+
+def list_versions(canvas_id: str, limit: int = 50) -> list[dict]:
+    with session() as s:
+        rows = s.scalars(select(CanvasVersion).where(CanvasVersion.canvas_id == canvas_id)
+                         .order_by(CanvasVersion.created_at.desc()).limit(limit)).all()
+        return [{"id": r.id, "version": r.version, "label": r.label, "authorId": r.author_id,
+                 "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
+
+
+def get_version_doc(canvas_id: str, version_id: str) -> str | None:
+    with session() as s:
+        v = s.get(CanvasVersion, version_id)
+        return v.doc if v and v.canvas_id == canvas_id else None
 
 
 def set_setting(key: str, value, scope: str = "global", scope_id: str = "") -> None:

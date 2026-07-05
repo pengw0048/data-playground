@@ -223,7 +223,9 @@ interface Store {
 export type DpView = 'canvas' | 'files' | 'tables' | 'transforms'
 
 function emptyDoc(): CanvasDoc {
-  return { id: `canvas_${Math.floor(performance.now())}`, name: 'untitled', version: 1, nodes: [], edges: [] }
+  // a random suffix keeps ids unique — performance.now() resets per page load, so a bare timestamp can
+  // collide across freshly-loaded tabs/tests and leak one canvas's runs/history into another
+  return { id: `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`, name: 'untitled', version: 1, nodes: [], edges: [] }
 }
 
 // Fold legacy documents into the current node model on load:

@@ -123,6 +123,7 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              inputs=[_in(("dataset",))], outputs=[_out()],
              params=[ParamSpec(name="column", type="string", default="embedding"),
                      ParamSpec(name="queryRow", type="int", default=0, label="query = row #"),
+                     ParamSpec(name="queryVector", type="string", label="or query vector (JSON [..])"),
                      ParamSpec(name="k", type="int", default=10)],
              blurb="top-K nearest by cosine similarity to a chosen row (brute-force)"),
     # Meta-programming primitive (see docs/meta-programming.zh.md): a composite node whose

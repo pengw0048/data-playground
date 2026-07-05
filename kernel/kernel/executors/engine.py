@@ -9,6 +9,7 @@ so what you see on the sample is faithful — except nodes flagged not-previewab
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import duckdb
@@ -415,26 +416,57 @@ class LoweringEngine:
         cfg = _cfg(node)
         col = cfg.get("column", "embedding")
         k = int(cfg.get("k", 10))
-        qrow = max(0, int(cfg.get("queryRow", 0)))
         if not inputs:
             raise NotPreviewable(node, "vector-search needs a dataset input")
         # the true nearest-K are over ALL rows (and the query row itself must come from the full set),
         # not a 2000-row prefix — score the full input in preview too
         src = inputs[0] if self.full else self._faithful_inputs(node)[0]
         base = self._view(src, "vs")
-        # brute-force cosine similarity to a chosen row's vector (the query), out-of-core in DuckDB
         con = db.conn()
-        try:
-            q = con.sql(f'SELECT "{col}" AS q FROM {base} OFFSET {qrow} LIMIT 1').fetchone()
-        except Exception as e:  # noqa: BLE001
-            raise NotPreviewable(node, f"no vector column '{col}': {e}") from e
-        if not q or q[0] is None:
-            raise NotPreviewable(node, f"no vector in column '{col}'")
-        qlit = "[" + ", ".join(str(float(x)) for x in q[0]) + "]::DOUBLE[]"
+        # query = an explicit external vector (e.g. a text embedding), else a chosen row's vector.
+        # the UI/config may carry it as a JSON string "[...]" or as a real list.
+        qv = cfg.get("queryVector")
+        if isinstance(qv, str) and qv.strip():
+            try:
+                qv = json.loads(qv)
+            except ValueError:
+                qv = None
+        if isinstance(qv, (list, tuple)) and qv:
+            query = [float(x) for x in qv]
+        else:
+            qrow = max(0, int(cfg.get("queryRow", 0)))
+            try:
+                q = con.sql(f'SELECT "{col}" AS q FROM {base} OFFSET {qrow} LIMIT 1').fetchone()
+            except Exception as e:  # noqa: BLE001
+                raise NotPreviewable(node, f"no vector column '{col}': {e}") from e
+            if not q or q[0] is None:
+                raise NotPreviewable(node, f"no vector in column '{col}'")
+            query = [float(x) for x in q[0]]
+        # native ANN when the input is a bare Lance source (uses its vector index if present), else a
+        # brute-force cosine scan out-of-core in DuckDB
+        luri = self._bare_lance_source(node)
+        if luri is not None:
+            try:
+                return self.resolve_adapter(luri).nearest(luri, col, query, k)
+            except Exception:  # noqa: BLE001 — no index / older lance / unsupported → brute force
+                pass
+        qlit = "[" + ", ".join(str(x) for x in query) + "]::DOUBLE[]"
         return con.sql(
             f'SELECT *, list_cosine_similarity("{col}", {qlit}) AS _score '
             f'FROM {base} ORDER BY _score DESC LIMIT {k}'
         )
+
+    def _bare_lance_source(self, node: GraphNode) -> str | None:
+        """The .lance uri if this node's single input is a bare Lance source (no ops between) — so
+        vector-search can use Lance's native nearest search instead of a full brute-force cosine scan."""
+        inc = g.incoming(self.graph, node.id)
+        if len(inc) != 1:
+            return None
+        src = g.node_map(self.graph).get(inc[0].source)
+        if src is None or src.type != "source":
+            return None
+        uri = (src.data.get("config", {}) if isinstance(src.data, dict) else {}).get("uri", "")
+        return uri if str(uri).lower().rstrip("/").endswith(".lance") else None
 
 
 def _apply_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node) -> list[dict]:

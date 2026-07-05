@@ -2,6 +2,13 @@
 
 _综合自 6 个并行调查员的 64 条原始发现（frontend-features:10, kernel-engine:17, collab-multiuser:11, robustness-tests:9, product-ux:10, todo-sweep:7），每条附 file:line 依据。_
 
+## 交付状态 (2026-07-05)
+
+- ✅ **Quick wins (7/7)** — atomic overwrite, subprocess run-history parity, resilient run polling, s3 storage boot, autosave 403-vs-offline, removed fake metric sparkline, grounded run estimate. (commit `7e15bb8`)
+- ✅ **High-value (7/7)** — faithful preview (join/sort/vector), interruptible/lock-freeing execution, CRDT-scoped undo, viewer-role WS enforcement + ShareModal, clipboard/select-all/multi-duplicate, join ON-expression, source CSV parse options. (commit `78c8807`)
+- ✅ **Bigger bets (3/4)** — Lance streaming scan (out-of-core), canvas version history + restore, Lance native ANN + external query vector. (+ fixed a latent non-unique canvas-id bug)
+- ⏳ **Bigger bet — real per-user identity (BB.2)**: NOT shipped. The current shared-password gate is a *documented, intentional* internal-tool simplification, and a real per-user credential/SSO model forces product decisions (per-user passwords vs OIDC; provisioning; reset flow) + is a security-sensitive, hard-to-reverse change. Needs an owner decision before implementation — see below.
+
 ## 总览判断
 
 The kernel is a genuinely real out-of-core DuckDB lowering engine with working object-store I/O, a content-addressed cache, run history, and a live CRDT collab layer — this is a serious product, not a demo. But its two headline promises are currently violated in the exact places users hit at scale: "the sample is faithful to the real run" is false for join/sort/vector-search, and "out-of-core" is false for Lance (full materialization), while the collab and permission layers can silently lose or leak a user's work. The single most important theme to pursue next is closing the correctness/trust gaps that make real features quietly behave differently than advertised — data-safe writes, faithful previews, enforceable sharing, and interruptible/bounded execution — before adding surface area.

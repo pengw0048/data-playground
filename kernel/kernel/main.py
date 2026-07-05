@@ -462,6 +462,8 @@ def get_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
 @api.put("/canvas/{canvas_id}")
 def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> dict:
     role = metadb.canvas_role(canvas_id, uid)  # None if the canvas doesn't exist yet
+    doc_json = json.dumps(doc)
+    version = doc.get("version", 1)
     with metadb.session() as s:
         c = s.get(metadb.Canvas, canvas_id)
         if c and role not in ("owner", "editor"):
@@ -470,15 +472,48 @@ def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> d
             c = metadb.Canvas(id=canvas_id, owner_id=uid)  # first save → the creator owns it
             s.add(c)
         c.name = doc.get("name") or c.name or "untitled"
-        c.version = doc.get("version", c.version)
-        c.doc = json.dumps(doc)
-        return {"ok": True, "id": canvas_id}
+        c.version = version
+        c.doc = doc_json
+    # keep a throttled snapshot history so a bad edit is recoverable (autosave fires ~every 400ms; the
+    # snapshotter dedups + rate-limits so it doesn't store every keystroke)
+    metadb.snapshot_canvas(canvas_id, doc_json, version, author_id=uid)
+    return {"ok": True, "id": canvas_id}
+
+
+@api.get("/canvas/{canvas_id}/versions")
+def get_canvas_versions(canvas_id: str, uid: str = Depends(current_user)) -> list[dict]:
+    if metadb.canvas_role(canvas_id, uid) is None:
+        raise HTTPException(404, "not found")
+    return metadb.list_versions(canvas_id)
+
+
+class RestoreRequest(BaseModel):
+    version_id: str
+    label: str | None = None  # optional name for the safety snapshot taken of the pre-restore state
+
+
+@api.post("/canvas/{canvas_id}/restore")
+def restore_canvas(canvas_id: str, req: RestoreRequest, uid: str = Depends(current_user)) -> dict:
+    if metadb.canvas_role(canvas_id, uid) not in ("owner", "editor"):
+        raise HTTPException(403, "you don't have edit access to this canvas")
+    doc = metadb.get_version_doc(canvas_id, req.version_id)
+    if doc is None:
+        raise HTTPException(404, "version not found")
+    with metadb.session() as s:
+        c = s.get(metadb.Canvas, canvas_id)
+        if c is None:
+            raise HTTPException(404, "not found")
+        # snapshot the CURRENT state first so a restore is itself undoable, then swap in the old doc
+        metadb.snapshot_canvas(canvas_id, c.doc, c.version, author_id=uid, label="before restore")
+        c.doc = doc
+        c.version = (c.version or 1) + 1
+    return {"ok": True, "id": canvas_id, "doc": json.loads(doc)}
 
 
 @api.delete("/canvas/{canvas_id}")
 def delete_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
     if metadb.canvas_role(canvas_id, uid) == "owner":  # only the owner can delete
-        metadb.delete_canvas_cascade(canvas_id)  # also drop shares + run history (no FK cascade)
+        metadb.delete_canvas_cascade(canvas_id)  # also drop shares + run history + versions (no FK cascade)
     return {"ok": True}
 
 

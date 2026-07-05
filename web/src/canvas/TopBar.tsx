@@ -6,7 +6,9 @@ import { Popover } from '../ui/Popover'
 import { SettingsModal } from '../panels/SettingsModal'
 import { CanvasSettingsModal } from '../panels/CanvasSettingsModal'
 import { RunHistoryModal } from '../panels/RunHistoryModal'
+import { VersionHistoryModal } from '../panels/VersionHistoryModal'
 import { ShareModal } from '../panels/ShareModal'
+import { crdtUndoActive } from '../collab/undo'
 
 export function TopBar() {
   const doc = useStore((s) => s.doc)
@@ -14,11 +16,14 @@ export function TopBar() {
   const kernelInfo = useStore((s) => s.kernelInfo)
   const saved = useStore((s) => s.saved)
   const rerunAll = useStore((s) => s.rerunAll)
-  const canUndo = useStore((s) => s.past.length > 0)
-  const canRedo = useStore((s) => s.future.length > 0)
+  // in a co-edit session undo/redo go through the CRDT manager (not the snapshot stacks), so enable the
+  // buttons whenever collab is active — pressing with empty history is a harmless no-op
+  const canUndo = useStore((s) => s.past.length > 0) || crdtUndoActive()
+  const canRedo = useStore((s) => s.future.length > 0) || crdtUndoActive()
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [canvasSettingsOpen, setCanvasSettingsOpen] = useState(false)
   const [runsOpen, setRunsOpen] = useState(false)
+  const [versionsOpen, setVersionsOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
 
   // let anything (e.g. the agent's "Configure a model" CTA) open Settings
@@ -31,7 +36,7 @@ export function TopBar() {
   return (
     <>
       <div style={{ position: 'absolute', top: 16, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <AppMenu onSettings={() => setSettingsOpen(true)} onRunHistory={() => setRunsOpen(true)} />
+        <AppMenu onSettings={() => setSettingsOpen(true)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} />
         <span style={{ fontSize: 13.5, color: color.text3 }}>/</span>
         <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
         <span data-testid="autosave" title={!kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined} style={{ fontSize: 11, color: color.text3, marginLeft: 2 }}>· {saved ? (kernelUp ? 'saved' : 'saved locally') : 'saving…'}</span>
@@ -69,6 +74,7 @@ export function TopBar() {
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
       {canvasSettingsOpen && <CanvasSettingsModal onClose={() => setCanvasSettingsOpen(false)} />}
       {runsOpen && <RunHistoryModal onClose={() => setRunsOpen(false)} />}
+      {versionsOpen && <VersionHistoryModal onClose={() => setVersionsOpen(false)} />}
       {shareOpen && <ShareModal onClose={() => setShareOpen(false)} />}
     </>
   )
@@ -91,7 +97,7 @@ function PeerAvatars() {
   )
 }
 
-function AppMenu({ onSettings, onRunHistory }: { onSettings: () => void; onRunHistory: () => void }) {
+function AppMenu({ onSettings, onRunHistory, onVersionHistory }: { onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void }) {
   const ref = useRef<HTMLButtonElement>(null)
   const [open, setOpen] = useState(false)
   const setView = useStore((s) => s.setView)
@@ -107,6 +113,7 @@ function AppMenu({ onSettings, onRunHistory }: { onSettings: () => void; onRunHi
         <MenuItem icon="chevronLeft" label="Back to files" onClick={() => { setView('files'); setOpen(false) }} />
         <MenuItem icon="plus" label="New file" onClick={() => { newFile(); setOpen(false) }} />
         <MenuItem icon="clock" label="Run history" onClick={() => { onRunHistory(); setOpen(false) }} />
+        <MenuItem icon="refresh" label="Version history" onClick={() => { onVersionHistory(); setOpen(false) }} />
         <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />
         <MenuItem icon="settings" label="Settings" onClick={() => { onSettings(); setOpen(false) }} />
       </Popover>

@@ -230,9 +230,8 @@ class DuckDBAdapter:
 class LanceAdapter:
     """Lance is open source, so it is a CORE adapter (PRD Appendix A note). pylance loaded lazily.
 
-    NOTE: a full scan (limit=None) currently materializes the dataset via ds.to_table() before
-    handing it to DuckDB — unlike the Parquet path it is not yet streaming. Column/limit pushdown
-    (preview, vector-search) is lazy. Streaming full scans are a follow-up.
+    Scans STREAM into DuckDB via a Lance scanner → Arrow RecordBatchReader (out-of-core: batches are
+    pulled on demand, never materializing the whole dataset in RAM), with column/limit pushdown.
     """
 
     name = "lance"
@@ -247,12 +246,22 @@ class LanceAdapter:
     def scan(self, uri: str, columns: list[str] | None = None,
              predicate: str | None = None, limit: int | None = None,
              options: dict | None = None) -> Relation:  # options (CSV knobs) don't apply to Lance — ignored
-        ds = self._dataset(uri)
-        tbl = ds.to_table(columns=columns, limit=limit)  # lazy column/limit pushdown
-        rel = db.conn().from_arrow(tbl)
+        # stream batches into DuckDB instead of ds.to_table() (which loads the ENTIRE dataset into RAM
+        # before handing it over — a real-scale Lance run/write would OOM and defeat out-of-core).
+        reader = self._dataset(uri).scanner(columns=columns, limit=limit).to_reader()
+        rel = db.conn().from_arrow(reader)
         if predicate:
             rel = rel.filter(predicate)
         return rel
+
+    def nearest(self, uri: str, column: str, query, k: int = 10) -> Relation:
+        """Top-k nearest rows to a query vector via Lance's native search (a vector index if one exists,
+        else a flat scan) — pushed into Lance rather than a brute-force cosine over every row. Streams
+        the result and exposes `_score` = cosine similarity (1 − distance), matching the generic path."""
+        reader = self._dataset(uri).scanner(
+            nearest={"column": column, "q": list(query), "k": int(k), "metric": "cosine"}).to_reader()
+        rel = db.conn().from_arrow(reader)
+        return rel.project("* EXCLUDE (_distance), (1 - _distance) AS _score")  # Lance ranks by distance asc
 
     def schema(self, uri: str) -> list[ColumnSchema]:
         return relation_columns(self.scan(uri, limit=0))
