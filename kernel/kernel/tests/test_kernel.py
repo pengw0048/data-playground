@@ -707,6 +707,11 @@ def test_api_routes_require_auth_when_enabled(monkeypatch):
     assert client.post("/api/data/sample", json={"uri": "/etc/passwd", "k": 5}).status_code == 401   # no unauth file-read
     assert client.post("/api/users", json={"name": "Mallory", "password": "x"}).status_code == 401    # no self-registration
     assert client.post("/api/catalog/register", json={"uri": "/etc/hosts"}).status_code == 401
+    # a representative route from EACH router module must be gated (proves the include-time gate survived
+    # the split into routers/{catalog,runs,workspace}): catalog (/data,/catalog), runs (/run), workspace
+    # (/users,/canvas,/settings — /settings holds object-store secrets so it must never be reachable unauth)
+    assert client.get("/api/canvas").status_code == 401
+    assert client.get("/api/settings").status_code == 401
     # but the login screen's public surface still works pre-session
     assert client.get("/api/auth/status").status_code == 200
     assert client.get("/api/users").status_code == 200 and all("email" not in u for u in client.get("/api/users").json())
