@@ -1,8 +1,8 @@
 import { register, type NodeComponentProps } from '../registry'
 import { useStore } from '../../store/graph'
 import { CodeSnippet } from '../../ui/CodeSnippet'
-import { color, radius, shadow } from '../../theme/tokens'
 import { Icon } from '../../ui/Icon'
+import { cn } from '@/lib/utils'
 
 // A "code on the canvas" layer (à la Figma): a code block that lives on the canvas as an annotation.
 // Syntax-highlighted read-only preview; double-click (or ⤢) opens the fullscreen Monaco editor. Like
@@ -16,25 +16,25 @@ function CodeBlock({ id, data, selected }: NodeComponentProps) {
   const lang: Lang = data.config.lang === 'sql' ? 'sql' : 'python'
 
   return (
-    <div onDoubleClick={() => openFullscreen(id, 'code', lang)} className="dp-no-select"
-      style={{ width: 320, minHeight: 96, background: '#fff', border: selected ? `1.5px solid ${color.focus}` : `1px solid ${color.border}`,
-        borderRadius: radius.node, boxShadow: selected ? shadow.focus : shadow.card, overflow: 'hidden' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px 6px 10px', borderBottom: `1px solid ${color.hairline}`, background: '#f7f8fa' }}>
-        <Icon name="code" size={12} style={{ color: color.text3 }} />
-        <button className="nodrag" onClick={(e) => { e.stopPropagation(); updateConfig(id, { lang: lang === 'python' ? 'sql' : 'python' }) }}
-          title="Toggle language" style={{ border: 'none', background: '#eef0f3', color: color.text2, fontSize: 9.5, fontWeight: 600, letterSpacing: 0.4, textTransform: 'uppercase', padding: '2px 7px', borderRadius: radius.chip, cursor: 'pointer' }}>
+    <div onDoubleClick={() => openFullscreen(id, 'code', lang)}
+      className={cn('dp-no-select min-h-24 w-80 overflow-hidden rounded-lg border bg-card shadow-sm',
+        selected ? 'border-primary ring-2 ring-primary/20' : 'border-border')}>
+      <div className="flex items-center gap-1.5 border-b border-border bg-muted py-1.5 pl-2.5 pr-2 text-muted-foreground">
+        <Icon name="code" size={12} />
+        <button className="nodrag rounded bg-secondary px-[7px] py-0.5 text-[9.5px] font-semibold uppercase tracking-[0.4px] text-muted-foreground" onClick={(e) => { e.stopPropagation(); updateConfig(id, { lang: lang === 'python' ? 'sql' : 'python' }) }}
+          title="Toggle language">
           {lang}
         </button>
-        <span style={{ flex: 1 }} />
-        <button className="nodrag" onClick={(e) => { e.stopPropagation(); openFullscreen(id, 'code', lang) }}
-          title="Open fullscreen editor" style={{ border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer', display: 'grid', placeItems: 'center', width: 22, height: 20 }}>
+        <span className="flex-1" />
+        <button className="nodrag grid h-5 w-[22px] place-items-center text-muted-foreground" onClick={(e) => { e.stopPropagation(); openFullscreen(id, 'code', lang) }}
+          title="Open fullscreen editor">
           <Icon name="external" size={13} />
         </button>
       </div>
-      <div style={{ padding: 10, maxHeight: 240, overflow: 'auto' }}>
+      <div className="max-h-60 overflow-auto p-2.5">
         {code.trim()
           ? <CodeSnippet code={code} language={lang} style={{ fontSize: 11, lineHeight: 1.5 }} />
-          : <span style={{ color: color.text3, fontStyle: 'italic', fontSize: 12 }}>Double-click to write code…</span>}
+          : <span className="text-xs italic text-muted-foreground">Double-click to write code…</span>}
       </div>
     </div>
   )

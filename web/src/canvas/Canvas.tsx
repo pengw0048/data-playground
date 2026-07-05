@@ -15,6 +15,7 @@ import { ConnectMenu } from './ConnectMenu'
 import { PanelHost } from '../panels/PanelHost'
 import { PeerCursors } from './PeerCursors'
 import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
+import { Button } from '@/components/ui/button'
 
 const edgeTypes = { wire: WireEdge }
 
@@ -46,15 +47,15 @@ function EmptyState() {
     addNode('source', { x: c.x - 116, y: c.y - 40 })
   }
   return (
-    <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', pointerEvents: 'none' }}>
-      <div style={{ textAlign: 'center', pointerEvents: 'auto' }}>
-        <div style={{ fontSize: 15, fontWeight: 600, color: color.ink }}>Empty canvas</div>
-        <div style={{ fontSize: 12.5, color: color.text3, marginTop: 6, maxWidth: 320, lineHeight: 1.5 }}>
+    <div className="pointer-events-none absolute inset-0 grid place-items-center">
+      <div className="pointer-events-auto text-center">
+        <div className="text-[15px] font-semibold text-foreground">Empty canvas</div>
+        <div className="mx-auto mt-1.5 max-w-[320px] text-[12.5px] leading-normal text-muted-foreground">
           Add a dataset source to begin.
         </div>
-        <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginTop: 14 }}>
-          <button onClick={add} style={{ padding: '8px 16px', border: 'none', borderRadius: 9, background: color.ink, color: '#fff', fontSize: 12.5, fontWeight: 600 }}>+ Add a source</button>
-          <button onClick={() => setAgentOpen(true)} style={{ padding: '8px 16px', border: `1px solid ${color.border}`, borderRadius: 9, background: '#fff', color: color.text2, fontSize: 12.5, fontWeight: 600 }}>Ask the Agent</button>
+        <div className="mt-3.5 flex justify-center gap-2">
+          <Button onClick={add} className="rounded-lg bg-foreground text-[12.5px] text-background hover:bg-foreground/90">+ Add a source</Button>
+          <Button variant="outline" onClick={() => setAgentOpen(true)} className="rounded-lg text-[12.5px] text-muted-foreground">Ask the Agent</Button>
         </div>
       </div>
     </div>

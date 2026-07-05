@@ -13,7 +13,7 @@ function Metric({ id, data }: NodeComponentProps) {
   const columns = useInputColumns(id)
   return (
     <NodeCard id={id} data={data} metaOverride={`${agg}${agg !== 'count' && column ? `(${column})` : ''} · scalar`}>
-      <div style={{ display: 'flex', gap: 8 }}>
+      <div className="flex gap-2">
         <Field label="agg" style={{ flex: 1 }}>
           <MiniSelect<Agg> value={agg} onChange={(v) => updateConfig(id, { agg: v })} options={[{ value: 'count', label: 'count' }, { value: 'mean', label: 'mean' }, { value: 'sum', label: 'sum' }, { value: 'min', label: 'min' }, { value: 'max', label: 'max' }]} />
         </Field>

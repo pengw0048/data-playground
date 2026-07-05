@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store/graph'
 import { capabilitiesFor } from '../nodes/registry'
-import { radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
+import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
 import type { ColumnSchema } from '../types/graph'
 
 const PAGE = 50
@@ -36,36 +37,35 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const atEnd = !res.hasMore  // the kernel peeks one extra row, so this is right even at exact multiples
 
   return (
-    <div className="dp-dark" style={{ color: 'var(--viewer-text)' }}>
+    <div className="dp-dark text-foreground">
       {/* tab bar + row-count */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 11px', borderBottom: '1px solid var(--viewer-line)' }}>
+      <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
         {!isMetric && detail == null && tabs.map((t) => (
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
-            style={{
-              fontSize: 11.5, fontWeight: 600, padding: '4px 10px', border: 'none', borderRadius: 6,
-              background: activeTab === t.id ? '#e7ebf5' : 'transparent',
-              color: activeTab === t.id ? '#3355c6' : 'var(--viewer-text-2)',
-            }}
+            className={cn(
+              'rounded-md px-2.5 py-1 text-[11.5px] font-semibold',
+              activeTab === t.id ? 'bg-primary/10 text-primary' : 'text-muted-foreground',
+            )}
           >
             {t.label}
           </button>
         ))}
         {detail != null && (
-          <button onClick={() => setDetail(null)} style={{ fontSize: 11.5, fontWeight: 600, padding: '4px 8px', border: 'none', borderRadius: 6, background: 'transparent', color: '#3355c6', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+          <button onClick={() => setDetail(null)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-semibold text-primary">
             <Icon name="chevronLeft" size={12} /> Row {offset + detail}
           </button>
         )}
-        <span style={{ flex: 1 }} />
+        <span className="flex-1" />
         {!isMetric && detail == null && (
           <>
-            <span style={{ fontSize: 10.5, color: 'var(--viewer-text-2)' }}>
+            <span className="text-[10.5px] text-muted-foreground">
               rows {res.rows.length ? offset : 0}–{offset + res.rows.length}
-              {res.truncated && <span style={{ marginLeft: 6, background: '#eef0f3', padding: '1px 6px', borderRadius: 4 }}>sample</span>}
+              {res.truncated && <span className="ml-1.5 rounded bg-muted px-1.5 py-px">sample</span>}
             </span>
             {activeTab === 'rows' && (
-              <span style={{ display: 'inline-flex', gap: 2, marginLeft: 4 }}>
+              <span className="ml-1 inline-flex gap-0.5">
                 <PageBtn dir="prev" disabled={offset === 0} onClick={() => page(Math.max(0, offset - PAGE))} />
                 <PageBtn dir="next" disabled={atEnd} onClick={() => page(offset + PAGE)} />
               </span>
@@ -94,7 +94,10 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
 function PageBtn({ dir, disabled, onClick }: { dir: 'prev' | 'next'; disabled: boolean; onClick: () => void }) {
   return (
     <button aria-label={dir === 'prev' ? 'Previous page' : 'Next page'} onClick={onClick} disabled={disabled}
-      style={{ width: 22, height: 20, display: 'grid', placeItems: 'center', border: 'none', borderRadius: 5, background: 'transparent', color: disabled ? '#c8ccd2' : 'var(--viewer-text-2)', cursor: disabled ? 'default' : 'pointer' }}>
+      className={cn(
+        'grid h-5 w-[22px] place-items-center rounded-[5px]',
+        disabled ? 'cursor-default text-muted-foreground/40' : 'cursor-pointer text-muted-foreground',
+      )}>
       <Icon name={dir === 'prev' ? 'chevronLeft' : 'chevronRight'} size={13} />
     </button>
   )
@@ -103,18 +106,18 @@ function PageBtn({ dir, disabled, onClick }: { dir: 'prev' | 'next'; disabled: b
 // Full detail for one row — every column with its full value (untruncated array / url / etc.).
 function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<string, unknown> }) {
   return (
-    <div style={{ maxHeight: 440, overflow: 'auto', padding: '4px 0' }}>
+    <div className="max-h-[440px] overflow-auto py-1">
       {columns.map((c) => (
-        <div key={c.name} style={{ display: 'flex', gap: 10, padding: '8px 12px', borderBottom: '1px solid var(--viewer-line)' }}>
-          <div style={{ width: 130, flex: '0 0 130px' }}>
-            <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--viewer-text)', wordBreak: 'break-word' }}>{c.name}</div>
-            <div style={{ fontSize: 9.5, color: 'var(--viewer-text-2)' }}>{c.type}</div>
+        <div key={c.name} className="flex gap-2.5 border-b border-border px-3 py-2">
+          <div className="w-[130px] flex-[0_0_130px]">
+            <div className="break-words text-[11.5px] font-semibold text-foreground">{c.name}</div>
+            <div className="text-[9.5px] text-muted-foreground">{c.type}</div>
           </div>
-          <div style={{ flex: 1, minWidth: 0, fontSize: 11.5 }}>
+          <div className="min-w-0 flex-1 text-[11.5px]">
             {c.capabilities.includes('media') && row[c.name] != null && (
-              <img src={String(row[c.name])} loading="lazy" style={{ maxWidth: 200, maxHeight: 140, borderRadius: 6, display: 'block', marginBottom: 6, background: '#eceef1' }} onError={(e) => (e.currentTarget.style.display = 'none')} />
+              <img src={String(row[c.name])} loading="lazy" className="mb-1.5 block max-h-[140px] max-w-[200px] rounded-md bg-muted" onError={(e) => (e.currentTarget.style.display = 'none')} />
             )}
-            <div className="dp-mono" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--viewer-text)' }}>
+            <div className="dp-mono whitespace-pre-wrap break-words text-foreground">
               {row[c.name] == null ? '·' : Array.isArray(row[c.name]) ? JSON.stringify(row[c.name]) : String(row[c.name])}
             </div>
           </div>
@@ -126,15 +129,15 @@ function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<stri
 
 function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; rows: Record<string, unknown>[]; onRowClick: (i: number) => void }) {
   return (
-    <div style={{ overflow: 'auto', maxHeight: 440 }}>
-      <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 11 }}>
+    <div className="max-h-[440px] overflow-auto">
+      <table className="w-full border-collapse text-[11px]">
         <thead>
           <tr>
             {columns.map((c) => (
-              <th key={c.name} style={{ textAlign: 'left', padding: '7px 10px', position: 'sticky', top: 0, background: 'var(--viewer-2)', color: 'var(--viewer-text-2)', fontWeight: 600, whiteSpace: 'nowrap', borderBottom: '1px solid var(--viewer-line)' }}>
+              <th key={c.name} className="sticky top-0 whitespace-nowrap border-b border-border bg-muted px-2.5 py-[7px] text-left font-semibold text-muted-foreground">
                 {c.name}
-                {c.capabilities.includes('media') && <span title="media column — thumbnails in the Media tab" style={{ marginLeft: 5, opacity: .6, cursor: 'help' }}>▦</span>}
-                {c.capabilities.includes('vector') && <span title="vector / embedding column" style={{ marginLeft: 5, opacity: .6, cursor: 'help' }}>⋮⋮</span>}
+                {c.capabilities.includes('media') && <span title="media column — thumbnails in the Media tab" className="ml-[5px] cursor-help opacity-60">▦</span>}
+                {c.capabilities.includes('vector') && <span title="vector / embedding column" className="ml-[5px] cursor-help opacity-60">⋮⋮</span>}
               </th>
             ))}
           </tr>
@@ -142,11 +145,9 @@ function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; row
         <tbody>
           {rows.map((r, i) => (
             <tr key={i} onClick={() => onRowClick(i)} title="Click for row detail"
-              style={{ borderBottom: '1px solid var(--viewer-line)', cursor: 'pointer' }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--viewer-2)')}
-              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}>
+              className="cursor-pointer border-b border-border hover:bg-muted">
               {columns.map((c) => (
-                <td key={c.name} style={{ padding: '6px 10px', whiteSpace: 'nowrap', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis' }} className={c.type.includes('[]') ? 'dp-mono' : undefined}>
+                <td key={c.name} className={cn('max-w-[260px] overflow-hidden text-ellipsis whitespace-nowrap px-2.5 py-1.5', c.type.includes('[]') && 'dp-mono')}>
                   <Cell col={c} value={r[c.name]} />
                 </td>
               ))}
@@ -159,40 +160,40 @@ function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; row
 }
 
 function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
-  if (value == null) return <span style={{ color: '#b0b4bc' }}>·</span>
+  if (value == null) return <span className="text-muted-foreground/60">·</span>
   if (col.capabilities.includes('media')) {
     const url = String(value)
     return (
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-        <img src={url} loading="lazy" style={{ width: 34, height: 24, objectFit: 'cover', borderRadius: 3, background: '#eceef1' }} onError={(e) => (e.currentTarget.style.display = 'none')} />
-        <span style={{ color: 'var(--viewer-text-2)', maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis' }}>{url.split('/').slice(-1)[0]}</span>
+      <span className="inline-flex items-center gap-1.5">
+        <img src={url} loading="lazy" className="h-6 w-[34px] rounded-sm bg-muted object-cover" onError={(e) => (e.currentTarget.style.display = 'none')} />
+        <span className="max-w-[150px] overflow-hidden text-ellipsis text-muted-foreground">{url.split('/').slice(-1)[0]}</span>
       </span>
     )
   }
   if (col.capabilities.includes('vector') && Array.isArray(value)) {
-    return <span style={{ fontSize: 10, fontWeight: 600, color: '#3355c6', background: '#e7ecfb', padding: '1px 6px', borderRadius: 4 }}>[{(value as number[]).length}]</span>
+    return <span className="rounded bg-primary/10 px-1.5 py-px text-[10px] font-semibold text-primary">[{(value as number[]).length}]</span>
   }
   if (Array.isArray(value)) return <span>[{value.length}]</span>
-  if (value === true) return <span style={{ color: '#2f9e5f' }}>true</span>
-  if (value === false) return <span style={{ color: '#d64550' }}>false</span>
+  if (value === true) return <span className="text-[#2f9e5f]">true</span>
+  if (value === false) return <span className="text-destructive">false</span>
   return <span>{String(value)}</span>
 }
 
 function MetricValue({ rows }: { rows: Record<string, unknown>[] }) {
   const v = rows[0]?.value
   return (
-    <div style={{ padding: '28px 16px', textAlign: 'center' }}>
-      <div style={{ fontSize: 34, fontWeight: 700, color: 'var(--viewer-text)' }}>{typeof v === 'number' ? v.toLocaleString() : String(v)}</div>
-      <div style={{ marginTop: 6, fontSize: 11, color: 'var(--viewer-text-2)' }}>{String(rows[0]?.metric ?? 'metric')} · over the full dataset</div>
+    <div className="px-4 py-7 text-center">
+      <div className="text-[34px] font-bold text-foreground">{typeof v === 'number' ? v.toLocaleString() : String(v)}</div>
+      <div className="mt-1.5 text-[11px] text-muted-foreground">{String(rows[0]?.metric ?? 'metric')} · over the full dataset</div>
     </div>
   )
 }
 
 function Skeleton() {
   return (
-    <div className="dp-dark" style={{ padding: 16 }}>
+    <div className="dp-dark p-4">
       {[0, 1, 2, 3, 4].map((i) => (
-        <div key={i} style={{ height: 12, background: '#eceef1', borderRadius: 4, margin: '10px 0', width: `${90 - i * 8}%`, animation: 'dp-pulse 1.2s infinite' }} />
+        <div key={i} className="my-2.5 h-3 rounded bg-muted" style={{ width: `${90 - i * 8}%`, animation: 'dp-pulse 1.2s infinite' }} />
       ))}
     </div>
   )
@@ -200,31 +201,26 @@ function Skeleton() {
 
 function ErrorState({ reason, onRetry }: { reason: string; onRetry: () => void }) {
   return (
-    <div className="dp-dark" style={{ padding: '24px 20px', textAlign: 'center', color: 'var(--viewer-text-2)' }}>
-      <div style={{ display: 'inline-grid', placeItems: 'center', width: 40, height: 40, borderRadius: 10, background: '#fbeef0', color: '#d64550', marginBottom: 12 }}>
+    <div className="dp-dark px-5 py-6 text-center text-muted-foreground">
+      <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-destructive/10 text-destructive">
         <Icon name="close" size={18} />
       </div>
-      <div style={{ fontSize: 13, fontWeight: 600, color: '#d64550' }}>Preview failed</div>
-      <div className="dp-mono" style={{ fontSize: 11, marginTop: 8, lineHeight: 1.5, maxWidth: 380, marginInline: 'auto', color: 'var(--viewer-text-2)', whiteSpace: 'pre-wrap', textAlign: 'left', background: '#faf1f2', border: '1px solid #f0dcdf', borderRadius: 8, padding: 10 }}>{reason}</div>
-      <button onClick={onRetry} style={{ marginTop: 14, padding: '7px 16px', border: '1px solid var(--viewer-line)', borderRadius: 8, background: '#fff', color: 'var(--viewer-text)', fontSize: 12, fontWeight: 600 }}>Retry</button>
+      <div className="text-[13px] font-semibold text-destructive">Preview failed</div>
+      <div className="dp-mono mx-auto mt-2 max-w-[380px] whitespace-pre-wrap rounded-lg border border-destructive/20 bg-destructive/10 p-2.5 text-left text-[11px] leading-normal text-muted-foreground">{reason}</div>
+      <Button variant="outline" size="sm" onClick={onRetry} className="mt-3.5">Retry</Button>
     </div>
   )
 }
 
 function NotPreviewable({ reason, onRun }: { reason: string; onRun: () => void }) {
   return (
-    <div className="dp-dark" style={{ padding: '28px 20px', textAlign: 'center', color: 'var(--viewer-text-2)' }}>
-      <div style={{ display: 'inline-grid', placeItems: 'center', width: 40, height: 40, borderRadius: 10, background: '#fbf1dc', color: '#d99a2b', marginBottom: 12 }}>
+    <div className="dp-dark px-5 py-7 text-center text-muted-foreground">
+      <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-[#fbf1dc] text-[#d99a2b]">
         <Icon name="power" size={18} />
       </div>
-      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--viewer-text)' }}>Not sample-previewable</div>
-      <div style={{ fontSize: 11.5, marginTop: 5, lineHeight: 1.5, maxWidth: 320, marginInline: 'auto' }}>{reason}</div>
-      <button
-        onClick={onRun}
-        style={{ marginTop: 14, padding: '7px 16px', border: '1px solid var(--viewer-line)', borderRadius: 8, background: '#fff', color: 'var(--viewer-text)', fontSize: 12, fontWeight: 600 }}
-      >
-        Run a full pass →
-      </button>
+      <div className="text-[13px] font-semibold text-foreground">Not sample-previewable</div>
+      <div className="mx-auto mt-[5px] max-w-[320px] text-[11.5px] leading-normal">{reason}</div>
+      <Button variant="outline" size="sm" onClick={onRun} className="mt-3.5">Run a full pass →</Button>
     </div>
   )
 }

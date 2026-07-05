@@ -11,7 +11,7 @@ function VectorSearch({ id, data }: NodeComponentProps) {
   const hasVec = Array.isArray(data.config.queryVector) && (data.config.queryVector as unknown[]).length > 0
   return (
     <NodeCard id={id} data={data} metaOverride={`top-${k} by cosine · ${col}${hasVec ? ' · query vector' : ` · row ${qrow}`}`}>
-      <div style={{ display: 'flex', gap: 8 }}>
+      <div className="flex gap-2">
         <Field label="vector column" style={{ flex: 1.5 }}>
           <MiniInput mono value={col} onChange={(v) => updateConfig(id, { column: v })} />
         </Field>

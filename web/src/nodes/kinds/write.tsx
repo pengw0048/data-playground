@@ -10,7 +10,7 @@ function Write({ id, data }: NodeComponentProps) {
   const dest = (data.config.destName as string | undefined) ?? 'Workspace outputs'
   return (
     <NodeCard id={id} data={data} metaOverride={name ? `→ ${dest} · ${mode}` : 'name an output → (destination in the panel)'}>
-      <div style={{ display: 'flex', gap: 8 }}>
+      <div className="flex gap-2">
         <Field label="file name" style={{ flex: 1.6 }}>
           <MiniInput value={name} placeholder="output.parquet" onChange={(v) => updateConfig(id, { filename: v })} />
         </Field>

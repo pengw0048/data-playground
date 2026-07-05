@@ -12,7 +12,7 @@ function Join({ id, data }: NodeComponentProps) {
   const columns = useInputColumns(id)  // union of left + right port columns
   return (
     <NodeCard id={id} data={data} metaOverride={`${how}${cond ? ` · on ${cond}` : on ? ` · on ${on}` : ''}`}>
-      <div style={{ display: 'flex', gap: 8 }}>
+      <div className="flex gap-2">
         <Field label="shared key" style={{ flex: 1.4 }}>
           <ColumnCombo value={on} columns={columns} placeholder="key" onChange={(v) => updateConfig(id, { on: v })} />
         </Field>

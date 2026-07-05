@@ -1,9 +1,16 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useUpdateNodeInternals } from '@xyflow/react'
-import { color, kindAccent, radius, shadow, status as statusTok } from '../theme/tokens'
+import { kindAccent, status as statusTok } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
-import { Popover } from '../ui/Popover'
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from '@/components/ui/dropdown-menu'
+import { cn } from '@/lib/utils'
 import { Port } from './Port'
 import { getSpec, nodeOutputs, type NodeSpec } from './registry'
 import { nodeInvalidReason } from './generic'
@@ -69,14 +76,8 @@ export function NodeCard({ id, data, children, metaOverride }: {
 
   const tag = (spec?.tag ?? kind).toUpperCase()
 
-  const border = bypassed
-    ? `1.5px dashed ${accent}`
-    : selected
-      ? `1px solid ${color.focus}`
-      : `1px solid ${color.border}`
-
   return (
-    <div style={{ position: 'relative', width: 232, opacity: off ? 0.45 : 1 }} className="dp-no-select"
+    <div className={cn('dp-no-select relative w-[232px]', off && 'opacity-45')}
       onMouseEnter={enterHover} onMouseLeave={leaveHover}>
       {/* input ports */}
       {(spec?.inputs ?? []).map((p, i) => (
@@ -88,81 +89,72 @@ export function NodeCard({ id, data, children, metaOverride }: {
       ))}
 
       <div
+        // flat card: thin token border, soft shadow. Selection reads as a primary ring (no heavy
+        // border); a bypassed node keeps its dashed accent outline (dynamic color → inline).
+        className={cn(
+          'overflow-hidden rounded-xl border bg-card shadow-sm transition-[box-shadow,border-color] duration-100',
+          !bypassed && (selected ? 'border-primary' : 'border-border'),
+          selected && 'ring-2 ring-primary/20',
+        )}
         style={{
-          background: color.card,
-          border,
-          borderRadius: radius.node,
-          boxShadow: selected ? shadow.focus : shadow.card,
-          overflow: 'hidden',
-          filter: off ? 'grayscale(0.7)' : undefined,
-          transition: 'box-shadow .12s, border-color .12s',
+          ...(bypassed ? { border: `1.5px dashed ${accent}` } : {}),
+          ...(off ? { filter: 'grayscale(0.7)' } : {}),
         }}
       >
-        <div style={{ display: 'flex' }}>
-          {/* accent stripe */}
-          <div style={{ width: 6, background: bypassed ? 'transparent' : accent, flex: '0 0 6px' }} />
-          <div style={{ flex: 1, minWidth: 0, padding: '11px 12px 0 10px' }}>
+        <div className="flex">
+          {/* accent stripe (kind color → inline; tokens can't express per-node values) */}
+          <div className="w-1.5 shrink-0" style={{ background: bypassed ? 'transparent' : accent }} />
+          <div className="min-w-0 flex-1 pt-[11px] pr-3 pl-2.5">
             {/* header */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+            <div className="flex items-center gap-[7px]">
               <span
-                className={data.status === 'running' ? 'dp-running-glyph' : undefined}
-                style={{ color: st.color, fontSize: 12, lineHeight: 1, width: 12, textAlign: 'center' }}
+                className={cn('w-3 text-center text-xs leading-none', data.status === 'running' && 'dp-running-glyph')}
+                style={{ color: st.color }}
                 title={st.label}
               >
                 {st.glyph}
               </span>
               <EditableTitle id={id} title={data.title} onRename={rename} selected={selected} />
-              <span style={{ flex: 1 }} />
+              <span className="flex-1" />
               {disabled && (
-                <span style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: 0.5, color: '#8a6d0b', background: '#fbf1dc', padding: '2px 6px', borderRadius: radius.chip, flex: '0 0 auto' }}>
+                <span className="shrink-0 rounded px-1.5 py-0.5 text-[8.5px] font-bold tracking-[0.5px]"
+                  style={{ color: '#8a6d0b', background: '#fbf1dc' }}>
                   DISABLED
                 </span>
               )}
-              <span
-                style={{
-                  fontSize: 8.5, fontWeight: 600, letterSpacing: 0.6, color: color.text3,
-                  background: '#f1f2f4', padding: '2px 6px', borderRadius: radius.chip, flex: '0 0 auto',
-                }}
-              >
+              <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[8.5px] font-semibold tracking-[0.6px] text-muted-foreground">
                 {tag}
               </span>
             </div>
 
             {/* meta */}
-            <div style={{ marginTop: 5, fontSize: 11.5, color: color.text2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minHeight: 16 }}>
+            <div className="mt-[5px] min-h-4 truncate text-[11.5px] text-muted-foreground">
               {metaOverride ?? data.meta ?? ''}
             </div>
 
             {/* a run awaiting confirmation stays visible ON the card (so a rerun-all of several
                 sinks doesn't hide all-but-one behind the single floating panel) */}
             {runState === 'confirm' && (
-              <button className="nodrag" onClick={(e) => { e.stopPropagation(); useStore.getState().openPanel(id, 'run') }}
-                style={{ marginTop: 6, display: 'inline-flex', alignItems: 'center', gap: 5, border: '1px solid #e7c66b', background: '#fbf1dc', color: '#8a6d0b', fontSize: 11, fontWeight: 600, padding: '4px 9px', borderRadius: 7, cursor: 'pointer' }}>
+              <button className="nodrag mt-1.5 inline-flex cursor-pointer items-center gap-[5px] rounded-md border px-[9px] py-1 text-[11px] font-semibold"
+                style={{ borderColor: '#e7c66b', background: '#fbf1dc', color: '#8a6d0b' }}
+                onClick={(e) => { e.stopPropagation(); useStore.getState().openPanel(id, 'run') }}>
                 <Icon name="power" size={11} /> Confirm run…
               </button>
             )}
 
             {/* compact body (kind-specific, kept small — P5) */}
-            {children && <div style={{ marginTop: 8 }}>{children}</div>}
+            {children && <div className="mt-2">{children}</div>}
 
           </div>
         </div>
       </div>
 
       {/* action shelf — revealed on hover / selection / run. It floats BELOW the card (absolute), so
-          appearing/disappearing never changes the card's height and the side ports never shift. */}
+          appearing/disappearing never changes the card's height and the side ports never shift.
+          A COMPACT floating toolbar (fit-content) tucked under the card's left edge; a descendant of
+          the hover wrapper, so the mouse can travel card ↔ bar without dropping the hover. */}
       {showShelf && (
-        <div
-          className="nodrag"
-          style={{
-            // a COMPACT floating toolbar tucked just under the card's left edge — fit-content width (not
-            // a dull full-card-width bar). A descendant of the hover wrapper, so the mouse can travel
-            // card ↔ bar without the hover dropping; the small offset reads as an intentional gap.
-            position: 'absolute', top: 'calc(100% + 5px)', left: 0, zIndex: 4,
-            display: 'inline-flex', alignItems: 'center', gap: 1, padding: '3px 4px',
-            background: '#fff', border: `1px solid ${color.border}`, borderRadius: 9, boxShadow: shadow.card,
-          }}
-        >
+        <div className="nodrag absolute left-0 top-[calc(100%+5px)] z-[4] inline-flex items-center gap-px rounded-lg border border-border bg-card px-1 py-[3px] shadow-sm">
           <ActionIcon
             name="eye" label={invalid ?? (runnable ? (openPanel === 'data' ? 'Hide data' : 'View data') : 'Connect a source to preview')}
             active={openPanel === 'data'} disabled={!runnable || !!invalid}
@@ -191,23 +183,20 @@ export function NodeCard({ id, data, children, metaOverride }: {
 function ActionIcon({ name, label, active, onClick, disabled }: {
   name: IconName; label: string; active?: boolean; onClick: () => void; disabled?: boolean
 }) {
-  const [hover, setHover] = useState(false)
   return (
     <Tooltip label={label}>
       <button
         aria-label={label}
         aria-disabled={disabled}
-        onMouseEnter={() => setHover(true)}
-        onMouseLeave={() => setHover(false)}
         onClick={(e) => { e.stopPropagation(); if (!disabled) onClick() }}
-        style={{
-          width: 26, height: 24, display: 'grid', placeItems: 'center', border: 'none',
-          borderRadius: 6,
-          background: disabled ? 'transparent' : active ? '#e7ebf5' : hover ? '#eceef1' : 'transparent',
-          color: disabled ? '#c8ccd2' : active ? color.focus : hover ? color.ink : color.text3,
-          cursor: disabled ? 'not-allowed' : 'pointer',
-          transition: 'background .1s, color .1s',
-        }}
+        className={cn(
+          'grid h-6 w-[26px] place-items-center rounded-md transition-colors',
+          disabled
+            ? 'cursor-not-allowed bg-transparent text-muted-foreground/40'
+            : active
+              ? 'bg-primary/10 text-primary'
+              : 'cursor-pointer bg-transparent text-muted-foreground hover:bg-accent hover:text-foreground',
+        )}
       >
         <Icon name={name} />
       </button>
@@ -234,7 +223,7 @@ function EditableTitle({ id, title, onRename, selected }: { id: string; title: s
         onClick={(e) => e.stopPropagation()}
         onBlur={() => { setEditing(false); if (val.trim()) onRename(id, val.trim()) }}
         onKeyDown={(e) => { if (e.key === 'Enter') { setEditing(false); if (val.trim()) onRename(id, val.trim()) } if (e.key === 'Escape') { setVal(title); setEditing(false) } }}
-        style={{ fontSize: 13.5, fontWeight: 600, color: color.ink, border: `1px solid ${color.focus}`, borderRadius: 5, padding: '1px 4px', outline: 'none', width: 130 }}
+        className="w-[130px] rounded-sm border border-primary px-1 py-px text-[13.5px] font-semibold text-foreground outline-none"
       />
     )
   }
@@ -244,7 +233,7 @@ function EditableTitle({ id, title, onRename, selected }: { id: string; title: s
       onClick={(e) => { if (selected) { e.stopPropagation(); setEditing(true) } }}
       onDoubleClick={(e) => { e.stopPropagation(); setEditing(true) }}
       title="Click (when selected) or double-click to rename"
-      style={{ fontSize: 13.5, fontWeight: 600, color: color.ink, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', cursor: 'text' }}
+      className="cursor-text truncate text-[13.5px] font-semibold text-foreground"
     >
       {title}
     </span>
@@ -253,41 +242,45 @@ function EditableTitle({ id, title, onRename, selected }: { id: string; title: s
 
 function MoreMenu({ id, kind }: { id: string; kind: string }) {
   const [open, setOpen] = useState(false)
-  const btnRef = useRef<HTMLButtonElement>(null)
   const { bypass, disable, duplicate, removeNode, openPanel } = useStore.getState()
   const canBypass = getSpec(kind)?.canBypass
 
+  // items call store actions directly (no Dialogs), so onSelect can run inline and let the menu
+  // close normally. role="button" preserves the original buttons' a11y role.
   const item = (icon: IconName, label: string, fn: () => void, danger = false) => (
-    <button
-      onClick={(e) => { e.stopPropagation(); fn(); setOpen(false) }}
-      style={{
-        display: 'flex', alignItems: 'center', gap: 9, width: '100%', padding: '7px 10px',
-        border: 'none', background: 'transparent', color: danger ? color.failed : color.text2,
-        fontSize: 12, textAlign: 'left', borderRadius: 6,
-      }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = '#f2f3f5')}
-      onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+    <DropdownMenuItem
+      role="button"
+      onSelect={() => fn()}
+      className={cn(danger && 'text-destructive focus:text-destructive')}
     >
       <Icon name={icon} /> {label}
-    </button>
+    </DropdownMenuItem>
   )
 
   return (
-    <>
+    <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
       <Tooltip label="More">
-        <button
-          ref={btnRef}
-          aria-label="More"
-          onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}
-          style={{
-            width: 26, height: 24, display: 'grid', placeItems: 'center', border: 'none',
-            borderRadius: 6, background: open ? '#eceef1' : 'transparent', color: open ? color.ink : color.text3,
-          }}
-        >
-          <Icon name="more" />
-        </button>
+        <DropdownMenuTrigger asChild>
+          <button
+            aria-label="More"
+            onClick={(e) => e.stopPropagation()}
+            className={cn(
+              'grid h-6 w-[26px] place-items-center rounded-md transition-colors',
+              open ? 'bg-accent text-foreground' : 'cursor-pointer bg-transparent text-muted-foreground hover:bg-accent hover:text-foreground',
+            )}
+          >
+            <Icon name="more" />
+          </button>
+        </DropdownMenuTrigger>
       </Tooltip>
-      <Popover anchorRef={btnRef} open={open} onClose={() => setOpen(false)} width={184} align="right">
+      <DropdownMenuContent
+        align="end"
+        className="dp-panel w-[184px]"
+        // don't yank focus back to the trigger on close — the shelf/trigger may unmount, and the
+        // "Rename" flow needs the freshly-mounted title input to keep focus (matches the old popover)
+        onCloseAutoFocus={(e) => e.preventDefault()}
+        onClick={(e) => e.stopPropagation()}
+      >
         {item('rename', 'Rename', () => window.dispatchEvent(new CustomEvent('dp-rename', { detail: { id } })))}
         {item('play', 'Run details', () => openPanel(id, 'run'))}
         {item('duplicate', 'Duplicate', () => duplicate(id))}
@@ -295,9 +288,9 @@ function MoreMenu({ id, kind }: { id: string; kind: string }) {
         {item('mute', 'Disable (+ downstream)', () => disable(id))}
         {item('export', 'Export data', () => exportNode(id))}
         {item('lineage', 'Lineage', () => openPanel(id, 'lineage'))}
-        <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />
+        <DropdownMenuSeparator />
         {item('trash', 'Delete', () => removeNode(id), true)}
-      </Popover>
-    </>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }

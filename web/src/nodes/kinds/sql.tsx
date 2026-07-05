@@ -1,7 +1,6 @@
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useStore } from '../../store/graph'
-import { color } from '../../theme/tokens'
 import { CodeSnippet } from '../../ui/CodeSnippet'
 
 const DEFAULT_SQL = 'SELECT * FROM input LIMIT 100'
@@ -13,11 +12,7 @@ function Sql({ id, data }: NodeComponentProps) {
     <NodeCard id={id} data={data} metaOverride="SQL → view">
       <button
         onClick={(e) => { e.stopPropagation(); openFullscreen(id, 'sql', 'sql') }}
-        style={{
-          display: 'block', width: '100%', textAlign: 'left', background: 'var(--code-bg)',
-          border: `1px solid ${color.border}`, borderRadius: 8, padding: '8px 10px', fontSize: 10.5, lineHeight: 1.4,
-          whiteSpace: 'pre-wrap', cursor: 'text', maxHeight: 54, overflow: 'hidden',
-        }}
+        className="block max-h-[54px] w-full cursor-text overflow-hidden whitespace-pre-wrap rounded-md border border-border bg-[var(--code-bg)] px-2.5 py-2 text-left text-[10.5px] leading-[1.4]"
       >
         <CodeSnippet code={sql} language="sql" />
       </button>

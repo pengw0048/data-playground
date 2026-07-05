@@ -1,9 +1,10 @@
-import { useState, type CSSProperties } from 'react'
+import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { register, type NodeComponentProps } from '../registry'
 import { useStore } from '../../store/graph'
-import { color, radius, shadow } from '../../theme/tokens'
+import { color } from '../../theme/tokens'
+import { cn } from '@/lib/utils'
 
 // A canvas annotation: a resizable-ish markdown text box. It is a real node (persisted, movable,
 // selectable) but carries NO ports and is stripped from the graph sent to the kernel (see toGraph),
@@ -16,16 +17,13 @@ function Note({ id, data, selected }: NodeComponentProps) {
   return (
     <div
       onDoubleClick={() => setEditing(true)}
-      style={{
-        width: 268, minHeight: 96, background: '#fffdf3',
-        border: selected ? `1.5px solid ${color.focus}` : `1px solid #ece3c4`,
-        borderRadius: radius.node, boxShadow: selected ? shadow.focus : shadow.card,
-        padding: 12, fontSize: 12.5, color: color.ink, overflow: 'hidden',
-      }}
+      className={cn('min-h-24 w-[268px] overflow-hidden rounded-lg p-3 text-[12.5px] text-foreground',
+        selected ? 'shadow-md ring-2 ring-primary/20' : 'shadow-sm')}
+      style={{ background: '#fffdf3', border: selected ? `1.5px solid ${color.focus}` : '1px solid #ece3c4' }}
     >
       {editing ? (
         <textarea
-          className="nodrag nowheel dp-mono"  /* nowheel: let the wheel scroll the textarea, not pan the canvas */
+          className="nodrag nowheel dp-mono min-h-[120px] max-h-[400px] w-full resize-y overflow-y-auto border-none bg-transparent text-xs leading-normal text-foreground outline-none"  /* nowheel: let the wheel scroll the textarea, not pan the canvas */
           autoFocus
           value={md}
           onChange={(e) => updateConfig(id, { markdown: e.target.value })}
@@ -33,23 +31,17 @@ function Note({ id, data, selected }: NodeComponentProps) {
           onKeyDown={(e) => { if (e.key === 'Escape') setEditing(false) }}
           spellCheck={false}
           placeholder="# Markdown…"
-          style={{
-            width: '100%', minHeight: 120, maxHeight: 400, overflowY: 'auto', resize: 'vertical',
-            border: 'none', outline: 'none', background: 'transparent', color: color.ink, fontSize: 12, lineHeight: 1.5,
-          }}
         />
       ) : md.trim() ? (
-        <div className="nowheel" style={mdWrap}>
+        <div className="nowheel max-h-[400px] overflow-y-auto break-words leading-[1.55]">
           <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD}>{md}</ReactMarkdown>
         </div>
       ) : (
-        <div style={{ color: color.text3, fontStyle: 'italic' }}>Double-click to edit…</div>
+        <div className="italic text-muted-foreground">Double-click to edit…</div>
       )}
     </div>
   )
 }
-
-const mdWrap: CSSProperties = { lineHeight: 1.55, wordBreak: 'break-word', maxHeight: 400, overflowY: 'auto' }
 // compact, self-contained markdown styling (no global CSS dependency)
 const MD = {
   h1: (p: any) => <div style={{ fontSize: 15, fontWeight: 700, margin: '2px 0 6px' }} {...p} />,

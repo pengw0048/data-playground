@@ -9,7 +9,7 @@ function Sample({ id, data }: NodeComponentProps) {
   const seed = Number(data.config.seed ?? 42)
   return (
     <NodeCard id={id} data={data} metaOverride={`${n.toLocaleString()} rows · seed ${seed}`}>
-      <div style={{ display: 'flex', gap: 8 }}>
+      <div className="flex gap-2">
         <Field label="n" style={{ flex: 1 }}>
           <MiniInput value={String(n)} onChange={(v) => updateConfig(id, { n: Number(v) || 0 })} />
         </Field>

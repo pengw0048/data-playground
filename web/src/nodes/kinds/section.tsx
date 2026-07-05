@@ -3,9 +3,10 @@ import { useUpdateNodeInternals } from '@xyflow/react'
 import { register, nodeOutputs, type NodeComponentProps } from '../registry'
 import { Port } from '../Port'
 import { useStore, nodeRunnable } from '../../store/graph'
-import { color, radius, status as statusTok } from '../../theme/tokens'
+import { status as statusTok } from '../../theme/tokens'
 import { Icon } from '../../ui/Icon'
 import { Tooltip } from '../../ui/Tooltip'
+import { cn } from '@/lib/utils'
 
 // The meta-programming node renders as a CONTAINER frame: nodes dropped inside it (parentId) are the
 // section's callable children (alias = their title); a driver script (in the panel) calls them with
@@ -40,51 +41,46 @@ function Section({ id, data, selected }: NodeComponentProps) {
       {inputs.map((p, i) => <Port key={p.id} spec={p as any} side="input" index={i} count={inputs.length} />)}
       {outs.map((p, i) => <Port key={p.id} spec={p} side="output" index={i} count={outs.length} nodeId={id} />)}
 
-      <div style={{
-        width: '100%', height: '100%', display: 'flex', flexDirection: 'column',
-        background: 'rgba(138,143,152,0.05)', border: `1.5px ${selected ? 'solid' : 'dashed'} ${selected ? color.focus : '#b9bec6'}`,
-        borderRadius: radius.node, boxShadow: selected ? '0 0 0 3px rgba(60,110,240,0.12)' : undefined,
-      }}>
+      <div className={cn(
+        'flex h-full w-full flex-col rounded-lg border-[1.5px] bg-muted/40',
+        selected ? 'border-solid border-primary ring-[3px] ring-primary/15' : 'border-dashed border-muted-foreground/40',
+      )}>
         {/* header */}
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 7, padding: '8px 10px',
-          borderBottom: `1px solid ${color.hairline}`, background: '#fff',
-          borderRadius: `${radius.node}px ${radius.node}px 0 0`,
-        }}>
-          <span style={{ color: st.color, fontSize: 12, width: 12, textAlign: 'center' }} title={st.label}>{st.glyph}</span>
+        <div className="flex items-center gap-[7px] rounded-t-lg border-b border-border bg-card px-2.5 py-2">
+          <span className="w-3 text-center text-xs" style={{ color: st.color }} title={st.label}>{st.glyph}</span>
           {editing ? (
             <input
               autoFocus value={val} onChange={(e) => setVal(e.target.value)} onClick={(e) => e.stopPropagation()}
               onBlur={() => { setEditing(false); if (val.trim()) rename(id, val.trim()) }}
               onKeyDown={(e) => { if (e.key === 'Enter') { setEditing(false); if (val.trim()) rename(id, val.trim()) } if (e.key === 'Escape') { setVal(data.title); setEditing(false) } }}
-              style={{ fontSize: 13, fontWeight: 600, color: color.ink, border: `1px solid ${color.focus}`, borderRadius: 5, padding: '1px 4px', outline: 'none', width: 140 }}
+              className="w-[140px] rounded border border-primary px-1 py-px text-[13px] font-semibold text-foreground outline-none"
             />
           ) : (
             <span onDoubleClick={(e) => { e.stopPropagation(); setEditing(true) }}
-              style={{ fontSize: 13, fontWeight: 600, color: color.ink, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'text' }}>
+              className="flex-1 cursor-text truncate text-[13px] font-semibold text-foreground">
               {data.title}
             </span>
           )}
-          <span style={{ flex: editing ? 1 : undefined }} />
-          <span style={{ fontSize: 8.5, fontWeight: 600, letterSpacing: 0.6, color: color.text3, background: '#f1f2f4', padding: '2px 6px', borderRadius: radius.chip }}>SECTION</span>
+          <span className={editing ? 'flex-1' : undefined} />
+          <span className="rounded bg-muted px-1.5 py-0.5 text-[8.5px] font-semibold tracking-[0.6px] text-muted-foreground">SECTION</span>
           <Tooltip label={runnable ? 'Run up to here' : 'Connect a source to run'}>
             <button aria-label="Run section" aria-disabled={!runnable} onClick={(e) => { e.stopPropagation(); if (runnable) requestRun(id) }}
-              style={{ width: 24, height: 22, display: 'grid', placeItems: 'center', border: 'none', borderRadius: 6, background: 'transparent', color: runnable ? color.text2 : '#c8ccd2', cursor: runnable ? 'pointer' : 'not-allowed' }}>
+              className={cn('grid h-[22px] w-6 place-items-center rounded-md', runnable ? 'cursor-pointer text-muted-foreground' : 'cursor-not-allowed text-muted-foreground/40')}>
               <Icon name="play" size={13} />
             </button>
           </Tooltip>
         </div>
 
         {/* body — the drop zone for contained nodes */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, padding: 12 }}>
-          <div style={{ fontSize: 11.5, color: color.text3, textAlign: 'center', lineHeight: 1.5 }}>
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 p-3">
+          <div className="text-center text-[11.5px] leading-normal text-muted-foreground">
             {childCount > 0
               ? `${childCount} contained node${childCount > 1 ? 's' : ''} · script drives them`
               : 'Drop nodes here to contain them,\nthen script the loop/branch.'}
           </div>
           <button
             onClick={(e) => { e.stopPropagation(); togglePanel(id, 'section') }}
-            style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: '#fff', border: `1px solid ${color.border}`, borderRadius: 8, padding: '5px 12px', fontSize: 11.5, color: openPanel === 'section' ? color.focus : color.text2, cursor: 'pointer' }}
+            className={cn('inline-flex items-center gap-[5px] rounded-md border border-border bg-card px-3 py-[5px] text-[11.5px]', openPanel === 'section' ? 'text-primary' : 'text-muted-foreground')}
           >
             <Icon name="code" size={12} /> Edit script →
           </button>

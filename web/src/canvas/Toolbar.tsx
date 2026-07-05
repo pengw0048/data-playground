@@ -2,10 +2,11 @@ import { useRef, useState } from 'react'
 import { useReactFlow } from '@xyflow/react'
 import { allSpecs } from '../nodes'
 import { useStore, freePosition } from '../store/graph'
-import { categoryOrder, color, kindAccent, shadow, type Category } from '../theme/tokens'
+import { categoryOrder, color, kindAccent, type Category } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
 import { Popover } from '../ui/Popover'
+import { cn } from '@/lib/utils'
 
 const CATEGORY_ICON: Record<Category, IconName> = {
   io: 'db', shape: 'sample', compute: 'fx', query: 'sql', inspect: 'note', control: 'branch',
@@ -33,13 +34,8 @@ export function Toolbar() {
   }
 
   return (
-    <div data-testid="toolbar" style={{ position: 'absolute', left: '50%', bottom: 22, transform: 'translateX(-50%)', zIndex: 16 }}>
-      <div
-        style={{
-          display: 'flex', alignItems: 'center', gap: 4, padding: 6, background: '#fff',
-          border: `1px solid ${color.border}`, borderRadius: 14, boxShadow: shadow.panel,
-        }}
-      >
+    <div data-testid="toolbar" className="absolute bottom-[22px] left-1/2 z-[16] -translate-x-1/2">
+      <div className="flex items-center gap-1 rounded-2xl border border-border bg-card p-1.5 shadow-lg">
         {cats.map((cat) => (
           <CategoryButton
             key={cat}
@@ -52,14 +48,13 @@ export function Toolbar() {
           />
         ))}
 
-        <div style={{ width: 1, height: 22, background: color.hairline, margin: '0 4px' }} />
+        <div className="mx-1 h-[22px] w-px bg-border" />
 
         <button
           onClick={() => setAgentOpen(!agentOpen)}
-          style={{
-            display: 'inline-flex', alignItems: 'center', gap: 7, padding: '7px 14px', border: 'none', borderRadius: 10,
-            background: agentOpen ? '#efeaff' : 'linear-gradient(180deg,#f3effe,#ece5fc)', color: '#6b4bd6', fontSize: 12.5, fontWeight: 600,
-          }}
+          className="inline-flex items-center gap-[7px] rounded-lg px-3.5 py-[7px] text-[12.5px] font-semibold"
+          // Agent brand accent (violet) — no design token expresses it; matches the AgentDock it opens.
+          style={{ background: agentOpen ? '#efeaff' : 'linear-gradient(180deg,#f3effe,#ece5fc)', color: '#6b4bd6' }}
         >
           <Icon name="sparkle" size={14} /> Agent
         </button>
@@ -80,31 +75,29 @@ function CategoryButton({ cat, open, onToggle, onClose, specs, onPick }: {
           ref={ref}
           aria-label={CATEGORY_LABEL[cat]}
           onClick={(e) => { e.stopPropagation(); onToggle() }}
-          style={{
-            width: 38, height: 34, display: 'grid', placeItems: 'center', border: 'none', borderRadius: 10,
-            background: open ? '#eef0f3' : 'transparent', color: open ? color.ink : color.text2,
-          }}
+          className={cn(
+            'grid h-[34px] w-[38px] place-items-center rounded-lg transition-colors',
+            open ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent hover:text-foreground',
+          )}
         >
           <Icon name={CATEGORY_ICON[cat]} size={16} />
         </button>
       </Tooltip>
       {/* portal popover positioned once against the button (no percentage-based jump) */}
       <Popover anchorRef={ref} open={open} onClose={onClose} width={210} placement="top" align="left">
-        <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, padding: '5px 8px' }}>
+        <div className="px-2 py-[5px] text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">
           {CATEGORY_LABEL[cat]}
         </div>
         {specs.map((s) => (
           <button
             key={s.kind}
             onClick={(e) => { e.stopPropagation(); onPick(s.kind) }}
-            style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 8px', border: 'none', background: 'transparent', borderRadius: 7 }}
-            onMouseEnter={(e) => (e.currentTarget.style.background = '#f2f3f5')}
-            onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+            className="flex w-full items-center gap-[9px] rounded-md px-2 py-[7px] text-left hover:bg-accent"
           >
-            <span style={{ width: 4, height: 15, borderRadius: 2, background: kindAccent[s.kind] ?? color.text3 }} />
-            <span style={{ display: 'flex', flexDirection: 'column' }}>
-              <span style={{ fontSize: 12.5, fontWeight: 600, color: color.ink }}>{s.title}</span>
-              <span style={{ fontSize: 10, color: color.text3 }}>{s.blurb}</span>
+            <span className="h-[15px] w-1 rounded-sm" style={{ background: kindAccent[s.kind] ?? color.text3 }} />
+            <span className="flex flex-col">
+              <span className="text-[12.5px] font-semibold text-foreground">{s.title}</span>
+              <span className="text-[10px] text-muted-foreground">{s.blurb}</span>
             </span>
           </button>
         ))}

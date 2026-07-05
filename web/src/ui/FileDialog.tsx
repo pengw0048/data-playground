@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, type BrowseEntry, type DestinationPreset } from '../api/client'
-import { color, radius, shadow } from '../theme/tokens'
+import { cn } from '@/lib/utils'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Icon } from './Icon'
 
 // An open/save dialog over the configured destinations (local dirs + object-store prefixes), styled
@@ -66,59 +68,58 @@ export function FileDialog(props:
   }
 
   return createPortal(
-    <div className="dp-modal-overlay" onMouseDown={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(20,22,28,.35)', zIndex: 2100, display: 'grid', placeItems: 'center' }}>
+    <div className="dp-modal-overlay fixed inset-0 z-[2100] grid place-items-center bg-black/30" onMouseDown={onClose}>
       <div onMouseDown={(e) => e.stopPropagation()}
-        style={{ width: 'min(640px, 94vw)', height: 'min(460px, 88vh)', background: '#fff', border: `1px solid ${color.border}`, borderRadius: radius.panel, boxShadow: shadow.panel, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '11px 14px', borderBottom: `1px solid ${color.hairline}` }}>
-          <Icon name={mode === 'save' ? 'export' : 'db'} size={14} style={{ color: color.text2 }} />
-          <span style={{ fontSize: 13.5, fontWeight: 600 }}>{props.title ?? (mode === 'save' ? 'Save output' : 'Open a file')}</span>
-          <span style={{ flex: 1 }} />
-          <button onClick={onClose} aria-label="Close" style={{ width: 26, height: 24, border: 'none', background: 'transparent', color: color.text3, display: 'grid', placeItems: 'center' }}><Icon name="close" size={13} /></button>
+        className="flex h-[min(460px,88vh)] w-[min(640px,94vw)] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-lg">
+        <div className="flex items-center gap-2 border-b border-border px-[14px] py-[11px]">
+          <span className="flex items-center text-muted-foreground"><Icon name={mode === 'save' ? 'export' : 'db'} size={14} /></span>
+          <span className="text-[13.5px] font-semibold">{props.title ?? (mode === 'save' ? 'Save output' : 'Open a file')}</span>
+          <span className="flex-1" />
+          <button onClick={onClose} aria-label="Close" className="grid h-6 w-[26px] place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"><Icon name="close" size={13} /></button>
         </div>
 
-        <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
+        <div className="flex min-h-0 flex-1">
           {/* left "places" sidebar — switch destination */}
-          <div style={{ width: 168, flex: '0 0 168px', borderRight: `1px solid ${color.hairline}`, overflowY: 'auto', padding: 6, background: '#fbfbfc' }}>
-            <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3, padding: '4px 8px' }}>Places</div>
+          <div className="w-[168px] shrink-0 overflow-y-auto border-r border-border bg-muted/30 p-1.5">
+            <div className="px-2 py-1 text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">Places</div>
             {dests.map((d) => (
               <button key={d.id} onClick={() => { setDestId(d.id); setPath('') }}
-                style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', padding: '7px 8px', border: 'none', borderRadius: 7, cursor: 'pointer', fontSize: 12,
-                  background: d.id === destId ? '#e9ecf2' : 'transparent', color: d.id === destId ? color.ink : color.text2 }}>
-                <Icon name={d.backend === 'local' ? 'grid' : 'link'} size={13} style={{ color: color.text3 }} />
-                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.name}</span>
+                className={cn('flex w-full items-center gap-2 rounded-md px-2 py-[7px] text-left text-xs transition-colors',
+                  d.id === destId ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/50')}>
+                <span className="flex items-center text-muted-foreground"><Icon name={d.backend === 'local' ? 'grid' : 'link'} size={13} /></span>
+                <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{d.name}</span>
               </button>
             ))}
-            {dests.length === 0 && <div style={{ fontSize: 11, color: color.text3, padding: 8 }}>No destinations.</div>}
+            {dests.length === 0 && <div className="p-2 text-[11px] text-muted-foreground">No destinations.</div>}
           </div>
 
           {/* main: breadcrumb + entries */}
-          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '7px 12px', borderBottom: `1px solid ${color.hairline}`, fontSize: 11.5, color: color.text2, overflowX: 'auto', whiteSpace: 'nowrap' }}>
-              <button onClick={() => setPath('')} style={crumbBtn}>{dest?.name ?? '—'}</button>
+          <div className="flex min-w-0 flex-1 flex-col">
+            <div className="flex items-center gap-1 overflow-x-auto whitespace-nowrap border-b border-border px-3 py-[7px] text-[11.5px] text-muted-foreground">
+              <button onClick={() => setPath('')} className={crumbBtn}>{dest?.name ?? '—'}</button>
               {segs.map((s, i) => (
-                <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                  <Icon name="chevronRight" size={10} style={{ color: color.text3 }} />
-                  <button onClick={() => setPath(segs.slice(0, i + 1).join('/'))} style={crumbBtn}>{s}</button>
+                <span key={i} className="inline-flex items-center gap-1">
+                  <span className="flex items-center text-muted-foreground"><Icon name="chevronRight" size={10} /></span>
+                  <button onClick={() => setPath(segs.slice(0, i + 1).join('/'))} className={crumbBtn}>{s}</button>
                 </span>
               ))}
-              <span style={{ flex: 1 }} />
-              {mode === 'save' && writable && <button onClick={newFolder} title="New folder" style={{ ...crumbBtn, color: color.text3 }}><Icon name="plus" size={11} /> Folder</button>}
+              <span className="flex-1" />
+              {mode === 'save' && writable && <button onClick={newFolder} title="New folder" className={cn(crumbBtn, 'text-muted-foreground')}><Icon name="plus" size={11} /> Folder</button>}
             </div>
-            <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 6 }}>
-              {loading ? <div style={{ padding: 16, fontSize: 12, color: color.text3 }}>loading…</div>
-                : err ? <div style={{ padding: 16, fontSize: 12, color: color.text2, lineHeight: 1.5 }}>{err}</div>
-                : entries.length === 0 ? <div style={{ padding: 16, fontSize: 12, color: color.text3 }}>Empty folder.</div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+              {loading ? <div className="p-4 text-xs text-muted-foreground">loading…</div>
+                : err ? <div className="p-4 text-xs leading-relaxed text-muted-foreground">{err}</div>
+                : entries.length === 0 ? <div className="p-4 text-xs text-muted-foreground">Empty folder.</div>
                 : entries.map((e) => (
                   <button key={e.uri} onClick={() => {
                     if (e.kind === 'dir') setPath(path ? `${path}/${e.name}` : e.name)
                     else if (mode === 'open') props.onPick({ uri: e.uri, name: e.name })
                     else setFilename(e.name)  // save: click a file to overwrite it
                   }}
-                    style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '8px 10px', border: 'none', background: 'transparent', borderRadius: 7, fontSize: 12.5, color: color.ink, cursor: 'pointer' }}
-                    onMouseEnter={(ev) => (ev.currentTarget.style.background = '#f2f3f5')} onMouseLeave={(ev) => (ev.currentTarget.style.background = 'transparent')}>
-                    <Icon name={e.kind === 'dir' ? 'grid' : 'db'} size={14} style={{ color: e.kind === 'dir' ? color.focus : color.text3 }} />
-                    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>{e.name}</span>
-                    {e.kind === 'dir' && <Icon name="chevronRight" size={12} style={{ color: color.text3 }} />}
+                    className="flex w-full items-center gap-[9px] rounded-md px-2.5 py-2 text-left text-[12.5px] text-foreground transition-colors hover:bg-accent">
+                    <span className={cn('flex items-center', e.kind === 'dir' ? 'text-primary' : 'text-muted-foreground')}><Icon name={e.kind === 'dir' ? 'grid' : 'db'} size={14} /></span>
+                    <span className="flex-1 overflow-hidden text-ellipsis">{e.name}</span>
+                    {e.kind === 'dir' && <span className="flex items-center text-muted-foreground"><Icon name="chevronRight" size={12} /></span>}
                   </button>
                 ))}
             </div>
@@ -126,18 +127,18 @@ export function FileDialog(props:
         </div>
 
         {mode === 'save' && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderTop: `1px solid ${color.hairline}` }}>
+          <div className="flex items-center gap-2 border-t border-border px-[14px] py-2.5">
             {!writable
-              ? <span style={{ flex: 1, fontSize: 11, color: '#a2731a' }}>This destination can't be written from the core — install its plugin or pick a local place.</span>
+              ? <span className="flex-1 text-[11px] text-amber-600">This destination can't be written from the core — install its plugin or pick a local place.</span>
               : <>
-                  <span style={{ fontSize: 11.5, color: color.text3 }}>Save as</span>
-                  <input ref={fileRef} value={filename} onChange={(e) => setFilename(e.target.value)}
-                    className="dp-mono" style={{ flex: 1, fontSize: 12.5, border: `1px solid ${color.border}`, borderRadius: 7, padding: '7px 9px', outline: 'none' }} />
+                  <span className="text-[11.5px] text-muted-foreground">Save as</span>
+                  <Input ref={fileRef} value={filename} onChange={(e) => setFilename(e.target.value)}
+                    className="dp-mono min-w-0 flex-1 text-[12.5px]" />
                 </>}
-            <button disabled={!filename.trim() || !dest || !writable} onClick={() => dest && props.onPick({ destId, destName: dest.name, path, filename: filename.trim() })}
-              style={{ padding: '8px 16px', border: 'none', borderRadius: 8, background: color.ink, color: '#fff', fontSize: 12.5, fontWeight: 600, opacity: filename.trim() && dest && writable ? 1 : 0.5, cursor: filename.trim() && writable ? 'pointer' : 'not-allowed' }}>
+            <Button size="sm" disabled={!filename.trim() || !dest || !writable}
+              onClick={() => dest && props.onPick({ destId, destName: dest.name, path, filename: filename.trim() })}>
               Save
-            </button>
+            </Button>
           </div>
         )}
       </div>
@@ -146,4 +147,4 @@ export function FileDialog(props:
   )
 }
 
-const crumbBtn = { border: 'none', background: 'transparent', color: color.focus, fontSize: 11.5, fontWeight: 600, cursor: 'pointer', padding: '2px 4px', borderRadius: 5, display: 'inline-flex', alignItems: 'center', gap: 3 } as const
+const crumbBtn = 'inline-flex items-center gap-[3px] rounded px-1 py-0.5 text-[11.5px] font-semibold text-primary transition-colors hover:bg-accent/60'

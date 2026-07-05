@@ -2,9 +2,15 @@ import { useEffect, useState } from 'react'
 import { useStore, nodeRunnable } from '../store/graph'
 import { getSpec } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
-import { color, radius, status as statusTok, kindAccent } from '../theme/tokens'
+import { color, status as statusTok, kindAccent } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { FileDialog } from '../ui/FileDialog'
+import { miniInputClass } from '../ui/controls'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Separator } from '@/components/ui/separator'
+import { cn } from '@/lib/utils'
 
 export const INSPECTOR_W = 300
 
@@ -19,11 +25,10 @@ export function Inspector() {
   const node = id ? nodes.find((n) => n.id === id) : null
 
   return (
-    <aside data-testid="inspector" style={{
-      width: INSPECTOR_W, flex: `0 0 ${INSPECTOR_W}px`, height: '100%', background: '#fff',
-      borderLeft: `1px solid ${color.border}`, display: 'flex', flexDirection: 'column', overflow: 'hidden',
-    }}>
-      <div style={{ height: 52, flex: '0 0 52px', borderBottom: `1px solid ${color.hairline}`, display: 'flex', alignItems: 'center', padding: '0 14px', fontSize: 13, fontWeight: 600, color: color.ink }}>
+    <aside data-testid="inspector"
+      className="flex h-full flex-col overflow-hidden border-l border-border bg-card"
+      style={{ width: INSPECTOR_W, flex: `0 0 ${INSPECTOR_W}px` }}>
+      <div className="flex h-[52px] flex-none items-center border-b border-border px-3.5 text-[13px] font-semibold text-foreground">
         Inspector
       </div>
       {node ? <NodeInspector key={node.id} nodeId={node.id} />
@@ -34,7 +39,7 @@ export function Inspector() {
 
 function Empty({ text }: { text: string }) {
   return (
-    <div style={{ flex: 1, display: 'grid', placeItems: 'center', padding: 24, textAlign: 'center', color: color.text3, fontSize: 12, lineHeight: 1.6 }}>
+    <div className="grid flex-1 place-items-center p-6 text-center text-xs leading-relaxed text-muted-foreground">
       {text}
     </div>
   )
@@ -59,28 +64,27 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const invalid = nodeInvalidReason(node)
 
   return (
-    <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
+    <div className="flex flex-1 flex-col overflow-y-auto">
       {/* header */}
-      <div style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 8, borderBottom: `1px solid ${color.hairline}` }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ width: 4, height: 26, borderRadius: 2, background: kindAccent[kind] ?? color.text3 }} />
+      <div className="flex flex-col gap-2 border-b border-border px-3.5 py-3">
+        <div className="flex items-center gap-2">
+          <span className="h-[26px] w-1 flex-none rounded-sm" style={{ background: kindAccent[kind] ?? color.text3 }} />
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
             onBlur={() => { if (name.trim() && name !== node.data.title) rename(nodeId, name.trim()) }}
             onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
-            style={{ flex: 1, minWidth: 0, fontSize: 14, fontWeight: 600, color: color.ink, border: '1px solid transparent', borderRadius: 6, padding: '3px 6px', outline: 'none', background: 'transparent' }}
-            onFocus={(e) => (e.currentTarget.style.borderColor = color.border)}
+            className="min-w-0 flex-1 rounded-md border border-transparent bg-transparent px-1.5 py-[3px] text-sm font-semibold text-foreground outline-none transition-colors focus:border-border"
           />
-          <span style={{ fontSize: 8.5, fontWeight: 600, letterSpacing: 0.6, color: color.text3, background: '#f1f2f4', padding: '2px 6px', borderRadius: radius.chip }}>
+          <span className="rounded bg-muted px-1.5 py-0.5 text-[8.5px] font-semibold tracking-[0.6px] text-muted-foreground">
             {(spec?.tag ?? kind).toUpperCase()}
           </span>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11.5, color: color.text2 }}>
+        <div className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
           {/* a note is an annotation — it never runs, so a run status (draft/stale/…) is meaningless */}
-          {kind === 'note' ? <span style={{ color: color.text3 }}>annotation</span>
+          {kind === 'note' ? <span>annotation</span>
             : <><span style={{ color: st.color }}>{st.glyph}</span> {st.label}</>}
-          {spec?.blurb && <span style={{ color: color.text3 }}>· {spec.blurb}</span>}
+          {spec?.blurb && <span className="text-muted-foreground/70">· {spec.blurb}</span>}
         </div>
       </div>
 
@@ -88,7 +92,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       <Section title="Properties">
         <NodeParamFields nodeId={nodeId} />
         {codeParams.length === 0 && (bspec?.params ?? []).length === 0 && kind !== 'write' && (
-          <div style={{ fontSize: 11.5, color: color.text3 }}>No editable parameters.</div>
+          <div className="text-[11.5px] text-muted-foreground">No editable parameters.</div>
         )}
       </Section>
 
@@ -100,10 +104,11 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         const codeText = String(cfg[p.name] ?? p.default ?? '')
         return (
           <Section key={p.name} title={p.label ?? p.name}>
-            <pre className="dp-mono" style={{ margin: 0, maxHeight: 120, overflow: 'auto', fontSize: 10.5, lineHeight: 1.5, color: color.text2, background: 'var(--code-bg, #f7f8fa)', border: `1px solid ${color.border}`, borderRadius: 8, padding: 8, whiteSpace: 'pre' }}>
+            <pre className="dp-mono m-0 max-h-[120px] overflow-auto whitespace-pre rounded-lg border border-border p-2 text-[10.5px] leading-normal text-muted-foreground"
+              style={{ background: 'var(--code-bg, #f7f8fa)' }}>
               {codeText || '(empty)'}
             </pre>
-            <div style={{ marginTop: 6, display: 'flex', gap: 6 }}>
+            <div className="mt-1.5 flex gap-1.5">
               {kind === 'section' ? (
                 <CodeBtn icon="code" label="Open section editor →" onClick={() => togglePanel(nodeId, 'section')} />
               ) : (
@@ -117,23 +122,23 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* ports — a real port label (join left/right, metric value) shows as a name; the default
           in/out ports just show their wire type. Outputs carry a typed/untyped schema badge. */}
       <Section title="Ports">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11.5, color: color.text2 }}>
+        <div className="flex flex-col gap-1 text-[11.5px] text-muted-foreground">
           {(spec?.inputs ?? []).map((p) => <PortRow key={`in-${p.id}`} dir="in" name={portName(p)} wire={p.wire} />)}
           {(spec?.outputs ?? []).map((p, i) => (
             <PortRow key={`out-${p.id}`} dir="out" name={portName(p)} wire={p.wire}
               schema={i === 0 ? (outSchema === undefined ? undefined : outSchema) : undefined} />
           ))}
-          {(spec?.inputs ?? []).length === 0 && (spec?.outputs ?? []).length === 0 && <span style={{ color: color.text3 }}>—</span>}
+          {(spec?.inputs ?? []).length === 0 && (spec?.outputs ?? []).length === 0 && <span>—</span>}
         </div>
         {/* editable output ports: only on the section (its driver script emit()s to named ports) —
             fixed-port ops (filter/sort/join) keep their ports as a type contract the wires rely on */}
-        {kind === 'section' && <OutputPortsEditor nodeId={nodeId} />}
+        {kind === 'section' && <><Separator className="my-1" /><OutputPortsEditor nodeId={nodeId} /></>}
       </Section>
 
       {/* actions */}
       <Section title="Actions">
-        {invalid && <div style={{ fontSize: 11, color: '#a2731a', marginBottom: 6 }}>⚠ {invalid}</div>}
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        {invalid && <div className="mb-1.5 text-[11px] text-amber-700">⚠ {invalid}</div>}
+        <div className="flex flex-wrap gap-1.5">
           {/* a note never runs — only offer duplicate / delete for annotations */}
           {kind !== 'note' && <>
             <Action icon="eye" label="View data" disabled={!runnable || !!invalid} onClick={() => runPreview(nodeId)} />
@@ -159,22 +164,22 @@ function OutputPortsEditor({ nodeId }: { nodeId: string }) {
   const updateConfig = useStore((s) => s.updateConfig)
   const commit = (next: string[]) => updateConfig(nodeId, { outputs: next })
   return (
-    <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
-      <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.4, color: color.text3 }}>OUTPUT PORTS (emit)</div>
+    <div className="mt-2 flex flex-col gap-1">
+      <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground">OUTPUT PORTS (emit)</Label>
       {outputs.map((name, i) => (
-        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <input value={name} onChange={(e) => commit(outputs.map((x, j) => (j === i ? e.target.value.replace(/\s+/g, '_') : x)))}
-            className="dp-mono" style={{ flex: 1, fontSize: 11, border: `1px solid ${color.border}`, borderRadius: 6, padding: '4px 7px', outline: 'none' }} />
+        <div key={i} className="flex items-center gap-1">
+          <Input value={name} onChange={(e) => commit(outputs.map((x, j) => (j === i ? e.target.value.replace(/\s+/g, '_') : x)))}
+            className={cn(miniInputClass, 'dp-mono flex-1 text-[11px] md:text-[11px]')} />
           {outputs.length > 1 && (
-            <button onClick={() => commit(outputs.filter((_, j) => j !== i))} title="Remove port"
-              style={{ border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer', display: 'grid', placeItems: 'center', width: 20, height: 20 }}><Icon name="close" size={11} /></button>
+            <Button variant="ghost" size="icon" onClick={() => commit(outputs.filter((_, j) => j !== i))} title="Remove port"
+              className="h-5 w-5 flex-none text-muted-foreground [&_svg]:size-3"><Icon name="close" size={11} /></Button>
           )}
         </div>
       ))}
-      <button onClick={() => commit([...outputs, `out${outputs.length + 1}`])}
-        style={{ display: 'inline-flex', alignItems: 'center', gap: 4, alignSelf: 'flex-start', border: `1px dashed ${color.border}`, background: 'transparent', color: color.text3, fontSize: 10.5, padding: '4px 8px', borderRadius: radius.chip, cursor: 'pointer' }}>
+      <Button variant="outline" size="sm" onClick={() => commit([...outputs, `out${outputs.length + 1}`])}
+        className="h-auto gap-1 self-start border-dashed px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none [&_svg]:size-3">
         <Icon name="plus" size={11} /> add port
-      </button>
+      </Button>
     </div>
   )
 }
@@ -190,13 +195,13 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
   const destPath = String(cfg.destPath ?? '')
   return (
     <Section title="Output">
-      <div style={{ fontSize: 11.5, color: color.text2 }}>
-        <div className="dp-mono" style={{ color: color.ink }}>{filename}</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 3, color: color.text3 }}>
+      <div className="text-[11.5px] text-muted-foreground">
+        <div className="dp-mono text-foreground">{filename}</div>
+        <div className="mt-[3px] flex items-center gap-[5px] text-muted-foreground">
           <Icon name="export" size={11} /> {destName}{destPath ? `/${destPath}` : ''}
         </div>
       </div>
-      <div style={{ marginTop: 8 }}>
+      <div className="mt-2">
         <CodeBtn icon="export" label="Change destination…" onClick={() => setDlg(true)} />
       </div>
       {dlg && (
@@ -209,17 +214,17 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
 
 function CodeBtn({ icon, label, onClick }: { icon: IconName; label: string; onClick: () => void }) {
   return (
-    <button onClick={onClick}
-      style={{ display: 'inline-flex', alignItems: 'center', gap: 5, border: `1px solid ${color.border}`, borderRadius: 7, background: '#fff', color: color.focus, fontSize: 11.5, padding: '5px 10px', cursor: 'pointer' }}>
+    <Button variant="outline" size="sm" onClick={onClick}
+      className="h-auto gap-1.5 px-2.5 py-1.5 text-[11.5px] font-medium text-primary shadow-none [&_svg]:size-3">
       <Icon name={icon} size={12} /> {label}
-    </button>
+    </Button>
   )
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div style={{ padding: '12px 14px', borderBottom: `1px solid ${color.hairline}`, display: 'flex', flexDirection: 'column', gap: 8 }}>
-      <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: color.text3 }}>{title}</div>
+    <div className="flex flex-col gap-2 border-b border-border px-3.5 py-3">
+      <div className="text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">{title}</div>
       {children}
     </div>
   )
@@ -237,26 +242,27 @@ function PortRow({ dir, name, wire, schema }: {
 }) {
   const badge = schema === undefined ? null : schema === null ? 'untyped' : `${schema.length} cols`
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-      <span style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: 0.4, color: color.text3, width: 26 }}>{dir === 'in' ? 'IN' : 'OUT'}</span>
-      {name && <span style={{ color: color.text2 }}>{name}</span>}
-      <span style={{ flex: 1, fontSize: 10.5, color: color.text3 }}>{wire}</span>
-      {badge && <span style={{ fontSize: 9.5, color: schema === null ? '#a2731a' : '#1f7a45', background: schema === null ? '#fbf1dc' : '#e3f3ea', padding: '1px 6px', borderRadius: radius.chip }}>{badge}</span>}
+    <div className="flex items-center gap-[7px]">
+      <span className="w-[26px] text-[8.5px] font-bold tracking-[0.4px] text-muted-foreground">{dir === 'in' ? 'IN' : 'OUT'}</span>
+      {name && <span className="text-foreground">{name}</span>}
+      <span className="flex-1 text-[10.5px] text-muted-foreground">{wire}</span>
+      {badge && <span className={cn('rounded px-1.5 py-px text-[9.5px]', schema === null ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700')}>{badge}</span>}
     </div>
   )
 }
 
 function Action({ icon, label, onClick, disabled, danger }: { icon: IconName; label: string; onClick: () => void; disabled?: boolean; danger?: boolean }) {
   return (
-    <button
+    <Button
+      variant="outline" size="sm"
       onClick={() => { if (!disabled) onClick() }}
       aria-disabled={disabled}
-      style={{
-        display: 'inline-flex', alignItems: 'center', gap: 5, border: `1px solid ${color.border}`, borderRadius: 7,
-        background: '#fff', color: disabled ? '#c8ccd2' : danger ? color.failed : color.text2,
-        fontSize: 11.5, padding: '5px 9px', cursor: disabled ? 'not-allowed' : 'pointer',
-      }}>
+      className={cn(
+        'h-auto gap-1.5 px-2 py-1.5 text-[11.5px] font-medium shadow-none [&_svg]:size-3',
+        danger ? 'text-destructive' : 'text-muted-foreground',
+        disabled && 'cursor-not-allowed opacity-50',
+      )}>
       <Icon name={icon} size={12} /> {label}
-    </button>
+    </Button>
   )
 }

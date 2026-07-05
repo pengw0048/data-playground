@@ -2,7 +2,6 @@ import { useRef, useState } from 'react'
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useStore } from '../../store/graph'
-import { color } from '../../theme/tokens'
 import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
@@ -42,30 +41,27 @@ function Source({ id, data }: NodeComponentProps) {
           ref={btnRef}
           title={`${table.name} · ${String(data.config.uri ?? '')}\nClick to change dataset`}
           onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}
-          style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%', padding: '6px 8px', border: `1px solid ${color.border}`, borderRadius: 7, background: '#fff', color: color.text2, fontSize: 11.5, cursor: 'pointer' }}
+          className="flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] text-muted-foreground"
         >
-          <Icon name="db" size={13} style={{ color: color.text3 }} />
-          <span style={{ flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: color.ink, fontWeight: 500 }}>{table.name}</span>
-          <Icon name="chevronDown" size={12} style={{ color: color.text3 }} />
+          <Icon name="db" size={13} />
+          <span className="flex-1 truncate text-left font-medium text-foreground">{table.name}</span>
+          <Icon name="chevronDown" size={12} />
         </button>
       ) : (
         <button
           ref={btnRef}
           onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}
-          style={{
-            display: 'flex', alignItems: 'center', gap: 6, width: '100%', padding: '6px 8px',
-            border: `1px solid ${color.border}`, borderRadius: 7, background: '#fff', color: color.text3, fontSize: 11.5,
-          }}
+          className="flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] text-muted-foreground"
         >
           <Icon name="db" size={13} />
-          <span style={{ flex: 1, textAlign: 'left' }}>Select dataset</span>
+          <span className="flex-1 text-left">Select dataset</span>
           <Icon name="chevronDown" size={12} />
         </button>
       )}
 
       <Popover anchorRef={btnRef} open={open} onClose={() => setOpen(false)} width={230}>
         {catalog.length === 0 && (
-          <div style={{ padding: 8, fontSize: 11.5, color: color.text3 }}>kernel offline — no catalog</div>
+          <div className="p-2 text-[11.5px] text-muted-foreground">kernel offline — no catalog</div>
         )}
         {catalog.map((t) => (
           <button
@@ -76,23 +72,17 @@ function Source({ id, data }: NodeComponentProps) {
               rename(id, t.name)
               setOpen(false)
             }}
-            style={{
-              display: 'flex', flexDirection: 'column', gap: 1, width: '100%', textAlign: 'left',
-              padding: '7px 9px', border: 'none', background: 'transparent', borderRadius: 7,
-            }}
-            onMouseEnter={(e) => (e.currentTarget.style.background = '#f2f3f5')}
-            onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+            className="flex w-full flex-col gap-px rounded-md px-[9px] py-[7px] text-left hover:bg-accent"
           >
-            <span style={{ fontSize: 12, fontWeight: 600, color: color.ink }}>{t.name}</span>
-            <span style={{ fontSize: 10, color: color.text3 }}>
+            <span className="text-xs font-semibold text-foreground">{t.name}</span>
+            <span className="text-[10px] text-muted-foreground">
               {(t.rowCount ?? 0).toLocaleString()} rows · {t.columns.length} cols
             </span>
           </button>
         ))}
-        <div style={{ height: 1, background: color.hairline, margin: '4px 0' }} />
+        <div className="my-1 h-px bg-border" />
         <button onClick={(e) => { e.stopPropagation(); setOpen(false); setDialog(true) }}
-          style={{ display: 'flex', alignItems: 'center', gap: 7, width: '100%', textAlign: 'left', padding: '7px 9px', border: 'none', background: 'transparent', borderRadius: 7, fontSize: 12, color: color.focus, cursor: 'pointer' }}
-          onMouseEnter={(e) => (e.currentTarget.style.background = '#f2f3f5')} onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}>
+          className="flex w-full items-center gap-[7px] rounded-md px-[9px] py-[7px] text-left text-xs text-primary hover:bg-accent">
           <Icon name="search" size={12} /> Browse files…
         </button>
       </Popover>

@@ -7,6 +7,7 @@ import { Segmented } from '../../ui/controls'
 import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
 import { CodeSnippet } from '../../ui/CodeSnippet'
+import { cn } from '@/lib/utils'
 import type { ProcessorMode, TransformSource } from '../../types/graph'
 
 const DEFAULT_CODE = `def fn(row):
@@ -60,22 +61,21 @@ function Transform({ id, data }: NodeComponentProps) {
             <button
               ref={pickRef}
               onClick={(e) => { e.stopPropagation(); setPickOpen((v) => !v) }}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 6, width: '100%', padding: '6px 8px',
-                border: `1px solid ${color.border}`, borderRadius: 7, background: '#fff',
-                color: proc ? color.ink : color.text3, fontSize: 11.5,
-              }}
+              className={cn(
+                'flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px]',
+                proc ? 'text-foreground' : 'text-muted-foreground',
+              )}
             >
               <Icon name="fx" size={13} />
-              <span style={{ flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              <span className="flex-1 truncate text-left">
                 {proc?.title ?? 'select processor'}
               </span>
-              {proc && <span style={{ fontSize: 10, color: color.text3 }}>{proc.version}</span>}
+              {proc && <span className="text-[10px] text-muted-foreground">{proc.version}</span>}
               <Icon name="chevronDown" size={12} />
             </button>
             <Popover anchorRef={pickRef} open={pickOpen} onClose={() => setPickOpen(false)} width={220}>
               {processors.length === 0 && (
-                <div style={{ padding: 9, fontSize: 11, color: color.text3, lineHeight: 1.4 }}>
+                <div className="p-[9px] text-[11px] leading-[1.4] text-muted-foreground">
                   Library is empty. Write an ad-hoc cell and “Promote to library”.
                 </div>
               )}
@@ -83,11 +83,9 @@ function Transform({ id, data }: NodeComponentProps) {
                 <button
                   key={p.id}
                   onClick={(e) => { e.stopPropagation(); updateConfig(id, { processor: p.id, version: p.version, mode: p.mode }); setPickOpen(false) }}
-                  style={{ display: 'flex', flexDirection: 'column', gap: 1, width: '100%', textAlign: 'left', padding: '7px 9px', border: 'none', background: 'transparent', borderRadius: 7 }}
-                  onMouseEnter={(e) => (e.currentTarget.style.background = '#f2f3f5')}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                  className="flex w-full flex-col gap-px rounded-md px-[9px] py-[7px] text-left hover:bg-accent"
                 >
-                  <span style={{ fontSize: 12, fontWeight: 600, color: color.ink }}>{p.title} <span style={{ color: color.text3, fontWeight: 400 }}>· {p.mode}</span></span>
+                  <span className="text-xs font-semibold text-foreground">{p.title} <span className="font-normal text-muted-foreground">· {p.mode}</span></span>
                 </button>
               ))}
             </Popover>
@@ -96,11 +94,7 @@ function Transform({ id, data }: NodeComponentProps) {
           <button
             onClick={(e) => { e.stopPropagation(); openFullscreen(id, 'code', 'python') }}
             title="Open the code editor"
-            style={{
-              display: 'block', width: '100%', textAlign: 'left', background: 'var(--code-bg)',
-              border: `1px solid ${color.border}`, borderRadius: 8, padding: '8px 10px', fontSize: 10.5, lineHeight: 1.4,
-              whiteSpace: 'pre', overflow: 'hidden', textOverflow: 'ellipsis', cursor: 'text',
-            }}
+            className="block w-full cursor-text overflow-hidden text-ellipsis whitespace-pre rounded-md border border-border bg-[var(--code-bg)] px-2.5 py-2 text-left text-[10.5px] leading-[1.4]"
           >
             <CodeSnippet code={String(data.config.code ?? DEFAULT_CODE).split('\n').slice(0, 3).join('\n')} language="python" />
           </button>

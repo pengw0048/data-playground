@@ -1,7 +1,9 @@
 import { useEffect } from 'react'
 import { useStore } from '../store/graph'
-import { color, radius, status as statusTok } from '../theme/tokens'
+import { color, status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
+import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
@@ -19,59 +21,59 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const st = run?.status
 
   return (
-    <div style={{ padding: 14 }}>
+    <div className="p-3.5">
       {(phase === 'estimating' || (!est && phase !== 'running' && phase !== 'done' && phase !== 'failed')) && (
-        <div style={{ color: color.text3, fontSize: 12, padding: '10px 0' }}>estimating…</div>
+        <div className="py-2.5 text-xs text-muted-foreground">estimating…</div>
       )}
 
       {(phase === 'estimated' || phase === 'confirm') && est && (
         <>
           <Label>{phase === 'confirm' ? 'HEADS UP' : 'ESTIMATE'}</Label>
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 2 }}>
-            <span style={{ fontSize: 24, fontWeight: 700, color: color.ink }}>
+          <div className="mt-0.5 flex items-baseline gap-2">
+            <span className="text-2xl font-bold text-foreground">
               {est.rows != null ? `${est.rows.toLocaleString()} rows` : 'Size unknown'}
             </span>
           </div>
-          {est.breakdown && <div style={{ fontSize: 11, color: color.text3, marginTop: 8 }}>{est.breakdown}</div>}
+          {est.breakdown && <div className="mt-2 text-[11px] text-muted-foreground">{est.breakdown}</div>}
           {phase === 'confirm' ? (
-            <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
-              <button onClick={() => doRun(nodeId, true)} style={btn('#d99a2b', '#fff', 1)}>Run</button>
-              <button onClick={() => useStore.getState().closePanel(nodeId)} style={btn('#fff', color.text2, 1, true)}>Cancel</button>
+            <div className="mt-3.5 flex gap-2">
+              <Button size="sm" onClick={() => doRun(nodeId, true)} className="flex-1 bg-[#d99a2b] text-white hover:bg-[#c98d24]">Run</Button>
+              <Button size="sm" variant="outline" onClick={() => useStore.getState().closePanel(nodeId)} className="flex-1">Cancel</Button>
             </div>
           ) : (
-            <button onClick={() => doRun(nodeId, false)} style={{ ...btn(color.ink, '#fff', 1), marginTop: 14 }}>Run</button>
+            <Button size="sm" onClick={() => doRun(nodeId, false)} className="mt-3.5 w-full">Run</Button>
           )}
         </>
       )}
 
       {phase === 'running' && st && (
         <>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-            <span className="dp-running-glyph" style={{ color: color.running }}>●</span>
-            <span style={{ fontSize: 13, fontWeight: 600 }}>running</span>
+          <div className="mb-2.5 flex items-center gap-2">
+            <span className="dp-running-glyph text-primary">●</span>
+            <span className="text-[13px] font-semibold">running</span>
           </div>
           <ProgressBar value={st.totalRows ? st.rowsProcessed / Math.max(1, st.totalRows) : 0.3} />
-          <div style={{ fontSize: 11.5, color: color.text2, margin: '8px 0' }}>
+          <div className="my-2 text-[11.5px] text-muted-foreground">
             {st.rowsProcessed.toLocaleString()}{st.totalRows ? ` / ${st.totalRows.toLocaleString()}` : ''} rows
           </div>
           <PerNode st={st} />
-          <button onClick={() => cancel(nodeId)} style={{ ...btn('#fff', color.ink, 1, true), marginTop: 12 }}>
-            <Icon name="stop" size={12} /> &nbsp;Stop
-          </button>
+          <Button size="sm" variant="outline" onClick={() => cancel(nodeId)} className="mt-3 w-full">
+            <Icon name="stop" size={12} /> Stop
+          </Button>
         </>
       )}
 
       {phase === 'done' && st && (
         <>
           <Label>DONE</Label>
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 2 }}>
-            <span style={{ color: color.latest, fontSize: 16 }}>✓</span>
-            <span style={{ fontSize: 22, fontWeight: 700, color: color.ink }}>{(st.totalRows ?? st.rowsProcessed).toLocaleString()} rows</span>
-            <span style={{ fontSize: 13, color: color.text2 }}>· {fmtTime(st.ms / 1000)}</span>
+          <div className="mt-0.5 flex items-baseline gap-2">
+            <span className="text-base" style={{ color: color.latest }}>✓</span>
+            <span className="text-[22px] font-bold text-foreground">{(st.totalRows ?? st.rowsProcessed).toLocaleString()} rows</span>
+            <span className="text-[13px] text-muted-foreground">· {fmtTime(st.ms / 1000)}</span>
           </div>
-          {st.outputTable && <div style={{ fontSize: 12, color: color.ink, marginTop: 10 }}>wrote <b>{st.outputTable}</b></div>}
+          {st.outputTable && <div className="mt-2.5 text-xs text-foreground">wrote <b>{st.outputTable}</b></div>}
           {st.outputUri && (
-            <div title={st.outputUri} className="dp-mono" style={{ fontSize: 10.5, color: color.text2, marginTop: 6, background: '#f7f8fa', border: `1px solid ${color.hairline}`, borderRadius: 6, padding: '5px 8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div title={st.outputUri} className="dp-mono mt-1.5 overflow-hidden text-ellipsis whitespace-nowrap rounded-md border border-border bg-muted px-2 py-[5px] text-[10.5px] text-muted-foreground">
               → {st.outputUri}
             </div>
           )}
@@ -80,16 +82,16 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
       )}
 
       {phase === 'failed' && (
-        <div style={{ padding: '8px 0' }}>
+        <div className="py-2">
           <Label>FAILED</Label>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
-            <span style={{ color: color.failed }}>✕</span>
-            <span style={{ fontSize: 13, fontWeight: 600, color: color.failed }}>run failed</span>
+          <div className="mt-1 flex items-center gap-2">
+            <span className="text-destructive">✕</span>
+            <span className="text-[13px] font-semibold text-destructive">run failed</span>
           </div>
-          <div className="dp-mono" style={{ fontSize: 11, color: color.text2, marginTop: 8, background: '#fbeff0', padding: 10, borderRadius: 8, whiteSpace: 'pre-wrap' }}>
+          <div className="dp-mono mt-2 whitespace-pre-wrap rounded-lg bg-destructive/10 p-2.5 text-[11px] text-muted-foreground">
             {run?.error ?? st?.error ?? 'unknown error'}
           </div>
-          <button onClick={() => estimate(nodeId)} style={{ ...btn('#fff', color.ink, 1, true), marginTop: 12 }}>Retry</button>
+          <Button size="sm" variant="outline" onClick={() => estimate(nodeId)} className="mt-3 w-full">Retry</Button>
         </div>
       )}
     </div>
@@ -99,15 +101,15 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
 function PerNode({ st, compact }: { st: { perNode: { nodeId: string; status: string; label?: string | null; rows?: number | null }[] }; compact?: boolean }) {
   const items = st.perNode.filter((p) => p.nodeId !== '__error_gate__' || !compact)
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: compact ? 12 : 6 }}>
+    <div className={cn('flex flex-col gap-1', compact ? 'mt-3' : 'mt-1.5')}>
       {items.map((p) => {
         const s = statusTok[(p.status as keyof typeof statusTok)] ?? statusTok.queued
         return (
-          <div key={p.nodeId} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
-            <span className={p.status === 'running' ? 'dp-running-glyph' : undefined} style={{ color: s.color, width: 10 }}>{s.glyph}</span>
-            <span style={{ color: color.text2 }}>{p.label ?? p.nodeId}</span>
-            <span style={{ flex: 1 }} />
-            {p.rows != null && p.status === 'done' && <span style={{ color: color.text3 }}>{p.rows.toLocaleString()} rows</span>}
+          <div key={p.nodeId} className="flex items-center gap-2 text-[11px]">
+            <span className={cn('w-2.5', p.status === 'running' && 'dp-running-glyph')} style={{ color: s.color }}>{s.glyph}</span>
+            <span className="text-muted-foreground">{p.label ?? p.nodeId}</span>
+            <span className="flex-1" />
+            {p.rows != null && p.status === 'done' && <span className="text-muted-foreground">{p.rows.toLocaleString()} rows</span>}
           </div>
         )
       })}
@@ -117,22 +119,14 @@ function PerNode({ st, compact }: { st: { perNode: { nodeId: string; status: str
 
 function ProgressBar({ value }: { value: number }) {
   return (
-    <div style={{ height: 6, background: '#eceef1', borderRadius: 4, overflow: 'hidden' }}>
-      <div style={{ height: '100%', width: `${Math.min(100, Math.max(6, value * 100))}%`, background: color.running, borderRadius: 4, transition: 'width .3s' }} />
+    <div className="h-1.5 overflow-hidden rounded bg-muted">
+      <div className="h-full rounded bg-primary transition-[width] duration-300" style={{ width: `${Math.min(100, Math.max(6, value * 100))}%` }} />
     </div>
   )
 }
 
 function Label({ children }: { children: React.ReactNode }) {
-  return <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.6, color: color.text3 }}>{children}</div>
-}
-
-function btn(bg: string, fg: string, flex = 0, outline = false): React.CSSProperties {
-  return {
-    display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 4, flex: flex ? 1 : undefined,
-    padding: '9px 14px', border: outline ? `1px solid ${color.border}` : 'none', borderRadius: radius.button,
-    background: bg, color: fg, fontSize: 12.5, fontWeight: 600, width: flex ? undefined : '100%',
-  }
+  return <div className="text-[9.5px] font-bold tracking-[0.6px] text-muted-foreground">{children}</div>
 }
 
 function fmtTime(seconds: number): string {

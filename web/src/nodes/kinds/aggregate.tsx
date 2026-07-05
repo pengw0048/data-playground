@@ -11,7 +11,7 @@ function Aggregate({ id, data }: NodeComponentProps) {
   const columns = useInputColumns(id)
   return (
     <NodeCard id={id} data={data} metaOverride={`group by ${group || '—'} · needs full pass`}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div className="flex flex-col gap-2">
         <Field label="group by">
           <ColumnCombo value={group} columns={columns} placeholder="category" onChange={(v) => updateConfig(id, { groupBy: v })} />
         </Field>

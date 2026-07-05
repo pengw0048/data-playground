@@ -1,6 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
-import { color, radius, shadow } from '../theme/tokens'
 
 // A popover rendered in a portal on document.body, positioned relative to an anchor. This is
 // how in-node menus (table picker, processor picker, ⋯ menu) escape the node's clipping and
@@ -67,13 +66,9 @@ export function Popover({
   return createPortal(
     <div
       ref={popRef}
-      className="dp-panel"
+      className="dp-panel fixed z-[1000] overflow-y-auto rounded-lg border border-border bg-popover p-[5px] text-popover-foreground shadow-lg"
       onMouseDown={(e) => e.stopPropagation()}
-      style={{
-        position: 'fixed', left: pos.left, top: pos.top, bottom: pos.bottom, width: pos.width, zIndex: 1000,
-        background: '#fff', border: `1px solid ${color.border}`, borderRadius: radius.panel,
-        boxShadow: shadow.panel, padding: 5, maxHeight, overflowY: 'auto',
-      }}
+      style={{ left: pos.left, top: pos.top, bottom: pos.bottom, width: pos.width, maxHeight }}
     >
       {children}
     </div>,

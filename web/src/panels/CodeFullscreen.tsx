@@ -1,6 +1,5 @@
 import { Suspense, lazy, useEffect } from 'react'
 import { useStore, nodeRunnable } from '../store/graph'
-import { color } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { MiniSelect } from '../ui/controls'
 import type { ProcessorMode } from '../types/graph'
@@ -36,23 +35,22 @@ export function CodeFullscreen() {
   const completions = [...new Set(Object.values(previews).flatMap((p) => (p.result?.columns ?? []).map((c) => c.name)))]
 
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 60, background: 'rgba(16,20,30,0.45)', display: 'flex', flexDirection: 'column', padding: 28 }}
-      onClick={close}>
+    <div className="fixed inset-0 z-[60] flex flex-col bg-[#10141e]/45 p-7" onClick={close}>
       <div onClick={(e) => e.stopPropagation()}
-        style={{ flex: 1, minHeight: 0, background: '#fff', borderRadius: 12, overflow: 'hidden', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(16,20,30,0.35)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: `1px solid ${color.hairline}` }}>
-          <Icon name="code" size={14} style={{ color: color.text3 }} />
-          <span style={{ fontSize: 13, fontWeight: 600, color: color.ink }}>{node.data.title}</span>
-          <span style={{ fontSize: 12.5, color: color.text3 }}>· {fs.param} · {language}</span>
-          {isLibrary && <span style={{ fontSize: 11, color: color.text3, display: 'inline-flex', alignItems: 'center', gap: 5 }}>· read-only · {proc?.title} {proc?.version} (registry)</span>}
-          <span style={{ flex: 1 }} />
+        className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl bg-card shadow-2xl">
+        <div className="flex items-center gap-2 border-b border-border px-3.5 py-2.5">
+          <span className="flex items-center text-muted-foreground"><Icon name="code" size={14} /></span>
+          <span className="text-[13px] font-semibold text-foreground">{node.data.title}</span>
+          <span className="text-[12.5px] text-muted-foreground">· {fs.param} · {language}</span>
+          {isLibrary && <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">· read-only · {proc?.title} {proc?.version} (registry)</span>}
+          <span className="flex-1" />
           <button onClick={close} aria-label="Close" title="Close (Esc)"
-            style={{ width: 28, height: 26, display: 'grid', placeItems: 'center', border: 'none', borderRadius: 7, background: 'transparent', color: color.text2, cursor: 'pointer' }}>
+            className="grid h-[26px] w-7 place-items-center rounded-md border-0 bg-transparent text-muted-foreground hover:text-foreground">
             <Icon name="close" size={15} />
           </button>
         </div>
-        <div style={{ flex: 1, minHeight: 0 }}>
-          <Suspense fallback={<div style={{ height: '100%', display: 'grid', placeItems: 'center', color: color.text3, fontSize: 12 }}>loading editor…</div>}>
+        <div className="min-h-0 flex-1">
+          <Suspense fallback={<div className="grid h-full place-items-center text-xs text-muted-foreground">loading editor…</div>}>
             <CodeEditor language={language} height="100%" value={value} readOnly={isLibrary} completions={completions}
               onChange={(v) => updateConfig(fs.nodeId, { [fs.param]: v })} />
           </Suspense>
@@ -60,31 +58,31 @@ export function CodeFullscreen() {
 
         {/* operator controls — Python transforms get mode/on_error/Promote; anything runnable gets Preview */}
         {(isTransform && !isLibrary) || canPreview ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderTop: `1px solid ${color.hairline}` }}>
+          <div className="flex items-center gap-2.5 border-t border-border px-3.5 py-2.5">
             {isTransform && !isLibrary && (
               <>
-                <span style={{ fontSize: 10.5, color: color.text3 }}>mode</span>
-                <div style={{ width: 130 }}>
+                <span className="text-[10.5px] text-muted-foreground">mode</span>
+                <div className="w-[130px]">
                   <MiniSelect<ProcessorMode> value={(cfg.mode as ProcessorMode) ?? 'map'} onChange={(v) => updateConfig(fs.nodeId, { mode: v })}
                     options={[{ value: 'map', label: 'map' }, { value: 'map_batches', label: 'map_batches' }, { value: 'filter', label: 'filter' }, { value: 'flat_map', label: 'flat_map' }]} />
                 </div>
-                <span style={{ fontSize: 10.5, color: color.text3 }}>on_error</span>
-                <div style={{ width: 88 }}>
+                <span className="text-[10.5px] text-muted-foreground">on_error</span>
+                <div className="w-[88px]">
                   <MiniSelect value={(cfg.onError as 'raise' | 'skip') ?? 'raise'} onChange={(v) => updateConfig(fs.nodeId, { onError: v })}
                     options={[{ value: 'raise', label: 'raise' }, { value: 'skip', label: 'skip' }]} />
                 </div>
               </>
             )}
-            <span style={{ flex: 1 }} />
+            <span className="flex-1" />
             {isTransform && !isLibrary && (
               <button onClick={() => promote(fs.nodeId)}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '8px 14px', border: `1px solid ${color.border}`, borderRadius: 8, background: '#fff', color: color.focus, fontSize: 12, fontWeight: 600 }}>
+                className="inline-flex items-center gap-[5px] rounded-md border border-border bg-background px-3.5 py-2 text-xs font-semibold text-primary hover:bg-accent">
                 Promote to library <Icon name="external" size={12} />
               </button>
             )}
             {canPreview && (
               <button onClick={() => runPreview(fs.nodeId)}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '8px 16px', border: 'none', borderRadius: 8, background: color.ink, color: '#fff', fontSize: 12.5, fontWeight: 600 }}>
+                className="inline-flex items-center gap-[5px] rounded-md bg-primary px-4 py-2 text-[12.5px] font-semibold text-primary-foreground hover:bg-primary/90">
                 <Icon name="eye" size={12} /> Preview
               </button>
             )}
