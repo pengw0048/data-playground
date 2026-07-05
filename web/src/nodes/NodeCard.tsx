@@ -22,6 +22,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === id))
   const spec = getSpec(node?.type ?? 'transform') as NodeSpec | undefined
   const selected = useStore((s) => s.selectedIds.includes(id))
+  // the action shelf carries SINGLE-node actions, so only show it for a lone selection — a marquee/
+  // shift-select of many cards must not float (and strand) one shelf per card
+  const soleSelected = useStore((s) => s.selectedIds.length <= 1 && s.selectedIds.includes(id))
   const openPanel = useStore((s) => s.openPanels[id])
   const runPreview = useStore((s) => s.runPreview)
   const requestRun = useStore((s) => s.requestRun)
@@ -60,8 +63,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const hasCode = KINDS_WITH_CODE.has(kind)
   const busy = runState === 'running' || runState === 'estimating'
   const invalid = node ? nodeInvalidReason(node) : null   // e.g. "order by is required"
-  // the action shelf is revealed on hover / selection / while running, so a resting card is clean
-  const showShelf = selected || hover || busy
+  // the action shelf is revealed on hover / sole-selection / while running, so a resting card is clean
+  // and a multi-card marquee doesn't strand a shelf under every selected node
+  const showShelf = soleSelected || hover || busy
 
   const tag = (spec?.tag ?? kind).toUpperCase()
 
@@ -76,7 +80,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
       onMouseEnter={enterHover} onMouseLeave={leaveHover}>
       {/* input ports */}
       {(spec?.inputs ?? []).map((p, i) => (
-        <Port key={p.id} spec={p} side="input" index={i} count={spec!.inputs.length} />
+        <Port key={p.id} spec={p} side="input" index={i} count={spec!.inputs.length} nodeId={id} />
       ))}
       {/* output ports — instance-declared (multi-output) or the static spec */}
       {(node ? nodeOutputs(node) : spec?.outputs ?? []).map((p, i, arr) => (
@@ -151,10 +155,11 @@ export function NodeCard({ id, data, children, metaOverride }: {
         <div
           className="nodrag"
           style={{
-            // sits flush under the card (no dead gap). It's a descendant of the hover wrapper, so the
-            // mouse can travel card ↔ bar without the hover ever dropping (no own handlers needed).
-            position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 4,
-            display: 'flex', alignItems: 'center', gap: 2, padding: '6px 6px 4px',
+            // a COMPACT floating toolbar tucked just under the card's left edge — fit-content width (not
+            // a dull full-card-width bar). A descendant of the hover wrapper, so the mouse can travel
+            // card ↔ bar without the hover dropping; the small offset reads as an intentional gap.
+            position: 'absolute', top: 'calc(100% + 5px)', left: 0, zIndex: 4,
+            display: 'inline-flex', alignItems: 'center', gap: 1, padding: '3px 4px',
             background: '#fff', border: `1px solid ${color.border}`, borderRadius: 9, boxShadow: shadow.card,
           }}
         >
@@ -176,7 +181,6 @@ export function NodeCard({ id, data, children, metaOverride }: {
           )}
           <ActionIcon name="clock" label="History" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
           {hasCode && <ActionIcon name="code" label="Edit code" onClick={() => openCodeFullscreen(id, kind === 'sql' ? 'sql' : 'code', kind === 'sql' ? 'sql' : 'python')} />}
-          <span style={{ flex: 1 }} />
           <MoreMenu id={id} kind={kind} />
         </div>
       )}

@@ -25,7 +25,7 @@ function Note({ id, data, selected }: NodeComponentProps) {
     >
       {editing ? (
         <textarea
-          className="nodrag dp-mono"
+          className="nodrag nowheel dp-mono"  /* nowheel: let the wheel scroll the textarea, not pan the canvas */
           autoFocus
           value={md}
           onChange={(e) => updateConfig(id, { markdown: e.target.value })}
@@ -34,12 +34,12 @@ function Note({ id, data, selected }: NodeComponentProps) {
           spellCheck={false}
           placeholder="# Markdown…"
           style={{
-            width: '100%', minHeight: 120, resize: 'vertical', border: 'none', outline: 'none',
-            background: 'transparent', color: color.ink, fontSize: 12, lineHeight: 1.5,
+            width: '100%', minHeight: 120, maxHeight: 400, overflowY: 'auto', resize: 'vertical',
+            border: 'none', outline: 'none', background: 'transparent', color: color.ink, fontSize: 12, lineHeight: 1.5,
           }}
         />
       ) : md.trim() ? (
-        <div style={mdWrap}>
+        <div className="nowheel" style={mdWrap}>
           <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD}>{md}</ReactMarkdown>
         </div>
       ) : (
@@ -49,7 +49,7 @@ function Note({ id, data, selected }: NodeComponentProps) {
   )
 }
 
-const mdWrap: CSSProperties = { lineHeight: 1.55, wordBreak: 'break-word' }
+const mdWrap: CSSProperties = { lineHeight: 1.55, wordBreak: 'break-word', maxHeight: 400, overflowY: 'auto' }
 // compact, self-contained markdown styling (no global CSS dependency)
 const MD = {
   h1: (p: any) => <div style={{ fontSize: 15, fontWeight: 700, margin: '2px 0 6px' }} {...p} />,

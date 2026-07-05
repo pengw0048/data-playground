@@ -198,7 +198,8 @@ test.describe('Data Playground canvas', () => {
 
   test('settings modal edits and saves the agent config', async ({ page }) => {
     await page.goto('/')
-    await page.getByLabel('Settings').click()
+    await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
+    await page.getByText('Settings', { exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Settings' }).or(page.getByText('Settings', { exact: true }).first())).toBeVisible()
     const model = page.getByPlaceholder('anthropic/claude-opus-4-8')
     await expect(model).toBeVisible()
@@ -209,7 +210,8 @@ test.describe('Data Playground canvas', () => {
 
   test('settings manages destinations', async ({ page }) => {
     await page.goto('/')
-    await page.getByLabel('Settings').click()
+    await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
+    await page.getByText('Settings', { exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Settings' }).or(page.getByText('Settings', { exact: true }).first())).toBeVisible()
     // datasets live on the Tables page now, not in Settings — add an output destination (a real, consumed setting)
     await page.getByPlaceholder('e.g. S3 exports').fill('scratch')
@@ -432,10 +434,14 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText(/No runs yet/)).toBeVisible()
   })
 
-  test('the top bar shows identity only — no user switching', async ({ page }) => {
+  test('identity lives on the files shell, not the canvas chrome — and no user switching', async ({ page }) => {
     await page.goto('/')
-    await expect(page.getByTitle(/Signed in as/)).toBeVisible() // identity indicator
-    await expect(page.getByText('Switch user (dev)')).toHaveCount(0) // the switcher is gone
+    // the canvas top-right no longer carries an account avatar (identity/logout belong on the shell)
+    await expect(page.getByTitle(/Signed in as/)).toHaveCount(0)
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to files').click()
+    await expect(page.getByText('signed in')).toBeVisible() // identity indicator on the files shell
+    await expect(page.getByText('Switch user (dev)')).toHaveCount(0) // no switcher anywhere
     await expect(page.getByPlaceholder('new user…')).toHaveCount(0)
   })
 

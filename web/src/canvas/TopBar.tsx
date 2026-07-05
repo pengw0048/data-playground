@@ -65,11 +65,8 @@ export function TopBar() {
           style={{ ...pill, background: '#2f6ef0', color: '#fff', border: 'none' }}>
           <Icon name="link" size={13} /> Share
         </button>
-        <button aria-label="Settings" title="Settings" onClick={() => setSettingsOpen(true)}
-          style={{ width: 34, height: 34, display: 'grid', placeItems: 'center', background: '#fff', border: `1px solid ${color.border}`, borderRadius: 20, boxShadow: shadow.card, color: color.text2, cursor: 'pointer' }}>
-          <Icon name="settings" size={15} />
-        </button>
-        <AccountMenu />
+        {/* Settings lives in the app menu (top-left); identity + log out live on the files shell —
+            no redundant Settings button / account avatar here. */}
       </div>
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
       {canvasSettingsOpen && <CanvasSettingsModal onClose={() => setCanvasSettingsOpen(false)} />}
@@ -177,18 +174,6 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
 
 // A pure identity indicator — who you are, nothing to switch. (Real users don't switch identity;
 // in an auth deployment it comes from login. Logout lives on the files home.)
-function AccountMenu() {
-  const currentUser = useStore((s) => s.currentUser)
-  return (
-    <div title={`Signed in as ${currentUser?.name ?? 'local'}`}
-      style={{ width: 34, height: 34, display: 'grid', placeItems: 'center', background: '#fff', border: `1px solid ${color.border}`, borderRadius: '50%', boxShadow: shadow.card }}>
-      <span style={{ width: 24, height: 24, borderRadius: '50%', background: '#e7e0fb', color: '#6b4bd6', display: 'grid', placeItems: 'center', fontSize: 11, fontWeight: 700 }}>
-        {(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}
-      </span>
-    </div>
-  )
-}
-
 function IconBtn({ name, label, onClick, disabled }: { name: IconName; label: string; onClick: () => void; disabled?: boolean }) {
   return (
     <button aria-label={label} title={label} onClick={onClick} disabled={disabled}

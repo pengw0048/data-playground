@@ -77,7 +77,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           </span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11.5, color: color.text2 }}>
-          <span style={{ color: st.color }}>{st.glyph}</span> {st.label}
+          {/* a note is an annotation — it never runs, so a run status (draft/stale/…) is meaningless */}
+          {kind === 'note' ? <span style={{ color: color.text3 }}>annotation</span>
+            : <><span style={{ color: st.color }}>{st.glyph}</span> {st.label}</>}
           {spec?.blurb && <span style={{ color: color.text3 }}>· {spec.blurb}</span>}
         </div>
       </div>
@@ -132,11 +134,14 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       <Section title="Actions">
         {invalid && <div style={{ fontSize: 11, color: '#a2731a', marginBottom: 6 }}>⚠ {invalid}</div>}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-          <Action icon="eye" label="View data" disabled={!runnable || !!invalid} onClick={() => runPreview(nodeId)} />
-          <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : 'Run'} disabled={(!runnable || !!invalid) && runState !== 'running'}
-            onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
-          {spec?.canBypass && <Action icon="power" label="Bypass" onClick={() => bypass(nodeId)} />}
-          <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} onClick={() => disable(nodeId)} />
+          {/* a note never runs — only offer duplicate / delete for annotations */}
+          {kind !== 'note' && <>
+            <Action icon="eye" label="View data" disabled={!runnable || !!invalid} onClick={() => runPreview(nodeId)} />
+            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : 'Run'} disabled={(!runnable || !!invalid) && runState !== 'running'}
+              onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
+            {spec?.canBypass && <Action icon="power" label="Bypass" onClick={() => bypass(nodeId)} />}
+            <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} onClick={() => disable(nodeId)} />
+          </>}
           <Action icon="duplicate" label="Duplicate" onClick={() => duplicate(nodeId)} />
           <Action icon="trash" label="Delete" danger onClick={() => removeNode(nodeId)} />
         </div>
