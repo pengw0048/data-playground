@@ -135,6 +135,11 @@ export const api = {
   putSetting: (scope: 'global' | 'user', key: string, value: unknown) =>
     req<{ ok: boolean }>('/settings', { method: 'PUT', body: JSON.stringify({ scope, key, value }) }),
 
+  // destinations (save/open "places" — local + pluggable object stores)
+  destinations: () => req<{ destinations: DestinationPreset[]; backends: string[] }>('/destinations'),
+  browseDestination: (destinationId: string, path = '') =>
+    req<BrowseResult>('/destinations/browse', { method: 'POST', body: JSON.stringify({ destinationId, path }) }),
+
   // per-user canvases (multi-file)
   listCanvases: () => req<CanvasFile[]>('/canvas'),
   getCanvas: (id: string) => req<CanvasDoc>(`/canvas/${id}`),
@@ -154,6 +159,9 @@ export const api = {
     req<{ ok: boolean }>(`/canvas/${canvasId}/share/${userId}`, { method: 'DELETE' }),
 }
 
+export interface DestinationPreset { id: string; name: string; backend: string; root: string }
+export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
+export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export interface RunRecordDto { id: string; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputTable?: string | null; createdAt?: string | null }
 export interface ShareInfo { userId: string; name: string; role: string }
 export interface DpUser { id: string; name: string; email?: string | null }

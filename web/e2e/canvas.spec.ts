@@ -446,6 +446,28 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByRole('button', { name: /^Row / })).toBeVisible() // detail back-button
   })
 
+  test('a write node picks an output destination via the save dialog', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Sources & sinks', 'write')
+    await page.locator('.react-flow__node').getByRole('button', { name: /Change/ }).click()
+    await expect(page.getByText('Save output to…')).toBeVisible()
+    const dialog = page.locator('.dp-modal-overlay')
+    await expect(dialog.getByRole('combobox')).toContainText('Workspace outputs') // the default local place
+    await dialog.locator('input').fill('my_output')
+    await dialog.getByRole('button', { name: 'Save here' }).click()
+    await expect(page.getByText('Save output to…')).toHaveCount(0) // dialog closed on save
+    await expect(page.locator('.react-flow__node').getByText('Workspace outputs')).toBeVisible() // target shown on the card
+  })
+
+  test('the source node can browse files (open dialog)', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Sources & sinks', 'source')
+    await page.locator('.react-flow__node').getByRole('button', { name: /Select dataset/ }).click()
+    await page.getByText('Browse files…').click()
+    await expect(page.getByText('Open a dataset')).toBeVisible() // the open dialog over destinations
+    await expect(page.locator('.dp-modal-overlay').getByRole('combobox')).toContainText('Workspace outputs')
+  })
+
   test('a table is registered and added to the canvas from the Tables view', async ({ page }) => {
     await fresh(page) // empty new canvas is the current doc
     await page.getByTestId('app-menu').click()

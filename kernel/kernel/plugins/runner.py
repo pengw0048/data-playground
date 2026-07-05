@@ -196,7 +196,14 @@ class LocalRunner:
             return int(cached.get("rows") or 0)
         fmt = (cfg.get("format") or "parquet").lower()
         ext = {"parquet": ".parquet", "csv": ".csv", "lance": ".lance"}.get(fmt, ".parquet")
-        uri = self.storage.output_uri(name, ext)
+        # a write node may target a chosen destination (a preset place — local dir / object-store
+        # prefix); otherwise fall back to the default local outputs storage.
+        dest_id = cfg.get("destId")
+        if dest_id:
+            from kernel import destinations
+            uri = destinations.target_uri(self.workspace, dest_id, cfg.get("destPath", ""), f"{name}{ext}")
+        else:
+            uri = self.storage.output_uri(name, ext)
 
         inc = g.incoming(graph, node.id)
         if not inc:

@@ -1,0 +1,126 @@
+"""Destinations — a pluggable "places" list for save/open dialogs (like a file dialog's sidebar).
+
+A destination is a named place data is read from / written to: a local directory tree, or an
+object-store prefix (s3://…, gs://…). Core ships the `local` backend; object stores are a PLUGIN
+backend — core keeps them as a known kind (so a target uri can be picked and saved) but browsing
+and writing without the plugin's adapter fail honestly rather than silently going local.
+
+A backend implements DestinationBackend and is registered via register_backend(); an org plugin
+adds real s3/gcs/catalog browsing the same way. Presets (named roots) live in global settings.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Protocol, runtime_checkable
+
+from kernel import metadb
+
+
+@runtime_checkable
+class DestinationBackend(Protocol):
+    kind: str
+    def browse(self, root: str, path: str) -> dict: ...          # {path, entries:[{name,kind,uri}], error?}
+    def target_uri(self, root: str, path: str, filename: str) -> str: ...
+
+
+class LocalBackend:
+    kind = "local"
+
+    def browse(self, root: str, path: str) -> dict:
+        top = os.path.realpath(root)
+        base = os.path.realpath(os.path.join(top, path.lstrip("/")))
+        if not (base == top or base.startswith(top + os.sep)):  # never escape the destination root
+            base, path = top, ""
+        try:
+            names = sorted(os.listdir(base))
+        except OSError as e:
+            return {"path": path, "entries": [], "error": str(e)}
+        entries = []
+        for fn in names:
+            if fn.startswith("."):
+                continue
+            p = os.path.join(base, fn)
+            # a `.lance` dir is a dataset (a "file"), not a folder to descend into
+            is_dir = os.path.isdir(p) and not fn.endswith(".lance")
+            entries.append({"name": fn, "kind": "dir" if is_dir else "file", "uri": p})
+        return {"path": path, "entries": entries}
+
+    def target_uri(self, root: str, path: str, filename: str) -> str:
+        top = os.path.realpath(root)
+        base = os.path.realpath(os.path.join(top, path.lstrip("/")))
+        if not (base == top or base.startswith(top + os.sep)):  # a `..` subpath must not escape the root
+            base = top
+        return os.path.join(base, os.path.basename(filename))  # basename: never let the filename traverse either
+
+
+class _ObjectStoreStub:
+    """s3:// / gs:// — a plugin backend. Core recognizes the kind so a target uri can be picked and
+    saved, but can't enumerate keys without the object-store plugin installed."""
+
+    def __init__(self, kind: str):
+        self.kind = kind
+
+    def browse(self, root: str, path: str) -> dict:
+        return {"path": path, "entries": [],
+                "error": f"{self.kind}:// browsing needs the object-store plugin — type a prefix, or install it"}
+
+    def target_uri(self, root: str, path: str, filename: str) -> str:
+        base = (root.rstrip("/") + "/" + path.strip("/")).rstrip("/")
+        return f"{base}/{filename}"
+
+
+_BACKENDS: dict[str, DestinationBackend] = {
+    "local": LocalBackend(), "s3": _ObjectStoreStub("s3"), "gs": _ObjectStoreStub("gs"),
+}
+
+
+def register_backend(b: DestinationBackend) -> None:
+    """Plugin extension point — add real s3/gcs/catalog browsing behind the same interface."""
+    _BACKENDS[b.kind] = b
+
+
+def backend_kinds() -> list[str]:
+    return list(_BACKENDS)
+
+
+def _default_root(workspace: str) -> str:
+    url = os.environ.get("DP_STORAGE_URL", "").strip()
+    if url.startswith(("s3://", "gs://")):
+        return url
+    return (url[len("file://"):] if url.startswith("file://") else url) or os.path.join(workspace, "outputs")
+
+
+def presets(workspace: str) -> list[dict]:
+    """User-configured destinations (global setting `destinations`), always including the default
+    local outputs place so there's somewhere to write out of the box."""
+    saved = metadb.get_setting("destinations", "global", default=[]) or []
+    saved = [d for d in saved if isinstance(d, dict) and d.get("id")]
+    if not any(d.get("id") == "outputs" for d in saved):
+        root = _default_root(workspace)
+        kind = "s3" if root.startswith("s3://") else "gs" if root.startswith("gs://") else "local"
+        saved = [{"id": "outputs", "name": "Workspace outputs", "backend": kind, "root": root}, *saved]
+    return saved
+
+
+def _find(workspace: str, dest_id: str) -> dict | None:
+    return next((d for d in presets(workspace) if d.get("id") == dest_id), None)
+
+
+def browse(workspace: str, dest_id: str, path: str) -> dict:
+    d = _find(workspace, dest_id)
+    if not d:
+        return {"path": path, "entries": [], "error": "unknown destination"}
+    b = _BACKENDS.get(d.get("backend", "local"))
+    if not b:
+        return {"path": path, "entries": [], "error": f"no backend for '{d.get('backend')}'"}
+    res = b.browse(d.get("root", ""), path or "")
+    res["writable"] = isinstance(b, LocalBackend)  # core can only write local; object stores need the plugin adapter
+    return res
+
+
+def target_uri(workspace: str, dest_id: str, path: str, filename: str) -> str:
+    d = _find(workspace, dest_id)
+    if not d:
+        raise ValueError(f"unknown destination '{dest_id}'")
+    return _BACKENDS[d.get("backend", "local")].target_uri(d.get("root", ""), path or "", filename)

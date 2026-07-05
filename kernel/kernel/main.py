@@ -220,6 +220,28 @@ def graph_schema(req: CompileRequest) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Destinations (save/open "places") — local + pluggable object-store backends
+# --------------------------------------------------------------------------- #
+class BrowseRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    destination_id: str
+    path: str = ""
+
+
+@api.get("/destinations")
+def list_destinations() -> dict:
+    from kernel import destinations
+    ws = get_deps().workspace
+    return {"destinations": destinations.presets(ws), "backends": destinations.backend_kinds()}
+
+
+@api.post("/destinations/browse")
+def browse_destination(req: BrowseRequest) -> dict:
+    from kernel import destinations
+    return destinations.browse(get_deps().workspace, req.destination_id, req.path)
+
+
+# --------------------------------------------------------------------------- #
 # Agent (optional LLM planner — key stays in the kernel, never the browser)
 # --------------------------------------------------------------------------- #
 class AgentRequest(BaseModel):
