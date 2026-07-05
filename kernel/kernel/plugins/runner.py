@@ -156,11 +156,14 @@ class LocalRunner:
             with self._lock:
                 self._cache[phash] = {"rows": rows_seen, "uri": status.output_uri, "table": status.output_table}
         except Exception as e:  # noqa: BLE001
-            status.status = "failed"
-            status.error = f"{type(e).__name__}: {e}"
-            for p in status.per_node:
-                if p.status == "running":
-                    p.status = "failed"
+            if cancel.is_set():
+                status.status = "cancelled"  # an interrupted step is a cancel, not a failure
+            else:
+                status.status = "failed"
+                status.error = f"{type(e).__name__}: {e}"
+                for p in status.per_node:
+                    if p.status == "running":
+                        p.status = "failed"
         finally:
             db.drop_created_views()
             for pth in engine.spill_files:  # GC temp parquet spilled this run (outputs already committed)
@@ -243,5 +246,6 @@ class LocalRunner:
         if st.status in ("queued", "running"):
             if run_id in self._cancel:
                 self._cancel[run_id].set()
+            db.interrupt()  # abort the in-flight DuckDB step so cancel actually stops work + frees the lock
             st.status = "cancelled"
         return st

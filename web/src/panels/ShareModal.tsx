@@ -15,6 +15,7 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
   const [visibility, setVisibility] = useState('private')
   const [shares, setShares] = useState<ShareInfo[]>([])
   const [pick, setPick] = useState('')
+  const [role, setRole] = useState<'editor' | 'viewer'>('editor')
 
   const load = () => api.getShares(canvasId).then((r) => { setVisibility(r.visibility); setShares(r.shares) }).catch(() => {})
   useEffect(() => { load() }, [canvasId])
@@ -22,9 +23,10 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
   const setVis = async (v: string) => { setVisibility(v); await api.addShare(canvasId, { visibility: v }).catch((e) => pushToast((e as Error).message, 'error')) }
   const add = async () => {
     if (!pick) return
-    await api.addShare(canvasId, { userId: pick, role: 'editor' }).catch((e) => pushToast((e as Error).message, 'error'))
+    await api.addShare(canvasId, { userId: pick, role }).catch((e) => pushToast((e as Error).message, 'error'))
     setPick(''); load()
   }
+  const changeRole = async (userId: string, r: string) => { await api.addShare(canvasId, { userId, role: r }).catch((e) => pushToast((e as Error).message, 'error')); load() }
   const remove = async (userId: string) => { await api.removeShare(canvasId, userId).catch(() => {}); load() }
 
   const sharedIds = new Set([currentUser?.id, ...shares.map((s) => s.userId)])
@@ -71,7 +73,12 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
               {shares.map((sh) => (
                 <div key={sh.userId} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, color: color.ink }}>
                   <span style={{ width: 22, height: 22, borderRadius: '50%', background: '#eef0f3', color: color.text2, display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700 }}>{sh.name.slice(0, 1).toUpperCase()}</span>
-                  <span style={{ flex: 1 }}>{sh.name} <span style={{ color: color.text3 }}>· {sh.role}</span></span>
+                  <span style={{ flex: 1 }}>{sh.name}</span>
+                  <select value={sh.role} onChange={(e) => changeRole(sh.userId, e.target.value)} title="Access level"
+                    style={{ fontSize: 11, border: `1px solid ${color.border}`, borderRadius: 6, padding: '3px 6px', background: '#fff', color: color.text2 }}>
+                    <option value="editor">can edit</option>
+                    <option value="viewer">can view</option>
+                  </select>
                   <button onClick={() => remove(sh.userId)} title="Remove" style={{ border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer' }}><Icon name="close" size={13} /></button>
                 </div>
               ))}
@@ -82,6 +89,11 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
                   style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '6px 8px', background: '#fff' }}>
                   <option value="">Add a collaborator…</option>
                   {addable.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+                </select>
+                <select value={role} onChange={(e) => setRole(e.target.value as 'editor' | 'viewer')} title="Access level"
+                  style={{ fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '6px 8px', background: '#fff' }}>
+                  <option value="editor">can edit</option>
+                  <option value="viewer">can view</option>
                 </select>
                 <button onClick={add} disabled={!pick} style={{ border: 'none', borderRadius: 6, background: color.ink, color: '#fff', fontSize: 12, fontWeight: 600, padding: '0 14px', cursor: pick ? 'pointer' : 'not-allowed', opacity: pick ? 1 : 0.5 }}>Add</button>
               </div>

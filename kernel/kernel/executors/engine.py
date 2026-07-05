@@ -114,6 +114,31 @@ class LoweringEngine:
             out.append(rel)
         return out
 
+    def _faithful_inputs(self, node: GraphNode) -> list[Relation]:
+        """Lower this node's inputs UNSAMPLED even during preview, so an op that must see all rows
+        (join / sort / vector-search) is FAITHFUL — the op's own LIMIT then makes it an efficient
+        top-N, bounded by the preview budget. A truncated-prefix version of these ops lies (a join of
+        two independent 2000-row prefixes finds few real matches; a sort/vector-search shows the top
+        of an arbitrary prefix, not the true top-K). Refuse honestly (P8) if a Python transform is
+        upstream — a 'full' eval would spill every row inside a preview."""
+        if self.full:
+            return self._inputs(node)
+        chain = g.upstream_chain(self.graph, node.id)
+        if any(n.type in ("transform", "notebook", "opaque", "loop") for n in chain):
+            raise NotPreviewable(node, f"{node.type} over a transformed input — needs a full pass")
+        full = LoweringEngine(self.graph, self.resolve_adapter, self.registry, sample_k=None, full=True,
+                              node_lowerings=self.node_lowerings, node_specs=self.node_specs)
+        return [full.relation(e.source, e.source_handle) for e in g.incoming(self.graph, node.id)]
+
+    def _join_projection(self, left: Relation, right: Relation) -> str:
+        """SELECT list for an ON-expression join: all left columns as-is, right columns renamed with a
+        `_2` suffix where they clash with a left column, so the joined relation has no duplicate names."""
+        lcols = list(left.columns)
+        lset = set(lcols)
+        parts = [f'a."{c}"' for c in lcols]
+        parts += [f'b."{c}" AS "{c}_2"' if c in lset else f'b."{c}"' for c in right.columns]
+        return ", ".join(parts)
+
     def _view(self, rel: Relation, base: str = "v") -> str:
         # process-globally-unique name so concurrent engines never clobber each other's views
         name = db.unique_view(base)
@@ -133,9 +158,19 @@ class LoweringEngine:
             uri = cfg.get("uri") or cfg.get("table")
             if not uri:
                 raise NotPreviewable(node, "no dataset selected")
+            # pass CSV parse overrides only when the user actually set them (not the 'auto' default), so
+            # any adapter (incl. plugins) whose scan() predates the `options` kwarg keeps working
+            opts: dict = {}
+            _d = str(cfg.get("delimiter", "")).strip()
+            if _d:
+                opts["delimiter"] = _d
+            _h = str(cfg.get("header", "")).strip().lower()
+            if _h in ("yes", "no"):
+                opts["header"] = _h
+            extra = {"options": opts} if opts else {}
             if self.schema_only:
-                return self.resolve_adapter(uri).scan(uri, limit=0)  # metadata only — never materialize
-            rel = self.resolve_adapter(uri).scan(uri)
+                return self.resolve_adapter(uri).scan(uri, limit=0, **extra)  # metadata only — never materialize
+            rel = self.resolve_adapter(uri).scan(uri, **extra)
             if self.sample_k and not self.full:
                 rel = rel.limit(self.sample_k)
             return rel
@@ -177,7 +212,12 @@ class LoweringEngine:
 
         if t == "sort":
             by = (cfg.get("by") or "").strip()
-            return parent.order(by) if by else parent
+            if not by:
+                return parent
+            # the true top-N is over ALL rows, not a 2000-row prefix — sort the full input in preview
+            # too (the preview limit turns it into an efficient top-N)
+            src = parent if self.full else self._faithful_inputs(node)[0]
+            return src.order(by)
 
         if t == "dedup":
             on = (cfg.get("on") or "").strip()
@@ -211,12 +251,22 @@ class LoweringEngine:
             if len(inputs) < 2:
                 return parent
             on = (cfg.get("on") or "").strip()
+            cond = (cfg.get("condition") or "").strip()  # raw ON expression, aliases a.<col> / b.<col>
             how = (cfg.get("how") or "inner").lower()
             how = how if how in ("inner", "left", "right", "full", "outer", "cross") else "inner"
             how = "full" if how == "outer" else how
-            a, b = self._view(inputs[0], "ja"), self._view(inputs[1], "jb")
-            if how == "cross" or not on:
-                return db.conn().sql(f"SELECT * FROM {a} CROSS JOIN {b}")
+            # joining two independently-truncated prefixes finds few/no real matches — join the FULL
+            # inputs even in preview (bounded by the preview limit + budget)
+            ins = inputs if self.full else self._faithful_inputs(node)
+            a, b = self._view(ins[0], "ja"), self._view(ins[1], "jb")
+            if how == "cross" or (not on and not cond):
+                return db.conn().sql(f"SELECT a.*, b.* FROM {a} AS a CROSS JOIN {b} AS b")
+            if cond:
+                # an ON expression (e.g. `a.user_id = b.uid`, or a composite/inequality condition) —
+                # keep BOTH sides' columns but rename right-side name clashes, so a downstream select/sql
+                # isn't ambiguous (USING coalesces keys; a bare ON does not)
+                proj = self._join_projection(ins[0], ins[1])
+                return db.conn().sql(f"SELECT {proj} FROM {a} AS a {how.upper()} JOIN {b} AS b ON ({cond})")
             cols = ", ".join(f'"{c.strip()}"' for c in on.split(","))
             return db.conn().sql(f"SELECT * FROM {a} {how.upper()} JOIN {b} USING ({cols})")
 
@@ -368,7 +418,10 @@ class LoweringEngine:
         qrow = max(0, int(cfg.get("queryRow", 0)))
         if not inputs:
             raise NotPreviewable(node, "vector-search needs a dataset input")
-        base = self._view(inputs[0], "vs")
+        # the true nearest-K are over ALL rows (and the query row itself must come from the full set),
+        # not a 2000-row prefix — score the full input in preview too
+        src = inputs[0] if self.full else self._faithful_inputs(node)[0]
+        base = self._view(src, "vs")
         # brute-force cosine similarity to a chosen row's vector (the query), out-of-core in DuckDB
         con = db.conn()
         try:

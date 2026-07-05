@@ -5,6 +5,7 @@
 // unchanged — the store still autosaves the canvas snapshot to the DB.
 import * as Y from 'yjs'
 import { useStore } from '../store/graph'
+import { crdtUndo } from './undo'
 import type { CanvasDoc, CanvasNode, CanvasEdge } from '../types/graph'
 
 let ydoc = new Y.Doc()
@@ -14,6 +15,7 @@ let ready = false          // gate local→Y pushes until we've synced peers' st
 let lastDoc: CanvasDoc | undefined
 let broadcast: ((u: Uint8Array) => void) | null = null
 let unsub: (() => void) | null = null
+let undoMgr: Y.UndoManager | null = null
 
 const b64 = {
   enc: (u: Uint8Array) => {
@@ -81,13 +83,22 @@ export function startYSync(send: (u: Uint8Array) => void): void {
                  // live state, so a joiner can't clobber unpersisted edits (hydrateIfEmpty handles "first")
 
   ydoc.on('update', (u: Uint8Array, origin) => {
-    if (origin !== 'store') {          // remote edit / local hydrate → reflect into the store
+    if (origin !== 'store') {          // remote edit / local hydrate / undo-redo → reflect into the store
       applying = true
       try { useStore.setState({ doc: yToDoc(useStore.getState().doc) }) } finally { applying = false }
       if (origin === 'remote') ready = true  // we've merged a peer's state → the store now matches Y
     }
-    if (origin === 'store' && broadcast) broadcast(u)  // only genuine local edits go on the wire
+    // anything NOT applied from a peer is a local change (a store edit or an undo/redo) → put it on the
+    // wire; a 'remote' update is an echo we must not rebroadcast.
+    if (origin !== 'remote' && broadcast) broadcast(u)
   })
+
+  // CRDT-aware undo/redo: track ONLY local edits (origin 'store'), so undo reverts my own changes and
+  // never deletes a node/edge a peer added concurrently (the old full-doc snapshot did exactly that).
+  undoMgr = new Y.UndoManager([nodes(), edges(), meta()], { trackedOrigins: new Set(['store']) })
+  crdtUndo.undo = () => undoMgr?.undo()
+  crdtUndo.redo = () => undoMgr?.redo()
+  crdtUndo.boundary = () => undoMgr?.stopCapturing()  // start a fresh undo item at explicit checkpoints
 
   lastDoc = useStore.getState().doc
   unsub = useStore.subscribe((s) => {
@@ -116,6 +127,8 @@ export function stopYSync(): void {
   ready = false
   unsub?.(); unsub = null
   broadcast = null
+  undoMgr?.destroy(); undoMgr = null
+  crdtUndo.undo = crdtUndo.redo = crdtUndo.boundary = null  // store falls back to its snapshot stack
   ydoc.destroy()
   ydoc = new Y.Doc()
 }

@@ -109,6 +109,47 @@ def test_join_and_sql():
     assert not r["notPreviewable"] and r["rows"][0]["n"] > 0
 
 
+def test_preview_is_faithful_for_join_and_sort(tmp_path):
+    # preview used to truncate each source to its first 2000 rows and THEN join/sort — so a join of
+    # two non-overlapping prefixes showed 0 matches, and a sort showed the top of an arbitrary prefix.
+    # It now runs these over the full inputs (bounded by the preview limit), so the sample is faithful.
+    import duckdb
+    left, right = str(tmp_path / "left.parquet"), str(tmp_path / "right.parquet")
+    # matching keys live only in rows past the 2000-row preview window of at least one side
+    duckdb.connect().execute(f"COPY (SELECT i AS id, i*10 AS lval FROM range(0,3000) t(i)) TO '{left}' (FORMAT PARQUET)")
+    duckdb.connect().execute(f"COPY (SELECT i AS id FROM range(2500,5500) t(i)) TO '{right}' (FORMAT PARQUET)")
+    gj = {"id": "c", "version": 1, "nodes": [
+        N("l", "source", {"uri": left}), N("r", "source", {"uri": right}),
+        N("j", "join", {"on": "id", "how": "inner"}),
+    ], "edges": [E("l", "j", None, "a"), E("r", "j", None, "b")]}
+    rj = client.post("/api/run/preview", json={"graph": gj, "nodeId": "j", "k": 50}).json()
+    assert not rj["notPreviewable"] and rj["rowCount"] > 0  # real matches (2500..2999), not the old 0
+    gs = {"id": "c2", "version": 1, "nodes": [
+        N("l", "source", {"uri": left}), N("s", "sort", {"by": "lval DESC"}),
+    ], "edges": [E("l", "s")]}
+    rs = client.post("/api/run/preview", json={"graph": gs, "nodeId": "s", "k": 5}).json()
+    assert rs["rows"][0]["lval"] == 29990  # the TRUE global max (id=2999), not a 2000-row-prefix max
+
+
+def test_join_on_expression_with_differing_keys(tmp_path):
+    # join used to emit only USING(cols), requiring identical key names; an ON expression now supports
+    # differently-named keys (a.id = b.uid) and renames right-side column clashes so downstream isn't
+    # ambiguous.
+    import duckdb
+    left, right = str(tmp_path / "l.parquet"), str(tmp_path / "r.parquet")
+    duckdb.connect().execute(f"COPY (SELECT i AS id, 'L'||i AS name FROM range(0,5) t(i)) TO '{left}' (FORMAT PARQUET)")
+    duckdb.connect().execute(f"COPY (SELECT i AS uid, 'R'||i AS name FROM range(2,7) t(i)) TO '{right}' (FORMAT PARQUET)")
+    g = {"id": "c", "version": 1, "nodes": [
+        N("l", "source", {"uri": left}), N("r", "source", {"uri": right}),
+        N("j", "join", {"how": "inner", "condition": "a.id = b.uid"}),
+    ], "edges": [E("l", "j", None, "a"), E("r", "j", None, "b")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "j", "k": 50}).json()
+    assert not r["notPreviewable"], r.get("reason")
+    cols = [c["name"] for c in r["columns"]]
+    assert cols == ["id", "name", "uid", "name_2"]  # right-side 'name' renamed → no ambiguity
+    assert r["rowCount"] == 3  # ids 2,3,4 overlap
+
+
 def test_dedup_and_metric():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
@@ -345,6 +386,22 @@ def test_write_formats_round_trip(tmp_path):
             assert a.scan(res["uri"]).fetchall() == [(3, "z")], ext  # part-*.<ext> read back from the dir
 
 
+def test_source_csv_parse_options(tmp_path):
+    # the source node can override CSV auto-detection (delimiter + header) — needed for semicolon files,
+    # headerless files, etc. Blank/'auto' keeps DuckDB's sniffer.
+    from kernel import db
+    from kernel.plugins.adapters import DuckDBAdapter
+    p = str(tmp_path / "s.csv")
+    with open(p, "w") as f:
+        f.write("a;b\n1;2\n3;4\n")
+    a = DuckDBAdapter()
+    with db.lock():
+        auto = a.scan(p)  # auto: ';' sniffed, first row treated as header → 2 data rows
+        assert auto.columns == ["a", "b"] and auto.aggregate("count(*)").fetchone()[0] == 2
+        opt = a.scan(p, options={"delimiter": ";", "header": "no"})  # explicit: no header → 3 data rows
+        assert opt.columns == ["column0", "column1"] and opt.aggregate("count(*)").fetchone()[0] == 3
+
+
 def test_overwrite_is_atomic_and_preserves_old_data_on_failure(tmp_path):
     # a failed/cancelled overwrite must NOT truncate the existing dataset: we write to a temp sibling
     # and os.replace only on success (review finding — silent data loss on re-run failure).
@@ -383,6 +440,24 @@ def test_estimate_reports_real_rows_and_gates_only_large_runs(tmp_path):
     # end-to-end: the endpoint returns the real count for a small source, no gate, and no ETA field
     est = client.post("/api/run/estimate", json={"graph": g.model_dump(), "targetNodeId": "s"}).json()
     assert est["rows"] == 10 and est["needsConfirm"] is False and "seconds" not in est
+
+
+def test_timeout_interrupts_stuck_query_and_frees_the_lock():
+    # a runaway/long DuckDB query used to keep holding the process-global lock after its wall-clock
+    # budget elapsed, wedging every later preview/run. run_with_timeout now interrupts it so the
+    # worker unwinds and releases the lock.
+    from kernel import db
+    from kernel.sandbox import SandboxError, run_with_timeout
+    con = db.conn()
+
+    def stuck():
+        with db.lock():  # ~10^10-row cross join — far exceeds the budget unless interrupted
+            con.execute("SELECT count(*) FROM range(100000000) a(x), range(200) b(y)").fetchone()
+
+    with pytest.raises(SandboxError):
+        run_with_timeout(stuck, 0.5, on_timeout=db.interrupt)
+    with db.lock():  # the lock is free and the connection is usable again — not wedged
+        assert con.execute("SELECT 42").fetchone() == (42,)
 
 
 def test_metric_over_transform_upstream_not_previewable():
@@ -811,6 +886,39 @@ def test_collab_ws_requires_auth_when_enabled(monkeypatch):
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/ws/collab/some_canvas"):
                 pass
+    finally:
+        client.cookies.clear()
+
+
+def test_collab_relay_gates_viewer_doc_updates(monkeypatch):
+    # a viewer may watch (presence + peers' edits) but its OWN doc updates ('yjs' carries CRDT state)
+    # must NOT be relayed — else an editor peer would merge + autosave them, laundering a change past
+    # the read-only boundary that put_canvas enforces.
+    from kernel import auth, metadb
+    from kernel.metadb import Canvas, session
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    cid = "cvs_viewer_gate"
+    with session() as s:
+        if s.get(Canvas, cid) is None:
+            s.add(Canvas(id=cid, owner_id="owner_u", name="t", version=1, doc="{}", visibility="private"))
+    metadb.share_canvas(cid, "editor_u", "editor")
+    metadb.share_canvas(cid, "viewer_u", "viewer")
+    ed_cookie = {"cookie": f"dp_session={auth.sign('editor_u')}"}
+    vw_cookie = {"cookie": f"dp_session={auth.sign('viewer_u')}"}
+    client.cookies.clear()
+    try:
+        with client.websocket_connect(f"/ws/collab/{cid}", headers=ed_cookie) as ed:
+            with client.websocket_connect(f"/ws/collab/{cid}", headers=vw_cookie) as vw:
+                # the viewer sends a doc update then a presence; the editor must receive ONLY the presence
+                # (if the yjs had been relayed it would arrive first)
+                vw.send_json({"clientId": "V", "type": "yjs", "update": "AAAA"})
+                vw.send_json({"clientId": "V", "type": "presence", "name": "Val"})
+                got = ed.receive_json()
+                assert got["type"] == "presence" and got["clientId"] == "V"  # yjs dropped, presence relayed
+                # an editor's doc update DOES reach the viewer (a writer's edits flow to watchers)
+                ed.send_json({"clientId": "E", "type": "yjs", "update": "BBBB"})
+                got2 = vw.receive_json()
+                assert got2["type"] == "yjs" and got2["clientId"] == "E"
     finally:
         client.cookies.clear()
 

@@ -363,6 +363,39 @@ test.describe('Data Playground canvas', () => {
     await b.close()
   })
 
+  test('undo is CRDT-scoped — it never erases a peer\'s concurrent node', async ({ page }) => {
+    // regression: undo used to push a stale full-doc snapshot into the CRDT, deleting any node a peer
+    // added after the snapshot — for everyone. Undo must now revert only the local user's own edit.
+    await fresh(page) // A
+    const b = await page.context().newPage()
+    await b.goto('/')
+    await expect(b.getByTestId('toolbar')).toBeVisible()
+    await addNode(page, 'Shape', 'filter')       // A adds a node
+    await expect(b.locator('.react-flow__node')).toHaveCount(1, { timeout: 12_000 }) // B sees it
+    await addNode(b, 'Shape', 'sort')            // B adds a node concurrently
+    await expect(page.locator('.react-flow__node')).toHaveCount(2, { timeout: 12_000 }) // A sees both
+    // A undoes ITS add — B's node must survive on BOTH clients (old bug: both dropped to 0)
+    await page.locator('.react-flow__pane').click({ position: { x: 12, y: 12 } }) // focus A's canvas
+    await page.keyboard.press('ControlOrMeta+z')
+    await expect(page.locator('.react-flow__node')).toHaveCount(1, { timeout: 12_000 }) // A: only B's node left
+    await expect(b.locator('.react-flow__node')).toHaveCount(1, { timeout: 12_000 })    // B: its node preserved
+    await b.close()
+  })
+
+  test('clipboard: select-all, copy/paste and multi-duplicate the selection', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+    await addNode(page, 'Shape', 'sort')
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await page.locator('.react-flow__pane').click({ position: { x: 12, y: 12 } }) // focus the canvas
+    await page.keyboard.press('ControlOrMeta+a') // select all
+    await page.keyboard.press('ControlOrMeta+c') // copy the selection
+    await page.keyboard.press('ControlOrMeta+v') // paste → 2 more nodes (ids remapped, no collision)
+    await expect(page.locator('.react-flow__node')).toHaveCount(4)
+    await page.keyboard.press('ControlOrMeta+d') // duplicate the (pasted) selection → 2 more
+    await expect(page.locator('.react-flow__node')).toHaveCount(6)
+  })
+
   test('the Share dialog sets visibility and adds a collaborator', async ({ page }) => {
     // seed a collaborator via the API (there's no in-app user switching anymore) — bootstrap picks it up
     await page.request.post('/api/users', { data: { name: 'Dana' }, headers: { 'X-DP-User': 'local' } })
@@ -371,13 +404,14 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('Share this canvas')).toBeVisible()
     // flip visibility to workspace
     await page.getByRole('button', { name: 'Everyone in workspace' }).click()
-    // add Dana as a collaborator
-    const select = page.getByRole('combobox')
+    // add Dana as a collaborator (the collaborator picker is the first combobox; a role picker sits beside it)
+    const select = page.getByRole('combobox').first()
     await select.selectOption({ label: 'Dana' })
     const addBtn = page.locator('button', { hasText: 'Add' }).last()
     await expect(addBtn).toBeEnabled()
     await addBtn.click()
-    await expect(page.getByText('Dana', { exact: false }).filter({ hasText: 'editor' })).toBeVisible()
+    await expect(page.getByText('Dana', { exact: false })).toBeVisible() // added to collaborators
+    await expect(page.locator('option[value="viewer"]').first()).toBeAttached() // viewer role is assignable end-to-end
   })
 
   test('the app menu opens persisted run history', async ({ page }) => {

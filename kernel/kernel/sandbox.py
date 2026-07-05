@@ -101,8 +101,10 @@ def compile_operator(code: str, mode: str) -> Callable:
     return entry
 
 
-def run_with_timeout(fn: Callable[[], Any], seconds: float) -> Any:
-    """Run fn() in a worker thread, enforcing a wall-clock budget."""
+def run_with_timeout(fn: Callable[[], Any], seconds: float, on_timeout: Callable[[], None] | None = None) -> Any:
+    """Run fn() in a worker thread, enforcing a wall-clock budget. On timeout, `on_timeout` (e.g.
+    db.interrupt) is fired to abort in-flight work so the worker can unwind and release any lock it
+    holds; we then give it a brief grace to do so before raising."""
     result: list[Any] = []
     error: list[BaseException] = []
 
@@ -116,6 +118,12 @@ def run_with_timeout(fn: Callable[[], Any], seconds: float) -> Any:
     t.start()
     t.join(seconds)
     if t.is_alive():
+        if on_timeout is not None:
+            try:
+                on_timeout()  # abort the stuck query so the worker releases the process-global lock
+            except Exception:  # noqa: BLE001
+                pass
+            t.join(2.0)  # grace for the interrupted worker to unwind its finally (lock release)
         raise SandboxError(f"cell exceeded the {seconds:g}s time budget")
     if error:
         raise error[0]

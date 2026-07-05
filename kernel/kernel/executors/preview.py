@@ -44,7 +44,9 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
         return SampleResult(columns=cols, rows=rows[:k], row_count=len(rows[:k]), has_more=has_more, truncated=True)
 
     try:
-        return run_with_timeout(work, PREVIEW_BUDGET_S)
+        # on timeout, interrupt the in-flight DuckDB query so the worker releases db.lock() instead of
+        # wedging every later preview/run until restart
+        return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=db.interrupt)
     except NotPreviewable as e:
         return SampleResult(not_previewable=True, reason=e.reason)     # honest P8 state
     except Exception as e:  # noqa: BLE001

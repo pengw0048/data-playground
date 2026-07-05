@@ -58,6 +58,23 @@ def path_of(uri: str) -> str:
     return p.path if p.scheme in ("file", "") else uri
 
 
+def _csv_kwargs(options: dict | None) -> dict:
+    """Map a source node's CSV parse overrides to DuckDB read_csv kwargs. Empty → auto-detect (default).
+    `delimiter` accepts a literal char or the words 'tab'/'\\t'; `header` is an explicit bool."""
+    if not options:
+        return {}
+    kw: dict = {}
+    d = str(options.get("delimiter") or "").strip()
+    if d:
+        kw["delimiter"] = {"tab": "\t", "\\t": "\t"}.get(d.lower(), d)
+    h = str(options.get("header") or "").strip().lower()
+    if h in ("yes", "true", "1"):
+        kw["header"] = True
+    elif h in ("no", "false", "0"):
+        kw["header"] = False
+    return kw
+
+
 def relation_columns(rel: Relation) -> list[ColumnSchema]:
     cols = [ColumnSchema(name=n, type=display_type(str(t))) for n, t in zip(rel.columns, rel.types)]
     return tag_columns(cols)
@@ -94,9 +111,10 @@ class DuckDBAdapter:
         return p.endswith(self._EXTS)
 
     def scan(self, uri: str, columns: list[str] | None = None,
-             predicate: str | None = None, limit: int | None = None) -> Relation:
+             predicate: str | None = None, limit: int | None = None,
+             options: dict | None = None) -> Relation:
         con = db.conn()
-        rel = self._read(con, uri)
+        rel = self._read(con, uri, options)
         if columns:
             rel = rel.project(", ".join(f'"{c}"' for c in columns))
         if predicate:
@@ -105,14 +123,15 @@ class DuckDBAdapter:
             rel = rel.limit(int(limit))
         return rel
 
-    def _read(self, con: duckdb.DuckDBPyConnection, uri: str) -> Relation:
+    def _read(self, con: duckdb.DuckDBPyConnection, uri: str, options: dict | None = None) -> Relation:
+        csv = _csv_kwargs(options)  # explicit CSV parse overrides (delimiter / header); else auto-detect
         if uri.startswith("mem://"):
             return con.table(uri[len("mem://"):])
         if is_object_uri(uri):
             db.ensure_object_store()  # load httpfs + credentials
             low = uri.lower()
             if low.endswith((".csv", ".tsv")):
-                return con.read_csv(uri)
+                return con.read_csv(uri, **csv)
             if low.endswith((".json", ".ndjson")):
                 return con.read_json(uri)
             if low.endswith((".parquet", ".pq")):
@@ -123,7 +142,7 @@ class DuckDBAdapter:
         if os.path.isdir(p):
             return self._read_dir(con, p)
         if low.endswith((".csv", ".tsv")):
-            return con.read_csv(p)
+            return con.read_csv(p, **csv)
         if low.endswith((".json", ".ndjson")):
             return con.read_json(p)
         if low.endswith((".arrow", ".feather", ".ipc")):
@@ -226,7 +245,8 @@ class LanceAdapter:
         return lance.dataset(path_of(uri))
 
     def scan(self, uri: str, columns: list[str] | None = None,
-             predicate: str | None = None, limit: int | None = None) -> Relation:
+             predicate: str | None = None, limit: int | None = None,
+             options: dict | None = None) -> Relation:  # options (CSV knobs) don't apply to Lance — ignored
         ds = self._dataset(uri)
         tbl = ds.to_table(columns=columns, limit=limit)  # lazy column/limit pushdown
         rel = db.conn().from_arrow(tbl)

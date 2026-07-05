@@ -11,6 +11,7 @@ import { registerGenericNodes, nodeInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
 import { parseHash } from '../router'
 import { api, KernelError, setApiUser, type AgentBackendNode, type AgentBackendEdge, type DpUser, type CanvasFile } from '../api/client'
+import { crdtUndo, crdtUndoActive } from '../collab/undo'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 
@@ -72,6 +73,29 @@ export function newId(kind: string): string {
   return `${kind}-${_seq}-${Math.floor(performance.now() % 100000)}`
 }
 
+// In-app clipboard for copy/paste of a node selection — lives in the module so it works across canvases
+// in the same tab (the system clipboard can't hold graph structure).
+let _clipboard: { nodes: CanvasNode[]; edges: CanvasEdge[] } | null = null
+const _clone = <T,>(x: T): T => JSON.parse(JSON.stringify(x))
+
+// Clone a set of nodes + the edges wholly inside that set, remapping every id and offsetting position,
+// so a paste/duplicate lands a self-contained copy that never collides with the originals.
+function cloneSubgraph(nodes: CanvasNode[], edges: CanvasEdge[], dx = 40, dy = 40): { nodes: CanvasNode[]; edges: CanvasEdge[] } {
+  const idMap = new Map<string, string>()
+  for (const n of nodes) idMap.set(n.id, newId(n.type))
+  const clones = nodes.map((n) => ({
+    ..._clone(n),
+    id: idMap.get(n.id)!,
+    parentId: n.parentId && idMap.has(n.parentId) ? idMap.get(n.parentId)! : null, // keep containment only if the parent came too
+    position: { x: n.position.x + dx, y: n.position.y + dy },
+    data: { ..._clone(n.data), status: 'draft' as const, history: [] },
+  }))
+  const clonedEdges = edges
+    .filter((e) => idMap.has(e.source) && idMap.has(e.target))
+    .map((e) => ({ ..._clone(e), id: `e-${idMap.get(e.source)}-${idMap.get(e.target)}-${Math.floor(performance.now() % 100000)}`, source: idMap.get(e.source)!, target: idMap.get(e.target)! }))
+  return { nodes: clones, edges: clonedEdges }
+}
+
 interface PreviewState { loading?: boolean; result?: SampleResult; error?: string; offset?: number }
 interface RunState {
   estimate?: RunEstimate
@@ -117,7 +141,12 @@ interface Store {
   removeEdge: (id: string) => void
   select: (id: string | null) => void
   setSelection: (ids: string[]) => void
+  selectAll: () => void
   removeSelected: () => void
+  copySelection: () => void
+  cutSelection: () => void
+  paste: () => void
+  duplicateSelected: () => void
 
   bypass: (id: string) => void
   disable: (id: string) => void
@@ -300,11 +329,15 @@ export const useStore = create<Store>((set, get) => ({
   setNodes: (nodes) => set((s) => ({ doc: { ...s.doc, nodes } })),
   setEdges: (edges) => set((s) => ({ doc: { ...s.doc, edges } })),
 
-  // push the current doc onto the undo stack (called before a structural mutation)
-  commit: () => set((s) => ({ past: [...s.past, s.doc].slice(-50), future: [] })),
+  // push the current doc onto the undo stack (called before a structural mutation). While co-editing,
+  // also mark a checkpoint in the CRDT UndoManager so undo granularity matches these boundaries.
+  commit: () => { crdtUndo.boundary?.(); set((s) => ({ past: [...s.past, s.doc].slice(-50), future: [] })) },
 
   undo: () => {
     _cfgEdit = { id: '', t: 0 }  // a following edit starts a fresh undo checkpoint
+    // co-editing: undo via the CRDT manager, scoped to MY edits — never deletes a peer's concurrent
+    // node/edge (the full-doc snapshot below would). The Y→store bridge updates the doc.
+    if (crdtUndoActive()) { crdtUndo.undo!(); set({ openPanels: {} }); return }
     set((s) => {
       if (s.past.length === 0) return {}
       const prev = s.past[s.past.length - 1]
@@ -314,6 +347,7 @@ export const useStore = create<Store>((set, get) => ({
 
   redo: () => {
     _cfgEdit = { id: '', t: 0 }
+    if (crdtUndoActive()) { crdtUndo.redo!(); set({ openPanels: {} }); return }
     set((s) => {
       if (s.future.length === 0) return {}
       const next = s.future[0]
@@ -434,6 +468,46 @@ export const useStore = create<Store>((set, get) => ({
   select: (id) => set({ selectedId: id, selectedIds: id ? [id] : [] }),
 
   setSelection: (ids) => set({ selectedIds: ids, selectedId: ids[ids.length - 1] ?? null }),
+
+  selectAll: () => set((s) => ({ selectedIds: s.doc.nodes.map((n) => n.id), selectedId: s.doc.nodes[s.doc.nodes.length - 1]?.id ?? null })),
+
+  copySelection: () => {
+    const s = get()
+    const ids = new Set(s.selectedIds.length ? s.selectedIds : (s.selectedId ? [s.selectedId] : []))
+    if (!ids.size) return
+    _clipboard = {
+      nodes: s.doc.nodes.filter((n) => ids.has(n.id)).map(_clone),
+      edges: s.doc.edges.filter((e) => ids.has(e.source) && ids.has(e.target)).map(_clone),
+    }
+  },
+
+  cutSelection: () => { get().copySelection(); get().removeSelected() },
+
+  paste: () => {
+    if (!_clipboard || !_clipboard.nodes.length) return
+    get().commit()
+    const { nodes, edges } = cloneSubgraph(_clipboard.nodes, _clipboard.edges)
+    set((s) => ({
+      doc: { ...s.doc, nodes: [...s.doc.nodes, ...nodes], edges: [...s.doc.edges, ...edges] },
+      selectedIds: nodes.map((n) => n.id), selectedId: nodes[nodes.length - 1]?.id ?? null,
+    }))
+  },
+
+  duplicateSelected: () => {
+    const s = get()
+    const ids = s.selectedIds.length ? s.selectedIds : (s.selectedId ? [s.selectedId] : [])
+    if (ids.length <= 1) { if (ids[0]) get().duplicate(ids[0]); return }  // single → reuse the existing path
+    get().commit()
+    const sel = new Set(ids)
+    const { nodes, edges } = cloneSubgraph(
+      s.doc.nodes.filter((n) => sel.has(n.id)),
+      s.doc.edges.filter((e) => sel.has(e.source) && sel.has(e.target)),
+    )
+    set((st) => ({
+      doc: { ...st.doc, nodes: [...st.doc.nodes, ...nodes], edges: [...st.doc.edges, ...edges] },
+      selectedIds: nodes.map((n) => n.id), selectedId: nodes[nodes.length - 1]?.id ?? null,
+    }))
+  },
 
   removeSelected: () => {
     const ids = get().selectedIds.length ? get().selectedIds : (get().selectedId ? [get().selectedId!] : [])

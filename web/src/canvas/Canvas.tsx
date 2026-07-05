@@ -218,6 +218,15 @@ export function Canvas() {
         return
       }
       if ((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y')) { e.preventDefault(); useStore.getState().redo(); return }
+      // clipboard + selection (work on the canvas, not in a field — inputs bailed out above)
+      if (e.metaKey || e.ctrlKey) {
+        const k = e.key.toLowerCase()
+        if (k === 'a') { e.preventDefault(); useStore.getState().selectAll(); return }
+        if (k === 'c') { e.preventDefault(); useStore.getState().copySelection(); return }
+        if (k === 'x') { e.preventDefault(); useStore.getState().cutSelection(); return }
+        if (k === 'v') { e.preventDefault(); useStore.getState().paste(); return }
+        if (k === 'd') { e.preventDefault(); useStore.getState().duplicateSelected(); return }
+      }
       // Escape closes any open floating panel (data viewer / run / …) and clears the selection
       if (e.key === 'Escape') {
         if (Object.keys(useStore.getState().openPanels).length) useStore.setState({ openPanels: {} })

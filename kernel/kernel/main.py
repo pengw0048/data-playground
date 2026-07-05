@@ -592,11 +592,14 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
     # when auth is enabled, the collab channel is gated exactly like the HTTP canvas routes: a valid
     # signed session cookie + some role on this canvas. (Open mode: unauthenticated, like the rest.)
     from kernel import auth
+    can_write = True  # open mode (no auth): a single-user/trusted instance — everyone may edit
     if auth.auth_enabled():
         uid = auth.verify(ws.cookies.get("dp_session"))
-        if not uid or metadb.canvas_role(canvas_id, uid) is None:
+        role = metadb.canvas_role(canvas_id, uid) if uid else None
+        if role is None:
             await ws.close(code=1008)  # policy violation
             return
+        can_write = role in ("owner", "editor")  # a viewer may watch, not mutate
     await ws.accept()
     room = _collab_rooms.setdefault(canvas_id, set())
     room.add(ws)
@@ -605,6 +608,11 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
             msg = await ws.receive_json()
             if isinstance(msg, dict) and msg.get("clientId"):
                 _collab_ids[ws] = msg["clientId"]
+            # a viewer may receive edits + presence, but its own doc updates ('yjs' carries CRDT state)
+            # must NOT be relayed — else an editor peer would merge + autosave them, laundering a change
+            # past the read-only boundary that put_canvas enforces.
+            if not can_write and isinstance(msg, dict) and msg.get("type") == "yjs":
+                continue
             for peer in list(room):
                 if peer is not ws:
                     try:

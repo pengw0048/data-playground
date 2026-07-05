@@ -79,6 +79,20 @@ def ensure_object_store() -> None:
                 pass
 
 
+def interrupt() -> None:
+    """Abort the in-flight DuckDB query. Safe to call from ANOTHER thread (that's the point): it lets
+    a cancel or a preview timeout actually stop a long-running query so the worker thread unwinds and
+    releases the process-global lock, instead of pinning the whole engine until the kernel restarts.
+    (A pure-Python runaway inside a transform can't be stopped this way — use the subprocess backend
+    for real isolation.)"""
+    c = _conn
+    if c is not None:
+        try:
+            c.interrupt()
+        except Exception:  # noqa: BLE001 — nothing running, or already finished
+            pass
+
+
 def unique_view(prefix: str = "v") -> str:
     """A process-globally-unique temp view name (never collides across engines/threads)."""
     with _lock:

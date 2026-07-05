@@ -59,7 +59,9 @@ def _out(wire="dataset", id="out", label=None):
 
 BUILTIN_NODE_SPECS: list[NodeSpec] = [
     NodeSpec(kind="source", title="source", category="io", tag="dataset", inputs=[], outputs=[_out()],
-             params=[ParamSpec(name="uri", type="string", label="dataset uri")],
+             params=[ParamSpec(name="uri", type="string", label="dataset uri"),
+                     ParamSpec(name="delimiter", type="string", label="CSV delimiter (blank=auto, 'tab'=TSV)"),
+                     ParamSpec(name="header", type="select", options=["auto", "yes", "no"], default="auto", label="CSV header row")],
              blurb="read a registered dataset (Parquet/CSV/JSON/Arrow/Lance)"),
     NodeSpec(kind="sample", title="sample", category="shape", tag="sample",
              inputs=[_in(("dataset",))], outputs=[_out("sample")], can_bypass=True,
@@ -90,9 +92,10 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
     NodeSpec(kind="join", title="join", category="compute", tag="join",
              inputs=[_in(("dataset", "sample"), id="a", label="left"), _in(("dataset", "sample"), id="b", label="right")],
              outputs=[_out()],
-             params=[ParamSpec(name="on", type="string", label="key(s)", required=True),
+             params=[ParamSpec(name="on", type="string", label="shared key(s)"),
+                     ParamSpec(name="condition", type="string", label="or ON expression (a.x = b.y)"),
                      ParamSpec(name="how", type="select", options=["inner", "left", "right", "outer"], default="inner")],
-             blurb="out-of-core hash join on a key"),
+             blurb="out-of-core hash join — shared keys, or an ON expression across differing keys"),
     NodeSpec(kind="aggregate", title="aggregate", category="compute", tag="aggregate",
              inputs=[_in(("dataset",))], outputs=[_out()], previewable=False,
              params=[ParamSpec(name="groupBy", type="string", label="group by"),
