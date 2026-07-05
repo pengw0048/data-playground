@@ -5,7 +5,7 @@
 // unchanged — the store still autosaves the canvas snapshot to the DB.
 import * as Y from 'yjs'
 import { useStore } from '../store/graph'
-import { crdtUndo } from './undo'
+import { crdtUndo, collabApply } from './undo'
 import type { CanvasDoc, CanvasNode, CanvasEdge } from '../types/graph'
 
 let ydoc = new Y.Doc()
@@ -85,7 +85,10 @@ export function startYSync(send: (u: Uint8Array) => void): void {
   ydoc.on('update', (u: Uint8Array, origin) => {
     if (origin !== 'store') {          // remote edit / local hydrate / undo-redo → reflect into the store
       applying = true
-      try { useStore.setState({ doc: yToDoc(useStore.getState().doc) }) } finally { applying = false }
+      // a peer's edit (origin 'remote') must NOT be re-persisted by this client — only local edits and
+      // local undo/redo autosave. The autosave subscriber (synchronous within this setState) reads this.
+      collabApply.remote = origin === 'remote'
+      try { useStore.setState({ doc: yToDoc(useStore.getState().doc) }) } finally { applying = false; collabApply.remote = false }
       if (origin === 'remote') ready = true  // we've merged a peer's state → the store now matches Y
     }
     // anything NOT applied from a peer is a local change (a store edit or an undo/redo) → put it on the

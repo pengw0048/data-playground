@@ -2,9 +2,10 @@
 
 A small SQLAlchemy layer, separate from `db.py` (which is the DuckDB data engine). Dev uses a
 bundled SQLite file; deployment points DP_DATABASE_URL at Postgres. Only the connection string is
-config; all metadata lives in this instance's DB. Auth is intentionally light (internal-tool grade):
-the current user is carried in an `X-DP-User` header and defaults to a seeded local user — real
-authentication is a later, separable layer.
+config; all metadata lives in this instance's DB. Per-user authentication is implemented in
+`kernel.auth` + `current_user` (signed session cookies gated by DP_AUTH_SECRET, verifying each
+user's own scrypt password hash); with no secret set, an open X-DP-User dev mode defaults to a
+seeded local user.
 """
 
 from __future__ import annotations
