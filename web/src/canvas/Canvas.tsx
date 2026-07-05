@@ -96,7 +96,11 @@ export function Canvas() {
       const mapped = doc.nodes.map((n) => {
         const p = prevById.get(n.id)
         return {
-          id: n.id, type: n.type, position: n.position, data: n.data as any,
+          id: n.id, type: n.type,
+          // keep the LIVE position of a node React Flow is currently dragging — the store now holds only
+          // its pre-drag value (positions commit on drag stop), so a remote peer edit arriving mid-drag
+          // must not snap the dragged node back to that stale value.
+          position: p?.dragging ? p.position : n.position, data: n.data as any,
           // a section is a sized container; its contained nodes render inside it (parentId), clamped
           ...(n.type === 'section' ? { style: { width: SECTION_W, height: SECTION_H } } : {}),
           ...(n.parentId ? { parentId: n.parentId } : {}), // no extent:'parent' so a child can be dragged back out to detach
@@ -123,8 +127,11 @@ export function Canvas() {
   const onNodesChange = useCallback((changes: NodeChange[]) => {
     // apply ALL changes locally (incl. dimensions/measured, so RF shows the nodes)
     setRfNodes((prev) => applyNodeChanges(changes, prev))
-    // sync position changes back to the store (source of truth for persistence)
-    const moved = changes.filter((c) => c.type === 'position' && (c as any).position) as any[]
+    // sync position changes to the store (persistence source of truth) ONLY when settled — skip the
+    // per-frame `dragging:true` changes. Otherwise every mousemove rewrites the whole doc.nodes array,
+    // re-runs the reconcile effect (rebuilding ALL RF nodes, O(n)/frame) and floods the collab socket.
+    // RF emits the final position with dragging:false at release; non-drag moves have it unset too.
+    const moved = changes.filter((c) => c.type === 'position' && (c as any).position && !(c as any).dragging) as any[]
     if (moved.length) {
       const byId = new Map(moved.map((c) => [c.id, c.position]))
       setNodes(useStore.getState().doc.nodes.map((n) => (byId.has(n.id) ? { ...n, position: byId.get(n.id) } : n)))

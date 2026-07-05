@@ -1,8 +1,13 @@
 """Data Playground kernel — FastAPI app (PRD §9).
 
-One kernel per open canvas session. Backend-agnostic core; the default bundle runs fully
-offline (DuckDB adapter, in-memory catalog, local runner). All routes under /api, JSON,
-camelCase on the wire.
+A single shared multi-user workspace server: one FastAPI process serves the SPA, the JSON API,
+the collab/run WebSockets, and the data engine. Users authenticate per-user (signed session
+cookies when DP_AUTH_SECRET is set; an open X-DP-User dev mode otherwise); each user has their own
+canvases, plus workspace shares, in a SQLite/Postgres metadata DB. The data engine itself is
+intentionally SHARED and process-global — one DuckDB connection pool, one catalog, one run index
+across all users (see kernel.deps) — not one kernel per session. Backend-agnostic core; the
+default bundle runs fully offline (DuckDB adapter, in-memory catalog, local out-of-core runner).
+All routes under /api, JSON, camelCase on the wire.
 """
 
 from __future__ import annotations
@@ -10,21 +15,27 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 
-from fastapi import APIRouter, Cookie, Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import APIRouter, Cookie, Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
+from sqlalchemy import select as _sa_select
 
-from kernel import compiler
+from kernel import auth, compiler, db, destinations, metadb
 from kernel import graph as graph_mod
-from kernel import metadb
+from kernel.agent import agent_status, run_agent
 from kernel.deps import get_deps
+from kernel.executors.engine import _table_to_rows
 from kernel.executors.preview import preview_node
+from kernel.executors.schema import schema_for_graph
 from kernel.graph import upstream_chain
+from kernel.plugins.adapters import relation_columns
+from kernel.security import current_user
 from kernel.models import (
     CatalogTable,
     ColumnSchema,
@@ -96,8 +107,6 @@ class RegisterRequest(BaseModel):
 @api.post("/catalog/register", response_model=CatalogTable)
 def catalog_register(req: RegisterRequest) -> CatalogTable:
     deps = get_deps()
-    import os
-    import re
     has_scheme = bool(re.match(r"^[a-z][a-z0-9+.-]*://", req.uri))
     uri = req.uri if has_scheme else os.path.abspath(os.path.expanduser(req.uri))
     name = req.name or os.path.splitext(os.path.basename(uri.rstrip("/")))[0]
@@ -126,11 +135,8 @@ def data_sample(req: SampleRequest) -> SampleResult:
     if req.k is not None and req.k < 0:
         raise HTTPException(400, "k must be >= 0")
     try:
-        from kernel import db
-        from kernel.executors.engine import _table_to_rows
-        from kernel.plugins.adapters import relation_columns
         adapter = deps.resolve_adapter(req.uri)
-        with db.lock():  # serialize DuckDB access
+        with db.run_scope():  # own cursor — a big sample doesn't block other users' runs/previews
             rel = adapter.scan(req.uri, req.columns, limit=req.k)
             cols = relation_columns(rel)          # schema is metadata — no second scan needed
             rows = _table_to_rows(rel.to_arrow_table())
@@ -215,7 +221,6 @@ def run_preview(req: PreviewRequest) -> SampleResult:
 def graph_schema(req: CompileRequest) -> dict:
     """Per-node output columns (metadata-only) for editor column suggestions — see executors/schema."""
     deps = get_deps()
-    from kernel.executors.schema import schema_for_graph
     return schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
                             deps.node_lowerings, deps.node_specs)
 
@@ -231,14 +236,12 @@ class BrowseRequest(BaseModel):
 
 @api.get("/destinations")
 def list_destinations() -> dict:
-    from kernel import destinations
     ws = get_deps().workspace
     return {"destinations": destinations.presets(ws), "backends": destinations.backend_kinds()}
 
 
 @api.post("/destinations/browse")
 def browse_destination(req: BrowseRequest) -> dict:
-    from kernel import destinations
     return destinations.browse(get_deps().workspace, req.destination_id, req.path)
 
 
@@ -251,7 +254,6 @@ class MkdirRequest(BaseModel):
 
 @api.post("/destinations/mkdir")
 def mkdir_destination(req: MkdirRequest) -> dict:
-    from kernel import destinations
     return destinations.mkdir(get_deps().workspace, req.destination_id, req.path, req.name)
 
 
@@ -266,13 +268,11 @@ class AgentRequest(BaseModel):
 
 @api.get("/agent")
 def agent_get_status() -> dict:
-    from kernel.agent import agent_status
     return agent_status()
 
 
 @api.post("/agent")
 def agent_act(req: AgentRequest) -> dict:
-    from kernel.agent import agent_status, run_agent
     st = agent_status()
     if not st["available"]:
         return {"available": False, "reason": st["reason"]}
@@ -336,12 +336,21 @@ def _runner_for(run_id: str):
     return deps.run_index.get(run_id, deps.runner)
 
 
-@api.get("/run/{run_id}", response_model=RunStatus)
-def run_status(run_id: str) -> RunStatus:
+def _status_or_lost(run_id: str) -> RunStatus:
+    """This run's live status, or a synthetic TERMINAL status if the kernel no longer knows it —
+    evicted from the bounded run history, or lost to a restart (run state is in-memory). Returning a
+    terminal RunStatus instead of a 404 lets the client resolve the node cleanly instead of
+    exhausting its retry budget and stranding it 'running'."""
     try:
         return _runner_for(run_id).status(run_id)
     except KeyError:
-        raise HTTPException(404, f"run '{run_id}' not found")
+        return RunStatus(run_id=run_id, status="failed",
+                         error="run not found — it was evicted or the kernel restarted")
+
+
+@api.get("/run/{run_id}", response_model=RunStatus)
+def run_status(run_id: str) -> RunStatus:
+    return _status_or_lost(run_id)
 
 
 @api.post("/run/{run_id}/cancel", response_model=RunStatus)
@@ -353,28 +362,11 @@ def run_cancel(run_id: str) -> RunStatus:
 
 
 # --------------------------------------------------------------------------- #
-# Users + canvases + settings (metadata DB — per-user multi-file, internal-tool-grade auth)
+# Users + canvases + settings (metadata DB — per-user multi-file, internal-tool-grade auth).
+# `current_user` (the auth dependency) lives in kernel.security (imported above).
 # --------------------------------------------------------------------------- #
-from sqlalchemy import select as _sa_select  # noqa: E402
-
-
-def current_user(x_dp_user: str | None = Header(default=None),
-                 dp_session: str | None = Cookie(default=None)) -> str:
-    """Resolve the request's user. With auth enabled (DP_AUTH_SECRET), identity comes ONLY from a
-    valid signed session cookie (a raw header is not trusted); otherwise it's the X-DP-User header
-    (open internal-tool mode), defaulting to the local user."""
-    from kernel import auth
-    if auth.auth_enabled():
-        uid = auth.verify(dp_session)
-        if not uid:
-            raise HTTPException(401, "authentication required")
-        return metadb.resolve_user(uid)
-    return metadb.resolve_user(x_dp_user)
-
-
 @public.get("/auth/status")
 def auth_status(dp_session: str | None = Cookie(default=None)) -> dict:
-    from kernel import auth
     if not auth.auth_enabled():
         return {"authEnabled": False, "userId": metadb.DEFAULT_USER_ID}
     return {"authEnabled": True, "userId": auth.verify(dp_session)}
@@ -382,7 +374,6 @@ def auth_status(dp_session: str | None = Cookie(default=None)) -> dict:
 
 @public.post("/auth/login")
 def auth_login(body: dict, response: Response) -> dict:
-    from kernel import auth
     if not auth.auth_enabled():
         return {"ok": True, "userId": metadb.resolve_user(body.get("userId"))}
     uid = body.get("userId") or ""
@@ -399,7 +390,6 @@ def auth_login(body: dict, response: Response) -> dict:
 @api.post("/auth/password")
 def change_password(body: dict, uid: str = Depends(current_user)) -> dict:
     """Set/rotate the CURRENT user's password. If one is already set, the old password must match."""
-    from kernel import auth
     current = metadb.user_password_hash(uid)
     if current and not auth.verify_password(body.get("oldPassword", ""), current):
         raise HTTPException(403, "current password is incorrect")
@@ -440,7 +430,6 @@ def list_users() -> list[dict]:
 
 @api.post("/users")
 def create_user(body: UserBody, uid: str = Depends(current_user)) -> dict:  # gated: no anonymous self-registration
-    from kernel import auth
     with metadb.session() as s:
         u = metadb.User(name=body.name, email=body.email,
                         password_hash=auth.hash_password(body.password) if body.password else None)
@@ -649,11 +638,7 @@ async def ws_run(ws: WebSocket, run_id: str):
     await ws.accept()
     try:
         while True:
-            try:
-                st = _runner_for(run_id).status(run_id)
-            except KeyError:
-                await ws.send_json({"error": "run not found"})
-                break
+            st = _status_or_lost(run_id)  # terminal 'failed' if the kernel lost the run (not a hang)
             await ws.send_json(st.model_dump(by_alias=True))
             if st.status in ("done", "failed", "cancelled"):
                 break
@@ -674,7 +659,6 @@ _collab_ids: dict[WebSocket, str] = {}  # socket -> its clientId (for leave noti
 async def ws_collab(ws: WebSocket, canvas_id: str):
     # when auth is enabled, the collab channel is gated exactly like the HTTP canvas routes: a valid
     # signed session cookie + some role on this canvas. (Open mode: unauthenticated, like the rest.)
-    from kernel import auth
     can_write = True  # open mode (no auth): a single-user/trusted instance — everyone may edit
     if auth.auth_enabled():
         uid = auth.verify(ws.cookies.get("dp_session"))

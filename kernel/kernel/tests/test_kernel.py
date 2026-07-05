@@ -493,6 +493,52 @@ def test_timeout_interrupts_stuck_query_and_frees_the_lock():
         assert con.execute("SELECT 42").fetchone() == (42,)
 
 
+def test_run_scope_does_not_hold_the_global_lock():
+    # a run/preview now runs on its OWN cursor (db.run_scope), so it must NOT hold the process-global
+    # lock — another thread can take db.lock() while a scope is mid-work. Before, a whole run held it.
+    import threading
+    from kernel import db
+    in_scope = threading.Event(); release = threading.Event()
+
+    def worker():
+        with db.run_scope() as scope:
+            scope.con.execute("SELECT 1").fetchone()
+            in_scope.set()
+            release.wait(2.0)  # keep the scope open while the main thread tries the lock
+
+    t = threading.Thread(target=worker, daemon=True); t.start()
+    try:
+        assert in_scope.wait(2.0)
+        got = db.lock().acquire(timeout=1.0)  # must be immediately free — the scope doesn't hold it
+        assert got, "a run_scope must not hold the process-global lock"
+        db.lock().release()
+    finally:
+        release.set(); t.join(2.0)
+
+
+def test_run_scope_failure_does_not_wedge_the_next_scope():
+    # a failed statement aborts only THIS scope's cursor transaction; a fresh scope is unaffected
+    # (the old shared connection would stay wedged with "current transaction is aborted").
+    from kernel import db
+    with db.run_scope() as s1:
+        with pytest.raises(Exception):
+            s1.con.execute("SELECT * FROM does_not_exist_xyz").fetchone()
+    with db.run_scope() as s2:
+        assert s2.con.execute("SELECT 99").fetchone() == (99,)
+
+
+def test_run_scope_tracks_views_on_the_scope_not_globally():
+    # temp views minted inside a scope are tracked on the scope (dropped on its own cursor at exit),
+    # never leaked to the global _created_views set — so one run's cleanup can't drop another's views.
+    from kernel import db
+    before = set(db._created_views)
+    with db.run_scope() as s:
+        v = db.unique_view("t")
+        assert v in s.views
+    assert v not in db._created_views
+    assert set(db._created_views) == before
+
+
 def test_metric_over_transform_upstream_not_previewable():
     # a metric whose upstream has a Python transform must refuse preview, not spill all rows (finding #6)
     code = "def fn(row):\n    row['w2'] = row['width'] * 2\n    return row"
@@ -1077,6 +1123,133 @@ def test_execution_backend_plugin_contract(tmp_path):
     d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     d.runners.insert(0, fake)
     assert d.pick_runner(object()) is fake  # selected over the local runner because can_run is true
+
+
+def test_spi_contracts_are_the_real_ones():
+    # the old plugins/base.py "contract" was dead code with wrong signatures; it's deleted. The live
+    # contracts must match the real code: adapters expose the methods the engine actually calls, and
+    # the runners structurally satisfy ExecutionBackend.
+    import importlib
+    from kernel.backends import ExecutionBackend
+    from kernel.plugins.adapters import DuckDBAdapter, LanceAdapter
+    from kernel.plugins.runner import LocalRunner
+    from kernel.subprocess_runner import SubprocessRunner
+    assert importlib.util.find_spec("kernel.plugins.base") is None  # dead SPI file is gone
+    for adapter in (DuckDBAdapter(), LanceAdapter()):
+        for m in ("matches", "scan", "schema", "count", "fingerprint", "write"):
+            assert callable(getattr(adapter, m, None)), f"{type(adapter).__name__} missing {m}"
+    deps = get_deps()
+    assert isinstance(deps.runner, ExecutionBackend)
+    assert isinstance([r for r in deps.runners if isinstance(r, SubprocessRunner)][0], ExecutionBackend)
+    assert isinstance(deps.runner, LocalRunner)
+
+
+def test_plugin_version_negotiation(tmp_path):
+    # a drop-in pack declaring a newer core than we provide is SKIPPED with a clear error (not
+    # registered then crashed); one declaring our version (or none) loads normally.
+    from kernel.deps import Deps, CORE_API_VERSION
+
+    def make_pack(name, min_core):
+        d = tmp_path / "ws" / "plugins" / name
+        d.mkdir(parents=True)
+        (d / "dataplay.toml").write_text(
+            f'name = "{name}"\nversion = "0.1.0"\n' + (f"min_core_api = {min_core}\n" if min_core is not None else ""))
+        (d / "__init__.py").write_text(
+            "from kernel.sdk import NodeSpec, PortSpec\n"
+            "def register(reg):\n"
+            f"    reg.add_node(NodeSpec(kind='{name}_node', title='{name}', category='compute',\n"
+            "        inputs=[PortSpec(id='in', wire='dataset')], outputs=[PortSpec(id='out', wire='dataset')], params=[]))\n")
+
+    make_pack("goodpack", CORE_API_VERSION)
+    make_pack("toonew", CORE_API_VERSION + 1)
+    make_pack("unversioned", None)
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    assert "goodpack_node" in d.node_specs and "unversioned_node" in d.node_specs  # compatible / no manifest → load
+    assert "toonew_node" not in d.node_specs                                       # incompatible → skipped
+    err = [p for p in d.plugins if p.get("name") == "toonew" and p.get("error")]
+    assert err and "core API" in err[0]["error"]
+
+
+def test_nodespec_frontend_backend_parity():
+    # backend nodespecs (/api/nodes) and the frontend hand-built cards (web/src/nodes/kinds/*.tsx)
+    # define every built-in kind twice; this guards against the two silently drifting on ports/accepts
+    # (they had, on `sql`). Parse each frontend register({...}) literal and compare to BUILTIN_NODE_SPECS.
+    import re
+    from pathlib import Path
+    from kernel.nodespecs import BUILTIN_NODE_SPECS
+    kinds_dir = Path(__file__).resolve().parents[3] / "web" / "src" / "nodes" / "kinds"
+    assert kinds_dir.is_dir(), kinds_dir
+
+    def balanced(s: str, start: int, o: str, c: str):
+        # content between the first `o` at/after start and its matching `c`, plus the closing index
+        i = s.find(o, start)
+        if i < 0:
+            return None, -1
+        depth = 0
+        for k in range(i, len(s)):
+            if s[k] == o:
+                depth += 1
+            elif s[k] == c:
+                depth -= 1
+                if depth == 0:
+                    return s[i + 1:k], k
+        return None, -1
+
+    def array_ports(body: str, key: str) -> dict[str, tuple[str, tuple]]:
+        # parse `key: [ {port}, {port} ]` → {port_id: (wire, sorted(accepts))}, balancing brackets/braces
+        m = re.search(rf"\b{key}:\s*\[", body)
+        if not m:
+            return {}
+        arr, _ = balanced(body, m.start(), "[", "]")
+        if arr is None:
+            return {}
+        out, pos = {}, 0
+        while True:
+            obj, end = balanced(arr, pos, "{", "}")
+            if obj is None:
+                break
+            pos = end + 1
+            pid = re.search(r"\bid:\s*'([^']+)'", obj)
+            wire = re.search(r"\bwire:\s*'([^']+)'", obj)
+            if not (pid and wire):
+                continue
+            acc = re.search(r"\baccepts:\s*\[([^\]]*)\]", obj)  # accepts has no nested [] → plain regex ok
+            accepts = tuple(sorted(re.findall(r"'([^']+)'", acc.group(1)))) if acc else ()
+            out[pid.group(1)] = (wire.group(1), accepts)
+        return out
+
+    # index frontend files by the kind their register({...}) literal declares
+    fe: dict[str, dict] = {}
+    for f in kinds_dir.glob("*.tsx"):
+        src = f.read_text()
+        ri = src.find("register(")
+        if ri < 0:
+            continue
+        body, _ = balanced(src, ri, "{", "}")  # the first arg object literal
+        if body is None:
+            continue
+        kind = re.search(r"\bkind:\s*'([^']+)'", body)
+        if not kind:
+            continue
+        fe[kind.group(1)] = {"file": f.name,
+                             "inputs": array_ports(body, "inputs"),
+                             "outputs": array_ports(body, "outputs")}
+
+    mismatches = []
+    checked = 0
+    for spec in BUILTIN_NODE_SPECS:
+        card = fe.get(spec.kind)
+        if card is None:  # some backend kinds render via the generic card, not a hand-built one — fine
+            continue
+        checked += 1
+        be_in = {p.id: (p.wire, tuple(sorted(p.accepts or []))) for p in spec.inputs}
+        be_out = {p.id: (p.wire, tuple(sorted(p.accepts or []))) for p in spec.outputs}
+        if be_in != card["inputs"]:
+            mismatches.append(f"{spec.kind} ({card['file']}) inputs: backend {be_in} != frontend {card['inputs']}")
+        if be_out != card["outputs"]:
+            mismatches.append(f"{spec.kind} ({card['file']}) outputs: backend {be_out} != frontend {card['outputs']}")
+    assert checked >= 8, f"parser matched too few kinds ({checked}) — frontend format may have changed"
+    assert not mismatches, "backend/frontend node-spec drift:\n" + "\n".join(mismatches)
 
 
 def test_signed_session_auth(monkeypatch):

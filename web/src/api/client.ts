@@ -145,8 +145,8 @@ export const api = {
   getCanvas: (id: string) => req<CanvasDoc>(`/canvas/${id}`),
   createCanvas: (doc: CanvasDoc) =>
     req<{ ok: boolean; id: string }>('/canvas', { method: 'POST', body: JSON.stringify(doc) }),
-  saveCanvas: (doc: CanvasDoc) =>
-    req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc) }),
+  saveCanvas: (doc: CanvasDoc, keepalive = false) =>  // keepalive: let the PUT survive a tab-close flush
+    req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc), keepalive }),
   deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),
   listRuns: (canvasId: string) => req<RunRecordDto[]>(`/canvas/${canvasId}/runs`),
   listVersions: (canvasId: string) => req<CanvasVersionDto[]>(`/canvas/${canvasId}/versions`),

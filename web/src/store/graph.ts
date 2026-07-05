@@ -11,7 +11,7 @@ import { registerGenericNodes, nodeInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
 import { parseHash } from '../router'
 import { api, KernelError, setApiUser, type AgentBackendNode, type AgentBackendEdge, type DpUser, type CanvasFile } from '../api/client'
-import { crdtUndo, crdtUndoActive } from '../collab/undo'
+import { crdtUndo, crdtUndoActive, collabApply } from '../collab/undo'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 
@@ -853,17 +853,28 @@ export const useStore = create<Store>((set, get) => ({
 
 // Auto-persist the canvas to localStorage (debounced) so a refresh keeps your work.
 let _saveTimer: ReturnType<typeof setTimeout> | undefined
+let _cacheTimer: ReturnType<typeof setTimeout> | undefined
 let _lastDoc: CanvasDoc | undefined
 let _bootstrapped = false  // don't autosave the throwaway initial empty doc before the real one loads
 useStore.subscribe((s) => {
   if (s.doc === _lastDoc) return
   _lastDoc = s.doc
   if (!_bootstrapped) return  // bootstrap will load & set the real doc; skip persisting anything before that
+  // Always keep THIS browser's offline cache current — INCLUDING a peer's merged edit. It's network-free
+  // (no PUT), so it causes no write amplification, but it stops an offline reload from losing peer edits
+  // received this session.
+  clearTimeout(_cacheTimer)
+  _cacheTimer = setTimeout(() => {
+    try { localStorage.setItem(LS_KEY, JSON.stringify(useStore.getState().doc)) } catch { /* quota */ }
+  }, 400)
+  // a peer's edit was merged into our doc (via the CRDT) — the editing peer PUTs it, so we must NOT also
+  // PUT it. Without this guard, N co-editors each write the whole doc on every edit (N-way amplification).
+  // Local edits + local undo/redo (collabApply.remote === false) still PUT. (Cache above is unconditional.)
+  if (collabApply.remote) return
   if (s.saved) useStore.setState({ saved: false })  // dirty → "saving…"
   clearTimeout(_saveTimer)
   _saveTimer = setTimeout(async () => {
     const doc = useStore.getState().doc
-    try { localStorage.setItem(LS_KEY, JSON.stringify(doc)) } catch { /* quota */ }
     try {
       await api.saveCanvas(doc)  // PUT to the metadata DB (per-user, upsert)
       useStore.setState((st) => ({
@@ -885,6 +896,20 @@ useStore.subscribe((s) => {
     }
   }, 400)
 })
+
+// Flush a pending local save on tab close, so an edit made inside the 400ms debounce isn't lost. This
+// also closes the collab case where the originating editor — the only client that PUTs its own edit —
+// disconnects mid-debounce. Fires ONLY when there's an unsaved LOCAL edit (saved === false); a client
+// that merely merged peer edits stays saved:true, so it won't redundantly PUT. keepalive lets the
+// request outlive the unloading page.
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', () => {
+    if (!_bootstrapped || useStore.getState().saved) return
+    const doc = useStore.getState().doc
+    try { localStorage.setItem(LS_KEY, JSON.stringify(doc)) } catch { /* quota */ }
+    void api.saveCanvas(doc, true).catch(() => {})  // best-effort; can't await on unload
+  })
+}
 
 // Refresh per-node output schema (column suggestions) a beat after a SCHEMA-RELEVANT change — the
 // wiring or any node's config/kind/on-off. Node positions never affect columns, so dragging must

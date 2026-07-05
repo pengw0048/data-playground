@@ -29,24 +29,29 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
     engine = LoweringEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
                             node_lowerings=node_lowerings, node_specs=node_specs)
 
+    holder: dict = {}  # published by the worker thread so the timeout can interrupt its cursor
+
     def work() -> SampleResult:
-        # serialize all DuckDB access; drop the temp views this eval minted
-        with db.lock():
-            try:
-                # fetch one extra row to know if a NEXT page exists (so the UI can disable Next at the
-                # true end, even when the total is an exact multiple of the page size). NOTE: offset
-                # pagination assumes a stable row order; a join/aggregate result is unordered, so pages
-                # over such a node may not be perfectly consistent — acceptable for a bounded preview.
-                rows, cols = engine.rows(node_id, k + 1, offset)
-            finally:
-                db.drop_created_views()
-        has_more = len(rows) > k
-        return SampleResult(columns=cols, rows=rows[:k], row_count=len(rows[:k]), has_more=has_more, truncated=True)
+        # run on our OWN cursor (created on THIS worker thread so its thread-local binding is correct),
+        # not the process-global lock — a slow preview no longer blocks other users' work
+        with db.run_scope() as scope:
+            holder["scope"] = scope
+            # fetch one extra row to know if a NEXT page exists (so the UI can disable Next at the
+            # true end, even when the total is an exact multiple of the page size). NOTE: offset
+            # pagination assumes a stable row order; a join/aggregate result is unordered, so pages
+            # over such a node may not be perfectly consistent — acceptable for a bounded preview.
+            rows, cols = engine.rows(node_id, k + 1, offset)
+            has_more = len(rows) > k
+            return SampleResult(columns=cols, rows=rows[:k], row_count=len(rows[:k]), has_more=has_more, truncated=True)
+
+    def on_timeout() -> None:
+        # interrupt THIS preview's cursor so the worker unwinds (its scope exit drops its views);
+        # interrupting the base connection would NOT stop a query running on the cursor
+        sc = holder.get("scope")
+        (sc.interrupt() if sc is not None else db.interrupt())
 
     try:
-        # on timeout, interrupt the in-flight DuckDB query so the worker releases db.lock() instead of
-        # wedging every later preview/run until restart
-        return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=db.interrupt)
+        return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
     except NotPreviewable as e:
         return SampleResult(not_previewable=True, reason=e.reason)     # honest P8 state
     except Exception as e:  # noqa: BLE001

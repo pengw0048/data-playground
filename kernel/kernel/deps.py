@@ -14,6 +14,7 @@ import importlib.util
 import os
 import sys
 
+from kernel.backends import NodeLowering
 from kernel.models import KernelInfo
 from kernel.nodespecs import BUILTIN_NODE_SPECS, NodeSpec
 from kernel.plugins.adapters import DuckDBAdapter, default_adapters
@@ -23,6 +24,11 @@ from kernel.plugins.processors import InMemoryProcessorRegistry
 from kernel.plugins.runner import LocalRunner
 from kernel.settings import settings
 
+# Version of the plugin SPI this core exposes. A plugin's dataplay.toml may declare `min_core_api`
+# (an int); a pack requiring a newer core than this is skipped at load with a clear error instead of
+# being registered and crashing later. Bump when a breaking SPI change lands.
+CORE_API_VERSION = 1
+
 
 class Registry:
     """Passed to each plugin pack's register(reg) so it can add things (§8)."""
@@ -30,7 +36,9 @@ class Registry:
     def __init__(self, deps: "Deps"):
         self.deps = deps
 
-    def add_node(self, spec: NodeSpec, lower=None) -> None:
+    def add_node(self, spec: NodeSpec, lower: "NodeLowering | None" = None) -> None:
+        # `lower` is the node's lowering callable — see kernel.backends.NodeLowering for its exact
+        # signature/return contract (called by the engine as lower(engine, node, inputs)).
         # refuse to shadow a built-in OR an already-registered plugin kind — overwriting would
         # corrupt the /api/nodes contract and leave the original's lower() as dead code
         if spec.kind in self.deps.builtin_kinds:
@@ -86,6 +94,9 @@ class Deps:
         self._manifests: dict[str, dict] = {}
         from kernel.storage import make_storage
         self.storage = make_storage(workspace)
+        # ONE catalog + run_index (below), shared by every user of this instance — by design: this is a
+        # single-instance workspace server, not one kernel per session. Per-user boundaries are enforced
+        # at the canvas/share/settings layer (metadb + current_user), not by isolating the data engine.
         self.catalog = InMemoryCatalog(data_dir, self.resolve_adapter)
         # re-register previously written outputs so committed tables survive a kernel restart
         # (they live in storage, separate from the seeded data_dir).
@@ -139,8 +150,8 @@ class Deps:
             for name in sorted(os.listdir(plugins_dir)):
                 pack = os.path.join(plugins_dir, name)
                 if os.path.isdir(pack) and os.path.exists(os.path.join(pack, "__init__.py")):
-                    self._read_manifest(pack, name)
-                    self._register_module(name, reg)
+                    if self._read_manifest(pack, name):  # skip a pack with a missing/bad/incompatible manifest
+                        self._register_module(name, reg)
         # 2) configured modules (DP_PLUGINS) + installed entry points
         for mod in settings.plugin_modules:
             self._register_module(mod, reg)
@@ -155,11 +166,14 @@ class Deps:
         except Exception:  # noqa: BLE001
             pass
 
-    def _read_manifest(self, pack_dir: str, name: str) -> None:
-        """Read + validate dataplay.toml (name/version required) and record it (§8.0)."""
+    def _read_manifest(self, pack_dir: str, name: str) -> bool:
+        """Read + validate dataplay.toml (name/version required; optional `min_core_api`) and record
+        it (§8.0). Returns whether the pack is OK to load: a missing/malformed manifest, or one whose
+        `min_core_api` exceeds this core's CORE_API_VERSION, is recorded as an error and NOT loaded —
+        an honest compat failure instead of a register()-time crash later."""
         path = os.path.join(pack_dir, "dataplay.toml")
         if not os.path.exists(path):
-            return
+            return True  # no manifest is allowed (loads unversioned); only a PRESENT-but-bad one blocks
         try:
             import tomllib
             with open(path, "rb") as f:
@@ -167,10 +181,17 @@ class Deps:
             missing = [k for k in ("name", "version") if k not in man]
             if missing:
                 self.plugins.append({"name": name, "source": "drop-in", "error": f"dataplay.toml missing: {', '.join(missing)}"})
-            else:
-                self._manifests[name] = man
+                return False
+            min_core = man.get("min_core_api")
+            if min_core is not None and int(min_core) > CORE_API_VERSION:
+                self.plugins.append({"name": name, "source": "drop-in",
+                                     "error": f"requires core API >= {int(min_core)}; this core is {CORE_API_VERSION}"})
+                return False
+            self._manifests[name] = man
+            return True
         except Exception as e:  # noqa: BLE001
             self.plugins.append({"name": name, "source": "drop-in", "error": f"bad dataplay.toml: {e}"})
+            return False
 
     def _register_module(self, mod: str, reg: Registry) -> None:
         try:

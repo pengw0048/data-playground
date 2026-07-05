@@ -10,9 +10,30 @@ becomes a matter of *which backend*, not a core rewrite.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
-from kernel.models import CompilePlan, Graph, Placement, RunEstimate, RunStatus
+import duckdb
+
+from kernel.models import CompilePlan, Graph, GraphNode, Placement, RunEstimate, RunStatus
+
+# The `dataset` wire is a lazy DuckDB relation — the currency a node lowering produces/consumes.
+Relation = duckdb.DuckDBPyRelation
+
+
+@runtime_checkable
+class NodeLowering(Protocol):
+    """The lowering callable a plugin passes to `reg.add_node(spec, lower)` — how a custom node kind
+    turns its inputs into a DuckDB relation plan.
+
+    `engine` is the `kernel.executors.engine.LoweringEngine` driving the pass (typed `Any` to avoid a
+    runtime import cycle; use `engine.full`, `engine.node_specs`, `engine._view(rel)` etc.). `inputs`
+    are the already-lowered upstream relations, in incoming-edge order. Return a single `Relation`
+    for a single-output node, or `{port_id: Relation}` for a multi-output node — the engine routes by
+    the wired `source_handle` (default port id is "out"). Lowering is LAZY: return relations, don't
+    force execution; the runner materializes at the end.
+    """
+
+    def __call__(self, engine: Any, node: GraphNode, inputs: list[Relation]) -> "Relation | dict[str, Relation]": ...
 
 
 @runtime_checkable

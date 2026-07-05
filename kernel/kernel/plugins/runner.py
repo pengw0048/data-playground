@@ -50,6 +50,7 @@ class LocalRunner:
         self.node_specs = node_specs if node_specs is not None else {}
         self.runs: dict[str, RunStatus] = {}
         self._cancel: dict[str, threading.Event] = {}
+        self._scopes: dict[str, object] = {}  # run_id -> db._Scope, so cancel interrupts THIS run's cursor
         self._cache: dict[str, dict] = {}
         self._lock = threading.Lock()
 
@@ -125,61 +126,66 @@ class LocalRunner:
                                 node_lowerings=self.node_lowerings, node_specs=self.node_specs)
         nm = g.node_map(graph)
         rows_seen = 0
-        db.lock().acquire()  # serialize all DuckDB access for the whole run
-        try:
-            for step in plan.steps:
-                if cancel.is_set():
-                    status.status = "cancelled"
-                    return
-                pn = next((p for p in status.per_node if p.node_id == step.node_id), None)
-                if pn:
-                    pn.status = "running"
-                t0 = time.time()
-                if step.kind == "error_gate":
-                    time.sleep(0.02)
-                elif step.kind == "write":
-                    rows_seen = self._commit_write(nm[step.node_id], graph, engine, status, cached)
-                else:
-                    engine.relation(step.node_id)  # lower (lazy) — cheap
-                if pn:
-                    pn.status = "done"
-                    pn.ms = int((time.time() - t0) * 1000)
-                    pn.rows = rows_seen or None
-                status.rows_processed = rows_seen
-
-            # if the target is not a sink, force execution to a real row count
-            if target and nm.get(target) and nm[target].type not in ("write",):
-                rows_seen = self._count(engine, target, cached)
-                status.rows_processed = rows_seen
-
-            status.status = "done"
+        # Run on our OWN DuckDB cursor (db.run_scope), NOT the process-global lock: a long run no
+        # longer serializes every other user's preview/sample/run, and a failure here can't wedge them.
+        with db.run_scope() as scope:
             with self._lock:
-                self._cache[phash] = {"rows": rows_seen, "uri": status.output_uri, "table": status.output_table}
-        except Exception as e:  # noqa: BLE001
-            if cancel.is_set():
-                status.status = "cancelled"  # an interrupted step is a cancel, not a failure
-            else:
-                status.status = "failed"
-                status.error = f"{type(e).__name__}: {e}"
-                for p in status.per_node:
-                    if p.status == "running":
-                        p.status = "failed"
-        finally:
-            db.drop_created_views()
-            for pth in engine.spill_files:  # GC temp parquet spilled this run (outputs already committed)
-                try:
-                    os.remove(pth)
-                except OSError:
-                    pass
-            db.lock().release()
-            status.ms = int((time.time() - started) * 1000)
-            status.total_rows = rows_seen
-            self._cancel.pop(run_id, None)  # done/failed/cancelled → drop the cancel Event
-            if self.on_complete:  # persist the finished run (run history); never let it break the run
-                try:
-                    self.on_complete(graph, target, status)
-                except Exception:  # noqa: BLE001
-                    pass
+                self._scopes[run_id] = scope  # cancel() interrupts this scope's cursor
+            try:
+                for step in plan.steps:
+                    if cancel.is_set():
+                        status.status = "cancelled"
+                        return
+                    pn = next((p for p in status.per_node if p.node_id == step.node_id), None)
+                    if pn:
+                        pn.status = "running"
+                    t0 = time.time()
+                    if step.kind == "error_gate":
+                        time.sleep(0.02)
+                    elif step.kind == "write":
+                        rows_seen = self._commit_write(nm[step.node_id], graph, engine, status, cached)
+                    else:
+                        engine.relation(step.node_id)  # lower (lazy) — cheap
+                    if pn:
+                        pn.status = "done"
+                        pn.ms = int((time.time() - t0) * 1000)
+                        pn.rows = rows_seen or None
+                    status.rows_processed = rows_seen
+
+                # if the target is not a sink, force execution to a real row count
+                if target and nm.get(target) and nm[target].type not in ("write",):
+                    rows_seen = self._count(engine, target, cached)
+                    status.rows_processed = rows_seen
+
+                status.status = "done"
+                with self._lock:
+                    self._cache[phash] = {"rows": rows_seen, "uri": status.output_uri, "table": status.output_table}
+            except Exception as e:  # noqa: BLE001
+                if cancel.is_set():
+                    status.status = "cancelled"  # an interrupted step is a cancel, not a failure
+                else:
+                    status.status = "failed"
+                    status.error = f"{type(e).__name__}: {e}"
+                    for p in status.per_node:
+                        if p.status == "running":
+                            p.status = "failed"
+            finally:
+                # scope exit (below) rolls back + drops this run's views on its own cursor
+                for pth in engine.spill_files:  # GC temp parquet spilled this run (outputs already committed)
+                    try:
+                        os.remove(pth)
+                    except OSError:
+                        pass
+                status.ms = int((time.time() - started) * 1000)
+                status.total_rows = rows_seen
+                with self._lock:
+                    self._cancel.pop(run_id, None)  # done/failed/cancelled → drop the cancel Event
+                    self._scopes.pop(run_id, None)
+                if self.on_complete:  # persist the finished run (run history); never let it break the run
+                    try:
+                        self.on_complete(graph, target, status)
+                    except Exception:  # noqa: BLE001
+                        pass
 
     def _count(self, engine: LoweringEngine, node_id: str, cached: dict | None) -> int:
         if cached and cached.get("rows") is not None:
@@ -246,6 +252,8 @@ class LocalRunner:
         if st.status in ("queued", "running"):
             if run_id in self._cancel:
                 self._cancel[run_id].set()
-            db.interrupt()  # abort the in-flight DuckDB step so cancel actually stops work + frees the lock
+            scope = self._scopes.get(run_id)
+            if scope is not None:
+                scope.interrupt()  # abort THIS run's cursor (base-conn interrupt wouldn't touch it)
             st.status = "cancelled"
         return st

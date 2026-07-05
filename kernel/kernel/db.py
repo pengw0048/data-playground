@@ -1,43 +1,117 @@
 """Shared DuckDB connection — the default local data engine.
 
 DuckDB reads Parquet/CSV, samples, counts, runs SQL views, and writes outputs. No external
-service. A `DuckDBPyConnection` is NOT safe for concurrent use, so all execution is serialized
-under one reentrant lock (`with db.lock(): ...`) and temporary view names are process-globally
-unique (concurrent evaluations would otherwise clobber each other's views).
+service. A single `DuckDBPyConnection` is NOT safe for concurrent use by multiple threads, so
+there are two access modes:
+
+- **Base connection** (`conn()` outside a scope) + `db.lock()` — for quick shared metadata ops
+  (catalog registration, object-store setup, schema fetch on the request thread). Serialized.
+- **Per-run scope** (`with db.run_scope(): ...`) — a whole preview/run evaluation runs on its OWN
+  cursor (a second connection to the same in-memory database: shared catalog/tables/secrets, but
+  an INDEPENDENT transaction). Concurrent runs/previews therefore no longer serialize on one lock,
+  and one run's failure (an aborted transaction) or its view cleanup can't wedge or clobber another
+  run — each scope drops only the temp views IT minted. Cursor ops are thread-confined, so they
+  need no lock. This is what stops a single long run from freezing every other user's preview/run.
+
+Temp view names are still process-globally unique so names never collide across scopes/threads.
 """
 
 from __future__ import annotations
 
 import itertools
 import threading
+from contextlib import contextmanager
+from typing import Iterator
 
 import duckdb
 
-_lock = threading.RLock()  # reentrant: serializes ALL DuckDB access; query()/execute() nest under it
+_lock = threading.RLock()  # serializes access to the shared BASE connection (not per-run cursors)
 _conn: duckdb.DuckDBPyConnection | None = None
 _view_seq = itertools.count(1)
 _created_views: set[str] = set()
+_local = threading.local()  # per-thread run scope: .con (the cursor) + .scope (the _Scope)
 
 
 def lock() -> threading.RLock:
-    """Acquire around a whole preview/run evaluation: `with db.lock(): ...`."""
+    """Acquire around a base-connection metadata op: `with db.lock(): ...`. Per-run/preview work
+    should use `run_scope()` instead (its own cursor, no global serialization)."""
     return _lock
 
 
-def conn() -> duckdb.DuckDBPyConnection:
+def _apply_session(c: duckdb.DuckDBPyConnection) -> None:
+    c.execute("SET enable_progress_bar = false")
+    # Do NOT auto-install/auto-load extensions: that let ANY uri (e.g. https://evil/x.parquet)
+    # silently pull in httpfs and fetch it (SSRF). Object-store access loads httpfs EXPLICITLY in
+    # ensure_object_store(), so s3://gs:// still work; other schemes now fail closed instead of
+    # reaching out. Re-asserted on every per-run cursor (below) since it's a security setting.
+    c.execute("SET autoinstall_known_extensions = false")
+    c.execute("SET autoload_known_extensions = false")
+
+
+def _base_conn() -> duckdb.DuckDBPyConnection:
     global _conn
     if _conn is None:
         with _lock:
             if _conn is None:
                 _conn = duckdb.connect(":memory:")
-                _conn.execute("SET enable_progress_bar = false")
-                # Do NOT auto-install/auto-load extensions: that let ANY uri (e.g. https://evil/x.parquet)
-                # silently pull in httpfs and fetch it (SSRF). Object-store access loads httpfs
-                # EXPLICITLY in ensure_object_store(), so s3://gs:// still work; other schemes now fail
-                # closed instead of reaching out.
-                _conn.execute("SET autoinstall_known_extensions = false")
-                _conn.execute("SET autoload_known_extensions = false")
+                _apply_session(_conn)
     return _conn
+
+
+def conn() -> duckdb.DuckDBPyConnection:
+    """The DuckDB connection for the caller: the current thread's per-run CURSOR when inside a
+    `run_scope()`, else the shared base connection. Engine/adapter code calls this unchanged."""
+    c = getattr(_local, "con", None)
+    return c if c is not None else _base_conn()
+
+
+class _Scope:
+    """One run/preview's isolated DuckDB cursor + the temp views it minted."""
+
+    def __init__(self, con: duckdb.DuckDBPyConnection):
+        self.con = con
+        self.views: set[str] = set()
+
+    def interrupt(self) -> None:
+        """Abort this scope's in-flight query. Safe to call from ANOTHER thread (cancel / preview
+        timeout) — interrupting the BASE connection would NOT stop a query running on this cursor."""
+        try:
+            self.con.interrupt()
+        except Exception:  # noqa: BLE001 — nothing running / already finished
+            pass
+
+
+@contextmanager
+def run_scope() -> Iterator[_Scope]:
+    """Give this thread its own DuckDB cursor for the duration of a run/preview, so it doesn't
+    serialize on (or get wedged by) any other run. Yields a `_Scope` whose `.interrupt()` a canceller
+    can call from another thread. On exit, rolls back and drops only the views this scope created."""
+    cur = _base_conn().cursor()
+    try:
+        _apply_session(cur)  # re-assert the SSRF-safe extension policy on the cursor (defensive)
+    except Exception:  # noqa: BLE001
+        pass
+    scope = _Scope(cur)
+    _local.con = cur
+    _local.scope = scope
+    try:
+        yield scope
+    finally:
+        _local.con = None
+        _local.scope = None
+        try:
+            cur.execute("ROLLBACK")  # clear any aborted transaction before dropping views
+        except Exception:  # noqa: BLE001 — no active transaction
+            pass
+        for n in list(scope.views):
+            try:
+                cur.execute(f'DROP VIEW IF EXISTS "{n}"')
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            cur.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 _obj_store_loaded = False
@@ -97,11 +171,17 @@ def interrupt() -> None:
 
 
 def unique_view(prefix: str = "v") -> str:
-    """A process-globally-unique temp view name (never collides across engines/threads)."""
-    with _lock:
-        name = f"dp_{prefix}_{next(_view_seq)}"
-        _created_views.add(name)
-        return name
+    """A process-globally-unique temp view name (never collides across engines/threads). Inside a
+    run_scope the name is tracked on the SCOPE (dropped when the scope exits, on its own cursor);
+    otherwise on the global set (dropped by drop_created_views under the base connection)."""
+    name = f"dp_{prefix}_{next(_view_seq)}"  # itertools.count.__next__ is atomic under the GIL
+    scope = getattr(_local, "scope", None)
+    if scope is not None:
+        scope.views.add(name)
+    else:
+        with _lock:
+            _created_views.add(name)
+    return name
 
 
 def drop_created_views() -> None:

@@ -44,26 +44,19 @@ def tag_columns(columns: list[ColumnSchema]) -> list[ColumnSchema]:
     return columns
 
 
+# A registered capability contributes only its id + label to KernelInfo (Deps.info / GET /api/kernel).
+# It does NOT decide column tagging: backend DETECTION lives in tag_columns (above); the per-capability
+# viewer UI is a separate FRONTEND registration (web/src/nodes/capabilities.tsx). So a plugin's
+# `reg.add_capability(...)` announces a capability id; lighting up new column tags means extending
+# tag_columns, and adding a viewer tab means the frontend hook — not a predicate()/columns() here.
 class MediaCapability:
     id = "media"
     label = "Media"
-
-    def predicate(self, columns: list[ColumnSchema]) -> bool:
-        return any("media" in c.capabilities for c in columns)
-
-    def columns(self, columns: list[ColumnSchema]) -> list[str]:
-        return [c.name for c in columns if "media" in c.capabilities]
 
 
 class VectorCapability:
     id = "vector"
     label = "Vectors"
-
-    def predicate(self, columns: list[ColumnSchema]) -> bool:
-        return any("vector" in c.capabilities for c in columns)
-
-    def columns(self, columns: list[ColumnSchema]) -> list[str]:
-        return [c.name for c in columns if "vector" in c.capabilities]
 
 
 BUILTIN_CAPABILITIES = [MediaCapability(), VectorCapability()]
