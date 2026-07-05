@@ -15,7 +15,9 @@ Example plugin (`plugins/mypack/__init__.py`):
 
     def lower(engine, node, inputs):
         col = node.data.get("config", {}).get("column", "name")
-        return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM {input}')
+        # NOTE: {{input}} in an f-string emits the literal {input} token that ctx.sql substitutes with
+        # the input view name. A bare {input} would be interpolated by Python to the builtin `input`.
+        return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM {{input}}')
 
     def register(reg):
         reg.add_node(SPEC, lower)

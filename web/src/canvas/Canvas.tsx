@@ -134,6 +134,9 @@ export function Canvas() {
     const moved = changes.filter((c) => c.type === 'position' && (c as any).position && !(c as any).dragging) as any[]
     if (moved.length) {
       const byId = new Map(moved.map((c) => [c.id, c.position]))
+      // snapshot the pre-move doc so a settled drag is its OWN undo step (setNodes doesn't commit);
+      // also marks a CRDT boundary so undo behaves the same solo and while co-editing.
+      useStore.getState().commit()
       setNodes(useStore.getState().doc.nodes.map((n) => (byId.has(n.id) ? { ...n, position: byId.get(n.id) } : n)))
     }
     // fold select changes into the multi-selection set (box-select emits many)

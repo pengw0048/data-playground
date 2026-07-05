@@ -29,6 +29,9 @@ from kernel.models import (
 
 router = APIRouter()
 
+_RUN_INDEX_MAX = 1000  # cap deps.run_index (run_id -> owning runner); well above either runner's own cap
+
+
 def _reject_invalid(graph, deps) -> None:
     """400 on a graph the type system forbids (server-side; the frontend blocks these too)."""
     errs = graph_mod.type_errors(graph, deps.node_specs)
@@ -166,6 +169,10 @@ def run(req: RunRequest) -> RunStatus:
         raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
     status = runner.run(plan, req.graph, req.target_node_id, est.placement)
     deps.run_index[status.run_id] = runner  # so status/cancel/ws reach the right runner
+    # bound run_index (insertion-ordered) so it can't grow for the process lifetime — the runners
+    # themselves only retain the last _MAX_RUNS, and _status_or_lost already tolerates a missing id.
+    while len(deps.run_index) > _RUN_INDEX_MAX:
+        deps.run_index.pop(next(iter(deps.run_index)))
     return status
 
 

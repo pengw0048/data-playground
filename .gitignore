@@ -41,3 +41,5 @@ kernel/_web/
 kernel/test-results/
 
 kernel/data/canvases/
+
+/test-results/

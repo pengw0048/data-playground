@@ -22,7 +22,7 @@ import time
 import uuid
 
 from kernel.models import CompilePlan, Graph, PerNodeStatus, Placement, RunEstimate, RunStatus
-from kernel.plugins.runner import _CONFIRM_ROWS
+from kernel.plugins.runner import _CONFIRM_ROWS, _MAX_RUNS
 
 
 class SubprocessRunner:
@@ -75,8 +75,21 @@ class SubprocessRunner:
         with self._lock:
             self.runs[run_id] = status
             self._procs[run_id] = proc
+            self._evict()
         threading.Thread(target=self._watch, args=(run_id, proc, status_file, job_dir, graph, target_node_id), daemon=True).start()
         return status
+
+    def _evict(self) -> None:
+        """Bound self.runs (called under self._lock) — subprocess runs accumulated forever otherwise.
+        Evict only TERMINAL runs (oldest first); never drop a run whose child is still executing."""
+        _terminal = {"done", "failed", "cancelled"}
+        while len(self.runs) > _MAX_RUNS:
+            victim = next((rid for rid, st in self.runs.items() if st.status in _terminal), None)
+            if victim is None:
+                break  # all retained runs are still live — exceed the cap rather than drop one
+            self.runs.pop(victim, None)
+            self._cancelled.discard(victim)
+            self._procs.pop(victim, None)
 
     def _read(self, run_id: str, status_file: str) -> bool:
         """Merge the child's latest status; return True once it's terminal."""
