@@ -209,7 +209,7 @@ export function FilterBuilder({ nodeId }: { nodeId: string }) {
 }
 
 const dirBtn = {
-  border: `1px solid ${color.border}`, background: '#fff', color: color.text2, fontSize: 9.5, fontWeight: 700,
+  border: `1px solid ${color.border}`, background: 'hsl(var(--card))', color: color.text2, fontSize: 9.5, fontWeight: 700,
   letterSpacing: 0.4, padding: '4px 6px', borderRadius: 6, cursor: 'pointer', flex: '0 0 auto',
 } as const
 const xBtn = {

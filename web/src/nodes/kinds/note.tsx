@@ -15,15 +15,17 @@ function Note({ id, data, selected }: NodeComponentProps) {
   const md = String(data.config.markdown ?? '')
 
   return (
+    // the note is a paper-like annotation with a FIXED cream background, so its ink is pinned dark
+    // (text-[#2c2a20]) in both themes — text-foreground would flip to near-white in dark, invisible on cream
     <div
       onDoubleClick={() => setEditing(true)}
-      className={cn('min-h-24 w-[268px] overflow-hidden rounded-lg p-3 text-[12.5px] text-foreground',
+      className={cn('min-h-24 w-[268px] overflow-hidden rounded-lg p-3 text-[12.5px] text-[#2c2a20]',
         selected ? 'shadow-md ring-2 ring-primary/20' : 'shadow-sm')}
       style={{ background: '#fffdf3', border: selected ? `1.5px solid ${color.focus}` : '1px solid #ece3c4' }}
     >
       {editing ? (
         <textarea
-          className="nodrag nowheel dp-mono min-h-[120px] max-h-[400px] w-full resize-y overflow-y-auto border-none bg-transparent text-xs leading-normal text-foreground outline-none"  /* nowheel: let the wheel scroll the textarea, not pan the canvas */
+          className="nodrag nowheel dp-mono min-h-[120px] max-h-[400px] w-full resize-y overflow-y-auto border-none bg-transparent text-xs leading-normal text-[#2c2a20] outline-none"  /* nowheel: let the wheel scroll the textarea, not pan the canvas; ink pinned to match the cream note */
           autoFocus
           value={md}
           onChange={(e) => updateConfig(id, { markdown: e.target.value })}
@@ -37,7 +39,7 @@ function Note({ id, data, selected }: NodeComponentProps) {
           <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD}>{md}</ReactMarkdown>
         </div>
       ) : (
-        <div className="italic text-muted-foreground">Double-click to edit…</div>
+        <div className="italic text-[#9a9482]">Double-click to edit…</div>
       )}
     </div>
   )
@@ -54,7 +56,7 @@ const MD = {
   a: (p: any) => <a style={{ color: color.focus }} target="_blank" rel="noreferrer" {...p} />,
   code: (p: any) => <code className="dp-mono" style={{ background: '#f1efe4', padding: '1px 4px', borderRadius: 4, fontSize: 11 }} {...p} />,
   pre: (p: any) => <pre className="dp-mono" style={{ background: '#f1efe4', padding: 8, borderRadius: 6, overflowX: 'auto', fontSize: 11, margin: '0 0 6px' }} {...p} />,
-  blockquote: (p: any) => <blockquote style={{ borderLeft: `3px solid #e0d7b5`, margin: '0 0 6px', padding: '2px 0 2px 8px', color: color.text2 }} {...p} />,
+  blockquote: (p: any) => <blockquote style={{ borderLeft: `3px solid #e0d7b5`, margin: '0 0 6px', padding: '2px 0 2px 8px', color: '#6b6659' }} {...p} />,
   table: (p: any) => <table style={{ borderCollapse: 'collapse', fontSize: 11, margin: '0 0 6px' }} {...p} />,
   th: (p: any) => <th style={{ border: '1px solid #e0d7b5', padding: '2px 6px', textAlign: 'left' }} {...p} />,
   td: (p: any) => <td style={{ border: '1px solid #e0d7b5', padding: '2px 6px' }} {...p} />,

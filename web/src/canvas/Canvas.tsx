@@ -294,12 +294,14 @@ export function Canvas() {
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="#d6d9df" />
         {/* zoom controls sit ABOVE the minimap so they never overlap */}
         <Controls showInteractive={false} position="bottom-left" style={{ marginBottom: 132, marginLeft: 12 }} />
+        {/* MiniMap paints to a 2D canvas where CSS vars don't resolve, so maskColor + the nodeColor
+            fallback are literals (a theme-neutral gray veil; not the now-var color.text3). */}
         <MiniMap
           pannable
           position="bottom-left"
           style={{ marginBottom: 12, marginLeft: 12, width: 168, height: 108 }}
-          maskColor="rgba(244,245,247,0.7)"
-          nodeColor={(n) => kindAccent[n.type ?? ''] ?? color.text3}
+          maskColor="rgba(128,128,128,0.2)"
+          nodeColor={(n) => kindAccent[n.type ?? ''] ?? '#98a0ac'}
           nodeStrokeWidth={0}
           onClick={(_, pos) => setCenter(pos.x, pos.y, { zoom: getZoom(), duration: 350 })}
         />

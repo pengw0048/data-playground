@@ -49,7 +49,7 @@ export function NodeParamFields({ nodeId }: { nodeId: string }) {
                 onChange={(v) => updateConfig(nodeId, { [p.name]: v })} />
             ) : p.type === 'bool' ? (
               <button onClick={(e) => { e.stopPropagation(); updateConfig(nodeId, { [p.name]: !val }) }}
-                style={{ fontSize: 11.5, textAlign: 'left', padding: '5px 7px', border: `1px solid ${color.border}`, borderRadius: 6, background: '#fff', color: color.ink }}>
+                style={{ fontSize: 11.5, textAlign: 'left', padding: '5px 7px', border: `1px solid ${color.border}`, borderRadius: 6, background: 'transparent', color: color.ink }}>
                 {val ? 'true' : 'false'}
               </button>
             ) : p.type === 'int' || p.type === 'float' ? (

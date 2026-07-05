@@ -28,7 +28,7 @@ export class ErrorBoundary extends Component<
           <div className="dp-mono" style={{ fontSize: 11, color: color.text3, whiteSpace: 'pre-wrap', maxHeight: 120, overflow: 'auto' }}>
             {this.state.err.message}
           </div>
-          <button onClick={this.reset} style={{ marginTop: 10, padding: '6px 12px', border: `1px solid ${color.border}`, borderRadius: 8, background: '#fff', fontSize: 12, fontWeight: 600 }}>
+          <button onClick={this.reset} style={{ marginTop: 10, padding: '6px 12px', border: `1px solid ${color.border}`, borderRadius: 8, background: 'hsl(var(--card))', fontSize: 12, fontWeight: 600 }}>
             Dismiss
           </button>
         </div>

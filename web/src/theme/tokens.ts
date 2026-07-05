@@ -6,16 +6,19 @@
 // them here lets the many inline-styled components re-skin in one place while they migrate to the
 // Tailwind/shadcn primitives. ONE primary blue now (the review found two: #2f6ef0 vs #3b7fe0).
 export const color = {
-  // neutrals (slate)
-  canvas: '#f7f8fa',
-  card: '#ffffff',
-  border: '#e5e8ec',
-  hairline: '#eef1f4',
-  ink: '#171a21',
-  text2: '#5b616e',
-  text3: '#98a0ac',
+  // Neutrals resolve to the CSS-var tokens (index.css :root + [data-theme='dark']) so every inline
+  // style that reads color.* re-skins with the theme in one place — no static light hex that would
+  // stay light in dark mode. Used only in style={{}} / className contexts, where var() resolves.
+  canvas: 'var(--canvas)',
+  card: 'hsl(var(--card))',
+  border: 'hsl(var(--border))',
+  hairline: 'var(--hairline)',
+  ink: 'hsl(var(--foreground))',
+  text2: 'hsl(var(--muted-foreground))',
+  text3: 'var(--text-3)',
 
-  // status — reserved semantic
+  // status — reserved semantic (kept as literal hex: read on both themes, and some are used as canvas
+  // fill / in alpha-concatenated shadow strings where a CSS var() would not resolve)
   latest: '#16a34a',
   stale: '#d99a2b',
   running: '#2f7ff5',
@@ -23,7 +26,8 @@ export const color = {
   queued: '#8a94a6',
   draft: '#aab1bd',
 
-  // wire / selection — single brand blue (matches --primary)
+  // wire / selection — literal hex on purpose: consumed as SVG presentation attributes (ArrowDefs,
+  // WireEdge) and in alpha-concatenated strings (shadow.focus), where var() does NOT resolve.
   wire: '#aab0ba',
   wireActive: '#2f7ff5',
   focus: '#2f7ff5',

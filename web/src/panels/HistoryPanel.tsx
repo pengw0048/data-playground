@@ -36,7 +36,7 @@ export function HistoryPanel({ nodeId }: { nodeId: string }) {
           </div>
           <button
             onClick={() => restore(nodeId, v.id)}
-            style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 10px', border: `1px solid ${color.border}`, borderRadius: 7, background: '#fff', color: color.focus, fontSize: 11, fontWeight: 600 }}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 10px', border: `1px solid ${color.border}`, borderRadius: 7, background: 'hsl(var(--card))', color: color.focus, fontSize: 11, fontWeight: 600 }}
           >
             <Icon name="refresh" size={12} /> Restore
           </button>

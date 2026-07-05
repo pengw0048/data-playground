@@ -27,7 +27,7 @@ export function ConnectMenu({ x, y, wire, onPick, onClose }: {
       className="dp-panel"
       style={{
         position: 'fixed', left: x, top: y, zIndex: 60, minWidth: 176,
-        background: '#fff', border: `1px solid ${color.border}`, borderRadius: 12, boxShadow: shadow.panel,
+        background: 'hsl(var(--popover))', border: `1px solid ${color.border}`, borderRadius: 12, boxShadow: shadow.panel,
         padding: 5, maxHeight: 320, overflowY: 'auto',
       }}
     >

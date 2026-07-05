@@ -143,15 +143,15 @@ function FilesContent() {
   return (
     <>
       <ViewHeader title="Recents" action={
-        <button onClick={() => newFile()} data-testid="new-file" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 14px', border: 'none', borderRadius: 9, background: color.ink, color: '#fff', fontSize: 12.5, fontWeight: 600, cursor: 'pointer' }}>
+        <button onClick={() => newFile()} data-testid="new-file" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 14px', border: 'none', borderRadius: 9, background: color.ink, color: 'hsl(var(--background))', fontSize: 12.5, fontWeight: 600, cursor: 'pointer' }}>
           <Icon name="plus" size={13} /> New file
         </button>
       } />
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 16, padding: '4px 28px 28px' }}>
         {files.map((f) => (
           <div key={f.id} className="dp-file-card" onClick={() => openFile(f.id)}
-            style={{ cursor: 'pointer', borderRadius: 12, border: `1px solid ${color.border}`, background: '#fff', overflow: 'hidden', boxShadow: shadow.card }}>
-            <div style={{ height: 132, background: 'linear-gradient(135deg,#f3f5f8,#e9edf3)', display: 'grid', placeItems: 'center', color: color.text3 }}>
+            style={{ cursor: 'pointer', borderRadius: 12, border: `1px solid ${color.border}`, background: 'hsl(var(--card))', overflow: 'hidden', boxShadow: shadow.card }}>
+            <div style={{ height: 132, background: 'linear-gradient(135deg, hsl(var(--muted)), hsl(var(--accent)))', display: 'grid', placeItems: 'center', color: color.text3 }}>
               <Icon name="grid" size={26} />
             </div>
             <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -186,12 +186,12 @@ function TablesContent() {
           <input value={uri} onChange={(e) => setUri(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') register() }} data-testid="register-dataset"
             placeholder="Register a dataset — path or uri to Parquet/CSV/JSON/Arrow/Lance"
             style={{ flex: 1, fontSize: 12.5, border: `1px solid ${color.border}`, borderRadius: 9, padding: '9px 12px', outline: 'none' }} />
-          <button onClick={register} style={{ border: 'none', borderRadius: 9, background: color.ink, color: '#fff', fontSize: 12.5, fontWeight: 600, padding: '0 16px', cursor: 'pointer' }}>Register</button>
+          <button onClick={register} style={{ border: 'none', borderRadius: 9, background: color.ink, color: 'hsl(var(--background))', fontSize: 12.5, fontWeight: 600, padding: '0 16px', cursor: 'pointer' }}>Register</button>
         </div>
         {err && <div style={{ fontSize: 11, color: color.failed }}>{err}</div>}
         {catalog.map((t) => (
           <button key={t.uri} onClick={() => addToCanvas('source', { uri: t.uri, tableId: t.id }, t.name)} title="Add as a source on the canvas"
-            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', border: `1px solid ${color.border}`, borderRadius: 10, background: '#fff', cursor: 'pointer', textAlign: 'left' }}
+            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', border: `1px solid ${color.border}`, borderRadius: 10, background: 'hsl(var(--card))', cursor: 'pointer', textAlign: 'left' }}
             onMouseEnter={(e) => (e.currentTarget.style.background = '#f7f8fa')} onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}>
             <Icon name="db" size={16} style={{ color: color.text3 }} />
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -218,7 +218,7 @@ function TransformsContent() {
       <div style={{ padding: '4px 28px 28px', display: 'flex', flexDirection: 'column', gap: 8 }}>
         {processors.map((p) => (
           <button key={p.id} onClick={() => addToCanvas('transform', { source: 'library', processor: p.id, version: p.version, mode: p.mode }, p.title || p.id)} title="Add to the canvas"
-            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', border: `1px solid ${color.border}`, borderRadius: 10, background: '#fff', cursor: 'pointer', textAlign: 'left' }}
+            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', border: `1px solid ${color.border}`, borderRadius: 10, background: 'hsl(var(--card))', cursor: 'pointer', textAlign: 'left' }}
             onMouseEnter={(e) => (e.currentTarget.style.background = '#f7f8fa')} onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}>
             <Icon name="fx" size={16} style={{ color: color.text3 }} />
             <div style={{ flex: 1, minWidth: 0 }}>

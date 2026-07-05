@@ -67,7 +67,7 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
                 <input value={s.alias} placeholder="alias" onChange={(e) => patchSub(i, { alias: e.target.value })}
                   style={{ width: 120, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', outline: 'none' }} />
                 <select value={s.type} onChange={(e) => patchSub(i, { type: e.target.value })}
-                  style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', background: '#fff' }}>
+                  style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', background: 'hsl(var(--card))' }}>
                   {kinds.map((k) => <option key={k} value={k}>{k}</option>)}
                 </select>
                 <button onClick={() => setSubs(subnodes.filter((_, j) => j !== i))} title="remove"
@@ -78,7 +78,7 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
           ))}
           <button
             onClick={() => setSubs([...subnodes, { alias: `n${subnodes.length + 1}`, type: kinds[0] ?? 'filter', config: {} }])}
-            style={{ alignSelf: 'flex-start', display: 'inline-flex', alignItems: 'center', gap: 5, border: `1px solid ${color.border}`, borderRadius: 7, background: '#fff', color: color.text2, fontSize: 12, padding: '6px 10px' }}>
+            style={{ alignSelf: 'flex-start', display: 'inline-flex', alignItems: 'center', gap: 5, border: `1px solid ${color.border}`, borderRadius: 7, background: 'hsl(var(--card))', color: color.text2, fontSize: 12, padding: '6px 10px' }}>
             <Icon name="plus" size={12} /> <span>add node</span>
           </button>
         </div>

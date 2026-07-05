@@ -64,7 +64,7 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
     <div className="dp-float dp-panel" style={{ position: 'fixed', left, top, width, zIndex: 25 }}>
       <div
         style={{
-          background: '#fff',
+          background: 'hsl(var(--card))',  // themed — the panel content uses text-foreground, which flips
           border: `1px solid ${color.border}`,
           borderRadius: radius.panel, boxShadow: shadow.panel, overflow: 'hidden',
           maxHeight: panelMaxHeight, display: 'flex', flexDirection: 'column',
