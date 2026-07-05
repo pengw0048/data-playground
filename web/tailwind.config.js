@@ -29,8 +29,9 @@ export default {
       animation: { 'accordion-down': 'accordion-down 0.2s ease-out', 'accordion-up': 'accordion-up 0.2s ease-out' },
     },
   },
-  // scope Tailwind's Preflight OFF for now: the app is still mostly inline-styled, and a global reset
-  // would shift the un-migrated screens. shadcn components carry their own resets via utility classes.
-  corePlugins: { preflight: false },
+  // Preflight ON: shadcn components assume it (it resets native control chrome — otherwise the browser's
+  // default button/input border bleeds through, e.g. heavy borders on ghost buttons). The app's own
+  // index.css rules + inline styles are declared after @tailwind base, so they still win on the
+  // un-migrated screens.
   plugins: [tailwindcssAnimate],
 }
