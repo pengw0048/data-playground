@@ -351,6 +351,20 @@ test.describe('Data Playground canvas', () => {
     await b.close()
   })
 
+  test('two clients co-edit the same canvas (Yjs CRDT)', async ({ page }) => {
+    await fresh(page) // A: a fresh empty canvas, now the last-opened file
+    const b = await page.context().newPage()
+    await b.goto('/') // B opens the same last-opened canvas → same collab room
+    await expect(b.getByTestId('toolbar')).toBeVisible()
+    await expect(b.locator('.react-flow__node')).toHaveCount(0)
+    // A adds a node; B sees it appear over the CRDT (no reload)
+    await addNode(page, 'Shape', 'filter')
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await expect(b.locator('.react-flow__node')).toHaveCount(1, { timeout: 12_000 })
+    // and an edit on A propagates to B (rename via the node title)
+    await b.close()
+  })
+
   test('the Share dialog sets visibility and adds a collaborator', async ({ page }) => {
     // seed a collaborator via the API (there's no in-app user switching anymore) — bootstrap picks it up
     await page.request.post('/api/users', { data: { name: 'Dana' }, headers: { 'X-DP-User': 'local' } })

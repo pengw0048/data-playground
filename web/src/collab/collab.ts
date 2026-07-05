@@ -1,8 +1,9 @@
 import { useStore } from '../store/graph'
+import { startYSync, stopYSync, applyYUpdate, encodeYState, encodeYStateVector, yUpdateB64 } from './ydoc'
 
-// Realtime presence over the kernel's per-canvas collab room (/ws/collab/{id}). This first version
-// carries PRESENCE (who's here + live cursors); the same relay also carries doc messages, so live
-// co-editing / a Yjs CRDT binding is the next step. One connection per open canvas, with reconnect.
+// Realtime collaboration over the kernel's per-canvas room (/ws/collab/{id}): PRESENCE (who's here +
+// live cursors) AND live co-editing (a Yjs CRDT — see ydoc.ts). One connection per open canvas, with
+// reconnect. Doc edits merge; on (re)connect we run a Yjs sync handshake so late joiners catch up.
 
 const COLORS = ['#e5484d', '#0091ff', '#30a46c', '#f76b15', '#8e4ec6', '#e5b100', '#d6409f', '#12a594']
 const clientId = Math.random().toString(36).slice(2, 10)
@@ -30,12 +31,17 @@ function openSocket(canvasId: string): void {
     return
   }
   ws = sock
-  sock.onopen = () => send({ type: 'presence', name: myName(), color })  // announce arrival
+  sock.onopen = () => {
+    send({ type: 'presence', name: myName(), color })   // announce arrival
+    send({ type: 'ysync', sv: encodeYStateVector() })   // ask peers for edits we're missing (CRDT sync step 1)
+  }
   sock.onmessage = (ev) => {
     let msg: any
     try { msg = JSON.parse(ev.data) } catch { return }
     if (!msg || msg.clientId === clientId) return
     const st = useStore.getState()
+    if (msg.type === 'yjs' && typeof msg.update === 'string') { applyYUpdate(msg.update); return }
+    if (msg.type === 'ysync') { send({ type: 'yjs', update: encodeYState(msg.sv) }); return }  // reply with their missing state
     if (msg.type === 'leave') { st.dropPeer(msg.clientId); return }
     if (msg.type === 'presence') {
       const prev = st.peers[msg.clientId]
@@ -44,7 +50,7 @@ function openSocket(canvasId: string): void {
         color: msg.color ?? prev?.color ?? '#888',
         cursor: msg.cursor ?? prev?.cursor,  // a plain presence (no cursor) must not blank the cursor
       })
-      if (!prev) send({ type: 'presence', name: myName(), color })  // greet the newcomer so they see us
+      if (!prev) { send({ type: 'presence', name: myName(), color }); send({ type: 'ysync', sv: encodeYStateVector() }) }  // greet + resync
     }
   }
   sock.onclose = () => {
@@ -61,6 +67,7 @@ export function connectCollab(canvasId: string): void {
   if (!canvasId || (roomId === canvasId && ws && ws.readyState <= WebSocket.OPEN)) return
   disconnectCollab()
   roomId = canvasId
+  startYSync((u) => send({ type: 'yjs', update: yUpdateB64(u) }))  // CRDT bound to the store; edits go on the wire
   openSocket(canvasId)
 }
 
@@ -68,6 +75,7 @@ export function disconnectCollab(): void {
   roomId = ''
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
   useStore.getState().clearPeers()
+  stopYSync()
   if (ws) {
     const s = ws
     ws = null
