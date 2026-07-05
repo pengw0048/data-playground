@@ -17,6 +17,7 @@ import { RunHistoryModal } from '../panels/RunHistoryModal'
 import { VersionHistoryModal } from '../panels/VersionHistoryModal'
 import { ShareModal } from '../panels/ShareModal'
 import { crdtUndoActive } from '../collab/undo'
+import { resolvedTheme, toggleTheme } from '../theme/mode'
 
 export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
@@ -50,6 +51,7 @@ export function TopBar() {
         <span className="ml-1.5 inline-flex gap-0.5">
           <IconBtn name="undo" label="Undo" disabled={!canUndo} onClick={() => useStore.getState().undo()} />
           <IconBtn name="redo" label="Redo" disabled={!canRedo} onClick={() => useStore.getState().redo()} />
+          <ThemeToggle />
         </span>
       </div>
 
@@ -188,4 +190,17 @@ function IconBtn({ name, label, onClick, disabled }: { name: IconName; label: st
       <Icon name={name} size={14} />
     </Button>
   )
+}
+
+function ThemeToggle() {
+  const [dark, setDark] = useState(() => resolvedTheme() === 'dark')
+  useEffect(() => {
+    const sync = () => setDark(resolvedTheme() === 'dark')
+    window.addEventListener('dp-theme-change', sync)
+    const mql = window.matchMedia('(prefers-color-scheme: dark)')
+    mql.addEventListener('change', sync)  // reflect OS changes while in 'system' mode
+    return () => { window.removeEventListener('dp-theme-change', sync); mql.removeEventListener('change', sync) }
+  }, [])
+  // moon = "switch to dark" (shown in light); sun = "switch to light" (shown in dark)
+  return <IconBtn name={dark ? 'sun' : 'moon'} label={dark ? 'Switch to light theme' : 'Switch to dark theme'} onClick={toggleTheme} />
 }

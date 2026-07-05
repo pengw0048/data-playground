@@ -40,7 +40,7 @@ export function ConnectMenu({ x, y, wire, onPick, onClose }: {
           key={s.kind}
           onClick={(e) => { e.stopPropagation(); onPick(s.kind) }}
           style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 8px', border: 'none', background: 'transparent', borderRadius: 7 }}
-          onMouseEnter={(e) => (e.currentTarget.style.background = '#f2f3f5')}
+          onMouseEnter={(e) => (e.currentTarget.style.background = 'hsl(var(--accent))')}
           onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
         >
           <span style={{ width: 4, height: 14, borderRadius: 2, background: kindAccent[s.kind] ?? color.text3 }} />

@@ -10,7 +10,7 @@ export function Segmented<T extends string>({ options, value, onChange, accent =
   accent?: string
 }) {
   return (
-    <div style={{ display: 'inline-flex', gap: 3, background: '#f1f2f4', padding: 2, borderRadius: radius.button }}>
+    <div style={{ display: 'inline-flex', gap: 3, background: 'hsl(var(--secondary))', padding: 2, borderRadius: radius.button }}>
       {options.map((o) => {
         const active = o.value === value
         return (

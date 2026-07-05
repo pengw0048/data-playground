@@ -47,7 +47,8 @@ test.describe('Data Playground canvas', () => {
     await page.getByRole('button', { name: 'Shape', exact: true }).click()
     const menu = page.locator('.dp-panel', { hasText: 'filter' }).last()
     await expect(menu).toBeVisible()
-    const first = await boxOf(menu)
+    await page.waitForTimeout(200) // let the .12s open animation (translateY -2px) settle before the baseline,
+    const first = await boxOf(menu) // so this measures a re-position JUMP on a later tick, not the open transition
     await page.waitForTimeout(350) // if it re-positioned on a later tick, this would catch the shift
     const second = await boxOf(menu)
     expect(Math.abs(first.x - second.x)).toBeLessThan(2)
@@ -55,6 +56,20 @@ test.describe('Data Playground canvas', () => {
     // grows upward: the menu sits entirely above the toolbar
     const tb = await boxOf(toolbar)
     expect(second.y + second.height).toBeLessThanOrEqual(tb.y + 2)
+  })
+
+  test('the theme toggle switches between light and dark (and flips the tokens)', async ({ page }) => {
+    await page.emulateMedia({ colorScheme: 'light' })  // deterministic default (no OS 'dark' bleed-through)
+    await page.goto('/')
+    const html = page.locator('html')
+    await expect(html).not.toHaveAttribute('data-theme', 'dark')  // light is the default
+    await page.getByRole('button', { name: 'Switch to dark theme' }).click()
+    await expect(html).toHaveAttribute('data-theme', 'dark')
+    // the shadcn token actually flips (not just the attribute) — proves the palette is wired
+    const bg = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--background').trim())
+    expect(bg).toBe('222 24% 10%')
+    await page.getByRole('button', { name: 'Switch to light theme' }).click()
+    await expect(html).not.toHaveAttribute('data-theme', 'dark')
   })
 
   test('added nodes do not overlap each other', async ({ page }) => {

@@ -7,9 +7,11 @@ export type IconName =
   | 'chevronDown' | 'chevronRight' | 'chevronLeft' | 'lineage' | 'power' | 'mute' | 'rename'
   | 'duplicate' | 'export' | 'trash' | 'search' | 'sparkle' | 'grid' | 'branch' | 'loop'
   | 'fx' | 'sample' | 'arrow' | 'external' | 'check' | 'db' | 'sigma' | 'sql' | 'note'
-  | 'minus' | 'link' | 'settings' | 'undo' | 'redo'
+  | 'minus' | 'link' | 'settings' | 'undo' | 'redo' | 'sun' | 'moon'
 
 const P: Record<IconName, JSX.Element> = {
+  sun: <><circle cx="8" cy="8" r="3.1" /><path d="M8 1v1.8M8 13.2V15M15 8h-1.8M2.8 8H1M12.9 3.1l-1.3 1.3M4.4 11.6l-1.3 1.3M12.9 12.9l-1.3-1.3M4.4 4.4 3.1 3.1" /></>,
+  moon: <path d="M13.5 9.3A5.6 5.6 0 1 1 6.7 2.5 4.4 4.4 0 0 0 13.5 9.3Z" />,
   eye: <><path d="M1 8s2.7-5 7-5 7 5 7 5-2.7 5-7 5-7-5-7-5Z" /><circle cx="8" cy="8" r="2.2" /></>,
   settings: <><circle cx="8" cy="8" r="2.3" /><path d="M8 1v2.2M8 12.8V15M15 8h-2.2M3.2 8H1M12.9 3.1l-1.6 1.6M4.7 11.3l-1.6 1.6M12.9 12.9l-1.6-1.6M4.7 4.7 3.1 3.1" /></>,
   play: <path d="M4.5 3.2v9.6l7.5-4.8-7.5-4.8Z" />,

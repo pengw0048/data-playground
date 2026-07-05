@@ -13,7 +13,7 @@ export function CodeEditor({ value, onChange, language, readOnly, height = 200, 
 }) {
   columnStore.columns = completions ?? []
   return (
-    <div style={{ border: '1px solid var(--viewer-border, #e3e6ea)', borderRadius: 8, overflow: 'hidden', height }}>
+    <div style={{ border: '1px solid hsl(var(--border))', borderRadius: 8, overflow: 'hidden', height }}>
       <Editor
         language={language}
         theme="dp-light"

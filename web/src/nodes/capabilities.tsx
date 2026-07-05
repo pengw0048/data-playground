@@ -18,7 +18,7 @@ function MediaGrid({ columns, rows }: { columns: ColumnSchema[]; rows: Record<st
         const url = String(r[col] ?? '')
         return (
           <div key={i} style={{ background: 'var(--viewer-2)', borderRadius: 8, overflow: 'hidden', border: '1px solid var(--viewer-line)' }}>
-            <div style={{ position: 'relative', aspectRatio: '4/3', background: '#eceef1', display: 'grid', placeItems: 'center' }}>
+            <div style={{ position: 'relative', aspectRatio: '4/3', background: 'hsl(var(--muted))', display: 'grid', placeItems: 'center' }}>
               <img
                 src={url}
                 loading="lazy"
