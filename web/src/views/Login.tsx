@@ -3,7 +3,7 @@ import { api, type DpUser } from '../api/client'
 import { color, radius, shadow } from '../theme/tokens'
 
 // Shown only when auth is enabled (DP_AUTH_SECRET) and there's no valid session. Pick who you are +
-// the shared password → a signed session cookie. A per-user credential / SSO replaces this later.
+// your own password → a signed session cookie (verified against your per-user credential).
 export function Login({ onLoggedIn }: { onLoggedIn: (userId: string) => void }) {
   const [users, setUsers] = useState<DpUser[]>([])
   const [userId, setUserId] = useState('')

@@ -155,6 +155,8 @@ export const api = {
   authStatus: () => req<{ authEnabled: boolean; userId: string | null }>('/auth/status'),
   login: (userId: string, password: string) => req<{ ok: boolean; userId: string }>('/auth/login', { method: 'POST', body: JSON.stringify({ userId, password }) }),
   logout: () => req<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
+  changePassword: (oldPassword: string, newPassword: string) =>
+    req<{ ok: boolean }>('/auth/password', { method: 'POST', body: JSON.stringify({ oldPassword, newPassword }) }),
   getShares: (canvasId: string) => req<{ visibility: string; shares: ShareInfo[] }>(`/canvas/${canvasId}/shares`),
   addShare: (canvasId: string, body: { userId?: string; role?: string; visibility?: string }) =>
     req<{ ok: boolean }>(`/canvas/${canvasId}/share`, { method: 'POST', body: JSON.stringify(body) }),

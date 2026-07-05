@@ -5,16 +5,16 @@ DP_AUTH_SECRET (+ DP_AUTH_PASSWORD) to REQUIRE a signed session cookie: /auth/lo
 password and issues an HMAC-signed, time-limited token; a raw header is no longer trusted, and tokens
 can't be forged without the secret.
 
-CAVEAT (by design, documented): this is a SHARED-password gate — /auth/login lets any holder of the
-one password claim any user id, so it authenticates "someone with the instance password", not a
-specific person. Password holders can therefore act as each other; the owner/editor/viewer model
-isolates outsiders, not co-holders. Per-user credentials / SSO (a real authentication factor bound to
-the identity) are the production upgrade and plug into /auth/login — the signing + session plumbing
-stays the same.
+Identity is PER-USER: /auth/login verifies the submitted password against that user's own scrypt hash
+(users.password_hash), so knowing the shared instance password no longer lets you sign in as someone
+else. DP_AUTH_PASSWORD survives only as a BOOTSTRAP: on first init it seeds the default user's hash so
+an existing deployment keeps working; admins then create users with their own passwords and everyone
+can rotate their own. SSO/OIDC would slot into the same /auth/login + session plumbing later.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import os
@@ -60,7 +60,30 @@ def verify(token: str | None) -> str | None:
     return user_id
 
 
-def check_password(pw: str) -> bool:
-    """The shared login gate (DP_AUTH_PASSWORD). A real per-user credential/SSO replaces this."""
-    expected = os.environ.get("DP_AUTH_PASSWORD", "")
-    return bool(expected) and hmac.compare_digest(pw or "", expected)
+_SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32}  # ~16MB work factor — fine for interactive login
+
+
+def hash_password(pw: str) -> str:
+    """A salted scrypt hash, stored as 'scrypt$<salt_b64>$<hash_b64>' (stdlib only, no new dep)."""
+    salt = os.urandom(16)
+    dk = hashlib.scrypt(pw.encode(), salt=salt, **_SCRYPT)
+    return f"scrypt${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+
+
+def verify_password(pw: str, stored: str | None) -> bool:
+    """Constant-time check of a password against a stored scrypt hash. False if unset/malformed."""
+    if not stored or not stored.startswith("scrypt$"):
+        return False
+    try:
+        _, salt_b64, hash_b64 = stored.split("$")
+        salt, expected = base64.b64decode(salt_b64), base64.b64decode(hash_b64)
+        dk = hashlib.scrypt(pw.encode(), salt=salt, n=_SCRYPT["n"], r=_SCRYPT["r"], p=_SCRYPT["p"], dklen=len(expected))
+        return hmac.compare_digest(dk, expected)
+    except Exception:  # noqa: BLE001 — any parse/format error → not a valid credential
+        return False
+
+
+def bootstrap_password() -> str:
+    """Optional DP_AUTH_PASSWORD — seeds the default user's credential on first init so an existing
+    shared-password deployment keeps working after upgrade. Not a login path on its own."""
+    return os.environ.get("DP_AUTH_PASSWORD", "")

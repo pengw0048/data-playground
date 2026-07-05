@@ -28,6 +28,7 @@ function Rail({ onSettings }: { onSettings: () => void }) {
   const setView = useStore((s) => s.setView)
   const currentUser = useStore((s) => s.currentUser)
   const authEnabled = useStore((s) => s.authEnabled)
+  const [pwOpen, setPwOpen] = useState(false)
   const logout = async () => { await api.logout().catch(() => {}); location.reload() }
 
   const item = (v: DpView, icon: IconName, label: string) => (
@@ -61,13 +62,57 @@ function Rail({ onSettings }: { onSettings: () => void }) {
           <div style={{ fontSize: 10, color: color.text3 }}>signed in</div>
         </div>
         {authEnabled && (
-          <button onClick={logout} title="Log out" data-testid="logout"
-            style={{ border: `1px solid ${color.border}`, background: '#fff', color: color.text2, fontSize: 11.5, fontWeight: 600, padding: '5px 10px', borderRadius: 7, cursor: 'pointer' }}>
-            Log out
-          </button>
+          <>
+            <button onClick={() => setPwOpen(true)} title="Change password" data-testid="change-password"
+              style={{ border: `1px solid ${color.border}`, background: '#fff', color: color.text2, fontSize: 11.5, fontWeight: 600, padding: '5px 10px', borderRadius: 7, cursor: 'pointer' }}>
+              Password
+            </button>
+            <button onClick={logout} title="Log out" data-testid="logout"
+              style={{ border: `1px solid ${color.border}`, background: '#fff', color: color.text2, fontSize: 11.5, fontWeight: 600, padding: '5px 10px', borderRadius: 7, cursor: 'pointer' }}>
+              Log out
+            </button>
+          </>
         )}
       </div>
+      {pwOpen && <ChangePasswordModal onClose={() => setPwOpen(false)} />}
     </aside>
+  )
+}
+
+function ChangePasswordModal({ onClose }: { onClose: () => void }) {
+  const pushToast = useStore((s) => s.pushToast)
+  const [oldPw, setOldPw] = useState('')
+  const [newPw, setNewPw] = useState('')
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  const submit = async () => {
+    if (newPw.length < 6) { setErr('New password must be at least 6 characters'); return }
+    setBusy(true); setErr('')
+    try { await api.changePassword(oldPw, newPw); pushToast('Password changed', 'success'); onClose() }
+    catch (e) { setErr((e as Error).message || 'Could not change password') }
+    finally { setBusy(false) }
+  }
+  const field = { width: '100%', marginTop: 4, fontSize: 13, border: `1px solid ${color.border}`, borderRadius: 8, padding: '8px 10px', outline: 'none' } as const
+  return (
+    <div className="dp-modal-overlay" onMouseDown={onClose} style={{ position: 'fixed', inset: 0, zIndex: 2000, background: 'rgba(16,20,30,0.4)', display: 'grid', placeItems: 'center' }}>
+      <div onMouseDown={(e) => e.stopPropagation()} style={{ width: 320, background: '#fff', border: `1px solid ${color.border}`, borderRadius: radius.panel, boxShadow: shadow.panel, padding: 20 }}>
+        <div style={{ fontSize: 14, fontWeight: 700, color: color.ink, marginBottom: 12 }}>Change password</div>
+        <label style={{ fontSize: 11, color: color.text2 }}>Current password
+          <input type="password" value={oldPw} autoFocus onChange={(e) => setOldPw(e.target.value)} style={field} />
+        </label>
+        <label style={{ fontSize: 11, color: color.text2, display: 'block', marginTop: 10 }}>New password
+          <input type="password" value={newPw} onChange={(e) => setNewPw(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') submit() }} style={field} />
+        </label>
+        {err && <div style={{ fontSize: 12, color: color.failed, marginTop: 8 }}>{err}</div>}
+        <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+          <button onClick={submit} disabled={busy} style={{ flex: 1, border: 'none', borderRadius: 8, background: color.ink, color: '#fff', fontSize: 13, fontWeight: 600, padding: '9px 0', cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.6 : 1 }}>
+            {busy ? 'Saving…' : 'Change password'}
+          </button>
+          <button onClick={onClose} style={{ border: `1px solid ${color.border}`, borderRadius: 8, background: '#fff', color: color.text2, fontSize: 13, fontWeight: 600, padding: '9px 14px', cursor: 'pointer' }}>Cancel</button>
+        </div>
+      </div>
+    </div>
   )
 }
 

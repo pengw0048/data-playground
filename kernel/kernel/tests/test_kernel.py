@@ -591,6 +591,29 @@ def test_users_create_and_list():
     assert created["id"] in ids and "local" in ids and created["id"] not in before
 
 
+def test_per_user_password_is_not_a_skeleton_key(monkeypatch):
+    # with auth on, a password authenticates ONLY its own user — knowing the shared/bootstrap password
+    # no longer lets anyone sign in as someone else (the documented impersonation hole, now closed).
+    from kernel import metadb
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    monkeypatch.setenv("DP_AUTH_PASSWORD", "bootpw")
+    metadb.init_db()  # seeds the default user's credential from the bootstrap password
+    client.cookies.clear()
+    b = client.post("/api/users", json={"name": "Bella", "password": "pwBella"}).json()
+    assert client.post("/api/auth/login", json={"userId": b["id"], "password": "pwBella"}).status_code == 200
+    assert client.post("/api/auth/login", json={"userId": b["id"], "password": "bootpw"}).status_code == 401  # not a skeleton key
+    assert client.post("/api/auth/login", json={"userId": b["id"], "password": "wrong"}).status_code == 401
+    # self-service rotation: old must match; afterwards only the new password works
+    client.cookies.clear()
+    client.post("/api/auth/login", json={"userId": b["id"], "password": "pwBella"})
+    assert client.post("/api/auth/password", json={"oldPassword": "x", "newPassword": "pwNew12"}).status_code == 403
+    assert client.post("/api/auth/password", json={"oldPassword": "pwBella", "newPassword": "pwNew12"}).status_code == 200
+    client.cookies.clear()
+    assert client.post("/api/auth/login", json={"userId": b["id"], "password": "pwBella"}).status_code == 401
+    assert client.post("/api/auth/login", json={"userId": b["id"], "password": "pwNew12"}).status_code == 200
+    client.cookies.clear()
+
+
 def test_canvas_crud_is_per_user():
     doc = {"id": "cv1", "name": "My Canvas", "version": 3, "nodes": [], "edges": []}
     r = client.put("/api/canvas/cv1", json=doc).json()
@@ -1005,18 +1028,18 @@ def test_execution_backend_plugin_contract(tmp_path):
 
 def test_signed_session_auth(monkeypatch):
     # with auth enabled, identity must come from a valid signed session cookie — a raw header is not
-    # trusted, protected endpoints 401 without a session, and login requires the shared password.
+    # trusted, protected endpoints 401 without a session, and login requires the user's own password.
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
-    monkeypatch.setenv("DP_AUTH_PASSWORD", "hunter2")
     client.cookies.clear()
+    uid = client.post("/api/users", json={"name": "Sess", "password": "sesspw1"}).json()["id"]  # known credential
     try:
         assert client.get("/api/auth/status").json() == {"authEnabled": True, "userId": None}
-        assert client.get("/api/canvas").status_code == 401                                   # no session
-        assert client.get("/api/canvas", headers={"X-DP-User": "local"}).status_code == 401   # header not trusted
-        assert client.post("/api/auth/login", json={"password": "wrong"}).status_code == 401   # bad password
-        assert client.post("/api/auth/login", json={"userId": "local", "password": "hunter2"}).status_code == 200
-        assert client.get("/api/canvas").status_code == 200                                    # signed cookie carried
-        assert client.get("/api/auth/status").json()["userId"] == "local"
+        assert client.get("/api/canvas").status_code == 401                                 # no session
+        assert client.get("/api/canvas", headers={"X-DP-User": uid}).status_code == 401     # header not trusted
+        assert client.post("/api/auth/login", json={"userId": uid, "password": "wrong"}).status_code == 401
+        assert client.post("/api/auth/login", json={"userId": uid, "password": "sesspw1"}).status_code == 200
+        assert client.get("/api/canvas").status_code == 200                                 # signed cookie carried
+        assert client.get("/api/auth/status").json()["userId"] == uid
     finally:
         client.cookies.clear()
 

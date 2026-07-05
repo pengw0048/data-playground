@@ -40,6 +40,7 @@ class User(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
     name: Mapped[str] = mapped_column(String)
     email: Mapped[str | None] = mapped_column(String, nullable=True)
+    password_hash: Mapped[str | None] = mapped_column(String, nullable=True)  # per-user credential (auth mode)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -142,8 +143,15 @@ def init_db() -> None:
         command.stamp(cfg, "0001_baseline")  # legacy DB → adopt the baseline without recreating tables
     command.upgrade(cfg, "head")
     with session() as s:
-        if s.get(User, DEFAULT_USER_ID) is None:
-            s.add(User(id=DEFAULT_USER_ID, name="Local"))
+        u = s.get(User, DEFAULT_USER_ID)
+        if u is None:
+            u = User(id=DEFAULT_USER_ID, name="Local")
+            s.add(u)
+        # bootstrap: seed the default user's credential from DP_AUTH_PASSWORD (once) so an existing
+        # shared-password deployment keeps working after upgrading to per-user auth
+        from kernel import auth
+        if auth.auth_enabled() and not u.password_hash and auth.bootstrap_password():
+            u.password_hash = auth.hash_password(auth.bootstrap_password())
 
 
 @contextlib.contextmanager
@@ -169,6 +177,21 @@ def resolve_user(user_id: str | None) -> str:
         if s.get(User, DEFAULT_USER_ID) is None:
             s.add(User(id=DEFAULT_USER_ID, name="Local"))
         return DEFAULT_USER_ID
+
+
+def user_password_hash(user_id: str) -> str | None:
+    with session() as s:
+        u = s.get(User, user_id)
+        return u.password_hash if u else None
+
+
+def set_user_password(user_id: str, pw_hash: str | None) -> bool:
+    with session() as s:
+        u = s.get(User, user_id)
+        if u is None:
+            return False
+        u.password_hash = pw_hash
+        return True
 
 
 def get_setting(key: str, scope: str = "global", scope_id: str = "", default=None):

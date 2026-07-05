@@ -384,13 +384,29 @@ def auth_login(body: dict, response: Response) -> dict:
     from kernel import auth
     if not auth.auth_enabled():
         return {"ok": True, "userId": metadb.resolve_user(body.get("userId"))}
-    if not auth.check_password(body.get("password", "")):
-        raise HTTPException(401, "invalid password")
-    uid = metadb.resolve_user(body.get("userId"))
+    uid = body.get("userId") or ""
+    # PER-USER: the password must match THIS user's own credential — knowing the instance/bootstrap
+    # password no longer lets you sign in as someone else
+    if not uid or not auth.verify_password(body.get("password", ""), metadb.user_password_hash(uid)):
+        raise HTTPException(401, "invalid user or password")
     # Secure flag opt-in for HTTPS deployments (default off so internal http installs still work)
     response.set_cookie("dp_session", auth.sign(uid), httponly=True, samesite="lax",
                         secure=bool(os.environ.get("DP_AUTH_SECURE_COOKIE")))
     return {"ok": True, "userId": uid}
+
+
+@api.post("/auth/password")
+def change_password(body: dict, uid: str = Depends(current_user)) -> dict:
+    """Set/rotate the CURRENT user's password. If one is already set, the old password must match."""
+    from kernel import auth
+    current = metadb.user_password_hash(uid)
+    if current and not auth.verify_password(body.get("oldPassword", ""), current):
+        raise HTTPException(403, "current password is incorrect")
+    new = body.get("newPassword") or ""
+    if len(new) < 6:
+        raise HTTPException(400, "password must be at least 6 characters")
+    metadb.set_user_password(uid, auth.hash_password(new))
+    return {"ok": True}
 
 
 @api.post("/auth/logout")
@@ -403,6 +419,7 @@ class UserBody(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
     name: str
     email: str | None = None
+    password: str | None = None  # set the new user's credential (required for login when auth is on)
 
 
 class SettingBody(BaseModel):
@@ -420,8 +437,10 @@ def list_users() -> list[dict]:
 
 @api.post("/users")
 def create_user(body: UserBody) -> dict:
+    from kernel import auth
     with metadb.session() as s:
-        u = metadb.User(name=body.name, email=body.email)
+        u = metadb.User(name=body.name, email=body.email,
+                        password_hash=auth.hash_password(body.password) if body.password else None)
         s.add(u)
         s.flush()
         return {"id": u.id, "name": u.name, "email": u.email}

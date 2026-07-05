@@ -6,8 +6,7 @@ _综合自 6 个并行调查员的 64 条原始发现（frontend-features:10, ke
 
 - ✅ **Quick wins (7/7)** — atomic overwrite, subprocess run-history parity, resilient run polling, s3 storage boot, autosave 403-vs-offline, removed fake metric sparkline, grounded run estimate. (commit `7e15bb8`)
 - ✅ **High-value (7/7)** — faithful preview (join/sort/vector), interruptible/lock-freeing execution, CRDT-scoped undo, viewer-role WS enforcement + ShareModal, clipboard/select-all/multi-duplicate, join ON-expression, source CSV parse options. (commit `78c8807`)
-- ✅ **Bigger bets (3/4)** — Lance streaming scan (out-of-core), canvas version history + restore, Lance native ANN + external query vector. (+ fixed a latent non-unique canvas-id bug)
-- ⏳ **Bigger bet — real per-user identity (BB.2)**: NOT shipped. The current shared-password gate is a *documented, intentional* internal-tool simplification, and a real per-user credential/SSO model forces product decisions (per-user passwords vs OIDC; provisioning; reset flow) + is a security-sensitive, hard-to-reverse change. Needs an owner decision before implementation — see below.
+- ✅ **Bigger bets (4/4)** — Lance streaming scan (out-of-core), canvas version history + restore, Lance native ANN + external query vector (+ fixed a latent non-unique canvas-id bug), and **real per-user identity**: login now verifies each user's own scrypt-hashed password (`users.password_hash`), so the shared/bootstrap password is no longer a skeleton key. `DP_AUTH_PASSWORD` survives only to bootstrap the default user on first init; admins create users with passwords (POST /api/users) and anyone can rotate their own (POST /auth/password + a "Password" button in the shell). Owner chose per-user passwords over OIDC/SSO.
 
 ## 总览判断
 
