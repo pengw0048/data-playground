@@ -31,9 +31,7 @@ _OP_SECONDS_PER_1K = {
     "read": 0.01, "sample": 0.005, "filter": 0.008, "select": 0.006, "op": 0.02, "sql": 0.02,
     "join": 0.05, "reduce": 0.03, "write": 0.03, "opaque": 0.2, "error_gate": 0.001,
 }
-_COST_PER_SEC = 0.0008
-_DISTRIBUTED_ROWS = 20_000_000
-_CONFIRM_COST = 5.0
+_CONFIRM_ROWS = 5_000_000   # a full pass over this many rows is worth a heads-up before it runs
 _MAX_RUNS = 100          # cap retained run history / cache so a long-lived kernel doesn't grow forever
 
 
@@ -65,10 +63,9 @@ class LocalRunner:
     # -- estimate ---------------------------------------------------------- #
     def estimate(self, plan: CompilePlan, rows: int) -> RunEstimate:
         seconds = max(0.15, sum(_OP_SECONDS_PER_1K.get(s.kind, 0.02) * (rows / 1000.0) for s in plan.steps))
-        cost = round(seconds * _COST_PER_SEC * (1 + rows / 1_000_000), 4)
-        placement: Placement = "distributed" if rows >= _DISTRIBUTED_ROWS else "local"
-        needs_confirm = cost >= _CONFIRM_COST or placement == "distributed"
-        return RunEstimate(rows=rows, seconds=round(seconds, 2), cost_usd=cost, placement=placement,
+        placement: Placement = "local"  # the only backend today; a cluster runner (plugin) sets its own
+        needs_confirm = rows >= _CONFIRM_ROWS
+        return RunEstimate(rows=rows, seconds=round(seconds, 2), placement=placement,
                            needs_confirm=needs_confirm, breakdown=f"{rows:,} rows · {len(plan.steps)} steps · out-of-core")
 
     # -- plan hash (content addressing) ------------------------------------ #
@@ -172,7 +169,6 @@ class LocalRunner:
             db.lock().release()
             status.ms = int((time.time() - started) * 1000)
             status.total_rows = rows_seen
-            status.cost_usd = round(status.ms / 1000 * _COST_PER_SEC, 4)
             self._cancel.pop(run_id, None)  # done/failed/cancelled → drop the cancel Event
             if self.on_complete:  # persist the finished run (run history); never let it break the run
                 try:
@@ -190,8 +186,10 @@ class LocalRunner:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         name = cfg.get("name") or node.data.get("title") or "output"
         name = "".join(c if c.isalnum() or c in "_-" else "_" for c in name)
-        # content-addressed skip: identical plan (same configs + source fingerprint) already wrote this
-        if cached and cached.get("table") and cached.get("uri") and os.path.exists(cached["uri"]):
+        mode = cfg.get("writeMode", "overwrite")
+        # content-addressed skip: an identical overwrite plan already wrote this, so re-running is a
+        # no-op. append is NOT idempotent (it must add a part every run), so it never uses the cache.
+        if mode != "append" and cached and cached.get("table") and cached.get("uri") and os.path.exists(cached["uri"]):
             status.output_uri, status.output_table = cached["uri"], cached["table"]
             return int(cached.get("rows") or 0)
         fmt = (cfg.get("format") or "parquet").lower()
@@ -217,12 +215,13 @@ class LocalRunner:
         # persist that port's data, not the default/first one. Mirrors LoweringEngine._inputs.
         parent_rel = engine.relation(inc[0].source, inc[0].source_handle)
         adapter = self.resolve_adapter(uri)
-        res = adapter.write(uri, parent_rel, cfg.get("writeMode", "overwrite"))
+        res = adapter.write(uri, parent_rel, mode)
         rows = int(res.get("rows") or 0)
+        out_uri = res.get("uri", uri)  # append writes into a directory of parts — register THAT
 
         parent_uris = [u for e in inc for u in [self._source_uri(nm_node=e.source, graph=graph)] if u]
-        self.catalog.register_output(name=name, uri=uri, version="v1", parents=parent_uris, pipeline="canvas")
-        status.output_uri = uri
+        self.catalog.register_output(name=name, uri=out_uri, version="v1", parents=parent_uris, pipeline="canvas")
+        status.output_uri = out_uri
         status.output_table = name
         return rows
 

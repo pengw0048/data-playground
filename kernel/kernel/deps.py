@@ -110,6 +110,14 @@ class Deps:
         return self.default_adapter
 
     def pick_runner(self, plan):
+        # honor the chosen backend (Settings → Execution) when it's registered and can run this plan;
+        # otherwise the first runner that can, else the default. Real once plugins add more runners.
+        from kernel import metadb
+        chosen = metadb.get_setting("backend", "global", default="") or ""
+        if chosen:
+            for r in self.runners:
+                if getattr(r, "name", None) == chosen and r.can_run(plan):
+                    return r
         for r in self.runners:
             if r.can_run(plan):
                 return r

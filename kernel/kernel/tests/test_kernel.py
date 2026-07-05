@@ -308,15 +308,23 @@ def test_sandbox_blocks_dunder_escape():
     assert "__" in (r.get("reason") or "") or "allowed" in (r.get("reason") or "")
 
 
-def test_write_mode_append_rejected_not_silent_overwrite():
-    # append/merge must error rather than silently overwrite (finding #7)
-    g = {"id": "c", "version": 1, "nodes": [
-        N("src", "source", {"uri": _uri("images")}),
-        N("wr", "write", {"name": "append_test", "writeMode": "append"}),
-    ], "edges": [E("src", "wr")]}
-    r = client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()
-    st = _poll(r["runId"])
-    assert st["status"] == "failed" and "append" in (st.get("error") or "").lower()
+def test_write_mode_append_builds_a_readable_directory_dataset():
+    # append is REAL: it writes a directory of part files that reads back as the accumulated rows
+    def append_run():
+        g = {"id": "c", "version": 1, "nodes": [
+            N("src", "source", {"uri": _uri("images")}),
+            N("wr", "write", {"name": "append_ds", "writeMode": "append", "format": "parquet"}),
+        ], "edges": [E("src", "wr")]}
+        return _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
+
+    st1 = append_run()
+    assert st1["status"] == "done", st1.get("error")
+    n, out = st1["totalRows"], st1["outputUri"]
+    assert n and out and not out.endswith(".parquet")  # a directory, not a single file
+    append_run()  # a second part
+    pv = client.post("/api/run/preview", json={"graph": {"id": "c", "version": 1,
+        "nodes": [N("s", "source", {"uri": out})], "edges": []}, "nodeId": "s", "k": 100000}).json()
+    assert pv["rowCount"] >= 2 * n and pv["rowCount"] % n == 0  # each append added a full part, read back together
 
 
 def test_metric_over_transform_upstream_not_previewable():

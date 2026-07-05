@@ -844,7 +844,7 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       g.updateData(nodeId, {
         status: status.status === 'done' ? 'latest' : status.status === 'failed' ? 'failed' : 'stale',
         lastRun: status.status === 'done'
-          ? { rows: status.totalRows ?? status.rowsProcessed, ms: status.ms, cost: status.costUsd, placement: status.placement }
+          ? { rows: status.totalRows ?? status.rowsProcessed, ms: status.ms, placement: status.placement }
           : undefined,
       })
       if (status.status === 'done') {
@@ -855,7 +855,6 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
             id: `v_${Math.floor(performance.now())}`,
             ts: Date.now(),
             rows: status.totalRows ?? undefined,
-            cost: status.costUsd,
             label: `run · ${status.totalRows ?? status.rowsProcessed} rows`,
             config: { ...node.data.config },
           }

@@ -50,7 +50,7 @@ function EmptyState() {
       <div style={{ textAlign: 'center', pointerEvents: 'auto' }}>
         <div style={{ fontSize: 15, fontWeight: 600, color: color.ink }}>Empty canvas</div>
         <div style={{ fontSize: 12.5, color: color.text3, marginTop: 6, maxWidth: 320, lineHeight: 1.5 }}>
-          Add a dataset source to begin — then wire operators, preview on a sample, and run at scale.
+          Add a dataset source to begin.
         </div>
         <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginTop: 14 }}>
           <button onClick={add} style={{ padding: '8px 16px', border: 'none', borderRadius: 9, background: color.ink, color: '#fff', fontSize: 12.5, fontWeight: 600 }}>+ Add a source</button>

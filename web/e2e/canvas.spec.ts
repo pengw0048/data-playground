@@ -207,17 +207,17 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('Saved', { exact: true })).toBeVisible()
   })
 
-  test('settings manages datasets and connected repos', async ({ page }) => {
+  test('settings manages datasets and destinations', async ({ page }) => {
     await page.goto('/')
     await page.getByLabel('Settings').click()
     // "Datasets" appears in both the left nav and the section title — scope to the register input
     await expect(page.getByPlaceholder(/Parquet\/CSV\/JSON/)).toBeVisible()
-    await expect(page.getByText('Connected repositories')).toBeVisible()
     await expect(page.getByText('images', { exact: true })).toBeVisible() // seeded dataset is listed
-    await page.getByPlaceholder('name').fill('acme-tools')
-    await page.getByPlaceholder('https://github.com/org/repo').fill('https://github.com/acme/tools')
-    await page.getByPlaceholder('https://github.com/org/repo').press('Enter')
-    await expect(page.getByText('acme-tools', { exact: true })).toBeVisible() // repo added to the list
+    // add an output destination (a local dir) — a real, consumed setting
+    await page.getByPlaceholder('e.g. S3 exports').fill('scratch')
+    await page.getByPlaceholder('/path/to/dir').fill('/tmp/dp-scratch')
+    await page.getByPlaceholder('/path/to/dir').press('Enter')
+    await expect(page.getByText('scratch', { exact: true })).toBeVisible() // destination added to the list
   })
 
   test('a section node opens its editor and adds a contained node', async ({ page }) => {

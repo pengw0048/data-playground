@@ -11,7 +11,7 @@ function Write({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
   const [dialog, setDialog] = useState(false)
   const name = String(data.config.name ?? '')
-  const mode = (data.config.writeMode as 'append' | 'merge' | 'overwrite') ?? 'overwrite'
+  const mode = (data.config.writeMode as 'append' | 'overwrite') ?? 'overwrite'
   const destName = data.config.destName as string | undefined
   const destPath = String(data.config.destPath ?? '')
   const where = destName ? `${destName}${destPath ? `/${destPath}` : ''}` : 'Workspace outputs'
@@ -23,7 +23,7 @@ function Write({ id, data }: NodeComponentProps) {
             <MiniInput value={name} placeholder="output_table" onChange={(v) => updateConfig(id, { name: v })} />
           </Field>
           <Field label="mode" style={{ flex: 1 }}>
-            <MiniSelect value={mode} onChange={(v) => updateConfig(id, { writeMode: v })} options={[{ value: 'overwrite', label: 'overwrite' }, { value: 'append', label: 'append' }, { value: 'merge', label: 'merge' }]} />
+            <MiniSelect value={mode} onChange={(v) => updateConfig(id, { writeMode: v })} options={[{ value: 'overwrite', label: 'overwrite' }, { value: 'append', label: 'append' }]} />
           </Field>
         </div>
         {/* where the output goes — a chosen destination place, or the default workspace outputs */}

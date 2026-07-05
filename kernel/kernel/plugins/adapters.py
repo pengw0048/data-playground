@@ -13,6 +13,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import os
+import uuid
 from urllib.parse import urlparse
 
 import duckdb
@@ -133,12 +134,22 @@ class DuckDBAdapter:
         return _fingerprint_path(path_of(uri))
 
     def write(self, uri: str, rel: Relation, mode: str = "overwrite") -> dict:
-        if mode not in ("overwrite", None):
-            # append/merge aren't implemented for files yet — refuse rather than silently overwrite
-            raise NotImplementedError(f"write mode '{mode}' is not supported for {os.path.splitext(uri)[1] or 'this'} output yet — use overwrite")
         p = path_of(uri)
-        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
         low = p.lower()
+        rows = int(rel.aggregate("count(*)").fetchone()[0])
+        if mode == "append":
+            # append = a DIRECTORY dataset of part files (out-of-core; the dir reader reads them all
+            # back). Only for row formats — parquet/csv; feather/arrow have no directory-scan reader.
+            if not low.endswith((".parquet", ".pq", ".csv", ".tsv")):
+                raise NotImplementedError(f"append is only supported for parquet/csv outputs, not {os.path.splitext(p)[1] or 'this'}")
+            d, ext = os.path.splitext(p)  # /out/name.parquet -> dir "/out/name", ext ".parquet"
+            os.makedirs(d, exist_ok=True)
+            part = os.path.join(d, f"part-{uuid.uuid4().hex[:12]}{ext}")
+            (rel.write_csv if ext.lower() in (".csv", ".tsv") else rel.write_parquet)(part)
+            return {"uri": d, "rows": rows}
+        if mode not in ("overwrite", None):
+            raise NotImplementedError(f"write mode '{mode}' is not supported — use overwrite or append")
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
         if low.endswith((".csv", ".tsv")):
             rel.write_csv(p)
         elif low.endswith((".arrow", ".feather", ".ipc")):
@@ -146,7 +157,7 @@ class DuckDBAdapter:
             feather.write_feather(rel.to_arrow_table(), p)
         else:
             rel.write_parquet(p)
-        return {"uri": uri, "rows": rel.aggregate("count(*)").fetchone()[0]}
+        return {"uri": uri, "rows": rows}
 
 
 class LanceAdapter:
@@ -192,9 +203,11 @@ class LanceAdapter:
 
     def write(self, uri: str, rel: Relation, mode: str = "overwrite") -> dict:
         import lance
-        tbl = rel.to_arrow_table()
-        lance.write_dataset(tbl, path_of(uri), mode="overwrite" if mode == "overwrite" else "append")
-        return {"uri": uri, "rows": tbl.num_rows}
+        rows = int(rel.aggregate("count(*)").fetchone()[0])
+        # stream RecordBatches into Lance (bounded memory) instead of materializing the whole table
+        reader = rel.record_batch(1 << 16)
+        lance.write_dataset(reader, path_of(uri), mode="overwrite" if mode == "overwrite" else "append")
+        return {"uri": uri, "rows": rows}
 
 
 def default_adapters() -> list:

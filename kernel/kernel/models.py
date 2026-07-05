@@ -126,7 +126,6 @@ class PipelineImport(Wire):
 class RunEstimate(Wire):
     rows: int
     seconds: float
-    cost_usd: float
     placement: Placement
     needs_confirm: bool
     breakdown: str | None = None
@@ -145,7 +144,6 @@ class RunStatus(Wire):
     status: Literal["queued", "running", "done", "failed", "cancelled"]
     rows_processed: int = 0
     total_rows: int | None = None
-    cost_usd: float = 0.0
     ms: int = 0
     placement: Placement = "local"
     per_node: list[PerNodeStatus] = []

@@ -31,7 +31,7 @@ export function HistoryPanel({ nodeId }: { nodeId: string }) {
               {v.label}{i === 0 && <span style={{ marginLeft: 6, fontSize: 10, color: color.running }}>· latest</span>}
             </div>
             <div style={{ fontSize: 10.5, color: color.text3 }}>
-              {timeAgo(v.ts)}{v.cost != null ? ` · $${v.cost.toFixed(2)}` : ''}{v.rows != null ? ` · ${v.rows.toLocaleString()} rows` : ''}
+              {timeAgo(v.ts)}{v.rows != null ? ` · ${v.rows.toLocaleString()} rows` : ''}
             </div>
           </div>
           <button

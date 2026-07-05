@@ -47,7 +47,7 @@ export interface NodeConfig {
   column?: string
   // write
   name?: string
-  writeMode?: 'append' | 'merge' | 'overwrite'
+  writeMode?: 'append' | 'overwrite'
   // loop
   maxIters?: number
   budgetUsd?: number
@@ -58,7 +58,6 @@ export interface NodeConfig {
 export interface LastRun {
   rows: number
   ms: number
-  cost: number
   placement: 'local' | 'distributed'
 }
 
@@ -66,7 +65,6 @@ export interface NodeVersion {
   id: string
   ts: number
   rows?: number
-  cost?: number
   label: string
   config: NodeConfig
 }

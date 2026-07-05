@@ -365,13 +365,14 @@ class LoweringEngine:
         cfg = _cfg(node)
         col = cfg.get("column", "embedding")
         k = int(cfg.get("k", 10))
+        qrow = max(0, int(cfg.get("queryRow", 0)))
         if not inputs:
             raise NotPreviewable(node, "vector-search needs a dataset input")
         base = self._view(inputs[0], "vs")
-        # brute-force cosine similarity to the first row's vector (query), out-of-core in DuckDB
+        # brute-force cosine similarity to a chosen row's vector (the query), out-of-core in DuckDB
         con = db.conn()
         try:
-            q = con.sql(f'SELECT "{col}" AS q FROM {base} LIMIT 1').fetchone()
+            q = con.sql(f'SELECT "{col}" AS q FROM {base} OFFSET {qrow} LIMIT 1').fetchone()
         except Exception as e:  # noqa: BLE001
             raise NotPreviewable(node, f"no vector column '{col}': {e}") from e
         if not q or q[0] is None:

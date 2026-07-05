@@ -14,7 +14,6 @@ const CATS: { id: string; label: string; icon: IconName }[] = [
   { id: 'execution', label: 'Execution', icon: 'play' },
   { id: 'datasets', label: 'Datasets', icon: 'db' },
   { id: 'destinations', label: 'Destinations', icon: 'export' },
-  { id: 'repos', label: 'Repositories', icon: 'link' },
 ]
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
@@ -26,7 +25,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [savedMsg, setSavedMsg] = useState('')
   const [dsUri, setDsUri] = useState('')
   const [dsErr, setDsErr] = useState('')
-  const [repo, setRepo] = useState({ name: '', url: '' })
   const [dest, setDest] = useState({ name: '', backend: 'local', root: '' })
   const [active, setActive] = useState('agent')
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -42,13 +40,11 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
   const val = (k: string) => (g[k] == null ? '' : String(g[k]))
   const set = (k: string, v: string) => setG((prev) => ({ ...prev, [k]: v }))
-  const repos = (Array.isArray(g.connectedRepos) ? g.connectedRepos : []) as { name: string; url: string }[]
   const dests = (Array.isArray(g.destinations) ? g.destinations : []) as { id: string; name: string; backend: string; root: string }[]
   const save = async () => {
     for (const k of ['agentModel', 'agentApiKey', 'agentBaseUrl', 'backend']) {
       await api.putSetting('global', k, g[k] ?? '').catch(() => {})
     }
-    await api.putSetting('global', 'connectedRepos', repos).catch(() => {})
     await api.putSetting('global', 'destinations', dests).catch(() => {})
     setSavedMsg('Saved'); setTimeout(() => setSavedMsg(''), 1400)
   }
@@ -64,11 +60,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     setDsErr('')
     try { await api.registerFile(uri); await refreshCatalog(); setDsUri('') }
     catch (e) { setDsErr((e as Error).message) }
-  }
-  const addRepo = () => {
-    const url = repo.url.trim(); if (!url) return
-    setG((prev) => ({ ...prev, connectedRepos: [...repos, { name: repo.name.trim() || url, url }] }))
-    setRepo({ name: '', url: '' })
   }
   const go = (id: string) => { setActive(id); document.getElementById(`set-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
   const runners = kernelInfo?.runners ?? ['local-out-of-core']
@@ -103,14 +94,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             {loading ? <div style={{ fontSize: 12.5, color: color.text3 }}>loading…</div> : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 26 }}>
                 <Section id="agent" title="Agent (LLM)">
-                  <p style={{ margin: '0 0 10px', fontSize: 11.5, color: color.text3, lineHeight: 1.5 }}>
-                    Provider-agnostic. Pick a model and set the matching provider key — the key lives in the kernel,
-                    never the browser. Leave the key blank to use an env var instead.
-                  </p>
                   <Field label="Model"><Input value={val('agentModel')} placeholder="anthropic/claude-opus-4-8" onChange={(v) => set('agentModel', v)} /></Field>
-                  <div style={{ fontSize: 10.5, color: color.text3, margin: '-4px 0 8px' }}>e.g. anthropic/claude-opus-4-8 · anthropic/claude-sonnet-5 · openai/gpt-5 · google/gemini-2.5-pro · ollama/llama3.3</div>
-                  <Field label="API key"><Input type="password" value={val('agentApiKey')} placeholder="sk-… (or leave blank for env)" onChange={(v) => set('agentApiKey', v)} /></Field>
-                  <Field label="Base URL (local / self-hosted)"><Input value={val('agentBaseUrl')} placeholder="http://localhost:11434 (ollama, optional)" onChange={(v) => set('agentBaseUrl', v)} /></Field>
+                  <div style={{ fontSize: 10.5, color: color.text3, margin: '-4px 0 8px' }}>e.g. anthropic/claude-opus-4-8 · openai/gpt-5 · google/gemini-2.5-pro · ollama/llama3.3</div>
+                  <Field label="API key"><Input type="password" value={val('agentApiKey')} placeholder="sk-… (or blank to use an env var)" onChange={(v) => set('agentApiKey', v)} /></Field>
+                  <Field label="Base URL"><Input value={val('agentBaseUrl')} placeholder="http://localhost:11434 (optional)" onChange={(v) => set('agentBaseUrl', v)} /></Field>
                 </Section>
 
                 <Section id="execution" title="Execution backend">
@@ -120,7 +107,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                       {runners.map((r) => <option key={r} value={r}>{r}</option>)}
                     </select>
                   </Field>
-                  <div style={{ fontSize: 10.5, color: color.text3, marginTop: 4 }}>The default local out-of-core engine (DuckDB/Arrow/Polars). Cluster runners install as plugins.</div>
                 </Section>
 
                 <Section id="datasets" title="Datasets">
@@ -175,31 +161,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                       placeholder={dest.backend === 'local' ? '/path/to/dir' : `${dest.backend}://bucket/prefix`}
                       style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 7, padding: '7px 9px', outline: 'none' }} />
                     <button onClick={addDest} style={{ border: 'none', borderRadius: 7, background: color.ink, color: '#fff', fontSize: 12, fontWeight: 600, padding: '0 12px' }}>Add</button>
-                  </div>
-                </Section>
-
-                <Section id="repos" title="Connected repositories">
-                  <p style={{ margin: '0 0 8px', fontSize: 11.5, color: color.text3, lineHeight: 1.5 }}>
-                    Code repositories the workspace can pull processors/nodes from (managed here; integration is a plugin).
-                  </p>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 8 }}>
-                    {repos.map((r, i) => (
-                      <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: color.ink }}>
-                        <Icon name="link" size={12} style={{ color: color.text3 }} />
-                        <span style={{ fontWeight: 600 }}>{r.name}</span>
-                        <span style={{ flex: 1, color: color.text3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11 }}>{r.url}</span>
-                        <button onClick={() => setG((prev) => ({ ...prev, connectedRepos: repos.filter((_, j) => j !== i) }))}
-                          style={{ border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer', display: 'grid', placeItems: 'center' }}><Icon name="close" size={12} /></button>
-                      </div>
-                    ))}
-                    {repos.length === 0 && <div style={{ fontSize: 11.5, color: color.text3 }}>None connected.</div>}
-                  </div>
-                  <div style={{ display: 'flex', gap: 6 }}>
-                    <input value={repo.name} onChange={(e) => setRepo({ ...repo, name: e.target.value })} placeholder="name"
-                      style={{ width: 110, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 7, padding: '7px 9px', outline: 'none' }} />
-                    <input value={repo.url} onChange={(e) => setRepo({ ...repo, url: e.target.value })} onKeyDown={(e) => { if (e.key === 'Enter') addRepo() }} placeholder="https://github.com/org/repo"
-                      style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 7, padding: '7px 9px', outline: 'none' }} />
-                    <button onClick={addRepo} style={{ border: 'none', borderRadius: 7, background: color.ink, color: '#fff', fontSize: 12, fontWeight: 600, padding: '0 12px' }}>Add</button>
                   </div>
                 </Section>
               </div>

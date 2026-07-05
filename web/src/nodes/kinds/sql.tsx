@@ -10,7 +10,7 @@ function Sql({ id, data }: NodeComponentProps) {
   const openFullscreen = useStore((s) => s.openCodeFullscreen)
   const sql = String(data.config.sql ?? DEFAULT_SQL)
   return (
-    <NodeCard id={id} data={data} metaOverride="SQL → view · DuckDB on the sample">
+    <NodeCard id={id} data={data} metaOverride="SQL → view">
       <button
         onClick={(e) => { e.stopPropagation(); openFullscreen(id, 'sql', 'sql') }}
         style={{

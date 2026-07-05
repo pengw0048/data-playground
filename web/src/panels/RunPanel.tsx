@@ -1,7 +1,6 @@
 import { useEffect } from 'react'
 import { useStore } from '../store/graph'
 import { color, radius, status as statusTok } from '../theme/tokens'
-import { Chip } from '../ui/controls'
 import { Icon } from '../ui/Icon'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
@@ -29,25 +28,18 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
         <>
           <Label>{phase === 'confirm' ? 'HEADS UP' : 'ESTIMATE'}</Label>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 2 }}>
-            <span style={{ fontSize: 27, fontWeight: 700, color: color.ink }}>~{fmtCost(est.costUsd)}</span>
+            <span style={{ fontSize: 24, fontWeight: 700, color: color.ink }}>{est.rows.toLocaleString()} rows</span>
             <span style={{ fontSize: 13, color: color.text2 }}>· ~{fmtTime(est.seconds)}</span>
           </div>
-          <div style={{ marginTop: 8 }}>
-            {phase === 'confirm'
-              ? <Chip tone="amber">{est.placement === 'distributed' ? 'on the cluster' : 'expensive'}</Chip>
-              : <Chip tone="blue">{est.placement === 'distributed' ? 'runs on cluster · auto' : 'runs in your pod · auto'}</Chip>}
-          </div>
-          <div style={{ fontSize: 11, color: color.text3, marginTop: 8 }}>{est.breakdown} · placement automatic</div>
-
+          {est.breakdown && <div style={{ fontSize: 11, color: color.text3, marginTop: 8 }}>{est.breakdown}</div>}
           {phase === 'confirm' ? (
             <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
-              <button onClick={() => doRun(nodeId, true)} style={btn('#d99a2b', '#fff', 1)}>Run anyway</button>
+              <button onClick={() => doRun(nodeId, true)} style={btn('#d99a2b', '#fff', 1)}>Run</button>
               <button onClick={() => useStore.getState().closePanel(nodeId)} style={btn('#fff', color.text2, 1, true)}>Cancel</button>
             </div>
           ) : (
             <button onClick={() => doRun(nodeId, false)} style={{ ...btn(color.ink, '#fff', 1), marginTop: 14 }}>Run</button>
           )}
-          <div style={{ fontSize: 10.5, color: color.text3, marginTop: 9 }}>you never pick GPUs / cluster / priority</div>
         </>
       )}
 
@@ -56,12 +48,10 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
             <span className="dp-running-glyph" style={{ color: color.running }}>●</span>
             <span style={{ fontSize: 13, fontWeight: 600 }}>running</span>
-            <span style={{ flex: 1 }} />
-            <Chip tone="blue">{st.placement === 'distributed' ? 'cluster · auto' : 'pod · auto'}</Chip>
           </div>
           <ProgressBar value={st.totalRows ? st.rowsProcessed / Math.max(1, st.totalRows) : 0.3} />
           <div style={{ fontSize: 11.5, color: color.text2, margin: '8px 0' }}>
-            {st.rowsProcessed.toLocaleString()}{st.totalRows ? ` / ${st.totalRows.toLocaleString()}` : ''} rows · {fmtCost(st.costUsd)} so far
+            {st.rowsProcessed.toLocaleString()}{st.totalRows ? ` / ${st.totalRows.toLocaleString()}` : ''} rows
           </div>
           <PerNode st={st} />
           <button onClick={() => cancel(nodeId)} style={{ ...btn('#fff', color.ink, 1, true), marginTop: 12 }}>
@@ -73,22 +63,17 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
       {phase === 'done' && st && (
         <>
           <Label>DONE</Label>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 2 }}>
             <span style={{ color: color.latest, fontSize: 16 }}>✓</span>
-            <span style={{ fontSize: 24, fontWeight: 700, color: color.latest }}>{fmtCost(st.costUsd)}</span>
+            <span style={{ fontSize: 22, fontWeight: 700, color: color.ink }}>{(st.totalRows ?? st.rowsProcessed).toLocaleString()} rows</span>
             <span style={{ fontSize: 13, color: color.text2 }}>· {fmtTime(st.ms / 1000)}</span>
           </div>
-          <div style={{ fontSize: 12, color: color.ink, marginTop: 10 }}>
-            {st.outputTable ? <>wrote <b>{st.outputTable}</b> · {(st.totalRows ?? st.rowsProcessed).toLocaleString()} rows</> : <>{(st.totalRows ?? st.rowsProcessed).toLocaleString()} rows processed</>}
-          </div>
+          {st.outputTable && <div style={{ fontSize: 12, color: color.ink, marginTop: 10 }}>wrote <b>{st.outputTable}</b></div>}
           {st.outputUri && (
             <div title={st.outputUri} className="dp-mono" style={{ fontSize: 10.5, color: color.text2, marginTop: 6, background: '#f7f8fa', border: `1px solid ${color.hairline}`, borderRadius: 6, padding: '5px 8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               → {st.outputUri}
             </div>
           )}
-          <div style={{ fontSize: 10.5, color: color.text3, marginTop: 6 }}>
-            {st.placement === 'distributed' ? 'ran on the cluster' : 'ran in your pod'} · registered in the catalog
-          </div>
           <PerNode st={st} compact />
         </>
       )}
@@ -147,12 +132,6 @@ function btn(bg: string, fg: string, flex = 0, outline = false): React.CSSProper
     padding: '9px 14px', border: outline ? `1px solid ${color.border}` : 'none', borderRadius: radius.button,
     background: bg, color: fg, fontSize: 12.5, fontWeight: 600, width: flex ? undefined : '100%',
   }
-}
-
-function fmtCost(usd: number): string {
-  if (usd <= 0) return '$0.00'
-  if (usd < 0.01) return '<$0.01'
-  return `$${usd.toFixed(2)}`
 }
 
 function fmtTime(seconds: number): string {

@@ -58,7 +58,6 @@ export type Placement = 'local' | 'distributed'
 export interface RunEstimate {
   rows: number
   seconds: number
-  costUsd: number
   placement: Placement
   needsConfirm: boolean
   breakdown?: string | null
@@ -79,7 +78,6 @@ export interface RunStatus {
   status: RunState
   rowsProcessed: number
   totalRows?: number | null
-  costUsd: number
   ms: number
   placement: Placement
   perNode: PerNodeStatus[]

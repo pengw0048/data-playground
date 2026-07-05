@@ -119,8 +119,10 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              blurb="reduce to a scalar"),
     NodeSpec(kind="vector-search", title="vector-search", category="query", tag="vector",
              inputs=[_in(("dataset",))], outputs=[_out()],
-             params=[ParamSpec(name="column", type="string", default="embedding"), ParamSpec(name="k", type="int", default=10)],
-             blurb="top-K nearest by cosine similarity (Lance ANN / brute-force)"),
+             params=[ParamSpec(name="column", type="string", default="embedding"),
+                     ParamSpec(name="queryRow", type="int", default=0, label="query = row #"),
+                     ParamSpec(name="k", type="int", default=10)],
+             blurb="top-K nearest by cosine similarity to a chosen row (brute-force)"),
     # Meta-programming primitive (see docs/meta-programming.zh.md): a composite node whose
     # implementation is a driver script (Python) over contained nodes, with real control flow
     # (for/while/if), bounded. Not sample-previewable. The nested-frame UI to manage its contained

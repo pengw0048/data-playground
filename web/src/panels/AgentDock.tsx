@@ -73,7 +73,7 @@ export function AgentDock() {
           {llm && !ready ? (
             <div style={{ fontSize: 11.5, color: color.text2, lineHeight: 1.6 }}>
               <b>Agent unavailable</b> — {llm.reason ?? 'no model configured'}.<br />
-              Set a model in <b>Settings → Agent</b> (a provider key stays in the kernel, never the browser), then reopen this.
+              Set a model in <b>Settings → Agent</b>.
               <div style={{ marginTop: 10 }}>
                 <button data-testid="agent-configure" onClick={() => window.dispatchEvent(new CustomEvent('dp-open-settings'))}
                   style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '6px 12px', border: 'none', borderRadius: 8, background: '#6b4bd6', color: '#fff', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
@@ -83,7 +83,7 @@ export function AgentDock() {
             </div>
           ) : log.length === 0 && (
             <div style={{ fontSize: 11.5, color: color.text3, lineHeight: 1.6 }}>
-              Describe an outcome — e.g. <i>“sample images, filter where is_valid, write a table”</i>. Build creates real, inspectable nodes.
+              Describe an outcome — e.g. <i>“sample images, filter where is_valid, write a table”</i>.
             </div>
           )}
           {log.map((m, i) => (
