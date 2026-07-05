@@ -241,6 +241,19 @@ def browse_destination(req: BrowseRequest) -> dict:
     return destinations.browse(get_deps().workspace, req.destination_id, req.path)
 
 
+class MkdirRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    destination_id: str
+    path: str = ""
+    name: str
+
+
+@api.post("/destinations/mkdir")
+def mkdir_destination(req: MkdirRequest) -> dict:
+    from kernel import destinations
+    return destinations.mkdir(get_deps().workspace, req.destination_id, req.path, req.name)
+
+
 # --------------------------------------------------------------------------- #
 # Agent (optional LLM planner — key stays in the kernel, never the browser)
 # --------------------------------------------------------------------------- #

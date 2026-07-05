@@ -132,7 +132,10 @@ class DuckDBAdapter:
         return con.read_parquet(p)
 
     def _read_dir(self, con: duckdb.DuckDBPyConnection, d: str) -> Relation:
-        for ext, reader in ((".parquet", con.read_parquet), (".csv", con.read_csv), (".json", con.read_json)):
+        # cover every extension the append writer can emit (a dir of part-*.<ext>): parquet/pq, csv/tsv, json
+        readers = ((".parquet", con.read_parquet), (".pq", con.read_parquet), (".csv", con.read_csv),
+                   (".tsv", con.read_csv), (".json", con.read_json))
+        for ext, reader in readers:
             if glob.glob(os.path.join(d, f"**/*{ext}"), recursive=True):
                 return reader(os.path.join(d, f"**/*{ext}"))
         raise ValueError(f"no parquet/csv/json files under {d}")
@@ -180,6 +183,9 @@ class DuckDBAdapter:
             os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
         if low.endswith((".csv", ".tsv")):
             rel.write_csv(target)
+        elif low.endswith((".json", ".ndjson")):
+            # DuckDB writes JSON out-of-core via COPY; ARRAY true emits a top-level [] read_json reads back
+            rel.query("_w", f"COPY _w TO '{target.replace(chr(39), chr(39) * 2)}' (FORMAT JSON, ARRAY true)")
         elif low.endswith((".arrow", ".feather", ".ipc")):
             import pyarrow.feather as feather
             feather.write_feather(rel.to_arrow_table(), target)

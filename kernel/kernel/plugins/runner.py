@@ -184,24 +184,29 @@ class LocalRunner:
     def _commit_write(self, node, graph: Graph, engine: LoweringEngine, status: RunStatus,
                       cached: dict | None) -> int:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-        name = cfg.get("name") or node.data.get("title") or "output"
-        name = "".join(c if c.isalnum() or c in "_-" else "_" for c in name)
         mode = cfg.get("writeMode", "overwrite")
         # content-addressed skip: an identical overwrite plan already wrote this, so re-running is a
         # no-op. append is NOT idempotent (it must add a part every run), so it never uses the cache.
         if mode != "append" and cached and cached.get("table") and cached.get("uri") and os.path.exists(cached["uri"]):
             status.output_uri, status.output_table = cached["uri"], cached["table"]
             return int(cached.get("rows") or 0)
-        fmt = (cfg.get("format") or "parquet").lower()
-        ext = {"parquet": ".parquet", "csv": ".csv", "lance": ".lance"}.get(fmt, ".parquet")
+        # the output file name (the extension picks the format); `name` (its base) is the catalog table.
+        raw = cfg.get("filename") or cfg.get("name") or node.data.get("title") or "output"
+        fname = "".join(c if c.isalnum() or c in "_-." else "_" for c in str(raw)).strip(".") or "output"
+        base, ext = os.path.splitext(fname)
+        _KNOWN = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", ".json", ".lance")
+        if ext.lower() not in _KNOWN:  # no/unknown extension → apply the format (default parquet)
+            ext = {"parquet": ".parquet", "csv": ".csv", "lance": ".lance"}.get((cfg.get("format") or "parquet").lower(), ".parquet")
+            base, fname = fname, f"{fname}{ext}"
+        name = base
         # a write node may target a chosen destination (a preset place — local dir / object-store
         # prefix); otherwise fall back to the default local outputs storage.
         dest_id = cfg.get("destId")
         if dest_id:
             from kernel import destinations
-            uri = destinations.target_uri(self.workspace, dest_id, cfg.get("destPath", ""), f"{name}{ext}")
+            uri = destinations.target_uri(self.workspace, dest_id, cfg.get("destPath", ""), fname)
         else:
-            uri = self.storage.output_uri(name, ext)
+            uri = self.storage.output_uri(base, ext)
 
         inc = g.incoming(graph, node.id)
         if not inc:

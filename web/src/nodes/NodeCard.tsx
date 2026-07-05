@@ -32,7 +32,15 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const rename = useStore((s) => s.rename)
   const runState = useStore((s) => s.runs[id]?.phase)
   const runnable = useStore((s) => nodeRunnable(s.doc, id))
+  // hover drives the action shelf. The shelf is a DOM descendant of this wrapper (just positioned
+  // below it), so the wrapper's own enter/leave already covers card↔shelf travel — moving between
+  // them never leaves the subtree, so onMouseLeave doesn't fire. A short grace delay on leave then
+  // debounces the final exit so a quick brush-past doesn't flicker the shelf.
   const [hover, setHover] = useState(false)
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const enterHover = () => { if (hoverTimer.current) clearTimeout(hoverTimer.current); setHover(true) }
+  const leaveHover = () => { hoverTimer.current = setTimeout(() => setHover(false), 160) }
+  useEffect(() => () => { if (hoverTimer.current) clearTimeout(hoverTimer.current) }, [])
   // disabled = this node is turned off; offDownstream = an upstream node is off, so this one is off too
   const offDownstream = useStore((s) => !s.doc.nodes.find((n) => n.id === id)?.data.disabled && isDisabled(s.doc, id))
 
@@ -65,7 +73,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
 
   return (
     <div style={{ position: 'relative', width: 232, opacity: off ? 0.45 : 1 }} className="dp-no-select"
-      onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}>
+      onMouseEnter={enterHover} onMouseLeave={leaveHover}>
       {/* input ports */}
       {(spec?.inputs ?? []).map((p, i) => (
         <Port key={p.id} spec={p} side="input" index={i} count={spec!.inputs.length} />
@@ -143,8 +151,10 @@ export function NodeCard({ id, data, children, metaOverride }: {
         <div
           className="nodrag"
           style={{
-            position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 4, zIndex: 4,
-            display: 'flex', alignItems: 'center', gap: 2, padding: '4px 6px',
+            // sits flush under the card (no dead gap). It's a descendant of the hover wrapper, so the
+            // mouse can travel card ↔ bar without the hover ever dropping (no own handlers needed).
+            position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 4,
+            display: 'flex', alignItems: 'center', gap: 2, padding: '6px 6px 4px',
             background: '#fff', border: `1px solid ${color.border}`, borderRadius: 9, boxShadow: shadow.card,
           }}
         >

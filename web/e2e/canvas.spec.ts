@@ -207,13 +207,11 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('Saved', { exact: true })).toBeVisible()
   })
 
-  test('settings manages datasets and destinations', async ({ page }) => {
+  test('settings manages destinations', async ({ page }) => {
     await page.goto('/')
     await page.getByLabel('Settings').click()
-    // "Datasets" appears in both the left nav and the section title — scope to the register input
-    await expect(page.getByPlaceholder(/Parquet\/CSV\/JSON/)).toBeVisible()
-    await expect(page.getByText('images', { exact: true })).toBeVisible() // seeded dataset is listed
-    // add an output destination (a local dir) — a real, consumed setting
+    await expect(page.getByRole('heading', { name: 'Settings' }).or(page.getByText('Settings', { exact: true }).first())).toBeVisible()
+    // datasets live on the Tables page now, not in Settings — add an output destination (a real, consumed setting)
     await page.getByPlaceholder('e.g. S3 exports').fill('scratch')
     await page.getByPlaceholder('/path/to/dir').fill('/tmp/dp-scratch')
     await page.getByPlaceholder('/path/to/dir').press('Enter')
@@ -462,15 +460,16 @@ test.describe('Data Playground canvas', () => {
 
   test('a write node picks an output destination via the save dialog', async ({ page }) => {
     await fresh(page)
-    await addNode(page, 'Sources & sinks', 'write')
-    await page.locator('.react-flow__node').getByRole('button', { name: /Change/ }).click()
-    await expect(page.getByText('Save output to…')).toBeVisible()
+    await addNode(page, 'Sources & sinks', 'write') // auto-selected → destination lives in the inspector
+    const inspector = page.getByTestId('inspector')
+    await inspector.getByRole('button', { name: /Change destination/ }).click()
+    await expect(page.getByText('Save output', { exact: true })).toBeVisible()
     const dialog = page.locator('.dp-modal-overlay')
-    await expect(dialog.getByRole('combobox')).toContainText('Workspace outputs') // the default local place
-    await dialog.locator('input').fill('my_output')
-    await dialog.getByRole('button', { name: 'Save here' }).click()
-    await expect(page.getByText('Save output to…')).toHaveCount(0) // dialog closed on save
-    await expect(page.locator('.react-flow__node').getByText('Workspace outputs')).toBeVisible() // target shown on the card
+    await expect(dialog.getByRole('button', { name: 'Workspace outputs' }).first()).toBeVisible() // default place in the sidebar
+    await dialog.locator('input').fill('my_output.parquet')
+    await dialog.getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(page.getByText('Save output', { exact: true })).toHaveCount(0) // dialog closed on save
+    await expect(inspector.getByText('Workspace outputs')).toBeVisible() // target shown in the inspector
   })
 
   test('the source node can browse files (open dialog)', async ({ page }) => {
@@ -479,7 +478,7 @@ test.describe('Data Playground canvas', () => {
     await page.locator('.react-flow__node').getByRole('button', { name: /Select dataset/ }).click()
     await page.getByText('Browse files…').click()
     await expect(page.getByText('Open a dataset')).toBeVisible() // the open dialog over destinations
-    await expect(page.locator('.dp-modal-overlay').getByRole('combobox')).toContainText('Workspace outputs')
+    await expect(page.locator('.dp-modal-overlay').getByRole('button', { name: 'Workspace outputs' }).first()).toBeVisible()
   })
 
   test('a table is registered and added to the canvas from the Tables view', async ({ page }) => {

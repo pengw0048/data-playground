@@ -328,6 +328,23 @@ def test_write_mode_append_builds_a_readable_directory_dataset():
     assert pv["rowCount"] >= 2 * n and pv["rowCount"] % n == 0  # each append added a full part, read back together
 
 
+def test_write_formats_round_trip(tmp_path):
+    # every extension the write node accepts must read back — no silent corruption (review findings):
+    # .json is written via DuckDB COPY (not parquet bytes in a .json file), and .pq / .tsv append parts
+    # are discovered by the directory reader.
+    from kernel import db
+    from kernel.plugins.adapters import DuckDBAdapter
+    a = DuckDBAdapter()
+    con = db.conn()
+    with db.lock():
+        rel = con.sql("SELECT 1 AS a, 'x' AS b UNION ALL SELECT 2 AS a, 'y' AS b")
+        a.write(str(tmp_path / "out.json"), rel, "overwrite")
+        assert sorted(a.scan(str(tmp_path / "out.json")).fetchall()) == [(1, "x"), (2, "y")]
+        for ext in (".pq", ".tsv"):
+            res = a.write(str(tmp_path / f"app{ext}"), con.sql("SELECT 3 AS a, 'z' AS b"), "append")
+            assert a.scan(res["uri"]).fetchall() == [(3, "z")], ext  # part-*.<ext> read back from the dir
+
+
 def test_metric_over_transform_upstream_not_previewable():
     # a metric whose upstream has a Python transform must refuse preview, not spill all rows (finding #6)
     code = "def fn(row):\n    row['w2'] = row['width'] * 2\n    return row"

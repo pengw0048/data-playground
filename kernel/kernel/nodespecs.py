@@ -108,9 +108,8 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              blurb="distinct rows (hash-based, spillable)"),
     NodeSpec(kind="write", title="write", category="io", tag="write",
              inputs=[_in(("dataset", "sample", "selection"))], outputs=[_out()], previewable=False,
-             params=[ParamSpec(name="name", type="string", label="output name"),
-                     ParamSpec(name="format", type="select", options=["parquet", "csv", "lance"], default="parquet"),
-                     ParamSpec(name="writeMode", type="select", options=["overwrite", "append"], default="overwrite")],
+             # filename (its extension picks the format) + destination are edited on the card / panel
+             params=[ParamSpec(name="writeMode", type="select", options=["overwrite", "append"], default="overwrite")],
              blurb="materialize to Parquet/CSV/Lance (streaming sink)"),
     NodeSpec(kind="metric", title="metric", category="inspect", tag="metric",
              inputs=[_in()], outputs=[_out("metric", label="value")],

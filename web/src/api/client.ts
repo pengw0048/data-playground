@@ -137,6 +137,8 @@ export const api = {
   destinations: () => req<{ destinations: DestinationPreset[]; backends: string[] }>('/destinations'),
   browseDestination: (destinationId: string, path = '') =>
     req<BrowseResult>('/destinations/browse', { method: 'POST', body: JSON.stringify({ destinationId, path }) }),
+  mkdirDestination: (destinationId: string, path: string, name: string) =>
+    req<{ ok?: boolean; error?: string }>('/destinations/mkdir', { method: 'POST', body: JSON.stringify({ destinationId, path, name }) }),
 
   // per-user canvases (multi-file)
   listCanvases: () => req<CanvasFile[]>('/canvas'),

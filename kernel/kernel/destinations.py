@@ -47,11 +47,15 @@ class LocalBackend:
         return {"path": path, "entries": entries}
 
     def target_uri(self, root: str, path: str, filename: str) -> str:
+        return os.path.join(self._safe(root, path), os.path.basename(filename))  # basename: no traversal via the name
+
+    def _safe(self, root: str, path: str) -> str:
         top = os.path.realpath(root)
         base = os.path.realpath(os.path.join(top, path.lstrip("/")))
-        if not (base == top or base.startswith(top + os.sep)):  # a `..` subpath must not escape the root
-            base = top
-        return os.path.join(base, os.path.basename(filename))  # basename: never let the filename traverse either
+        return base if (base == top or base.startswith(top + os.sep)) else top  # never escape the root
+
+    def mkdir(self, root: str, path: str, name: str) -> None:
+        os.makedirs(os.path.join(self._safe(root, path), os.path.basename(name)), exist_ok=True)
 
 
 class ObjectStoreBackend:
@@ -136,3 +140,17 @@ def target_uri(workspace: str, dest_id: str, path: str, filename: str) -> str:
     if not d:
         raise ValueError(f"unknown destination '{dest_id}'")
     return _BACKENDS[d.get("backend", "local")].target_uri(d.get("root", ""), path or "", filename)
+
+
+def mkdir(workspace: str, dest_id: str, path: str, name: str) -> dict:
+    d = _find(workspace, dest_id)
+    if not d:
+        return {"error": "unknown destination"}
+    b = _BACKENDS.get(d.get("backend", "local"))
+    if b is None or not hasattr(b, "mkdir"):
+        return {"ok": True}  # object stores have no real folders — the prefix is created on write
+    try:
+        b.mkdir(d.get("root", ""), path or "", name)
+        return {"ok": True}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}

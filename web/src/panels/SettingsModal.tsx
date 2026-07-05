@@ -7,24 +7,19 @@ import { Icon, type IconName } from '../ui/Icon'
 
 // App / workspace settings — a full-screen page with a left category nav (like Figma / most apps),
 // not a cramped modal. These are GLOBAL: the LLM agent (provider-agnostic; the key lives in the
-// kernel), the execution backend, datasets, connected repos. Canvas-scoped settings live in the
-// separate CanvasSettingsModal (opened from the file menu).
+// kernel), the execution backend, and save/open destinations. Datasets have their own Tables page;
+// canvas-scoped settings live in the separate CanvasSettingsModal (opened from the file menu).
 const CATS: { id: string; label: string; icon: IconName }[] = [
   { id: 'agent', label: 'Agent', icon: 'sparkle' },
   { id: 'execution', label: 'Execution', icon: 'play' },
-  { id: 'datasets', label: 'Datasets', icon: 'db' },
   { id: 'destinations', label: 'Destinations', icon: 'export' },
 ]
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const kernelInfo = useStore((s) => s.kernelInfo)
-  const catalog = useStore((s) => s.catalog)
-  const refreshCatalog = useStore((s) => s.refreshCatalog)
   const [g, setG] = useState<Record<string, unknown>>({})
   const [loading, setLoading] = useState(true)
   const [savedMsg, setSavedMsg] = useState('')
-  const [dsUri, setDsUri] = useState('')
-  const [dsErr, setDsErr] = useState('')
   const [dest, setDest] = useState({ name: '', backend: 'local', root: '' })
   const [active, setActive] = useState('agent')
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -57,12 +52,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Math.abs(Math.floor(Math.random() * 1e6))}`
     setG((prev) => ({ ...prev, destinations: [...dests, { id, name, backend: dest.backend, root }] }))
     setDest({ name: '', backend: 'local', root: '' })
-  }
-  const addDataset = async () => {
-    const uri = dsUri.trim(); if (!uri) return
-    setDsErr('')
-    try { await api.registerFile(uri); await refreshCatalog(); setDsUri('') }
-    catch (e) { setDsErr((e as Error).message) }
   }
   const go = (id: string) => { setActive(id); document.getElementById(`set-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
   const runners = kernelInfo?.runners ?? ['local-out-of-core']
@@ -110,27 +99,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                       {runners.map((r) => <option key={r} value={r}>{r}</option>)}
                     </select>
                   </Field>
-                </Section>
-
-                <Section id="datasets" title="Datasets">
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 8, maxHeight: 200, overflowY: 'auto' }}>
-                    {catalog.map((t) => (
-                      <div key={t.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: color.ink }}>
-                        <Icon name="db" size={12} style={{ color: color.text3 }} />
-                        <span style={{ fontWeight: 600 }}>{t.name}</span>
-                        <span style={{ flex: 1, color: color.text3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11 }}>{t.uri}</span>
-                        {t.rowCount != null && <span style={{ fontSize: 10.5, color: color.text3 }}>{t.rowCount} rows</span>}
-                      </div>
-                    ))}
-                    {catalog.length === 0 && <div style={{ fontSize: 11.5, color: color.text3 }}>No datasets registered.</div>}
-                  </div>
-                  <div style={{ display: 'flex', gap: 6 }}>
-                    <input value={dsUri} onChange={(e) => setDsUri(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addDataset() }}
-                      placeholder="path or uri to a Parquet/CSV/JSON/Arrow/Lance dataset"
-                      style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 7, padding: '7px 9px', outline: 'none' }} />
-                    <button onClick={addDataset} style={{ border: 'none', borderRadius: 7, background: color.ink, color: '#fff', fontSize: 12, fontWeight: 600, padding: '0 12px' }}>Register</button>
-                  </div>
-                  {dsErr && <div style={{ fontSize: 10.5, color: color.failed, marginTop: 4 }}>{dsErr}</div>}
                 </Section>
 
                 <Section id="destinations" title="Destinations">

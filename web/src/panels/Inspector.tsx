@@ -4,6 +4,7 @@ import { getSpec } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
 import { color, radius, status as statusTok, kindAccent } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
+import { FileDialog } from '../ui/FileDialog'
 
 export const INSPECTOR_W = 300
 
@@ -84,10 +85,13 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* properties (reused generic param editor) */}
       <Section title="Properties">
         <NodeParamFields nodeId={nodeId} />
-        {codeParams.length === 0 && (bspec?.params ?? []).length === 0 && (
+        {codeParams.length === 0 && (bspec?.params ?? []).length === 0 && kind !== 'write' && (
           <div style={{ fontSize: 11.5, color: color.text3 }}>No editable parameters.</div>
         )}
       </Section>
+
+      {/* a write node's output destination lives here in the panel, not cluttering the card */}
+      {kind === 'write' && <WriteDestination nodeId={nodeId} />}
 
       {/* code snippet + open the full editor (Monaco panel; fullscreen editor is a later step) */}
       {codeParams.map((p) => {
@@ -167,6 +171,34 @@ function OutputPortsEditor({ nodeId }: { nodeId: string }) {
         <Icon name="plus" size={11} /> add port
       </button>
     </div>
+  )
+}
+
+// The write node's output destination — chosen here in the property panel via the save dialog.
+function WriteDestination({ nodeId }: { nodeId: string }) {
+  const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
+  const updateConfig = useStore((s) => s.updateConfig)
+  const [dlg, setDlg] = useState(false)
+  const cfg = (node?.data.config ?? {}) as Record<string, unknown>
+  const filename = String(cfg.filename ?? cfg.name ?? 'output.parquet')
+  const destName = (cfg.destName as string) ?? 'Workspace outputs'
+  const destPath = String(cfg.destPath ?? '')
+  return (
+    <Section title="Output">
+      <div style={{ fontSize: 11.5, color: color.text2 }}>
+        <div className="dp-mono" style={{ color: color.ink }}>{filename}</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 3, color: color.text3 }}>
+          <Icon name="export" size={11} /> {destName}{destPath ? `/${destPath}` : ''}
+        </div>
+      </div>
+      <div style={{ marginTop: 8 }}>
+        <CodeBtn icon="export" label="Change destination…" onClick={() => setDlg(true)} />
+      </div>
+      {dlg && (
+        <FileDialog mode="save" defaultName={filename} onClose={() => setDlg(false)}
+          onPick={(r) => { updateConfig(nodeId, { destId: r.destId, destName: r.destName, destPath: r.path, filename: r.filename }); setDlg(false) }} />
+      )}
+    </Section>
   )
 }
 
