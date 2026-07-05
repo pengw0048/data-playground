@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
 from kernel.deps import get_deps
@@ -529,6 +530,44 @@ def test_preview_has_more_marks_the_last_page(tmp_path):
     b = client.post("/api/run/preview", json={"graph": g, "nodeId": "s", "k": 50, "offset": 50}).json()
     assert len(a["rows"]) == 50 and a["hasMore"] is True     # page 0 → there IS a next page
     assert len(b["rows"]) == 50 and b["hasMore"] is False    # page 1 is the last — no phantom empty page
+
+
+def test_object_store_s3_roundtrip_and_browse(tmp_path):
+    # REAL object storage via DuckDB httpfs, proven end-to-end against an in-process S3 (moto server):
+    # write a dataset to s3://, read it back, and browse the prefix.
+    pytest.importorskip("moto")
+    pytest.importorskip("flask")  # ThreadedMotoServer needs moto[server]
+    boto3 = pytest.importorskip("boto3")
+    from moto.server import ThreadedMotoServer
+
+    from kernel import db, destinations, metadb
+    from kernel.plugins.adapters import DuckDBAdapter
+
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    try:
+        host, port = server.get_host_and_port()
+        endpoint = f"http://{host}:{port}"
+        boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
+                     region_name="us-east-1").create_bucket(Bucket="bkt")
+        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
+                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        db._obj_store_loaded = False  # re-load httpfs + re-register the secret against the moto endpoint
+        a = DuckDBAdapter()
+        p = _seq_parquet(tmp_path, n=25)
+        with db.lock():
+            res = a.write("s3://bkt/data/out.parquet", db.conn().read_parquet(p), "overwrite")
+            assert res["rows"] == 25
+            n = a.scan("s3://bkt/data/out.parquet").aggregate("count(*) AS c").fetchone()[0]
+        assert n == 25  # read back what we wrote, over the wire
+
+        metadb.set_setting("destinations", [{"id": "b", "name": "bkt", "backend": "s3", "root": "s3://bkt"}], "global")
+        br = destinations.browse(str(tmp_path), "b", "data")
+        assert not br.get("error"), br.get("error")
+        assert any(e["name"] == "out.parquet" for e in br["entries"])
+    finally:
+        server.stop()
+        metadb.set_setting("objectStore", {}, "global")  # restore the default credential chain for other tests
 
 
 def _section(nid, script, subnodes, params=None, max_runs=200):

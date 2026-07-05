@@ -41,11 +41,14 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const val = (k: string) => (g[k] == null ? '' : String(g[k]))
   const set = (k: string, v: string) => setG((prev) => ({ ...prev, [k]: v }))
   const dests = (Array.isArray(g.destinations) ? g.destinations : []) as { id: string; name: string; backend: string; root: string }[]
+  const obj = (g.objectStore && typeof g.objectStore === 'object' ? g.objectStore : {}) as Record<string, string>
+  const setObj = (k: string, v: string) => setG((prev) => ({ ...prev, objectStore: { ...(prev.objectStore as object ?? {}), [k]: v } }))
   const save = async () => {
     for (const k of ['agentModel', 'agentApiKey', 'agentBaseUrl', 'backend']) {
       await api.putSetting('global', k, g[k] ?? '').catch(() => {})
     }
     await api.putSetting('global', 'destinations', dests).catch(() => {})
+    await api.putSetting('global', 'objectStore', obj).catch(() => {})
     setSavedMsg('Saved'); setTimeout(() => setSavedMsg(''), 1400)
   }
   const addDest = () => {
@@ -132,8 +135,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
                 <Section id="destinations" title="Destinations">
                   <p style={{ margin: '0 0 8px', fontSize: 11.5, color: color.text3, lineHeight: 1.5 }}>
-                    Named places to save outputs / open files (a local directory, or an object-store prefix).
-                    "Workspace outputs" is always available. Object stores (s3://, gs://) browse via a plugin.
+                    Named places to save outputs / open files: a local directory, or an object-store prefix (s3://, gs://).
                   </p>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 8 }}>
                     {dests.map((d, i) => (
@@ -161,6 +163,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                       placeholder={dest.backend === 'local' ? '/path/to/dir' : `${dest.backend}://bucket/prefix`}
                       style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 7, padding: '7px 9px', outline: 'none' }} />
                     <button onClick={addDest} style={{ border: 'none', borderRadius: 7, background: color.ink, color: '#fff', fontSize: 12, fontWeight: 600, padding: '0 12px' }}>Add</button>
+                  </div>
+
+                  <div style={{ fontSize: 11.5, color: color.text2, fontWeight: 600, marginTop: 16, marginBottom: 6 }}>Object-store credentials</div>
+                  <div style={{ fontSize: 10.5, color: color.text3, marginBottom: 8 }}>Leave blank to use the environment (AWS_* / ~/.aws / instance role). Set keys for MinIO / R2 / other S3-compatible endpoints.</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                    <Input value={obj.accessKeyId ?? ''} placeholder="access key id" onChange={(v) => setObj('accessKeyId', v)} />
+                    <Input type="password" value={obj.secretAccessKey ?? ''} placeholder="secret access key" onChange={(v) => setObj('secretAccessKey', v)} />
+                    <Input value={obj.region ?? ''} placeholder="region (e.g. us-east-1)" onChange={(v) => setObj('region', v)} />
+                    <Input value={obj.endpoint ?? ''} placeholder="endpoint (MinIO/R2, optional)" onChange={(v) => setObj('endpoint', v)} />
                   </div>
                 </Section>
               </div>

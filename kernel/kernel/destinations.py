@@ -54,16 +54,28 @@ class LocalBackend:
         return os.path.join(base, os.path.basename(filename))  # basename: never let the filename traverse either
 
 
-class _ObjectStoreStub:
-    """s3:// / gs:// — a plugin backend. Core recognizes the kind so a target uri can be picked and
-    saved, but can't enumerate keys without the object-store plugin installed."""
+class ObjectStoreBackend:
+    """s3:// / gs:// — real, via DuckDB httpfs. Lists objects at a prefix with glob() and writes via
+    the adapter. (Object stores have no true folders, so browse shows the objects at the prefix; you
+    can also type a sub-prefix.)"""
 
     def __init__(self, kind: str):
         self.kind = kind
 
     def browse(self, root: str, path: str) -> dict:
-        return {"path": path, "entries": [],
-                "error": f"{self.kind}:// browsing needs the object-store plugin — type a prefix, or install it"}
+        from kernel import db
+        prefix = (root.rstrip("/") + "/" + path.strip("/")).rstrip("/") if path else root.rstrip("/")
+        try:
+            db.ensure_object_store()
+            with db.lock():
+                rows = db.conn().execute(f"SELECT file FROM glob('{prefix}/*')").fetchall()
+        except Exception as e:  # noqa: BLE001 — no creds / bad bucket → say so honestly
+            return {"path": path, "entries": [], "error": str(e)}
+        entries = []
+        for (f,) in rows:
+            name = f.rstrip("/").rsplit("/", 1)[-1]
+            entries.append({"name": name, "kind": "dir" if f.endswith("/") else "file", "uri": f})
+        return {"path": path, "entries": entries}
 
     def target_uri(self, root: str, path: str, filename: str) -> str:
         base = (root.rstrip("/") + "/" + path.strip("/")).rstrip("/")
@@ -71,7 +83,7 @@ class _ObjectStoreStub:
 
 
 _BACKENDS: dict[str, DestinationBackend] = {
-    "local": LocalBackend(), "s3": _ObjectStoreStub("s3"), "gs": _ObjectStoreStub("gs"),
+    "local": LocalBackend(), "s3": ObjectStoreBackend("s3"), "gs": ObjectStoreBackend("gs"),
 }
 
 
@@ -115,7 +127,7 @@ def browse(workspace: str, dest_id: str, path: str) -> dict:
     if not b:
         return {"path": path, "entries": [], "error": f"no backend for '{d.get('backend')}'"}
     res = b.browse(d.get("root", ""), path or "")
-    res["writable"] = isinstance(b, LocalBackend)  # core can only write local; object stores need the plugin adapter
+    res["writable"] = True  # both local and object-store backends can write
     return res
 
 

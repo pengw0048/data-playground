@@ -45,6 +45,14 @@ def display_type(duckdb_type: str) -> str:
     return _TYPE_MAP.get(t, t.lower())
 
 
+_OBJECT_SCHEMES = ("s3://", "gs://", "gcs://", "r2://")
+
+
+def is_object_uri(uri: str) -> bool:
+    """An object-store uri (s3://, gs://, …) — read/written via DuckDB httpfs, not the local FS."""
+    return uri.startswith(_OBJECT_SCHEMES)
+
+
 def path_of(uri: str) -> str:
     p = urlparse(uri)
     return p.path if p.scheme in ("file", "") else uri
@@ -78,7 +86,7 @@ class DuckDBAdapter:
     _EXTS = (".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson", ".arrow", ".feather", ".ipc")
 
     def matches(self, uri: str) -> bool:
-        if uri.startswith("mem://"):
+        if uri.startswith("mem://") or is_object_uri(uri):
             return True
         p = path_of(uri).lower()
         if os.path.isdir(path_of(uri)):
@@ -100,6 +108,16 @@ class DuckDBAdapter:
     def _read(self, con: duckdb.DuckDBPyConnection, uri: str) -> Relation:
         if uri.startswith("mem://"):
             return con.table(uri[len("mem://"):])
+        if is_object_uri(uri):
+            db.ensure_object_store()  # load httpfs + credentials
+            low = uri.lower()
+            if low.endswith((".csv", ".tsv")):
+                return con.read_csv(uri)
+            if low.endswith((".json", ".ndjson")):
+                return con.read_json(uri)
+            if low.endswith((".parquet", ".pq")):
+                return con.read_parquet(uri)
+            return con.read_parquet(uri.rstrip("/") + "/**/*.parquet")  # a prefix of parts (append output)
         p = path_of(uri)
         low = p.lower()
         if os.path.isdir(p):
@@ -131,32 +149,42 @@ class DuckDBAdapter:
     def fingerprint(self, uri: str) -> str:
         if uri.startswith("mem://"):
             return "mem"
+        if is_object_uri(uri):
+            return "obj:" + hashlib.sha256(uri.encode()).hexdigest()[:12]  # can't stat; key by uri
         return _fingerprint_path(path_of(uri))
 
     def write(self, uri: str, rel: Relation, mode: str = "overwrite") -> dict:
-        p = path_of(uri)
-        low = p.lower()
+        obj = is_object_uri(uri)
+        if obj:
+            db.ensure_object_store()  # load httpfs + credentials
+        target = uri if obj else path_of(uri)  # object stores keep the full s3://… uri
+        low = target.lower()
         rows = int(rel.aggregate("count(*)").fetchone()[0])
         if mode == "append":
-            # append = a DIRECTORY dataset of part files (out-of-core; the dir reader reads them all
+            # append = a DIRECTORY / prefix of part files (out-of-core; the reader reads them all
             # back). Only for row formats — parquet/csv; feather/arrow have no directory-scan reader.
             if not low.endswith((".parquet", ".pq", ".csv", ".tsv")):
-                raise NotImplementedError(f"append is only supported for parquet/csv outputs, not {os.path.splitext(p)[1] or 'this'}")
-            d, ext = os.path.splitext(p)  # /out/name.parquet -> dir "/out/name", ext ".parquet"
-            os.makedirs(d, exist_ok=True)
-            part = os.path.join(d, f"part-{uuid.uuid4().hex[:12]}{ext}")
+                raise NotImplementedError(f"append is only supported for parquet/csv outputs, not {os.path.splitext(target)[1] or 'this'}")
+            base, ext = os.path.splitext(target)  # name.parquet -> prefix "name", ext ".parquet"
+            part_name = f"part-{uuid.uuid4().hex[:12]}{ext}"
+            if obj:
+                part = base.rstrip("/") + "/" + part_name
+            else:
+                os.makedirs(base, exist_ok=True)
+                part = os.path.join(base, part_name)
             (rel.write_csv if ext.lower() in (".csv", ".tsv") else rel.write_parquet)(part)
-            return {"uri": d, "rows": rows}
+            return {"uri": base, "rows": rows}
         if mode not in ("overwrite", None):
             raise NotImplementedError(f"write mode '{mode}' is not supported — use overwrite or append")
-        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        if not obj:
+            os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
         if low.endswith((".csv", ".tsv")):
-            rel.write_csv(p)
+            rel.write_csv(target)
         elif low.endswith((".arrow", ".feather", ".ipc")):
             import pyarrow.feather as feather
-            feather.write_feather(rel.to_arrow_table(), p)
+            feather.write_feather(rel.to_arrow_table(), target)
         else:
-            rel.write_parquet(p)
+            rel.write_parquet(target)
         return {"uri": uri, "rows": rows}
 
 

@@ -31,7 +31,51 @@ def conn() -> duckdb.DuckDBPyConnection:
             if _conn is None:
                 _conn = duckdb.connect(":memory:")
                 _conn.execute("SET enable_progress_bar = false")
+                # let object-store access (s3://, gs://) auto-load the bundled httpfs extension
+                _conn.execute("SET autoinstall_known_extensions = true")
+                _conn.execute("SET autoload_known_extensions = true")
     return _conn
+
+
+_obj_store_loaded = False
+
+
+def _sql_str(s: str) -> str:
+    return str(s).replace("'", "''")
+
+
+def ensure_object_store() -> None:
+    """Prepare the connection for object storage (s3://, gs://): load httpfs and (re)register
+    credentials. Called before an object-store read/write. Credentials come from the `objectStore`
+    setting (explicit keys — for AWS, MinIO, R2, or any S3-compatible endpoint) or, when none are
+    set, the standard AWS credential chain (env vars / ~/.aws / instance role)."""
+    global _obj_store_loaded
+    with _lock:
+        c = conn()
+        if not _obj_store_loaded:
+            c.execute("LOAD httpfs")
+            _obj_store_loaded = True
+        from kernel import metadb
+        cfg = metadb.get_setting("objectStore", "global", default={}) or {}
+        for kind, secret in (("s3", "dp_s3"), ("gcs", "dp_gcs")):
+            try:
+                if cfg.get("accessKeyId") and cfg.get("secretAccessKey"):
+                    parts = [f"TYPE {kind}", f"KEY_ID '{_sql_str(cfg['accessKeyId'])}'",
+                             f"SECRET '{_sql_str(cfg['secretAccessKey'])}'"]
+                    if cfg.get("region"):
+                        parts.append(f"REGION '{_sql_str(cfg['region'])}'")
+                    endpoint = str(cfg.get("endpoint") or "").strip()
+                    if kind == "s3" and endpoint:
+                        # DuckDB wants host[:port] with no scheme; the scheme decides USE_SSL
+                        use_ssl = not endpoint.startswith("http://") if cfg.get("useSsl") is None else bool(cfg.get("useSsl"))
+                        host = endpoint.split("://", 1)[-1].rstrip("/")
+                        parts += [f"ENDPOINT '{_sql_str(host)}'", "URL_STYLE 'path'",
+                                  f"USE_SSL {'true' if use_ssl else 'false'}"]
+                    c.execute(f"CREATE OR REPLACE SECRET {secret} ({', '.join(parts)})")
+                else:
+                    c.execute(f"CREATE OR REPLACE SECRET {secret} (TYPE {kind}, PROVIDER credential_chain)")
+            except Exception:  # noqa: BLE001 — a secret type may be unavailable; the other still helps
+                pass
 
 
 def unique_view(prefix: str = "v") -> str:
