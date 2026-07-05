@@ -26,9 +26,11 @@ export function canvasLink(id: string): string {
 
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
 interface RouterStore {
-  getState: () => { view: DpView; doc: { id: string }; setView: (v: DpView) => void; openFile: (id: string) => Promise<void> }
+  getState: () => { view: DpView; doc: { id: string }; setView: (v: DpView) => void; openFile: (id: string) => Promise<boolean> }
   subscribe: (fn: (s: { view: DpView; doc: { id: string } }) => void) => void
 }
+
+const hashFor = (s: { view: DpView; doc: { id: string } }) => routeHash(s.view, s.view === 'canvas' ? s.doc.id : undefined)
 
 let _inited = false
 /** Wire the store ↔ the URL hash (two-way, loop-guarded). Call once at startup, after bootstrap. */
@@ -36,28 +38,32 @@ export function initRouter(store: RouterStore): void {
   if (_inited) return  // idempotent (React StrictMode double-invokes effects in dev)
   _inited = true
   let applying = false
-  const apply = () => {
+  const apply = async () => {
     const r = parseHash()
     const st = store.getState()
-    applying = true
+    applying = true  // held across the await so openFile's sets don't trigger the store→hash push
     try {
       if (r.view === 'canvas' && r.canvasId) {
-        if (st.doc.id !== r.canvasId) void st.openFile(r.canvasId)  // may be a shared canvas → authorized server-side
-        else if (st.view !== 'canvas') st.setView('canvas')
+        if (st.doc.id !== r.canvasId) {
+          const ok = await st.openFile(r.canvasId)  // may be a shared canvas → authorized server-side
+          if (!ok) {
+            // bad / revoked / unauthorized link: reflect the ACTUAL (unchanged) state and REPLACE the
+            // bad history entry, so Back doesn't return to it and the store→hash sync doesn't bounce.
+            history.replaceState(null, '', hashFor(store.getState()))
+          }
+        } else if (st.view !== 'canvas') st.setView('canvas')
       } else if (st.view !== r.view) {
         st.setView(r.view)
       }
     } finally { applying = false }
   }
-  window.addEventListener('hashchange', apply)
+  window.addEventListener('hashchange', () => { void apply() })
   // store → hash: only when the view or open canvas actually changes (not on every autosave)
   store.subscribe((s) => {
     if (applying) return
-    const want = routeHash(s.view, s.view === 'canvas' ? s.doc.id : undefined)
+    const want = hashFor(s)
     if (location.hash !== want) location.hash = want  // pushes a history entry → back/forward works
   })
   // reflect the state bootstrap just settled into the URL, without adding a history entry
-  const st0 = store.getState()
-  const want0 = routeHash(st0.view, st0.view === 'canvas' ? st0.doc.id : undefined)
-  if (location.hash !== want0) history.replaceState(null, '', want0)
+  if (location.hash !== hashFor(store.getState())) history.replaceState(null, '', hashFor(store.getState()))
 }

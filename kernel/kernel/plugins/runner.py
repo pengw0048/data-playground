@@ -202,6 +202,11 @@ class LocalRunner:
         if dest_id:
             from kernel import destinations
             uri = destinations.target_uri(self.workspace, dest_id, cfg.get("destPath", ""), f"{name}{ext}")
+            # core has no object-store WRITER — fail honestly rather than letting the local adapter
+            # create a stray "s3:/…" directory + a cryptic error (the plugin adds the real writer)
+            scheme = uri.split("://", 1)[0] if "://" in uri else ""
+            if scheme and scheme != "file":
+                raise RuntimeError(f"writing to {scheme}:// needs the object-store plugin — pick a local destination")
         else:
             uri = self.storage.output_uri(name, ext)
 

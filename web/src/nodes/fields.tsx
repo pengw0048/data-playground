@@ -136,14 +136,14 @@ function parseFilter(pred: string): Cond[] | null {
   }
   return conds
 }
-function literal(val: string, colType: string | undefined, columns: ColumnSchema[]): string {
+function literal(val: string, colType: string | undefined): string {
+  // A filter VALUE is treated as a literal. Numbers / bool / null / already-quoted pass through;
+  // everything else is quoted as a string (so a value that happens to equal a column name isn't
+  // silently turned into a column reference). Column-vs-column comparisons use the raw-SQL toggle.
   const v = val.trim()
   if (v === '') return "''"
-  // already a literal we shouldn't touch: number, bool/null, or an explicitly-quoted string
   if (/^-?\d+(\.\d+)?$/.test(v) || /^(true|false|null)$/i.test(v) || /^'.*'$/.test(v)) return v
-  // the value datalist suggests column names — if the RHS IS a known column, it's a column ref, not a string
-  if (columns.some((c) => c.name === v)) return v
-  // date/time/timestamp columns need quoted literals too (unquoted 2024-01-01 = integer arithmetic)
+  // date/time/timestamp values need quoting too (unquoted 2024-01-01 = integer arithmetic)
   const stringy = !colType || /string|json|struct|list|bytes|date|time|timestamp/.test(colType)
   return stringy ? `'${v.replace(/'/g, "''")}'` : v
 }
@@ -151,7 +151,7 @@ function serializeFilter(conds: Cond[], columns: ColumnSchema[]): string {
   return conds.filter((c) => c.col.trim()).map((c) => {
     if (c.op === 'IS NULL' || c.op === 'IS NOT NULL') return `${c.col} ${c.op}`
     const t = columns.find((x) => x.name === c.col)?.type
-    return `${c.col} ${c.op} ${literal(c.val, t, columns)}`
+    return `${c.col} ${c.op} ${literal(c.val, t)}`
   }).join(' AND ')
 }
 
@@ -193,7 +193,8 @@ export function FilterBuilder({ nodeId }: { nodeId: string }) {
           </select>
           {c.op !== 'IS NULL' && c.op !== 'IS NOT NULL' && (
             <div style={{ flex: 1, minWidth: 0 }}>
-              <ColumnCombo value={c.val} columns={columns} placeholder="value"
+              {/* a literal value — no column suggestions (that would invite the value→column confusion) */}
+              <ColumnCombo value={c.val} columns={[]} placeholder="value"
                 onChange={(v) => commit(conds.map((x, j) => (j === i ? { ...x, val: v } : x)))} />
             </div>
           )}

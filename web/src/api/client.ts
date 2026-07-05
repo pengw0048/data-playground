@@ -129,8 +129,6 @@ export const api = {
   // users (internal-tool identity) + settings
   me: () => req<DpUser>('/me'),
   users: () => req<DpUser[]>('/users'),
-  createUser: (name: string, email?: string) =>
-    req<DpUser>('/users', { method: 'POST', body: JSON.stringify({ name, email }) }),
   getSettings: () => req<{ global: Record<string, unknown>; user: Record<string, unknown> }>('/settings'),
   putSetting: (scope: 'global' | 'user', key: string, value: unknown) =>
     req<{ ok: boolean }>('/settings', { method: 'PUT', body: JSON.stringify({ scope, key, value }) }),

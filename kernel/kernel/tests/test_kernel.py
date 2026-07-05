@@ -514,6 +514,15 @@ def test_preview_paginates_with_offset(tmp_path):
     assert [r["v"] for r in pg1["rows"]] == list(range(10, 20))  # offset advances the window
 
 
+def test_preview_has_more_marks_the_last_page(tmp_path):
+    p = _seq_parquet(tmp_path, n=100)  # exactly 2 pages of 50
+    g = {"id": "c1", "version": 1, "nodes": [N("s", "source", {"uri": p})], "edges": []}
+    a = client.post("/api/run/preview", json={"graph": g, "nodeId": "s", "k": 50, "offset": 0}).json()
+    b = client.post("/api/run/preview", json={"graph": g, "nodeId": "s", "k": 50, "offset": 50}).json()
+    assert len(a["rows"]) == 50 and a["hasMore"] is True     # page 0 → there IS a next page
+    assert len(b["rows"]) == 50 and b["hasMore"] is False    # page 1 is the last — no phantom empty page
+
+
 def _section(nid, script, subnodes, params=None, max_runs=200):
     return N(nid, "section", {"script": script, "subnodes": subnodes,
                               "params": params or {}, "maxRuns": max_runs})

@@ -33,10 +33,15 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
         # serialize all DuckDB access; drop the temp views this eval minted
         with db.lock():
             try:
-                rows, cols = engine.rows(node_id, k, offset)
+                # fetch one extra row to know if a NEXT page exists (so the UI can disable Next at the
+                # true end, even when the total is an exact multiple of the page size). NOTE: offset
+                # pagination assumes a stable row order; a join/aggregate result is unordered, so pages
+                # over such a node may not be perfectly consistent — acceptable for a bounded preview.
+                rows, cols = engine.rows(node_id, k + 1, offset)
             finally:
                 db.drop_created_views()
-        return SampleResult(columns=cols, rows=rows, row_count=len(rows), truncated=True)
+        has_more = len(rows) > k
+        return SampleResult(columns=cols, rows=rows[:k], row_count=len(rows[:k]), has_more=has_more, truncated=True)
 
     try:
         return run_with_timeout(work, PREVIEW_BUDGET_S)

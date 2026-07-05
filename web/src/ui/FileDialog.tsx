@@ -20,13 +20,15 @@ export function FileDialog(props:
   const [entries, setEntries] = useState<BrowseEntry[]>([])
   const [err, setErr] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [writable, setWritable] = useState(true)
   const [filename, setFilename] = useState(mode === 'save' ? (props.defaultName ?? 'output') : '')
 
   useEffect(() => {
     api.destinations().then((d) => {
       setDests(d.destinations)
       setDestId((cur) => cur || d.destinations[0]?.id || '')
-    }).catch((e) => setErr((e as Error).message))
+      if (d.destinations.length === 0) setLoading(false)
+    }).catch((e) => { setErr((e as Error).message); setLoading(false) })  // don't hang on "loading…" if the fetch fails
   }, [])
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -34,10 +36,10 @@ export function FileDialog(props:
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
   useEffect(() => {
-    if (!destId) return
+    if (!destId) { setLoading(false); return }
     setLoading(true)
     api.browseDestination(destId, path)
-      .then((r) => { setEntries(r.entries); setErr(r.error ?? null) })
+      .then((r) => { setEntries(r.entries); setErr(r.error ?? null); setWritable(r.writable !== false) })
       .catch((e) => { setEntries([]); setErr((e as Error).message) })
       .finally(() => setLoading(false))
   }, [destId, path])
@@ -96,11 +98,15 @@ export function FileDialog(props:
         {/* save footer */}
         {mode === 'save' && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderTop: `1px solid ${color.hairline}` }}>
-            <span style={{ fontSize: 11.5, color: color.text3 }}>file name</span>
-            <input value={filename} onChange={(e) => setFilename(e.target.value)}
-              style={{ flex: 1, fontSize: 12.5, border: `1px solid ${color.border}`, borderRadius: 7, padding: '7px 9px', outline: 'none' }} />
-            <button disabled={!filename.trim() || !dest} onClick={() => dest && props.onPick({ destId, destName: dest.name, path, filename: filename.trim() })}
-              style={{ padding: '8px 16px', border: 'none', borderRadius: 8, background: color.ink, color: '#fff', fontSize: 12.5, fontWeight: 600, opacity: filename.trim() && dest ? 1 : 0.5, cursor: filename.trim() ? 'pointer' : 'not-allowed' }}>
+            {!writable
+              ? <span style={{ flex: 1, fontSize: 11, color: '#a2731a' }}>This destination can't be written from the core — install its plugin or pick a local place.</span>
+              : <>
+                  <span style={{ fontSize: 11.5, color: color.text3 }}>file name</span>
+                  <input value={filename} onChange={(e) => setFilename(e.target.value)}
+                    style={{ flex: 1, fontSize: 12.5, border: `1px solid ${color.border}`, borderRadius: 7, padding: '7px 9px', outline: 'none' }} />
+                </>}
+            <button disabled={!filename.trim() || !dest || !writable} onClick={() => dest && props.onPick({ destId, destName: dest.name, path, filename: filename.trim() })}
+              style={{ padding: '8px 16px', border: 'none', borderRadius: 8, background: color.ink, color: '#fff', fontSize: 12.5, fontWeight: 600, opacity: filename.trim() && dest && writable ? 1 : 0.5, cursor: filename.trim() && writable ? 'pointer' : 'not-allowed' }}>
               Save here
             </button>
           </div>

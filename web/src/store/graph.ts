@@ -72,7 +72,7 @@ export function newId(kind: string): string {
   return `${kind}-${_seq}-${Math.floor(performance.now() % 100000)}`
 }
 
-interface PreviewState { loading?: boolean; result?: SampleResult; error?: string }
+interface PreviewState { loading?: boolean; result?: SampleResult; error?: string; offset?: number }
 interface RunState {
   estimate?: RunEstimate
   status?: RunStatus
@@ -183,12 +183,10 @@ interface Store {
   users: DpUser[]
   files: CanvasFile[]
   refreshFiles: () => Promise<void>
-  openFile: (id: string) => Promise<void>
+  openFile: (id: string) => Promise<boolean>
   newFile: () => Promise<void>
   renameFile: (name: string) => void
   deleteFile: (id: string) => Promise<void>
-  switchUser: (id: string) => Promise<void>
-  createUser: (name: string) => Promise<void>
 }
 
 // Top-level views (like Figma's Recents / Design surfaces). 'canvas' is the editor; settings is a modal.
@@ -503,14 +501,16 @@ export const useStore = create<Store>((set, get) => ({
     set((s) => (s.openPanels[id] ? { openPanels: {} } : {})),
 
   runPreview: async (id: string, offset = 0) => {
-    set((s) => ({ previews: { ...s.previews, [id]: { loading: true } }, openPanels: { [id]: 'data' } }))
+    // offset lives in the preview state (single source of truth) so an external Refresh (which
+    // re-fetches page 0) and the panel's page controls never disagree.
+    set((s) => ({ previews: { ...s.previews, [id]: { loading: true, offset } }, openPanels: { [id]: 'data' } }))
     try {
       // A preview is a bounded peek (a page of rows), NOT a full materialized run — we deliberately
       // do NOT flip status to 'latest' (that green state means a real run). Paginated via `offset`.
       const result = await api.preview(get().doc, id, 50, offset)
-      set((s) => ({ previews: { ...s.previews, [id]: { result } } }))
+      set((s) => ({ previews: { ...s.previews, [id]: { result, offset } } }))
     } catch (e) {
-      set((s) => ({ previews: { ...s.previews, [id]: { error: (e as Error).message } } }))
+      set((s) => ({ previews: { ...s.previews, [id]: { error: (e as Error).message, offset } } }))
     }
   },
 
@@ -666,12 +666,15 @@ export const useStore = create<Store>((set, get) => ({
       // current canvas underneath, then switches to that shell view below.
       const route = parseHash()
       const last = localStorage.getItem(OPEN_KEY(me.id))
-      const openId = (route.view === 'canvas' && route.canvasId)
-        ? route.canvasId
-        : (last && files.some((f) => f.id === last) ? last : files[0]?.id)
-      if (openId) await get().openFile(openId)
-      else await get().newFile()
-      if (route.view !== 'canvas') get().setView(route.view)
+      const fallback = last && files.some((f) => f.id === last) ? last : files[0]?.id
+      // a deep-linked canvas that can't be opened (bad/revoked/other-user's link) must NOT discard
+      // the last-opened file into a throwaway blank — fall back cleanly.
+      const opened = (route.view === 'canvas' && route.canvasId) ? await get().openFile(route.canvasId) : false
+      if (!opened) {
+        if (fallback) await get().openFile(fallback)
+        else await get().newFile()
+        if (route.view !== 'canvas') get().setView(route.view)
+      }
     } catch {
       // offline / no kernel: fall back to the local cached doc so work survives a refresh
       try {
@@ -692,7 +695,14 @@ export const useStore = create<Store>((set, get) => ({
       const uid = get().currentUser?.id
       if (uid) localStorage.setItem(OPEN_KEY(uid), id)
       set({ view: 'canvas' })  // opening a file navigates to the editor
-    } catch { await get().refreshFiles() }  // stale card (deleted elsewhere) → prune it from the list
+      return true
+    } catch {
+      // not found / no access / deleted elsewhere → leave the current canvas & view untouched, prune
+      // the stale card, and tell the user. The caller decides where to land (never a silent blank).
+      await get().refreshFiles()
+      get().pushToast('That canvas could not be opened (not found or no access)', 'error')
+      return false
+    }
   },
 
   newFile: async () => {
@@ -718,27 +728,6 @@ export const useStore = create<Store>((set, get) => ({
       if (next) await get().openFile(next)
       else await get().newFile()
     }
-  },
-
-  switchUser: async (id) => {
-    setApiUser(id); localStorage.setItem(USER_KEY, id)
-    const me = get().users.find((u) => u.id === id) ?? await api.me()
-    set({ currentUser: me })
-    await get().refreshFiles()
-    // if switching from a shell view (Recents/Tables/…), stay there and show the new user's files;
-    // only auto-open a file (→ editor) when the switch happened from the canvas.
-    if (get().view !== 'canvas') return
-    const files = get().files
-    const last = localStorage.getItem(OPEN_KEY(id))
-    const openId = last && files.some((f) => f.id === last) ? last : files[0]?.id
-    if (openId) await get().openFile(openId)
-    else await get().newFile()
-  },
-
-  createUser: async (name) => {
-    const u = await api.createUser(name)
-    set((s) => ({ users: [...s.users, u] }))
-    await get().switchUser(u.id)
   },
 
   refreshCatalog: async () => {

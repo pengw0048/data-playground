@@ -85,6 +85,7 @@ class SampleResult(Wire):
     columns: list[ColumnSchema] = []
     rows: list[dict[str, Any]] = []
     row_count: int | None = None
+    has_more: bool = False     # another page exists after this one (for paginated previews)
     truncated: bool = False
     preview_ref: str | None = None
     not_previewable: bool = False

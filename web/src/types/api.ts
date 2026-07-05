@@ -31,6 +31,7 @@ export interface SampleResult {
   columns: ColumnSchema[]
   rows: Record<string, unknown>[]
   rowCount?: number | null
+  hasMore?: boolean
   truncated: boolean
   previewRef?: string | null
   notPreviewable: boolean

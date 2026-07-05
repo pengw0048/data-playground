@@ -12,14 +12,14 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const runPreview = useStore((s) => s.runPreview)
   const requestRun = useStore((s) => s.requestRun)
   const [tab, setTab] = useState('rows')
-  const [offset, setOffset] = useState(0)
   const [detail, setDetail] = useState<number | null>(null)  // index of the row whose detail is open
+  const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
 
   useEffect(() => {
     if (!preview) runPreview(nodeId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeId])
-  const page = (o: number) => { setDetail(null); setOffset(o); runPreview(nodeId, o) }
+  const page = (o: number) => { setDetail(null); runPreview(nodeId, o) }
 
   if (!preview || preview.loading) return <Skeleton />
   if (preview.error) return <ErrorState reason={preview.error} onRetry={() => runPreview(nodeId, offset)} />
@@ -33,7 +33,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const tabs = [{ id: 'rows', label: 'Rows' }, ...caps.map((c) => ({ id: c.id, label: c.label }))]
   // a refresh may drop the capability whose tab was selected — fall back to Rows
   const activeTab = tab === 'rows' || caps.some((c) => c.id === tab) ? tab : 'rows'
-  const atEnd = res.rows.length < PAGE  // a short page means there's no next page in the preview window
+  const atEnd = !res.hasMore  // the kernel peeks one extra row, so this is right even at exact multiples
 
   return (
     <div className="dp-dark" style={{ color: 'var(--viewer-text)' }}>
