@@ -59,6 +59,11 @@ for _d in (metadb.get_setting("datasets", "global", default=[]) or []):
 
 @app.websocket("/ws/run/{run_id}")
 async def ws_run(ws: WebSocket, run_id: str):
+    # gate the status stream like the HTTP GET /run/{id} (which is behind the auth router) and ws_collab:
+    # a run's status carries row counts, per-node state, error text (may embed paths) and output names.
+    if auth.auth_enabled() and not auth.verify(ws.cookies.get("dp_session")):
+        await ws.close(code=1008)  # policy violation — no valid session
+        return
     await ws.accept()
     try:
         while True:

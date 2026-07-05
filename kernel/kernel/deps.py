@@ -4,7 +4,7 @@ The core depends only on the SPI. This wires the DEFAULT setup (DuckDB+Lance ada
 local out-of-core runner, in-memory catalog, media/vector capabilities, node specs). Extra
 plugin packs are discovered two ways (§8.0): a drop-in `plugins/<pack>/` folder in the
 workspace, and pip-installed packages exposing a `dataplay.plugins` entry point. Each calls
-`register(reg)` to add nodes / adapters / runners / capabilities / catalog / planner.
+`register(reg)` to add nodes / adapters / runners / capabilities / catalog.
 """
 
 from __future__ import annotations
@@ -67,9 +67,6 @@ class Registry:
     def set_catalog(self, catalog) -> None:
         self.deps.catalog = catalog
 
-    def set_planner(self, planner) -> None:
-        self.deps.planner = planner
-
 
 def _persist_run(graph, target, status) -> None:
     """Runner on_complete hook: keep a finished run with its canvas (canvas id == graph.id)."""
@@ -89,7 +86,6 @@ class Deps:
         self.node_specs: dict[str, NodeSpec] = {s.kind: s for s in BUILTIN_NODE_SPECS}
         self.builtin_kinds = {s.kind for s in BUILTIN_NODE_SPECS}
         self.node_lowerings: dict[str, object] = {}
-        self.planner = None
         self.plugins: list[dict] = []
         self._manifests: dict[str, dict] = {}
         from kernel.storage import make_storage

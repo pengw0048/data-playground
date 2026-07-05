@@ -106,11 +106,17 @@ class LocalRunner:
         return status
 
     def _evict(self) -> None:
-        """Bound retained run/cancel/cache state (called under self._lock). Dicts keep insertion order."""
+        """Bound retained run/cancel/cache state (called under self._lock). Dicts keep insertion order.
+        Evict only TERMINAL runs (oldest first) — never a queued/running one, so a long run submitted
+        early isn't dropped mid-flight by 100 later submissions (which would 404 its status poll)."""
+        _terminal = {"done", "failed", "cancelled"}
         while len(self.runs) > _MAX_RUNS:
-            old = next(iter(self.runs))
-            self.runs.pop(old, None)
-            self._cancel.pop(old, None)
+            victim = next((rid for rid, st in self.runs.items() if st.status in _terminal), None)
+            if victim is None:
+                break  # everything retained is still in-flight — exceed the cap rather than drop a live run
+            self.runs.pop(victim, None)
+            self._cancel.pop(victim, None)
+            self._scopes.pop(victim, None)
         while len(self._cache) > _MAX_RUNS:
             self._cache.pop(next(iter(self._cache)), None)
 

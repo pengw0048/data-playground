@@ -1076,6 +1076,43 @@ def test_collab_ws_requires_auth_when_enabled(monkeypatch):
         client.cookies.clear()
 
 
+def test_run_ws_requires_auth_when_enabled(monkeypatch):
+    # the run-status stream carries per-node status, error text (may embed paths) + output names — gate
+    # it like GET /run/{id} and the collab ws, instead of streaming to any unauthenticated socket.
+    import pytest
+    from starlette.websockets import WebSocketDisconnect
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    client.cookies.clear()
+    try:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws/run/run_whatever"):
+                pass
+    finally:
+        client.cookies.clear()
+
+
+def test_evict_never_drops_a_running_run():
+    # a long run submitted early must not be evicted by 100 later submissions while still executing —
+    # _evict skips non-terminal runs (else its status poll would 404 and strand the node).
+    from kernel.deps import get_deps
+    from kernel.models import RunStatus
+    from kernel.plugins.runner import _MAX_RUNS
+    r = get_deps().runner
+    with r._lock:
+        saved = dict(r.runs)
+        try:
+            r.runs.clear()
+            r.runs["run_live"] = RunStatus(run_id="run_live", status="running")  # oldest + still running
+            for i in range(_MAX_RUNS + 5):
+                r.runs[f"run_done_{i}"] = RunStatus(run_id=f"run_done_{i}", status="done")
+            r._evict()
+            assert "run_live" in r.runs          # the in-flight run survived
+            assert len(r.runs) == _MAX_RUNS      # only terminal runs were dropped, down to the cap
+        finally:
+            r.runs.clear()
+            r.runs.update(saved)
+
+
 def test_collab_relay_gates_viewer_doc_updates(monkeypatch):
     # a viewer may watch (presence + peers' edits) but its OWN doc updates ('yjs' carries CRDT state)
     # must NOT be relayed — else an editor peer would merge + autosave them, laundering a change past
