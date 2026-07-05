@@ -46,7 +46,8 @@ from kernel.models import (
 from kernel.plugins.importer import ImporterNotConfigured
 from kernel.settings import settings
 
-api = APIRouter(prefix="/api")
+api = APIRouter(prefix="/api")           # authed by default (gated at include time, see app setup)
+public = APIRouter(prefix="/api")        # reachable pre-login: auth status/login/logout + the login roster
 
 
 # --------------------------------------------------------------------------- #
@@ -371,7 +372,7 @@ def current_user(x_dp_user: str | None = Header(default=None),
     return metadb.resolve_user(x_dp_user)
 
 
-@api.get("/auth/status")
+@public.get("/auth/status")
 def auth_status(dp_session: str | None = Cookie(default=None)) -> dict:
     from kernel import auth
     if not auth.auth_enabled():
@@ -379,7 +380,7 @@ def auth_status(dp_session: str | None = Cookie(default=None)) -> dict:
     return {"authEnabled": True, "userId": auth.verify(dp_session)}
 
 
-@api.post("/auth/login")
+@public.post("/auth/login")
 def auth_login(body: dict, response: Response) -> dict:
     from kernel import auth
     if not auth.auth_enabled():
@@ -409,7 +410,7 @@ def change_password(body: dict, uid: str = Depends(current_user)) -> dict:
     return {"ok": True}
 
 
-@api.post("/auth/logout")
+@public.post("/auth/logout")
 def auth_logout(response: Response) -> dict:
     response.delete_cookie("dp_session")
     return {"ok": True}
@@ -429,14 +430,16 @@ class SettingBody(BaseModel):
     value: object = None
 
 
-@api.get("/users")
+# public: the login screen needs the roster to populate its user picker BEFORE a session exists — so
+# id + name only (no emails), and no other data.
+@public.get("/users")
 def list_users() -> list[dict]:
     with metadb.session() as s:
-        return [{"id": u.id, "name": u.name, "email": u.email} for u in s.scalars(_sa_select(metadb.User))]
+        return [{"id": u.id, "name": u.name} for u in s.scalars(_sa_select(metadb.User))]
 
 
 @api.post("/users")
-def create_user(body: UserBody) -> dict:
+def create_user(body: UserBody, uid: str = Depends(current_user)) -> dict:  # gated: no anonymous self-registration
     from kernel import auth
     with metadb.session() as s:
         u = metadb.User(name=body.name, email=body.email,
@@ -573,6 +576,20 @@ def canvas_runs(canvas_id: str, uid: str = Depends(current_user)) -> list[dict]:
     return metadb.list_runs(canvas_id)
 
 
+# Secrets never leave the kernel in plaintext. GET redacts them to a sentinel (fields are password
+# inputs, so it just shows dots); PUT treats the sentinel as "unchanged" and preserves the stored value.
+_REDACTED = "__redacted__"
+_SECRET_SUBKEYS = ("accessKeyId", "secretAccessKey")  # within the objectStore setting
+
+
+def _redact_global(key: str, value):
+    if key == "agentApiKey":
+        return _REDACTED if value else value
+    if key == "objectStore" and isinstance(value, dict):
+        return {k: (_REDACTED if k in _SECRET_SUBKEYS and v else v) for k, v in value.items()}
+    return value
+
+
 @api.get("/settings")
 def get_settings(uid: str = Depends(current_user)) -> dict:
     with metadb.session() as s:
@@ -580,7 +597,7 @@ def get_settings(uid: str = Depends(current_user)) -> dict:
         out: dict = {"global": {}, "user": {}}
         for r in rows:
             if r.scope == "global":
-                out["global"][r.key] = json.loads(r.value)
+                out["global"][r.key] = _redact_global(r.key, json.loads(r.value))
             elif r.scope == "user" and r.scope_id == uid:
                 out["user"][r.key] = json.loads(r.value)
         return out
@@ -589,7 +606,14 @@ def get_settings(uid: str = Depends(current_user)) -> dict:
 @api.put("/settings")
 def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
     scope_id = uid if body.scope == "user" else ""
-    metadb.set_setting(body.key, body.value, scope=body.scope, scope_id=scope_id)
+    value = body.value
+    if body.scope == "global":  # a redaction sentinel means "keep what's stored" — never overwrite a secret with dots
+        stored = metadb.get_setting(body.key, "global", default=None)
+        if body.key == "agentApiKey" and value == _REDACTED:
+            value = stored
+        elif body.key == "objectStore" and isinstance(value, dict) and isinstance(stored, dict):
+            value = {**value, **{k: stored.get(k) for k in _SECRET_SUBKEYS if value.get(k) == _REDACTED}}
+    metadb.set_setting(body.key, value, scope=body.scope, scope_id=scope_id)
     return {"ok": True}
 
 
@@ -605,7 +629,12 @@ app.add_middleware(
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_methods=["*"], allow_headers=["*"],
 )
-app.include_router(api)
+# EVERY /api route requires a resolved user (open mode → local; auth mode → a valid session). Only the
+# `public` router (auth status/login/logout + the login roster) is reachable pre-login. This makes auth
+# the SECURE DEFAULT — new routes are gated unless explicitly added to `public` — instead of the old
+# opt-in-per-route model that left /run, /data, /catalog, POST /users wide open.
+app.include_router(public)
+app.include_router(api, dependencies=[Depends(current_user)])
 metadb.init_db()  # create metadata tables (idempotent) + seed the default local user
 # re-register user-added datasets (from settings) so they survive a restart
 for _d in (metadb.get_setting("datasets", "global", default=[]) or []):

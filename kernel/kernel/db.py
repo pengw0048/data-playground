@@ -31,9 +31,12 @@ def conn() -> duckdb.DuckDBPyConnection:
             if _conn is None:
                 _conn = duckdb.connect(":memory:")
                 _conn.execute("SET enable_progress_bar = false")
-                # let object-store access (s3://, gs://) auto-load the bundled httpfs extension
-                _conn.execute("SET autoinstall_known_extensions = true")
-                _conn.execute("SET autoload_known_extensions = true")
+                # Do NOT auto-install/auto-load extensions: that let ANY uri (e.g. https://evil/x.parquet)
+                # silently pull in httpfs and fetch it (SSRF). Object-store access loads httpfs
+                # EXPLICITLY in ensure_object_store(), so s3://gs:// still work; other schemes now fail
+                # closed instead of reaching out.
+                _conn.execute("SET autoinstall_known_extensions = false")
+                _conn.execute("SET autoload_known_extensions = false")
     return _conn
 
 

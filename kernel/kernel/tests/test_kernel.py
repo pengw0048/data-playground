@@ -338,6 +338,39 @@ def test_concurrent_previews_do_not_corrupt():
     assert all(ok and not npv for _, ok, npv in results)  # no cross-contamination, no crash
 
 
+def test_sandbox_blocks_format_string_escape():
+    # the AST guard rejects `.__class__` attribute access; the format-field escape hides the dunder in
+    # a STRING — "{0.__class__.__mro__[-1].__subclasses__}".format(()) — so string literals with '__'
+    # (and getattr(x, "__class__")) are rejected too.
+    code = "def fn(row):\n    row['x'] = '{0.__class__.__mro__[-1].__subclasses__}'.format(())\n    return row"
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("images")}),
+        N("xf", "transform", {"source": "adhoc", "mode": "map", "code": code}),
+    ], "edges": [E("src", "xf")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "xf", "k": 5}).json()
+    assert r["error"] or r["notPreviewable"]
+    assert "__" in (r.get("reason") or "")
+
+
+def test_settings_redacts_secrets():
+    # GET /settings must not disclose the LLM key or object-store secrets in plaintext; a PUT that
+    # echoes the redaction sentinel preserves the stored secret (doesn't overwrite it with dots).
+    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "sk-super-secret"})
+    client.put("/api/settings", json={"scope": "global", "key": "objectStore",
+                                      "value": {"accessKeyId": "AKIA", "secretAccessKey": "shh", "region": "us-east-1"}})
+    g = client.get("/api/settings").json()["global"]
+    assert g["agentApiKey"] == "__redacted__"                    # key not disclosed
+    assert g["objectStore"]["secretAccessKey"] == "__redacted__" and g["objectStore"]["accessKeyId"] == "__redacted__"
+    assert g["objectStore"]["region"] == "us-east-1"             # non-secret still visible
+    # saving back the redacted view keeps the real secrets (a no-op edit doesn't wipe them)
+    client.put("/api/settings", json={"scope": "global", "key": "objectStore",
+                                      "value": {"accessKeyId": "__redacted__", "secretAccessKey": "__redacted__", "region": "eu-west-1"}})
+    from kernel import metadb
+    stored = metadb.get_setting("objectStore", "global")
+    assert stored["secretAccessKey"] == "shh" and stored["accessKeyId"] == "AKIA" and stored["region"] == "eu-west-1"
+    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": ""})  # restore
+
+
 def test_sandbox_blocks_dunder_escape():
     # the classic ().__class__.__mro__ escape must be rejected (finding #4)
     code = "def fn(row):\n    row['x'] = ().__class__.__mro__[-1].__subclasses__()\n    return row"
@@ -592,25 +625,45 @@ def test_users_create_and_list():
 
 
 def test_per_user_password_is_not_a_skeleton_key(monkeypatch):
-    # with auth on, a password authenticates ONLY its own user — knowing the shared/bootstrap password
-    # no longer lets anyone sign in as someone else (the documented impersonation hole, now closed).
-    from kernel import metadb
+    # with auth on, a password authenticates ONLY its own user — no shared/skeleton password.
+    from kernel import auth, metadb
+    from kernel.metadb import User, session
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
-    monkeypatch.setenv("DP_AUTH_PASSWORD", "bootpw")
-    metadb.init_db()  # seeds the default user's credential from the bootstrap password
+    bid = "bella_u"
+    with session() as s:  # provision directly (create_user is now gated — see the auth-boundary test)
+        if s.get(User, bid) is None:
+            s.add(User(id=bid, name="Bella", password_hash=auth.hash_password("pwBella")))
     client.cookies.clear()
-    b = client.post("/api/users", json={"name": "Bella", "password": "pwBella"}).json()
-    assert client.post("/api/auth/login", json={"userId": b["id"], "password": "pwBella"}).status_code == 200
-    assert client.post("/api/auth/login", json={"userId": b["id"], "password": "bootpw"}).status_code == 401  # not a skeleton key
-    assert client.post("/api/auth/login", json={"userId": b["id"], "password": "wrong"}).status_code == 401
+    assert client.post("/api/auth/login", json={"userId": bid, "password": "pwBella"}).status_code == 200
+    assert client.post("/api/auth/login", json={"userId": bid, "password": "otherpw"}).status_code == 401  # not a skeleton key
+    assert client.post("/api/auth/login", json={"userId": bid, "password": "wrong"}).status_code == 401
     # self-service rotation: old must match; afterwards only the new password works
     client.cookies.clear()
-    client.post("/api/auth/login", json={"userId": b["id"], "password": "pwBella"})
+    client.post("/api/auth/login", json={"userId": bid, "password": "pwBella"})
     assert client.post("/api/auth/password", json={"oldPassword": "x", "newPassword": "pwNew12"}).status_code == 403
     assert client.post("/api/auth/password", json={"oldPassword": "pwBella", "newPassword": "pwNew12"}).status_code == 200
     client.cookies.clear()
-    assert client.post("/api/auth/login", json={"userId": b["id"], "password": "pwBella"}).status_code == 401
-    assert client.post("/api/auth/login", json={"userId": b["id"], "password": "pwNew12"}).status_code == 200
+    assert client.post("/api/auth/login", json={"userId": bid, "password": "pwBella"}).status_code == 401
+    assert client.post("/api/auth/login", json={"userId": bid, "password": "pwNew12"}).status_code == 200
+    client.cookies.clear()
+
+
+def test_api_routes_require_auth_when_enabled(monkeypatch):
+    # SECURE DEFAULT: with auth enabled, the whole /api surface needs a session — the high-impact routes
+    # (/run code-exec, /data file-read, POST /users self-registration) used to be wide open. Only the
+    # login roster + auth status/login stay public.
+    from kernel import auth, metadb
+    from kernel.metadb import User, session
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    client.cookies.clear()
+    g = {"id": "x", "version": 1, "nodes": [N("s", "source", {"uri": "/etc/hosts"})], "edges": []}
+    assert client.post("/api/run", json={"graph": g, "targetNodeId": "s"}).status_code == 401       # no unauth code-exec
+    assert client.post("/api/data/sample", json={"uri": "/etc/passwd", "k": 5}).status_code == 401   # no unauth file-read
+    assert client.post("/api/users", json={"name": "Mallory", "password": "x"}).status_code == 401    # no self-registration
+    assert client.post("/api/catalog/register", json={"uri": "/etc/hosts"}).status_code == 401
+    # but the login screen's public surface still works pre-session
+    assert client.get("/api/auth/status").status_code == 200
+    assert client.get("/api/users").status_code == 200 and all("email" not in u for u in client.get("/api/users").json())
     client.cookies.clear()
 
 
@@ -1029,9 +1082,14 @@ def test_execution_backend_plugin_contract(tmp_path):
 def test_signed_session_auth(monkeypatch):
     # with auth enabled, identity must come from a valid signed session cookie — a raw header is not
     # trusted, protected endpoints 401 without a session, and login requires the user's own password.
+    from kernel import auth
+    from kernel.metadb import User, session
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
     client.cookies.clear()
-    uid = client.post("/api/users", json={"name": "Sess", "password": "sesspw1"}).json()["id"]  # known credential
+    uid = "sess_u"
+    with session() as s:  # provision directly (create_user is gated when auth is on)
+        if s.get(User, uid) is None:
+            s.add(User(id=uid, name="Sess", password_hash=auth.hash_password("sesspw1")))
     try:
         assert client.get("/api/auth/status").json() == {"authEnabled": True, "userId": None}
         assert client.get("/api/canvas").status_code == 401                                 # no session

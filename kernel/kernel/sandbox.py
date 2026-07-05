@@ -33,8 +33,8 @@ _SAFE_BUILTINS = {
         "frozenset", "int", "isinstance", "issubclass", "len", "list", "map", "max",
         "min", "print", "range", "reversed", "round", "set", "sorted", "str", "sum",
         "tuple", "zip", "True", "False", "None", "ValueError", "KeyError", "TypeError",
-        "IndexError", "Exception", "repr", "ord", "chr", "hex", "bin", "format",
-    )
+        "IndexError", "Exception", "repr", "ord", "chr", "hex", "bin",
+    )  # NOTE: no "format" — str.format("{0.__class__...}") reaches dunders through a format field
 }
 
 _ENTRY_NAMES = ["fn", "transform", "process", "map", "op"]
@@ -70,6 +70,11 @@ def _reject_dunder(code: str) -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
             raise SandboxError(f"access to '{node.attr}' is not allowed in an ad-hoc cell")
+        # dunders reached through a STRING instead of an attribute node — `"{0.__class__.__mro__...}"
+        # .format(x)` or `getattr(x, "__class__")`. A data-transform cell has no need for '__' in a
+        # string literal, so reject it (closes the format-field / getattr escape in this soft guard).
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "__" in node.value:
+            raise SandboxError("string literals containing '__' are not allowed in an ad-hoc cell")
         if isinstance(node, ast.Name) and node.id.startswith("__") and node.id.endswith("__"):
             raise SandboxError(f"access to '{node.id}' is not allowed in an ad-hoc cell")
 
