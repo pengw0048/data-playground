@@ -10,6 +10,7 @@ import type { CanvasDoc, CanvasNode, CanvasEdge } from '../types/graph'
 let ydoc = new Y.Doc()
 let applying = false        // a store change currently originates from Y → don't push it back
 let active = false
+let ready = false          // gate local→Y pushes until we've synced peers' state (or confirmed first)
 let lastDoc: CanvasDoc | undefined
 let broadcast: ((u: Uint8Array) => void) | null = null
 let unsub: (() => void) | null = null
@@ -76,13 +77,14 @@ export function startYSync(send: (u: Uint8Array) => void): void {
   ydoc = new Y.Doc()
   broadcast = send
   active = true
-  const doc0 = useStore.getState().doc
-  ydoc.transact(() => pushDocToY(doc0), 'hydrate')  // seed Y from the loaded canvas (does NOT broadcast)
+  ready = false  // do NOT seed Y from the (possibly stale) DB snapshot yet — first try to sync peers'
+                 // live state, so a joiner can't clobber unpersisted edits (hydrateIfEmpty handles "first")
 
   ydoc.on('update', (u: Uint8Array, origin) => {
-    if (origin !== 'store') {          // remote edit (or local hydrate) → reflect into the store
+    if (origin !== 'store') {          // remote edit / local hydrate → reflect into the store
       applying = true
       try { useStore.setState({ doc: yToDoc(useStore.getState().doc) }) } finally { applying = false }
+      if (origin === 'remote') ready = true  // we've merged a peer's state → the store now matches Y
     }
     if (origin === 'store' && broadcast) broadcast(u)  // only genuine local edits go on the wire
   })
@@ -91,13 +93,27 @@ export function startYSync(send: (u: Uint8Array) => void): void {
   unsub = useStore.subscribe((s) => {
     if (s.doc === lastDoc) return
     lastDoc = s.doc
-    if (applying || !active) return    // this change came from Y → don't echo it back
+    if (applying || !active || !ready) return  // from Y, or not yet synced → don't echo/clobber
     pushDocToY(s.doc)
   })
 }
 
+/** Seed Y from the store's current doc IFF nothing has arrived from peers — i.e. we're the first
+ * client in the room. Called on a short delay after joining. Idempotent. */
+export function hydrateIfEmpty(): void {
+  if (ready || !active) return
+  if (nodes().size === 0 && edges().size === 0) pushDocToY(useStore.getState().doc)  // no peer state → we seed it
+  ready = true
+}
+
+/** Whether we hold any shared state — used to skip empty ysync replies (avoids full-doc storms). */
+export function hasYState(): boolean {
+  return nodes().size > 0 || edges().size > 0
+}
+
 export function stopYSync(): void {
   active = false
+  ready = false
   unsub?.(); unsub = null
   broadcast = null
   ydoc.destroy()

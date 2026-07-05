@@ -547,6 +547,9 @@ def test_subprocess_runner_executes_in_isolation(tmp_path):
         assert st["status"] == "done", st.get("error")
         assert st["outputTable"] == "subproc_out"
         assert (st["totalRows"] or st["rowsProcessed"]) == 40
+        # the child wrote in its own (discarded) catalog — the parent must still register it live
+        tables = client.get("/api/catalog/tables").json()
+        assert any(t["name"] == "subproc_out" for t in tables)
     finally:
         metadb.set_setting("backend", "", "global")  # restore the default in-process runner
 

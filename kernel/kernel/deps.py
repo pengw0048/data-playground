@@ -99,7 +99,7 @@ class Deps:
         from kernel.subprocess_runner import SubprocessRunner
         # a second, real backend: run jobs in an isolated OS process (Settings → Execution). Selected
         # by name via pick_runner; pod/Ray runners install as plugins over the same protocol.
-        self.runners = [self.runner, SubprocessRunner(workspace, data_dir)]
+        self.runners = [self.runner, SubprocessRunner(workspace, data_dir, catalog=self.catalog)]
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self._load_plugins()
 

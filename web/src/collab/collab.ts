@@ -1,5 +1,5 @@
 import { useStore } from '../store/graph'
-import { startYSync, stopYSync, applyYUpdate, encodeYState, encodeYStateVector, yUpdateB64 } from './ydoc'
+import { startYSync, stopYSync, applyYUpdate, encodeYState, encodeYStateVector, yUpdateB64, hydrateIfEmpty, hasYState } from './ydoc'
 
 // Realtime collaboration over the kernel's per-canvas room (/ws/collab/{id}): PRESENCE (who's here +
 // live cursors) AND live co-editing (a Yjs CRDT — see ydoc.ts). One connection per open canvas, with
@@ -13,6 +13,7 @@ let ws: WebSocket | null = null
 let roomId = ''
 let cursorTimer: ReturnType<typeof setTimeout> | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let hydrateTimer: ReturnType<typeof setTimeout> | null = null
 
 function myName(): string {
   return useStore.getState().currentUser?.name ?? 'Someone'
@@ -34,6 +35,9 @@ function openSocket(canvasId: string): void {
   sock.onopen = () => {
     send({ type: 'presence', name: myName(), color })   // announce arrival
     send({ type: 'ysync', sv: encodeYStateVector() })   // ask peers for edits we're missing (CRDT sync step 1)
+    // if no peer has answered shortly, we're the first here → seed the shared doc from our snapshot
+    if (hydrateTimer) clearTimeout(hydrateTimer)
+    hydrateTimer = setTimeout(() => hydrateIfEmpty(), 800)
   }
   sock.onmessage = (ev) => {
     let msg: any
@@ -41,7 +45,7 @@ function openSocket(canvasId: string): void {
     if (!msg || msg.clientId === clientId) return
     const st = useStore.getState()
     if (msg.type === 'yjs' && typeof msg.update === 'string') { applyYUpdate(msg.update); return }
-    if (msg.type === 'ysync') { send({ type: 'yjs', update: encodeYState(msg.sv) }); return }  // reply with their missing state
+    if (msg.type === 'ysync') { if (hasYState()) send({ type: 'yjs', update: encodeYState(msg.sv) }); return }  // reply only if we have state (avoids empty-doc storms)
     if (msg.type === 'leave') { st.dropPeer(msg.clientId); return }
     if (msg.type === 'presence') {
       const prev = st.peers[msg.clientId]
@@ -74,6 +78,7 @@ export function connectCollab(canvasId: string): void {
 export function disconnectCollab(): void {
   roomId = ''
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  if (hydrateTimer) { clearTimeout(hydrateTimer); hydrateTimer = null }
   useStore.getState().clearPeers()
   stopYSync()
   if (ws) {

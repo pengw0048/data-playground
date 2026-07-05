@@ -10,6 +10,7 @@ Ray backends would be plugins over this same ExecutionBackend protocol.)
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
@@ -27,12 +28,25 @@ from kernel.plugins.runner import _CONFIRM_ROWS, _OP_SECONDS_PER_1K
 class SubprocessRunner:
     name = "local-subprocess"
 
-    def __init__(self, workspace: str, data_dir: str):
+    def __init__(self, workspace: str, data_dir: str, catalog=None):
         self.workspace = workspace
         self.data_dir = data_dir
+        self.catalog = catalog  # register outputs written by children into the parent's live catalog
         self.runs: dict[str, RunStatus] = {}
         self._procs: dict[str, subprocess.Popen] = {}
+        self._cancelled: set[str] = set()
         self._lock = threading.Lock()
+        atexit.register(self._terminate_all)  # don't orphan running children when the kernel exits
+
+    def _terminate_all(self) -> None:
+        with self._lock:
+            procs = list(self._procs.values())
+        for p in procs:
+            try:
+                if p.poll() is None:
+                    p.terminate()
+            except Exception:  # noqa: BLE001
+                pass
 
     def can_run(self, plan: CompilePlan) -> bool:
         return plan.acyclic
@@ -64,6 +78,8 @@ class SubprocessRunner:
 
     def _read(self, run_id: str, status_file: str) -> bool:
         """Merge the child's latest status; return True once it's terminal."""
+        if run_id in self._cancelled:
+            return True  # cancel already set the terminal state; don't let a stale 'running' file overwrite it
         try:
             with open(status_file) as f:
                 payload = json.load(f)
@@ -83,9 +99,20 @@ class SubprocessRunner:
             time.sleep(0.15)
         proc.wait()
         st = self.runs.get(run_id)
-        if st and st.status in ("queued", "running"):  # exited without a terminal status (crash/OOM/kill)
-            st.status = "failed"
-            st.error = st.error or f"execution process exited (code {proc.returncode})"
+        if st and st.status in ("queued", "running"):  # exited without a terminal status
+            if run_id in self._cancelled:
+                st.status = "cancelled"                 # a hard-killed cancel, not a failure
+            else:
+                st.status = "failed"                    # crash / OOM / unexpected exit
+                st.error = st.error or f"execution process exited (code {proc.returncode})"
+        # a subprocess run wrote its output in the CHILD's catalog (discarded) — register it here so
+        # it shows up in the parent's live catalog, just like an in-process run.
+        if st and st.status == "done" and st.output_uri and st.output_table and self.catalog is not None:
+            try:
+                self.catalog.register_output(name=st.output_table, uri=st.output_uri, version="v1",
+                                             parents=[], pipeline="canvas")
+            except Exception:  # noqa: BLE001
+                pass
         shutil.rmtree(job_dir, ignore_errors=True)
         with self._lock:
             self._procs.pop(run_id, None)
@@ -94,6 +121,7 @@ class SubprocessRunner:
         return self.runs[run_id]
 
     def cancel(self, run_id: str) -> RunStatus:
+        self._cancelled.add(run_id)  # so _watch reports 'cancelled', not 'failed', for the hard-killed child
         with self._lock:
             proc = self._procs.get(run_id)
         if proc is not None and proc.poll() is None:
