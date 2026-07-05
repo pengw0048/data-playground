@@ -62,7 +62,7 @@ export function TopBar() {
           <Icon name="refresh" size={13} /> Rerun all
         </button>
         <button data-testid="share-btn" onClick={() => setShareOpen(true)} title="Share this canvas"
-          style={{ ...pill, background: '#2f6ef0', color: '#fff', border: 'none' }}>
+          style={{ ...pill, background: color.focus, color: '#fff', border: 'none' }}>
           <Icon name="link" size={13} /> Share
         </button>
         {/* Settings lives in the app menu (top-left); identity + log out live on the files shell —

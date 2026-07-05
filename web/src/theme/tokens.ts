@@ -2,28 +2,31 @@
 // P4: colors have exactly one job. Type accents are MUTED / non-semantic; red·amber·green
 // are reserved for status; blue = focus/selection AND running (never on the same element).
 
+// These mirror the shadcn CSS-var tokens in index.css (slate neutrals + one blue primary). Keeping
+// them here lets the many inline-styled components re-skin in one place while they migrate to the
+// Tailwind/shadcn primitives. ONE primary blue now (the review found two: #2f6ef0 vs #3b7fe0).
 export const color = {
-  // neutrals
-  canvas: '#f4f5f7',
+  // neutrals (slate)
+  canvas: '#f7f8fa',
   card: '#ffffff',
-  border: '#e3e5ea',
-  hairline: '#ececef',
-  ink: '#1a1c22',
-  text2: '#565a63',
-  text3: '#8a8f98',
+  border: '#e5e8ec',
+  hairline: '#eef1f4',
+  ink: '#171a21',
+  text2: '#5b616e',
+  text3: '#98a0ac',
 
   // status — reserved semantic
-  latest: '#2f9e5f',
+  latest: '#16a34a',
   stale: '#d99a2b',
-  running: '#3b7fe0',
-  failed: '#d64550',
+  running: '#2f7ff5',
+  failed: '#e0483d',
   queued: '#8a94a6',
-  draft: '#b0b4bc',
+  draft: '#aab1bd',
 
-  // wire / selection
+  // wire / selection — single brand blue (matches --primary)
   wire: '#aab0ba',
-  wireActive: '#3b7fe0',
-  focus: '#3b7fe0',
+  wireActive: '#2f7ff5',
+  focus: '#2f7ff5',
 } as const
 
 // Muted, non-semantic accent stripe per node kind (left edge, 6px).
