@@ -53,6 +53,7 @@ def ensure_object_store() -> None:
     with _lock:
         c = conn()
         if not _obj_store_loaded:
+            c.execute("INSTALL httpfs")  # bundled on some platforms, downloaded on others (needs net once)
             c.execute("LOAD httpfs")
             _obj_store_loaded = True
         from kernel import metadb

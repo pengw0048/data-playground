@@ -543,6 +543,13 @@ def test_object_store_s3_roundtrip_and_browse(tmp_path):
     from kernel import db, destinations, metadb
     from kernel.plugins.adapters import DuckDBAdapter
 
+    try:  # httpfs is downloaded on first install — skip if this environment can't fetch it
+        with db.lock():
+            db.conn().execute("INSTALL httpfs")
+            db.conn().execute("LOAD httpfs")
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"httpfs unavailable: {e}")
+
     server = ThreadedMotoServer(port=0)
     server.start()
     try:
