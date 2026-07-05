@@ -181,16 +181,30 @@ class DuckDBAdapter:
             raise NotImplementedError(f"write mode '{mode}' is not supported — use overwrite or append")
         if not obj:
             os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-        if low.endswith((".csv", ".tsv")):
-            rel.write_csv(target)
-        elif low.endswith((".json", ".ndjson")):
-            # DuckDB writes JSON out-of-core via COPY; ARRAY true emits a top-level [] read_json reads back
-            rel.query("_w", f"COPY _w TO '{target.replace(chr(39), chr(39) * 2)}' (FORMAT JSON, ARRAY true)")
-        elif low.endswith((".arrow", ".feather", ".ipc")):
-            import pyarrow.feather as feather
-            feather.write_feather(rel.to_arrow_table(), target)
-        else:
-            rel.write_parquet(target)
+        # Local overwrite: write to a temp sibling then os.replace, so a failed or cancelled write
+        # never truncates the existing dataset. (Object stores: a single-object PUT lands atomically;
+        # there's no cheap server-side rename, so write in place.) The format is chosen by `low` (the
+        # real extension) while the bytes go to `wtarget`, which is renamed to `target` on success.
+        wtarget = target if obj else f"{target}.tmp-{uuid.uuid4().hex[:8]}"
+        try:
+            if low.endswith((".csv", ".tsv")):
+                rel.write_csv(wtarget)
+            elif low.endswith((".json", ".ndjson")):
+                # DuckDB writes JSON out-of-core via COPY; ARRAY true emits a top-level [] read_json reads back
+                rel.query("_w", f"COPY _w TO '{wtarget.replace(chr(39), chr(39) * 2)}' (FORMAT JSON, ARRAY true)")
+            elif low.endswith((".arrow", ".feather", ".ipc")):
+                import pyarrow.feather as feather
+                feather.write_feather(rel.to_arrow_table(), wtarget)
+            else:
+                rel.write_parquet(wtarget)
+            if not obj:
+                os.replace(wtarget, target)
+        except BaseException:
+            if not obj:
+                import contextlib
+                with contextlib.suppress(OSError):
+                    os.remove(wtarget)
+            raise
         return {"uri": uri, "rows": rows}
 
 

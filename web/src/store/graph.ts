@@ -86,6 +86,7 @@ interface Store {
   doc: CanvasDoc
   kernelInfo: KernelInfo | null
   kernelUp: boolean
+  accessDenied: boolean  // server rejected the save with 403 (view-only / access revoked) — NOT offline
   catalog: CatalogTable[]
   processors: ProcessorDescriptor[]
   specsVersion: number
@@ -279,6 +280,7 @@ export const useStore = create<Store>((set, get) => ({
   files: [],
   kernelInfo: null,
   kernelUp: false,
+  accessDenied: false,
   catalog: [],
   processors: [],
   specsVersion: 0,
@@ -791,11 +793,19 @@ useStore.subscribe((s) => {
       useStore.setState((st) => ({
         saved: true,
         kernelUp: true,  // a successful save confirms the kernel is reachable (clears the offline banner)
+        accessDenied: false,  // a save went through → we clearly still have edit access
         files: st.files.map((f) => (f.id === doc.id ? { ...f, name: doc.name ?? f.name, version: doc.version } : f)),
       }))
-    } catch {
-      // offline: the localStorage cache still holds it; flag the kernel down so the banner shows
-      useStore.setState({ saved: true, kernelUp: false })
+    } catch (e) {
+      if (e instanceof KernelError && e.status === 403) {
+        // permission, NOT connectivity: the kernel is up but rejected the write (view-only / access
+        // revoked). Don't show the "offline" banner or pretend it synced — say so, once.
+        if (!useStore.getState().accessDenied) useStore.getState().pushToast('You have view-only access — changes are kept in this browser but not saved to the server', 'error')
+        useStore.setState({ saved: true, kernelUp: true, accessDenied: true })
+      } else {
+        // offline: the localStorage cache still holds it; flag the kernel down so the banner shows
+        useStore.setState({ saved: true, kernelUp: false })
+      }
     }
   }, 400)
 })
@@ -826,13 +836,21 @@ useStore.subscribe((s) => {
 })
 
 function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void, nodeId: string, runId: string) {
+  let fails = 0
   const tick = async () => {
     // stop polling if the node was deleted mid-run (don't re-insert a runs entry for it)
     if (!get().doc.nodes.some((n) => n.id === nodeId)) return
     let status: RunStatus
     try {
       status = await api.runStatus(runId)
+      fails = 0
     } catch {
+      // a transient blip (network hiccup / brief kernel restart) must not strand the node spinning
+      // forever — retry a few times with backoff, then give up and surface it instead of hanging.
+      if (++fails <= 6) { setTimeout(tick, 800); return }
+      set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase: 'idle' as const }), phase: 'idle' } } }))
+      get().updateData(nodeId, { status: 'stale' })
+      get().pushToast('Lost track of the run — the kernel became unreachable', 'error')
       return
     }
     set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase: 'running' as const }), status } } }))

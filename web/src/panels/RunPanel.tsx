@@ -28,8 +28,9 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
         <>
           <Label>{phase === 'confirm' ? 'HEADS UP' : 'ESTIMATE'}</Label>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 2 }}>
-            <span style={{ fontSize: 24, fontWeight: 700, color: color.ink }}>{est.rows.toLocaleString()} rows</span>
-            <span style={{ fontSize: 13, color: color.text2 }}>· ~{fmtTime(est.seconds)}</span>
+            <span style={{ fontSize: 24, fontWeight: 700, color: color.ink }}>
+              {est.rows != null ? `${est.rows.toLocaleString()} rows` : 'Size unknown'}
+            </span>
           </div>
           {est.breakdown && <div style={{ fontSize: 11, color: color.text3, marginTop: 8 }}>{est.breakdown}</div>}
           {phase === 'confirm' ? (

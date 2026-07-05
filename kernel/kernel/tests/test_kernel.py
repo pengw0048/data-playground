@@ -345,6 +345,46 @@ def test_write_formats_round_trip(tmp_path):
             assert a.scan(res["uri"]).fetchall() == [(3, "z")], ext  # part-*.<ext> read back from the dir
 
 
+def test_overwrite_is_atomic_and_preserves_old_data_on_failure(tmp_path):
+    # a failed/cancelled overwrite must NOT truncate the existing dataset: we write to a temp sibling
+    # and os.replace only on success (review finding — silent data loss on re-run failure).
+    import glob as _glob
+    from kernel import db
+    from kernel.plugins.adapters import DuckDBAdapter
+    a = DuckDBAdapter()
+    con = db.conn()
+    t = str(tmp_path / "out.parquet")
+    with db.lock():
+        a.write(t, con.sql("SELECT 42 AS a"), "overwrite")
+        old = a.scan(t).fetchall()
+        with pytest.raises(Exception):  # count(*) succeeds; the scan hits error() mid-write
+            a.write(t, con.sql("SELECT CASE WHEN a >= 0 THEN error('boom') END AS a FROM range(3) t(a)"), "overwrite")
+        assert a.scan(t).fetchall() == old  # original data intact
+        assert not _glob.glob(str(tmp_path / "*.tmp-*"))  # no leftover temp file
+        a.write(t, con.sql("SELECT 7 AS a"), "overwrite")  # a real overwrite still replaces cleanly
+        assert a.scan(t).fetchall() == [(7,)]
+        assert not _glob.glob(str(tmp_path / "*.tmp-*"))
+
+
+def test_estimate_reports_real_rows_and_gates_only_large_runs(tmp_path):
+    # the estimate is grounded: it reports the REAL source-row count (or None when unknown, not a
+    # fabricated 1000), carries no invented ETA, and gates only a genuinely large countable pass.
+    from kernel import compiler
+    from kernel.deps import get_deps
+    from kernel.models import Graph
+    deps = get_deps()
+    p = _seq_parquet(tmp_path, n=10)
+    g = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": p})], "edges": []})
+    plan = compiler.compile_plan(g, "s", deps.registry, deps.node_specs)
+    r = deps.runner
+    assert r.estimate(plan, None).rows is None and r.estimate(plan, None).needs_confirm is False  # unknown → no fake, no gate
+    assert r.estimate(plan, 10).needs_confirm is False and r.estimate(plan, 10).rows == 10          # small known
+    assert r.estimate(plan, 6_000_000).needs_confirm is True                                        # big known → gate
+    # end-to-end: the endpoint returns the real count for a small source, no gate, and no ETA field
+    est = client.post("/api/run/estimate", json={"graph": g.model_dump(), "targetNodeId": "s"}).json()
+    assert est["rows"] == 10 and est["needsConfirm"] is False and "seconds" not in est
+
+
 def test_metric_over_transform_upstream_not_previewable():
     # a metric whose upstream has a Python transform must refuse preview, not spill all rows (finding #6)
     code = "def fn(row):\n    row['w2'] = row['width'] * 2\n    return row"
@@ -569,6 +609,40 @@ def test_subprocess_runner_executes_in_isolation(tmp_path):
         assert any(t["name"] == "subproc_out" for t in tables)
     finally:
         metadb.set_setting("backend", "", "global")  # restore the default in-process runner
+
+
+def test_subprocess_run_is_recorded_in_history(tmp_path):
+    # run history must be captured for the isolated-process backend too. The PARENT records it (the
+    # child disables its own on_complete to avoid a daemon-thread race that dropped records): a run
+    # records exactly once — not zero (lost), not twice (double).
+    import time as _t
+
+    from kernel import metadb
+    from kernel.metadb import Canvas, session
+    cid = "cvs_subproc_hist"
+    with session() as s:
+        if s.get(Canvas, cid) is None:
+            s.add(Canvas(id=cid, owner_id=metadb.DEFAULT_USER_ID, name="t", version=1, doc="{}", visibility="private"))
+    before = len(metadb.list_runs(cid))
+    metadb.set_setting("backend", "local-subprocess", "global")
+    try:
+        p = _seq_parquet(tmp_path, n=30)
+        g = {"id": cid, "version": 1, "nodes": [
+            N("src", "source", {"uri": p}),
+            N("wr", "write", {"filename": "hist_out.parquet", "writeMode": "overwrite"}),
+        ], "edges": [E("src", "wr")]}
+        r = client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()
+        assert _poll(r["runId"], tries=400)["status"] == "done"
+        runs = metadb.list_runs(cid)
+        for _ in range(50):  # let the parent watcher thread persist the terminal run
+            runs = metadb.list_runs(cid)
+            if len(runs) > before:
+                break
+            _t.sleep(0.1)
+        assert len(runs) == before + 1, [r["status"] for r in runs]  # exactly one, no race-loss / double
+        assert runs[0]["status"] == "done"
+    finally:
+        metadb.set_setting("backend", "", "global")
 
 
 def test_object_store_s3_roundtrip_and_browse(tmp_path):

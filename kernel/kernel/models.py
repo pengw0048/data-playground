@@ -124,8 +124,7 @@ class PipelineImport(Wire):
 # Execution
 # --------------------------------------------------------------------------- #
 class RunEstimate(Wire):
-    rows: int
-    seconds: float
+    rows: int | None = None   # real source-row count; None when no source is countable (size unknown)
     placement: Placement
     needs_confirm: bool
     breakdown: str | None = None

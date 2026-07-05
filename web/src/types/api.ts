@@ -56,8 +56,7 @@ export interface ProcessorDescriptor {
 export type Placement = 'local' | 'distributed'
 
 export interface RunEstimate {
-  rows: number
-  seconds: number
+  rows: number | null   // real source-row count; null when size is unknown (no countable source)
   placement: Placement
   needsConfirm: boolean
   breakdown?: string | null

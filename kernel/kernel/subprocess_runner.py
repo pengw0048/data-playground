@@ -22,7 +22,7 @@ import time
 import uuid
 
 from kernel.models import CompilePlan, Graph, PerNodeStatus, Placement, RunEstimate, RunStatus
-from kernel.plugins.runner import _CONFIRM_ROWS, _OP_SECONDS_PER_1K
+from kernel.plugins.runner import _CONFIRM_ROWS
 
 
 class SubprocessRunner:
@@ -32,6 +32,7 @@ class SubprocessRunner:
         self.workspace = workspace
         self.data_dir = data_dir
         self.catalog = catalog  # register outputs written by children into the parent's live catalog
+        self.on_complete = None  # optional (graph, target, status) hook — Deps wires it to run-history
         self.runs: dict[str, RunStatus] = {}
         self._procs: dict[str, subprocess.Popen] = {}
         self._cancelled: set[str] = set()
@@ -51,10 +52,11 @@ class SubprocessRunner:
     def can_run(self, plan: CompilePlan) -> bool:
         return plan.acyclic
 
-    def estimate(self, plan: CompilePlan, rows: int) -> RunEstimate:
-        seconds = max(0.15, sum(_OP_SECONDS_PER_1K.get(s.kind, 0.02) * (rows / 1000.0) for s in plan.steps))
-        return RunEstimate(rows=rows, seconds=round(seconds, 2), placement="local",
-                           needs_confirm=rows >= _CONFIRM_ROWS,
+    def estimate(self, plan: CompilePlan, rows: int | None) -> RunEstimate:
+        if rows is None:  # unknown size (uncountable → unreadable → fails fast) — no fabricated ETA, no gate
+            return RunEstimate(rows=None, placement="local", needs_confirm=False,
+                               breakdown=f"size unknown · {len(plan.steps)} steps · isolated process")
+        return RunEstimate(rows=rows, placement="local", needs_confirm=rows >= _CONFIRM_ROWS,
                            breakdown=f"{rows:,} rows · {len(plan.steps)} steps · isolated process")
 
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
@@ -73,7 +75,7 @@ class SubprocessRunner:
         with self._lock:
             self.runs[run_id] = status
             self._procs[run_id] = proc
-        threading.Thread(target=self._watch, args=(run_id, proc, status_file, job_dir), daemon=True).start()
+        threading.Thread(target=self._watch, args=(run_id, proc, status_file, job_dir, graph, target_node_id), daemon=True).start()
         return status
 
     def _read(self, run_id: str, status_file: str) -> bool:
@@ -88,7 +90,8 @@ class SubprocessRunner:
         self.runs[run_id] = RunStatus(**{**payload, "run_id": run_id})  # the child had its own run id
         return self.runs[run_id].status in ("done", "failed", "cancelled")
 
-    def _watch(self, run_id: str, proc: subprocess.Popen, status_file: str, job_dir: str) -> None:
+    def _watch(self, run_id: str, proc: subprocess.Popen, status_file: str, job_dir: str,
+               graph: Graph, target: str | None) -> None:
         while True:
             if self._read(run_id, status_file):
                 break
@@ -99,7 +102,8 @@ class SubprocessRunner:
             time.sleep(0.15)
         proc.wait()
         st = self.runs.get(run_id)
-        if st and st.status in ("queued", "running"):  # exited without a terminal status
+        forced = bool(st and st.status in ("queued", "running"))  # exited without a terminal status
+        if forced:
             if run_id in self._cancelled:
                 st.status = "cancelled"                 # a hard-killed cancel, not a failure
             else:
@@ -111,6 +115,15 @@ class SubprocessRunner:
             try:
                 self.catalog.register_output(name=st.output_table, uri=st.output_uri, version="v1",
                                              parents=[], pipeline="canvas")
+            except Exception:  # noqa: BLE001
+                pass
+        # Persist run history here (the child disables its own on_complete to avoid a daemon-thread
+        # race). We read the terminal status from the child's atomically-written status file, or the
+        # status we forced above on a crash/cancel — recording every terminal run, like the in-process
+        # backend, with no double-write.
+        if st is not None and self.on_complete and st.status in ("done", "failed", "cancelled"):
+            try:
+                self.on_complete(graph, target, st)
             except Exception:  # noqa: BLE001
                 pass
         shutil.rmtree(job_dir, ignore_errors=True)

@@ -27,10 +27,6 @@ from kernel.models import (
     RunStatus,
 )
 
-_OP_SECONDS_PER_1K = {
-    "read": 0.01, "sample": 0.005, "filter": 0.008, "select": 0.006, "op": 0.02, "sql": 0.02,
-    "join": 0.05, "reduce": 0.03, "write": 0.03, "opaque": 0.2, "error_gate": 0.001,
-}
 _CONFIRM_ROWS = 5_000_000   # a full pass over this many rows is worth a heads-up before it runs
 _MAX_RUNS = 100          # cap retained run history / cache so a long-lived kernel doesn't grow forever
 
@@ -61,12 +57,18 @@ class LocalRunner:
         return plan.acyclic
 
     # -- estimate ---------------------------------------------------------- #
-    def estimate(self, plan: CompilePlan, rows: int) -> RunEstimate:
-        seconds = max(0.15, sum(_OP_SECONDS_PER_1K.get(s.kind, 0.02) * (rows / 1000.0) for s in plan.steps))
+    def estimate(self, plan: CompilePlan, rows: int | None) -> RunEstimate:
+        # No fabricated ETA — a per-op seconds guess is uncalibrated and misleadingly precise. Report
+        # the real source-row count, or "unknown" (rather than the old rows=1000 that also slipped the
+        # confirm gate). Unknown means the source couldn't be counted, which for the built-in adapters
+        # means it can't be scanned either — the run will fail fast — so it needs no confirm gate; only
+        # a genuinely large, countable pass does.
         placement: Placement = "local"  # the only backend today; a cluster runner (plugin) sets its own
-        needs_confirm = rows >= _CONFIRM_ROWS
-        return RunEstimate(rows=rows, seconds=round(seconds, 2), placement=placement,
-                           needs_confirm=needs_confirm, breakdown=f"{rows:,} rows · {len(plan.steps)} steps · out-of-core")
+        if rows is None:
+            return RunEstimate(rows=None, placement=placement, needs_confirm=False,
+                               breakdown=f"size unknown · {len(plan.steps)} steps · out-of-core")
+        return RunEstimate(rows=rows, placement=placement, needs_confirm=rows >= _CONFIRM_ROWS,
+                           breakdown=f"{rows:,} rows · {len(plan.steps)} steps · out-of-core")
 
     # -- plan hash (content addressing) ------------------------------------ #
     def _plan_hash(self, graph: Graph, target: str | None) -> str:

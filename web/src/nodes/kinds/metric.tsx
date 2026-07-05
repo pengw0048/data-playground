@@ -12,7 +12,7 @@ function Metric({ id, data }: NodeComponentProps) {
   const column = String(data.config.column ?? '')
   const columns = useInputColumns(id)
   return (
-    <NodeCard id={id} data={data} metaOverride={`${agg}${agg !== 'count' && column ? `(${column})` : ''} · value + sparkline`}>
+    <NodeCard id={id} data={data} metaOverride={`${agg}${agg !== 'count' && column ? `(${column})` : ''} · scalar`}>
       <div style={{ display: 'flex', gap: 8 }}>
         <Field label="agg" style={{ flex: 1 }}>
           <MiniSelect<Agg> value={agg} onChange={(v) => updateConfig(id, { agg: v })} options={[{ value: 'count', label: 'count' }, { value: 'mean', label: 'mean' }, { value: 'sum', label: 'sum' }, { value: 'min', label: 'min' }, { value: 'max', label: 'max' }]} />
@@ -34,8 +34,8 @@ register(
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'] }],
     outputs: [{ id: 'out', wire: 'metric', label: 'value' }],
     canBypass: false,
-    blurb: 'reduce to a scalar / series',
-    defaultData: () => ({ title: 'metric', status: 'draft', config: { agg: 'count' }, meta: 'count · value + sparkline' }),
+    blurb: 'reduce to a scalar',
+    defaultData: () => ({ title: 'metric', status: 'draft', config: { agg: 'count' }, meta: 'count · scalar' }),
   },
   Metric,
 )

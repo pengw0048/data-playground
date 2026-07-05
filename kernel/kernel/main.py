@@ -282,8 +282,12 @@ def agent_act(req: AgentRequest) -> dict:
     return {"available": True, **out}
 
 
-def _row_estimate(req_graph, target_node_id, deps) -> int:
+def _row_estimate(req_graph, target_node_id, deps) -> int | None:
+    """Largest real source-row count feeding this run, or None when no source is countable. Returning
+    None (rather than a fabricated number) lets the estimator err toward confirmation on unknown size
+    instead of silently slipping the confirm gate."""
     chain = upstream_chain(req_graph, target_node_id) if target_node_id else req_graph.nodes
+    counts: list[int] = []
     for n in chain:
         if n.type == "source":
             cfg = n.data.get("config", {}) if isinstance(n.data, dict) else {}
@@ -291,11 +295,11 @@ def _row_estimate(req_graph, target_node_id, deps) -> int:
             if uri:
                 try:
                     c = deps.resolve_adapter(uri).count(uri)
-                    if c:
-                        return c
+                    if c is not None:
+                        counts.append(c)
                 except Exception:  # noqa: BLE001
                     pass
-    return 1000
+    return max(counts) if counts else None
 
 
 @api.post("/run/estimate", response_model=RunEstimate)
@@ -320,7 +324,7 @@ def run(req: RunRequest) -> RunStatus:
     rows = _row_estimate(req.graph, req.target_node_id, deps)
     est = runner.estimate(plan, rows)
     if est.needs_confirm and not req.confirmed:
-        raise HTTPException(409, "run needs confirmation (cost/placement over threshold)")
+        raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
     status = runner.run(plan, req.graph, req.target_node_id, est.placement)
     deps.run_index[status.run_id] = runner  # so status/cancel/ws reach the right runner
     return status

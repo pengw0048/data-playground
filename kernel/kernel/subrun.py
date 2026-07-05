@@ -30,6 +30,10 @@ def main() -> int:
         from kernel.deps import set_workspace
         from kernel.models import Graph
         deps = set_workspace(job["workspace"], job["dataDir"])
+        # the PARENT (SubprocessRunner) owns run-history recording — it reads our terminal status file
+        # and persists it. Recording here would race: on_complete runs in a daemon thread AFTER status
+        # flips to "done", and this process can exit (or be hard-killed on cancel) before it commits.
+        deps.runner.on_complete = None
         graph = Graph(**job["graph"])
         plan = compiler.compile_plan(graph, job.get("target"), deps.registry, deps.node_specs)
         st = deps.runner.run(plan, graph, job.get("target"), "local")  # in-process runner, in THIS process
