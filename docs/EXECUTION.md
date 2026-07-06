@@ -1,6 +1,8 @@
-# 执行与放置(Execution & Placement)设计 — 评审稿 v2
+# 执行与放置(Execution & Placement)设计 + 实现现状
 
-_状态:设计评审中(未实现)。v2 已折入一轮基于真实代码的对抗式评审(含实测证明的缺陷)。目标:把"假 kernel"变成真能按能力把每一步放到具体 worker(pod 或进程,取决于插件)上跑、默认自动计划、可手动覆盖/钉住、结果进共享存储从而跨运行复用、相邻同放置的步骤融合成一个操作(甚至一个 Ray job)的执行层 —— 同时不破坏"每一步都能看到真实数据"这个核心卖点。_
+_状态:**A1 / A2 / Phase B / C1–C3 / A3 已实现并 shipped**(见 §9 每阶段的 commit)。这份文档既是设计,也记录了已落地的部分。目标(已达成):把"假 kernel"变成真能按能力把每一步放到具体 worker(pod 或进程,取决于插件)上跑、结果进内容寻址共享存储从而跨运行复用、相邻同放置的步骤融合、并保住"每一步都能看到真实数据"(预览恒可看 + checkpoint 物化)。_
+
+**已实现一览:** 真实计算拓扑(Compute UI)· 持久跨实例结果缓存 · 节点 requires 声明(UI)· 整-run 能力自动路由 · **per-node 放置**(planner 切 region + RunController 物化交接)· **物理跨-worker 执行**(区域在 pool worker 子进程里跑)· checkpoint 物化可观测。剩余增强见 §9 尾。_
 
 ## 0. 现状(为什么说是"假 kernel")
 
@@ -110,7 +112,15 @@ def cancel_unit(handle: UnitHandle) -> None
 - **cancel 走持久句柄**:派发时把每单元 `(backend, UnitHandle)` 落 DB;`cancel(run_id)` 由 controller 读 DB → 对每个未完成单元调 `backend.cancel_unit(handle)`。任意实例可取消,不依赖内存 `run_index`。
 - **reconcile 加 ownership**:`run_states` 增 `owner_instance_id` + `heartbeat_at`;启动时只把"本实例拥有且已死"或"心跳超时"的标 interrupted,不碰别的活实例的 run(正好落实 metadb.py:410 的 TODO 与"一个实例启动取消另一个实例活 run"的隐患)。
 
-## 9. 增量路径(**已按评审重排** —— 每步独立可发布、可测)
+## 9. 增量路径 —— 实现现状（每步独立发布、可测）
+
+**已 shipped:** A1 内容 key 加固（`c0cf926`）· A2 持久共享 ResultStore（`48c0105`）· Phase B 资源模型 + KernelInfo backends[] + requires + Compute UI（`763a4eb`/`ba4b26a`）· C1 参考 pool 后端 + 能力匹配（`6df03e8`）· C1.5 能力自动路由（`04d201c`）· C4-lite requires 编辑器（`df2bc08`）· C2 planner + RunController + 物化交接（`09d77df`/`1679e12`）· A3 checkpoint 物化 UI（`62c0a45`）· C3 物理跨-worker 执行（`bb02792`）。
+
+**剩余增强（非阻塞）:** 多输出端口的 per-port ref（当前按节点）· branch 已删（流程控制=section，不需要）· Lance-带索引 ResultRef（当前 parquet 交接，vector-search 跨边界会退化为暴力扫描）· 分布式 run 的 owner/heartbeat reconcile（当前单实例假设）· 每-region status 进 per_node 的更细粒度 · store 的 TTL/引用计数 GC · planner 计算的"将物化"预览标注（当前只标 checkpoint/write）。
+
+---
+
+### 原始增量设计（保留，作为路线依据）
 
 原"P0 = 纯元数据"零执行价值却仍扰动 runners 契约与 KernelInfo 形状,不划算。重排为:
 
