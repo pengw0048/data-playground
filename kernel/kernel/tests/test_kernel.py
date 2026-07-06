@@ -398,6 +398,28 @@ def test_user_scoped_backend_preference_wins_over_global(tmp_path):
         metadb.set_setting("backend", "", scope="global")  # don't leak a global runner choice to other tests
 
 
+def test_auth_mode_defaults_to_subprocess_runner_for_isolation(tmp_path, monkeypatch):
+    # multi-user safety: with auth ON and no explicit backend, pick_runner defaults to the OS-isolated
+    # subprocess runner so a user's arbitrary Python can't crash/hang the shared kernel; open mode
+    # stays in-process (trusted + faster); an explicit Settings choice always wins.
+    import types
+
+    from kernel import metadb
+    from kernel.deps import Deps
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    plan = types.SimpleNamespace(acyclic=True)
+    metadb.set_setting("backend", "", scope="global")
+    try:
+        monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
+        assert d.pick_runner(plan).name == "local-out-of-core"       # open mode → in-process
+        monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+        assert d.pick_runner(plan).name == "local-subprocess"        # auth on → OS isolation by default
+        metadb.set_setting("backend", "local-out-of-core", scope="global")
+        assert d.pick_runner(plan).name == "local-out-of-core"       # explicit choice wins even under auth
+    finally:
+        metadb.set_setting("backend", "", scope="global")
+
+
 def test_sandbox_blocks_dunder_escape():
     # the classic ().__class__.__mro__ escape must be rejected (finding #4)
     code = "def fn(row):\n    row['x'] = ().__class__.__mro__[-1].__subclasses__()\n    return row"

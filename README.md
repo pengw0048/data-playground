@@ -105,6 +105,16 @@ documents `deploy.replicas` + sticky routing for the multi-instance case. Set `D
 `DP_DATASET_ROOTS` for a multi-user deployment; TLS/reverse-proxy is operator-specific (front it with
 nginx/Caddy). The app is on `http://localhost:8471`.
 
+**Multi-user isolation.** When auth is on (`DP_AUTH_SECRET` set), runs default to the **subprocess
+runner** — each run executes in its own OS process, so a user's arbitrary Python (transform / section
+scripts) can't crash, hang, or OOM the shared kernel, and a runaway loop can be hard-killed. Paired
+with `DP_DATASET_ROOTS`, local dataset reads are confined to the allowed roots. Be honest about the
+boundary, though: subprocesses still run as the **same OS user on the same filesystem**, and the code
+"sandbox" is a soft guard, not a security boundary — this is crash/DoS isolation, **not** a
+multi-tenant jail. Real tenant isolation needs OS-level sandboxing (containers, per-user accounts, or
+a pod/queue `ExecutionBackend` plugin). Open single-user mode stays in-process (trusted + faster);
+override either way in Settings → Execution.
+
 ## Plugins — a stranger's node appears typed & wired, no core edit
 
 Drop a package in `<workspace>/plugins/<pack>/` (or pip-install one exposing a `dataplay.plugins`

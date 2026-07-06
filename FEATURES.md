@@ -83,11 +83,11 @@ _最后更新：2026-07-06。**133 项功能**（旧扁平清单 142 条里的 9
 
 **实现**
 - ✅ **LocalRunner（本地核外）** — 后台守护线程、进程内运行，发每节点状态转换。 `kernel/kernel/plugins/runner.py:34`
-- ✅ **SubprocessRunner（进程隔离）** — 真 OS 进程隔离，崩溃/OOM 不拖垮 kernel，取消=硬 terminate()。 `kernel/kernel/subprocess_runner.py:28`
+- ✅ **SubprocessRunner（进程隔离）** — 真 OS 进程隔离，崩溃/OOM 不拖垮 kernel，取消=硬 terminate()；**auth 模式下默认走它**（多用户隔离）。 `kernel/kernel/subprocess_runner.py:28`
 - 🟡 **pod/Ray/队列 runner** — 文档化的插件扩展点，未内置发布；"专用执行层"目前仍是脚手架。 `kernel/kernel/deps.py:116-147; SettingsModal.tsx:95-104`
 
 **选择**
-- ✅ **pick_runner** — 尊重 Settings 的 backend + per-user 偏好（空=继承）、再取首个 can_run；run_index 路由 status/cancel（上限 1000）。 `kernel/kernel/deps.py:135-147; routers/runs.py:165-181`
+- ✅ **pick_runner（含多用户隔离默认）** — 尊重 Settings 的 backend + per-user 偏好（空=继承）；**无显式选择且 auth 开启时默认 subprocess**（开放模式保持进程内），再取首个 can_run；run_index 路由 status/cancel。 `kernel/kernel/deps.py:135-147; test_auth_mode_defaults_to_subprocess_runner_for_isolation`
 
 **生命周期**
 - ✅ **每运行的 DuckDB 游标隔离（db.run_scope）** — 并发运行/预览不再串行在全局锁；退出只回滚 + 清自己的视图。 `kernel/kernel/db.py:84`
@@ -100,7 +100,7 @@ _最后更新：2026-07-06。**133 项功能**（旧扁平清单 142 条里的 9
 
 ### §2.4 计算节点执行 · 4✅ 1🟡
 - ✅ **Transform 逃生舱（在 Arrow RecordBatches 上跑 Python）** — map/filter/flat_map/map_batches；onError='skip' 丢失败行；完整运行溢出 Parquet。 `kernel/kernel/executors/engine.py:331`
-- ✅ **用户单元格代码的软沙箱** — 软性防护非安全边界；builtins 白名单 + import 白名单 + AST 拒 dunder + 墙钟超时。 `kernel/kernel/sandbox.py:82`
+- ✅ **用户单元格代码的软沙箱** — 软性防护非安全边界；builtins 白名单 + import 白名单 + AST 拒 dunder + 墙钟超时。多用户真正的隔离靠 auth 模式默认的 subprocess runner（崩溃/DoS 隔离，非多租户牢笼；见 §2.3、README 多用户隔离）。 `kernel/kernel/sandbox.py:82`
 - ✅ **Section 元编程（驱动脚本复合节点）** — 只完整遍历，每次迭代物化 Parquet + GC；run() 携带 parentId 子树以支持嵌套 section。 `↗ 容器 UI 见 §1.6` `kernel/kernel/section.py:75`
 - ✅ **向量搜索引擎入口** — 查询向量来自配置或选中行，预览也在完整输入（忠实）；裸 Lance source 走原生 ANN 否则暴力余弦。 `↗ 详见 §3.5` `kernel/kernel/executors/engine.py:415`
 - 🟡 **独立的 loop 节点** — 裸 loop 是直通占位符，真迭代走 section；环路一开始被拒（必须封装）。 `↗ §1.3 控制流` `kernel/kernel/executors/engine.py:307`

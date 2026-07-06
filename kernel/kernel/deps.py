@@ -143,10 +143,16 @@ class Deps:
         # honor the chosen backend (Settings → Execution) when it's registered and can run this plan;
         # otherwise the first runner that can, else the default. Real once plugins add more runners.
         # A per-user preference wins over the workspace default (empty = inherit the global choice).
-        from kernel import metadb
+        from kernel import auth, metadb
         chosen = (metadb.get_setting("backend", "user", uid, default="") if uid else "") or ""
         if not chosen:
             chosen = metadb.get_setting("backend", "global", default="") or ""
+        # multi-user safety: with auth ON and no explicit choice, default to the subprocess runner so a
+        # user's arbitrary Python can't crash / hang / OOM the shared kernel process (and a runaway
+        # pure-Python loop can be hard-killed). Open single-user mode stays in-process — trusted +
+        # faster + keeps the content-addressed cache. An explicit Settings→Execution choice always wins.
+        if not chosen and auth.auth_enabled():
+            chosen = "local-subprocess"
         if chosen:
             for r in self.runners:
                 if getattr(r, "name", None) == chosen and r.can_run(plan):
