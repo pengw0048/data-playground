@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import threading
 
+from kernel import metadb
 from kernel.models import (
     CatalogTable,
     LineageEdge,
@@ -67,11 +68,39 @@ class InMemoryCatalog:
             )
             self.tables[tid] = table
             self._by_uri[uri] = tid
+            self._persist(table)  # write-through to the shared DB (cross-instance / restart-durable)
             return table
+
+    def _persist(self, table: CatalogTable) -> None:
+        """Mirror an entry to the shared catalog table. Best-effort: a DB hiccup must not break the
+        in-memory catalog, which still serves this instance."""
+        try:
+            metadb.catalog_upsert_entry(table.uri, table.name, table.model_dump(by_alias=True))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _load_from_db(self) -> None:
+        """Merge catalog entries/edges registered by OTHER instances (or before a restart) into this
+        instance's in-memory view. Called at the start of each read so a dataset another stateless web
+        instance registered becomes visible here. Best-effort — a DB error just serves the local cache."""
+        try:
+            for d in metadb.catalog_entries():
+                uri = d.get("uri")
+                if uri and uri not in self._by_uri:
+                    t = CatalogTable.model_validate(d)
+                    self.tables[t.id] = t
+                    self._by_uri[uri] = t.id
+            have = {(e.parent, e.child) for e in self.edges}
+            for e in metadb.catalog_edges():
+                if (e["parent"], e["child"]) not in have:
+                    self.edges.append(LineageEdge(parent=e["parent"], child=e["child"], pipeline=e.get("pipeline")))
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- CatalogProvider --------------------------------------------------- #
     def list_tables(self, q: str | None) -> list[CatalogTable]:
         with self._lock:
+            self._load_from_db()  # pick up entries registered by other instances / before a restart
             items = list(self.tables.values())  # snapshot under the lock; safe to filter after
         if q:
             ql = q.lower()
@@ -80,6 +109,7 @@ class InMemoryCatalog:
 
     def get_table(self, id_or_name: str) -> CatalogTable:
         with self._lock:
+            self._load_from_db()  # another instance may have registered it
             if id_or_name in self.tables:
                 return self.tables[id_or_name]
             if id_or_name in self._by_uri:
@@ -93,6 +123,7 @@ class InMemoryCatalog:
         # collect the connected component around `uri` (over a snapshot so a concurrent register can't
         # mutate tables/edges mid-traversal)
         with self._lock:
+            self._load_from_db()  # include lineage recorded by other instances
             tables = dict(self.tables)
             by_uri = dict(self._by_uri)
             all_edges = list(self.edges)
@@ -123,12 +154,17 @@ class InMemoryCatalog:
             if any(e.parent == parent and e.child == child for e in self.edges):
                 return  # dedupe: one edge per (parent, child)
             self.edges.append(LineageEdge(parent=parent, child=child, pipeline=pipeline))
+        try:
+            metadb.catalog_add_edge(parent, child, pipeline)  # write-through (best-effort)
+        except Exception:  # noqa: BLE001
+            pass
 
     def register(self, table: CatalogTable, parents: list[str] | None = None,
                  pipeline: str | None = None) -> None:
         with self._lock:
             self.tables[table.id] = table
             self._by_uri[table.uri] = table.id
+            self._persist(table)
         for parent in parents or []:
             self._add_edge(parent, table.uri, pipeline)
 

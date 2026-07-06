@@ -1146,6 +1146,21 @@ def test_reconcile_marks_orphaned_runs_interrupted():
     assert d["status"] == "failed" and "restart" in (d.get("error") or "")
 
 
+def test_catalog_entries_are_shared_across_instances(tmp_path):
+    # a dataset/output registered on one instance's catalog is visible to ANOTHER instance (and after a
+    # restart) via the shared DB — the catalog half of making the web tier stateless.
+    from kernel.deps import get_deps
+    from kernel.plugins.catalog import InMemoryCatalog
+    deps = get_deps()
+    uri = str(tmp_path / "shared_out.parquet")
+    deps.catalog.register_output(name="shared_out_x", uri=uri, version="v1", parents=[], pipeline="canvas")
+    # a FRESH catalog with an empty data_dir (a different web instance) seeds nothing locally, but loads
+    # the entry from the shared DB on read
+    other = InMemoryCatalog(str(tmp_path / "empty_dir"), deps.resolve_adapter)
+    assert "shared_out_x" in [t.name for t in other.list_tables(None)]
+    assert other.get_table("shared_out_x").uri == uri
+
+
 def test_collab_relay_gates_viewer_doc_updates(monkeypatch):
     # a viewer may watch (presence + peers' edits) but its OWN doc updates ('yjs' carries CRDT state)
     # must NOT be relayed — else an editor peer would merge + autosave them, laundering a change past

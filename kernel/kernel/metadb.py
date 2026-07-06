@@ -107,6 +107,28 @@ class RunState(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
+class CatalogEntry(Base):
+    """A registered dataset / written output, shared across instances. The in-memory catalog write-throughs
+    here on register and loads from here on read, so a dataset registered on one (stateless) web instance
+    is visible to the others + survives a restart without re-probing. Keyed by uri; `doc` is the full
+    CatalogTable (incl. probed schema) as JSON so no re-probe is needed to serve it."""
+    __tablename__ = "catalog_entries"
+    uri: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, index=True)
+    doc: Mapped[str] = mapped_column(Text)  # the full CatalogTable as JSON
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class CatalogEdge(Base):
+    """A lineage edge (parent uri → child uri), shared like CatalogEntry so lineage is cross-instance."""
+    __tablename__ = "catalog_edges"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    parent: Mapped[str] = mapped_column(String, index=True)
+    child: Mapped[str] = mapped_column(String, index=True)
+    pipeline: Mapped[str | None] = mapped_column(String, nullable=True)
+    __table_args__ = (UniqueConstraint("parent", "child", name="uq_catalog_edge"),)
+
+
 class Setting(Base):
     __tablename__ = "settings"
     # scope 'global' (scope_id='') for system settings; scope 'user' (scope_id=user id) for prefs
@@ -339,6 +361,41 @@ def get_run_state(run_id: str) -> dict | None:
     with session() as s:
         r = s.get(RunState, run_id)
         return json.loads(r.doc) if r else None
+
+
+def catalog_upsert_entry(uri: str, name: str, doc: dict) -> None:
+    """Write-through a catalog entry (registered dataset / written output) to the shared DB, keyed by
+    uri, so other instances + a restart see it. `doc` is the full CatalogTable model_dump."""
+    with session() as s:
+        r = s.get(CatalogEntry, uri)
+        payload = json.dumps(doc, default=str)
+        if r is None:
+            s.add(CatalogEntry(uri=uri, name=name, doc=payload))
+        else:
+            r.name = name
+            r.doc = payload
+
+
+def catalog_add_edge(parent: str, child: str, pipeline: str | None = None) -> None:
+    """Write-through a lineage edge; one row per (parent, child)."""
+    if parent == child:
+        return
+    with session() as s:
+        exists = s.scalars(select(CatalogEdge).where(CatalogEdge.parent == parent, CatalogEdge.child == child)).first()
+        if exists is None:
+            s.add(CatalogEdge(parent=parent, child=child, pipeline=pipeline))
+
+
+def catalog_entries() -> list[dict]:
+    """Every persisted catalog entry, as CatalogTable-shaped dicts (for the in-memory catalog to load)."""
+    with session() as s:
+        return [json.loads(r.doc) for r in s.scalars(select(CatalogEntry))]
+
+
+def catalog_edges() -> list[dict]:
+    with session() as s:
+        return [{"parent": r.parent, "child": r.child, "pipeline": r.pipeline}
+                for r in s.scalars(select(CatalogEdge))]
 
 
 def reconcile_orphaned_runs() -> int:
