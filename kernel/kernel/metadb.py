@@ -94,6 +94,19 @@ class CanvasVersion(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class RunState(Base):
+    """Live / last-known status of a run, keyed by run_id, so GET /run/{id} + the status WebSocket are
+    served from the shared DB: ANY (stateless) web instance can answer, and status survives a kernel
+    restart instead of 404-ing. Distinct from RunRecord (the per-canvas run HISTORY). One row per run.
+    (This is the run-state half of making the web tier stateless — see kernel.deps.)"""
+    __tablename__ = "run_states"
+    run_id: Mapped[str] = mapped_column(String, primary_key=True)
+    canvas_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String, index=True)  # queued | running | done | failed | cancelled
+    doc: Mapped[str] = mapped_column(Text)  # the full RunStatus as JSON
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
 class Setting(Base):
     __tablename__ = "settings"
     # scope 'global' (scope_id='') for system settings; scope 'user' (scope_id=user id) for prefs
@@ -153,6 +166,7 @@ def init_db() -> None:
         from kernel import auth
         if auth.auth_enabled() and not u.password_hash and auth.bootstrap_password():
             u.password_hash = auth.hash_password(auth.bootstrap_password())
+    reconcile_orphaned_runs()  # any run left in-flight by the previous process is dead → mark interrupted
 
 
 @contextlib.contextmanager
@@ -302,6 +316,50 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
         return [{"id": r.id, "status": r.status, "targetNodeId": r.target_node_id, "rows": r.rows,
                  "ms": r.ms, "error": r.error, "outputTable": r.output_table,
                  "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
+
+
+def save_run_state(run_id: str, status: dict, canvas_id: str | None = None) -> None:
+    """Upsert a run's live status (the runner calls this on each transition). `status` is a RunStatus
+    model_dump; stored whole as JSON so GET /run/{id} can rebuild it on any instance."""
+    with session() as s:
+        r = s.get(RunState, run_id)
+        st = str(status.get("status", "running"))
+        payload = json.dumps(status, default=str)
+        if r is None:
+            s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload))
+        else:
+            r.status = st
+            r.doc = payload
+            if canvas_id and not r.canvas_id:
+                r.canvas_id = canvas_id
+
+
+def get_run_state(run_id: str) -> dict | None:
+    """The last-persisted RunStatus dict for a run, or None if unknown to this instance's DB."""
+    with session() as s:
+        r = s.get(RunState, run_id)
+        return json.loads(r.doc) if r else None
+
+
+def reconcile_orphaned_runs() -> int:
+    """On startup, mark any non-terminal run_state as interrupted: a run left 'running'/'queued' when the
+    kernel stopped is dead (its in-memory executor is gone), so leaving it non-terminal would make a
+    client poll forever. Returns how many were reconciled. NOTE: assumes a SINGLE execution instance —
+    when execution is distributed (ExecutionBackend plugins), replace this with per-run instance
+    ownership + heartbeat so one instance's startup can't cancel another's live runs."""
+    n = 0
+    with session() as s:
+        for r in s.scalars(select(RunState).where(RunState.status.in_(("queued", "running")))):
+            try:
+                d = json.loads(r.doc)
+            except Exception:  # noqa: BLE001
+                d = {"run_id": r.run_id}
+            d["status"] = "failed"
+            d["error"] = "interrupted — the kernel restarted while this run was in flight"
+            r.status = "failed"
+            r.doc = json.dumps(d, default=str)
+            n += 1
+    return n
 
 
 def snapshot_canvas(canvas_id: str, doc_json: str, version: int, author_id: str | None = None,

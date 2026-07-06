@@ -33,6 +33,7 @@ class SubprocessRunner:
         self.data_dir = data_dir
         self.catalog = catalog  # register outputs written by children into the parent's live catalog
         self.on_complete = None  # optional (graph, target, status) hook — Deps wires it to run-history
+        self.on_status = None    # optional (graph, status) hook — Deps wires it to DB-backed live status
         self.runs: dict[str, RunStatus] = {}
         self._procs: dict[str, subprocess.Popen] = {}
         self._cancelled: set[str] = set()
@@ -76,8 +77,16 @@ class SubprocessRunner:
             self.runs[run_id] = status
             self._procs[run_id] = proc
             self._evict()
+        self._emit(graph, status)  # persist 'queued' to the DB (pollable on any instance / after restart)
         threading.Thread(target=self._watch, args=(run_id, proc, status_file, job_dir, graph, target_node_id), daemon=True).start()
         return status
+
+    def _emit(self, graph: Graph, status: RunStatus) -> None:
+        if self.on_status:
+            try:
+                self.on_status(graph, status)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _evict(self) -> None:
         """Bound self.runs (called under self._lock) — subprocess runs accumulated forever otherwise.
@@ -134,11 +143,13 @@ class SubprocessRunner:
         # race). We read the terminal status from the child's atomically-written status file, or the
         # status we forced above on a crash/cancel — recording every terminal run, like the in-process
         # backend, with no double-write.
-        if st is not None and self.on_complete and st.status in ("done", "failed", "cancelled"):
-            try:
-                self.on_complete(graph, target, st)
-            except Exception:  # noqa: BLE001
-                pass
+        if st is not None and st.status in ("done", "failed", "cancelled"):
+            self._emit(graph, st)  # persist the terminal status to the DB (cross-instance / restart-safe)
+            if self.on_complete:
+                try:
+                    self.on_complete(graph, target, st)
+                except Exception:  # noqa: BLE001
+                    pass
         shutil.rmtree(job_dir, ignore_errors=True)
         with self._lock:
             self._procs.pop(run_id, None)
