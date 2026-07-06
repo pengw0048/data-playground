@@ -18,6 +18,7 @@ const CATS: { id: string; label: string; icon: IconName }[] = [
   { id: 'agent', label: 'Agent', icon: 'sparkle' },
   { id: 'execution', label: 'Execution', icon: 'play' },
   { id: 'destinations', label: 'Destinations', icon: 'export' },
+  { id: 'members', label: 'Members', icon: 'users' },
 ]
 
 // sentinel for the runner select's "inherit the workspace default" option (Radix Select forbids an
@@ -26,13 +27,30 @@ const INHERIT = '__default__'
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const kernelInfo = useStore((s) => s.kernelInfo)
+  const users = useStore((s) => s.users)
+  const currentUser = useStore((s) => s.currentUser)
+  const authEnabled = useStore((s) => s.authEnabled)
+  const refreshUsers = useStore((s) => s.refreshUsers)
+  const pushToast = useStore((s) => s.pushToast)
   const [g, setG] = useState<Record<string, unknown>>({})
   const [u, setU] = useState<Record<string, unknown>>({})  // per-user settings (scope='user')
   const [loading, setLoading] = useState(true)
   const [savedMsg, setSavedMsg] = useState('')
   const [dest, setDest] = useState({ name: '', backend: 'local', root: '' })
+  const [newUser, setNewUser] = useState({ name: '', password: '' })
   const [active, setActive] = useState('agent')
   const scrollRef = useRef<HTMLDivElement>(null)
+
+  const addUser = async () => {
+    const name = newUser.name.trim()
+    if (!name) return
+    try {
+      await api.createUser(name, newUser.password || undefined)
+      setNewUser({ name: '', password: '' })
+      await refreshUsers()
+      pushToast(`Added ${name}`, 'success')
+    } catch (e) { pushToast((e as Error).message, 'error') }
+  }
 
   useEffect(() => {
     api.getSettings().then((s) => { setG(s.global); setU(s.user) }).catch(() => {}).finally(() => setLoading(false))
@@ -152,6 +170,31 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     <Input type="password" value={obj.secretAccessKey ?? ''} placeholder="secret access key" onChange={(e) => setObj('secretAccessKey', e.target.value)} />
                     <Input value={obj.region ?? ''} placeholder="region (e.g. us-east-1)" onChange={(e) => setObj('region', e.target.value)} />
                     <Input value={obj.endpoint ?? ''} placeholder="endpoint (MinIO/R2, optional)" onChange={(e) => setObj('endpoint', e.target.value)} />
+                  </div>
+                </Section>
+
+                <Section id="members" title="Members">
+                  <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
+                    People who can sign in and be added as collaborators.
+                    {authEnabled
+                      ? ' Set an initial password below; each member can then rotate their own from the account menu.'
+                      : ' Sign-in is off (no DP_AUTH_SECRET), so passwords are unused until you enable auth — anyone with the URL is trusted.'}
+                  </p>
+                  <div className="mb-2.5 flex flex-col gap-1">
+                    {users.map((usr) => (
+                      <div key={usr.id} className="flex items-center gap-2 text-xs text-foreground">
+                        <span className="grid h-[22px] w-[22px] place-items-center rounded-full bg-muted text-[10px] font-bold text-muted-foreground">{usr.name.slice(0, 1).toUpperCase()}</span>
+                        <span className="flex-1">{usr.name}</span>
+                        {usr.id === currentUser?.id && <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">you</Badge>}
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex gap-1.5">
+                    <Input value={newUser.name} onChange={(e) => setNewUser({ ...newUser, name: e.target.value })} placeholder="Name" className="w-[150px] shrink-0" />
+                    <Input type="password" value={newUser.password} onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
+                      onKeyDown={(e) => { if (e.key === 'Enter') addUser() }}
+                      placeholder={authEnabled ? 'Initial password (optional)' : 'Password (unused until auth is on)'} className="min-w-0 flex-1" />
+                    <Button onClick={addUser} disabled={!newUser.name.trim()} className="shrink-0">Add member</Button>
                   </div>
                 </Section>
               </div>

@@ -213,6 +213,7 @@ interface Store {
   users: DpUser[]
   files: CanvasFile[]
   refreshFiles: () => Promise<void>
+  refreshUsers: () => Promise<void>
   openFile: (id: string) => Promise<boolean>
   newFile: () => Promise<void>
   renameFile: (name: string) => void
@@ -765,6 +766,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   refreshFiles: async () => { try { set({ files: await api.listCanvases() }) } catch { /* offline */ } },
+  refreshUsers: async () => { try { set({ users: await api.users() }) } catch { /* offline */ } },
 
   openFile: async (id) => {
     try {

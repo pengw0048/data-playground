@@ -235,6 +235,18 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('scratch', { exact: true })).toBeVisible() // destination added to the list
   })
 
+  test('settings Members creates a user', async ({ page }) => {
+    await page.goto('/')
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Settings', { exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
+    await page.getByRole('button', { name: 'Members' }).click()
+    const name = `Member ${Date.now()}`
+    await page.getByPlaceholder('Name').fill(name)
+    await page.getByRole('button', { name: 'Add member' }).click()
+    await expect(page.getByText(name, { exact: true })).toBeVisible() // new member appears in the roster
+  })
+
   test('a section node opens its editor and adds a contained node', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Compute', 'section')
