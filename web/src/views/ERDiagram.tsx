@@ -44,6 +44,14 @@ function EntityNode({ data }: { data: EntityData }) {
 
 const nodeTypes = { entity: EntityNode }
 
+const _POS_KEY = 'dp-er-positions'
+function loadPositions(): Record<string, { x: number; y: number }> {
+  try { return JSON.parse(localStorage.getItem(_POS_KEY) || '{}') } catch { return {} }
+}
+function savePositions(p: Record<string, { x: number; y: number }>): void {
+  try { localStorage.setItem(_POS_KEY, JSON.stringify(p)) } catch { /* storage full / disabled — layout just won't persist */ }
+}
+
 function keyColsLower(t: CatalogTable): string[] {
   return t.columns.filter((c) => c.capabilities?.includes('key')).map((c) => c.name.toLowerCase())
 }
@@ -65,7 +73,8 @@ export function ERDiagram() {
   const refreshCatalog = useStore((s) => s.refreshCatalog)
   const pushToast = useStore((s) => s.pushToast)
   const [rels, setRels] = useState<Relationship[]>([])
-  const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({})
+  // node layout survives navigation (the view unmounts) via localStorage, keyed by table id
+  const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>(loadPositions)
 
   useEffect(() => {
     api.relationships().then(setRels).catch(() => setRels([]))
@@ -75,11 +84,13 @@ export function ERDiagram() {
   const byUri = useMemo(() => Object.fromEntries(catalog.map((t) => [t.uri, t.id])), [catalog])
   const pkOf = (t: CatalogTable) => t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
 
+  // clicking a column toggles its membership in the declared primary key — so clicking several
+  // columns builds a COMPOSITE key (in click order); clicking a member again removes it.
   const toggleCol = useCallback(async (tableId: string, col: string) => {
     const t = catalog.find((x) => x.id === tableId)
     if (!t) return
     const cur = t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
-    const next = cur.length === 1 && cur[0] === col ? [] : [col]  // v1: single-column declared PK
+    const next = cur.includes(col) ? cur.filter((c) => c !== col) : [...cur, col]
     try {
       await api.declareKey(tableId, next)
       await refreshCatalog()
@@ -142,6 +153,7 @@ export function ERDiagram() {
     setPositions((p) => {
       const next = { ...p }
       for (const ch of changes) if (ch.type === 'position' && ch.position) next[ch.id] = ch.position
+      savePositions(next)
       return next
     })
   }, [])
@@ -153,7 +165,7 @@ export function ERDiagram() {
     <div className="relative h-full w-full">
       <div className="pointer-events-none absolute left-3 top-3 z-10 max-w-[320px] rounded-md border border-border bg-card/90 px-3 py-2 text-[10.5px] leading-relaxed text-muted-foreground backdrop-blur">
         <div className="mb-0.5 text-[12px] font-semibold text-foreground">Relationships (ER)</div>
-        🔑 click a column to declare its primary key · drag between two tables to declare a join (keys + cardinality measured) · click a solid edge to remove · dashed = possible join
+        🔑 click column(s) to declare the primary key (click several for a composite key) · drag between two tables to declare a join (keys + cardinality measured) · click a solid edge to remove · dashed = possible join
       </div>
       <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange}
         onConnect={onConnect} onEdgeClick={onEdgeClick} fitView minZoom={0.2} colorMode={resolvedTheme()}
