@@ -1656,6 +1656,26 @@ def test_pool_backend_workers_and_placement(tmp_path, monkeypatch):
     assert any(w.capacity.gpu == 2 and w.capacity.gpu_type == "a100" for w in pool_b.workers)
 
 
+def test_run_routes_to_a_capability_matching_backend(tmp_path, monkeypatch):
+    # C1.5: a graph declaring a GPU requirement auto-routes to a backend that can place it (the pool),
+    # even when the default backend can't. A hint, not a gate: no requirement → the choice is untouched.
+    import json
+
+    from kernel.deps import Deps
+    from kernel.models import Graph
+    from kernel.routers.runs import _route_by_capability
+    monkeypatch.setenv("DP_POOL_WORKERS", json.dumps([{"name": "gpu", "cpu": 16, "gpu": 2, "gpu_type": "a100"}]))
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    gpu_graph = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        {"id": "cap", "type": "transform", "position": {"x": 0, "y": 0},
+         "data": {"config": {"code": "def fn(row):\n    return row", "requires": {"gpu": 2, "gpuType": "a100"}}}},
+    ], "edges": [E("src", "cap")]})
+    plain = Graph(**{"id": "c", "version": 1, "nodes": [N("src", "source", {"uri": _uri("events")})], "edges": []})
+    assert _route_by_capability(d, d.runner, gpu_graph).name == "local-pool"  # in-process can't place gpu → pool
+    assert _route_by_capability(d, d.runner, plain) is d.runner               # no requirement → unchanged
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).

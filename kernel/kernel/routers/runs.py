@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
-from kernel import compiler, destinations
+from kernel import compiler, destinations, placement
 from kernel import graph as graph_mod
 from kernel.agent import agent_status, run_agent
 from kernel.deps import get_deps
@@ -145,6 +145,23 @@ def _row_estimate(req_graph, target_node_id, deps) -> int | None:
     return max(counts) if counts else None
 
 
+def _route_by_capability(deps, chosen, graph):
+    """If the graph declares a compute requirement the chosen backend can't place, prefer a backend
+    whose place() satisfies it (e.g. the GPU pool). A routing HINT, not a hard gate: if nothing can
+    place it (no matching pool configured), fall back to the chosen backend (OSS simulates GPUs, so an
+    unmet requirement still runs locally rather than blocking)."""
+    req = placement.graph_requires(graph, deps.node_specs)
+    if not (req.cpu or req.gpu or req.gpu_type or req.mem or req.labels):  # no requirement → leave choice
+        return chosen
+
+    def _can_place(r):
+        return hasattr(r, "place") and r.place(req) is not None
+
+    if _can_place(chosen):
+        return chosen
+    return next((r for r in deps.runners if _can_place(r)), chosen)
+
+
 def _cached_noop(runner, graph, target) -> bool:
     """True if this exact plan already has a reusable result — re-running just re-points at an existing
     output, so it needs no size confirmation (fixes the 'full cache hit still prompts' false gate)."""
@@ -184,7 +201,7 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
-    runner = deps.pick_runner(plan, uid)
+    runner = _route_by_capability(deps, deps.pick_runner(plan, uid), req.graph)  # honor node requires
     rows = _row_estimate(req.graph, req.target_node_id, deps)
     est = runner.estimate(plan, rows)
     if est.needs_confirm and not req.confirmed and not _cached_noop(runner, req.graph, req.target_node_id):
