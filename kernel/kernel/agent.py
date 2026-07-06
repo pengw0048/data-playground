@@ -70,18 +70,23 @@ Call those only when they want the canvas built or modified. When in doubt, prop
 words and let them ask you to build it.
 
 When you DO build:
-- Call list_catalog and list_node_kinds first to see the datasets and node kinds.
+- Call list_catalog and list_node_kinds first to see the datasets (with their columns + primary-key \
+candidates) and node kinds.
 - Every pipeline starts from a `source` node whose `uri` is a catalog table's uri.
 - Connect with `connect(source_id, target_id)`. Multi-input nodes (e.g. `join`) expose named \
 input handles — pass target_handle.
+- BEFORE joining two datasets, call `join_hints(left_uri, right_uri)` — don't guess the key. It \
+gives the right key column(s) and the MEASURED cardinality. A 1:N / N:M join multiplies rows, so if \
+you then need one row per parent, add an `aggregate`. Set the join's `on` (same-named keys) or \
+`condition` (`a.x = b.y` for differing names).
 - Configure with the params shown by list_node_kinds. For a `filter`, set `predicate` to a SQL \
 boolean expression over the columns. For `sql`, write a query using `input` as the table name. For \
 `transform`, write a Python function `def fn(row): ...` (mode "map") that returns the row.
 - Use `preview(node_id)` to SEE real sample rows and verify a step before continuing. Adapt to \
 what the data actually looks like.
 - Build the MINIMUM graph that achieves the outcome. Don't add nodes they didn't ask for.
-- When the graph is complete, STOP calling tools and reply with a one-sentence summary of what you \
-built.
+- Before you finish, call `validate` to confirm there are no typed-wire errors and no unintended \
+join fan-out. Then STOP calling tools and reply with a one-sentence summary of what you built.
 
 Be concise. Prefer relational nodes (filter/select/sql/aggregate/join) over Python transforms when \
 they suffice — they push down and run out-of-core."""
@@ -132,10 +137,66 @@ try:
 
     @_agent.tool
     def list_catalog(ctx: RunContext[_Ctx]) -> dict:
-        """List the datasets registered in the local catalog (name, uri, columns)."""
-        out = {"tables": [{"name": t.name, "uri": t.uri, "columns": [c.name for c in t.columns]}
+        """List the datasets in the catalog: name, uri, columns, row count, and detected primary-key
+        candidate column(s) — the keys you join on. Call join_hints to see how two datasets relate."""
+        out = {"tables": [{"name": t.name, "uri": t.uri, "rowCount": t.row_count,
+                           "columns": [c.name for c in t.columns],
+                           "keys": [k.columns for k in t.keys]}
                           for t in ctx.deps.kdeps.catalog.list_tables(None)]}
         ctx.deps.transcript.append({"tool": "list_catalog", "input": {}, "result": out})
+        return out
+
+    @_agent.tool
+    def join_hints(ctx: RunContext[_Ctx], left_uri: str, right_uri: str) -> dict:
+        """How two catalog datasets can join: ranked key column pairs with the join CARDINALITY
+        MEASURED from the data (1:1 / 1:N / N:1 / N:M), plus any owner-declared relationship. Use this
+        to pick the right join key and to know whether a join fans out (a 1:N/N:M join multiplies rows
+        — aggregate afterward if you need the parent grain)."""
+        from kernel import relationships as rel
+        d = ctx.deps.kdeps
+
+        def cols(uri):
+            try:
+                return d.catalog.get_table(uri).columns
+            except KeyError:
+                return d.resolve_adapter(uri).schema(uri)
+        try:
+            sugg = rel.suggest_joins(cols(left_uri), cols(right_uri),
+                                     rel.measured_unique(left_uri, d.resolve_adapter),
+                                     rel.measured_unique(right_uri, d.resolve_adapter))
+            out = {"suggestions": [s.model_dump(by_alias=True) for s in sugg],
+                   "declared": [r.model_dump(by_alias=True) for r in d.catalog.relationships(left_uri)
+                                if right_uri in (r.left_uri, r.right_uri)]}
+        except Exception as e:  # noqa: BLE001
+            out = {"error": f"{type(e).__name__}: {e}"}
+        ctx.deps.transcript.append({"tool": "join_hints", "input": {"left_uri": left_uri, "right_uri": right_uri}, "result": out})
+        return out
+
+    @_agent.tool
+    def validate(ctx: RunContext[_Ctx]) -> dict:
+        """Check the canvas you've built so far WITHOUT running it: typed-wire errors (incompatible
+        connections) and, for each join node, its measured cardinality + a fan-out warning. Call this
+        before you finish to confirm the graph is correct."""
+        from kernel import graph as gmod
+        from kernel import relationships as rel
+        from kernel.executors.schema import schema_for_graph
+        from kernel.models import Graph
+        d = ctx.deps.kdeps
+        out: dict = {}
+        try:
+            g = Graph.model_validate(ctx.deps.wg)
+            out["type_errors"] = gmod.type_errors(g, d.node_specs)
+            cols = schema_for_graph(g, d.resolve_adapter, d.registry, d.node_lowerings, d.node_specs)
+            joins = {}
+            for n in g.nodes:
+                if n.type == "join":
+                    ja = rel.analyze_join(g, n.id, cols, d.catalog, d.resolve_adapter)
+                    joins[n.id] = {"cardinality": (ja.suggestions[0].cardinality if ja.suggestions else "unknown"),
+                                   "warning": ja.warning, "note": ja.note}
+            out["joins"] = joins
+        except Exception as e:  # noqa: BLE001
+            out = {"error": f"{type(e).__name__}: {e}"}
+        ctx.deps.transcript.append({"tool": "validate", "input": {}, "result": out})
         return out
 
     @_agent.tool

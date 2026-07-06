@@ -643,6 +643,43 @@ def test_agent_builds_graph_via_tool_loop():
     assert [t["tool"] for t in out["transcript"]] == ["add_node", "add_node", "connect"]
 
 
+def test_agent_join_hints_and_validate_tools():
+    # the LLM does declarative selection by calling OUR tools for ground truth: list_catalog (now with
+    # primary-key candidates), join_hints (measured cardinality), validate (typed-wire + fan-out check).
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    from kernel.agent import run_agent
+    ev, img = _uri("events"), _uri("images")
+    steps = [
+        ToolCallPart(tool_name="list_catalog", args={}),
+        ToolCallPart(tool_name="join_hints", args={"left_uri": img, "right_uri": ev}),
+        ToolCallPart(tool_name="add_node", args={"kind": "source", "config": {"uri": img}}),
+        ToolCallPart(tool_name="add_node", args={"kind": "source", "config": {"uri": ev}}),
+        ToolCallPart(tool_name="add_node", args={"kind": "join", "config": {"on": "id"}}),
+        ToolCallPart(tool_name="connect", args={"source_id": "source_a1", "target_id": "join_a3", "target_handle": "a"}),
+        ToolCallPart(tool_name="connect", args={"source_id": "source_a2", "target_id": "join_a3", "target_handle": "b"}),
+        ToolCallPart(tool_name="validate", args={}),
+        TextPart("Joined images and events on id."),
+    ]
+    calls = {"i": 0}
+
+    def fn(messages, info: AgentInfo) -> ModelResponse:
+        part = steps[calls["i"]]
+        calls["i"] += 1
+        return ModelResponse(parts=[part])
+
+    out = run_agent("join images and events", {"nodes": [], "edges": []}, get_deps(), model=FunctionModel(fn))
+    tr = {t["tool"]: t["result"] for t in out["transcript"]}
+    # list_catalog now surfaces primary-key candidates the agent joins on
+    assert any(row["keys"] for row in tr["list_catalog"]["tables"])
+    # join_hints gives measured cardinality: id↔id is 1:1, id↔user_id is 1:N
+    cards = {tuple(s["rightColumns"]): s["cardinality"] for s in tr["join_hints"]["suggestions"]}
+    assert cards.get(("id",)) == "1:1" and cards.get(("user_id",)) == "1:N"
+    # validate checks the built graph: no typed-wire errors, and the join node is analyzed
+    assert tr["validate"]["type_errors"] == [] and "join_a3" in tr["validate"]["joins"]
+
+
 def test_agent_can_answer_without_touching_the_canvas():
     # No plan/build mode: the model may just reply in text (no mutating tools). The graph comes back
     # unchanged with an empty transcript, so the frontend leaves the canvas alone.

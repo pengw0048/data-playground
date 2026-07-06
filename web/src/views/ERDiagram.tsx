@@ -6,7 +6,10 @@ import {
 import { useStore } from '../store/graph'
 import { api } from '../api/client'
 import { resolvedTheme } from '../theme/mode'
-import type { CatalogTable, Relationship } from '../types/api'
+import { MiniSelect } from '../ui/controls'
+import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import type { CatalogTable, Relationship, JoinSuggestion, Cardinality } from '../types/api'
 import { cn } from '@/lib/utils'
 
 // The ER / "UML" view: every catalog dataset is an entity (columns, primary key badged); declared
@@ -73,6 +76,7 @@ export function ERDiagram() {
   const refreshCatalog = useStore((s) => s.refreshCatalog)
   const pushToast = useStore((s) => s.pushToast)
   const [rels, setRels] = useState<Relationship[]>([])
+  const [pending, setPending] = useState<{ left: CatalogTable; right: CatalogTable; suggestions: JoinSuggestion[] } | null>(null)
   // node layout survives navigation (the view unmounts) via localStorage, keyed by table id
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>(loadPositions)
 
@@ -129,19 +133,14 @@ export function ERDiagram() {
     return out
   }, [rels, catalog, byUri])
 
+  // dragging between two entities opens the picker (choose a suggested key or set columns/cardinality
+  // by hand) rather than blindly declaring the top suggestion — needed for tables with several FKs.
   const onConnect = useCallback(async (c: Connection) => {
     const s = catalog.find((t) => t.id === c.source), t = catalog.find((x) => x.id === c.target)
     if (!s || !t || s.id === t.id) return
-    try {
-      const top = (await api.joinSuggestions(s.uri, t.uri))[0]
-      if (!top) { pushToast('no matching key columns between these tables', 'error'); return }
-      setRels(await api.addRelationship({
-        leftUri: s.uri, leftColumns: top.leftColumns, rightUri: t.uri, rightColumns: top.rightColumns,
-        cardinality: top.cardinality, confidence: 'declared',
-      }))
-      pushToast(`declared ${s.name} → ${t.name} (${top.cardinality})`, 'success')
-    } catch (e) { pushToast(String((e as Error).message || e), 'error') }
-  }, [catalog, pushToast])
+    const suggestions = await api.joinSuggestions(s.uri, t.uri).catch(() => [])
+    setPending({ left: s, right: t, suggestions })
+  }, [catalog])
 
   const onEdgeClick = useCallback(async (_e: React.MouseEvent, edge: Edge) => {
     const rel = (edge.data as { rel?: Relationship } | undefined)?.rel
@@ -173,6 +172,88 @@ export function ERDiagram() {
         <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="var(--dots)" />
         <Controls showInteractive={false} />
       </ReactFlow>
+      {pending && (
+        <RelationshipDialog left={pending.left} right={pending.right} suggestions={pending.suggestions}
+          onClose={() => setPending(null)}
+          onDeclared={(next) => { setRels(next); setPending(null) }} />
+      )}
     </div>
+  )
+}
+
+const CARDINALITIES: Cardinality[] = ['1:1', '1:N', 'N:1', 'N:M', 'unknown']
+
+// Pick the join key(s) + cardinality when declaring a relationship: seed from the ranked suggestions,
+// or toggle columns on each side by hand (equal counts) and choose the cardinality.
+function RelationshipDialog({ left, right, suggestions, onClose, onDeclared }: {
+  left: CatalogTable; right: CatalogTable; suggestions: JoinSuggestion[]
+  onClose: () => void; onDeclared: (rels: Relationship[]) => void
+}) {
+  const pushToast = useStore((s) => s.pushToast)
+  const top = suggestions[0]
+  const [lc, setLc] = useState<string[]>(top?.leftColumns ?? [])
+  const [rc, setRc] = useState<string[]>(top?.rightColumns ?? [])
+  const [card, setCard] = useState<Cardinality>(top?.cardinality ?? 'unknown')
+  const [busy, setBusy] = useState(false)
+
+  const toggle = (arr: string[], set: (v: string[]) => void, col: string) =>
+    set(arr.includes(col) ? arr.filter((c) => c !== col) : [...arr, col])
+  const pick = (s: JoinSuggestion) => { setLc(s.leftColumns); setRc(s.rightColumns); setCard(s.cardinality) }
+  const ok = lc.length > 0 && lc.length === rc.length
+  const declare = async () => {
+    setBusy(true)
+    try {
+      onDeclared(await api.addRelationship({ leftUri: left.uri, leftColumns: lc, rightUri: right.uri, rightColumns: rc, cardinality: card, confidence: 'declared' }))
+      pushToast(`declared ${left.name} → ${right.name} (${card})`, 'success')
+    } catch (e) { pushToast(String((e as Error).message || e), 'error'); setBusy(false) }
+  }
+
+  const colList = (t: CatalogTable, arr: string[], set: (v: string[]) => void) => (
+    <div className="flex max-h-[180px] flex-1 flex-col gap-0.5 overflow-y-auto rounded-md border border-border p-1.5">
+      {t.columns.map((c) => (
+        <button key={c.name} onClick={() => toggle(arr, set, c.name)}
+          className={cn('flex items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-[11.5px] hover:bg-accent',
+            arr.includes(c.name) && 'bg-primary/10 font-semibold text-foreground')}>
+          <span className="w-3 text-center text-[10px]">{arr.includes(c.name) ? (arr.indexOf(c.name) + 1) : ''}</span>
+          <span className="dp-mono flex-1 truncate">{c.name}</span>
+          {c.capabilities?.includes('key') && <span className="text-[9px] text-muted-foreground">key</span>}
+        </button>
+      ))}
+    </div>
+  )
+
+  return (
+    <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
+      <DialogContent className="max-w-[480px]">
+        <DialogHeader><DialogTitle className="text-[14px]">Declare a join: {left.name} → {right.name}</DialogTitle></DialogHeader>
+        {suggestions.length > 0 && (
+          <div className="flex flex-col gap-1">
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Suggested (measured)</div>
+            {suggestions.slice(0, 5).map((s, i) => (
+              <button key={i} onClick={() => pick(s)}
+                className="flex items-center gap-2 rounded-md border border-border px-2 py-1 text-left hover:bg-accent">
+                <span className="dp-mono flex-1 truncate text-[11px]">{s.leftColumns.join('+')} = {s.rightColumns.join('+')}</span>
+                <span className="rounded bg-muted px-1.5 py-px text-[9.5px] font-semibold">{s.cardinality}</span>
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Keys (click columns in order; equal count on each side)</div>
+        <div className="flex gap-2">
+          {colList(left, lc, setLc)}
+          <div className="self-center text-[12px] text-muted-foreground">=</div>
+          {colList(right, rc, setRc)}
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <label className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground">Cardinality
+            <MiniSelect value={card} options={CARDINALITIES.map((c) => ({ value: c, label: c }))} onChange={(v) => setCard(v as Cardinality)} />
+          </label>
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" onClick={onClose}>Cancel</Button>
+            <Button size="sm" disabled={!ok || busy} onClick={declare}>Declare</Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
   )
 }
