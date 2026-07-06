@@ -159,6 +159,8 @@ class LoweringEngine:
             uri = cfg.get("uri") or cfg.get("table")
             if not uri:
                 raise NotPreviewable(node, "no dataset selected")
+            from kernel import paths
+            paths.ensure_local_uri_allowed(uri)  # multi-user: a source can't read an arbitrary local file
             # pass CSV parse overrides only when the user actually set them (not the 'auto' default), so
             # any adapter (incl. plugins) whose scan() predates the `options` kwarg keeps working
             opts: dict = {}

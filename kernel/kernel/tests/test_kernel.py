@@ -718,6 +718,22 @@ def test_api_routes_require_auth_when_enabled(monkeypatch):
     client.cookies.clear()
 
 
+def test_local_dataset_path_confined_in_auth_mode(monkeypatch):
+    # in a multi-user (auth) deployment a source / register must not read an arbitrary local file —
+    # local paths are confined to the workspace / data dir / DP_DATASET_ROOTS. Open mode = trusted, no confinement.
+    import os as _os
+    from kernel import paths
+    from kernel.settings import settings
+    inside = _os.path.join(settings.data_dir, "some_dataset.parquet")
+    monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
+    paths.ensure_local_uri_allowed("/etc/passwd")           # open mode → no confinement
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    paths.ensure_local_uri_allowed(inside)                  # inside a root → allowed
+    paths.ensure_local_uri_allowed("s3://bucket/x.parquet")  # object-store → not a local path → allowed
+    with pytest.raises(PermissionError):
+        paths.ensure_local_uri_allowed("/etc/passwd")       # outside every root → rejected
+
+
 def test_canvas_crud_is_per_user():
     doc = {"id": "cv1", "name": "My Canvas", "version": 3, "nodes": [], "edges": []}
     r = client.put("/api/canvas/cv1", json=doc).json()

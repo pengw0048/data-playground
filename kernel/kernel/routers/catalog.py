@@ -78,6 +78,11 @@ def catalog_register(req: RegisterRequest) -> CatalogTable:
     has_scheme = bool(re.match(r"^[a-z][a-z0-9+.-]*://", req.uri))
     uri = req.uri if has_scheme else os.path.abspath(os.path.expanduser(req.uri))
     name = req.name or os.path.splitext(os.path.basename(uri.rstrip("/")))[0]
+    from kernel import paths
+    try:
+        paths.ensure_local_uri_allowed(uri)  # multi-user: don't let a user register an arbitrary local file
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     try:
         deps.resolve_adapter(uri).schema(uri)  # validate readable
     except Exception as e:  # noqa: BLE001
@@ -102,6 +107,11 @@ def data_sample(req: SampleRequest) -> SampleResult:
     deps = get_deps()
     if req.k is not None and req.k < 0:
         raise HTTPException(400, "k must be >= 0")
+    from kernel import paths
+    try:
+        paths.ensure_local_uri_allowed(req.uri)  # multi-user: don't sample an arbitrary local file
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     try:
         adapter = deps.resolve_adapter(req.uri)
         with db.run_scope():  # own cursor — a big sample doesn't block other users' runs/previews
