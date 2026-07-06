@@ -235,6 +235,18 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('scratch', { exact: true })).toBeVisible() // destination added to the list
   })
 
+  test('settings Execution shows the real compute topology', async ({ page }) => {
+    await page.goto('/')
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Settings', { exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
+    await page.getByRole('button', { name: 'Execution' }).click()
+    await expect(page.getByText('Compute', { exact: true })).toBeVisible()
+    // the local backend reports a worker with real host capacity (e.g. "N cpu")
+    await expect(page.getByText('local-out-of-core:local')).toBeVisible()
+    await expect(page.getByText(/\d+ cpu/).first()).toBeVisible()
+  })
+
   test('settings Members creates a user', async ({ page }) => {
     await page.goto('/')
     await page.getByTestId('app-menu').click()

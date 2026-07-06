@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
+import type { ResourceSpec } from '../types/api'
 import { useStore } from '../store/graph'
 import { Icon, type IconName } from '../ui/Icon'
 import { cn } from '@/lib/utils'
@@ -128,6 +129,28 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     </Select>
                   </Field>
                   <div className="-mt-1 text-[10.5px] text-muted-foreground">Your preference for your own runs — falls back to the workspace default.</div>
+
+                  <div className="mb-1.5 mt-4 text-[11.5px] font-semibold text-foreground">Compute</div>
+                  <div className="mb-2 text-[10.5px] text-muted-foreground">Backends and the workers (pods / processes) they offer, with capacity. A pod/Ray backend plugin adds its own here.</div>
+                  <div className="flex flex-col gap-1.5">
+                    {(kernelInfo?.backends ?? []).map((b) => (
+                      <div key={b.name} className="rounded-md border border-border p-2">
+                        <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+                          <Icon name="db" size={12} /> {b.name}
+                          <span className="text-[10px] font-normal text-muted-foreground">· {b.workers.length} worker{b.workers.length === 1 ? '' : 's'}</span>
+                        </div>
+                        <div className="mt-1 flex flex-col gap-0.5">
+                          {b.workers.map((w) => (
+                            <div key={w.id} className="flex items-center gap-1.5 text-[10.5px] text-muted-foreground">
+                              <span className={cn('h-1.5 w-1.5 rounded-full', w.state === 'idle' ? 'bg-green-500' : w.state === 'busy' ? 'bg-amber-500' : 'bg-muted-foreground')} />
+                              <span className="font-mono">{w.id}</span><span>· {capLabel(w.capacity)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    {(kernelInfo?.backends ?? []).length === 0 && <div className="text-[11.5px] text-muted-foreground">No backends reported.</div>}
+                  </div>
                 </Section>
 
                 <Section id="destinations" title="Destinations">
@@ -213,6 +236,14 @@ function Section({ id, title, children }: { id: string; title: string; children:
       {children}
     </div>
   )
+}
+
+function capLabel(c: ResourceSpec): string {
+  const parts: string[] = []
+  if (c.gpu) parts.push(`${c.gpu}× ${c.gpuType ?? 'gpu'}`)
+  if (c.cpu) parts.push(`${c.cpu} cpu`)
+  if (c.mem) parts.push(String(c.mem))
+  return parts.join(' · ') || 'unspecified'
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {

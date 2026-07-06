@@ -1,6 +1,16 @@
 // Kernel API DTOs (PRD §9) — camelCase on the wire, mirrors kernel/models.py.
 import type { ColumnSchema } from './graph'
 
+export interface ResourceSpec {
+  cpu?: number | null
+  mem?: string | null
+  gpu?: number | null
+  gpuType?: string | null
+  labels?: Record<string, string>
+}
+export interface WorkerInfo { id: string; capacity: ResourceSpec; state: 'idle' | 'busy' | 'down' }
+export interface BackendInfo { name: string; workers: WorkerInfo[] }
+
 export interface KernelInfo {
   mode: 'local' | 'distributed'
   backend: string
@@ -10,6 +20,7 @@ export interface KernelInfo {
   runners: string[]
   processors: string[]
   capabilities: string[]
+  backends: BackendInfo[]
 }
 
 export interface CatalogTable {
