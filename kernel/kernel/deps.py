@@ -162,6 +162,12 @@ class Deps:
             pool.on_complete = _persist_run
             pool.on_status = _persist_run_state
             self.runners.append(pool)
+        # RunController owns a logical run across placement regions (multi-region = a placed node /
+        # checkpoint / fan-out); a single default region delegates to the base runner unchanged.
+        from kernel.run_controller import RunController
+        self.controller = RunController(self, self.runner, self._place)
+        self.controller.on_status = _persist_run_state
+        self.controller.on_complete = _persist_run
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self._load_plugins()
 
@@ -263,6 +269,16 @@ class Deps:
             print(f"[deps] failed to load plugin '{mod}': {e}")
             self.plugins.append({"name": mod, "source": "module", "error": f"{type(e).__name__}: {e}",
                                  "traceback": traceback.format_exc().splitlines()[-3:]})
+
+    def _place(self, requires):
+        """First (backend_name, worker_id) across the registered backends that satisfies `requires`,
+        or None → the default in-process backend. Used by the placement planner / RunController."""
+        for r in self.runners:
+            if hasattr(r, "place"):
+                w = r.place(requires)
+                if w:
+                    return (r.name, w)
+        return None
 
     def _backends(self) -> list[BackendInfo]:
         """Real backend/worker topology + capacities. A backend that advertises workers() (a pod/Ray

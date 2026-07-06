@@ -206,8 +206,14 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
     est = runner.estimate(plan, rows)
     if est.needs_confirm and not req.confirmed and not _cached_noop(runner, req.graph, req.target_node_id):
         raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
-    status = runner.run(plan, req.graph, req.target_node_id, est.placement)
-    deps.run_index[status.run_id] = runner  # so status/cancel/ws reach the right runner
+    # a run that splits across placement regions (a placed node / checkpoint / fan-out) is owned by the
+    # RunController; a single default region returns None → the base runner, exactly as before.
+    overall = deps.controller.run(req.graph, req.target_node_id)
+    if overall is not None:
+        status, owner = overall, deps.controller
+    else:
+        status, owner = runner.run(plan, req.graph, req.target_node_id, est.placement), runner
+    deps.run_index[status.run_id] = owner  # so status/cancel/ws reach the right owner
     # bound run_index (insertion-ordered) so it can't grow for the process lifetime — the runners
     # themselves only retain the last _MAX_RUNS, and _status_or_lost already tolerates a missing id.
     while len(deps.run_index) > _RUN_INDEX_MAX:

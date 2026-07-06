@@ -1722,6 +1722,22 @@ def test_planner_partitions_by_placement():
     assert secr.backend == "pool" and secr.worker == "gpu"                     # requires escalated from the contained node
 
 
+def test_run_controller_executes_checkpointed_regions(tmp_path):
+    # C2: a `checkpoint` splits the run into two regions; the controller materializes the upstream
+    # region, then runs the final region reading its ref — the result matches an unsplit run.
+    p = _seq_parquet(tmp_path)  # v = 0..999
+    gd = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": p}),
+        {"id": "f1", "type": "filter", "position": {"x": 0, "y": 0}, "data": {"config": {"predicate": "v < 500", "checkpoint": True}}},
+        N("f2", "filter", {"predicate": "v >= 100"}),
+        N("wr", "write", {"name": "ckpt_out"}),
+    ], "edges": [E("src", "f1"), E("f1", "f2"), E("f2", "wr")]}
+    st = _poll(client.post("/api/run", json={"graph": gd, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
+    assert st["status"] == "done", st
+    out = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_ckpt_out").uri, "k": 5}).json()
+    assert out["rowCount"] == 400  # v in [100, 500) → 400 rows, split across two regions
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).

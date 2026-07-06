@@ -90,6 +90,9 @@ def plan_regions(graph: Graph, target: str, node_specs: dict,
     #    (out-degree ≥ 2 within the cone) — the last keeps regions tree-shaped so no node is computed twice.
     mat: set[str] = {target}
     for nid in chain:
+        cfg = nm[nid].data.get("config", {}) if isinstance(nm[nid].data, dict) else {}
+        if cfg.get("checkpoint") is True:  # user pinned this node to materialize (inspect + reuse)
+            mat.add(nid)
         oe = outs(nid)
         if len(oe) >= 2:
             mat.add(nid)
