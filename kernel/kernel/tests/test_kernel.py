@@ -1769,6 +1769,59 @@ def test_run_controller_places_a_region_on_a_pool_worker(tmp_path, monkeypatch):
     assert "v2" in [c.name for c in tbl.columns]                     # the GPU-placed transform ran (added v2)
 
 
+def test_plan_not_cacheable_for_stale_prone_plans():
+    # adversarial-review fix: the DURABLE cache must NOT reuse plans whose identity isn't fully in the
+    # key — object-store/mem sources (URI-only fingerprint), append (not idempotent), library/plugin
+    # ops (code not hashed). A miss just recomputes; a stale durable hit is fleet-wide wrong data.
+    from kernel.models import Graph
+    r = get_deps().runner
+    obj = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": "s3://b/x.parquet"})], "edges": []})
+    assert r._plan_cacheable(obj, "s") is False
+    ap = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": _uri("events")}),
+                                                     N("w", "write", {"name": "o", "writeMode": "append"})], "edges": [E("s", "w")]})
+    assert r._plan_cacheable(ap, "w") is False
+    lib = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": _uri("events")}),
+                   {"id": "xf", "type": "transform", "position": {"x": 0, "y": 0}, "data": {"config": {"source": "library", "processor": "p1", "version": "v1"}}}], "edges": [E("s", "xf")]})
+    assert r._plan_cacheable(lib, "xf") is False
+    ok = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": _uri("events")}), N("f", "filter", {"predicate": "amount > 0"})], "edges": [E("s", "f")]})
+    assert r._plan_cacheable(ok, "f") is True  # plain local overwrite plan is still reusable
+
+
+def test_subgraph_preserves_join_operand_order():
+    # adversarial-review fix (#5): the region's reduced graph must keep a multi-input node's operands
+    # in ORIGINAL order — the engine feeds join positionally, so a swapped ref/intra edge silently
+    # joins the wrong sides. Here operand 'a' is a cut (ref), 'b' is intra; order must stay [a, b].
+    from kernel import graph as gg
+    from kernel.models import Graph, ResourceSpec
+    from kernel.planner import Region
+    ctrl = get_deps().controller
+    graph = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("upA", "source", {"uri": _uri("events")}), N("inB", "source", {"uri": _uri("events")}),
+        {"id": "j", "type": "join", "position": {"x": 0, "y": 0}, "data": {"config": {}}},
+    ], "edges": [
+        {"id": "ea", "source": "upA", "target": "j", "targetHandle": "a", "data": {"wire": "dataset"}},
+        {"id": "eb", "source": "inB", "target": "j", "targetHandle": "b", "data": {"wire": "dataset"}},
+    ]})
+    region = Region(id="r", node_ids={"inB", "j"}, output_node="j", backend="default", worker=None,
+                    requires=ResourceSpec(), cut_inputs=[("upA", None, "j", "a")])
+    sub = ctrl._subgraph(graph, region, {"upA": "/tmp/ref.parquet"})
+    assert [e.target_handle for e in gg.incoming(sub, "j")] == ["a", "b"]  # ref 'a' first, intra 'b' second
+
+
+def test_controller_refuses_unsafe_splits():
+    # adversarial-review fix (#6): a checkpoint would split this, but an INTERMEDIATE write must commit
+    # (materializing it would drop the commit) — so the controller refuses to split and runs it whole.
+    from kernel.models import Graph
+    ctrl = get_deps().controller
+    g_mid_write = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        {"id": "f1", "type": "filter", "position": {"x": 0, "y": 0}, "data": {"config": {"predicate": "amount > 0", "checkpoint": True}}},
+        N("w1", "write", {"name": "mid"}),  # intermediate write (not the target)
+        N("wr", "write", {"name": "fin"}),
+    ], "edges": [E("src", "f1"), E("f1", "w1"), E("w1", "wr")]})
+    assert ctrl.run(g_mid_write, "wr") is None  # refuses the split → base runner (whole graph, commits both writes)
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).

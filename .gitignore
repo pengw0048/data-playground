@@ -23,6 +23,7 @@ kernel/data/*.json
 kernel/data/*.arrow
 kernel/data/**/*.lance
 kernel/outputs/
+kernel/regions/
 kernel/canvases/
 kernel/data/outputs/
 kernel/_web/

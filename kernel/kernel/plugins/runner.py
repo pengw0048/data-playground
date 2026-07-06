@@ -109,9 +109,19 @@ class LocalRunner:
         return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
     def _plan_cacheable(self, graph: Graph, target: str | None) -> bool:
-        """A node can opt OUT of result reuse (config.cacheable is False) — e.g. a non-deterministic
-        transform. Opting one node out makes the whole plan non-cacheable (its result isn't
-        reproducible), so neither read nor write the cache. (Append is handled separately in the write.)"""
+        """Whether this plan's result may be reused from the DURABLE store. Conservative on purpose —
+        the store is persistent + shared, so a stale hit is permanent, fleet-wide wrong data; a miss
+        just recomputes. Non-cacheable when the plan's identity ISN'T fully captured by the content key:
+
+        - an explicit opt-out (config.cacheable is False) — e.g. a non-deterministic / GPU transform;
+        - an object-store or mem:// source — its fingerprint is URI-only, so an in-place overwrite
+          wouldn't change the key (a same-path daily refresh would serve the OLD result); [TODO: fold
+          an etag/size/mtime content fingerprint and re-enable reuse for immutable object data];
+        - a library transform or a plugin node kind — the processor/plugin CODE isn't in the key, so a
+          re-promote / plugin upgrade under the same id wouldn't invalidate it;
+        - an append write — not idempotent (must add a part every run); reuse would drop the append.
+        """
+        from kernel.plugins.adapters import is_object_uri
         from kernel.section import _descendants
         chain = list(g.upstream_chain(graph, target) if target else g.topo_order(graph))
         nodes = list(chain)
@@ -122,6 +132,14 @@ class LocalRunner:
             cfg = n.data.get("config", {}) if isinstance(n.data, dict) else {}
             if cfg.get("cacheable") is False:
                 return False
+            if n.type == "source":
+                uri = str(cfg.get("uri") or cfg.get("table") or "")
+                if uri.startswith("mem://") or is_object_uri(uri):
+                    return False  # URI-only fingerprint → an in-place overwrite wouldn't invalidate
+            if n.type == "write" and cfg.get("writeMode") == "append":
+                return False  # append is not idempotent — never reuse (also keeps the confirm gate honest)
+            if cfg.get("source") == "library" or n.type in self.node_lowerings:
+                return False  # processor / plugin CODE isn't in the key → a same-id upgrade would go stale
         return True
 
     def _cache_get(self, key: str) -> dict | None:

@@ -50,6 +50,8 @@ class RunController:
         regions = self.plan(graph, target)
         if len(regions) <= 1 and (not regions or regions[0].backend == "default"):
             return None
+        if not self._safe_to_split(graph, target, regions):
+            return None  # a shape the region machinery can't yet materialize correctly → run whole, in-process
         run_id = f"run_{uuid.uuid4().hex[:10]}"
         nm = g.node_map(graph)
         per = [PerNodeStatus(node_id=nid, status="queued", label=nm[nid].type)
@@ -95,6 +97,10 @@ class RunController:
             if status.status == "failed":
                 status.error = f"{type(e).__name__}: {e}"
         finally:
+            if status.status in ("failed", "cancelled"):  # don't leave earlier/other regions stuck
+                for p in status.per_node:
+                    if p.status != "done":
+                        p.status = status.status
             status.ms = int((time.time() - started) * 1000)
             status.total_rows = status.rows_processed
             self._emit(graph, status)
@@ -106,6 +112,28 @@ class RunController:
                     self.on_complete(graph, target, status)
                 except Exception:  # noqa: BLE001
                     pass
+
+    @staticmethod
+    def _prune_regions(d: str, keep: int = 500) -> None:
+        try:
+            files = sorted((os.path.join(d, f) for f in os.listdir(d)), key=os.path.getmtime)
+            for f in files[:-keep]:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def _safe_to_split(self, graph: Graph, target: str, regions) -> bool:
+        """Refuse to split (→ run the whole graph in-process, correct but unplaced) for shapes the
+        single-port parquet handoff can't represent yet, rather than silently corrupt data:
+        - a cross-region cut off a NON-default output port (a multi-output node / section named port);
+        - an intermediate `write` (materializing it would drop its commit + catalog side-effect)."""
+        nm = g.node_map(graph)
+        if any(sh not in (None, "out") for r in regions for (_u, sh, _i, _t) in r.cut_inputs):
+            return False
+        return not any(nm[nid].type == "write" and nid != target for r in regions for nid in r.node_ids)
 
     def _backend_runner(self, region):
         """The runner that executes a region: the in-process base for 'default', else the named backend
@@ -135,6 +163,7 @@ class RunController:
             return cached["uri"]  # reuse — the upstream region didn't change
         out_dir = os.path.join(self.deps.workspace, "regions")
         os.makedirs(out_dir, exist_ok=True)
+        self._prune_regions(out_dir)  # bound the handoff dir (a coarse GC; TTL/refcount is a later refinement)
         out_uri = os.path.join(out_dir, f"{region.id}_{key}.parquet")
         backend = self._backend_runner(region)
         if backend is self.base:
@@ -145,7 +174,7 @@ class RunController:
         else:
             sub = backend.run_unit(subg, region.output_node, out_uri)
             with self._lock:
-                self._sub[run_id] = sub.run_id
+                self._sub[run_id] = (backend, sub.run_id)
             s = self._await(backend, sub.run_id, cancel_run=run_id)
             if s.status != "done":
                 raise RuntimeError(f"region {region.id} on {region.backend} {s.status}: {s.error}")
@@ -160,22 +189,31 @@ class RunController:
         backend = self._backend_runner(region)
         sub = backend.run(plan, subg, region.output_node, "local")
         with self._lock:
-            self._sub[run_id] = sub.run_id
+            self._sub[run_id] = (backend, sub.run_id)
         return self._await(backend, sub.run_id, cancel_run=run_id)
 
     def _subgraph(self, graph: Graph, region, ref_uri: dict[str, str]) -> Graph:
+        # Rebuild the region as a graph, preserving each node's ORIGINAL incoming-edge order (the engine
+        # feeds multi-input nodes like join positionally, so a swapped operand order silently corrupts
+        # results). A cut input (source outside the region = an upstream materialized region) is replaced
+        # IN PLACE by a ref-source reading that region's parquet.
         nm = g.node_map(graph)
         nodes = [nm[nid] for nid in region.node_ids if nid in nm]
         have = {n.id for n in nodes}
-        edges = [e for e in graph.edges if e.source in region.node_ids and e.target in region.node_ids]
-        for (up_node, _sh, into, th) in region.cut_inputs:
-            rid = f"__ref_{up_node}"
-            if rid not in have:
-                nodes.append(GraphNode(id=rid, type="source", position=Position(x=0, y=0),
-                                       data={"config": {"uri": ref_uri[up_node]}}))
-                have.add(rid)
-            edges.append(GraphEdge(id=f"__e_{rid}_{into}_{th or 'in'}", source=rid, target=into,
-                                   source_handle=None, target_handle=th, data=GraphEdgeData()))
+        edges: list[GraphEdge] = []
+        for nid in region.node_ids:
+            for e in g.incoming(graph, nid):  # original order, per node
+                if e.source in region.node_ids:
+                    edges.append(e)  # intra-region edge, unchanged
+                else:  # a cut → read the upstream region's ref at THIS operand position
+                    rid = f"__ref_{e.source}"
+                    if rid not in have:
+                        nodes.append(GraphNode(id=rid, type="source", position=Position(x=0, y=0),
+                                               data={"config": {"uri": ref_uri[e.source]}}))
+                        have.add(rid)
+                    edges.append(GraphEdge(id=f"__e_{rid}_{nid}_{e.target_handle or 'in'}", source=rid,
+                                           target=nid, source_handle=None, target_handle=e.target_handle,
+                                           data=GraphEdgeData()))
         return Graph(id="_region", version=1, nodes=nodes, edges=edges)
 
     # -- status / cancel (a logical run, keyed by the overall run_id) ------- #
@@ -198,10 +236,11 @@ class RunController:
         ev = self._cancel.get(run_id)
         if ev:
             ev.set()
-        sub = self._sub.get(run_id)
-        if sub:
+        pair = self._sub.get(run_id)
+        if pair:
+            backend, sub_id = pair  # cancel on the backend that OWNS the in-flight region (pool, not base)
             try:
-                self.base.cancel(sub)
+                backend.cancel(sub_id)
             except Exception:  # noqa: BLE001
                 pass
         st = self.runs.get(run_id)
