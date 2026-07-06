@@ -72,6 +72,18 @@ class CatalogTable(Wire):
 Cardinality = Literal["1:1", "1:N", "N:1", "N:M", "unknown"]
 
 
+class Relationship(Wire):
+    """A declared relationship between two datasets — the user-asserted join edge shown in the ER
+    view. `confidence='declared'` (owner-asserted, trusted like a real FK). Composite via the column
+    lists. This is the escape hatch for opaque transforms: declare what the code produced."""
+    left_uri: str
+    left_columns: list[str]
+    right_uri: str
+    right_columns: list[str]
+    cardinality: Cardinality = "unknown"
+    confidence: Literal["declared", "verified", "inferred"] = "declared"
+
+
 class JoinSuggestion(Wire):
     """A proposed way to join two datasets: matching key column(s) on each side + the measured
     join cardinality. Surfaced in the join node's inspector (catalog-driven join hints)."""

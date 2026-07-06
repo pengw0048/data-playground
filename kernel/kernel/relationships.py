@@ -213,6 +213,25 @@ def _grain_unique_oracle(graph: Graph, input_id: str, catalog, resolve_adapter):
     return fn
 
 
+def _declared_suggestion(graph: Graph, left_id: str, right_id: str, catalog) -> JoinSuggestion | None:
+    """A JoinSuggestion from an owner-declared relationship between the two inputs' source datasets
+    (either orientation), or None. Trusted over measurement — the user asserted this join."""
+    lsrc, rsrc = _lone_source_uri(graph, left_id), _lone_source_uri(graph, right_id)
+    if not lsrc or not rsrc:
+        return None
+    for r in catalog.relationships():
+        if r.left_uri == lsrc and r.right_uri == rsrc:
+            return JoinSuggestion(left_columns=r.left_columns, right_columns=r.right_columns,
+                                  cardinality=r.cardinality, confidence="declared", score=10.0,
+                                  reason="declared relationship")
+        if r.left_uri == rsrc and r.right_uri == lsrc:  # stored the other way round → flip to left/right here
+            flip = {"1:N": "N:1", "N:1": "1:N"}.get(r.cardinality, r.cardinality)
+            return JoinSuggestion(left_columns=r.right_columns, right_columns=r.left_columns,
+                                  cardinality=flip, confidence="declared", score=10.0,
+                                  reason="declared relationship")
+    return None
+
+
 def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | None],
                  catalog, resolve_adapter) -> JoinAnalysis:
     """Rank join keys for a join node's two inputs and warn if the join fans out (not 1:1).
@@ -232,6 +251,11 @@ def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | N
     suggestions = suggest_joins(lcols, rcols,
                                 _grain_unique_oracle(graph, left, catalog, resolve_adapter),
                                 _grain_unique_oracle(graph, right, catalog, resolve_adapter))
+    # a DECLARED relationship between the two inputs' source datasets leads (owner-asserted, trusted)
+    declared = _declared_suggestion(graph, left, right, catalog)
+    if declared:
+        suggestions = [declared] + [s for s in suggestions
+                                    if (s.left_columns, s.right_columns) != (declared.left_columns, declared.right_columns)]
     if not suggestions:
         return JoinAnalysis(note="no matching key columns between the two inputs")
     warning = None

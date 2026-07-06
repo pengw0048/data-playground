@@ -27,6 +27,7 @@ from kernel.models import (
     LineageResult,
     PipelineImport,
     ProcessorDescriptor,
+    Relationship,
     SampleRequest,
     SampleResult,
 )
@@ -71,6 +72,46 @@ class JoinSuggestRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
     left_uri: str
     right_uri: str
+
+
+class DeclareKeyRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    columns: list[str] = []  # empty → clear the declared key
+
+
+@router.put("/catalog/tables/{table_id}/key", response_model=CatalogTable)
+def declare_key(table_id: str, req: DeclareKeyRequest) -> CatalogTable:
+    """Set (or clear, with []) a dataset's owner-declared primary key — leads its keys and wins in
+    grain. The escape hatch when the name heuristic misses or an opaque transform produced the data."""
+    cat = get_deps().catalog
+    try:
+        table = cat.get_table(table_id)
+    except KeyError:
+        raise HTTPException(404, f"table '{table_id}' not found")
+    have = {c.name for c in table.columns}
+    missing = [c for c in req.columns if c not in have]
+    if missing:
+        raise HTTPException(400, f"columns not in '{table.name}': {', '.join(missing)}")
+    cat.set_declared_key(table.uri, req.columns)
+    return cat.get_table(table.id)
+
+
+@router.get("/catalog/relationships", response_model=list[Relationship])
+def list_relationships(uri: str | None = None) -> list[Relationship]:
+    return get_deps().catalog.relationships(uri)
+
+
+@router.post("/catalog/relationships", response_model=list[Relationship])
+def add_relationship(rel: Relationship) -> list[Relationship]:
+    get_deps().catalog.add_relationship(rel)
+    return get_deps().catalog.relationships()
+
+
+@router.post("/catalog/relationships/delete", response_model=list[Relationship])
+def delete_relationship(rel: Relationship) -> list[Relationship]:
+    """POST (not DELETE) — the relationship identity is a body, and DELETE-with-body is unreliable."""
+    get_deps().catalog.remove_relationship(rel)
+    return get_deps().catalog.relationships()
 
 
 @router.post("/catalog/join-suggestions", response_model=list[JoinSuggestion])

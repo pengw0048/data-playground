@@ -12,10 +12,15 @@ import threading
 from kernel import metadb
 from kernel.models import (
     CatalogTable,
+    KeyInfo,
     LineageEdge,
     LineageNode,
     LineageResult,
+    Relationship,
 )
+
+_DECLARED_KEYS = "catalog_declared_keys"      # Setting: {uri: [col, ...]} — owner-declared primary keys
+_RELATIONSHIPS = "catalog_relationships"      # Setting: [Relationship dict, ...] — owner-declared join edges
 
 
 class InMemoryCatalog:
@@ -59,7 +64,10 @@ class InMemoryCatalog:
         except Exception:
             columns, count = [], None
         from kernel.relationships import key_candidates
-        keys = key_candidates(columns)  # inferred (name-based) PK candidates — no scan; verified on demand
+        # owner-DECLARED key (if any) leads, then inferred (name-based) candidates minus the declared dup
+        declared = self._declared_keys().get(uri)
+        inferred = [k for k in key_candidates(columns) if list(k.columns) != list(declared or [])]
+        keys = ([KeyInfo(columns=list(declared), confidence="declared")] if declared else []) + inferred
         with self._lock:
             tid = f"tbl_{name}" if uri not in self._by_uri else self._by_uri[uri]
             if any(t.id == f"tbl_{name}" and t.uri != uri for t in self.tables.values()):
@@ -176,3 +184,54 @@ class InMemoryCatalog:
         for parent in parents:
             self._add_edge(parent, uri, pipeline)
         return table
+
+    # -- declared keys & relationships (owner-asserted; shared via Settings, cross-instance) ------- #
+    def _declared_keys(self) -> dict[str, list[str]]:
+        try:
+            return metadb.get_setting(_DECLARED_KEYS, "global", default={}) or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def set_declared_key(self, uri: str, columns: list[str] | None) -> None:
+        """Set (or clear, columns=None/[]) the owner-declared primary key of a dataset. Declared keys
+        lead a table's `keys` and win in grain — the escape hatch for a dataset an opaque transform
+        produced or whose key the name heuristic missed."""
+        with self._lock:
+            keys = self._declared_keys()
+            if columns:
+                keys[uri] = list(columns)
+            else:
+                keys.pop(uri, None)
+            metadb.set_setting(_DECLARED_KEYS, keys, "global")
+            tid = self._by_uri.get(uri)
+            if tid and tid in self.tables:  # reflect immediately in the live table
+                t = self.tables[tid]
+                inferred = [k for k in t.keys if k.confidence != "declared" and list(k.columns) != list(columns or [])]
+                t.keys = ([KeyInfo(columns=list(columns), confidence="declared")] if columns else []) + inferred
+                self._persist(t)
+
+    def relationships(self, uri: str | None = None) -> list[Relationship]:
+        """Owner-declared join edges; filtered to those touching `uri` when given."""
+        try:
+            raw = metadb.get_setting(_RELATIONSHIPS, "global", default=[]) or []
+        except Exception:  # noqa: BLE001
+            raw = []
+        rels = [Relationship.model_validate(r) for r in raw]
+        if uri is not None:
+            rels = [r for r in rels if uri in (r.left_uri, r.right_uri)]
+        return rels
+
+    @staticmethod
+    def _rel_key(r: Relationship) -> tuple:
+        return (r.left_uri, tuple(r.left_columns), r.right_uri, tuple(r.right_columns))
+
+    def add_relationship(self, rel: Relationship) -> None:
+        with self._lock:
+            rels = [r for r in self.relationships() if self._rel_key(r) != self._rel_key(rel)]  # replace dup
+            rels.append(rel)
+            metadb.set_setting(_RELATIONSHIPS, [r.model_dump(by_alias=True) for r in rels], "global")
+
+    def remove_relationship(self, rel: Relationship) -> None:
+        with self._lock:
+            rels = [r for r in self.relationships() if self._rel_key(r) != self._rel_key(rel)]
+            metadb.set_setting(_RELATIONSHIPS, [r.model_dump(by_alias=True) for r in rels], "global")

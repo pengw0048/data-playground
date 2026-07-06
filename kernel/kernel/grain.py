@@ -92,6 +92,7 @@ def _source_grain(uri, catalog) -> GrainInfo:
         return _UNKNOWN
     if not table.keys:
         return GrainInfo(columns=None, known=False, note="no key detected for this dataset")
-    best = next((k for k in table.keys if k.confidence == "verified"), table.keys[0])
-    return GrainInfo(columns=list(best.columns), known=True, verified=(best.confidence == "verified"),
+    rank = {"declared": 0, "verified": 1, "inferred": 2}  # a declared/verified key beats a name guess
+    best = min(table.keys, key=lambda k: rank.get(k.confidence, 3))
+    return GrainInfo(columns=list(best.columns), known=True, verified=(best.confidence in ("declared", "verified")),
                      note=f"{best.confidence} primary key")

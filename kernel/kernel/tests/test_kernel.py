@@ -1996,6 +1996,48 @@ def test_grain_lost_when_select_renames_the_key():
     assert sel("md5(id) AS h").known is False            # derived → grain not claimed
 
 
+def test_declared_key_overrides_inference_and_grain():
+    # declared keys are the escape hatch (opaque transforms / missed heuristics): a declared PK leads
+    # the table's keys and WINS in grain over inferred/measured. Cleans up so it can't leak.
+    from kernel import grain
+    from kernel.models import Graph
+    d = get_deps()
+    ev = d.catalog.get_table("tbl_events")
+    try:
+        r = client.put(f"/api/catalog/tables/{ev.id}/key", json={"columns": ["user_id"]})
+        assert r.status_code == 200
+        keys = r.json()["keys"]
+        assert keys[0] == {"columns": ["user_id"], "confidence": "declared", "unique": None}
+        assert not any(k["columns"] == ["user_id"] and k["confidence"] == "inferred" for k in keys)  # dedup
+        g_ = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev.uri})], "edges": []})
+        gi = grain.grain_of(g_, "s", d.catalog)
+        assert gi.columns == ["user_id"] and gi.verified  # declared key wins over the inferred `id`
+        assert client.put(f"/api/catalog/tables/{ev.id}/key", json={"columns": ["nope"]}).status_code == 400
+    finally:
+        client.put(f"/api/catalog/tables/{ev.id}/key", json={"columns": []})  # clear (don't leak)
+    assert [k.columns for k in d.catalog.get_table(ev.id).keys] == [["id"]]  # back to inferred only
+
+
+def test_relationship_crud_and_leads_join_analysis():
+    # declared relationships persist (Settings, cross-instance) and TRUMP measurement in join analysis.
+    d = get_deps()
+    ev, img = _uri("events"), _uri("images")
+    rel = {"leftUri": img, "leftColumns": ["id"], "rightUri": ev, "rightColumns": ["user_id"], "cardinality": "1:N"}
+    try:
+        assert client.post("/api/catalog/relationships", json=rel).status_code == 200
+        listed = client.get(f"/api/catalog/relationships?uri={ev}").json()
+        assert len(listed) == 1 and listed[0]["cardinality"] == "1:N" and listed[0]["confidence"] == "declared"
+        graph = {"id": "c", "version": 1, "nodes": [
+            N("l", "source", {"uri": img}), N("r", "source", {"uri": ev}), N("j", "join", {}),
+        ], "edges": [E("l", "j", th="a"), E("r", "j", th="b")]}
+        ja = client.post("/api/graph/join-analysis", json={"graph": graph, "targetNodeId": "j"}).json()
+        top = ja["suggestions"][0]
+        assert top["confidence"] == "declared" and top["leftColumns"] == ["id"] and top["rightColumns"] == ["user_id"]
+    finally:
+        client.post("/api/catalog/relationships/delete", json=rel)
+    assert client.get("/api/catalog/relationships").json() == []
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).
