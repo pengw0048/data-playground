@@ -441,7 +441,7 @@ def test_write_formats_round_trip(tmp_path):
         rel = con.sql("SELECT 1 AS a, 'x' AS b UNION ALL SELECT 2 AS a, 'y' AS b")
         a.write(str(tmp_path / "out.json"), rel, "overwrite")
         assert sorted(a.scan(str(tmp_path / "out.json")).fetchall()) == [(1, "x"), (2, "y")]
-        for ext in (".pq", ".tsv"):
+        for ext in (".pq", ".tsv", ".json"):
             res = a.write(str(tmp_path / f"app{ext}"), con.sql("SELECT 3 AS a, 'z' AS b"), "append")
             assert a.scan(res["uri"]).fetchall() == [(3, "z")], ext  # part-*.<ext> read back from the dir
 

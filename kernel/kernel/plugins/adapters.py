@@ -184,9 +184,10 @@ class DuckDBAdapter:
         rows = int(rel.aggregate("count(*)").fetchone()[0])
         if mode == "append":
             # append = a DIRECTORY / prefix of part files (out-of-core; the reader reads them all
-            # back). Only for row formats — parquet/csv; feather/arrow have no directory-scan reader.
-            if not low.endswith((".parquet", ".pq", ".csv", ".tsv")):
-                raise NotImplementedError(f"append is only supported for parquet/csv outputs, not {os.path.splitext(target)[1] or 'this'}")
+            # back via _read_dir). Only for row formats that have a directory-scan reader —
+            # parquet/csv/tsv/json; feather/arrow have no directory-scan reader.
+            if not low.endswith((".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson")):
+                raise NotImplementedError(f"append is only supported for parquet/csv/json outputs, not {os.path.splitext(target)[1] or 'this'}")
             base, ext = os.path.splitext(target)  # name.parquet -> prefix "name", ext ".parquet"
             part_name = f"part-{uuid.uuid4().hex[:12]}{ext}"
             if obj:
@@ -194,7 +195,13 @@ class DuckDBAdapter:
             else:
                 os.makedirs(base, exist_ok=True)
                 part = os.path.join(base, part_name)
-            (rel.write_csv if ext.lower() in (".csv", ".tsv") else rel.write_parquet)(part)
+            el = ext.lower()
+            if el in (".csv", ".tsv"):
+                rel.write_csv(part)
+            elif el in (".json", ".ndjson"):  # same out-of-core COPY as the overwrite path, one part file
+                rel.query("_w", f"COPY _w TO '{part.replace(chr(39), chr(39) * 2)}' (FORMAT JSON, ARRAY true)")
+            else:
+                rel.write_parquet(part)
             return {"uri": base, "rows": rows}
         if mode not in ("overwrite", None):
             raise NotImplementedError(f"write mode '{mode}' is not supported — use overwrite or append")
