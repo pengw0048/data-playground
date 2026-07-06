@@ -18,7 +18,7 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 
 - ⬜ **branch / loop / variable 控制流节点**（画布与节点交互）—— 有意省略，非缺口：控制流统一由 'section' 容器的驱动脚本承担（section.tsx:102）—— branch 与两个 filter 冗余，loop/variable 都能在 section 脚本里表达。残留的 'control' 工具栏分类（Toolbar.tsx:12）没有任何节点注册，空分类会被丢弃（Toolbar.tsx:27），所以该分组不会显示。`web/src/theme/tokens.ts:54`
 - 🟡 **能力驱动的查看器标签页**（画布与节点交互）—— media 能力会根据列能力添加一个图片网格标签页。只有 'media' 内置发布了；vectors 标签页已被有意移除（capabilities.tsx:49），所以注册机制是真实的，但内置集合很小。`web/src/nodes/capabilities.tsx:42`
-- 🟡 **Agent dock（从意图构建流水线）**（画布与节点交互）—— 有 Plan/Build 两种模式；Build 会应用 LLM 生成的图（applyAgentGraph）并运行终端节点。设计上的缺口：需要在服务端配置 DP_AGENT_MODEL + 供应商 key —— 没有配置模型时它就是 'unavailable'（AgentDock.tsx:32），不存在基于规则的兜底。`web/src/panels/AgentDock.tsx:14`
+- 🟡 **Agent dock（一次对话，模型自己决定答还是建）**（画布与节点交互）—— 没有 Plan/Build 模式：模型每条消息自行决定是纯文字回答/建议，还是调用改图工具（add/connect/set_config）。前端只在它这轮真的改了图（有成功的改图工具调用）时才 applyAgentGraph + 跑终端节点，否则只显示回复、画布不动。设计上的注意点：需要在服务端配置 DP_AGENT_MODEL + 供应商 key —— 没配置时就是 'unavailable'，不存在基于规则的兜底。`web/src/panels/AgentDock.tsx（submit 里的 mutated 检测）; kernel/kernel/agent.py（对话式 system prompt）`
 - 🟡 **运行取消 + 查询中断**（引擎与执行）—— 在各步骤之间可取消，并能在运行自己的游标上中断正在执行的 DuckDB 查询。缺口（已在 db.py:163 说明）：transform 内部的纯 Python 死循环（例如 `while True`）在进程内无法被中断 —— 只有 subprocess runner 的强制 kill 才能停下它。`kernel/kernel/plugins/runner.py:268 cancel() sets Event + scope.interrupt(); kernel/kernel/db.py:75 _Scope.interrupt calls con.interrupt() from another thread`
 - 🟡 **内容寻址缓存（未变更的 plan 直接走缓存）**（引擎与执行）—— 仅为进程内的内存 dict，上限为最近 100 条（_MAX_RUNS，runner.py:130）—— 不会在 kernel 重启后持久化，也不会在多个 web 实例/subprocess runner 之间共享（SubprocessRunner 没有缓存）。缓存的是行数 + 输出 uri/table，而非中间关系。`kernel/kernel/plugins/runner.py:76 _plan_hash (node config + source fingerprint + edges/handles); result stored/read at runner.py:141,180; write-skip for idempotent overwrite at runner.py:220`
 - 🟡 **成本 / 确认门控**（引擎与执行）—— 门控只有一个固定的源行数阈值（5M）—— 没有字节大小/成本模型。大小未知时返回 needs_confirm=False（runner.py:69），所以一个无法计数的源会按设计绕过门控（理由：无法计数→无法读取→快速失败）。`kernel/kernel/plugins/runner.py:72 needs_confirm = rows >= _CONFIRM_ROWS (5,000,000); enforced at kernel/kernel/routers/runs.py:168 → HTTP 409 unless req.confirmed`
@@ -63,7 +63,7 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 - ✅ **schema 感知的列选择器字段** —— ColumnCombo + useInputColumns 从每节点的输出 schema（在结构变更时获取，graph.refreshSchemas:818）把类型化的列建议喂给各类型卡片（例如 join key、sort/dedup key）。 `web/src/nodes/fields.tsx:1`
 - ✅ **空画布状态** —— 当 doc.nodes 为空时显示：'Add a source'（在视口中心放置一个 source）和 'Ask the Agent'。 `web/src/canvas/Canvas.tsx:41`
 - ✅ **小地图 + 缩放控件** —— 控件堆叠在一个可平移的 MiniMap 之上（节点用类型强调色着色，点击可重新居中）；放置得不重叠。 `web/src/canvas/Canvas.tsx:296`
-- 🟡 **Agent dock（从意图构建流水线）** —— 有 Plan/Build 两种模式；Build 会应用 LLM 生成的图（applyAgentGraph）并运行终端节点。设计上的缺口：需要在服务端配置 DP_AGENT_MODEL + 供应商 key —— 没有配置模型时它就是 'unavailable'（AgentDock.tsx:32），不存在基于规则的兜底。 `web/src/panels/AgentDock.tsx:14`
+- 🟡 **Agent dock（一次对话，模型自己决定答还是建）** —— 没有 Plan/Build 模式：模型每条消息自行决定是纯文字回答/建议，还是调用改图工具（add/connect/set_config）。前端只在它这轮真的改了图时才 applyAgentGraph + 跑终端节点，否则只显示回复、画布不动（test_agent_can_answer_without_touching_the_canvas 锁定这条路径）。设计上的注意点：需要在服务端配置 DP_AGENT_MODEL + 供应商 key —— 没配置时就是 'unavailable'，不存在基于规则的兜底。 `web/src/panels/AgentDock.tsx; kernel/kernel/agent.py`
 - ✅ **独立的连线删除 / 重连** —— 双击一条连线可将其移除（通过提交实现可撤销）；把连线端点拖到一个空闲端口可重新布线（onReconnect，校验时忽略被移动的那条边）。节点删除仍走应用层的 Delete 键处理逻辑。 `web/src/canvas/Canvas.tsx:293 onEdgeDoubleClick→removeEdge; :182 onReconnect`
 - ✅ **画布上的实时在线状态 / 对等端光标** —— 画布在挂载时加入一个在线状态房间（Canvas.tsx:82），在 mousemove 时广播光标（sendCursor），并渲染对等端的实时光标；图编辑通过 Yjs CRDT 合并（collab）。 `web/src/canvas/PeerCursors.tsx:1`
 

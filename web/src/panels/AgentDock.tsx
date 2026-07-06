@@ -3,19 +3,17 @@ import { useStore } from '../store/graph'
 import { api } from '../api/client'
 import { color, kindAccent } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
-import { Segmented } from '../ui/controls'
 import { cn } from '@/lib/utils'
 import { Input } from '@/components/ui/input'
 
-// The agent is an actor (§5.8): you describe an outcome; it BUILDS real, inspectable typed nodes
-// via a server-side tool-use loop. It requires a configured model (DP_AGENT_MODEL + a provider key,
-// set in Settings — the key stays in the kernel, never the browser). With no model it is simply
-// unavailable — no rule-based stand-in that pretends to be an LLM.
+// The agent is an actor (§5.8): one conversation, no plan/build mode. You talk to it; the MODEL
+// decides per message whether to just answer/advise or to actually build — calling the mutating
+// tools (add/connect/set_config). We apply its graph to the canvas only when it did change it.
+// Requires a configured model (DP_AGENT_MODEL + a provider key, set in Settings — the key stays in
+// the kernel, never the browser). With no model it is simply unavailable — no rule-based stand-in.
 export function AgentDock() {
   const open = useStore((s) => s.agentOpen)
   const setOpen = useStore((s) => s.setAgentOpen)
-  const mode = useStore((s) => s.agentMode)
-  const setMode = useStore((s) => s.setAgentMode)
   const log = useStore((s) => s.agentLog)
   const push = useStore((s) => s.pushAgent)
   const [text, setText] = useState('')
@@ -40,9 +38,13 @@ export function AgentDock() {
       const { doc } = useStore.getState()
       const res = await api.agentAct(doc, intent)
       if (res.available && res.graph) {
-        const built = (res.transcript ?? []).filter((t) => t.tool === 'add_node').map((t) => String(t.input.kind))
-        push({ role: 'agent', text: res.summary || (mode === 'build' ? 'Built the pipeline.' : 'Proposed a pipeline.'), plan: built.length ? built : undefined })
-        if (mode === 'build') {
+        const tx = res.transcript ?? []
+        // the model chose to build iff it made a successful mutating tool call this turn; a pure
+        // answer/plan turn (only reads, or text) leaves the canvas untouched.
+        const mutated = tx.some((t) => ['add_node', 'connect', 'set_config'].includes(t.tool) && !t.result?.error)
+        const built = tx.filter((t) => t.tool === 'add_node' && !t.result?.error).map((t) => String(t.input.kind))
+        push({ role: 'agent', text: res.summary || (mutated ? 'Updated the canvas.' : 'Done.'), plan: built.length ? built : undefined })
+        if (mutated) {
           useStore.getState().applyAgentGraph(res.graph)
           runTerminal(res.graph)
         }
@@ -67,7 +69,6 @@ export function AgentDock() {
             {ready ? (llm?.model ?? 'llm') : 'unavailable'}
           </span>
           <span className="flex-1" />
-          <Segmented options={[{ value: 'plan', label: 'Plan' }, { value: 'build', label: 'Build' }]} value={mode} onChange={setMode} accent="#6b4bd6" />
           <button onClick={() => setOpen(false)} className="grid h-[22px] w-6 place-items-center border-0 bg-transparent text-muted-foreground hover:text-foreground"><Icon name="close" size={13} /></button>
         </div>
 
@@ -116,13 +117,13 @@ export function AgentDock() {
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') submit() }}
-            placeholder={ready ? 'Describe an outcome…' : 'Configure a model to use the agent'}
+            placeholder={ready ? 'Ask, or describe what to build…' : 'Configure a model to use the agent'}
             disabled={busy || !ready}
             className="flex-1 text-[12.5px] md:text-[12.5px]"
           />
           <button data-testid="agent-submit" onClick={submit} disabled={busy || !ready}
             className="rounded-md bg-[#6b4bd6] px-4 text-[12.5px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60">
-            {mode === 'build' ? 'Build' : 'Plan'}
+            Send
           </button>
         </div>
       </div>

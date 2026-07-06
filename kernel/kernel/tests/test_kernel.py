@@ -621,6 +621,24 @@ def test_agent_builds_graph_via_tool_loop():
     assert [t["tool"] for t in out["transcript"]] == ["add_node", "add_node", "connect"]
 
 
+def test_agent_can_answer_without_touching_the_canvas():
+    # No plan/build mode: the model may just reply in text (no mutating tools). The graph comes back
+    # unchanged with an empty transcript, so the frontend leaves the canvas alone.
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    from kernel.agent import run_agent
+
+    def fn(messages, info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart("Sample, then filter on is_valid — want me to build it?")])
+
+    g = {"nodes": [{"id": "s1", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {}}}], "edges": []}
+    out = run_agent("how would I clean this?", g, get_deps(), model=FunctionModel(fn))
+    assert out["transcript"] == []                             # no tools called at all
+    assert [n["id"] for n in out["graph"]["nodes"]] == ["s1"]  # canvas untouched
+    assert out["summary"].startswith("Sample")                # the text reply is the summary
+
+
 def test_agent_status_honors_explicit_api_key(monkeypatch):
     # an explicit DP_AGENT_API_KEY override must make the agent available even with no env-var key
     # (regression: status previously only checked agent_base_url and mis-reported unavailable)

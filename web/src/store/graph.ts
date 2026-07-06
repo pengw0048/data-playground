@@ -126,7 +126,6 @@ interface Store {
   saved: boolean          // auto-save state (localStorage), shown subtly in the top bar
 
   agentOpen: boolean
-  agentMode: 'plan' | 'build'
   agentLog: AgentMsg[]
 
   // -- graph mutation --
@@ -179,7 +178,6 @@ interface Store {
 
   // -- agent --
   setAgentOpen: (v: boolean) => void
-  setAgentMode: (m: 'plan' | 'build') => void
   pushAgent: (m: AgentMsg) => void
 
   // -- persistence --
@@ -326,7 +324,6 @@ export const useStore = create<Store>((set, get) => ({
   future: [],
   saved: true,
   agentOpen: false,
-  agentMode: 'build',
   agentLog: [],
 
   setNodes: (nodes) => set((s) => ({ doc: { ...s.doc, nodes } })),
@@ -825,7 +822,6 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   setAgentOpen: (v) => set({ agentOpen: v }),
-  setAgentMode: (m) => set({ agentMode: m }),
   pushAgent: (m) => set((s) => ({ agentLog: [...s.agentLog, m] })),
 
   save: async () => {

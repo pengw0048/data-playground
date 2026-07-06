@@ -7,8 +7,10 @@ bedrock/…) or any OpenAI-compatible endpoint (a local Ollama, a gateway) via D
 matching provider key is read from the environment (ANTHROPIC_API_KEY / OPENAI_API_KEY / …) or the
 UI settings and stays in the kernel, never the browser (NFR-4). LiteLLM is kept only to detect which
 provider key is configured (agent_status). Tools add/connect/configure/preview nodes on a working
-copy of the graph; run_agent returns the finished graph + a transcript. When no provider is
-configured the frontend falls back to the offline planner.
+copy of the graph; run_agent returns the (possibly unchanged) graph + a transcript. There is no
+plan/build mode — the model decides per message whether to just answer or to call the mutating
+tools; the frontend applies the graph only when it actually did. With no provider configured the
+agent is simply unavailable (no rule-based stand-in).
 """
 
 from __future__ import annotations
@@ -55,23 +57,31 @@ def agent_status() -> dict:
 
 _SYSTEM = """\
 You are the agent inside Data Playground — a node-based canvas for data ("like ComfyUI, but for \
-typed columnar data"). You BUILD real, inspectable pipelines by calling tools that add nodes, \
-connect them, and configure them. Nodes lower to a typed logical plan (a DuckDB relation), so the \
-same graph runs on a preview sample or at full scale.
+typed columnar data"). You can do two things, and you decide which fits each message:
+  1. Just answer / advise / think an approach through — reply in text. Use only the read-only \
+tools (list_catalog, list_node_kinds, preview) if you need to look first.
+  2. Build or change the canvas — call add_node / connect / set_config to construct real, \
+inspectable typed nodes. Nodes lower to a typed logical plan (a DuckDB relation), so the same \
+graph runs on a preview sample or at full scale.
 
-How to work:
-- First call list_catalog and list_node_kinds to see the available datasets and node kinds.
+Decide from the message: if the user is asking a question, exploring, or doesn't clearly want the \
+canvas changed, answer in text and DON'T call the mutating tools (add_node/connect/set_config). \
+Call those only when they want the canvas built or modified. When in doubt, propose the plan in \
+words and let them ask you to build it.
+
+When you DO build:
+- Call list_catalog and list_node_kinds first to see the datasets and node kinds.
 - Every pipeline starts from a `source` node whose `uri` is a catalog table's uri.
-- Connect nodes with `connect(source_id, target_id)`. Multi-input nodes (e.g. `join`) expose \
-named input handles — pass target_handle for those.
-- Configure nodes with the params shown by list_node_kinds. For a `filter`, set `predicate` to a \
-SQL boolean expression over the columns. For `sql`, write a query using `input` as the table name. \
-For `transform`, write a Python function `def fn(row): ...` (mode "map") that returns the row.
+- Connect with `connect(source_id, target_id)`. Multi-input nodes (e.g. `join`) expose named \
+input handles — pass target_handle.
+- Configure with the params shown by list_node_kinds. For a `filter`, set `predicate` to a SQL \
+boolean expression over the columns. For `sql`, write a query using `input` as the table name. For \
+`transform`, write a Python function `def fn(row): ...` (mode "map") that returns the row.
 - Use `preview(node_id)` to SEE real sample rows and verify a step before continuing. Adapt to \
 what the data actually looks like.
-- Build the MINIMUM graph that achieves the user's outcome. Don't add nodes they didn't ask for.
+- Build the MINIMUM graph that achieves the outcome. Don't add nodes they didn't ask for.
 - When the graph is complete, STOP calling tools and reply with a one-sentence summary of what you \
-built. If you cannot map the request to a pipeline, reply explaining why.
+built.
 
 Be concise. Prefer relational nodes (filter/select/sql/aggregate/join) over Python transforms when \
 they suffice — they push down and run out-of-core."""
@@ -246,9 +256,9 @@ def run_agent(outcome: str, graph: dict, deps, model=None) -> dict:
     ctx = _Ctx(kdeps=deps, wg=wg, seq=[0], transcript=[])
     m = model if model is not None else _build_model(*_agent_config())
 
-    prompt = (f"Outcome: {outcome}\n\nCurrent canvas has {len(wg['nodes'])} node(s) and "
-              f"{len(wg['edges'])} edge(s). Build (or extend) a pipeline to achieve the outcome. "
-              "Start by listing the catalog and node kinds.")
+    prompt = (f"{outcome}\n\n(The canvas currently has {len(wg['nodes'])} node(s) and "
+              f"{len(wg['edges'])} edge(s).) Respond to this — answer or advise in text, or build/"
+              "modify the canvas by calling tools, whichever the message calls for.")
     # request_limit bounds the loop (was the manual step cap) so a confused model can't run away.
     result = _agent.run_sync(prompt, model=m, deps=ctx,
                              usage_limits=UsageLimits(request_limit=settings.agent_max_steps))
