@@ -1,7 +1,7 @@
 """ExecutionBackend — the plugin contract for WHERE a pipeline runs.
 
 The default `LocalRunner` executes out-of-core in this process. A plugin can register another backend
-via `register(reg)` → `reg.add_runner(backend)` — a subprocess/pod, a Ray cluster, a the pipeline runtime head-pod,
+via `register(reg)` → `reg.add_runner(backend)` — a subprocess/pod, a Ray cluster, a head-pod driver,
 a remote service, etc. The kernel routes each run to the first backend whose `can_run(plan)` is true
 (Deps.pick_runner), then sends status/cancel for that run to the same backend (Deps.run_index).
 Implement this Protocol and nothing else in the core needs to change — execution isolation/scale

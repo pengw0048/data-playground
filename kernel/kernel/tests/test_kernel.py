@@ -1204,7 +1204,7 @@ def test_collab_relay_gates_viewer_doc_updates(monkeypatch):
 
 
 def test_execution_backend_plugin_contract(tmp_path):
-    # a plugin can register an alternate execution backend (pod/Ray/the pipeline runtime/…); the kernel routes runs
+    # a plugin can register an alternate execution backend (pod/Ray/queue/…); the kernel routes runs
     # to the first backend whose can_run(plan) is true. This proves the ExecutionBackend extension point.
     from kernel.backends import ExecutionBackend
     from kernel.deps import Deps

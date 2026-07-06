@@ -1,6 +1,6 @@
 // Built-in capability providers (§5.4). Media + vector are generic, schema-driven, and add
-// viewer tabs — they never change a node's ports. Reference-bundle capabilities (e.g.
-// column-mirror) would register the same way from a plugin.
+// viewer tabs — they never change a node's ports. Plugin-bundle capabilities (e.g. a
+// warehouse-mirror tab) would register the same way from a plugin.
 import { registerCapability } from './registry'
 import { Icon } from '../ui/Icon'
 import type { ColumnSchema } from '../types/graph'
