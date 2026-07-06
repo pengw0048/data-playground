@@ -102,18 +102,12 @@ class LoweringEngine:
                             for n, t in zip(tbl.column_names, tbl.schema.types)])
         return _table_to_rows(tbl), cols
 
-    # -- inputs (honors branch routing) ------------------------------------ #
+    # -- inputs ------------------------------------------------------------ #
     def _inputs(self, node: GraphNode) -> list[Relation]:
         if node.id in self.bound_inputs:  # section sub-node: input injected by the driver script
             return [self.bound_inputs[node.id]]
-        out: list[Relation] = []
-        for e in g.incoming(self.graph, node.id):
-            rel = self.relation(e.source, e.source_handle)  # route by the source port (multi-output)
-            parent = g.node_map(self.graph)[e.source]
-            if parent.type == "branch":
-                rel = self._route_branch(parent, rel, e.source_handle)
-            out.append(rel)
-        return out
+        # route each incoming edge by its source port (multi-output nodes lower to {port -> Relation})
+        return [self.relation(e.source, e.source_handle) for e in g.incoming(self.graph, node.id)]
 
     def _faithful_inputs(self, node: GraphNode) -> list[Relation]:
         """Lower this node's inputs UNSAMPLED even during preview, so an op that must see all rows
@@ -300,9 +294,6 @@ class LoweringEngine:
             title = (node.data.get("title") if isinstance(node.data, dict) else None) or "metric"
             return db.conn().sql(f"SELECT '{_sql_str(title)}' AS metric, ({expr})::DOUBLE AS value FROM {v}")
 
-        if t == "branch":
-            return parent  # router; routing applied on outgoing edges
-
         if t == "vector-search":
             return self._vector_search(node, inputs)
 
@@ -320,14 +311,6 @@ class LoweringEngine:
     def _spec_previewable(self, kind: str) -> bool:
         spec = self.node_specs.get(kind)
         return bool(getattr(spec, "previewable", True)) if spec is not None else True
-
-    # -- branch routing ---------------------------------------------------- #
-    def _route_branch(self, node: GraphNode, rel: Relation, handle: str | None) -> Relation:
-        pred = (_cfg(node).get("predicate") or "").strip()
-        want_true = (handle or "true") != "false"
-        if not pred:
-            return rel if want_true else rel.filter("1=0")
-        return rel.filter(pred if want_true else f"NOT ({pred})")
 
     # -- transform escape hatch (Python over Arrow batches) ---------------- #
     def _transform(self, node: GraphNode, parent: Relation) -> Relation:

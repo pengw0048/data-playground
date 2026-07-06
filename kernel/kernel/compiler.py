@@ -15,7 +15,7 @@ _STEP_KIND = {
     "source": "read", "sample": "sample", "filter": "filter", "select": "select",
     "sort": "op", "dedup": "op", "sql": "sql", "join": "join", "aggregate": "reduce",
     "transform": "op", "notebook": "op", "metric": "reduce", "write": "write",
-    "opaque": "opaque", "loop": "loop", "branch": "branch", "variable": "op",
+    "opaque": "opaque", "loop": "loop", "variable": "op",
     "vector-search": "query",
 }
 

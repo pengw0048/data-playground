@@ -2,7 +2,7 @@
 
 _验收清单，按架构层次组织：**层 → 组件 → 角色**（接口 / 实现 / 选择判断 / 生命周期 / UI / 安全 / 持久化…）。每个叶子由 `file:line` 佐证。图例：✅ 已实现 · 🟡 部分实现（见备注） · ⬜ 未实现（脚手架 / 规划中 / 有意省略）。跨层复用的组件只写一处，别处用 `↗ 见 §X` 交叉引用（交叉引用行不带状态图标、不计数）。_
 
-_最后更新：2026-07-06。**133 项功能**（旧扁平清单 142 条里的 9 处跨层重复已合并为交叉引用）—— ✅ 116 · 🟡 14 · ⬜ 3。_
+_最后更新：2026-07-06。**132 项功能**（旧扁平清单 142 条里的跨层重复已合并为交叉引用；移除了死掉的 branch 路由）—— ✅ 115 · 🟡 14 · ⬜ 3。_
 
 **层次总览**
 
@@ -41,7 +41,7 @@ _最后更新：2026-07-06。**133 项功能**（旧扁平清单 142 条里的 9
 - ✅ **节点 + 能力注册表（插件模型）** — register(spec,component)；glob kinds/*.tsx，加类型=加文件。 `web/src/nodes/registry.ts:32`
 - ✅ **schema 驱动的通用节点（backend/插件类型）** — registerGenericNodes 无前端代码渲染任何 /api/nodes 类型。 `↗ 详见 §5.2 通用渲染` `web/src/nodes/generic.tsx:97`
 - ✅ **内置节点类型（source/sample/filter/select/transform/sql/join/aggregate/sort/dedup/write/metric/vector-search/section/note/code）** — 16 个手工卡片，nodespecs.py 镜像计算类型。 `web/src/nodes/kinds/source.tsx:94`
-- ⬜ **branch / loop / variable 控制流节点** — 有意省略、非缺口：控制流统一由 section 驱动脚本承担；残留的 'control' 工具栏分类无节点注册，空分类被丢弃不显示。 `↗ 相关 §2.1 分支路由 / §2.4 loop` `web/src/theme/tokens.ts:54`
+- ⬜ **branch / loop / variable 控制流节点** — 有意省略、非缺口：控制流统一由 section 驱动脚本承担。branch 连引擎里残留的 `_route_branch` 路由机器件也已一并移除(不可达死代码);残留的 'control' 工具栏分类无节点注册,空分类被丢弃不显示。 `web/src/theme/tokens.ts:54`
 
 ### §1.4 端口与连线 · 4✅
 - ✅ **类型化端口 + 连线类型** — 形状+色调编码 dataset/selection/sample/sql-view/metric/value；多输出经 config.outputs。 `web/src/nodes/Port.tsx:13`
@@ -67,11 +67,10 @@ _最后更新：2026-07-06。**133 项功能**（旧扁平清单 142 条里的 9
 
 ## §2 内核 · 执行引擎
 
-### §2.1 下降引擎（LoweringEngine）· 3✅
+### §2.1 下降引擎（LoweringEngine）· 2✅
 - **接口：NodeLowering 协议** — 引擎经 node_lowerings 分派插件类型（单输出 Relation / 多输出 {port:Relation}）。 `↗ 契约叶子见 §5.2 节点 SPI`
 - ✅ **图 → DuckDB 关系 plan** — 每关系节点降为 DuckDBPyRelation；多输出 {port->Relation} 按 source_handle 路由。 `kernel/kernel/executors/engine.py:150`
 - ✅ **核外执行（DuckDB 流式 + 溢出磁盘）** — 关系算子原生流式/溢出；temp_directory 显式设为 DP_SPILL_DIR（运维可控）、DP_MEMORY_LIMIT 可限内存；Python transform 溢出 Parquet 再读回，runner GC。**benchmark 背书**：240M 行/4.7GB 在 1.3GiB 上限下排序、溢出 4.9GB、峰值 RSS 仅 2.3GB。 `kernel/kernel/db.py _apply_session; engine.py:364; docs/BENCHMARK.md`
-- ✅ **分支路由（条件式边路由）** — 空谓词→true，`1=0`→false；按每条出边应用。 `kernel/kernel/executors/engine.py:322`
 
 ### §2.2 预览与 schema · 3✅
 - ✅ **忠实的样本预览（join/sort/vector 对完整输入运行）** — 这些算子预览时以未采样子引擎下降，LIMIT 成诚实 top-N；预览预算 2000 行。 `kernel/kernel/executors/engine.py:118`
