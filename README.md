@@ -21,6 +21,9 @@ dataplay                        # serves the canvas + engine in one process, ope
 dataplay --workspace ./my-proj --port 8471
 ```
 
+**New here?** The **[5-minute tour](docs/TUTORIAL.md)** builds a real pipeline on the seeded data —
+events → keep purchases → total per user → save.
+
 ---
 
 ## What you get, offline, out of the box
