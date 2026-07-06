@@ -122,6 +122,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* compute placement: what this step needs → the run routes to a matching worker (e.g. a GPU pool) */}
       {(kind === 'transform' || kind === 'section') && <ResourcesSection nodeId={nodeId} />}
 
+      {/* checkpoint: materialize this node's output → inspectable + reused across runs (splits a region) */}
+      {kind !== 'source' && kind !== 'note' && kind !== 'write' && <CheckpointToggle nodeId={nodeId} />}
+
       {/* ports — a real port label (join left/right, metric value) shows as a name; the default
           in/out ports just show their wire type. Outputs carry a typed/untyped schema badge. */}
       <Section title="Ports">
@@ -221,6 +224,21 @@ function CodeBtn({ icon, label, onClick }: { icon: IconName; label: string; onCl
       className="h-auto gap-1.5 px-2.5 py-1.5 text-[11.5px] font-medium text-primary shadow-none [&_svg]:size-3">
       <Icon name={icon} size={12} /> {label}
     </Button>
+  )
+}
+
+function CheckpointToggle({ nodeId }: { nodeId: string }) {
+  const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
+  const updateConfig = useStore((s) => s.updateConfig)
+  const on = !!(node?.data.config as Record<string, unknown>)?.checkpoint
+  return (
+    <Section title="Materialization">
+      <button data-testid="checkpoint-toggle" onClick={() => updateConfig(nodeId, { checkpoint: on ? undefined : true })}
+        className="flex w-full items-center gap-2 rounded-md border border-border px-2.5 py-1.5 text-left text-[11.5px] text-foreground hover:bg-accent">
+        <span className={cn('h-2 w-2 shrink-0 rounded-full', on ? 'bg-primary' : 'border border-muted-foreground')} />
+        {on ? 'Checkpointed — output materialized (inspectable + reused across runs)' : 'Checkpoint here (materialize this step’s output)'}
+      </button>
+    </Section>
   )
 }
 

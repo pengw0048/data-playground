@@ -122,6 +122,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
                   DISABLED
                 </span>
               )}
+              {(data.config as Record<string, unknown>)?.checkpoint ? (
+                <span className="shrink-0 text-[9px] leading-none text-primary" title="Checkpointed — output materialized (inspectable + reused across runs)">●</span>
+              ) : null}
               <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[8.5px] font-semibold tracking-[0.6px] text-muted-foreground">
                 {tag}
               </span>

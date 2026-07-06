@@ -334,6 +334,15 @@ test.describe('Data Playground canvas', () => {
     await expect(gpus).toHaveValue('8') // written to config.requires → routes to a GPU worker at run time
   })
 
+  test('checkpointing a node marks it materialized on the graph', async ({ page }) => {
+    await fresh(page)
+    const inspector = page.getByTestId('inspector')
+    await addNode(page, 'Shape', 'filter') // auto-selected
+    await inspector.getByTestId('checkpoint-toggle').click()
+    // the card now shows the materialized ● (output persisted → inspectable + reused across runs)
+    await expect(page.locator('.react-flow__node').getByTitle(/Checkpointed/)).toBeVisible()
+  })
+
   test('a code block lives on the canvas and opens the fullscreen editor on double-click', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Inspect', 'code')
