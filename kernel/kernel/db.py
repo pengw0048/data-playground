@@ -40,6 +40,40 @@ def lock() -> threading.RLock:
     return _lock
 
 
+def _rollback_base() -> None:
+    """Clear an ABORTED implicit transaction on the base connection. A statement that fails mid-work
+    (a bad scan, a swallowed adapter probe, an interrupted query) leaves DuckDB's implicit transaction
+    aborted, and every LATER base-connection op then fails with 'current transaction is aborted' — one
+    shared connection would wedge the whole engine until restart. Roll back so a failure self-heals.
+    Caller must hold `_lock`."""
+    try:
+        if _conn is not None:
+            _conn.execute("ROLLBACK")
+    except Exception:  # noqa: BLE001 — no active transaction to roll back
+        pass
+
+
+@contextmanager
+def base_guard() -> Iterator[None]:
+    """Serialize a base-connection EXECUTION and keep it un-wedged. A no-op inside a `run_scope()` —
+    there `conn()` is a thread-confined cursor that needs no lock — but otherwise holds the
+    base-connection lock for the whole op and ROLLS BACK on failure. Wrap adapter metadata ops
+    (count/schema) that can run OFF the request thread: a catalog register fires on a runner /
+    subprocess-watch DAEMON thread and probes the adapter, while request threads touch the base
+    connection — and a bare DuckDBPyConnection is not safe for concurrent use (a lazy relation only
+    executes when fetched, so the lock must span the fetch, not just the build). The rollback stops a
+    single failed probe from leaving the shared connection's transaction aborted for everyone else."""
+    if getattr(_local, "con", None) is not None:
+        yield  # inside a run_scope: own cursor, already thread-confined
+    else:
+        with _lock:
+            try:
+                yield
+            except BaseException:
+                _rollback_base()  # a failed base-conn statement must not wedge later ops
+                raise
+
+
 def _spill_dir() -> str:
     """The on-disk spill location — where DuckDB writes external sort/hash/aggregate temp files and
     where the Python-transform spill lands. Operator-controllable via DP_SPILL_DIR."""
@@ -106,7 +140,8 @@ def run_scope() -> Iterator[_Scope]:
     """Give this thread its own DuckDB cursor for the duration of a run/preview, so it doesn't
     serialize on (or get wedged by) any other run. Yields a `_Scope` whose `.interrupt()` a canceller
     can call from another thread. On exit, rolls back and drops only the views this scope created."""
-    cur = _base_conn().cursor()
+    with _lock:
+        cur = _base_conn().cursor()  # cursor creation touches the base connection — serialize it too
     try:
         _apply_session(cur)  # re-assert the SSRF-safe extension policy on the cursor (defensive)
     except Exception:  # noqa: BLE001
@@ -226,18 +261,18 @@ def drop_created_views() -> None:
 
 
 def query(sql: str, params: list | None = None) -> list[dict]:
-    with _lock:
+    with base_guard():  # serialize + roll back on failure so bad SQL can't wedge the base connection
         cur = conn().execute(sql, params or [])
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 def query_columns(sql: str, params: list | None = None) -> list[tuple[str, str]]:
-    with _lock:
+    with base_guard():
         cur = conn().execute(f"DESCRIBE {sql}", params or [])
         return [(r[0], r[1]) for r in cur.fetchall()]
 
 
 def execute(sql: str, params: list | None = None) -> None:
-    with _lock:
+    with base_guard():
         conn().execute(sql, params or [])

@@ -1822,6 +1822,63 @@ def test_controller_refuses_unsafe_splits():
     assert ctrl.run(g_mid_write, "wr") is None  # refuses the split → base runner (whole graph, commits both writes)
 
 
+def test_base_guard_recovers_an_aborted_base_connection():
+    # adversarial-review fix (#10): a failed base-conn statement leaves DuckDB's implicit transaction
+    # ABORTED, and one shared connection then rejects EVERY later op with "transaction is aborted" —
+    # wedging the whole engine until restart. base_guard must roll it back so ops self-heal. Reproduce
+    # the aborted state deterministically, then prove a follow-up op recovers (would wedge forever
+    # without the rollback). SELECT 1 executes even when aborted, so probe a real table read.
+    from kernel import db
+    path = _uri("events")
+    q = f"SELECT count(*) AS n FROM read_parquet('{path.replace(chr(39), chr(39) * 2)}')"
+    assert db.query(q)[0]["n"] > 0  # baseline
+    with db.lock():  # wedge the base connection: a failing statement inside an explicit transaction
+        db._base_conn().execute("BEGIN TRANSACTION")
+        try:
+            db._base_conn().execute("SELECT CAST('abc' AS INTEGER)").fetchall()  # leaves txn aborted
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        db.query(q)  # inherits the aborted txn, fails — but base_guard ROLLS BACK on the way out
+    except Exception:  # noqa: BLE001
+        pass
+    assert db.query(q)[0]["n"] > 0  # healed — stays wedged forever without the rollback
+
+
+def test_base_connection_concurrent_access_stays_clean():
+    # adversarial-review fix (#10): catalog register (count/schema on runner / subprocess-watch DAEMON
+    # threads), run_scope cursor creation, and request threads ALL touch the base DuckDB connection —
+    # which is not safe for concurrent use. base_guard (count/schema/query) + serialized cursor
+    # creation must keep it clean under contention (before the fix this raced: count()->None, an
+    # aborted-transaction cascade, or a hard crash). Hammer all three paths concurrently.
+    import concurrent.futures
+
+    from kernel import db
+    uri = _uri("events")
+    adapter = get_deps().resolve_adapter(uri)
+    errors: list[Exception] = []
+
+    def metadata(_):
+        try:
+            assert adapter.count(uri) and adapter.count(uri) > 0  # never a concurrency-induced None
+            adapter.schema(uri)
+            db.query("SELECT count(*) FROM range(10)")
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    def scoped(_):
+        try:
+            with db.run_scope():  # exercises the (now serialized) base-connection cursor creation
+                db.conn().execute("SELECT count(*) FROM range(5000)").fetchone()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+        futs = [ex.submit(metadata, i) for i in range(120)] + [ex.submit(scoped, i) for i in range(120)]
+        concurrent.futures.wait(futs)
+    assert not errors, errors[:3]
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).

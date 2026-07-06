@@ -160,11 +160,13 @@ class DuckDBAdapter:
         raise ValueError(f"no parquet/csv/json files under {d}")
 
     def schema(self, uri: str) -> list[ColumnSchema]:
-        return relation_columns(self.scan(uri, limit=0))
+        with db.base_guard():  # executes on the base connection when off a run_scope (catalog probe)
+            return relation_columns(self.scan(uri, limit=0))
 
     def count(self, uri: str) -> int | None:
         try:
-            return int(self.scan(uri).aggregate("count(*) AS n").fetchone()[0])
+            with db.base_guard():  # serialize the base-connection fetch (register runs on daemon threads)
+                return int(self.scan(uri).aggregate("count(*) AS n").fetchone()[0])
         except Exception:  # noqa: BLE001
             return None
 
@@ -271,11 +273,12 @@ class LanceAdapter:
         return rel.project("* EXCLUDE (_distance), (1 - _distance) AS _score")  # Lance ranks by distance asc
 
     def schema(self, uri: str) -> list[ColumnSchema]:
-        return relation_columns(self.scan(uri, limit=0))
+        with db.base_guard():  # scan() feeds a Lance reader into the base DuckDB connection off-scope
+            return relation_columns(self.scan(uri, limit=0))
 
     def count(self, uri: str) -> int | None:
         try:
-            return int(self._dataset(uri).count_rows())
+            return int(self._dataset(uri).count_rows())  # pure pylance — no shared DuckDB connection
         except Exception:  # noqa: BLE001
             return None
 
