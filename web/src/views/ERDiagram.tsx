@@ -5,6 +5,7 @@ import {
 } from '@xyflow/react'
 import { useStore } from '../store/graph'
 import { api } from '../api/client'
+import { resolvedTheme } from '../theme/mode'
 import type { CatalogTable, Relationship } from '../types/api'
 import { cn } from '@/lib/utils'
 
@@ -47,14 +48,16 @@ function keyColsLower(t: CatalogTable): string[] {
   return t.columns.filter((c) => c.capabilities?.includes('key')).map((c) => c.name.toLowerCase())
 }
 
-// cheap client-side "these could join": a shared key column by name, or an id <-> *_id FK naming.
+// cheap client-side "these could plausibly join": a shared NON-generic key name (e.g. both have
+// `user_id`), or an FK-style `id` <-> `<thing>_id` match. Deliberately NOT bare-`id` <-> bare-`id`:
+// every table has a surrogate `id`, so matching those would draw a complete-graph hairball of
+// meaningless hints. A real join needs a qualified signal.
+const BARE_KEYS = ['id', 'uuid', 'guid', 'pk']
 function sharesKey(a: CatalogTable, b: CatalogTable): boolean {
-  const ka = new Set(keyColsLower(a))
-  const bare = ['id', 'uuid', 'guid', 'pk']
-  return keyColsLower(b).some((n) =>
-    ka.has(n)
-    || (bare.includes(n) && [...ka].some((x) => x.endsWith('_' + n)))
-    || [...ka].some((x) => bare.includes(x) && n.endsWith('_' + x)))
+  const ka = keyColsLower(a), kb = keyColsLower(b)
+  const fk = (xs: string[], ys: string[]) => xs.some((x) => BARE_KEYS.includes(x) && ys.some((y) => y.endsWith('_' + x)))
+  const sharedNonBare = ka.some((x) => !BARE_KEYS.includes(x) && kb.includes(x))
+  return sharedNonBare || fk(ka, kb) || fk(kb, ka)
 }
 
 export function ERDiagram() {
@@ -153,8 +156,9 @@ export function ERDiagram() {
         🔑 click a column to declare its primary key · drag between two tables to declare a join (keys + cardinality measured) · click a solid edge to remove · dashed = possible join
       </div>
       <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange}
-        onConnect={onConnect} onEdgeClick={onEdgeClick} fitView minZoom={0.2} proOptions={{ hideAttribution: true }}>
-        <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
+        onConnect={onConnect} onEdgeClick={onEdgeClick} fitView minZoom={0.2} colorMode={resolvedTheme()}
+        proOptions={{ hideAttribution: true }}>
+        <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="var(--dots)" />
         <Controls showInteractive={false} />
       </ReactFlow>
     </div>

@@ -64,10 +64,7 @@ class InMemoryCatalog:
         except Exception:
             columns, count = [], None
         from kernel.relationships import key_candidates
-        # owner-DECLARED key (if any) leads, then inferred (name-based) candidates minus the declared dup
-        declared = self._declared_keys().get(uri)
-        inferred = [k for k in key_candidates(columns) if list(k.columns) != list(declared or [])]
-        keys = ([KeyInfo(columns=list(declared), confidence="declared")] if declared else []) + inferred
+        keys = key_candidates(columns)  # inferred candidates; the declared key is OVERLAID on read (_overlay)
         with self._lock:
             tid = f"tbl_{name}" if uri not in self._by_uri else self._by_uri[uri]
             if any(t.id == f"tbl_{name}" and t.uri != uri for t in self.tables.values()):
@@ -107,11 +104,25 @@ class InMemoryCatalog:
         except Exception:  # noqa: BLE001
             pass
 
+    def _overlay(self, t: CatalogTable, dmap: dict[str, list[str]] | None = None) -> CatalogTable:
+        """Apply the owner-declared key (from Settings — the authoritative, cross-instance store) on
+        top of a table's inferred keys, freshly recomputed from its columns. Overlaying on READ (not
+        baking declared into the stored doc) is what makes a declared key: (a) visible on a peer that
+        already cached the dataset, and (b) cleanly reversible — clearing it restores the inferred key.
+        `dmap` lets list_tables read Settings once for the whole list."""
+        from kernel.relationships import key_candidates
+        declared = (dmap if dmap is not None else self._declared_keys()).get(t.uri)
+        inferred = [k for k in key_candidates(t.columns) if list(k.columns) != list(declared or [])]
+        keys = ([KeyInfo(columns=list(declared), confidence="declared")] if declared else []) + inferred
+        return t if keys == t.keys else t.model_copy(update={"keys": keys})
+
     # -- CatalogProvider --------------------------------------------------- #
     def list_tables(self, q: str | None) -> list[CatalogTable]:
         with self._lock:
             self._load_from_db()  # pick up entries registered by other instances / before a restart
             items = list(self.tables.values())  # snapshot under the lock; safe to filter after
+        dmap = self._declared_keys()  # one read for the whole list
+        items = [self._overlay(t, dmap) for t in items]
         if q:
             ql = q.lower()
             items = [t for t in items if ql in t.name.lower() or ql in t.uri.lower()]
@@ -121,12 +132,12 @@ class InMemoryCatalog:
         with self._lock:
             self._load_from_db()  # another instance may have registered it
             if id_or_name in self.tables:
-                return self.tables[id_or_name]
+                return self._overlay(self.tables[id_or_name])
             if id_or_name in self._by_uri:
-                return self.tables[self._by_uri[id_or_name]]
+                return self._overlay(self.tables[self._by_uri[id_or_name]])
             for t in self.tables.values():
                 if t.name == id_or_name:
-                    return t
+                    return self._overlay(t)
         raise KeyError(id_or_name)
 
     def lineage(self, uri: str) -> LineageResult:
@@ -193,8 +204,9 @@ class InMemoryCatalog:
             return {}
 
     def set_declared_key(self, uri: str, columns: list[str] | None) -> None:
-        """Set (or clear, columns=None/[]) the owner-declared primary key of a dataset. Declared keys
-        lead a table's `keys` and win in grain — the escape hatch for a dataset an opaque transform
+        """Set (or clear, columns=None/[]) the owner-declared primary key of a dataset — stored in the
+        authoritative Settings map and OVERLAID on read (_overlay), so it works cross-instance and a
+        clear cleanly restores the inferred key. The escape hatch for a dataset an opaque transform
         produced or whose key the name heuristic missed."""
         with self._lock:
             keys = self._declared_keys()
@@ -203,27 +215,30 @@ class InMemoryCatalog:
             else:
                 keys.pop(uri, None)
             metadb.set_setting(_DECLARED_KEYS, keys, "global")
-            tid = self._by_uri.get(uri)
-            if tid and tid in self.tables:  # reflect immediately in the live table
-                t = self.tables[tid]
-                inferred = [k for k in t.keys if k.confidence != "declared" and list(k.columns) != list(columns or [])]
-                t.keys = ([KeyInfo(columns=list(columns), confidence="declared")] if columns else []) + inferred
-                self._persist(t)
 
     def relationships(self, uri: str | None = None) -> list[Relationship]:
-        """Owner-declared join edges; filtered to those touching `uri` when given."""
+        """Owner-declared join edges; filtered to those touching `uri` when given. A malformed stored
+        row (a manual edit / version skew) is skipped, never fatal — otherwise one bad row would 500
+        the whole feature, including the delete path needed to remove it."""
         try:
             raw = metadb.get_setting(_RELATIONSHIPS, "global", default=[]) or []
         except Exception:  # noqa: BLE001
             raw = []
-        rels = [Relationship.model_validate(r) for r in raw]
+        rels: list[Relationship] = []
+        for r in raw:
+            try:
+                rels.append(Relationship.model_validate(r))
+            except Exception:  # noqa: BLE001 — skip a bad row, don't take down relationships()
+                pass
         if uri is not None:
             rels = [r for r in rels if uri in (r.left_uri, r.right_uri)]
         return rels
 
     @staticmethod
-    def _rel_key(r: Relationship) -> tuple:
-        return (r.left_uri, tuple(r.left_columns), r.right_uri, tuple(r.right_columns))
+    def _rel_key(r: Relationship) -> frozenset:
+        # orientation-insensitive: A→B and B→A on swapped columns are ONE logical relationship, so
+        # re-declaring in reverse replaces rather than duplicates (a frozenset of the two endpoints).
+        return frozenset({(r.left_uri, tuple(r.left_columns)), (r.right_uri, tuple(r.right_columns))})
 
     def add_relationship(self, rel: Relationship) -> None:
         with self._lock:

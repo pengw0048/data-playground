@@ -2015,7 +2015,8 @@ def test_declared_key_overrides_inference_and_grain():
         assert client.put(f"/api/catalog/tables/{ev.id}/key", json={"columns": ["nope"]}).status_code == 400
     finally:
         client.put(f"/api/catalog/tables/{ev.id}/key", json={"columns": []})  # clear (don't leak)
-    assert [k.columns for k in d.catalog.get_table(ev.id).keys] == [["id"]]  # back to inferred only
+    # clearing restores ALL inferred keys (a declared key must not eat the name-heuristic fallback)
+    assert {tuple(k.columns) for k in d.catalog.get_table(ev.id).keys} == {("id",), ("user_id",)}
 
 
 def test_relationship_crud_and_leads_join_analysis():
@@ -2036,6 +2037,41 @@ def test_relationship_crud_and_leads_join_analysis():
     finally:
         client.post("/api/catalog/relationships/delete", json=rel)
     assert client.get("/api/catalog/relationships").json() == []
+
+
+def test_measure_unique_composite_null_is_not_unique():
+    # adversarial-review #8: a composite key with a NULL field must read NON-unique (a NULL key can't
+    # join) — count(DISTINCT (a,b)) alone counts null-bearing tuples as distinct, so a FILTER excludes
+    # them, matching the single-column NULL semantics.
+    import pyarrow as pa
+
+    from kernel import db, relationships as rel
+    # rows: (1,None),(1,None),(2,'y') — distinct non-null tuples = 1 (only (2,'y')), count(*) = 3 → not unique
+    tbl = pa.table({"a": [1, 1, 2], "b": [None, None, "y"]})
+
+    class OneShot:
+        def scan(self, uri, columns=None, **k):
+            sel = tbl.select(columns) if columns else tbl
+            return db.conn().from_arrow(pa.RecordBatchReader.from_batches(sel.schema, sel.to_batches()))
+    assert rel.measure_unique("x", ["a", "b"], lambda u: OneShot())[0] is False
+
+
+def test_relationships_survives_a_malformed_stored_row():
+    # adversarial-review #3: a bad row in the relationships Setting (manual edit / version skew) must
+    # be skipped, not 500 the whole feature (incl. the delete path needed to remove it).
+    from kernel import metadb
+    from kernel.deps import get_deps
+    cat = get_deps().catalog
+    good = {"leftUri": _uri("images"), "leftColumns": ["id"], "rightUri": _uri("events"),
+            "rightColumns": ["user_id"], "cardinality": "1:N", "confidence": "declared"}
+    prev = metadb.get_setting("catalog_relationships", "global", default=[])
+    try:
+        metadb.set_setting("catalog_relationships", [{"garbage": True}, good], "global")  # one bad, one good
+        rels = cat.relationships()  # must not raise
+        assert len(rels) == 1 and rels[0].cardinality == "1:N"
+        assert client.get("/api/catalog/relationships").status_code == 200
+    finally:
+        metadb.set_setting("catalog_relationships", prev or [], "global")
 
 
 def test_example_plugin_loads_and_runs(tmp_path):

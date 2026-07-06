@@ -56,7 +56,14 @@ def measure_unique(uri: str, cols: list[str], resolve_adapter) -> tuple[bool | N
     and stall other previews. Returns (None, n) when the data/columns can't be read (→ 'unknown'
     cardinality, never a false 'not unique') and (None, 0) for empty data (cardinality is moot)."""
     quoted = ", ".join(f'"{c}"' for c in cols)
-    dexpr = f"count(DISTINCT ({quoted}))" if len(cols) > 1 else f"count(DISTINCT {quoted})"
+    if len(cols) > 1:
+        # a composite (a,b) struct is non-null even when a field is NULL, so count(DISTINCT (a,b))
+        # would count a null-bearing tuple as a distinct value — reporting a NULL-containing key as
+        # unique. Exclude any-null tuples (FILTER) to match the single-column NULL semantics.
+        notnull = " AND ".join(f'"{c}" IS NOT NULL' for c in cols)
+        dexpr = f"count(DISTINCT ({quoted})) FILTER (WHERE {notnull})"
+    else:
+        dexpr = f"count(DISTINCT {quoted})"  # excludes NULLs already
     try:
         adapter = resolve_adapter(uri)
         with db.run_scope():
@@ -213,23 +220,25 @@ def _grain_unique_oracle(graph: Graph, input_id: str, catalog, resolve_adapter):
     return fn
 
 
-def _declared_suggestion(graph: Graph, left_id: str, right_id: str, catalog) -> JoinSuggestion | None:
-    """A JoinSuggestion from an owner-declared relationship between the two inputs' source datasets
-    (either orientation), or None. Trusted over measurement — the user asserted this join."""
+def _declared_suggestions(graph: Graph, left_id: str, right_id: str, catalog) -> list[JoinSuggestion]:
+    """JoinSuggestions from EVERY owner-declared relationship between the two inputs' source datasets
+    (either orientation) — trusted over measurement. Returns all matches, not just the first, so two
+    declared relationships on different key columns both surface."""
     lsrc, rsrc = _lone_source_uri(graph, left_id), _lone_source_uri(graph, right_id)
     if not lsrc or not rsrc:
-        return None
+        return []
+    out: list[JoinSuggestion] = []
     for r in catalog.relationships():
         if r.left_uri == lsrc and r.right_uri == rsrc:
-            return JoinSuggestion(left_columns=r.left_columns, right_columns=r.right_columns,
-                                  cardinality=r.cardinality, confidence="declared", score=10.0,
-                                  reason="declared relationship")
-        if r.left_uri == rsrc and r.right_uri == lsrc:  # stored the other way round → flip to left/right here
+            out.append(JoinSuggestion(left_columns=r.left_columns, right_columns=r.right_columns,
+                                      cardinality=r.cardinality, confidence="declared", score=10.0,
+                                      reason="declared relationship"))
+        elif r.left_uri == rsrc and r.right_uri == lsrc:  # stored the other way round → flip to left/right
             flip = {"1:N": "N:1", "N:1": "1:N"}.get(r.cardinality, r.cardinality)
-            return JoinSuggestion(left_columns=r.right_columns, right_columns=r.left_columns,
-                                  cardinality=flip, confidence="declared", score=10.0,
-                                  reason="declared relationship")
-    return None
+            out.append(JoinSuggestion(left_columns=r.right_columns, right_columns=r.left_columns,
+                                      cardinality=flip, confidence="declared", score=10.0,
+                                      reason="declared relationship"))
+    return out
 
 
 def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | None],
@@ -251,11 +260,17 @@ def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | N
     suggestions = suggest_joins(lcols, rcols,
                                 _grain_unique_oracle(graph, left, catalog, resolve_adapter),
                                 _grain_unique_oracle(graph, right, catalog, resolve_adapter))
-    # a DECLARED relationship between the two inputs' source datasets leads (owner-asserted, trusted)
-    declared = _declared_suggestion(graph, left, right, catalog)
-    if declared:
-        suggestions = [declared] + [s for s in suggestions
-                                    if (s.left_columns, s.right_columns) != (declared.left_columns, declared.right_columns)]
+    # DECLARED relationships between the two inputs' source datasets lead (owner-asserted, trusted).
+    # A declared edge with cardinality 'unknown' borrows the MEASURED cardinality for the same columns
+    # so the fan-out warning still fires (declaring a join shouldn't hide that it multiplies rows).
+    declared = _declared_suggestions(graph, left, right, catalog)
+    cols_key = lambda s: (tuple(s.left_columns), tuple(s.right_columns))  # noqa: E731
+    measured_by_cols = {cols_key(s): s.cardinality for s in suggestions}
+    for d in declared:
+        if d.cardinality == "unknown":
+            d.cardinality = measured_by_cols.get(cols_key(d), "unknown")
+    declared_cols = {cols_key(d) for d in declared}
+    suggestions = declared + [s for s in suggestions if cols_key(s) not in declared_cols]
     if not suggestions:
         return JoinAnalysis(note="no matching key columns between the two inputs")
     warning = None
