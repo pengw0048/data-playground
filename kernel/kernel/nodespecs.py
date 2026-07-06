@@ -12,6 +12,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
+from kernel.models import ResourceSpec  # noqa: F401 — used in the NodeSpec.requires annotation
+
 WireType = Literal["dataset", "sample", "selection", "sql-view", "metric", "value"]
 
 
@@ -47,6 +49,8 @@ class NodeSpec(_M):
     can_bypass: bool = False
     previewable: bool = True
     blurb: str = ""
+    requires: "ResourceSpec | None" = None  # plugin-declared default compute need (e.g. gpu>=8); per-
+    #                                          instance override lives in node config.requires (Phase B+)
 
 
 def _in(accepts=("dataset", "sample"), wire="dataset", id="in", label=None):

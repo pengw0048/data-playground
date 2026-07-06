@@ -15,7 +15,7 @@ import os
 import sys
 
 from kernel.backends import NodeLowering
-from kernel.models import KernelInfo
+from kernel.models import BackendInfo, KernelInfo, ResourceSpec, WorkerInfo
 from kernel.nodespecs import BUILTIN_NODE_SPECS, NodeSpec
 from kernel.plugins.adapters import DuckDBAdapter, default_adapters
 from kernel.plugins.capabilities import BUILTIN_CAPABILITIES
@@ -98,6 +98,17 @@ def _result_get(key):
 def _result_put(key, doc) -> None:
     from kernel import metadb
     metadb.put_result(key, doc)
+
+
+def _host_capacity() -> ResourceSpec:
+    """The local machine's resources, advertised as the capacity of the built-in local backends."""
+    cpu = float(os.cpu_count() or 1)
+    mem = None
+    try:  # best-effort total RAM (Linux/macOS); GPUs unknown to the local backend
+        mem = f"{os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') // (1024 ** 3)}GB"
+    except (ValueError, OSError, AttributeError):
+        pass
+    return ResourceSpec(cpu=cpu, mem=mem)
 
 
 class Deps:
@@ -243,6 +254,23 @@ class Deps:
             self.plugins.append({"name": mod, "source": "module", "error": f"{type(e).__name__}: {e}",
                                  "traceback": traceback.format_exc().splitlines()[-3:]})
 
+    def _backends(self) -> list[BackendInfo]:
+        """Real backend/worker topology + capacities. A backend that advertises workers() (a pod/Ray
+        pool — Phase C) reports them; the built-in local runners don't, so each shows one local slot
+        whose capacity is the host. This is the honest data behind the Compute view."""
+        cap = _host_capacity()
+        out: list[BackendInfo] = []
+        for r in self.runners:
+            workers = None
+            if hasattr(r, "workers"):
+                try:
+                    workers = list(r.workers())
+                except Exception:  # noqa: BLE001
+                    workers = None
+            out.append(BackendInfo(name=r.name, workers=workers if workers is not None
+                                   else [WorkerInfo(id=f"{r.name}:local", capacity=cap)]))
+        return out
+
     def info(self) -> KernelInfo:
         return KernelInfo(
             mode="local", backend="duckdb+polars+arrow", warm=True,
@@ -250,6 +278,7 @@ class Deps:
             runners=[r.name for r in self.runners],
             processors=[p.id for p in self.registry.list()],
             capabilities=[c.id for c in self.capabilities],
+            backends=self._backends(),
         )
 
 

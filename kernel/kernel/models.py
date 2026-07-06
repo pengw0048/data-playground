@@ -166,6 +166,32 @@ class CompilePlan(Wire):
     error: str | None = None
 
 
+class ResourceSpec(Wire):
+    """A compute-resource shape, used BOTH ways: a worker advertises its `capacity`, a step declares
+    its `requires`. A worker satisfies a step when its capacity ⊇ the requirement (kernel.placement,
+    Phase C). All fields optional — an empty spec means "no particular requirement / unspecified"."""
+    cpu: float | None = None       # cores
+    mem: str | None = None         # e.g. "64GB"
+    gpu: int | None = None         # gpu count
+    gpu_type: str | None = None    # e.g. "a100"
+    labels: dict[str, str] = {}
+
+
+class WorkerInfo(Wire):
+    """One execution slot in a backend — a pod, a process, or the local host (the backend decides
+    which). `capacity` is what it advertises; Phase C's scheduler matches a step's requires against it."""
+    id: str
+    capacity: ResourceSpec = ResourceSpec()
+    state: Literal["idle", "busy", "down"] = "idle"
+
+
+class BackendInfo(Wire):
+    """An execution backend and the workers it currently offers (powers the real Compute view — the
+    honest replacement for the hardcoded `warm`)."""
+    name: str
+    workers: list[WorkerInfo] = []
+
+
 class KernelInfo(Wire):
     mode: Literal["local", "distributed"] = "local"
     backend: str = "duckdb"
@@ -175,6 +201,7 @@ class KernelInfo(Wire):
     runners: list[str] = []
     processors: list[str] = []
     capabilities: list[str] = []
+    backends: list[BackendInfo] = []  # real backend/worker topology + capacities (additive; runners kept)
 
 
 class ProcessorDescriptor(Wire):

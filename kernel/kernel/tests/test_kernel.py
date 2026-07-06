@@ -1598,6 +1598,23 @@ def test_plan_cacheable_opt_out():
     assert r._plan_cacheable(base({"cacheable": False}), "xf") is False
 
 
+def test_kernel_info_reports_backends_with_capacity():
+    # Phase B: KernelInfo gains a real backends[] topology (additive — the runners contract is kept).
+    info = client.get("/api/kernel").json()
+    assert info["runners"] == ["local-out-of-core", "local-subprocess"]  # unchanged pinned contract
+    names = {b["name"] for b in info["backends"]}
+    assert {"local-out-of-core", "local-subprocess"} <= names
+    w = info["backends"][0]["workers"][0]
+    assert w["capacity"]["cpu"] >= 1  # a real local worker advertising the host's capacity
+
+
+def test_node_spec_exposes_requires():
+    # Phase B: NodeSpec carries an optional `requires` (plugin-declared compute need); built-ins none.
+    specs = client.get("/api/nodes").json()
+    src = next(s for s in specs if s["kind"] == "source")
+    assert "requires" in src and src["requires"] is None
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).
