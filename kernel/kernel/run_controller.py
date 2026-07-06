@@ -86,7 +86,7 @@ class RunController:
                         self._mark(status, region, "failed")
                         return
                 else:
-                    ref_uri[region.output_node] = self._materialize(graph, region, ref_uri)
+                    ref_uri[region.output_node] = self._materialize(run_id, graph, region, ref_uri)
                 self._mark(status, region, "done")
                 self._emit(graph, status)
             status.status = "done"
@@ -107,9 +107,27 @@ class RunController:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def _materialize(self, graph: Graph, region, ref_uri: dict[str, str]) -> str:
-        """Run an intermediate region in-process and write its output to a durable, content-addressed
-        parquet — reused across runs when the region's plan hash is unchanged."""
+    def _backend_runner(self, region):
+        """The runner that executes a region: the in-process base for 'default', else the named backend
+        (a pool / pod / Ray runner) — so a PLACED region physically runs on its worker (C3)."""
+        if region.backend == "default":
+            return self.base
+        return next((r for r in self.deps.runners if r.name == region.backend), self.base)
+
+    def _await(self, backend, sub_id: str, cancel_run: str | None = None) -> RunStatus:
+        while True:
+            s = backend.status(sub_id)
+            if s.status in ("done", "failed", "cancelled"):
+                return s
+            if cancel_run and self._cancel[cancel_run].is_set():
+                backend.cancel(sub_id)
+                return backend.status(sub_id)
+            time.sleep(0.1)
+
+    def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str]) -> str:
+        """Materialize an intermediate region's output to a durable, content-addressed parquet — reused
+        across runs when the region's plan hash is unchanged. Runs in-process for a default region, or
+        in the target worker's PROCESS for a placed region (C3)."""
         subg = self._subgraph(graph, region, ref_uri)
         key = self.base._plan_hash(subg, region.output_node)
         cached = self.base._cache_get(key)
@@ -118,28 +136,32 @@ class RunController:
         out_dir = os.path.join(self.deps.workspace, "regions")
         os.makedirs(out_dir, exist_ok=True)
         out_uri = os.path.join(out_dir, f"{region.id}_{key}.parquet")
-        with db.run_scope():
-            eng = LoweringEngine(subg, self.deps.resolve_adapter, self.deps.registry, full=True,
-                                 node_lowerings=self.deps.node_lowerings, node_specs=self.deps.node_specs)
-            eng.relation(region.output_node).write_parquet(out_uri)
+        backend = self._backend_runner(region)
+        if backend is self.base:
+            with db.run_scope():
+                eng = LoweringEngine(subg, self.deps.resolve_adapter, self.deps.registry, full=True,
+                                     node_lowerings=self.deps.node_lowerings, node_specs=self.deps.node_specs)
+                eng.relation(region.output_node).write_parquet(out_uri)
+        else:
+            sub = backend.run_unit(subg, region.output_node, out_uri)
+            with self._lock:
+                self._sub[run_id] = sub.run_id
+            s = self._await(backend, sub.run_id, cancel_run=run_id)
+            if s.status != "done":
+                raise RuntimeError(f"region {region.id} on {region.backend} {s.status}: {s.error}")
         self.base._cache_put(key, {"uri": out_uri, "table": region.id, "rows": None})
         return out_uri
 
     def _run_final(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str]) -> RunStatus:
-        """Run the final (target) region via the base runner over the reduced graph, waiting for it."""
+        """Run the final (target) region over the reduced graph, waiting for it — on the base runner
+        (default) or on the region's target backend (a placed final region), so writes commit normally."""
         subg = self._subgraph(graph, region, ref_uri)
         plan = compiler.compile_plan(subg, region.output_node, self.deps.registry, self.deps.node_specs)
-        sub = self.base.run(plan, subg, region.output_node, "local")
+        backend = self._backend_runner(region)
+        sub = backend.run(plan, subg, region.output_node, "local")
         with self._lock:
             self._sub[run_id] = sub.run_id
-        while True:
-            s = self.base.status(sub.run_id)
-            if s.status in ("done", "failed", "cancelled"):
-                return s
-            if self._cancel[run_id].is_set():
-                self.base.cancel(sub.run_id)
-                return self.base.status(sub.run_id)
-            time.sleep(0.1)
+        return self._await(backend, sub.run_id, cancel_run=run_id)
 
     def _subgraph(self, graph: Graph, region, ref_uri: dict[str, str]) -> Graph:
         nm = g.node_map(graph)

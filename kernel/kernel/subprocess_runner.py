@@ -65,20 +65,31 @@ class SubprocessRunner:
         run_id = f"run_{uuid.uuid4().hex[:10]}"
         per = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=per)
+        return self._spawn(status, {}, graph, target_node_id)
+
+    def run_unit(self, graph: Graph, output_node: str, output_uri: str) -> RunStatus:
+        """Run a placement region's sub-graph in a worker PROCESS and materialize output_node's relation
+        to output_uri (no catalog registration). This is how a placed region executes on its worker —
+        the seam a pod/Ray backend overrides to allocate a pod / submit a job."""
+        run_id = f"unit_{uuid.uuid4().hex[:10]}"
+        status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=[])
+        return self._spawn(status, {"materializeUri": output_uri}, graph, output_node)
+
+    def _spawn(self, status: RunStatus, job_extra: dict, graph: Graph, target: str | None) -> RunStatus:
+        run_id = status.run_id
         job_dir = tempfile.mkdtemp(prefix="dp-run-")
         status_file = os.path.join(job_dir, "status.json")
         job_file = os.path.join(job_dir, "job.json")
         with open(job_file, "w") as f:
-            json.dump({"workspace": self.workspace, "dataDir": self.data_dir,
-                       "graph": graph.model_dump(), "target": target_node_id,
-                       "statusFile": status_file}, f)
+            json.dump({"workspace": self.workspace, "dataDir": self.data_dir, "graph": graph.model_dump(),
+                       "target": target, "statusFile": status_file, **job_extra}, f)
         proc = subprocess.Popen([sys.executable, "-m", "kernel.subrun", job_file])
         with self._lock:
             self.runs[run_id] = status
             self._procs[run_id] = proc
             self._evict()
         self._emit(graph, status)  # persist 'queued' to the DB (pollable on any instance / after restart)
-        threading.Thread(target=self._watch, args=(run_id, proc, status_file, job_dir, graph, target_node_id), daemon=True).start()
+        threading.Thread(target=self._watch, args=(run_id, proc, status_file, job_dir, graph, target), daemon=True).start()
         return status
 
     def _emit(self, graph: Graph, status: RunStatus) -> None:

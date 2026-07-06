@@ -35,6 +35,19 @@ def main() -> int:
         # flips to "done", and this process can exit (or be hard-killed on cancel) before it commits.
         deps.runner.on_complete = None
         graph = Graph(**job["graph"])
+        # region-materialize mode (RunController C3): run this sub-graph in THIS worker process and
+        # write the target node's relation to a given uri — how a placed region executes on its worker.
+        mat_uri = job.get("materializeUri")
+        if mat_uri:
+            from kernel import db
+            from kernel.executors.engine import LoweringEngine
+            with db.run_scope():
+                eng = LoweringEngine(graph, deps.resolve_adapter, deps.registry, full=True,
+                                     node_lowerings=deps.node_lowerings, node_specs=deps.node_specs)
+                eng.relation(job.get("target")).write_parquet(mat_uri)
+            _atomic_write(status_file, {"run_id": "child", "status": "done", "per_node": [], "rows_processed": 0,
+                                        "ms": 0, "placement": "local", "output_uri": mat_uri})
+            return 0
         plan = compiler.compile_plan(graph, job.get("target"), deps.registry, deps.node_specs)
         st = deps.runner.run(plan, graph, job.get("target"), "local")  # in-process runner, in THIS process
         rid = st.run_id

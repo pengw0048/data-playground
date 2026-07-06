@@ -1738,6 +1738,37 @@ def test_run_controller_executes_checkpointed_regions(tmp_path):
     assert out["rowCount"] == 400  # v in [100, 500) → 400 rows, split across two regions
 
 
+def test_run_controller_places_a_region_on_a_pool_worker(tmp_path, monkeypatch):
+    # C3: a GPU-requiring transform in the middle physically runs in the pool WORKER's process
+    # (subprocess run_unit), the rest on the default backend; the joined result is correct.
+    import json
+
+    from kernel.deps import Deps
+    from kernel.models import Graph
+    monkeypatch.setenv("DP_POOL_WORKERS", json.dumps([{"name": "gpu", "cpu": 8, "gpu": 2, "gpu_type": "a100"}]))
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    p = _seq_parquet(tmp_path)  # v = 0..999
+    gd = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": p}),
+        {"id": "cap", "type": "transform", "position": {"x": 0, "y": 0},
+         "data": {"config": {"source": "adhoc", "mode": "map",
+                             "code": "def fn(row):\n    row['v2'] = row['v'] * 2\n    return row",
+                             "requires": {"gpu": 2, "gpuType": "a100"}}}},
+        N("wr", "write", {"name": "c3out"}),
+    ], "edges": [E("src", "cap"), E("cap", "wr")]})
+    st = d.controller.run(gd, "wr")
+    assert st is not None  # a placed region → multi-region (not the single-region base path)
+    for _ in range(300):
+        if d.controller.status(st.run_id).status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.1)
+    final = d.controller.status(st.run_id)
+    assert final.status == "done", final.error
+    assert final.rows_processed == 1000                              # all rows joined back through the ref handoffs
+    tbl = d.catalog.get_table("tbl_c3out")
+    assert "v2" in [c.name for c in tbl.columns]                     # the GPU-placed transform ran (added v2)
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).
