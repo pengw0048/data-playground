@@ -58,13 +58,15 @@ class InMemoryCatalog:
             count = adapter.count(uri)
         except Exception:
             columns, count = [], None
+        from kernel.relationships import key_candidates
+        keys = key_candidates(columns)  # inferred (name-based) PK candidates — no scan; verified on demand
         with self._lock:
             tid = f"tbl_{name}" if uri not in self._by_uri else self._by_uri[uri]
             if any(t.id == f"tbl_{name}" and t.uri != uri for t in self.tables.values()):
                 tid = f"tbl_{name}_{_h.sha1(uri.encode()).hexdigest()[:6]}"
             table = CatalogTable(
                 id=tid, name=name, uri=uri, row_count=count, version=version,
-                columns=columns, meta=meta,
+                columns=columns, keys=keys, meta=meta,
             )
             self.tables[tid] = table
             self._by_uri[uri] = tid

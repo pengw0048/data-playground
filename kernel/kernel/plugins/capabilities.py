@@ -13,6 +13,9 @@ from kernel.models import ColumnSchema
 _MEDIA_NAME = re.compile(r"(media|image|img|video|thumb|frame|photo|asset|clip|url|uri|path)", re.I)
 _MEDIA_EXT = re.compile(r"\.(mp4|mov|mkv|webm|png|jpe?g|gif|webp|wav|mp3|flac)\b", re.I)
 _VECTOR_NAME = re.compile(r"(embed|embedding|vector|feature)", re.I)
+# an id-like column name: `id`, `uuid`, `pk`, or a *_id / *_key / *_uid suffix (the usual join keys).
+_KEY_NAME = re.compile(r"^(id|uuid|guid|pk)$|_(id|uid|uuid|guid|key|pk)$", re.I)
+_KEY_TYPES = {"int", "string", "bytes"}  # a plausible join-key type (not float/bool/vector/media)
 
 
 def is_media_column(col: ColumnSchema) -> bool:
@@ -32,6 +35,24 @@ def is_vector_column(col: ColumnSchema) -> bool:
     return is_list and bool(_VECTOR_NAME.search(col.name))
 
 
+def is_key_column(col: ColumnSchema) -> bool:
+    """An id-like column — a likely join key. Name heuristic + a scalar key-able type (a media/
+    vector column is never a key even if it matches the name pattern, e.g. `image_id` is a key but
+    `image_url` is media). Whether it's ACTUALLY unique is measured separately (see relationships)."""
+    if "key" in col.capabilities:
+        return True
+    if is_media_column(col) or is_vector_column(col):
+        return False
+    return bool(_KEY_NAME.search(col.name)) and display_base_type(col.type) in _KEY_TYPES
+
+
+def display_base_type(t: str) -> str:
+    """The generic base type ('int'/'string'/...), stripping a '[]' list suffix — matches the
+    display types adapters emit (adapters.display_type)."""
+    t = t.lower()
+    return t[:-2] if t.endswith("[]") else t
+
+
 def tag_columns(columns: list[ColumnSchema]) -> list[ColumnSchema]:
     """Annotate columns with detected capability tags (idempotent)."""
     for c in columns:
@@ -40,6 +61,8 @@ def tag_columns(columns: list[ColumnSchema]) -> list[ColumnSchema]:
             caps.add("media")
         if is_vector_column(c):
             caps.add("vector")
+        if is_key_column(c):
+            caps.add("key")
         c.capabilities = sorted(caps)
     return columns
 

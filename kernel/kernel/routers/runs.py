@@ -21,6 +21,7 @@ from kernel.models import (
     CompilePlan,
     CompileRequest,
     EstimateRequest,
+    JoinAnalysis,
     PreviewRequest,
     RunEstimate,
     RunRequest,
@@ -65,6 +66,19 @@ def graph_schema(req: CompileRequest) -> dict:
     deps = get_deps()
     return schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
                             deps.node_lowerings, deps.node_specs)
+
+
+@router.post("/graph/join-analysis", response_model=JoinAnalysis)
+def join_analysis(req: CompileRequest) -> JoinAnalysis:
+    """Catalog-driven join hints for a join node (target_node_id): ranked key suggestions for its
+    two inputs (cardinality from measured/grain-derived key uniqueness) + a fan-out warning."""
+    from kernel import relationships as rel
+    deps = get_deps()
+    if not req.target_node_id:
+        return JoinAnalysis(note="no join node selected")
+    cols = schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
+                            deps.node_lowerings, deps.node_specs)
+    return rel.analyze_join(req.graph, req.target_node_id, cols, deps.catalog, deps.resolve_adapter)
 
 
 # --------------------------------------------------------------------------- #

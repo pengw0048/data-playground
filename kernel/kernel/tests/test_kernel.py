@@ -1879,6 +1879,123 @@ def test_base_connection_concurrent_access_stays_clean():
     assert not errors, errors[:3]
 
 
+def test_key_detection_tags_id_columns():
+    # catalog-driven join hints start from key detection: id-like columns get a "key" capability;
+    # media / vector / value columns never do (an image_url is not a join key).
+    from kernel.models import ColumnSchema
+    from kernel.plugins.capabilities import tag_columns
+    tagged = {c.name: c.capabilities for c in tag_columns([
+        ColumnSchema(name="id", type="int"), ColumnSchema(name="user_id", type="int"),
+        ColumnSchema(name="order_uuid", type="string"), ColumnSchema(name="amount", type="float"),
+        ColumnSchema(name="image_url", type="string"), ColumnSchema(name="grid", type="int"),
+    ])}
+    assert "key" in tagged["id"] and "key" in tagged["user_id"] and "key" in tagged["order_uuid"]
+    assert "key" not in tagged["amount"]      # a measure, not a key
+    assert "key" not in tagged["image_url"]   # media beats the (absent) key match
+    assert "key" not in tagged["grid"]        # ends in 'id' but isn't an id column
+
+
+def test_catalog_infers_key_candidates():
+    # every seeded dataset exposes inferred primary-key candidates (composite-aware model, single here)
+    d = get_deps()
+    evs = d.catalog.get_table("tbl_events")
+    keycols = {tuple(k.columns) for k in evs.keys}
+    assert ("id",) in keycols and ("user_id",) in keycols
+    assert all(k.confidence == "inferred" for k in evs.keys)  # name-based, not yet measured
+
+
+def test_join_suggestions_measure_cardinality():
+    # THE catalog-driven join hint: two datasets → ranked keys with MEASURED cardinality. events.id
+    # and images.id are both unique (1:1); images.id ↔ events.user_id is 1:N (user_id repeats).
+    d = get_deps()
+    body = {"leftUri": d.catalog.get_table("tbl_images").uri, "rightUri": d.catalog.get_table("tbl_events").uri}
+    sugg = client.post("/api/catalog/join-suggestions", json=body).json()
+    assert sugg, "expected at least one join suggestion"
+    top = sugg[0]
+    assert top["leftColumns"] == ["id"] and top["rightColumns"] == ["id"] and top["cardinality"] == "1:1"
+    assert top["confidence"] == "verified"  # cardinality came from the data, not a guess
+    one_to_many = next(s for s in sugg if s["rightColumns"] == ["user_id"])
+    assert one_to_many["cardinality"] == "1:N"  # one image id → many events
+
+
+def test_grain_propagates_through_relational_ops():
+    # the core insight: a filtered/sampled dataset keeps its key (still joinable); a group-by re-grains
+    # to its group key. grain_of computes this structurally (no scan).
+    from kernel import grain
+    from kernel.models import Graph
+    d = get_deps()
+    g_ = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        {"id": "f", "type": "filter", "position": {"x": 0, "y": 0}, "data": {"config": {"predicate": "amount > 0"}}},
+        {"id": "agg", "type": "aggregate", "position": {"x": 0, "y": 0}, "data": {"config": {"groupBy": "user_id", "aggs": "count(*) AS n"}}},
+    ], "edges": [E("src", "f"), E("f", "agg")]})
+    assert grain.grain_of(g_, "f", d.catalog).columns == ["id"]        # filter preserves the key
+    ag = grain.grain_of(g_, "agg", d.catalog)
+    assert ag.columns == ["user_id"] and ag.verified                    # re-grained to the group key, unique
+
+
+def test_join_analysis_warns_on_fanout():
+    # P2: when the best join isn't 1:1, warn that rows fan out. events-aggregated-by-user_id (unique
+    # user_id) joined to raw events (user_id repeats) is 1:N.
+    d = get_deps()
+    ev = _uri("events")
+    graph = {"id": "c", "version": 1, "nodes": [
+        N("l0", "source", {"uri": ev}),
+        {"id": "l", "type": "aggregate", "position": {"x": 0, "y": 0}, "data": {"config": {"groupBy": "user_id", "aggs": "count(*) AS n"}}},
+        N("r", "source", {"uri": ev}),
+        N("j", "join", {}),
+    ], "edges": [E("l0", "l"), E("l", "j", th="a"), E("r", "j", th="b")]}
+    ja = client.post("/api/graph/join-analysis", json={"graph": graph, "targetNodeId": "j"}).json()
+    assert ja["suggestions"], "expected a user_id join suggestion"
+    assert ja["suggestions"][0]["cardinality"] == "1:N"
+    assert ja["warning"] and "fans out" in ja["warning"]
+
+
+def test_measure_unique_handles_one_shot_reader_relation():
+    # adversarial-review #1: an adapter (Lance) whose scan returns a ONE-SHOT Arrow reader relation
+    # must be measured in a SINGLE pass — a two-pass count-then-distinct drains the reader and reports
+    # every key non-unique. A unique key must read unique; a repeating one, non-unique.
+    import pyarrow as pa
+
+    from kernel import db, relationships as rel
+    tbl = pa.table({"id": list(range(100)), "grp": [i % 10 for i in range(100)]})
+
+    class OneShot:
+        def scan(self, uri, columns=None, **k):
+            sel = tbl.select(columns) if columns else tbl
+            return db.conn().from_arrow(pa.RecordBatchReader.from_batches(sel.schema, sel.to_batches()))
+    resolve = lambda uri: OneShot()  # noqa: E731
+    assert rel.measure_unique("x", ["id"], resolve)[0] is True     # not drained to distinct=0
+    assert rel.measure_unique("x", ["grp"], resolve)[0] is False   # 10 distinct / 100 rows
+
+
+def test_cardinality_unknown_when_key_unmeasurable():
+    # adversarial-review #4/#8: an unreadable column (or empty data) → uniqueness is None ('unknown'),
+    # never a false 'not unique' that would fabricate an N:M cardinality stamped 'verified'.
+    from kernel import relationships as rel
+    d = get_deps()
+    assert rel.measure_unique(_uri("events"), ["nope_missing_col"], d.resolve_adapter)[0] is None
+    assert rel.cardinality(None, True) == "unknown"
+
+
+def test_grain_lost_when_select_renames_the_key():
+    # adversarial-review #2: a select that renames/derives the key must NOT keep reporting the old key
+    # as grain (a downstream measure would then hit the wrong physical column). A bare passthrough keeps it.
+    from kernel import grain
+    from kernel.models import Graph
+    d = get_deps()
+
+    def sel(expr):
+        g_ = Graph(**{"id": "c", "version": 1, "nodes": [
+            N("src", "source", {"uri": _uri("events")}),
+            {"id": "s", "type": "select", "position": {"x": 0, "y": 0}, "data": {"config": {"select": expr}}},
+        ], "edges": [E("src", "s")]})
+        return grain.grain_of(g_, "s", d.catalog)
+    assert sel("id, amount").columns == ["id"]        # bare passthrough → key survives
+    assert sel("id AS event_id, amount").known is False  # renamed away → grain not claimed
+    assert sel("md5(id) AS h").known is False            # derived → grain not claimed
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).

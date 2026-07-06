@@ -48,6 +48,15 @@ class ColumnSchema(Wire):
     capabilities: list[str] = []
 
 
+class KeyInfo(Wire):
+    """A candidate/known key of a dataset — the column(s) that identify a row (a primary key).
+    Composite = more than one column. `confidence`: 'declared' (owner-asserted) | 'verified'
+    (measured unique on the data) | 'inferred' (name heuristic, unmeasured)."""
+    columns: list[str]
+    confidence: Literal["declared", "verified", "inferred"] = "inferred"
+    unique: bool | None = None  # measured: distinct(cols) == count; None = not measured
+
+
 class CatalogTable(Wire):
     id: str
     name: str
@@ -55,8 +64,43 @@ class CatalogTable(Wire):
     row_count: int | None = None
     version: str | None = None
     columns: list[ColumnSchema] = []
+    keys: list[KeyInfo] = []  # candidate/known keys (primary-key candidates), composite-aware
     updated_at: str | None = None
     meta: str | None = None
+
+
+Cardinality = Literal["1:1", "1:N", "N:1", "N:M", "unknown"]
+
+
+class JoinSuggestion(Wire):
+    """A proposed way to join two datasets: matching key column(s) on each side + the measured
+    join cardinality. Surfaced in the join node's inspector (catalog-driven join hints)."""
+    left_columns: list[str]
+    right_columns: list[str]
+    cardinality: Cardinality = "unknown"
+    confidence: Literal["declared", "verified", "inferred"] = "inferred"
+    score: float = 0.0            # ranking (higher = more likely the intended join)
+    reason: str = ""              # human-readable why
+
+
+class JoinAnalysis(Wire):
+    """Everything the join node's inspector needs: ranked key suggestions for its two inputs, and a
+    fan-out warning when the join isn't 1:1 (the result lands at the finer grain — a later
+    parent-grain metric would double-count unless you aggregate)."""
+    suggestions: list[JoinSuggestion] = []
+    warning: str | None = None
+    note: str | None = None  # why suggestions are empty / cardinality unknown, when applicable
+
+
+class GrainInfo(Wire):
+    """The grain of a relation on the canvas: the key column(s) at which each row is distinct,
+    propagated through relational ops. `known=False` means the grain couldn't be determined (an
+    opaque transform, an un-keyed source). This is what lets a filtered/sampled/aggregated dataset
+    still be recognized as joinable — its grain still carries the key."""
+    columns: list[str] | None = None
+    known: bool = False
+    verified: bool = False        # the grain columns are measured-unique at the source
+    note: str = ""
 
 
 class LineageNode(Wire):

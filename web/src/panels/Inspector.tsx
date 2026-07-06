@@ -6,6 +6,8 @@ import { color, status as statusTok, kindAccent } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { FileDialog } from '../ui/FileDialog'
 import { miniInputClass } from '../ui/controls'
+import { api } from '../api/client'
+import type { JoinAnalysis, JoinSuggestion } from '../types/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -118,6 +120,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           </Section>
         )
       })}
+
+      {/* catalog-driven join hints: suggested keys (measured cardinality) + a fan-out warning */}
+      {kind === 'join' && <JoinHints nodeId={nodeId} />}
 
       {/* compute placement: what this step needs → the run routes to a matching worker (e.g. a GPU pool) */}
       {(kind === 'transform' || kind === 'section') && <ResourcesSection nodeId={nodeId} />}
@@ -265,6 +270,74 @@ function ResourcesSection({ nodeId }: { nodeId: string }) {
         <label className="flex flex-col gap-0.5 text-[10px] text-muted-foreground">CPUs
           <Input type="number" min={0} className="h-7 text-[11.5px] md:text-[11.5px]" value={req.cpu ?? ''} onChange={(e) => set({ cpu: num(e.target.value) })} /></label>
       </div>
+    </Section>
+  )
+}
+
+const CARD_TONE: Record<string, string> = {
+  '1:1': 'bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-300',
+  '1:N': 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
+  'N:1': 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
+  'N:M': 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300',
+  unknown: 'bg-muted text-muted-foreground',
+}
+
+// Join hints (catalog-driven): the backend suggests key columns for the two inputs, with the join
+// cardinality MEASURED from the data. Clicking a suggestion fills the join's `on`/`condition`. A
+// non-1:1 join gets a fan-out warning (the result lands at the finer grain — rows multiply).
+function JoinHints({ nodeId }: { nodeId: string }) {
+  const doc = useStore((s) => s.doc)
+  const updateConfig = useStore((s) => s.updateConfig)
+  const [analysis, setAnalysis] = useState<JoinAnalysis | null>(null)
+  const [loading, setLoading] = useState(true)  // first analysis is pending → show 'Analyzing…', not 'no matches'
+  // re-analyze when the graph shape or any node's config changes (debounced); positions don't matter
+  const sig = JSON.stringify([doc.edges.map((e) => [e.source, e.target, e.targetHandle]),
+    doc.nodes.map((n) => [n.id, n.type, n.data.config])])
+  useEffect(() => {
+    let off = false
+    const t = setTimeout(() => {
+      setLoading(true)
+      api.joinAnalysis(doc, nodeId)
+        .then((a) => { if (!off) setAnalysis(a) })
+        .catch(() => { if (!off) setAnalysis(null) })
+        .finally(() => { if (!off) setLoading(false) })
+    }, 300)
+    return () => { off = true; clearTimeout(t) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeId, sig])
+
+  const apply = (s: JoinSuggestion) => {
+    const same = s.leftColumns.length === s.rightColumns.length && s.leftColumns.every((c, i) => c === s.rightColumns[i])
+    if (same) updateConfig(nodeId, { on: s.leftColumns.join(', '), condition: '' })
+    else updateConfig(nodeId, { condition: s.leftColumns.map((c, i) => `a.${c} = b.${s.rightColumns[i]}`).join(' AND '), on: '' })
+  }
+
+  const suggestions = analysis?.suggestions ?? []
+  return (
+    <Section title="Join hints">
+      {analysis?.warning && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-[10.5px] leading-relaxed text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300">
+          ⚠ {analysis.warning}
+        </div>
+      )}
+      {suggestions.length === 0 ? (
+        <div className="text-[10.5px] leading-relaxed text-muted-foreground">
+          {loading ? 'Analyzing keys…' : (analysis?.note ?? 'No matching key columns between the two inputs.')}
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1">
+          {suggestions.slice(0, 6).map((s, i) => (
+            <button key={i} onClick={() => apply(s)} title={`${s.reason} · apply to the join`}
+              className="flex items-center gap-2 rounded-md border border-border px-2 py-1.5 text-left hover:bg-accent">
+              <span className="dp-mono flex-1 truncate text-[10.5px] text-foreground">
+                {s.leftColumns.join('+')} = {s.rightColumns.join('+')}
+              </span>
+              <span className={cn('rounded px-1.5 py-px text-[9.5px] font-semibold', CARD_TONE[s.cardinality] ?? CARD_TONE.unknown)}>{s.cardinality}</span>
+            </button>
+          ))}
+          <div className="text-[9.5px] leading-relaxed text-muted-foreground">Cardinality measured from the data · click to fill the join key.</div>
+        </div>
+      )}
     </Section>
   )
 }

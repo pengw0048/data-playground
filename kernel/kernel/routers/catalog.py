@@ -22,6 +22,7 @@ from kernel.models import (
     CatalogTable,
     ColumnSchema,
     ImportRequest,
+    JoinSuggestion,
     KernelInfo,
     LineageResult,
     PipelineImport,
@@ -64,6 +65,32 @@ def get_table(table_id: str) -> CatalogTable:
 @router.get("/catalog/lineage", response_model=LineageResult)
 def lineage(uri: str = Query(...)) -> LineageResult:
     return get_deps().catalog.lineage(uri)
+
+
+class JoinSuggestRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    left_uri: str
+    right_uri: str
+
+
+@router.post("/catalog/join-suggestions", response_model=list[JoinSuggestion])
+def join_suggestions(req: JoinSuggestRequest) -> list[JoinSuggestion]:
+    """Ranked ways to join two catalog datasets, with cardinality MEASURED on the data (see
+    kernel.relationships) — the catalog-driven 'how do these join?' hint."""
+    from kernel import relationships as rel
+    deps = get_deps()
+
+    def cols(uri: str):
+        try:
+            return deps.catalog.get_table(uri).columns
+        except KeyError:
+            return deps.resolve_adapter(uri).schema(uri)  # not registered → probe directly
+    try:
+        return rel.suggest_joins(cols(req.left_uri), cols(req.right_uri),
+                                 rel.measured_unique(req.left_uri, deps.resolve_adapter),
+                                 rel.measured_unique(req.right_uri, deps.resolve_adapter))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"{type(e).__name__}: {e}")
 
 
 class RegisterRequest(BaseModel):

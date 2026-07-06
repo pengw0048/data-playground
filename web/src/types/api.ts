@@ -23,6 +23,8 @@ export interface KernelInfo {
   backends: BackendInfo[]
 }
 
+export interface KeyInfo { columns: string[]; confidence: 'declared' | 'verified' | 'inferred'; unique?: boolean | null }
+
 export interface CatalogTable {
   id: string
   name: string
@@ -30,8 +32,26 @@ export interface CatalogTable {
   rowCount?: number | null
   version?: string | null
   columns: ColumnSchema[]
+  keys?: KeyInfo[]
   updatedAt?: string | null
   meta?: string | null
+}
+
+export type Cardinality = '1:1' | '1:N' | 'N:1' | 'N:M' | 'unknown'
+
+export interface JoinSuggestion {
+  leftColumns: string[]
+  rightColumns: string[]
+  cardinality: Cardinality
+  confidence: 'declared' | 'verified' | 'inferred'
+  score: number
+  reason: string
+}
+
+export interface JoinAnalysis {
+  suggestions: JoinSuggestion[]
+  warning?: string | null
+  note?: string | null
 }
 
 export interface LineageNode { id: string; name: string; uri: string; kind: string }

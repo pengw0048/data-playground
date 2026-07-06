@@ -1,6 +1,6 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
-  CatalogTable, CompilePlan, KernelInfo, LineageResult, PipelineImport,
+  CatalogTable, CompilePlan, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   ProcessorDescriptor, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
@@ -112,6 +112,13 @@ export const api = {
   // per-node output columns (metadata only) → editor column suggestions; null = untyped port
   schema: (doc: CanvasDoc) =>
     req<Record<string, ColumnSchema[] | null>>('/graph/schema', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }) }),
+
+  // catalog-driven join hints for a join node: ranked keys (measured cardinality) + a fan-out warning
+  joinAnalysis: (doc: CanvasDoc, nodeId: string) =>
+    req<JoinAnalysis>('/graph/join-analysis', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId: nodeId }) }),
+  // ranked ways to join two catalog datasets directly (used outside the canvas)
+  joinSuggestions: (leftUri: string, rightUri: string) =>
+    req<JoinSuggestion[]>('/catalog/join-suggestions', { method: 'POST', body: JSON.stringify({ leftUri, rightUri }) }),
 
   estimate: (doc: CanvasDoc, targetNodeId?: string) =>
     req<RunEstimate>('/run/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
