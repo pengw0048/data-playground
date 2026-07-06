@@ -1676,6 +1676,52 @@ def test_run_routes_to_a_capability_matching_backend(tmp_path, monkeypatch):
     assert _route_by_capability(d, d.runner, plain) is d.runner               # no requirement → unchanged
 
 
+def test_planner_partitions_by_placement():
+    # C2: split a run's graph into regions — plain graph = one region; a GPU transform in the middle =
+    # three regions (cpu → gpu → cpu) with materialized handoffs; a section is one opaque unit.
+    from kernel import planner
+    from kernel.models import Graph
+    specs = get_deps().node_specs
+
+    def place_fn(req):  # fake GPU pool
+        return ("pool", "gpu") if req.gpu else None
+
+    lin = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}), N("f", "filter", {"predicate": "amount > 0"}), N("wr", "write", {"name": "o"}),
+    ], "edges": [E("src", "f"), E("f", "wr")]})
+    r = planner.plan_regions(lin, "wr", specs, place_fn)
+    assert len(r) == 1 and r[0].node_ids == {"src", "f", "wr"} and r[0].backend == "default"
+
+    gpu = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}), N("f", "filter", {"predicate": "amount > 0"}),
+        {"id": "cap", "type": "transform", "position": {"x": 0, "y": 0},
+         "data": {"config": {"code": "def fn(r):\n    return r", "requires": {"gpu": 2}}}},
+        N("wr", "write", {"name": "o"}),
+    ], "edges": [E("src", "f"), E("f", "cap"), E("cap", "wr")]})
+    rs = planner.plan_regions(gpu, "wr", specs, place_fn)
+    by_out = {x.output_node: x for x in rs}
+    assert set(by_out) == {"f", "cap", "wr"}                                   # f/cap/wr are boundaries
+    assert by_out["cap"].backend == "pool" and by_out["cap"].worker == "gpu"   # placed on the GPU worker
+    assert by_out["f"].node_ids == {"src", "f"}                                # region absorbs its upstream
+    order = [x.output_node for x in rs]
+    assert order.index("f") < order.index("cap") < order.index("wr")           # topo order
+    assert any(ci[0] == "f" and ci[2] == "cap" for ci in by_out["cap"].cut_inputs)   # cap reads f's ref
+    assert any(ci[0] == "cap" and ci[2] == "wr" for ci in by_out["wr"].cut_inputs)   # wr reads cap's ref
+
+    sec = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        {"id": "sec", "type": "section", "position": {"x": 0, "y": 0}, "data": {"config": {"script": "emit(inputs['in'])\n"}}},
+        {"id": "gk", "type": "transform", "parentId": "sec", "position": {"x": 0, "y": 0},
+         "data": {"config": {"code": "def fn(r):\n    return r", "requires": {"gpu": 4}}}},
+        N("wr", "write", {"name": "o"}),
+    ], "edges": [E("src", "sec"), E("sec", "wr")]})
+    rs2 = planner.plan_regions(sec, "wr", specs, place_fn)
+    all_nodes = {n for x in rs2 for n in x.node_ids}
+    assert "gk" not in all_nodes                                               # section child isn't a top-level region node
+    secr = next(x for x in rs2 if "sec" in x.node_ids)
+    assert secr.backend == "pool" and secr.worker == "gpu"                     # requires escalated from the contained node
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).
