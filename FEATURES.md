@@ -3,15 +3,15 @@
 _验收评审清单，由对整个代码库的普查生成（每一项都由一个 `file:line` 作为证据支撑）。_
 _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限定到白名单 roots；Dockerfile + docker-compose 部署）。图例：✅ 已实现 · 🟡 部分实现（见备注） · ⬜ 未实现（仅有脚手架/规划中，或有意省略）。_
 
-**142 项功能 —— ✅ 118 项已实现 · 🟡 21 项部分实现 · ⬜ 3 项未实现。**
+**142 项功能 —— ✅ 120 项已实现 · 🟡 19 项部分实现 · ⬜ 3 项未实现。**
 
 | 领域 | ✅ | 🟡 | ⬜ |
 |---|--:|--:|--:|
 | 画布与节点交互 | 23 | 3 | 1 |
 | 引擎与执行 | 16 | 4 | 0 |
 | 数据、适配器与目录 | 26 | 4 | 0 |
-| 协作、多用户与认证 | 20 | 2 | 0 |
-| 可扩展性与插件 SPI | 13 | 3 | 0 |
+| 协作、多用户与认证 | 21 | 1 | 0 |
+| 可扩展性与插件 SPI | 14 | 2 | 0 |
 | 平台、设计系统与运维 | 20 | 5 | 2 |
 
 ## ⚠️ 尚未完全完成（验收重点）
@@ -29,8 +29,6 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 - 🟡 **原子覆盖写（临时文件 + os.replace）**（数据、适配器与目录）—— 仅对本地写入是原子的 —— 失败/取消的写入不会截断已有数据集（test_kernel.py:438）。对象存储的覆盖写是就地写入（依赖单对象 PUT 的原子性；多文件/目录的对象存储覆盖写不是事务性的）。`kernel/kernel/plugins/adapters.py:203`
 - 🟡 **目标位置 —— 对象存储 backend 浏览 + target_uri**（数据、适配器与目录）—— 通过 glob() 浏览某个前缀；对象存储的 mkdir 是空操作（没有真正的文件夹 —— 前缀在写入时才创建，destinations.py:150）。当凭证/桶缺失时，浏览错误会如实暴露出来。`kernel/kernel/destinations.py:61`
 - 🟡 **协作 WebSocket 中继（按画布分房间）**（协作、多用户与认证）—— 仅为每实例的内存态。多实例/无状态 web 部署需要把每个画布 sticky routing 到单一实例（已在 main.py:11-13 的 docstring 中承认）；处于不同实例上的对等端不会互相看到对方。对默认的单进程部署来说没问题。`kernel/kernel/main.py:88-135 _collab_rooms is an in-memory dict[canvas_id -> set[WebSocket]]`
-- 🟡 **画布分享 —— 可见性（private/workspace）+ 显式协作者（editor/viewer）**（协作、多用户与认证）—— 缺口：'workspace' 可见性会给实例上的每个用户授予 EDITOR 权限（metadb.py:248-249）—— 不存在 workspace 只读层级。显式的按用户 viewer 角色是有的，但你无法让一个画布以 workspace 可见的只读方式呈现。`kernel/kernel/routers/workspace.py:197-213 owner-only add/remove share + set visibility; metadb.canvas_role (metadb.py:240-251); web/src/panels/ShareModal.tsx; test_canvas_sharing_access_and_authz (test_kernel.py:1368)`
-- 🟡 **NodeSpec 通用前端渲染（插件节点无需前端代码）**（可扩展性与插件 SPI）—— 插件节点会用来自 /api/nodes 的类型化端口/参数进行通用渲染。缺口：NodeParamFields 会过滤掉 type==='code' 的参数，而 GenericNode 只渲染 NodeParamFields —— 所以一个声明了 code 参数（python/sql）的插件节点在通用卡片里没有任何编辑器；只有手工构建的卡片才渲染代码编辑器。`web/src/nodes/generic.tsx:97-119, generic.tsx:39`
 - 🟡 **Capabilities —— media/vector 列标注 + 查看器标签页**（可扩展性与插件 SPI）—— media/vector 检测是可用的（在 tag_columns 里用正则匹配 name/type），Media 查看器网格也能渲染。缺口：(1) reg.add_capability 只是向 KernelInfo 声明一个 id+label —— 插件无法添加新的列检测（tag_columns 是硬编码的核心逻辑），也无法添加查看器标签页（那是单独的前端注册），正如模块 docstring 自己承认的（capabilities.py:47-51）。(2) Vector 查看器标签页已被移除（capabilities.tsx:49-50）；vectors 只在单元格里获得一个内联的 chip。`kernel/kernel/plugins/capabilities.py:35-51, web/src/nodes/capabilities.tsx:42-50`
 - 🟡 **流水线导入器 SPI（/pipelines/import）**（可扩展性与插件 SPI）—— 扩展点现在诚实了：deps.importer 默认是 NullImporter，所以 /pipelines/import 返回 501 未配置（此前是一个错误的 400），插件通过 reg.set_importer 注册一个真正的导入器。按设计不内置任何导入器（没有通用的流水线格式）。`kernel/kernel/deps.py:98 self.importer=NullImporter(); Registry.set_importer; routers/catalog.py:125 →501`
 - 🟡 **用户级设置**（平台、设计系统与运维）—— DB schema 以及 GET/PUT 都支持 scope='user'，但 SettingsModal 只读写 global（state 仅从 s.global 播种，line 33）。除了主题之外没有用户偏好的 UI 入口（而主题存在 localStorage，不在 DB 里）。`kernel/kernel/metadb.py:132-140,464-470; routers/workspace.py:246-247`
@@ -143,7 +141,7 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 - ✅ **安全默认的 /api 认证门控（路由级 Depends）** —— 门控在 include 时施加，所以新加的路由默认受保护，除非明确挂到 public_router 上。 `kernel/kernel/main.py:50-54 public_router mounted WITHOUT gate, catalog/runs/workspace routers mounted WITH Depends(current_user); test_api_routes_require_auth_when_enabled (test_kernel.py:697) proves /run, /data, POST /users, /catalog, /canvas, /settings all 401 unauth while /auth/status + GET /users stay public`
 - ✅ **登录界面 + 登录名单** —— 用户选择器 + 密码。没有 SSO/OIDC（auth.py:12 注明它 'would slot in later' —— 未实现）。 `web/src/views/Login.tsx:10-21 login form; web/src/App.tsx:38 renders Login when authEnabled && !userId; public GET /users returns id+name only, no emails (workspace.py:81-84, asserted test_kernel.py:719)`
 - ✅ **管理员创建用户** —— 按设计不做自助注册；不存在角色/管理员的区分 —— 任何已认证用户都能创建用户（POST /users 只由 current_user 门控，没有管理员检查）。 `kernel/kernel/routers/workspace.py:87-94 POST /users (gated — no anonymous self-registration), sets scrypt hash if password provided`
-- 🟡 **画布分享 —— 可见性（private/workspace）+ 显式协作者（editor/viewer）** —— 缺口：'workspace' 可见性会给实例上的每个用户授予 EDITOR 权限（metadb.py:248-249）—— 不存在 workspace 只读层级。显式的按用户 viewer 角色是有的，但你无法让一个画布以 workspace 可见的只读方式呈现。 `kernel/kernel/routers/workspace.py:197-213 owner-only add/remove share + set visibility; metadb.canvas_role (metadb.py:240-251); web/src/panels/ShareModal.tsx; test_canvas_sharing_access_and_authz (test_kernel.py:1368)`
+- ✅ **画布分享 —— 可见性（private/workspace/workspace_view）+ 显式协作者（editor/viewer）** —— 三档可见性：private、workspace（人人可编辑）、workspace_view（人人只读，除非另有显式 editor 分享）。canvas_role 对 workspace_view 返回 viewer，而 put_canvas 本就对非 editor/owner 返回 403，所以只读是自动强制的。ShareModal 提供第三档；add_share 校验可见性值（未知→400）。 `kernel/kernel/metadb.py canvas_role + list_canvases_for; routers/workspace.py add_share 校验; web/src/panels/ShareModal.tsx; test_workspace_view_visibility_is_read_only`
 - ✅ **画布访问控制 / 授权（owner/editor/viewer 角色）** —— 前端在保存返回 403 时显示一个 'view-only' 提示 + accessDenied 状态，而不是假装同步（graph.ts:887-891）。 `metadb.canvas_role returns owner\|editor\|viewer\|None (metadb.py:240-251); put_canvas 403s non-editors (workspace.py:129-147); delete is owner-only (workspace.py:180-184); editor cannot re-share (workspace.py:199, asserted test_kernel.py:1385)`
 - ✅ **自动保存（防抖 PUT）+ 离线缓存** `web/src/store/graph.ts:859-898 400ms-debounced saveCanvas PUT + unconditional localStorage cache; distinguishes 403 (view-only) from offline (graph.ts:886-895)`
 - ✅ **协作写放大防护** —— 防止 N 个协同编辑者在每次按键时各自 PUT 整个文档（N 倍放大）。离线缓存的写入仍然是无条件的，这样重新加载后仍保留已合并的对等端编辑。 `web/src/collab/undo.ts:23 collabApply.remote flag; graph.ts:870-873 skips PUT for a peer's merged edit (only the originating editor PUTs); local edits + undo/redo still PUT`
@@ -161,7 +159,7 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 - ✅ **插件发现 —— DP_PLUGINS 环境变量模块列表** —— 逗号分隔的模块名被导入，并通过 _register_module 调用 register(reg)。 `kernel/kernel/settings.py:20, kernel/kernel/deps.py:163-164`
 - ✅ **节点编写 SDK —— add_node + ctx 构建器（sql/arrow_map/polars）** —— ctx.sql 使用一个 {input} 占位视图；arrow_map/polars 是惰性的 relation->relation 辅助函数。add_node 拒绝遮蔽一个内置或已注册的插件类型（deps.py:44-49）。 `kernel/kernel/sdk.py:38-70, kernel/kernel/deps.py:39-52`
 - ✅ **NodeLowering 协议（插件下降契约）** —— runtime_checkable 的 Protocol；引擎通过 deps.node_lowerings 分派插件类型。单输出返回 Relation，多输出返回 {port_id: Relation}。 `kernel/kernel/backends.py:23-36`
-- 🟡 **NodeSpec 通用前端渲染（插件节点无需前端代码）** —— 插件节点会用来自 /api/nodes 的类型化端口/参数进行通用渲染。缺口：NodeParamFields 会过滤掉 type==='code' 的参数，而 GenericNode 只渲染 NodeParamFields —— 所以一个声明了 code 参数（python/sql）的插件节点在通用卡片里没有任何编辑器；只有手工构建的卡片才渲染代码编辑器。 `web/src/nodes/generic.tsx:97-119, generic.tsx:39`
+- ✅ **NodeSpec 通用前端渲染（插件节点无需前端代码）** —— 插件节点用来自 /api/nodes 的类型化端口/参数进行通用渲染，包括 code 参数：GenericNode 现在给每个 type==='code' 的参数渲染一个片段预览按钮，打开那唯一的全屏编辑器（与手工卡片一致，按 param 的 lang 选 python/sql）。已用一个声明了 python code 参数的示例插件端到端验证（/api/nodes 携带 lang，registerGenericNodes 接住它）。 `web/src/nodes/generic.tsx GenericNode + NodeParamFields`
 - ✅ **前后端节点 spec 一致性守卫** —— 测试会解析每个 web/src/nodes/kinds/*.tsx 的 register({...}) 字面量，并把 ports/wire/accepts 与 BUILTIN_NODE_SPECS 比对，为拥有手工卡片的类型守护漂移。通用渲染的类型会被跳过（按设计）。 `kernel/kernel/tests/test_kernel.py:1263-1334`
 - ✅ **数据集适配器 SPI（add_adapter；DuckDB + Lance 内置）** —— DuckDBAdapter（parquet/csv/json/arrow/dir/对象存储）+ LanceAdapter。完整实现了 matches/scan/schema/count/fingerprint/write 契约。插件用 insert(0) 抢在默认之前认领 URI；resolve_adapter 回退到 DuckDBAdapter。 `kernel/kernel/plugins/adapters.py:99-291, kernel/kernel/deps.py:54-55,126-133`
 - ✅ **Lance 原生 ANN（可选的 adapter.nearest）** —— LanceAdapter.nearest 把余弦 kNN 下推到 Lance（索引或平铺扫描），暴露 _score=1-distance。当适配器缺少 nearest 时，通用的 vector-search 节点回退到暴力余弦。 `kernel/kernel/plugins/adapters.py:257-264`
