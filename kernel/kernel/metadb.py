@@ -151,6 +151,23 @@ class Setting(Base):
     __table_args__ = (UniqueConstraint("scope", "scope_id", "key", name="uq_setting"),)
 
 
+class CatalogRelationship(Base):
+    """An owner-declared join relationship, ONE ROW each (keyed by an orientation-insensitive rel_key)
+    — not a single JSON blob, so two instances declaring different relationships can't clobber each
+    other (each add/remove touches only its own row). `doc` is the full Relationship model_dump."""
+    __tablename__ = "catalog_relationships"
+    rel_key: Mapped[str] = mapped_column(String, primary_key=True)
+    doc: Mapped[str] = mapped_column(Text)
+
+
+class CatalogDeclaredKey(Base):
+    """An owner-declared primary key, ONE ROW per dataset uri (columns as a JSON list) — same
+    per-row isolation as CatalogRelationship (no shared-blob lost update)."""
+    __tablename__ = "catalog_declared_keys"
+    uri: Mapped[str] = mapped_column(String, primary_key=True)
+    columns: Mapped[str] = mapped_column(Text)  # JSON list of column names
+
+
 _engine = None
 _Session = None
 
@@ -441,6 +458,52 @@ def catalog_edges() -> list[dict]:
     with session() as s:
         return [{"parent": r.parent, "child": r.child, "pipeline": r.pipeline}
                 for r in s.scalars(select(CatalogEdge))]
+
+
+def catalog_relationships() -> list[dict]:
+    """Every declared relationship as a Relationship-shaped dict."""
+    with session() as s:
+        return [json.loads(r.doc) for r in s.scalars(select(CatalogRelationship))]
+
+
+def catalog_upsert_relationship(rel_key: str, doc: dict) -> None:
+    """Insert or replace ONE relationship row (keyed by rel_key) — no read-modify-write of a shared
+    blob, so a concurrent declare of a DIFFERENT relationship on another instance can't be lost."""
+    with session() as s:
+        r = s.get(CatalogRelationship, rel_key)
+        payload = json.dumps(doc, default=str)
+        if r is None:
+            s.add(CatalogRelationship(rel_key=rel_key, doc=payload))
+        else:
+            r.doc = payload
+
+
+def catalog_delete_relationship(rel_key: str) -> None:
+    with session() as s:
+        r = s.get(CatalogRelationship, rel_key)
+        if r is not None:
+            s.delete(r)
+
+
+def catalog_declared_keys() -> dict[str, list]:
+    """{uri: [column, ...]} for every declared primary key."""
+    with session() as s:
+        return {r.uri: json.loads(r.columns) for r in s.scalars(select(CatalogDeclaredKey))}
+
+
+def catalog_set_declared_key(uri: str, columns: list) -> None:
+    """Set (columns non-empty) or clear (empty) ONE dataset's declared key — a single row, so it
+    can't clobber another dataset's key set concurrently on another instance."""
+    with session() as s:
+        r = s.get(CatalogDeclaredKey, uri)
+        if columns:
+            payload = json.dumps(list(columns))
+            if r is None:
+                s.add(CatalogDeclaredKey(uri=uri, columns=payload))
+            else:
+                r.columns = payload
+        elif r is not None:
+            s.delete(r)
 
 
 def reconcile_orphaned_runs() -> int:

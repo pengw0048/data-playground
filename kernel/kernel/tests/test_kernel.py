@@ -2101,14 +2101,15 @@ def test_relationships_survives_a_malformed_stored_row():
     cat = get_deps().catalog
     good = {"leftUri": _uri("images"), "leftColumns": ["id"], "rightUri": _uri("events"),
             "rightColumns": ["user_id"], "cardinality": "1:N", "confidence": "declared"}
-    prev = metadb.get_setting("catalog_relationships", "global", default=[])
     try:
-        metadb.set_setting("catalog_relationships", [{"garbage": True}, good], "global")  # one bad, one good
+        metadb.catalog_upsert_relationship("__bad__", {"garbage": True})       # a malformed row
+        metadb.catalog_upsert_relationship("__good__", good)                   # a valid row
         rels = cat.relationships()  # must not raise
         assert len(rels) == 1 and rels[0].cardinality == "1:N"
         assert client.get("/api/catalog/relationships").status_code == 200
     finally:
-        metadb.set_setting("catalog_relationships", prev or [], "global")
+        metadb.catalog_delete_relationship("__bad__")
+        metadb.catalog_delete_relationship("__good__")
 
 
 def test_join_analysis_reflects_the_configured_key():
@@ -2128,6 +2129,33 @@ def test_join_analysis_reflects_the_configured_key():
     top = ja.suggestions[0]
     assert top.left_columns == ["id"] and top.right_columns == ["user_id"]  # the CONFIGURED key leads
     assert top.cardinality == "1:N" and ja.warning and "fans out" in ja.warning
+
+
+def test_declared_keys_and_relationships_are_independent_rows():
+    # #9 fix: each declared key / relationship is its OWN DB row (not one shared JSON blob), so setting
+    # one never rewrites/clobbers another — the mechanism that stops cross-instance lost updates.
+    from kernel import metadb
+    from kernel.models import Relationship
+    d = get_deps()
+    ev, img, mov = _uri("events"), _uri("images"), _uri("movies")
+    r1 = Relationship(left_uri=img, left_columns=["id"], right_uri=ev, right_columns=["user_id"], cardinality="1:N")
+    r2 = Relationship(left_uri=mov, left_columns=["id"], right_uri=ev, right_columns=["user_id"], cardinality="1:N")
+    try:
+        d.catalog.set_declared_key(ev, ["user_id"])
+        d.catalog.set_declared_key(img, ["id"])                 # must NOT drop events' key
+        km = metadb.catalog_declared_keys()
+        assert km.get(ev) == ["user_id"] and km.get(img) == ["id"]
+        d.catalog.add_relationship(r1)
+        d.catalog.add_relationship(r2)                          # a different pair → its own row
+        assert len(d.catalog.relationships()) == 2
+        d.catalog.remove_relationship(r1)                       # removing one leaves the other intact
+        rest = d.catalog.relationships()
+        assert len(rest) == 1 and rest[0].left_uri == mov
+    finally:
+        d.catalog.set_declared_key(ev, [])
+        d.catalog.set_declared_key(img, [])
+        d.catalog.remove_relationship(r1)
+        d.catalog.remove_relationship(r2)
 
 
 def test_example_plugin_loads_and_runs(tmp_path):

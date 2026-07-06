@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import threading
 
+import json
+
 from kernel import metadb
 from kernel.models import (
     CatalogTable,
@@ -18,9 +20,6 @@ from kernel.models import (
     LineageResult,
     Relationship,
 )
-
-_DECLARED_KEYS = "catalog_declared_keys"      # Setting: {uri: [col, ...]} — owner-declared primary keys
-_RELATIONSHIPS = "catalog_relationships"      # Setting: [Relationship dict, ...] — owner-declared join edges
 
 
 class InMemoryCatalog:
@@ -196,32 +195,28 @@ class InMemoryCatalog:
             self._add_edge(parent, uri, pipeline)
         return table
 
-    # -- declared keys & relationships (owner-asserted; shared via Settings, cross-instance) ------- #
+    # -- declared keys & relationships (owner-asserted; per-ROW in the shared DB, cross-instance) --- #
+    # Stored one-row-each (metadb.catalog_declared_keys / catalog_relationships), NOT a single JSON
+    # blob, so two instances declaring different keys/relationships can't clobber each other.
     def _declared_keys(self) -> dict[str, list[str]]:
         try:
-            return metadb.get_setting(_DECLARED_KEYS, "global", default={}) or {}
+            return metadb.catalog_declared_keys()
         except Exception:  # noqa: BLE001
             return {}
 
     def set_declared_key(self, uri: str, columns: list[str] | None) -> None:
-        """Set (or clear, columns=None/[]) the owner-declared primary key of a dataset — stored in the
-        authoritative Settings map and OVERLAID on read (_overlay), so it works cross-instance and a
-        clear cleanly restores the inferred key. The escape hatch for a dataset an opaque transform
-        produced or whose key the name heuristic missed."""
-        with self._lock:
-            keys = self._declared_keys()
-            if columns:
-                keys[uri] = list(columns)
-            else:
-                keys.pop(uri, None)
-            metadb.set_setting(_DECLARED_KEYS, keys, "global")
+        """Set (or clear, columns=None/[]) the owner-declared primary key of a dataset — one DB row,
+        OVERLAID on read (_overlay), so it works cross-instance and a clear cleanly restores the
+        inferred key. The escape hatch for a dataset an opaque transform produced or whose key the
+        name heuristic missed."""
+        metadb.catalog_set_declared_key(uri, list(columns or []))
 
     def relationships(self, uri: str | None = None) -> list[Relationship]:
         """Owner-declared join edges; filtered to those touching `uri` when given. A malformed stored
         row (a manual edit / version skew) is skipped, never fatal — otherwise one bad row would 500
         the whole feature, including the delete path needed to remove it."""
         try:
-            raw = metadb.get_setting(_RELATIONSHIPS, "global", default=[]) or []
+            raw = metadb.catalog_relationships()
         except Exception:  # noqa: BLE001
             raw = []
         rels: list[Relationship] = []
@@ -235,18 +230,14 @@ class InMemoryCatalog:
         return rels
 
     @staticmethod
-    def _rel_key(r: Relationship) -> frozenset:
-        # orientation-insensitive: A→B and B→A on swapped columns are ONE logical relationship, so
-        # re-declaring in reverse replaces rather than duplicates (a frozenset of the two endpoints).
-        return frozenset({(r.left_uri, tuple(r.left_columns)), (r.right_uri, tuple(r.right_columns))})
+    def _rel_key(r: Relationship) -> str:
+        # orientation-insensitive canonical key: A→B and B→A on swapped columns are ONE logical
+        # relationship (sorted endpoints), so re-declaring in reverse replaces its row, not adds one.
+        ends = sorted([[r.left_uri, list(r.left_columns)], [r.right_uri, list(r.right_columns)]])
+        return json.dumps(ends)
 
     def add_relationship(self, rel: Relationship) -> None:
-        with self._lock:
-            rels = [r for r in self.relationships() if self._rel_key(r) != self._rel_key(rel)]  # replace dup
-            rels.append(rel)
-            metadb.set_setting(_RELATIONSHIPS, [r.model_dump(by_alias=True) for r in rels], "global")
+        metadb.catalog_upsert_relationship(self._rel_key(rel), rel.model_dump(by_alias=True))
 
     def remove_relationship(self, rel: Relationship) -> None:
-        with self._lock:
-            rels = [r for r in self.relationships() if self._rel_key(r) != self._rel_key(rel)]
-            metadb.set_setting(_RELATIONSHIPS, [r.model_dump(by_alias=True) for r in rels], "global")
+        metadb.catalog_delete_relationship(self._rel_key(rel))
