@@ -3,11 +3,11 @@
 _验收评审清单，由对整个代码库的普查生成（每一项都由一个 `file:line` 作为证据支撑）。_
 _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限定到白名单 roots；Dockerfile + docker-compose 部署）。图例：✅ 已实现 · 🟡 部分实现（见备注） · ⬜ 未实现（仅有脚手架/规划中，或有意省略）。_
 
-**142 项功能 —— ✅ 123 项已实现 · 🟡 16 项部分实现 · ⬜ 3 项未实现。**
+**142 项功能 —— ✅ 124 项已实现 · 🟡 15 项部分实现 · ⬜ 3 项未实现。**
 
 | 领域 | ✅ | 🟡 | ⬜ |
 |---|--:|--:|--:|
-| 画布与节点交互 | 23 | 3 | 1 |
+| 画布与节点交互 | 24 | 2 | 1 |
 | 引擎与执行 | 16 | 4 | 0 |
 | 数据、适配器与目录 | 27 | 3 | 0 |
 | 协作、多用户与认证 | 21 | 1 | 0 |
@@ -17,7 +17,6 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 ## ⚠️ 尚未完全完成（验收重点）
 
 - ⬜ **branch / loop / variable 控制流节点**（画布与节点交互）—— 有意省略，非缺口：控制流统一由 'section' 容器的驱动脚本承担（section.tsx:102）—— branch 与两个 filter 冗余，loop/variable 都能在 section 脚本里表达。残留的 'control' 工具栏分类（Toolbar.tsx:12）没有任何节点注册，空分类会被丢弃（Toolbar.tsx:27），所以该分组不会显示。`web/src/theme/tokens.ts:54`
-- 🟡 **Section 容器（嵌套 / 拖入拖出 / 驱动脚本）**（画布与节点交互）—— 渲染为一个有尺寸的框架；拖进去的节点通过屏幕空间的重叠命中测试成为 parentId 子节点（Canvas.tsx:179），也可以再拖出去解除关联。缺口：嵌套只支持一层 —— 把一个 section 拖到另一个 section 上会被明确拒绝（Canvas.tsx:180）。`web/src/nodes/kinds/section.tsx:93`
 - 🟡 **能力驱动的查看器标签页**（画布与节点交互）—— media 能力会根据列能力添加一个图片网格标签页。只有 'media' 内置发布了；vectors 标签页已被有意移除（capabilities.tsx:49），所以注册机制是真实的，但内置集合很小。`web/src/nodes/capabilities.tsx:42`
 - 🟡 **Agent dock（从意图构建流水线）**（画布与节点交互）—— 有 Plan/Build 两种模式；Build 会应用 LLM 生成的图（applyAgentGraph）并运行终端节点。设计上的缺口：需要在服务端配置 DP_AGENT_MODEL + 供应商 key —— 没有配置模型时它就是 'unavailable'（AgentDock.tsx:32），不存在基于规则的兜底。`web/src/panels/AgentDock.tsx:14`
 - 🟡 **运行取消 + 查询中断**（引擎与执行）—— 在各步骤之间可取消，并能在运行自己的游标上中断正在执行的 DuckDB 查询。缺口（已在 db.py:163 说明）：transform 内部的纯 Python 死循环（例如 `while True`）在进程内无法被中断 —— 只有 subprocess runner 的强制 kill 才能停下它。`kernel/kernel/plugins/runner.py:268 cancel() sets Event + scope.interrupt(); kernel/kernel/db.py:75 _Scope.interrupt calls con.interrupt() from another thread`
@@ -46,7 +45,7 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 - ✅ **schema 驱动的通用节点（backend/插件类型）** —— registerGenericNodes() 能在无前端代码的情况下渲染任何 /api/nodes 类型 —— 类型化端口、参数表单字段、必填参数校验 —— 除非已有手工构建的卡片。 `web/src/nodes/generic.tsx:97`
 - ✅ **内置节点类型（source/sample/filter/select/transform/sql/join/aggregate/sort/dedup/write/metric/vector-search/section/note/code）** —— 16 个手工构建的类型文件各自调用 register()；backend 的 nodespecs.py 镜像了这些计算类型。'notebook' 在加载时会被迁移为 'transform'（graph.ts:239）。 `web/src/nodes/kinds/source.tsx:94`
 - ⬜ **branch / loop / variable 控制流节点** —— 有意省略，非缺口：控制流统一由 'section' 容器的驱动脚本承担（section.tsx:102）—— branch 与两个 filter 冗余，loop/variable 都能在 section 脚本里表达。残留的 'control' 工具栏分类（Toolbar.tsx:12）没有任何节点注册，空分类会被丢弃（Toolbar.tsx:27），所以该分组不会显示。 `web/src/theme/tokens.ts:54`
-- 🟡 **Section 容器（嵌套 / 拖入拖出 / 驱动脚本）** —— 渲染为一个有尺寸的框架；拖进去的节点通过屏幕空间的重叠命中测试成为 parentId 子节点（Canvas.tsx:179），也可以再拖出去解除关联。缺口：嵌套只支持一层 —— 把一个 section 拖到另一个 section 上会被明确拒绝（Canvas.tsx:180）。 `web/src/nodes/kinds/section.tsx:93`
+- ✅ **Section 容器（嵌套 / 拖入拖出 / 驱动脚本）** —— 渲染为一个有尺寸的框架；拖进去的节点通过屏幕空间重叠命中测试成为 parentId 子节点，也可再拖出解除关联。嵌套 section 能运行：run() 会把被调用节点的 parentId 子树带进子引擎，所以一个套在 section 里的 section 能解析出自己的子节点（多层，已测）。视觉拖拽嵌套刻意保持单层（框是固定尺寸，同尺寸 section 无法整齐嵌入）—— 更深的嵌套用驱动脚本表达（一个 section 的脚本可以 run() 另一个 section）。 `kernel/kernel/section.py run()/_descendants; test_section_nests_multiple_levels_by_parentid; web/src/canvas/Canvas.tsx（单层 guard + 理由）`
 - ✅ **类型化端口 + 连线类型** —— 端口的形状+色调编码了连线类型（dataset/selection/sample/sql-view/metric/value；tokens.ts:63）。未连接时是空心的，连上后填充，悬停会变大并显示 '+'。多输出节点通过 config.outputs 声明实例端口（registry.ts:54）。 `web/src/nodes/Port.tsx:13`
 - ✅ **连接校验（类型化、单输入、join 双输入）** —— isValidConnection 检查源连线 ∈ 目标 port.accepts（registry.canConnect:89），并拒绝一个已被占用的输入 handle；join 的 a/b handle 允许两个不同的输入。 `web/src/canvas/Canvas.tsx:158`
 - ✅ **从端口连出的添加节点菜单** —— 在输出端口上普通点击（Port.tsx:52 派发 dp-port-click；拖拽连接会抑制它）会打开一个菜单，过滤出首个输入能接受该连线的类型（registry.kindsAcceptingWire），然后把新节点连接好。 `web/src/canvas/ConnectMenu.tsx:7`
