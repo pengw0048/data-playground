@@ -74,10 +74,34 @@ kernel/  FastAPI (one server, serves the SPA + API + WS + engine). graph → COM
          (DuckDB · Polars · Arrow · Lance). Everything specific is a plugin (§8 SPI).
 ```
 
+## Scaling out: multiple stateless web instances
+
+One process is the default and is all most people need. To run several web instances behind a load
+balancer, the app's runtime coordination state is now shared, not process-local:
+
+- **Metadata** (users, canvases, shares, settings, versions, run history) — in the SQL metadata DB.
+  Point `DP_DATABASE_URL` at Postgres so every instance shares it.
+- **Run status** — mirrored to the DB (`run_states`), so `GET /run/{id}` and the status WebSocket are
+  answerable from any instance and survive a restart.
+- **Catalog** (registered datasets + written outputs + lineage) — write-through to the DB
+  (`catalog_entries` / `catalog_edges`), so a dataset registered on one instance is visible to all.
+- **Object storage** (`s3://` / `gs://`) holds the data itself; each instance's own DuckDB reads it.
+
+Two things are deployment-side, not app config:
+
+- **Collab** uses one in-memory room per canvas, so route each canvas to a consistent instance —
+  a sticky hash on the `/ws/collab/{canvas_id}` path (Figma-style). Example nginx:
+  `hash $arg_canvas consistent;` keyed on the canvas id, or any LB with path/consistent-hash routing.
+- **Execution** currently runs in the accepting instance (status is shared via `run_states`, so any
+  instance can report it). For a dedicated execution tier, add an `ExecutionBackend` plugin (§8 SPI —
+  a Ray/pod/queue runner); that step also wants per-run instance ownership + a heartbeat so one
+  instance's startup reconcile can't cancel another's live runs (a `TODO` marks the spot in
+  `metadb.reconcile_orphaned_runs`).
+
 ## Plugins — a stranger's node appears typed & wired, no core edit
 
 Drop a package in `<workspace>/plugins/<pack>/` (or pip-install one exposing a `dataplay.plugins`
-entry point). It registers nodes / adapters / runners / capabilities / catalog / planner:
+entry point). It registers nodes / adapters / runners / capabilities / catalog:
 
 ```python
 # plugins/upcase/__init__.py

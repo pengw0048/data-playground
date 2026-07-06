@@ -98,9 +98,10 @@ class Deps:
         self._manifests: dict[str, dict] = {}
         from kernel.storage import make_storage
         self.storage = make_storage(workspace)
-        # ONE catalog + run_index (below), shared by every user of this instance — by design: this is a
-        # single-instance workspace server, not one kernel per session. Per-user boundaries are enforced
-        # at the canvas/share/settings layer (metadb + current_user), not by isolating the data engine.
+        # The catalog is shared by every user (by design — one workspace, not one kernel per session);
+        # per-user boundaries are enforced at the canvas/share/settings layer, not by isolating the data
+        # engine. InMemoryCatalog is a per-instance CACHE that write-throughs to + loads from the shared
+        # DB (catalog_entries/edges), so multiple stateless web instances stay consistent.
         self.catalog = InMemoryCatalog(data_dir, self.resolve_adapter)
         # re-register previously written outputs so committed tables survive a kernel restart
         # (they live in storage, separate from the seeded data_dir).

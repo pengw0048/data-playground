@@ -1,13 +1,18 @@
 """Data Playground kernel — FastAPI app factory (PRD §9).
 
-A single shared multi-user workspace server: one FastAPI process serves the SPA, the JSON API,
-the collab/run WebSockets, and the data engine. Users authenticate per-user (signed session
-cookies when DP_AUTH_SECRET is set; an open X-DP-User dev mode otherwise); each user has their own
-canvases, plus workspace shares, in a SQLite/Postgres metadata DB. The data engine itself is
-intentionally SHARED and process-global — one DuckDB connection pool, one catalog, one run index
-across all users (see kernel.deps) — not one kernel per session. Backend-agnostic core; the
-default bundle runs fully offline (DuckDB adapter, in-memory catalog, local out-of-core runner).
-All routes under /api, JSON, camelCase on the wire.
+A shared multi-user workspace server. One FastAPI process serves the SPA, the JSON API, the
+collab/run WebSockets, and the data engine — and it runs standalone by default. Users authenticate
+per-user (signed session cookies when DP_AUTH_SECRET is set; an open X-DP-User dev mode otherwise);
+each user has their own canvases + workspace shares in a SQLite/Postgres metadata DB.
+
+It is also STATELESS-WEB-READY: the runtime coordination state that used to be process-local is now
+shared — metadata, run status (`run_states`), and the catalog (`catalog_entries`/`catalog_edges`)
+all live in the DB, and the data itself in object storage — so several web instances behind a load
+balancer converge (see README "Scaling out"). The per-instance pieces are collab (one in-memory room
+per canvas → route each canvas to a consistent instance) and execution (runs on the accepting
+instance; status is shared, so any instance can report it). Backend-agnostic core; the default
+bundle runs fully offline (DuckDB adapter, local out-of-core runner). All routes under /api, JSON,
+camelCase on the wire.
 
 The routes live in kernel.routers.{catalog,runs,workspace}; this module wires them onto the app,
 gates them (see below), and owns the two WebSockets + the static SPA mount. `current_user` lives
