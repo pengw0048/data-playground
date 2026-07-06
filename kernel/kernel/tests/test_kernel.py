@@ -1615,6 +1615,47 @@ def test_node_spec_exposes_requires():
     assert "requires" in src and src["requires"] is None
 
 
+def test_placement_satisfies_and_graph_requires():
+    # C1: the capability-match rule + whole-graph aggregate requirement.
+    from kernel import placement
+    from kernel.models import Graph, ResourceSpec
+    gpu = ResourceSpec(cpu=16, gpu=2, gpu_type="a100", mem="64GB")
+    cpu = ResourceSpec(cpu=8)
+    assert placement.satisfies(gpu, ResourceSpec(gpu=2, gpu_type="a100"))
+    assert placement.satisfies(gpu, None)                             # no requirement → any worker
+    assert not placement.satisfies(cpu, ResourceSpec(gpu=1))          # cpu worker can't host a gpu step
+    assert not placement.satisfies(gpu, ResourceSpec(gpu=4))          # not enough gpus
+    assert not placement.satisfies(gpu, ResourceSpec(gpu_type="h100"))  # wrong gpu type
+    assert not placement.satisfies(cpu, ResourceSpec(mem="32GB"))     # not enough mem
+    g = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        {"id": "cap", "type": "transform", "position": {"x": 0, "y": 0},
+         "data": {"config": {"code": "def fn(row):\n    return row", "requires": {"gpu": 8, "gpuType": "a100"}}}},
+    ], "edges": [E("src", "cap")]})
+    req = placement.graph_requires(g, get_deps().node_specs)
+    assert req.gpu == 8 and req.gpu_type == "a100"                    # max over the graph's nodes
+
+
+def test_pool_backend_workers_and_placement(tmp_path, monkeypatch):
+    # C1: DP_POOL_WORKERS registers a reference pool backend that advertises workers with capacities
+    # and places by capability — the whole path is real (only the GPU is simulated), no cluster needed.
+    import json
+
+    from kernel.deps import Deps
+    from kernel.models import ResourceSpec
+    monkeypatch.setenv("DP_POOL_WORKERS", json.dumps([{"name": "cpu", "cpu": 8},
+                                                      {"name": "gpu", "cpu": 16, "gpu": 2, "gpu_type": "a100"}]))
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    pool = next(r for r in d.runners if r.name == "local-pool")
+    assert {w.id for w in pool.workers()} == {"cpu", "gpu"}
+    assert pool.place(ResourceSpec(gpu=2, gpu_type="a100")) == "gpu"  # only the gpu worker satisfies it
+    assert pool.place(ResourceSpec(cpu=4)) in ("cpu", "gpu")          # both satisfy; idle-first
+    assert pool.place(ResourceSpec(gpu=4)) is None                    # nothing in the pool satisfies it
+    # and it surfaces in KernelInfo.backends (→ the Compute view) with its capacities
+    pool_b = next(b for b in d.info().backends if b.name == "local-pool")
+    assert any(w.capacity.gpu == 2 and w.capacity.gpu_type == "a100" for w in pool_b.workers)
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).

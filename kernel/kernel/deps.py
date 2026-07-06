@@ -152,6 +152,16 @@ class Deps:
         sub.on_complete = _persist_run  # record cancelled/crashed isolated runs the child couldn't
         sub.on_status = _persist_run_state
         self.runners = [self.runner, sub]
+        # opt-in reference multi-worker pool (DP_POOL_WORKERS): capability-based placement without a
+        # cluster — pods are processes with configured capacities. Shows in the Compute view + is
+        # selectable/placeable. Absent → default behavior unchanged. (k8s/Ray = plugins over the same API.)
+        from kernel.pool_runner import PoolRunner, pool_workers_from_env
+        pool_cfg = pool_workers_from_env()
+        if pool_cfg:
+            pool = PoolRunner(workspace, data_dir, pool_cfg, node_specs=self.node_specs, catalog=self.catalog)
+            pool.on_complete = _persist_run
+            pool.on_status = _persist_run_state
+            self.runners.append(pool)
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self._load_plugins()
 
