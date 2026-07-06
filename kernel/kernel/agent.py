@@ -155,18 +155,22 @@ try:
         from kernel import relationships as rel
         d = ctx.deps.kdeps
 
-        def cols(uri):
+        # accept a uri OR a table name/id: resolve to the canonical uri so BOTH the column probe and
+        # the cardinality MEASUREMENT (which needs a real uri to scan) use the same, correct dataset.
+        def resolve(arg):
             try:
-                return d.catalog.get_table(uri).columns
+                t = d.catalog.get_table(arg)
+                return t.uri, t.columns
             except KeyError:
-                return d.resolve_adapter(uri).schema(uri)
+                return arg, d.resolve_adapter(arg).schema(arg)
         try:
-            sugg = rel.suggest_joins(cols(left_uri), cols(right_uri),
-                                     rel.measured_unique(left_uri, d.resolve_adapter),
-                                     rel.measured_unique(right_uri, d.resolve_adapter))
+            (luri, lcols), (ruri, rcols) = resolve(left_uri), resolve(right_uri)
+            sugg = rel.suggest_joins(lcols, rcols,
+                                     rel.measured_unique(luri, d.resolve_adapter),
+                                     rel.measured_unique(ruri, d.resolve_adapter))
             out = {"suggestions": [s.model_dump(by_alias=True) for s in sugg],
-                   "declared": [r.model_dump(by_alias=True) for r in d.catalog.relationships(left_uri)
-                                if right_uri in (r.left_uri, r.right_uri)]}
+                   "declared": [r.model_dump(by_alias=True) for r in d.catalog.relationships(luri)
+                                if ruri in (r.left_uri, r.right_uri)]}
         except Exception as e:  # noqa: BLE001
             out = {"error": f"{type(e).__name__}: {e}"}
         ctx.deps.transcript.append({"tool": "join_hints", "input": {"left_uri": left_uri, "right_uri": right_uri}, "result": out})
@@ -321,9 +325,16 @@ def run_agent(outcome: str, graph: dict, deps, model=None) -> dict:
               f"{len(wg['edges'])} edge(s).) Respond to this — answer or advise in text, or build/"
               "modify the canvas by calling tools, whichever the message calls for.")
     # request_limit bounds the loop (was the manual step cap) so a confused model can't run away.
-    result = _agent.run_sync(prompt, model=m, deps=ctx,
-                             usage_limits=UsageLimits(request_limit=settings.agent_max_steps))
-    summary = (result.output or "").strip() or "Done."
+    # Hitting the cap must NOT discard the work done so far — the extra read tools (join_hints /
+    # validate) make the cap more reachable, so return the partial graph + transcript instead of 502.
+    from pydantic_ai.exceptions import UsageLimitExceeded
+    try:
+        result = _agent.run_sync(prompt, model=m, deps=ctx,
+                                 usage_limits=UsageLimits(request_limit=settings.agent_max_steps))
+        summary = (result.output or "").strip() or "Done."
+    except UsageLimitExceeded:
+        summary = (f"Stopped at the {settings.agent_max_steps}-step limit — returning the partial build "
+                   "so far. Ask me to continue if it's incomplete.")
     _layout(wg, existing_ids)
     return {"graph": wg, "transcript": ctx.transcript, "summary": summary}
 

@@ -173,7 +173,10 @@ export function ERDiagram() {
         <Controls showInteractive={false} />
       </ReactFlow>
       {pending && (
-        <RelationshipDialog left={pending.left} right={pending.right} suggestions={pending.suggestions}
+        // keyed by the pair so switching pending pairs REMOUNTS (re-seeds lc/rc/card) — otherwise a
+        // rapid second drag would reuse the dialog with the first pair's stale columns
+        <RelationshipDialog key={`${pending.left.id}|${pending.right.id}`}
+          left={pending.left} right={pending.right} suggestions={pending.suggestions}
           onClose={() => setPending(null)}
           onDeclared={(next) => { setRels(next); setPending(null) }} />
       )}
@@ -196,8 +199,10 @@ function RelationshipDialog({ left, right, suggestions, onClose, onDeclared }: {
   const [card, setCard] = useState<Cardinality>(top?.cardinality ?? 'unknown')
   const [busy, setBusy] = useState(false)
 
-  const toggle = (arr: string[], set: (v: string[]) => void, col: string) =>
+  const toggle = (arr: string[], set: (v: string[]) => void, col: string) => {
     set(arr.includes(col) ? arr.filter((c) => c !== col) : [...arr, col])
+    setCard('unknown')  // hand-editing the key invalidates a cardinality that was MEASURED for another key
+  }
   const pick = (s: JoinSuggestion) => { setLc(s.leftColumns); setRc(s.rightColumns); setCard(s.cardinality) }
   const ok = lc.length > 0 && lc.length === rc.length
   const declare = async () => {

@@ -2111,6 +2111,25 @@ def test_relationships_survives_a_malformed_stored_row():
         metadb.set_setting("catalog_relationships", prev or [], "global")
 
 
+def test_join_analysis_reflects_the_configured_key():
+    # adversarial-review: analyze_join (→ agent `validate`) must report the cardinality of the key the
+    # join is ACTUALLY configured with, not the top-ranked candidate — else the 'no fan-out' all-clear
+    # is wrong. images.id↔events.id is 1:1 (ranks top), but a join CONFIGURED on id=user_id is 1:N.
+    from kernel import relationships as rel
+    from kernel.executors.schema import schema_for_graph
+    from kernel.models import Graph
+    d = get_deps()
+    graph = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("l", "source", {"uri": _uri("images")}), N("r", "source", {"uri": _uri("events")}),
+        {"id": "j", "type": "join", "position": {"x": 0, "y": 0}, "data": {"config": {"condition": "a.id = b.user_id"}}},
+    ], "edges": [E("l", "j", th="a"), E("r", "j", th="b")]})
+    cols = schema_for_graph(graph, d.resolve_adapter, d.registry, d.node_lowerings, d.node_specs)
+    ja = rel.analyze_join(graph, "j", cols, d.catalog, d.resolve_adapter)
+    top = ja.suggestions[0]
+    assert top.left_columns == ["id"] and top.right_columns == ["user_id"]  # the CONFIGURED key leads
+    assert top.cardinality == "1:N" and ja.warning and "fans out" in ja.warning
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).

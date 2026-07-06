@@ -13,6 +13,7 @@ measured over the tuple. Matching pairs single- and multi-column key sets betwee
 
 from __future__ import annotations
 
+import re
 from itertools import combinations
 
 from kernel import db
@@ -241,6 +242,29 @@ def _declared_suggestions(graph: Graph, left_id: str, right_id: str, catalog) ->
     return out
 
 
+def _configured_join_key(node) -> tuple[list[str], list[str]] | None:
+    """The (left_cols, right_cols) the join node is ACTUALLY configured with: `on` (a USING list of
+    same-named columns) or `condition` (`a.x = b.y AND …`, matching the engine's a/b aliasing). None
+    if unconfigured (a fresh join) — then analyze_join just ranks candidates as before."""
+    if node is None:
+        return None
+    cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+    on = str(cfg.get("on") or "").strip()
+    if on:
+        cols = [c.strip().strip('"') for c in on.split(",") if c.strip()]
+        return (cols, cols) if cols else None
+    cond = str(cfg.get("condition") or "").strip()
+    if cond:
+        left, right = [], []
+        for s1, c1, s2, c2 in re.findall(r'([ab])\.("?\w+"?)\s*=\s*([ab])\.("?\w+"?)', cond):
+            c1, c2 = c1.strip('"'), c2.strip('"')
+            if {s1, s2} == {"a", "b"}:
+                (left, right) = (left + [c1], right + [c2]) if s1 == "a" else (left + [c2], right + [c1])
+        if left:
+            return (left, right)
+    return None
+
+
 def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | None],
                  catalog, resolve_adapter) -> JoinAnalysis:
     """Rank join keys for a join node's two inputs and warn if the join fans out (not 1:1).
@@ -257,9 +281,9 @@ def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | N
         return JoinAnalysis(note="input columns aren't known yet (run an upstream code op to type them)")
     lcols = [ColumnSchema.model_validate(c) for c in lcols_raw]
     rcols = [ColumnSchema.model_validate(c) for c in rcols_raw]
-    suggestions = suggest_joins(lcols, rcols,
-                                _grain_unique_oracle(graph, left, catalog, resolve_adapter),
-                                _grain_unique_oracle(graph, right, catalog, resolve_adapter))
+    lo = _grain_unique_oracle(graph, left, catalog, resolve_adapter)
+    ro = _grain_unique_oracle(graph, right, catalog, resolve_adapter)
+    suggestions = suggest_joins(lcols, rcols, lo, ro)
     # DECLARED relationships between the two inputs' source datasets lead (owner-asserted, trusted).
     # A declared edge with cardinality 'unknown' borrows the MEASURED cardinality for the same columns
     # so the fan-out warning still fires (declaring a join shouldn't hide that it multiplies rows).
@@ -271,6 +295,19 @@ def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | N
             d.cardinality = measured_by_cols.get(cols_key(d), "unknown")
     declared_cols = {cols_key(d) for d in declared}
     suggestions = declared + [s for s in suggestions if cols_key(s) not in declared_cols]
+    # If the join is already CONFIGURED (on / condition), the warning must reflect the key it ACTUALLY
+    # uses — not the top-ranked candidate. Surface that key's cardinality first (measuring it if it
+    # isn't among the suggestions), so `validate`'s all-clear can't be a different key's cardinality.
+    configured = _configured_join_key(g.node_map(graph).get(node_id))
+    if configured:
+        cl, cr = configured
+        active = next((s for s in suggestions if s.left_columns == cl and s.right_columns == cr), None)
+        if active is None:
+            card = cardinality(lo(cl), ro(cr))
+            active = JoinSuggestion(left_columns=cl, right_columns=cr, cardinality=card,
+                                    confidence="verified" if card != "unknown" else "inferred",
+                                    reason="configured join key")
+        suggestions = [active] + [s for s in suggestions if s is not active]
     if not suggestions:
         return JoinAnalysis(note="no matching key columns between the two inputs")
     warning = None
