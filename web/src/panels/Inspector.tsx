@@ -119,6 +119,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         )
       })}
 
+      {/* compute placement: what this step needs → the run routes to a matching worker (e.g. a GPU pool) */}
+      {(kind === 'transform' || kind === 'section') && <ResourcesSection nodeId={nodeId} />}
+
       {/* ports — a real port label (join left/right, metric value) shows as a name; the default
           in/out ports just show their wire type. Outputs carry a typed/untyped schema badge. */}
       <Section title="Ports">
@@ -218,6 +221,33 @@ function CodeBtn({ icon, label, onClick }: { icon: IconName; label: string; onCl
       className="h-auto gap-1.5 px-2.5 py-1.5 text-[11.5px] font-medium text-primary shadow-none [&_svg]:size-3">
       <Icon name={icon} size={12} /> {label}
     </Button>
+  )
+}
+
+function ResourcesSection({ nodeId }: { nodeId: string }) {
+  const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
+  const updateConfig = useStore((s) => s.updateConfig)
+  const req = ((node?.data.config as Record<string, unknown>)?.requires ?? {}) as { cpu?: number; gpu?: number; gpuType?: string }
+  const set = (patch: Record<string, unknown>) => {
+    const next: Record<string, unknown> = { ...req, ...patch }
+    for (const k of Object.keys(next)) if (next[k] === '' || next[k] == null) delete next[k]
+    updateConfig(nodeId, { requires: Object.keys(next).length ? next : undefined })
+  }
+  const num = (v: string) => (v === '' ? undefined : Number(v))
+  return (
+    <Section title="Resources (placement)">
+      <div className="mb-1.5 text-[10.5px] leading-relaxed text-muted-foreground">
+        What this step needs — the run routes to a worker that satisfies it (e.g. a GPU pool). Blank = no requirement.
+      </div>
+      <div className="grid grid-cols-3 gap-1.5">
+        <label className="flex flex-col gap-0.5 text-[10px] text-muted-foreground">GPUs
+          <Input type="number" min={0} className="h-7 text-[11.5px] md:text-[11.5px]" value={req.gpu ?? ''} onChange={(e) => set({ gpu: num(e.target.value) })} /></label>
+        <label className="flex flex-col gap-0.5 text-[10px] text-muted-foreground">GPU type
+          <Input className="h-7 text-[11.5px] md:text-[11.5px]" placeholder="a100" value={req.gpuType ?? ''} onChange={(e) => set({ gpuType: e.target.value || undefined })} /></label>
+        <label className="flex flex-col gap-0.5 text-[10px] text-muted-foreground">CPUs
+          <Input type="number" min={0} className="h-7 text-[11.5px] md:text-[11.5px]" value={req.cpu ?? ''} onChange={(e) => set({ cpu: num(e.target.value) })} /></label>
+      </div>
+    </Section>
   )
 }
 

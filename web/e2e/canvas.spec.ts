@@ -324,6 +324,16 @@ test.describe('Data Playground canvas', () => {
     await expect(pred).toHaveValue('amount > 0')
   })
 
+  test('the inspector edits a step resource requirement (placement)', async ({ page }) => {
+    await fresh(page)
+    const inspector = page.getByTestId('inspector')
+    await addNode(page, 'Compute', 'transform') // auto-selected; transform can declare compute needs
+    await expect(inspector.getByText('Resources (placement)')).toBeVisible()
+    const gpus = inspector.locator('label').filter({ hasText: 'GPUs' }).locator('input')
+    await gpus.fill('8')
+    await expect(gpus).toHaveValue('8') // written to config.requires → routes to a GPU worker at run time
+  })
+
   test('a code block lives on the canvas and opens the fullscreen editor on double-click', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Inspect', 'code')
