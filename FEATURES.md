@@ -70,7 +70,7 @@ _最后更新：2026-07-06。**133 项功能**（旧扁平清单 142 条里的 9
 ### §2.1 下降引擎（LoweringEngine）· 3✅
 - **接口：NodeLowering 协议** — 引擎经 node_lowerings 分派插件类型（单输出 Relation / 多输出 {port:Relation}）。 `↗ 契约叶子见 §5.2 节点 SPI`
 - ✅ **图 → DuckDB 关系 plan** — 每关系节点降为 DuckDBPyRelation；多输出 {port->Relation} 按 source_handle 路由。 `kernel/kernel/executors/engine.py:150`
-- ✅ **核外执行（DuckDB 流式 + 溢出磁盘）** — 关系算子原生流式/溢出；Python transform 溢出 Parquet 再读回，runner GC。 `kernel/kernel/plugins/runner.py:142; engine.py:364`
+- ✅ **核外执行（DuckDB 流式 + 溢出磁盘）** — 关系算子原生流式/溢出；temp_directory 显式设为 DP_SPILL_DIR（运维可控）、DP_MEMORY_LIMIT 可限内存；Python transform 溢出 Parquet 再读回，runner GC。**benchmark 背书**：240M 行/4.7GB 在 1.3GiB 上限下排序、溢出 4.9GB、峰值 RSS 仅 2.3GB。 `kernel/kernel/db.py _apply_session; engine.py:364; docs/BENCHMARK.md`
 - ✅ **分支路由（条件式边路由）** — 空谓词→true，`1=0`→false；按每条出边应用。 `kernel/kernel/executors/engine.py:322`
 
 ### §2.2 预览与 schema · 3✅
