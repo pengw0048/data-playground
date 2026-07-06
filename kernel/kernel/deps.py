@@ -139,11 +139,14 @@ class Deps:
                 continue
         return self.default_adapter
 
-    def pick_runner(self, plan):
+    def pick_runner(self, plan, uid: str | None = None):
         # honor the chosen backend (Settings → Execution) when it's registered and can run this plan;
         # otherwise the first runner that can, else the default. Real once plugins add more runners.
+        # A per-user preference wins over the workspace default (empty = inherit the global choice).
         from kernel import metadb
-        chosen = metadb.get_setting("backend", "global", default="") or ""
+        chosen = (metadb.get_setting("backend", "user", uid, default="") if uid else "") or ""
+        if not chosen:
+            chosen = metadb.get_setting("backend", "global", default="") or ""
         if chosen:
             for r in self.runners:
                 if getattr(r, "name", None) == chosen and r.can_run(plan):

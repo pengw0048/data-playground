@@ -371,6 +371,33 @@ def test_settings_redacts_secrets():
     client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": ""})  # restore
 
 
+def test_user_scoped_settings_are_isolated_per_user():
+    # scope='user' settings persist and don't leak across users (backs the Settings UI's user tier).
+    alice = client.post("/api/users", json={"name": "SettingsAlice"}).json()["id"]
+    bob = client.post("/api/users", json={"name": "SettingsBob"}).json()["id"]
+    client.put("/api/settings", json={"scope": "user", "key": "backend", "value": "local-subprocess"}, headers={"X-DP-User": alice})
+    assert client.get("/api/settings", headers={"X-DP-User": alice}).json()["user"].get("backend") == "local-subprocess"
+    assert client.get("/api/settings", headers={"X-DP-User": bob}).json()["user"].get("backend") is None  # not Alice's
+
+
+def test_user_scoped_backend_preference_wins_over_global(tmp_path):
+    # pick_runner resolves a per-user runner preference before the workspace default (empty = inherit).
+    import types
+    from kernel.deps import Deps
+    from kernel import metadb
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    assert {"local-out-of-core", "local-subprocess"} <= {r.name for r in d.runners}
+    plan = types.SimpleNamespace(acyclic=True)
+    metadb.set_setting("backend", "local-out-of-core", scope="global")
+    metadb.set_setting("backend", "local-subprocess", scope="user", scope_id="prefalice")
+    try:
+        assert d.pick_runner(plan).name == "local-out-of-core"            # no uid → workspace default
+        assert d.pick_runner(plan, "prefalice").name == "local-subprocess"  # per-user override wins
+        assert d.pick_runner(plan, "prefbob").name == "local-out-of-core"   # other user → workspace default
+    finally:
+        metadb.set_setting("backend", "", scope="global")  # don't leak a global runner choice to other tests
+
+
 def test_sandbox_blocks_dunder_escape():
     # the classic ().__class__.__mro__ escape must be rejected (finding #4)
     code = "def fn(row):\n    row['x'] = ().__class__.__mro__[-1].__subclasses__()\n    return row"

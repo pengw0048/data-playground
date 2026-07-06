@@ -4,7 +4,7 @@ the execution routes (and where a run writes). Split out of main.py; all authed 
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
@@ -14,6 +14,7 @@ from kernel.agent import agent_status, run_agent
 from kernel.deps import get_deps
 from kernel.executors.preview import preview_node
 from kernel.executors.schema import schema_for_graph
+from kernel.security import current_user
 from kernel.graph import upstream_chain
 from kernel.settings import settings
 from kernel.models import (
@@ -145,24 +146,24 @@ def _row_estimate(req_graph, target_node_id, deps) -> int | None:
 
 
 @router.post("/run/estimate", response_model=RunEstimate)
-def run_estimate(req: EstimateRequest) -> RunEstimate:
+def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunEstimate:
     deps = get_deps()
     _reject_invalid(req.graph, deps)
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
     rows = _row_estimate(req.graph, req.target_node_id, deps)
-    return deps.pick_runner(plan).estimate(plan, rows)
+    return deps.pick_runner(plan, uid).estimate(plan, rows)
 
 
 @router.post("/run", response_model=RunStatus)
-def run(req: RunRequest) -> RunStatus:
+def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
     deps = get_deps()
     _reject_invalid(req.graph, deps)
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
-    runner = deps.pick_runner(plan)
+    runner = deps.pick_runner(plan, uid)
     rows = _row_estimate(req.graph, req.target_node_id, deps)
     est = runner.estimate(plan, rows)
     if est.needs_confirm and not req.confirmed:

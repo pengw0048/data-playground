@@ -20,9 +20,14 @@ const CATS: { id: string; label: string; icon: IconName }[] = [
   { id: 'destinations', label: 'Destinations', icon: 'export' },
 ]
 
+// sentinel for the runner select's "inherit the workspace default" option (Radix Select forbids an
+// empty-string value); on save it maps back to '' so the per-user setting clears the override.
+const INHERIT = '__default__'
+
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const kernelInfo = useStore((s) => s.kernelInfo)
   const [g, setG] = useState<Record<string, unknown>>({})
+  const [u, setU] = useState<Record<string, unknown>>({})  // per-user settings (scope='user')
   const [loading, setLoading] = useState(true)
   const [savedMsg, setSavedMsg] = useState('')
   const [dest, setDest] = useState({ name: '', backend: 'local', root: '' })
@@ -30,7 +35,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    api.getSettings().then((s) => setG(s.global)).catch(() => {}).finally(() => setLoading(false))
+    api.getSettings().then((s) => { setG(s.global); setU(s.user) }).catch(() => {}).finally(() => setLoading(false))
   }, [])
 
   const val = (k: string) => (g[k] == null ? '' : String(g[k]))
@@ -39,11 +44,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const obj = (g.objectStore && typeof g.objectStore === 'object' ? g.objectStore : {}) as Record<string, string>
   const setObj = (k: string, v: string) => setG((prev) => ({ ...prev, objectStore: { ...(prev.objectStore as object ?? {}), [k]: v } }))
   const save = async () => {
-    for (const k of ['agentModel', 'agentApiKey', 'agentBaseUrl', 'backend']) {
+    for (const k of ['agentModel', 'agentApiKey', 'agentBaseUrl']) {
       await api.putSetting('global', k, g[k] ?? '').catch(() => {})
     }
     await api.putSetting('global', 'destinations', dests).catch(() => {})
     await api.putSetting('global', 'objectStore', obj).catch(() => {})
+    // the runner is a per-user preference; the sentinel means "inherit the workspace default"
+    await api.putSetting('user', 'backend', u.backend === INHERIT ? '' : (u.backend ?? '')).catch(() => {})
     setSavedMsg('Saved'); setTimeout(() => setSavedMsg(''), 1400)
   }
   const addDest = () => {
@@ -94,13 +101,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
                 <Section id="execution" title="Execution backend">
                   <Field label="Runner">
-                    <Select value={val('backend') || runners[0]} onValueChange={(v) => set('backend', v)}>
+                    <Select value={(u.backend ? String(u.backend) : INHERIT)} onValueChange={(v) => setU((p) => ({ ...p, backend: v }))}>
                       <SelectTrigger><SelectValue /></SelectTrigger>
                       <SelectContent>
+                        <SelectItem value={INHERIT}>Workspace default{g.backend ? ` (${String(g.backend)})` : ` (${runners[0]})`}</SelectItem>
                         {runners.map((r) => <SelectItem key={r} value={r}>{r}</SelectItem>)}
                       </SelectContent>
                     </Select>
                   </Field>
+                  <div className="-mt-1 text-[10.5px] text-muted-foreground">Your preference for your own runs — falls back to the workspace default.</div>
                 </Section>
 
                 <Section id="destinations" title="Destinations">
