@@ -45,6 +45,10 @@ class LocalRunner:
         self.storage = storage if storage is not None else make_storage(workspace)
         self.on_complete = None  # optional (graph, target, status) hook — Deps wires it to run-history persistence
         self.on_status = None    # optional (graph, status) hook fired on each transition — DB-backed live status
+        # optional result-cache hooks (Deps wires them to the DB-backed content-addressed store, so
+        # reuse survives restart + is shared across instances). Absent → fall back to the in-process dict.
+        self.result_get = None   # (key) -> {uri, table, rows} | None
+        self.result_put = None   # (key, doc) -> None
         # keep the SAME dict object deps passes (plugins fill it AFTER construction) — an
         # empty {} is falsy, so `or {}` would rebind a new dict and drop plugin lowerings.
         self.node_lowerings = node_lowerings if node_lowerings is not None else {}
@@ -104,6 +108,56 @@ class LocalRunner:
                         for e in graph.edges if e.source in ids and e.target in ids)
         return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
+    def _plan_cacheable(self, graph: Graph, target: str | None) -> bool:
+        """A node can opt OUT of result reuse (config.cacheable is False) — e.g. a non-deterministic
+        transform. Opting one node out makes the whole plan non-cacheable (its result isn't
+        reproducible), so neither read nor write the cache. (Append is handled separately in the write.)"""
+        from kernel.section import _descendants
+        chain = list(g.upstream_chain(graph, target) if target else g.topo_order(graph))
+        nodes = list(chain)
+        for n in chain:
+            if n.type == "section":
+                nodes += _descendants(graph, n.id)
+        for n in nodes:
+            cfg = n.data.get("config", {}) if isinstance(n.data, dict) else {}
+            if cfg.get("cacheable") is False:
+                return False
+        return True
+
+    def _cache_get(self, key: str) -> dict | None:
+        if self.result_get:  # DB-backed shared/persistent store (Deps-wired)
+            try:
+                return self.result_get(key)
+            except Exception:  # noqa: BLE001 — a cache miss is always safe (recompute)
+                return None
+        with self._lock:
+            return self._cache.get(key)
+
+    def _cache_put(self, key: str, doc: dict) -> None:
+        if self.result_put:
+            try:
+                self.result_put(key, doc)
+            except Exception:  # noqa: BLE001 — never let caching break a successful run
+                pass
+            return
+        with self._lock:
+            self._cache[key] = doc
+
+    def _output_exists(self, uri: str) -> bool:
+        """Store-aware existence: a persisted result pointer is only reusable if its artifact is still
+        there. os.path.exists is wrong for object stores (s3/gs) — probe via the adapter instead. On
+        ANY uncertainty return False, so we RECOMPUTE rather than serve a missing/stale artifact."""
+        if not uri:
+            return False
+        if "://" not in uri or uri.startswith("file://"):
+            p = uri[len("file://"):] if uri.startswith("file://") else uri
+            return os.path.exists(p)
+        try:
+            self.resolve_adapter(uri).schema(uri)  # reads object metadata; missing → raises → recompute
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     # -- run --------------------------------------------------------------- #
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
             placement: Placement) -> RunStatus:
@@ -148,8 +202,8 @@ class LocalRunner:
         status.status = "running"
         self._emit(graph, status)
         phash = self._plan_hash(graph, target)
-        with self._lock:
-            cached = self._cache.get(phash)
+        cacheable = self._plan_cacheable(graph, target)
+        cached = self._cache_get(phash) if cacheable else None
         engine = LoweringEngine(graph, self.resolve_adapter, self.registry, full=True,
                                 node_lowerings=self.node_lowerings, node_specs=self.node_specs)
         nm = g.node_map(graph)
@@ -185,8 +239,8 @@ class LocalRunner:
                     status.rows_processed = rows_seen
 
                 status.status = "done"
-                with self._lock:
-                    self._cache[phash] = {"rows": rows_seen, "uri": status.output_uri, "table": status.output_table}
+                if cacheable:
+                    self._cache_put(phash, {"rows": rows_seen, "uri": status.output_uri, "table": status.output_table})
             except Exception as e:  # noqa: BLE001
                 if cancel.is_set():
                     status.status = "cancelled"  # an interrupted step is a cancel, not a failure
@@ -226,7 +280,7 @@ class LocalRunner:
         mode = cfg.get("writeMode", "overwrite")
         # content-addressed skip: an identical overwrite plan already wrote this, so re-running is a
         # no-op. append is NOT idempotent (it must add a part every run), so it never uses the cache.
-        if mode != "append" and cached and cached.get("table") and cached.get("uri") and os.path.exists(cached["uri"]):
+        if mode != "append" and cached and cached.get("table") and cached.get("uri") and self._output_exists(cached["uri"]):
             status.output_uri, status.output_table = cached["uri"], cached["table"]
             return int(cached.get("rows") or 0)
         # the output file name (the extension picks the format); `name` (its base) is the catalog table.

@@ -129,6 +129,17 @@ class CatalogEdge(Base):
     __table_args__ = (UniqueConstraint("parent", "child", name="uq_catalog_edge"),)
 
 
+class ResultCache(Base):
+    """Content-addressed result index: a run plan's content hash → where its output landed (uri /
+    table / rows / fmt, as JSON). Persisted + shared so a completed run's output is REUSED across
+    kernel restarts AND across stateless web instances — the old in-process dict was per-process and
+    lost on restart. Not authoritative data: a miss just recomputes, so it's safe to prune (newest N)."""
+    __tablename__ = "result_cache"
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    doc: Mapped[str] = mapped_column(Text)  # {uri, table, rows, fmt}
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class Setting(Base):
     __tablename__ = "settings"
     # scope 'global' (scope_id='') for system settings; scope 'user' (scope_id=user id) for prefs
@@ -367,6 +378,34 @@ def get_run_state(run_id: str) -> dict | None:
     with session() as s:
         r = s.get(RunState, run_id)
         return json.loads(r.doc) if r else None
+
+
+_RESULT_CACHE_MAX = 1000  # persistent equivalent of the old in-process _MAX_RUNS cache cap
+
+
+def get_result(key: str) -> dict | None:
+    """The stored result pointer ({uri, table, rows, fmt}) for a plan's content hash, or None."""
+    with session() as s:
+        r = s.get(ResultCache, key)
+        return json.loads(r.doc) if r else None
+
+
+def put_result(key: str, doc: dict) -> None:
+    """Upsert a completed run's result pointer, then prune to the newest N (safe: a miss recomputes)."""
+    with session() as s:
+        r = s.get(ResultCache, key)
+        payload = json.dumps(doc, default=str)
+        if r is None:
+            s.add(ResultCache(key=key, doc=payload))
+        else:
+            r.doc = payload
+        s.flush()
+        stale = s.scalars(select(ResultCache.key).order_by(ResultCache.created_at.desc())
+                          .offset(_RESULT_CACHE_MAX)).all()
+        for k in stale:
+            obj = s.get(ResultCache, k)
+            if obj:
+                s.delete(obj)
 
 
 def catalog_upsert_entry(uri: str, name: str, doc: dict) -> None:

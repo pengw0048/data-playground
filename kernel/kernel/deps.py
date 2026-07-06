@@ -88,6 +88,18 @@ def _persist_run_state(graph, status) -> None:
     metadb.save_run_state(status.run_id, status.model_dump(), canvas_id=getattr(graph, "id", None))
 
 
+def _result_get(key):
+    """Runner result-cache read hook: the DB-backed content-addressed result index (survives restart +
+    shared across stateless instances), replacing the runner's per-process dict."""
+    from kernel import metadb
+    return metadb.get_result(key)
+
+
+def _result_put(key, doc) -> None:
+    from kernel import metadb
+    metadb.put_result(key, doc)
+
+
 class Deps:
     def __init__(self, workspace: str, data_dir: str):
         self.workspace = workspace
@@ -120,6 +132,8 @@ class Deps:
                                   storage=self.storage)
         self.runner.on_complete = _persist_run  # keep finished runs with their canvas (run history)
         self.runner.on_status = _persist_run_state  # mirror live status to the DB (stateless-web reads)
+        self.runner.result_get = _result_get  # DB-backed content-addressed result reuse (cross-run/restart)
+        self.runner.result_put = _result_put
         from kernel.subprocess_runner import SubprocessRunner
         # a second, real backend: run jobs in an isolated OS process (Settings → Execution). Selected
         # by name via pick_runner; pod/Ray runners install as plugins over the same protocol.

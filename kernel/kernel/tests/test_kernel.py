@@ -1568,6 +1568,36 @@ def test_plan_hash_includes_section_children():
     assert r._plan_hash(graph_with("amount > 0"), "wr") == r._plan_hash(graph_with("amount > 0"), "wr")
 
 
+def test_completed_run_result_is_db_cached(tmp_path):
+    # A2: a finished run persists its result pointer to the shared DB (result_cache), so it's reused
+    # across a kernel restart / another stateless instance — not just the accepting process's dict.
+    from kernel import metadb
+    from kernel.models import Graph
+    p = _seq_parquet(tmp_path)
+    gd = {"id": "c", "version": 1, "nodes": [N("src", "source", {"uri": p}), N("wr", "write", {"name": "a2cache"})],
+          "edges": [E("src", "wr")]}
+    st = _poll(client.post("/api/run", json={"graph": gd, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
+    assert st["status"] == "done"
+    phash = get_deps().runner._plan_hash(Graph(**gd), "wr")
+    c = metadb.get_result(phash)
+    assert c and c.get("uri") and c.get("table")                 # persisted to the shared DB
+    assert get_deps().runner._cache_get(phash)["table"] == c["table"]  # a fresh instance reads the same pointer
+
+
+def test_plan_cacheable_opt_out():
+    # A2: a node with config.cacheable=False makes the whole plan non-cacheable (non-deterministic op),
+    # so its result is neither stored nor reused.
+    from kernel.models import Graph
+    r = get_deps().runner
+    base = lambda extra: Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        {"id": "xf", "type": "transform", "position": {"x": 0, "y": 0},
+         "data": {"config": {"source": "adhoc", "mode": "map", "code": "def fn(row):\n    return row", **extra}}},
+    ], "edges": [E("src", "xf")]})
+    assert r._plan_cacheable(base({}), "xf") is True
+    assert r._plan_cacheable(base({"cacheable": False}), "xf") is False
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).

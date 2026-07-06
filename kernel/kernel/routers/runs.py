@@ -145,6 +145,23 @@ def _row_estimate(req_graph, target_node_id, deps) -> int | None:
     return max(counts) if counts else None
 
 
+def _cached_noop(runner, graph, target) -> bool:
+    """True if this exact plan already has a reusable result — re-running just re-points at an existing
+    output, so it needs no size confirmation (fixes the 'full cache hit still prompts' false gate)."""
+    if not all(hasattr(runner, m) for m in ("_plan_hash", "_plan_cacheable", "_cache_get", "_output_exists")):
+        return False
+    try:
+        if not runner._plan_cacheable(graph, target):
+            return False
+        c = runner._cache_get(runner._plan_hash(graph, target))
+        if c is None:
+            return False
+        uri = c.get("uri")
+        return (not uri) or runner._output_exists(uri)  # non-sink hit (rows cached) OR the artifact still exists
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @router.post("/run/estimate", response_model=RunEstimate)
 def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunEstimate:
     deps = get_deps()
@@ -153,7 +170,11 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
     rows = _row_estimate(req.graph, req.target_node_id, deps)
-    return deps.pick_runner(plan, uid).estimate(plan, rows)
+    runner = deps.pick_runner(plan, uid)
+    est = runner.estimate(plan, rows)
+    if est.needs_confirm and _cached_noop(runner, req.graph, req.target_node_id):
+        est.needs_confirm = False  # reusing a cached result is a no-op, not a big pass
+    return est
 
 
 @router.post("/run", response_model=RunStatus)
@@ -166,7 +187,7 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
     runner = deps.pick_runner(plan, uid)
     rows = _row_estimate(req.graph, req.target_node_id, deps)
     est = runner.estimate(plan, rows)
-    if est.needs_confirm and not req.confirmed:
+    if est.needs_confirm and not req.confirmed and not _cached_noop(runner, req.graph, req.target_node_id):
         raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
     status = runner.run(plan, req.graph, req.target_node_id, est.placement)
     deps.run_index[status.run_id] = runner  # so status/cancel/ws reach the right runner
