@@ -66,10 +66,29 @@ def _collect_subnodes(engine, node) -> dict:
         for k in kids:
             data = k.data if isinstance(k.data, dict) else {}
             alias = str(data.get("title") or k.id).strip()
-            out[alias] = {"alias": alias, "type": k.type, "config": data.get("config", {}) or {}}
+            # keep the node id so run() can carry this kid's own contained subtree (nested sections)
+            out[alias] = {"alias": alias, "type": k.type, "config": data.get("config", {}) or {}, "id": k.id}
         return out
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
     return {s["alias"]: s for s in (cfg.get("subnodes") or []) if s.get("alias")}
+
+
+def _descendants(graph, root_id: str) -> list:
+    """Every node contained (transitively) inside root_id, via parent_id — for nested sections."""
+    kids_by_parent: dict = {}
+    for n in graph.nodes:
+        pid = getattr(n, "parent_id", None)
+        if pid:
+            kids_by_parent.setdefault(pid, []).append(n)
+    out, stack, seen = [], list(kids_by_parent.get(root_id, [])), set()
+    while stack:
+        n = stack.pop()
+        if n.id in seen:
+            continue
+        seen.add(n.id)
+        out.append(n)
+        stack.extend(kids_by_parent.get(n.id, []))
+    return out
 
 
 def run_section(engine, node, inputs):
@@ -101,8 +120,17 @@ def run_section(engine, node, inputs):
             raise SectionError(f"section calls unknown node '{alias}'")
         data = kw.pop("data", None)  # a handle to bind as this node's input
         conf = {**(spec.get("config") or {}), **kw}  # remaining kwargs override config (e.g. prompt=…)
-        mini = Graph(id="_sec", version=1, edges=[], nodes=[
-            GraphNode(id=alias, type=spec["type"], position=Position(x=0, y=0), data={"config": conf})])
+        nodes = [GraphNode(id=alias, type=spec["type"], position=Position(x=0, y=0), data={"config": conf})]
+        # nested sections: carry the aliased node's contained subtree so, when it's itself a section,
+        # its own children resolve. Their parent_id points at the ORIGINAL node id (not `alias`), so
+        # reparent the direct children onto `alias`; deeper descendants keep their original parent.
+        orig = spec.get("id")
+        if orig:
+            for n in _descendants(engine.graph, orig):
+                pid = alias if getattr(n, "parent_id", None) == orig else getattr(n, "parent_id", None)
+                nodes.append(GraphNode(id=n.id, type=n.type, position=n.position,
+                                       data=(n.data if isinstance(n.data, dict) else {}), parent_id=pid))
+        mini = Graph(id="_sec", version=1, edges=[], nodes=nodes)
         sub = LoweringEngine(mini, engine.resolve_adapter, engine.registry, full=True,
                              node_lowerings=engine.node_lowerings, node_specs=engine.node_specs,
                              bound_inputs={alias: data} if data is not None else None,

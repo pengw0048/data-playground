@@ -1486,6 +1486,27 @@ def test_section_runs_its_parentid_children(tmp_path):
     assert out["rowCount"] == 300  # the contained 'keep' filter kept v < 300
 
 
+def test_section_nests_multiple_levels_by_parentid(tmp_path):
+    # visual containment nests: a section contained in another section (parentId) runs, and its own
+    # contained node resolves — outer.run('inner') carries inner's subtree so inner.run('keep') works.
+    p = _seq_parquet(tmp_path)  # v = 0..999
+    keep = {"id": "k1", "type": "filter", "parentId": "inner", "position": {"x": 0, "y": 0},
+            "data": {"title": "keep", "config": {"predicate": "v < 300"}}}
+    inner = {"id": "inner", "type": "section", "parentId": "outer", "position": {"x": 0, "y": 0},
+             "data": {"title": "inner", "config": {"script": "emit(run('keep', data=inputs['in']))\n",
+                                                   "subnodes": [], "params": {}, "maxRuns": 50}}}
+    outer = {"id": "outer", "type": "section", "position": {"x": 0, "y": 0},
+             "data": {"title": "outer", "config": {"script": "emit(run('inner', data=inputs['in']))\n",
+                                                   "subnodes": [], "params": {}, "maxRuns": 50}}}
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": p}), outer, inner, keep, N("wr", "write", {"name": "sec_nested"}),
+    ], "edges": [E("src", "outer"), E("outer", "wr")]}
+    st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
+    assert st["status"] == "done"
+    out = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_sec_nested").uri, "k": 5}).json()
+    assert out["rowCount"] == 300  # outer → inner → keep(v<300), nested two levels deep
+
+
 def test_section_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),

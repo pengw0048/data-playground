@@ -193,7 +193,11 @@ export function Canvas() {
   // Dropping a node onto a section makes it a contained child (parentId); dragging it out detaches
   // it. Coordinates convert between absolute (top-level) and relative-to-section on the boundary.
   const onNodeDragStop = useCallback((e: MouseEvent | TouchEvent, dragged: Node) => {
-    if (dragged.type === 'section') return // don't nest sections (one level for now)
+    // visual drag-containment is one level: section frames are a fixed size, so a same-size section
+    // can't sit cleanly inside another. Nested logic is expressed in the driver script instead — a
+    // section's script can run() another section (the engine carries the nested subtree; see
+    // kernel/section.py run()/_descendants and test_section_nests_multiple_levels_by_parentid).
+    if (dragged.type === 'section') return
     const nodes = useStore.getState().doc.nodes
     const cur = nodes.find((n) => n.id === dragged.id)
     const curParent = cur?.parentId ?? null
