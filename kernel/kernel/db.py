@@ -19,6 +19,8 @@ Temp view names are still process-globally unique so names never collide across 
 from __future__ import annotations
 
 import itertools
+import os
+import tempfile
 import threading
 from contextlib import contextmanager
 from typing import Iterator
@@ -38,6 +40,14 @@ def lock() -> threading.RLock:
     return _lock
 
 
+def _spill_dir() -> str:
+    """The on-disk spill location — where DuckDB writes external sort/hash/aggregate temp files and
+    where the Python-transform spill lands. Operator-controllable via DP_SPILL_DIR."""
+    d = os.environ.get("DP_SPILL_DIR") or os.path.join(tempfile.gettempdir(), "dataplay-spill")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def _apply_session(c: duckdb.DuckDBPyConnection) -> None:
     c.execute("SET enable_progress_bar = false")
     # Do NOT auto-install/auto-load extensions: that let ANY uri (e.g. https://evil/x.parquet)
@@ -46,6 +56,16 @@ def _apply_session(c: duckdb.DuckDBPyConnection) -> None:
     # reaching out. Re-asserted on every per-run cursor (below) since it's a security setting.
     c.execute("SET autoinstall_known_extensions = false")
     c.execute("SET autoload_known_extensions = false")
+    # Out-of-core: point DuckDB's temp files at an explicit, operator-controllable dir so large
+    # sorts/joins/aggregates spill to disk instead of failing (robust across versions + lets a deploy
+    # put spill on fast/roomy disk). DP_MEMORY_LIMIT optionally caps per-kernel RAM (multi-tenant).
+    try:
+        c.execute("SET temp_directory = ?", [_spill_dir()])
+        ml = os.environ.get("DP_MEMORY_LIMIT")
+        if ml:
+            c.execute("SET memory_limit = ?", [ml])
+    except Exception:  # noqa: BLE001 — never let a tuning knob block the connection
+        pass
 
 
 def _base_conn() -> duckdb.DuckDBPyConnection:

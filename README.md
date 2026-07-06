@@ -32,8 +32,9 @@ dataplay --workspace ./my-proj --port 8471
 - **See inside every step** — click a node's eye to see the real rows + schema flowing out of it, on
   a bounded sample, instantly. Media columns render thumbnails; vector columns get an inspector.
 - **Run at scale, out-of-core** — the same graph runs over the full dataset. The default engine is
-  DuckDB + Polars + Arrow: joins/aggregations/sorts spill to disk instead of crashing. Verified at
-  8M rows in ~0.1s on a laptop.
+  DuckDB + Polars + Arrow: joins/aggregations/sorts spill to disk instead of crashing. Measured: it
+  sorted a **4.7 GB / 240M-row** dataset under a **1.3 GiB memory cap** (spilling 4.9 GB to disk) —
+  peak RSS tracks the memory cap, not the data size. See [docs/BENCHMARK.md](docs/BENCHMARK.md).
 - **Honest previews (P8)** — global aggregates, writes, and opaque ops say *"needs a full pass"*
   rather than computing a misleading answer on a sample.
 - **Extend it like ComfyUI** — drop a Python package in `<workspace>/plugins/` and your typed node
