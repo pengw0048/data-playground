@@ -44,6 +44,7 @@ class LocalRunner:
         from kernel.storage import make_storage
         self.storage = storage if storage is not None else make_storage(workspace)
         self.on_complete = None  # optional (graph, target, status) hook — Deps wires it to run-history persistence
+        self.on_status = None    # optional (graph, status) hook fired on each transition — DB-backed live status
         # keep the SAME dict object deps passes (plugins fill it AFTER construction) — an
         # empty {} is falsy, so `or {}` would rebind a new dict and drop plugin lowerings.
         self.node_lowerings = node_lowerings if node_lowerings is not None else {}
@@ -102,8 +103,17 @@ class LocalRunner:
             self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()
             self._evict()
+        self._emit(graph, status)  # persist 'queued' before the worker starts (pollable on any instance)
         threading.Thread(target=self._execute, args=(run_id, plan, graph, target_node_id), daemon=True).start()
         return status
+
+    def _emit(self, graph: Graph, status: RunStatus) -> None:
+        """Fire the on_status hook (DB-backed live status); never let persistence break a run."""
+        if self.on_status:
+            try:
+                self.on_status(graph, status)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _evict(self) -> None:
         """Bound retained run/cancel/cache state (called under self._lock). Dicts keep insertion order.
@@ -125,6 +135,7 @@ class LocalRunner:
         cancel = self._cancel[run_id]
         started = time.time()
         status.status = "running"
+        self._emit(graph, status)
         phash = self._plan_hash(graph, target)
         with self._lock:
             cached = self._cache.get(phash)
@@ -157,6 +168,7 @@ class LocalRunner:
                         pn.ms = int((time.time() - t0) * 1000)
                         pn.rows = rows_seen or None
                     status.rows_processed = rows_seen
+                    self._emit(graph, status)  # per-node progress → DB (cross-instance polling sees it advance)
 
                 # if the target is not a sink, force execution to a real row count
                 if target and nm.get(target) and nm[target].type not in ("write",):
@@ -184,6 +196,7 @@ class LocalRunner:
                         pass
                 status.ms = int((time.time() - started) * 1000)
                 status.total_rows = rows_seen
+                self._emit(graph, status)  # persist the terminal status (done/failed/cancelled) to the DB
                 with self._lock:
                     self._cancel.pop(run_id, None)  # done/failed/cancelled → drop the cancel Event
                     self._scopes.pop(run_id, None)

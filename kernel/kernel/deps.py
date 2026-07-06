@@ -75,6 +75,14 @@ def _persist_run(graph, target, status) -> None:
                       rows=status.total_rows, ms=status.ms, error=status.error, output_table=status.output_table)
 
 
+def _persist_run_state(graph, status) -> None:
+    """Runner on_status hook: upsert the run's live status to the shared DB on every transition, so
+    GET /run/{id} + the status WebSocket are answerable from ANY web instance and survive a restart
+    (not just the in-memory dict of the instance that accepted the run)."""
+    from kernel import metadb
+    metadb.save_run_state(status.run_id, status.model_dump(), canvas_id=getattr(graph, "id", None))
+
+
 class Deps:
     def __init__(self, workspace: str, data_dir: str):
         self.workspace = workspace
@@ -103,11 +111,13 @@ class Deps:
                                   node_lowerings=self.node_lowerings, node_specs=self.node_specs,
                                   storage=self.storage)
         self.runner.on_complete = _persist_run  # keep finished runs with their canvas (run history)
+        self.runner.on_status = _persist_run_state  # mirror live status to the DB (stateless-web reads)
         from kernel.subprocess_runner import SubprocessRunner
         # a second, real backend: run jobs in an isolated OS process (Settings → Execution). Selected
         # by name via pick_runner; pod/Ray runners install as plugins over the same protocol.
         sub = SubprocessRunner(workspace, data_dir, catalog=self.catalog)
         sub.on_complete = _persist_run  # record cancelled/crashed isolated runs the child couldn't
+        sub.on_status = _persist_run_state
         self.runners = [self.runner, sub]
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self._load_plugins()

@@ -182,13 +182,17 @@ def _runner_for(run_id: str):
 
 
 def _status_or_lost(run_id: str) -> RunStatus:
-    """This run's live status, or a synthetic TERMINAL status if the kernel no longer knows it —
-    evicted from the bounded run history, or lost to a restart (run state is in-memory). Returning a
-    terminal RunStatus instead of a 404 lets the client resolve the node cleanly instead of
-    exhausting its retry budget and stranding it 'running'."""
+    """This run's status, resolved in order: (1) the owning runner's in-memory status (freshest — this
+    instance ran it); (2) the shared DB (run_states) — so ANOTHER stateless web instance, or this one
+    after a restart, can still answer; (3) a synthetic terminal status. Returning terminal instead of a
+    404 lets the client resolve the node cleanly instead of exhausting its retries and stranding it."""
     try:
         return _runner_for(run_id).status(run_id)
     except KeyError:
+        from kernel import metadb
+        persisted = metadb.get_run_state(run_id)
+        if persisted is not None:
+            return RunStatus(**persisted)
         return RunStatus(run_id=run_id, status="failed",
                          error="run not found — it was evicted or the kernel restarted")
 

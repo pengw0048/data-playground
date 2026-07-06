@@ -1113,6 +1113,39 @@ def test_evict_never_drops_a_running_run():
             r.runs.update(saved)
 
 
+def test_run_state_persists_and_survives_loss_of_memory():
+    # a run's status is mirrored to the shared DB (run_states), so GET /run/{id} still answers after the
+    # owning runner forgets it in memory — the enabler for stateless web instances + restart survival.
+    from kernel import metadb
+    from kernel.deps import get_deps
+    g = {"id": "cv_runstate", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        N("f", "filter", {"predicate": "amount > 0"}),
+    ], "edges": [E("src", "f")]}
+    rid = client.post("/api/run", json={"graph": g, "targetNodeId": "f", "confirmed": True}).json()["runId"]
+    assert _poll(rid)["status"] == "done"
+    assert metadb.get_run_state(rid)["status"] == "done"   # mirrored to the DB on the terminal transition
+    # drop it from every in-memory runner + the index (simulate another instance / a kernel restart)
+    deps = get_deps()
+    for runner in deps.runners:
+        runner.runs.pop(rid, None)
+    deps.run_index.pop(rid, None)
+    got = client.get(f"/api/run/{rid}").json()
+    assert got["status"] == "done"                          # resolved from the DB, not the synthetic terminal
+    assert "not found" not in (got.get("error") or "")
+
+
+def test_reconcile_marks_orphaned_runs_interrupted():
+    # a run left 'running' when the kernel stopped must be reconciled to terminal on startup, else a
+    # client would poll it forever (the persisted status would say 'running' with no executor behind it).
+    from kernel import metadb
+    metadb.save_run_state("run_orphan_x", {"run_id": "run_orphan_x", "status": "running", "per_node": []})
+    assert metadb.get_run_state("run_orphan_x")["status"] == "running"
+    assert metadb.reconcile_orphaned_runs() >= 1
+    d = metadb.get_run_state("run_orphan_x")
+    assert d["status"] == "failed" and "restart" in (d.get("error") or "")
+
+
 def test_collab_relay_gates_viewer_doc_updates(monkeypatch):
     # a viewer may watch (presence + peers' edits) but its OWN doc updates ('yjs' carries CRDT state)
     # must NOT be relayed — else an editor peer would merge + autosave them, laundering a change past
