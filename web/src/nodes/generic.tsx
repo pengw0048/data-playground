@@ -6,6 +6,7 @@ import { register, getSpec, type NodeComponentProps } from './registry'
 import { NodeCard } from './NodeCard'
 import { useStore } from '../store/graph'
 import { Field, MiniInput, MiniSelect } from '../ui/controls'
+import { CodeSnippet } from '../ui/CodeSnippet'
 import { color } from '../theme/tokens'
 import type { BackendNodeSpec } from '../api/client'
 import type { WireType } from '../theme/tokens'
@@ -86,9 +87,28 @@ function NumberField({ value, isInt, onCommit }: { value: unknown; isInt: boolea
 
 function GenericNode({ id, data }: NodeComponentProps) {
   const spec = backendSpecs[useStore((s) => s.doc.nodes.find((n) => n.id === id))?.type ?? '']
+  const openFullscreen = useStore((s) => s.openCodeFullscreen)
+  // code params (python/sql) can't render as a plain field — give them the same snippet-preview
+  // button the hand-built cards use, opening the one fullscreen editor. Without this a plugin node
+  // that declares a code param had no editor at all in the generic card.
+  const codeParams = (spec?.params ?? []).filter((p) => p.type === 'code')
   return (
     <NodeCard id={id} data={data} metaOverride={spec?.blurb}>
-      <NodeParamFields nodeId={id} />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <NodeParamFields nodeId={id} />
+        {codeParams.map((p) => {
+          const lang = p.lang === 'sql' ? 'sql' : 'python'
+          const code = String((data.config as any)[p.name] ?? p.default ?? '')
+          return (
+            <button key={p.name}
+              onClick={(e) => { e.stopPropagation(); openFullscreen(id, p.name, p.lang) }}
+              title={`Edit ${p.label ?? p.name}`}
+              className="block w-full cursor-text overflow-hidden text-ellipsis whitespace-pre rounded-md border border-border bg-[var(--code-bg)] px-2.5 py-2 text-left text-[10.5px] leading-[1.4]">
+              <CodeSnippet code={(code || `# ${p.label ?? p.name}`).split('\n').slice(0, 3).join('\n')} language={lang} />
+            </button>
+          )
+        })}
+      </div>
     </NodeCard>
   )
 }
