@@ -65,7 +65,7 @@ def cancel_unit(handle: UnitHandle) -> None
 
 **存在性检查**:`has(key)` 必须查**真实 store**(本地 AND 对象存储)。现有 skip 用 `os.path.exists`(runner.py:218),对 s3/gs **永远 False** → 天真复用在最常见的部署场景(README "Scaling out")静默失效。
 
-**保留/GC**:持久共享 store 需要引用计数 / TTL / 保留策略(进程内 `_MAX_RUNS` 驱逐无等价物)—— 否则要么无限增长,要么驱逐掉别人还在复用的 ref。
+**保留/GC**:持久共享 store 用**引用计数 + TTL**(refcount 防止驱逐仍被下游/其他 run 复用的 ref;TTL 兜底回收长期无人引用的)。进程内 `_MAX_RUNS` 驱逐无等价物,故必须显式设计。
 
 ## 4. 放置计划器(Planner)
 
@@ -77,8 +77,8 @@ def cancel_unit(handle: UnitHandle) -> None
 4. **物化点(精确规则)**:一个节点是物化点 ⟺ 它是 sink(write) **或** 任一出边**跨 target 边界** **或** 它 feed **>1** 个否则会重算它的单元 **或** 用户打了 checkpoint。所有消费者(本地/远端)都读它的 ref。(这消解了"融进 D1 → D2 没 ref 可读"的 fan-out 歧义。)
 5. **port 感知**:节点可多输出 `{port→Relation}`(engine.py:73),section 多命名端口,write 按 source_handle 路由。**ResultRef 按 (单元, 输出 port)**;多输出单元写 N 个 ref;下游按 source_handle 解析。
 6. **保住快路径**:
-   - **branch**:谓词在**消费者**侧应用(engine.py:112),branch 本身是直通。若在 branch 处物化,会物化**未过滤**的关系;要么在 branch 处物化**两个已过滤的 ref**,要么把 branch 谓词 + handle 带进下游单元让它读 ref 后再过滤。**二选一(待定)**。
-   - **Lance 原生 ANN**:vector-search 只在输入是**裸 .lance 源**(中间无算子)时走原生 nearest();一旦在 Lance 源与 vector-search 间插入 parquet 边界 → 退化为 O(N) 暴力扫描,且 parquet ref 带不了 Lance 索引。→ 让 vector-search 与其 Lance 源**留在同一单元**(不插边界),或让 ResultRef 能引用 **Lance URI**(不只 parquet)。
+   - **branch**:不适用 —— branch 不是节点类型(流程控制 = section);残留的 `_route_branch` 死代码已移除。
+   - **Lance 原生 ANN**:vector-search 只在输入是**裸 .lance 源**时走原生 nearest();若在 Lance 源与 search 间插入 **parquet** 边界会退化为 O(N) 暴力扫描。→ 物化边界**按下游快路径选格式**:vector-search 的上游边界物化成**带向量索引的 Lance 表**(ResultRef 支持 Lance 格式),search 读这张 persisted indexed Lance 表 → 原生 ANN 跨边界存活。它俩因此**可以分到不同单元**。
 7. **执行**:单元 DAG 拓扑序(无依赖可并行),各单元交 target 后端 `run_unit`;controller 聚合状态。MVP 调度:首个满足的空闲 worker(带 §2.3 的 reserve/lease,避免并发双占)。
 
 ## 5. 物化与可观测 —— "还能不能看中间节点的数据?"(评审 + 用户重点)
@@ -116,18 +116,20 @@ def cancel_unit(handle: UnitHandle) -> None
 
 - **Phase A — 持久化本地 ResultStore(真价值、单进程、零分布式)**:给现有 `LocalRunner` 加一个本地(+ 可选 s3)持久 ResultStore,做**跨运行复用 + resume**。前置必做:§3 的 key 加固(section 后代 + transform 代码 + 对象存储内容指纹)、`append`/`cacheable=false` 绕过、**store-aware `has()`**(不是 `os.path.exists`)、cache-aware `estimate()`(修假 confirm)。**再加 §5 的物化状态**(节点 ●/○ + checkpoint)——此时"物化"就是"写进本地 store"。这是最小的、能独立交付价值的一步。
 - **Phase B — 控制面重构(无行为变化)**:引入 `RunController`(即使只有一个本地后端);KernelInfo **加** `backends[]` 字段;节点 `requires`(纯元数据 + UI)。为 `ExecutionBackend` 的可选方法定契约、bump `CORE_API_VERSION`;旧后端走退化路径。
-- **Phase C — 本地多进程 pool 参考后端 + 真放置**:pod=子进程、能力可配;`workers()/place()/run_unit`;planner 的 per-node 放置 + 边界物化 + fan-out/port/branch/Lance 处理。**无需 k8s 即可演示/测试**"GPU 之外全真"。前置:图切分 + 把被切的边重写成"ref-source"节点(让子图从物化 parquet 起,而不是原始源)+ 新的 child 入口模式(现有 `subrun.py` 跑整图,不够)。注意**worker 复用跨租户会重新引入进程内状态泄漏**(削弱刚加的 subprocess 隔离)—— pool 的租户策略要定。
+- **Phase C — 本地多进程 pool 参考后端 + 真放置**:pod=子进程、能力可配;`workers()/place()/run_unit`;planner 的 per-node 放置 + 边界物化 + fan-out/port/Lance 处理。**无需 k8s 即可演示/测试**"GPU 之外全真"。前置:图切分 + 把被切的边重写成"ref-source"节点(让子图从物化产物起,而不是原始源)+ 新的 child 入口模式(现有 `subrun.py` 跑整图,不够)。**worker 复用 = 用户可选、类 Jupyter kernel**:默认每 run 新进程(强隔离,延续刚加的 subprocess 默认);用户可显式 **attach 一个持久、可重启的 compute session**(跨 run 复用、快,代价是进程内跨 run 状态不再天然清空 —— 由用户主动选择 + 可重启来管理,正如 Jupyter 重启 kernel)。
 - **Phase D — 插件后端**:Ray(`run_unit`=一个 Ray job)、k8s-pod;跨实例 ownership+heartbeat(§8)。
 
 ## 10. 开源边界
 - **OSS 内**:全部 SPI + 模型 + planner + 本地多进程 pool 参考后端 + local/s3 ResultStore + 物化状态 UI + Compute UI。→ 完全可用、可演示、可测。
 - **插件(可开源可专有)**:Ray backend、k8s-pod backend、专有调度器/排队。
 
-## 11. 待你拍板的关键决定
-1. **`requires` 不进内容 key**(内容 = 输入+config+代码,不含"在哪跑")—— 认可?
-2. **section 是放置不透明的原子单元**(不下钻;captioning 要么独立 transform 节点、要么整个 section 放 GPU worker)—— 认可?
-3. **branch 跨边界**:在 branch 处物化两个已过滤 ref,还是把谓词带进下游单元?
-4. **Lance 源 + vector-search 不被边界拆开**(留同一单元 / 或 ResultRef 支持 Lance URI)—— 倾向?
-5. **路线从 Phase A(持久本地 ResultStore + 物化可观测)起步**,而不是原来的纯元数据 P0 —— 认可?
-6. **pool worker 是否跨 run/租户复用进程**(复用=快但削弱隔离;每 run 新进程=隔离但慢)—— 倾向?
-7. 缓存/store 的**保留/GC 策略**(引用计数 / TTL / 手动)—— 倾向?
+## 11. 决定(评审已定)
+1. ✅ **`requires` 不进内容 key**(内容 = 输入+config+代码,与"在哪跑"无关)。
+2. ✅ **section 是放置不透明的原子单元**;captioning 要么是独立 transform 节点(自成单元)、要么整个 section 放到 GPU worker。
+3. ✅ **不需要 branch 节点** —— 流程控制统一用 section。branch 从来不是内置节点(nodespecs.py 注释:与两个 filter 冗余),引擎里残留的 `_route_branch` 是**死代码,已移除**;原"branch 跨边界"决定作废。
+4. ✅ **Lance 与 vector-search 可以分开**:把 Lance 边界**物化成带向量索引的 Lance 表**(ResultRef 支持 Lance 格式,不只 parquet),下游 search 直接用这张持久化的 indexed Lance 表 → 原生 ANN 跨边界存活。物化格式按下游快路径选(默认 parquet;需 ANN 时 Lance+index)。
+5. ✅ **路线从 Phase A 起步**(持久本地 ResultStore + 物化可观测),不是原来的纯元数据 P0。
+6. ✅ **worker 复用让用户选,心智模型 = Jupyter kernel**:可 attach 一个持久、可重启的 compute session(跨 run 复用、快),也可用每 run 新进程(强隔离)。默认隔离,attach 为显式选择、可重启。
+7. ✅ **store 保留 = TTL + 引用计数**(refcount 防止驱逐还在被复用的 ref;TTL 兜底回收无人引用的)。
+
+实现时再细化(不阻塞方向):§8 的 run_states 按单元拆行的具体 schema、place() 的 lease 细节、集群 `workers()` 的 TTL 值。
