@@ -70,6 +70,7 @@ export function Canvas() {
   const setNodes = useStore((s) => s.setNodes)
   const setEdges = useStore((s) => s.setEdges)
   const connect = useStore((s) => s.connect)
+  const removeEdge = useStore((s) => s.removeEdge)
   const setParent = useStore((s) => s.setParent)
   const select = useStore((s) => s.select)
   const removeSelected = useStore((s) => s.removeSelected)
@@ -174,6 +175,21 @@ export function Canvas() {
     })
   }, [isValidConnection, connect, doc.nodes])
 
+  // Reroute a wire by dragging an endpoint to a new port (RF onReconnect). Validate the new target
+  // ignoring the edge being moved (so re-dropping on its own port isn't a false "occupied"), then
+  // swap it. Without this a wire could only be changed by deleting a node.
+  const onReconnect = useCallback((oldEdge: Edge, c: Connection) => {
+    const sw = portWire(doc.nodes, c.source!, c.sourceHandle, 'source')
+    const tgt = doc.nodes.find((n) => n.id === c.target)
+    if (!tgt || !canConnect(sw, tgt.type, c.targetHandle)) return
+    const occupied = doc.edges.some((e) => e.id !== oldEdge.id && e.target === c.target
+      && (e.targetHandle ?? null) === (c.targetHandle ?? null))
+    if (occupied) return
+    removeEdge(oldEdge.id)
+    connect({ id: newId('e'), source: c.source!, target: c.target!,
+      sourceHandle: c.sourceHandle, targetHandle: c.targetHandle, data: { wire: (sw ?? 'dataset') as WireType } })
+  }, [doc.nodes, doc.edges, removeEdge, connect])
+
   // Dropping a node onto a section makes it a contained child (parentId); dragging it out detaches
   // it. Coordinates convert between absolute (top-level) and relative-to-section on the boundary.
   const onNodeDragStop = useCallback((e: MouseEvent | TouchEvent, dragged: Node) => {
@@ -273,6 +289,8 @@ export function Canvas() {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
+        onReconnect={onReconnect}
+        onEdgeDoubleClick={(_, edge) => removeEdge(edge.id)}
         onNodeDragStop={onNodeDragStop}
         isValidConnection={isValidConnection}
         onPaneClick={() => { select(null); setMenu(null); useStore.setState({ openPanels: {} }) }}
@@ -291,7 +309,7 @@ export function Canvas() {
         multiSelectionKeyCode={['Meta', 'Shift']}
         deleteKeyCode={null}
       >
-        <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="#d6d9df" />
+        <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="var(--dots)" />  {/* themed: light/dark via --dots */}
         {/* zoom controls sit ABOVE the minimap so they never overlap */}
         <Controls showInteractive={false} position="bottom-left" style={{ marginBottom: 132, marginLeft: 12 }} />
         {/* MiniMap paints to a 2D canvas where CSS vars don't resolve, so maskColor + the nodeColor

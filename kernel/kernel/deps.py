@@ -67,6 +67,11 @@ class Registry:
     def set_catalog(self, catalog) -> None:
         self.deps.catalog = catalog
 
+    def set_importer(self, importer) -> None:
+        # a pipeline importer (§5.6/§7.5). Without one, deps.importer stays the NullImporter → the
+        # /pipelines/import endpoint reports 'not configured' (501), not a broken 500.
+        self.deps.importer = importer
+
 
 def _persist_run(graph, target, status) -> None:
     """Runner on_complete hook: keep a finished run with its canvas (canvas id == graph.id)."""
@@ -90,6 +95,8 @@ class Deps:
         self.adapters = default_adapters()
         self.default_adapter = DuckDBAdapter()
         self.registry = InMemoryProcessorRegistry()
+        from kernel.plugins.importer import NullImporter
+        self.importer = NullImporter()  # replaced by a plugin via reg.set_importer; else /import → 501
         self.capabilities = list(BUILTIN_CAPABILITIES)
         self.node_specs: dict[str, NodeSpec] = {s.kind: s for s in BUILTIN_NODE_SPECS}
         self.builtin_kinds = {s.kind for s in BUILTIN_NODE_SPECS}

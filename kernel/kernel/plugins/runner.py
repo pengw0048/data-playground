@@ -157,9 +157,7 @@ class LocalRunner:
                     if pn:
                         pn.status = "running"
                     t0 = time.time()
-                    if step.kind == "error_gate":
-                        time.sleep(0.02)
-                    elif step.kind == "write":
+                    if step.kind == "write":
                         rows_seen = self._commit_write(nm[step.node_id], graph, engine, status, cached)
                     else:
                         engine.relation(step.node_id)  # lower (lazy) — cheap

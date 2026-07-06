@@ -1161,6 +1161,15 @@ def test_catalog_entries_are_shared_across_instances(tmp_path):
     assert other.get_table("shared_out_x").uri == uri
 
 
+def test_pipelines_import_reports_not_configured():
+    # with no importer plugin, the endpoint must HONESTLY report 501 not-configured — it used to 400
+    # with an AttributeError because Deps had no .importer attr (dead scaffolding). Now deps.importer
+    # defaults to NullImporter → ImporterNotConfigured → 501.
+    r = client.post("/api/pipelines/import", json={"config": "x", "params": {}})
+    assert r.status_code == 501
+    assert "importer" in r.text.lower()
+
+
 def test_collab_relay_gates_viewer_doc_updates(monkeypatch):
     # a viewer may watch (presence + peers' edits) but its OWN doc updates ('yjs' carries CRDT state)
     # must NOT be relayed — else an editor peer would merge + autosave them, laundering a change past

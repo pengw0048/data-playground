@@ -1,7 +1,8 @@
 /* Data Playground — global styles. Tokens mirror src/theme/tokens.ts. */
 @import '@xyflow/react/dist/style.css';
 
-/* Tailwind + shadcn/ui (Preflight is disabled in tailwind.config.js while the UI is mid-migration). */
+/* Tailwind + shadcn/ui. Preflight is ON (tailwind.config.js) — shadcn primitives rely on its native-
+   control reset; app CSS + inline styles declared after @tailwind base still win where they overlap. */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;

@@ -148,8 +148,9 @@ export DP_AGENT_MODEL=anthropic/claude-opus-4-8   && export ANTHROPIC_API_KEY=sk
 # export DP_AGENT_MODEL=ollama/llama3             && export DP_AGENT_BASE_URL=http://localhost:11434  # local, no key
 ```
 
-Without a configured model it falls back to a built-in offline keyword planner, so the feature
-degrades cleanly. The dock shows which is active.
+The agent is optional: with no `DP_AGENT_MODEL` configured, the dock shows "Agent unavailable" and
+the rest of the app works unchanged — there is deliberately no rule-based stand-in that pretends to
+be an LLM. Everything else (build graphs, run, preview) works fully offline without it.
 
 ## License
 

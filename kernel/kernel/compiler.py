@@ -33,16 +33,10 @@ def compile_plan(graph, target_node_id: str | None = None, registry=None, node_s
 
     chain = (g.upstream_chain(graph, target_node_id) if target_node_id else g.topo_order(graph))
     steps: list[PlanStep] = []
-    has_write = False
     for node in chain:
         kind = _STEP_KIND.get(node.type, "op")
-        if node.type == "write":
-            has_write = True
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         mode = cfg.get("mode") if node.type in ("transform", "notebook") else node.type
         steps.append(PlanStep(node_id=node.id, kind=kind, mode=mode,
                               previewable=node_previewable(node, registry, node_specs), label=_label(node)))
-    if has_write:
-        steps.append(PlanStep(node_id="__error_gate__", kind="error_gate", mode="gate",
-                              previewable=False, label="error-rate gate"))
     return CompilePlan(target_node_id=target_node_id, steps=steps, acyclic=True)
