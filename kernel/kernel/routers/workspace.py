@@ -199,6 +199,8 @@ def add_share(canvas_id: str, body: dict, uid: str = Depends(current_user)) -> d
     if metadb.canvas_role(canvas_id, uid) != "owner":
         raise HTTPException(403, "only the owner can share")
     if "visibility" in body:
+        if body["visibility"] not in ("private", "workspace", "workspace_view"):
+            raise HTTPException(400, "invalid visibility")
         metadb.set_visibility(canvas_id, body["visibility"])
     if body.get("userId"):
         metadb.share_canvas(canvas_id, body["userId"], body.get("role", "editor"))

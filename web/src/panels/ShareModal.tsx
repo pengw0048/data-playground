@@ -62,11 +62,11 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
           </div>
           <div>
             <div className={sectionLabel}>Visibility</div>
-            <div className="inline-flex gap-[3px] rounded-md bg-muted p-0.5">
-              {(['private', 'workspace'] as const).map((v) => (
+            <div className="inline-flex flex-wrap gap-[3px] rounded-md bg-muted p-0.5">
+              {(['private', 'workspace', 'workspace_view'] as const).map((v) => (
                 <Button key={v} type="button" size="sm" variant={visibility === v ? 'default' : 'ghost'} onClick={() => setVis(v)}
                   className="h-7 px-3 text-[11.5px]">
-                  {v === 'private' ? 'Private' : 'Everyone in workspace'}
+                  {v === 'private' ? 'Private' : v === 'workspace' ? 'Everyone in workspace' : 'Everyone in workspace (view-only)'}
                 </Button>
               ))}
             </div>

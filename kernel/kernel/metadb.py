@@ -52,7 +52,7 @@ class Canvas(Base):
     name: Mapped[str] = mapped_column(String, default="untitled")
     version: Mapped[int] = mapped_column(Integer, default=1)
     doc: Mapped[str] = mapped_column(Text, default="{}")  # the full CanvasDoc as JSON
-    visibility: Mapped[str] = mapped_column(String, default="private")  # 'private' | 'workspace'
+    visibility: Mapped[str] = mapped_column(String, default="private")  # 'private' | 'workspace' (edit) | 'workspace_view' (read-only)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
@@ -248,7 +248,11 @@ def canvas_role(canvas_id: str, uid: str) -> str | None:
         if c.visibility == "workspace":
             return "editor"  # any user of this instance can edit a workspace-visible canvas
         sh = s.scalar(select(CanvasShare).where(CanvasShare.canvas_id == canvas_id, CanvasShare.user_id == uid))
-        return sh.role if sh else None
+        if sh:
+            return sh.role
+        if c.visibility == "workspace_view":
+            return "viewer"  # workspace-visible but read-only, unless explicitly shared as editor above
+        return None
 
 
 def share_canvas(canvas_id: str, user_id: str, role: str = "editor") -> None:
@@ -300,6 +304,8 @@ def list_canvases_for(uid: str) -> list[dict]:
             out.setdefault(c.id, _canvas_row(c, role, True))
         for c in s.scalars(select(Canvas).where(Canvas.visibility == "workspace", Canvas.owner_id != uid)):
             out.setdefault(c.id, _canvas_row(c, "editor", True))
+        for c in s.scalars(select(Canvas).where(Canvas.visibility == "workspace_view", Canvas.owner_id != uid)):
+            out.setdefault(c.id, _canvas_row(c, "viewer", True))
         return sorted(out.values(), key=lambda r: r["updatedAt"] or "", reverse=True)
 
 

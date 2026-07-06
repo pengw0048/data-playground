@@ -419,8 +419,10 @@ test.describe('Data Playground canvas', () => {
     await fresh(page)
     await page.getByTestId('share-btn').click()
     await expect(page.getByText('Share this canvas')).toBeVisible()
-    // flip visibility to workspace
-    await page.getByRole('button', { name: 'Everyone in workspace' }).click()
+    // a read-only workspace tier is offered alongside the editable one
+    await expect(page.getByRole('button', { name: 'Everyone in workspace (view-only)' })).toBeVisible()
+    // flip visibility to workspace (exact — 'view-only' shares the prefix)
+    await page.getByRole('button', { name: 'Everyone in workspace', exact: true }).click()
     // add Dana as a collaborator (the collaborator picker is the first combobox; a role picker sits beside it)
     const select = page.getByRole('combobox').first()
     await select.selectOption({ label: 'Dana' })

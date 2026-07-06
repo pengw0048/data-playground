@@ -1409,6 +1409,25 @@ def test_canvas_sharing_access_and_authz():
     assert client.post(f"/api/canvas/{cid}/share", json={"userId": "local", "role": "editor"}, headers=hb).status_code == 403
 
 
+def test_workspace_view_visibility_is_read_only():
+    # 'workspace_view' opens a canvas to everyone but read-only (viewer); 'workspace' opens it editable.
+    carol = client.post("/api/users", json={"name": "Carol"}).json()["id"]
+    cid = "wsview_cv"
+    client.put(f"/api/canvas/{cid}", json={"id": cid, "name": "ro", "version": 1, "nodes": [], "edges": []})
+    hc = {"X-DP-User": carol}
+    assert client.get(f"/api/canvas/{cid}", headers=hc).status_code == 404  # private until shared
+    # owner opens it view-only to the workspace
+    client.post(f"/api/canvas/{cid}/share", json={"visibility": "workspace_view"})
+    assert client.get(f"/api/canvas/{cid}", headers=hc).status_code == 200            # everyone can read
+    assert client.put(f"/api/canvas/{cid}", json={"id": cid, "name": "x", "version": 2, "nodes": [], "edges": []}, headers=hc).status_code == 403  # but not write
+    assert any(f["id"] == cid and f["role"] == "viewer" for f in client.get("/api/canvas", headers=hc).json())
+    # flip to editable workspace visibility → the same user can now write
+    client.post(f"/api/canvas/{cid}/share", json={"visibility": "workspace"})
+    assert client.put(f"/api/canvas/{cid}", json={"id": cid, "name": "y", "version": 3, "nodes": [], "edges": []}, headers=hc).status_code == 200
+    # an unknown visibility value is rejected
+    assert client.post(f"/api/canvas/{cid}/share", json={"visibility": "public"}).status_code == 400
+
+
 def test_written_outputs_reregister_on_restart(tmp_path):
     # durability: an output written to storage must reappear in the catalog after a kernel restart
     # (a fresh Deps), not vanish because the seeded data_dir doesn't include the outputs location.
