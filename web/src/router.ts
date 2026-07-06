@@ -9,7 +9,7 @@ export function parseHash(): Route {
   const h = location.hash.replace(/^#\/?/, '')
   const [seg, id] = h.split('/')
   if (seg === 'canvas' && id) return { view: 'canvas', canvasId: decodeURIComponent(id) }
-  if (seg === 'files' || seg === 'tables' || seg === 'transforms') return { view: seg }
+  if (seg === 'files' || seg === 'tables' || seg === 'transforms' || seg === 'relationships') return { view: seg }
   // bare "/" opens the editor on the last/newest canvas (bootstrap picks the id) — matches the app's
   // default landing; the files home is reachable via #/files.
   return { view: 'canvas' }

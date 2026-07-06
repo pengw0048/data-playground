@@ -54,6 +54,15 @@ export interface JoinAnalysis {
   note?: string | null
 }
 
+export interface Relationship {
+  leftUri: string
+  leftColumns: string[]
+  rightUri: string
+  rightColumns: string[]
+  cardinality: Cardinality
+  confidence: 'declared' | 'verified' | 'inferred'
+}
+
 export interface LineageNode { id: string; name: string; uri: string; kind: string }
 export interface LineageEdge { parent: string; child: string; column?: string | null; pipeline?: string | null }
 export interface LineageResult { nodes: LineageNode[]; edges: LineageEdge[] }

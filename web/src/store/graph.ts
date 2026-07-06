@@ -219,7 +219,7 @@ interface Store {
 }
 
 // Top-level views (like Figma's Recents / Design surfaces). 'canvas' is the editor; settings is a modal.
-export type DpView = 'canvas' | 'files' | 'tables' | 'transforms'
+export type DpView = 'canvas' | 'files' | 'tables' | 'transforms' | 'relationships'
 
 function emptyDoc(): CanvasDoc {
   // a random suffix keeps ids unique — performance.now() resets per page load, so a bare timestamp can

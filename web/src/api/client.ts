@@ -1,7 +1,7 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
   CatalogTable, CompilePlan, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  ProcessorDescriptor, RunEstimate, RunStatus, SampleResult,
+  ProcessorDescriptor, Relationship, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -119,6 +119,16 @@ export const api = {
   // ranked ways to join two catalog datasets directly (used outside the canvas)
   joinSuggestions: (leftUri: string, rightUri: string) =>
     req<JoinSuggestion[]>('/catalog/join-suggestions', { method: 'POST', body: JSON.stringify({ leftUri, rightUri }) }),
+
+  // owner-declared keys + relationships (the ER view)
+  declareKey: (tableId: string, columns: string[]) =>
+    req<CatalogTable>(`/catalog/tables/${encodeURIComponent(tableId)}/key`, { method: 'PUT', body: JSON.stringify({ columns }) }),
+  relationships: (uri?: string) =>
+    req<Relationship[]>(`/catalog/relationships${uri ? `?uri=${encodeURIComponent(uri)}` : ''}`),
+  addRelationship: (rel: Relationship) =>
+    req<Relationship[]>('/catalog/relationships', { method: 'POST', body: JSON.stringify(rel) }),
+  deleteRelationship: (rel: Relationship) =>
+    req<Relationship[]>('/catalog/relationships/delete', { method: 'POST', body: JSON.stringify(rel) }),
 
   estimate: (doc: CanvasDoc, targetNodeId?: string) =>
     req<RunEstimate>('/run/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),

@@ -4,6 +4,7 @@ import { api } from '../api/client'
 import { color, radius, shadow } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { SettingsModal } from '../panels/SettingsModal'
+import { ERDiagram } from './ERDiagram'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
@@ -22,6 +23,7 @@ export function Shell() {
         {view === 'files' && <FilesContent />}
         {view === 'tables' && <TablesContent />}
         {view === 'transforms' && <TransformsContent />}
+        {view === 'relationships' && <div style={{ height: '100%' }}><ERDiagram /></div>}
       </main>
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
     </div>
@@ -54,6 +56,7 @@ function Rail({ onSettings }: { onSettings: () => void }) {
         {item('files', 'clock', 'Recents')}
         {item('tables', 'db', 'Tables')}
         {item('transforms', 'fx', 'Transforms')}
+        {item('relationships', 'lineage', 'Relationships')}
         <Button variant="ghost" onClick={onSettings}
           className="h-auto w-full justify-start gap-2.5 px-2.5 py-2 text-[13px] font-medium text-muted-foreground">
           <Icon name="settings" size={15} /> Settings

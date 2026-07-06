@@ -385,6 +385,20 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('toolbar')).toBeVisible()
   })
 
+  test('the relationships (ER) view renders the catalog as entities', async ({ page }) => {
+    await fresh(page)
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to files').click()
+    await page.getByTestId('rail-relationships').click()
+    // the ER canvas mounts with the seeded datasets as draggable entities (with their columns)
+    await expect(page.getByText('Relationships (ER)')).toBeVisible({ timeout: 10_000 })
+    const entities = page.locator('.react-flow__node')
+    await expect(entities.filter({ hasText: 'events' }).first()).toBeVisible()
+    await expect(entities.filter({ hasText: 'images' }).first()).toBeVisible()
+    // a key column is present in the entity (id) — the material for join hints
+    await expect(entities.filter({ hasText: 'events' }).first().getByText('user_id')).toBeVisible()
+  })
+
   test('a failing run surfaces an error toast (not a silent failure)', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Sources & sinks', 'source') // auto-selected → editable in the inspector
