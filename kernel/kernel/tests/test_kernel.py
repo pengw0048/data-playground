@@ -1547,6 +1547,27 @@ def test_section_nests_multiple_levels_by_parentid(tmp_path):
     assert out["rowCount"] == 300  # outer → inner → keep(v<300), nested two levels deep
 
 
+def test_plan_hash_includes_section_children():
+    # regression: a node CONTAINED in a section (parent_id) carries the real behavior (its predicate /
+    # transform code), but it isn't in the upstream chain — a naive chain hash collided (proven). The
+    # content key must fold section descendants, else editing a contained node reuses a stale result.
+    from kernel.models import Graph
+    r = get_deps().runner
+
+    def graph_with(pred):
+        return Graph(**{"id": "c", "version": 1, "nodes": [
+            N("src", "source", {"uri": _uri("events")}),
+            {"id": "sec", "type": "section", "position": {"x": 0, "y": 0},
+             "data": {"config": {"script": "emit(run('keep', data=inputs['in']))\n", "subnodes": [], "maxRuns": 10}}},
+            {"id": "k", "type": "filter", "parentId": "sec", "position": {"x": 0, "y": 0},
+             "data": {"title": "keep", "config": {"predicate": pred}}},
+            N("wr", "write", {"name": "o"}),
+        ], "edges": [E("src", "sec"), E("sec", "wr")]})
+
+    assert r._plan_hash(graph_with("amount > 0"), "wr") != r._plan_hash(graph_with("amount > 999"), "wr")
+    assert r._plan_hash(graph_with("amount > 0"), "wr") == r._plan_hash(graph_with("amount > 0"), "wr")
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).

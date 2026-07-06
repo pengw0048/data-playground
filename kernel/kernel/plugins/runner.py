@@ -74,18 +74,29 @@ class LocalRunner:
 
     # -- plan hash (content addressing) ------------------------------------ #
     def _plan_hash(self, graph: Graph, target: str | None) -> str:
+        from kernel.section import _descendants  # section's parent_id-contained nodes
         chain = g.upstream_chain(graph, target) if target else g.topo_order(graph)
-        parts = []
-        for n in chain:
+
+        def _fold(n, prefix=""):
             cfg = n.data.get("config", {}) if isinstance(n.data, dict) else {}
-            parts.append(f"{n.id}:{n.type}:{json.dumps(cfg, sort_keys=True, default=str)}")
+            parts.append(f"{prefix}{n.id}:{n.type}:{json.dumps(cfg, sort_keys=True, default=str)}")
             if n.type == "source":
                 uri = cfg.get("uri") or cfg.get("table")
                 if uri:
                     try:
-                        parts.append(f"fp:{self.resolve_adapter(uri).fingerprint(uri)}")
+                        parts.append(f"{prefix}fp:{self.resolve_adapter(uri).fingerprint(uri)}")
                     except Exception:  # noqa: BLE001
                         pass
+            # a section's behavior lives on its CONTAINED nodes (parent_id), not on the section's
+            # own config or the upstream chain — fold them in (recursively) or editing a contained
+            # filter/transform silently reuses the stale result. Sorted for a stable key.
+            if n.type == "section":
+                for c in sorted(_descendants(graph, n.id), key=lambda x: x.id):
+                    _fold(c, prefix=f"sub[{n.id}]:")
+
+        parts: list[str] = []
+        for n in chain:
+            _fold(n)
         # edges + their handles are part of the plan: re-routing an edge to a different output port
         # (same node configs) must invalidate the cache, else it returns the old port's result.
         ids = {n.id for n in chain}
