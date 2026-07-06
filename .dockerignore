@@ -1,0 +1,15 @@
+# build the image from source only — never copy local build/venv/artifacts in
+**/node_modules
+**/.venv
+web/dist
+web/test-results
+test-results
+**/__pycache__
+**/*.pyc
+.git
+.github
+kernel/dataplay.db
+kernel/canvases
+kernel/outputs
+kernel/data/outputs
+# NOTE: don't exclude *.md — kernel/pyproject.toml has `readme = "README.md"`, so the build needs it.

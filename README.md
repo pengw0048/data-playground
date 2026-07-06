@@ -98,6 +98,13 @@ Two things are deployment-side, not app config:
   instance's startup reconcile can't cancel another's live runs (a `TODO` marks the spot in
   `metadb.reconcile_orphaned_runs`).
 
+**Run with Docker.** `docker compose up` builds one image (Vite SPA baked in) and runs it against
+Postgres — the shared-metadata, restart-durable setup the bullets above describe. `Dockerfile` is the
+single-image build (`docker build -t dataplay .`); `docker-compose.yml` adds Postgres + volumes and
+documents `deploy.replicas` + sticky routing for the multi-instance case. Set `DP_AUTH_SECRET` and
+`DP_DATASET_ROOTS` for a multi-user deployment; TLS/reverse-proxy is operator-specific (front it with
+nginx/Caddy). The app is on `http://localhost:8471`.
+
 ## Plugins — a stranger's node appears typed & wired, no core edit
 
 Drop a package in `<workspace>/plugins/<pack>/` (or pip-install one exposing a `dataplay.plugins`

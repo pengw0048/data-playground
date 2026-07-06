@@ -1,0 +1,47 @@
+# Data Playground — Postgres-backed, restart-durable single-instance setup.
+#
+# `docker compose up` → the app on http://localhost:8471 with its metadata (users, canvases, run
+# state, catalog) in Postgres, so it survives restarts and is ready to scale out. To run SEVERAL
+# stateless web instances, set `deploy.replicas` (or run more `kernel` services) behind a load
+# balancer that sticky-routes /ws/collab/{canvas_id} by canvas id — see the README "Scaling out".
+services:
+  kernel:
+    build: .
+    ports:
+      - "8471:8471"
+    environment:
+      # shared metadata DB → the web tier is stateless (run state + catalog + canvases all live here)
+      DP_DATABASE_URL: "postgresql+psycopg://dp:dp@postgres:5432/dataplay"
+      # per-user auth (signed session cookies). CHANGE THIS in production.
+      DP_AUTH_SECRET: "${DP_AUTH_SECRET:-change-me-in-production}"
+      # multi-user: confine dataset reads to these roots (see kernel/kernel/paths.py). The workspace
+      # volume is /data; add more host roots you mount if users load datasets from them.
+      DP_DATASET_ROOTS: "/data"
+      # optional LLM agent — set a model + its key to enable the agent dock:
+      # DP_AGENT_MODEL: "anthropic/claude-opus-4-8"
+      # ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    volumes:
+      - dp-data:/data          # canvases/outputs/plugins + seeded sample datasets
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: dp
+      POSTGRES_PASSWORD: dp
+      POSTGRES_DB: dataplay
+    volumes:
+      - dp-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dp -d dataplay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  dp-data:
+  dp-pg:
