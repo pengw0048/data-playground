@@ -3,7 +3,7 @@
 _验收评审清单，由对整个代码库的普查生成（每一项都由一个 `file:line` 作为证据支撑）。_
 _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限定到白名单 roots；Dockerfile + docker-compose 部署）。图例：✅ 已实现 · 🟡 部分实现（见备注） · ⬜ 未实现（仅有脚手架/规划中，或有意省略）。_
 
-**142 项功能 —— ✅ 120 项已实现 · 🟡 19 项部分实现 · ⬜ 3 项未实现。**
+**142 项功能 —— ✅ 122 项已实现 · 🟡 17 项部分实现 · ⬜ 3 项未实现。**
 
 | 领域 | ✅ | 🟡 | ⬜ |
 |---|--:|--:|--:|
@@ -12,7 +12,7 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 | 数据、适配器与目录 | 26 | 4 | 0 |
 | 协作、多用户与认证 | 21 | 1 | 0 |
 | 可扩展性与插件 SPI | 14 | 2 | 0 |
-| 平台、设计系统与运维 | 20 | 5 | 2 |
+| 平台、设计系统与运维 | 22 | 3 | 2 |
 
 ## ⚠️ 尚未完全完成（验收重点）
 
@@ -31,12 +31,10 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 - 🟡 **协作 WebSocket 中继（按画布分房间）**（协作、多用户与认证）—— 仅为每实例的内存态。多实例/无状态 web 部署需要把每个画布 sticky routing 到单一实例（已在 main.py:11-13 的 docstring 中承认）；处于不同实例上的对等端不会互相看到对方。对默认的单进程部署来说没问题。`kernel/kernel/main.py:88-135 _collab_rooms is an in-memory dict[canvas_id -> set[WebSocket]]`
 - 🟡 **Capabilities —— media/vector 列标注 + 查看器标签页**（可扩展性与插件 SPI）—— media/vector 检测是可用的（在 tag_columns 里用正则匹配 name/type），Media 查看器网格也能渲染。缺口：(1) reg.add_capability 只是向 KernelInfo 声明一个 id+label —— 插件无法添加新的列检测（tag_columns 是硬编码的核心逻辑），也无法添加查看器标签页（那是单独的前端注册），正如模块 docstring 自己承认的（capabilities.py:47-51）。(2) Vector 查看器标签页已被移除（capabilities.tsx:49-50）；vectors 只在单元格里获得一个内联的 chip。`kernel/kernel/plugins/capabilities.py:35-51, web/src/nodes/capabilities.tsx:42-50`
 - 🟡 **流水线导入器 SPI（/pipelines/import）**（可扩展性与插件 SPI）—— 扩展点现在诚实了：deps.importer 默认是 NullImporter，所以 /pipelines/import 返回 501 未配置（此前是一个错误的 400），插件通过 reg.set_importer 注册一个真正的导入器。按设计不内置任何导入器（没有通用的流水线格式）。`kernel/kernel/deps.py:98 self.importer=NullImporter(); Registry.set_importer; routers/catalog.py:125 →501`
-- 🟡 **用户级设置**（平台、设计系统与运维）—— DB schema 以及 GET/PUT 都支持 scope='user'，但 SettingsModal 只读写 global（state 仅从 s.global 播种，line 33）。除了主题之外没有用户偏好的 UI 入口（而主题存在 localStorage，不在 DB 里）。`kernel/kernel/metadb.py:132-140,464-470; routers/workspace.py:246-247`
 - 🟡 **shadcn/ui 迁移**（平台、设计系统与运维）—— Radix+cva 的 shadcn 原语已经存在，较新的面板也在使用它们，但迁移明确尚未完成 —— 仍有许多内联样式/遗留变量的组件。index.css:4 写着 'Preflight is disabled … mid-migration'，而 tailwind.config.js 写着 'Preflight ON' —— 一处陈旧、自相矛盾的注释。`web/src/components/ui/*.tsx (button,dialog,input,select,…); index.css:4 vs tailwind.config.js Preflight comment`
 - ⬜ **Agent 离线关键词规划器兜底**（平台、设计系统与运维）—— 这是有意为之，不是缺陷：刻意不做任何基于规则、假装成 LLM 的替身；没有 DP_AGENT_MODEL 时 dock 显示 "unavailable"，其余一切照常工作。README 已修正以保持一致（此前曾错误地声称有离线规划器）。`web/src/panels/AgentDock.tsx:13,50-51; README.md:151-152`
 - ⬜ **无状态 web 就绪 —— 分布式执行**（平台、设计系统与运维）—— 执行始终在接收请求的那个实例上运行。reconcile_orphaned_runs 假设只有单一执行实例 —— 启动时它会把所有非终态的运行标记为 failed，所以在多实例部署里一个实例的重启会取消掉另一个实例上正在进行的运行。需要按运行的实例归属 + 心跳 + 一个 ExecutionBackend 插件。已作为已知缺口记录在案。`kernel/kernel/metadb.py:401-419 (reconcile_orphaned_runs TODO); README.md:95-99`
 - 🟡 **实时协作（按画布分房间）**（平台、设计系统与运维）—— 每个画布一个内存态的广播中继，带在线状态 + 角色门控（viewer 无法中继 yjs 编辑）。最后写入者获胜，并非无冲突（Yjs/CRDT 依赖已经引入，但备注为未来的加固项）。房间是进程本地的 → 部署时必须把 /ws/collab/{canvas_id} sticky-route 到单一实例（没有服务端协调）。`kernel/kernel/main.py:88-135`
-- 🟡 **用户管理（创建用户）**（平台、设计系统与运维）—— POST /users 存在（受门控，无匿名自助注册），GET /users 支撑登录名单，但没有任何管理 UI 用来创建用户或设置他们的密码 —— 只能通过 API/脚本完成。只有自助改密码这一项被暴露出来。`kernel/kernel/routers/workspace.py:81-94; web/src/api/client.ts:131`
 - 🟡 **可插拔的执行 backend 选择**（平台、设计系统与运维）—— pick_runner 会尊重 'backend' 设置；内置发布了 LocalRunner + 一个真正的 SubprocessRunner。UI 的 runner 选择器可用，但 pod/Ray/队列 runner 只是文档中记载的插件扩展点，并未内置发布 —— 所以 '专用执行层' 目前只是脚手架。`kernel/kernel/deps.py:116-147; SettingsModal.tsx:95-104`
 
 ---
@@ -181,7 +179,7 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 - ✅ **按用户的密码认证（scrypt + 签名会话 cookie）** —— HMAC 签名、周级 TTL 的会话 token；按用户加盐的 scrypt hash；DP_AUTH_PASSWORD 只引导默认用户；登录界面、登出、改密 UI 全部具备。通过 DP_AUTH_SECRET 选择开启；否则是开放的 X-DP-User 开发模式。 `kernel/kernel/auth.py:38-83; routers/workspace.py:31-56; web/src/views/Login.tsx; web/src/views/Shell.tsx:72-119`
 - ✅ **设置 API 里的密文脱敏** —— GET 把 agentApiKey + objectStore.{accessKeyId,secretAccessKey} 脱敏为一个哨兵值；PUT 把哨兵值当作 '未改动'，这样点点点永远不会覆盖一个已存的密文。 `kernel/kernel/routers/workspace.py:226-262`
 - ✅ **全局设置页面（agent / execution / destinations）** —— 全屏设置，带左侧导航。覆盖 agent 的 model/key/baseURL、execution 的 runner 选择器、destinations + 对象存储凭证。 `web/src/panels/SettingsModal.tsx:23-154; routers/workspace.py:238-262`
-- 🟡 **用户级设置** —— DB schema 以及 GET/PUT 都支持 scope='user'，但 SettingsModal 只读写 global（state 仅从 s.global 播种，line 33）。除了主题之外没有用户偏好的 UI 入口（而主题存在 localStorage，不在 DB 里）。 `kernel/kernel/metadb.py:132-140,464-470; routers/workspace.py:246-247`
+- ✅ **用户级设置** —— DB/API 一直支持 scope='user'；Settings UI 现在也接住了：Execution → Runner 是一个 per-user 偏好，pick_runner 先取用户选择、再回退到 workspace 默认（空=继承），run/estimate 会带上当前用户。主题仍走 localStorage（首帧前生效、无闪烁）。 `web/src/panels/SettingsModal.tsx（u 状态 + INHERIT 哨兵）; kernel/kernel/deps.py pick_runner(plan, uid); routers/runs.py; test_user_scoped_settings_are_isolated_per_user + test_user_scoped_backend_preference_wins_over_global`
 - ✅ **元数据 DB（SQLAlchemy，开发用 SQLite / 生产用 Postgres）** —— 用户、画布、分享、运行记录/状态、版本、目录条目/边、设置。唯一可配置的是连接字符串（DP_DATABASE_URL）。 `kernel/kernel/metadb.py:39-154; settings.py:17-18; pyproject.toml postgres extra`
 - ✅ **Alembic 迁移（含遗留 DB 收编）** —— 7 个 revision，每个都带 upgrade+downgrade；init_db 对 Alembic 之前的 DB 打上 0001_baseline 印记，然后升级到 head。Alembic 是 schema 的唯一真相源（不是 create_all）。 `kernel/kernel/metadb.py:167-191; migrations/versions/0001..0007`
 - ✅ **亮/暗主题切换（跟随系统，无闪烁）** —— light/dark/system 三种模式，localStorage 持久化，在 <html> 上打上 data-theme，system 模式下跟随操作系统，在首次绘制前应用。切换在 TopBar 里。 `web/src/theme/mode.ts:9-43; web/src/main.tsx:7; web/src/canvas/TopBar.tsx:205; tailwind.config.js darkMode:['class','[data-theme="dark"]']`
@@ -196,7 +194,7 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 - ✅ **画布版本快照 + 恢复** —— 节流的自动快照（去重，90s，保留 30 份）+ 保存时的命名快照；恢复端点会先快照当前状态，所以恢复本身也可撤销。 `kernel/kernel/metadb.py:84-94,422-461; routers/workspace.py:150-177`
 - ✅ **启动时协调孤儿运行** —— 被一个已停止的 kernel 留在 queued/running 的运行会被标记为 failed('interrupted')，这样客户端不会永远轮询。对单实例是正确的；对多实例不安全（见分布式执行缺口）。 `kernel/kernel/metadb.py:191,401-419`
 - ✅ **离线 / 零配置运行** —— 无需云账号/外部服务；内置 SQLite；首次运行播种样本数据；引擎依赖（DuckDB/Polars/Arrow，可选 Lance）全部本地。Agent + Postgres + Lance 是可选的 extra。 `README.md:8-9,26; kernel/kernel/settings.py:13-18; pyproject.toml core deps`
-- 🟡 **用户管理（创建用户）** —— POST /users 存在（受门控，无匿名自助注册），GET /users 支撑登录名单，但没有任何管理 UI 用来创建用户或设置他们的密码 —— 只能通过 API/脚本完成。只有自助改密码这一项被暴露出来。 `kernel/kernel/routers/workspace.py:81-94; web/src/api/client.ts:131`
+- ✅ **用户管理（创建用户）** —— Settings → Members 列出成员并创建成员（姓名 + 可选初始密码，走已有的 POST /users，之后刷新名单，分享选择器也能看到）。密码轮换仍是自助（账户菜单）—— 没有 admin 角色，所以不提供管理员重置端点（否则任何用户都能劫持账号）。 `web/src/panels/SettingsModal.tsx（Members）; api.createUser; store.refreshUsers; e2e 'settings Members creates a user'`
 - ✅ **部署文档 + Docker** —— README 覆盖无状态 web 模型、DP_DATABASE_URL→Postgres、对象存储与协作的 nginx 一致性哈希示例；新增 Dockerfile（单镜像：Vite 构建 SPA → uv 同步内核并强制包含 SPA，已端到端冒烟测试 /api/health + 引擎 warm + SPA）与 docker-compose（Postgres + 卷 + 认证/数据集 root 环境变量，并说明 deploy.replicas + sticky routing）。TLS/反向代理留给运维方（README 已注明）。 `Dockerfile; docker-compose.yml; .dockerignore; README.md 'Run with Docker'`
 - ✅ **插件发现与 SPI（nodes/adapters/runners/capabilities/catalog）** —— 两条发现路径（拖入式 <workspace>/plugins/<pack>/ + pip entry points）；清单（dataplay.toml）校验带 min_core_api 门控；拒绝遮蔽内置或已注册的类型。错误被记录（经由 GET /plugins 暴露）而不是让启动崩溃。 `kernel/kernel/deps.py:33-215; kernel/README.md`
 - 🟡 **可插拔的执行 backend 选择** —— pick_runner 会尊重 'backend' 设置；内置发布了 LocalRunner + 一个真正的 SubprocessRunner。UI 的 runner 选择器可用，但 pod/Ray/队列 runner 只是文档中记载的插件扩展点，并未内置发布 —— 所以 '专用执行层' 目前只是脚手架。 `kernel/kernel/deps.py:116-147; SettingsModal.tsx:95-104`
