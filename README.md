@@ -131,14 +131,16 @@ SPEC = NodeSpec(kind="upcase", title="uppercase", category="compute",
 
 def lower(engine, node, inputs):                      # contribute one step to the plan
     col = node.data.get("config", {}).get("column", "name")
-    return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM _')
+    return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM {{input}}')
 
 def register(reg):
     reg.add_node(SPEC, lower)
 ```
 
 Restart the server → `uppercase` is in the Add-node menu, typed, wired, previewable, runnable — the
-frontend rendered it from `/api/nodes`, with no JS written. See `kernel/README.md` for every SPI axis.
+frontend rendered it from `/api/nodes`, with no JS written. A complete, tested example lives in
+[`examples/plugins/dp_example/`](examples/plugins/dp_example/); **[docs/PLUGINS.md](docs/PLUGINS.md)**
+walks through it and the full SPI. See also `kernel/README.md`.
 
 ## Develop
 

@@ -1547,6 +1547,41 @@ def test_section_nests_multiple_levels_by_parentid(tmp_path):
     assert out["rowCount"] == 300  # outer → inner → keep(v<300), nested two levels deep
 
 
+def test_example_plugin_loads_and_runs(tmp_path):
+    # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
+    # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).
+    import shutil
+    from pathlib import Path
+
+    import duckdb
+
+    from kernel import db
+    from kernel.deps import Deps
+    from kernel.executors.engine import LoweringEngine
+    from kernel.models import Graph
+
+    src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_example"
+    assert src.exists(), src
+    ws = tmp_path / "ws"
+    (ws / "plugins").mkdir(parents=True)
+    shutil.copytree(src, ws / "plugins" / "dp_example")
+
+    d = Deps(str(ws), str(tmp_path / "data"))
+    assert "redact" in d.node_specs  # discovered + registered, no core edit
+
+    p = str(tmp_path / "people.parquet")
+    duckdb.connect().execute(f"COPY (SELECT 'alice' AS name UNION ALL SELECT 'bob') TO '{p}' (FORMAT PARQUET)")
+    g = Graph(**{"id": "c", "version": 1, "nodes": [
+        {"id": "src", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": p}}},
+        {"id": "r", "type": "redact", "position": {"x": 0, "y": 0}, "data": {"config": {"column": "name", "keep": 1}}},
+    ], "edges": [{"id": "e", "source": "src", "target": "r", "data": {"wire": "dataset"}}]})
+    with db.run_scope():
+        eng = LoweringEngine(g, d.resolve_adapter, d.registry, full=True,
+                             node_lowerings=d.node_lowerings, node_specs=d.node_specs)
+        rows = sorted(eng.relation("r").fetchall())
+    assert rows == [("a****",), ("b**",)]  # 'alice'→'a'+4× *, 'bob'→'b'+2× *
+
+
 def test_section_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),

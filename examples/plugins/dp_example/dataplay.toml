@@ -1,0 +1,6 @@
+# Plugin manifest. `name` + `version` are required; `min_core_api` is optional — if set, the kernel
+# refuses to load the pack when its core API is older than this (forward-compat guard). See
+# kernel/kernel/deps.py CORE_API_VERSION and docs/PLUGINS.md.
+name = "dp-example"
+version = "0.1.0"
+# min_core_api = "1.0"
