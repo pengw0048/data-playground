@@ -3,13 +3,13 @@
 _验收评审清单，由对整个代码库的普查生成（每一项都由一个 `file:line` 作为证据支撑）。_
 _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限定到白名单 roots；Dockerfile + docker-compose 部署）。图例：✅ 已实现 · 🟡 部分实现（见备注） · ⬜ 未实现（仅有脚手架/规划中，或有意省略）。_
 
-**142 项功能 —— ✅ 122 项已实现 · 🟡 17 项部分实现 · ⬜ 3 项未实现。**
+**142 项功能 —— ✅ 123 项已实现 · 🟡 16 项部分实现 · ⬜ 3 项未实现。**
 
 | 领域 | ✅ | 🟡 | ⬜ |
 |---|--:|--:|--:|
 | 画布与节点交互 | 23 | 3 | 1 |
 | 引擎与执行 | 16 | 4 | 0 |
-| 数据、适配器与目录 | 26 | 4 | 0 |
+| 数据、适配器与目录 | 27 | 3 | 0 |
 | 协作、多用户与认证 | 21 | 1 | 0 |
 | 可扩展性与插件 SPI | 14 | 2 | 0 |
 | 平台、设计系统与运维 | 22 | 3 | 2 |
@@ -25,7 +25,6 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 - 🟡 **成本 / 确认门控**（引擎与执行）—— 门控只有一个固定的源行数阈值（5M）—— 没有字节大小/成本模型。大小未知时返回 needs_confirm=False（runner.py:69），所以一个无法计数的源会按设计绕过门控（理由：无法计数→无法读取→快速失败）。`kernel/kernel/plugins/runner.py:72 needs_confirm = rows >= _CONFIRM_ROWS (5,000,000); enforced at kernel/kernel/routers/runs.py:168 → HTTP 409 unless req.confirmed`
 - 🟡 **独立的 loop 节点**（引擎与执行）—— 一个裸的 'loop' 节点在引擎里不做任何真正的迭代 —— 它是一个直通占位符。真正的迭代式控制流通过 `section`（maxRuns 驱动脚本）来实现。环路在一开始就会被拒绝（必须被封装，见 §5.7，engine.py 的 is_acyclic 检查）。`kernel/kernel/executors/engine.py:307 loop/opaque/write just pass through parent on full run and raise NotPreviewable otherwise; compiler maps it to kind='loop' (compiler.py:19)`
 - 🟡 **DuckDB 适配器 —— Arrow/Feather/IPC 扫描**（数据、适配器与目录）—— 仅限本地文件；feather 通过 pyarrow 读入 DuckDB。feather 没有对象存储路径，也不支持追加（写入追加会拒绝它，adapters.py:188）。`kernel/kernel/plugins/adapters.py:148`
-- 🟡 **写入模式追加（分片文件目录）**（数据、适配器与目录）—— 只支持 parquet/csv/tsv（以及 Lance 原生追加）；JSON/Arrow/Feather 会抛出 NotImplementedError。每次运行追加一个分片文件；读取时用 glob 把它们汇总回来（test_kernel.py:386）。`kernel/kernel/plugins/adapters.py:185`
 - 🟡 **原子覆盖写（临时文件 + os.replace）**（数据、适配器与目录）—— 仅对本地写入是原子的 —— 失败/取消的写入不会截断已有数据集（test_kernel.py:438）。对象存储的覆盖写是就地写入（依赖单对象 PUT 的原子性；多文件/目录的对象存储覆盖写不是事务性的）。`kernel/kernel/plugins/adapters.py:203`
 - 🟡 **目标位置 —— 对象存储 backend 浏览 + target_uri**（数据、适配器与目录）—— 通过 glob() 浏览某个前缀；对象存储的 mkdir 是空操作（没有真正的文件夹 —— 前缀在写入时才创建，destinations.py:150）。当凭证/桶缺失时，浏览错误会如实暴露出来。`kernel/kernel/destinations.py:61`
 - 🟡 **协作 WebSocket 中继（按画布分房间）**（协作、多用户与认证）—— 仅为每实例的内存态。多实例/无状态 web 部署需要把每个画布 sticky routing 到单一实例（已在 main.py:11-13 的 docstring 中承认）；处于不同实例上的对等端不会互相看到对方。对默认的单进程部署来说没问题。`kernel/kernel/main.py:88-135 _collab_rooms is an in-memory dict[canvas_id -> set[WebSocket]]`
@@ -111,7 +110,7 @@ _最后更新：2026-07-06（新增：认证模式下把本地数据集路径限
 - ✅ **目录 DB 支撑 / 跨实例（catalog_entries + catalog_edges）** —— 在 _persist/_add_edge 时写穿；通过 _load_from_db 在读取时合并，所以另一个无状态实例注册的数据集会变得可见（test_kernel.py:1149）。尽力而为（DB 错误被吞掉）；每次 list/get/lineage 都会从 DB 做一次完整的重新合并 —— 没有增量同步，在大型目录下是一个扩展性问题。 `kernel/kernel/plugins/catalog.py:82`
 - ✅ **写入格式 parquet / csv / tsv / json / arrow / lance** —— 按扩展名选择格式；JSON 经由 COPY ...（FORMAT JSON, ARRAY true）；Lance 经由流式 record batch。往返测试在 test_kernel.py:405。 `kernel/kernel/plugins/adapters.py:207`
 - ✅ **写入模式覆盖** `kernel/kernel/plugins/adapters.py:199`
-- 🟡 **写入模式追加（分片文件目录）** —— 只支持 parquet/csv/tsv（以及 Lance 原生追加）；JSON/Arrow/Feather 会抛出 NotImplementedError。每次运行追加一个分片文件；读取时用 glob 把它们汇总回来（test_kernel.py:386）。 `kernel/kernel/plugins/adapters.py:185`
+- ✅ **写入模式追加（分片文件目录）** —— parquet/csv/tsv/json（以及 Lance 原生追加）：每次运行写入一个 part-*.<ext> 分片文件，_read_dir 用 glob 把它们汇总读回（往返测试覆盖 .pq/.tsv/.json）。Arrow/Feather 有意不支持追加（没有目录扫描读取器）；对象存储追加的读回目前仍只认 parquet 分片。 `kernel/kernel/plugins/adapters.py write(mode="append") + _read_dir; test_write_formats_round_trip`
 - 🟡 **原子覆盖写（临时文件 + os.replace）** —— 仅对本地写入是原子的 —— 失败/取消的写入不会截断已有数据集（test_kernel.py:438）。对象存储的覆盖写是就地写入（依赖单对象 PUT 的原子性；多文件/目录的对象存储覆盖写不是事务性的）。 `kernel/kernel/plugins/adapters.py:203`
 - ✅ **内容寻址的写入跳过（幂等覆盖重跑）** —— 当一个完全相同的覆盖 plan 已经产生过输出且它仍然存在时，跳过重写；追加从不缓存。 `kernel/kernel/plugins/runner.py:218`
 - ✅ **目标位置 —— 本地 backend 浏览 + mkdir（受 root 限定）** —— realpath 检查阻止越出目标 root 的遍历；.lance 目录以文件形式显示。 `kernel/kernel/destinations.py:27`
