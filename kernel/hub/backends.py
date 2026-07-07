@@ -78,6 +78,20 @@ class KernelSpawner(Protocol):
 
 
 @runtime_checkable
+class PlaceableBackend(Protocol):
+    """OPTIONAL companion to ExecutionBackend for a DISTRIBUTED backend that places work on typed workers
+    (GPU / region routing) and runs a single placed region. The core FEATURE-DETECTS these via hasattr
+    (deps.py `_place`/info, runs.py `_route_by_capability`, run_controller.run_unit), so a backend
+    implements them ONLY if it supports placement — they are NOT part of the required ExecutionBackend
+    contract. A Ray/k8s cluster backend implements all three; the built-in PoolRunner has workers/place
+    and SubprocessRunner has run_unit. `place(requires)` picks a worker for a resource need (or None);
+    `workers()` advertises capacities (WorkerInfo); `run_unit` runs one region's subgraph to `output_uri`."""
+    def workers(self) -> list: ...
+    def place(self, requires: Any) -> "str | None": ...
+    def run_unit(self, graph: Graph, output_node: str, output_uri: str) -> RunStatus: ...
+
+
+@runtime_checkable
 class DatasetAdapter(Protocol):
     """How a URI becomes readable/writable columnar data — the seam for a new storage/format/warehouse
     (Iceberg, Delta, a REST source, …). Register a plugin adapter via `reg.add_adapter(a)`; it is

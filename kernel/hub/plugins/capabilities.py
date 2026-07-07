@@ -53,8 +53,21 @@ def display_base_type(t: str) -> str:
     return t[:-2] if t.endswith("[]") else t
 
 
+# Plugin-registered column detectors: a capability object with a `detect(col)->bool` (wired via
+# reg.add_capability → register_detector) gets its tag applied by tag_columns alongside the built-in
+# media/vector/key — so add_capability is a REAL seam (a plugin can tag columns) without editing core.
+_EXTRA_DETECTORS: list[tuple[str, object]] = []
+
+
+def register_detector(cap_id: str, detect) -> None:
+    """Register a plugin capability's column detector (idempotent per id)."""
+    if callable(detect) and not any(cid == cap_id for cid, _ in _EXTRA_DETECTORS):
+        _EXTRA_DETECTORS.append((cap_id, detect))
+
+
 def tag_columns(columns: list[ColumnSchema]) -> list[ColumnSchema]:
-    """Annotate columns with detected capability tags (idempotent)."""
+    """Annotate columns with detected capability tags (idempotent) — built-in media/vector/key plus any
+    plugin-registered detectors."""
     for c in columns:
         caps = set(c.capabilities)
         if is_media_column(c):
@@ -63,15 +76,21 @@ def tag_columns(columns: list[ColumnSchema]) -> list[ColumnSchema]:
             caps.add("vector")
         if is_key_column(c):
             caps.add("key")
+        for cap_id, detect in _EXTRA_DETECTORS:
+            try:
+                if detect(c):
+                    caps.add(cap_id)
+            except Exception:  # noqa: BLE001 — a plugin detector must never break column tagging
+                pass
         c.capabilities = sorted(caps)
     return columns
 
 
-# A registered capability contributes only its id + label to KernelInfo (Deps.info / GET /api/kernel).
-# It does NOT decide column tagging: backend DETECTION lives in tag_columns (above); the per-capability
-# viewer UI is a separate FRONTEND registration (web/src/nodes/capabilities.tsx). So a plugin's
-# `reg.add_capability(...)` announces a capability id; lighting up new column tags means extending
-# tag_columns, and adding a viewer tab means the frontend hook — not a predicate()/columns() here.
+# A registered capability contributes its id + label to KernelInfo (Deps.info / GET /api/kernel). It may
+# ALSO carry an optional `detect(col)->bool` — if present, reg.add_capability registers it (via
+# register_detector) so tag_columns tags matching columns with the capability id, no core edit needed.
+# (The per-capability viewer UI is still a separate FRONTEND registration in web/src/nodes/capabilities.tsx.)
+# The built-in media/vector below have no detect attr — their detection is the hardcoded heuristics above.
 class MediaCapability:
     id = "media"
     label = "Media"

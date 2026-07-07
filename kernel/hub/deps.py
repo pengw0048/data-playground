@@ -60,6 +60,10 @@ class Registry:
 
     def add_capability(self, cap) -> None:
         self.deps.capabilities.append(cap)
+        detect = getattr(cap, "detect", None)  # optional column detector → tag_columns applies it (no core edit)
+        if callable(detect):
+            from hub.plugins import capabilities as caps
+            caps.register_detector(getattr(cap, "id", ""), detect)
 
     def add_processor(self, proc) -> None:
         self.deps.registry.register(proc)

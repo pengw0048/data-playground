@@ -1817,6 +1817,41 @@ def test_adapter_and_catalog_conform_to_formal_protocols():
     assert isinstance(get_deps().catalog, CatalogProvider)  # the built-in InMemoryCatalog IS the reference
 
 
+def test_plugin_capability_detector_tags_columns():
+    # add_capability is a real seam now: a capability with a detect(col)->bool tags matching columns via
+    # tag_columns, no core edit. (Built-in media/vector still run from the hardcoded heuristics.)
+    from hub.deps import Registry, get_deps
+    from hub.models import ColumnSchema
+    from hub.plugins import capabilities as caps
+
+    class GeoCap:
+        id = "geo"
+        label = "Geo"
+        def detect(self, col):
+            return col.name in ("lat", "lon")
+
+    Registry(get_deps()).add_capability(GeoCap())
+    cols = caps.tag_columns([ColumnSchema(name="lat", type="float"), ColumnSchema(name="city", type="string")])
+    assert "geo" in cols[0].capabilities and "geo" not in cols[1].capabilities
+
+
+def test_placeable_backend_protocol():
+    # the optional distributed-placement contract exists as a typed Protocol; a full impl conforms, a
+    # partial one does not (the core feature-detects per method, so a non-distributed backend omits them).
+    from hub.backends import PlaceableBackend
+
+    class FullPlaceable:
+        def workers(self): return []
+        def place(self, requires): return None
+        def run_unit(self, graph, output_node, output_uri): return None
+
+    class Partial:
+        def workers(self): return []
+
+    assert isinstance(FullPlaceable(), PlaceableBackend)
+    assert not isinstance(Partial(), PlaceableBackend)
+
+
 def test_kernel_spawner_selectable_via_dotted_path(monkeypatch):
     # a 3rd substrate is a config value, not a core patch: DP_KERNEL_SPAWNER=pkg.mod:Cls loads the plugin.
     from hub import deps as depsmod

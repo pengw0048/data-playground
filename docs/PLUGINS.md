@@ -95,7 +95,7 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 | `reg.add_node(spec, build)` | a canvas node | `NodeSpec` + `build(engine, node, inputs) -> relation` |
 | `reg.add_adapter(adapter)` | a dataset source/sink (claim a URI scheme) | `DatasetAdapter` Protocol in `kernel/hub/backends.py`: `name/matches/scan/schema/count/fingerprint/write` (+ optional `nearest`) |
 | `reg.add_runner(runner)` | an execution backend (pod/Ray/queue) | `ExecutionBackend` Protocol (`backends.py`): `name/can_run/estimate/run/status/cancel` |
-| `reg.add_capability(cap)` | a declared column capability (id + label) | `id`+`label` only — **announces** a capability to `/kernel`. NB: it does NOT itself detect/tag columns (that's core `tag_columns`) or add a viewer tab (frontend) — see `kernel/hub/plugins/capabilities.py`. |
+| `reg.add_capability(cap)` | a declared column capability | `id`+`label`, plus an OPTIONAL `detect(col)->bool` — if present, `tag_columns` tags matching columns with the id (no core edit). A viewer tab is still a separate frontend registration. See `kernel/hub/plugins/capabilities.py`. |
 | `reg.add_processor(proc)` | a reusable transform in the library picker | a `Processor` (`id/title/mode/build(params)`); see `kernel/hub/plugins/processors.py` |
 | `reg.set_catalog(catalog)` | the whole dataset catalog provider | `CatalogProvider` Protocol (`backends.py`): `list_tables/get_table/lineage/relationships/resolve_ref/register/register_output/unregister/set_declared_key/add_relationship/remove_relationship`. **`get_table` MUST raise `KeyError` on a miss.** A read-only external catalog can subclass `InMemoryCatalog` and override only the reads. |
 | `reg.set_importer(importer)` | `/pipelines/import` (import a foreign pipeline format) | default is a `NullImporter` (501) |
@@ -104,6 +104,13 @@ Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter
 by `pick_runner` (respects the Settings → Execution choice, else the first that `can_run`). **The
 built-ins go through these same seams — the DuckDB/Lance adapters, the InMemoryCatalog, and the local
 runners are just the first implementations registered, not a privileged core path.**
+
+A distributed runner that places work on typed workers (GPU / region routing) can additionally implement
+the optional `PlaceableBackend` Protocol (`backends.py`): `workers()` (advertise capacities), `place(requires)`
+(pick a worker, or None), `run_unit(graph, output_node, output_uri)` (run one placed region). The core
+feature-detects these, so a non-distributed backend omits them; a node declares a need via
+`NodeSpec.requires` / `config.requires`, and placement activates only when a `place()`-capable backend is
+registered (`DP_POOL_WORKERS` or a plugin).
 
 Two substrates are selected by a setting rather than `register(reg)` — set it to a built-in keyword or a
 **dotted path to your own class** (`pkg.module:Class`), so a third implementation needs no core patch:
