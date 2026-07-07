@@ -1,11 +1,13 @@
 name: CI
 
-# Manual only. This is a PRIVATE repo, so Actions minutes are billed, and the e2e job (~17 min:
-# Playwright installs Chromium + OS deps every run) would drain the monthly budget on every push.
-# Run the suites LOCALLY during dev (`cd kernel && uv run pytest -q`; `cd web && npm run e2e`), and
-# trigger this in a clean env before a release / when you want the full check:
-#   gh workflow run ci.yml      (or the Actions tab → CI → Run workflow)
+# Auto-runs on push to main + on PRs — the repo is PUBLIC, so GitHub Actions minutes are free/unlimited.
+# (Also manually triggerable via workflow_dispatch.) The per-job timeout caps below stay as hygiene so a
+# hung run can't spin to the 6h default. You can still run the suites locally during dev
+# (`cd kernel && uv run pytest -q`; `cd web && npm run e2e`).
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
