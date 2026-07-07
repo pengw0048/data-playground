@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store/graph'
 import { capabilitiesFor } from '../nodes/registry'
+import { api } from '../api/client'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import type { ColumnSchema } from '../types/graph'
+import type { ProfileResult } from '../types/api'
 
 const PAGE = 50
 
@@ -36,9 +38,9 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const isMetric = node?.type === 'metric'
   const isChart = node?.type === 'chart'
   const special = isMetric || isChart
-  const tabs = [{ id: 'rows', label: 'Rows' }, ...caps.map((c) => ({ id: c.id, label: c.label }))]
+  const tabs = [{ id: 'rows', label: 'Rows' }, ...caps.map((c) => ({ id: c.id, label: c.label })), { id: 'stats', label: 'Stats' }]
   // a refresh may drop the capability whose tab was selected — fall back to Rows
-  const activeTab = tab === 'rows' || caps.some((c) => c.id === tab) ? tab : 'rows'
+  const activeTab = tab === 'rows' || tab === 'stats' || caps.some((c) => c.id === tab) ? tab : 'rows'
   const atEnd = !res.hasMore  // the kernel peeks one extra row, so this is right even at exact multiples
 
   return (
@@ -63,7 +65,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
           </button>
         )}
         <span className="flex-1" />
-        {!special && detail == null && (
+        {!special && detail == null && activeTab !== 'stats' && (
           <>
             <span className="text-[10.5px] text-muted-foreground">
               rows {res.rows.length ? offset : 0}–{offset + res.rows.length}
@@ -89,6 +91,8 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
         <RowDetail columns={columns as ColumnSchema[]} row={res.rows[detail]} />
       ) : activeTab === 'rows' ? (
         <RowsTable columns={columns as ColumnSchema[]} rows={res.rows} onRowClick={setDetail} />
+      ) : activeTab === 'stats' ? (
+        <StatsView nodeId={nodeId} />
       ) : (
         (() => {
           const cap = caps.find((c) => c.id === activeTab)
@@ -109,6 +113,56 @@ function PageBtn({ dir, disabled, onClick }: { dir: 'prev' | 'next'; disabled: b
       )}>
       <Icon name={dir === 'prev' ? 'chevronLeft' : 'chevronRight'} size={13} />
     </button>
+  )
+}
+
+const fmtNum = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 3 })
+
+// Per-column stats over the previewed sample (null%/distinct/min/max/mean). Fetched lazily on tab
+// open (remounts → refetches), and honest: labeled "sample", and it inherits preview's P8 refusal.
+function StatsView({ nodeId }: { nodeId: string }) {
+  const doc = useStore((s) => s.doc)
+  const requestRun = useStore((s) => s.requestRun)
+  const [st, setSt] = useState<{ loading: boolean; res?: ProfileResult; err?: string }>({ loading: true })
+  const load = () => {
+    setSt({ loading: true })
+    api.profile(doc, nodeId)
+      .then((res) => setSt({ loading: false, res }))
+      .catch((e) => setSt({ loading: false, err: e?.message ?? String(e) }))
+  }
+  useEffect(load, [nodeId])  // eslint-disable-line react-hooks/exhaustive-deps
+  if (st.loading) return <Skeleton />
+  if (st.err) return <ErrorState reason={st.err} onRetry={load} />
+  const res = st.res!
+  if (res.error) return <ErrorState reason={res.reason ?? 'profile failed'} onRetry={load} />
+  if (res.notPreviewable) return <NotPreviewable reason={res.reason ?? 'needs a full pass'} onRun={() => requestRun(nodeId)} />
+  const pct = (n: number) => (res.rowCount ? Math.round((n / res.rowCount) * 100) : 0)
+  return (
+    <div className="max-h-[360px] overflow-auto">
+      <div className="px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
+        stats over the previewed sample · {res.rowCount.toLocaleString()} rows
+      </div>
+      <table className="w-full text-[11.5px] tabular-nums">
+        <thead className="sticky top-0 bg-card text-[10px] uppercase tracking-wide text-muted-foreground">
+          <tr>{['Column', 'Type', 'Nulls', 'Distinct', 'Min', 'Max', 'Mean'].map((h) => (
+            <th key={h} className="px-2 py-1 text-left font-semibold">{h}</th>
+          ))}</tr>
+        </thead>
+        <tbody>
+          {res.columns.map((c) => (
+            <tr key={c.name} className="border-t border-border/60">
+              <td className="px-2 py-1 font-medium text-foreground">{c.name}</td>
+              <td className="px-2 py-1 text-muted-foreground">{c.type}</td>
+              <td className="px-2 py-1 text-muted-foreground">{c.nulls ? `${c.nulls} · ${pct(c.nulls)}%` : '—'}</td>
+              <td className="px-2 py-1 text-muted-foreground">{c.distinct ?? '—'}</td>
+              <td className="max-w-[120px] truncate px-2 py-1 text-muted-foreground" title={c.min ?? ''}>{c.min ?? '—'}</td>
+              <td className="max-w-[120px] truncate px-2 py-1 text-muted-foreground" title={c.max ?? ''}>{c.max ?? '—'}</td>
+              <td className="px-2 py-1 text-muted-foreground">{c.mean != null ? fmtNum(c.mean) : '—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
 

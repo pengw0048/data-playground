@@ -151,6 +151,26 @@ class SampleResult(Wire):
     wire: WireType = "dataset"
 
 
+class ColumnProfile(Wire):
+    name: str
+    type: str
+    non_null: int = 0
+    nulls: int = 0
+    distinct: int | None = None    # exact over the sample; None for nested/uncomparable types
+    min: str | None = None         # stringified (numeric / temporal / text); None if not applicable
+    max: str | None = None
+    mean: float | None = None      # numeric columns only
+
+
+class ProfileResult(Wire):
+    columns: list[ColumnProfile] = []
+    row_count: int = 0             # rows actually profiled (the bounded sample, NOT the full total)
+    sampled: bool = True           # stats are over the previewed sample, not the whole dataset
+    not_previewable: bool = False
+    error: bool = False
+    reason: str | None = None
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline import
 # --------------------------------------------------------------------------- #

@@ -1,7 +1,7 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
   CatalogTable, CompilePlan, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  ProcessorDescriptor, Relationship, RunEstimate, RunStatus, SampleResult,
+  ProcessorDescriptor, ProfileResult, Relationship, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -108,6 +108,8 @@ export const api = {
 
   preview: (doc: CanvasDoc, nodeId: string, k = 50, offset = 0) =>
     req<SampleResult>('/run/preview', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, k, offset }) }),
+  profile: (doc: CanvasDoc, nodeId: string) =>
+    req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
 
   // per-node output columns (metadata only) → editor column suggestions; null = untyped port
   schema: (doc: CanvasDoc) =>

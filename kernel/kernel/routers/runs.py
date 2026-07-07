@@ -13,6 +13,7 @@ from kernel import graph as graph_mod
 from kernel.agent import agent_status, run_agent
 from kernel.deps import get_deps
 from kernel.executors.preview import preview_node
+from kernel.executors.profile import profile_node
 from kernel.executors.schema import schema_for_graph
 from kernel.security import current_user
 from kernel.graph import upstream_chain
@@ -23,6 +24,7 @@ from kernel.models import (
     EstimateRequest,
     JoinAnalysis,
     PreviewRequest,
+    ProfileResult,
     RunEstimate,
     RunRequest,
     RunStatus,
@@ -60,6 +62,15 @@ def run_preview(req: PreviewRequest) -> SampleResult:
     return preview_node(req.graph, req.node_id, k,
                         deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
                         offset=max(0, req.offset))
+
+
+@router.post("/run/profile", response_model=ProfileResult)
+def run_profile(req: PreviewRequest) -> ProfileResult:
+    """Per-column stats (null/distinct/min/max/mean) over the previewed sample of a node's output."""
+    deps = get_deps()
+    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    return profile_node(req.graph, req.node_id,
+                        deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs)
 
 
 @router.post("/graph/schema")

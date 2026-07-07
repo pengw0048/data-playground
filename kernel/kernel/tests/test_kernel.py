@@ -78,6 +78,36 @@ def test_preview_pipeline_derives_and_sorts():
     assert areas == sorted(areas, reverse=True)
 
 
+def test_profile_returns_column_stats():
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("images")}),
+        N("sel", "select", {"select": "id, width, height, width*height AS area"}),
+    ], "edges": [E("src", "sel")]}
+    r = client.post("/api/run/profile", json={"graph": g, "nodeId": "sel"}).json()
+    assert not r["error"] and not r["notPreviewable"]
+    assert r["sampled"] is True and r["rowCount"] > 0
+    cols = {c["name"]: c for c in r["columns"]}
+    assert "area" in cols
+    area = cols["area"]
+    assert area["nonNull"] + area["nulls"] == r["rowCount"]  # every row is null or not
+    assert area["distinct"] is not None
+    assert area["mean"] is not None                          # numeric → has a mean
+    assert area["min"] is not None and area["max"] is not None
+
+
+def test_profile_over_transform_upstream_of_faithful_op_is_honest():
+    # a sort over a transformed input can't be previewed on a sample → profile must refuse honestly,
+    # not fabricate stats from a truncated prefix
+    code = "def fn(row):\n    row['area'] = row['width'] * row['height']\n    return row"
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("images")}),
+        N("xf", "transform", {"source": "adhoc", "mode": "map", "code": code}),
+        N("srt", "sort", {"by": "area DESC"}),
+    ], "edges": [E("src", "xf"), E("xf", "srt")]}
+    r = client.post("/api/run/profile", json={"graph": g, "nodeId": "srt"}).json()
+    assert r["notPreviewable"] is True
+
+
 def test_aggregate_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("images")}),

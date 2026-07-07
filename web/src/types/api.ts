@@ -80,6 +80,26 @@ export interface SampleResult {
   wire: string
 }
 
+export interface ColumnProfile {
+  name: string
+  type: string
+  nonNull: number
+  nulls: number
+  distinct?: number | null
+  min?: string | null
+  max?: string | null
+  mean?: number | null
+}
+
+export interface ProfileResult {
+  columns: ColumnProfile[]
+  rowCount: number
+  sampled: boolean
+  notPreviewable: boolean
+  error?: boolean
+  reason?: string | null
+}
+
 export interface ProcessorDescriptor {
   id: string
   version: string
