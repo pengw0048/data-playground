@@ -7,7 +7,7 @@ You'll build **events → keep purchases → total per user → save** — clean
 
 ```bash
 make setup && make run             # from a clone → serves on http://localhost:8471, opens a browser
-# after setup the command is:  cd kernel && uv run dataplay   (not yet on PyPI)
+# after setup the command is:  cd kernel && uv run dataplay
 ```
 
 (Or `docker compose up` — see the README.) On first run it seeds three generic datasets you'll see in
@@ -35,7 +35,7 @@ Click the source's **output port** — a menu offers the nodes that can accept i
 event = 'purchase'
 ```
 
-Preview the filter — now only purchase rows. (A `filter` lowers to SQL and pushes down, so it's cheap.)
+Preview the filter — now only purchase rows. (A `filter` builds SQL and pushes down, so it's cheap.)
 
 ## 4 · Total spend per user (aggregate)
 
@@ -67,7 +67,7 @@ answer). When it finishes, the output is registered in the catalog: open **Table
 
 ## What just happened
 
-Each node **lowered to one logical plan** (a DuckDB relation); the identical plan ran on a bounded
+Each node **built one logical plan** (a DuckDB relation); the identical plan ran on a bounded
 sample for each preview and over the full dataset out-of-core for the run. Edit any node and it — plus
 everything downstream — goes **stale** (a re-run recomputes only what changed).
 

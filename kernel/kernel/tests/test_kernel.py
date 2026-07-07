@@ -1,4 +1,4 @@
-"""End-to-end kernel tests — the real out-of-core lowering engine on real files."""
+"""End-to-end kernel tests — the real out-of-core build engine on real files."""
 
 from __future__ import annotations
 
@@ -277,7 +277,7 @@ def test_plugin_run_applies_lowering(tmp_path):
                     inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
                     params=[])
     deps.node_specs[spec.kind] = spec
-    deps.node_lowerings[spec.kind] = lambda engine, node, inputs: ctx.sql(inputs[0], "SELECT *, 42 AS c FROM {input}")
+    deps.node_builders[spec.kind] = lambda engine, node, inputs: ctx.sql(inputs[0], "SELECT *, 42 AS c FROM {input}")
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
         N("p", "const42", {}),
@@ -286,7 +286,7 @@ def test_plugin_run_applies_lowering(tmp_path):
     r = client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()
     assert _poll(r["runId"])["status"] == "done"
     out = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_plugin_out").uri, "k": 3}).json()
-    assert "c" in [c["name"] for c in out["columns"]]           # plugin lowering was applied
+    assert "c" in [c["name"] for c in out["columns"]]           # plugin build was applied
     assert all(row["c"] == 42 for row in out["rows"])           # transformed, not passthrough
 
 
@@ -327,10 +327,10 @@ def test_concurrent_previews_do_not_corrupt():
     def run(i):
         if i % 2 == 0:
             r = preview_node(graph_for(imgs, "is_valid = true"), "d", 20,
-                             deps.resolve_adapter, deps.registry, deps.node_lowerings, deps.node_specs)
+                             deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs)
             return "images", all(row.get("is_valid") for row in r.rows), r.not_previewable
         r = preview_node(graph_for(evs, "amount > 1"), "d", 20,
-                         deps.resolve_adapter, deps.registry, deps.node_lowerings, deps.node_specs)
+                         deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs)
         return "events", all(row.get("amount", 0) > 1 for row in r.rows), r.not_previewable
 
     with cf.ThreadPoolExecutor(max_workers=8) as ex:
@@ -743,11 +743,11 @@ def test_plugin_node_lowering():
     spec = NodeSpec(kind="upper_fmt", title="upper", category="compute",
                     inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
                     params=[ParamSpec(name="column", type="string", default="format")])
-    def lower(engine, node, inputs):
+    def build(engine, node, inputs):
         col = node.data.get("config", {}).get("column", "format")
         return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM _')
     deps.node_specs[spec.kind] = spec
-    deps.node_lowerings[spec.kind] = lower
+    deps.node_builders[spec.kind] = build
 
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("images")}),
@@ -2129,7 +2129,7 @@ def test_join_analysis_reflects_the_configured_key():
         N("l", "source", {"uri": _uri("images")}), N("r", "source", {"uri": _uri("events")}),
         {"id": "j", "type": "join", "position": {"x": 0, "y": 0}, "data": {"config": {"condition": "a.id = b.user_id"}}},
     ], "edges": [E("l", "j", th="a"), E("r", "j", th="b")]})
-    cols = schema_for_graph(graph, d.resolve_adapter, d.registry, d.node_lowerings, d.node_specs)
+    cols = schema_for_graph(graph, d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
     ja = rel.analyze_join(graph, "j", cols, d.catalog, d.resolve_adapter)
     top = ja.suggestions[0]
     assert top.left_columns == ["id"] and top.right_columns == ["user_id"]  # the CONFIGURED key leads
@@ -2227,7 +2227,7 @@ def test_catalog_missing_flag_and_unregister(tmp_path):
 
 
 def test_chart_node_produces_series():
-    # F37 (charting): the chart node lowers to an (x, y) series — grouped agg(y) by x (bar/line), or
+    # F37 (charting): the chart node builds an (x, y) series — grouped agg(y) by x (bar/line), or
     # raw x,y points (scatter). Runs out-of-core server-side; the panel renders the SVG.
     ev = _uri("events")
 
@@ -2281,7 +2281,7 @@ def test_example_plugin_loads_and_runs(tmp_path):
 
     from kernel import db
     from kernel.deps import Deps
-    from kernel.executors.engine import LoweringEngine
+    from kernel.executors.engine import BuildEngine
     from kernel.models import Graph
 
     src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_example"
@@ -2300,8 +2300,8 @@ def test_example_plugin_loads_and_runs(tmp_path):
         {"id": "r", "type": "redact", "position": {"x": 0, "y": 0}, "data": {"config": {"column": "name", "keep": 1}}},
     ], "edges": [{"id": "e", "source": "src", "target": "r", "data": {"wire": "dataset"}}]})
     with db.run_scope():
-        eng = LoweringEngine(g, d.resolve_adapter, d.registry, full=True,
-                             node_lowerings=d.node_lowerings, node_specs=d.node_specs)
+        eng = BuildEngine(g, d.resolve_adapter, d.registry, full=True,
+                             node_builders=d.node_builders, node_specs=d.node_specs)
         rows = sorted(eng.relation("r").fetchall())
     assert rows == [("a****",), ("b**",)]  # 'alice'→'a'+4× *, 'bob'→'b'+2× *
 

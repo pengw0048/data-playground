@@ -7,8 +7,8 @@ import { ColumnCombo, useInputColumns } from '../fields'
 type ChartType = 'bar' | 'line' | 'scatter' | 'area'
 type Agg = 'none' | 'count' | 'sum' | 'mean' | 'min' | 'max'
 
-// The `chart` node turns a column pair into a visualization (rendered in the data panel). It lowers
-// to an (x, y) series — grouped `agg(y) by x` for bar/line, or raw x,y points for scatter — so it
+// The `chart` node turns a column pair into a visualization (rendered in the data panel). It builds
+// an (x, y) series — grouped `agg(y) by x` for bar/line, or raw x,y points for scatter — so it
 // runs out-of-core at scale and chains like any dataset.
 function Chart({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)

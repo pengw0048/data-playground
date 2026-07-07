@@ -5,7 +5,7 @@ node appears on the canvas — typed, wired, and previewable — with **no chang
 the whole point of the plugin SPI: a stranger's node shows up first-class.
 
 `redact` masks a (PII-ish) text column, keeping only the first N characters and replacing the rest
-with `*`. It lowers to plain SQL via `ctx.sql`, so it pushes down and runs out-of-core like any
+with `*`. It builds plain SQL via `ctx.sql`, so it pushes down and runs out-of-core like any
 built-in relational node.
 """
 
@@ -26,7 +26,7 @@ SPEC = NodeSpec(
 )
 
 
-def lower(engine, node, inputs):
+def build(engine, node, inputs):
     """Contribute one step to the logical plan: SELECT * with the target column replaced by a mask.
 
     `inputs[0]` is the upstream relation. `ctx.sql` runs SQL over it, referencing it as the
@@ -45,4 +45,4 @@ def lower(engine, node, inputs):
 
 def register(reg):
     """Discovery entry point — the kernel calls this once with the plugin Registry."""
-    reg.add_node(SPEC, lower)
+    reg.add_node(SPEC, build)

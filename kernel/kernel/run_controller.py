@@ -22,7 +22,7 @@ import uuid
 from kernel import compiler, db
 from kernel import graph as g
 from kernel import planner
-from kernel.executors.engine import LoweringEngine
+from kernel.executors.engine import BuildEngine
 from kernel.models import (Graph, GraphEdge, GraphEdgeData, GraphNode, PerNodeStatus, Position, RunStatus)
 
 
@@ -168,8 +168,8 @@ class RunController:
         backend = self._backend_runner(region)
         if backend is self.base:
             with db.run_scope():
-                eng = LoweringEngine(subg, self.deps.resolve_adapter, self.deps.registry, full=True,
-                                     node_lowerings=self.deps.node_lowerings, node_specs=self.deps.node_specs)
+                eng = BuildEngine(subg, self.deps.resolve_adapter, self.deps.registry, full=True,
+                                     node_builders=self.deps.node_builders, node_specs=self.deps.node_specs)
                 eng.relation(region.output_node).write_parquet(out_uri)
         else:
             sub = backend.run_unit(subg, region.output_node, out_uri)

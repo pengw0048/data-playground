@@ -16,20 +16,20 @@ import duckdb
 
 from kernel.models import CompilePlan, Graph, GraphNode, Placement, RunEstimate, RunStatus
 
-# The `dataset` wire is a lazy DuckDB relation — the currency a node lowering produces/consumes.
+# The `dataset` wire is a lazy DuckDB relation — the currency a node's build produces/consumes.
 Relation = duckdb.DuckDBPyRelation
 
 
 @runtime_checkable
-class NodeLowering(Protocol):
-    """The lowering callable a plugin passes to `reg.add_node(spec, lower)` — how a custom node kind
+class NodeBuilder(Protocol):
+    """The build callable a plugin passes to `reg.add_node(spec, build)` — how a custom node kind
     turns its inputs into a DuckDB relation plan.
 
-    `engine` is the `kernel.executors.engine.LoweringEngine` driving the pass (typed `Any` to avoid a
+    `engine` is the `kernel.executors.engine.BuildEngine` driving the pass (typed `Any` to avoid a
     runtime import cycle; use `engine.full`, `engine.node_specs`, `engine._view(rel)` etc.). `inputs`
-    are the already-lowered upstream relations, in incoming-edge order. Return a single `Relation`
+    are the already-built upstream relations, in incoming-edge order. Return a single `Relation`
     for a single-output node, or `{port_id: Relation}` for a multi-output node — the engine routes by
-    the wired `source_handle` (default port id is "out"). Lowering is LAZY: return relations, don't
+    the wired `source_handle` (default port id is "out"). Building is LAZY: return relations, don't
     force execution; the runner materializes at the end.
     """
 

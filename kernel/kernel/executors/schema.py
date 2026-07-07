@@ -9,7 +9,7 @@ dedup/join/sql/aggregate/metric) carry a schema DuckDB can resolve lazily; code 
 from __future__ import annotations
 
 from kernel import db, graph as g
-from kernel.executors.engine import LoweringEngine, _disabled
+from kernel.executors.engine import BuildEngine, _disabled
 from kernel.models import Graph
 from kernel.plugins.adapters import relation_columns
 
@@ -18,15 +18,15 @@ _UNTYPED = {"transform", "notebook", "section", "vector-search", "loop", "opaque
 
 
 def schema_for_graph(graph: Graph, resolve_adapter, registry,
-                     node_lowerings=None, node_specs=None) -> dict[str, list | None]:
+                     node_builders=None, node_specs=None) -> dict[str, list | None]:
     if not g.is_acyclic(graph):
         return {}
-    untyped = _UNTYPED | set(node_lowerings or {})  # plugin kinds are untyped too (they execute)
+    untyped = _UNTYPED | set(node_builders or {})  # plugin kinds are untyped too (they execute)
     # schema_only → sources scan with limit=0 (metadata only, no materialization even for eager
     # adapters like Lance), so this whole pass is cheap. We do NOT wrap it in a timeout: a timeout
     # abandons a worker thread that still holds the shared DuckDB lock, wedging every later query.
-    engine = LoweringEngine(graph, resolve_adapter, registry, sample_k=None, full=True,
-                            node_lowerings=node_lowerings, node_specs=node_specs, schema_only=True)
+    engine = BuildEngine(graph, resolve_adapter, registry, sample_k=None, full=True,
+                            node_builders=node_builders, node_specs=node_specs, schema_only=True)
     out: dict[str, list | None] = {}
     # run on our own cursor (scope exit drops the views it minted); doesn't block concurrent runs
     with db.run_scope():

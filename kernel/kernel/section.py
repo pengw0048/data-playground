@@ -97,7 +97,7 @@ def run_section(engine, node, inputs):
     A single-output section emit(rel)s to the default "out" port; a multi-output section
     emit("name", rel)s to named ports that the outer graph wires by source_handle.
     """
-    from kernel.executors.engine import LoweringEngine
+    from kernel.executors.engine import BuildEngine
 
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
     script = (cfg.get("script") or "").strip()
@@ -131,8 +131,8 @@ def run_section(engine, node, inputs):
                 nodes.append(GraphNode(id=n.id, type=n.type, position=n.position,
                                        data=(n.data if isinstance(n.data, dict) else {}), parent_id=pid))
         mini = Graph(id="_sec", version=1, edges=[], nodes=nodes)
-        sub = LoweringEngine(mini, engine.resolve_adapter, engine.registry, full=True,
-                             node_lowerings=engine.node_lowerings, node_specs=engine.node_specs,
+        sub = BuildEngine(mini, engine.resolve_adapter, engine.registry, full=True,
+                             node_builders=engine.node_builders, node_specs=engine.node_specs,
                              bound_inputs={alias: data} if data is not None else None,
                              spill_files=engine.spill_files)  # share the list so sub-node spill is GC'd too
         return _materialize(engine, sub.relation(alias))

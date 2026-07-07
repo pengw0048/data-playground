@@ -1,6 +1,6 @@
 """Default runner — the local out-of-core engine.
 
-Lowers the graph to a DuckDB relation plan and executes it out-of-core (DuckDB streams and
+Builds the graph into a DuckDB relation plan and executes it out-of-core (DuckDB streams and
 spills, so bigger-than-RAM is fine). Estimates cost coarsely and picks placement by a threshold
 — no resource knobs (P4). A runner plugin (Ray/Dask) would bind the SAME plan to a cluster.
 Content-addressed: an unchanged plan (by node config + source fingerprint) is served from cache
@@ -17,7 +17,7 @@ import time
 import uuid
 
 from kernel import db, graph as g
-from kernel.executors.engine import LoweringEngine
+from kernel.executors.engine import BuildEngine
 from kernel.models import (
     CompilePlan,
     Graph,
@@ -34,7 +34,7 @@ _MAX_RUNS = 100          # cap retained run history / cache so a long-lived kern
 class LocalRunner:
     name = "local-out-of-core"
 
-    def __init__(self, resolve_adapter, registry, catalog, workspace: str, node_lowerings=None,
+    def __init__(self, resolve_adapter, registry, catalog, workspace: str, node_builders=None,
                  node_specs=None, storage=None):
         self.resolve_adapter = resolve_adapter
         self.registry = registry
@@ -51,7 +51,7 @@ class LocalRunner:
         self.result_put = None   # (key, doc) -> None
         # keep the SAME dict object deps passes (plugins fill it AFTER construction) — an
         # empty {} is falsy, so `or {}` would rebind a new dict and drop plugin lowerings.
-        self.node_lowerings = node_lowerings if node_lowerings is not None else {}
+        self.node_builders = node_builders if node_builders is not None else {}
         self.node_specs = node_specs if node_specs is not None else {}
         self.runs: dict[str, RunStatus] = {}
         self._cancel: dict[str, threading.Event] = {}
@@ -138,7 +138,7 @@ class LocalRunner:
                     return False  # URI-only fingerprint → an in-place overwrite wouldn't invalidate
             if n.type == "write" and cfg.get("writeMode") == "append":
                 return False  # append is not idempotent — never reuse (also keeps the confirm gate honest)
-            if cfg.get("source") == "library" or n.type in self.node_lowerings:
+            if cfg.get("source") == "library" or n.type in self.node_builders:
                 return False  # processor / plugin CODE isn't in the key → a same-id upgrade would go stale
         return True
 
@@ -222,8 +222,8 @@ class LocalRunner:
         phash = self._plan_hash(graph, target)
         cacheable = self._plan_cacheable(graph, target)
         cached = self._cache_get(phash) if cacheable else None
-        engine = LoweringEngine(graph, self.resolve_adapter, self.registry, full=True,
-                                node_lowerings=self.node_lowerings, node_specs=self.node_specs)
+        engine = BuildEngine(graph, self.resolve_adapter, self.registry, full=True,
+                                node_builders=self.node_builders, node_specs=self.node_specs)
         nm = g.node_map(graph)
         rows_seen = 0
         # Run on our OWN DuckDB cursor (db.run_scope), NOT the process-global lock: a long run no
@@ -243,7 +243,7 @@ class LocalRunner:
                     if step.kind == "write":
                         rows_seen = self._commit_write(nm[step.node_id], graph, engine, status, cached)
                     else:
-                        engine.relation(step.node_id)  # lower (lazy) — cheap
+                        engine.relation(step.node_id)  # build (lazy) — cheap
                     if pn:
                         pn.status = "done"
                         pn.ms = int((time.time() - t0) * 1000)
@@ -287,12 +287,12 @@ class LocalRunner:
                     except Exception:  # noqa: BLE001
                         pass
 
-    def _count(self, engine: LoweringEngine, node_id: str, cached: dict | None) -> int:
+    def _count(self, engine: BuildEngine, node_id: str, cached: dict | None) -> int:
         if cached and cached.get("rows") is not None:
             return cached["rows"]
         return int(engine.relation(node_id).aggregate("count(*) AS n").fetchone()[0])
 
-    def _commit_write(self, node, graph: Graph, engine: LoweringEngine, status: RunStatus,
+    def _commit_write(self, node, graph: Graph, engine: BuildEngine, status: RunStatus,
                       cached: dict | None) -> int:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         mode = cfg.get("writeMode", "overwrite")
@@ -323,7 +323,7 @@ class LocalRunner:
         if not inc:
             return 0
         # route by the wired output PORT (source_handle) — a write off a multi-output node must
-        # persist that port's data, not the default/first one. Mirrors LoweringEngine._inputs.
+        # persist that port's data, not the default/first one. Mirrors BuildEngine._inputs.
         parent_rel = engine.relation(inc[0].source, inc[0].source_handle)
         adapter = self.resolve_adapter(uri)
         res = adapter.write(uri, parent_rel, mode)

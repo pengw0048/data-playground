@@ -1,6 +1,6 @@
 """Sample-preview — run source→node on a bounded sample, off the full run.
 
-Uses the SAME lowering as a full run, with the source bounded to a preview scan budget, so the
+Uses the SAME build as a full run, with the source bounded to a preview scan budget, so the
 rows you see are faithful to what runs at scale. Stops honestly at non-previewable stages (P8),
 and distinguishes an honest "needs a full pass" from a real error (bad cell/query/graph).
 """
@@ -8,7 +8,7 @@ and distinguishes an honest "needs a full pass" from a real error (bad cell/quer
 from __future__ import annotations
 
 from kernel import db, graph as g
-from kernel.executors.engine import LoweringEngine, NotPreviewable
+from kernel.executors.engine import BuildEngine, NotPreviewable
 from kernel.models import Graph, SampleResult
 from kernel.sandbox import run_with_timeout
 
@@ -17,7 +17,7 @@ PREVIEW_BUDGET_S = 8.0
 
 
 def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
-                 node_lowerings=None, node_specs=None, offset: int = 0) -> SampleResult:
+                 node_builders=None, node_specs=None, offset: int = 0) -> SampleResult:
     # clean, up-front graph checks (don't rely on a Python RecursionError for cycles)
     if not g.is_acyclic(graph):
         return SampleResult(error=True, reason="graph has a cycle — control flow must be encapsulated (§5.7)")
@@ -26,8 +26,8 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
         if errs:
             return SampleResult(error=True, reason="incompatible connection: " + "; ".join(errs[:3]))
 
-    engine = LoweringEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
-                            node_lowerings=node_lowerings, node_specs=node_specs)
+    engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
+                            node_builders=node_builders, node_specs=node_specs)
 
     holder: dict = {}  # published by the worker thread so the timeout can interrupt its cursor
 

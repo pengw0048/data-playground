@@ -61,7 +61,7 @@ typed columnar data"). You can do two things, and you decide which fits each mes
   1. Just answer / advise / think an approach through — reply in text. Use only the read-only \
 tools (list_catalog, list_node_kinds, preview) if you need to look first.
   2. Build or change the canvas — call add_node / connect / set_config to construct real, \
-inspectable typed nodes. Nodes lower to a typed logical plan (a DuckDB relation), so the same \
+inspectable typed nodes. Nodes build a typed logical plan (a DuckDB relation), so the same \
 graph runs on a preview sample or at full scale.
 
 Decide from the message: if the user is asking a question, exploring, or doesn't clearly want the \
@@ -113,7 +113,7 @@ def _node_kinds(deps) -> list[dict]:
 # --------------------------------------------------------------------------- #
 @dataclass
 class _Ctx:
-    kdeps: Any            # kernel Deps: catalog / node_specs / resolve_adapter / registry / node_lowerings
+    kdeps: Any            # kernel Deps: catalog / node_specs / resolve_adapter / registry / node_builders
     wg: dict              # working graph {id, version, nodes, edges}
     seq: list             # id counter [int]
     transcript: list      # [{tool, input, result}] for the UI
@@ -190,7 +190,7 @@ try:
         try:
             g = Graph.model_validate(ctx.deps.wg)
             out["type_errors"] = gmod.type_errors(g, d.node_specs)
-            cols = schema_for_graph(g, d.resolve_adapter, d.registry, d.node_lowerings, d.node_specs)
+            cols = schema_for_graph(g, d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
             joins = {}
             for n in g.nodes:
                 if n.type == "join":
@@ -268,7 +268,7 @@ try:
         else:
             try:
                 res = preview_node(Graph(**ctx.deps.wg), node_id, 8, d.resolve_adapter, d.registry,
-                                   d.node_lowerings, d.node_specs)
+                                   d.node_builders, d.node_specs)
                 if res.not_previewable:
                     out = {"not_previewable": True, "reason": res.reason}
                 elif res.error:

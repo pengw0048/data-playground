@@ -1,7 +1,7 @@
-"""The lowering engine — a node lowers to a step in a typed logical plan.
+"""The build engine — a node builds a step in a typed logical plan.
 
 The `dataset` wire is a lazy DuckDB relation; relational ops (filter/select/join/aggregate/
-sort/dedup/sql/sample) lower to relation transforms that DuckDB executes out-of-core (streaming,
+sort/dedup/sql/sample) build relation transforms that DuckDB executes out-of-core (streaming,
 spilling to disk). The `transform` node is the escape hatch: arbitrary Python over Arrow
 `RecordBatch`es. The SAME relation is executed on a bounded sample (preview) or in full (run),
 so what you see on the sample is faithful — except nodes flagged not-previewable (P8).
@@ -46,9 +46,9 @@ def _disabled(node: GraphNode) -> bool:
     return bool(node.data.get("disabled")) if isinstance(node.data, dict) else False
 
 
-class LoweringEngine:
+class BuildEngine:
     def __init__(self, graph: Graph, resolve_adapter, registry, sample_k: int | None = None,
-                 full: bool = False, node_lowerings: dict | None = None, node_specs: dict | None = None,
+                 full: bool = False, node_builders: dict | None = None, node_specs: dict | None = None,
                  bound_inputs: dict | None = None, spill_files: list | None = None,
                  schema_only: bool = False):
         self.graph = graph
@@ -59,7 +59,7 @@ class LoweringEngine:
         # schema_only: we only want column names/types, never rows — scan sources with limit=0 so
         # even an eager adapter (Lance materializes on to_table) touches no data. See executors/schema.
         self.schema_only = schema_only
-        self.node_lowerings = node_lowerings or {}
+        self.node_builders = node_builders or {}
         self.node_specs = node_specs or {}
         # a node id -> Relation to inject as that node's input (used to run a section's sub-node
         # against a script-provided handle instead of a wired upstream edge)
@@ -68,7 +68,7 @@ class LoweringEngine:
         # runner deletes them in its finally so they don't accumulate across the kernel's lifetime.
         # Shared with sub-engines (sections) so a contained transform's spill is GC'd too.
         self.spill_files = spill_files if spill_files is not None else []
-        # a node lowers to either one Relation (single output) or a dict of named output ports
+        # a node builds either one Relation (single output) or a dict of named output ports
         # (multi-output — e.g. a section that emit()s several named result sets)
         self._cache: dict[str, "Relation | dict[str, Relation]"] = {}
 
@@ -78,17 +78,17 @@ class LoweringEngine:
             self._cache[node_id] = self._lower(g.node_map(self.graph)[node_id])
         return self._pick(node_id, self._cache[node_id], handle)
 
-    def _pick(self, node_id: str, lowered, handle: str | None) -> Relation:
-        # single-output nodes lower to a bare Relation and ignore the handle; multi-output nodes
-        # lower to {port -> Relation}, so route by the edge's source_handle (default port = "out").
-        if not isinstance(lowered, dict):
-            return lowered
-        if handle is not None and handle in lowered:
-            return lowered[handle]
+    def _pick(self, node_id: str, built, handle: str | None) -> Relation:
+        # single-output nodes build a bare Relation and ignore the handle; multi-output nodes
+        # build {port -> Relation}, so route by the edge's source_handle (default port = "out").
+        if not isinstance(built, dict):
+            return built
+        if handle is not None and handle in built:
+            return built[handle]
         if handle is None:
             # explicit key check — a DuckDB relation is falsy when it has 0 rows (defines __len__),
-            # so `lowered.get("out") or …` would wrongly skip an empty default port (and force a count).
-            return lowered["out"] if "out" in lowered else next(iter(lowered.values()))
+            # so `built.get("out") or …` would wrongly skip an empty default port (and force a count).
+            return built["out"] if "out" in built else next(iter(built.values()))
         raise NotPreviewable(g.node_map(self.graph)[node_id], f"output port '{handle}' was not produced")
 
     def rows(self, node_id: str, k: int, offset: int = 0) -> tuple[list[dict], list[ColumnSchema]]:
@@ -106,11 +106,11 @@ class LoweringEngine:
     def _inputs(self, node: GraphNode) -> list[Relation]:
         if node.id in self.bound_inputs:  # section sub-node: input injected by the driver script
             return [self.bound_inputs[node.id]]
-        # route each incoming edge by its source port (multi-output nodes lower to {port -> Relation})
+        # route each incoming edge by its source port (multi-output nodes build {port -> Relation})
         return [self.relation(e.source, e.source_handle) for e in g.incoming(self.graph, node.id)]
 
     def _faithful_inputs(self, node: GraphNode) -> list[Relation]:
-        """Lower this node's inputs UNSAMPLED even during preview, so an op that must see all rows
+        """Build this node's inputs UNSAMPLED even during preview, so an op that must see all rows
         (join / sort / vector-search) is FAITHFUL — the op's own LIMIT then makes it an efficient
         top-N, bounded by the preview budget. A truncated-prefix version of these ops lies (a join of
         two independent 2000-row prefixes finds few real matches; a sort/vector-search shows the top
@@ -121,8 +121,8 @@ class LoweringEngine:
         chain = g.upstream_chain(self.graph, node.id)
         if any(n.type in ("transform", "notebook", "opaque", "loop") for n in chain):
             raise NotPreviewable(node, f"{node.type} over a transformed input — needs a full pass")
-        full = LoweringEngine(self.graph, self.resolve_adapter, self.registry, sample_k=None, full=True,
-                              node_lowerings=self.node_lowerings, node_specs=self.node_specs)
+        full = BuildEngine(self.graph, self.resolve_adapter, self.registry, sample_k=None, full=True,
+                              node_builders=self.node_builders, node_specs=self.node_specs)
         return [full.relation(e.source, e.source_handle) for e in g.incoming(self.graph, node.id)]
 
     def _join_projection(self, left: Relation, right: Relation) -> str:
@@ -140,7 +140,7 @@ class LoweringEngine:
         rel.create_view(name, replace=True)
         return name
 
-    # -- lowering ---------------------------------------------------------- #
+    # -- building ---------------------------------------------------------- #
     def _lower(self, node: GraphNode) -> Relation:  # noqa: C901
         t = node.type
         cfg = _cfg(node)
@@ -175,10 +175,10 @@ class LoweringEngine:
         inputs = self._inputs(node)
         # plugin-provided node kinds (§8.1) — dispatch BEFORE the no-inputs guard so a plugin
         # can define a 0-input source/generator. Honor the plugin's declared previewable.
-        if t in self.node_lowerings:
+        if t in self.node_builders:
             if not self.full and not self._spec_previewable(t):
                 raise NotPreviewable(node, f"'{t}' is not sample-previewable — needs a full pass")
-            return self.node_lowerings[t](self, node, inputs)
+            return self.node_builders[t](self, node, inputs)
 
         if t == "section":  # composite node implemented by a driver script over contained nodes
             if not self.full:  # runs real work over its nodes — not faithful on a sample (P8)
@@ -285,8 +285,8 @@ class LoweringEngine:
                     raise NotPreviewable(node, "metric over a transformed input — needs a full pass")
                 inc = g.incoming(self.graph, node.id)
                 if inc:
-                    full = LoweringEngine(self.graph, self.resolve_adapter, self.registry,
-                                          sample_k=None, full=True, node_lowerings=self.node_lowerings,
+                    full = BuildEngine(self.graph, self.resolve_adapter, self.registry,
+                                          sample_k=None, full=True, node_builders=self.node_builders,
                                           node_specs=self.node_specs)
                     base = full.relation(inc[0].source, inc[0].source_handle)
             expr = "count(*)" if agg == "count" or not col else f'{_agg_name(agg)}("{_ident(col)}")'
@@ -311,8 +311,8 @@ class LoweringEngine:
                     raise NotPreviewable(node, "chart over a transformed input — needs a full pass")
                 inc = g.incoming(self.graph, node.id)
                 if inc:
-                    full = LoweringEngine(self.graph, self.resolve_adapter, self.registry, sample_k=None,
-                                          full=True, node_lowerings=self.node_lowerings, node_specs=self.node_specs)
+                    full = BuildEngine(self.graph, self.resolve_adapter, self.registry, sample_k=None,
+                                          full=True, node_builders=self.node_builders, node_specs=self.node_specs)
                     base = full.relation(inc[0].source, inc[0].source_handle)
             v, xq = self._view(base, "ch"), f'"{_ident(x)}"'
             if agg == "none":  # raw points (scatter/line) — the chart series is x,y as-is

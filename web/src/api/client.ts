@@ -37,7 +37,7 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
 }
 
 // Strip transient UI-only fields the kernel does not need before sending a graph.
-// `note` nodes are canvas annotations with no ports/lowering — the engine never sees them.
+// `note` nodes are canvas annotations with no ports/build step — the engine never sees them.
 function toGraph(doc: CanvasDoc) {
   const dataNodes = doc.nodes.filter((n) => n.type !== 'note' && n.type !== 'code')
   const dataIds = new Set(dataNodes.map((n) => n.id))

@@ -58,7 +58,7 @@ def run_preview(req: PreviewRequest) -> SampleResult:
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     k = req.k if req.k is not None else settings.preview_k
     return preview_node(req.graph, req.node_id, k,
-                        deps.resolve_adapter, deps.registry, deps.node_lowerings, deps.node_specs,
+                        deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
                         offset=max(0, req.offset))
 
 
@@ -68,7 +68,7 @@ def graph_schema(req: CompileRequest) -> dict:
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     return schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
-                            deps.node_lowerings, deps.node_specs)
+                            deps.node_builders, deps.node_specs)
 
 
 @router.post("/graph/join-analysis", response_model=JoinAnalysis)
@@ -80,7 +80,7 @@ def join_analysis(req: CompileRequest) -> JoinAnalysis:
     if not req.target_node_id:
         return JoinAnalysis(note="no join node selected")
     cols = schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
-                            deps.node_lowerings, deps.node_specs)
+                            deps.node_builders, deps.node_specs)
     return rel.analyze_join(req.graph, req.target_node_id, cols, deps.catalog, deps.resolve_adapter)
 
 

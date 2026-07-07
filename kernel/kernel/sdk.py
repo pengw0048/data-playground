@@ -1,7 +1,7 @@
 """Node-authoring SDK — what a plugin pack imports to add a typed node.
 
-A plugin's `register(reg)` calls `reg.add_node(spec, lower)`. `spec` is a NodeSpec (typed ports
-+ params, rendered generically by the SPA — no frontend code needed). `lower(engine, node,
+A plugin's `register(reg)` calls `reg.add_node(spec, build)`. `spec` is a NodeSpec (typed ports
++ params, rendered generically by the SPA — no frontend code needed). `build(engine, node,
 inputs) -> relation` contributes one step to the logical plan; use the `ctx` helpers to build it
 from DuckDB SQL, a Polars transform, or an Arrow-batch UDF — all out-of-core, runner-portable.
 
@@ -13,14 +13,14 @@ Example plugin (`plugins/mypack/__init__.py`):
                     inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
                     params=[ParamSpec(name="column", type="string", default="name")])
 
-    def lower(engine, node, inputs):
+    def build(engine, node, inputs):
         col = node.data.get("config", {}).get("column", "name")
         # NOTE: {{input}} in an f-string emits the literal {input} token that ctx.sql substitutes with
         # the input view name. A bare {input} would be interpolated by Python to the builtin `input`.
         return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM {{input}}')
 
     def register(reg):
-        reg.add_node(SPEC, lower)
+        reg.add_node(SPEC, build)
 """
 
 from __future__ import annotations

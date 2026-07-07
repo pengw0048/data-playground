@@ -14,7 +14,7 @@ import importlib.util
 import os
 import sys
 
-from kernel.backends import NodeLowering
+from kernel.backends import NodeBuilder
 from kernel.models import BackendInfo, KernelInfo, ResourceSpec, WorkerInfo
 from kernel.nodespecs import BUILTIN_NODE_SPECS, NodeSpec
 from kernel.plugins.adapters import DuckDBAdapter, default_adapters
@@ -36,11 +36,11 @@ class Registry:
     def __init__(self, deps: "Deps"):
         self.deps = deps
 
-    def add_node(self, spec: NodeSpec, lower: "NodeLowering | None" = None) -> None:
-        # `lower` is the node's lowering callable — see kernel.backends.NodeLowering for its exact
-        # signature/return contract (called by the engine as lower(engine, node, inputs)).
+    def add_node(self, spec: NodeSpec, build: "NodeBuilder | None" = None) -> None:
+        # `build` is the node's build callable — see kernel.backends.NodeBuilder for its exact
+        # signature/return contract (called by the engine as build(engine, node, inputs)).
         # refuse to shadow a built-in OR an already-registered plugin kind — overwriting would
-        # corrupt the /api/nodes contract and leave the original's lower() as dead code
+        # corrupt the /api/nodes contract and leave the original's build() as dead code
         if spec.kind in self.deps.builtin_kinds:
             print(f"[deps] plugin node '{spec.kind}' collides with a built-in kind — refused")
             return
@@ -48,8 +48,8 @@ class Registry:
             print(f"[deps] plugin node '{spec.kind}' already registered by another plugin — refused")
             return
         self.deps.node_specs[spec.kind] = spec
-        if lower is not None:
-            self.deps.node_lowerings[spec.kind] = lower
+        if build is not None:
+            self.deps.node_builders[spec.kind] = build
 
     def add_adapter(self, adapter) -> None:
         self.deps.adapters.insert(0, adapter)  # plugins claim uris before defaults
@@ -123,7 +123,7 @@ class Deps:
         self.capabilities = list(BUILTIN_CAPABILITIES)
         self.node_specs: dict[str, NodeSpec] = {s.kind: s for s in BUILTIN_NODE_SPECS}
         self.builtin_kinds = {s.kind for s in BUILTIN_NODE_SPECS}
-        self.node_lowerings: dict[str, object] = {}
+        self.node_builders: dict[str, object] = {}
         self.plugins: list[dict] = []
         self._manifests: dict[str, dict] = {}
         from kernel.storage import make_storage
@@ -139,7 +139,7 @@ class Deps:
             name = os.path.splitext(os.path.basename(uri.rstrip("/")))[0]
             self.catalog.register_output(name=name, uri=uri, version="v1", parents=[], pipeline="canvas")
         self.runner = LocalRunner(self.resolve_adapter, self.registry, self.catalog, workspace,
-                                  node_lowerings=self.node_lowerings, node_specs=self.node_specs,
+                                  node_builders=self.node_builders, node_specs=self.node_specs,
                                   storage=self.storage)
         self.runner.on_complete = _persist_run  # keep finished runs with their canvas (run history)
         self.runner.on_status = _persist_run_state  # mirror live status to the DB (stateless-web reads)

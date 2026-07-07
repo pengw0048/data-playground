@@ -40,10 +40,10 @@ def main() -> int:
         mat_uri = job.get("materializeUri")
         if mat_uri:
             from kernel import db
-            from kernel.executors.engine import LoweringEngine
+            from kernel.executors.engine import BuildEngine
             with db.run_scope():
-                eng = LoweringEngine(graph, deps.resolve_adapter, deps.registry, full=True,
-                                     node_lowerings=deps.node_lowerings, node_specs=deps.node_specs)
+                eng = BuildEngine(graph, deps.resolve_adapter, deps.registry, full=True,
+                                     node_builders=deps.node_builders, node_specs=deps.node_specs)
                 eng.relation(job.get("target")).write_parquet(mat_uri)
             _atomic_write(status_file, {"run_id": "child", "status": "done", "per_node": [], "rows_processed": 0,
                                         "ms": 0, "placement": "local", "output_uri": mat_uri})

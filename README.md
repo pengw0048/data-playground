@@ -9,10 +9,10 @@ pool backend ships; Ray/pod/queue runners are plugin territory).
 Clone it and it works: **no cloud account, no external services, no mock mode.** Point it at your
 Parquet / CSV / JSON / Arrow / Lance files and you're doing real data work in five minutes.
 
-![the canvas](docs/screenshot.png)
+![The Data Playground canvas — datasets and operators wired into a node graph, with a data panel showing the real rows flowing out of a node.](docs/screenshot.png)
 
 > **Prereqs:** [uv](https://docs.astral.sh/uv/) and Node 20+ (uv fetches the pinned Python 3.12
-> automatically). Install uv: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+> automatically).
 
 ```bash
 make setup && make run          # → http://127.0.0.1:8471 (seeds sample data on first run)
@@ -25,8 +25,7 @@ cd kernel && uv run dataplay              # serves the canvas + engine in one pr
 cd kernel && uv run dataplay --workspace ./my-proj --port 8471
 ```
 
-(Not yet published to PyPI — install from a clone with `uv pip install -e 'kernel[agent]'` for a bare
-`dataplay` on your PATH.)
+(Install from a clone with `uv pip install -e 'kernel[agent]'` for a bare `dataplay` on your PATH.)
 
 **New here?** The **[5-minute tour](docs/TUTORIAL.md)** builds a real pipeline on the seeded data —
 events → keep purchases → total per user → save.
@@ -47,8 +46,6 @@ events → keep purchases → total per user → save.
 - **Run at scale, out-of-core** — the same graph runs over the full dataset. The default engine is
   DuckDB + Polars + Arrow: joins/aggregations/sorts spill to disk instead of crashing, so a dataset
   bigger than RAM sorts under a bounded memory cap rather than OOM-ing.
-- **Honest previews** — global aggregates, writes, and opaque ops say *"needs a full pass"*
-  rather than computing a misleading answer on a sample.
 - **Extend it like ComfyUI** — drop a Python package in `<workspace>/plugins/` and your typed node
   appears in the Add-node menu, **rendered and wired with no frontend code** (§ Plugins).
 - **Save, undo, export** — the canvas is diff-friendly JSON, auto-persisted; `⌘Z`/`⌘⇧Z` undo/redo;
@@ -56,16 +53,16 @@ events → keep purchases → total per user → save.
 
 ---
 
-## The load-bearing idea: a node lowers to a logical plan
+## The load-bearing idea: a node builds a logical plan
 
-A node does **not** run Python per-row on the server. It **lowers to a step in a typed logical plan**:
+A node does **not** run Python per-row on the server. It **builds a step in a typed logical plan**:
 
 - a **relational op** (`filter`/`select`/`join`/`aggregate`/`sort`/`dedup`/`sql`) → a DuckDB relation,
   so it's pushed down, optimized, and out-of-core; or
 - a **Python batch UDF** over Arrow `RecordBatch`es (the `transform` escape hatch) → portable to any
   runner.
 
-The runner lowers + executes the whole plan. That's what makes *same graph, sample and scale* real:
+The runner builds + executes the whole plan. That's what makes *same graph, sample and scale* real:
 the identical plan runs on a bounded sample (instant preview) or over the full dataset out-of-core
 (local) — and a runner plugin (Ray/Dask) would bind the same plan to a cluster, no rewrite.
 
@@ -144,12 +141,12 @@ SPEC = NodeSpec(kind="upcase", title="uppercase", category="compute",
                 inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
                 params=[ParamSpec(name="column", type="string", default="name")])
 
-def lower(engine, node, inputs):                      # contribute one step to the plan
+def build(engine, node, inputs):                      # contribute one step to the plan
     col = node.data.get("config", {}).get("column", "name")
     return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM {{input}}')
 
 def register(reg):
-    reg.add_node(SPEC, lower)
+    reg.add_node(SPEC, build)
 ```
 
 Restart the server → `uppercase` is in the Add-node menu, typed, wired, previewable, runnable — the
@@ -190,7 +187,7 @@ model string), so you point it at whatever model you have (the key lives in the 
 browser):
 
 ```bash
-uv pip install -e 'kernel[agent]'     # from a clone (not yet on PyPI)
+uv pip install -e 'kernel[agent]'     # from a clone
 
 # pick a provider via DP_AGENT_MODEL + its key:
 export DP_AGENT_MODEL=anthropic/claude-opus-4-8   && export ANTHROPIC_API_KEY=sk-ant-...   # default

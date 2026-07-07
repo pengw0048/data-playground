@@ -23,7 +23,7 @@ SPEC = NodeSpec(
     blurb="mask a text column (PII) — keep the first N chars, replace the rest with *",
 )
 
-def lower(engine, node, inputs):
+def build(engine, node, inputs):
     cfg = node.data.get("config", {})
     col = (cfg.get("column") or "").strip()
     if not col:
@@ -34,7 +34,7 @@ def lower(engine, node, inputs):
     return ctx.sql(inputs[0], f'SELECT * REPLACE ({masked} AS "{col}") FROM {{input}}')
 
 def register(reg):
-    reg.add_node(SPEC, lower)
+    reg.add_node(SPEC, build)
 ```
 
 That's the whole plugin. Two pieces:
@@ -43,7 +43,7 @@ That's the whole plugin. Two pieces:
   is the port's type — `dataset`/`sample`/`selection`/`sql-view`/`metric`/`value`; `accepts` lists
   which wires an input port allows), and **params** (`string`/`text`/`code`/`int`/`float`/`bool`/
   `select`/`columns`). The SPA renders the card generically from this — no frontend code.
-- **`lower(engine, node, inputs)`** — contributes one step to the logical plan. `inputs[0]` is the
+- **`build(engine, node, inputs)`** — contributes one step to the logical plan. `inputs[0]` is the
   upstream relation; return a relation. Because it returns a lazy DuckDB relation, it pushes down and
   runs out-of-core exactly like a built-in node — on a preview sample or at full scale.
 
@@ -92,7 +92,7 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 
 | call | extends | contract |
 |---|---|---|
-| `reg.add_node(spec, lower)` | a canvas node | `NodeSpec` + `lower(engine, node, inputs) -> relation` |
+| `reg.add_node(spec, build)` | a canvas node | `NodeSpec` + `build(engine, node, inputs) -> relation` |
 | `reg.add_adapter(adapter)` | a dataset source/sink (claim a URI scheme) | `matches/scan/schema/count/fingerprint/write` (see `kernel/kernel/backends.py`) |
 | `reg.add_runner(runner)` | an execution backend (pod/Ray/queue) | `ExecutionBackend`: `name/can_run/estimate/run/status/cancel` |
 | `reg.add_capability(cap)` | a declared column capability (id + label) | see `kernel/kernel/plugins/capabilities.py` |

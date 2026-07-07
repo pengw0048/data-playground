@@ -11,8 +11,8 @@ real code and was imported nowhere), each contract lives next to the code that U
   `nearest(...)` for native ANN.) Register via `reg.add_adapter(...)`.
 - Execution backends — the `ExecutionBackend` Protocol in `kernel.backends` (runtime-checkable).
   `LocalRunner` / `SubprocessRunner` implement it. Register via `reg.add_runner(...)`.
-- Node kinds + their lowering — `NodeSpec` in `kernel.nodespecs`; the lowering callable is the
-  `NodeLowering` Protocol in `kernel.backends`. Register via `reg.add_node(spec, lower)`.
+- Node kinds + their build — `NodeSpec` in `kernel.nodespecs`; the build callable is the
+  `NodeBuilder` Protocol in `kernel.backends`. Register via `reg.add_node(spec, build)`.
 - Capabilities — an `id` + `label` object (see `kernel.plugins.capabilities`); register via
   `reg.add_capability(...)`. Column-tag DETECTION lives in `capabilities.tag_columns`; per-capability
   viewer UI is registered on the frontend (`web/src/nodes/capabilities.tsx`).

@@ -14,13 +14,13 @@ uv run pytest -q                     # end-to-end tests (real engine on real fil
 
 Optional Lance support: `uv sync --extra lance`.
 
-## The engine (default runner) — a node lowers to a plan
+## The engine (default runner) — a node builds a plan
 
-`dataset` = a lazy **DuckDB relation**. Each node lowers to a relation transform (out-of-core,
+`dataset` = a lazy **DuckDB relation**. Each node builds a relation transform (out-of-core,
 spills) or, for `transform`, a Python UDF over Arrow batches. The runner executes the composed
-relation; preview runs the SAME lowering with a bounded source sample (faithful — honest previews).
+relation; preview runs the SAME build with a bounded source sample (faithful — honest previews).
 
-| op | lowering |
+| op | build |
 |---|---|
 | filter/select/sort/dedup | `rel.filter/.project/.order/.distinct` |
 | join / aggregate | DuckDB out-of-core hash join / group-by |
@@ -46,8 +46,8 @@ kernel/
   deps.py          composition root + plugin discovery (plugins/ folder + entry points)
   db.py            shared DuckDB connection
   executors/
-    engine.py      the lowering engine (relation per node, out-of-core)
-    preview.py     sample-preview (same lowering, bounded source)
+    engine.py      the build engine (relation per node, out-of-core)
+    preview.py     sample-preview (same build, bounded source)
   plugins/
     adapters.py    Parquet/CSV/JSON/Arrow + Lance adapters (lazy scan + fingerprint)
     runner.py      local out-of-core runner + estimate/placement + content-addressed cache
@@ -72,7 +72,7 @@ catalog/planner. Discovered two ways:
 - **drop-in:** `<workspace>/plugins/<pack>/__init__.py` (+ `dataplay.toml` manifest) — restart to load.
 - **installed:** a pip package exposing a `dataplay.plugins` entry point, or `DP_PLUGINS=mod1,mod2`.
 
-`reg.add_node(spec, lower)` registers a typed node; `lower(engine, node, inputs) -> relation` builds
+`reg.add_node(spec, build)` registers a typed node; `build(engine, node, inputs) -> relation` builds
 its plan step with the `ctx` helpers (`ctx.sql`, `ctx.arrow_map`, `ctx.polars`). The SPA renders it
 from `/api/nodes` — no frontend code. Org-specific backends (managed catalog, cluster runner, private
 model pipelines) belong in such a pack, never in the core.
