@@ -329,6 +329,7 @@ class Graph(Wire):
     version: int = 1
     nodes: list[GraphNode] = []
     edges: list[GraphEdge] = []
+    requirements: list[str] = []  # pip specs the canvas needs; the kernel installs them + allows importing them
 
 
 # --------------------------------------------------------------------------- #

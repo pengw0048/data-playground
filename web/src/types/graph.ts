@@ -109,6 +109,7 @@ export interface CanvasDoc {
   version: number
   nodes: CanvasNode[]
   edges: CanvasEdge[]
+  requirements?: string[]  // pip specs this canvas needs; its kernel installs them (travels with the canvas)
 }
 
 export interface ColumnSchema {

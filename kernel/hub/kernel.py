@@ -80,6 +80,13 @@ def main() -> None:
         if tok != token:
             raise HTTPException(401, "bad kernel token")
 
+    def _ensure_deps(graph) -> None:
+        # install the canvas's declared pip deps into this kernel + let the sandbox import them (cached)
+        reqs = getattr(graph, "requirements", None) or []
+        if reqs:
+            from hub import kernel_deps, sandbox
+            sandbox.allow_modules(kernel_deps.ensure(reqs, kernel_deps.deps_dir(args.workspace, canvas)))
+
     def _heartbeat_loop() -> None:
         while True:
             time.sleep(5.0)
@@ -107,6 +114,7 @@ def main() -> None:
         _auth(x_dp_kernel_token)
         last_activity[0] = time.monotonic()
         graph = Graph(**body.graph)
+        _ensure_deps(graph)
         plan = compiler.compile_plan(graph, body.target, deps.registry, deps.node_specs)
         st = deps.runner.run(plan, graph, body.target, body.placement, run_id=body.run_id)
         return st.model_dump()
@@ -116,7 +124,9 @@ def main() -> None:
         _auth(x_dp_kernel_token)
         last_activity[0] = time.monotonic()
         from hub.executors.preview import preview_node
-        return preview_node(Graph(**body.graph), body.node_id, body.k, deps.resolve_adapter,
+        graph = Graph(**body.graph)
+        _ensure_deps(graph)
+        return preview_node(graph, body.node_id, body.k, deps.resolve_adapter,
                             deps.registry, deps.node_builders, deps.node_specs, offset=body.offset, cache=warm).model_dump()
 
     @app.post("/profile")
@@ -124,7 +134,9 @@ def main() -> None:
         _auth(x_dp_kernel_token)
         last_activity[0] = time.monotonic()
         from hub.executors.profile import profile_node
-        return profile_node(Graph(**body.graph), body.node_id, deps.resolve_adapter,
+        graph = Graph(**body.graph)
+        _ensure_deps(graph)
+        return profile_node(graph, body.node_id, deps.resolve_adapter,
                             deps.registry, deps.node_builders, deps.node_specs, cache=warm).model_dump()
 
     @app.post("/cancel")

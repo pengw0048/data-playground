@@ -215,6 +215,7 @@ interface Store {
   openFile: (id: string) => Promise<boolean>
   newFile: () => Promise<void>
   renameFile: (name: string) => void
+  setRequirements: (reqs: string[]) => void
   deleteFile: (id: string) => Promise<void>
 }
 
@@ -798,6 +799,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   renameFile: (name) => set((s) => ({ doc: { ...s.doc, name } })),  // autosave PUTs + refreshes the list
+  setRequirements: (reqs) => set((s) => ({ doc: { ...s.doc, requirements: reqs } })),  // canvas pip deps; autosave persists
 
   deleteFile: async (id) => {
     // permanent + not undoable → confirm first (guards both the file menu and the Recents trash)

@@ -1384,6 +1384,23 @@ def test_canvas_kernel_state_and_restart():
     metadb.drop_kernel(cid, "k1")
 
 
+def test_canvas_declared_deps_gate_the_sandbox_import_allowlist():
+    # ① per-canvas deps: a module outside the default cell allowlist is blocked, UNTIL the canvas
+    # declares it (the kernel installs it → sandbox.allow_modules), then a transform can import it.
+    from hub import sandbox
+    src = "import base64\ndef fn(row): return row"
+    try:
+        sandbox.compile_operator(src, "map")
+        assert False, "base64 should be blocked by default"
+    except sandbox.SandboxError:
+        pass
+    try:
+        sandbox.allow_modules({"base64"})          # what the kernel does after installing declared deps
+        assert callable(sandbox.compile_operator(src, "map"))
+    finally:
+        sandbox._KERNEL_ALLOWED.discard("base64")  # don't leak the allowance to other tests
+
+
 def test_pod_spawner_builds_manifests_and_conforms_to_the_spi():
     # Phase 3: the PodSpawner is the cross-host substrate behind the SAME KernelSpawner protocol. Test
     # the manifest it builds with a FAKE k8s client (no cluster needed) — a pod running `hub.kernel`

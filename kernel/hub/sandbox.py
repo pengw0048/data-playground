@@ -40,11 +40,25 @@ _SAFE_BUILTINS = {
 _ENTRY_NAMES = ["fn", "transform", "process", "map", "op"]
 
 
+# Extra top-level modules a cell may import — the canvas's declared dependencies, installed by the
+# per-canvas kernel (see hub.kernel_deps). Process-global because a kernel serves ONE canvas, so its
+# declared deps are the same for every run/preview; empty in the hub / open in-process mode. Reset on
+# Restart kernel. (This loosens the soft import guard for packages the user explicitly asked for — the
+# hard boundary is still OS-level isolation; a declared dep is arbitrary code either way.)
+_KERNEL_ALLOWED: set[str] = set()
+_allowed_lock = threading.Lock()
+
+
+def allow_modules(names) -> None:
+    with _allowed_lock:
+        _KERNEL_ALLOWED.update(names)
+
+
 def _guarded_import(name, *args, **kwargs):
     root = name.split(".")[0]
-    if root in _ALLOWED_MODULES:
+    if root in _ALLOWED_MODULES or root in _KERNEL_ALLOWED:
         return __import__(name, *args, **kwargs)
-    raise ImportError(f"import of '{name}' is not allowed in an ad-hoc cell")
+    raise ImportError(f"import of '{name}' is not allowed (add it to the canvas's requirements to enable)")
 
 
 def _namespace() -> dict:

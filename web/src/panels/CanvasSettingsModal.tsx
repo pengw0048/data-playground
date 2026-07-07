@@ -12,7 +12,9 @@ import { Label } from '@/components/ui/label'
 export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
   const doc = useStore((s) => s.doc)
   const renameFile = useStore((s) => s.renameFile)
+  const setRequirements = useStore((s) => s.setRequirements)
   const [name, setName] = useState(doc.name ?? '')
+  const [reqs, setReqs] = useState((doc.requirements ?? []).join('\n'))
   const [visibility, setVisibility] = useState<'private' | 'workspace'>('private')
 
   useEffect(() => {
@@ -53,6 +55,18 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
               ))}
             </div>
             <div className="mt-2 text-[10.5px] text-muted-foreground">Invite specific people from the <b>Share</b> button.</div>
+          </div>
+          <div>
+            <Label className="mb-1 block text-[11.5px] font-normal text-muted-foreground">Dependencies (pip)</Label>
+            <textarea
+              value={reqs}
+              onChange={(e) => { setReqs(e.target.value); setRequirements(e.target.value.split('\n').map((s) => s.trim()).filter(Boolean)) }}
+              placeholder={'pandas\nscikit-learn==1.5'}
+              spellCheck={false}
+              rows={3}
+              className="dp-mono w-full resize-y rounded-md border border-border bg-background px-2 py-1.5 text-[11.5px] text-foreground outline-none"
+            />
+            <div className="mt-1 text-[10.5px] text-muted-foreground">One pip spec per line — installed on this canvas's kernel, then importable in <code>transform</code> cells. Travels with the canvas.</div>
           </div>
         </div>
       </DialogContent>
