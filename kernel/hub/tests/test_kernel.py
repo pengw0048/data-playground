@@ -1835,6 +1835,40 @@ def test_plugin_capability_detector_tags_columns():
     assert "geo" in cols[0].capabilities and "geo" not in cols[1].capabilities
 
 
+def test_sql_catalog_reference_plugin(tmp_path):
+    # the shipped examples/plugins/dp_sql_catalog SqlCatalog surfaces datasets from a SQL (name, uri)
+    # table — the read-external catalog pattern: overrides list_tables/get_table, inherits resolve_ref +
+    # the KeyError-on-miss contract. Proves the CatalogProvider seam end-to-end (SQLite; no extra dep).
+    import importlib.util
+    from pathlib import Path
+    import duckdb
+    import pytest as _pt
+    import sqlalchemy as sa
+    from hub.deps import get_deps
+
+    p = str(tmp_path / "sales.parquet")
+    duckdb.connect(":memory:").execute(
+        f"COPY (SELECT i AS id, i * 2 AS amt FROM range(0, 5) t(i)) TO '{p}' (FORMAT PARQUET)")
+    dburl = "sqlite:///" + str(tmp_path / "meta.db")
+    eng = sa.create_engine(dburl)
+    with eng.begin() as c:
+        c.execute(sa.text("CREATE TABLE datasets (name TEXT, uri TEXT)"))
+        c.execute(sa.text("INSERT INTO datasets VALUES ('sales', :u)"), {"u": p})
+
+    src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_sql_catalog" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("dp_sql_catalog_ref", src)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    cat = mod.SqlCatalog(str(tmp_path / "empty"), get_deps().resolve_adapter, dburl, "datasets")
+    assert isinstance(cat, __import__("hub.backends", fromlist=["CatalogProvider"]).CatalogProvider)
+    assert "sales" in {t.name for t in cat.list_tables(None)}
+    t = cat.get_table("sales")
+    assert t.uri == p and {c.name for c in t.columns} == {"id", "amt"} and t.row_count == 5
+    assert cat.resolve_ref("sales") == p          # inherited: bare name → uri
+    with _pt.raises(KeyError):                     # inherited contract: miss raises KeyError
+        cat.get_table("nonexistent")
+
+
 def test_placeable_backend_protocol():
     # the optional distributed-placement contract exists as a typed Protocol; a full impl conforms, a
     # partial one does not (the core feature-detects per method, so a non-distributed backend omits them).

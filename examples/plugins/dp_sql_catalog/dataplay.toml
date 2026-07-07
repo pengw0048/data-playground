@@ -1,0 +1,4 @@
+# Reference plugin: a dataset catalog backed by a SQL table. See __init__.py.
+name = "dp-sql-catalog"
+version = "0.1.0"
+# min_core_api = 1
