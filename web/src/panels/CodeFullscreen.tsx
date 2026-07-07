@@ -2,6 +2,7 @@ import { Suspense, lazy, useEffect } from 'react'
 import { useStore, nodeRunnable } from '../store/graph'
 import { Icon } from '../ui/Icon'
 import { MiniSelect } from '../ui/controls'
+import { DataPanel } from './DataPanel'
 import type { ProcessorMode } from '../types/graph'
 
 const CodeEditor = lazy(() => import('../ui/CodeEditor').then((m) => ({ default: m.CodeEditor })))
@@ -49,11 +50,19 @@ export function CodeFullscreen() {
             <Icon name="close" size={15} />
           </button>
         </div>
-        <div className="min-h-0 flex-1">
-          <Suspense fallback={<div className="grid h-full place-items-center text-xs text-muted-foreground">loading editor…</div>}>
-            <CodeEditor language={language} height="100%" value={value} readOnly={isLibrary} completions={completions}
-              onChange={(v) => updateConfig(fs.nodeId, { [fs.param]: v })} />
-          </Suspense>
+        <div className="flex min-h-0 flex-1">
+          <div className="min-h-0 flex-1">
+            <Suspense fallback={<div className="grid h-full place-items-center text-xs text-muted-foreground">loading editor…</div>}>
+              <CodeEditor language={language} height="100%" value={value} readOnly={isLibrary} completions={completions}
+                onChange={(v) => updateConfig(fs.nodeId, { [fs.param]: v })} />
+            </Suspense>
+          </div>
+          {/* run + see results without leaving the editor — the node runs on its current input */}
+          {canPreview && (
+            <div className="flex min-h-0 w-[42%] max-w-[640px] flex-col overflow-auto border-l border-border">
+              <DataPanel nodeId={fs.nodeId} />
+            </div>
+          )}
         </div>
 
         {/* operator controls — Python transforms get mode/on_error/Promote; anything runnable gets Preview */}
