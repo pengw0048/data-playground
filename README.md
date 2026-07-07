@@ -70,21 +70,20 @@ logical plan**:
   **batched** function over Arrow `RecordBatch`es, deferred into the same plan and portable to any
   runner.
 
-A **runner** is whatever executes that assembled plan. The default runner is the local **out-of-core
-engine** (DuckDB · Polars · Arrow). Because a graph is *just a plan*, the **same** graph runs three
-ways with no rewrite: on a small sample for an **instant preview**, over the **full dataset**
-out-of-core, or — via a different runner plugged in behind the same interface (subprocess isolation,
-or a cluster backend) — across **many machines**.
+A **runner** executes that assembled plan. By default it's the canvas's **kernel** — a warm,
+restart-durable process (one per canvas, Jupyter-style) running the local out-of-core engine
+(DuckDB · Polars · Arrow). Because a graph is *just a plan*, the **same** graph runs three ways with no
+rewrite: on a small sample for an **instant preview**, over the **full dataset** out-of-core, or — via
+a cluster runner (a plugin) — across **many machines**.
 
 ```mermaid
 flowchart LR
   G["Canvas graph<br/>(web · React Flow)"] --> C["Compiler"]
   C --> P["Typed logical plan"]
-  P -->|"bounded sample"| PV["Instant preview<br/>while you explore"]
-  P -->|"full dataset"| R{"Runner<br/>(chosen for you)"}
-  R -->|"default"| E["Local out-of-core engine<br/>DuckDB · Polars · Arrow"]
-  R -->|"multi-user"| S["Subprocess isolation"]
-  R -->|"cluster plugin"| K["Cluster backend<br/>(ExecutionBackend SPI)"]
+  P -->|"bounded sample"| PV["Instant preview<br/>(warm on the kernel)"]
+  P -->|"full dataset"| R{"Runner"}
+  R -->|"default"| E["Per-canvas kernel<br/>warm · restart-durable<br/>(DuckDB · Polars · Arrow)"]
+  R -->|"cluster · plugin"| K["ExecutionBackend<br/>(Ray / pod / queue)"]
 ```
 
 Because a wire carries a **typed table** (not raw bytes), the canvas knows every port's schema: it
@@ -102,10 +101,10 @@ web/     React + React Flow + zustand — the canvas: node cards, typed wires, a
          built-in or plugin — generically from the /api/nodes schema, so a new node type
          needs no frontend code.
 
-kernel/  One FastAPI server that serves the web app, the API, the WebSockets, and the engine.
-         A graph is compiled to a logical plan, then a runner executes it. The default runner
-         is the local out-of-core engine (DuckDB · Polars · Arrow); everything else specific
-         is a plugin.
+kernel/  The `hub` package: one FastAPI server that serves the web app, the API, the WebSockets,
+         and the engine. A graph is compiled to a logical plan; by default it runs on the canvas's
+         own kernel — a warm, restart-durable process running the local out-of-core engine
+         (DuckDB · Polars · Arrow). Everything else specific is a plugin.
 ```
 
 ---
@@ -211,11 +210,11 @@ Two *runtime* things still have **instance affinity** — they need routing, not
 - **Live collaboration** keeps one in-memory room per canvas, so peers editing the same canvas must
   reach the same instance. The canvas id is in the WebSocket path (`/ws/collab/{canvas_id}`), so route
   on the path with a consistent hash — e.g. nginx `hash $uri consistent;` in the `upstream` block.
-- **Execution** runs in whichever instance accepts the run (its status is shared via `run_states`, so
-  any instance can still report it). For a dedicated execution tier, add a cluster **runner** — the
-  same runner interface (the `ExecutionBackend` plugin SPI) as a Ray/pod/queue backend. That step also
-  wants per-run instance ownership + a heartbeat so one instance's startup cleanup can't cancel
-  another's live runs (a `NOTE` in `metadb.reconcile_orphaned_runs` marks the spot).
+- **Execution** runs on a per-canvas **kernel** — a detached process that outlives the hub — so a run
+  survives the hub restarting or being redeployed, and any instance can report its status (shared via
+  `run_states`); a reopened canvas reattaches to a still-running run via `GET /canvas/{id}/active-runs`.
+  A single-host hub reaps a canvas's kernel by a heartbeat-gated DB lease; a cluster substrate (a pod
+  per canvas) is a `KernelSpawner` / `ExecutionBackend` plugin — the same interface, a different spawner.
 
 **With Docker.** `docker compose up` builds one image (the web app baked in) and runs it against
 Postgres — the shared, restart-durable setup above. `Dockerfile` is the single-image build
@@ -225,20 +224,22 @@ Postgres — the shared, restart-durable setup above. `Dockerfile` is the single
 
 ---
 
-## Multi-user isolation — and its limits
+## Execution isolation — and its limits
 
-With auth on (`DP_AUTH_SECRET` set), each run executes in its own OS process (the **subprocess
-runner**), so a user's arbitrary Python (transform / section scripts) can't crash, hang, or OOM the
-shared kernel, and a runaway loop can be hard-killed. Paired with `DP_DATASET_ROOTS`, filesystem
-access is confined to the allowed roots by DuckDB's native sandbox — uniformly, including raw `sql`
-(`read_csv` / `COPY` can't escape) — as long as no object store is configured (object storage needs
-network access, which the sandbox disables, so the two are mutually exclusive).
+Every canvas runs on its own **kernel** — a separate, long-lived OS process — so a user's arbitrary
+Python (transform / section scripts) can't crash, hang, or OOM the hub or another canvas, and a
+wedged kernel is restartable (Settings → Execution → **Restart kernel**) without losing your other
+canvases. Paired with `DP_DATASET_ROOTS`, filesystem access is confined to the allowed roots by
+DuckDB's native sandbox — uniformly, including raw `sql` (`read_csv` / `COPY` can't escape) — as long
+as no object store is configured (object storage needs network access, which the sandbox disables, so
+the two are mutually exclusive).
 
-**This is crash/DoS isolation, not a multi-tenant jail.** Subprocesses still run as the **same OS
-user on the same filesystem**, and the code "sandbox" is a soft guard, not a security boundary. Real
-tenant isolation needs OS-level sandboxing — containers, per-user accounts, or a pod/queue runner.
-(Open single-user mode stays in-process, trusted and faster; switch either way in Settings →
-Execution.)
+**This is crash/DoS isolation, not a multi-tenant jail.** A kernel still runs as the **same OS user on
+the same filesystem**, and the code "sandbox" is a soft guard, not a security boundary. And a kernel
+is per-*canvas*: collaborators editing a **shared** canvas share one kernel, so a runaway transform
+there can wedge a co-editor's runs (a restart clears it). Real tenant isolation needs OS-level
+sandboxing — containers, per-user accounts, or a pod-per-canvas `ExecutionBackend` plugin. (The
+in-process and subprocess runners stay selectable in Settings → Execution.)
 
 ---
 
