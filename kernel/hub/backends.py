@@ -55,3 +55,20 @@ class ExecutionBackend(Protocol):
     def status(self, run_id: str) -> RunStatus: ...
 
     def cancel(self, run_id: str) -> RunStatus: ...
+
+
+@runtime_checkable
+class KernelSpawner(Protocol):
+    """How a per-canvas kernel is launched — the substrate seam under KernelBackend. `spawn` starts a
+    kernel that binds a command channel and marks its lease ready (via metadb.mark_kernel_ready) with a
+    reachable endpoint; `kill` force-removes it (a hub on another host can't SIGKILL a process, so the
+    cluster substrate deletes the pod). The built-in LocalProcessSpawner runs a detached local process;
+    a PodSpawner (a per-canvas k8s Pod + Service) is the cross-host substrate — same protocol."""
+    name: str
+
+    def spawn(self, canvas_id: str, kernel_id: str, token: str) -> None: ...
+
+    def kill(self, canvas_id: str, kernel_id: str) -> None:
+        """Best-effort force-remove of a canvas's kernel (local process self-exits on fence/idle, so
+        this is a no-op there; a pod substrate deletes the Pod + Service)."""
+        ...

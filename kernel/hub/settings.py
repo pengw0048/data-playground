@@ -28,6 +28,9 @@ class Settings:
     # execution backend opt-in: "kernel" routes runs to a per-canvas, restart-surviving kernel process
     # (else the in-process / subprocess runner). Empty = default selection (see deps.pick_runner).
     execution: str = os.environ.get("DP_EXECUTION", "").strip()
+    # how a per-canvas kernel is launched: "local" (a detached process, single-host) or "pod" (a k8s
+    # Pod + Service per canvas, cross-host). See hub.kernel_backend / hub.pod_spawner.
+    kernel_spawner: str = os.environ.get("DP_KERNEL_SPAWNER", "local").strip()
 
 
 settings = Settings()

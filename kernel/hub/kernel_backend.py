@@ -63,6 +63,12 @@ class LocalProcessSpawner:
              "--workspace", self.workspace, "--data-dir", self.data_dir, "--port", str(port)],
             start_new_session=True)  # own process group → a hub SIGTERM/exit doesn't take it down
 
+    def kill(self, canvas_id: str, kernel_id: str) -> None:
+        # no-op: a local kernel self-exits when fenced out or idle (it heartbeats the lease). Cross-host
+        # force-kill is the pod substrate's job (delete the pod); a local process on another host is
+        # unreachable to SIGKILL anyway.
+        pass
+
 
 class KernelBackend:
     """ExecutionBackend that runs on a per-canvas kernel process (name 'kernel')."""
@@ -124,6 +130,13 @@ class KernelBackend:
             return RunStatus(run_id=run_id, status="failed", placement="local", per_node=[],
                              error="run not found (no kernel state)")
         return RunStatus(**d)
+
+    def kill(self, canvas_id: str, kernel_id: str) -> None:
+        """Force-remove a canvas's kernel via the substrate (delete the pod). No-op for local."""
+        try:
+            self.spawner.kill(canvas_id, kernel_id)
+        except Exception:  # noqa: BLE001
+            pass
 
     def cancel(self, run_id: str) -> RunStatus:
         k = metadb.kernel_for_run(run_id)

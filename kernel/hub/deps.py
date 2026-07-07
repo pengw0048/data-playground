@@ -167,7 +167,11 @@ class Deps:
         # (DP_EXECUTION=kernel, honored in pick_runner). The kernel writes run_states itself, so no
         # on_status/complete wiring here; estimate/can_run delegate to the base runner (hub-side gate).
         from hub.kernel_backend import KernelBackend, LocalProcessSpawner
-        self.runners.append(KernelBackend(self.runner, LocalProcessSpawner(workspace, data_dir)))
+        spawner = LocalProcessSpawner(workspace, data_dir)
+        if settings.kernel_spawner == "pod":   # cross-host substrate: a k8s Pod + Service per canvas
+            from hub.pod_spawner import PodSpawner
+            spawner = PodSpawner(workspace, data_dir)
+        self.runners.append(KernelBackend(self.runner, spawner))
         # RunController owns a logical run across placement regions (multi-region = a placed node /
         # checkpoint / fan-out); a single default region delegates to the base runner unchanged.
         from hub.run_controller import RunController

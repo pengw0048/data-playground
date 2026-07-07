@@ -262,10 +262,14 @@ def canvas_kernel_restart(canvas_id: str, uid: str = Depends(current_user)) -> d
     if not k or not k.get("endpoint"):
         return {"ok": True, "restarted": False}  # none live → next run spawns fresh anyway
     from hub import kernel_backend
+    from hub.deps import get_deps
     try:
-        kernel_backend._post(k["endpoint"], "/shutdown", k["token"], {}, timeout=5.0)
+        kernel_backend._post(k["endpoint"], "/shutdown", k["token"], {}, timeout=5.0)  # graceful
     except Exception:  # noqa: BLE001 — unreachable = already dead; the lease reaps, next run respawns
         pass
+    kb = get_deps().kernel_backend()  # force-remove the substrate too (deletes the pod; no-op for local)
+    if kb is not None:
+        kb.kill(canvas_id, k["kernel_id"])
     return {"ok": True, "restarted": True}
 
 

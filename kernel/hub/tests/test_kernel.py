@@ -1384,6 +1384,49 @@ def test_canvas_kernel_state_and_restart():
     metadb.drop_kernel(cid, "k1")
 
 
+def test_pod_spawner_builds_manifests_and_conforms_to_the_spi():
+    # Phase 3: the PodSpawner is the cross-host substrate behind the SAME KernelSpawner protocol. Test
+    # the manifest it builds with a FAKE k8s client (no cluster needed) — a pod running `hub.kernel`
+    # bound to 0.0.0.0 advertising its Service DNS, and a Service that selects it.
+    from hub.backends import KernelSpawner
+    from hub.kernel_backend import LocalProcessSpawner
+    from hub.pod_spawner import PodSpawner
+    assert isinstance(LocalProcessSpawner("/ws", "/ws/data"), KernelSpawner)  # both substrates conform
+
+    class FakeApi:
+        def __init__(self): self.calls = []
+        def create_namespaced_service(self, ns, body): self.calls.append(("svc", ns, body))
+        def create_namespaced_pod(self, ns, body): self.calls.append(("pod", ns, body))
+        def delete_namespaced_pod(self, name, ns): self.calls.append(("del-pod", name, ns))
+        def delete_namespaced_service(self, name, ns): self.calls.append(("del-svc", name, ns))
+
+    api = FakeApi()
+    sp = PodSpawner("/ws", "/ws/data", client=api)
+    assert isinstance(sp, KernelSpawner)
+    sp.spawn("cv-abc", "k1", "tok123")
+    assert [c[0] for c in api.calls] == ["svc", "pod"]      # Service created before the Pod
+    svc, pod = api.calls[0][2], api.calls[1][2]
+    name = svc["metadata"]["name"]
+    assert name.startswith("dp-kernel-")
+    cmd = pod["spec"]["containers"][0]["command"]
+    assert cmd[:3] == ["python", "-m", "hub.kernel"]
+    assert {"cv-abc", "k1", "tok123", "0.0.0.0"} <= set(cmd)  # our canvas/kernel/token + bind-all
+    assert f"{name}.default.svc.cluster.local" in cmd        # advertise-host = the Service DNS
+    assert svc["spec"]["selector"]["dp-canvas"] == pod["metadata"]["labels"]["dp-canvas"]  # Service → Pod
+    sp.kill("cv-abc", "k1")
+    assert ("del-pod", name, "default") in api.calls and ("del-svc", name, "default") in api.calls
+
+
+def test_kernel_spawner_is_selectable_pod(tmp_path, monkeypatch):
+    # DP_KERNEL_SPAWNER=pod swaps the substrate under KernelBackend without touching anything else
+    from hub import settings as sm
+    from hub.deps import Deps
+    from hub.pod_spawner import PodSpawner
+    monkeypatch.setattr(sm.settings, "kernel_spawner", "pod")
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))  # constructing PodSpawner is lazy (no k8s client yet)
+    assert isinstance(d.kernel_backend().spawner, PodSpawner)
+
+
 def test_kernel_backend_runs_a_canvas_end_to_end():
     # DP_EXECUTION=kernel routes a run to a real, DETACHED per-canvas kernel PROCESS: it runs the job on
     # its own warm engine and writes run_states, which the hub reads back → done. Exercises the whole

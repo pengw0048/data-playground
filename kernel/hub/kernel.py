@@ -41,7 +41,8 @@ def main() -> None:
     p.add_argument("--workspace", required=True)
     p.add_argument("--data-dir", required=True)
     p.add_argument("--port", type=int, required=True)
-    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--host", default="127.0.0.1")            # bind address (0.0.0.0 in a pod)
+    p.add_argument("--advertise-host", default=None)         # address the hub reaches us at (Service DNS in a pod); defaults to --host
     p.add_argument("--idle-ttl", type=float, default=float(os.environ.get("DP_KERNEL_IDLE_TTL", "900")))
     args = p.parse_args()
 
@@ -93,8 +94,9 @@ def main() -> None:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # mark ready only once uvicorn is actually serving, so the hub never POSTs to a dead port
-        metadb.mark_kernel_ready(canvas, kid, f"{args.host}:{args.port}")
+        # mark ready only once uvicorn is actually serving, so the hub never POSTs to a dead port.
+        # advertise the address the hub reaches us at (Service DNS in a pod), not the bind host.
+        metadb.mark_kernel_ready(canvas, kid, f"{args.advertise_host or args.host}:{args.port}")
         threading.Thread(target=_heartbeat_loop, daemon=True).start()
         yield
 
