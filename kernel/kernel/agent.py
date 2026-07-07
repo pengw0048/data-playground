@@ -309,7 +309,7 @@ def _build_model(model: str, api_key: str | None, base_url: str | None):
 def run_agent(outcome: str, graph: dict, deps, model=None) -> dict:
     """Run the tool-use loop; return {graph, transcript, summary}. `model` is injected in tests."""
     if _agent is None:
-        raise RuntimeError("agent extra not installed: pip install 'data-playground[agent]'")
+        raise RuntimeError("agent extra not installed: from a clone, run `uv pip install -e 'kernel[agent]'`")
     from pydantic_ai.usage import UsageLimits
 
     wg = {

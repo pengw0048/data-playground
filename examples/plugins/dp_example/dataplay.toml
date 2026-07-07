@@ -3,4 +3,4 @@
 # kernel/kernel/deps.py CORE_API_VERSION and docs/PLUGINS.md.
 name = "dp-example"
 version = "0.1.0"
-# min_core_api = "1.0"
+# min_core_api = 1

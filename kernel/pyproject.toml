@@ -3,8 +3,20 @@ name = "data-playground"
 version = "0.1.0"
 description = "An open-source, node-based canvas for data — like ComfyUI, but for typed columnar dataflow. Works offline on real Parquet/CSV/JSON/Arrow/Lance, out-of-core."
 readme = "README.md"
-license = { text = "Apache-2.0" }
-requires-python = ">=3.11,<3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11,<3.14"
+authors = [{ name = "Data Playground contributors" }]
+keywords = ["data", "dataflow", "duckdb", "arrow", "etl", "node-based", "canvas", "offline"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Database",
+]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
@@ -25,7 +37,12 @@ agent = [
     "litellm>=1.50",
 ]
 postgres = ["psycopg[binary]>=3.1"]  # metadata DB on Postgres for deployment (dev uses bundled SQLite)
-dev = ["pytest>=8.0", "httpx>=0.27", "moto[s3,server]>=5.0", "boto3>=1.34", "data-playground[agent]"]
+dev = ["pytest>=8.0", "httpx>=0.27", "moto[s3,server]>=5.0", "boto3>=1.34", "data-playground[agent]", "data-playground[lance]"]
+
+[project.urls]
+Homepage = "https://github.com/pengw0048/data-playground"
+Repository = "https://github.com/pengw0048/data-playground"
+Issues = "https://github.com/pengw0048/data-playground/issues"
 
 [project.scripts]
 dataplay = "kernel.cli:main"

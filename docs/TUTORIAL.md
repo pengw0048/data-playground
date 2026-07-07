@@ -7,7 +7,7 @@ You'll build **events → keep purchases → total per user → save** — clean
 
 ```bash
 make setup && make run             # from a clone → serves on http://localhost:8471, opens a browser
-# once installed as a package, it's just:  dataplay
+# after setup the command is:  cd kernel && uv run dataplay   (not yet on PyPI)
 ```
 
 (Or `docker compose up` — see the README.) On first run it seeds three generic datasets you'll see in
@@ -44,13 +44,16 @@ From the filter's output port, add an **aggregate** (or toolbar → **Compute** 
 - **group by**: `user_id`
 - **aggregations**: `sum(amount) AS spend, count(*) AS purchases`
 
-Preview it — one row per user with their total spend. (Even in preview this is honest: the aggregate
-runs over the *full* input and the preview limit becomes a true top-N, not a lie about a 2,000-row
-prefix.)
+Preview it — but a group-by can't be sampled honestly (a 2,000-row prefix would lie about the totals),
+so instead of a wrong answer the panel says **"needs a full pass"** with a **Run a full pass →**
+button. Click it: one row per user with their total spend, computed over the whole input. (That's the
+honesty rule from the README — aggregates/writes refuse a sample rather than mislead.)
 
 ## 5 · Biggest spenders first (sort — optional)
 
-Add a **sort** (toolbar → **Shape** → `sort`), set **by** to `spend DESC`. Preview: top spenders first.
+Add a **sort** (toolbar → **Shape** → `sort`), set **by** to `spend DESC`. Because it sits downstream
+of the aggregate, its preview also says **"needs a full pass"** — click **Run a full pass →**: top
+spenders first.
 
 ## 6 · Save it (write + run)
 

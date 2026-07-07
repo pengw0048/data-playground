@@ -3,23 +3,30 @@
 **Like ComfyUI, but for data.** A node-based canvas where edges carry *typed columnar tables*:
 wire datasets and operators into a graph, see the **real rows out of every step** on a bounded
 sample, and run the **same graph at scale** — out-of-core on your laptop (bigger-than-RAM is fine),
-or on a cluster via a runner plugin — with no rewrite.
+or, via the **ExecutionBackend plugin SPI**, on a cluster with no rewrite (a reference multi-worker
+pool backend ships; Ray/pod/queue runners are plugin territory).
 
 Clone it and it works: **no cloud account, no external services, no mock mode.** Point it at your
 Parquet / CSV / JSON / Arrow / Lance files and you're doing real data work in five minutes.
 
 ![the canvas](docs/screenshot.png)
 
+> **Prereqs:** [uv](https://docs.astral.sh/uv/) and Node 20+ (uv fetches the pinned Python 3.12
+> automatically). Install uv: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+
 ```bash
 make setup && make run          # → http://127.0.0.1:8471 (seeds sample data on first run)
 ```
 
-Once installed as a package, it's one command:
+`make setup` installs the `dataplay` command into the local venv, so from then on it's one command:
 
 ```bash
-dataplay                        # serves the canvas + engine in one process, opens your browser
-dataplay --workspace ./my-proj --port 8471
+cd kernel && uv run dataplay              # serves the canvas + engine in one process, opens your browser
+cd kernel && uv run dataplay --workspace ./my-proj --port 8471
 ```
+
+(Not yet published to PyPI — install from a clone with `uv pip install -e 'kernel[agent]'` for a bare
+`dataplay` on your PATH.)
 
 **New here?** The **[5-minute tour](docs/TUTORIAL.md)** builds a real pipeline on the seeded data —
 events → keep purchases → total per user → save.
@@ -38,7 +45,7 @@ events → keep purchases → total per user → save.
   DuckDB + Polars + Arrow: joins/aggregations/sorts spill to disk instead of crashing. Measured: it
   sorted a **4.7 GB / 240M-row** dataset under a **1.3 GiB memory cap** (spilling 4.9 GB to disk) —
   peak RSS tracks the memory cap, not the data size. See [docs/BENCHMARK.md](docs/BENCHMARK.md).
-- **Honest previews (P8)** — global aggregates, writes, and opaque ops say *"needs a full pass"*
+- **Honest previews** — global aggregates, writes, and opaque ops say *"needs a full pass"*
   rather than computing a misleading answer on a sample.
 - **Extend it like ComfyUI** — drop a Python package in `<workspace>/plugins/` and your typed node
   appears in the Add-node menu, **rendered and wired with no frontend code** (§ Plugins).
@@ -75,7 +82,7 @@ web/     React + React Flow + zustand — the canvas, uniform node card, typed w
 
 kernel/  FastAPI (one server, serves the SPA + API + WS + engine). graph → COMPILER → logical
          plan → runner.execute(). The default runner is the local out-of-core engine
-         (DuckDB · Polars · Arrow · Lance). Everything specific is a plugin (§8 SPI).
+         (DuckDB · Polars · Arrow · Lance). Everything specific is a plugin (§7 SPI).
 ```
 
 ## Scaling out: multiple stateless web instances
@@ -97,7 +104,7 @@ Two things are deployment-side, not app config:
   a sticky hash on the `/ws/collab/{canvas_id}` path (Figma-style). Example nginx:
   `hash $arg_canvas consistent;` keyed on the canvas id, or any LB with path/consistent-hash routing.
 - **Execution** currently runs in the accepting instance (status is shared via `run_states`, so any
-  instance can report it). For a dedicated execution tier, add an `ExecutionBackend` plugin (§8 SPI —
+  instance can report it). For a dedicated execution tier, add an `ExecutionBackend` plugin (§7 SPI —
   a Ray/pod/queue runner); that step also wants per-run instance ownership + a heartbeat so one
   instance's startup reconcile can't cancel another's live runs (a `TODO` marks the spot in
   `metadb.reconcile_orphaned_runs`).
@@ -158,13 +165,15 @@ make e2e       # browser end-to-end tests (Playwright on the real UI) — see do
 ## The agent
 
 The agent is an actor: describe an outcome and it **builds real, inspectable, typed nodes** on the
-canvas. It is **provider-agnostic** — a server-side tool-use loop via [LiteLLM](https://docs.litellm.ai),
-so you point it at whatever model you have (the key lives in the kernel, never the browser):
+canvas. It is **provider-agnostic** — a server-side tool-use loop run in-process by
+[Pydantic AI](https://ai.pydantic.dev) (LiteLLM is used only to detect provider keys + parse the
+model string), so you point it at whatever model you have (the key lives in the kernel, never the
+browser):
 
 ```bash
-pip install 'data-playground[agent]'
+uv pip install -e 'kernel[agent]'     # from a clone (not yet on PyPI)
 
-# pick any provider LiteLLM supports via DP_AGENT_MODEL + its key:
+# pick a provider via DP_AGENT_MODEL + its key:
 export DP_AGENT_MODEL=anthropic/claude-opus-4-8   && export ANTHROPIC_API_KEY=sk-ant-...   # default
 # export DP_AGENT_MODEL=openai/gpt-4o             && export OPENAI_API_KEY=sk-...
 # export DP_AGENT_MODEL=gemini/gemini-1.5-pro     && export GEMINI_API_KEY=...

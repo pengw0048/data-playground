@@ -1382,11 +1382,16 @@ def test_plugin_version_negotiation(tmp_path):
     make_pack("goodpack", CORE_API_VERSION)
     make_pack("toonew", CORE_API_VERSION + 1)
     make_pack("unversioned", None)
+    make_pack("stringver", '"1.0"')  # the DOCUMENTED form — F11: int("1.0") used to crash the parse
+    make_pack("garbage", '"abc"')    # a non-version value → clear error, not a raw traceback
     d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     assert "goodpack_node" in d.node_specs and "unversioned_node" in d.node_specs  # compatible / no manifest → load
+    assert "stringver_node" in d.node_specs                                        # "1.0" parses to major 1 → loads
     assert "toonew_node" not in d.node_specs                                       # incompatible → skipped
     err = [p for p in d.plugins if p.get("name") == "toonew" and p.get("error")]
     assert err and "core API" in err[0]["error"]
+    gerr = [p for p in d.plugins if p.get("name") == "garbage" and p.get("error")]
+    assert gerr and "version number" in gerr[0]["error"]
 
 
 def test_nodespec_frontend_backend_parity():

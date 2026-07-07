@@ -247,10 +247,17 @@ class Deps:
                 self.plugins.append({"name": name, "source": "drop-in", "error": f"dataplay.toml missing: {', '.join(missing)}"})
                 return False
             min_core = man.get("min_core_api")
-            if min_core is not None and int(min_core) > CORE_API_VERSION:
-                self.plugins.append({"name": name, "source": "drop-in",
-                                     "error": f"requires core API >= {int(min_core)}; this core is {CORE_API_VERSION}"})
-                return False
+            if min_core is not None:
+                try:
+                    need = int(str(min_core).split(".")[0])  # accept 1, "1", or the documented "1.0" (major only)
+                except ValueError:
+                    self.plugins.append({"name": name, "source": "drop-in",
+                                         "error": f"min_core_api must be a version number, got {min_core!r}"})
+                    return False
+                if need > CORE_API_VERSION:
+                    self.plugins.append({"name": name, "source": "drop-in",
+                                         "error": f"requires core API >= {need}; this core is {CORE_API_VERSION}"})
+                    return False
             self._manifests[name] = man
             return True
         except Exception as e:  # noqa: BLE001

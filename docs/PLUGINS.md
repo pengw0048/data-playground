@@ -79,7 +79,7 @@ A drop-in pack may include a manifest. `name` + `version` are required; `min_cor
 ```toml
 name = "dp-example"
 version = "0.1.0"
-# min_core_api = "1.0"   # refuse to load if the kernel's CORE_API_VERSION is older
+# min_core_api = 1       # refuse to load if the kernel's CORE_API_VERSION is older
 ```
 
 `min_core_api` is a forward-compat guard: if your plugin needs a newer core than it's running on, the

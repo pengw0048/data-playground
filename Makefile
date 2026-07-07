@@ -1,7 +1,10 @@
 .PHONY: setup run dev-kernel dev-web build test e2e e2e-install seed clean
 
 # One-time setup: kernel deps + sample data + web deps.
+# web/dist is gitignored so a fresh clone lacks it; the kernel wheel force-includes ../web/dist, so
+# create it BEFORE `uv sync` or hatchling aborts with FileNotFoundError (`make run` rebuilds it for real).
 setup:
+	mkdir -p web/dist
 	cd kernel && uv sync --extra dev && uv run python -m kernel.seed
 	cd web && npm install
 
