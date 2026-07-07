@@ -195,6 +195,11 @@ class PipelineImport(Wire):
     data_filter: str | None = None
     stages: list[ImportStage] = []
     driver_steps: list[DriverStep] = []
+    # A runnable canvas graph the importer decomposed the foreign pipeline into. When present, the SPA
+    # drops it straight onto a fresh canvas (via applyAgentGraph) and it runs like any other graph —
+    # this is what makes "import an external pipeline → runnable canvas" real. stages/driver_steps stay
+    # as the human-readable description. None ⇒ the importer only described the pipeline, didn't build it.
+    graph: "Graph | None" = None
 
 
 # --------------------------------------------------------------------------- #

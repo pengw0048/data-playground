@@ -1,0 +1,4 @@
+# Reference plugin: a pipeline importer (JSON pipeline format → runnable canvas graph). See __init__.py.
+name = "dp-json-pipeline"
+version = "0.1.0"
+# min_core_api = 1

@@ -13,6 +13,7 @@ import {
 import { cn } from '@/lib/utils'
 import { SettingsModal } from '../panels/SettingsModal'
 import { CanvasSettingsModal } from '../panels/CanvasSettingsModal'
+import { ImportPipelineModal } from '../panels/ImportPipelineModal'
 import { RunHistoryModal } from '../panels/RunHistoryModal'
 import { VersionHistoryModal } from '../panels/VersionHistoryModal'
 import { ShareModal } from '../panels/ShareModal'
@@ -33,6 +34,7 @@ export function TopBar() {
   const [runsOpen, setRunsOpen] = useState(false)
   const [versionsOpen, setVersionsOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
+  const [importOpen, setImportOpen] = useState(false)
 
   // let anything (e.g. the agent's "Configure a model" CTA) open Settings
   useEffect(() => {
@@ -44,7 +46,7 @@ export function TopBar() {
   return (
     <>
       <div style={{ position: 'absolute', top: 16, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <AppMenu onSettings={() => setSettingsOpen(true)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} />
+        <AppMenu onSettings={() => setSettingsOpen(true)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} />
         <span className="text-[13.5px] text-muted-foreground">/</span>
         <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
         <span data-testid="autosave" title={!kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined} className="ml-0.5 text-[11px] text-muted-foreground">· {saved ? (kernelUp ? 'saved' : 'saved locally') : 'saving…'}</span>
@@ -78,6 +80,7 @@ export function TopBar() {
       {runsOpen && <RunHistoryModal onClose={() => setRunsOpen(false)} />}
       {versionsOpen && <VersionHistoryModal onClose={() => setVersionsOpen(false)} />}
       {shareOpen && <ShareModal onClose={() => setShareOpen(false)} />}
+      {importOpen && <ImportPipelineModal onClose={() => setImportOpen(false)} />}
     </>
   )
 }
@@ -102,8 +105,8 @@ function PeerAvatars() {
   )
 }
 
-// The app menu (Figma-style hamburger): Back to files, New file, Run history, Version history, Settings.
-function AppMenu({ onSettings, onRunHistory, onVersionHistory }: { onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void }) {
+// The app menu (Figma-style hamburger): Back to files, New file, Import pipeline, Run/Version history, Settings.
+function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport }: { onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void; onImport: () => void }) {
   const setView = useStore((s) => s.setView)
   const newFile = useStore((s) => s.newFile)
   return (
@@ -120,6 +123,8 @@ function AppMenu({ onSettings, onRunHistory, onVersionHistory }: { onSettings: (
         <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
         {/* defer modal opens to the next tick — otherwise the menu-item pointerup that's still
             propagating is caught by the just-mounted dialog's dismiss layer and closes it instantly */}
+        <DropdownMenuItem data-testid="import-pipeline" onSelect={() => setTimeout(onImport)}><Icon name="import" size={14} /> Import pipeline…</DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> Run history</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>
         <DropdownMenuSeparator />

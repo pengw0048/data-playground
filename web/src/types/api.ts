@@ -171,4 +171,10 @@ export interface PipelineImport {
   dataFilter?: string | null
   stages: ImportStage[]
   driverSteps: DriverStep[]
+  // a runnable canvas graph the importer decomposed the pipeline into — dropped onto a fresh canvas
+  // (via applyAgentGraph) so it runs like any other graph. Same node/edge shape the agent returns.
+  graph?: {
+    nodes: { id: string; type: string; position: { x: number; y: number }; data: { title?: string; config?: Record<string, unknown> } }[]
+    edges: { id: string; source: string; target: string; sourceHandle?: string | null; targetHandle?: string | null; data?: { wire: string } }[]
+  }
 }

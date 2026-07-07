@@ -2033,6 +2033,39 @@ def test_pipelines_import_reports_not_configured():
     assert "importer" in r.text.lower()
 
 
+def test_json_pipeline_importer_round_trips_to_a_run():
+    # The dp_json_pipeline reference importer parses a JSON pipeline into a runnable canvas graph; the
+    # /pipelines/import route lays it out; the returned graph runs end-to-end — proving import→canvas→run
+    # plugin-only (readiness item 8). Loaded via importlib and swapped onto deps.importer for the test.
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_json_pipeline" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("dp_json_pipeline_ref", src)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    from hub.plugins.importer import Importer
+    imp = mod.JsonPipelineImporter()
+    assert isinstance(imp, Importer)  # conforms to the formal SPI Protocol
+
+    deps = get_deps()
+    prev = deps.importer
+    deps.importer = imp
+    try:
+        cfg = json.dumps({"source": _uri("events"),
+                          "steps": [{"filter": "amount > 0"}, {"select": "amount"}],
+                          "write": {"name": "imported_out"}})
+        g = client.post("/api/pipelines/import", json={"config": cfg}).json()["graph"]
+        assert [n["type"] for n in g["nodes"]] == ["source", "filter", "select", "write"]
+        assert [(e["source"], e["target"]) for e in g["edges"]] == [("src", "step1"), ("step1", "step2"), ("step2", "sink")]
+        assert not all(n["position"]["x"] == 0 and n["position"]["y"] == 0 for n in g["nodes"])  # route laid it out
+        st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "sink", "confirmed": True}).json()["runId"])
+        assert st["status"] == "done"  # the imported graph is directly runnable
+    finally:
+        deps.importer = prev
+
+
 def test_collab_relay_gates_viewer_doc_updates(monkeypatch):
     # a viewer may watch (presence + peers' edits) but its OWN doc updates ('yjs' carries CRDT state)
     # must NOT be relayed — else an editor peer would merge + autosave them, laundering a change past

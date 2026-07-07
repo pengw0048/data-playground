@@ -9,11 +9,25 @@ rather than faking a decomposition.
 
 from __future__ import annotations
 
+from typing import Protocol, runtime_checkable
+
 from hub.models import PipelineImport
 
 
 class ImporterNotConfigured(Exception):
     pass
+
+
+@runtime_checkable
+class Importer(Protocol):
+    """The pipeline-import SPI. A bundle registers one via `reg.set_importer(...)`. `import_pipeline`
+    parses a foreign pipeline `config` (its own format) and returns a `PipelineImport`; populate its
+    `graph` with a runnable canvas Graph (nodes/edges of built-in or plugin kinds) to make the import
+    land on a canvas and run. Raise `ImporterNotConfigured` if this bundle can't import (the default)."""
+
+    name: str
+
+    def import_pipeline(self, config: str, params: dict | None) -> PipelineImport: ...
 
 
 class NullImporter:

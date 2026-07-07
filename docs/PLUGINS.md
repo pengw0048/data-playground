@@ -98,7 +98,7 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 | `reg.add_capability(cap)` | a declared column capability | `id`+`label`, plus an OPTIONAL `detect(col)->bool` — if present, `tag_columns` tags matching columns with the id (no core edit). A viewer tab is still a separate frontend registration. See `kernel/hub/plugins/capabilities.py`. |
 | `reg.add_processor(proc)` | a reusable transform in the library picker | a `Processor` (`id/title/mode/build(params)`); see `kernel/hub/plugins/processors.py` |
 | `reg.set_catalog(catalog)` | the whole dataset catalog provider | `CatalogProvider` Protocol (`backends.py`): `list_tables/get_table/lineage/relationships/resolve_ref/register/register_output/unregister/set_declared_key/add_relationship/remove_relationship`. **`get_table` MUST raise `KeyError` on a miss.** A read-only external catalog can subclass `InMemoryCatalog` and override only the reads (as `dp_sql_catalog` does). A catalog that *fully* replaces the built-in — not subclassing `InMemoryCatalog` — won't automatically receive run-completion `register_output` write-backs (runners hold the catalog they were built with), so either subclass `InMemoryCatalog` or forward `register_output` to your store. |
-| `reg.set_importer(importer)` | `/pipelines/import` (import a foreign pipeline format) | default is a `NullImporter` (501) |
+| `reg.set_importer(importer)` | `/pipelines/import` (import a foreign pipeline format) | `Importer` Protocol (`plugins/importer.py`): `name` + `import_pipeline(config, params) -> PipelineImport`. Populate `PipelineImport.graph` with a runnable canvas `Graph` (nodes/edges of built-in or plugin kinds) and the SPA drops it onto a fresh canvas and runs it — this is what makes *import a pipeline → runnable canvas* real. Default is a `NullImporter` (501, honest). The core auto-lays-out an imported graph left unpositioned. |
 
 Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter; runners are picked
 by `pick_runner` (respects the Settings → Execution choice, else the first that `can_run`). **The
@@ -138,6 +138,7 @@ test in `kernel/hub/tests/test_kernel.py` you can copy:
 | [`dp_sql_catalog`](../examples/plugins/dp_sql_catalog/) | `set_catalog` | a `CatalogProvider` backed by a SQL `datasets(name, uri)` table — subclasses `InMemoryCatalog`, overrides only the reads; `DP_SQL_CATALOG_URL` / `DP_SQL_CATALOG_TABLE` | uses `sqlalchemy` (core dep) |
 | [`dp_hf_datasets`](../examples/plugins/dp_hf_datasets/) | `add_adapter` | read a Hugging Face Hub dataset as a source: `hf://<id>[@<config>][:<split>]` | `pip install 'data-playground[hf]'` |
 | [`dp_iceberg`](../examples/plugins/dp_iceberg/) | `add_adapter` | read an Apache Iceberg table as a source: `iceberg://<catalog>/<namespace>.<table>` (catalog from your pyiceberg config) | `pip install 'data-playground[iceberg]'` |
+| [`dp_json_pipeline`](../examples/plugins/dp_json_pipeline/) | `set_importer` | parse a tiny JSON pipeline (`source`/`steps`/`write`) into a runnable canvas graph — import → canvas → run | — |
 
 The adapters are read-only sources (`write` raises) and import their heavy dependency lazily, so the
 pack loads even without the extra installed and only errors when its URI scheme is actually used. Both

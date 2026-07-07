@@ -5,7 +5,7 @@ import type { CSSProperties } from 'react'
 export type IconName =
   | 'eye' | 'play' | 'clock' | 'code' | 'more' | 'refresh' | 'stop' | 'plus' | 'close'
   | 'chevronDown' | 'chevronRight' | 'chevronLeft' | 'lineage' | 'power' | 'mute' | 'rename'
-  | 'duplicate' | 'export' | 'trash' | 'search' | 'sparkle' | 'grid' | 'branch' | 'loop'
+  | 'duplicate' | 'export' | 'import' | 'trash' | 'search' | 'sparkle' | 'grid' | 'branch' | 'loop'
   | 'fx' | 'sample' | 'arrow' | 'external' | 'check' | 'db' | 'sigma' | 'sql' | 'note'
   | 'minus' | 'link' | 'settings' | 'undo' | 'redo' | 'sun' | 'moon' | 'users' | 'maximize' | 'minimize'
 
@@ -35,6 +35,7 @@ const P: Record<IconName, JSX.Element> = {
   rename: <><path d="M10.5 3.2 12.8 5.5 6 12.3 3.5 12.8 4 10.3z" /></>,
   duplicate: <><rect x="5.5" y="5.5" width="7.5" height="7.5" rx="1.2" /><path d="M3 10.5V3.2h7.3" /></>,
   export: <><path d="M8 2.5v7.5" /><path d="M5 6.5 8 3.5l3 3" /><path d="M3 11.5v1.8h10v-1.8" /></>,
+  import: <><path d="M8 2.5v7.5" /><path d="M5 7 8 10l3-3" /><path d="M3 11.5v1.8h10v-1.8" /></>,
   trash: <><path d="M3.5 4.5h9M6 4.5V3h4v1.5M5 4.5l.6 8.3h4.8L11 4.5" /></>,
   search: <><circle cx="7" cy="7" r="4" /><path d="M10 10l3.5 3.5" /></>,
   sparkle: <path d="M8 2.5l1.4 3.6L13 7.5l-3.6 1.4L8 12.5 6.6 8.9 3 7.5l3.6-1.4z" />,
