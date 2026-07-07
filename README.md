@@ -155,6 +155,20 @@ frontend rendered it from `/api/nodes`, with no JS written. A complete, tested e
 [`examples/plugins/dp_example/`](examples/plugins/dp_example/); **[docs/PLUGINS.md](docs/PLUGINS.md)**
 walks through it and the full SPI. See also `kernel/README.md`.
 
+## Control flow — sections + driver scripts
+
+There are no `branch` / `loop` / `variable` node types. Instead, control flow lives inside a
+**`section`**: a composite node whose body is a small **driver script** (Python) that calls its
+contained nodes with real `for` / `while` / `if` and an `emit(...)` for the output — so iteration and
+branching are just code over typed nodes, bounded and inspectable. This is the as-built model that
+replaced the original branch/loop nodes. (Design details: `docs/CONTROL_FLOW.md` — in Chinese.)
+
+## Keyboard shortcuts
+
+`⌘Z` / `⌘⇧Z` (or `⌘Y`) undo / redo · `⌘A` select all · `⌘C` / `⌘X` / `⌘V` copy / cut / paste ·
+`⌘D` duplicate · `Delete` remove · `B` bypass · `D` disable · `Esc` clear selection or close a panel.
+Click a node's **output port** to open the connect menu (or drag to wire).
+
 ## Develop
 
 ```bash

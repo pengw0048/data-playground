@@ -10,6 +10,8 @@ kernel/   FastAPI app + the out-of-core engine (DuckDB · Polars · Arrow · Lan
           the SPA + API + WebSocket + engine. Tests in kernel/kernel/tests/. Benchmark in kernel/bench/.
 web/      React + Vite + Zustand + React Flow + shadcn/ui. Renders ANY node from /api/nodes.
 docs/     PRD, CONTROL_FLOW, TESTING, BENCHMARK, PLUGINS. FEATURES.md (repo root) is the feature tree.
+          (FEATURES.md · CONTROL_FLOW.md · EXECUTION.md are Chinese working notes; README · PRD ·
+          TESTING · BENCHMARK · PLUGINS are English.)
 examples/ Runnable example plugins (start here to extend the kernel).
 ```
 
