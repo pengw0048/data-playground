@@ -33,6 +33,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const authEnabled = useStore((s) => s.authEnabled)
   const refreshUsers = useStore((s) => s.refreshUsers)
   const pushToast = useStore((s) => s.pushToast)
+  const canvasId = useStore((s) => s.doc.id)
   const [g, setG] = useState<Record<string, unknown>>({})
   const [u, setU] = useState<Record<string, unknown>>({})  // per-user settings (scope='user')
   const [loading, setLoading] = useState(true)
@@ -129,6 +130,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     </Select>
                   </Field>
                   <div className="-mt-1 text-[10.5px] text-muted-foreground">Your preference for your own runs — falls back to the workspace default.</div>
+                  {((u.backend && u.backend !== INHERIT ? String(u.backend) : (g.backend ? String(g.backend) : runners[0])) === 'kernel') && (
+                    <div className="mt-2 flex items-center gap-2">
+                      <Button variant="outline" size="sm" onClick={async () => {
+                        const r = await api.restartKernel(canvasId).catch(() => null)
+                        pushToast(r?.restarted ? 'Kernel restarting…' : 'No live kernel — a fresh one starts on the next run', 'success')
+                      }}>Restart kernel</Button>
+                      <span className="text-[10.5px] text-muted-foreground">Clears this canvas's warm kernel (a wedged transform / stale state); the next run starts fresh.</span>
+                    </div>
+                  )}
 
                   <div className="mb-1.5 mt-4 text-[11.5px] font-semibold text-foreground">Compute</div>
                   <div className="mb-2 text-[10.5px] text-muted-foreground">Backends and the workers (pods / processes) they offer, with capacity. A pod/Ray backend plugin adds its own here.</div>

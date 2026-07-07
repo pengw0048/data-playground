@@ -40,7 +40,7 @@ def test_kernel_info():
     info = client.get("/api/kernel").json()
     assert info["backend"] == "duckdb+polars+arrow"
     assert "duckdb" in info["adapters"] and "lance" in info["adapters"]
-    assert info["runners"] == ["local-out-of-core", "local-subprocess"]
+    assert info["runners"] == ["local-out-of-core", "local-subprocess", "kernel"]
     assert {"media", "vector"} <= set(info["capabilities"])
 
 
@@ -1340,6 +1340,24 @@ def test_active_runs_survive_a_simulated_hub_restart():
     metadb.drop_kernel(cid, "k_reattach")
 
 
+def test_canvas_kernel_state_and_restart():
+    # the Jupyter-style kernel controls: state is visible per canvas, and restart is a safe no-op when
+    # nothing's live (the next run spawns fresh). Token/endpoint are never exposed.
+    from hub import metadb
+    from hub.metadb import Canvas, session
+    cid = "cv_krestart"
+    with session() as s:
+        if s.get(Canvas, cid) is None:
+            s.add(Canvas(id=cid, owner_id=metadb.DEFAULT_USER_ID, name="t", version=1, doc="{}", visibility="private"))
+    assert client.get(f"/api/canvas/{cid}/kernel").json() == {"exists": False}
+    metadb.claim_kernel(cid, "k1", "tok")                      # a lease, not yet ready (no endpoint)
+    st = client.get(f"/api/canvas/{cid}/kernel").json()
+    assert st == {"exists": True, "state": "starting", "stale": False} and "token" not in st
+    r = client.post(f"/api/canvas/{cid}/kernel/restart").json()
+    assert r == {"ok": True, "restarted": False}               # not ready → nothing to shut down
+    metadb.drop_kernel(cid, "k1")
+
+
 def test_kernel_backend_runs_a_canvas_end_to_end():
     # DP_EXECUTION=kernel routes a run to a real, DETACHED per-canvas kernel PROCESS: it runs the job on
     # its own warm engine and writes run_states, which the hub reads back → done. Exercises the whole
@@ -1750,7 +1768,7 @@ def test_plan_cacheable_opt_out():
 def test_kernel_info_reports_backends_with_capacity():
     # Phase B: KernelInfo gains a real backends[] topology (additive — the runners contract is kept).
     info = client.get("/api/kernel").json()
-    assert info["runners"] == ["local-out-of-core", "local-subprocess"]  # unchanged pinned contract
+    assert info["runners"] == ["local-out-of-core", "local-subprocess", "kernel"]  # kernel is now a registered, selectable backend
     names = {b["name"] for b in info["backends"]}
     assert {"local-out-of-core", "local-subprocess"} <= names
     w = info["backends"][0]["workers"][0]

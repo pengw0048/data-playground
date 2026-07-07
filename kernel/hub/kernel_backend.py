@@ -73,6 +73,7 @@ class KernelBackend:
         self.spawner = spawner
         self.on_status = None     # unused: the kernel writes run_states directly (single writer)
         self.on_complete = None
+        self.runs: dict = {}      # no in-memory runs here (status is DB-backed via the kernel); kept for interface parity
 
     def can_run(self, plan: CompilePlan) -> bool:
         return True

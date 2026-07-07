@@ -242,6 +242,33 @@ def canvas_active_runs(canvas_id: str, uid: str = Depends(current_user)) -> list
     return [RunStatus(**d) for d in metadb.active_runs(canvas_id)]
 
 
+@router.get("/canvas/{canvas_id}/kernel")
+def canvas_kernel(canvas_id: str, uid: str = Depends(current_user)) -> dict:
+    """The per-canvas execution kernel's state (Jupyter-style), or {exists:false} if none is running.
+    Token/endpoint are internal — only state + staleness are surfaced."""
+    if metadb.canvas_role(canvas_id, uid) is None:
+        raise HTTPException(404, "not found")
+    k = metadb.get_kernel(canvas_id)
+    return {"exists": False} if k is None else {"exists": True, "state": k["state"], "stale": k["stale"]}
+
+
+@router.post("/canvas/{canvas_id}/kernel/restart")
+def canvas_kernel_restart(canvas_id: str, uid: str = Depends(current_user)) -> dict:
+    """Restart the canvas's kernel (Jupyter's 'Restart kernel'): shut the current one down; the next
+    run/preview spawns a fresh one. A wedged transform or a stale warm state is cleared this way."""
+    if metadb.canvas_role(canvas_id, uid) is None:
+        raise HTTPException(404, "not found")
+    k = metadb.get_kernel(canvas_id)
+    if not k or not k.get("endpoint"):
+        return {"ok": True, "restarted": False}  # none live → next run spawns fresh anyway
+    from hub import kernel_backend
+    try:
+        kernel_backend._post(k["endpoint"], "/shutdown", k["token"], {}, timeout=5.0)
+    except Exception:  # noqa: BLE001 — unreachable = already dead; the lease reaps, next run respawns
+        pass
+    return {"ok": True, "restarted": True}
+
+
 # Secrets never leave the kernel in plaintext. GET redacts them to a sentinel (fields are password
 # inputs, so it just shows dots); PUT treats the sentinel as "unchanged" and preserves the stored value.
 _REDACTED = "__redacted__"

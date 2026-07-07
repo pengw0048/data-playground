@@ -162,12 +162,12 @@ class Deps:
             pool.on_complete = _persist_run
             pool.on_status = _persist_run_state
             self.runners.append(pool)
-        # opt-in per-canvas kernel (DP_EXECUTION=kernel): runs go to a long-lived, restart-surviving
-        # kernel process (one per canvas). The kernel writes run_states itself, so no on_status/complete
-        # wiring here. estimate/can_run delegate to the base runner (hub-side confirm gate stays put).
-        if settings.execution == "kernel":
-            from hub.kernel_backend import KernelBackend, LocalProcessSpawner
-            self.runners.append(KernelBackend(self.runner, LocalProcessSpawner(workspace, data_dir)))
+        # per-canvas kernel: runs go to a long-lived, restart-surviving kernel process (one per canvas).
+        # Always REGISTERED so it's selectable from Settings → Execution; only the DEFAULT is opt-in
+        # (DP_EXECUTION=kernel, honored in pick_runner). The kernel writes run_states itself, so no
+        # on_status/complete wiring here; estimate/can_run delegate to the base runner (hub-side gate).
+        from hub.kernel_backend import KernelBackend, LocalProcessSpawner
+        self.runners.append(KernelBackend(self.runner, LocalProcessSpawner(workspace, data_dir)))
         # RunController owns a logical run across placement regions (multi-region = a placed node /
         # checkpoint / fan-out); a single default region delegates to the base runner unchanged.
         from hub.run_controller import RunController
