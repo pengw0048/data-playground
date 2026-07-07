@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useStore, type DpView } from '../store/graph'
 import { api } from '../api/client'
 import { color, radius, shadow } from '../theme/tokens'
@@ -173,12 +173,19 @@ function FilesContent() {
 function TablesContent() {
   const catalog = useStore((s) => s.catalog)
   const refreshCatalog = useStore((s) => s.refreshCatalog)
+  const uploadDataset = useStore((s) => s.uploadDataset)
   const addToCanvas = useStore((s) => s.addToCanvas)
+  const fileRef = useRef<HTMLInputElement>(null)
   const [uri, setUri] = useState('')
   const [err, setErr] = useState('')
+  const [uploading, setUploading] = useState(false)
   const register = async () => {
     const u = uri.trim(); if (!u) return; setErr('')
     try { await api.registerFile(u); await refreshCatalog(); setUri('') } catch (e) { setErr((e as Error).message) }
+  }
+  const onUpload = async (f?: File) => {
+    if (!f) return
+    setUploading(true); await uploadDataset(f); setUploading(false)  // uploads + refreshes the catalog
   }
   return (
     <>
@@ -190,6 +197,13 @@ function TablesContent() {
             placeholder="Register a dataset — path or uri to Parquet/CSV/JSON/Arrow/Lance"
             style={{ flex: 1, fontSize: 12.5, border: `1px solid ${color.border}`, borderRadius: 9, padding: '9px 12px', outline: 'none' }} />
           <button onClick={register} style={{ border: 'none', borderRadius: 9, background: color.ink, color: 'hsl(var(--background))', fontSize: 12.5, fontWeight: 600, padding: '0 16px', cursor: 'pointer' }}>Register</button>
+          {/* or upload the bytes directly (server-side path not required) */}
+          <button onClick={() => fileRef.current?.click()} disabled={uploading} title="Upload a dataset file from your machine"
+            style={{ border: `1px solid ${color.border}`, borderRadius: 9, background: 'hsl(var(--card))', color: color.ink, fontSize: 12.5, fontWeight: 600, padding: '0 16px', cursor: uploading ? 'default' : 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <Icon name="export" size={13} /> {uploading ? 'Uploading…' : 'Upload'}
+          </button>
+          <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
+            onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
         </div>
         {err && <div style={{ fontSize: 11, color: color.failed }}>{err}</div>}
         {catalog.map((t) => (

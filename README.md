@@ -36,7 +36,9 @@ events → keep purchases → total per user → save.
 ## What you get, offline, out of the box
 
 - **Open real data** — Parquet, CSV, JSON, Arrow/Feather, Lance, and directories-of-files. The
-  workspace catalog starts as your local files; `POST /api/catalog/register` (or a `source` node) adds more.
+  workspace catalog starts as your local files; add more by registering a path (`POST /api/catalog/register`
+  or a `source` node), or **upload a file** — drag it onto the canvas to drop a bound `source` node, or use
+  the Upload button in a source node / the Tables view.
 - **Explore & transform** — `filter`, `select`, `join`, `aggregate`, `sort`, `dedup`, `sql`, `sample`,
   `metric`, `chart`, `vector-search`, and `transform` (arbitrary Python) nodes that **actually execute**.
 - **See your pipeline three ways** — its **shape** (typed nodes and wires on the canvas), its **data**
@@ -203,7 +205,10 @@ can serve any request.
   answerable from any instance and survive a restart.
 - **Catalog** (registered datasets, written outputs, lineage) → written through to the DB
   (`catalog_entries` / `catalog_edges`), so a dataset registered on one instance is visible to all.
-- **The data itself** → object storage (`s3://` / `gs://`); each instance's own DuckDB reads it.
+- **The data itself** → object storage (`s3://` / `gs://`); each instance's own DuckDB reads it. This
+  is also where **uploads** must land to be shared: set `DP_STORAGE_URL` to an object-store prefix and an
+  uploaded file is written there (visible to every instance); left as the default local dir, an upload is
+  only readable on the instance that received it — fine single-host, not across a load balancer.
 
 Two *runtime* things still have **instance affinity** — they need routing, not config:
 

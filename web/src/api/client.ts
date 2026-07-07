@@ -20,7 +20,10 @@ export class KernelError extends Error {
 }
 
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(opts?.headers as Record<string, string>) }
+  // Only JSON string bodies get the JSON content-type; a raw File/Blob upload keeps the browser's own
+  // content-type (forcing application/json would corrupt it). Non-string body ⇒ don't set it.
+  const rawBody = opts?.body != null && typeof opts.body !== 'string'
+  const headers: Record<string, string> = { ...(rawBody ? {} : { 'Content-Type': 'application/json' }), ...(opts?.headers as Record<string, string>) }
   if (_userId) headers['X-DP-User'] = _userId
   const res = await fetch(`${BASE}${path}`, { ...opts, headers })
   if (!res.ok) {
@@ -87,6 +90,9 @@ export const api = {
   nodes: () => req<BackendNodeSpec[]>('/nodes'),
   registerFile: (uri: string, name?: string) =>
     req<CatalogTable>('/catalog/register', { method: 'POST', body: JSON.stringify({ uri, name }) }),
+  // upload a dataset file's bytes (raw body; name in a header) → lands in shared storage + registers
+  uploadFile: (file: File) =>
+    req<CatalogTable>('/catalog/upload', { method: 'POST', body: file, headers: { 'X-Upload-Filename': encodeURIComponent(file.name) } }),
 
   tables: (q?: string) => req<CatalogTable[]>(`/catalog/tables${q ? `?q=${encodeURIComponent(q)}` : ''}`),
   table: (id: string) => req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}`),

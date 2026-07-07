@@ -248,6 +248,39 @@ def test_register_endpoint():
     assert t["name"] == "movies_again" and t["rowCount"] == 200
 
 
+def _upload(filename: str, body: bytes):
+    # raw-body upload: the file bytes ARE the body; the name rides in the X-Upload-Filename header
+    return client.post("/api/catalog/upload", content=body, headers={"X-Upload-Filename": filename})
+
+
+def test_upload_registers_and_is_readable():
+    r = _upload("cities.csv", b"id,city\n1,paris\n2,rome\n3,paris\n")
+    assert r.status_code == 200, r.text
+    t = r.json()
+    assert t["name"] == "cities"
+    assert {c["name"] for c in t["columns"]} == {"id", "city"} and t["rowCount"] == 3
+    # visible in the (cross-instance) catalog and sampleable via its uri
+    assert "cities" in {x["name"] for x in client.get("/api/catalog/tables").json()}
+    s = client.post("/api/data/sample", json={"uri": t["uri"], "k": 10}).json()
+    assert len(s["rows"]) == 3
+
+
+def test_upload_rejects_unsupported_type():
+    assert _upload("notes.txt", b"hello").status_code == 400
+
+
+def test_upload_rejects_oversized(monkeypatch):
+    from hub.settings import settings
+    monkeypatch.setattr(settings, "max_upload_bytes", 8)  # tiny cap → the 20-byte body is aborted mid-stream
+    assert _upload("big.csv", b"a\n" + b"1\n" * 9).status_code == 413
+
+
+def test_upload_same_name_does_not_clobber():
+    a = _upload("dup.csv", b"a\n1\n").json()
+    b = _upload("dup.csv", b"a\n2\n").json()
+    assert a["uri"] != b["uri"]  # a short suffix keeps the two stored files distinct
+
+
 # --------------------------------------------------------------------------- #
 # Regression tests for adversarial-acceptance findings
 # --------------------------------------------------------------------------- #
@@ -1126,6 +1159,56 @@ def test_object_store_s3_roundtrip_and_browse(tmp_path):
     finally:
         server.stop()
         metadb.set_setting("objectStore", {}, "global")  # restore the default credential chain for other tests
+
+
+def test_upload_lands_bytes_in_object_store(tmp_path):
+    # Object-store deployments (multi-instance): uploaded bytes must round-trip through DuckDB httpfs to
+    # s3:// so every web instance can read them. _land_upload re-encodes to the SAME format at the target
+    # uri (csv stays csv); arrow/feather — which have no object-store reader — normalize to parquet.
+    pytest.importorskip("moto")
+    pytest.importorskip("flask")
+    boto3 = pytest.importorskip("boto3")
+    from moto.server import ThreadedMotoServer
+
+    from hub import db, metadb
+    from hub.routers.catalog import _land_upload
+
+    try:
+        with db.lock():
+            db.conn().execute("INSTALL httpfs"); db.conn().execute("LOAD httpfs")
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"httpfs unavailable: {e}")
+
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    try:
+        host, port = server.get_host_and_port()
+        endpoint = f"http://{host}:{port}"
+        boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
+                     region_name="us-east-1").create_bucket(Bucket="bkt")
+        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
+                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        db._obj_store_loaded = False
+        deps = get_deps()
+
+        csv = str(tmp_path / "u.csv")
+        with open(csv, "w") as f:
+            f.write("id,city\n1,paris\n2,rome\n")
+        final = _land_upload(deps, csv, "s3://bkt/up/cities.csv")
+        assert final == "s3://bkt/up/cities.csv"  # same format, kept in the object store
+        with db.lock():
+            assert deps.resolve_adapter(final).scan(final).aggregate("count(*) AS c").fetchone()[0] == 2
+
+        import pyarrow as pa, pyarrow.feather as feather
+        arrow = str(tmp_path / "u.arrow")
+        feather.write_feather(pa.table({"v": [1, 2, 3]}), arrow)
+        final2 = _land_upload(deps, arrow, "s3://bkt/up/x.arrow")
+        assert final2 == "s3://bkt/up/x.parquet"  # arrow has no object-store reader → normalized to parquet
+        with db.lock():
+            assert deps.resolve_adapter(final2).scan(final2).aggregate("count(*) AS c").fetchone()[0] == 3
+    finally:
+        server.stop()
+        metadb.set_setting("objectStore", {}, "global")
 
 
 def _section(nid, script, subnodes, params=None, max_runs=200):

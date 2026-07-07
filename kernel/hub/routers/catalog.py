@@ -6,18 +6,24 @@ Split out of main.py. All routes are authed: main includes this router with
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
+import tempfile
+import uuid
+from urllib.parse import unquote
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
 from hub import db, metadb
 from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
-from hub.plugins.adapters import relation_columns
+from hub.plugins.adapters import is_object_uri, path_of, relation_columns
 from hub.plugins.importer import ImporterNotConfigured
+from hub.settings import settings
 from hub.models import (
     CatalogTable,
     ColumnSchema,
@@ -167,6 +173,95 @@ def catalog_register(req: RegisterRequest) -> CatalogTable:
     # on every read + across restart — so no separate 'datasets' settings blob (its read-modify-write
     # dropped a concurrent registration; F45). The per-row store is authoritative + cross-instance.
     return deps.catalog.register_output(name=name, uri=uri, version="v1", parents=[])
+
+
+# --------------------------------------------------------------------------- #
+# Upload (bytes → shared storage → catalog)
+# --------------------------------------------------------------------------- #
+# The formats DuckDB can read directly. Lance is a directory, not a single uploaded file, so it's out.
+_UPLOAD_EXTS = (".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson", ".arrow", ".feather", ".ipc")
+
+
+def _land_upload(deps, tmp_path: str, target_uri: str) -> str:
+    """Move the just-received temp file to its final home and return the landed uri.
+
+    LOCAL: a byte-for-byte atomic rename (tmp is created in the target dir, so os.replace is atomic and
+    never crosses a filesystem). OBJECT STORE: there is no generic multi-backend raw-PUT, so round-trip
+    the bytes through DuckDB's httpfs write path (parquet→parquet, csv→csv, json→json). That writer picks
+    the format purely by extension, so where the exact byte format can't be preserved the target extension
+    is normalized to match what actually gets written — else a reader would mis-parse: tsv→csv (write emits
+    commas), ndjson→json (write emits a JSON array), arrow/feather→parquet (no object-store reader at all).
+    The returned uri reflects any such extension change.
+    """
+    if is_object_uri(target_uri):
+        base, low = os.path.splitext(target_uri)[0], target_uri.lower()
+        if low.endswith((".arrow", ".feather", ".ipc")):
+            target_uri = base + ".parquet"
+        elif low.endswith(".tsv"):
+            target_uri = base + ".csv"
+        elif low.endswith(".ndjson"):
+            target_uri = base + ".json"
+        with db.run_scope():  # own cursor — an upload re-encode doesn't hold the base lock / block runs
+            rel = deps.resolve_adapter(tmp_path).scan(tmp_path)
+            deps.resolve_adapter(target_uri).write(target_uri, rel)
+        return target_uri
+    dest = path_of(target_uri)
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    os.replace(tmp_path, dest)  # atomic (same dir as the temp); leaves nothing to clean up
+    return target_uri
+
+
+def _finalize_upload(deps, tmp: str, target: str, name: str) -> CatalogTable:
+    """Validate → land → register. All DuckDB work, so it runs in a threadpool (not the event loop).
+    Validate the temp file FIRST so an unreadable upload is rejected without leaving an orphan behind."""
+    try:
+        deps.resolve_adapter(tmp).schema(tmp)  # the uploaded bytes are readable (metadata only, limit=0)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"uploaded file is not readable: {e}")
+    final = _land_upload(deps, tmp, target)
+    with db.run_scope():  # own cursor — register's count(*) full-scan (CSV/JSON) must not hold the base lock
+        return deps.catalog.register_output(name=name, uri=final, version="v1", parents=[])
+
+
+@router.post("/catalog/upload", response_model=CatalogTable)
+async def catalog_upload(request: Request) -> CatalogTable:
+    """Upload a dataset file's bytes and register it. The raw request body IS the file; its name comes in
+    the X-Upload-Filename header. Bytes STREAM to a temp file, capped at DP_MAX_UPLOAD_BYTES as they arrive
+    (so an oversized upload is aborted without being buffered anywhere — no reliance on Content-Length),
+    then land in shared storage (a local dir, or object storage when DP_STORAGE_URL is set — visible to
+    every instance) and register into the cross-instance catalog, returned as a CatalogTable."""
+    deps = get_deps()
+    raw = os.path.basename(unquote(request.headers.get("x-upload-filename") or "").replace("\\", "/")) or "upload"
+    stem, ext = os.path.splitext(raw)
+    ext = ext.lower()
+    if ext not in _UPLOAD_EXTS:
+        raise HTTPException(400, f"unsupported file type '{ext or raw}' — upload Parquet / CSV / TSV / JSON / Arrow")
+    name = stem or "upload"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", stem) or "upload"
+    # short suffix so two uploads of the same filename don't silently clobber each other (the catalog
+    # still shows the clean name; only the stored file path is uniquified)
+    target = deps.storage.output_uri(f"{safe}-{uuid.uuid4().hex[:6]}", ext)
+    obj = is_object_uri(target)
+    limit = settings.max_upload_bytes
+    tmp_dir = None if obj else (os.path.dirname(path_of(target)) or ".")
+    if tmp_dir:
+        os.makedirs(tmp_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=ext, dir=tmp_dir)
+    try:
+        written = 0
+        with os.fdopen(fd, "wb") as out:
+            async for chunk in request.stream():  # pulled from the socket as it arrives — nothing pre-buffered
+                written += len(chunk)
+                if written > limit:  # abort mid-stream, before the whole body lands anywhere
+                    raise HTTPException(413, f"upload exceeds the {limit}-byte limit (raise DP_MAX_UPLOAD_BYTES)")
+                out.write(chunk)
+        if written == 0:
+            raise HTTPException(400, "empty upload")
+        # landing + schema probe + register are blocking DuckDB calls — run them off the event loop
+        return await run_in_threadpool(_finalize_upload, deps, tmp, target, name)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)  # local: already moved (no-op); object store / any error: drop the temp
 
 
 # --------------------------------------------------------------------------- #

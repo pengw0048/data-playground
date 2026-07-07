@@ -10,12 +10,24 @@ import { api } from '../../api/client'
 function Source({ id, data }: NodeComponentProps) {
   const [open, setOpen] = useState(false)
   const [dialog, setDialog] = useState(false)
+  const [uploading, setUploading] = useState(false)
   const btnRef = useRef<HTMLButtonElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
   const catalog = useStore((s) => s.catalog)
   const refreshCatalog = useStore((s) => s.refreshCatalog)
+  const uploadDataset = useStore((s) => s.uploadDataset)
   const updateConfig = useStore((s) => s.updateConfig)
   const rename = useStore((s) => s.rename)
   const table = catalog.find((t) => t.uri === data.config.uri)
+
+  // upload a local file → store it + bind this source to it
+  const onUpload = async (f: File | undefined) => {
+    if (!f) return
+    setOpen(false); setUploading(true)
+    const t = await uploadDataset(f)  // uploads + refreshes catalog; toasts on failure
+    setUploading(false)
+    if (t) { updateConfig(id, { uri: t.uri, tableId: t.id }); rename(id, t.name) }
+  }
 
   // pick a file from a destination (local dir / object store) → register it + use it as this source
   const pickFile = async (uri: string, fname: string) => {
@@ -85,7 +97,14 @@ function Source({ id, data }: NodeComponentProps) {
           className="flex w-full items-center gap-[7px] rounded-md px-[9px] py-[7px] text-left text-xs text-primary hover:bg-accent">
           <Icon name="search" size={12} /> Browse files…
         </button>
+        <button onClick={(e) => { e.stopPropagation(); fileRef.current?.click() }}
+          className="flex w-full items-center gap-[7px] rounded-md px-[9px] py-[7px] text-left text-xs text-primary hover:bg-accent">
+          <Icon name="export" size={12} /> Upload a file…
+        </button>
       </Popover>
+      {uploading && <div className="mt-1 text-[10.5px] text-muted-foreground">Uploading…</div>}
+      <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
+        onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
       {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)} onPick={(r) => pickFile(r.uri, r.name)} />}
     </NodeCard>
   )

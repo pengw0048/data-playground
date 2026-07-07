@@ -175,6 +175,8 @@ interface Store {
   bootstrap: () => Promise<void>
   refreshCatalog: () => Promise<void>
   refreshSchemas: () => Promise<void>
+  // upload a dataset file → shared storage + catalog; returns the new table (null on failure/offline)
+  uploadDataset: (file: File) => Promise<CatalogTable | null>
 
   // -- agent --
   setAgentOpen: (v: boolean) => void
@@ -820,6 +822,18 @@ export const useStore = create<Store>((set, get) => ({
       const catalog = await api.tables()
       set({ catalog })
     } catch { /* noop */ }
+  },
+
+  uploadDataset: async (file) => {
+    if (!get().kernelUp) { get().pushToast('Kernel offline — cannot upload a file', 'error'); return null }
+    try {
+      const t = await api.uploadFile(file)
+      await get().refreshCatalog()  // so the new dataset appears in the catalog + pickers
+      return t
+    } catch (e) {
+      get().pushToast(`Upload failed: ${e instanceof Error ? e.message : String(e)}`, 'error')
+      return null
+    }
   },
 
   refreshSchemas: async () => {

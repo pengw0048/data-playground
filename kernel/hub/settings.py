@@ -17,6 +17,9 @@ class Settings:
     database_url: str = os.environ.get("DP_DATABASE_URL") or (
         "sqlite:///" + os.path.join(os.environ.get("DP_WORKSPACE", _KERNEL_ROOT), "dataplay.db"))
     preview_k: int = int(os.environ.get("DP_PREVIEW_K", "50"))
+    # cap on a single dataset upload (POST /catalog/upload). Streamed + enforced as bytes arrive, so a
+    # too-large upload is rejected without buffering it. Default 2 GiB; raise for bigger local files.
+    max_upload_bytes: int = int(os.environ.get("DP_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
     plugin_modules: list[str] = [m.strip() for m in os.environ.get("DP_PLUGINS", "").split(",") if m.strip()]
     # LLM agent (optional, provider-agnostic via LiteLLM): pick any model with DP_AGENT_MODEL, e.g.
     # anthropic/claude-opus-4-8, openai/gpt-5, gemini/gemini-2.5-pro, openrouter/…, ollama/llama3.3.

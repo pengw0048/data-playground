@@ -87,6 +87,34 @@ export function Canvas() {
 
   const [menu, setMenu] = useState<{ x: number; y: number; wire: WireType; source: { nodeId: string | null; handleId: string | null } } | null>(null)
 
+  // Drag a data file from the OS onto the canvas → upload it and drop a bound source node where it landed.
+  const [dropActive, setDropActive] = useState(false)
+  const onDragOverFiles = useCallback((e: React.DragEvent) => {
+    if (!Array.from(e.dataTransfer?.types ?? []).includes('Files')) return  // ignore node/text drags
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'copy'
+    setDropActive(true)
+  }, [])
+  const onDragLeaveFiles = useCallback((e: React.DragEvent) => {
+    if (!e.currentTarget.contains(e.relatedTarget as HTMLElement | null)) setDropActive(false)  // not a child-to-child move
+  }, [])
+  const onDropFiles = useCallback(async (e: React.DragEvent) => {
+    const files = Array.from(e.dataTransfer?.files ?? [])
+    if (!files.length) return
+    e.preventDefault()
+    setDropActive(false)
+    const base = screenToFlowPosition({ x: e.clientX, y: e.clientY })
+    const s = useStore.getState()
+    if (!s.kernelUp) { s.pushToast('Kernel offline — cannot upload a file', 'error'); return }
+    for (const file of files) {
+      const t = await s.uploadDataset(file)  // uploads + refreshes the catalog; toasts on failure
+      if (!t) continue
+      const g = useStore.getState()
+      const pos = freePosition(g.doc.nodes, { x: base.x - 116, y: base.y - 40 })
+      g.addNode('source', pos, { uri: t.uri, tableId: t.id }, t.name)
+    }
+  }, [screenToFlowPosition])
+
   // React Flow needs to own node measurements (`measured`/width/height): if we rebuilt node
   // objects from the store every render we'd drop them, and RF keeps unmeasured nodes hidden.
   // So we keep a local RF-nodes state and reconcile from the store, preserving measured fields.
@@ -282,7 +310,8 @@ export function Canvas() {
 
   return (
     <div style={{ position: 'absolute', inset: 0 }}
-      onMouseMove={(e) => { const p = screenToFlowPosition({ x: e.clientX, y: e.clientY }); sendCursor(p.x, p.y) }}>
+      onMouseMove={(e) => { const p = screenToFlowPosition({ x: e.clientX, y: e.clientY }); sendCursor(p.x, p.y) }}
+      onDragOver={onDragOverFiles} onDragLeave={onDragLeaveFiles} onDrop={onDropFiles}>
       <ArrowDefs />
       <PeerCursors />
       <ReactFlow
@@ -330,6 +359,15 @@ export function Canvas() {
       </ReactFlow>
 
       {doc.nodes.length === 0 && <EmptyState />}
+
+      {/* file-drop affordance — pointer-events:none so it never intercepts the drop itself */}
+      {dropActive && (
+        <div className="pointer-events-none absolute inset-3 z-50 grid place-items-center rounded-xl border-2 border-dashed border-primary bg-primary/5">
+          <div className="rounded-lg bg-card px-4 py-2.5 text-[13px] font-semibold text-foreground shadow-lg">
+            Drop to upload as a source · Parquet / CSV / JSON / Arrow
+          </div>
+        </div>
+      )}
 
       <PanelHost />
 
