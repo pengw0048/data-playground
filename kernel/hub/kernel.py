@@ -26,6 +26,13 @@ class RunBody(BaseModel):
     placement: str = "local"
 
 
+class PreviewBody(BaseModel):
+    graph: dict
+    node_id: str
+    k: int = 50
+    offset: int = 0
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="hub.kernel")
     p.add_argument("--canvas", required=True)
@@ -98,6 +105,22 @@ def main() -> None:
         plan = compiler.compile_plan(graph, body.target, deps.registry, deps.node_specs)
         st = deps.runner.run(plan, graph, body.target, body.placement, run_id=body.run_id)
         return st.model_dump()
+
+    @app.post("/preview")
+    def preview(body: PreviewBody, x_dp_kernel_token: str = Header(None)):
+        _auth(x_dp_kernel_token)
+        last_activity[0] = time.monotonic()
+        from hub.executors.preview import preview_node
+        return preview_node(Graph(**body.graph), body.node_id, body.k, deps.resolve_adapter,
+                            deps.registry, deps.node_builders, deps.node_specs, offset=body.offset).model_dump()
+
+    @app.post("/profile")
+    def profile(body: PreviewBody, x_dp_kernel_token: str = Header(None)):
+        _auth(x_dp_kernel_token)
+        last_activity[0] = time.monotonic()
+        from hub.executors.profile import profile_node
+        return profile_node(Graph(**body.graph), body.node_id, deps.resolve_adapter,
+                            deps.registry, deps.node_builders, deps.node_specs).model_dump()
 
     @app.post("/cancel")
     def cancel(body: dict, x_dp_kernel_token: str = Header(None)):

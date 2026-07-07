@@ -1379,6 +1379,12 @@ def test_kernel_backend_runs_a_canvas_end_to_end():
         st = _poll(r["runId"], tries=400)
         assert st["status"] == "done", st.get("error")
         assert metadb.get_kernel(canvas_id) is not None   # a live kernel owned the run
+        # Phase 2 step 1: preview + profile also route to the (same, warm) kernel and return correct data
+        pv = client.post("/api/run/preview", json={"graph": g, "nodeId": "flt", "k": 5}).json()
+        assert not pv["notPreviewable"] and not pv.get("error"), pv
+        assert all(row["amount"] > 1 for row in pv["rows"])          # filter really ran on the kernel
+        pf = client.post("/api/run/profile", json={"graph": g, "nodeId": "flt"}).json()
+        assert pf["sampled"] is True and any(c["name"] == "amount" for c in pf["columns"])
     finally:
         k = metadb.get_kernel(canvas_id)
         if k and k.get("endpoint"):

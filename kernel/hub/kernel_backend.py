@@ -108,6 +108,16 @@ class KernelBackend:
         body = {"run_id": run_id, "graph": graph.model_dump(), "target": target_node_id, "placement": placement}
         return RunStatus(**_post(endpoint, "/run", token, body))
 
+    def preview(self, graph: Graph, node_id: str, k: int, offset: int) -> dict:
+        """Run a sample preview on the canvas's warm kernel (so it shares the kernel's engine + cache)."""
+        endpoint, token = self._ensure_kernel(getattr(graph, "id", None) or "canvas")
+        return _post(endpoint, "/preview", token,
+                     {"graph": graph.model_dump(), "node_id": node_id, "k": k, "offset": offset})
+
+    def profile(self, graph: Graph, node_id: str) -> dict:
+        endpoint, token = self._ensure_kernel(getattr(graph, "id", None) or "canvas")
+        return _post(endpoint, "/profile", token, {"graph": graph.model_dump(), "node_id": node_id})
+
     def status(self, run_id: str) -> RunStatus:
         d = metadb.get_run_state(run_id)  # the kernel is the writer; the DB is the source of truth
         if d is None:

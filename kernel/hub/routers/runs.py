@@ -55,20 +55,24 @@ def compile_graph(req: CompileRequest) -> CompilePlan:
 
 
 @router.post("/run/preview", response_model=SampleResult)
-def run_preview(req: PreviewRequest) -> SampleResult:
+def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> SampleResult:
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     k = req.k if req.k is not None else settings.preview_k
+    if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+        return SampleResult(**kb.preview(req.graph, req.node_id, k, max(0, req.offset)))  # on the canvas's warm kernel
     return preview_node(req.graph, req.node_id, k,
                         deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
                         offset=max(0, req.offset))
 
 
 @router.post("/run/profile", response_model=ProfileResult)
-def run_profile(req: PreviewRequest) -> ProfileResult:
+def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> ProfileResult:
     """Per-column stats (null/distinct/min/max/mean) over the previewed sample of a node's output."""
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+        return ProfileResult(**kb.profile(req.graph, req.node_id))       # on the canvas's warm kernel
     return profile_node(req.graph, req.node_id,
                         deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs)
 

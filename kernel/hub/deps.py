@@ -186,22 +186,30 @@ class Deps:
                 continue
         return self.default_adapter
 
-    def pick_runner(self, plan, uid: str | None = None):
-        # honor the chosen backend (Settings → Execution) when it's registered and can run this plan;
-        # otherwise the first runner that can, else the default. Real once plugins add more runners.
-        # A per-user preference wins over the workspace default (empty = inherit the global choice).
+    def chosen_backend(self, uid: str | None = None) -> str:
+        """The selected execution backend NAME: per-user preference > workspace default > DP_EXECUTION >
+        (auth-on) subprocess isolation. Empty = no explicit choice (pick_runner falls to first-that-can).
+        Also drives whether preview/profile route to the kernel."""
         from hub import auth, metadb
         chosen = (metadb.get_setting("backend", "user", uid, default="") if uid else "") or ""
         if not chosen:
             chosen = metadb.get_setting("backend", "global", default="") or ""
-        # multi-user safety: with auth ON and no explicit choice, default to the subprocess runner so a
-        # user's arbitrary Python can't crash / hang / OOM the shared kernel process (and a runaway
-        # pure-Python loop can be hard-killed). Open single-user mode stays in-process — trusted +
-        # faster + keeps the content-addressed cache. An explicit Settings→Execution choice always wins.
         if not chosen and settings.execution:
             chosen = settings.execution     # DP_EXECUTION opt-in (e.g. 'kernel') is the default when set
         if not chosen and auth.auth_enabled():
+            # multi-user safety: a user's arbitrary Python must not crash/hang/OOM the shared process.
             chosen = "local-subprocess"
+        return chosen
+
+    def kernel_backend(self):
+        """The registered per-canvas KernelBackend (for preview/profile routing), or None."""
+        from hub.kernel_backend import KernelBackend
+        return next((r for r in self.runners if isinstance(r, KernelBackend)), None)
+
+    def pick_runner(self, plan, uid: str | None = None):
+        # honor the chosen backend (Settings → Execution) when it's registered and can run this plan;
+        # otherwise the first runner that can, else the default.
+        chosen = self.chosen_backend(uid)
         if chosen:
             for r in self.runners:
                 if getattr(r, "name", None) == chosen and r.can_run(plan):
