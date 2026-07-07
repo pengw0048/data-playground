@@ -633,6 +633,16 @@ def get_kernel(canvas_id: str) -> dict | None:
                 "token": r.token, "state": r.state, "stale": _kernel_stale(r)}
 
 
+def kernel_for_run(run_id: str) -> dict | None:
+    """The kernel currently owning a run's canvas (endpoint + token) — for routing cancel to it."""
+    with session() as s:
+        r = s.get(RunState, run_id)
+        if r is None or not r.canvas_id:
+            return None
+        k = s.get(Kernel, r.canvas_id)
+        return {"endpoint": k.endpoint, "token": k.token, "kernel_id": k.kernel_id} if k else None
+
+
 def reap_kernels() -> int:
     """Delete leases whose kernel is presumed dead (stale heartbeat). Any hub, on boot + on a timer."""
     n = 0

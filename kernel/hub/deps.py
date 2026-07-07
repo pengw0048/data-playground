@@ -162,6 +162,12 @@ class Deps:
             pool.on_complete = _persist_run
             pool.on_status = _persist_run_state
             self.runners.append(pool)
+        # opt-in per-canvas kernel (DP_EXECUTION=kernel): runs go to a long-lived, restart-surviving
+        # kernel process (one per canvas). The kernel writes run_states itself, so no on_status/complete
+        # wiring here. estimate/can_run delegate to the base runner (hub-side confirm gate stays put).
+        if settings.execution == "kernel":
+            from hub.kernel_backend import KernelBackend, LocalProcessSpawner
+            self.runners.append(KernelBackend(self.runner, LocalProcessSpawner(workspace, data_dir)))
         # RunController owns a logical run across placement regions (multi-region = a placed node /
         # checkpoint / fan-out); a single default region delegates to the base runner unchanged.
         from hub.run_controller import RunController
@@ -192,6 +198,8 @@ class Deps:
         # user's arbitrary Python can't crash / hang / OOM the shared kernel process (and a runaway
         # pure-Python loop can be hard-killed). Open single-user mode stays in-process — trusted +
         # faster + keeps the content-addressed cache. An explicit Settings→Execution choice always wins.
+        if not chosen and settings.execution:
+            chosen = settings.execution     # DP_EXECUTION opt-in (e.g. 'kernel') is the default when set
         if not chosen and auth.auth_enabled():
             chosen = "local-subprocess"
         if chosen:

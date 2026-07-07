@@ -178,8 +178,8 @@ class LocalRunner:
 
     # -- run --------------------------------------------------------------- #
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
-            placement: Placement) -> RunStatus:
-        run_id = f"run_{uuid.uuid4().hex[:10]}"
+            placement: Placement, run_id: str | None = None) -> RunStatus:
+        run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         status = RunStatus(run_id=run_id, status="queued", placement=placement, per_node=per_node)
         with self._lock:

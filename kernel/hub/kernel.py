@@ -1,0 +1,118 @@
+"""A per-canvas execution KERNEL: a long-lived, detached process that runs one canvas's runs on a
+warm in-process engine and writes run status to the shared DB — so the hub (web tier) can restart
+without killing an in-flight run. Launched by hub.kernel_backend.LocalProcessSpawner as
+`python -m hub.kernel --canvas <id> --kernel-id <id> --token <tok> --workspace ... --port <p>`.
+
+Phase 1 is a COLD kernel: the DuckDB connection + the DB-backed result cache are warm across runs for
+free, but the per-kernel relation cache and preview-on-kernel come in Phase 2. Command channel here is
+just /run, /cancel, /shutdown over token-authed loopback HTTP. The kernel OWNS run_states writes
+(stamped with its kernel_id) — the single writer; the hub's KernelBackend only reads them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+
+from pydantic import BaseModel
+
+
+class RunBody(BaseModel):
+    # module-level (not inside main): with `from __future__ import annotations`, FastAPI must resolve
+    # the body annotation from module globals — a function-local model resolves to nothing → 422.
+    run_id: str
+    graph: dict
+    target: str | None = None
+    placement: str = "local"
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="hub.kernel")
+    p.add_argument("--canvas", required=True)
+    p.add_argument("--kernel-id", required=True)
+    p.add_argument("--token", required=True)
+    p.add_argument("--workspace", required=True)
+    p.add_argument("--data-dir", required=True)
+    p.add_argument("--port", type=int, required=True)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--idle-ttl", type=float, default=float(os.environ.get("DP_KERNEL_IDLE_TTL", "900")))
+    args = p.parse_args()
+
+    # Freeze the workspace into the env BEFORE importing hub.settings (its DB url is frozen at import).
+    # The hub's env is inherited, so these are usually already set to the same values — setdefault keeps
+    # the hub's, guaranteeing the kernel shares the hub's metadata DB (run_states / kernels).
+    os.environ.setdefault("DP_WORKSPACE", args.workspace)
+    os.environ.setdefault("DP_DATA_DIR", args.data_dir)
+
+    import threading
+    import time
+    from contextlib import asynccontextmanager
+
+    import uvicorn
+    from fastapi import FastAPI, Header, HTTPException
+
+    from hub import compiler, metadb
+    from hub.deps import set_workspace
+    from hub.models import Graph
+
+    canvas, kid, token = args.canvas, args.kernel_id, args.token
+    deps = set_workspace(args.workspace, args.data_dir)
+    # single-writer: the kernel persists run_states stamped with OUR kernel_id (so the boot-time reaper
+    # spares this run while we're alive). on_complete (run history) stays wired — we're long-lived, so
+    # its daemon-thread commit isn't racing a process exit the way the one-shot subprocess child was.
+    deps.runner.on_status = lambda g, st: metadb.save_run_state(
+        st.run_id, st.model_dump(), canvas_id=getattr(g, "id", None), kernel_id=kid)
+
+    last_activity = [time.monotonic()]
+
+    def _auth(tok: str | None) -> None:
+        if tok != token:
+            raise HTTPException(401, "bad kernel token")
+
+    def _heartbeat_loop() -> None:
+        while True:
+            time.sleep(5.0)
+            if not metadb.heartbeat_kernel(canvas, kid):
+                os._exit(0)  # fenced out — a newer kernel took over this canvas
+            busy = any(s.status in ("queued", "running") for s in deps.runner.runs.values())
+            if busy:
+                last_activity[0] = time.monotonic()
+            elif time.monotonic() - last_activity[0] > args.idle_ttl:
+                metadb.drop_kernel(canvas, kid)  # fenced delete — releases only if still ours
+                os._exit(0)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # mark ready only once uvicorn is actually serving, so the hub never POSTs to a dead port
+        metadb.mark_kernel_ready(canvas, kid, f"{args.host}:{args.port}")
+        threading.Thread(target=_heartbeat_loop, daemon=True).start()
+        yield
+
+    app = FastAPI(lifespan=lifespan)
+
+    @app.post("/run")
+    def run(body: RunBody, x_dp_kernel_token: str = Header(None)):
+        _auth(x_dp_kernel_token)
+        last_activity[0] = time.monotonic()
+        graph = Graph(**body.graph)
+        plan = compiler.compile_plan(graph, body.target, deps.registry, deps.node_specs)
+        st = deps.runner.run(plan, graph, body.target, body.placement, run_id=body.run_id)
+        return st.model_dump()
+
+    @app.post("/cancel")
+    def cancel(body: dict, x_dp_kernel_token: str = Header(None)):
+        _auth(x_dp_kernel_token)
+        return deps.runner.cancel(body["run_id"]).model_dump()
+
+    @app.post("/shutdown")
+    def shutdown(x_dp_kernel_token: str = Header(None)):
+        _auth(x_dp_kernel_token)
+        metadb.drop_kernel(canvas, kid)
+        threading.Timer(0.2, lambda: os._exit(0)).start()
+        return {"ok": True}
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+
+
+if __name__ == "__main__":
+    main()

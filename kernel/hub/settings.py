@@ -25,6 +25,9 @@ class Settings:
     agent_base_url: str | None = os.environ.get("DP_AGENT_BASE_URL") or None  # local/self-hosted endpoint
     agent_api_key: str | None = os.environ.get("DP_AGENT_API_KEY") or None    # optional explicit override
     agent_max_steps: int = int(os.environ.get("DP_AGENT_MAX_STEPS", "24"))
+    # execution backend opt-in: "kernel" routes runs to a per-canvas, restart-surviving kernel process
+    # (else the in-process / subprocess runner). Empty = default selection (see deps.pick_runner).
+    execution: str = os.environ.get("DP_EXECUTION", "").strip()
 
 
 settings = Settings()

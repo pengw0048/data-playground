@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
@@ -1315,6 +1316,39 @@ def test_kernel_lease_is_single_spawner_and_fenced():
     assert metadb.get_kernel("cv_fence") is not None
     metadb.drop_kernel("cv_fence", "k_A")                            # the real owner releases
     assert metadb.get_kernel("cv_fence") is None
+
+
+def test_kernel_backend_runs_a_canvas_end_to_end():
+    # DP_EXECUTION=kernel routes a run to a real, DETACHED per-canvas kernel PROCESS: it runs the job on
+    # its own warm engine and writes run_states, which the hub reads back → done. Exercises the whole
+    # path (atomic lease → spawn → token-authed loopback command channel → run → status via the DB).
+    from hub import deps as dm, kernel_backend, metadb
+    from hub import settings as sm
+    canvas_id = "cv_kernel_e2e"
+    os.environ["DP_KERNEL_IDLE_TTL"] = "6"          # backstop: the detached kernel self-exits soon if idle
+    old = sm.settings.execution
+    sm.settings.execution = "kernel"
+    dm.set_workspace(sm.settings.workspace, sm.settings.data_dir)   # rebuild deps → registers KernelBackend
+    try:
+        assert any(getattr(r, "name", "") == "kernel" for r in dm.get_deps().runners)
+        g = {"id": canvas_id, "version": 1, "nodes": [
+            N("src", "source", {"uri": _uri("events")}),
+            N("flt", "filter", {"predicate": "amount > 1"}),
+        ], "edges": [E("src", "flt")]}
+        r = client.post("/api/run", json={"graph": g, "targetNodeId": "flt", "confirmed": True}).json()
+        st = _poll(r["runId"], tries=400)
+        assert st["status"] == "done", st.get("error")
+        assert metadb.get_kernel(canvas_id) is not None   # a live kernel owned the run
+    finally:
+        k = metadb.get_kernel(canvas_id)
+        if k and k.get("endpoint"):
+            try:
+                kernel_backend._post(k["endpoint"], "/shutdown", k["token"], {}, timeout=5.0)
+            except Exception:  # noqa: BLE001
+                pass
+        os.environ.pop("DP_KERNEL_IDLE_TTL", None)
+        sm.settings.execution = old
+        dm.set_workspace(sm.settings.workspace, sm.settings.data_dir)  # restore clean runners (pinned contract)
 
 
 def test_catalog_entries_are_shared_across_instances(tmp_path):
