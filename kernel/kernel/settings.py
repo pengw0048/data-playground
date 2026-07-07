@@ -19,7 +19,7 @@ class Settings:
     preview_k: int = int(os.environ.get("DP_PREVIEW_K", "50"))
     plugin_modules: list[str] = [m.strip() for m in os.environ.get("DP_PLUGINS", "").split(",") if m.strip()]
     # LLM agent (optional, provider-agnostic via LiteLLM): pick any model with DP_AGENT_MODEL, e.g.
-    # anthropic/claude-opus-4-8, openai/gpt-4o, gemini/gemini-1.5-pro, openrouter/…, ollama/llama3.
+    # anthropic/claude-opus-4-8, openai/gpt-5, gemini/gemini-2.5-pro, openrouter/…, ollama/llama3.3.
     # The matching provider key is read from the env (ANTHROPIC_API_KEY / OPENAI_API_KEY / …).
     agent_model: str = os.environ.get("DP_AGENT_MODEL", "anthropic/claude-opus-4-8")
     agent_base_url: str | None = os.environ.get("DP_AGENT_BASE_URL") or None  # local/self-hosted endpoint
