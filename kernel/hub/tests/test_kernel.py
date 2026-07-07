@@ -3216,6 +3216,134 @@ def test_lower_to_ir_and_clean_classification():
     assert o3["fn"] == "filter_sql" and o3["tf"] == "filter"
 
 
+def _load_dp_ray():
+    import importlib.util
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_ray" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("dp_ray_ref", src)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)  # loads WITHOUT ray (lazy import)
+    return mod
+
+
+def _ray_node(nid, t, cfg):
+    return {"id": nid, "type": t, "position": {"x": 0, "y": 0}, "data": {"config": cfg}}
+
+
+def _ray_edge(s, t):
+    return {"id": f"{s}{t}", "source": s, "target": t, "data": {"wire": "dataset"}}
+
+
+def test_ray_backend_operator_gating_and_fallback(tmp_path):
+    # The dp_ray reference backend runs the clean IR subset on Ray Data. Ray's streaming executor must
+    # spawn worker processes, which many sandboxes/CI can't — so this test covers everything that does
+    # NOT need a live cluster (the live differential run is test_ray_backend_live_differential, opt-in):
+    #   (1) the map/filter operator the backend runs ON Ray IS the DuckDB engine's sandbox operator, so
+    #       results are identical BY CONSTRUCTION — verified by applying _make_mapper to a real Arrow batch;
+    #   (2) can_run gates the clean subset from the CompilePlan;
+    #   (3) a non-clean (relational) graph runs but falls back to the DuckDB LocalRunner.
+    # The dp_ray module imports ray LAZILY (inside run/execute), so this loads and runs without ray.
+    import time
+
+    import duckdb
+    import pyarrow as pa
+
+    from hub.compiler import compile_plan
+    from hub.deps import Deps
+    from hub.ir import lower_to_ir
+    from hub.models import Graph
+
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    mod = _load_dp_ray()
+    rr = mod.RayRunner(deps)
+
+    def G(nodes, edges):
+        return Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": edges})
+
+    # (1) the exact operator the Ray map_batches UDF applies, run on a real Arrow batch — no Ray needed
+    tbl = pa.table({"x": list(range(1, 11))})
+    mapped = mod._make_mapper({"mode": "map", "code": "def fn(r):\n    r['x'] = r['x']*2\n    return r", "onError": "raise"})(tbl)
+    assert mapped.column("x").to_pylist() == [2 * i for i in range(1, 11)]
+    filtered = mod._make_mapper({"mode": "filter", "code": "def fn(r):\n    return r['x'] > 8", "onError": "raise"})(tbl)
+    assert filtered.column("x").to_pylist() == [9, 10]
+
+    # (2) can_run: a source→map→write graph is clean; a relational graph is not
+    clean = G([_ray_node("src", "source", {"uri": "x.parquet"}),
+               _ray_node("m", "transform", {"mode": "map", "code": "def fn(r): return r"}),
+               _ray_node("w", "write", {"name": "o"})], [_ray_edge("src", "m"), _ray_edge("m", "w")])
+    assert rr.can_run(compile_plan(clean, "w", deps.registry, deps.node_specs)) is True
+
+    p = str(tmp_path / "nums.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM range(1,6) t(x)) TO '{p}' (FORMAT PARQUET)")
+    dirty = G([_ray_node("src", "source", {"uri": p}),
+               _ray_node("a", "aggregate", {"aggs": "count(*) AS n"}),
+               _ray_node("w", "write", {"name": "agg_out"})], [_ray_edge("src", "a"), _ray_edge("a", "w")])
+    dplan = compile_plan(dirty, "w", deps.registry, deps.node_specs)
+    assert rr.can_run(dplan) is False  # (3) relational → not clean
+
+    # …and run() delegates a non-clean graph to the DuckDB base runner (never touches Ray) → it completes
+    st = rr.run(dplan, dirty, "w", "local")
+    for _ in range(300):
+        if deps.runner.status(st.run_id).status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.05)
+    assert deps.runner.status(st.run_id).status == "done"
+
+    # a library transform with no inlined code isn't Ray-runnable (a worker can't reach the driver registry)
+    libg = G([_ray_node("src", "source", {"uri": "x.parquet"}),
+              _ray_node("m", "transform", {"mode": "map", "source": "library", "processor": "p1"}),
+              _ray_node("w", "write", {"name": "o"})], [_ray_edge("src", "m"), _ray_edge("m", "w")])
+    assert rr._ray_runnable(lower_to_ir(libg, "w", deps.node_specs)) is False
+
+
+@pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="live Ray Data run — set DP_TEST_RAY_LIVE=1 on a host where Ray's executor runs")
+def test_ray_backend_live_differential(tmp_path):
+    # End-to-end: run source→map→filter→write on Ray Data and assert the output equals the DuckDB
+    # LocalRunner's, byte-for-byte. Opt-in (Ray's streaming executor needs to spawn workers, which a
+    # sandbox/CI often can't); run on a real machine: DP_TEST_RAY_LIVE=1 uv run --no-sync pytest -k live_differential
+    import time
+
+    import duckdb
+
+    from hub.compiler import compile_plan
+    from hub.deps import Deps
+    from hub.models import Graph
+
+    pytest.importorskip("ray")
+    p = str(tmp_path / "nums.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM range(1,11) t(x)) TO '{p}' (FORMAT PARQUET)")
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+
+    def mk(wname):
+        return Graph(**{"id": "c", "version": 1, "nodes": [
+            _ray_node("src", "source", {"uri": p}),
+            _ray_node("m", "transform", {"mode": "map", "code": "def fn(row):\n    row['x'] = row['x'] * 2\n    return row"}),
+            _ray_node("f", "transform", {"mode": "filter", "code": "def fn(row):\n    return row['x'] > 8"}),
+            _ray_node("w", "write", {"name": wname}),
+        ], "edges": [_ray_edge("src", "m"), _ray_edge("m", "f"), _ray_edge("f", "w")]})
+
+    def poll(runner, run_id):
+        for _ in range(600):
+            st = runner.status(run_id)
+            if st.status in ("done", "failed", "cancelled"):
+                return st
+            time.sleep(0.1)
+        return st
+
+    gr = mk("ray_out")
+    st_ray = poll(rr, rr.run(compile_plan(gr, "w", deps.registry, deps.node_specs), gr, "w", "local").run_id)
+    assert st_ray.status == "done" and st_ray.placement == "distributed", st_ray.error
+    gl = mk("local_out")
+    st_loc = poll(deps.runner, deps.runner.run(compile_plan(gl, "w", deps.registry, deps.node_specs), gl, "w", "local").run_id)
+    assert st_loc.status == "done", st_loc.error
+
+    def rows(uri):
+        return sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{uri}')").fetchall())
+    assert rows(st_ray.output_uri) == rows(st_loc.output_uri) == [10, 12, 14, 16, 18, 20]
+
+
 def test_section_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),

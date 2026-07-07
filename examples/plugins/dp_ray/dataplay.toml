@@ -1,0 +1,4 @@
+# Reference plugin: a Ray Data execution backend that runs the clean IR subset. See __init__.py.
+name = "dp-ray"
+version = "0.1.0"
+# min_core_api = 1
