@@ -16,6 +16,7 @@ from pydantic.alias_generators import to_camel
 from sqlalchemy import select as _sa_select
 
 from hub import auth, metadb
+from hub.models import RunStatus
 from hub.security import current_user
 
 router = APIRouter()
@@ -229,6 +230,16 @@ def canvas_runs(canvas_id: str, uid: str = Depends(current_user)) -> list[dict]:
     if metadb.canvas_role(canvas_id, uid) is None:  # same authz as the other canvas endpoints
         raise HTTPException(404, "not found")
     return metadb.list_runs(canvas_id)
+
+
+@router.get("/canvas/{canvas_id}/active-runs", response_model=list[RunStatus])
+def canvas_active_runs(canvas_id: str, uid: str = Depends(current_user)) -> list[RunStatus]:
+    """In-flight runs for a canvas, so a reopened canvas re-subscribes to a run that survived a hub
+    restart on its kernel (rather than the run silently vanishing from the UI). Rebuilt into RunStatus
+    so it serializes with the same camelCase wire shape as GET /run/{id}."""
+    if metadb.canvas_role(canvas_id, uid) is None:
+        raise HTTPException(404, "not found")
+    return [RunStatus(**d) for d in metadb.active_runs(canvas_id)]
 
 
 # Secrets never leave the kernel in plaintext. GET redacts them to a sentinel (fields are password

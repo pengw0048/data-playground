@@ -56,7 +56,8 @@ class RunController:
         nm = g.node_map(graph)
         per = [PerNodeStatus(node_id=nid, status="queued", label=nm[nid].type)
                for r in regions for nid in r.node_ids if nid in nm]
-        status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=per)
+        status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=per,
+                           target_node_id=target)
         with self._lock:
             self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()

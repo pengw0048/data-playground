@@ -218,6 +218,7 @@ class PerNodeStatus(Wire):
 class RunStatus(Wire):
     run_id: str
     status: Literal["queued", "running", "done", "failed", "cancelled"]
+    target_node_id: str | None = None   # the run's sink — lets a reattaching client re-bind the run to its node
     rows_processed: int = 0
     total_rows: int | None = None
     ms: int = 0

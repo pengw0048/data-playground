@@ -633,6 +633,20 @@ def get_kernel(canvas_id: str) -> dict | None:
                 "token": r.token, "state": r.state, "stale": _kernel_stale(r)}
 
 
+def active_runs(canvas_id: str) -> list[dict]:
+    """In-flight runs (queued/running) for a canvas — so a reopened canvas re-subscribes to a run that
+    outlived a hub restart (its kernel kept it alive). Returns each run's last-known RunStatus dict."""
+    out = []
+    with session() as s:
+        for r in s.scalars(select(RunState).where(RunState.canvas_id == canvas_id,
+                                                   RunState.status.in_(("queued", "running")))):
+            try:
+                out.append(json.loads(r.doc))
+            except Exception:  # noqa: BLE001
+                out.append({"run_id": r.run_id, "status": r.status})
+    return out
+
+
 def kernel_for_run(run_id: str) -> dict | None:
     """The kernel currently owning a run's canvas (endpoint + token) — for routing cancel to it."""
     with session() as s:

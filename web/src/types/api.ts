@@ -135,6 +135,7 @@ export interface PerNodeStatus {
 export interface RunStatus {
   runId: string
   status: RunState
+  targetNodeId?: string | null
   rowsProcessed: number
   totalRows?: number | null
   ms: number

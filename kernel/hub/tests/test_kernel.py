@@ -1318,6 +1318,28 @@ def test_kernel_lease_is_single_spawner_and_fenced():
     assert metadb.get_kernel("cv_fence") is None
 
 
+def test_active_runs_survive_a_simulated_hub_restart():
+    # the reattach invariant: a run whose kernel is alive is SPARED by the boot reconcile (exactly what
+    # a hub restart runs) and still surfaces via /canvas/{id}/active-runs with its target node, so a
+    # reopened tab re-subscribes. (Actually SIGKILLing the hub process is a manual/e2e step.)
+    from hub import metadb
+    from hub.metadb import Canvas, session
+    cid = "cv_reattach"
+    with session() as s:
+        if s.get(Canvas, cid) is None:
+            s.add(Canvas(id=cid, owner_id=metadb.DEFAULT_USER_ID, name="t", version=1, doc="{}", visibility="private"))
+    metadb.claim_kernel(cid, "k_reattach", "tok")     # a live kernel (fresh heartbeat)
+    metadb.save_run_state("run_reattach", {"run_id": "run_reattach", "status": "running",
+                                           "target_node_id": "sink", "per_node": []},
+                          canvas_id=cid, kernel_id="k_reattach")
+    metadb.reap_kernels(); metadb.reap_orphaned_runs()   # <- exactly what init_db runs on a hub restart
+    assert metadb.get_run_state("run_reattach")["status"] == "running"   # spared: its kernel is alive
+    active = client.get(f"/api/canvas/{cid}/active-runs").json()
+    assert [r["runId"] for r in active] == ["run_reattach"]
+    assert active[0]["targetNodeId"] == "sink"           # camelCase wire shape + the sink to re-bind to
+    metadb.drop_kernel(cid, "k_reattach")
+
+
 def test_kernel_backend_runs_a_canvas_end_to_end():
     # DP_EXECUTION=kernel routes a run to a real, DETACHED per-canvas kernel PROCESS: it runs the job on
     # its own warm engine and writes run_states, which the hub reads back → done. Exercises the whole

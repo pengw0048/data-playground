@@ -139,6 +139,7 @@ export const api = {
     req<RunStatus>('/run', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed }) }),
 
   runStatus: (runId: string) => req<RunStatus>(`/run/${runId}`),
+  activeRuns: (canvasId: string) => req<RunStatus[]>(`/canvas/${encodeURIComponent(canvasId)}/active-runs`),
   cancelRun: (runId: string) => req<RunStatus>(`/run/${runId}/cancel`, { method: 'POST' }),
 
   agentStatus: () => req<{ available: boolean; reason: string; model?: string }>('/agent'),

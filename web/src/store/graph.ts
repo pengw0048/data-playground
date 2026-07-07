@@ -836,7 +836,12 @@ export const useStore = create<Store>((set, get) => ({
     } catch { /* offline: keep in memory */ }
   },
 
-  loadDoc: (doc) => { _cfgEdit = { id: '', t: 0 }; set({ doc: migrateDoc(doc), previews: {}, runs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [] }) },
+  loadDoc: (doc) => {
+    _cfgEdit = { id: '', t: 0 }
+    const d = migrateDoc(doc)
+    set({ doc: d, previews: {}, runs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [] })
+    reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
+  },
 
   // Apply a graph the LLM agent built (extends the canvas). Undoable; preserves UI state of nodes
   // whose ids already exist, and marks touched nodes stale so the user can preview/run them.
@@ -964,6 +969,19 @@ function applyPerNodeStatus(
     })
     return changed ? { doc: { ...s.doc, nodes } } : {}
   })
+}
+
+// On canvas open, re-subscribe to any run still in flight (queued/running) — one that survived a hub
+// restart on its per-canvas kernel. Without this, a reopened tab shows nothing though the run is live.
+function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void, canvasId: string) {
+  api.activeRuns(canvasId).then((runs) => {
+    for (const st of runs) {
+      const nodeId = st.targetNodeId
+      if (!nodeId || !get().doc.nodes.some((n) => n.id === nodeId)) continue
+      set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { phase: 'running' as const, status: st } } }))
+      pollRun(get, set, nodeId, st.runId)
+    }
+  }).catch(() => { /* offline / no such canvas — nothing to reattach */ })
 }
 
 function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void, nodeId: string, runId: string) {
