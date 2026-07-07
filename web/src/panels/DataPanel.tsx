@@ -12,6 +12,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const preview = useStore((s) => s.previews[nodeId])
   const runPreview = useStore((s) => s.runPreview)
   const requestRun = useStore((s) => s.requestRun)
+  const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const [tab, setTab] = useState('rows')
   const [detail, setDetail] = useState<number | null>(null)  // index of the row whose detail is open
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
@@ -30,7 +31,11 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
 
   const columns = res.columns
   const caps = capabilitiesFor(columns as ColumnSchema[])
-  const isMetric = columns.length === 2 && columns.some((c) => c.name === 'value') && columns.some((c) => c.name === 'metric')
+  // gate the scalar/chart views on the NODE TYPE, not a column-name heuristic — otherwise any
+  // 2-column dataset that happens to have columns named 'metric'+'value' was hijacked (F42).
+  const isMetric = node?.type === 'metric'
+  const isChart = node?.type === 'chart'
+  const special = isMetric || isChart
   const tabs = [{ id: 'rows', label: 'Rows' }, ...caps.map((c) => ({ id: c.id, label: c.label }))]
   // a refresh may drop the capability whose tab was selected — fall back to Rows
   const activeTab = tab === 'rows' || caps.some((c) => c.id === tab) ? tab : 'rows'
@@ -40,7 +45,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
     <div className="dp-dark text-foreground">
       {/* tab bar + row-count */}
       <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
-        {!isMetric && detail == null && tabs.map((t) => (
+        {!special && detail == null && tabs.map((t) => (
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
@@ -58,7 +63,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
           </button>
         )}
         <span className="flex-1" />
-        {!isMetric && detail == null && (
+        {!special && detail == null && (
           <>
             <span className="text-[10.5px] text-muted-foreground">
               rows {res.rows.length ? offset : 0}–{offset + res.rows.length}
@@ -74,7 +79,11 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
         )}
       </div>
 
-      {isMetric ? (
+      {isChart ? (
+        <ChartView rows={res.rows} type={String(node?.data.config.chartType ?? 'bar')}
+          xLabel={String(node?.data.config.x ?? 'x')}
+          yLabel={String(node?.data.config.agg && node?.data.config.agg !== 'none' ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})` : (node?.data.config.y ?? 'y'))} />
+      ) : isMetric ? (
         <MetricValue rows={res.rows} />
       ) : detail != null && res.rows[detail] ? (
         <RowDetail columns={columns as ColumnSchema[]} row={res.rows[detail]} />
@@ -177,6 +186,58 @@ function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
   if (value === true) return <span className="text-[#2f9e5f]">true</span>
   if (value === false) return <span className="text-destructive">false</span>
   return <span>{String(value)}</span>
+}
+
+// A dependency-free SVG chart of the (x, y) series the `chart` node emits — bar / line / area /
+// scatter. Colors are theme tokens so it works in dark mode; the axis labels come from the node's
+// chosen columns. Kept simple on purpose (the heavy lifting — grouping/aggregation — is server-side).
+function ChartView({ rows, type, xLabel, yLabel }: { rows: Record<string, unknown>[]; type: string; xLabel: string; yLabel: string }) {
+  const pts = rows.map((r) => ({ x: r.x, y: Number(r.y) })).filter((p) => Number.isFinite(p.y))
+  if (!pts.length) return <div className="px-4 py-10 text-center text-[12px] text-muted-foreground">No data to chart — pick X/Y columns.</div>
+  const W = 640, H = 320, padL = 48, padR = 16, padT = 16, padB = 44
+  const plotW = W - padL - padR, plotH = H - padT - padB
+  const ys = pts.map((p) => p.y)
+  const yMax = Math.max(0, ...ys), yMin = Math.min(0, ...ys), ySpan = yMax - yMin || 1
+  const yPix = (v: number) => padT + plotH - ((v - yMin) / ySpan) * plotH
+  const numX = pts.every((p) => typeof p.x === 'number')
+  const xs = pts.map((p) => Number(p.x)), xMin = Math.min(...xs), xMax = Math.max(...xs), xSpan = xMax - xMin || 1
+  const xPix = (i: number) => (type === 'scatter' && numX)
+    ? padL + ((xs[i] - xMin) / xSpan) * plotW
+    : (pts.length === 1 ? padL + plotW / 2 : padL + (i / (pts.length - 1)) * plotW)
+  const fmt = (v: number) => (Math.abs(v) >= 1000 || (v !== 0 && Math.abs(v) < 0.01) ? v.toExponential(1) : (Math.round(v * 100) / 100).toString())
+  const line = pts.map((p, i) => `${xPix(i)},${yPix(p.y)}`).join(' ')
+  const barW = Math.max(2, (plotW / pts.length) * 0.7)
+  const tickIdx = Array.from(new Set([0, ...Array.from({ length: Math.min(8, pts.length) }, (_, k) => Math.round(k * (pts.length - 1) / Math.max(1, Math.min(8, pts.length) - 1)))]))
+
+  return (
+    <div className="p-3">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 340 }} role="img" aria-label={`${type} chart`}>
+        {/* y axis: zero/baseline + min/max labels */}
+        <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="hsl(var(--border))" />
+        <line x1={padL} y1={yPix(0)} x2={W - padR} y2={yPix(0)} stroke="hsl(var(--border))" />
+        {[yMax, yMin].map((v, k) => (
+          <text key={k} x={padL - 6} y={yPix(v) + 3} textAnchor="end" fontSize="10" fill="hsl(var(--muted-foreground))">{fmt(v)}</text>
+        ))}
+        {(type === 'bar') && pts.map((p, i) => (
+          <rect key={i} x={xPix(i) - barW / 2} y={Math.min(yPix(p.y), yPix(0))} width={barW}
+            height={Math.abs(yPix(p.y) - yPix(0))} fill="hsl(var(--primary))" opacity={0.85} />
+        ))}
+        {(type === 'area') && <polygon points={`${padL},${yPix(0)} ${line} ${xPix(pts.length - 1)},${yPix(0)}`} fill="hsl(var(--primary))" opacity={0.2} />}
+        {(type === 'line' || type === 'area') && <polyline points={line} fill="none" stroke="hsl(var(--primary))" strokeWidth={1.75} />}
+        {(type === 'scatter' || type === 'line' || type === 'area') && pts.map((p, i) => (
+          <circle key={i} cx={xPix(i)} cy={yPix(p.y)} r={type === 'scatter' ? 3 : 2.2} fill="hsl(var(--primary))" opacity={0.85} />
+        ))}
+        {/* x tick labels */}
+        {tickIdx.map((i) => (
+          <text key={i} x={xPix(i)} y={padT + plotH + 16} textAnchor="middle" fontSize="10" fill="hsl(var(--muted-foreground))">
+            {String(pts[i]?.x).slice(0, 10)}
+          </text>
+        ))}
+        <text x={padL + plotW / 2} y={H - 4} textAnchor="middle" fontSize="10.5" fill="hsl(var(--muted-foreground))" fontWeight="600">{xLabel}</text>
+      </svg>
+      <div className="mt-1 text-center text-[10.5px] text-muted-foreground">{yLabel} vs {xLabel} · {pts.length} point{pts.length === 1 ? '' : 's'}</div>
+    </div>
+  )
 }
 
 function MetricValue({ rows }: { rows: Record<string, unknown>[] }) {

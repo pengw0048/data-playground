@@ -123,6 +123,13 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              params=[ParamSpec(name="agg", type="select", options=["count", "mean", "sum", "min", "max"], default="count"),
                      ParamSpec(name="column", type="string")],
              blurb="reduce to a scalar"),
+    NodeSpec(kind="chart", title="chart", category="inspect", tag="chart",
+             inputs=[_in()], outputs=[_out()],  # emits the (x, y) series → chains like any dataset
+             params=[ParamSpec(name="chartType", type="select", options=["bar", "line", "scatter", "area"], default="bar"),
+                     ParamSpec(name="x", type="string", label="X column"),
+                     ParamSpec(name="y", type="string", label="Y column"),
+                     ParamSpec(name="agg", type="select", options=["none", "count", "sum", "mean", "min", "max"], default="count", label="aggregate Y by X")],
+             blurb="visualize a column pair — grouped bar/line, or raw scatter"),
     NodeSpec(kind="vector-search", title="vector-search", category="query", tag="vector",
              inputs=[_in(("dataset",))], outputs=[_out()],
              params=[ParamSpec(name="column", type="string", default="embedding"),

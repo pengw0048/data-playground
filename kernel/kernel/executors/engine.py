@@ -294,6 +294,31 @@ class LoweringEngine:
             title = (node.data.get("title") if isinstance(node.data, dict) else None) or "metric"
             return db.conn().sql(f"SELECT '{_sql_str(title)}' AS metric, ({expr})::DOUBLE AS value FROM {v}")
 
+        if t == "chart":
+            x, y, agg = cfg.get("x"), cfg.get("y"), cfg.get("agg", "none")
+            if not x:
+                raise NotPreviewable(node, "pick an X column to chart")
+            if agg == "none" and not y:
+                raise NotPreviewable(node, "pick a Y column (or an aggregation) to chart")
+            base = parent
+            if agg != "none" and not self.full:
+                # a grouped chart aggregates over ALL rows — compute over the full input even in
+                # preview (honest, like metric); refuse if a Python transform is upstream.
+                chain = g.upstream_chain(self.graph, node.id)
+                if any(n.type in ("transform", "notebook", "opaque", "loop") for n in chain):
+                    raise NotPreviewable(node, "chart over a transformed input — needs a full pass")
+                inc = g.incoming(self.graph, node.id)
+                if inc:
+                    full = LoweringEngine(self.graph, self.resolve_adapter, self.registry, sample_k=None,
+                                          full=True, node_lowerings=self.node_lowerings, node_specs=self.node_specs)
+                    base = full.relation(inc[0].source, inc[0].source_handle)
+            v, xq = self._view(base, "ch"), f'"{_ident(x)}"'
+            if agg == "none":  # raw points (scatter/line) — the chart series is x,y as-is
+                return db.conn().sql(f'SELECT {xq} AS x, "{_ident(y)}" AS y FROM {v}')
+            yexpr = "count(*)" if agg == "count" or not y else f'{_agg_name(agg)}("{_ident(y)}")'
+            # grouped series (bar/line): one point per distinct x, capped so a huge-cardinality x can't blow up the chart
+            return db.conn().sql(f"SELECT {xq} AS x, ({yexpr})::DOUBLE AS y FROM {v} GROUP BY {xq} ORDER BY {xq} LIMIT 2000")
+
         if t == "vector-search":
             return self._vector_search(node, inputs)
 

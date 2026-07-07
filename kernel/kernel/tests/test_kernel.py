@@ -2209,6 +2209,25 @@ def test_sql_fs_sandbox_confines_reads_in_auth_mode(monkeypatch, tmp_path):
         c.execute(f"SELECT count(*) FROM read_csv('{outside}')").fetchall()            # outside: blocked
 
 
+def test_chart_node_produces_series():
+    # F37 (charting): the chart node lowers to an (x, y) series — grouped agg(y) by x (bar/line), or
+    # raw x,y points (scatter). Runs out-of-core server-side; the panel renders the SVG.
+    ev = _uri("events")
+
+    def chart(cfg):
+        g = {"id": "c", "version": 1, "nodes": [
+            N("s", "source", {"uri": ev}),
+            {"id": "ch", "type": "chart", "position": {"x": 0, "y": 0}, "data": {"config": cfg}}],
+            "edges": [E("s", "ch")]}
+        return client.post("/api/run/preview", json={"graph": g, "nodeId": "ch", "k": 50}).json()
+    bar = chart({"chartType": "bar", "x": "event", "agg": "count"})
+    assert not bar.get("notPreviewable") and {c["name"] for c in bar["columns"]} == {"x", "y"}
+    assert {r["x"] for r in bar["rows"]} == {"view", "click", "purchase", "signup"}  # one point per distinct event
+    scatter = chart({"chartType": "scatter", "x": "user_id", "y": "amount", "agg": "none"})
+    assert {c["name"] for c in scatter["columns"]} == {"x", "y"} and scatter["rows"]
+    assert chart({"chartType": "bar", "agg": "count"}).get("notPreviewable")  # no X → honest refusal
+
+
 def test_library_transform_falls_back_to_kept_code():
     # F9: a promoted library node whose processor is gone (in-memory promote lost on restart) still
     # runs — the node keeps its original code and the engine falls back to it, so the user's code is

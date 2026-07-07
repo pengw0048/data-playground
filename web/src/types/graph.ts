@@ -42,9 +42,13 @@ export interface NodeConfig {
   how?: 'inner' | 'left'
   // sql
   sql?: string
-  // metric
-  agg?: 'count' | 'mean' | 'sum' | 'min' | 'max'
+  // metric / chart
+  agg?: 'none' | 'count' | 'mean' | 'sum' | 'min' | 'max'
   column?: string
+  // chart
+  chartType?: 'bar' | 'line' | 'scatter' | 'area'
+  x?: string
+  y?: string
   // write
   name?: string
   writeMode?: 'append' | 'overwrite'
