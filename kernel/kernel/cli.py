@@ -26,6 +26,25 @@ def main() -> None:
     data_dir = os.path.abspath(args.data_dir or os.path.join(workspace, "data"))
     os.makedirs(workspace, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
+    # Export BEFORE anything imports kernel.settings (which freezes these from the env at import), so
+    # --workspace actually isolates the metadata DB / catalog / dataset-confinement roots — not just
+    # the Deps singleton. setdefault: an explicit DP_WORKSPACE/DP_DATA_DIR (or DP_DATABASE_URL) wins.
+    os.environ.setdefault("DP_WORKSPACE", workspace)
+    os.environ.setdefault("DP_DATA_DIR", data_dir)
+
+    # Refuse a non-loopback bind in open (no-auth) mode unless explicitly allowed — an unauthenticated
+    # bind on the LAN is arbitrary code/file access. Set DP_AUTH_SECRET (multi-user auth) or
+    # DP_ALLOW_INSECURE_BIND=1 (trusted private network).
+    from kernel import auth
+    loopback = args.host in ("127.0.0.1", "::1", "localhost", "")
+    if not loopback and not auth.auth_enabled() and os.environ.get("DP_ALLOW_INSECURE_BIND") != "1":
+        raise SystemExit(
+            f"refusing to bind {args.host} with no auth — anyone on the network would get full "
+            "code/file access. Set DP_AUTH_SECRET (multi-user auth) or DP_ALLOW_INSECURE_BIND=1 "
+            "(trusted private network).")
+    if not loopback and not auth.auth_enabled():
+        print(f"\n  ⚠  WARNING: serving {args.host} in OPEN mode (no auth) — anyone who can reach this "
+              "host has full access. Trust the network/firewall.\n")
 
     if args.seed:
         from kernel.seed import seed_if_empty

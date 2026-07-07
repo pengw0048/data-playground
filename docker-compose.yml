@@ -12,8 +12,9 @@ services:
     environment:
       # shared metadata DB → the web tier is stateless (run state + catalog + canvases all live here)
       DP_DATABASE_URL: "postgresql+psycopg://dp:dp@postgres:5432/dataplay"
-      # per-user auth (signed session cookies). CHANGE THIS in production.
-      DP_AUTH_SECRET: "${DP_AUTH_SECRET:-change-me-in-production}"
+      # per-user auth (signed session cookies). REQUIRED — compose refuses to start without it, so
+      # sessions can't be forged with a shipped default. Generate one: `openssl rand -hex 32`.
+      DP_AUTH_SECRET: "${DP_AUTH_SECRET:?set DP_AUTH_SECRET to a random secret, e.g. openssl rand -hex 32}"
       # multi-user: confine dataset reads to these roots (see kernel/kernel/paths.py). The workspace
       # volume is /data; add more host roots you mount if users load datasets from them.
       DP_DATASET_ROOTS: "/data"

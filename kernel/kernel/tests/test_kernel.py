@@ -2163,6 +2163,31 @@ def test_declared_keys_and_relationships_are_independent_rows():
         d.catalog.remove_relationship(r2)
 
 
+def test_sql_fs_sandbox_confines_reads_in_auth_mode(monkeypatch, tmp_path):
+    # F4: in multi-user (auth) mode with no object store, DuckDB's filesystem is confined to the
+    # allowed roots, so a `sql` node's read_csv/COPY can't reach arbitrary local files. Test the
+    # mechanism on an isolated connection (doesn't touch the shared base conn).
+    import os
+    import tempfile
+
+    import duckdb
+
+    from kernel import db
+    monkeypatch.setenv("DP_AUTH_SECRET", "x" * 40)          # auth on
+    monkeypatch.setenv("DP_DATASET_ROOTS", str(tmp_path))   # allowed root
+    inside = tmp_path / "ok.csv"
+    inside.write_text("a\n1\n")
+    outside_dir = tempfile.mkdtemp()                        # a dir NOT under any allowed root
+    outside = os.path.join(outside_dir, "secret.csv")
+    with open(outside, "w") as f:
+        f.write("s\n9\n")
+    c = duckdb.connect(":memory:")
+    db._maybe_sandbox_fs(c)  # apply the same sandbox the base conn gets in auth + no-object-store mode
+    assert c.execute(f"SELECT count(*) FROM read_csv('{inside}')").fetchone()[0] == 1  # inside a root: OK
+    with pytest.raises(Exception):
+        c.execute(f"SELECT count(*) FROM read_csv('{outside}')").fetchall()            # outside: blocked
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).

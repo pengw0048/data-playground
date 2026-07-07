@@ -23,6 +23,10 @@ WORKDIR /app/kernel
 RUN uv sync --extra postgres     # builds the package (force-includes ../web/dist) + runtime deps + psycopg
 
 ENV DP_WORKSPACE=/data
+# The single-image build binds 0.0.0.0 in OPEN mode (no auth), which the CLI otherwise refuses. This
+# opts in explicitly: it's a SINGLE-USER image — trust the network/firewall, or set DP_AUTH_SECRET
+# (as docker-compose.yml does) for multi-user auth. A loud warning prints at startup in open mode.
+ENV DP_ALLOW_INSECURE_BIND=1
 EXPOSE 8471
 VOLUME ["/data"]
 

@@ -119,7 +119,10 @@ nginx/Caddy). The app is on `http://localhost:8471`.
 **Multi-user isolation.** When auth is on (`DP_AUTH_SECRET` set), runs default to the **subprocess
 runner** — each run executes in its own OS process, so a user's arbitrary Python (transform / section
 scripts) can't crash, hang, or OOM the shared kernel, and a runaway loop can be hard-killed. Paired
-with `DP_DATASET_ROOTS`, local dataset reads are confined to the allowed roots. Be honest about the
+with `DP_DATASET_ROOTS`, filesystem access is confined to the allowed roots via DuckDB's native
+sandbox — covering every node uniformly, including raw `sql` (`read_csv`/`COPY` can't escape) — when
+no object store is configured (`s3://`/`gs://` need network access, which the sandbox disables, so
+the two are mutually exclusive). Be honest about the rest of the
 boundary, though: subprocesses still run as the **same OS user on the same filesystem**, and the code
 "sandbox" is a soft guard, not a security boundary — this is crash/DoS isolation, **not** a
 multi-tenant jail. Real tenant isolation needs OS-level sandboxing (containers, per-user accounts, or

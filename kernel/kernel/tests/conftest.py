@@ -3,7 +3,11 @@
 import os
 import tempfile
 
-os.environ.setdefault("DP_DATABASE_URL", "sqlite:///" + os.path.join(tempfile.mkdtemp(prefix="dp-test-"), "test.db"))
+# FORCE a throwaway metadata DB (override, not setdefault) so pytest NEVER writes a real/exported
+# DP_DATABASE_URL — a dev running the suite with their prod/dev DB exported would otherwise have the
+# tests destructively mutate it. Opt into a specific test DB (e.g. Postgres, F54) via DP_TEST_DATABASE_URL.
+os.environ["DP_DATABASE_URL"] = os.environ.get("DP_TEST_DATABASE_URL") or (
+    "sqlite:///" + os.path.join(tempfile.mkdtemp(prefix="dp-test-"), "test.db"))
 
 # Ensure the sample datasets (events/images/movies) exist before the catalog is built. They're
 # gitignored (regenerated via `make seed`), so a fresh checkout / CI has an empty data dir and the

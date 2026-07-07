@@ -31,6 +31,18 @@ def auth_enabled() -> bool:
     return bool(_secret())
 
 
+# Known-weak defaults that must never guard real sessions — the secret is public (repo/docs), so a
+# token signed with it is forgeable. reject_weak_secret() is called once at startup (main.py).
+_WEAK_SECRETS = {"change-me-in-production", "changeme", "secret", "dev", "test"}
+
+
+def reject_weak_secret() -> None:
+    if _secret().strip() in _WEAK_SECRETS:
+        raise RuntimeError(
+            "DP_AUTH_SECRET is a known-weak/default value — sessions signed with it are forgeable. "
+            "Set a real random secret, e.g. `openssl rand -hex 32`.")
+
+
 def _mac(payload: str) -> str:
     return hmac.new(_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
 

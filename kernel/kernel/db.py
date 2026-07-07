@@ -102,6 +102,30 @@ def _apply_session(c: duckdb.DuckDBPyConnection) -> None:
         pass
 
 
+def _maybe_sandbox_fs(c: duckdb.DuckDBPyConnection) -> None:
+    """Confine DuckDB's filesystem to the allowed dataset roots (+ spill dir) and disable external
+    access — so a `sql` node's read_csv/read_text/COPY can't reach arbitrary local files or the
+    network, closing the one data-confinement gap the per-node ensure_local_uri_allowed check misses.
+
+    Applied ONCE on the base connection (DuckDB's enable_external_access is a process-wide, one-way
+    switch — it also propagates to cursors), and only when: auth is enabled (multi-user; open
+    single-user mode is a trusted local tool) AND no object store is configured (s3://gs:// need
+    httpfs + network, which enable_external_access=false blocks — a documented mutual exclusivity)."""
+    try:
+        from kernel import auth
+        if not auth.auth_enabled():
+            return
+        from kernel import metadb
+        if metadb.get_setting("objectStore", "global", default={}):
+            return  # object storage needs external access → can't also FS-sandbox (documented boundary)
+        from kernel import paths
+        dirs = sorted({d for d in (*paths.allowed_roots(), _spill_dir()) if d})
+        c.execute("SET allowed_directories = ?", [dirs])
+        c.execute("SET enable_external_access = false")
+    except Exception:  # noqa: BLE001 — never block connection creation on the sandbox
+        pass
+
+
 def _base_conn() -> duckdb.DuckDBPyConnection:
     global _conn
     if _conn is None:
@@ -109,6 +133,7 @@ def _base_conn() -> duckdb.DuckDBPyConnection:
             if _conn is None:
                 _conn = duckdb.connect(":memory:")
                 _apply_session(_conn)
+                _maybe_sandbox_fs(_conn)  # multi-user + no object store → confine the FS (sql node too)
     return _conn
 
 

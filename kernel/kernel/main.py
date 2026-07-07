@@ -53,6 +53,7 @@ app.include_router(catalog.router, prefix="/api", dependencies=_GATE)
 app.include_router(runs.router, prefix="/api", dependencies=_GATE)
 app.include_router(workspace.router, prefix="/api", dependencies=_GATE)
 
+auth.reject_weak_secret()  # fail fast on a shipped/known-weak DP_AUTH_SECRET (forgeable sessions)
 metadb.init_db()  # create metadata tables (idempotent) + seed the default local user
 # re-register user-added datasets (from settings) so they survive a restart
 for _d in (metadb.get_setting("datasets", "global", default=[]) or []):
@@ -62,12 +63,24 @@ for _d in (metadb.get_setting("datasets", "global", default=[]) or []):
         pass
 
 
+def _cross_site_ws(ws: WebSocket) -> bool:
+    """A browser page from ANOTHER origin opening this socket (cross-site WebSocket hijacking): the
+    browser still attaches our cookies, so a signed session would be replayed. Reject when the Origin
+    header is present and its host:port doesn't match Host. A missing Origin = a non-browser client
+    (CLI/test) — CSWSH is a browser-only attack, so allow it."""
+    origin = ws.headers.get("origin")
+    if not origin:
+        return False
+    from urllib.parse import urlparse
+    return urlparse(origin).netloc != ws.headers.get("host", "")
+
+
 @app.websocket("/ws/run/{run_id}")
 async def ws_run(ws: WebSocket, run_id: str):
     # gate the status stream like the HTTP GET /run/{id} (which is behind the auth router) and ws_collab:
     # a run's status carries row counts, per-node state, error text (may embed paths) and output names.
-    if auth.auth_enabled() and not auth.verify(ws.cookies.get("dp_session")):
-        await ws.close(code=1008)  # policy violation — no valid session
+    if _cross_site_ws(ws) or (auth.auth_enabled() and not auth.verify(ws.cookies.get("dp_session"))):
+        await ws.close(code=1008)  # policy violation — cross-site origin or no valid session
         return
     await ws.accept()
     try:
@@ -93,6 +106,9 @@ _collab_ids: dict[WebSocket, str] = {}  # socket -> its clientId (for leave noti
 async def ws_collab(ws: WebSocket, canvas_id: str):
     # when auth is enabled, the collab channel is gated exactly like the HTTP canvas routes: a valid
     # signed session cookie + some role on this canvas. (Open mode: unauthenticated, like the rest.)
+    if _cross_site_ws(ws):
+        await ws.close(code=1008)  # cross-site origin — reject before touching the room
+        return
     can_write = True  # open mode (no auth): a single-user/trusted instance — everyone may edit
     if auth.auth_enabled():
         uid = auth.verify(ws.cookies.get("dp_session"))
