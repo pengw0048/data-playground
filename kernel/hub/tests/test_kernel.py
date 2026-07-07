@@ -331,6 +331,142 @@ def test_preview_k_defaults_to_setting_when_omitted(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Acceptance coverage backfill — deterministic paths the 3rd acceptance found untested
+# --------------------------------------------------------------------------- #
+def _age_kernel_heartbeat(canvas_id: str):
+    import datetime
+    from hub import metadb
+    from hub.metadb import Kernel, session
+    old = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=metadb.KERNEL_STALE_S + 5)
+    with session() as s:
+        s.get(Kernel, canvas_id).heartbeat_at = old  # backdate past the stale threshold
+
+
+def test_stale_kernel_is_reaped_and_its_run_failed():
+    # the 'owning kernel truly dead' path (aged heartbeat): get_kernel reports stale, reap_kernels deletes
+    # the lease (and returns the pair), reap_orphaned_runs then fails that lease's in-flight run.
+    from hub import metadb
+    metadb.claim_kernel("cv_stale", "k_stale", "tok"); metadb.mark_kernel_ready("cv_stale", "k_stale", "1.2.3.4:9")
+    metadb.save_run_state("run_stale", {"run_id": "run_stale", "status": "running", "per_node": []},
+                          canvas_id="cv_stale", kernel_id="k_stale")
+    _age_kernel_heartbeat("cv_stale")
+    assert metadb.get_kernel("cv_stale")["stale"] is True
+    assert ("cv_stale", "k_stale") in metadb.reap_kernels()      # stale lease deleted
+    assert metadb.get_kernel("cv_stale") is None
+    metadb.reap_orphaned_runs()
+    assert metadb.get_run_state("run_stale")["status"] == "failed"
+
+
+def test_claim_kernel_takes_over_a_stale_lease():
+    # the takeover branch (won=True on a stale lease): a new claimer wins + fences the old kernel_id.
+    from hub import metadb
+    metadb.claim_kernel("cv_takeover", "k_old", "tokold")
+    _age_kernel_heartbeat("cv_takeover")
+    r = metadb.claim_kernel("cv_takeover", "k_new", "toknew")
+    assert r["won"] is True and r["kernel_id"] == "k_new"
+    assert metadb.heartbeat_kernel("cv_takeover", "k_old") is False  # the replaced id is fenced out
+    assert metadb.heartbeat_kernel("cv_takeover", "k_new") is True
+    metadb.drop_kernel("cv_takeover", "k_new")
+
+
+def test_dp_execution_is_the_third_precedence_tier(tmp_path, monkeypatch):
+    # precedence: per-user > workspace > DP_EXECUTION > kernel default. With no user/global setting,
+    # DP_EXECUTION (settings.execution) is honored — the tier only incidentally covered before.
+    from hub.deps import Deps
+    from hub.settings import settings
+    monkeypatch.setattr(settings, "execution", "local-out-of-core")
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    assert d.chosen_backend(uid=None) == "local-out-of-core"
+    monkeypatch.setattr(settings, "execution", "")  # cleared → the kernel default
+    assert d.chosen_backend(uid=None) == "kernel"
+
+
+def test_relation_cache_drops_over_cap_and_never_retries():
+    # the OOM guard: a relation over cap_rows is materialized with LIMIT cap+1, detected as too-big,
+    # dropped (not cached), and remembered so it isn't re-materialized on the next put.
+    from hub import db
+    from hub.relation_cache import RelationCache
+    c = RelationCache(cap_rows=3, max_entries=8)
+    with db.lock():
+        db.conn().execute("CREATE OR REPLACE VIEW _rc_big AS SELECT * FROM range(5) t(v)")  # 5 > cap 3
+        assert c.put("big", "_rc_big") is None    # over cap → not cached
+        assert c.get("big") is None               # a miss
+        assert "big" in c._toobig                 # remembered → won't retry
+        assert c.put("big", "_rc_big") is None
+
+
+def test_kernel_deps_ensure_idempotent_and_records_failure(tmp_path, monkeypatch):
+    # kernel_deps had ZERO direct coverage. Monkeypatch pip (no network): ensure skips a re-install of the
+    # same set, re-installs a changed set, and on failure caches the attempt (no re-run) + logs to stderr.
+    import subprocess
+    import sys
+    import hub.kernel_deps as kd
+    calls = []
+
+    def fake_ok(cmd, **kw):
+        calls.append(cmd)
+        ti = cmd.index("--target"); os.makedirs(os.path.join(cmd[ti + 1], "pandas"), exist_ok=True)
+        return object()
+    monkeypatch.setattr(kd.subprocess, "run", fake_ok)
+    kd._installed.clear()
+    tgt = str(tmp_path / "deps")
+    assert "pandas" in kd.ensure(["pandas"], tgt) and len(calls) == 1
+    kd.ensure(["pandas"], tgt); assert len(calls) == 1              # same set → skipped (idempotent)
+    kd.ensure(["pandas", "numpy"], tgt); assert len(calls) == 2      # changed set → re-installed
+    assert tgt == sys.path[0]                                        # deps dir inserted at front
+
+    def fake_fail(cmd, **kw):
+        calls.append(cmd)
+        raise subprocess.CalledProcessError(1, cmd, stderr=b"No matching distribution")
+    monkeypatch.setattr(kd.subprocess, "run", fake_fail)
+    tgt2 = str(tmp_path / "deps2")
+    kd.ensure(["nope"], tgt2); n = len(calls)
+    kd.ensure(["nope"], tgt2)                                        # failed set cached → no re-run
+    assert len(calls) == n
+
+
+def test_kernel_deps_helpers(tmp_path):
+    import hub.kernel_deps as kd
+    a = kd.deps_dir("/ws", "canvasA"); b = kd.deps_dir("/ws", "canvasB")
+    assert a != b and a.startswith("/ws")                           # per-canvas isolation, stable hash
+    assert kd.deps_dir("/ws", "canvasA") == a                       # deterministic
+    from pathlib import Path
+    t = Path(tmp_path)
+    for n in ("pandas", "_internal", "junk.dist-info"):
+        (t / n).mkdir()
+    (t / "solo.py").touch(); (t / "notes.txt").touch()
+    mods = kd._top_level_modules(t)
+    assert mods == {"pandas", "solo"}                               # dirs + .py; skips _*, .dist-info, .txt
+
+
+def test_upload_edge_cases():
+    assert _upload("empty.csv", b"").status_code == 400             # empty upload
+    assert _upload("bad.parquet", b"not a parquet at all").status_code == 400  # valid ext, corrupt bytes
+    trav = _upload("../../../etc/passwd.csv", b"id\n1\n").json()    # path traversal in the filename
+    assert trav["name"] == "passwd" and "/etc/" not in trav["uri"] and ".." not in trav["uri"]
+    tsv = _upload("t.tsv", b"a\tb\n1\t2\n").json()                  # TSV auto-detect (no options passed)
+    assert {c["name"] for c in tsv["columns"]} == {"a", "b"} and tsv["rowCount"] == 1
+    nd = _upload("n.ndjson", b'{"a":1}\n{"a":2}\n').json()          # NDJSON local round-trip
+    assert nd["rowCount"] == 2 and "a" in {c["name"] for c in nd["columns"]}
+
+
+def test_profile_handles_nested_type_column():
+    # profile.py's nested-type branch returns count-only for list/struct/map (no min/max/mean/distinct);
+    # only scalar columns were exercised. A list column (images.embedding) must profile without crashing.
+    from hub.deps import get_deps
+    from hub.executors.profile import profile_node
+    from hub.models import Graph
+    d = get_deps()
+    g = Graph(**{"id": "cP", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("images")}),
+        N("sel", "select", {"select": "id, embedding"}),
+    ], "edges": [E("src", "sel")]})
+    r = profile_node(g, "sel", d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
+    assert not r.error
+    assert "embedding" in [c.name for c in r.columns]  # nested column present, count-only, no crash
+
+
+# --------------------------------------------------------------------------- #
 # Regression tests for adversarial-acceptance findings
 # --------------------------------------------------------------------------- #
 def test_aggregate_keeps_group_key():
