@@ -37,6 +37,35 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
   const rect = el?.getBoundingClientRect()
   const title = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId)?.data.title ?? '')
   const close = useStore((s) => s.closePanel)
+  const [max, setMax] = useState(false)
+
+  const content = (
+    <>
+      <PanelTitle nodeId={nodeId} title={title} kind={kind} maximized={max} onToggleMax={() => setMax((m) => !m)} onClose={() => close(nodeId)} />
+      <div style={{ overflow: 'auto', flex: 1 }}>
+        <ErrorBoundary compact>
+          {kind === 'data' && <DataPanel nodeId={nodeId} />}
+          {kind === 'run' && <RunPanel nodeId={nodeId} />}
+          {kind === 'history' && <HistoryPanel nodeId={nodeId} />}
+          {kind === 'section' && <SectionPanel nodeId={nodeId} />}
+          {kind === 'lineage' && <LineagePanel nodeId={nodeId} />}
+        </ErrorBoundary>
+      </div>
+    </>
+  )
+
+  // maximized → a full-viewport overlay (same content), like the code editor's fullscreen
+  if (max) {
+    return (
+      <div className="fixed inset-0 z-[60] flex flex-col bg-[#10141e]/45 p-7" onClick={() => setMax(false)}>
+        <div onClick={(e) => e.stopPropagation()}
+          className="flex min-h-0 flex-1 flex-col overflow-hidden"
+          style={{ background: 'hsl(var(--card))', border: `1px solid ${color.border}`, borderRadius: radius.panel, boxShadow: shadow.panel }}>
+          {content}
+        </div>
+      </div>
+    )
+  }
 
   if (!rect) return null
   const width = kind === 'data' ? 460 : kind === 'run' ? 340 : kind === 'section' ? 460 : 300
@@ -70,23 +99,15 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
           maxHeight: panelMaxHeight, display: 'flex', flexDirection: 'column',
         }}
       >
-        <PanelTitle nodeId={nodeId} title={title} kind={kind} onClose={() => close(nodeId)} />
-        <div style={{ overflow: 'auto', flex: 1 }}>
-          <ErrorBoundary compact>
-            {kind === 'data' && <DataPanel nodeId={nodeId} />}
-            {kind === 'run' && <RunPanel nodeId={nodeId} />}
-            {kind === 'history' && <HistoryPanel nodeId={nodeId} />}
-            {kind === 'section' && <SectionPanel nodeId={nodeId} />}
-            {kind === 'lineage' && <LineagePanel nodeId={nodeId} />}
-          </ErrorBoundary>
-        </div>
+        {content}
       </div>
     </div>
   )
 }
 
-function PanelTitle({ nodeId, title, kind, dark, onClose }: {
-  nodeId: string; title: string; kind: PanelKind; dark?: boolean; onClose: () => void
+function PanelTitle({ nodeId, title, kind, dark, maximized, onToggleMax, onClose }: {
+  nodeId: string; title: string; kind: PanelKind; dark?: boolean
+  maximized?: boolean; onToggleMax?: () => void; onClose: () => void
 }) {
   const label = { data: 'data', run: 'run', history: 'history', lineage: 'lineage', section: 'section' }[kind]
   const runPreview = useStore((s) => s.runPreview)
@@ -104,6 +125,11 @@ function PanelTitle({ nodeId, title, kind, dark, onClose }: {
       <span style={{ flex: 1 }} />
       {kind === 'data' && (
         <button onClick={() => runPreview(nodeId)} title="Refresh" style={iconBtn(dark)}><Icon name="refresh" size={13} /></button>
+      )}
+      {onToggleMax && (
+        <button onClick={onToggleMax} title={maximized ? 'Restore' : 'Maximize'} style={iconBtn(dark)}>
+          <Icon name={maximized ? 'minimize' : 'maximize'} size={13} />
+        </button>
       )}
       <button onClick={onClose} title="Close" style={iconBtn(dark)}><Icon name="close" size={13} /></button>
     </div>
