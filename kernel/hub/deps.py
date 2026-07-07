@@ -212,6 +212,9 @@ class Deps:
         # honor the chosen backend (Settings → Execution) when it's registered and can run this plan;
         # otherwise the first runner that can, else the default.
         chosen = self.chosen_backend(uid)
+        if chosen and chosen not in {getattr(r, "name", None) for r in self.runners}:
+            chosen = "kernel"  # a stale / uninstalled-plugin selection → the kernel DEFAULT, not the
+            #                    generic first-capable runner (which silently was local-out-of-core)
         if chosen:
             for r in self.runners:
                 if getattr(r, "name", None) == chosen and r.can_run(plan):

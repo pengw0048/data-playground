@@ -354,7 +354,7 @@ class CompileRequest(Wire):
 class PreviewRequest(Wire):
     graph: Graph
     node_id: str
-    k: int = 50
+    k: int | None = None  # None → fall back to settings.preview_k (DP_PREVIEW_K); an explicit int wins
     offset: int = 0
 
 

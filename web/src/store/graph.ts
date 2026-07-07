@@ -1015,11 +1015,15 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
   }).catch(() => { /* offline / no such canvas — nothing to reattach */ })
 }
 
+const _polling = new Set<string>()  // run ids with a live poll loop — dedup so reattach can't double-poll one
+
 function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void, nodeId: string, runId: string) {
+  if (_polling.has(runId)) return  // already polling this run (e.g. reattach after re-open) — one loop only
+  _polling.add(runId)
   let fails = 0
   const tick = async () => {
     // stop polling if the node was deleted mid-run (don't re-insert a runs entry for it)
-    if (!get().doc.nodes.some((n) => n.id === nodeId)) return
+    if (!get().doc.nodes.some((n) => n.id === nodeId)) { _polling.delete(runId); return }
     let status: RunStatus
     try {
       status = await api.runStatus(runId)
@@ -1032,6 +1036,7 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       get().updateData(nodeId, { status: 'stale' })
       settleAnimatingNodes(set)  // no final status will arrive — clear every still-animating node, not just the target
       get().pushToast('Lost track of the run — the kernel became unreachable', 'error')
+      _polling.delete(runId)
       return
     }
     set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase: 'running' as const }), status } } }))
@@ -1062,6 +1067,7 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
         }
         void g.refreshCatalog()
       }
+      _polling.delete(runId)
       return
     }
     setTimeout(tick, 300)

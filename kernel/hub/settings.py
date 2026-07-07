@@ -33,7 +33,7 @@ class Settings:
     execution: str = os.environ.get("DP_EXECUTION", "").strip()
     # how a per-canvas kernel is launched: "local" (a detached process, single-host) or "pod" (a k8s
     # Pod + Service per canvas, cross-host). See hub.kernel_backend / hub.pod_spawner.
-    kernel_spawner: str = os.environ.get("DP_KERNEL_SPAWNER", "local").strip()
+    kernel_spawner: str = os.environ.get("DP_KERNEL_SPAWNER", "local").strip().lower()
 
 
 settings = Settings()

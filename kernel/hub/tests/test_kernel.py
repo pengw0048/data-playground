@@ -320,6 +320,16 @@ def test_sandbox_set_allowed_replaces_not_grows():
     assert not sandbox._KERNEL_ALLOWED
 
 
+def test_preview_k_defaults_to_setting_when_omitted(monkeypatch):
+    # regression: PreviewRequest.k was typed int=50, so req.k was never None and the `else preview_k`
+    # fallback (DP_PREVIEW_K) was dead. k is now optional → an omitted k uses settings.preview_k.
+    from hub.settings import settings
+    monkeypatch.setattr(settings, "preview_k", 3)
+    g = {"id": "c", "version": 1, "nodes": [N("src", "source", {"uri": _uri("events")})], "edges": []}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "src"})  # no k → falls back to preview_k
+    assert r.status_code == 200 and len(r.json()["rows"]) <= 3
+
+
 # --------------------------------------------------------------------------- #
 # Regression tests for adversarial-acceptance findings
 # --------------------------------------------------------------------------- #

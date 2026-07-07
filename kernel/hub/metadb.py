@@ -572,7 +572,11 @@ def claim_kernel(canvas_id: str, kernel_id: str, token: str) -> dict:
     exists, use its `endpoint`. A stale/dead lease is taken over (rebinding fences the old kernel_id)."""
     now = _now()
     with session() as s:
-        r = s.get(Kernel, canvas_id)
+        # row-lock the read so a concurrent stale-lease takeover serializes: the second claimer blocks,
+        # then re-reads the freshly-rebound (no-longer-stale) row and loses (won=False). Without it two
+        # hubs could both read the same stale row, both pass the staleness check, and both spawn.
+        # (SELECT … FOR UPDATE on Postgres — the prod DB; a no-op on single-process SQLite dev.)
+        r = s.get(Kernel, canvas_id, with_for_update=True)
         if r is not None:
             if not _kernel_stale(r):
                 return {"won": False, "endpoint": r.endpoint, "state": r.state, "kernel_id": r.kernel_id}
