@@ -18,7 +18,7 @@ Optional Lance support: `uv sync --extra lance`.
 
 `dataset` = a lazy **DuckDB relation**. Each node lowers to a relation transform (out-of-core,
 spills) or, for `transform`, a Python UDF over Arrow batches. The runner executes the composed
-relation; preview runs the SAME lowering with a bounded source sample (faithful, P8-honest).
+relation; preview runs the SAME lowering with a bounded source sample (faithful — honest previews).
 
 | op | lowering |
 |---|---|
@@ -30,14 +30,14 @@ relation; preview runs the SAME lowering with a bounded source sample (faithful,
 | vector-search | cosine similarity top-K (Lance ANN when available) |
 | write | streaming sink → Parquet/CSV/Lance, registered in the catalog |
 
-Not sample-previewable (P8): `aggregate`, `write`, `opaque`, `loop` → "needs a full pass".
+Not sample-previewable: `aggregate`, `write`, `opaque`, `loop` → "needs a full pass".
 
 ## Layout
 
 ```
 kernel/
   cli.py           `dataplay` — one-command launcher (seed + serve + open browser)
-  main.py          FastAPI routes (§10) + /ws
+  main.py          FastAPI routes + /ws
   nodespecs.py     built-in node schemas served at /api/nodes (powers generic rendering)
   compiler.py      graph → typed logical plan
   sandbox.py       ad-hoc cell compiler (soft sandbox + time budget)
@@ -49,14 +49,14 @@ kernel/
     engine.py      the lowering engine (relation per node, out-of-core)
     preview.py     sample-preview (same lowering, bounded source)
   plugins/
-    adapters.py    Parquet/CSV/JSON/Arrow + Lance adapters (lazy scan + fingerprint) [§8.2]
-    runner.py      local out-of-core runner + estimate/placement + content-addressed cache [§8.3]
-    catalog.py     workspace catalog + lineage [§8.5]
-    capabilities.py media + vector [§8.4]
+    adapters.py    Parquet/CSV/JSON/Arrow + Lance adapters (lazy scan + fingerprint)
+    runner.py      local out-of-core runner + estimate/placement + content-addressed cache
+    catalog.py     workspace catalog + lineage
+    capabilities.py media + vector
     processors.py  processor registry (promote-to-library)
 ```
 
-## API (§10)
+## API
 
 `GET /api/kernel` · `GET /api/nodes` (every node's schema) · `GET /api/plugins` ·
 `GET /api/catalog/tables[/{id}]` · `POST /api/catalog/register` · `GET /api/catalog/lineage?uri=` ·
@@ -64,7 +64,7 @@ kernel/
 `POST /api/run/estimate` · `POST /api/run` · `GET /api/run/{id}` · `POST /api/run/{id}/cancel` ·
 `WS /ws/run/{id}`.
 
-## Plugins (§8.0) — the extension model
+## Plugins — the extension model
 
 A plugin is a Python package with a `register(reg)` that adds nodes/adapters/runners/capabilities/
 catalog/planner. Discovered two ways:

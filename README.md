@@ -38,9 +38,12 @@ events → keep purchases → total per user → save.
 - **Open real data** — Parquet, CSV, JSON, Arrow/Feather, Lance, and directories-of-files. The
   workspace catalog is your local files; `POST /api/catalog/register` (or a `source` node) adds more.
 - **Explore & transform** — `filter`, `select`, `join`, `aggregate`, `sort`, `dedup`, `sql`, `sample`,
-  `metric`, `vector-search`, and `transform` (arbitrary Python) nodes that **actually execute**.
+  `metric`, `chart`, `vector-search`, and `transform` (arbitrary Python) nodes that **actually execute**.
 - **See inside every step** — click a node's eye to see the real rows + schema flowing out of it, on
   a bounded sample, instantly. Media columns render thumbnails; vector columns get an inspector.
+- **See how tables relate** — the catalog detects join keys, measures cardinality on real data
+  (1:1 / 1:N / N:M), and suggests how two datasets join; declare keys/relationships by hand and view
+  them as an ER/UML diagram.
 - **Run at scale, out-of-core** — the same graph runs over the full dataset. The default engine is
   DuckDB + Polars + Arrow: joins/aggregations/sorts spill to disk instead of crashing, so a dataset
   bigger than RAM sorts under a bounded memory cap rather than OOM-ing.
@@ -81,7 +84,7 @@ web/     React + React Flow + zustand — the canvas, uniform node card, typed w
 
 kernel/  FastAPI (one server, serves the SPA + API + WS + engine). graph → COMPILER → logical
          plan → runner.execute(). The default runner is the local out-of-core engine
-         (DuckDB · Polars · Arrow · Lance). Everything specific is a plugin (§7 SPI).
+         (DuckDB · Polars · Arrow · Lance). Everything specific is a plugin (see Plugins below).
 ```
 
 ## Scaling out: multiple stateless web instances
@@ -103,7 +106,7 @@ Two things are deployment-side, not app config:
   a sticky hash on the `/ws/collab/{canvas_id}` path (Figma-style). Example nginx:
   `hash $arg_canvas consistent;` keyed on the canvas id, or any LB with path/consistent-hash routing.
 - **Execution** currently runs in the accepting instance (status is shared via `run_states`, so any
-  instance can report it). For a dedicated execution tier, add an `ExecutionBackend` plugin (§7 SPI —
+  instance can report it). For a dedicated execution tier, add an `ExecutionBackend` plugin (the plugin SPI —
   a Ray/pod/queue runner); that step also wants per-run instance ownership + a heartbeat so one
   instance's startup reconcile can't cancel another's live runs (a `TODO` marks the spot in
   `metadb.reconcile_orphaned_runs`).
