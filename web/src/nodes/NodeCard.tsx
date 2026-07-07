@@ -19,6 +19,7 @@ import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
 
 const KINDS_WITH_CODE = new Set(['transform', 'sql'])
+const fmtMs = (ms: number) => (ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`)
 
 export function NodeCard({ id, data, children, metaOverride }: {
   id: string
@@ -133,6 +134,14 @@ export function NodeCard({ id, data, children, metaOverride }: {
             <div className="mt-[5px] min-h-4 truncate text-[11.5px] text-muted-foreground">
               {metaOverride ?? data.meta ?? ''}
             </div>
+
+            {/* last run stats — so a completed node carries its result (rows · time) at a glance */}
+            {data.status === 'latest' && data.lastRun && (
+              <div className="mt-0.5 truncate text-[10.5px] tabular-nums text-muted-foreground/70">
+                {data.lastRun.rows.toLocaleString()} rows · {fmtMs(data.lastRun.ms)}
+                {data.lastRun.placement === 'distributed' && ' · distributed'}
+              </div>
+            )}
 
             {/* a run awaiting confirmation stays visible ON the card (so a rerun-all of several
                 sinks doesn't hide all-but-one behind the single floating panel) */}

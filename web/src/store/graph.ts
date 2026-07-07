@@ -940,6 +940,32 @@ useStore.subscribe((s) => {
   _schemaTimer = setTimeout(() => { if (useStore.getState().kernelUp) void useStore.getState().refreshSchemas() }, 500)
 })
 
+// Map backend per-node run states onto each node's card status so the WHOLE graph animates during a
+// run (queued → running → done) and a failing INTERMEDIATE node turns red — not just the target sink.
+// Transient by design: only nodes that actually advanced get a new object (idle ticks return {} → no
+// doc-identity change → no autosave/PUT churn), and terminal states settle to latest/failed/stale.
+const _PERNODE_STATUS: Record<string, NodeStatus> = {
+  queued: 'queued', running: 'running', done: 'latest', failed: 'failed', cancelled: 'stale',
+}
+function applyPerNodeStatus(
+  set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
+  perNode: RunStatus['perNode'],
+) {
+  const next = new Map<string, NodeStatus>()
+  for (const p of perNode ?? []) { const ns = _PERNODE_STATUS[p.status]; if (ns) next.set(p.nodeId, ns) }
+  if (!next.size) return
+  set((s) => {
+    let changed = false
+    const nodes = s.doc.nodes.map((n) => {
+      const ns = next.get(n.id)
+      if (!ns || n.data.status === ns) return n
+      changed = true
+      return { ...n, data: { ...n.data, status: ns } }
+    })
+    return changed ? { doc: { ...s.doc, nodes } } : {}
+  })
+}
+
 function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void, nodeId: string, runId: string) {
   let fails = 0
   const tick = async () => {
@@ -959,6 +985,7 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       return
     }
     set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase: 'running' as const }), status } } }))
+    applyPerNodeStatus(set, status.perNode)  // animate every node on the canvas, not just the target
     if (status.status === 'done' || status.status === 'failed' || status.status === 'cancelled') {
       const phase = status.status === 'done' ? 'done' : status.status === 'failed' ? 'failed' : 'idle'
       set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase } as any), status, phase } } }))
