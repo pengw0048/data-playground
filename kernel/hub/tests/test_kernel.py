@@ -1285,15 +1285,36 @@ def test_run_state_persists_and_survives_loss_of_memory():
     assert "not found" not in (got.get("error") or "")
 
 
-def test_reconcile_marks_orphaned_runs_interrupted():
-    # a run left 'running' when the kernel stopped must be reconciled to terminal on startup, else a
-    # client would poll it forever (the persisted status would say 'running' with no executor behind it).
+def test_reaper_fails_kernelless_orphan_but_spares_live_kernel_run():
+    # a kernel-less (in-process) run left 'running' when the hub stopped must be reaped to terminal on
+    # boot, else a client polls it forever. But a run owned by a STILL-LIVE kernel must survive so the
+    # client can reattach — the exact distinction the old blanket reconcile got wrong.
     from hub import metadb
     metadb.save_run_state("run_orphan_x", {"run_id": "run_orphan_x", "status": "running", "per_node": []})
-    assert metadb.get_run_state("run_orphan_x")["status"] == "running"
-    assert metadb.reconcile_orphaned_runs() >= 1
-    d = metadb.get_run_state("run_orphan_x")
-    assert d["status"] == "failed" and "restart" in (d.get("error") or "")
+    metadb.claim_kernel("cv_live", "k_live_1", "tok")                 # a live kernel (fresh heartbeat)
+    metadb.save_run_state("run_live_y", {"run_id": "run_live_y", "status": "running", "per_node": []},
+                          canvas_id="cv_live", kernel_id="k_live_1")
+    assert metadb.reap_orphaned_runs() >= 1
+    assert metadb.get_run_state("run_orphan_x")["status"] == "failed"  # no kernel → reaped
+    assert metadb.get_run_state("run_live_y")["status"] == "running"   # live kernel → spared (reattach)
+    metadb.drop_kernel("cv_live", "k_live_1")
+
+
+def test_kernel_lease_is_single_spawner_and_fenced():
+    # the split-brain invariant: for one canvas, exactly one claimer wins; a fenced-out (replaced)
+    # kernel can neither heartbeat nor drop the new owner's lease.
+    from hub import metadb
+    a = metadb.claim_kernel("cv_fence", "k_A", "tokA")
+    b = metadb.claim_kernel("cv_fence", "k_B", "tokB")               # a fresh lease exists → B loses
+    assert a["won"] is True and b["won"] is False
+    assert metadb.heartbeat_kernel("cv_fence", "k_A") is True        # owner heartbeats
+    assert metadb.heartbeat_kernel("cv_fence", "k_ghost") is False   # a stranger id is fenced out
+    metadb.mark_kernel_ready("cv_fence", "k_A", "127.0.0.1:9999")
+    assert metadb.get_kernel("cv_fence")["endpoint"] == "127.0.0.1:9999"
+    metadb.drop_kernel("cv_fence", "k_ghost")                        # a zombie can't delete the owner
+    assert metadb.get_kernel("cv_fence") is not None
+    metadb.drop_kernel("cv_fence", "k_A")                            # the real owner releases
+    assert metadb.get_kernel("cv_fence") is None
 
 
 def test_catalog_entries_are_shared_across_instances(tmp_path):

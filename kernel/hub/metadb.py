@@ -17,6 +17,7 @@ import os
 import uuid
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from hub.settings import settings
@@ -105,7 +106,23 @@ class RunState(Base):
     canvas_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     status: Mapped[str] = mapped_column(String, index=True)  # queued | running | done | failed | cancelled
     doc: Mapped[str] = mapped_column(Text)  # the full RunStatus as JSON
+    kernel_id: Mapped[str | None] = mapped_column(String, nullable=True)  # owning kernel (None = in-process/subprocess run, dies with the hub)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class Kernel(Base):
+    """Lease for a per-canvas execution kernel (a long-lived process, or a pod). `canvas_id` PK makes
+    the INSERT the single-spawner claim; `kernel_id` fences a replaced/zombie kernel out of
+    heartbeating / dropping the row / writing run status — the guard the whole no-split-brain
+    invariant rests on. Any hub reaches a kernel by resolving canvas_id → endpoint (no sticky LB)."""
+    __tablename__ = "kernels"
+    canvas_id: Mapped[str] = mapped_column(String, primary_key=True)
+    kernel_id: Mapped[str] = mapped_column(String)
+    endpoint: Mapped[str | None] = mapped_column(String, nullable=True)
+    token: Mapped[str] = mapped_column(String)
+    state: Mapped[str] = mapped_column(String)  # starting | ready
+    heartbeat_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class CatalogEntry(Base):
@@ -219,7 +236,8 @@ def init_db() -> None:
         from hub import auth
         if auth.auth_enabled() and not u.password_hash and auth.bootstrap_password():
             u.password_hash = auth.hash_password(auth.bootstrap_password())
-    reconcile_orphaned_runs()  # any run left in-flight by the previous process is dead → mark interrupted
+    reap_kernels()        # drop leases whose kernel is dead (stale heartbeat)
+    reap_orphaned_runs()  # fail in-flight runs whose owning kernel is gone; live-kernel runs survive (reattach)
 
 
 @contextlib.contextmanager
@@ -386,20 +404,23 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
                  "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
 
 
-def save_run_state(run_id: str, status: dict, canvas_id: str | None = None) -> None:
+def save_run_state(run_id: str, status: dict, canvas_id: str | None = None, kernel_id: str | None = None) -> None:
     """Upsert a run's live status (the runner calls this on each transition). `status` is a RunStatus
-    model_dump; stored whole as JSON so GET /run/{id} can rebuild it on any instance."""
+    model_dump; stored whole as JSON so GET /run/{id} can rebuild it on any instance. `kernel_id`
+    stamps the owning kernel so the boot-time reaper fails a run only when its kernel is gone."""
     with session() as s:
         r = s.get(RunState, run_id)
         st = str(status.get("status", "running"))
         payload = json.dumps(status, default=str)
         if r is None:
-            s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload))
+            s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload, kernel_id=kernel_id))
         else:
             r.status = st
             r.doc = payload
             if canvas_id and not r.canvas_id:
                 r.canvas_id = canvas_id
+            if kernel_id and not r.kernel_id:
+                r.kernel_id = kernel_id
 
 
 def get_run_state(run_id: str) -> dict | None:
@@ -526,21 +547,119 @@ def catalog_set_declared_key(uri: str, columns: list) -> None:
             s.delete(r)
 
 
-def reconcile_orphaned_runs() -> int:
-    """On startup, mark any non-terminal run_state as interrupted: a run left 'running'/'queued' when the
-    kernel stopped is dead (its in-memory executor is gone), so leaving it non-terminal would make a
-    client poll forever. Returns how many were reconciled. NOTE: assumes a SINGLE execution instance —
-    when execution is distributed (ExecutionBackend plugins), replace this with per-run instance
-    ownership + heartbeat so one instance's startup can't cancel another's live runs."""
+# --------------------------------------------------------------------------- #
+# Kernels — the per-canvas execution-kernel lease (Phase 1 of the session kernel)
+# --------------------------------------------------------------------------- #
+KERNEL_STALE_S = 30  # a kernel whose heartbeat is older than this is presumed dead
+
+
+def _stale_secs(dt: "datetime.datetime | None") -> float:
+    if dt is None:
+        return float("inf")
+    if dt.tzinfo is None:  # SQLite reads DateTime back naive — treat stored times as UTC
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return (_now() - dt).total_seconds()
+
+
+def _kernel_stale(r: "Kernel") -> bool:
+    return _stale_secs(r.heartbeat_at) >= KERNEL_STALE_S
+
+
+def claim_kernel(canvas_id: str, kernel_id: str, token: str) -> dict:
+    """Atomically claim the right to spawn THE kernel for a canvas — the single-spawner guard the
+    no-split-brain invariant rests on. Returns {won, endpoint, state, kernel_id}: won=True → this
+    caller holds the lease under `kernel_id` and should spawn; won=False → a live kernel already
+    exists, use its `endpoint`. A stale/dead lease is taken over (rebinding fences the old kernel_id)."""
+    now = _now()
+    with session() as s:
+        r = s.get(Kernel, canvas_id)
+        if r is not None:
+            if not _kernel_stale(r):
+                return {"won": False, "endpoint": r.endpoint, "state": r.state, "kernel_id": r.kernel_id}
+            r.kernel_id, r.token, r.state = kernel_id, token, "starting"  # take over (fences the old id)
+            r.endpoint, r.heartbeat_at, r.started_at = None, now, now
+            return {"won": True, "endpoint": None, "state": "starting", "kernel_id": kernel_id}
+        s.add(Kernel(canvas_id=canvas_id, kernel_id=kernel_id, token=token, state="starting",
+                     heartbeat_at=now, started_at=now))
+        try:
+            s.flush()  # a concurrent creator makes the PK insert fail → we lost the race
+        except IntegrityError:
+            s.rollback()
+            r = s.get(Kernel, canvas_id)
+            return {"won": False, "endpoint": r.endpoint if r else None,
+                    "state": r.state if r else "starting", "kernel_id": r.kernel_id if r else ""}
+        return {"won": True, "endpoint": None, "state": "starting", "kernel_id": kernel_id}
+
+
+def _fenced(s, canvas_id: str, kernel_id: str) -> "Kernel | None":
+    """The lease row IFF it's still ours — a kernel fenced out (replaced by a newer one) sees None."""
+    r = s.get(Kernel, canvas_id)
+    return r if (r is not None and r.kernel_id == kernel_id) else None
+
+
+def mark_kernel_ready(canvas_id: str, kernel_id: str, endpoint: str) -> bool:
+    with session() as s:
+        r = _fenced(s, canvas_id, kernel_id)
+        if r is None:
+            return False
+        r.state, r.endpoint, r.heartbeat_at = "ready", endpoint, _now()
+        return True
+
+
+def heartbeat_kernel(canvas_id: str, kernel_id: str) -> bool:
+    """Touch the lease. False if we've been fenced out (a newer kernel took over) → the kernel exits."""
+    with session() as s:
+        r = _fenced(s, canvas_id, kernel_id)
+        if r is None:
+            return False
+        r.heartbeat_at = _now()
+        return True
+
+
+def drop_kernel(canvas_id: str, kernel_id: str) -> None:
+    """Release our lease (idle-exit / explicit shutdown). Fenced: a zombie can't delete the new owner."""
+    with session() as s:
+        r = _fenced(s, canvas_id, kernel_id)
+        if r is not None:
+            s.delete(r)
+
+
+def get_kernel(canvas_id: str) -> dict | None:
+    with session() as s:
+        r = s.get(Kernel, canvas_id)
+        if r is None:
+            return None
+        return {"canvas_id": r.canvas_id, "kernel_id": r.kernel_id, "endpoint": r.endpoint,
+                "token": r.token, "state": r.state, "stale": _kernel_stale(r)}
+
+
+def reap_kernels() -> int:
+    """Delete leases whose kernel is presumed dead (stale heartbeat). Any hub, on boot + on a timer."""
     n = 0
     with session() as s:
+        for r in s.scalars(select(Kernel)):
+            if _kernel_stale(r):
+                s.delete(r)
+                n += 1
+    return n
+
+
+def reap_orphaned_runs() -> int:
+    """On hub boot: fail a non-terminal run ONLY if its owning kernel is gone/stale, or it had no kernel
+    (an in-process / subprocess run, which dies with the hub). A run owned by a still-live kernel is
+    LEFT running so the client reattaches — replacing the old blanket "fail every run on restart"."""
+    n = 0
+    with session() as s:
+        live = {k.kernel_id for k in s.scalars(select(Kernel)) if not _kernel_stale(k)}
         for r in s.scalars(select(RunState).where(RunState.status.in_(("queued", "running")))):
+            if r.kernel_id and r.kernel_id in live:
+                continue  # owning kernel is alive → leave it running (reattach)
             try:
                 d = json.loads(r.doc)
             except Exception:  # noqa: BLE001
                 d = {"run_id": r.run_id}
             d["status"] = "failed"
-            d["error"] = "interrupted — the kernel restarted while this run was in flight"
+            d["error"] = "interrupted — the run's kernel is gone (hub restarted with no live kernel)"
             r.status = "failed"
             r.doc = json.dumps(d, default=str)
             n += 1
