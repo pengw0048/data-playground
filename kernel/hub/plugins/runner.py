@@ -206,6 +206,9 @@ class LocalRunner:
             except Exception as e:  # noqa: BLE001
                 if cancel.is_set():
                     status.status = "cancelled"  # an interrupted step is a cancel, not a failure
+                    for p in status.per_node:  # settle the interrupted node too (else it animates forever)
+                        if p.status == "running":
+                            p.status = "cancelled"
                 else:
                     status.status = "failed"
                     status.error = f"{type(e).__name__}: {e}"

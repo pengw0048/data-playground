@@ -1443,6 +1443,45 @@ def test_periodic_reaper_spares_kernelless_run_but_fails_dead_kernel_run():
     assert metadb.get_run_state("run_dead_kernel")["status"] == "failed"   # dead kernel → reaped
 
 
+def test_cancel_falls_back_to_db_status_when_not_owned_here():
+    # a run this process doesn't own (hub restarted, or another stateless instance accepted it): cancel
+    # must resolve via the DB-backed kernel backend and return the last-known status, never 404.
+    from hub import metadb
+    metadb.save_run_state("run_cancel_db", {"run_id": "run_cancel_db", "status": "running", "per_node": []},
+                          canvas_id="cv_cancel_db", kernel_id="k_none")  # no live kernel owns cv_cancel_db
+    get_deps().run_index.pop("run_cancel_db", None)  # ensure this process doesn't own it
+    r = client.post("/api/run/run_cancel_db/cancel")
+    assert r.status_code == 200, r.text                       # not a 404
+    assert r.json()["status"] in ("running", "cancelled", "failed")
+
+
+def test_kernel_for_run_none_when_owning_kernel_fenced_out():
+    # after a takeover (k_old replaced by k_new on one canvas), cancel must NOT be routed to k_new — it
+    # never ran the run. kernel_for_run returns None so the backend falls back to the persisted status.
+    from hub import metadb
+    metadb.claim_kernel("cv_kfr", "k_new", "tok"); metadb.mark_kernel_ready("cv_kfr", "k_new", "1.2.3.4:9")
+    metadb.save_run_state("run_kfr", {"run_id": "run_kfr", "status": "running"},
+                          canvas_id="cv_kfr", kernel_id="k_old")  # owned by a since-replaced kernel
+    assert metadb.kernel_for_run("run_kfr") is None
+    metadb.drop_kernel("cv_kfr", "k_new")
+
+
+def test_restart_clears_lease_even_if_kernel_unreachable():
+    # restart must be authoritative: it clears the lease itself, so a dead/unreachable kernel that can't
+    # drop its own lease doesn't leave the canvas bound to a dead endpoint until the reaper fires.
+    from hub import metadb
+    from hub.metadb import Canvas, session
+    cid = "cv_restart_auth"
+    with session() as s:
+        if s.get(Canvas, cid) is None:
+            s.add(Canvas(id=cid, owner_id=metadb.DEFAULT_USER_ID, name="t", version=1, doc="{}", visibility="private"))
+    metadb.claim_kernel(cid, "k_restart", "tok")
+    metadb.mark_kernel_ready(cid, "k_restart", "127.0.0.1:1")  # unreachable endpoint (shutdown POST fails)
+    r = client.post(f"/api/canvas/{cid}/kernel/restart")
+    assert r.status_code == 200 and r.json()["restarted"] is True
+    assert metadb.get_kernel(cid) is None  # lease cleared despite the kernel being unreachable
+
+
 def test_kernel_lease_is_single_spawner_and_fenced():
     # the split-brain invariant: for one canvas, exactly one claimer wins; a fenced-out (replaced)
     # kernel can neither heartbeat nor drop the new owner's lease.

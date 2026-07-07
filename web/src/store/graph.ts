@@ -669,6 +669,7 @@ export const useStore = create<Store>((set, get) => ({
     await api.cancelRun(st.runId).catch(() => {})
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'idle' } } }))
     get().updateData(id, { status: 'stale' })
+    settleAnimatingNodes(set)  // clear intermediate nodes' animation now, not only when the next poll lands
   },
 
   clearRun: (id) =>
@@ -968,6 +969,20 @@ useStore.subscribe((s) => {
 const _PERNODE_STATUS: Record<string, NodeStatus> = {
   queued: 'queued', running: 'running', done: 'latest', failed: 'failed', cancelled: 'stale',
 }
+// Flip every still-animating node (queued/running) to a terminal 'stale' — for when a run ends WITHOUT
+// a final per-node snapshot to settle them: a user cancel (the optimistic pre-poll window) or the poll
+// giving up because the kernel became unreachable. Without it an intermediate node animates forever.
+function settleAnimatingNodes(set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void) {
+  set((s) => {
+    let changed = false
+    const nodes = s.doc.nodes.map((n) => {
+      if (n.data.status === 'running' || n.data.status === 'queued') { changed = true; return { ...n, data: { ...n.data, status: 'stale' as NodeStatus } } }
+      return n
+    })
+    return changed ? { doc: { ...s.doc, nodes } } : {}
+  })
+}
+
 function applyPerNodeStatus(
   set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
   perNode: RunStatus['perNode'],
@@ -1015,6 +1030,7 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       if (++fails <= 6) { setTimeout(tick, 800); return }
       set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase: 'idle' as const }), phase: 'idle' } } }))
       get().updateData(nodeId, { status: 'stale' })
+      settleAnimatingNodes(set)  // no final status will arrive — clear every still-animating node, not just the target
       get().pushToast('Lost track of the run — the kernel became unreachable', 'error')
       return
     }

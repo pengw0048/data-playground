@@ -648,13 +648,18 @@ def active_runs(canvas_id: str) -> list[dict]:
 
 
 def kernel_for_run(run_id: str) -> dict | None:
-    """The kernel currently owning a run's canvas (endpoint + token) — for routing cancel to it."""
+    """The kernel that OWNS a run (endpoint + token) — for routing cancel to it. None if the run's owning
+    kernel no longer holds the canvas lease (fenced / replaced / gone): routing /cancel to whatever kernel
+    now holds the canvas would hit one that never knew this run (an HTTP error), so the caller instead
+    falls back to the last-known persisted status."""
     with session() as s:
         r = s.get(RunState, run_id)
         if r is None or not r.canvas_id:
             return None
         k = s.get(Kernel, r.canvas_id)
-        return {"endpoint": k.endpoint, "token": k.token, "kernel_id": k.kernel_id} if k else None
+        if k is None or (r.kernel_id and k.kernel_id != r.kernel_id):
+            return None
+        return {"endpoint": k.endpoint, "token": k.token, "kernel_id": k.kernel_id}
 
 
 def reap_kernels() -> int:

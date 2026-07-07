@@ -143,6 +143,7 @@ class KernelBackend:
         if k and k["endpoint"]:
             try:
                 return RunStatus(**_post(k["endpoint"], "/cancel", k["token"], {"run_id": run_id}, timeout=15.0))
-            except (urllib.error.URLError, OSError):
-                pass  # kernel unreachable → fall through to the last-known DB status
+            except (urllib.error.URLError, OSError, RuntimeError):
+                pass  # kernel unreachable, OR it doesn't own this run (_post raises RuntimeError on an
+                      # HTTP error after a cross-kernel handoff) → fall through to the last-known DB status
         return self.status(run_id)

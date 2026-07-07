@@ -283,8 +283,19 @@ def run_status(run_id: str) -> RunStatus:
 
 @router.post("/run/{run_id}/cancel", response_model=RunStatus)
 def run_cancel(run_id: str) -> RunStatus:
-    try:
-        return _runner_for(run_id).cancel(run_id)
-    except KeyError:
-        raise HTTPException(404, f"run '{run_id}' not found")
+    deps = get_deps()
+    owner = deps.run_index.get(run_id)
+    if owner is not None:
+        return owner.cancel(run_id)  # this instance ran it → cancel in-process
+    # not owned here (the hub restarted, or another stateless instance accepted the run) — route via the
+    # DB-backed kernel backend, which resolves the owning kernel from run_states and cancels it (or
+    # returns the last-known persisted status). Mirrors _status_or_lost so cancel never 404s a live run.
+    kb = deps.kernel_backend()
+    if kb is not None:
+        return kb.cancel(run_id)
+    from hub import metadb
+    persisted = metadb.get_run_state(run_id)
+    if persisted is not None:
+        return RunStatus(**persisted)
+    raise HTTPException(404, f"run '{run_id}' not found")
 

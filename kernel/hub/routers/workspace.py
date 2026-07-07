@@ -270,6 +270,10 @@ def canvas_kernel_restart(canvas_id: str, uid: str = Depends(current_user)) -> d
     kb = get_deps().kernel_backend()  # force-remove the substrate too (deletes the pod; no-op for local)
     if kb is not None:
         kb.kill(canvas_id, k["kernel_id"])
+    # authoritative: clear the lease ourselves even if the kernel was unreachable and couldn't drop it —
+    # else the canvas stays bound to a dead endpoint until the reaper fires. Fenced by kernel_id, so it
+    # never deletes a newer kernel that already took over the canvas.
+    metadb.drop_kernel(canvas_id, k["kernel_id"])
     return {"ok": True, "restarted": True}
 
 
