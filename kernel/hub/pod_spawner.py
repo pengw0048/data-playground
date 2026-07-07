@@ -46,9 +46,21 @@ class PodSpawner:
         return self._client
 
     @staticmethod
-    def _name(canvas_id: str) -> str:
-        # a DNS-1123 name derived from the canvas id (which may contain anything)
-        return "dp-kernel-" + hashlib.sha1(canvas_id.encode()).hexdigest()[:16]
+    def _name(canvas_id: str, kernel_id: str) -> str:
+        # a DNS-1123 name unique per (canvas, kernel) — so a NEW kernel never collides with a
+        # still-terminating old one (no 409), and kill(canvas, kernel_id) is naturally FENCED: it can
+        # only delete ITS kernel's pod/service, never a newer kernel that already took over the canvas.
+        return "dp-kernel-" + hashlib.sha1(f"{canvas_id}/{kernel_id}".encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _create_idempotent(create_fn, ns: str, body: dict) -> None:
+        try:
+            create_fn(ns, body)
+        except Exception as e:  # noqa: BLE001
+            # 409 AlreadyExists = a prior spawn of THIS kernel_id already created it (the name is unique
+            # per kernel_id, so it's ours) → idempotent, fine. Anything else is a real error → re-raise.
+            if getattr(e, "status", None) != 409:
+                raise
 
     def _pod_body(self, name: str, cmd: list[str]) -> dict:
         return {
@@ -72,21 +84,24 @@ class PodSpawner:
                          "ports": [{"port": _PORT, "targetPort": _PORT}]}}
 
     def spawn(self, canvas_id: str, kernel_id: str, token: str) -> None:
-        name = self._name(canvas_id)
+        name = self._name(canvas_id, kernel_id)
         dns = f"{name}.{self.ns}.svc.cluster.local"
         cmd = ["python", "-m", "hub.kernel",
                "--canvas", canvas_id, "--kernel-id", kernel_id, "--token", token,
                "--workspace", self.workspace, "--data-dir", self.data_dir,
                "--port", str(_PORT), "--host", "0.0.0.0", "--advertise-host", dns]
         api = self._api()
-        api.create_namespaced_service(self.ns, self._svc_body(name))
-        api.create_namespaced_pod(self.ns, self._pod_body(name, cmd))
+        self._create_idempotent(api.create_namespaced_service, self.ns, self._svc_body(name))
+        self._create_idempotent(api.create_namespaced_pod, self.ns, self._pod_body(name, cmd))
         # the pod's kernel marks the lease ready with `dns:_PORT` once serving; ensure_kernel polls it.
 
     def kill(self, canvas_id: str, kernel_id: str) -> None:
-        name = self._name(canvas_id)
+        name = self._name(canvas_id, kernel_id)
         api = self._api()
-        for fn in (lambda: api.delete_namespaced_pod(name, self.ns),
+        # grace_period_seconds=0: the kernel was already asked to exit (or is dead), so don't wait out
+        # k8s's 30s termination grace — free the name immediately (a same-name recreate never 409s anyway
+        # now that the name carries kernel_id, but this also frees resources promptly).
+        for fn in (lambda: api.delete_namespaced_pod(name, self.ns, grace_period_seconds=0),
                    lambda: api.delete_namespaced_service(name, self.ns)):
             try:
                 fn()

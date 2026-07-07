@@ -662,15 +662,17 @@ def kernel_for_run(run_id: str) -> dict | None:
         return {"endpoint": k.endpoint, "token": k.token, "kernel_id": k.kernel_id}
 
 
-def reap_kernels() -> int:
-    """Delete leases whose kernel is presumed dead (stale heartbeat). Any hub, on boot + on a timer."""
-    n = 0
+def reap_kernels() -> list[tuple[str, str]]:
+    """Delete leases whose kernel is presumed dead (stale heartbeat). Any hub, on boot + on a timer.
+    Returns the reaped (canvas_id, kernel_id) pairs so the caller can also tear down the substrate
+    (delete the pod + service) — otherwise a crashed/fenced pod's k8s objects accumulate as orphans."""
+    reaped: list[tuple[str, str]] = []
     with session() as s:
         for r in s.scalars(select(Kernel)):
             if _kernel_stale(r):
+                reaped.append((r.canvas_id, r.kernel_id))
                 s.delete(r)
-                n += 1
-    return n
+    return reaped
 
 
 def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:

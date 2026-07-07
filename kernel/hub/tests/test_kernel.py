@@ -1569,8 +1569,8 @@ def test_pod_spawner_builds_manifests_and_conforms_to_the_spi():
         def __init__(self): self.calls = []
         def create_namespaced_service(self, ns, body): self.calls.append(("svc", ns, body))
         def create_namespaced_pod(self, ns, body): self.calls.append(("pod", ns, body))
-        def delete_namespaced_pod(self, name, ns): self.calls.append(("del-pod", name, ns))
-        def delete_namespaced_service(self, name, ns): self.calls.append(("del-svc", name, ns))
+        def delete_namespaced_pod(self, name, ns, **kw): self.calls.append(("del-pod", name, ns))
+        def delete_namespaced_service(self, name, ns, **kw): self.calls.append(("del-svc", name, ns))
 
     api = FakeApi()
     sp = PodSpawner("/ws", "/ws/data", client=api)
@@ -1587,6 +1587,33 @@ def test_pod_spawner_builds_manifests_and_conforms_to_the_spi():
     assert svc["spec"]["selector"]["dp-canvas"] == pod["metadata"]["labels"]["dp-canvas"]  # Service → Pod
     sp.kill("cv-abc", "k1")
     assert ("del-pod", name, "default") in api.calls and ("del-svc", name, "default") in api.calls
+
+
+def test_pod_spawner_names_per_kernel_and_is_fenced_and_idempotent():
+    # regressions: (a) the pod/service name must be unique per (canvas, kernel_id) so a new kernel never
+    # collides with a still-terminating old one; (b) kill is thereby FENCED — killing k1 can't delete
+    # k2's objects; (c) a 409 AlreadyExists on create (a retry of the same kernel_id) is tolerated.
+    from hub.pod_spawner import PodSpawner
+
+    class Fake:
+        def __init__(self): self.created, self.deleted, self.pod_409 = [], [], False
+        def create_namespaced_service(self, ns, body): self.created.append(body["metadata"]["name"])
+        def create_namespaced_pod(self, ns, body):
+            if self.pod_409:
+                e = Exception("conflict"); e.status = 409; raise e
+            self.created.append(body["metadata"]["name"])
+        def delete_namespaced_pod(self, name, ns, **kw): self.deleted.append(name)
+        def delete_namespaced_service(self, name, ns, **kw): self.deleted.append(name)
+
+    fake = Fake()
+    sp = PodSpawner("/ws", "/ws/data", client=fake)
+    n1, n2 = sp._name("cv", "k1"), sp._name("cv", "k2")
+    assert n1 != n2                                   # same canvas, different kernel → distinct names
+    sp.spawn("cv", "k1", "t"); sp.spawn("cv", "k2", "t")
+    sp.kill("cv", "k1")                               # fenced: only k1's objects, never k2's (the new owner)
+    assert set(fake.deleted) == {n1}
+    fake.pod_409 = True
+    sp.spawn("cv", "k3", "t")                         # a 409 on pod create must NOT raise (idempotent)
 
 
 def test_kernel_spawner_is_selectable_pod(tmp_path, monkeypatch):

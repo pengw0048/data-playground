@@ -68,11 +68,18 @@ metadb.init_db()  # create metadata tables (idempotent) + seed the default local
 # so a kernel-less in-process run — which belongs to THIS live hub (or another live instance) — is
 # never reaped mid-flight; only its dead-kernel runs are. Idempotent DB writes → safe on every instance.
 def _reaper_loop() -> None:
+    from hub.deps import get_deps
     while True:
         time.sleep(metadb.KERNEL_STALE_S)
         try:
-            metadb.reap_kernels()
+            reaped = metadb.reap_kernels()
             metadb.reap_orphaned_runs(only_kernel_runs=True)
+            # tear down each reaped kernel's substrate too (delete the pod+service; a no-op for the
+            # local process spawner), so a crashed/fenced pod's k8s objects don't accumulate as orphans.
+            kb = get_deps().kernel_backend() if reaped else None
+            for canvas_id, kernel_id in reaped:
+                if kb is not None:
+                    kb.kill(canvas_id, kernel_id)
         except Exception:  # noqa: BLE001 — a transient DB hiccup must not kill the reaper
             pass
 
