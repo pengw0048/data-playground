@@ -43,8 +43,10 @@ _ENTRY_NAMES = ["fn", "transform", "process", "map", "op"]
 # Extra top-level modules a cell may import — the canvas's declared dependencies, installed by the
 # per-canvas kernel (see hub.kernel_deps). Process-global because a kernel serves ONE canvas, so its
 # declared deps are the same for every run/preview; empty in the hub / open in-process mode. Reset on
-# Restart kernel. (This loosens the soft import guard for packages the user explicitly asked for — the
-# hard boundary is still OS-level isolation; a declared dep is arbitrary code either way.)
+# Restart kernel. (This loosens the soft import guard for the canvas's declared deps AND their full
+# transitive dependency closure — the allow-set is every top-level module in the --target dir, so
+# declaring `pandas` also allows numpy/pytz/etc. The hard boundary is still OS-level isolation; a
+# declared dep is arbitrary code either way. Can be turned off with DP_CANVAS_PIP_DEPS.)
 _KERNEL_ALLOWED: set[str] = set()
 _allowed_lock = threading.Lock()
 

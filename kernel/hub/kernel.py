@@ -85,6 +85,10 @@ def main() -> None:
         # (replace, not grow — so removing a requirement stops allowing it; empty requirements → allow
         # nothing). Runs on every request; ensure() is idempotent so it's cheap once installed.
         from hub import kernel_deps, sandbox
+        from hub.settings import settings
+        if not settings.canvas_pip_deps:  # operator disabled per-canvas deps → install nothing, allow nothing
+            sandbox.set_allowed(set())
+            return
         reqs = getattr(graph, "requirements", None) or []
         mods = kernel_deps.ensure(reqs, kernel_deps.deps_dir(args.workspace, canvas)) if reqs else set()
         sandbox.set_allowed(mods)

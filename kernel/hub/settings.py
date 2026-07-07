@@ -34,6 +34,10 @@ class Settings:
     # how a per-canvas kernel is launched: "local" (a detached process, single-host) or "pod" (a k8s
     # Pod + Service per canvas, cross-host). See hub.kernel_backend / hub.pod_spawner.
     kernel_spawner: str = os.environ.get("DP_KERNEL_SPAWNER", "local").strip().lower()
+    # per-canvas pip deps (kernel installs a canvas's declared requirements). Arbitrary code + egress, so
+    # a locked-down deployment can turn it OFF here: the kernel then installs nothing and allows no extra
+    # imports (canvases must rely on a pre-baked image instead). Default on (trusted/local tool).
+    canvas_pip_deps: bool = os.environ.get("DP_CANVAS_PIP_DEPS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 settings = Settings()

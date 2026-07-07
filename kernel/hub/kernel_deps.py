@@ -6,8 +6,9 @@ it anywhere → its kernel installs what it needs.
 
 Trust note: installing pip packages is arbitrary code + network egress. A per-canvas kernel already
 runs the user's arbitrary Python, so this is consistent for a trusted (local) or single-tenant kernel;
-a locked-down deployment should disable it or pre-bake an image (a deployment concern, like the rest of
-the soft sandbox).
+a locked-down deployment can turn it off with DP_CANVAS_PIP_DEPS=0 (the kernel then installs nothing and
+allows no extra imports — use a pre-baked image), like the rest of the soft sandbox. NB: the sandbox
+allow-set is the whole --target dir (declared deps + their transitive closure), not only the named reqs.
 """
 
 from __future__ import annotations

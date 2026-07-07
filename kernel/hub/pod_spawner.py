@@ -20,7 +20,7 @@ import os
 # DP_* env the kernel pod needs to share the hub's DB / storage / auth / dataset roots. Object-store
 # creds ride along too so the pod's DuckDB can read s3://gs:// data.
 _FORWARD_ENV = ("DP_DATABASE_URL", "DP_DATASET_ROOTS", "DP_AUTH_SECRET", "DP_STORAGE_URL",
-                "DP_MEMORY_LIMIT", "DP_SPILL_DIR", "DP_KERNEL_IDLE_TTL",
+                "DP_MEMORY_LIMIT", "DP_SPILL_DIR", "DP_KERNEL_IDLE_TTL", "DP_CANVAS_PIP_DEPS",
                 "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION",
                 "GOOGLE_APPLICATION_CREDENTIALS")
 _PORT = 8500  # fixed inside the pod; the Service exposes it

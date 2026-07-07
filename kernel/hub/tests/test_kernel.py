@@ -2062,6 +2062,7 @@ def test_plan_hash_includes_bypass_and_disable_flags():
     base = r._plan_hash(graph_with({}), "wr")
     assert base != r._plan_hash(graph_with({"bypassed": True}), "wr")   # bypass changes the lowered plan
     assert base != r._plan_hash(graph_with({"disabled": True}), "wr")   # disable too
+    assert base != r._plan_hash(graph_with({"title": "renamed"}), "wr") # title too (a metric emits it)
     assert base == r._plan_hash(graph_with({"bypassed": False}), "wr")  # explicit False == absent
 
 
