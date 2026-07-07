@@ -96,6 +96,7 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 | `reg.add_adapter(adapter)` | a dataset source/sink (claim a URI scheme) | `matches/scan/schema/count/fingerprint/write` (see `kernel/kernel/backends.py`) |
 | `reg.add_runner(runner)` | an execution backend (pod/Ray/queue) | `ExecutionBackend`: `name/can_run/estimate/run/status/cancel` |
 | `reg.add_capability(cap)` | a declared column capability (id + label) | see `kernel/kernel/plugins/capabilities.py` |
+| `reg.add_processor(proc)` | a reusable transform in the library picker | a `Processor` (`id/title/mode/build(params)`); see `kernel/kernel/plugins/processors.py` |
 | `reg.set_catalog(catalog)` | the dataset catalog provider | replaces the default `InMemoryCatalog` |
 | `reg.set_importer(importer)` | `/pipelines/import` (import a foreign pipeline format) | default is a `NullImporter` (501) |
 

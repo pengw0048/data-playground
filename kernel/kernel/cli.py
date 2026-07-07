@@ -55,12 +55,18 @@ def main() -> None:
     from kernel.deps import set_workspace
     set_workspace(workspace, data_dir)
 
+    import logging
     import uvicorn
+    # Emit logs by default (was silent at 'warning') so a failing/dying server leaves a trace —
+    # startup, requests, and tracebacks. Level is DP_LOG_LEVEL (info default; debug/warning/error).
+    level = os.environ.get("DP_LOG_LEVEL", "info").lower()
+    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO),
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     url = f"http://{args.host}:{args.port}"
     print(f"\n  Data Playground  →  {url}\n  workspace: {workspace}\n  data:      {data_dir}\n")
     if args.open:
         threading.Timer(1.3, lambda: webbrowser.open(url)).start()
-    uvicorn.run("kernel.main:app", host=args.host, port=args.port, log_level="warning")
+    uvicorn.run("kernel.main:app", host=args.host, port=args.port, log_level=level)
 
 
 if __name__ == "__main__":
