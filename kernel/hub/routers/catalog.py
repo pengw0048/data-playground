@@ -236,14 +236,17 @@ async def catalog_upload(request: Request) -> CatalogTable:
     ext = ext.lower()
     if ext not in _UPLOAD_EXTS:
         raise HTTPException(400, f"unsupported file type '{ext or raw}' — upload Parquet / CSV / TSV / JSON / Arrow")
-    name = stem or "upload"
+    name = re.sub(r"[\x00-\x1f\x7f]", "", stem) or "upload"  # strip control chars (they flow into the table id + UI)
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", stem) or "upload"
     # short suffix so two uploads of the same filename don't silently clobber each other (the catalog
     # still shows the clean name; only the stored file path is uniquified)
     target = deps.storage.output_uri(f"{safe}-{uuid.uuid4().hex[:6]}", ext)
     obj = is_object_uri(target)
     limit = settings.max_upload_bytes
-    tmp_dir = None if obj else (os.path.dirname(path_of(target)) or ".")
+    # stream the temp into a HIDDEN subdir of the outputs dir — same filesystem as the target (so the
+    # final os.replace stays atomic), but list_outputs (non-recursive, skips non-.lance dirs) won't
+    # enumerate it, so a crash-orphaned temp is never re-registered as a phantom dataset on next boot.
+    tmp_dir = None if obj else os.path.join(os.path.dirname(path_of(target)) or ".", ".uploads-tmp")
     if tmp_dir:
         os.makedirs(tmp_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(suffix=ext, dir=tmp_dir)

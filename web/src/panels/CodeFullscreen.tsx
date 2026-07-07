@@ -34,11 +34,12 @@ export function CodeFullscreen() {
   const proc = processors.find((p) => p.id === cfg.processor)
   // annotation `code` nodes and library transforms don't run/preview here
   const canPreview = runnable && node.type !== 'code' && !isLibrary
-  // seed Monaco autocomplete with THIS node's input columns (precise — what a filter/select/sql/
-  // transform references), falling back to any columns seen in previews when the schema isn't resolved yet
+  // seed Monaco autocomplete with THIS node's input columns (precise — what a filter/select/sql/transform
+  // references). Fall back to THIS node's own last-preview columns when the input schema isn't resolved yet
+  // — NOT every node's previews (that leaked unrelated columns from across the whole graph).
   const inputNames = inputCols.map((c) => c.name)
-  const seen = Object.values(previews).flatMap((p) => (p.result?.columns ?? []).map((c) => c.name))
-  const completions = [...new Set([...inputNames, ...seen])]
+  const own = (previews[fs.nodeId]?.result?.columns ?? []).map((c) => c.name)
+  const completions = [...new Set(inputNames.length ? inputNames : own)]
 
   return (
     <div className="fixed inset-0 z-[60] flex flex-col bg-[#10141e]/45 p-7" onClick={close}>

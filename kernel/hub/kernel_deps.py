@@ -47,9 +47,10 @@ def _top_level_modules(target: Path) -> set[str]:
 
 def ensure(reqs: list[str], target_dir: str) -> set[str]:
     """Install `reqs` into target_dir (idempotent — skipped if the same set is already there), put the
-    dir on sys.path, and return the top-level importable module names for the sandbox to allow. On a
-    failed install we don't cache it and return whatever's present, so the missing import surfaces as a
-    clear error at run time rather than silently."""
+    dir on sys.path, and return the top-level importable module names for the sandbox to allow. A failed
+    install is CACHED against this reqset (so a permanently-bad requirement isn't re-run on every
+    run/preview/profile — that could hang up to INSTALL_TIMEOUT_S each time) and logged to stderr (not
+    swallowed silently); editing the requirements changes the reqset and re-triggers the install."""
     target = Path(target_dir)
     reqset = frozenset(reqs or [])
     if str(target) not in sys.path:
@@ -64,6 +65,10 @@ def ensure(reqs: list[str], target_dir: str) -> set[str]:
                 _installed[target_dir] = reqset
                 import importlib
                 importlib.invalidate_caches()  # so a freshly-installed package is importable now
-            except Exception:  # noqa: BLE001 — leave uncached; the import error will be clear at run time
-                pass
+            except Exception as e:  # noqa: BLE001
+                _installed[target_dir] = reqset  # cache the attempt — don't re-run pip on every call
+                err = getattr(e, "stderr", None)
+                if isinstance(err, bytes):
+                    err = err.decode("utf-8", "replace")
+                sys.stderr.write(f"[kernel_deps] pip install failed for {list(reqs)}: {err or e}\n")
         return _top_level_modules(target)

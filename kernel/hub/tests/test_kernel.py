@@ -300,6 +300,26 @@ def test_upload_same_name_does_not_clobber():
     assert a["uri"] != b["uri"]  # a short suffix keeps the two stored files distinct
 
 
+def test_upload_strips_control_chars_from_name():
+    t = _upload("a\x01b\x7fc.csv", b"x\n1\n").json()  # control chars flow into the table id + UI
+    assert t["name"] == "abc"
+
+
+def test_map_column_type_is_distinct_from_struct():
+    from hub.plugins.adapters import display_type
+    assert display_type("MAP(VARCHAR, BIGINT)") == "map"   # was folded into 'struct' → UI showed [N]
+    assert display_type("STRUCT(a INTEGER)") == "struct"
+
+
+def test_sandbox_set_allowed_replaces_not_grows():
+    from hub import sandbox
+    sandbox.allow_modules({"pandas"})
+    sandbox.set_allowed({"numpy"})       # replace, not grow
+    assert "numpy" in sandbox._KERNEL_ALLOWED and "pandas" not in sandbox._KERNEL_ALLOWED
+    sandbox.set_allowed(set())           # emptied requirements → allow nothing
+    assert not sandbox._KERNEL_ALLOWED
+
+
 # --------------------------------------------------------------------------- #
 # Regression tests for adversarial-acceptance findings
 # --------------------------------------------------------------------------- #

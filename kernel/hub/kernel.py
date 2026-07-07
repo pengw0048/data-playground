@@ -81,11 +81,13 @@ def main() -> None:
             raise HTTPException(401, "bad kernel token")
 
     def _ensure_deps(graph) -> None:
-        # install the canvas's declared pip deps into this kernel + let the sandbox import them (cached)
+        # install the canvas's declared pip deps into this kernel + let the sandbox import EXACTLY them
+        # (replace, not grow — so removing a requirement stops allowing it; empty requirements → allow
+        # nothing). Runs on every request; ensure() is idempotent so it's cheap once installed.
+        from hub import kernel_deps, sandbox
         reqs = getattr(graph, "requirements", None) or []
-        if reqs:
-            from hub import kernel_deps, sandbox
-            sandbox.allow_modules(kernel_deps.ensure(reqs, kernel_deps.deps_dir(args.workspace, canvas)))
+        mods = kernel_deps.ensure(reqs, kernel_deps.deps_dir(args.workspace, canvas)) if reqs else set()
+        sandbox.set_allowed(mods)
 
     def _heartbeat_loop() -> None:
         while True:

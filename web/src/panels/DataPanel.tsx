@@ -239,6 +239,8 @@ function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
   if (col.capabilities.includes('vector') && Array.isArray(value)) {
     return <span className="rounded bg-primary/10 px-1.5 py-px text-[10px] font-semibold text-primary">[{(value as number[]).length}]</span>
   }
+  // a MAP arrives as [[k,v],…] — an array, but it's a struct-like value, so show its JSON, not a [N] badge
+  if (col.type === 'map') return <span className="dp-mono">{JSON.stringify(value)}</span>
   if (Array.isArray(value)) return <span>[{value.length}]</span>
   if (value === true) return <span className="text-[#2f9e5f]">true</span>
   if (value === false) return <span className="text-destructive">false</span>

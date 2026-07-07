@@ -54,6 +54,15 @@ def allow_modules(names) -> None:
         _KERNEL_ALLOWED.update(names)
 
 
+def set_allowed(names) -> None:
+    """REPLACE the kernel allow-set with exactly `names` (this run's requirement modules). allow_modules
+    only ever grew it, so a requirement removed from the canvas stayed importable; replacing means an
+    emptied/changed requirements list revokes what it no longer declares."""
+    with _allowed_lock:
+        _KERNEL_ALLOWED.clear()
+        _KERNEL_ALLOWED.update(names)
+
+
 def _guarded_import(name, *args, **kwargs):
     root = name.split(".")[0]
     if root in _ALLOWED_MODULES or root in _KERNEL_ALLOWED:

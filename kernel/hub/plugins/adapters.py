@@ -38,7 +38,9 @@ def display_type(duckdb_type: str) -> str:
         return f"{display_type(t[:-2])}[]"
     if t.startswith(("DECIMAL", "NUMERIC")):
         return "float"
-    if t.startswith(("STRUCT", "MAP")):
+    if t.startswith("MAP"):
+        return "map"  # a MAP arrives on the wire as [[k,v],…]; distinct from STRUCT so the UI renders it right
+    if t.startswith("STRUCT"):
         return "struct"
     if t.startswith("LIST"):
         return "list"
