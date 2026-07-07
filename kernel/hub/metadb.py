@@ -668,16 +668,22 @@ def reap_kernels() -> int:
     return n
 
 
-def reap_orphaned_runs() -> int:
-    """On hub boot: fail a non-terminal run ONLY if its owning kernel is gone/stale, or it had no kernel
-    (an in-process / subprocess run, which dies with the hub). A run owned by a still-live kernel is
-    LEFT running so the client reattaches — replacing the old blanket "fail every run on restart"."""
+def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
+    """Fail a non-terminal run whose owning kernel is gone/stale. A run owned by a still-live kernel is
+    LEFT running so the client reattaches — replacing the old blanket "fail every run on restart".
+
+    `only_kernel_runs` distinguishes the two callers: on hub BOOT (default False) a kernel-less run —
+    an in-process / subprocess run — belonged to the now-dead previous hub, so it is reaped too. On the
+    PERIODIC path (True) a kernel-less run belongs to THIS live hub process (or, across instances, to
+    another live one) and must NOT be reaped mid-flight — only its dead-kernel runs are."""
     n = 0
     with session() as s:
         live = {k.kernel_id for k in s.scalars(select(Kernel)) if not _kernel_stale(k)}
         for r in s.scalars(select(RunState).where(RunState.status.in_(("queued", "running")))):
             if r.kernel_id and r.kernel_id in live:
                 continue  # owning kernel is alive → leave it running (reattach)
+            if only_kernel_runs and not r.kernel_id:
+                continue  # periodic path: a kernel-less run belongs to a live hub process, not us to reap
             try:
                 d = json.loads(r.doc)
             except Exception:  # noqa: BLE001

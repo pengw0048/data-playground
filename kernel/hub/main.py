@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+import time
 
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -57,6 +59,25 @@ metadb.init_db()  # create metadata tables (idempotent) + seed the default local
 # user-added datasets survive restart via the per-row catalog_entries store (register_output
 # write-throughs there); the catalog's _load_from_db restores them lazily on first read. No
 # import-time re-register loop (removed the blocking probe-per-dataset startup pass; F45/F24).
+
+
+# Periodic reaper — the "on a timer" half of reap_kernels' contract (boot is the other half). Every
+# KERNEL_STALE_S: drop dead leases, then fail runs whose owning kernel is gone. Without this a kernel
+# that crashed / OOM'd / was restarted mid-run leaves its run stuck 'running' forever (the client
+# reattaches and spins), since nothing else fails it while the hub keeps living. only_kernel_runs=True
+# so a kernel-less in-process run — which belongs to THIS live hub (or another live instance) — is
+# never reaped mid-flight; only its dead-kernel runs are. Idempotent DB writes → safe on every instance.
+def _reaper_loop() -> None:
+    while True:
+        time.sleep(metadb.KERNEL_STALE_S)
+        try:
+            metadb.reap_kernels()
+            metadb.reap_orphaned_runs(only_kernel_runs=True)
+        except Exception:  # noqa: BLE001 — a transient DB hiccup must not kill the reaper
+            pass
+
+
+threading.Thread(target=_reaper_loop, daemon=True, name="dp-reaper").start()
 
 
 def _cross_site_ws(ws: WebSocket) -> bool:

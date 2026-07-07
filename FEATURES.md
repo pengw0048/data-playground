@@ -2,7 +2,7 @@
 
 _验收清单，按架构层次组织：**层 → 组件 → 角色**（接口 / 实现 / 选择判断 / 生命周期 / UI / 安全 / 持久化…）。每个叶子由 `file:line` 佐证。图例：✅ 已实现 · 🟡 部分实现（见备注） · ⬜ 未实现（脚手架 / 规划中 / 有意省略）。跨层复用的组件只写一处，别处用 `↗ 见 §X` 交叉引用（交叉引用行不带状态图标、不计数）。_
 
-_最后更新：2026-07-07。**155 项功能**（含验收批次：chart 节点、按名字解析 source、目录缺失检测/注销、DuckDB 沙箱、admin 角色、弱密钥拒绝、跨站 WS 门、启动护栏；Jupyter 式 per-canvas 执行 kernel——**现为默认执行模型**：run/preview/profile 全走 kernel、扛住 hub 重启 + 重连、预览热缓存；`kernel/` 包已改名 `hub/`；跨机底座可插拔（`KernelSpawner` SPI + 参考 PodSpawner，`DP_KERNEL_SPAWNER=pod`）；以及编辑器体验批次：每画布 pip 依赖、编辑器内联运行结果、面板全屏、Monaco 列名补全喂输入 schema；以及上传数据集：拖到画布/节点/Tables 上传 → 落进共享存储 + 注册进跨实例目录）—— ✅ 141 · 🟡 14 · ⬜ 2。_
+_最后更新：2026-07-07。**157 项功能**（含验收批次：chart 节点、按名字解析 source、目录缺失检测/注销、DuckDB 沙箱、admin 角色、弱密钥拒绝、跨站 WS 门、启动护栏；Jupyter 式 per-canvas 执行 kernel——**现为默认执行模型**：run/preview/profile 全走 kernel、扛住 hub 重启 + 重连、预览热缓存；`kernel/` 包已改名 `hub/`；跨机底座可插拔（`KernelSpawner` SPI + 参考 PodSpawner，`DP_KERNEL_SPAWNER=pod`）；以及编辑器体验批次：每画布 pip 依赖、编辑器内联运行结果、面板全屏、Monaco 列名补全喂输入 schema；以及上传数据集：拖到画布/节点/Tables 上传 → 落进共享存储 + 注册进跨实例目录）—— ✅ 141 · 🟡 14 · ⬜ 2。_
 
 **层次总览**
 

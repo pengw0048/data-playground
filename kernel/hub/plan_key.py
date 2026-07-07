@@ -21,8 +21,13 @@ def plan_hash(graph: Graph, target: str | None, resolve_adapter) -> str:
     parts: list[str] = []
 
     def _fold(n, prefix=""):
-        cfg = n.data.get("config", {}) if isinstance(n.data, dict) else {}
-        parts.append(f"{prefix}{n.id}:{n.type}:{json.dumps(cfg, sort_keys=True, default=str)}")
+        data = n.data if isinstance(n.data, dict) else {}
+        cfg = data.get("config", {})
+        # bypassed/disabled are SIBLINGS of config on data, and the engine changes the lowered relation
+        # based on them (engine.py reads node.data.bypassed / .disabled) — so they must be in the key,
+        # else toggling bypass/disable serves a stale cached preview/result.
+        flags = f"b{int(bool(data.get('bypassed')))}d{int(bool(data.get('disabled')))}"
+        parts.append(f"{prefix}{n.id}:{n.type}:{flags}:{json.dumps(cfg, sort_keys=True, default=str)}")
         if n.type == "source":
             uri = cfg.get("uri") or cfg.get("table")
             if uri:

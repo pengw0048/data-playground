@@ -137,6 +137,25 @@ def test_warm_relation_cache_reuses_and_invalidates():
     assert all(row["dbl"] == row["amount"] * 2 for row in r3.rows)
 
 
+def test_relation_cache_no_deadlock_and_eviction_safe():
+    # regressions: (a) put() of an already-cached key must NOT self-deadlock (it re-entered a non-reentrant
+    # lock via get()); (b) a relation handed out by get()/put() must survive a concurrent LRU eviction of
+    # its backing table — it is materialized into an independent Arrow-backed relation, not a lazy view.
+    from hub import db
+    from hub.relation_cache import RelationCache
+    c = RelationCache(cap_rows=100, max_entries=2)  # tiny LRU → easy to force eviction
+    with db.lock():
+        con = db.conn()
+        con.execute("CREATE OR REPLACE VIEW _rc_test_src AS SELECT * FROM range(5) t(v)")
+        assert c.put("kA", "_rc_test_src") is not None
+        assert c.put("kA", "_rc_test_src") is not None   # repeat same key — must NOT deadlock
+        held = c.get("kA")                                # a hit → an independent relation
+        assert held is not None and held.aggregate("count(*) AS n").fetchone()[0] == 5
+        con.execute("CREATE OR REPLACE VIEW _rc_test_src2 AS SELECT * FROM range(3) t(v)")
+        c.put("kB", "_rc_test_src2"); c.put("kC", "_rc_test_src2")  # evicts kA (max_entries=2) + drops its table
+        assert held.aggregate("count(*) AS n").fetchone()[0] == 5   # still scannable — arrow-backed
+
+
 def test_aggregate_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("images")}),
@@ -1410,6 +1429,20 @@ def test_reaper_fails_kernelless_orphan_but_spares_live_kernel_run():
     metadb.drop_kernel("cv_live", "k_live_1")
 
 
+def test_periodic_reaper_spares_kernelless_run_but_fails_dead_kernel_run():
+    # the PERIODIC reaper (only_kernel_runs=True) runs WHILE the hub lives — so unlike boot it must NOT
+    # touch a kernel-less in-process run (that belongs to this live hub), yet it must still fail a run
+    # whose owning kernel is gone (kernel crashed / restarted mid-run) — else that run spins 'running'
+    # forever and the client reattaches to a ghost. This is the fix for the boot-only-reaper bug.
+    from hub import metadb
+    metadb.save_run_state("run_local_live", {"run_id": "run_local_live", "status": "running", "per_node": []})
+    metadb.save_run_state("run_dead_kernel", {"run_id": "run_dead_kernel", "status": "running", "per_node": []},
+                          canvas_id="cv_dead", kernel_id="k_gone")  # no lease for k_gone → its kernel is gone
+    metadb.reap_orphaned_runs(only_kernel_runs=True)
+    assert metadb.get_run_state("run_local_live")["status"] == "running"   # spared: a live hub owns it
+    assert metadb.get_run_state("run_dead_kernel")["status"] == "failed"   # dead kernel → reaped
+
+
 def test_kernel_lease_is_single_spawner_and_fenced():
     # the split-brain invariant: for one canvas, exactly one claimer wins; a fenced-out (replaced)
     # kernel can neither heartbeat nor drop the new owner's lease.
@@ -1913,6 +1946,27 @@ def test_plan_hash_includes_section_children():
 
     assert r._plan_hash(graph_with("amount > 0"), "wr") != r._plan_hash(graph_with("amount > 999"), "wr")
     assert r._plan_hash(graph_with("amount > 0"), "wr") == r._plan_hash(graph_with("amount > 0"), "wr")
+
+
+def test_plan_hash_includes_bypass_and_disable_flags():
+    # regression: bypassed/disabled live on data (siblings of config) and the engine lowers the relation
+    # from them, but the plan hash folded only data.config — so toggling bypass served a STALE cached
+    # preview/result. The hash must change when either flag flips.
+    from hub.models import Graph
+    r = get_deps().runner
+
+    def graph_with(flags):
+        return Graph(**{"id": "c", "version": 1, "nodes": [
+            N("src", "source", {"uri": _uri("events")}),
+            {"id": "f", "type": "filter", "position": {"x": 0, "y": 0},
+             "data": {"title": "f", "config": {"predicate": "amount > 0"}, **flags}},
+            N("wr", "write", {"name": "o"}),
+        ], "edges": [E("src", "f"), E("f", "wr")]})
+
+    base = r._plan_hash(graph_with({}), "wr")
+    assert base != r._plan_hash(graph_with({"bypassed": True}), "wr")   # bypass changes the lowered plan
+    assert base != r._plan_hash(graph_with({"disabled": True}), "wr")   # disable too
+    assert base == r._plan_hash(graph_with({"bypassed": False}), "wr")  # explicit False == absent
 
 
 def test_completed_run_result_is_db_cached(tmp_path):
