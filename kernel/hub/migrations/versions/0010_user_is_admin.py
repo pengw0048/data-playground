@@ -18,7 +18,8 @@ depends_on = None
 
 def upgrade() -> None:
     op.add_column("users", sa.Column("is_admin", sa.Boolean(), server_default=sa.false(), nullable=False))
-    op.execute("UPDATE users SET is_admin = 1 WHERE id = 'local'")  # the bootstrap user is the admin
+    # `= true`, not `= 1`: Postgres rejects an integer for a BOOLEAN column (SQLite is lax and took 1).
+    op.execute("UPDATE users SET is_admin = true WHERE id = 'local'")  # the bootstrap user is the admin
 
 
 def downgrade() -> None:

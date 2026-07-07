@@ -20,7 +20,15 @@ COPY kernel/ ./kernel/
 # hub/_web at build time (so the served SPA matches the packaged kernel)
 COPY --from=web /web/dist ./web/dist
 WORKDIR /app/kernel
-RUN uv sync --extra postgres     # builds the package (force-includes ../web/dist) + runtime deps + psycopg
+RUN uv sync --extra pod --extra postgres  # builds the package (force-includes ../web/dist) + runtime deps + psycopg + k8s client
+
+# Put the uv venv on PATH so a bare `python` / `dataplay` resolves to it. REQUIRED for the pod kernel
+# substrate: PodSpawner launches a kernel pod with `python -m hub.kernel …`, and without this that bare
+# `python` is the system interpreter, which can't import `hub` (it lives in /app/kernel/.venv).
+ENV PATH="/app/kernel/.venv/bin:$PATH"
+# Unbuffered stdout/stderr so a container's (and a kernel pod's) logs stream live to `kubectl logs`
+# instead of sitting in Python's block buffer until the process exits.
+ENV PYTHONUNBUFFERED=1
 
 ENV DP_WORKSPACE=/data
 # The single-image build binds 0.0.0.0 in OPEN mode (no auth), which the CLI otherwise refuses. This

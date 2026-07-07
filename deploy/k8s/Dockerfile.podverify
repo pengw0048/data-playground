@@ -1,0 +1,8 @@
+# Verification-only image: the base app image + the sample datasets baked in read-only, so the hub pod
+# AND every spawned kernel pod see the SAME seed data at the same path (a local single-node stand-in for
+# the "data on shared storage" contract — real deployments point DP_STORAGE_URL at object storage
+# instead of baking data). Used by deploy/verify-pod-substrate.sh only; NOT the production image.
+FROM dataplay:local
+# `python` resolves to the venv (PATH set in the base image); seed_if_empty writes events/images/movies
+# into the default data dir so the catalog auto-discovers them in every pod.
+RUN python -c "from hub.seed import seed_if_empty; seed_if_empty('/app/kernel/data')"

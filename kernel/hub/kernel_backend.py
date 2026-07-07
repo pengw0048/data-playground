@@ -22,7 +22,10 @@ import urllib.request
 from hub import metadb
 from hub.models import CompilePlan, Graph, RunEstimate, RunStatus
 
-KERNEL_START_TIMEOUT_S = 30.0
+# How long to wait for a freshly-spawned kernel to mark its lease ready. A local process is up in a
+# second or two, but a POD cold-start (schedule + image + heavy imports: duckdb/polars/pyarrow) can take
+# far longer — so it's configurable (DP_KERNEL_READY_TIMEOUT_S). The pod deployment sets it higher.
+KERNEL_START_TIMEOUT_S = float(os.environ.get("DP_KERNEL_READY_TIMEOUT_S", "30"))
 
 
 def _free_port() -> int:
@@ -34,15 +37,23 @@ def _free_port() -> int:
         s.close()
 
 
-def _post(endpoint: str, path: str, token: str, body: dict, timeout: float = 60.0) -> dict:
+def _post(endpoint: str, path: str, token: str, body: dict, timeout: float = 60.0, connect_retries: int = 20) -> dict:
     req = urllib.request.Request(
         f"http://{endpoint}{path}", data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", "X-DP-Kernel-Token": token}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:  # surface the kernel's error body, don't swallow it as a bare code
-        raise RuntimeError(f"kernel {path} → {e.code}: {e.read().decode(errors='replace')[:400]}") from e
+    for attempt in range(connect_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:  # a real HTTP response from the kernel — surface it, don't retry
+            raise RuntimeError(f"kernel {path} → {e.code}: {e.read().decode(errors='replace')[:400]}") from e
+        except (urllib.error.URLError, OSError):
+            # connection-level failure. On a POD substrate the kernel marks its lease ready as soon as it's
+            # serving, but k8s only routes the Service to the pod once its readiness probe passes — so the
+            # first POST can be refused for a beat. Retry briefly; raise only if it never becomes reachable.
+            if attempt >= connect_retries:
+                raise
+            time.sleep(0.5)
 
 
 class LocalProcessSpawner:
@@ -142,7 +153,7 @@ class KernelBackend:
         k = metadb.kernel_for_run(run_id)
         if k and k["endpoint"]:
             try:
-                return RunStatus(**_post(k["endpoint"], "/cancel", k["token"], {"run_id": run_id}, timeout=15.0))
+                return RunStatus(**_post(k["endpoint"], "/cancel", k["token"], {"run_id": run_id}, timeout=15.0, connect_retries=0))
             except (urllib.error.URLError, OSError, RuntimeError):
                 pass  # kernel unreachable, OR it doesn't own this run (_post raises RuntimeError on an
                       # HTTP error after a cross-kernel handoff) → fall through to the last-known DB status

@@ -1,0 +1,102 @@
+# Reference deployment of the per-canvas kernel POD substrate (DP_KERNEL_SPAWNER=pod).
+#
+# The hub runs in-cluster; when a canvas runs, PodSpawner creates a Pod + Service per canvas that runs
+# `python -m hub.kernel`, connects to the SHARED Postgres, marks its lease ready, and the hub reaches it
+# at the Service DNS. This is the manifest set exercised by deploy/verify-pod-substrate.sh on a local
+# kind cluster. Adapt (real image registry, object storage for data, resource limits, NetworkPolicy)
+# before any real use — it is a reference, not a production chart.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dp
+---
+# --- shared metadata DB (the hub AND every kernel pod write run_states / the lease / the catalog here) ---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: postgres, namespace: dp }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER, value: dp }
+            - { name: POSTGRES_PASSWORD, value: dp }
+            - { name: POSTGRES_DB, value: dp }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [{ containerPort: 5432 }]
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "dp"] }
+            initialDelaySeconds: 3
+            periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres, namespace: dp }
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+# --- RBAC: the hub's ServiceAccount may create/delete the per-canvas kernel Pods + Services ---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: dp-hub, namespace: dp }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: dp-kernel-spawner, namespace: dp }
+rules:
+  - apiGroups: [""]
+    resources: [pods, services]
+    verbs: [get, list, watch, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: dp-hub-spawner, namespace: dp }
+subjects:
+  - { kind: ServiceAccount, name: dp-hub, namespace: dp }
+roleRef: { kind: Role, name: dp-kernel-spawner, apiGroup: rbac.authorization.k8s.io }
+---
+# --- the hub (stateless web + API); runs the kernel substrate as pods ---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: dp-hub, namespace: dp }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: dp-hub } }
+  template:
+    metadata: { labels: { app: dp-hub } }
+    spec:
+      serviceAccountName: dp-hub
+      containers:
+        - name: hub
+          image: dataplay:podverify # kind-loaded; also DP_KERNEL_IMAGE below (same image runs the kernel)
+          imagePullPolicy: IfNotPresent
+          # point data-dir at the seed baked into the image (a non-volume path); the default
+          # <workspace>/data would be the empty /data emptyDir, which also masks any baked files there.
+          command: ["dataplay", "--host", "0.0.0.0", "--port", "8471", "--no-open", "--workspace", "/data", "--data-dir", "/app/kernel/data"]
+          env:
+            - { name: DP_DATABASE_URL, value: "postgresql+psycopg://dp:dp@postgres:5432/dp" }
+            - { name: DP_KERNEL_SPAWNER, value: "pod" } # PodSpawner instead of a local process
+            - { name: DP_KERNEL_IMAGE, value: "dataplay:podverify" } # image each kernel pod runs
+            - { name: DP_KERNEL_NAMESPACE, value: "dp" } # where kernel pods/services are created
+            - { name: DP_KERNEL_READY_TIMEOUT_S, value: "180" } # pod cold-start (schedule+imports) > 30s
+            - { name: DP_ALLOW_INSECURE_BIND, value: "1" } # single-user/open mode for the demo
+            - { name: DP_WORKSPACE, value: "/data" }
+          ports: [{ containerPort: 8471 }]
+          readinessProbe:
+            httpGet: { path: /api/health, port: 8471 }
+            initialDelaySeconds: 5
+            periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata: { name: dp-hub, namespace: dp }
+spec:
+  selector: { app: dp-hub }
+  ports: [{ port: 8471, targetPort: 8471 }]
