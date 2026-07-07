@@ -44,6 +44,7 @@ def _reject_invalid(graph, deps) -> None:
 @router.post("/graph/compile", response_model=CompilePlan)
 def compile_graph(req: CompileRequest) -> CompilePlan:
     deps = get_deps()
+    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     errs = graph_mod.type_errors(req.graph, deps.node_specs)
     if errs:
         return CompilePlan(target_node_id=req.target_node_id, steps=[], acyclic=True,
@@ -54,6 +55,7 @@ def compile_graph(req: CompileRequest) -> CompilePlan:
 @router.post("/run/preview", response_model=SampleResult)
 def run_preview(req: PreviewRequest) -> SampleResult:
     deps = get_deps()
+    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     k = req.k if req.k is not None else settings.preview_k
     return preview_node(req.graph, req.node_id, k,
                         deps.resolve_adapter, deps.registry, deps.node_lowerings, deps.node_specs,
@@ -64,6 +66,7 @@ def run_preview(req: PreviewRequest) -> SampleResult:
 def graph_schema(req: CompileRequest) -> dict:
     """Per-node output columns (metadata-only) for editor column suggestions — see executors/schema."""
     deps = get_deps()
+    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     return schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
                             deps.node_lowerings, deps.node_specs)
 
@@ -196,6 +199,7 @@ def _cached_noop(runner, graph, target) -> bool:
 @router.post("/run/estimate", response_model=RunEstimate)
 def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunEstimate:
     deps = get_deps()
+    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps)
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs)
     if not plan.acyclic:
@@ -211,6 +215,7 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
 @router.post("/run", response_model=RunStatus)
 def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
     deps = get_deps()
+    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps)
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs)
     if not plan.acyclic:

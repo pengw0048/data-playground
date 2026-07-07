@@ -60,6 +60,10 @@ def main() -> None:
     # Emit logs by default (was silent at 'warning') so a failing/dying server leaves a trace —
     # startup, requests, and tracebacks. Level is DP_LOG_LEVEL (info default; debug/warning/error).
     level = os.environ.get("DP_LOG_LEVEL", "info").lower()
+    if level == "warn":
+        level = "warning"  # Python logging accepts 'warn'; uvicorn does not
+    if level not in ("critical", "error", "warning", "info", "debug", "trace"):
+        level = "info"  # unknown value → don't crash uvicorn.run(log_level=...)
     logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     url = f"http://{args.host}:{args.port}"

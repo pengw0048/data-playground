@@ -16,6 +16,19 @@ def node_map(graph: Graph) -> dict[str, GraphNode]:
     return {n.id: n for n in graph.nodes}
 
 
+def resolve_source_refs(graph: Graph, resolve) -> None:
+    """Rewrite each `source` node's uri IN PLACE via `resolve` (a name/id → uri function, e.g.
+    catalog.resolve_ref) so a source can name a catalog table instead of only a path/uri. A no-op for
+    real paths/uris and unknown tokens. Called at the graph-consuming API entry points, so the engine,
+    compiler, and estimator all see resolved uris; the persisted canvas doc is untouched."""
+    for n in graph.nodes:
+        if n.type != "source" or not isinstance(n.data, dict):
+            continue
+        cfg = n.data.get("config")
+        if isinstance(cfg, dict) and (cfg.get("uri") or cfg.get("table")):
+            cfg["uri"] = resolve(cfg.get("uri") or cfg.get("table"))
+
+
 def incoming(graph: Graph, node_id: str) -> list[GraphEdge]:
     return [e for e in graph.edges if e.target == node_id]
 

@@ -2242,7 +2242,18 @@ def test_chart_node_produces_series():
     assert {r["x"] for r in bar["rows"]} == {"view", "click", "purchase", "signup"}  # one point per distinct event
     scatter = chart({"chartType": "scatter", "x": "user_id", "y": "amount", "agg": "none"})
     assert {c["name"] for c in scatter["columns"]} == {"x", "y"} and scatter["rows"]
-    assert chart({"chartType": "bar", "agg": "count"}).get("notPreviewable")  # no X → honest refusal
+    assert chart({"chartType": "bar", "agg": "count"}).get("notPreviewable")       # no X → honest refusal
+    assert chart({"chartType": "bar", "x": "event", "agg": "sum"}).get("notPreviewable")  # sum needs a Y (not silent count)
+    minmax = chart({"chartType": "bar", "x": "event", "y": "event", "agg": "max"})  # max of a TEXT column
+    assert not minmax.get("error"), minmax  # TRY_CAST → NULL y (dropped), not a raw ConversionException
+
+
+def test_source_node_accepts_catalog_name():
+    # F50: a source node can name a catalog table (by name OR id) instead of the full path/uri.
+    for ref in ("events", "tbl_events"):
+        g = {"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ref})], "edges": []}
+        r = client.post("/api/run/preview", json={"graph": g, "nodeId": "s", "k": 3}).json()
+        assert not r.get("error") and not r.get("notPreviewable") and r["rows"], (ref, r)
 
 
 def test_library_transform_falls_back_to_kept_code():

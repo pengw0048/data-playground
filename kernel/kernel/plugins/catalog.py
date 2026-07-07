@@ -114,9 +114,11 @@ class InMemoryCatalog:
         declared = (dmap if dmap is not None else self._declared_keys()).get(t.uri)
         inferred = [k for k in key_candidates(t.columns) if list(k.columns) != list(declared or [])]
         keys = ([KeyInfo(columns=list(declared), confidence="declared")] if declared else []) + inferred
-        # flag a local-path dataset whose file no longer exists (e.g. `make clean` / a deleted temp),
+        # flag a LOCAL-path dataset whose file no longer exists (e.g. `make clean` / a deleted temp),
         # so the UI can grey it out + offer removal instead of surfacing a raw IOException on click.
-        missing = not is_object_uri(t.uri) and not os.path.exists(path_of(t.uri))
+        # Skip object-store (s3/gs) and mem:// datasets — neither is an on-disk path.
+        local = not is_object_uri(t.uri) and not t.uri.startswith("mem://")
+        missing = local and not os.path.exists(path_of(t.uri))
         if keys == t.keys and missing == t.missing:
             return t
         return t.model_copy(update={"keys": keys, "missing": missing})
@@ -201,6 +203,17 @@ class InMemoryCatalog:
             self._add_edge(parent, uri, pipeline)
         return table
 
+    def resolve_ref(self, ref: str) -> str:
+        """Resolve a source reference to a dataset URI: a real path or scheme'd uri passes through
+        unchanged; a bare catalog table NAME or ID resolves to its uri — so an API/agent client can
+        point a `source` node at 'events' or 'tbl_events' instead of the full path (F50)."""
+        if not ref or "://" in ref or "/" in ref or "\\" in ref:
+            return ref  # already a path / object-store uri
+        try:
+            return self.get_table(ref).uri
+        except KeyError:
+            return ref  # unknown token → leave it (the normal "cannot read" error will surface)
+
     def unregister(self, id_or_name: str) -> bool:
         """Remove a dataset from the catalog (in-memory + the shared per-row store) — for pruning a
         dead entry whose backing file is gone. Returns False if not found. Declared keys/relationships
@@ -214,10 +227,12 @@ class InMemoryCatalog:
                 return False
             self.tables.pop(tid, None)
             self._by_uri.pop(t.uri, None)
-        try:
-            metadb.catalog_delete_entry(t.uri)
-        except Exception:  # noqa: BLE001
-            pass
+            # delete the DB row INSIDE the lock: doing it after releasing let a concurrent
+            # _load_from_db re-add the just-removed row (the delete wouldn't stick).
+            try:
+                metadb.catalog_delete_entry(t.uri)
+            except Exception:  # noqa: BLE001
+                pass
         return True
 
     # -- declared keys & relationships (owner-asserted; per-ROW in the shared DB, cross-instance) --- #

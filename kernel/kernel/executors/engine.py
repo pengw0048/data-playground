@@ -295,11 +295,13 @@ class LoweringEngine:
             return db.conn().sql(f"SELECT '{_sql_str(title)}' AS metric, ({expr})::DOUBLE AS value FROM {v}")
 
         if t == "chart":
-            x, y, agg = cfg.get("x"), cfg.get("y"), cfg.get("agg", "none")
+            x, y, agg = cfg.get("x"), cfg.get("y"), cfg.get("agg", "count")  # default matches nodespec/UI
             if not x:
                 raise NotPreviewable(node, "pick an X column to chart")
             if agg == "none" and not y:
                 raise NotPreviewable(node, "pick a Y column (or an aggregation) to chart")
+            if agg not in ("none", "count") and not y:  # sum/mean/min/max need a Y (don't silently count)
+                raise NotPreviewable(node, f"pick a Y column to {agg}")
             base = parent
             if agg != "none" and not self.full:
                 # a grouped chart aggregates over ALL rows — compute over the full input even in
@@ -316,8 +318,10 @@ class LoweringEngine:
             if agg == "none":  # raw points (scatter/line) — the chart series is x,y as-is
                 return db.conn().sql(f'SELECT {xq} AS x, "{_ident(y)}" AS y FROM {v}')
             yexpr = "count(*)" if agg == "count" or not y else f'{_agg_name(agg)}("{_ident(y)}")'
-            # grouped series (bar/line): one point per distinct x, capped so a huge-cardinality x can't blow up the chart
-            return db.conn().sql(f"SELECT {xq} AS x, ({yexpr})::DOUBLE AS y FROM {v} GROUP BY {xq} ORDER BY {xq} LIMIT 2000")
+            # grouped series (bar/line): one point per distinct x, capped so a huge-cardinality x can't
+            # blow up the chart. TRY_CAST (not ::DOUBLE) so a non-numeric/temporal min/max degrades to
+            # NULL (dropped by the renderer) instead of a raw ConversionException.
+            return db.conn().sql(f"SELECT {xq} AS x, TRY_CAST(({yexpr}) AS DOUBLE) AS y FROM {v} GROUP BY {xq} ORDER BY {xq} LIMIT 2000")
 
         if t == "vector-search":
             return self._vector_search(node, inputs)

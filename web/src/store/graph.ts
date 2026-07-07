@@ -583,7 +583,10 @@ export const useStore = create<Store>((set, get) => ({
     try {
       // A preview is a bounded peek (a page of rows), NOT a full materialized run — we deliberately
       // do NOT flip status to 'latest' (that green state means a real run). Paginated via `offset`.
-      const result = await api.preview(get().doc, id, 50, offset)
+      // A chart renders its whole series at once, so fetch up to the backend's grouped cap (2000)
+      // instead of a 50-row page (which silently truncated bar/scatter to the first 50 points).
+      const k = get().doc.nodes.find((n) => n.id === id)?.type === 'chart' ? 2000 : 50
+      const result = await api.preview(get().doc, id, k, offset)
       set((s) => ({ previews: { ...s.previews, [id]: { result, offset } } }))
     } catch (e) {
       set((s) => ({ previews: { ...s.previews, [id]: { error: (e as Error).message, offset } } }))
