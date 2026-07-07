@@ -62,8 +62,11 @@ def main() -> None:
     from hub.deps import set_workspace
     from hub.models import Graph
 
+    from hub.relation_cache import RelationCache
+
     canvas, kid, token = args.canvas, args.kernel_id, args.token
     deps = set_workspace(args.workspace, args.data_dir)
+    warm = RelationCache()  # per-kernel warm cache of preview intermediate relations (dropped on restart)
     # single-writer: the kernel persists run_states stamped with OUR kernel_id (so the boot-time reaper
     # spares this run while we're alive). on_complete (run history) stays wired — we're long-lived, so
     # its daemon-thread commit isn't racing a process exit the way the one-shot subprocess child was.
@@ -112,7 +115,7 @@ def main() -> None:
         last_activity[0] = time.monotonic()
         from hub.executors.preview import preview_node
         return preview_node(Graph(**body.graph), body.node_id, body.k, deps.resolve_adapter,
-                            deps.registry, deps.node_builders, deps.node_specs, offset=body.offset).model_dump()
+                            deps.registry, deps.node_builders, deps.node_specs, offset=body.offset, cache=warm).model_dump()
 
     @app.post("/profile")
     def profile(body: PreviewBody, x_dp_kernel_token: str = Header(None)):
@@ -120,7 +123,7 @@ def main() -> None:
         last_activity[0] = time.monotonic()
         from hub.executors.profile import profile_node
         return profile_node(Graph(**body.graph), body.node_id, deps.resolve_adapter,
-                            deps.registry, deps.node_builders, deps.node_specs).model_dump()
+                            deps.registry, deps.node_builders, deps.node_specs, cache=warm).model_dump()
 
     @app.post("/cancel")
     def cancel(body: dict, x_dp_kernel_token: str = Header(None)):

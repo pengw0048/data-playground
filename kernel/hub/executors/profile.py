@@ -50,7 +50,7 @@ def _stat(arr: pa.ChunkedArray, n: int, t: pa.DataType) -> dict:
 
 
 def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
-                 node_builders=None, node_specs=None) -> ProfileResult:
+                 node_builders=None, node_specs=None, cache=None) -> ProfileResult:
     if not g.is_acyclic(graph):
         return ProfileResult(error=True, reason="graph has a cycle — control flow must be encapsulated")
     if node_specs:
@@ -59,7 +59,8 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
             return ProfileResult(error=True, reason="incompatible connection: " + "; ".join(errs[:3]))
 
     engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
-                         node_builders=node_builders, node_specs=node_specs)
+                         node_builders=node_builders, node_specs=node_specs,
+                         warm=cache, warm_scope="preview")
     holder: dict = {}
 
     def work() -> ProfileResult:

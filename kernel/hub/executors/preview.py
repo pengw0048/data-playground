@@ -17,7 +17,7 @@ PREVIEW_BUDGET_S = 8.0
 
 
 def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
-                 node_builders=None, node_specs=None, offset: int = 0) -> SampleResult:
+                 node_builders=None, node_specs=None, offset: int = 0, cache=None) -> SampleResult:
     # clean, up-front graph checks (don't rely on a Python RecursionError for cycles)
     if not g.is_acyclic(graph):
         return SampleResult(error=True, reason="graph has a cycle — control flow must be encapsulated (§5.7)")
@@ -27,7 +27,8 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
             return SampleResult(error=True, reason="incompatible connection: " + "; ".join(errs[:3]))
 
     engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
-                            node_builders=node_builders, node_specs=node_specs)
+                            node_builders=node_builders, node_specs=node_specs,
+                            warm=cache, warm_scope="preview")  # kernel's warm relation cache (None in-hub)
 
     holder: dict = {}  # published by the worker thread so the timeout can interrupt its cursor
 

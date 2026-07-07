@@ -76,71 +76,14 @@ class LocalRunner:
         return RunEstimate(rows=rows, placement=placement, needs_confirm=rows >= _CONFIRM_ROWS,
                            breakdown=f"{rows:,} rows · {len(plan.steps)} steps · out-of-core")
 
-    # -- plan hash (content addressing) ------------------------------------ #
+    # -- plan hash (content addressing) — shared logic in hub.plan_key ------ #
     def _plan_hash(self, graph: Graph, target: str | None) -> str:
-        from hub.section import _descendants  # section's parent_id-contained nodes
-        chain = g.upstream_chain(graph, target) if target else g.topo_order(graph)
-
-        def _fold(n, prefix=""):
-            cfg = n.data.get("config", {}) if isinstance(n.data, dict) else {}
-            parts.append(f"{prefix}{n.id}:{n.type}:{json.dumps(cfg, sort_keys=True, default=str)}")
-            if n.type == "source":
-                uri = cfg.get("uri") or cfg.get("table")
-                if uri:
-                    try:
-                        parts.append(f"{prefix}fp:{self.resolve_adapter(uri).fingerprint(uri)}")
-                    except Exception:  # noqa: BLE001
-                        pass
-            # a section's behavior lives on its CONTAINED nodes (parent_id), not on the section's
-            # own config or the upstream chain — fold them in (recursively) or editing a contained
-            # filter/transform silently reuses the stale result. Sorted for a stable key.
-            if n.type == "section":
-                for c in sorted(_descendants(graph, n.id), key=lambda x: x.id):
-                    _fold(c, prefix=f"sub[{n.id}]:")
-
-        parts: list[str] = []
-        for n in chain:
-            _fold(n)
-        # edges + their handles are part of the plan: re-routing an edge to a different output port
-        # (same node configs) must invalidate the cache, else it returns the old port's result.
-        ids = {n.id for n in chain}
-        parts += sorted(f"e:{e.source}:{e.source_handle}:{e.target}:{e.target_handle}"
-                        for e in graph.edges if e.source in ids and e.target in ids)
-        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+        from hub.plan_key import plan_hash
+        return plan_hash(graph, target, self.resolve_adapter)
 
     def _plan_cacheable(self, graph: Graph, target: str | None) -> bool:
-        """Whether this plan's result may be reused from the DURABLE store. Conservative on purpose —
-        the store is persistent + shared, so a stale hit is permanent, fleet-wide wrong data; a miss
-        just recomputes. Non-cacheable when the plan's identity ISN'T fully captured by the content key:
-
-        - an explicit opt-out (config.cacheable is False) — e.g. a non-deterministic / GPU transform;
-        - an object-store or mem:// source — its fingerprint is URI-only, so an in-place overwrite
-          wouldn't change the key (a same-path daily refresh would serve the OLD result); [TODO: fold
-          an etag/size/mtime content fingerprint and re-enable reuse for immutable object data];
-        - a library transform or a plugin node kind — the processor/plugin CODE isn't in the key, so a
-          re-promote / plugin upgrade under the same id wouldn't invalidate it;
-        - an append write — not idempotent (must add a part every run); reuse would drop the append.
-        """
-        from hub.plugins.adapters import is_object_uri
-        from hub.section import _descendants
-        chain = list(g.upstream_chain(graph, target) if target else g.topo_order(graph))
-        nodes = list(chain)
-        for n in chain:
-            if n.type == "section":
-                nodes += _descendants(graph, n.id)
-        for n in nodes:
-            cfg = n.data.get("config", {}) if isinstance(n.data, dict) else {}
-            if cfg.get("cacheable") is False:
-                return False
-            if n.type == "source":
-                uri = str(cfg.get("uri") or cfg.get("table") or "")
-                if uri.startswith("mem://") or is_object_uri(uri):
-                    return False  # URI-only fingerprint → an in-place overwrite wouldn't invalidate
-            if n.type == "write" and cfg.get("writeMode") == "append":
-                return False  # append is not idempotent — never reuse (also keeps the confirm gate honest)
-            if cfg.get("source") == "library" or n.type in self.node_builders:
-                return False  # processor / plugin CODE isn't in the key → a same-id upgrade would go stale
-        return True
+        from hub.plan_key import plan_cacheable
+        return plan_cacheable(graph, target, self.node_builders)
 
     def _cache_get(self, key: str) -> dict | None:
         if self.result_get:  # DB-backed shared/persistent store (Deps-wired)

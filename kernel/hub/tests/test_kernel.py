@@ -109,6 +109,34 @@ def test_profile_over_transform_upstream_of_faithful_op_is_honest():
     assert r["notPreviewable"] is True
 
 
+def test_warm_relation_cache_reuses_and_invalidates():
+    # Phase 2 step 2: the kernel's warm preview cache must (a) return identical data on a repeat
+    # preview (a hit doesn't corrupt), and CRITICALLY (b) invalidate on an edit — a changed plan_hash
+    # must never serve the stale cached relation (the #1 hazard of caching intermediates).
+    from hub.deps import get_deps
+    from hub.executors.preview import preview_node
+    from hub.models import Graph
+    from hub.relation_cache import RelationCache
+    d = get_deps()
+    cache = RelationCache()
+
+    def prev(sel):
+        gr = Graph(**{"id": "cvW", "version": 1, "nodes": [
+            N("src", "source", {"uri": _uri("events")}),
+            N("sel", "select", {"select": sel}),
+        ], "edges": [E("src", "sel")]})
+        return preview_node(gr, "sel", 10, d.resolve_adapter, d.registry, d.node_builders, d.node_specs, cache=cache)
+
+    r1 = prev("user_id, amount")
+    r2 = prev("user_id, amount")                     # same plan → cache HIT
+    assert not r1.error and not r2.error
+    assert [c.name for c in r1.columns] == ["user_id", "amount"]
+    assert r1.rows == r2.rows                        # a hit returns the identical materialized data
+    r3 = prev("user_id, amount, amount * 2 AS dbl")  # edited select → new plan_hash → must NOT be stale
+    assert [c.name for c in r3.columns] == ["user_id", "amount", "dbl"]
+    assert all(row["dbl"] == row["amount"] * 2 for row in r3.rows)
+
+
 def test_aggregate_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("images")}),

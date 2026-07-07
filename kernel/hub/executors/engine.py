@@ -50,7 +50,7 @@ class BuildEngine:
     def __init__(self, graph: Graph, resolve_adapter, registry, sample_k: int | None = None,
                  full: bool = False, node_builders: dict | None = None, node_specs: dict | None = None,
                  bound_inputs: dict | None = None, spill_files: list | None = None,
-                 schema_only: bool = False):
+                 schema_only: bool = False, warm=None, warm_scope: str = ""):
         self.graph = graph
         self.resolve_adapter = resolve_adapter
         self.registry = registry
@@ -68,6 +68,10 @@ class BuildEngine:
         # runner deletes them in its finally so they don't accumulate across the kernel's lifetime.
         # Shared with sub-engines (sections) so a contained transform's spill is GC'd too.
         self.spill_files = spill_files if spill_files is not None else []
+        # warm: an optional cross-build RelationCache (the kernel's, preview scope) — reuses unchanged
+        # upstream node relations across previews. warm_scope isolates preview vs run keys.
+        self.warm = warm
+        self.warm_scope = warm_scope
         # a node builds either one Relation (single output) or a dict of named output ports
         # (multi-output — e.g. a section that emit()s several named result sets)
         self._cache: dict[str, "Relation | dict[str, Relation]"] = {}
@@ -75,8 +79,29 @@ class BuildEngine:
     # -- public ------------------------------------------------------------ #
     def relation(self, node_id: str, handle: str | None = None) -> Relation:
         if node_id not in self._cache:
-            self._cache[node_id] = self._lower(g.node_map(self.graph)[node_id])
+            self._cache[node_id] = self._warm_or_lower(node_id)
         return self._pick(node_id, self._cache[node_id], handle)
+
+    def _warm_or_lower(self, node_id: str):
+        """Build a node — reusing the warm cache when set. A hit skips the whole upstream subgraph; a
+        cacheable miss is materialized (row-capped) for the next preview. Keyed by the shared plan_hash
+        so any edit invalidates it; only single-output, cacheable nodes are cached."""
+        node = g.node_map(self.graph)[node_id]
+        if self.warm is None:
+            return self._lower(node)
+        from hub.plan_key import plan_cacheable, plan_hash
+        if not plan_cacheable(self.graph, node_id, self.node_builders):
+            return self._lower(node)
+        key = f"{self.warm_scope}:{plan_hash(self.graph, node_id, self.resolve_adapter)}"
+        hit = self.warm.get(key)
+        if hit is not None:
+            return hit
+        built = self._lower(node)
+        if not isinstance(built, dict):  # cache single-output relations only (multi-output is rarer)
+            cached = self.warm.put(key, self._view(built))
+            if cached is not None:
+                return cached
+        return built
 
     def _pick(self, node_id: str, built, handle: str | None) -> Relation:
         # single-output nodes build a bare Relation and ignore the handle; multi-output nodes
