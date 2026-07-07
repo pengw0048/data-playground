@@ -126,3 +126,25 @@ The example is covered by a test that loads it via drop-in discovery and runs it
 (`test_example_plugin_loads_and_runs` in `kernel/hub/tests/test_kernel.py`) — a good template for
 testing your own. `GET /api/plugins` lists loaded packs (with any load error), and `GET /api/nodes`
 shows your node's schema the SPA renders from.
+
+## Reference plugins
+
+`examples/plugins/` ships four working plugins — each exercises a different seam end-to-end and has a
+test in `kernel/hub/tests/test_kernel.py` you can copy:
+
+| plugin | seam | what it does | extra |
+|---|---|---|---|
+| [`dp_example`](../examples/plugins/dp_example/) | `add_node` | a `redact` compute node (mask a PII column) | — |
+| [`dp_sql_catalog`](../examples/plugins/dp_sql_catalog/) | `set_catalog` | a `CatalogProvider` backed by a SQL `datasets(name, uri)` table — subclasses `InMemoryCatalog`, overrides only the reads; `DP_SQL_CATALOG_URL` / `DP_SQL_CATALOG_TABLE` | uses `sqlalchemy` (core dep) |
+| [`dp_hf_datasets`](../examples/plugins/dp_hf_datasets/) | `add_adapter` | read a Hugging Face Hub dataset as a source: `hf://<id>[@<config>][:<split>]` | `pip install 'data-playground[hf]'` |
+| [`dp_iceberg`](../examples/plugins/dp_iceberg/) | `add_adapter` | read an Apache Iceberg table as a source: `iceberg://<catalog>/<namespace>.<table>` (catalog from your pyiceberg config) | `pip install 'data-playground[iceberg]'` |
+
+The adapters are read-only sources (`write` raises) and import their heavy dependency lazily, so the
+pack loads even without the extra installed and only errors when its URI scheme is actually used. Both
+adapter tests run against an in-memory stand-in (`importorskip` → skipped in CI without the extra), so
+they prove the wiring; verify the network path against your own Hub/warehouse.
+
+> **A distributed execution backend** (e.g. Ray Data) is the natural next reference plugin, but a
+> faithful one should *lower from* an engine-neutral plan rather than re-read node configs — so it's
+> gated on the execution-IR work (see the readiness notes). Shipping a config-reading Ray backend now
+> would enshrine the very coupling that work removes, so it's deferred rather than stubbed.
