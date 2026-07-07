@@ -9,6 +9,11 @@ import tempfile
 os.environ["DP_DATABASE_URL"] = os.environ.get("DP_TEST_DATABASE_URL") or (
     "sqlite:///" + os.path.join(tempfile.mkdtemp(prefix="dp-test-"), "test.db"))
 
+# The product default execution is now the per-canvas kernel (a spawned process). Force the suite to
+# the in-process runner so tests don't spawn a kernel per run (fast + deterministic); the kernel path
+# keeps its own dedicated tests (which set execution back to "kernel"). Set before hub.settings imports.
+os.environ.setdefault("DP_EXECUTION", "local-out-of-core")
+
 # Ensure the sample datasets (events/images/movies) exist before the catalog is built. They're
 # gitignored (regenerated via `make seed`), so a fresh checkout / CI has an empty data dir and the
 # many tests that read tbl_events/tbl_images would fail with KeyError. seed_if_empty is a no-op

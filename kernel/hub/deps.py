@@ -188,17 +188,15 @@ class Deps:
 
     def chosen_backend(self, uid: str | None = None) -> str:
         """The selected execution backend NAME: per-user preference > workspace default > DP_EXECUTION >
-        (auth-on) subprocess isolation. Empty = no explicit choice (pick_runner falls to first-that-can).
-        Also drives whether preview/profile route to the kernel."""
-        from hub import auth, metadb
+        the default (the per-canvas KERNEL). Kernel-only: with no explicit choice, execution runs on the
+        canvas's kernel — process isolation (a runaway transform only wedges that canvas, restartably) +
+        durability (survives a hub restart) + warm reuse. Also drives preview/profile routing."""
+        from hub import metadb
         chosen = (metadb.get_setting("backend", "user", uid, default="") if uid else "") or ""
         if not chosen:
             chosen = metadb.get_setting("backend", "global", default="") or ""
-        if not chosen and settings.execution:
-            chosen = settings.execution     # DP_EXECUTION opt-in (e.g. 'kernel') is the default when set
-        if not chosen and auth.auth_enabled():
-            # multi-user safety: a user's arbitrary Python must not crash/hang/OOM the shared process.
-            chosen = "local-subprocess"
+        if not chosen:
+            chosen = settings.execution or "kernel"   # DP_EXECUTION overrides; else the kernel is default
         return chosen
 
     def kernel_backend(self):

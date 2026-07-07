@@ -457,24 +457,22 @@ def test_user_scoped_backend_preference_wins_over_global(tmp_path):
         metadb.set_setting("backend", "", scope="global")  # don't leak a global runner choice to other tests
 
 
-def test_auth_mode_defaults_to_subprocess_runner_for_isolation(tmp_path, monkeypatch):
-    # multi-user safety: with auth ON and no explicit backend, pick_runner defaults to the OS-isolated
-    # subprocess runner so a user's arbitrary Python can't crash/hang the shared kernel; open mode
-    # stays in-process (trusted + faster); an explicit Settings choice always wins.
+def test_default_execution_is_the_per_canvas_kernel(tmp_path, monkeypatch):
+    # kernel-only: with no explicit backend choice, execution defaults to the per-canvas kernel
+    # (process isolation + durability + warm reuse). An explicit Settings→Execution choice still wins.
     import types
 
     from hub import metadb
+    from hub import settings as sm
     from hub.deps import Deps
     d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     plan = types.SimpleNamespace(acyclic=True)
     metadb.set_setting("backend", "", scope="global")
+    monkeypatch.setattr(sm.settings, "execution", "")  # test the TRUE default (conftest sets DP_EXECUTION for suite speed)
     try:
-        monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
-        assert d.pick_runner(plan).name == "local-out-of-core"       # open mode → in-process
-        monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
-        assert d.pick_runner(plan).name == "local-subprocess"        # auth on → OS isolation by default
+        assert d.pick_runner(plan).name == "kernel"                  # default → the per-canvas kernel
         metadb.set_setting("backend", "local-out-of-core", scope="global")
-        assert d.pick_runner(plan).name == "local-out-of-core"       # explicit choice wins even under auth
+        assert d.pick_runner(plan).name == "local-out-of-core"       # explicit choice wins over the default
     finally:
         metadb.set_setting("backend", "", scope="global")
 
@@ -1496,11 +1494,16 @@ def test_execution_backend_plugin_contract(tmp_path):
         def status(self, run_id): return None
         def cancel(self, run_id): return None
 
+    from hub import metadb
     fake = FakeBackend()
     assert isinstance(fake, ExecutionBackend)  # structural conformance to the contract
     d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     d.runners.insert(0, fake)
-    assert d.pick_runner(object()) is fake  # selected over the local runner because can_run is true
+    metadb.set_setting("backend", "fake-pod", scope="global")  # select the plugin backend by name
+    try:
+        assert d.pick_runner(object()) is fake  # the chosen backend is routed to (the extension point)
+    finally:
+        metadb.set_setting("backend", "", scope="global")
 
 
 def test_spi_contracts_are_the_real_ones():
