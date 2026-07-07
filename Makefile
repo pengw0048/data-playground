@@ -38,10 +38,6 @@ e2e: build
 seed:
 	cd kernel && uv run python -m kernel.seed
 
-# Out-of-core validation: sort a dataset far larger than the memory cap; see docs/BENCHMARK.md.
-bench:
-	cd kernel && uv run python -m bench.out_of_core
-
 clean:
 	rm -rf web/dist web/node_modules kernel/.venv kernel/outputs kernel/canvases kernel/data/outputs
 	rm -f kernel/dataplay.db* kernel/e2e-test.db*   # metadata DB (+ WAL/SHM sidecars) — full reset incl. the catalog

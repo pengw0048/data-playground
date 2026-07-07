@@ -77,6 +77,6 @@ everything downstream — goes **stale** (a re-run recomputes only what changed)
   purchases, keep the top spenders"*; it builds the same nodes (needs a model configured in Settings).
 - **Add your own node** — [docs/PLUGINS.md](PLUGINS.md): a plugin node shows up typed & wired with no
   core edit.
-- **Run it at scale** — [docs/BENCHMARK.md](BENCHMARK.md): the engine sorts multi-GB datasets under a
-  small memory cap by spilling to disk.
+- **Run it at scale** — the engine sorts multi-GB datasets under a small memory cap by spilling to
+  disk, so the same graph runs over data bigger than RAM.
 - **Collaborate / deploy** — the README covers real-time collab, multi-user auth, and scaling out.
