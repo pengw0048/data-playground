@@ -213,8 +213,9 @@ Two *runtime* things still have **instance affinity** — they need routing, not
 - **Execution** runs on a per-canvas **kernel** — a detached process that outlives the hub — so a run
   survives the hub restarting or being redeployed, and any instance can report its status (shared via
   `run_states`); a reopened canvas reattaches to a still-running run via `GET /canvas/{id}/active-runs`.
-  A single-host hub reaps a canvas's kernel by a heartbeat-gated DB lease; a cluster substrate (a pod
-  per canvas) is a `KernelSpawner` / `ExecutionBackend` plugin — the same interface, a different spawner.
+  A single-host hub reaps a canvas's kernel by a heartbeat-gated DB lease; for cross-host, set
+  `DP_KERNEL_SPAWNER=pod` (`kernel[pod]`) to run each canvas's kernel as a k8s Pod + Service — a
+  reference `KernelSpawner` you verify + tailor to your cluster (RBAC, image, data mounts).
 
 **With Docker.** `docker compose up` builds one image (the web app baked in) and runs it against
 Postgres — the shared, restart-durable setup above. `Dockerfile` is the single-image build
