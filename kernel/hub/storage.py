@@ -65,7 +65,13 @@ class ObjectStorage:
 def make_storage(workspace: str) -> Storage:
     """DP_STORAGE_URL selects the backend. Default (unset) = ``<workspace>/outputs`` locally; a
     ``file://`` or absolute path overrides the dir; an ``s3://…`` / ``gs://…`` uri persists outputs
-    to that object-store prefix (real, via httpfs)."""
+    to that object-store prefix (real, via httpfs). For a CUSTOM sink, set ``DP_STORAGE`` to a dotted
+    path to a Storage class (``pkg.mod:Cls``), instantiated as ``Cls(workspace)`` — a plugin sink with
+    no core patch. The built-in Local/Object storages are just the two default paths here."""
+    cls = os.environ.get("DP_STORAGE", "").strip()
+    if cls:
+        from hub.settings import import_dotted
+        return import_dotted(cls)(workspace)
     url = os.environ.get("DP_STORAGE_URL", "").strip()
     if is_object_uri(url):
         return ObjectStorage(url)

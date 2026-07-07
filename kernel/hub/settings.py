@@ -31,9 +31,11 @@ class Settings:
     # execution backend opt-in: "kernel" routes runs to a per-canvas, restart-surviving kernel process
     # (else the in-process / subprocess runner). Empty = default selection (see deps.pick_runner).
     execution: str = os.environ.get("DP_EXECUTION", "").strip()
-    # how a per-canvas kernel is launched: "local" (a detached process, single-host) or "pod" (a k8s
-    # Pod + Service per canvas, cross-host). See hub.kernel_backend / hub.pod_spawner.
-    kernel_spawner: str = os.environ.get("DP_KERNEL_SPAWNER", "local").strip().lower()
+    # how a per-canvas kernel is launched: "local" (a detached process, single-host), "pod" (a k8s Pod +
+    # Service per canvas, cross-host), OR a dotted path to a plugin KernelSpawner class — e.g.
+    # DP_KERNEL_SPAWNER=my_pkg.spawners:EcsSpawner — so a third substrate needs no core patch. Case is
+    # preserved (a class path is case-sensitive); the local/pod keywords are matched case-insensitively.
+    kernel_spawner: str = os.environ.get("DP_KERNEL_SPAWNER", "local").strip()
     # per-canvas pip deps (kernel installs a canvas's declared requirements). Arbitrary code + egress, so
     # a locked-down deployment can turn it OFF here: the kernel then installs nothing and allows no extra
     # imports (canvases must rely on a pre-baked image instead). Default on (trusted/local tool).
@@ -41,3 +43,14 @@ class Settings:
 
 
 settings = Settings()
+
+
+def import_dotted(spec: str):
+    """Resolve a 'pkg.module:Attr' (or 'pkg.module.Attr') string to the object it names. Used to load a
+    plugin backend class from an env setting (kernel spawner, storage) so a third implementation is a
+    config value, not a core patch."""
+    import importlib
+    mod, sep, attr = spec.partition(":")
+    if not sep:
+        mod, _, attr = spec.rpartition(".")
+    return getattr(importlib.import_module(mod), attr)

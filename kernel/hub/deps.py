@@ -111,6 +111,23 @@ def _host_capacity() -> ResourceSpec:
     return ResourceSpec(cpu=cpu, mem=mem)
 
 
+def _make_spawner(workspace: str, data_dir: str):
+    """The per-canvas kernel substrate (KernelSpawner). Built-ins: 'local' (a detached process) and 'pod'
+    (a k8s Pod + Service). Anything else is a dotted path to a plugin spawner class
+    (DP_KERNEL_SPAWNER=pkg.mod:Cls) instantiated as Cls(workspace, data_dir) — so a third substrate
+    (ECS/Nomad/…) is a config value, not a core patch. The built-ins are just the two default paths here."""
+    spec = settings.kernel_spawner
+    low = spec.lower()
+    if low in ("", "local"):
+        from hub.kernel_backend import LocalProcessSpawner
+        return LocalProcessSpawner(workspace, data_dir)
+    if low == "pod":
+        from hub.pod_spawner import PodSpawner
+        return PodSpawner(workspace, data_dir)
+    from hub.settings import import_dotted
+    return import_dotted(spec)(workspace, data_dir)
+
+
 class Deps:
     def __init__(self, workspace: str, data_dir: str):
         self.workspace = workspace
@@ -166,12 +183,8 @@ class Deps:
         # Always REGISTERED so it's selectable from Settings → Execution; only the DEFAULT is opt-in
         # (DP_EXECUTION=kernel, honored in pick_runner). The kernel writes run_states itself, so no
         # on_status/complete wiring here; estimate/can_run delegate to the base runner (hub-side gate).
-        from hub.kernel_backend import KernelBackend, LocalProcessSpawner
-        spawner = LocalProcessSpawner(workspace, data_dir)
-        if settings.kernel_spawner == "pod":   # cross-host substrate: a k8s Pod + Service per canvas
-            from hub.pod_spawner import PodSpawner
-            spawner = PodSpawner(workspace, data_dir)
-        self.runners.append(KernelBackend(self.runner, spawner))
+        from hub.kernel_backend import KernelBackend
+        self.runners.append(KernelBackend(self.runner, _make_spawner(workspace, data_dir)))
         # RunController owns a logical run across placement regions (multi-region = a placed node /
         # checkpoint / fan-out); a single default region delegates to the base runner unchanged.
         from hub.run_controller import RunController

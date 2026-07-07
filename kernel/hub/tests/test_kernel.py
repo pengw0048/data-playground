@@ -22,6 +22,30 @@ def N(nid, t, cfg):
     return {"id": nid, "type": t, "position": {"x": 0, "y": 0}, "data": {"title": nid, "config": cfg}}
 
 
+class _FakeSpawner:  # a plugin KernelSpawner loaded via the DP_KERNEL_SPAWNER dotted path
+    name = "fake"
+
+    def __init__(self, workspace, data_dir):
+        self.args = (workspace, data_dir)
+
+    def spawn(self, canvas_id, kernel_id, token):
+        pass
+
+    def kill(self, canvas_id, kernel_id):
+        pass
+
+
+class _FakeStorage:  # a plugin Storage loaded via the DP_STORAGE dotted path
+    def __init__(self, workspace):
+        self.ws = workspace
+
+    def output_uri(self, name, ext):
+        return f"mem://{name}{ext}"
+
+    def list_outputs(self):
+        return []
+
+
 def E(s, tg, sh=None, th=None):
     return {"id": f"{s}-{tg}", "source": s, "target": tg, "sourceHandle": sh, "targetHandle": th,
             "data": {"wire": "dataset"}}
@@ -1780,6 +1804,33 @@ def test_pod_spawner_names_per_kernel_and_is_fenced_and_idempotent():
     assert set(fake.deleted) == {n1}
     fake.pod_409 = True
     sp.spawn("cv", "k3", "t")                         # a 409 on pod create must NOT raise (idempotent)
+
+
+def test_adapter_and_catalog_conform_to_formal_protocols():
+    # the two seams that were duck-typed are now runtime_checkable Protocols, and the BUILT-INS conform —
+    # i.e. the built-in adapters + catalog are the first implementations through the seam, not a privileged
+    # core path. A plugin has a typed target instead of reverse-engineering call sites.
+    from hub.backends import CatalogProvider, DatasetAdapter
+    from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
+    assert isinstance(DuckDBAdapter(), DatasetAdapter)
+    assert isinstance(LanceAdapter(), DatasetAdapter)
+    assert isinstance(get_deps().catalog, CatalogProvider)  # the built-in InMemoryCatalog IS the reference
+
+
+def test_kernel_spawner_selectable_via_dotted_path(monkeypatch):
+    # a 3rd substrate is a config value, not a core patch: DP_KERNEL_SPAWNER=pkg.mod:Cls loads the plugin.
+    from hub import deps as depsmod
+    from hub.settings import settings
+    monkeypatch.setattr(settings, "kernel_spawner", "hub.tests.test_kernel:_FakeSpawner")
+    sp = depsmod._make_spawner("/ws", "/ws/data")
+    assert type(sp).__name__ == "_FakeSpawner" and sp.args == ("/ws", "/ws/data")
+
+
+def test_storage_selectable_via_dotted_path(monkeypatch):
+    from hub import storage
+    monkeypatch.setenv("DP_STORAGE", "hub.tests.test_kernel:_FakeStorage")
+    s = storage.make_storage("/ws")
+    assert type(s).__name__ == "_FakeStorage" and s.ws == "/ws"
 
 
 def test_kernel_spawner_is_selectable_pod(tmp_path, monkeypatch):
