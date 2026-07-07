@@ -5,7 +5,7 @@
 # create it BEFORE `uv sync` or hatchling aborts with FileNotFoundError (`make run` rebuilds it for real).
 setup:
 	mkdir -p web/dist
-	cd kernel && uv sync --extra dev && uv run python -m kernel.seed
+	cd kernel && uv sync --extra dev && uv run python -m hub.seed
 	cd web && npm install
 
 # The product: build the SPA, then `dataplay` serves SPA + API + engine on :8471 and opens the browser.
@@ -14,7 +14,7 @@ run: build
 
 # Dev: kernel with autoreload (:8471) + Vite hot-reload (:5173, proxies /api).
 dev-kernel:
-	cd kernel && uv run uvicorn kernel.main:app --reload --port 8471
+	cd kernel && uv run uvicorn hub.main:app --reload --port 8471
 
 dev-web:
 	cd web && npm run dev
@@ -36,7 +36,7 @@ e2e: build
 	cd web && npm run e2e
 
 seed:
-	cd kernel && uv run python -m kernel.seed
+	cd kernel && uv run python -m hub.seed
 
 clean:
 	rm -rf web/dist web/node_modules kernel/.venv kernel/outputs kernel/canvases kernel/data/outputs

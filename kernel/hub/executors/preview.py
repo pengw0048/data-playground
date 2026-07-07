@@ -1,0 +1,58 @@
+"""Sample-preview — run source→node on a bounded sample, off the full run.
+
+Uses the SAME build as a full run, with the source bounded to a preview scan budget, so the
+rows you see are faithful to what runs at scale. Stops honestly at non-previewable stages (P8),
+and distinguishes an honest "needs a full pass" from a real error (bad cell/query/graph).
+"""
+
+from __future__ import annotations
+
+from hub import db, graph as g
+from hub.executors.engine import BuildEngine, NotPreviewable
+from hub.models import Graph, SampleResult
+from hub.sandbox import run_with_timeout
+
+PREVIEW_SCAN = 2000       # rows read at each source during preview (bounds transforms too)
+PREVIEW_BUDGET_S = 8.0
+
+
+def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
+                 node_builders=None, node_specs=None, offset: int = 0) -> SampleResult:
+    # clean, up-front graph checks (don't rely on a Python RecursionError for cycles)
+    if not g.is_acyclic(graph):
+        return SampleResult(error=True, reason="graph has a cycle — control flow must be encapsulated (§5.7)")
+    if node_specs:
+        errs = g.type_errors(graph, node_specs)
+        if errs:
+            return SampleResult(error=True, reason="incompatible connection: " + "; ".join(errs[:3]))
+
+    engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
+                            node_builders=node_builders, node_specs=node_specs)
+
+    holder: dict = {}  # published by the worker thread so the timeout can interrupt its cursor
+
+    def work() -> SampleResult:
+        # run on our OWN cursor (created on THIS worker thread so its thread-local binding is correct),
+        # not the process-global lock — a slow preview no longer blocks other users' work
+        with db.run_scope() as scope:
+            holder["scope"] = scope
+            # fetch one extra row to know if a NEXT page exists (so the UI can disable Next at the
+            # true end, even when the total is an exact multiple of the page size). NOTE: offset
+            # pagination assumes a stable row order; a join/aggregate result is unordered, so pages
+            # over such a node may not be perfectly consistent — acceptable for a bounded preview.
+            rows, cols = engine.rows(node_id, k + 1, offset)
+            has_more = len(rows) > k
+            return SampleResult(columns=cols, rows=rows[:k], row_count=len(rows[:k]), has_more=has_more, truncated=True)
+
+    def on_timeout() -> None:
+        # interrupt THIS preview's cursor so the worker unwinds (its scope exit drops its views);
+        # interrupting the base connection would NOT stop a query running on the cursor
+        sc = holder.get("scope")
+        (sc.interrupt() if sc is not None else db.interrupt())
+
+    try:
+        return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
+    except NotPreviewable as e:
+        return SampleResult(not_previewable=True, reason=e.reason)     # honest P8 state
+    except Exception as e:  # noqa: BLE001
+        return SampleResult(error=True, reason=f"{type(e).__name__}: {e}")  # a real failure

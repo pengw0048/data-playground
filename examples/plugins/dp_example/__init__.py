@@ -9,7 +9,7 @@ with `*`. It builds plain SQL via `ctx.sql`, so it pushes down and runs out-of-c
 built-in relational node.
 """
 
-from kernel.sdk import NodeSpec, ParamSpec, PortSpec, ctx
+from hub.sdk import NodeSpec, ParamSpec, PortSpec, ctx
 
 SPEC = NodeSpec(
     kind="redact",

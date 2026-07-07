@@ -15,7 +15,7 @@ services:
       # per-user auth (signed session cookies). REQUIRED — compose refuses to start without it, so
       # sessions can't be forged with a shipped default. Generate one: `openssl rand -hex 32`.
       DP_AUTH_SECRET: "${DP_AUTH_SECRET:?set DP_AUTH_SECRET to a random secret, e.g. openssl rand -hex 32}"
-      # multi-user: confine dataset reads to these roots (see kernel/kernel/paths.py). The workspace
+      # multi-user: confine dataset reads to these roots (see kernel/hub/paths.py). The workspace
       # volume is /data; add more host roots you mount if users load datasets from them.
       DP_DATASET_ROOTS: "/data"
       # optional LLM agent — set a model + its key to enable the agent dock:

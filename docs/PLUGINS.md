@@ -12,7 +12,7 @@ passing a `Registry` you use to add things:
 
 ```python
 # examples/plugins/dp_example/__init__.py
-from kernel.sdk import NodeSpec, ParamSpec, PortSpec, ctx
+from hub.sdk import NodeSpec, ParamSpec, PortSpec, ctx
 
 SPEC = NodeSpec(
     kind="redact", title="redact", category="compute", tag="redact",

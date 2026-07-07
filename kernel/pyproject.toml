@@ -45,23 +45,23 @@ Repository = "https://github.com/pengw0048/data-playground"
 Issues = "https://github.com/pengw0048/data-playground/issues"
 
 [project.scripts]
-dataplay = "kernel.cli:main"
+dataplay = "hub.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["kernel"]
+packages = ["hub"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"../web/dist" = "kernel/_web"
+"../web/dist" = "hub/_web"
 
 [tool.pytest.ini_options]
-testpaths = ["kernel/tests"]
+testpaths = ["hub/tests"]
 # Surface OUR deprecations as errors so they can't rot silently; ignore known third-party ones we
 # can't fix (pydantic_graph's event-loop deprecation surfaced by the agent's Pydantic AI loop).
 filterwarnings = [
-    "error::DeprecationWarning:kernel.*",
+    "error::DeprecationWarning:hub.*",
     "ignore:There is no current event loop:DeprecationWarning",
 ]

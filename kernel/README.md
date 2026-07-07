@@ -7,7 +7,7 @@ Backend-agnostic core; the default setup runs fully offline and out-of-core.
 
 ```bash
 uv sync --extra dev
-uv run python -m kernel.seed         # generic sample datasets into ./data
+uv run python -m hub.seed         # generic sample datasets into ./data
 uv run dataplay --workspace . --port 8471   # serve SPA+API+engine, open browser
 uv run pytest -q                     # end-to-end tests (real engine on real files)
 ```

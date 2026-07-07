@@ -126,7 +126,7 @@ entry point). It can register nodes, dataset adapters, runners, capabilities, or
 
 ```python
 # plugins/upcase/__init__.py
-from kernel.sdk import NodeSpec, PortSpec, ParamSpec, ctx
+from hub.sdk import NodeSpec, PortSpec, ParamSpec, ctx
 
 SPEC = NodeSpec(kind="upcase", title="uppercase", category="compute",
                 inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],

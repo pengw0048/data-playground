@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir uv
 WORKDIR /app
 COPY kernel/ ./kernel/
 # the SPA at ../web/dist relative to kernel/ — where pyproject's force-include bundles it into
-# kernel/_web at build time (so the served SPA matches the packaged kernel)
+# hub/_web at build time (so the served SPA matches the packaged kernel)
 COPY --from=web /web/dist ./web/dist
 WORKDIR /app/kernel
 RUN uv sync --extra postgres     # builds the package (force-includes ../web/dist) + runtime deps + psycopg
