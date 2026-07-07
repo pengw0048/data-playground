@@ -139,13 +139,23 @@ test in `kernel/hub/tests/test_kernel.py` you can copy:
 | [`dp_hf_datasets`](../examples/plugins/dp_hf_datasets/) | `add_adapter` | read a Hugging Face Hub dataset as a source: `hf://<id>[@<config>][:<split>]` | `pip install 'data-playground[hf]'` |
 | [`dp_iceberg`](../examples/plugins/dp_iceberg/) | `add_adapter` | read an Apache Iceberg table as a source: `iceberg://<catalog>/<namespace>.<table>` (catalog from your pyiceberg config) | `pip install 'data-playground[iceberg]'` |
 | [`dp_json_pipeline`](../examples/plugins/dp_json_pipeline/) | `set_importer` | parse a tiny JSON pipeline (`source`/`steps`/`write`) into a runnable canvas graph — import → canvas → run | — |
+| [`dp_ray`](../examples/plugins/dp_ray/) | `add_runner` | run the clean subset on **Ray Data** (`read → map/filter/flat_map/map_batches → write`), lowered from the engine-neutral IR; falls back to DuckDB for relational/opaque graphs. Opt-in via `DP_EXECUTION=ray-data` | `pip install 'data-playground[ray]'` |
 
 The adapters are read-only sources (`write` raises) and import their heavy dependency lazily, so the
 pack loads even without the extra installed and only errors when its URI scheme is actually used. Both
 adapter tests run against an in-memory stand-in (`importorskip` → skipped in CI without the extra), so
 they prove the wiring; verify the network path against your own Hub/warehouse.
 
-> **A distributed execution backend** (e.g. Ray Data) is the natural next reference plugin, but a
-> faithful one should *lower from* an engine-neutral plan rather than re-read node configs — so it's
-> gated on the execution-IR work (see the readiness notes). Shipping a config-reading Ray backend now
-> would enshrine the very coupling that work removes, so it's deferred rather than stubbed.
+### Running on another engine — the execution IR
+
+A distributed backend must not re-read node configs and re-implement lowering (and it could never run
+third-party plugin nodes that way). Instead it lowers from `hub.ir`: `lower_to_ir(graph, target)` reads
+the configs ONCE into a `CompiledIR` — a topological list of `IRStep`s, each a normalized `op` + resolved
+portable config + input wiring. A backend pattern-matches on `op`. `CompiledIR.is_clean()` /
+`plan_is_clean(plan)` mark the subset a map-style engine can run end-to-end (`read`, `write`,
+`passthrough`, and per-row/-batch `map`/`filter`/`flat_map`/`map_batches`); everything relational
+(`sql`/`join`/`aggregate`/`sort`/`dedup`), reducing (`metric`/`chart`), or opaque (`section`, plugin
+kinds) stays unsupported → gate `can_run` on it so the kernel falls back to the DuckDB engine. `dp_ray`
+above is the worked example — the first non-DuckDB engine to run a canvas, reusing the *same*
+`sandbox.compile_operator` the DuckDB engine runs so results are identical. (The default engine still
+lowers directly; rebuilding it on the IR too is future work.)
