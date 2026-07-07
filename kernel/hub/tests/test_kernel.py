@@ -1895,6 +1895,38 @@ def test_hf_datasets_adapter_reference_plugin(monkeypatch):
         assert len(a.scan("hf://x", limit=2).fetchall()) == 2
 
 
+def test_iceberg_adapter_reference_plugin(monkeypatch):
+    # the shipped examples/plugins/dp_iceberg adapter reads iceberg:// tables. Exercised against a stand-in
+    # catalog (no live warehouse): a fake load_catalog → table.scan().to_arrow() returns a pyarrow table,
+    # so the adapter's uri-parse + arrow→DuckDB + column/limit path runs. importorskip → CI skips without it.
+    import pytest as _pt
+    _pt.importorskip("pyiceberg")
+    import importlib.util
+    from pathlib import Path
+    import pyarrow as pa
+    import pyiceberg.catalog as pc
+    from hub import db
+    from hub.backends import DatasetAdapter
+
+    tbl = pa.table({"id": [1, 2], "v": ["a", "b"]})
+    scan = type("S", (), {"to_arrow": lambda self: tbl})()
+    table = type("T", (), {"scan": lambda self, **kw: scan})()
+    monkeypatch.setattr(pc, "load_catalog", lambda name=None, **kw: type("C", (), {"load_table": lambda self, i: table})())
+
+    src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_iceberg" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("dp_iceberg_ref", src)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    a = mod.IcebergAdapter()
+    assert isinstance(a, DatasetAdapter)
+    assert a.matches("iceberg://prod/sales.orders") and not a.matches("/tmp/x.parquet")
+    assert mod._parse("iceberg://prod/sales.orders") == ("prod", "sales.orders")  # first '/' splits catalog
+    assert {c.name for c in a.schema("iceberg://prod/db.t")} == {"id", "v"}
+    assert a.count("iceberg://prod/db.t") == 2
+    with db.base_guard():
+        assert len(a.scan("iceberg://prod/db.t", columns=["id"], limit=1).fetchall()) == 1
+
+
 def test_placeable_backend_protocol():
     # the optional distributed-placement contract exists as a typed Protocol; a full impl conforms, a
     # partial one does not (the core feature-detects per method, so a non-distributed backend omits them).

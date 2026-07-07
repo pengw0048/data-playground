@@ -1,0 +1,4 @@
+# Reference plugin: a dataset adapter for Apache Iceberg tables. See __init__.py.
+name = "dp-iceberg"
+version = "0.1.0"
+# min_core_api = 1
