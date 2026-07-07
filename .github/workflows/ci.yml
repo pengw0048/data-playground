@@ -1,14 +1,18 @@
 name: CI
 
+# Manual only. This is a PRIVATE repo, so Actions minutes are billed, and the e2e job (~17 min:
+# Playwright installs Chromium + OS deps every run) would drain the monthly budget on every push.
+# Run the suites LOCALLY during dev (`cd kernel && uv run pytest -q`; `cd web && npm run e2e`), and
+# trigger this in a clean env before a release / when you want the full check:
+#   gh workflow run ci.yml      (or the Actions tab → CI → Run workflow)
 on:
-  push:
-    branches: [main, master]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   kernel-tests:
     name: kernel (pytest — engine, plugins, agent)
     runs-on: ubuntu-latest
+    timeout-minutes: 10  # cap billed minutes — kill a hung run instead of letting it burn to the 6h default
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -24,6 +28,7 @@ jobs:
   e2e:
     name: e2e (Playwright — real UI on the real kernel)
     runs-on: ubuntu-latest
+    timeout-minutes: 25  # cap billed minutes (the ~17-min job) so a hang can't drain the budget
     env:
       CI: "true"
     steps:
