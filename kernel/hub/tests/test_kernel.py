@@ -3176,6 +3176,46 @@ def test_source_pushdown_into_scan(tmp_path):
     assert calls[0]["predicate"] is None              # ≥2 consumers → can't prove safety → no push-down
 
 
+def test_lower_to_ir_and_clean_classification():
+    # The engine-neutral IR normalizes each node to (op, resolved config, input wiring); is_clean()
+    # marks a run a map-style engine can execute, and plan_is_clean() answers the same from a
+    # CompilePlan (what can_run gets) — they must agree. Underpins the dp_ray reference backend.
+    from hub import ir
+    from hub.compiler import compile_plan
+    from hub.models import Graph
+
+    def G(nodes, edges):
+        return Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": edges})
+
+    src = N("src", "source", {"uri": _uri("events")})
+    wr = N("w", "write", {"name": "o"})
+
+    clean = G([src, N("m", "transform", {"mode": "map", "code": "def fn(r): return r"}), wr],
+              [E("src", "m"), E("m", "w")])
+    cir = ir.lower_to_ir(clean, "w")
+    assert [s.op for s in cir.steps] == ["read", "map", "write"]
+    assert cir.is_clean() and not cir.unsupported()
+    assert cir.by_id()["m"].inputs == [("src", None)]     # input wiring captured
+    assert ir.plan_is_clean(compile_plan(clean, "w"))      # can_run-side agrees
+
+    dirty = G([src, N("j", "sql", {"sql": "SELECT * FROM input"}), wr], [E("src", "j"), E("j", "w")])
+    di = ir.lower_to_ir(dirty, "w")
+    assert di.unsupported() == ["sql"] and not di.is_clean()
+    assert not ir.plan_is_clean(compile_plan(dirty, "w"))  # …and falls back
+
+    byp = N("b", "filter", {"predicate": "x>0"}); byp["data"]["bypassed"] = True
+    dis = N("d", "filter", {"predicate": "x>0"}); dis["data"]["disabled"] = True
+    ops = {s.id: s.op for s in ir.lower_to_ir(G([src, byp, dis], [E("src", "b"), E("b", "d")])).steps}
+    assert ops["b"] == "passthrough" and ops["d"] == "disabled"
+
+    # a filter NODE is a SQL predicate (not clean); a transform in filter MODE is a Python op (clean)
+    g3 = G([src, N("fn", "filter", {"predicate": "x>0"}),
+            N("tf", "transform", {"mode": "filter", "code": "def fn(r): return True"})],
+           [E("src", "fn"), E("fn", "tf")])
+    o3 = {s.id: s.op for s in ir.lower_to_ir(g3, "tf").steps}
+    assert o3["fn"] == "filter_sql" and o3["tf"] == "filter"
+
+
 def test_section_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
