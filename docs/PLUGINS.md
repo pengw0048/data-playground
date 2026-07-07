@@ -61,7 +61,7 @@ Prefer `ctx.sql` when it suffices — it stays in the engine and spills to disk.
 
 ## Loading it
 
-Three discovery paths (see `kernel/kernel/deps.py`):
+Three discovery paths (see `kernel/hub/deps.py`):
 
 1. **Drop-in** — copy the folder into `<workspace>/plugins/<pack>/`. Restart; it's picked up.
    ```bash
@@ -93,10 +93,10 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 | call | extends | contract |
 |---|---|---|
 | `reg.add_node(spec, build)` | a canvas node | `NodeSpec` + `build(engine, node, inputs) -> relation` |
-| `reg.add_adapter(adapter)` | a dataset source/sink (claim a URI scheme) | `matches/scan/schema/count/fingerprint/write` (see `kernel/kernel/backends.py`) |
+| `reg.add_adapter(adapter)` | a dataset source/sink (claim a URI scheme) | `matches/scan/schema/count/fingerprint/write` (see `kernel/hub/backends.py`) |
 | `reg.add_runner(runner)` | an execution backend (pod/Ray/queue) | `ExecutionBackend`: `name/can_run/estimate/run/status/cancel` |
-| `reg.add_capability(cap)` | a declared column capability (id + label) | see `kernel/kernel/plugins/capabilities.py` |
-| `reg.add_processor(proc)` | a reusable transform in the library picker | a `Processor` (`id/title/mode/build(params)`); see `kernel/kernel/plugins/processors.py` |
+| `reg.add_capability(cap)` | a declared column capability (id + label) | see `kernel/hub/plugins/capabilities.py` |
+| `reg.add_processor(proc)` | a reusable transform in the library picker | a `Processor` (`id/title/mode/build(params)`); see `kernel/hub/plugins/processors.py` |
 | `reg.set_catalog(catalog)` | the dataset catalog provider | replaces the default `InMemoryCatalog` |
 | `reg.set_importer(importer)` | `/pipelines/import` (import a foreign pipeline format) | default is a `NullImporter` (501) |
 
@@ -106,6 +106,6 @@ by `pick_runner` (respects the Settings → Execution choice, else the first tha
 ## Verifying it
 
 The example is covered by a test that loads it via drop-in discovery and runs its node
-(`test_example_plugin_loads_and_runs` in `kernel/kernel/tests/test_kernel.py`) — a good template for
+(`test_example_plugin_loads_and_runs` in `kernel/hub/tests/test_kernel.py`) — a good template for
 testing your own. `GET /api/plugins` lists loaded packs (with any load error), and `GET /api/nodes`
 shows your node's schema the SPA renders from.
