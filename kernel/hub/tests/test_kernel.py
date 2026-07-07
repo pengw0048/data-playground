@@ -1869,6 +1869,32 @@ def test_sql_catalog_reference_plugin(tmp_path):
         cat.get_table("nonexistent")
 
 
+def test_hf_datasets_adapter_reference_plugin(monkeypatch):
+    # the shipped examples/plugins/dp_hf_datasets adapter reads hf:// datasets. Proven WITHOUT network: a
+    # real in-memory HF Dataset is returned by a patched load_dataset, so the real arrow→DuckDB path runs.
+    ds_mod = __import__("pytest").importorskip("datasets")
+    import importlib.util
+    from pathlib import Path
+    from hub import db
+    from hub.backends import DatasetAdapter
+
+    fake = ds_mod.Dataset.from_dict({"id": [1, 2, 3], "txt": ["a", "b", "c"]})
+    monkeypatch.setattr(ds_mod, "load_dataset", lambda name, config=None, split=None: fake)
+    src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_hf_datasets" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("dp_hf_ref", src)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    a = mod.HfDatasetsAdapter()
+    assert isinstance(a, DatasetAdapter)
+    assert a.matches("hf://x:train") and not a.matches("/tmp/x.parquet")
+    assert mod._parse("hf://glue@mrpc:validation") == ("glue", "mrpc", "validation")
+    assert mod._parse("hf://stanfordnlp/imdb") == ("stanfordnlp/imdb", None, "train")  # id keeps its '/'
+    assert {c.name for c in a.schema("hf://x")} == {"id", "txt"}   # schema/count manage their own base_guard
+    assert a.count("hf://x") == 3
+    with db.base_guard():
+        assert len(a.scan("hf://x", limit=2).fetchall()) == 2
+
+
 def test_placeable_backend_protocol():
     # the optional distributed-placement contract exists as a typed Protocol; a full impl conforms, a
     # partial one does not (the core feature-detects per method, so a non-distributed backend omits them).

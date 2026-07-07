@@ -1,0 +1,4 @@
+# Reference plugin: a dataset adapter for Hugging Face datasets. See __init__.py.
+name = "dp-hf-datasets"
+version = "0.1.0"
+# min_core_api = 1

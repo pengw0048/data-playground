@@ -38,6 +38,7 @@ agent = [
 ]
 postgres = ["psycopg[binary]>=3.1"]  # metadata DB on Postgres for deployment (dev uses bundled SQLite)
 pod = ["kubernetes>=27"]  # cross-host kernel substrate: a Pod + Service per canvas (DP_KERNEL_SPAWNER=pod)
+hf = ["datasets>=2.0"]  # the examples/plugins/dp_hf_datasets reference adapter (hf:// Hugging Face datasets)
 dev = ["pytest>=8.0", "httpx>=0.27", "moto[s3,server]>=5.0", "boto3>=1.34", "data-playground[agent]", "data-playground[lance]"]
 
 [project.urls]
