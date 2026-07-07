@@ -317,10 +317,16 @@ class LoweringEngine:
         cfg = _cfg(node)
         if node.type == "transform" and cfg.get("source") == "library":
             pid = cfg.get("processor")
-            if not (pid and self.registry.has(pid)):
+            if pid and self.registry.has(pid):
+                proc = self.registry.get(pid)
+                fn, mode = proc.build(cfg.get("params", {})), proc.mode
+            elif cfg.get("code"):
+                # the library processor isn't registered (e.g. an in-memory promote lost on restart),
+                # but the node kept its original code — run that instead of failing (no data loss).
+                mode = cfg.get("mode", "map")
+                fn = sandbox.compile_operator(cfg["code"], mode)
+            else:
                 raise NotPreviewable(node, f"processor '{pid}' is not registered")
-            proc = self.registry.get(pid)
-            fn, mode = proc.build(cfg.get("params", {})), proc.mode
         else:
             code = cfg.get("code")
             mode = cfg.get("mode", "map")

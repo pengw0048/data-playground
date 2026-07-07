@@ -686,7 +686,10 @@ export const useStore = create<Store>((set, get) => ({
       outputSchema: (cfg.outputSchema as any) ?? [],
       blurb: 'promoted from an ad-hoc cell',
     })
-    get().updateConfig(id, { source: 'library', processor: desc.id, version: desc.version, code: null })
+    // KEEP the original code on the node (don't null it): the promote is in-memory server-side, so
+    // after a kernel restart the library id may be gone — the kept code lets the node still run
+    // (engine falls back to it) instead of the user's code being destroyed.
+    get().updateConfig(id, { source: 'library', processor: desc.id, version: desc.version })
     // refresh ONLY the processor list for the library picker — do NOT call bootstrap(), which
     // would re-hydrate the doc from (debounced, still-stale) localStorage and revert this node.
     try {

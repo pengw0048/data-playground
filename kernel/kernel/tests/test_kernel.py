@@ -2209,6 +2209,21 @@ def test_sql_fs_sandbox_confines_reads_in_auth_mode(monkeypatch, tmp_path):
         c.execute(f"SELECT count(*) FROM read_csv('{outside}')").fetchall()            # outside: blocked
 
 
+def test_library_transform_falls_back_to_kept_code():
+    # F9: a promoted library node whose processor is gone (in-memory promote lost on restart) still
+    # runs — the node keeps its original code and the engine falls back to it, so the user's code is
+    # never destroyed (was: NotPreviewable "processor not registered", code already nulled = data loss).
+    graph = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        {"id": "t", "type": "transform", "position": {"x": 0, "y": 0}, "data": {"config": {
+            "source": "library", "processor": "gone_xyz", "version": "v1", "mode": "map",
+            "code": "def fn(row):\n    row['flagged'] = True\n    return row"}}},
+    ], "edges": [E("src", "t")]}
+    r = client.post("/api/run/preview", json={"graph": graph, "nodeId": "t", "k": 5}).json()
+    assert not r.get("notPreviewable"), r
+    assert r["rows"] and all(row.get("flagged") is True for row in r["rows"])
+
+
 def test_example_plugin_loads_and_runs(tmp_path):
     # the shipped examples/plugins/dp_example package loads via drop-in discovery and its `redact`
     # node runs end-to-end — proof the plugin SPI works for a real third-party package (README claim).
