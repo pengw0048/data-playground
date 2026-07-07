@@ -85,7 +85,9 @@ async def ws_run(ws: WebSocket, run_id: str):
     await ws.accept()
     try:
         while True:
-            st = _status_or_lost(run_id)  # terminal 'failed' if the kernel lost the run (not a hang)
+            # _status_or_lost reads the shared run_states DB — run it off the event loop so a slow
+            # query can't stall every other connection on this worker.
+            st = await asyncio.to_thread(_status_or_lost, run_id)
             await ws.send_json(st.model_dump(by_alias=True))
             if st.status in ("done", "failed", "cancelled"):
                 break

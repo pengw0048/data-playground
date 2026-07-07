@@ -26,6 +26,10 @@ from kernel.plugins.capabilities import display_base_type, is_key_column
 # the combinatorics (C(n,k)) would explode.
 _MAX_KEY_WIDTH = 3
 
+# process-level uniqueness cache: (uri, cols, fingerprint) -> (unique, n). Best-effort — the
+# fingerprint keys it to the data version, so a changed file re-measures; bounded, safe to drop.
+_UNIQUE_CACHE: dict[tuple, tuple[bool | None, int]] = {}
+
 
 # --------------------------------------------------------------------------- #
 # key candidates (by name; uniqueness is MEASURED, not assumed)
@@ -67,10 +71,25 @@ def measure_unique(uri: str, cols: list[str], resolve_adapter) -> tuple[bool | N
         dexpr = f"count(DISTINCT {quoted})"  # excludes NULLs already
     try:
         adapter = resolve_adapter(uri)
+        # cache by (uri, cols, fingerprint) so the Inspector's debounced re-fires (typing on the
+        # canvas re-triggers join-analysis) don't re-scan the same data; the fingerprint (path
+        # mtime/size for local, uri for object/lance-version) invalidates the entry when data changes.
+        key = None
+        try:
+            key = (uri, tuple(cols), adapter.fingerprint(uri))
+            if key in _UNIQUE_CACHE:
+                return _UNIQUE_CACHE[key]
+        except Exception:  # noqa: BLE001 — adapter without fingerprint → just skip the cache
+            key = None
         with db.run_scope():
             n, d = adapter.scan(uri, columns=cols).aggregate(f"count(*) AS n, {dexpr} AS d").fetchone()
         n = int(n)
-        return ((d == n) if n else None, n)
+        result = ((d == n) if n else None, n)
+        if key is not None:
+            if len(_UNIQUE_CACHE) > 512:  # coarse bound — measurements are cheap to recompute
+                _UNIQUE_CACHE.clear()
+            _UNIQUE_CACHE[key] = result
+        return result
     except Exception:  # noqa: BLE001 — unreadable / bad columns → 'unknown', don't crash hints
         return (None, 0)
 

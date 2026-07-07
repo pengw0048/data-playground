@@ -37,7 +37,7 @@ class RunController:
         self.on_complete = None
         self.runs: dict[str, RunStatus] = {}
         self._cancel: dict[str, threading.Event] = {}
-        self._sub: dict[str, str] = {}   # overall run_id -> the base sub-run currently executing
+        self._sub: dict[str, tuple] = {}  # overall run_id -> (backend, sub_run_id) currently executing
         self._lock = threading.Lock()
 
     def plan(self, graph: Graph, target: str | None):

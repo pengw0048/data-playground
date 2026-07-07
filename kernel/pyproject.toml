@@ -59,3 +59,9 @@ packages = ["kernel"]
 
 [tool.pytest.ini_options]
 testpaths = ["kernel/tests"]
+# Surface OUR deprecations as errors so they can't rot silently; ignore known third-party ones we
+# can't fix (pydantic_graph's event-loop deprecation surfaced by the agent's Pydantic AI loop).
+filterwarnings = [
+    "error::DeprecationWarning:kernel.*",
+    "ignore:There is no current event loop:DeprecationWarning",
+]
