@@ -1,5 +1,6 @@
 import { Suspense, lazy, useEffect } from 'react'
 import { useStore, nodeRunnable } from '../store/graph'
+import { useInputColumns } from '../nodes/fields'
 import { Icon } from '../ui/Icon'
 import { MiniSelect } from '../ui/controls'
 import { DataPanel } from './DataPanel'
@@ -16,6 +17,7 @@ export function CodeFullscreen() {
   const runnable = useStore((s) => (fs ? nodeRunnable(s.doc, fs.nodeId) : false))
   const previews = useStore((s) => s.previews)
   const processors = useStore((s) => s.processors)
+  const inputCols = useInputColumns(fs?.nodeId ?? '')  // THIS node's input schema — the precise completions
   const { updateConfig, closeCodeFullscreen: close, runPreview, promote } = useStore.getState()
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
@@ -32,8 +34,11 @@ export function CodeFullscreen() {
   const proc = processors.find((p) => p.id === cfg.processor)
   // annotation `code` nodes and library transforms don't run/preview here
   const canPreview = runnable && node.type !== 'code' && !isLibrary
-  // seed Monaco autocomplete with every column seen in previews so far
-  const completions = [...new Set(Object.values(previews).flatMap((p) => (p.result?.columns ?? []).map((c) => c.name)))]
+  // seed Monaco autocomplete with THIS node's input columns (precise — what a filter/select/sql/
+  // transform references), falling back to any columns seen in previews when the schema isn't resolved yet
+  const inputNames = inputCols.map((c) => c.name)
+  const seen = Object.values(previews).flatMap((p) => (p.result?.columns ?? []).map((c) => c.name))
+  const completions = [...new Set([...inputNames, ...seen])]
 
   return (
     <div className="fixed inset-0 z-[60] flex flex-col bg-[#10141e]/45 p-7" onClick={close}>
