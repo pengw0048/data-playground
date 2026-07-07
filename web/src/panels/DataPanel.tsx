@@ -181,7 +181,7 @@ function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<stri
               <img src={String(row[c.name])} loading="lazy" className="mb-1.5 block max-h-[140px] max-w-[200px] rounded-md bg-muted" onError={(e) => (e.currentTarget.style.display = 'none')} />
             )}
             <div className="dp-mono whitespace-pre-wrap break-words text-foreground">
-              {row[c.name] == null ? '·' : Array.isArray(row[c.name]) ? JSON.stringify(row[c.name]) : String(row[c.name])}
+              {row[c.name] == null ? '·' : typeof row[c.name] === 'object' ? JSON.stringify(row[c.name], null, 2) : String(row[c.name])}
             </div>
           </div>
         </div>
@@ -197,10 +197,13 @@ function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; row
         <thead>
           <tr>
             {columns.map((c) => (
-              <th key={c.name} className="sticky top-0 whitespace-nowrap border-b border-border bg-muted px-2.5 py-[7px] text-left font-semibold text-muted-foreground">
-                {c.name}
-                {c.capabilities.includes('media') && <span title="media column — thumbnails in the Media tab" className="ml-[5px] cursor-help opacity-60">▦</span>}
-                {c.capabilities.includes('vector') && <span title="vector / embedding column" className="ml-[5px] cursor-help opacity-60">⋮⋮</span>}
+              <th key={c.name} className="sticky top-0 whitespace-nowrap border-b border-border bg-muted px-2.5 py-[6px] text-left font-semibold text-muted-foreground">
+                <div className="flex items-center">
+                  {c.name}
+                  {c.capabilities.includes('media') && <span title="media column — thumbnails in the Media tab" className="ml-[5px] cursor-help opacity-60">▦</span>}
+                  {c.capabilities.includes('vector') && <span title="vector / embedding column" className="ml-[5px] cursor-help opacity-60">⋮⋮</span>}
+                </div>
+                <div className="dp-mono text-[9px] font-normal lowercase tracking-tight opacity-55" title={c.type}>{c.type}</div>
               </th>
             ))}
           </tr>
@@ -239,6 +242,7 @@ function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
   if (Array.isArray(value)) return <span>[{value.length}]</span>
   if (value === true) return <span className="text-[#2f9e5f]">true</span>
   if (value === false) return <span className="text-destructive">false</span>
+  if (typeof value === 'object') return <span className="dp-mono">{JSON.stringify(value)}</span>  // struct/map — not [object Object]
   return <span>{String(value)}</span>
 }
 
