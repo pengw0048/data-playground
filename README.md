@@ -26,8 +26,7 @@ cd kernel && uv run dataplay --workspace ./my-proj --port 8471
 ```
 
 (A *workspace* is just a project directory — it holds your canvases, catalog, outputs, and plugins;
-it defaults to the current directory. Or `uv pip install -e 'kernel[agent]'` from a clone for a bare
-`dataplay` on your PATH.)
+it defaults to the current directory.)
 
 **New here?** The **[5-minute tour](docs/TUTORIAL.md)** builds a real pipeline on the seeded data:
 events → keep purchases → total per user → save.
@@ -40,14 +39,17 @@ events → keep purchases → total per user → save.
   workspace catalog starts as your local files; `POST /api/catalog/register` (or a `source` node) adds more.
 - **Explore & transform** — `filter`, `select`, `join`, `aggregate`, `sort`, `dedup`, `sql`, `sample`,
   `metric`, `chart`, `vector-search`, and `transform` (arbitrary Python) nodes that **actually execute**.
-- **See inside every step** — click a node's eye to see the real rows + schema flowing out of it, on
-  a bounded sample, instantly. Media columns render thumbnails; vector columns get an inspector.
+- **See your pipeline three ways** — its **shape** (typed nodes and wires on the canvas), its **data**
+  (click any node's eye for the real rows + schema flowing out of it on a bounded sample — media
+  thumbnails, a vector inspector, charts), and its **execution** (per-node run state, a run panel, and
+  persisted run history).
 - **See how tables relate** — the catalog detects join keys, measures cardinality on real data
   (1:1 / 1:N / N:M), and suggests how two datasets join; declare keys/relationships by hand and view
   them as an ER/UML diagram.
-- **Run over the full dataset, out-of-core** — the same graph runs on all your rows. The default
-  engine is DuckDB + Polars + Arrow: joins/aggregations/sorts spill to disk instead of crashing, so a
-  dataset bigger than RAM sorts under a bounded memory cap rather than OOM-ing.
+- **One graph, explore → scale** — the graph you explore with (instant sampled previews) is the *same*
+  one you run over the full dataset, out-of-core, with the runner chosen for you — no rewrite. The
+  default engine (DuckDB + Polars + Arrow) spills joins/sorts/aggregations to disk, so data bigger than
+  RAM doesn't OOM.
 - **Extend it with plugins** — drop a Python package in `<workspace>/plugins/` and your typed node
   appears in the Add-node menu, **rendered and wired with no frontend code** (see [Plugins](#plugins--add-a-typed-node-without-touching-the-core)).
 - **Save, undo, export** — the canvas is diff-friendly JSON, auto-persisted; `⌘Z`/`⌘⇧Z` undo/redo;
@@ -73,6 +75,17 @@ engine** (DuckDB · Polars · Arrow). Because a graph is *just a plan*, the **sa
 ways with no rewrite: on a small sample for an **instant preview**, over the **full dataset**
 out-of-core, or — via a different runner plugged in behind the same interface (subprocess isolation,
 or a cluster backend) — across **many machines**.
+
+```mermaid
+flowchart LR
+  G["Canvas graph<br/>(web · React Flow)"] --> C["Compiler"]
+  C --> P["Typed logical plan"]
+  P -->|"bounded sample"| PV["Instant preview<br/>while you explore"]
+  P -->|"full dataset"| R{"Runner<br/>(chosen for you)"}
+  R -->|"default"| E["Local out-of-core engine<br/>DuckDB · Polars · Arrow"]
+  R -->|"multi-user"| S["Subprocess isolation"]
+  R -->|"cluster plugin"| K["Cluster backend<br/>(ExecutionBackend SPI)"]
+```
 
 Because a wire carries a **typed table** (not raw bytes), the canvas knows every port's schema: it
 only lets you connect compatible ports, and the kernel independently re-checks the graph's types
