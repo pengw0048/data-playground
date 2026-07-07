@@ -2209,6 +2209,23 @@ def test_sql_fs_sandbox_confines_reads_in_auth_mode(monkeypatch, tmp_path):
         c.execute(f"SELECT count(*) FROM read_csv('{outside}')").fetchall()            # outside: blocked
 
 
+def test_catalog_missing_flag_and_unregister(tmp_path):
+    # F32: a registered dataset whose local file is later deleted is flagged `missing` (UI can grey it
+    # out); DELETE /catalog/tables/{id} prunes the dead entry instead of surfacing a raw IOException.
+    import os
+
+    import duckdb
+    p = tmp_path / "tmp_ds.parquet"
+    duckdb.connect().execute(f"COPY (SELECT 1 AS a) TO '{p}' (FORMAT PARQUET)")
+    reg = client.post("/api/catalog/register", json={"uri": str(p), "name": "tmp_ds"}).json()
+    tid = reg["id"]
+    assert client.get(f"/api/catalog/tables/{tid}").json()["missing"] is False   # file present
+    os.remove(p)
+    assert client.get(f"/api/catalog/tables/{tid}").json()["missing"] is True    # file gone → flagged
+    assert client.delete(f"/api/catalog/tables/{tid}").status_code == 200
+    assert client.get(f"/api/catalog/tables/{tid}").status_code == 404           # pruned, not resurrected
+
+
 def test_chart_node_produces_series():
     # F37 (charting): the chart node lowers to an (x, y) series — grouped agg(y) by x (bar/line), or
     # raw x,y points (scatter). Runs out-of-core server-side; the panel renders the SVG.

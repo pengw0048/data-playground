@@ -68,6 +68,14 @@ def lineage(uri: str = Query(...)) -> LineageResult:
     return get_deps().catalog.lineage(uri)
 
 
+@router.delete("/catalog/tables/{table_id}")
+def unregister_table(table_id: str) -> dict:
+    """Remove a dataset from the catalog (e.g. a dead entry whose file was deleted)."""
+    if not get_deps().catalog.unregister(table_id):
+        raise HTTPException(404, f"table '{table_id}' not found")
+    return {"ok": True}
+
+
 class JoinSuggestRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
     left_uri: str
@@ -155,16 +163,10 @@ def catalog_register(req: RegisterRequest) -> CatalogTable:
         deps.resolve_adapter(uri).schema(uri)  # validate readable
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"cannot read '{uri}': {e}")
-    t = deps.catalog.register_output(name=name, uri=uri, version="v1", parents=[])
-    # persist so user-added datasets survive a kernel restart (re-registered on startup)
-    try:
-        ds = metadb.get_setting("datasets", "global", default=[]) or []
-        if not any(d.get("uri") == uri for d in ds):
-            ds.append({"uri": uri, "name": name})
-            metadb.set_setting("datasets", ds, "global")
-    except Exception:  # noqa: BLE001
-        pass
-    return t
+    # register_output write-throughs per-row to catalog_entries (metadb), which _load_from_db restores
+    # on every read + across restart — so no separate 'datasets' settings blob (its read-modify-write
+    # dropped a concurrent registration; F45). The per-row store is authoritative + cross-instance.
+    return deps.catalog.register_output(name=name, uri=uri, version="v1", parents=[])
 
 
 # --------------------------------------------------------------------------- #

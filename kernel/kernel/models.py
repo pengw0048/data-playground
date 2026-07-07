@@ -65,6 +65,7 @@ class CatalogTable(Wire):
     version: str | None = None
     columns: list[ColumnSchema] = []
     keys: list[KeyInfo] = []  # candidate/known keys (primary-key candidates), composite-aware
+    missing: bool = False  # a local-path dataset whose file no longer exists (grey out / offer removal)
     updated_at: str | None = None
     meta: str | None = None
 

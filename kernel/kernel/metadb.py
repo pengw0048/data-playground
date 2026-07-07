@@ -466,6 +466,14 @@ def catalog_entries() -> list[dict]:
         return [json.loads(r.doc) for r in s.scalars(select(CatalogEntry))]
 
 
+def catalog_delete_entry(uri: str) -> None:
+    """Remove a catalog entry (unregister) from the shared store."""
+    with session() as s:
+        r = s.get(CatalogEntry, uri)
+        if r is not None:
+            s.delete(r)
+
+
 def catalog_edges() -> list[dict]:
     with session() as s:
         return [{"parent": r.parent, "child": r.child, "pipeline": r.pipeline}

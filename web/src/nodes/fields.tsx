@@ -127,8 +127,12 @@ function parseFilter(pred: string): Cond[] | null {
   for (const part of parts) {
     const nul = part.match(/^(.+?)\s+(IS NOT NULL|IS NULL)$/i)
     if (nul) { conds.push({ col: nul[1].trim(), op: nul[2].toUpperCase() as Op, val: '' }); continue }
-    const m = part.match(/^(.+?)\s*(!=|>=|<=|=|>|<|LIKE)\s*(.+)$/i)
-    if (!m) return null
+    // the column must be a bare identifier (or quoted), the operator EXACTLY one of OPS (negative
+    // lookahead so `>>>`/`>>` etc. don't parse as `>`), and the value must not start with an operator
+    // char — otherwise the predicate isn't faithfully representable as a builder row, so return null
+    // and let the card stay in raw-SQL mode instead of showing a condition the engine won't run (F43).
+    const m = part.match(/^([A-Za-z_][\w.]*|"[^"]+")\s*(!=|>=|<=|=|>|<|LIKE)(?![=<>!])\s*(.+)$/i)
+    if (!m || /^[=<>!]/.test(m[3].trim())) return null
     conds.push({ col: m[1].trim(), op: m[2].toUpperCase() as Op, val: m[3].trim() })
   }
   return conds

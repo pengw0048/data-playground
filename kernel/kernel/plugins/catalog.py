@@ -109,11 +109,17 @@ class InMemoryCatalog:
         baking declared into the stored doc) is what makes a declared key: (a) visible on a peer that
         already cached the dataset, and (b) cleanly reversible — clearing it restores the inferred key.
         `dmap` lets list_tables read Settings once for the whole list."""
+        from kernel.plugins.adapters import is_object_uri, path_of
         from kernel.relationships import key_candidates
         declared = (dmap if dmap is not None else self._declared_keys()).get(t.uri)
         inferred = [k for k in key_candidates(t.columns) if list(k.columns) != list(declared or [])]
         keys = ([KeyInfo(columns=list(declared), confidence="declared")] if declared else []) + inferred
-        return t if keys == t.keys else t.model_copy(update={"keys": keys})
+        # flag a local-path dataset whose file no longer exists (e.g. `make clean` / a deleted temp),
+        # so the UI can grey it out + offer removal instead of surfacing a raw IOException on click.
+        missing = not is_object_uri(t.uri) and not os.path.exists(path_of(t.uri))
+        if keys == t.keys and missing == t.missing:
+            return t
+        return t.model_copy(update={"keys": keys, "missing": missing})
 
     # -- CatalogProvider --------------------------------------------------- #
     def list_tables(self, q: str | None) -> list[CatalogTable]:
@@ -194,6 +200,25 @@ class InMemoryCatalog:
         for parent in parents:
             self._add_edge(parent, uri, pipeline)
         return table
+
+    def unregister(self, id_or_name: str) -> bool:
+        """Remove a dataset from the catalog (in-memory + the shared per-row store) — for pruning a
+        dead entry whose backing file is gone. Returns False if not found. Declared keys/relationships
+        keyed by the uri are left as-is (harmless dangling references)."""
+        with self._lock:
+            self._load_from_db()
+            tid = id_or_name if id_or_name in self.tables else self._by_uri.get(id_or_name) \
+                or next((t.id for t in self.tables.values() if t.name == id_or_name), None)
+            t = self.tables.get(tid) if tid else None
+            if t is None:
+                return False
+            self.tables.pop(tid, None)
+            self._by_uri.pop(t.uri, None)
+        try:
+            metadb.catalog_delete_entry(t.uri)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
 
     # -- declared keys & relationships (owner-asserted; per-ROW in the shared DB, cross-instance) --- #
     # Stored one-row-each (metadb.catalog_declared_keys / catalog_relationships), NOT a single JSON

@@ -44,3 +44,4 @@ bench:
 
 clean:
 	rm -rf web/dist web/node_modules kernel/.venv kernel/outputs kernel/canvases kernel/data/outputs
+	rm -f kernel/dataplay.db* kernel/e2e-test.db*   # metadata DB (+ WAL/SHM sidecars) — full reset incl. the catalog

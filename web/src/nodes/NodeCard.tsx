@@ -117,8 +117,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
               <EditableTitle id={id} title={data.title} onRename={rename} selected={selected} />
               <span className="flex-1" />
               {disabled && (
-                <span className="shrink-0 rounded px-1.5 py-0.5 text-[8.5px] font-bold tracking-[0.5px]"
-                  style={{ color: '#8a6d0b', background: '#fbf1dc' }}>
+                <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[8.5px] font-bold tracking-[0.5px] text-amber-700 dark:bg-amber-500/15 dark:text-amber-300">
                   DISABLED
                 </span>
               )}
@@ -138,8 +137,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
             {/* a run awaiting confirmation stays visible ON the card (so a rerun-all of several
                 sinks doesn't hide all-but-one behind the single floating panel) */}
             {runState === 'confirm' && (
-              <button className="nodrag mt-1.5 inline-flex cursor-pointer items-center gap-[5px] rounded-md border px-[9px] py-1 text-[11px] font-semibold"
-                style={{ borderColor: '#e7c66b', background: '#fbf1dc', color: '#8a6d0b' }}
+              <button className="nodrag mt-1.5 inline-flex cursor-pointer items-center gap-[5px] rounded-md border border-amber-300 bg-amber-100 px-[9px] py-1 text-[11px] font-semibold text-amber-700 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300"
                 onClick={(e) => { e.stopPropagation(); useStore.getState().openPanel(id, 'run') }}>
                 <Icon name="power" size={11} /> Confirm run…
               </button>

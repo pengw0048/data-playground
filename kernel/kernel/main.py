@@ -30,7 +30,6 @@ from fastapi.staticfiles import StaticFiles
 
 from kernel import auth, metadb
 from kernel.routers import catalog, runs, workspace
-from kernel.routers.catalog import RegisterRequest, catalog_register
 from kernel.routers.runs import _status_or_lost
 from kernel.security import current_user
 
@@ -55,12 +54,9 @@ app.include_router(workspace.router, prefix="/api", dependencies=_GATE)
 
 auth.reject_weak_secret()  # fail fast on a shipped/known-weak DP_AUTH_SECRET (forgeable sessions)
 metadb.init_db()  # create metadata tables (idempotent) + seed the default local user
-# re-register user-added datasets (from settings) so they survive a restart
-for _d in (metadb.get_setting("datasets", "global", default=[]) or []):
-    try:
-        catalog_register(RegisterRequest(uri=_d["uri"], name=_d.get("name")))
-    except Exception:  # noqa: BLE001
-        pass
+# user-added datasets survive restart via the per-row catalog_entries store (register_output
+# write-throughs there); the catalog's _load_from_db restores them lazily on first read. No
+# import-time re-register loop (removed the blocking probe-per-dataset startup pass; F45/F24).
 
 
 def _cross_site_ws(ws: WebSocket) -> bool:

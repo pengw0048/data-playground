@@ -81,15 +81,12 @@ export function MiniSelect<T extends string>({ value, options, onChange }: {
 }
 
 export function Chip({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'neutral' | 'blue' | 'amber' | 'green' }) {
-  const tones = {
-    neutral: { bg: '#f1f2f4', fg: color.text2 },
-    blue: { bg: '#e7ecfb', fg: '#3355c6' },
-    amber: { bg: '#fbf1dc', fg: '#a2731a' },
-    green: { bg: '#e3f3ea', fg: '#1f7a45' },
+  // dual-theme tones (were light-only hex — the neutral one went light-on-light in dark mode)
+  const cls = {
+    neutral: 'bg-muted text-muted-foreground',
+    blue: 'bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300',
+    amber: 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
+    green: 'bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-300',
   }[tone]
-  return (
-    <span style={{ fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: radius.chip, background: tones.bg, color: tones.fg }}>
-      {children}
-    </span>
-  )
+  return <span className={cn('rounded px-[7px] py-0.5 text-[10px] font-semibold', cls)}>{children}</span>
 }
