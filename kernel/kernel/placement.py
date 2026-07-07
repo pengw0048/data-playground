@@ -1,4 +1,4 @@
-"""Capability matching for execution placement (design: docs/EXECUTION.md §2/§4).
+"""Capability matching for execution placement.
 
 A worker advertises a `ResourceSpec` capacity; a step (or a whole graph) declares a `ResourceSpec`
 requirement. `satisfies(capacity, requires)` decides whether the worker can host it. Pure + tiny so

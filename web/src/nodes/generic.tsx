@@ -1,4 +1,4 @@
-// Generic node rendering (PRD §4.2, §8.7): any node the frontend doesn't have a hand-built
+// Generic node rendering: any node the frontend doesn't have a hand-built
 // card for — including plugin nodes — is rendered from its /api/nodes schema. A plugin that
 // registers a typed node therefore appears in the canvas, typed and wired, with NO frontend code.
 import { useEffect, useState } from 'react'

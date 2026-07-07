@@ -1,4 +1,4 @@
-"""Sample-preview (PRD §5.6 / FR-6.1) — run source→node on a bounded sample, off the full run.
+"""Sample-preview — run source→node on a bounded sample, off the full run.
 
 Uses the SAME lowering as a full run, with the source bounded to a preview scan budget, so the
 rows you see are faithful to what runs at scale. Stops honestly at non-previewable stages (P8),

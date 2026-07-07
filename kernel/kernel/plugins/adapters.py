@@ -1,4 +1,4 @@
-"""Dataset adapters — what a `dataset` can be (PRD §8.2).
+"""Dataset adapters — what a `dataset` can be.
 
 Each adapter turns a uri into a LAZY DuckDB relation (out-of-core: DuckDB streams and spills,
 never forcing a full in-memory materialization). Built-ins: Parquet, CSV, JSON, Arrow/Feather,
@@ -237,7 +237,7 @@ class DuckDBAdapter:
 
 
 class LanceAdapter:
-    """Lance is open source, so it is a CORE adapter (PRD Appendix A note). pylance loaded lazily.
+    """Lance is open source, so it is a CORE adapter. pylance loaded lazily.
 
     Scans STREAM into DuckDB via a Lance scanner → Arrow RecordBatchReader (out-of-core: batches are
     pulled on demand, never materializing the whole dataset in RAM), with column/limit pushdown.

@@ -1,4 +1,4 @@
-"""Kernel settings — zero-config defaults, env overrides (PRD NFR-9)."""
+"""Kernel settings — zero-config defaults, env overrides."""
 
 from __future__ import annotations
 

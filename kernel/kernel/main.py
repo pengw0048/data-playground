@@ -1,4 +1,4 @@
-"""Data Playground kernel — FastAPI app factory (PRD §9).
+"""Data Playground kernel — FastAPI app factory.
 
 A shared multi-user workspace server. One FastAPI process serves the SPA, the JSON API, the
 collab/run WebSockets, and the data engine — and it runs standalone by default. Users authenticate

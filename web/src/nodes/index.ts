@@ -1,4 +1,4 @@
-// Plugin loading (PRD §7.7): an eager glob over nodes/kinds/* runs each module's register()
+// Plugin loading: an eager glob over nodes/kinds/* runs each module's register()
 // side effect, so adding a node kind is just dropping a file. Capabilities register the same way.
 import type { ComponentType } from 'react'
 import { allSpecs, getComponent } from './registry'

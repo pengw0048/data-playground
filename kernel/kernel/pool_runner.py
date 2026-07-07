@@ -11,7 +11,7 @@ Config (DP_POOL_WORKERS, JSON):
     [{"name": "cpu", "cpu": 8}, {"name": "gpu", "cpu": 16, "gpu": 2, "gpu_type": "a100"}]
 
 Placement here is whole-run (the graph's max requirement → one worker); per-node placement + fusion
-across workers is docs/EXECUTION.md Phase C2/C3. Reserve/lease is not yet modeled — place() picks the
+across workers is a later phase. Reserve/lease is not yet modeled — place() picks the
 first capacity-matching worker (busy tracking is advisory, for the Compute view).
 """
 

@@ -1,6 +1,6 @@
 """Graph helpers — topological order, upstream chains, cycle detection.
 
-The top-level canvas graph must be acyclic (control flow is encapsulated, PRD §5.7).
+The top-level canvas graph must be acyclic (control flow is encapsulated).
 """
 
 from __future__ import annotations

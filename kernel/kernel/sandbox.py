@@ -1,4 +1,4 @@
-"""Ad-hoc cell sandbox — compiles a user operator body to a callable (PRD NFR-4).
+"""Ad-hoc cell sandbox — compiles a user operator body to a callable.
 
 The generic escape hatch: the user writes an operator inline (`def fn(row): ...`) and we
 run it over a small sample. This is a *soft* sandbox — a curated builtins whitelist, a

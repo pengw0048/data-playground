@@ -1,5 +1,5 @@
 """Placement planner — split a run's graph into regions (fused execution units) for per-node
-placement (docs/EXECUTION.md §4). Each region is a maximal same-target subgraph; at its boundaries
+placement. Each region is a maximal same-target subgraph; at its boundaries
 (a different-target edge, a fan-out, or the run target) its output is materialized to a ResultRef so
 a downstream region — possibly on another worker — reads it as a ref-source.
 

@@ -1,6 +1,6 @@
 """LLM-backed agent — an actor that BUILDS a real, typed dataflow graph on the canvas.
 
-This is the optional "real LLM" planner (PRD §5.8 / FR-A3). It is **provider-agnostic** and the
+This is the optional "real LLM" planner. It is **provider-agnostic** and the
 tool-use loop runs **in-process via Pydantic AI** — no `claude` CLI, no sidecar proxy. The model is
 chosen with DP_AGENT_MODEL: any Pydantic AI provider (openai/anthropic/google/groq/mistral/cohere/
 bedrock/…) or any OpenAI-compatible endpoint (a local Ollama, a gateway) via DP_AGENT_BASE_URL. The

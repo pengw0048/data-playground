@@ -1,4 +1,4 @@
-// Kernel API DTOs (PRD §9) — camelCase on the wire, mirrors kernel/models.py.
+// Kernel API DTOs — camelCase on the wire, mirrors kernel/models.py.
 import type { ColumnSchema } from './graph'
 
 export interface ResourceSpec {

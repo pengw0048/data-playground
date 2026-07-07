@@ -1,4 +1,4 @@
-"""The lowering engine (PRD §6/§7) — a node lowers to a step in a typed logical plan.
+"""The lowering engine — a node lowers to a step in a typed logical plan.
 
 The `dataset` wire is a lazy DuckDB relation; relational ops (filter/select/join/aggregate/
 sort/dedup/sql/sample) lower to relation transforms that DuckDB executes out-of-core (streaming,

@@ -1,4 +1,4 @@
-"""`dataplay` — the one-command launcher (PRD §1.1, FR-1.2, P6).
+"""`dataplay` — the one-command launcher.
 
 Starts a single server that serves the prebuilt SPA + the API + the engine, and opens the
 browser. Zero config: it uses (or creates) a workspace and seeds sample data on first run.

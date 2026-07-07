@@ -1,4 +1,4 @@
-"""Default runner (PRD §8.3) — the local out-of-core engine.
+"""Default runner — the local out-of-core engine.
 
 Lowers the graph to a DuckDB relation plan and executes it out-of-core (DuckDB streams and
 spills, so bigger-than-RAM is fine). Estimates cost coarsely and picks placement by a threshold

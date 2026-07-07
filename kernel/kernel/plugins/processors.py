@@ -1,4 +1,4 @@
-"""Processor registry (PRD §7.4) — a plugin extension point.
+"""Processor registry — a plugin extension point.
 
 The generic core ships with an EMPTY registry. Processors are registered by:
   1. a user promoting an ad-hoc transform cell to the library ("Promote to library"), or

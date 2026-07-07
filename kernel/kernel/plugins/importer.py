@@ -1,4 +1,4 @@
-"""Pipeline importer (PRD §5.6 / §7.5) — a bundle extension point.
+"""Pipeline importer — a bundle extension point.
 
 `import = run the factory` is inherently backend-specific (there is no generic pipeline
 format), so the generic core ships no importer. The SPI and the /pipelines/import endpoint
@@ -22,6 +22,6 @@ class NullImporter:
     def import_pipeline(self, config: str, params: dict | None) -> PipelineImport:
         raise ImporterNotConfigured(
             "No pipeline importer is registered in this bundle. Import is a plugin "
-            "capability (PRD §5.6) — the generic core ships none. Use an ad-hoc transform "
+            "capability — the generic core ships none. Use an ad-hoc transform "
             "cell or register an importer plugin."
         )

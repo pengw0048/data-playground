@@ -1,4 +1,4 @@
-"""Capability providers — predicate(schema) -> bool + the viewer tabs they add (PRD §5.4).
+"""Capability providers — predicate(schema) -> bool + the viewer tabs they add.
 
 Capabilities live on columns, not wires. They add actions/viewer tabs to any node whose
 data qualifies; they never change what connects.

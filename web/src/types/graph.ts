@@ -1,4 +1,4 @@
-// The canvas document model (PRD §8). Node ids are stable + globally unique (CRDT-friendly).
+// The canvas document model. Node ids are stable + globally unique (CRDT-friendly).
 import type { WireType } from '../theme/tokens'
 
 export type NodeStatus = 'draft' | 'latest' | 'stale' | 'queued' | 'running' | 'failed'

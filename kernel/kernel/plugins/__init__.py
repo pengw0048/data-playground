@@ -19,5 +19,5 @@ real code and was imported nowhere), each contract lives next to the code that U
 - Processors / catalog / pipeline importer — see `kernel.plugins.{processors,catalog,importer}`.
 
 Plugins declare a `dataplay.toml` manifest (name/version + an optional `min_core_api`) and are
-version-negotiated against `kernel.deps.CORE_API_VERSION` at load. See PRD §7/§8.
+version-negotiated against `kernel.deps.CORE_API_VERSION` at load.
 """

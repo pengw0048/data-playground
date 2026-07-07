@@ -1,4 +1,4 @@
-"""Backend node specs — the source of truth served at /api/nodes (PRD §4.2, §8.1).
+"""Backend node specs — the source of truth served at /api/nodes.
 
 The frontend renders + validates ANY node (built-in or plugin) generically from these schemas,
 so a plugin that registers a node needs no frontend code. Typed from day one (P7): ports and

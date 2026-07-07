@@ -1,4 +1,4 @@
-// Node & Capability registries (PRD §7.1). A node kind = a registered (spec, component)
+// Node & Capability registries. A node kind = a registered (spec, component)
 // pair. New capability = register(), never a new hardcoded card type (P3). The rest of the
 // frontend must not branch on specific kinds outside their own plugin file.
 import type { ComponentType } from 'react'

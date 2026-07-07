@@ -1,7 +1,7 @@
 """Core wire DTOs and the canvas graph model.
 
 Everything here is backend-agnostic. camelCase on the wire (to match the frontend),
-snake_case in Python. These shapes ARE the contract in PRD §9.
+snake_case in Python. These shapes ARE the contract.
 """
 
 from __future__ import annotations
@@ -275,7 +275,7 @@ class ProcessorDescriptor(Wire):
 
 
 # --------------------------------------------------------------------------- #
-# Canvas graph (mirrors PRD §8)
+# Canvas graph
 # --------------------------------------------------------------------------- #
 class Position(Wire):
     x: float

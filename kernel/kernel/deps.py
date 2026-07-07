@@ -1,4 +1,4 @@
-"""Composition root (PRD §6, §8.0) — builds the plugin registries at startup.
+"""Composition root — builds the plugin registries at startup.
 
 The core depends only on the SPI. This wires the DEFAULT setup (DuckDB+Lance adapters,
 local out-of-core runner, in-memory catalog, media/vector capabilities, node specs). Extra

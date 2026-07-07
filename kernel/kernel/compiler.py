@@ -1,4 +1,4 @@
-"""Compile: canvas graph → typed logical plan (PRD §9 tier 2, §10 /graph/compile).
+"""Compile: canvas graph → typed logical plan (served at /graph/compile).
 
 The plan mirrors the execution: source-read → operators → sink/commit → error-gate. It is what
 a runner executes and what estimate/placement reason over. Opaque/aggregate stages are single

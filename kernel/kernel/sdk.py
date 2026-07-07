@@ -1,4 +1,4 @@
-"""Node-authoring SDK (PRD §8.1) — what a plugin pack imports to add a typed node.
+"""Node-authoring SDK — what a plugin pack imports to add a typed node.
 
 A plugin's `register(reg)` calls `reg.add_node(spec, lower)`. `spec` is a NodeSpec (typed ports
 + params, rendered generically by the SPA — no frontend code needed). `lower(engine, node,

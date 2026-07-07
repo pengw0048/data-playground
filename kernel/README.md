@@ -1,6 +1,6 @@
 # Data Playground — kernel
 
-One FastAPI server that serves the SPA + API + WebSocket **and** runs the engine (PRD §6, P6).
+One FastAPI server that serves the SPA + API + WebSocket **and** runs the engine.
 Backend-agnostic core; the default setup runs fully offline and out-of-core.
 
 ## Run

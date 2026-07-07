@@ -1,4 +1,4 @@
-"""RunController — owner of a logical run across regions (docs/EXECUTION.md §2.4 / §4).
+"""RunController — owner of a logical run across regions.
 
 The common case — a plain graph that plans to a single default region — is NOT touched: run() returns
 None and the caller uses the base runner exactly as before (zero regression). A run that genuinely

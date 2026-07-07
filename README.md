@@ -161,7 +161,7 @@ There are no `branch` / `loop` / `variable` node types. Instead, control flow li
 **`section`**: a composite node whose body is a small **driver script** (Python) that calls its
 contained nodes with real `for` / `while` / `if` and an `emit(...)` for the output — so iteration and
 branching are just code over typed nodes, bounded and inspectable. This is the as-built model that
-replaced the original branch/loop nodes. (Design details: `docs/CONTROL_FLOW.md` — in Chinese.)
+replaced the original branch/loop nodes.
 
 ## Keyboard shortcuts
 
@@ -176,7 +176,7 @@ make setup     # kernel deps (uv) + sample data + web deps (npm)
 make run       # dataplay: build SPA + serve SPA+API on :8471, open browser
 make dev-web   # optional: Vite hot-reload on :5173 (proxies /api -> the kernel)
 make test      # kernel end-to-end tests (real engine on real files)
-make e2e       # browser end-to-end tests (Playwright on the real UI) — see docs/TESTING.md
+make e2e       # browser end-to-end tests (Playwright on the real UI)
 ```
 
 ## The agent

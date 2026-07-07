@@ -1,4 +1,4 @@
-"""Default catalog provider — in-memory, seeded from a local data directory (PRD §5.9).
+"""Default catalog provider — in-memory, seeded from a local data directory.
 
 Tables discovered on disk become catalog entries; `write` nodes register their outputs
 as new children, so lineage grows as the canvas runs.
