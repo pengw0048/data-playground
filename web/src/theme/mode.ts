@@ -2,6 +2,8 @@
 // (index.css) for the shadcn tokens and the legacy vars. This module only decides WHICH is active by
 // stamping `data-theme` on <html>, persists the user's choice, and follows the OS when set to 'system'.
 
+import { useEffect, useState } from 'react'
+
 export type ThemeMode = 'light' | 'dark' | 'system'
 const KEY = 'dp-theme'
 const mql = () => window.matchMedia('(prefers-color-scheme: dark)')
@@ -39,5 +41,18 @@ export function toggleTheme(): void {
 /** Apply the saved choice on boot and keep following the OS while in 'system' mode. Call once. */
 export function initTheme(): void {
   apply(getThemeMode())
-  mql().addEventListener('change', () => { if (getThemeMode() === 'system') apply('system') })
+  mql().addEventListener('change', () => {
+    if (getThemeMode() === 'system') { apply('system'); window.dispatchEvent(new Event('dp-theme-change')) }
+  })
+}
+
+/** Reactive resolved theme — re-renders on toggle OR OS change (both dispatch 'dp-theme-change'). */
+export function useResolvedTheme(): 'light' | 'dark' {
+  const [t, setT] = useState(resolvedTheme)
+  useEffect(() => {
+    const on = () => setT(resolvedTheme())
+    window.addEventListener('dp-theme-change', on)
+    return () => window.removeEventListener('dp-theme-change', on)
+  }, [])
+  return t
 }

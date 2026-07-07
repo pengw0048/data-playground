@@ -23,7 +23,10 @@ export function AgentDock() {
   useEffect(() => {
     if (!open) return
     api.agentStatus().then((s) => setLlm({ available: s.available, model: s.model, reason: s.reason })).catch(() => setLlm({ available: false, reason: 'kernel offline' }))
-  }, [open])
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }  // Esc closes the dock
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, setOpen])
 
   if (!open) return null
 

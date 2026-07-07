@@ -214,8 +214,8 @@ function ErrorState({ reason, onRetry }: { reason: string; onRetry: () => void }
 
 function NotPreviewable({ reason, onRun }: { reason: string; onRun: () => void }) {
   return (
-    <div className="dp-dark px-5 py-7 text-center text-muted-foreground">
-      <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-[#fbf1dc] text-[#d99a2b]">
+    <div className="px-5 py-7 text-center text-muted-foreground">
+      <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
         <Icon name="power" size={18} />
       </div>
       <div className="text-[13px] font-semibold text-foreground">Not sample-previewable</div>

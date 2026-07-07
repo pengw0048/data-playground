@@ -26,8 +26,9 @@ export function Port({ spec, side, index, count, nodeId }: {
   const base: React.CSSProperties = {
     width: hover ? 15 : 11,
     height: hover ? 15 : 11,
-    // hollow when nothing is wired; filled once connected (or while hovering, to preview the target)
-    background: connected || hover ? tok.color : '#fff',
+    // hollow when nothing is wired; filled once connected (or while hovering, to preview the target).
+    // the "hollow" fill is the CARD color (not #fff) so a port reads hollow on a dark card too.
+    background: connected || hover ? tok.color : 'hsl(var(--card))',
     border: `1.5px solid ${tok.color}`,
     top,
     [isSource ? 'right' : 'left']: hover ? -8 : -6,

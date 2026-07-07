@@ -26,6 +26,19 @@ monaco.editor.defineTheme('dp-light', {
   },
 })
 
+// Dark theme matching the app's dark code surfaces (--code-bg / --code-text in index.css).
+monaco.editor.defineTheme('dp-dark', {
+  base: 'vs-dark', inherit: true, rules: [],
+  colors: {
+    'editor.background': '#1a1e26',
+    'editor.foreground': '#d7dde5',
+    'editorLineNumber.foreground': '#4b5462',
+    'editor.lineHighlightBackground': '#20242c',
+    'editorCursor.foreground': '#d7dde5',
+    'editor.selectionBackground': '#2a3a4d',
+  },
+})
+
 // Column-name autocomplete for SQL/Python cells, backed by a mutable list the UI keeps current
 // (columns the user has seen in previews). Registered once — providers are global per language.
 export const columnStore: { columns: string[] } = { columns: [] }

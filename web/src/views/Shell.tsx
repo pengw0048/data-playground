@@ -195,7 +195,7 @@ function TablesContent() {
         {catalog.map((t) => (
           <button key={t.uri} onClick={() => addToCanvas('source', { uri: t.uri, tableId: t.id }, t.name)} title="Add as a source on the canvas"
             style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', border: `1px solid ${color.border}`, borderRadius: 10, background: 'hsl(var(--card))', cursor: 'pointer', textAlign: 'left' }}
-            onMouseEnter={(e) => (e.currentTarget.style.background = '#f7f8fa')} onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}>
+            onMouseEnter={(e) => (e.currentTarget.style.background = 'hsl(var(--accent))')} onMouseLeave={(e) => (e.currentTarget.style.background = 'hsl(var(--card))')}>
             <Icon name="db" size={16} style={{ color: color.text3 }} />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: color.ink }}>{t.name}</div>
@@ -222,13 +222,13 @@ function TransformsContent() {
         {processors.map((p) => (
           <button key={p.id} onClick={() => addToCanvas('transform', { source: 'library', processor: p.id, version: p.version, mode: p.mode }, p.title || p.id)} title="Add to the canvas"
             style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', border: `1px solid ${color.border}`, borderRadius: 10, background: 'hsl(var(--card))', cursor: 'pointer', textAlign: 'left' }}
-            onMouseEnter={(e) => (e.currentTarget.style.background = '#f7f8fa')} onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}>
+            onMouseEnter={(e) => (e.currentTarget.style.background = 'hsl(var(--accent))')} onMouseLeave={(e) => (e.currentTarget.style.background = 'hsl(var(--card))')}>
             <Icon name="fx" size={16} style={{ color: color.text3 }} />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: color.ink }}>{p.title || p.id}</div>
               <div style={{ fontSize: 11, color: color.text3 }}>{p.category}</div>
             </div>
-            {p.mode && <span style={{ fontSize: 10.5, color: color.text3, background: '#f1f2f4', padding: '2px 7px', borderRadius: radius.chip }}>{p.mode}</span>}
+            {p.mode && <span style={{ fontSize: 10.5, color: color.text3, background: 'hsl(var(--muted))', padding: '2px 7px', borderRadius: radius.chip }}>{p.mode}</span>}
             <span style={{ fontSize: 11, color: color.focus, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="plus" size={12} /> Use</span>
           </button>
         ))}

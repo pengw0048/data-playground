@@ -105,6 +105,14 @@
   --dots: #2a2f39;
   --scrollbar-thumb: #3a404c;
   color-scheme: dark;  /* native controls (scrollbars, form widgets) render dark */
+  /* React Flow chrome (minimap + zoom controls) — its light defaults glow on the dark canvas. */
+  --xy-minimap-background-color: #14171d;
+  --xy-minimap-mask-background-color: rgba(10, 12, 16, 0.6);
+  --xy-controls-button-background-color: #1a1e26;
+  --xy-controls-button-background-color-hover: #262b34;
+  --xy-controls-button-color: #cfd6df;
+  --xy-controls-button-color-hover: #ffffff;
+  --xy-controls-button-border-color: #2a2f39;
 }
 
 * { box-sizing: border-box; }

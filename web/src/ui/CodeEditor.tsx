@@ -1,5 +1,6 @@
 import Editor from '@monaco-editor/react'
 import { columnStore } from '../monaco-setup' // side-effect: wires Monaco offline (this chunk is lazy-loaded)
+import { useResolvedTheme } from '../theme/mode'
 
 // Monaco-backed code cell: syntax highlighting + autocomplete for SQL / Python. This module (and
 // all of Monaco) is code-split — CodePanel lazy-imports it, so the editor loads only when opened.
@@ -12,11 +13,12 @@ export function CodeEditor({ value, onChange, language, readOnly, height = 200, 
   completions?: string[]
 }) {
   columnStore.columns = completions ?? []
+  const dark = useResolvedTheme() === 'dark'  // @monaco-editor/react re-applies `theme` reactively
   return (
     <div style={{ border: '1px solid hsl(var(--border))', borderRadius: 8, overflow: 'hidden', height }}>
       <Editor
         language={language}
-        theme="dp-light"
+        theme={dark ? 'dp-dark' : 'dp-light'}
         value={value}
         onChange={(v) => onChange(v ?? '')}
         height="100%"
