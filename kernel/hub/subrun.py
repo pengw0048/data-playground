@@ -43,7 +43,8 @@ def main() -> int:
             from hub.executors.engine import BuildEngine
             with db.run_scope():
                 eng = BuildEngine(graph, deps.resolve_adapter, deps.registry, full=True,
-                                     node_builders=deps.node_builders, node_specs=deps.node_specs)
+                                     node_builders=deps.node_builders, node_specs=deps.node_specs,
+                                     pushdown=True, output_node=job.get("target"))
                 eng.relation(job.get("target")).write_parquet(mat_uri)
             _atomic_write(status_file, {"run_id": "child", "status": "done", "per_node": [], "rows_processed": 0,
                                         "ms": 0, "placement": "local", "output_uri": mat_uri})

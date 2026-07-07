@@ -170,7 +170,8 @@ class RunController:
         if backend is self.base:
             with db.run_scope():
                 eng = BuildEngine(subg, self.deps.resolve_adapter, self.deps.registry, full=True,
-                                     node_builders=self.deps.node_builders, node_specs=self.deps.node_specs)
+                                     node_builders=self.deps.node_builders, node_specs=self.deps.node_specs,
+                                     pushdown=True, output_node=region.output_node)
                 eng.relation(region.output_node).write_parquet(out_uri)
         else:
             sub = backend.run_unit(subg, region.output_node, out_uri)

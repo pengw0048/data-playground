@@ -3076,6 +3076,73 @@ def test_example_plugin_loads_and_runs(tmp_path):
     assert rows == [("a****",), ("b**",)]  # 'alice'→'a'+4× *, 'bob'→'b'+2× *
 
 
+def test_source_pushdown_into_scan(tmp_path):
+    # A single-consumer source→filter / source→select chain hands the predicate / projection to
+    # adapter.scan() on a full run, so an adapter that can prune at the source does — while the
+    # filter/select node STILL applies its op, so results are byte-identical. A spy adapter (delegating
+    # to the real DuckDB one) records the scan() kwargs; the guards (target-is-the-source, ≥2 consumers,
+    # non-plain projection) are exercised too.
+    import duckdb
+
+    from hub import db
+    from hub.deps import Deps
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+    from hub.plugins.adapters import DuckDBAdapter
+
+    p = str(tmp_path / "nums.parquet")
+    duckdb.connect().execute(
+        f"COPY (SELECT * FROM (VALUES (1,'a'),(2,'b'),(3,'c')) t(x,y)) TO '{p}' (FORMAT PARQUET)")
+
+    calls: list[dict] = []
+    real = DuckDBAdapter()
+
+    class Spy:
+        name = "spy"
+        def matches(self, uri): return True
+        def scan(self, uri, columns=None, predicate=None, limit=None, options=None):
+            calls.append({"columns": columns, "predicate": predicate})
+            return real.scan(uri, columns=columns, predicate=predicate, limit=limit, options=options)
+        def schema(self, uri): return real.schema(uri)
+        def count(self, uri): return real.count(uri)
+        def fingerprint(self, uri): return real.fingerprint(uri)
+        def write(self, uri, rel, mode="overwrite"): return real.write(uri, rel, mode)
+
+    (tmp_path / "ws").mkdir()
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    src = {"id": "src", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": p}}}
+
+    def run(nodes, edges, target, output_node):
+        calls.clear()
+        with db.run_scope():
+            eng = BuildEngine(Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": edges}),
+                                 lambda uri: Spy(), d.registry, full=True, node_builders=d.node_builders,
+                                 node_specs=d.node_specs, pushdown=True, output_node=output_node)
+            return sorted(eng.relation(target).fetchall())
+
+    def edge(s, t): return {"id": f"{s}{t}", "source": s, "target": t, "data": {"wire": "dataset"}}
+
+    flt = {"id": "f", "type": "filter", "position": {"x": 0, "y": 0}, "data": {"config": {"predicate": "x > 1"}}}
+    rows = run([src, flt], [edge("src", "f")], "f", "f")
+    assert calls[0]["predicate"] == "x > 1"           # predicate handed to the source
+    assert rows == [(2, "b"), (3, "c")]               # …and still correct (filter re-applies)
+
+    sel = {"id": "s", "type": "select", "position": {"x": 0, "y": 0}, "data": {"config": {"select": "x, y"}}}
+    run([src, sel], [edge("src", "s")], "s", "s")
+    assert calls[0]["columns"] == ["x", "y"]          # a plain column list is pushed as a projection
+
+    sel2 = {"id": "s", "type": "select", "position": {"x": 0, "y": 0}, "data": {"config": {"select": "x AS z"}}}
+    run([src, sel2], [edge("src", "s")], "s", "s")
+    assert calls[0]["columns"] is None                # `x AS z` isn't a provable column subset → not pushed
+
+    rows = run([src, flt], [edge("src", "f")], "src", "src")
+    assert calls[0]["predicate"] is None and rows == [(1, "a"), (2, "b"), (3, "c")]  # never prune the target itself
+
+    flt2 = {"id": "f2", "type": "filter", "position": {"x": 0, "y": 0}, "data": {"config": {"predicate": "x < 3"}}}
+    run([src, flt, flt2], [edge("src", "f"), edge("src", "f2")], "f", "f")
+    assert calls[0]["predicate"] is None              # ≥2 consumers → can't prove safety → no push-down
+
+
 def test_section_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),

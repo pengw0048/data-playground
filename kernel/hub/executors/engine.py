@@ -10,6 +10,7 @@ so what you see on the sample is faithful — except nodes flagged not-previewab
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import duckdb
@@ -42,6 +43,24 @@ def _bypassed(node: GraphNode) -> bool:
     return bool(node.data.get("bypassed")) if isinstance(node.data, dict) else False
 
 
+_PLAIN_COL = re.compile(r'^\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\s*$')
+
+
+def _plain_columns(expr: str) -> list[str] | None:
+    """A `select` expression → list of bare column names IFF it is a plain comma-separated identifier
+    list (quoted or bare). Returns None for anything else — `*`, `a AS b`, `a+1`, `f(x)`, `t.a` — so a
+    projection push-down is only ever a provable pure column subset (never drops a needed column)."""
+    if not expr:
+        return None
+    cols: list[str] = []
+    for part in expr.split(","):
+        m = _PLAIN_COL.match(part)
+        if not m:
+            return None
+        cols.append(m.group(1) or m.group(2))
+    return cols or None
+
+
 def _disabled(node: GraphNode) -> bool:
     return bool(node.data.get("disabled")) if isinstance(node.data, dict) else False
 
@@ -50,12 +69,19 @@ class BuildEngine:
     def __init__(self, graph: Graph, resolve_adapter, registry, sample_k: int | None = None,
                  full: bool = False, node_builders: dict | None = None, node_specs: dict | None = None,
                  bound_inputs: dict | None = None, spill_files: list | None = None,
-                 schema_only: bool = False, warm=None, warm_scope: str = ""):
+                 schema_only: bool = False, warm=None, warm_scope: str = "",
+                 pushdown: bool = False, output_node: str | None = None):
         self.graph = graph
         self.resolve_adapter = resolve_adapter
         self.registry = registry
         self.sample_k = sample_k
         self.full = full
+        # pushdown: hand a single-consumer source→filter/select's predicate/projection to adapter.scan()
+        # so an adapter that prunes at the source does. Full-run write/count paths only (preview keeps
+        # the plain scan so previewing a source shows the source). output_node = the run's requested
+        # target: never prune it (you asked to read that node directly). See _source_pushdown.
+        self.pushdown = pushdown
+        self._output_node = output_node
         # schema_only: we only want column names/types, never rows — scan sources with limit=0 so
         # even an eager adapter (Lance materializes on to_table) touches no data. See executors/schema.
         self.schema_only = schema_only
@@ -165,6 +191,25 @@ class BuildEngine:
         rel.create_view(name, replace=True)
         return name
 
+    def _source_pushdown(self, node: GraphNode) -> tuple[list[str] | None, str | None]:
+        """When a source has EXACTLY ONE consumer and it's a plain (not bypassed/disabled) filter or
+        select, hand that predicate / projection to adapter.scan() — so a warehouse/Iceberg/plugin
+        adapter prunes rows or columns at the source (the built-in DuckDB adapter honors them too). The
+        consumer node ALSO applies its own op, so the result is byte-identical whether or not the
+        adapter honors the hint; a source with 0 or ≥2 consumers is left alone (can't prove safety)."""
+        outs = g.outgoing(self.graph, node.id)
+        if len(outs) != 1:
+            return None, None
+        consumer = g.node_map(self.graph).get(outs[0].target)
+        if consumer is None or _disabled(consumer) or _bypassed(consumer):
+            return None, None
+        ccfg = _cfg(consumer)
+        if consumer.type == "filter":
+            return None, ((ccfg.get("predicate") or "").strip() or None)
+        if consumer.type == "select":
+            return _plain_columns((ccfg.get("select") or ccfg.get("expr") or "").strip()), None
+        return None, None
+
     # -- building ---------------------------------------------------------- #
     def _lower(self, node: GraphNode) -> Relation:  # noqa: C901
         t = node.type
@@ -192,6 +237,12 @@ class BuildEngine:
             extra = {"options": opts} if opts else {}
             if self.schema_only:
                 return self.resolve_adapter(uri).scan(uri, limit=0, **extra)  # metadata only — never materialize
+            if self.pushdown and node.id != self._output_node:
+                cols, pred = self._source_pushdown(node)  # prune at the source for adapters that can
+                if cols:
+                    extra["columns"] = cols
+                if pred:
+                    extra["predicate"] = pred
             rel = self.resolve_adapter(uri).scan(uri, **extra)
             if self.sample_k and not self.full:
                 rel = rel.limit(self.sample_k)

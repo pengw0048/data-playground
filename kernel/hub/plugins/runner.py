@@ -167,7 +167,8 @@ class LocalRunner:
         cacheable = self._plan_cacheable(graph, target)
         cached = self._cache_get(phash) if cacheable else None
         engine = BuildEngine(graph, self.resolve_adapter, self.registry, full=True,
-                                node_builders=self.node_builders, node_specs=self.node_specs)
+                                node_builders=self.node_builders, node_specs=self.node_specs,
+                                pushdown=True, output_node=target)
         nm = g.node_map(graph)
         rows_seen = 0
         # Run on our OWN DuckDB cursor (db.run_scope), NOT the process-global lock: a long run no
