@@ -84,8 +84,16 @@ def list_users() -> list[dict]:
         return [{"id": u.id, "name": u.name} for u in s.scalars(_sa_select(metadb.User))]
 
 
+def _require_admin(uid: str) -> None:
+    """Instance-wide config (global settings, user management) is admin-only in multi-user mode.
+    Open single-user mode has no privilege boundary — the single local user keeps full control."""
+    if auth.auth_enabled() and not metadb.is_admin(uid):
+        raise HTTPException(403, "admin only")
+
+
 @router.post("/users")
-def create_user(body: UserBody, uid: str = Depends(current_user)) -> dict:  # gated: no anonymous self-registration
+def create_user(body: UserBody, uid: str = Depends(current_user)) -> dict:  # admin-only (auth mode)
+    _require_admin(uid)
     with metadb.session() as s:
         u = metadb.User(name=body.name, email=body.email,
                         password_hash=auth.hash_password(body.password) if body.password else None)
@@ -252,6 +260,8 @@ def get_settings(uid: str = Depends(current_user)) -> dict:
 
 @router.put("/settings")
 def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
+    if body.scope == "global":
+        _require_admin(uid)  # instance-wide settings (object-store creds, agent key, destinations) — admin only
     scope_id = uid if body.scope == "user" else ""
     value = body.value
     if body.scope == "global":  # a redaction sentinel means "keep what's stored" — never overwrite a secret with dots

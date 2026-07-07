@@ -2163,6 +2163,27 @@ def test_declared_keys_and_relationships_are_independent_rows():
         d.catalog.remove_relationship(r2)
 
 
+def test_admin_gate_on_global_settings_and_users(monkeypatch):
+    # F10: instance-wide config (global settings, user creation) is admin-only in multi-user mode; the
+    # seeded/bootstrap user is admin, a new user is not. Open single-user mode has no gate.
+    from fastapi import HTTPException
+
+    from kernel import metadb
+    from kernel.routers.workspace import _require_admin
+    assert metadb.is_admin("local") is True                 # the bootstrap/default user is admin
+    with metadb.session() as s:
+        u = metadb.User(name="bob")
+        s.add(u)
+        s.flush()
+        bob = u.id
+    assert metadb.is_admin(bob) is False                    # a freshly-created user is NOT admin
+    _require_admin(bob)                                      # open mode (no auth) → no privilege boundary
+    monkeypatch.setenv("DP_AUTH_SECRET", "x" * 40)          # auth on
+    with pytest.raises(HTTPException):
+        _require_admin(bob)                                 # non-admin → 403
+    _require_admin("local")                                 # admin → allowed
+
+
 def test_sql_fs_sandbox_confines_reads_in_auth_mode(monkeypatch, tmp_path):
     # F4: in multi-user (auth) mode with no object store, DuckDB's filesystem is confined to the
     # allowed roots, so a `sql` node's read_csv/COPY can't reach arbitrary local files. Test the

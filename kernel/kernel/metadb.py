@@ -16,7 +16,7 @@ import json
 import os
 import uuid
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from kernel.settings import settings
@@ -42,6 +42,7 @@ class User(Base):
     name: Mapped[str] = mapped_column(String)
     email: Mapped[str | None] = mapped_column(String, nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String, nullable=True)  # per-user credential (auth mode)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)  # gates global settings + user management
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -209,8 +210,10 @@ def init_db() -> None:
     with session() as s:
         u = s.get(User, DEFAULT_USER_ID)
         if u is None:
-            u = User(id=DEFAULT_USER_ID, name="Local")
+            u = User(id=DEFAULT_USER_ID, name="Local", is_admin=True)  # the seeded/bootstrap user is the admin
             s.add(u)
+        elif not u.is_admin and s.query(User).filter(User.is_admin).count() == 0:
+            u.is_admin = True  # no admin exists yet (upgraded DB) → the default user becomes admin
         # bootstrap: seed the default user's credential from DP_AUTH_PASSWORD (once) so an existing
         # shared-password deployment keeps working after upgrading to per-user auth
         from kernel import auth
@@ -231,6 +234,15 @@ def session():
         raise
     finally:
         s.close()
+
+
+def is_admin(user_id: str | None) -> bool:
+    """Whether this user may change instance-wide config (global settings, user management)."""
+    if not user_id:
+        return False
+    with session() as s:
+        u = s.get(User, user_id)
+        return bool(u and u.is_admin)
 
 
 def resolve_user(user_id: str | None) -> str:
