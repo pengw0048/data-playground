@@ -3859,6 +3859,30 @@ def test_ray_backend_placement_and_tiers(tmp_path):
     assert hasattr(rr, "run_unit")                                     # PlaceableBackend region entry present
 
 
+def test_ray_backend_run_unit_falls_back_locally_for_a_nonclean_region(tmp_path):
+    # D fix: run_unit on a NON-clean region (aggregate) must NOT call the missing LocalRunner.run_unit —
+    # it materializes with the local DuckDB engine (correct, non-distributed). No Ray needed. Also guards
+    # _materialize_local creating a missing parent dir for the output uri.
+    import duckdb
+
+    from hub.deps import Deps
+    from hub.models import Graph
+    p = str(tmp_path / "nums.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES (1),(1),(2)) t(x)) TO '{p}' (FORMAT PARQUET)")
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+    gr = Graph(**{"id": "c", "version": 1, "nodes": [
+        _ray_node("s", "source", {"uri": p}),
+        _ray_node("a", "aggregate", {"groupBy": "x", "aggs": "count(*) AS n"}),
+    ], "edges": [_ray_edge("s", "a")]})
+    out = str(tmp_path / "sub" / "unit.parquet")  # parent dir missing → guards the local materialize makedirs
+    st = rr.run_unit(gr, "a", out)
+    assert st.status == "done", st.error
+    assert st.placement == "local"  # a non-clean region fell back to the local engine, not Ray
+    assert duckdb.connect().execute(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0] == 2
+
+
 @pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="live Ray run — opt-in (needs [ray] + a real executor). Enable: DP_TEST_RAY_LIVE=1.")
 def test_ray_backend_run_unit_live(tmp_path):
     # D end-to-end: run_unit executes a region on Ray (reads a parquet WORKER-DIRECT via ray.data.read_parquet)

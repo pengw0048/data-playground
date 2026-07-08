@@ -212,9 +212,9 @@ class RunController:
         from hub.plugins.adapters import is_object_uri
         with db.run_scope():
             if dst_tier.is_object or is_object_uri(src_uri):
-                db.ensure_object_store()
-            else:
-                os.makedirs(dst_tier.prefix, exist_ok=True)
+                db.ensure_object_store()      # register object-store creds for whichever side is s3/gs
+            if not dst_tier.is_object:
+                os.makedirs(dst_tier.prefix, exist_ok=True)  # DuckDB won't create a local file's parent dir
             db.conn().read_parquet(src_uri).write_parquet(dst_uri)
 
     def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], regions=None) -> str:

@@ -129,7 +129,7 @@ class RayRunner:
         falls back to the base runner's run_unit (subprocess-materialize, always correct)."""
         ir = lower_to_ir(graph, output_node, self.node_specs, self.deps.node_ir)
         if not self._ray_runnable(ir):
-            return self.base.run_unit(graph, output_node, output_uri)  # safe fallback (SubprocessRunner)
+            return self._materialize_local(graph, output_node, output_uri, run_id)  # non-clean → local engine
         run_id = run_id or f"unit_{uuid.uuid4().hex[:10]}"
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", target_node_id=output_node,
                            per_node=[PerNodeStatus(node_id=output_node, status="queued", label=output_node)])
@@ -138,6 +138,34 @@ class RayRunner:
             self._cancel[run_id] = threading.Event()
         threading.Thread(target=self._supervise, args=(run_id, graph, output_node, status),
                          kwargs={"materialize_uri": output_uri}, daemon=True).start()
+        return status
+
+    def _materialize_local(self, graph, output_node, output_uri, run_id=None) -> RunStatus:
+        """Non-clean region fallback: materialize it with the LOCAL DuckDB engine (correct, just not
+        distributed). Synchronous — returns a terminal status the RunController polls. Uses DuckDB only
+        (no Ray in this process), so no init-order deadlock. self.base (LocalRunner) has no run_unit."""
+        from hub.executors.engine import BuildEngine
+        from hub.plugins.adapters import is_object_uri
+        run_id = run_id or f"unit_{uuid.uuid4().hex[:10]}"
+        status = RunStatus(run_id=run_id, status="running", placement="local", target_node_id=output_node,
+                           per_node=[PerNodeStatus(node_id=output_node, status="running", label=output_node)])
+        with self._lock:
+            self.runs[run_id] = status
+        try:
+            with db.run_scope():
+                if is_object_uri(output_uri):
+                    db.ensure_object_store()
+                else:
+                    os.makedirs(os.path.dirname(output_uri) or ".", exist_ok=True)
+                eng = BuildEngine(graph, self.resolve_adapter, self.deps.registry, full=True,
+                                  node_builders=self.deps.node_builders, node_specs=self.node_specs,
+                                  output_node=output_node)
+                eng.relation(output_node).write_parquet(output_uri)
+            status.status, status.output_uri = "done", output_uri
+        except Exception as e:  # noqa: BLE001
+            status.status, status.error = "failed", f"{type(e).__name__}: {e}"
+        for p in status.per_node:
+            p.status = status.status
         return status
 
     def _ray_runnable(self, ir) -> bool:
