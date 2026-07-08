@@ -3094,6 +3094,75 @@ def test_join_analysis_reflects_the_configured_key():
     assert top.cardinality == "1:N" and ja.warning and "fans out" in ja.warning
 
 
+def test_transform_schema_contract_types_the_port_and_propagates_downstream():
+    # A transform is untyped by default (its output columns need running Python). A user-declared
+    # contract (config.outputSchema) must: (a) type the transform's OWN port verbatim, and (b) type
+    # a DOWNSTREAM relational node too — via a schema-only typed stand-in relation, no code run.
+    from hub.executors.schema import schema_for_graph
+    from hub.models import Graph
+    d = get_deps()
+
+    def cols(nodes, edges):
+        gph = Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": edges})
+        return schema_for_graph(gph, d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
+
+    src = N("s", "source", {"uri": _uri("events")})
+    edges = [E("s", "x"), E("x", "f")]
+
+    # undeclared → transform + its downstream filter are untyped (null)
+    plain = cols([src, N("x", "transform", {"source": "adhoc", "code": "def fn(r): return r"}),
+                  N("f", "filter", {"predicate": "score > 0"})], edges)
+    assert plain["x"] is None and plain["f"] is None
+
+    # declared → transform types verbatim, and the downstream filter is typed FROM the contract
+    contract = [{"name": "user_id", "type": "int", "capabilities": []},
+                {"name": "score", "type": "float", "capabilities": []}]
+    typed = cols([src, N("x", "transform", {"source": "adhoc", "code": "def fn(r): return r",
+                                             "outputSchema": contract}),
+                  N("f", "filter", {"predicate": "score > 0"})], edges)
+    assert typed["x"] is not None and [c["name"] for c in typed["x"]] == ["user_id", "score"]
+    assert typed["x"][0]["type"] == "int"  # the port shows the user's EXACT declared type
+    assert typed["f"] is not None and [c["name"] for c in typed["f"]] == ["user_id", "score"]  # propagated
+
+
+def test_transform_schema_contract_ignores_bypass_disabled_and_odd_names():
+    # Adversarial-review fixes: (1) a BYPASSED declared code op passes its INPUT through — its declaration
+    # must NOT apply (own port + downstream reflect the real input, not the contract). (2) a DISABLED
+    # declared code op emits nothing → untyped (like a disabled relational node), not the declared cols.
+    # (3) a declared column NAME with an embedded double-quote must not break the stand-in SQL.
+    from hub.executors.schema import schema_for_graph
+    from hub.models import Graph
+    d = get_deps()
+
+    def cols(x_data):
+        nodes = [N("s", "source", {"uri": _uri("events")}),
+                 {"id": "x", "type": "transform", "position": {"x": 0, "y": 0},
+                  "data": {"title": "x", "config": {"source": "adhoc", "code": "def fn(r): return r",
+                                                    "outputSchema": [{"name": "score", "type": "float", "capabilities": []}]},
+                           **x_data}},
+                 N("f", "filter", {"predicate": "id > 0"})]
+        gph = Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": [E("s", "x"), E("x", "f")]})
+        return schema_for_graph(gph, d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
+
+    ev_cols = ["id", "user_id", "event", "amount"]  # the real events schema
+    # bypassed → declaration ignored; transform + downstream reflect the passthrough (input) columns
+    byp = cols({"bypassed": True})
+    assert [c["name"] for c in byp["x"]] == ev_cols and "score" not in [c["name"] for c in byp["x"]]
+    assert [c["name"] for c in byp["f"]] == ev_cols  # downstream typed from the real passthrough
+    # disabled → emits nothing → untyped (null) on its own port too, like any disabled node
+    dis = cols({"disabled": True})
+    assert dis["x"] is None and dis["f"] is None
+    # a declared name with a literal double-quote must not raise — the stand-in escapes it, downstream types
+    weird = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("events")}),
+        N("x", "transform", {"source": "adhoc", "code": "def fn(r): return r",
+                             "outputSchema": [{"name": 'a"b', "type": "int", "capabilities": []}]}),
+        N("f", "filter", {"predicate": "1=1"})], "edges": [E("s", "x"), E("x", "f")]})
+    wc = schema_for_graph(weird, d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
+    assert [c["name"] for c in wc["x"]] == ['a"b']  # own port verbatim
+    assert wc["f"] is not None and [c["name"] for c in wc["f"]] == ['a"b']  # propagated (stand-in didn't crash)
+
+
 def test_declared_keys_and_relationships_are_independent_rows():
     # #9 fix: each declared key / relationship is its OWN DB row (not one shared JSON blob), so setting
     # one never rewrites/clobbers another — the mechanism that stops cross-instance lost updates.

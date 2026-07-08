@@ -66,6 +66,39 @@ def _disabled(node: GraphNode) -> bool:
     return bool(node.data.get("disabled")) if isinstance(node.data, dict) else False
 
 
+# code-op kinds whose OUTPUT columns can't be resolved without running them → untyped ports, UNLESS
+# the node carries a user-declared schema contract (config.outputSchema). See executors/schema.
+_CODE_KINDS = {"transform", "notebook", "section", "vector-search", "loop", "opaque"}
+
+_DUCK_TYPE = {
+    "int": "BIGINT", "integer": "BIGINT", "bigint": "BIGINT", "long": "BIGINT",
+    "smallint": "BIGINT", "tinyint": "BIGINT", "hugeint": "HUGEINT",
+    "float": "DOUBLE", "double": "DOUBLE", "real": "DOUBLE", "number": "DOUBLE", "decimal": "DOUBLE",
+    "bool": "BOOLEAN", "boolean": "BOOLEAN",
+    "string": "VARCHAR", "str": "VARCHAR", "text": "VARCHAR", "varchar": "VARCHAR",
+    "char": "VARCHAR", "utf8": "VARCHAR",
+    "date": "DATE", "timestamp": "TIMESTAMP", "datetime": "TIMESTAMP", "time": "TIME",
+    "blob": "BLOB", "bytes": "BLOB", "json": "JSON",
+}
+
+
+def declared_schema(node: GraphNode) -> list | None:
+    """A user-declared output-schema contract (config.outputSchema) on a code op, or None. Lets a
+    transform/plugin node carry a typed port + propagate types downstream without ever being run."""
+    sch = _cfg(node).get("outputSchema")
+    return sch if isinstance(sch, list) and sch else None
+
+
+def _duck_type(t: object) -> str:
+    """Map a declared/display column type to a DuckDB type for a schema-only stand-in relation. Coarse
+    on purpose (column-NAME propagation is what matters; exact type rarely does) — unknown → VARCHAR."""
+    s = str(t or "").strip()
+    is_list = s.endswith("]") or "list" in s.lower()
+    base = re.sub(r"[\[(<].*$", "", s).strip().lower()
+    d = _DUCK_TYPE.get(base, "VARCHAR")
+    return f"{d}[]" if is_list else d
+
+
 class BuildEngine:
     def __init__(self, graph: Graph, resolve_adapter, registry, sample_k: int | None = None,
                  full: bool = False, node_builders: dict | None = None, node_specs: dict | None = None,
@@ -192,6 +225,26 @@ class BuildEngine:
         rel.create_view(name, replace=True)
         return name
 
+    def _stand_in(self, cols: list) -> Relation:
+        """An empty relation with the declared column names/types — a typed schema_only stand-in for a
+        code op, so a declared contract propagates to downstream relational ops without running code."""
+        def _name(c) -> str:
+            return str((c.get("name") if isinstance(c, dict) else getattr(c, "name", "")) or "col")
+
+        def _type(c):
+            return c.get("type") if isinstance(c, dict) else getattr(c, "type", None)
+
+        def _q(n: str) -> str:  # a safely-quoted SQL identifier — double any embedded quote
+            return '"' + n.replace('"', '""') + '"'
+
+        names = [_name(c) for c in cols] or ["col"]
+        try:
+            parts = [f'CAST(NULL AS {_duck_type(_type(c))}) AS {_q(_name(c))}' for c in cols] or ["NULL AS col"]
+            return db.conn().sql(f"SELECT {', '.join(parts)} LIMIT 0")
+        except Exception:  # noqa: BLE001 — a declared type didn't parse → all-VARCHAR (names still propagate)
+            parts = [f'CAST(NULL AS VARCHAR) AS {_q(n)}' for n in names]
+            return db.conn().sql(f"SELECT {', '.join(parts)} LIMIT 0")
+
     def _source_pushdown(self, node: GraphNode) -> tuple[list[str] | None, str | None]:
         """When a source has EXACTLY ONE consumer and it's a plain (not bypassed/disabled) filter or
         select, hand that predicate / projection to adapter.scan() — so a warehouse/Iceberg/plugin
@@ -219,6 +272,14 @@ class BuildEngine:
         # a disabled node (and, since inputs pull through it, everything downstream) produces nothing
         if _disabled(node):
             raise NotPreviewable(node, "node is disabled")
+
+        # a declared output-schema contract on a code op: in schema_only mode, stand in a typed empty
+        # relation so its columns (and everything downstream) type WITHOUT running the code. A BYPASSED
+        # node is skipped — it passes its input through (handled below), so the declaration doesn't apply.
+        if self.schema_only and not _bypassed(node) and (t in _CODE_KINDS or t in self.node_builders):
+            dsch = declared_schema(node)
+            if dsch is not None:
+                return self._stand_in(dsch)
 
         if t == "source":
             uri = cfg.get("uri")

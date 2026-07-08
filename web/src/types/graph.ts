@@ -36,7 +36,8 @@ export interface NodeConfig {
   mode?: ProcessorMode
   onError?: 'raise' | 'skip'
   scope?: 'dataset' | 'sample'  // code node: label for whether it works over the full dataset or a sample
-  outputSchema?: ColumnSchema[]
+  outputSchema?: ColumnSchema[]           // declared output contract (types this port + downstream)
+  outputSchemaSource?: 'declared' | 'inferred'  // how outputSchema was filled (for the UI hint)
   // join
   on?: string
   how?: 'inner' | 'left'

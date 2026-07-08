@@ -8,6 +8,7 @@ import { FileDialog } from '../ui/FileDialog'
 import { miniInputClass } from '../ui/controls'
 import { api } from '../api/client'
 import type { JoinAnalysis, JoinSuggestion } from '../types/api'
+import type { ColumnSchema } from '../types/graph'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -15,6 +16,17 @@ import { Separator } from '@/components/ui/separator'
 import { cn } from '@/lib/utils'
 
 export const INSPECTOR_W = 300
+
+// Built-in node kinds with a hand-built card — everything else the app renders is a PLUGIN node.
+const BUILTIN_KINDS = new Set([
+  'source', 'filter', 'select', 'sort', 'dedup', 'join', 'sql', 'aggregate', 'sample',
+  'metric', 'chart', 'write', 'note', 'section', 'code', 'transform', 'vector-search',
+])
+// Kinds whose OUTPUT columns need running code, so they can carry a user schema contract — mirrors the
+// kernel's _UNTYPED set (minus 'section', which has its own port editor). Plugin kinds execute too, so
+// any non-built-in kind is contract-capable as well. Relational/io/annotation nodes are always typed.
+const CONTRACT_KINDS = new Set(['transform', 'notebook', 'vector-search', 'loop', 'opaque'])
+const canDeclareSchemaKind = (kind: string) => CONTRACT_KINDS.has(kind) || !BUILTIN_KINDS.has(kind)
 
 // Figma-style right property panel: shows the SELECTED node's properties (params reused from the
 // generic editor), a code snippet with "open editor", its ports, and actions. When nothing (or a
@@ -51,7 +63,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const runnable = useStore((s) => nodeRunnable(s.doc, nodeId))
   const runState = useStore((s) => s.runs[nodeId]?.phase)
-  const outSchema = useStore((s) => s.schemas[nodeId])  // ColumnSchema[] = typed · null = untyped
+  const serverSchema = useStore((s) => s.schemas[nodeId])  // ColumnSchema[] = typed · null = untyped · undefined = unknown
+  const allSchemas = useStore((s) => s.schemas)
+  const edges = useStore((s) => s.doc.edges)
   const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
   useEffect(() => setName(node?.data.title ?? ''), [node?.data.title])
@@ -64,6 +78,24 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const codeParams = (bspec?.params ?? []).filter((p) => p.type === 'code')
   const cfg = node.data.config as Record<string, unknown>
   const invalid = nodeInvalidReason(node)
+
+  // a code op / plugin kind can carry a declared/inferred schema contract; relational ops are always
+  // statically typed, and source/write/note/section are handled elsewhere.
+  const canDeclareSchema = canDeclareSchemaKind(kind) && !['source', 'write', 'note', 'section'].includes(kind)
+  // OUTPUT port schema: prefer the node's own declared contract (exact user types, instant) over the
+  // server-resolved schema — but only for a contract-capable, non-bypassed node (a bypassed node passes
+  // its input through, so its declaration doesn't describe its output). null = untyped, undefined = unknown.
+  const declaredOut = Array.isArray(cfg.outputSchema) && (cfg.outputSchema as ColumnSchema[]).length
+    ? (cfg.outputSchema as ColumnSchema[]) : null
+  const outSchema = (canDeclareSchema && declaredOut && !node.data.bypassed) ? declaredOut : serverSchema
+  // INPUT port schema = the OUTPUT schema of whatever is wired into that port (routed by targetHandle).
+  const inputSchemaFor = (portId: string): ColumnSchema[] | null | undefined => {
+    const inc = edges.filter((e) => e.target === nodeId)
+    const specIn = spec?.inputs ?? []
+    const e = inc.find((ed) => (ed.targetHandle ?? specIn[0]?.id ?? 'in') === portId)
+      ?? (specIn.length === 1 ? inc[0] : undefined)
+    return e ? allSchemas[e.source] : undefined
+  }
 
   return (
     <div className="flex flex-1 flex-col overflow-y-auto">
@@ -131,10 +163,11 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {kind !== 'source' && kind !== 'note' && kind !== 'write' && <CheckpointToggle nodeId={nodeId} />}
 
       {/* ports — a real port label (join left/right, metric value) shows as a name; the default
-          in/out ports just show their wire type. Outputs carry a typed/untyped schema badge. */}
+          in/out ports show their wire type + a typed/untyped schema badge (click "N cols" to expand
+          the columns). Input badges reflect the upstream's output schema. */}
       <Section title="Ports">
         <div className="flex flex-col gap-1 text-[11.5px] text-muted-foreground">
-          {(spec?.inputs ?? []).map((p) => <PortRow key={`in-${p.id}`} dir="in" name={portName(p)} wire={p.wire} />)}
+          {(spec?.inputs ?? []).map((p) => <PortRow key={`in-${p.id}`} dir="in" name={portName(p)} wire={p.wire} schema={inputSchemaFor(p.id)} />)}
           {(spec?.outputs ?? []).map((p, i) => (
             <PortRow key={`out-${p.id}`} dir="out" name={portName(p)} wire={p.wire}
               schema={i === 0 ? (outSchema === undefined ? undefined : outSchema) : undefined} />
@@ -145,6 +178,10 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
             fixed-port ops (filter/sort/join) keep their ports as a type contract the wires rely on */}
         {kind === 'section' && <><Separator className="my-1" /><OutputPortsEditor nodeId={nodeId} /></>}
       </Section>
+
+      {/* schema contract: a code op (transform/plugin/vector-search) is untyped until it runs — let the
+          user DECLARE its output columns, or infer them from a sample. Either way types it + downstream. */}
+      {canDeclareSchema && <SchemaContract nodeId={nodeId} runnable={runnable && !invalid} />}
 
       {/* actions */}
       <Section title="Actions">
@@ -359,16 +396,112 @@ function portName(p: { id: string; label?: string }): string | null {
 }
 
 function PortRow({ dir, name, wire, schema }: {
-  dir: 'in' | 'out'; name: string | null; wire: string; schema?: { name: string }[] | null
+  dir: 'in' | 'out'; name: string | null; wire: string; schema?: ColumnSchema[] | null
 }) {
-  const badge = schema === undefined ? null : schema === null ? 'untyped' : `${schema.length} cols`
+  const [open, setOpen] = useState(false)
+  const cols = Array.isArray(schema) ? schema : null
+  const badge = schema === undefined ? null : cols === null ? 'untyped' : `${cols.length} cols`
+  const expandable = !!cols && cols.length > 0
   return (
-    <div className="flex items-center gap-[7px]">
-      <span className="w-[26px] text-[8.5px] font-bold tracking-[0.4px] text-muted-foreground">{dir === 'in' ? 'IN' : 'OUT'}</span>
-      {name && <span className="text-foreground">{name}</span>}
-      <span className="flex-1 text-[10.5px] text-muted-foreground">{wire}</span>
-      {badge && <span className={cn('rounded px-1.5 py-px text-[9.5px]', schema === null ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700')}>{badge}</span>}
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center gap-[7px]">
+        <span className="w-[26px] text-[8.5px] font-bold tracking-[0.4px] text-muted-foreground">{dir === 'in' ? 'IN' : 'OUT'}</span>
+        {name && <span className="text-foreground">{name}</span>}
+        <span className="flex-1 text-[10.5px] text-muted-foreground">{wire}</span>
+        {badge && (
+          <button type="button" disabled={!expandable} onClick={() => setOpen((o) => !o)}
+            title={expandable ? (open ? 'Hide columns' : 'Show columns') : undefined}
+            className={cn('rounded px-1.5 py-px text-[9.5px]',
+              cols === null ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300'
+                : 'bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-300',
+              expandable && 'cursor-pointer hover:opacity-80')}>
+            {badge}
+          </button>
+        )}
+      </div>
+      {open && expandable && (
+        <div className="ml-[33px] flex flex-col gap-px rounded border border-border bg-muted/40 p-1">
+          {cols!.map((c, i) => (
+            <div key={i} className="flex items-baseline justify-between gap-2 text-[10px]">
+              <span className="dp-mono truncate text-foreground">{c.name}</span>
+              <span className="dp-mono flex-none text-muted-foreground">{c.type}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
+  )
+}
+
+// Schema contract for a code op (transform / plugin / vector-search): untyped until it runs. The user
+// can DECLARE the output columns (types this port + everything downstream via a typed stand-in) or
+// INFER them from a bounded sample run. Both write config.outputSchema — declaring is just the manual
+// path, inferring auto-fills it. Clearing it returns the port to untyped (dynamic) — all fine.
+function SchemaContract({ nodeId, runnable }: { nodeId: string; runnable: boolean }) {
+  const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
+  const updateConfig = useStore((s) => s.updateConfig)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const cfg = (node?.data.config ?? {}) as Record<string, unknown>
+  const declared = (Array.isArray(cfg.outputSchema) ? cfg.outputSchema : []) as ColumnSchema[]
+  const source = cfg.outputSchemaSource as string | undefined
+
+  // a manual edit (no explicit src) takes ownership → 'declared'; only "Infer from sample" sets 'inferred'.
+  const commit = (cols: ColumnSchema[], src: 'declared' | 'inferred' = 'declared') =>
+    updateConfig(nodeId, {
+      outputSchema: cols.length ? cols : undefined,
+      outputSchemaSource: cols.length ? src : undefined,
+    })
+
+  const infer = async () => {
+    setBusy(true); setErr(null)
+    try {
+      const res = await api.preview(useStore.getState().doc, nodeId, 50, 0)
+      if (res.error || res.notPreviewable) setErr(res.reason || 'could not infer — run needs a full pass')
+      else if (res.columns?.length) commit(res.columns as ColumnSchema[], 'inferred')
+      else setErr('no columns produced on the sample')
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'infer failed')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <Section title="Output schema (contract)">
+      <div className="text-[10.5px] leading-relaxed text-muted-foreground">
+        {declared.length
+          ? (source === 'inferred' ? 'Inferred from a sample — edit to pin it as the contract.' : 'Declared — types this port and everything downstream.')
+          : 'Untyped until it runs. Declare a contract, or infer it from a sample. Leave empty to stay dynamic.'}
+      </div>
+      {declared.map((c, i) => (
+        <div key={i} className="flex items-center gap-1">
+          <Input value={c.name} placeholder="column"
+            onChange={(e) => commit(declared.map((x, j) => (j === i ? { ...x, name: e.target.value.replace(/\s+/g, '_') } : x)))}
+            className={cn(miniInputClass, 'dp-mono min-w-0 flex-1 text-[11px] md:text-[11px]')} />
+          <Input value={c.type} placeholder="type"
+            onChange={(e) => commit(declared.map((x, j) => (j === i ? { ...x, type: e.target.value } : x)))}
+            className={cn(miniInputClass, 'dp-mono w-[80px] flex-none text-[11px] md:text-[11px]')} />
+          <Button variant="ghost" size="icon" onClick={() => commit(declared.filter((_, j) => j !== i))} title="Remove column"
+            className="h-5 w-5 flex-none text-muted-foreground [&_svg]:size-3"><Icon name="close" size={11} /></Button>
+        </div>
+      ))}
+      <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+        <Button variant="outline" size="sm"
+          onClick={() => commit([...declared, { name: `col${declared.length + 1}`, type: 'string', capabilities: [] }])}
+          className="h-auto gap-1 self-start border-dashed px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none [&_svg]:size-3">
+          <Icon name="plus" size={11} /> add column
+        </Button>
+        <Button variant="outline" size="sm" disabled={busy || !runnable} onClick={infer}
+          title={runnable ? 'Run a bounded sample to resolve the output columns' : 'Wire a runnable input first'}
+          className="h-auto gap-1 px-2 py-1 text-[10.5px] font-medium text-primary shadow-none [&_svg]:size-3">
+          <Icon name="eye" size={11} /> {busy ? 'Inferring…' : 'Infer from sample'}
+        </Button>
+        {declared.length > 0 && (
+          <Button variant="ghost" size="sm" onClick={() => commit([])}
+            className="h-auto px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none">Clear</Button>
+        )}
+      </div>
+      {err && <div className="text-[10px] leading-relaxed text-amber-700 dark:text-amber-300">⚠ {err}</div>}
+    </Section>
   )
 }
 
