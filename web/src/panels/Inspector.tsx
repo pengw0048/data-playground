@@ -28,7 +28,7 @@ const BUILTIN_KINDS = new Set([
 // kernel's _UNTYPED set (minus 'section', which has its own port editor). Plugin kinds execute too, so
 // any non-built-in kind is contract-capable as well. Relational/io/annotation nodes are always typed.
 const CONTRACT_KINDS = new Set(['transform', 'notebook', 'vector-search', 'loop', 'opaque'])
-const canDeclareSchemaKind = (kind: string) => CONTRACT_KINDS.has(kind) || !BUILTIN_KINDS.has(kind)
+export const canDeclareSchemaKind = (kind: string) => CONTRACT_KINDS.has(kind) || !BUILTIN_KINDS.has(kind)
 
 // Figma-style right property panel: shows the SELECTED node's properties (params reused from the
 // generic editor), a code snippet with "open editor", its ports, and actions. When nothing (or a
@@ -453,7 +453,7 @@ function portName(p: { id: string; label?: string }): string | null {
   return p.id === 'in' || p.id === 'out' ? null : p.id
 }
 
-function PortRow({ dir, name, wire, schema }: {
+export function PortRow({ dir, name, wire, schema }: {
   dir: 'in' | 'out'; name: string | null; wire: string; schema?: ColumnSchema[] | null
 }) {
   const [open, setOpen] = useState(false)
