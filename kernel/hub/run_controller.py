@@ -206,6 +206,17 @@ class RunController:
                 reach.append(tier_mod.backend_reach(self._backend_runner(rc), rc.backend == "default"))
         return tier_mod.pick_tier(tier_mod.tiers(self.deps.workspace), reach)
 
+    def _move_tier(self, src_uri: str, dst_uri: str, dst_tier) -> None:
+        """Copy a materialized region parquet across tiers (cheaper than recomputing). DuckDB streams it;
+        httpfs handles an object-store endpoint on either side."""
+        from hub.plugins.adapters import is_object_uri
+        with db.run_scope():
+            if dst_tier.is_object or is_object_uri(src_uri):
+                db.ensure_object_store()
+            else:
+                os.makedirs(dst_tier.prefix, exist_ok=True)
+            db.conn().read_parquet(src_uri).write_parquet(dst_uri)
+
     def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], regions=None) -> str:
         """Materialize an intermediate region's output to a durable, content-addressed parquet — reused
         across runs when the region's plan hash is unchanged. Runs in-process for a default region, or
@@ -225,6 +236,17 @@ class RunController:
         cached = self.base._cache_get(ckey)
         if cached and cached.get("uri") and self.base._output_exists(cached["uri"]):
             return cached["uri"]  # reuse — the upstream region didn't change (on this tier)
+        # C3 auto data-movement: a prior run materialized this exact region on ANOTHER tier → COPY it to
+        # the tier this run needs (cheaper than recomputing), e.g. a local result now feeding a remote step.
+        for other in tier_mod.tiers(self.deps.workspace).values():
+            if other.name == tier.name:
+                continue
+            alt = self.base._cache_get(f"{key}@{other.name}")
+            if alt and alt.get("uri") and self.base._output_exists(alt["uri"]):
+                dst = tier.uri(f"{region.id}_{key}.parquet")
+                self._move_tier(alt["uri"], dst, tier)
+                self.base._cache_put(ckey, {"uri": dst, "table": region.id, "rows": None})
+                return dst
         if tier.is_object:
             db.ensure_object_store()
         else:

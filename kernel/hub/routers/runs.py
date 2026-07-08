@@ -16,7 +16,6 @@ from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph
 from hub.security import current_user
-from hub.graph import upstream_chain
 from hub.settings import settings
 from hub.models import (
     CompilePlan,
@@ -178,23 +177,17 @@ def agent_act(req: AgentRequest) -> dict:
 
 
 def _row_estimate(req_graph, target_node_id, deps) -> int | None:
-    """Largest real source-row count feeding this run, or None when no source is countable. Returning
-    None (rather than a fabricated number) lets the estimator err toward confirmation on unknown size
-    instead of silently slipping the confirm gate."""
-    chain = upstream_chain(req_graph, target_node_id) if target_node_id else req_graph.nodes
-    counts: list[int] = []
-    for n in chain:
-        if n.type == "source":
-            cfg = n.data.get("config", {}) if isinstance(n.data, dict) else {}
-            uri = cfg.get("uri") or cfg.get("table")
-            if uri:
-                try:
-                    c = deps.resolve_adapter(uri).count(uri)
-                    if c is not None:
-                        counts.append(c)
-                except Exception:  # noqa: BLE001
-                    pass
-    return max(counts) if counts else None
+    """The largest data volume this run moves — the MAX estimated rows across the target's cone (which
+    includes the source counts, and a downstream sample's smaller output). Uses hub.estimate so the
+    confirm-gate, the placement policy, and the UI hint all share ONE estimator. None (nothing countable
+    / all unknown) lets the gate err toward confirmation rather than a fabricated number."""
+    from hub.estimate import estimate_sizes
+    try:
+        sizes = estimate_sizes(req_graph, deps.resolve_adapter, target=target_node_id)
+    except Exception:  # noqa: BLE001 — a bad estimate must not block the gate
+        return None
+    rows = [s.rows for s in sizes.values() if s.rows is not None]
+    return max(rows) if rows else None
 
 
 def _route_by_capability(deps, chosen, graph):

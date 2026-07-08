@@ -3251,6 +3251,38 @@ def test_graph_estimate_endpoint():
     assert r["s"]["rows"] is not None and r["s"]["rows"] > 0 and r["s"]["confidence"] == "exact"
 
 
+def test_move_tier_copies_a_region_parquet():
+    # C3 auto data-movement: copy a materialized region parquet from one location to another (used to
+    # reuse a prior run's result on a different tier instead of recomputing). Content must be preserved.
+    import os as _os
+    import tempfile
+    from hub import db
+    from hub.tiers import Tier
+    d = get_deps()
+    with tempfile.TemporaryDirectory() as tmp:
+        src = _os.path.join(tmp, "src.parquet")
+        dst = _os.path.join(tmp, "sub", "dst.parquet")
+        with db.run_scope():
+            db.conn().sql("SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,name)").write_parquet(src)
+        d.controller._move_tier(src, dst, Tier("local", _os.path.join(tmp, "sub"), 0))
+        assert _os.path.exists(dst)
+        with db.run_scope():
+            assert db.conn().read_parquet(dst).aggregate("count(*) AS n").fetchone()[0] == 2
+
+
+def test_row_estimate_uses_the_shared_estimator():
+    # the confirm-gate now shares hub.estimate: the "volume" of a source→sample(100) run is the source
+    # count (max across the cone), and an all-unknown run is None (→ err toward confirm), not fabricated.
+    from hub.routers.runs import _row_estimate
+    from hub.models import Graph
+    d = get_deps()
+    ev = _uri("events")
+    g1 = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev}), N("p", "sample", {"n": 100})], "edges": [E("s", "p")]})
+    assert _row_estimate(g1, "p", d) == d.resolve_adapter(ev).count(ev)  # max over cone = source count
+    g2 = Graph(**{"id": "c", "version": 1, "nodes": [N("t", "transform", {"code": "def fn(r): return r"})], "edges": []})
+    assert _row_estimate(g2, "t", d) is None  # all unknown → None (no fabricated number)
+
+
 def test_storage_tier_selection():
     # Phase C: pick the cheapest tier reachable by BOTH producer and consumer. local→local = local;
     # a remote party forces the shared object store; no object store + a remote party = no common tier.
