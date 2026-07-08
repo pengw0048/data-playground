@@ -24,6 +24,9 @@ _ALLOWED_MODULES = {
     "itertools": __import__("itertools"),
     "collections": __import__("collections"),
     "string": __import__("string"),
+    # always installed (the engine's data layer) + needed for the transform `arrow` batch format
+    # (a cell operating on a pyarrow.Table, e.g. `import pyarrow.compute`). Root "pyarrow" allows submodules.
+    "pyarrow": __import__("pyarrow"),
 }
 
 _SAFE_BUILTINS = {

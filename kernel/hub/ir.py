@@ -93,6 +93,8 @@ def resolve_config(node: GraphNode) -> dict:
     cfg = _cfg(node)
     if t in ("transform", "notebook"):
         c: dict = {"mode": cfg.get("mode", "map"), "onError": cfg.get("onError", "raise")}
+        if cfg.get("batchFormat") in ("pandas", "arrow"):  # map_batches representation (else row-dicts)
+            c["batchFormat"] = cfg["batchFormat"]
         if cfg.get("source") == "library":  # keep 'source' even without a processor, so the engine's
             c["source"] = "library"          # library branch still runs (and errors honestly if unconfigured)
             if cfg.get("processor"):

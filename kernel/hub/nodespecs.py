@@ -87,6 +87,8 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              params=[ParamSpec(name="source", type="select", options=["adhoc", "library"], default="adhoc"),
                      ParamSpec(name="scope", type="select", options=["dataset", "sample"], default="dataset", label="runs over"),
                      ParamSpec(name="mode", type="select", options=["map", "map_batches", "filter", "flat_map"], default="map"),
+                     ParamSpec(name="batchFormat", type="select", options=["rows", "pandas", "arrow"], default="rows",
+                               label="map_batches format"),
                      ParamSpec(name="code", type="code", lang="python")],
              blurb="Python over Arrow batches — library preset or ad-hoc cell"),
     NodeSpec(kind="sql", title="sql", category="query", tag="sql",

@@ -500,10 +500,18 @@ class BuildEngine:
             raise NotPreviewable(node, f"transform mode '{mode}' needs a full pass")
 
         on_error = cfg.get("onError", "raise")
+        # map_batches can hand the whole batch to the cell as a pandas DataFrame or a pyarrow Table
+        # (type-preserving) instead of the default row-dicts. Row modes (map/filter/flat_map) are dicts.
+        fmt = cfg.get("batchFormat", "rows") if mode == "map_batches" else "rows"
         try:
             if self.full:
-                return self._transform_spill(node, parent, fn, mode, on_error)
+                return self._transform_spill(node, parent, fn, mode, on_error, fmt)
             # preview: input is bounded (source sampled), so in-memory is fine and fast
+            if fmt in ("pandas", "arrow"):
+                tables = [_apply_batch(fn, pa.Table.from_batches([b]), fmt, on_error, node)
+                          for b in parent.to_arrow_reader(batch_size=2048)]
+                table = pa.concat_tables(tables) if tables else parent.limit(0).to_arrow_table()
+                return db.conn().from_arrow(table)
             out: list[dict] = []
             for batch in parent.to_arrow_reader(batch_size=2048):
                 out.extend(_apply_fn(fn, batch, mode, on_error, node))
@@ -514,7 +522,7 @@ class BuildEngine:
         except Exception as e:  # noqa: BLE001
             raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
 
-    def _transform_spill(self, node, parent, fn, mode, on_error) -> Relation:
+    def _transform_spill(self, node, parent, fn, mode, on_error, fmt="rows") -> Relation:
         """Full-run transform: stream output batches to a temp Parquet (bounded memory, out-of-core)."""
         import os
         import pyarrow.parquet as pq
@@ -525,12 +533,10 @@ class BuildEngine:
         buf: list[dict] = []
         FLUSH = 50_000
 
-        def flush():
-            nonlocal writer, buf
-            if not buf:
+        def write_tbl(tbl: "pa.Table") -> None:
+            nonlocal writer
+            if tbl.num_rows == 0 and writer is not None:
                 return
-            tbl = pa.Table.from_pylist(buf)
-            buf = []
             if writer is None:
                 writer = pq.ParquetWriter(path, tbl.schema)
             else:
@@ -540,12 +546,22 @@ class BuildEngine:
                     tbl = tbl.cast(writer.schema, safe=False)
             writer.write_table(tbl)
 
+        def flush():
+            nonlocal buf
+            if buf:
+                write_tbl(pa.Table.from_pylist(buf))
+                buf = []
+
         try:
-            for batch in parent.to_arrow_reader(batch_size=8192):
-                buf.extend(_apply_fn(fn, batch, mode, on_error, node))
-                if len(buf) >= FLUSH:
-                    flush()
-            flush()
+            if fmt in ("pandas", "arrow"):  # arrow-native: type-preserving, one table per input batch
+                for batch in parent.to_arrow_reader(batch_size=8192):
+                    write_tbl(_apply_batch(fn, pa.Table.from_batches([batch]), fmt, on_error, node))
+            else:
+                for batch in parent.to_arrow_reader(batch_size=8192):
+                    buf.extend(_apply_fn(fn, batch, mode, on_error, node))
+                    if len(buf) >= FLUSH:
+                        flush()
+                flush()
         except BaseException:
             # close + delete the partial spill so we never leak a handle or a truncated file
             if writer is not None:
@@ -646,6 +662,32 @@ def _apply_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node) -> li
                 continue
             raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
     return out
+
+
+def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node) -> "pa.Table":
+    """Run a `map_batches` UDF over a whole batch in the chosen representation — `pandas` (a DataFrame) or
+    `arrow` (a pyarrow.Table) — arrow-NATIVE so column types survive (no dict round-trip). Returns an
+    arrow Table. (The default `rows` format goes through _apply_fn instead.) pandas must be importable —
+    declare it in the canvas requirements; pyarrow is always present."""
+    try:
+        if fmt == "arrow":
+            res = fn(table)
+            if isinstance(res, pa.Table):
+                return res
+            if isinstance(res, pa.RecordBatch):
+                return pa.Table.from_batches([res])
+            raise TypeError(f"an arrow batch UDF must return a pyarrow.Table, got {type(res).__name__}")
+        import pandas as pd  # noqa: F401 — required only when the user picks the pandas format
+        res = fn(table.to_pandas())
+        if not isinstance(res, pd.DataFrame):
+            raise TypeError(f"a pandas batch UDF must return a DataFrame, got {type(res).__name__}")
+        return pa.Table.from_pandas(res, preserve_index=False)
+    except NotPreviewable:
+        raise
+    except Exception as e:  # noqa: BLE001
+        if on_error == "skip":
+            return table.slice(0, 0)  # drop the failed batch, keep its schema
+        raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
 
 
 def _table_to_rows(tbl: "pa.Table") -> list[dict]:

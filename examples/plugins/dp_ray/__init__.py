@@ -56,14 +56,17 @@ def _make_mapper(config: dict):
     """A Ray Data batch UDF that reuses the DuckDB engine's EXACT operator — so a transform produces the
     same rows on Ray as locally. Captures only plain strings, so it cloudpickles to Ray workers."""
     code, mode, on_error = config.get("code"), config["mode"], config.get("onError", "raise")
+    fmt = config.get("batchFormat", "rows") if mode == "map_batches" else "rows"
 
     def _op(table):  # a pyarrow.Table block
         import pyarrow as pa
 
         from hub import sandbox
-        from hub.executors.engine import _apply_fn
+        from hub.executors.engine import _apply_batch, _apply_fn
 
         fn = sandbox.compile_operator(code, mode)
+        if fmt in ("pandas", "arrow"):  # whole-batch pandas/arrow UDF — SAME arrow-native path as local
+            return _apply_batch(fn, table, fmt, on_error, None)
         rows: list[dict] = []
         for batch in table.to_batches():
             rows.extend(_apply_fn(fn, batch, mode, on_error, None))

@@ -3163,6 +3163,40 @@ def test_transform_schema_contract_ignores_bypass_disabled_and_odd_names():
     assert wc["f"] is not None and [c["name"] for c in wc["f"]] == ['a"b']  # propagated (stand-in didn't crash)
 
 
+def test_transform_batch_format_pandas_and_arrow():
+    # #1: map_batches can hand the whole batch to the cell as a pandas DataFrame or a pyarrow Table
+    # (type-preserving), not just row-dicts — and the choice flows through resolve_config to the engine.
+    from hub import db
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+    d = get_deps()
+    ev = _uri("events")  # has an int column 'amount'
+
+    def total(fmt, code):
+        gr = Graph(**{"id": "c", "version": 1, "nodes": [
+            N("s", "source", {"uri": ev}),
+            N("t", "transform", {"mode": "map_batches", "batchFormat": fmt, "code": code}),
+        ], "edges": [E("s", "t")]})
+        with db.run_scope():
+            eng = BuildEngine(gr, d.resolve_adapter, d.registry, full=True,
+                              node_specs=d.node_specs, node_builders=d.node_builders)
+            return eng.relation("t").aggregate("count(*) AS n, sum(doubled) AS s").fetchone()
+
+    pytest.importorskip("pandas")
+    n_pd, s_pd = total("pandas", "def fn(df):\n    df['doubled'] = df['id'] * 2\n    return df")
+    n_ar, s_ar = total("arrow", "def fn(t):\n    import pyarrow.compute as pc\n    return t.append_column('doubled', pc.multiply(t['id'], 2))")
+    assert n_pd > 0 and (n_pd, s_pd) == (n_ar, s_ar)  # both formats produce the same doubled column
+
+
+def test_ray_mapper_honors_batch_format():
+    # dp_ray must run the SAME arrow-native path for a pandas/arrow map_batches, so Ray == local.
+    import pyarrow as pa
+    op = _load_dp_ray()._make_mapper({"mode": "map_batches", "batchFormat": "arrow",
+                                      "code": "def fn(t):\n    import pyarrow.compute as pc\n    return t.append_column('y', pc.multiply(t['x'], 2))"})
+    out = op(pa.table({"x": [1, 2, 3]}))
+    assert out.column_names == ["x", "y"] and out["y"].to_pylist() == [2, 4, 6]
+
+
 def test_estimate_sizes_is_conservative_and_honest():
     # the per-node size estimate: conservative (never under-estimate), honest (unknown → None, not a
     # fabricated number), and measured-actuals override. Feeds placement + the confirm-gate + a UI hint.
