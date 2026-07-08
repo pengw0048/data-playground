@@ -3744,6 +3744,53 @@ def test_plugin_node_ir_hook_runs_on_duckdb_and_ray(tmp_path):
     assert sorted(out.column("name").to_pylist()) == ["AB", "CD"]  # Ray operator ≡ DuckDB build, by construction
 
 
+def test_similarity_dedup_plugin_clusters_and_marks_representatives(tmp_path):
+    # dp_similarity_dedup registers a `similarity-dedup` node: it clusters rows by embedding cosine distance
+    # and adds dup_group + is_representative. Exact-duplicate embeddings must land in one cluster each, with
+    # exactly one representative per cluster — regardless of threshold.
+    import shutil
+    from pathlib import Path
+
+    import duckdb
+
+    from hub import db
+    from hub.deps import Deps
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+
+    p = str(tmp_path / "emb.parquet")
+    # rows 0,1 ≡ [1,0,0]; rows 2,3 ≡ [0,1,0]; row 4 = [0,0,1] → 3 clusters, 3 representatives
+    duckdb.connect().execute(
+        f"COPY (SELECT * FROM (VALUES "
+        f"(0,[1.0,0.0,0.0]),(1,[1.0,0.0,0.0]),(2,[0.0,1.0,0.0]),(3,[0.0,1.0,0.0]),(4,[0.0,0.0,1.0])"
+        f") t(rid, embedding)) TO '{p}' (FORMAT PARQUET)")
+    ws = tmp_path / "ws"; (ws / "plugins").mkdir(parents=True)
+    shutil.copytree(Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_similarity_dedup",
+                    ws / "plugins" / "dp_similarity_dedup")
+    d = Deps(str(ws), str(tmp_path / "data"))
+    assert "similarity-dedup" in d.node_specs
+
+    G = Graph(**{"id": "c", "version": 1, "nodes": [
+        {"id": "src", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": p}}},
+        {"id": "dd", "type": "similarity-dedup", "position": {"x": 0, "y": 0},
+         "data": {"config": {"column": "embedding", "threshold": 0.05}}},
+    ], "edges": [{"id": "e1", "source": "src", "target": "dd", "data": {"wire": "dataset"}}]})
+
+    with db.run_scope():
+        eng = BuildEngine(G, d.resolve_adapter, d.registry, full=True,
+                          node_builders=d.node_builders, node_specs=d.node_specs)
+        tbl = eng.relation("dd").order("rid").to_arrow_table()
+        assert "dup_group" in tbl.column_names and "is_representative" in tbl.column_names
+        groups = tbl.column("dup_group").to_pylist()
+        reps = tbl.column("is_representative").to_pylist()
+        # 0,1 share a cluster; 2,3 share a cluster; 4 alone → 3 distinct groups, one representative each
+        assert groups[0] == groups[1] and groups[2] == groups[3]
+        assert len(set(groups)) == 3  # three distinct clusters
+        assert sum(bool(x) for x in reps) == 3
+        # a representative leads exactly the rows that carry its own group id
+        assert reps[0] != reps[1]  # one of {0,1} leads, the other doesn't
+
+
 def test_ir_unify_regressions(tmp_path):
     # three regressions the IR-unify adversarial pass caught, now fixed + locked:
     import duckdb

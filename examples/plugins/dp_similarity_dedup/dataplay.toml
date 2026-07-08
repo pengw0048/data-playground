@@ -1,0 +1,6 @@
+# Reference plugin: a `similarity-dedup` node that clusters near-duplicate rows by embedding cosine
+# distance and marks one representative per cluster. Brute-force O(n²) — preview on a sample first.
+# See __init__.py for the honest scale/accuracy limits.
+name = "dp-similarity-dedup"
+version = "0.1.0"
+# min_core_api = 1

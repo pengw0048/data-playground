@@ -142,7 +142,7 @@ shows your node's schema the SPA renders from.
 
 ## Reference plugins
 
-`examples/plugins/` ships four working plugins — each exercises a different seam end-to-end and has a
+`examples/plugins/` ships ten working plugins — each exercises a different seam end-to-end and has a
 test in `kernel/hub/tests/test_kernel.py` you can copy:
 
 | plugin | seam | what it does | extra |
@@ -156,6 +156,7 @@ test in `kernel/hub/tests/test_kernel.py` you can copy:
 | [`dp_datasets_place`](../examples/plugins/dp_datasets_place/) | `add_destination` | a save/open "place" (`kind='datasets'`) that browses only dataset files, hiding clutter; path-fenced to its root | — |
 | [`dp_json_view`](../examples/plugins/dp_json_view/) | `add_capability` | tags JSON-doc columns (name-based detector) + declares `viewer={"kind":"json"}` → the SPA shows a JSON tab that pretty-prints those cells, no frontend code | — |
 | [`dp_upper`](../examples/plugins/dp_upper/) | `add_node` (+`ir`) | an `upper` node whose DuckDB build + engine-neutral `ir` hook share one generated operator, so it runs on Ray too (a clean `map`), not just DuckDB | — |
+| [`dp_similarity_dedup`](../examples/plugins/dp_similarity_dedup/) | `add_node` | a `similarity-dedup` node: cluster near-duplicate rows by embedding cosine distance → adds `dup_group` + `is_representative` (filter downstream to keep one per cluster). Brute-force O(n²) — preview on a `sample` first; honest scale/accuracy limits in its docstring | — |
 
 The adapters are read-only sources (`write` raises) and import their heavy dependency lazily, so the
 pack loads even without the extra installed and only errors when its URI scheme is actually used. Both
