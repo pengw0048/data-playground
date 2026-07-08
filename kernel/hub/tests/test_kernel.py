@@ -3565,7 +3565,7 @@ def test_ray_backend_operator_gating_and_fallback(tmp_path):
     assert rr._ray_runnable(lower_to_ir(libg, "w", deps.node_specs)) is False
 
 
-@pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="live Ray Data run — set DP_TEST_RAY_LIVE=1 on a host where Ray's executor runs")
+@pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="live Ray Data run (opt-in) — needs a host where Ray's executor runs; NOTE dp_ray's inline in-process model deadlocks against the app's shared DuckDB connection after ray.init on some platforms (macOS), so this may hang there — the fix is a subprocess/job driver (see dp_ray docstring). The Part B mechanism is verified cluster-free by test_plugin_node_ir_hook_runs_on_duckdb_and_ray.")
 def test_ray_backend_live_differential(tmp_path):
     # End-to-end: run source→map→filter→write on Ray Data and assert the output equals the DuckDB
     # LocalRunner's, byte-for-byte. Opt-in (Ray's streaming executor needs to spawn workers, which a

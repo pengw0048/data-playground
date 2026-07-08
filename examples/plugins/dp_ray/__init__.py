@@ -12,10 +12,20 @@ which runs it correctly. `run()` re-checks and delegates too, so a mis-route deg
 Honest scope (a reference, not a tuned production backend): the map/filter/flat_map/map_batches stages
 run **distributed on Ray Data** — that's the point being proven. Source reads go through the driver's
 adapter (→ Arrow → `ray.data.from_arrow`) so EVERY source works (Lance/HF/Iceberg/plugin), and the sink
-collects to the driver and writes via the adapter, so the catalog/write contract is unchanged. A
-production backend would use `ray.data.read_*`/`write_parquet` for fully-distributed I/O; cancellation
-here is cooperative between IR steps (Ray has no cheap mid-Dataset abort), weaker than the DuckDB
-backend's cursor interrupt.
+collects to the driver and writes via the adapter; cancellation is cooperative between IR steps (Ray has
+no cheap mid-Dataset abort).
+
+KNOWN LIMITATION — inline execution vs the shared DuckDB connection. This reference runs Ray *in the
+kernel process* and does its source read / sink write / `register_output` through the app's shared DuckDB
+base connection. On some platforms (observed: macOS) a DuckDB materialization on that pre-existing shared
+connection DEADLOCKS once `ray.init()` has run in the same process — so the inline path can hang, and the
+opt-in `test_ray_backend_live_differential` will not complete there. Ray Data itself and this backend's
+operator path are verified to run correctly (see the probes / the operator-identity test); the deadlock
+is purely the in-process DuckDB↔Ray coexistence. **The production-correct design is process isolation: a
+subprocess (or Ray-job) driver whose own fresh process holds its DuckDB + Ray** — the same pattern the
+built-in SubprocessRunner uses. Building that isolated driver is the remaining work to make the live path
+robust; the Part B mechanism (a plugin node's `ir` hook → clean op → routed to a distributed backend) is
+already verified without a cluster by `test_plugin_node_ir_hook_runs_on_duckdb_and_ray`.
 
 Opt-in: `pip install 'data-playground[ray]'`, drop this folder in `<workspace>/plugins/`, and select it
 via Settings → Execution or `DP_EXECUTION=ray-data`. It never becomes the default (the kernel is), so a
@@ -53,6 +63,24 @@ def _make_mapper(config: dict):
         return pa.Table.from_pylist(rows) if rows else table.slice(0, 0)  # keep schema when a batch empties
 
     return _op
+
+
+_RAY_INITED = False
+
+
+def _ensure_ray() -> None:
+    """Initialize Ray ONCE. `ray.init()` installs signal handlers, which only works on the MAIN thread —
+    initializing it off the main thread leaves Ray Data's executor unable to make progress (it just
+    hangs). So we init from run() (dispatched on the main thread in the shipped test) rather than from
+    the background _execute thread. Caveat for production: a kernel that dispatches runs on a threadpool
+    should pre-initialize Ray on the main thread at startup (or use a Ray-job-submitting backend); this
+    reference keeps execution inline for clarity."""
+    global _RAY_INITED
+    if _RAY_INITED:
+        return
+    import ray
+    ray.init(ignore_reinit_error=True, configure_logging=False, log_to_driver=False, include_dashboard=False)
+    _RAY_INITED = True
 
 
 class RayRunner:
@@ -101,6 +129,7 @@ class RayRunner:
         ir = lower_to_ir(graph, target_node_id, self.node_specs, self.deps.node_ir)
         if not self._ray_runnable(ir):
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)  # safe fallback
+        _ensure_ray()  # init Ray HERE (run() is on the main thread) — never inside the _execute daemon
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=per_node,
@@ -121,16 +150,12 @@ class RayRunner:
                 pass
 
     def _execute(self, run_id, ir, graph, target, status) -> None:
-        import ray
-
         cancel = self._cancel[run_id]
         status.status = "running"
         self._emit(graph, status)
         rows_seen = 0
         try:
-            ray.init(ignore_reinit_error=True, configure_logging=False, log_to_driver=False,
-                     include_dashboard=False)
-            datasets: dict[str, object] = {}
+            datasets: dict[str, object] = {}  # Ray was already init'd on the main thread in run()
             for step in ir.steps:
                 if cancel.is_set():
                     status.status = "cancelled"
