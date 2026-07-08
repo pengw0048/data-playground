@@ -1,7 +1,7 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
   CatalogTable, CompilePlan, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  ProcessorDescriptor, ProfileResult, Relationship, RunEstimate, RunStatus, SampleResult,
+  PluginInfo, ProcessorDescriptor, ProfileResult, Relationship, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -163,6 +163,9 @@ export const api = {
   getSettings: () => req<{ global: Record<string, unknown>; user: Record<string, unknown> }>('/settings'),
   putSetting: (scope: 'global' | 'user', key: string, value: unknown) =>
     req<{ ok: boolean }>('/settings', { method: 'PUT', body: JSON.stringify({ scope, key, value }) }),
+
+  // loaded plugin packs (name/version/error + any declared [[config]] schema & current values)
+  plugins: () => req<PluginInfo[]>('/plugins'),
 
   // destinations (save/open "places" — local + pluggable object stores)
   destinations: () => req<{ destinations: DestinationPreset[]; backends: string[] }>('/destinations'),

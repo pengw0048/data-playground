@@ -161,6 +161,28 @@ export interface CompilePlan {
   error?: string | null
 }
 
+// A plugin's UI-configurable field, declared in its dataplay.toml [[config]] (see GET /plugins).
+export interface PluginConfigField {
+  key: string
+  type: string  // string | text | int | float | bool | select | password
+  label: string
+  default?: unknown
+  env?: string
+  secret?: boolean
+  options?: string[]
+  help?: string
+  placeholder?: string
+}
+export interface PluginInfo {
+  name: string
+  source: string
+  version?: string
+  error?: string
+  config?: PluginConfigField[]          // the declared schema (present only if the pack declares one)
+  config_values?: Record<string, unknown>  // current non-secret values from settings
+  config_set?: string[]                 // keys that have a stored value (incl. secrets — value never sent)
+}
+
 export interface ImportStage { name: string; processor: string; mode: string; previewable: boolean }
 export interface DriverStep { kind: string; label: string; nodeType?: string | null }
 export interface PipelineImport {

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
-import type { ResourceSpec } from '../types/api'
+import type { PluginInfo, ResourceSpec } from '../types/api'
 import { useStore } from '../store/graph'
 import { Icon, type IconName } from '../ui/Icon'
 import { cn } from '@/lib/utils'
@@ -19,6 +19,7 @@ const CATS: { id: string; label: string; icon: IconName }[] = [
   { id: 'agent', label: 'Agent', icon: 'sparkle' },
   { id: 'execution', label: 'Execution', icon: 'play' },
   { id: 'destinations', label: 'Destinations', icon: 'export' },
+  { id: 'plugins', label: 'Plugins', icon: 'grid' },
   { id: 'members', label: 'Members', icon: 'users' },
 ]
 
@@ -40,6 +41,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [savedMsg, setSavedMsg] = useState('')
   const [dest, setDest] = useState({ name: '', backend: 'local', root: '' })
   const [newUser, setNewUser] = useState({ name: '', password: '' })
+  const [plugins, setPlugins] = useState<PluginInfo[]>([])
+  const [pcfg, setPcfg] = useState<Record<string, Record<string, string>>>({})  // pack → edited { key: value }
   const [active, setActive] = useState('agent')
   const scrollRef = useRef<HTMLDivElement>(null)
 
@@ -56,7 +59,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     api.getSettings().then((s) => { setG(s.global); setU(s.user) }).catch(() => {}).finally(() => setLoading(false))
+    api.plugins().then(setPlugins).catch(() => {})
   }, [])
+
+  // a plugin config field's currently-shown value: the user's edit, else the stored (non-secret) value
+  const pval = (pack: string, key: string, stored: unknown) =>
+    pcfg[pack]?.[key] ?? (stored == null ? '' : String(stored))
+  const setPval = (pack: string, key: string, v: string) =>
+    setPcfg((prev) => ({ ...prev, [pack]: { ...(prev[pack] ?? {}), [key]: v } }))
+  const configurable = plugins.filter((p) => (p.config?.length ?? 0) > 0)
 
   const val = (k: string) => (g[k] == null ? '' : String(g[k]))
   const set = (k: string, v: string) => setG((prev) => ({ ...prev, [k]: v }))
@@ -71,6 +82,14 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     await api.putSetting('global', 'objectStore', obj).catch(() => {})
     // the runner is a per-user preference; the sentinel means "inherit the workspace default"
     await api.putSetting('user', 'backend', u.backend === INHERIT ? '' : (u.backend ?? '')).catch(() => {})
+    // edited plugin config → plugin.<pack>.<key> (skip a blank secret so it keeps its existing value)
+    for (const [pack, fields] of Object.entries(pcfg)) {
+      const schema = plugins.find((p) => p.name === pack)?.config ?? []
+      for (const [key, v] of Object.entries(fields)) {
+        if (schema.find((f) => f.key === key)?.secret && !v) continue
+        await api.putSetting('global', `plugin.${pack}.${key}`, v).catch(() => {})
+      }
+    }
     setSavedMsg('Saved'); setTimeout(() => setSavedMsg(''), 1400)
   }
   const addDest = () => {
@@ -204,6 +223,62 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     <Input value={obj.region ?? ''} placeholder="region (e.g. us-east-1)" onChange={(e) => setObj('region', e.target.value)} />
                     <Input value={obj.endpoint ?? ''} placeholder="endpoint (MinIO/R2, optional)" onChange={(e) => setObj('endpoint', e.target.value)} />
                   </div>
+                </Section>
+
+                <Section id="plugins" title="Plugins">
+                  <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
+                    Loaded plugin packs. A pack that declares config fields (in its <code>dataplay.toml</code>) can be set here.
+                    Changes take effect on the next kernel start.
+                  </p>
+                  <div className="mb-2.5 flex flex-col gap-1">
+                    {plugins.map((p) => (
+                      <div key={p.name} className="flex items-center gap-2 text-xs text-foreground">
+                        <span className="flex items-center text-muted-foreground"><Icon name={p.error ? 'close' : 'check'} size={12} /></span>
+                        <span className="font-semibold">{p.name}</span>
+                        {p.version && <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{p.version}</Badge>}
+                        <span className="text-[10px] text-muted-foreground">{p.source}</span>
+                        {p.error && <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-[10.5px] text-destructive">{p.error}</span>}
+                      </div>
+                    ))}
+                    {plugins.length === 0 && <div className="text-[11.5px] text-muted-foreground">No plugins loaded.</div>}
+                  </div>
+
+                  {configurable.map((p) => (
+                    <div key={p.name} className="mt-3 rounded-md border border-border p-3">
+                      <div className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold text-foreground">
+                        <Icon name="settings" size={12} /> {p.name}
+                      </div>
+                      {p.config!.map((f) => {
+                        const isSet = p.config_set?.includes(f.key)
+                        const ph = f.placeholder ?? (f.secret ? (isSet ? '•••••• (set — blank keeps it)' : 'not set')
+                          : (f.default != null ? String(f.default) : ''))
+                        return (
+                          <Field key={f.key} label={f.label}>
+                            {f.type === 'select' && f.options ? (
+                              <Select value={pval(p.name, f.key, p.config_values?.[f.key])} onValueChange={(v) => setPval(p.name, f.key, v)}>
+                                <SelectTrigger><SelectValue placeholder={ph} /></SelectTrigger>
+                                <SelectContent>{f.options.map((o) => <SelectItem key={o} value={o}>{o}</SelectItem>)}</SelectContent>
+                              </Select>
+                            ) : f.type === 'bool' ? (
+                              <Select value={pval(p.name, f.key, p.config_values?.[f.key]) || 'false'} onValueChange={(v) => setPval(p.name, f.key, v)}>
+                                <SelectTrigger><SelectValue /></SelectTrigger>
+                                <SelectContent><SelectItem value="true">true</SelectItem><SelectItem value="false">false</SelectItem></SelectContent>
+                              </Select>
+                            ) : (
+                              <Input
+                                type={f.secret || f.type === 'password' ? 'password' : (f.type === 'int' || f.type === 'float' ? 'number' : 'text')}
+                                value={f.secret ? (pcfg[p.name]?.[f.key] ?? '') : pval(p.name, f.key, p.config_values?.[f.key])}
+                                placeholder={ph}
+                                onChange={(e) => setPval(p.name, f.key, e.target.value)}
+                              />
+                            )}
+                            {f.help && <div className="mt-1 text-[10.5px] text-muted-foreground">{f.help}</div>}
+                          </Field>
+                        )
+                      })}
+                    </div>
+                  ))}
+                  {configurable.length === 0 && <div className="text-[11.5px] text-muted-foreground">No plugin declares configurable settings.</div>}
                 </Section>
 
                 <Section id="members" title="Members">

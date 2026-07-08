@@ -99,6 +99,7 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 | `reg.add_processor(proc)` | a reusable transform in the library picker | a `Processor` (`id/title/mode/build(params)`); see `kernel/hub/plugins/processors.py` |
 | `reg.set_catalog(catalog)` | the whole dataset catalog provider | `CatalogProvider` Protocol (`backends.py`): `list_tables/get_table/lineage/relationships/resolve_ref/register/register_output/unregister/set_declared_key/add_relationship/remove_relationship`. **`get_table` MUST raise `KeyError` on a miss.** A read-only external catalog can subclass `InMemoryCatalog` and override only the reads (as `dp_sql_catalog` does). A catalog that *fully* replaces the built-in — not subclassing `InMemoryCatalog` — won't automatically receive run-completion `register_output` write-backs (runners hold the catalog they were built with), so either subclass `InMemoryCatalog` or forward `register_output` to your store. |
 | `reg.set_importer(importer)` | `/pipelines/import` (import a foreign pipeline format) | `Importer` Protocol (`plugins/importer.py`): `name` + `import_pipeline(config, params) -> PipelineImport`. Populate `PipelineImport.graph` with a runnable canvas `Graph` (nodes/edges of built-in or plugin kinds) and the SPA drops it onto a fresh canvas and runs it — this is what makes *import a pipeline → runnable canvas* real. Default is a `NullImporter` (501, honest). The core auto-lays-out an imported graph left unpositioned. |
+| `reg.add_destination(backend)` | a save/open-dialog **"place"** (a browsable/writable location) | `DestinationBackend` Protocol (`destinations.py`): `kind` + `browse(root, path)` (→ `{path, entries:[{name, kind, uri}], error?}`) + `target_uri(root, path, filename)`. Claims a place `kind`; a user adds a preset (backend + root) in Settings → Destinations. Built-in `local`/`s3`/`gs` go through the same registry. |
 
 Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter; runners are picked
 by `pick_runner` (respects the Settings → Execution choice, else the first that `can_run`). **The
@@ -140,6 +141,7 @@ test in `kernel/hub/tests/test_kernel.py` you can copy:
 | [`dp_iceberg`](../examples/plugins/dp_iceberg/) | `add_adapter` | read an Apache Iceberg table as a source: `iceberg://<catalog>/<namespace>.<table>` (catalog from your pyiceberg config) | `pip install 'data-playground[iceberg]'` |
 | [`dp_json_pipeline`](../examples/plugins/dp_json_pipeline/) | `set_importer` | parse a tiny JSON pipeline (`source`/`steps`/`write`) into a runnable canvas graph — import → canvas → run | — |
 | [`dp_ray`](../examples/plugins/dp_ray/) | `add_runner` | run the clean subset on **Ray Data** (`read → map/filter/flat_map/map_batches → write`), lowered from the engine-neutral IR; falls back to DuckDB for relational/opaque graphs. Opt-in via `DP_EXECUTION=ray-data` | `pip install 'data-playground[ray]'` |
+| [`dp_datasets_place`](../examples/plugins/dp_datasets_place/) | `add_destination` | a save/open "place" (`kind='datasets'`) that browses only dataset files, hiding clutter; path-fenced to its root | — |
 
 The adapters are read-only sources (`write` raises) and import their heavy dependency lazily, so the
 pack loads even without the extra installed and only errors when its URI scheme is actually used. Both
@@ -159,3 +161,36 @@ kinds) stays unsupported → gate `can_run` on it so the kernel falls back to th
 above is the worked example — the first non-DuckDB engine to run a canvas, reusing the *same*
 `sandbox.compile_operator` the DuckDB engine runs so results are identical. (The default engine still
 lowers directly; rebuilding it on the IR too is future work.)
+
+## Configuring a plugin
+
+A plugin declares its settings in `dataplay.toml` as `[[config]]` fields (VSCode `contributes.configuration`
+style) — the core renders them into a form in **Settings → Plugins**, no frontend code:
+
+```toml
+[[config]]
+key = "url"                       # → the setting plugin.<pack>.url
+type = "string"                   # string · text · int · float · bool · select · password
+label = "SQLAlchemy URL"
+env = "DP_SQL_CATALOG_URL"         # env-var fallback (headless / 12-factor)
+placeholder = "postgresql+psycopg://…"
+help = "shown under the field"
+# also: default, secret = true (never echoed to the UI), options = [...] (for a select)
+```
+
+Read the values in `register(reg)` with **`reg.config(key, default=None)`**. Precedence:
+**UI setting (`plugin.<pack>.<key>`) > declared `env` var > declared `default` > the arg default** — so a
+plugin is configurable from the UI *and* still works headless via env:
+
+```python
+def register(reg):
+    url = reg.config("url")                     # Settings value, else DP_SQL_CATALOG_URL, else None
+    if not url:
+        return                                  # not configured → stay inactive
+    reg.set_catalog(SqlCatalog(url, reg.config("table", "datasets")))
+```
+
+`GET /api/plugins` surfaces each pack's schema + current values (secrets report only *whether* set, never
+the value). A changed setting applies on the **next kernel start** — plugins register once at startup, same
+as the env vars they fall back to. (Config fields need a drop-in `dataplay.toml`; `DP_PLUGINS`/entry-point
+packs still read env directly.) `dp_sql_catalog` is the worked example.
