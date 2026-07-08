@@ -25,9 +25,16 @@ def main() -> None:
     result = {"status": "failed", "error": "ray driver did not run", "rows": 0}
     try:
         os.environ.setdefault("RAY_DATA_DISABLE_PROGRESS_BARS", "1")
+        # THE macOS/uv fix: if the kernel was launched via `uv run`, Ray (RAY_ENABLE_UV_RUN_RUNTIME_ENV,
+        # default on) re-launches its WORKERS through uv too — which builds a fresh, ray-less .venv, so a
+        # worker can't `import ray`, the raylet dies, and the run hangs. Turn it off so workers use THIS
+        # interpreter (it has ray). Must precede `import ray` (read once as a module constant).
+        os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
         _log("import ray + init")
         import ray
-        ray.init(ignore_reinit_error=True, configure_logging=False, log_to_driver=False, include_dashboard=False)
+        _ncpu = os.environ.get("DP_RAY_NUM_CPUS")
+        ray.init(ignore_reinit_error=True, configure_logging=False, log_to_driver=False,
+                 include_dashboard=False, num_cpus=int(_ncpu) if _ncpu else None)
         _log("ray init done; set_workspace")
 
         from hub.deps import set_workspace

@@ -22,14 +22,15 @@ materialization on that pre-existing connection wedges once `ray.init()` has run
 before any DuckDB), and the parent only polls a status file — no DuckDB in the parent, no in-process
 coexistence. This is the production-correct shape (same isolation the built-in SubprocessRunner uses).
 
-ENVIRONMENT SENSITIVITY of the live path. Verified: Ray Data runs on a dev box, and this backend executes
-a real single-op graph correctly IN-PROCESS. But driving the FULL subprocess path to completion is
-sensitive to the local Ray environment — observed on one macOS box: the child's Ray cluster spawned its
-worker pool but the task stayed unscheduled (workers idle), plausibly a macOS worker-spawn / local-Ray
-quirk. So the opt-in `test_ray_backend_live_differential` may hang on such a setup — **verify on a clean
-Linux Ray environment**, where Ray Data is far more reliable.
-The Part B MECHANISM (a plugin node's `ir` hook → clean op → routed to a distributed backend, operator
-byte-identical) is verified WITHOUT a cluster by `test_plugin_node_ir_hook_runs_on_duckdb_and_ray`.
+The `uv` fix. If the kernel is launched via `uv run` (common), Ray's default behavior
+(`RAY_ENABLE_UV_RUN_RUNTIME_ENV`) re-launches its WORKERS through `uv` too — which builds a fresh,
+ray-less `.venv`, so workers can't `import ray`, the raylet dies, and the run hangs. The driver sets
+`RAY_ENABLE_UV_RUN_RUNTIME_ENV=0` (before `import ray`) so workers use its own interpreter (which has
+ray); `_supervise` also strips uv/`VIRTUAL_ENV` markers and runs the child off the repo's pyproject.
+With that, the live differential (`test_ray_backend_live_differential`) passes on macOS AND Linux — it's
+opt-in only because it needs the `[ray]` extra + is slow. `DP_RAY_NUM_CPUS` optionally caps the worker
+pool. The Part B mechanism (a plugin node's `ir` hook → clean op → routed here) is also covered
+cluster-free by `test_plugin_node_ir_hook_runs_on_duckdb_and_ray`.
 
 Opt-in: `pip install 'data-playground[ray]'`, drop this folder in `<workspace>/plugins/`, and select it
 via Settings → Execution or `DP_EXECUTION=ray-data`. It never becomes the default (the kernel is), so a
@@ -163,9 +164,20 @@ class RayRunner:
             # a full pipe would block the child mid-run; the result comes back via status_file). Own
             # session so Ray's worker signals/pgroup are decoupled from the (daemon-thread) parent.
             _dlog = open(os.path.join(work, "driver.log"), "w")
-            proc = subprocess.Popen([sys.executable, driver, job_file],
-                                    stdout=_dlog, stderr=_dlog, start_new_session=True,
-                                    env={**os.environ, "RAY_DATA_DISABLE_PROGRESS_BARS": "1"})
+            # CRITICAL for a kernel launched via `uv run`: Ray detects the uv context and re-launches its
+            # WORKERS through uv, which (with the repo pyproject + a VIRTUAL_ENV mismatch) builds a fresh
+            # ray-less .venv → workers can't `import ray` → the raylet dies and the run hangs. Strip the
+            # uv/venv markers and put the venv's bin on PATH so Ray runs workers with THIS interpreter
+            # (which has ray); run from the work dir so uv/Ray don't pick up the repo's pyproject.
+            venv_bin = os.path.dirname(sys.executable)
+            child_env = {k: v for k, v in os.environ.items()
+                         if k not in ("VIRTUAL_ENV", "UV", "UV_PROJECT_ENVIRONMENT", "CONDA_PREFIX")
+                         and not k.startswith("UV_")}
+            child_env["PATH"] = venv_bin + os.pathsep + child_env.get("PATH", "")
+            child_env["RAY_DATA_DISABLE_PROGRESS_BARS"] = "1"
+            child_env["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"  # workers use this interpreter, not a fresh uv venv
+            proc = subprocess.Popen([sys.executable, driver, job_file], cwd=work,
+                                    stdout=_dlog, stderr=_dlog, start_new_session=True, env=child_env)
             while proc.poll() is None:
                 if cancel.is_set():
                     proc.terminate()
