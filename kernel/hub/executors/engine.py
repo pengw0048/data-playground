@@ -508,8 +508,17 @@ class BuildEngine:
                 return self._transform_spill(node, parent, fn, mode, on_error, fmt)
             # preview: input is bounded (source sampled), so in-memory is fine and fast
             if fmt in ("pandas", "arrow"):
-                tables = [_apply_batch(fn, pa.Table.from_batches([b]), fmt, on_error, node)
-                          for b in parent.to_arrow_reader(batch_size=2048)]
+                tables: list = []
+                for b in parent.to_arrow_reader(batch_size=2048):
+                    t = _apply_batch(fn, pa.Table.from_batches([b]), fmt, on_error, node)
+                    if t is None:  # on_error='skip' dropped this batch
+                        continue
+                    if tables:  # tolerate per-batch dtype drift by casting to the first (matches the spill path)
+                        try:
+                            t = t.cast(tables[0].schema)
+                        except Exception:  # noqa: BLE001
+                            t = t.cast(tables[0].schema, safe=False)
+                    tables.append(t)
                 table = pa.concat_tables(tables) if tables else parent.limit(0).to_arrow_table()
                 return db.conn().from_arrow(table)
             out: list[dict] = []
@@ -555,7 +564,9 @@ class BuildEngine:
         try:
             if fmt in ("pandas", "arrow"):  # arrow-native: type-preserving, one table per input batch
                 for batch in parent.to_arrow_reader(batch_size=8192):
-                    write_tbl(_apply_batch(fn, pa.Table.from_batches([batch]), fmt, on_error, node))
+                    t = _apply_batch(fn, pa.Table.from_batches([batch]), fmt, on_error, node)
+                    if t is not None:  # on_error='skip' dropped this batch
+                        write_tbl(t)
             else:
                 for batch in parent.to_arrow_reader(batch_size=8192):
                     buf.extend(_apply_fn(fn, batch, mode, on_error, node))
@@ -664,11 +675,13 @@ def _apply_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node) -> li
     return out
 
 
-def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node) -> "pa.Table":
+def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node) -> "pa.Table | None":
     """Run a `map_batches` UDF over a whole batch in the chosen representation — `pandas` (a DataFrame) or
-    `arrow` (a pyarrow.Table) — arrow-NATIVE so column types survive (no dict round-trip). Returns an
-    arrow Table. (The default `rows` format goes through _apply_fn instead.) pandas must be importable —
-    declare it in the canvas requirements; pyarrow is always present."""
+    `arrow` (a pyarrow.Table) — arrow-NATIVE so column types survive (no dict round-trip). Returns the
+    output Table, or None when on_error='skip' swallowed a failure (the caller DROPS it — we can't emit a
+    correct-schema empty here, and the input schema would clash with the output schema of good batches).
+    (The default `rows` format goes through _apply_fn.) pandas must be declared in the canvas requirements;
+    pyarrow is always present."""
     try:
         if fmt == "arrow":
             res = fn(table)
@@ -686,7 +699,7 @@ def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node) -> "pa.Ta
         raise
     except Exception as e:  # noqa: BLE001
         if on_error == "skip":
-            return table.slice(0, 0)  # drop the failed batch, keep its schema
+            return None  # drop the failed batch entirely — a good batch defines the output schema
         raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
 
 

@@ -3188,6 +3188,30 @@ def test_transform_batch_format_pandas_and_arrow():
     assert n_pd > 0 and (n_pd, s_pd) == (n_ar, s_ar)  # both formats produce the same doubled column
 
 
+def test_apply_batch_skip_drops_the_batch_not_the_schema():
+    # fix: on_error='skip' must DROP a failed batch (return None → caller drops), NOT emit a wrong-schema
+    # empty table — otherwise a good batch (which adds/renames a column) can't concat with it and the run aborts.
+    import pyarrow as pa
+    from hub.executors.engine import _apply_batch
+    t = pa.table({"x": [1, 2]})
+    assert _apply_batch(lambda tb: 1 / 0, t, "arrow", "skip", None) is None          # skip → dropped
+    with pytest.raises(Exception):
+        _apply_batch(lambda tb: 1 / 0, t, "arrow", "raise", None)                    # raise → error
+    out = _apply_batch(lambda tb: tb.append_column("y", pa.array([9, 9])), t, "arrow", "raise", None)
+    assert out.column_names == ["x", "y"]                                            # success → the output table
+
+
+def test_sandbox_allows_pyarrow_compute_but_denies_file_io():
+    # fix: the arrow batch format needs pyarrow core + compute, but the soft baseline stays I/O-free —
+    # pyarrow's file-I/O submodules (fs/csv/parquet/dataset) must NOT be importable from an ad-hoc cell.
+    from hub import sandbox
+    assert sandbox._guarded_import("pyarrow") is not None
+    assert sandbox._guarded_import("pyarrow.compute") is not None
+    for m in ("pyarrow.fs", "pyarrow.csv", "pyarrow.parquet", "pyarrow.dataset", "pyarrow.feather"):
+        with pytest.raises(ImportError):
+            sandbox._guarded_import(m)
+
+
 def test_ray_mapper_honors_batch_format():
     # dp_ray must run the SAME arrow-native path for a pandas/arrow map_batches, so Ray == local.
     import pyarrow as pa

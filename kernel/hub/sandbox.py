@@ -68,8 +68,18 @@ def set_allowed(names) -> None:
         _KERNEL_ALLOWED.update(names)
 
 
+# file-I/O submodules that pyarrow being importable would otherwise expose — the soft baseline is kept
+# I/O-free on purpose (no `open`, no os/io), so the transform `arrow` format gets pyarrow core + compute
+# but NOT arbitrary local read/write. (`pyarrow.fs` etc. need an explicit import — they aren't reachable
+# via attribute access on the injected `pyarrow` — so denying the import fully closes the path.)
+_DENY_IMPORTS = {"pyarrow.fs", "pyarrow.dataset", "pyarrow.csv", "pyarrow.parquet", "pyarrow.orc",
+                 "pyarrow.json", "pyarrow.feather", "pyarrow.flight", "pyarrow.ipc", "pyarrow.hdfs"}
+
+
 def _guarded_import(name, *args, **kwargs):
     root = name.split(".")[0]
+    if name in _DENY_IMPORTS or any(name.startswith(d + ".") for d in _DENY_IMPORTS):
+        raise ImportError(f"import of '{name}' is not allowed (file I/O goes through source/write nodes)")
     if root in _ALLOWED_MODULES or root in _KERNEL_ALLOWED:
         return __import__(name, *args, **kwargs)
     raise ImportError(f"import of '{name}' is not allowed (add it to the canvas's requirements to enable)")

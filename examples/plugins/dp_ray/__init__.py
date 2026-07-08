@@ -66,7 +66,8 @@ def _make_mapper(config: dict):
 
         fn = sandbox.compile_operator(code, mode)
         if fmt in ("pandas", "arrow"):  # whole-batch pandas/arrow UDF — SAME arrow-native path as local
-            return _apply_batch(fn, table, fmt, on_error, None)
+            res = _apply_batch(fn, table, fmt, on_error, None)
+            return res if res is not None else table.slice(0, 0)  # skip → empty block (Ray needs a table)
         rows: list[dict] = []
         for batch in table.to_batches():
             rows.extend(_apply_fn(fn, batch, mode, on_error, None))

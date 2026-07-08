@@ -40,43 +40,58 @@ class RunController:
         self._sub: dict[str, tuple] = {}  # overall run_id -> (backend, sub_run_id) currently executing
         self._lock = threading.Lock()
 
-    def plan(self, graph: Graph, target: str | None):
+    def plan(self, graph: Graph, target: str | None, sizes: dict | None = None):
         if not target:
             return []
         return planner.plan_regions(graph, target, self.deps.node_specs, self.place_fn,
-                                    extra_requires=self._cost_requires(graph, target))
+                                    extra_requires=self._cost_requires(graph, target, sizes))
 
     def plan_summary(self, graph: Graph, target: str) -> list[dict]:
         """A human-facing execution plan: the regions this run splits into, each with its backend, the
         storage tier its boundary materializes to, and its estimated output size. Powers the UI 'run
-        plan' preview — so the cost-aware placement + tiering is something you can SEE before running."""
+        plan' preview — so the cost-aware placement + tiering is something you can SEE before running.
+        Mirrors run(): a single default region or a shape we can't safely split actually runs as ONE
+        in-process whole-graph pass, so report THAT (not a plan the run won't use)."""
         from hub import estimate as est_mod
-        regions = self.plan(graph, target)
         try:
-            sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target)
+            sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target)  # once — reused by plan()
         except Exception:  # noqa: BLE001
             sizes = {}
+
+        def _rows(nid):
+            e = sizes.get(nid)
+            return (e.rows if e else None, e.confidence if e else "unknown")
+
+        regions = self.plan(graph, target, sizes=sizes)
+        collapses = (len(regions) <= 1 and (not regions or regions[0].backend == "default")) \
+            or not self._safe_to_split(graph, target, regions)
+        if collapses:  # what run() will actually do: one default whole-graph region
+            rows, conf = _rows(target)
+            return [{"id": "r_all", "outputNode": target, "backend": "default", "worker": None,
+                     "nodeIds": [n.id for n in g.upstream_chain(graph, target)], "tier": None,
+                     "rows": rows, "confidence": conf}]
         out: list[dict] = []
         for i, r in enumerate(regions):
             final = i == len(regions) - 1
             tier = None if final else self._boundary_tier(r, regions)  # the final region isn't materialized
-            est = sizes.get(r.output_node)
+            rows, conf = _rows(r.output_node)
             out.append({"id": r.id, "outputNode": r.output_node, "backend": r.backend, "worker": r.worker,
                         "nodeIds": sorted(r.node_ids), "tier": (tier.name if tier else None),
-                        "rows": (est.rows if est else None), "confidence": (est.confidence if est else "unknown")})
+                        "rows": rows, "confidence": conf})
         return out
 
-    def _cost_requires(self, graph: Graph, target: str) -> dict:
+    def _cost_requires(self, graph: Graph, target: str, sizes: dict | None = None) -> dict:
         """Cost-based placement input: a BLOCKING region whose estimated working set exceeds the local
         memory budget 'wants' a backend with more memory → a `ResourceSpec(mem=…)` the planner folds in.
         A strict no-op when nothing exceeds the budget, or when no backend can satisfy it (place_fn then
         falls back to the local default). Never breaks a run — estimation failure → no extra requirement."""
         from hub import estimate as est_mod
         from hub.models import ResourceSpec
-        try:
-            sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target)
-        except Exception:  # noqa: BLE001 — placement is best-effort; a bad estimate must not block the run
-            return {}
+        if sizes is None:  # reuse a caller-computed estimate (plan_summary) to avoid a second source-count pass
+            try:
+                sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target)
+            except Exception:  # noqa: BLE001 — placement is best-effort; a bad estimate must not block the run
+                return {}
         from hub import placement
         budget = getattr(self.deps, "local_mem_bytes", 4 << 30)
         extra: dict = {}
