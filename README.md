@@ -70,7 +70,8 @@ logical plan**:
   DuckDB relation — pushed down, optimized, and out-of-core; or
 - the `transform` escape hatch runs your own Python — and even this isn't row-by-row: it's a
   **batched** function over Arrow `RecordBatch`es, deferred into the same plan and portable to any
-  runner.
+  runner. A `map_batches` cell picks how each batch arrives — row dicts (default), a **pandas
+  DataFrame**, or a **pyarrow Table** (arrow-native, so column types are preserved).
 
 A **runner** executes that assembled plan. By default it's the canvas's **kernel** — a warm,
 restart-durable process (one per canvas, Jupyter-style) running the local out-of-core engine
@@ -92,6 +93,14 @@ Because a wire carries a **typed table** (not raw bytes), the canvas knows every
 only lets you connect compatible ports, and the kernel independently re-checks the graph's types
 before running it. (Besides a full `dataset`, a wire can carry a `sample`, a column `selection`, or a
 computed `metric` / `value`.)
+
+The port **schema** is resolved metadata-only for a relational op (no data scanned), so you see its
+columns before running. A code op (`transform` / a plugin) is untyped until it runs — but you can
+**declare** its output columns, or **infer** them from a sample, as a contract that types its port and
+everything downstream (Inspector → *Output schema*). It's a **non-enforcing** type system: if a node's
+config references a column its input doesn't have, the node and the wire flag it amber — a hint, never a
+block, and only when the input schema is actually known. Cards also show a conservative **`~N rows`**
+size estimate before you run.
 
 ---
 
@@ -227,6 +236,38 @@ Postgres — the shared, restart-durable setup above. `Dockerfile` is the single
 (`docker build -t dataplay .`); `docker-compose.yml` adds Postgres, volumes, and documents
 `deploy.replicas` + sticky routing for the multi-instance case. Set `DP_AUTH_SECRET` and
 `DP_DATASET_ROOTS` for a multi-user deployment; TLS is operator-specific (front it with nginx/Caddy).
+
+---
+
+## Scaling execution — placement & tiered materialization
+
+The section above scales the *web tier*. This is the other axis: running the *compute* of one graph
+across more than the local kernel — a heavy step on a cluster, the rest local — without rewriting the
+graph. With only the local kernel registered it's all a no-op; it activates when you register a
+distributed backend (a plugin).
+
+A run splits into **regions** — maximal runs of adjacent nodes sharing a backend, cut only where they
+must (a backend change, a fan-out, or a `checkpoint`). Each region:
+
+- is **placed** by a cost estimate. A per-node, bottom-up size estimate — conservative (it never
+  under-estimates; it reports "unknown" rather than guessing a number) — decides whether a region's
+  working set fits the local kernel's memory (`DP_MEMORY_LIMIT` / `DP_KERNEL_MEM`, default 4 GB) or
+  wants a bigger backend. A manual `config.requires` (cpu / gpu / mem / labels) is an authoritative pin.
+- **hands off** through a **storage tier**: a boundary materializes to the cheapest tier both the
+  producing and consuming backend can reach — local disk for a local→local handoff, a shared object
+  store (`DP_STORAGE_URL`) when a remote backend is involved (so *not every handoff writes S3*). If a
+  later run needs the result on a different tier, it's copied, not recomputed.
+
+The **run-plan preview** (a node's Inspector → *Run plan*) shows this before you run — the regions,
+each region's backend, its handoff tier, and its estimated rows. It appears only when placement actually
+splits or routes; a plain local graph just shows its `~N rows` estimate on the card.
+
+**Adding a distributed backend is a plugin.** Implement the `ExecutionBackend` protocol, plus the
+optional `PlaceableBackend` — `workers()` / `place(requires)` / `run_unit(graph, output_node, output_uri)`
+/ `reachable_tiers()`. `run_unit` runs one region reading its input from a tier URI and writing its
+output to a tier URI, so workers read/write shared storage directly. The bundled **`dp_ray`** plugin is
+the working reference (region dispatch on Ray Data with worker-direct parquet reads, verified on real
+Ray) — point your own internal job system at the same `run_unit` contract.
 
 ---
 

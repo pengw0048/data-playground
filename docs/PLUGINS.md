@@ -108,10 +108,22 @@ runners are just the first implementations registered, not a privileged core pat
 
 A distributed runner that places work on typed workers (GPU / region routing) can additionally implement
 the optional `PlaceableBackend` Protocol (`backends.py`): `workers()` (advertise capacities), `place(requires)`
-(pick a worker, or None), `run_unit(graph, output_node, output_uri)` (run one placed region). The core
-feature-detects these, so a non-distributed backend omits them; a node declares a need via
-`NodeSpec.requires` / `config.requires`, and placement activates only when a `place()`-capable backend is
-registered (`DP_POOL_WORKERS` or a plugin).
+(pick a worker, or None), `run_unit(graph, output_node, output_uri)` (run one placed **region** — reading its
+input from the given tier URI and writing its output to `output_uri`, so workers touch shared storage
+directly), and `reachable_tiers()` (which storage tiers this backend can read/write — e.g. `("object",)` for
+a remote cluster, `("local","object")` for one sharing the hub's disk). The core feature-detects these, so a
+non-distributed backend omits them.
+
+**How placement + tiering drive `run_unit`.** A run splits into regions (maximal same-backend subgraphs, cut
+at a backend change / fan-out / `checkpoint`). A region is placed by a cost estimate — a conservative per-node
+size estimate (`hub/estimate.py`) raises a memory requirement when a blocking region's working set exceeds the
+local budget (`DP_MEMORY_LIMIT`), which `place()` routes to a worker with the memory; a manual `config.requires`
+mem is authoritative. A boundary materializes to the cheapest tier both the producing and consuming backend can
+reach (`reachable_tiers()` ∩), local for a local→local handoff, a shared object store (`DP_STORAGE_URL`) when a
+remote backend is involved. Placement activates only when a `place()`-capable backend is registered
+(`DP_POOL_WORKERS`, or a plugin — `dp_ray` claims a region tagged `config.requires.labels.engine=ray`); with
+only the local kernel it's a no-op. `POST /graph/plan` returns this plan (regions + backend + tier + estimate)
+— the Inspector's *Run plan* preview renders it.
 
 Two substrates are selected by a setting rather than `register(reg)` — set it to a built-in keyword or a
 **dotted path to your own class** (`pkg.module:Class`), so a third implementation needs no core patch:
@@ -140,7 +152,7 @@ test in `kernel/hub/tests/test_kernel.py` you can copy:
 | [`dp_hf_datasets`](../examples/plugins/dp_hf_datasets/) | `add_adapter` | read a Hugging Face Hub dataset as a source: `hf://<id>[@<config>][:<split>]` | `pip install 'data-playground[hf]'` |
 | [`dp_iceberg`](../examples/plugins/dp_iceberg/) | `add_adapter` | read an Apache Iceberg table as a source: `iceberg://<catalog>/<namespace>.<table>` (catalog from your pyiceberg config) | `pip install 'data-playground[iceberg]'` |
 | [`dp_json_pipeline`](../examples/plugins/dp_json_pipeline/) | `set_importer` | parse a tiny JSON pipeline (`source`/`steps`/`write`) into a runnable canvas graph — import → canvas → run | — |
-| [`dp_ray`](../examples/plugins/dp_ray/) | `add_runner` | run the clean subset on **Ray Data** (`read → map/filter/flat_map/map_batches → write`), lowered from the engine-neutral IR; falls back to DuckDB for relational/opaque graphs. Opt-in via `DP_EXECUTION=ray-data` | `pip install 'data-playground[ray]'` |
+| [`dp_ray`](../examples/plugins/dp_ray/) | `add_runner` (+ `PlaceableBackend`) | run the clean subset on **Ray Data** (`read → map/filter/flat_map/map_batches → write`), lowered from the engine-neutral IR; falls back to DuckDB for relational/opaque graphs. Opt-in whole-graph via `DP_EXECUTION=ray-data`; also a **region-dispatch** backend — `run_unit` runs one region on Ray with worker-direct parquet reads, claimed when a node is tagged `config.requires.labels.engine=ray`. The reference for a real distributed backend | `pip install 'data-playground[ray]'` |
 | [`dp_datasets_place`](../examples/plugins/dp_datasets_place/) | `add_destination` | a save/open "place" (`kind='datasets'`) that browses only dataset files, hiding clutter; path-fenced to its root | — |
 | [`dp_json_view`](../examples/plugins/dp_json_view/) | `add_capability` | tags JSON-doc columns (name-based detector) + declares `viewer={"kind":"json"}` → the SPA shows a JSON tab that pretty-prints those cells, no frontend code | — |
 | [`dp_upper`](../examples/plugins/dp_upper/) | `add_node` (+`ir`) | an `upper` node whose DuckDB build + engine-neutral `ir` hook share one generated operator, so it runs on Ray too (a clean `map`), not just DuckDB | — |
