@@ -49,8 +49,9 @@ def main() -> None:
         runner = mod.RayRunner(deps)
         graph, target = Graph(**job["graph"]), job["target"]
         ir = lower_to_ir(graph, target, deps.node_specs, deps.node_ir)
-        _log("lowered; _run_ir_sync")
-        result = runner._run_ir_sync(ir, graph, target)
+        mat = job.get("materialize_uri")
+        _log(f"lowered; {'_run_ir_materialize' if mat else '_run_ir_sync'}")
+        result = runner._run_ir_materialize(ir, graph, target, mat) if mat else runner._run_ir_sync(ir, graph, target)
         _log(f"run done: {result.get('status')}")
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read
         result = {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}

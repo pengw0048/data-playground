@@ -3843,6 +3843,56 @@ def test_ray_backend_live_differential(tmp_path):
     assert rows(st_ray.output_uri) == rows(st_loc.output_uri) == [10, 12, 14, 16, 18, 20]
 
 
+def test_ray_backend_placement_and_tiers(tmp_path):
+    # D: dp_ray is a PlaceableBackend (region dispatch). place() claims a region ONLY when it explicitly
+    # asks for engine=ray — the cost-based mem policy must NOT silently route here. No live Ray needed.
+    from hub.deps import Deps
+    from hub.models import ResourceSpec
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+    assert rr.reachable_tiers() == ("local", "object")
+    assert [w.id for w in rr.workers()] == ["ray"]
+    assert rr.place(ResourceSpec(labels={"engine": "ray"})) == "ray"   # explicit opt-in → claimed
+    assert rr.place(ResourceSpec(mem="1000GB")) is None                # a cost-based mem need → NOT claimed
+    assert rr.place(None) is None
+    assert hasattr(rr, "run_unit")                                     # PlaceableBackend region entry present
+
+
+@pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="live Ray run — opt-in (needs [ray] + a real executor). Enable: DP_TEST_RAY_LIVE=1.")
+def test_ray_backend_run_unit_live(tmp_path):
+    # D end-to-end: run_unit executes a region on Ray (reads a parquet WORKER-DIRECT via ray.data.read_parquet)
+    # and materializes output_node → a single parquet uri, matching the local engine byte-for-byte.
+    import time
+
+    import duckdb
+
+    from hub.deps import Deps
+    from hub.models import Graph
+
+    pytest.importorskip("ray")
+    p = str(tmp_path / "nums.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM range(1,11) t(x)) TO '{p}' (FORMAT PARQUET)")
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+    # a clean region: source → map(x*2); materialize the map node's output to a uri (no write node)
+    gr = Graph(**{"id": "c", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": p}),
+        _ray_node("m", "transform", {"mode": "map", "code": "def fn(row):\n    row['x'] = row['x'] * 2\n    return row"}),
+    ], "edges": [_ray_edge("src", "m")]})
+    out = str(tmp_path / "unit_out.parquet")
+    st = rr.run_unit(gr, "m", out)
+    for _ in range(900):
+        if rr.status(st.run_id).status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.1)
+    st = rr.status(st.run_id)
+    assert st.status == "done", st.error
+    got = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{out}')").fetchall())
+    assert got == [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+
+
 def test_section_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),

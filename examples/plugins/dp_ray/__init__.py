@@ -47,7 +47,7 @@ import uuid
 
 from hub import db, graph as g
 from hub.ir import CLEAN_TRANSFORM_MODES, lower_to_ir, plan_is_clean
-from hub.models import PerNodeStatus, RunStatus
+from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
 
 _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", ".json", ".lance")
 
@@ -108,6 +108,38 @@ class RayRunner:
             st.status = "cancelled"
         return st
 
+    # -- PlaceableBackend (region dispatch, Phase C3) ---------------------- #
+    # dp_ray advertises ONE synthetic worker labelled engine=ray. place() claims a region ONLY when it
+    # explicitly asks for engine=ray (config.requires.labels) — so the cost-based mem policy never
+    # silently routes here; a user opts a node into Ray deliberately. reachable_tiers: local Ray shares
+    # the fs and can read object storage, so both (a real remote cluster would declare object-only).
+    def workers(self) -> list:
+        return [WorkerInfo(id="ray", capacity=ResourceSpec(mem="1000GB", labels={"engine": "ray"}), state="idle")]
+
+    def place(self, requires) -> "str | None":
+        labels = getattr(requires, "labels", None) or {}
+        return "ray" if labels.get("engine") == "ray" else None
+
+    def reachable_tiers(self):
+        return ("local", "object")
+
+    def run_unit(self, graph, output_node, output_uri, run_id=None) -> RunStatus:
+        """Run ONE region's subgraph on Ray and materialize output_node → output_uri (the RunController
+        handoff contract). A clean region runs distributed on Ray (reads worker-direct); anything else
+        falls back to the base runner's run_unit (subprocess-materialize, always correct)."""
+        ir = lower_to_ir(graph, output_node, self.node_specs, self.deps.node_ir)
+        if not self._ray_runnable(ir):
+            return self.base.run_unit(graph, output_node, output_uri)  # safe fallback (SubprocessRunner)
+        run_id = run_id or f"unit_{uuid.uuid4().hex[:10]}"
+        status = RunStatus(run_id=run_id, status="queued", placement="distributed", target_node_id=output_node,
+                           per_node=[PerNodeStatus(node_id=output_node, status="queued", label=output_node)])
+        with self._lock:
+            self.runs[run_id] = status
+            self._cancel[run_id] = threading.Event()
+        threading.Thread(target=self._supervise, args=(run_id, graph, output_node, status),
+                         kwargs={"materialize_uri": output_uri}, daemon=True).start()
+        return status
+
     def _ray_runnable(self, ir) -> bool:
         # every clean transform must carry inlined code (a Ray worker has no access to the driver's
         # processor registry), else defer to the DuckDB engine.
@@ -141,9 +173,10 @@ class RayRunner:
             except Exception:  # noqa: BLE001 — never let persistence break a run
                 pass
 
-    def _supervise(self, run_id, graph, target, status) -> None:
+    def _supervise(self, run_id, graph, target, status, materialize_uri=None) -> None:
         """Parent side: spawn the isolated Ray driver, poll its status file, mirror the result. Touches
-        NO DuckDB (only subprocess + files + the DB-backed on_status/on_complete hooks) → never deadlocks."""
+        NO DuckDB (only subprocess + files + the DB-backed on_status/on_complete hooks) → never deadlocks.
+        `materialize_uri` set = region mode (write target → that uri); else whole-graph mode (write node)."""
         import json
         import subprocess
         import tempfile
@@ -156,7 +189,7 @@ class RayRunner:
         with open(job_file, "w") as f:
             json.dump({"workspace": self.deps.workspace, "data_dir": self.deps.data_dir, "target": target,
                        "graph": graph.model_dump(), "module": os.path.abspath(__file__),
-                       "status_file": status_file}, f)
+                       "materialize_uri": materialize_uri, "status_file": status_file}, f)
         driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_driver.py")
         result = None
         try:
@@ -226,12 +259,46 @@ class RayRunner:
         except Exception as e:  # noqa: BLE001
             return {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
 
+    def _run_ir_materialize(self, ir, graph, target, uri) -> dict:
+        """Child side, region mode: run the clean IR up to `target` on Ray (reads worker-direct) and
+        write that dataset to `uri` as a SINGLE parquet — the RunController handoff contract (a
+        downstream region's ref-source reads one file). The final collect matches run()'s sink funnel."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from hub.plugins.adapters import is_object_uri
+        try:
+            datasets: dict[str, object] = {}
+            for step in ir.steps:
+                if step.op == "write":  # a region is cut BEFORE any write; ignore a stray one
+                    continue
+                datasets[step.id] = self._build(step, datasets)
+            ds = datasets[target]
+            batches = list(ds.iter_batches(batch_format="pyarrow"))
+            tbl = pa.concat_tables(batches) if batches else pa.table({})
+            if is_object_uri(uri):
+                with db.base_guard():
+                    db.ensure_object_store()
+                    db.conn().from_arrow(tbl).write_parquet(uri)
+            else:
+                os.makedirs(os.path.dirname(uri) or ".", exist_ok=True)
+                pq.write_table(tbl, uri)
+            return {"status": "done", "rows": tbl.num_rows, "output_uri": uri, "output_table": None}
+        except Exception as e:  # noqa: BLE001
+            return {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
+
     def _build(self, step, datasets):
         import ray
 
         if step.op == "read":
             uri = step.config["uri"]
-            with db.base_guard():                              # any source (incl. Lance/HF/Iceberg/plugin)
+            from hub.plugins.adapters import is_object_uri
+            if uri.lower().endswith((".parquet", ".pq")) and not is_object_uri(uri):
+                try:
+                    return ray.data.read_parquet(uri)  # WORKER-DIRECT: Ray reads parquet on workers, no driver funnel
+                except Exception:  # noqa: BLE001 — fall back to the always-works driver-Arrow path below
+                    pass
+            with db.base_guard():                              # any other source (Lance/HF/Iceberg/CSV/object/plugin)
                 tbl = self.resolve_adapter(uri).scan(uri).to_arrow_table()
             return ray.data.from_arrow(tbl)
         parent = datasets[step.inputs[0][0]]                   # clean transforms/passthrough are single-input
