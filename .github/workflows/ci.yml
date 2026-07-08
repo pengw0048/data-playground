@@ -43,6 +43,8 @@ jobs:
       # built before `uv sync` or hatchling errors ("Forced include not found").
       - name: Install web deps
         run: cd web && npm install
+      - name: Unit tests (vitest — store + components)
+        run: cd web && npm test
       - name: Build SPA
         run: cd web && npm run build
       # kernel: the Playwright webServer boots `dataplay` (needs uv + deps incl. anthropic via dev)
