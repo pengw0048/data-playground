@@ -264,7 +264,9 @@ class BuildEngine:
             return parent
 
         if t == "sample":
-            n = max(0, int(cfg.get("n") or self.sample_k or 1000))  # unset → the engine's preview budget
+            # default ONLY when n is unset (None) — a configured n=0 means 0 rows, not the fallback
+            n = cfg.get("n")
+            n = max(0, int(n if n is not None else (self.sample_k or 1000)))
             seed = int(cfg.get("seed", 42))
             v = self._view(parent, "s")
             return db.conn().sql(f"SELECT * FROM {v} USING SAMPLE {n} ROWS (reservoir, {seed})")

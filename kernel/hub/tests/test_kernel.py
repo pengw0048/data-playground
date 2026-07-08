@@ -3379,6 +3379,50 @@ def test_plugin_node_ir_hook_runs_on_duckdb_and_ray(tmp_path):
     assert sorted(out.column("name").to_pylist()) == ["AB", "CD"]  # Ray operator ≡ DuckDB build, by construction
 
 
+def test_ir_unify_regressions(tmp_path):
+    # three regressions the IR-unify adversarial pass caught, now fixed + locked:
+    import duckdb
+    import pytest as _pt
+
+    from hub import db, ir as irmod
+    from hub.deps import get_deps
+    from hub.executors.engine import BuildEngine, NotPreviewable
+    from hub.models import Graph, GraphNode
+
+    p = str(tmp_path / "n.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM range(1,6) t(x)) TO '{p}' (FORMAT PARQUET)")
+    d = get_deps()
+    src = {"id": "src", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": p}}}
+
+    def G(nodes, edges):
+        return Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": edges})
+
+    def eng(graph):
+        return BuildEngine(graph, d.resolve_adapter, d.registry, full=True,
+                           node_builders=d.node_builders, node_specs=d.node_specs)
+
+    # (1) a sample node configured n=0 means ZERO rows — not the sample_k fallback (the `or 0` falsy bug)
+    g1 = G([src, {"id": "s", "type": "sample", "position": {"x": 0, "y": 0}, "data": {"config": {"n": 0}}}],
+           [{"id": "e", "source": "src", "target": "s", "data": {"wire": "dataset"}}])
+    with db.run_scope():
+        assert eng(g1).relation("s").fetchall() == []
+
+    # (2) a library transform with no processor + no code raises honestly (not a silent passthrough)
+    g2 = G([src, {"id": "t", "type": "transform", "position": {"x": 0, "y": 0}, "data": {"config": {"source": "library"}}}],
+           [{"id": "e", "source": "src", "target": "t", "data": {"wire": "dataset"}}])
+    with db.run_scope(), _pt.raises(NotPreviewable):
+        eng(g2).relation("t")
+
+    # (3) a plugin ir hook that RAISES degrades to opaque — never bricks compile/estimate/run
+    def boom(node):
+        raise ValueError("bad plugin hook")
+    node_ir = {"myplugin": boom}
+    assert irmod._op_and_config(GraphNode(id="m", type="myplugin", data={"config": {}}), node_ir)[0] == "opaque:myplugin"
+    g3 = G([src, {"id": "m", "type": "myplugin", "position": {"x": 0, "y": 0}, "data": {"config": {}}}],
+           [{"id": "e", "source": "src", "target": "m", "data": {"wire": "dataset"}}])
+    assert not irmod.lower_to_ir(g3, "m", d.node_specs, node_ir).is_clean()  # opaque → not clean, no raise
+
+
 def test_resolve_config_is_the_shared_builtin_resolver():
     # hub.ir.resolve_config is the SINGLE resolver both the IR and the DuckDB engine (executors/engine.py
     # _lower) read built-in config through — canonicalizing keys so they can't diverge. Lock the contract.

@@ -93,8 +93,10 @@ def resolve_config(node: GraphNode) -> dict:
     cfg = _cfg(node)
     if t in ("transform", "notebook"):
         c: dict = {"mode": cfg.get("mode", "map"), "onError": cfg.get("onError", "raise")}
-        if cfg.get("source") == "library" and cfg.get("processor"):
-            c |= {"source": "library", "processor": cfg.get("processor"), "params": cfg.get("params", {})}
+        if cfg.get("source") == "library":  # keep 'source' even without a processor, so the engine's
+            c["source"] = "library"          # library branch still runs (and errors honestly if unconfigured)
+            if cfg.get("processor"):
+                c |= {"processor": cfg.get("processor"), "params": cfg.get("params", {})}
         if cfg.get("code"):  # keep the code too — it's the portable, self-contained operator
             c["code"] = cfg["code"]
         return c
@@ -145,7 +147,10 @@ def _op_and_config(node: GraphNode, node_ir: dict | None = None) -> tuple[str, d
     # it lowers to a real op (e.g. a clean `map`) a distributed backend can run — else it's opaque (DuckDB-only)
     hook = (node_ir or {}).get(t)
     if callable(hook):
-        emitted = hook(node)
+        try:
+            emitted = hook(node)
+        except Exception:  # noqa: BLE001 — a buggy plugin hook must NOT brick compile/estimate/run
+            emitted = None  #                 (/graph/compile runs on every edit) → degrade to opaque
         if isinstance(emitted, dict) and emitted.get("op"):
             return emitted["op"], dict(emitted.get("config", {}))
     return f"opaque:{t}", dict(_cfg(node))
