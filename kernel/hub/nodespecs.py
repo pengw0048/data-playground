@@ -36,6 +36,8 @@ class ParamSpec(_M):
     label: str | None = None
     lang: str | None = None  # for code params: 'python' | 'sql'
     required: bool = False   # empty → the node is invalid and can't run (frontend gates Run + reason)
+    show_when: "dict | None" = None  # {'param': X, 'in': [...]} → the generic editor hides this field
+    #                                  unless config[X] is in the set (a dependent/conditional param)
 
 
 class NodeSpec(_M):
@@ -88,7 +90,7 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
                      ParamSpec(name="scope", type="select", options=["dataset", "sample"], default="dataset", label="runs over"),
                      ParamSpec(name="mode", type="select", options=["map", "map_batches", "filter", "flat_map"], default="map"),
                      ParamSpec(name="batchFormat", type="select", options=["rows", "pandas", "arrow"], default="rows",
-                               label="map_batches format"),
+                               label="batch format", show_when={"param": "mode", "in": ["map_batches"]}),
                      ParamSpec(name="code", type="code", lang="python")],
              blurb="Python over Arrow batches — library preset or ad-hoc cell"),
     NodeSpec(kind="sql", title="sql", category="query", tag="sql",

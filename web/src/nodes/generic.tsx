@@ -37,7 +37,11 @@ export function nodeInvalidReason(node: { type: string; data: { config: Record<s
 export function NodeParamFields({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
-  const editable = (backendSpecs[node?.type ?? '']?.params ?? []).filter((p) => p.type !== 'code')
+  const cfg = (node?.data.config ?? {}) as Record<string, unknown>
+  // hide a conditional param whose showWhen dependency isn't met (e.g. batchFormat only for map_batches)
+  const visible = (p: { showWhen?: { param: string; in: string[] } }) =>
+    !p.showWhen || p.showWhen.in.includes(String(cfg[p.showWhen.param] ?? ''))
+  const editable = (backendSpecs[node?.type ?? '']?.params ?? []).filter((p) => p.type !== 'code' && visible(p))
   if (editable.length === 0) return null
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>

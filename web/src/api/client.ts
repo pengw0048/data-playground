@@ -67,7 +67,7 @@ function toGraph(doc: CanvasDoc) {
 }
 
 export interface BackendPort { id: string; label?: string; wire: string; accepts?: string[] }
-export interface BackendParam { name: string; type: string; default?: unknown; options?: string[]; label?: string; lang?: string; required?: boolean }
+export interface BackendParam { name: string; type: string; default?: unknown; options?: string[]; label?: string; lang?: string; required?: boolean; showWhen?: { param: string; in: string[] } }
 export interface BackendNodeSpec {
   kind: string; title: string; category: string; tag?: string
   inputs: BackendPort[]; outputs: BackendPort[]; params: BackendParam[]
