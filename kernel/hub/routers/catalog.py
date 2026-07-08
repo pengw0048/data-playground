@@ -300,14 +300,14 @@ def data_sample(req: SampleRequest) -> SampleResult:
 def import_pipeline(req: ImportRequest) -> PipelineImport:
     try:
         result = get_deps().importer.import_pipeline(req.config, req.params)
+        # auto-lay-out an imported graph the importer didn't position (so nodes don't stack at 0,0); an
+        # importer that set its own positions keeps them. Inside the try so a bad graph → 400, not 500.
+        if result.graph and result.graph.nodes and all(n.position.x == 0 and n.position.y == 0 for n in result.graph.nodes):
+            g.layout(result.graph)
     except ImporterNotConfigured as e:
         raise HTTPException(501, str(e))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"{type(e).__name__}: {e}")
-    # auto-lay-out an imported graph the importer didn't position (so nodes don't stack at 0,0); an
-    # importer that set its own positions keeps them.
-    if result.graph and result.graph.nodes and all(n.position.x == 0 and n.position.y == 0 for n in result.graph.nodes):
-        g.layout(result.graph)
     return result
 
 

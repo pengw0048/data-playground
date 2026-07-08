@@ -15,21 +15,20 @@ class CycleError(Exception):
 def layout(graph: Graph, x0: float = 80.0, y0: float = 80.0, dx: float = 280.0, dy: float = 170.0) -> None:
     """Assign positions to a fresh graph's nodes by left-to-right topological layering — column = the
     longest path from a root, rows stack within a column. Mutates positions in place. Used to lay out an
-    IMPORTED pipeline so its nodes don't all stack at (0,0); safe on any acyclic graph (a back edge just
-    caps a node's depth at 0)."""
+    IMPORTED pipeline so its nodes don't all stack at (0,0). Iterative (no recursion, so a long chain can't
+    overflow the stack); a cyclic graph degrades to a single column rather than raising."""
     ids = {n.id for n in graph.nodes}
     depth: dict[str, int] = {}
-
-    def col(nid: str, seen: frozenset[str] = frozenset()) -> int:
-        if nid in depth:
-            return depth[nid]
-        ps = [e.source for e in incoming(graph, nid) if e.source in ids and e.source != nid and e.source not in seen]
-        depth[nid] = 1 + max((col(p, seen | {nid}) for p in ps), default=-1)
-        return depth[nid]
-
+    try:
+        ordered = topo_order(graph)  # parents precede children → each node's parents are already scored
+    except CycleError:
+        ordered = graph.nodes  # malformed (shouldn't happen post-import); lay out in list order, all col 0
+    for n in ordered:
+        ps = [e.source for e in incoming(graph, n.id) if e.source in ids and e.source != n.id]
+        depth[n.id] = 1 + max((depth.get(p, 0) for p in ps), default=-1)
     per_col: dict[int, int] = {}
     for n in graph.nodes:
-        c = col(n.id)
+        c = depth.get(n.id, 0)
         r = per_col.get(c, 0)
         per_col[c] = r + 1
         n.position = Position(x=x0 + c * dx, y=y0 + r * dy)

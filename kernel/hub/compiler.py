@@ -36,7 +36,9 @@ def compile_plan(graph, target_node_id: str | None = None, registry=None, node_s
     for node in chain:
         kind = _STEP_KIND.get(node.type, "op")
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-        mode = cfg.get("mode") if node.type in ("transform", "notebook") else node.type
+        # default the transform mode to "map" (as engine.node_previewable and ir._op_and_config do), so a
+        # mode-less transform classifies identically across the plan and the IR (ir.plan_is_clean vs is_clean)
+        mode = cfg.get("mode", "map") if node.type in ("transform", "notebook") else node.type
         steps.append(PlanStep(node_id=node.id, kind=kind, mode=mode,
                               previewable=node_previewable(node, registry, node_specs), label=_label(node)))
     return CompilePlan(target_node_id=target_node_id, steps=steps, acyclic=True)

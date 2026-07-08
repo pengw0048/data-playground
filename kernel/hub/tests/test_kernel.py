@@ -2033,6 +2033,21 @@ def test_pipelines_import_reports_not_configured():
     assert "importer" in r.text.lower()
 
 
+def test_layout_handles_large_reverse_ordered_graph():
+    # graph.layout must be iterative — a long chain listed sink-first (reverse topological order) used to
+    # overflow the recursion limit and 500 the import route. Now it lays out left-to-right by depth.
+    from hub import graph as gmod
+    from hub.models import Graph
+
+    n = 700
+    nodes = [{"id": f"x{i}", "type": "select", "position": {"x": 0, "y": 0}, "data": {"config": {}}} for i in range(n)]
+    edges = [{"id": f"e{i}", "source": f"x{i}", "target": f"x{i+1}", "data": {"wire": "dataset"}} for i in range(n - 1)]
+    gr = Graph(**{"id": "c", "version": 1, "nodes": list(reversed(nodes)), "edges": edges})  # sink-first
+    gmod.layout(gr)  # must not RecursionError
+    pos = {node.id: node.position for node in gr.nodes}
+    assert pos["x0"].x < pos["x350"].x < pos["x699"].x  # root → … → sink, laid out by increasing depth
+
+
 def test_json_pipeline_importer_round_trips_to_a_run():
     # The dp_json_pipeline reference importer parses a JSON pipeline into a runnable canvas graph; the
     # /pipelines/import route lays it out; the returned graph runs end-to-end — proving import→canvas→run
@@ -3197,6 +3212,10 @@ def test_lower_to_ir_and_clean_classification():
     assert cir.is_clean() and not cir.unsupported()
     assert cir.by_id()["m"].inputs == [("src", None)]     # input wiring captured
     assert ir.plan_is_clean(compile_plan(clean, "w"))      # can_run-side agrees
+
+    # a transform with NO `mode` key defaults to "map" on BOTH sides (compiler + IR) → they agree
+    ml = G([src, N("m2", "transform", {"code": "def fn(r): return r"}), wr], [E("src", "m2"), E("m2", "w")])
+    assert ir.lower_to_ir(ml, "w").is_clean() and ir.plan_is_clean(compile_plan(ml, "w"))
 
     dirty = G([src, N("j", "sql", {"sql": "SELECT * FROM input"}), wr], [E("src", "j"), E("j", "w")])
     di = ir.lower_to_ir(dirty, "w")

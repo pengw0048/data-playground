@@ -123,7 +123,8 @@ def _op_and_config(node: GraphNode) -> tuple[str, dict]:
     if op == "sample":
         return op, {"n": cfg.get("n", 1000), "seed": cfg.get("seed", 42)}
     if op == "write":
-        return op, {"name": cfg.get("name"), "filename": cfg.get("filename"),
+        title = node.data.get("title") if isinstance(node.data, dict) else None
+        return op, {"name": cfg.get("name"), "filename": cfg.get("filename"), "title": title,
                     "format": cfg.get("format", "parquet"), "writeMode": cfg.get("writeMode", "overwrite")}
     return op, dict(cfg)  # metric/chart/vector-search/section/opaque/loop/variable — carry cfg verbatim
 
@@ -151,7 +152,11 @@ def _plan_step_clean(step) -> bool:
 
 
 def plan_is_clean(plan: CompilePlan) -> bool:
-    """Conservative clean-subset check from a CompilePlan alone (for `can_run`). Conservative because a
-    bypassed relational node reads as its own kind here (→ not clean) though the IR would mark it
-    `passthrough`; erring toward fallback is always safe (the DuckDB engine runs it correctly)."""
+    """A FAST clean-subset pre-gate from a CompilePlan alone (for `ExecutionBackend.can_run`). A CompilePlan
+    doesn't carry a node's `disabled`/`bypassed` flags, so this can't see them — it classifies purely by
+    (kind, mode). That means it can disagree with `CompiledIR.is_clean()` on nodes whose flags matter (a
+    disabled node the plan reads as its clean kind; a bypassed relational node the IR would call
+    `passthrough`). So a backend MUST re-derive the IR and re-check `is_clean()` before executing — `dp_ray`
+    does, falling back to the DuckDB engine on a mismatch. (A disabled node makes the graph unrunnable on
+    ANY backend anyway, so the disagreement never yields a wrong result, only a fallback.)"""
     return bool(plan.acyclic) and bool(plan.steps) and all(_plan_step_clean(s) for s in plan.steps)

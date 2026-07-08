@@ -188,7 +188,7 @@ class RayRunner:
         import pyarrow as pa
 
         cfg = step.config
-        raw = cfg.get("filename") or cfg.get("name") or "output"
+        raw = cfg.get("filename") or cfg.get("name") or cfg.get("title") or "output"  # match LocalRunner
         fname = "".join(c if c.isalnum() or c in "_-." else "_" for c in str(raw)).strip(".") or "output"
         base, ext = os.path.splitext(fname)
         if ext.lower() not in _KNOWN_EXT:
