@@ -112,6 +112,8 @@ def resolve_config(node: GraphNode) -> dict:
         return c
     if t == "filter":
         return {"predicate": cfg.get("predicate", "")}
+    if t == "assert":  # a data-quality gate: rows where `predicate` is not TRUE = violations
+        return {"predicate": cfg.get("predicate", ""), "severity": cfg.get("severity", "warn")}
     if t == "select":
         return {"expr": cfg.get("select") or cfg.get("expr") or ""}
     if t == "sql":

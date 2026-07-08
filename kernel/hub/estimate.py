@@ -129,7 +129,7 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
                 out[nid] = first or _sized(None, "unknown", w)
             continue
 
-        if t in ("filter", "dedup"):  # row-reducing but unbounded → keep input as an UPPER bound
+        if t in ("filter", "dedup", "assert"):  # row-reducing but unbounded → keep input as an UPPER bound
             base = first.rows if first else None
             conf = "unknown" if not first or first.confidence == "unknown" else "bounded"
             out[nid] = _sized(base, conf, w, is_blocking(t))

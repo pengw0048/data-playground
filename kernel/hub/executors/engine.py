@@ -336,6 +336,17 @@ class BuildEngine:
             pred = (cfg.get("predicate") or "").strip()
             return parent.filter(pred) if pred else parent
 
+        if t == "assert":
+            # a data-quality gate — the node's relation IS the VIOLATING rows (so "view data" shows exactly
+            # what failed). `IS NOT TRUE` catches both false AND null, so `x > 0` flags a null x too. The
+            # runner fails the run on error-severity violations (see plugins/runner.py); no predicate =
+            # nothing violates → passthrough. Same columns as the input (SELECT *), so its port stays typed.
+            pred = (cfg.get("predicate") or "").strip()
+            if not pred:
+                return parent
+            v = self._view(parent, "as")
+            return db.conn().sql(f"SELECT * FROM {v} WHERE ({pred}) IS NOT TRUE")
+
         if t == "select":
             expr = (cfg.get("expr") or "").strip()  # resolver canonicalizes select/expr → 'expr'
             return parent.project(expr) if expr else parent

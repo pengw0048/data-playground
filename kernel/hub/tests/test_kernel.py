@@ -3221,6 +3221,49 @@ def test_ray_mapper_honors_batch_format():
     assert out.column_names == ["x", "y"] and out["y"].to_pylist() == [2, 4, 6]
 
 
+def test_assert_node_surfaces_violations_and_gates_the_run():
+    # the data-quality gate: its relation IS the violating rows (predicate not TRUE → view data shows what
+    # failed), and severity=error fails the run while warn records the count and continues.
+    import time
+
+    from hub import db
+    from hub.compiler import compile_plan
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+    d = get_deps()
+    ev = _uri("events")  # 'id' is a non-negative int in the seed
+
+    def graph(pred, sev="warn"):
+        return Graph(**{"id": "c", "version": 1, "nodes": [
+            N("s", "source", {"uri": ev}),
+            N("a", "assert", {"predicate": pred, "severity": sev})], "edges": [E("s", "a")]})
+
+    # engine: assert relation = the VIOLATING rows (IS NOT TRUE catches false + null)
+    with db.run_scope():
+        eng = BuildEngine(graph("id >= 0"), d.resolve_adapter, d.registry, full=True,
+                          node_specs=d.node_specs, node_builders=d.node_builders)
+        total = int(eng.relation("s").aggregate("count(*) AS n").fetchone()[0])
+        assert int(eng.relation("a").aggregate("count(*) AS n").fetchone()[0]) == 0        # all satisfy → 0
+        eng2 = BuildEngine(graph("id < 0"), d.resolve_adapter, d.registry, full=True,
+                           node_specs=d.node_specs, node_builders=d.node_builders)
+        assert int(eng2.relation("a").aggregate("count(*) AS n").fetchone()[0]) == total    # none satisfy → all
+
+    def run(pred, sev):
+        g = graph(pred, sev)
+        st = d.runner.run(compile_plan(g, "a", d.registry, d.node_specs), g, "a", "local")
+        for _ in range(200):
+            s = d.runner.status(st.run_id)
+            if s.status in ("done", "failed", "cancelled"):
+                return s
+            time.sleep(0.05)
+        return s
+
+    err = run("id < 0", "error")                    # every row violates + severity=error → run FAILS
+    assert err.status == "failed" and "assert" in (err.error or "").lower()
+    assert run("id < 0", "warn").status == "done"   # same violations but warn → run succeeds
+    assert run("id >= 0", "error").status == "done"  # no violations → error severity passes
+
+
 def test_estimate_sizes_is_conservative_and_honest():
     # the per-node size estimate: conservative (never under-estimate), honest (unknown → None, not a
     # fabricated number), and measured-actuals override. Feeds placement + the confirm-gate + a UI hint.

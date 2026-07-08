@@ -122,7 +122,7 @@ function referencedColumns(node: CanvasNode): string[] {
     case 'sort': return plain(str('by'))
     case 'dedup': return plain(str('on'))
     case 'aggregate': return plain(str('groupBy'))
-    case 'filter': return exprColumns(str('predicate'))
+    case 'filter': case 'assert': return exprColumns(str('predicate'))
     default: return []
   }
 }

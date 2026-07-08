@@ -127,6 +127,11 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              params=[ParamSpec(name="agg", type="select", options=["count", "mean", "sum", "min", "max"], default="count"),
                      ParamSpec(name="column", type="string")],
              blurb="reduce to a scalar"),
+    NodeSpec(kind="assert", title="assert", category="inspect", tag="check",
+             inputs=[_in(("dataset", "sample", "selection"))], outputs=[_out(label="violations")],
+             params=[ParamSpec(name="predicate", type="text", label="must hold for every row (SQL)"),
+                     ParamSpec(name="severity", type="select", options=["warn", "error"], default="warn")],
+             blurb="data-quality gate — shows the rows that violate; severity=error fails the run"),
     NodeSpec(kind="chart", title="chart", category="inspect", tag="chart",
              inputs=[_in()], outputs=[_out()],  # emits the (x, y) series → chains like any dataset
              params=[ParamSpec(name="chartType", type="select", options=["bar", "line", "scatter", "area"], default="bar"),

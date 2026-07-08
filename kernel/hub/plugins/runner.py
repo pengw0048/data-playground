@@ -187,6 +187,8 @@ class LocalRunner:
                     t0 = time.time()
                     if step.kind == "write":
                         rows_seen = self._commit_write(nm[step.node_id], graph, engine, status, cached)
+                    elif step.kind == "assert":
+                        rows_seen = self._check_assert(nm[step.node_id], engine)  # violation count; may raise
                     else:
                         engine.relation(step.node_id)  # build (lazy) — cheap
                     if pn:
@@ -239,6 +241,17 @@ class LocalRunner:
         if cached and cached.get("rows") is not None:
             return cached["rows"]
         return int(engine.relation(node_id).aggregate("count(*) AS n").fetchone()[0])
+
+    def _check_assert(self, node, engine: BuildEngine) -> int:
+        """A data-quality gate: the node's relation is the VIOLATING rows (predicate not TRUE). Count them;
+        on severity='error' with any violation, raise so the run fails with an actionable message (the
+        offending rows are inspectable by previewing the node). 'warn' just records the count."""
+        viol = int(engine.relation(node.id).aggregate("count(*) AS n").fetchone()[0])
+        cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+        if cfg.get("severity") == "error" and viol > 0:
+            title = (node.data.get("title") if isinstance(node.data, dict) else None) or node.id
+            raise RuntimeError(f"assert '{title}' failed: {viol} row(s) violate the check")
+        return viol
 
     def _commit_write(self, node, graph: Graph, engine: BuildEngine, status: RunStatus,
                       cached: dict | None) -> int:
