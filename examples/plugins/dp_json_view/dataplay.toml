@@ -1,0 +1,4 @@
+# Reference plugin: a capability that tags JSON-doc columns + adds a JSON viewer tab. See __init__.py.
+name = "dp-json-view"
+version = "0.1.0"
+# min_core_api = 1

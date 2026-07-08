@@ -275,6 +275,16 @@ class BackendInfo(Wire):
     workers: list[WorkerInfo] = []
 
 
+class CapabilityView(Wire):
+    """A plugin capability that contributes a VIEWER TAB, declaratively. `viewer.kind` names a generic
+    renderer the SPA ships (e.g. 'grid' = media/image grid, 'json' = pretty-printed cell) — so a plugin
+    adds a viewer tab (for columns it tags via its detector) with NO frontend code, the same way a
+    NodeSpec renders a node card. See kernel/hub/plugins/capabilities.py + web/src/nodes/capabilities."""
+    id: str
+    label: str
+    viewer: dict[str, Any]  # {kind: str, ...} — the generic frontend renderer + its params
+
+
 class KernelInfo(Wire):
     mode: Literal["local", "distributed"] = "local"
     backend: str = "duckdb"
@@ -284,6 +294,7 @@ class KernelInfo(Wire):
     runners: list[str] = []
     processors: list[str] = []
     capabilities: list[str] = []
+    capability_views: list[CapabilityView] = []  # plugin capabilities that declare a viewer tab (additive)
     backends: list[BackendInfo] = []  # real backend/worker topology + capacities (additive; runners kept)
 
 

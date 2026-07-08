@@ -1899,6 +1899,31 @@ def test_plugin_secret_not_leaked_via_settings():
         metadb.set_setting("plugin.dp_secretpk.host", "", "global")
 
 
+def test_json_view_capability_reference_plugin(tmp_path):
+    # the dp_json_view reference plugin adds a VIEWER TAB with no frontend code: its detector tags
+    # JSON-doc columns, and its declarative viewer is surfaced in KernelInfo.capability_views for the
+    # SPA to render generically. Proves the capability seam (detector + viewer) end-to-end.
+    import shutil
+    from pathlib import Path
+
+    from hub.deps import Deps
+    from hub.models import ColumnSchema
+    from hub.plugins.capabilities import tag_columns
+
+    ws = tmp_path / "ws"; (ws / "plugins").mkdir(parents=True)
+    src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_json_view"
+    shutil.copytree(src, ws / "plugins" / "dp_json_view")
+    deps = Deps(str(ws), str(tmp_path / "data"))
+
+    views = {v.id: v for v in deps.info().capability_views}
+    assert "json-doc" in views                                      # surfaced for the SPA
+    assert views["json-doc"].label == "JSON" and views["json-doc"].viewer == {"kind": "json"}
+
+    cols = tag_columns([ColumnSchema(name="payload", type="string"), ColumnSchema(name="qty", type="int")])
+    tagged = {c.name: c.capabilities for c in cols}
+    assert "json-doc" in tagged["payload"] and "json-doc" not in tagged["qty"]  # detector tags the right column
+
+
 def test_plugin_config_resolution(tmp_path, monkeypatch):
     # reg.config precedence for a pack's dataplay.toml [[config]] field:
     #   UI setting (plugin.<pack>.<key>) > declared env var > declared default > the arg default.

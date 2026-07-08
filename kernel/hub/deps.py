@@ -15,7 +15,7 @@ import os
 import sys
 
 from hub.backends import NodeBuilder
-from hub.models import BackendInfo, KernelInfo, ResourceSpec, WorkerInfo
+from hub.models import BackendInfo, CapabilityView, KernelInfo, ResourceSpec, WorkerInfo
 from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec
 from hub.plugins.adapters import DuckDBAdapter, default_adapters
 from hub.plugins.capabilities import BUILTIN_CAPABILITIES
@@ -410,6 +410,8 @@ class Deps:
             runners=[r.name for r in self.runners],
             processors=[p.id for p in self.registry.list()],
             capabilities=[c.id for c in self.capabilities],
+            capability_views=[CapabilityView(id=c.id, label=getattr(c, "label", c.id), viewer=getattr(c, "viewer"))
+                              for c in self.capabilities if isinstance(getattr(c, "viewer", None), dict)],
             backends=self._backends(),
         )
 

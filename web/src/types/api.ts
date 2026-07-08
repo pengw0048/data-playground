@@ -11,6 +11,7 @@ export interface ResourceSpec {
 export interface WorkerInfo { id: string; capacity: ResourceSpec; state: 'idle' | 'busy' | 'down' }
 export interface BackendInfo { name: string; workers: WorkerInfo[] }
 
+export interface CapabilityView { id: string; label: string; viewer: { kind: string } }
 export interface KernelInfo {
   mode: 'local' | 'distributed'
   backend: string
@@ -20,6 +21,7 @@ export interface KernelInfo {
   runners: string[]
   processors: string[]
   capabilities: string[]
+  capabilityViews?: CapabilityView[]  // plugin capabilities that declare a viewer tab (rendered generically)
   backends: BackendInfo[]
 }
 

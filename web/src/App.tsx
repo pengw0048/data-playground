@@ -13,6 +13,7 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { api } from './api/client'
 import { useStore } from './store/graph'
 import { initRouter } from './router'
+import { syncPluginCapabilities } from './nodes/capabilities'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 
 export default function App() {
@@ -30,7 +31,11 @@ export default function App() {
   useEffect(() => {
     if (auth && (!auth.authEnabled || auth.userId) && !booted) {
       setBooted(true)
-      bootstrap().then(() => initRouter(useStore))  // wire URL ↔ state once the initial canvas is settled
+      bootstrap().then(() => {
+        initRouter(useStore)  // wire URL ↔ state once the initial canvas is settled
+        // register generic viewer tabs for plugin capabilities that declare one (§5.6, no per-plugin FE code)
+        syncPluginCapabilities(useStore.getState().kernelInfo?.capabilityViews ?? [])
+      })
     }
   }, [auth, booted, bootstrap])
 
