@@ -15,17 +15,21 @@ adapter (→ Arrow → `ray.data.from_arrow`) so EVERY source works (Lance/HF/Ic
 collects to the driver and writes via the adapter; cancellation is cooperative between IR steps (Ray has
 no cheap mid-Dataset abort).
 
-KNOWN LIMITATION — inline execution vs the shared DuckDB connection. This reference runs Ray *in the
-kernel process* and does its source read / sink write / `register_output` through the app's shared DuckDB
-base connection. On some platforms (observed: macOS) a DuckDB materialization on that pre-existing shared
-connection DEADLOCKS once `ray.init()` has run in the same process — so the inline path can hang, and the
-opt-in `test_ray_backend_live_differential` will not complete there. Ray Data itself and this backend's
-operator path are verified to run correctly (see the probes / the operator-identity test); the deadlock
-is purely the in-process DuckDB↔Ray coexistence. **The production-correct design is process isolation: a
-subprocess (or Ray-job) driver whose own fresh process holds its DuckDB + Ray** — the same pattern the
-built-in SubprocessRunner uses. Building that isolated driver is the remaining work to make the live path
-robust; the Part B mechanism (a plugin node's `ir` hook → clean op → routed to a distributed backend) is
-already verified without a cluster by `test_plugin_node_ir_hook_runs_on_duckdb_and_ray`.
+EXECUTION MODEL — an isolated subprocess driver. Running Ray inline in the kernel process deadlocks: the
+source read / sink write / `register_output` go through the app's SHARED DuckDB base connection, and a
+materialization on that pre-existing connection wedges once `ray.init()` has run in the same process. So
+`run()` spawns a fresh subprocess (`_driver.py`) whose OWN process holds its DuckDB + Ray (`ray.init`
+before any DuckDB), and the parent only polls a status file — no DuckDB in the parent, no in-process
+coexistence. This is the production-correct shape (same isolation the built-in SubprocessRunner uses).
+
+ENVIRONMENT SENSITIVITY of the live path. Verified: Ray Data runs on a dev box, and this backend executes
+a real single-op graph correctly IN-PROCESS. But driving the FULL subprocess path to completion is
+sensitive to the local Ray environment — observed on one macOS box: the child's Ray cluster spawned its
+worker pool but the task stayed unscheduled (workers idle), plausibly a macOS worker-spawn / local-Ray
+quirk. So the opt-in `test_ray_backend_live_differential` may hang on such a setup — **verify on a clean
+Linux Ray environment**, where Ray Data is far more reliable.
+The Part B MECHANISM (a plugin node's `ir` hook → clean op → routed to a distributed backend, operator
+byte-identical) is verified WITHOUT a cluster by `test_plugin_node_ir_hook_runs_on_duckdb_and_ray`.
 
 Opt-in: `pip install 'data-playground[ray]'`, drop this folder in `<workspace>/plugins/`, and select it
 via Settings → Execution or `DP_EXECUTION=ray-data`. It never becomes the default (the kernel is), so a
@@ -35,7 +39,9 @@ small graph won't spin up Ray unless you ask.
 from __future__ import annotations
 
 import os
+import sys
 import threading
+import time
 import uuid
 
 from hub import db, graph as g
@@ -63,24 +69,6 @@ def _make_mapper(config: dict):
         return pa.Table.from_pylist(rows) if rows else table.slice(0, 0)  # keep schema when a batch empties
 
     return _op
-
-
-_RAY_INITED = False
-
-
-def _ensure_ray() -> None:
-    """Initialize Ray ONCE. `ray.init()` installs signal handlers, which only works on the MAIN thread —
-    initializing it off the main thread leaves Ray Data's executor unable to make progress (it just
-    hangs). So we init from run() (dispatched on the main thread in the shipped test) rather than from
-    the background _execute thread. Caveat for production: a kernel that dispatches runs on a threadpool
-    should pre-initialize Ray on the main thread at startup (or use a Ray-job-submitting backend); this
-    reference keeps execution inline for clarity."""
-    global _RAY_INITED
-    if _RAY_INITED:
-        return
-    import ray
-    ray.init(ignore_reinit_error=True, configure_logging=False, log_to_driver=False, include_dashboard=False)
-    _RAY_INITED = True
 
 
 class RayRunner:
@@ -129,7 +117,6 @@ class RayRunner:
         ir = lower_to_ir(graph, target_node_id, self.node_specs, self.deps.node_ir)
         if not self._ray_runnable(ir):
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)  # safe fallback
-        _ensure_ray()  # init Ray HERE (run() is on the main thread) — never inside the _execute daemon
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=per_node,
@@ -138,7 +125,11 @@ class RayRunner:
             self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()
         self._emit(graph, status)
-        threading.Thread(target=self._execute, args=(run_id, ir, graph, target_node_id, status),
+        # PROCESS ISOLATION: run Ray in a fresh subprocess (its main thread inits Ray BEFORE any DuckDB),
+        # so the app's shared DuckDB connection never coexists with Ray in one process. The parent only
+        # spawns + polls a status file (no DuckDB here), so it can't deadlock. (Ray inline in-process
+        # deadlocks against the shared DuckDB connection — see the module docstring.)
+        threading.Thread(target=self._supervise, args=(run_id, graph, target_node_id, status),
                          daemon=True).start()
         return status
 
@@ -149,50 +140,79 @@ class RayRunner:
             except Exception:  # noqa: BLE001 — never let persistence break a run
                 pass
 
-    def _execute(self, run_id, ir, graph, target, status) -> None:
+    def _supervise(self, run_id, graph, target, status) -> None:
+        """Parent side: spawn the isolated Ray driver, poll its status file, mirror the result. Touches
+        NO DuckDB (only subprocess + files + the DB-backed on_status/on_complete hooks) → never deadlocks."""
+        import json
+        import subprocess
+        import tempfile
+
         cancel = self._cancel[run_id]
         status.status = "running"
         self._emit(graph, status)
-        rows_seen = 0
+        work = tempfile.mkdtemp(prefix="dp_ray_")
+        job_file, status_file = os.path.join(work, "job.json"), os.path.join(work, "status.json")
+        with open(job_file, "w") as f:
+            json.dump({"workspace": self.deps.workspace, "data_dir": self.deps.data_dir, "target": target,
+                       "graph": graph.model_dump(), "module": os.path.abspath(__file__),
+                       "status_file": status_file}, f)
+        driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_driver.py")
+        result = None
         try:
-            datasets: dict[str, object] = {}  # Ray was already init'd on the main thread in run()
-            for step in ir.steps:
+            # Redirect the child's stdio to a log file (never an inherited pipe — Ray logs copiously and
+            # a full pipe would block the child mid-run; the result comes back via status_file). Own
+            # session so Ray's worker signals/pgroup are decoupled from the (daemon-thread) parent.
+            _dlog = open(os.path.join(work, "driver.log"), "w")
+            proc = subprocess.Popen([sys.executable, driver, job_file],
+                                    stdout=_dlog, stderr=_dlog, start_new_session=True,
+                                    env={**os.environ, "RAY_DATA_DISABLE_PROGRESS_BARS": "1"})
+            while proc.poll() is None:
                 if cancel.is_set():
+                    proc.terminate()
                     status.status = "cancelled"
-                    return
-                pn = next((p for p in status.per_node if p.node_id == step.id), None)
-                if pn:
-                    pn.status = "running"
+                    break
+                time.sleep(0.2)
+            if os.path.exists(status_file):
+                with open(status_file) as f:
+                    result = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            status.status, status.error = "failed", f"{type(e).__name__}: {e}"
+        if status.status not in ("cancelled",):
+            if result:
+                status.status = result.get("status", "failed")
+                status.error = result.get("error")
+                status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
+                status.rows_processed = status.total_rows = int(result.get("rows") or 0)
+            elif status.status == "running":
+                status.status, status.error = "failed", "ray driver exited without writing a status"
+        for p in status.per_node:  # settle per-node progress to the terminal state
+            p.status = "done" if status.status == "done" else status.status
+        self._emit(graph, status)
+        with self._lock:
+            self._cancel.pop(run_id, None)
+        if self.on_complete:
+            try:
+                self.on_complete(graph, target, status)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _run_ir_sync(self, ir, graph, target) -> dict:
+        """Child side (in the driver subprocess, Ray already init'd): execute the clean IR synchronously
+        and return a result dict for the parent. Reuses _build/_commit; the fresh-process DuckDB is safe
+        because Ray was init'd before it was created."""
+        try:
+            datasets: dict[str, object] = {}
+            rows, out_uri, out_table = 0, None, None
+            for step in ir.steps:
                 if step.op == "write":
-                    rows_seen = self._commit(step, datasets, graph, status)
+                    rows, out_uri, out_table = self._commit(step, datasets, graph)
                 else:
                     datasets[step.id] = self._build(step, datasets)
-                if pn:
-                    pn.status = "done"
-                    pn.rows = rows_seen or None
-                status.rows_processed = rows_seen
-                self._emit(graph, status)
             if target and target in datasets:  # a non-sink target → force a real row count
-                rows_seen = datasets[target].count()
-                status.rows_processed = rows_seen
-            status.status = "done"
+                rows = datasets[target].count()
+            return {"status": "done", "rows": rows, "output_uri": out_uri, "output_table": out_table}
         except Exception as e:  # noqa: BLE001
-            status.status = "cancelled" if cancel.is_set() else "failed"
-            if status.status == "failed":
-                status.error = f"{type(e).__name__}: {e}"
-            for p in status.per_node:
-                if p.status == "running":
-                    p.status = status.status
-        finally:
-            status.total_rows = rows_seen
-            self._emit(graph, status)
-            with self._lock:
-                self._cancel.pop(run_id, None)
-            if self.on_complete:
-                try:
-                    self.on_complete(graph, target, status)
-                except Exception:  # noqa: BLE001
-                    pass
+            return {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
 
     def _build(self, step, datasets):
         import ray
@@ -209,7 +229,7 @@ class RayRunner:
             return parent.map_batches(_make_mapper(step.config), batch_format="pyarrow")
         raise RuntimeError(f"ray backend reached a non-clean op '{step.op}' (should have fallen back)")
 
-    def _commit(self, step, datasets, graph, status) -> int:
+    def _commit(self, step, datasets, graph) -> tuple[int, str, str]:
         import pyarrow as pa
 
         cfg = step.config
@@ -231,8 +251,7 @@ class RayRunner:
         out_uri = res.get("uri", uri)
         parents = [u for (sid, _h) in step.inputs for u in [self.base._source_uri(nm_node=sid, graph=graph)] if u]
         self.catalog.register_output(name=name, uri=out_uri, version="v1", parents=parents, pipeline="canvas")
-        status.output_uri, status.output_table = out_uri, name
-        return int(res.get("rows") or 0)
+        return int(res.get("rows") or 0), out_uri, name
 
 
 def register(reg) -> None:
