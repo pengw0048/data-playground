@@ -8,6 +8,7 @@ import { buildNodeTypes } from '../nodes'
 import { SECTION_W, SECTION_H } from '../nodes/kinds/section'
 import { WireEdge } from '../wires/WireEdge'
 import { canConnect, portWire, getSpec } from '../nodes/registry'
+import { schemaWarnings } from '../nodes/schema'
 import { useStore, newId, freePosition } from '../store/graph'
 import { kindAccent, color } from '../theme/tokens'
 import type { WireType } from '../theme/tokens'
@@ -66,6 +67,9 @@ export function Canvas() {
   const specsVersion = useStore((s) => s.specsVersion)
   const nodeTypes = useMemo(() => buildNodeTypes(), [specsVersion])
   const doc = useStore((s) => s.doc)
+  const schemas = useStore((s) => s.schemas)
+  const previews = useStore((s) => s.previews)
+  const catalog = useStore((s) => s.catalog)
   const selectedIds = useStore((s) => s.selectedIds)
   const setNodes = useStore((s) => s.setNodes)
   const setEdges = useStore((s) => s.setEdges)
@@ -145,13 +149,23 @@ export function Canvas() {
     })
   }, [doc.nodes, selectedIds])
 
+  // nodes whose config references a column absent from their (known) input — drives the amber wire cue.
+  // Keyed by a stable membership string so warnedIds only changes IDENTITY when the set actually changes
+  // → rfEdges (and every WireEdge) don't rebuild on an unrelated keystroke.
+  const warnedKey = useMemo(() => {
+    const ids: string[] = []
+    for (const n of doc.nodes) if (schemaWarnings(doc, schemas, previews, catalog, n.id).length) ids.push(n.id)
+    return ids.sort().join(',')
+  }, [doc, schemas, previews, catalog])
+  const warnedIds = useMemo(() => new Set(warnedKey ? warnedKey.split(',') : []), [warnedKey])
+
   const rfEdges: Edge[] = useMemo(
     () => doc.edges.map((e) => ({
       id: e.id, source: e.source, target: e.target,
       sourceHandle: e.sourceHandle ?? undefined, targetHandle: e.targetHandle ?? undefined,
-      type: 'wire', data: e.data as any, markerEnd: 'dp-arrow',
+      type: 'wire', data: { ...(e.data as any), warned: warnedIds.has(e.target) }, markerEnd: 'dp-arrow',
     })),
-    [doc.edges],
+    [doc.edges, warnedIds],
   )
 
   const onNodesChange = useCallback((changes: NodeChange[]) => {

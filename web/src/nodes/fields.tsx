@@ -4,7 +4,7 @@
 // free-text fallback stays available for anything the builder can't express.
 import { useState } from 'react'
 import { useStore } from '../store/graph'
-import { inputColumns } from './schema'
+import { inputColumns, schemaWarnings } from './schema'
 import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Input } from '@/components/ui/input'
@@ -23,6 +23,20 @@ export function useInputColumns(nodeId: string): ColumnSchema[] {
   const catalog = useStore((s) => s.catalog)
   const nodes = useStore.getState().doc.nodes
   return inputColumns({ nodes, edges } as never, schemas, previews, catalog, nodeId)
+}
+
+/** Soft, non-blocking warnings for a node whose config references a column not in its (known) input —
+ * drives the amber cue on the card / inspector / wire. Reacts to this node's config too, so editing a
+ * predicate updates the cue immediately (not only after the debounced schema refetch). */
+export function useSchemaWarnings(nodeId: string): string[] {
+  const edges = useStore((s) => s.doc.edges)
+  const schemas = useStore((s) => s.schemas)
+  const previews = useStore((s) => s.previews)
+  const catalog = useStore((s) => s.catalog)
+  const config = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId)?.data.config)
+  void config
+  const nodes = useStore.getState().doc.nodes
+  return schemaWarnings({ nodes, edges } as never, schemas, previews, catalog, nodeId)
 }
 
 let _dl = 0

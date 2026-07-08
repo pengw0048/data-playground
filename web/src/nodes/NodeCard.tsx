@@ -14,6 +14,7 @@ import { cn } from '@/lib/utils'
 import { Port } from './Port'
 import { getSpec, nodeOutputs, type NodeSpec } from './registry'
 import { nodeInvalidReason } from './generic'
+import { useSchemaWarnings } from './fields'
 import { useStore, nodeRunnable, isDisabled, type PanelKind } from '../store/graph'
 import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
@@ -71,6 +72,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const hasCode = KINDS_WITH_CODE.has(kind)
   const busy = runState === 'running' || runState === 'estimating'
   const invalid = node ? nodeInvalidReason(node) : null   // e.g. "order by is required"
+  const warnings = useSchemaWarnings(id)   // soft cue: config references a column not in the input
   // the action shelf is revealed on hover / sole-selection / while running, so a resting card is clean
   // and a multi-card marquee doesn't strand a shelf under every selected node
   const showShelf = soleSelected || hover || busy
@@ -134,6 +136,13 @@ export function NodeCard({ id, data, children, metaOverride }: {
             <div className="mt-[5px] min-h-4 truncate text-[11.5px] text-muted-foreground">
               {metaOverride ?? data.meta ?? ''}
             </div>
+
+            {/* soft schema cue: config points at a column not in the input (never blocks a run) */}
+            {!invalid && warnings.length > 0 && !off && (
+              <div className="mt-0.5 truncate text-[10.5px] text-amber-700 dark:text-amber-300" title={warnings.join(' · ')}>
+                ⚠ {warnings[0]}
+              </div>
+            )}
 
             {/* last run stats — so a completed node carries its result (rows · time) at a glance */}
             {data.status === 'latest' && data.lastRun && (

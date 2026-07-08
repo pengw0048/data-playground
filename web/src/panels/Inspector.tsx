@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { useStore, nodeRunnable } from '../store/graph'
 import { getSpec } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
+import { useSchemaWarnings } from '../nodes/fields'
+import { codeHash } from '../nodes/schema'
 import { color, status as statusTok, kindAccent } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { FileDialog } from '../ui/FileDialog'
@@ -66,6 +68,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const serverSchema = useStore((s) => s.schemas[nodeId])  // ColumnSchema[] = typed · null = untyped · undefined = unknown
   const allSchemas = useStore((s) => s.schemas)
   const edges = useStore((s) => s.doc.edges)
+  const warnings = useSchemaWarnings(nodeId)   // config references a column not in the (known) input
   const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
   useEffect(() => setName(node?.data.title ?? ''), [node?.data.title])
@@ -186,6 +189,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* actions */}
       <Section title="Actions">
         {invalid && <div className="mb-1.5 text-[11px] text-amber-700">⚠ {invalid}</div>}
+        {!invalid && warnings.map((w, i) => (
+          <div key={i} className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">⚠ {w} — not found in the input schema</div>
+        ))}
         <div className="flex flex-wrap gap-1.5">
           {/* a note never runs — only offer duplicate / delete for annotations */}
           {kind !== 'note' && <>
@@ -445,12 +451,18 @@ function SchemaContract({ nodeId, runnable }: { nodeId: string; runnable: boolea
   const cfg = (node?.data.config ?? {}) as Record<string, unknown>
   const declared = (Array.isArray(cfg.outputSchema) ? cfg.outputSchema : []) as ColumnSchema[]
   const source = cfg.outputSchemaSource as string | undefined
+  const code = cfg.code == null ? null : String(cfg.code)  // the cell this contract describes (transform)
+  // the contract may be stale if the cell changed since it was pinned (only meaningful for a code cell)
+  const stale = declared.length > 0 && code != null && !!cfg.outputSchemaCodeHash
+    && cfg.outputSchemaCodeHash !== codeHash(code)
 
   // a manual edit (no explicit src) takes ownership → 'declared'; only "Infer from sample" sets 'inferred'.
+  // pin the current cell's hash alongside, so a later cell edit can flag the contract as possibly stale.
   const commit = (cols: ColumnSchema[], src: 'declared' | 'inferred' = 'declared') =>
     updateConfig(nodeId, {
       outputSchema: cols.length ? cols : undefined,
       outputSchemaSource: cols.length ? src : undefined,
+      outputSchemaCodeHash: cols.length && code != null ? codeHash(code) : undefined,
     })
 
   const infer = async () => {
@@ -472,6 +484,11 @@ function SchemaContract({ nodeId, runnable }: { nodeId: string; runnable: boolea
           ? (source === 'inferred' ? 'Inferred from a sample — edit to pin it as the contract.' : 'Declared — types this port and everything downstream.')
           : 'Untyped until it runs. Declare a contract, or infer it from a sample. Leave empty to stay dynamic.'}
       </div>
+      {stale && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-[10px] leading-relaxed text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300">
+          ⚠ The cell changed since this contract was pinned — it may be stale. Re-infer or edit to re-pin.
+        </div>
+      )}
       {declared.map((c, i) => (
         <div key={i} className="flex items-center gap-1">
           <Input value={c.name} placeholder="column"

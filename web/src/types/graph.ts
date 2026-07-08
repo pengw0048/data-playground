@@ -38,6 +38,7 @@ export interface NodeConfig {
   scope?: 'dataset' | 'sample'  // code node: label for whether it works over the full dataset or a sample
   outputSchema?: ColumnSchema[]           // declared output contract (types this port + downstream)
   outputSchemaSource?: 'declared' | 'inferred'  // how outputSchema was filled (for the UI hint)
+  outputSchemaCodeHash?: string           // hash of the cell when the contract was pinned → detect drift
   // join
   on?: string
   how?: 'inner' | 'left'
