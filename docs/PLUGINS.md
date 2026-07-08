@@ -92,7 +92,7 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 
 | call | extends | contract |
 |---|---|---|
-| `reg.add_node(spec, build)` | a canvas node | `NodeSpec` + `build(engine, node, inputs) -> relation` |
+| `reg.add_node(spec, build[, ir])` | a canvas node | `NodeSpec` + `build(engine, node, inputs) -> relation`. OPTIONAL `ir=ir(node) -> {"op", "config"} \| None`: an engine-neutral emit hook so the node lowers to a real IR op (e.g. a clean `map` with inlined `code`) instead of `opaque` — then a DISTRIBUTED backend runs it, not just DuckDB. See the IR section + `dp_upper`. |
 | `reg.add_adapter(adapter)` | a dataset source/sink (claim a URI scheme) | `DatasetAdapter` Protocol in `kernel/hub/backends.py`: `name/matches/scan/schema/count/fingerprint/write` (+ optional `nearest`) |
 | `reg.add_runner(runner)` | an execution backend (pod/Ray/queue) | `ExecutionBackend` Protocol (`backends.py`): `name/can_run/estimate/run/status/cancel` |
 | `reg.add_capability(cap)` | a declared column capability (+ optional viewer tab) | `id`+`label`; an OPTIONAL `detect(col)->bool` (present → `tag_columns` tags matching columns with the id, no core edit); and an OPTIONAL `viewer = {"kind": …}` — a declarative viewer TAB the SPA renders with a generic renderer (`grid` = media/image grid, `json` = pretty-printed cell), surfaced via `KernelInfo.capability_views`. So a plugin adds a viewer tab with **no frontend code**. See `kernel/hub/plugins/capabilities.py` + `web/src/nodes/capabilities.tsx`. |
@@ -143,6 +143,7 @@ test in `kernel/hub/tests/test_kernel.py` you can copy:
 | [`dp_ray`](../examples/plugins/dp_ray/) | `add_runner` | run the clean subset on **Ray Data** (`read → map/filter/flat_map/map_batches → write`), lowered from the engine-neutral IR; falls back to DuckDB for relational/opaque graphs. Opt-in via `DP_EXECUTION=ray-data` | `pip install 'data-playground[ray]'` |
 | [`dp_datasets_place`](../examples/plugins/dp_datasets_place/) | `add_destination` | a save/open "place" (`kind='datasets'`) that browses only dataset files, hiding clutter; path-fenced to its root | — |
 | [`dp_json_view`](../examples/plugins/dp_json_view/) | `add_capability` | tags JSON-doc columns (name-based detector) + declares `viewer={"kind":"json"}` → the SPA shows a JSON tab that pretty-prints those cells, no frontend code | — |
+| [`dp_upper`](../examples/plugins/dp_upper/) | `add_node` (+`ir`) | an `upper` node whose DuckDB build + engine-neutral `ir` hook share one generated operator, so it runs on Ray too (a clean `map`), not just DuckDB | — |
 
 The adapters are read-only sources (`write` raises) and import their heavy dependency lazily, so the
 pack loads even without the extra installed and only errors when its URI scheme is actually used. Both
@@ -151,17 +152,29 @@ they prove the wiring; verify the network path against your own Hub/warehouse.
 
 ### Running on another engine — the execution IR
 
-A distributed backend must not re-read node configs and re-implement lowering (and it could never run
-third-party plugin nodes that way). Instead it lowers from `hub.ir`: `lower_to_ir(graph, target)` reads
-the configs ONCE into a `CompiledIR` — a topological list of `IRStep`s, each a normalized `op` + resolved
-portable config + input wiring. A backend pattern-matches on `op`. `CompiledIR.is_clean()` /
-`plan_is_clean(plan)` mark the subset a map-style engine can run end-to-end (`read`, `write`,
-`passthrough`, and per-row/-batch `map`/`filter`/`flat_map`/`map_batches`); everything relational
-(`sql`/`join`/`aggregate`/`sort`/`dedup`), reducing (`metric`/`chart`), or opaque (`section`, plugin
-kinds) stays unsupported → gate `can_run` on it so the kernel falls back to the DuckDB engine. `dp_ray`
-above is the worked example — the first non-DuckDB engine to run a canvas, reusing the *same*
-`sandbox.compile_operator` the DuckDB engine runs so results are identical. (The default engine still
-lowers directly; rebuilding it on the IR too is future work.)
+A distributed backend must not re-read node configs and re-implement lowering. Instead it lowers from
+`hub.ir`: `lower_to_ir(graph, target)` reads the configs ONCE into a `CompiledIR` — a topological list of
+`IRStep`s, each a normalized `op` + resolved portable config + input wiring. A backend pattern-matches on
+`op`. `CompiledIR.is_clean()` / `plan_is_clean(plan)` mark the subset a map-style engine can run
+end-to-end (`read`, `write`, `passthrough`, and per-row/-batch `map`/`filter`/`flat_map`/`map_batches`);
+everything relational (`sql`/`join`/`aggregate`/`sort`/`dedup`), reducing (`metric`/`chart`), or opaque
+(`section`, and a plugin node with no `ir` hook) stays unsupported → gate `can_run` on it so the kernel
+falls back to the DuckDB engine. `dp_ray` above is the worked example — the first non-DuckDB engine to
+run a canvas, reusing the *same* `sandbox.compile_operator` the DuckDB engine runs so results are
+identical.
+
+Two properties make this real rather than a side artifact:
+
+- **One config resolver.** `hub.ir.resolve_config(node)` is the single place built-in node config is read
+  + key-normalized, and the DuckDB engine (`BuildEngine._lower`) reads through it too — so the engine and
+  every backend see the same config and can't diverge.
+- **Plugin nodes can run distributed.** A plugin node that provides an `ir` hook (`reg.add_node(spec,
+  build, ir=…)`) lowers to a real op instead of `opaque`, so it runs on a distributed backend — see
+  `dp_upper`, whose `build` and `ir` share one generated operator. The plan carries each step's `op`, so a
+  backend's `can_run` gates on the plugin node's real op too (not just built-ins).
+
+(The default engine still lowers directly — it's the reference IR interpreter — rather than executing the
+`CompiledIR` object; that internal convergence is future work.)
 
 ## Configuring a plugin
 

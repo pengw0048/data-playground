@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from hub import graph as g
 from hub.executors.engine import node_previewable
+from hub.ir import _op_and_config
 from hub.models import CompilePlan, GraphNode, PlanStep
 
 _STEP_KIND = {
@@ -26,7 +27,8 @@ def _label(node: GraphNode) -> str:
     return node.type
 
 
-def compile_plan(graph, target_node_id: str | None = None, registry=None, node_specs=None) -> CompilePlan:
+def compile_plan(graph, target_node_id: str | None = None, registry=None, node_specs=None,
+                 node_ir=None) -> CompilePlan:
     if not g.is_acyclic(graph):
         return CompilePlan(target_node_id=target_node_id, steps=[], acyclic=False,
                            error="graph has a cycle — control flow must be encapsulated (§5.7)")
@@ -36,9 +38,10 @@ def compile_plan(graph, target_node_id: str | None = None, registry=None, node_s
     for node in chain:
         kind = _STEP_KIND.get(node.type, "op")
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-        # default the transform mode to "map" (as engine.node_previewable and ir._op_and_config do), so a
-        # mode-less transform classifies identically across the plan and the IR (ir.plan_is_clean vs is_clean)
         mode = cfg.get("mode", "map") if node.type in ("transform", "notebook") else node.type
-        steps.append(PlanStep(node_id=node.id, kind=kind, mode=mode,
+        # the authoritative engine-neutral IR op (incl. a plugin node's emit hook via node_ir) — a
+        # backend's can_run gates the clean subset on THIS, so it's identical to what the IR lowers
+        op = _op_and_config(node, node_ir)[0]
+        steps.append(PlanStep(node_id=node.id, kind=kind, mode=mode, op=op,
                               previewable=node_previewable(node, registry, node_specs), label=_label(node)))
     return CompilePlan(target_node_id=target_node_id, steps=steps, acyclic=True)

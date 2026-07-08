@@ -57,9 +57,13 @@ class Registry:
             return field["default"]
         return default
 
-    def add_node(self, spec: NodeSpec, build: "NodeBuilder | None" = None) -> None:
+    def add_node(self, spec: NodeSpec, build: "NodeBuilder | None" = None, ir=None) -> None:
         # `build` is the node's build callable — see hub.backends.NodeBuilder for its exact
         # signature/return contract (called by the engine as build(engine, node, inputs)).
+        # `ir` is an OPTIONAL engine-neutral emit hook: ir(node) -> {"op", "config"} | None. When given,
+        # the node lowers to that IR op (e.g. a clean `map` with inlined `code`) instead of `opaque:<kind>`,
+        # so a distributed backend (dp_ray) can run it — NOT just DuckDB. The plugin guarantees its build()
+        # and its ir op compute the same thing (like the built-in transform shares its operator).
         # refuse to shadow a built-in OR an already-registered plugin kind — overwriting would
         # corrupt the /api/nodes contract and leave the original's build() as dead code
         if spec.kind in self.deps.builtin_kinds:
@@ -71,6 +75,8 @@ class Registry:
         self.deps.node_specs[spec.kind] = spec
         if build is not None:
             self.deps.node_builders[spec.kind] = build
+        if ir is not None:
+            self.deps.node_ir[spec.kind] = ir
 
     def add_adapter(self, adapter) -> None:
         self.deps.adapters.insert(0, adapter)  # plugins claim uris before defaults
@@ -196,6 +202,7 @@ class Deps:
         self.node_specs: dict[str, NodeSpec] = {s.kind: s for s in BUILTIN_NODE_SPECS}
         self.builtin_kinds = {s.kind for s in BUILTIN_NODE_SPECS}
         self.node_builders: dict[str, object] = {}
+        self.node_ir: dict[str, object] = {}  # kind -> ir(node) hook: an engine-neutral emit path (§ IR unify B)
         self.plugins: list[dict] = []
         self._manifests: dict[str, dict] = {}
         from hub.storage import make_storage

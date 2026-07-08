@@ -187,7 +187,7 @@ class RunController:
         """Run the final (target) region over the reduced graph, waiting for it — on the base runner
         (default) or on the region's target backend (a placed final region), so writes commit normally."""
         subg = self._subgraph(graph, region, ref_uri)
-        plan = compiler.compile_plan(subg, region.output_node, self.deps.registry, self.deps.node_specs)
+        plan = compiler.compile_plan(subg, region.output_node, self.deps.registry, self.deps.node_specs, self.deps.node_ir)
         backend = self._backend_runner(region)
         sub = backend.run(plan, subg, region.output_node, "local")
         with self._lock:

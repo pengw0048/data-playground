@@ -49,7 +49,7 @@ def main() -> int:
             _atomic_write(status_file, {"run_id": "child", "status": "done", "per_node": [], "rows_processed": 0,
                                         "ms": 0, "placement": "local", "output_uri": mat_uri})
             return 0
-        plan = compiler.compile_plan(graph, job.get("target"), deps.registry, deps.node_specs)
+        plan = compiler.compile_plan(graph, job.get("target"), deps.registry, deps.node_specs, deps.node_ir)
         st = deps.runner.run(plan, graph, job.get("target"), "local")  # in-process runner, in THIS process
         rid = st.run_id
         while True:

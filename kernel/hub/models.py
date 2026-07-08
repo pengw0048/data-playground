@@ -240,6 +240,7 @@ class PlanStep(Wire):
     mode: str | None = None
     previewable: bool = True
     label: str
+    op: str = ""  # the engine-neutral IR op (hub.ir) — lets ExecutionBackend.can_run gate on the clean subset
 
 
 class CompilePlan(Wire):

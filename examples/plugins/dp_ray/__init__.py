@@ -98,7 +98,7 @@ class RayRunner:
             s.config.get("code") for s in ir.steps if s.op in CLEAN_TRANSFORM_MODES)
 
     def run(self, plan, graph, target_node_id, placement, run_id=None) -> RunStatus:
-        ir = lower_to_ir(graph, target_node_id, self.node_specs)
+        ir = lower_to_ir(graph, target_node_id, self.node_specs, self.deps.node_ir)
         if not self._ray_runnable(ir):
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)  # safe fallback
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"

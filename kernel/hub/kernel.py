@@ -121,7 +121,7 @@ def main() -> None:
         last_activity[0] = time.monotonic()
         graph = Graph(**body.graph)
         _ensure_deps(graph)
-        plan = compiler.compile_plan(graph, body.target, deps.registry, deps.node_specs)
+        plan = compiler.compile_plan(graph, body.target, deps.registry, deps.node_specs, deps.node_ir)
         st = deps.runner.run(plan, graph, body.target, body.placement, run_id=body.run_id)
         return st.model_dump()
 

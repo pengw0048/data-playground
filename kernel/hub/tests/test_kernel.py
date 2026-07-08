@@ -3331,6 +3331,54 @@ def test_source_pushdown_into_scan(tmp_path):
     assert calls[0]["predicate"] is None              # ≥2 consumers → can't prove safety → no push-down
 
 
+def test_plugin_node_ir_hook_runs_on_duckdb_and_ray(tmp_path):
+    # dp_upper registers a node with an engine-neutral emit hook (reg.add_node(..., ir=…)): it lowers to
+    # a CLEAN `map` op (not opaque), so a distributed backend runs it, and its DuckDB build() + its ir op
+    # share the operator → identical results. The Ray operator identity is checked without a live cluster.
+    import importlib.util
+    import shutil
+    from pathlib import Path
+
+    import duckdb
+    import pyarrow as pa
+
+    from hub import db, ir as irmod
+    from hub.compiler import compile_plan
+    from hub.deps import Deps
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+
+    p = str(tmp_path / "t.parquet")
+    duckdb.connect().execute(f"COPY (SELECT 'ab' AS name UNION ALL SELECT 'cd') TO '{p}' (FORMAT PARQUET)")
+    ws = tmp_path / "ws"; (ws / "plugins").mkdir(parents=True)
+    shutil.copytree(Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_upper", ws / "plugins" / "dp_upper")
+    d = Deps(str(ws), str(tmp_path / "data"))
+    assert "upper" in d.node_specs and "upper" in d.node_ir  # node + its ir hook both registered
+
+    G = Graph(**{"id": "c", "version": 1, "nodes": [
+        {"id": "src", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": p}}},
+        {"id": "u", "type": "upper", "position": {"x": 0, "y": 0}, "data": {"config": {"column": "name"}}},
+        {"id": "w", "type": "write", "position": {"x": 0, "y": 0}, "data": {"config": {"name": "o"}}},
+    ], "edges": [{"id": "e1", "source": "src", "target": "u", "data": {"wire": "dataset"}},
+                 {"id": "e2", "source": "u", "target": "w", "data": {"wire": "dataset"}}]})
+
+    step = irmod.lower_to_ir(G, "w", d.node_specs, d.node_ir).by_id()["u"]
+    assert step.op == "map" and "code" in step.config           # emit hook → a clean op (not opaque:upper)
+    assert irmod.lower_to_ir(G, "w", d.node_specs, d.node_ir).is_clean()
+    assert irmod.plan_is_clean(compile_plan(G, "w", d.registry, d.node_specs, d.node_ir))  # can_run agrees
+    assert not irmod.lower_to_ir(G, "w", d.node_specs).is_clean()  # WITHOUT the hook → opaque → falls back
+
+    with db.run_scope():                                        # DuckDB build() uppercases
+        eng = BuildEngine(G, d.resolve_adapter, d.registry, full=True, node_builders=d.node_builders, node_specs=d.node_specs)
+        assert sorted(r[0] for r in eng.relation("u").fetchall()) == ["AB", "CD"]
+
+    ray_src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_ray" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("dp_ray_ref2", ray_src)
+    ray_mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(ray_mod)
+    out = ray_mod._make_mapper(step.config)(pa.table({"name": ["ab", "cd"]}))  # the SAME op dp_ray would run
+    assert sorted(out.column("name").to_pylist()) == ["AB", "CD"]  # Ray operator ≡ DuckDB build, by construction
+
+
 def test_resolve_config_is_the_shared_builtin_resolver():
     # hub.ir.resolve_config is the SINGLE resolver both the IR and the DuckDB engine (executors/engine.py
     # _lower) read built-in config through — canonicalizing keys so they can't diverge. Lock the contract.

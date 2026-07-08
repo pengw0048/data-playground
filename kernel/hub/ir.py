@@ -129,49 +129,47 @@ def resolve_config(node: GraphNode) -> dict:
     return dict(cfg)  # metric/chart/vector-search/section/opaque/loop/variable — carry cfg verbatim
 
 
-def _op_and_config(node: GraphNode) -> tuple[str, dict]:
+def _op_and_config(node: GraphNode, node_ir: dict | None = None) -> tuple[str, dict]:
     if _flag(node, "disabled"):
         return "disabled", {}
     if _flag(node, "bypassed"):
         return "passthrough", {}
-    cfg = resolve_config(node)
     t = node.type
     if t in ("transform", "notebook"):
+        cfg = resolve_config(node)
         mode = cfg.get("mode", "map")
-        op = mode if mode in CLEAN_TRANSFORM_MODES else f"transform:{mode}"
-    else:
-        op = _NODE_OP.get(t, f"opaque:{t}")  # unknown/plugin kinds → opaque (a backend must fall back)
-    return op, cfg
+        return (mode if mode in CLEAN_TRANSFORM_MODES else f"transform:{mode}"), cfg
+    if t in _NODE_OP:
+        return _NODE_OP[t], resolve_config(node)  # a built-in node
+    # a plugin/unknown kind: use its engine-neutral emit hook (reg.add_node(..., ir=…)) if it has one, so
+    # it lowers to a real op (e.g. a clean `map`) a distributed backend can run — else it's opaque (DuckDB-only)
+    hook = (node_ir or {}).get(t)
+    if callable(hook):
+        emitted = hook(node)
+        if isinstance(emitted, dict) and emitted.get("op"):
+            return emitted["op"], dict(emitted.get("config", {}))
+    return f"opaque:{t}", dict(_cfg(node))
 
 
-def lower_to_ir(graph: Graph, target_node_id: str | None = None, node_specs: dict | None = None) -> CompiledIR:
+def lower_to_ir(graph: Graph, target_node_id: str | None = None, node_specs: dict | None = None,
+                node_ir: dict | None = None) -> CompiledIR:
     """Lower a canvas graph to the engine-neutral IR — the target's upstream cone in topological order
-    (or the whole graph when target is None). Reads each node's config exactly once."""
+    (or the whole graph when target is None). Reads each node's config exactly once. `node_ir` (kind →
+    ir hook, from deps.node_ir) lets plugin nodes emit a real op instead of `opaque`."""
     chain = g.upstream_chain(graph, target_node_id) if target_node_id else g.topo_order(graph)
     steps: list[IRStep] = []
     for node in chain:
-        op, cfg = _op_and_config(node)
+        op, cfg = _op_and_config(node, node_ir)
         inputs = [(e.source, e.source_handle) for e in g.incoming(graph, node.id)]
         steps.append(IRStep(id=node.id, op=op, config=cfg, inputs=inputs))
     return CompiledIR(target=target_node_id, steps=steps)
 
 
-# op a PlanStep maps to, WITHOUT the graph — mirrors _op_and_config using only (kind, mode) so that
-# ExecutionBackend.can_run (which receives a CompilePlan, not the graph) can gate on the clean subset.
-def _plan_step_clean(step) -> bool:
-    if step.kind in ("read", "write"):
-        return True
-    # a transform/notebook node compiles to kind 'op' with mode = the transform mode; a bare relational
-    # node (sort/dedup/variable/section/plugin) is also kind 'op' but its mode is its own type → excluded.
-    return step.kind == "op" and step.mode in CLEAN_TRANSFORM_MODES
-
-
 def plan_is_clean(plan: CompilePlan) -> bool:
-    """A FAST clean-subset pre-gate from a CompilePlan alone (for `ExecutionBackend.can_run`). A CompilePlan
-    doesn't carry a node's `disabled`/`bypassed` flags, so this can't see them — it classifies purely by
-    (kind, mode). That means it can disagree with `CompiledIR.is_clean()` on nodes whose flags matter (a
-    disabled node the plan reads as its clean kind; a bypassed relational node the IR would call
-    `passthrough`). So a backend MUST re-derive the IR and re-check `is_clean()` before executing — `dp_ray`
-    does, falling back to the DuckDB engine on a mismatch. (A disabled node makes the graph unrunnable on
-    ANY backend anyway, so the disagreement never yields a wrong result, only a fallback.)"""
-    return bool(plan.acyclic) and bool(plan.steps) and all(_plan_step_clean(s) for s in plan.steps)
+    """Clean-subset gate from a CompilePlan alone (for `ExecutionBackend.can_run`). Each PlanStep now
+    carries its IR `op` (compile_plan sets it via `_op_and_config`, incl. a plugin node's engine-neutral
+    emit hook), so this is the AUTHORITATIVE classification — the same the IR uses — not a (kind, mode)
+    heuristic. Note `op` is derived without the disabled/bypassed flags, so a backend should still
+    re-check `is_clean()` on the freshly-lowered IR before executing (dp_ray does); erring toward the
+    DuckDB fallback is always safe."""
+    return bool(plan.acyclic) and bool(plan.steps) and all(s.op in CLEAN_OPS for s in plan.steps)

@@ -51,7 +51,7 @@ def compile_graph(req: CompileRequest) -> CompilePlan:
     if errs:
         return CompilePlan(target_node_id=req.target_node_id, steps=[], acyclic=True,
                            error="incompatible connection: " + "; ".join(errs[:5]))
-    return compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs)
+    return compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
 
 
 @router.post("/run/preview", response_model=SampleResult)
@@ -222,7 +222,7 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps)
-    plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs)
+    plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
     rows = _row_estimate(req.graph, req.target_node_id, deps)
@@ -238,7 +238,7 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps)
-    plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs)
+    plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
     runner = _route_by_capability(deps, deps.pick_runner(plan, uid), req.graph)  # honor node requires

@@ -1,0 +1,4 @@
+# Reference plugin: an `upper` node with an engine-neutral ir hook (runs on DuckDB AND Ray). See __init__.py.
+name = "dp-upper"
+version = "0.1.0"
+# min_core_api = 1
