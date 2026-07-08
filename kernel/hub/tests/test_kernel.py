@@ -3331,6 +3331,24 @@ def test_source_pushdown_into_scan(tmp_path):
     assert calls[0]["predicate"] is None              # ≥2 consumers → can't prove safety → no push-down
 
 
+def test_resolve_config_is_the_shared_builtin_resolver():
+    # hub.ir.resolve_config is the SINGLE resolver both the IR and the DuckDB engine (executors/engine.py
+    # _lower) read built-in config through — canonicalizing keys so they can't diverge. Lock the contract.
+    from hub.ir import resolve_config
+    from hub.models import GraphNode
+
+    def N(t, cfg, **data):
+        return GraphNode(id="n", type=t, data={"config": cfg, **data})
+
+    assert resolve_config(N("select", {"select": "a, b"})) == {"expr": "a, b"}            # select|expr → expr
+    assert resolve_config(N("aggregate", {"group": "k", "aggs": "sum(x)"})) == {"groupBy": "k", "aggs": "sum(x)"}
+    assert resolve_config(N("source", {"table": "t", "delimiter": ";", "header": "No"})) == \
+        {"uri": "t", "options": {"delimiter": ";", "header": "no"}}                        # uri|table → uri; opts nested + normalized
+    assert resolve_config(N("source", {"uri": "/p.parquet"})) == {"uri": "/p.parquet"}     # no options key when unset
+    assert resolve_config(N("sample", {})) == {"n": None, "seed": 42}                       # n unset → engine supplies sample_k
+    assert resolve_config(N("metric", {"agg": "mean", "column": "x"})) == {"agg": "mean", "column": "x"}  # verbatim
+
+
 def test_lower_to_ir_and_clean_classification():
     # The engine-neutral IR normalizes each node to (op, resolved config, input wiring); is_clean()
     # marks a run a map-style engine can execute, and plan_is_clean() answers the same from a

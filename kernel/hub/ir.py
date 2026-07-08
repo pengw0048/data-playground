@@ -81,52 +81,67 @@ def _flag(node: GraphNode, key: str) -> bool:
     return bool(node.data.get(key)) if isinstance(node.data, dict) else False
 
 
+def resolve_config(node: GraphNode) -> dict:
+    """The canonical, resolved config for a built-in node's TYPE — the SINGLE place built-in node config
+    is read + key-normalized, so the IR AND the DuckDB engine (executors/engine.py `_lower`) consume the
+    same thing and can't diverge (the class of bug that produced the earlier plan_is_clean mismatch).
+    Type-keyed (independent of bypass/disabled — those are op-level, handled by `_op_and_config`). Only
+    KEY canonicalization + `uri||table` resolution + `options` nesting + structural defaults (`how`) live
+    here; VALUE-level normalization (`.strip()`, engine-context defaults like the preview sample size)
+    stays in the consumer, so this never changes what the engine computes."""
+    t = node.type
+    cfg = _cfg(node)
+    if t in ("transform", "notebook"):
+        c: dict = {"mode": cfg.get("mode", "map"), "onError": cfg.get("onError", "raise")}
+        if cfg.get("source") == "library" and cfg.get("processor"):
+            c |= {"source": "library", "processor": cfg.get("processor"), "params": cfg.get("params", {})}
+        if cfg.get("code"):  # keep the code too — it's the portable, self-contained operator
+            c["code"] = cfg["code"]
+        return c
+    if t == "source":
+        opts = {k: str(cfg[k]).strip().lower() if k == "header" else str(cfg[k]).strip()
+                for k in ("delimiter", "header") if str(cfg.get(k, "")).strip()}
+        opts = {k: v for k, v in opts.items() if k != "header" or v in ("yes", "no")}  # header must be yes/no
+        c = {"uri": cfg.get("uri") or cfg.get("table")}
+        if opts:
+            c["options"] = opts
+        return c
+    if t == "filter":
+        return {"predicate": cfg.get("predicate", "")}
+    if t == "select":
+        return {"expr": cfg.get("select") or cfg.get("expr") or ""}
+    if t == "sql":
+        return {"sql": cfg.get("sql", "")}
+    if t == "join":
+        return {"on": cfg.get("on", ""), "condition": cfg.get("condition", ""), "how": cfg.get("how", "inner")}
+    if t == "aggregate":
+        return {"groupBy": cfg.get("groupBy") or cfg.get("group") or "", "aggs": cfg.get("aggs", "")}
+    if t == "sort":
+        return {"by": cfg.get("by", "")}
+    if t == "dedup":
+        return {"on": cfg.get("on", "")}
+    if t == "sample":
+        return {"n": cfg.get("n"), "seed": cfg.get("seed", 42)}  # n=None → the engine applies sample_k
+    if t == "write":
+        return {"name": cfg.get("name"), "filename": cfg.get("filename"),
+                "title": node.data.get("title") if isinstance(node.data, dict) else None,
+                "format": cfg.get("format", "parquet"), "writeMode": cfg.get("writeMode", "overwrite")}
+    return dict(cfg)  # metric/chart/vector-search/section/opaque/loop/variable — carry cfg verbatim
+
+
 def _op_and_config(node: GraphNode) -> tuple[str, dict]:
     if _flag(node, "disabled"):
         return "disabled", {}
     if _flag(node, "bypassed"):
         return "passthrough", {}
+    cfg = resolve_config(node)
     t = node.type
-    cfg = _cfg(node)
-
     if t in ("transform", "notebook"):
         mode = cfg.get("mode", "map")
         op = mode if mode in CLEAN_TRANSFORM_MODES else f"transform:{mode}"
-        c: dict = {"mode": mode, "onError": cfg.get("onError", "raise")}
-        if cfg.get("source") == "library" and cfg.get("processor"):
-            c |= {"source": "library", "processor": cfg.get("processor"), "params": cfg.get("params", {})}
-        if cfg.get("code"):  # keep the code too — it's the portable, self-contained operator
-            c["code"] = cfg["code"]
-        return op, c
-
-    op = _NODE_OP.get(t, f"opaque:{t}")  # unknown/plugin kinds → opaque (a backend must fall back)
-    if op == "read":
-        c = {"uri": cfg.get("uri") or cfg.get("table")}
-        opts = {k: str(cfg[k]).strip() for k in ("delimiter", "header") if str(cfg.get(k, "")).strip()}
-        if opts:
-            c["options"] = opts
-        return op, c
-    if op == "filter_sql":
-        return op, {"predicate": (cfg.get("predicate") or "").strip()}
-    if op == "project_sql":
-        return op, {"expr": (cfg.get("select") or cfg.get("expr") or "").strip()}
-    if op == "sql":
-        return op, {"sql": (cfg.get("sql") or "").strip()}
-    if op == "join":
-        return op, {"on": cfg.get("on", ""), "condition": cfg.get("condition", ""), "how": cfg.get("how", "inner")}
-    if op == "aggregate":
-        return op, {"groupBy": cfg.get("groupBy") or cfg.get("group", ""), "aggs": cfg.get("aggs", "")}
-    if op == "sort":
-        return op, {"by": cfg.get("by", "")}
-    if op == "dedup":
-        return op, {"on": cfg.get("on", "")}
-    if op == "sample":
-        return op, {"n": cfg.get("n", 1000), "seed": cfg.get("seed", 42)}
-    if op == "write":
-        title = node.data.get("title") if isinstance(node.data, dict) else None
-        return op, {"name": cfg.get("name"), "filename": cfg.get("filename"), "title": title,
-                    "format": cfg.get("format", "parquet"), "writeMode": cfg.get("writeMode", "overwrite")}
-    return op, dict(cfg)  # metric/chart/vector-search/section/opaque/loop/variable — carry cfg verbatim
+    else:
+        op = _NODE_OP.get(t, f"opaque:{t}")  # unknown/plugin kinds → opaque (a backend must fall back)
+    return op, cfg
 
 
 def lower_to_ir(graph: Graph, target_node_id: str | None = None, node_specs: dict | None = None) -> CompiledIR:

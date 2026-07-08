@@ -17,6 +17,7 @@ import duckdb
 import pyarrow as pa
 
 from hub import db, graph as g, sandbox
+from hub.ir import resolve_config  # single source of built-in node config resolution (shared with the IR)
 from hub.models import PREVIEWABLE_MODES, ColumnSchema, Graph, GraphNode
 from hub.plugins.adapters import display_type, relation_columns
 from hub.plugins.capabilities import tag_columns
@@ -213,28 +214,21 @@ class BuildEngine:
     # -- building ---------------------------------------------------------- #
     def _lower(self, node: GraphNode) -> Relation:  # noqa: C901
         t = node.type
-        cfg = _cfg(node)
+        cfg = resolve_config(node)  # the SAME resolver the IR uses (hub.ir) — one source of built-in config
 
         # a disabled node (and, since inputs pull through it, everything downstream) produces nothing
         if _disabled(node):
             raise NotPreviewable(node, "node is disabled")
 
         if t == "source":
-            uri = cfg.get("uri") or cfg.get("table")
+            uri = cfg.get("uri")
             if not uri:
                 raise NotPreviewable(node, "no dataset selected")
             from hub import paths
             paths.ensure_local_uri_allowed(uri)  # multi-user: a source can't read an arbitrary local file
-            # pass CSV parse overrides only when the user actually set them (not the 'auto' default), so
-            # any adapter (incl. plugins) whose scan() predates the `options` kwarg keeps working
-            opts: dict = {}
-            _d = str(cfg.get("delimiter", "")).strip()
-            if _d:
-                opts["delimiter"] = _d
-            _h = str(cfg.get("header", "")).strip().lower()
-            if _h in ("yes", "no"):
-                opts["header"] = _h
-            extra = {"options": opts} if opts else {}
+            # CSV parse overrides (delimiter/header), already normalized + nested under 'options' by the
+            # resolver — passed only when set, so an adapter whose scan() predates the kwarg keeps working
+            extra = {"options": cfg["options"]} if cfg.get("options") else {}
             if self.schema_only:
                 return self.resolve_adapter(uri).scan(uri, limit=0, **extra)  # metadata only — never materialize
             if self.pushdown and node.id != self._output_node:
@@ -270,7 +264,7 @@ class BuildEngine:
             return parent
 
         if t == "sample":
-            n = max(0, int(cfg.get("n", self.sample_k or 1000)))
+            n = max(0, int(cfg.get("n") or self.sample_k or 1000))  # unset → the engine's preview budget
             seed = int(cfg.get("seed", 42))
             v = self._view(parent, "s")
             return db.conn().sql(f"SELECT * FROM {v} USING SAMPLE {n} ROWS (reservoir, {seed})")
@@ -280,7 +274,7 @@ class BuildEngine:
             return parent.filter(pred) if pred else parent
 
         if t == "select":
-            expr = (cfg.get("select") or cfg.get("expr") or "").strip()
+            expr = (cfg.get("expr") or "").strip()  # resolver canonicalizes select/expr → 'expr'
             return parent.project(expr) if expr else parent
 
         if t == "sort":
@@ -304,7 +298,7 @@ class BuildEngine:
             if not self.full:
                 raise NotPreviewable(node, "global aggregate — needs a full pass (a sample would lie)")
             aggs = (cfg.get("aggs") or "count(*) AS n").strip()
-            group = (cfg.get("groupBy") or cfg.get("group") or "").strip()
+            group = (cfg.get("groupBy") or "").strip()  # resolver canonicalizes groupBy/group → 'groupBy'
             # include the group key(s) in the projection, else the aggregated rows are unlabeled
             return parent.aggregate(f"{group}, {aggs}", group) if group else parent.aggregate(aggs)
 
@@ -419,7 +413,7 @@ class BuildEngine:
 
     # -- transform escape hatch (Python over Arrow batches) ---------------- #
     def _transform(self, node: GraphNode, parent: Relation) -> Relation:
-        cfg = _cfg(node)
+        cfg = resolve_config(node)  # shared resolver (hub.ir): mode/code/source/processor/params/onError
         if node.type == "transform" and cfg.get("source") == "library":
             pid = cfg.get("processor")
             if pid and self.registry.has(pid):
