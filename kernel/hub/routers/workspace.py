@@ -283,8 +283,25 @@ _REDACTED = "__redacted__"
 _SECRET_SUBKEYS = ("accessKeyId", "secretAccessKey")  # within the objectStore setting
 
 
-def _redact_global(key: str, value):
-    if key == "agentApiKey":
+def _plugin_secret_keys() -> set[str]:
+    """Setting keys `plugin.<pack>.<field>` whose declared [[config]] field is `secret` — so GET redacts
+    them and PUT treats the redaction sentinel as 'unchanged', exactly like agentApiKey. A plugin's secret
+    (an API token / DB password) must not be readable by a non-admin via GET /settings the way /api/plugins
+    already avoids. Sourced from the loaded plugins' schemas; never crashes settings."""
+    out: set[str] = set()
+    try:
+        from hub.deps import get_deps
+        for p in get_deps().plugins:
+            for f in (p.get("config") or []):
+                if isinstance(f, dict) and f.get("secret") and f.get("key"):
+                    out.add(f"plugin.{p['name']}.{f['key']}")
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _redact_global(key: str, value, secret_keys: set[str] = frozenset()):
+    if key == "agentApiKey" or key in secret_keys:
         return _REDACTED if value else value
     if key == "objectStore" and isinstance(value, dict):
         return {k: (_REDACTED if k in _SECRET_SUBKEYS and v else v) for k, v in value.items()}
@@ -293,12 +310,13 @@ def _redact_global(key: str, value):
 
 @router.get("/settings")
 def get_settings(uid: str = Depends(current_user)) -> dict:
+    secret_keys = _plugin_secret_keys()
     with metadb.session() as s:
         rows = s.scalars(_sa_select(metadb.Setting))
         out: dict = {"global": {}, "user": {}}
         for r in rows:
             if r.scope == "global":
-                out["global"][r.key] = _redact_global(r.key, json.loads(r.value))
+                out["global"][r.key] = _redact_global(r.key, json.loads(r.value), secret_keys)
             elif r.scope == "user" and r.scope_id == uid:
                 out["user"][r.key] = json.loads(r.value)
         return out
@@ -312,8 +330,8 @@ def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
     value = body.value
     if body.scope == "global":  # a redaction sentinel means "keep what's stored" — never overwrite a secret with dots
         stored = metadb.get_setting(body.key, "global", default=None)
-        if body.key == "agentApiKey" and value == _REDACTED:
-            value = stored
+        if value == _REDACTED and (body.key == "agentApiKey" or body.key in _plugin_secret_keys()):
+            value = stored  # never overwrite a secret with the dots sentinel echoed by GET
         elif body.key == "objectStore" and isinstance(value, dict) and isinstance(stored, dict):
             value = {**value, **{k: stored.get(k) for k in _SECRET_SUBKEYS if value.get(k) == _REDACTED}}
     metadb.set_setting(body.key, value, scope=body.scope, scope_id=scope_id)

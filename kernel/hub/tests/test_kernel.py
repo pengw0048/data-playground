@@ -1869,6 +1869,36 @@ def test_sql_catalog_reference_plugin(tmp_path):
         cat.get_table("nonexistent")
 
 
+def test_plugin_secret_not_leaked_via_settings():
+    # a plugin's secret [[config]] field must NOT be readable in plaintext via GET /api/settings (only
+    # admins can PUT global settings, but any authenticated user can GET them) — the same "secrets never
+    # echo" contract /api/plugins upholds. And PUT with the redaction sentinel must keep the stored secret.
+    import json as _json
+
+    from hub import metadb
+    from hub.deps import get_deps
+
+    deps = get_deps()
+    fake = {"name": "dp_secretpk", "source": "drop-in",
+            "config": [{"key": "token", "type": "password", "secret": True},
+                       {"key": "host", "type": "string"}]}
+    deps.plugins.append(fake)
+    try:
+        client.put("/api/settings", json={"scope": "global", "key": "plugin.dp_secretpk.token", "value": "sk-LEAK-xyz"})
+        client.put("/api/settings", json={"scope": "global", "key": "plugin.dp_secretpk.host", "value": "db.internal"})
+        r = client.get("/api/settings").json()
+        assert r["global"]["plugin.dp_secretpk.token"] == "__redacted__"   # secret redacted
+        assert "sk-LEAK-xyz" not in _json.dumps(r)                          # value never in the payload
+        assert r["global"]["plugin.dp_secretpk.host"] == "db.internal"      # non-secret still visible
+        # PUT of the redaction sentinel keeps the stored secret (doesn't overwrite with dots)
+        client.put("/api/settings", json={"scope": "global", "key": "plugin.dp_secretpk.token", "value": "__redacted__"})
+        assert metadb.get_setting("plugin.dp_secretpk.token", "global") == "sk-LEAK-xyz"
+    finally:
+        deps.plugins.remove(fake)
+        metadb.set_setting("plugin.dp_secretpk.token", "", "global")
+        metadb.set_setting("plugin.dp_secretpk.host", "", "global")
+
+
 def test_plugin_config_resolution(tmp_path, monkeypatch):
     # reg.config precedence for a pack's dataplay.toml [[config]] field:
     #   UI setting (plugin.<pack>.<key>) > declared env var > declared default > the arg default.
