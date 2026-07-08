@@ -92,6 +92,20 @@ def graph_schema(req: CompileRequest) -> dict:
                             deps.node_builders, deps.node_specs)
 
 
+@router.post("/graph/estimate")
+def graph_estimate(req: CompileRequest) -> dict:
+    """Per-node output-SIZE estimate (rows + confidence) for the card size hint — see hub.estimate.
+    Conservative + honest: an unknown count comes back rows=null so the UI shows nothing, not a guess."""
+    from hub.estimate import estimate_sizes
+    deps = get_deps()
+    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
+    try:
+        sizes = estimate_sizes(req.graph, deps.resolve_adapter)
+    except Exception:  # noqa: BLE001 — a hint must never 500
+        return {}
+    return {nid: {"rows": s.rows, "confidence": s.confidence} for nid, s in sizes.items()}
+
+
 @router.post("/graph/join-analysis", response_model=JoinAnalysis)
 def join_analysis(req: CompileRequest) -> JoinAnalysis:
     """Catalog-driven join hints for a join node (target_node_id): ranked key suggestions for its

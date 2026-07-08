@@ -115,6 +115,7 @@ interface Store {
   processors: ProcessorDescriptor[]
   specsVersion: number
   schemas: SchemaMap               // per-node output columns (typed ports); null entry = untyped
+  sizes: Record<string, { rows: number | null; confidence: string }>  // per-node size estimate (card hint)
 
   selectedId: string | null        // primary selection (drives panels)
   selectedIds: string[]            // full multi-selection (box/shift-select)
@@ -318,6 +319,7 @@ export const useStore = create<Store>((set, get) => ({
   processors: [],
   specsVersion: 0,
   schemas: {},
+  sizes: {},
   selectedId: null,
   selectedIds: [],
   openPanels: {},
@@ -842,6 +844,9 @@ export const useStore = create<Store>((set, get) => ({
     const seq = ++_schemaSeq
     try { const schemas = await api.schema(get().doc); if (seq === _schemaSeq) set({ schemas }) }
     catch { /* offline: keep last-known */ }
+    // size estimate for the card "~N rows" hint — same trigger, independent (a failure never affects schemas)
+    try { const sizes = await api.graphSizes(get().doc); if (seq === _schemaSeq) set({ sizes }) }
+    catch { /* offline / no sources countable: keep last-known */ }
   },
 
   setAgentOpen: (v) => set({ agentOpen: v }),

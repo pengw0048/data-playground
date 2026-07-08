@@ -73,6 +73,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const busy = runState === 'running' || runState === 'estimating'
   const invalid = node ? nodeInvalidReason(node) : null   // e.g. "order by is required"
   const warnings = useSchemaWarnings(id)   // soft cue: config references a column not in the input
+  const sizeEst = useStore((s) => s.sizes[id])   // conservative pre-run size estimate (card hint)
   // the action shelf is revealed on hover / sole-selection / while running, so a resting card is clean
   // and a multi-card marquee doesn't strand a shelf under every selected node
   const showShelf = soleSelected || hover || busy
@@ -149,6 +150,14 @@ export function NodeCard({ id, data, children, metaOverride }: {
               <div className="mt-0.5 truncate text-[10.5px] tabular-nums text-muted-foreground/70">
                 {data.lastRun.rows.toLocaleString()} rows · {fmtMs(data.lastRun.ms)}
                 {data.lastRun.placement === 'distributed' && ' · distributed'}
+              </div>
+            )}
+
+            {/* size hint — a conservative estimate before you run; only when confidently estimable and
+                the node has no real last-run count to show instead. Unknown counts show nothing. */}
+            {!(data.status === 'latest' && data.lastRun) && sizeEst && sizeEst.rows != null && sizeEst.confidence !== 'unknown' && (
+              <div className="mt-0.5 truncate text-[10.5px] tabular-nums text-muted-foreground/55" title="Estimated output rows (before running)">
+                ~{sizeEst.rows.toLocaleString()} rows
               </div>
             )}
 

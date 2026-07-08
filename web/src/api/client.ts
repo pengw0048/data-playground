@@ -121,6 +121,9 @@ export const api = {
   // per-node output columns (metadata only) → editor column suggestions; null = untyped port
   schema: (doc: CanvasDoc) =>
     req<Record<string, ColumnSchema[] | null>>('/graph/schema', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }) }),
+  // per-node output-size estimate (rows + confidence) → the card "~N rows" hint; unknown → rows null
+  graphSizes: (doc: CanvasDoc) =>
+    req<Record<string, { rows: number | null; confidence: string }>>('/graph/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }) }),
 
   // catalog-driven join hints for a join node: ranked keys (measured cardinality) + a fan-out warning
   joinAnalysis: (doc: CanvasDoc, nodeId: string) =>

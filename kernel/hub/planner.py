@@ -61,13 +61,27 @@ def _region_requires(graph: Graph, node, node_specs: dict) -> ResourceSpec:
     return r
 
 
+def _merge_mem(r: ResourceSpec, extra: ResourceSpec | None) -> ResourceSpec:
+    """Fold a cost-based memory FLOOR into a node's requirement — the MAX of the two mems, keeping r's
+    other fields. The estimator only raises mem; it never lowers it or touches cpu/gpu/labels. Callers
+    (_cost_requires) skip any node that already declares mem, so a manual mem pin is never overridden."""
+    from hub.placement import _mem_gb
+    if extra is None or _mem_gb(extra.mem) <= _mem_gb(r.mem):
+        return r
+    return ResourceSpec(cpu=r.cpu, gpu=r.gpu, gpu_type=r.gpu_type, mem=extra.mem, labels=r.labels)
+
+
 def plan_regions(graph: Graph, target: str, node_specs: dict,
-                 place_fn: Callable[[ResourceSpec], "tuple[str, str] | None"]) -> list[Region]:
+                 place_fn: Callable[[ResourceSpec], "tuple[str, str] | None"],
+                 extra_requires: "dict[str, ResourceSpec] | None" = None) -> list[Region]:
     """Partition the upstream cone of `target` into topologically-ordered regions.
 
     place_fn(requires) -> (backend_name, worker_id) that satisfies it, or None → the default
     in-process backend. A node with no requirement always lands on the default (so plain relational
-    graphs stay one fused region)."""
+    graphs stay one fused region). `extra_requires` folds a cost-based mem FLOOR (from the size
+    estimate) into a node's requirement — the estimator's channel into placement (max on mem, other
+    fields untouched). A manual mem pin is authoritative: the caller omits an estimate for any node that
+    already declares mem, so this only ever adds mem where the user set none."""
     chain = [n.id for n in g.upstream_chain(graph, target)]
     if not chain:
         return []
@@ -78,7 +92,7 @@ def plan_regions(graph: Graph, target: str, node_specs: dict,
     tgt: dict[str, tuple[str, str | None]] = {}
     reqs: dict[str, ResourceSpec] = {}
     for nid in chain:
-        r = _region_requires(graph, nm[nid], node_specs)
+        r = _merge_mem(_region_requires(graph, nm[nid], node_specs), (extra_requires or {}).get(nid))
         reqs[nid] = r
         placed = place_fn(r) if _has_req(r) else None
         tgt[nid] = placed if placed else ("default", None)

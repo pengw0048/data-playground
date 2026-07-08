@@ -3163,6 +3163,133 @@ def test_transform_schema_contract_ignores_bypass_disabled_and_odd_names():
     assert wc["f"] is not None and [c["name"] for c in wc["f"]] == ['a"b']  # propagated (stand-in didn't crash)
 
 
+def test_estimate_sizes_is_conservative_and_honest():
+    # the per-node size estimate: conservative (never under-estimate), honest (unknown → None, not a
+    # fabricated number), and measured-actuals override. Feeds placement + the confirm-gate + a UI hint.
+    from hub.estimate import estimate_sizes
+    from hub.models import Graph
+    d = get_deps()
+    ev = _uri("events")  # a real seeded source with a known row count
+
+    def est(nodes, edges, **kw):
+        return estimate_sizes(Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": edges}), d.resolve_adapter, **kw)
+
+    nodes = [N("s", "source", {"uri": ev}), N("f", "filter", {"predicate": "amount > 0"}),
+             N("p", "sample", {"n": 100}), N("a", "aggregate", {"groupBy": "user_id", "aggs": "count(*) AS n"})]
+    edges = [E("s", "f"), E("f", "p"), E("p", "a")]
+    e = est(nodes, edges)
+    assert e["s"].rows is not None and e["s"].rows > 0 and e["s"].confidence == "exact"
+    assert e["f"].rows == e["s"].rows and e["f"].confidence == "bounded"   # filter = input (all-qualify upper bound)
+    assert e["p"].rows == min(100, e["s"].rows) and e["p"].confidence == "bounded"  # sample ≤ n
+    assert e["a"].rows is None and e["a"].confidence == "unknown" and e["a"].blocking  # aggregate collapse: unknown
+    assert e["s"].bytes and e["s"].bytes > 0  # bytes scale with rows
+
+    # a measured actual overrides the estimate and propagates downstream
+    e2 = est(nodes, edges, actuals={"f": 42})
+    assert e2["f"].rows == 42 and e2["f"].confidence == "exact"
+    assert e2["p"].rows == 42  # min(100, 42)
+
+    # a code op is honestly unknown (not a fabricated passthrough); a bypassed node passes input through
+    e3 = est([N("s", "source", {"uri": ev}), N("t", "transform", {"code": "def fn(r): return r"})], [E("s", "t")])
+    assert e3["t"].rows is None and e3["t"].confidence == "unknown"
+    byp = {"id": "b", "type": "filter", "position": {"x": 0, "y": 0}, "data": {"title": "b", "config": {"predicate": "x"}, "bypassed": True}}
+    e4 = est([N("s", "source", {"uri": ev}), byp], [E("s", "b")])
+    assert e4["b"].rows == e4["s"].rows  # bypassed → passthrough
+
+
+def test_cost_based_placement_routes_a_heavy_region_and_is_a_noop_without_a_backend():
+    # Phase B: a blocking region whose estimated working set exceeds the local budget (here: unknown,
+    # because its input is an opaque transform) 'wants' a bigger backend. With none registered it stays
+    # on the default (no behavior change); with one advertising the memory, the heavy region routes to it.
+    from hub.models import Graph, ResourceSpec
+    from hub.placement import satisfies
+    d = get_deps()
+    ev = _uri("events")
+    nodes = [N("s", "source", {"uri": ev}), N("t", "transform", {"code": "def fn(r): return r"}),
+             N("a", "aggregate", {"groupBy": "user_id", "aggs": "count(*) AS n"})]
+    graph = Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": [E("s", "t"), E("t", "a")]})
+
+    # (1) no cluster backend → everything on the default → single fused region → base runner (unchanged)
+    assert all(r.backend == "default" for r in d.controller.plan(graph, "a"))
+
+    # (2) a backend advertising big memory → the heavy aggregate region routes to it
+    class _Big:
+        name = "big"
+
+        def place(self, requires):
+            return "w1" if satisfies(ResourceSpec(mem="1000GB"), requires) else None
+
+    d.runners.insert(0, _Big())
+    try:
+        regions = d.controller.plan(graph, "a")
+        assert next(r for r in regions if r.output_node == "a").backend == "big"
+        assert next(r for r in regions if r.output_node == "t").backend == "default"  # light region stays local
+    finally:
+        d.runners[:] = [r for r in d.runners if getattr(r, "name", "") != "big"]
+
+
+def test_cost_placement_respects_a_manual_mem_pin():
+    # decision: a manual config.requires.mem is AUTHORITATIVE — the cost estimator must not raise it.
+    from hub.models import Graph
+    d = get_deps()
+    ev = _uri("events")
+    agg = {"id": "a", "type": "aggregate", "position": {"x": 0, "y": 0},
+           "data": {"title": "a", "config": {"groupBy": "user_id", "aggs": "count(*) AS n", "requires": {"mem": "2GB"}}}}
+    nodes = [N("s", "source", {"uri": ev}), N("t", "transform", {"code": "def fn(r): return r"}), agg]
+    graph = Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": [E("s", "t"), E("t", "a")]})
+    assert "a" not in d.controller._cost_requires(graph, "a")  # pinned mem → estimator adds nothing
+    agg["data"]["config"].pop("requires")                       # without the pin it WOULD add a mem floor
+    graph2 = Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": [E("s", "t"), E("t", "a")]})
+    assert "a" in d.controller._cost_requires(graph2, "a")
+
+
+def test_graph_estimate_endpoint():
+    # the size-hint endpoint: an exact count for a real source, honest confidence label
+    ev = _uri("events")
+    body = {"graph": {"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev})], "edges": []}}
+    r = client.post("/api/graph/estimate", json=body).json()
+    assert r["s"]["rows"] is not None and r["s"]["rows"] > 0 and r["s"]["confidence"] == "exact"
+
+
+def test_storage_tier_selection():
+    # Phase C: pick the cheapest tier reachable by BOTH producer and consumer. local→local = local;
+    # a remote party forces the shared object store; no object store + a remote party = no common tier.
+    from hub.tiers import Tier, pick_tier, backend_reach, LOCAL_REACH, REMOTE_REACH
+    tm = {"local": Tier("local", "/x", 0), "object": Tier("object", "s3://b/r", 10)}
+    assert pick_tier(tm, [LOCAL_REACH, LOCAL_REACH]).name == "local"        # local handoff → local
+    assert pick_tier(tm, [LOCAL_REACH, REMOTE_REACH]).name == "object"      # remote consumer → object
+    assert pick_tier({"local": tm["local"]}, [LOCAL_REACH, REMOTE_REACH]) is None  # no shared tier
+
+    class _B:
+        name = "b"
+    assert backend_reach(_B(), True) == LOCAL_REACH                        # default → local + object
+    assert backend_reach(_B(), False) == REMOTE_REACH                      # assumed-remote → object only
+
+    class _C:
+        name = "c"
+
+        def reachable_tiers(self):
+            return ("local",)
+    assert backend_reach(_C(), False) == ("local",)                        # a backend can override its reach
+
+
+def test_boundary_tier_is_local_for_default_handoff_object_for_remote():
+    from hub.planner import Region
+    from hub.models import ResourceSpec
+    d = get_deps()
+    prod = Region(id="r_x", node_ids={"x"}, output_node="x", backend="default", worker=None, requires=ResourceSpec(), cut_inputs=[])
+    cons_local = Region(id="r_y", node_ids={"y"}, output_node="y", backend="default", worker=None, requires=ResourceSpec(), cut_inputs=[("x", None, "y", None)])
+    assert d.controller._boundary_tier(prod, [prod, cons_local]).name == "local"  # default→default stays local
+
+    cons_remote = Region(id="r_z", node_ids={"z"}, output_node="z", backend="big", worker="w1", requires=ResourceSpec(), cut_inputs=[("x", None, "z", None)])
+    old = os.environ.get("DP_STORAGE_URL")
+    os.environ["DP_STORAGE_URL"] = "s3://bucket/out"
+    try:
+        assert d.controller._boundary_tier(prod, [prod, cons_remote]).name == "object"  # remote → object store
+    finally:
+        os.environ.pop("DP_STORAGE_URL", None) if old is None else os.environ.__setitem__("DP_STORAGE_URL", old)
+
+
 def test_declared_keys_and_relationships_are_independent_rows():
     # #9 fix: each declared key / relationship is its OWN DB row (not one shared JSON blob), so setting
     # one never rewrites/clobbers another — the mechanism that stops cross-instance lost updates.

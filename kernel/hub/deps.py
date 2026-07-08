@@ -247,6 +247,12 @@ class Deps:
         # on_status/complete wiring here; estimate/can_run delegate to the base runner (hub-side gate).
         from hub.kernel_backend import KernelBackend
         self.runners.append(KernelBackend(self.runner, _make_spawner(workspace, data_dir)))
+        # the local/kernel memory budget — cost-based placement routes a region whose estimated working
+        # set EXCEEDS this to a backend with more memory (a no-op when none is registered). From the
+        # DuckDB cap DP_MEMORY_LIMIT / DP_KERNEL_MEM, default 4GB. Set at spawn time for a pod/process.
+        from hub.placement import _mem_gb
+        _lm = os.environ.get("DP_MEMORY_LIMIT") or os.environ.get("DP_KERNEL_MEM") or "4GB"
+        self.local_mem_bytes = int((_mem_gb(_lm) or 4.0) * (1 << 30))
         # RunController owns a logical run across placement regions (multi-region = a placed node /
         # checkpoint / fan-out); a single default region delegates to the base runner unchanged.
         from hub.run_controller import RunController

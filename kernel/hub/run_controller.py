@@ -41,7 +41,48 @@ class RunController:
         self._lock = threading.Lock()
 
     def plan(self, graph: Graph, target: str | None):
-        return planner.plan_regions(graph, target, self.deps.node_specs, self.place_fn) if target else []
+        if not target:
+            return []
+        return planner.plan_regions(graph, target, self.deps.node_specs, self.place_fn,
+                                    extra_requires=self._cost_requires(graph, target))
+
+    def _cost_requires(self, graph: Graph, target: str) -> dict:
+        """Cost-based placement input: a BLOCKING region whose estimated working set exceeds the local
+        memory budget 'wants' a backend with more memory → a `ResourceSpec(mem=…)` the planner folds in.
+        A strict no-op when nothing exceeds the budget, or when no backend can satisfy it (place_fn then
+        falls back to the local default). Never breaks a run — estimation failure → no extra requirement."""
+        from hub import estimate as est_mod
+        from hub.models import ResourceSpec
+        try:
+            sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target)
+        except Exception:  # noqa: BLE001 — placement is best-effort; a bad estimate must not block the run
+            return {}
+        from hub import placement
+        budget = getattr(self.deps, "local_mem_bytes", 4 << 30)
+        extra: dict = {}
+        for n in g.upstream_chain(graph, target):
+            if not est_mod.is_blocking(n.type):
+                continue
+            manual = placement.node_requires(n, self.deps.node_specs)
+            if manual is not None and manual.mem:  # a declared mem pin is AUTHORITATIVE — never override it
+                continue
+            ws = self._working_set_bytes(graph, n.id, sizes)
+            if ws is None or ws > budget:  # unknown or over budget → route to a bigger backend if one exists
+                need = ws if ws is not None else budget * 2  # unknown input size → assume it exceeds local
+                extra[n.id] = ResourceSpec(mem=f"{max(1, (need + (1 << 30) - 1) >> 30)}GB")
+        return extra
+
+    @staticmethod
+    def _working_set_bytes(graph: Graph, nid: str, sizes: dict) -> "int | None":
+        """A blocking op's memory need ≈ the bytes it must hold = sum of its inputs' output bytes;
+        None (unknown) if any input's size is unknown."""
+        total = 0
+        for e in g.incoming(graph, nid):
+            s = sizes.get(e.source)
+            if s is None or s.bytes is None:
+                return None
+            total += s.bytes
+        return total
 
     # -- orchestration ----------------------------------------------------- #
     def run(self, graph: Graph, target: str | None) -> RunStatus | None:
@@ -89,7 +130,7 @@ class RunController:
                         self._mark(status, region, "failed")
                         return
                 else:
-                    ref_uri[region.output_node] = self._materialize(run_id, graph, region, ref_uri)
+                    ref_uri[region.output_node] = self._materialize(run_id, graph, region, ref_uri, regions)
                 self._mark(status, region, "done")
                 self._emit(graph, status)
             status.status = "done"
@@ -153,19 +194,43 @@ class RunController:
                 return backend.status(sub_id)
             time.sleep(0.1)
 
-    def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str]) -> str:
+    def _boundary_tier(self, region, regions):
+        """The tier to materialize `region`'s output on: the cheapest one reachable by BOTH its producer
+        backend and every consuming region's backend (local for a local→local handoff, a shared object
+        store when a remote backend is involved). None → no common tier (misconfiguration → caller warns)."""
+        from hub import tiers as tier_mod
+        prod = tier_mod.backend_reach(self._backend_runner(region), region.backend == "default")
+        reach = [prod]
+        for rc in regions:  # regions that read THIS boundary as a ref-source
+            if any(ci[0] == region.output_node for ci in rc.cut_inputs):
+                reach.append(tier_mod.backend_reach(self._backend_runner(rc), rc.backend == "default"))
+        return tier_mod.pick_tier(tier_mod.tiers(self.deps.workspace), reach)
+
+    def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], regions=None) -> str:
         """Materialize an intermediate region's output to a durable, content-addressed parquet — reused
         across runs when the region's plan hash is unchanged. Runs in-process for a default region, or
-        in the target worker's PROCESS for a placed region (C3)."""
+        in the target worker's PROCESS for a placed region (C3). The output lands on the tier reachable
+        by both producer and consumers (local, or a shared object store for a remote handoff — Phase C)."""
+        from hub import tiers as tier_mod
         subg = self._subgraph(graph, region, ref_uri)
         key = self.base._plan_hash(subg, region.output_node)
-        cached = self.base._cache_get(key)
+        picked = self._boundary_tier(region, regions or [])
+        tier = picked or tier_mod.Tier("local", os.path.join(self.deps.workspace, "regions"), 0)
+        if picked is None:  # remote handoff with no object store configured → local + a warning
+            import logging
+            logging.getLogger("hub").warning(
+                "region handoff: no shared tier reachable by producer+consumer — using local (a remote "
+                "backend will not see it; set DP_STORAGE_URL to a shared object store)")
+        ckey = f"{key}@{tier.name}"  # tier in the cache key: a local vs object copy are distinct entries
+        cached = self.base._cache_get(ckey)
         if cached and cached.get("uri") and self.base._output_exists(cached["uri"]):
-            return cached["uri"]  # reuse — the upstream region didn't change
-        out_dir = os.path.join(self.deps.workspace, "regions")
-        os.makedirs(out_dir, exist_ok=True)
-        self._prune_regions(out_dir)  # bound the handoff dir (a coarse GC; TTL/refcount is a later refinement)
-        out_uri = os.path.join(out_dir, f"{region.id}_{key}.parquet")
+            return cached["uri"]  # reuse — the upstream region didn't change (on this tier)
+        if tier.is_object:
+            db.ensure_object_store()
+        else:
+            os.makedirs(tier.prefix, exist_ok=True)
+            self._prune_regions(tier.prefix)  # bound the LOCAL handoff dir (coarse GC; TTL/refcount later)
+        out_uri = tier.uri(f"{region.id}_{key}.parquet")
         backend = self._backend_runner(region)
         if backend is self.base:
             with db.run_scope():
@@ -180,7 +245,7 @@ class RunController:
             s = self._await(backend, sub.run_id, cancel_run=run_id)
             if s.status != "done":
                 raise RuntimeError(f"region {region.id} on {region.backend} {s.status}: {s.error}")
-        self.base._cache_put(key, {"uri": out_uri, "table": region.id, "rows": None})
+        self.base._cache_put(ckey, {"uri": out_uri, "table": region.id, "rows": None})
         return out_uri
 
     def _run_final(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str]) -> RunStatus:
