@@ -3364,6 +3364,22 @@ def test_graph_plan_endpoint():
     assert next(x for x in r2["regions"] if x["outputNode"] == "f")["tier"] == "local"  # boundary → local
 
 
+def test_run_plan_flags_unsatisfied_resource_requirement():
+    # C: a node pins a resource (GPU) no registered backend provides → the run-plan flags it "unsatisfied"
+    # (pre-flight: it will run local, which may lack it). A plain graph has nothing unsatisfied.
+    from hub.models import Graph
+    d = get_deps()
+    ev = _uri("events")
+    gpu = {"id": "a", "type": "aggregate", "position": {"x": 0, "y": 0},
+           "data": {"title": "a", "config": {"groupBy": "user_id", "aggs": "count(*) AS n", "requires": {"gpu": 4, "gpuType": "a100"}}}}
+    g = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev}), gpu], "edges": [E("s", "a")]})
+    plan = d.controller.plan_summary(g, "a")
+    assert any(r.get("unsatisfied") and "a100" in (r.get("requires") or "") for r in plan)
+
+    g2 = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev}), N("f", "filter", {"predicate": "id > 0"})], "edges": [E("s", "f")]})
+    assert all(not r.get("unsatisfied") for r in d.controller.plan_summary(g2, "f"))
+
+
 def test_graph_estimate_endpoint():
     # the size-hint endpoint: an exact count for a real source, honest confidence label
     ev = _uri("events")

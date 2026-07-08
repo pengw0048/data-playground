@@ -126,7 +126,7 @@ export const api = {
     req<Record<string, { rows: number | null; confidence: string }>>('/graph/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }) }),
   // the execution plan for a target: regions + backend + boundary tier + estimated size (the run-plan preview)
   plan: (doc: CanvasDoc, targetNodeId: string) =>
-    req<{ regions: { id: string; outputNode: string; backend: string; worker: string | null; nodeIds: string[]; tier: string | null; rows: number | null; confidence: string }[]; error?: string }>(
+    req<{ regions: { id: string; outputNode: string; backend: string; worker: string | null; nodeIds: string[]; tier: string | null; rows: number | null; confidence: string; requires?: string; unsatisfied?: boolean }[]; error?: string }>(
       '/graph/plan', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
 
   // catalog-driven join hints for a join node: ranked keys (measured cardinality) + a fan-out warning

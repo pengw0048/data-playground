@@ -52,7 +52,7 @@ class RunController:
         plan' preview — so the cost-aware placement + tiering is something you can SEE before running.
         Mirrors run(): a single default region or a shape we can't safely split actually runs as ONE
         in-process whole-graph pass, so report THAT (not a plan the run won't use)."""
-        from hub import estimate as est_mod
+        from hub import estimate as est_mod, placement
         try:
             sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target)  # once — reused by plan()
         except Exception:  # noqa: BLE001
@@ -62,22 +62,40 @@ class RunController:
             e = sizes.get(nid)
             return (e.rows if e else None, e.confidence if e else "unknown")
 
+        def _req_str(r) -> str:  # a compact "4×a100 · 64GB · zone=eu" for the UI
+            parts = []
+            if getattr(r, "gpu", None):
+                parts.append(f"{r.gpu}×{r.gpu_type or 'gpu'}")
+            if getattr(r, "cpu", None):
+                parts.append(f"{r.cpu} cpu")
+            if getattr(r, "mem", None):
+                parts.append(str(r.mem))
+            if getattr(r, "labels", None):
+                parts += [f"{k}={v}" for k, v in r.labels.items()]
+            return " · ".join(parts)
+
         regions = self.plan(graph, target, sizes=sizes)
         collapses = (len(regions) <= 1 and (not regions or regions[0].backend == "default")) \
             or not self._safe_to_split(graph, target, regions)
         if collapses:  # what run() will actually do: one default whole-graph region
             rows, conf = _rows(target)
+            greq = placement.graph_requires(graph, self.deps.node_specs)  # unmet resource need on the local run?
+            unsat = planner._has_req(greq) and self.place_fn(greq) is None
             return [{"id": "r_all", "outputNode": target, "backend": "default", "worker": None,
                      "nodeIds": [n.id for n in g.upstream_chain(graph, target)], "tier": None,
-                     "rows": rows, "confidence": conf}]
+                     "rows": rows, "confidence": conf,
+                     "requires": _req_str(greq) if unsat else "", "unsatisfied": unsat}]
         out: list[dict] = []
         for i, r in enumerate(regions):
             final = i == len(regions) - 1
             tier = None if final else self._boundary_tier(r, regions)  # the final region isn't materialized
             rows, conf = _rows(r.output_node)
+            # a real resource requirement that no backend satisfied → fell back to local (may lack it): flag it
+            unsat = planner._has_req(r.requires) and r.backend == "default"
             out.append({"id": r.id, "outputNode": r.output_node, "backend": r.backend, "worker": r.worker,
                         "nodeIds": sorted(r.node_ids), "tier": (tier.name if tier else None),
-                        "rows": rows, "confidence": conf})
+                        "rows": rows, "confidence": conf,
+                        "requires": _req_str(r.requires), "unsatisfied": unsat})
         return out
 
     def _cost_requires(self, graph: Graph, target: str, sizes: dict | None = None) -> dict:

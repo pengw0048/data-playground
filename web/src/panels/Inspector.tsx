@@ -392,7 +392,7 @@ function JoinHints({ nodeId }: { nodeId: string }) {
 // Run-plan preview: the regions this node's run splits into, each with its backend, boundary tier, and
 // estimated size. Self-hides for the trivial case (one local region) — it lights up only when placement
 // did something (a cluster backend, an engine=ray label, or a checkpoint), so the scheduler is legible.
-type PlanRegion = { id: string; outputNode: string; backend: string; tier: string | null; rows: number | null; confidence: string }
+type PlanRegion = { id: string; outputNode: string; backend: string; tier: string | null; rows: number | null; confidence: string; requires?: string; unsatisfied?: boolean }
 function RunPlan({ nodeId }: { nodeId: string }) {
   const doc = useStore((s) => s.doc)
   const kernelUp = useStore((s) => s.kernelUp)
@@ -409,26 +409,35 @@ function RunPlan({ nodeId }: { nodeId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeId, sig, kernelUp])
 
-  // trivial = a single region on the local/default backend → nothing worth showing (the card already
-  // shows ~N rows). Surface only when placement split (>1) or routed to a non-default backend.
-  if (!regions || (regions.length <= 1 && regions.every((r) => r.backend === 'default'))) return null
+  // trivial = a single region on the local/default backend with no unmet requirement → nothing worth
+  // showing (the card already shows ~N rows). Surface when placement split (>1), routed off-local, or a
+  // resource requirement went unsatisfied (a pre-flight "this won't fit here" before you run).
+  if (!regions || (regions.length <= 1 && regions.every((r) => r.backend === 'default' && !r.unsatisfied))) return null
   const fmt = (n: number | null) => (n == null ? '?' : n.toLocaleString())
+  const multi = regions.length > 1
   return (
     <Section title="Run plan">
       <div className="mb-1 text-[10.5px] leading-relaxed text-muted-foreground">
-        This run splits into {regions.length} regions — each runs on its backend and hands off via a tier.
+        {multi ? `This run splits into ${regions.length} regions — each runs on its backend, handing off via a tier.`
+          : 'Placement for this run.'}
       </div>
       <div className="flex flex-col gap-1">
         {regions.map((r, i) => (
-          <div key={r.id} className="flex items-center gap-2 rounded-md border border-border px-2 py-1 text-[10.5px]">
+          <div key={r.id} className={cn('flex flex-wrap items-center gap-2 rounded-md border px-2 py-1 text-[10.5px]',
+            r.unsatisfied ? 'border-amber-300 dark:border-amber-500/40' : 'border-border')}>
             <span className={cn('rounded px-1.5 py-px text-[9.5px] font-semibold',
               r.backend === 'default' ? 'bg-muted text-muted-foreground' : 'bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300')}>
               {r.backend === 'default' ? 'local' : r.backend}
             </span>
             <span className="dp-mono flex-1 truncate text-foreground">{r.outputNode}</span>
             <span className="tabular-nums text-muted-foreground">{r.confidence === 'unknown' ? '' : `~${fmt(r.rows)}`}</span>
-            {i < regions.length - 1 && r.tier && (
+            {multi && i < regions.length - 1 && r.tier && (
               <span className="rounded bg-muted px-1.5 py-px text-[9px] text-muted-foreground" title="materialization tier for the handoff">→ {r.tier}</span>
+            )}
+            {r.unsatisfied && (
+              <span className="w-full text-[10px] text-amber-700 dark:text-amber-300" title="no registered backend satisfies this — it will run locally, which may lack the resource">
+                ⚠ needs {r.requires || 'resources'} — no backend provides it
+              </span>
             )}
           </div>
         ))}
