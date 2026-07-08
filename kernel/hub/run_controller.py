@@ -46,6 +46,26 @@ class RunController:
         return planner.plan_regions(graph, target, self.deps.node_specs, self.place_fn,
                                     extra_requires=self._cost_requires(graph, target))
 
+    def plan_summary(self, graph: Graph, target: str) -> list[dict]:
+        """A human-facing execution plan: the regions this run splits into, each with its backend, the
+        storage tier its boundary materializes to, and its estimated output size. Powers the UI 'run
+        plan' preview — so the cost-aware placement + tiering is something you can SEE before running."""
+        from hub import estimate as est_mod
+        regions = self.plan(graph, target)
+        try:
+            sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target)
+        except Exception:  # noqa: BLE001
+            sizes = {}
+        out: list[dict] = []
+        for i, r in enumerate(regions):
+            final = i == len(regions) - 1
+            tier = None if final else self._boundary_tier(r, regions)  # the final region isn't materialized
+            est = sizes.get(r.output_node)
+            out.append({"id": r.id, "outputNode": r.output_node, "backend": r.backend, "worker": r.worker,
+                        "nodeIds": sorted(r.node_ids), "tier": (tier.name if tier else None),
+                        "rows": (est.rows if est else None), "confidence": (est.confidence if est else "unknown")})
+        return out
+
     def _cost_requires(self, graph: Graph, target: str) -> dict:
         """Cost-based placement input: a BLOCKING region whose estimated working set exceeds the local
         memory budget 'wants' a backend with more memory → a `ResourceSpec(mem=…)` the planner folds in.

@@ -165,6 +165,10 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* checkpoint: materialize this node's output → inspectable + reused across runs (splits a region) */}
       {kind !== 'source' && kind !== 'note' && kind !== 'write' && <CheckpointToggle nodeId={nodeId} />}
 
+      {/* run plan: appears only when placement actually splits/routes this run (a cluster backend, an
+          engine label, or a checkpoint) — makes the cost-aware scheduler + tiering visible before running */}
+      {kind !== 'note' && <RunPlan nodeId={nodeId} />}
+
       {/* ports — a real port label (join left/right, metric value) shows as a name; the default
           in/out ports show their wire type + a typed/untyped schema badge (click "N cols" to expand
           the columns). Input badges reflect the upstream's output schema. */}
@@ -381,6 +385,54 @@ function JoinHints({ nodeId }: { nodeId: string }) {
           <div className="text-[9.5px] leading-relaxed text-muted-foreground">Cardinality measured from the data · click to fill the join key.</div>
         </div>
       )}
+    </Section>
+  )
+}
+
+// Run-plan preview: the regions this node's run splits into, each with its backend, boundary tier, and
+// estimated size. Self-hides for the trivial case (one local region) — it lights up only when placement
+// did something (a cluster backend, an engine=ray label, or a checkpoint), so the scheduler is legible.
+type PlanRegion = { id: string; outputNode: string; backend: string; tier: string | null; rows: number | null; confidence: string }
+function RunPlan({ nodeId }: { nodeId: string }) {
+  const doc = useStore((s) => s.doc)
+  const kernelUp = useStore((s) => s.kernelUp)
+  const [regions, setRegions] = useState<PlanRegion[] | null>(null)
+  const sig = JSON.stringify([doc.edges.map((e) => [e.source, e.target, e.targetHandle]),
+    doc.nodes.map((n) => [n.id, n.type, n.data.config])])
+  useEffect(() => {
+    if (!kernelUp) { setRegions(null); return }
+    let off = false
+    const t = setTimeout(() => {
+      api.plan(doc, nodeId).then((p) => { if (!off) setRegions(p.regions ?? []) }).catch(() => { if (!off) setRegions(null) })
+    }, 350)
+    return () => { off = true; clearTimeout(t) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeId, sig, kernelUp])
+
+  // trivial = a single region on the local/default backend → nothing worth showing (the card already
+  // shows ~N rows). Surface only when placement split (>1) or routed to a non-default backend.
+  if (!regions || (regions.length <= 1 && regions.every((r) => r.backend === 'default'))) return null
+  const fmt = (n: number | null) => (n == null ? '?' : n.toLocaleString())
+  return (
+    <Section title="Run plan">
+      <div className="mb-1 text-[10.5px] leading-relaxed text-muted-foreground">
+        This run splits into {regions.length} regions — each runs on its backend and hands off via a tier.
+      </div>
+      <div className="flex flex-col gap-1">
+        {regions.map((r, i) => (
+          <div key={r.id} className="flex items-center gap-2 rounded-md border border-border px-2 py-1 text-[10.5px]">
+            <span className={cn('rounded px-1.5 py-px text-[9.5px] font-semibold',
+              r.backend === 'default' ? 'bg-muted text-muted-foreground' : 'bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300')}>
+              {r.backend === 'default' ? 'local' : r.backend}
+            </span>
+            <span className="dp-mono flex-1 truncate text-foreground">{r.outputNode}</span>
+            <span className="tabular-nums text-muted-foreground">{r.confidence === 'unknown' ? '' : `~${fmt(r.rows)}`}</span>
+            {i < regions.length - 1 && r.tier && (
+              <span className="rounded bg-muted px-1.5 py-px text-[9px] text-muted-foreground" title="materialization tier for the handoff">→ {r.tier}</span>
+            )}
+          </div>
+        ))}
+      </div>
     </Section>
   )
 }

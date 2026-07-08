@@ -105,6 +105,22 @@ def graph_estimate(req: CompileRequest) -> dict:
     return {nid: {"rows": s.rows, "confidence": s.confidence} for nid, s in sizes.items()}
 
 
+@router.post("/graph/plan")
+def graph_plan(req: CompileRequest) -> dict:
+    """The execution plan for a target: the regions it splits into, each with backend + boundary tier +
+    estimated size — the UI 'run plan' preview that makes cost-based placement + tiering visible. A plain
+    graph is one 'default' region (runs locally); placement (a cluster backend / engine label / checkpoint)
+    splits it. Never 500s."""
+    deps = get_deps()
+    if not req.target_node_id:
+        return {"regions": []}
+    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
+    try:
+        return {"regions": deps.controller.plan_summary(req.graph, req.target_node_id)}
+    except Exception as e:  # noqa: BLE001 — a preview must never 500
+        return {"regions": [], "error": f"{type(e).__name__}: {e}"}
+
+
 @router.post("/graph/join-analysis", response_model=JoinAnalysis)
 def join_analysis(req: CompileRequest) -> JoinAnalysis:
     """Catalog-driven join hints for a join node (target_node_id): ranked key suggestions for its

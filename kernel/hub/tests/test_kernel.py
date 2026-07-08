@@ -3277,6 +3277,26 @@ def test_cost_placement_respects_a_manual_mem_pin():
     assert "a" in d.controller._cost_requires(graph2, "a")
 
 
+def test_graph_plan_endpoint():
+    # #4: the run-plan preview — a plain graph is one 'default' region; a checkpoint splits it into two,
+    # and the upstream boundary materializes to the local tier. Makes placement + tiering visible.
+    ev = _uri("events")
+    plain = {"graph": {"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": ev}), N("f", "filter", {"predicate": "amount > 0"})],
+        "edges": [E("s", "f")]}, "targetNodeId": "f"}
+    r1 = client.post("/api/graph/plan", json=plain).json()
+    assert len(r1["regions"]) == 1 and r1["regions"][0]["backend"] == "default"
+
+    ckpt = {"graph": {"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": ev}),
+        {"id": "f", "type": "filter", "position": {"x": 0, "y": 0}, "data": {"title": "f", "config": {"predicate": "amount > 0", "checkpoint": True}}},
+        N("g", "filter", {"predicate": "amount > 1"})],
+        "edges": [E("s", "f"), E("f", "g")]}, "targetNodeId": "g"}
+    r2 = client.post("/api/graph/plan", json=ckpt).json()
+    assert len(r2["regions"]) == 2
+    assert next(x for x in r2["regions"] if x["outputNode"] == "f")["tier"] == "local"  # boundary → local
+
+
 def test_graph_estimate_endpoint():
     # the size-hint endpoint: an exact count for a real source, honest confidence label
     ev = _uri("events")
