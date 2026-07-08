@@ -2,3 +2,21 @@
 name = "dp-sql-catalog"
 version = "0.1.0"
 # min_core_api = 1
+
+# UI-configurable fields (Settings → Plugins). A UI value wins; else the `env` var; else `default`.
+# Changing a value takes effect on the next kernel start (plugins register once at startup).
+[[config]]
+key = "url"
+type = "string"
+label = "SQLAlchemy URL"
+env = "DP_SQL_CATALOG_URL"
+placeholder = "postgresql+psycopg://… or sqlite:///…"
+help = "Any SQLAlchemy database URL. Unset → the plugin stays inactive (the built-in catalog is used)."
+
+[[config]]
+key = "table"
+type = "string"
+label = "datasets table"
+default = "datasets"
+env = "DP_SQL_CATALOG_TABLE"
+help = "Table with columns (name, uri) synced as the catalog."

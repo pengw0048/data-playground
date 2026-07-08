@@ -1869,6 +1869,57 @@ def test_sql_catalog_reference_plugin(tmp_path):
         cat.get_table("nonexistent")
 
 
+def test_plugin_config_resolution(tmp_path, monkeypatch):
+    # reg.config precedence for a pack's dataplay.toml [[config]] field:
+    #   UI setting (plugin.<pack>.<key>) > declared env var > declared default > the arg default.
+    from hub import metadb
+    from hub.deps import Deps, Registry
+
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    deps._manifests["dp_cfgx"] = {"config": [
+        {"key": "url", "type": "string", "env": "DP_CFGX_URL"},
+        {"key": "table", "type": "string", "default": "datasets"},
+    ]}
+    reg = Registry(deps); reg._pack = "dp_cfgx"
+    assert reg.config("table") == "datasets"          # declared default
+    assert reg.config("url") is None                  # nothing set anywhere
+    assert reg.config("url", "arg") == "arg"           # falls to the arg default
+    monkeypatch.setenv("DP_CFGX_URL", "sqlite:///env.db")
+    assert reg.config("url") == "sqlite:///env.db"     # declared env var
+    metadb.set_setting("plugin.dp_cfgx.url", "sqlite:///ui.db", "global")
+    assert reg.config("url") == "sqlite:///ui.db"      # UI setting WINS over env
+    assert Registry(deps).config("url", "d") == "d"    # no current pack → only the arg default
+
+
+def test_plugin_config_schema_surfaces_via_manifest(tmp_path, monkeypatch):
+    # dropping dp_sql_catalog in: its dataplay.toml [[config]] lands on the /api/plugins entry, and
+    # register() activates the plugin via reg.config's env fallback (DP_SQL_CATALOG_URL) — proving the
+    # declarative-schema → configurable-plugin path end-to-end.
+    import shutil
+    from pathlib import Path
+
+    import sqlalchemy as sa
+
+    from hub.deps import Deps
+
+    dburl = "sqlite:///" + str(tmp_path / "cat.db")
+    with sa.create_engine(dburl).begin() as c:
+        c.execute(sa.text("CREATE TABLE datasets (name TEXT, uri TEXT)"))
+    monkeypatch.setenv("DP_SQL_CATALOG_URL", dburl)
+
+    ws = tmp_path / "ws"; (ws / "plugins").mkdir(parents=True)
+    src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_sql_catalog"
+    shutil.copytree(src, ws / "plugins" / "dp_sql_catalog")
+    deps = Deps(str(ws), str(tmp_path / "data"))
+
+    assert deps.catalog.name == "sql-catalog"          # reg.config → env fallback activated it
+    entry = next(p for p in deps.plugins if p["name"] == "dp_sql_catalog")
+    fields = {f["key"]: f for f in entry["config"]}    # [[config]] parsed + attached to the plugin entry
+    assert set(fields) == {"url", "table"}
+    assert fields["url"]["env"] == "DP_SQL_CATALOG_URL" and fields["table"]["default"] == "datasets"
+
+
 def test_hf_datasets_adapter_reference_plugin(monkeypatch):
     # the shipped examples/plugins/dp_hf_datasets adapter reads hf:// datasets. Proven WITHOUT network: a
     # real in-memory HF Dataset is returned by a patched load_dataset, so the real arrow→DuckDB path runs.
@@ -2031,6 +2082,40 @@ def test_pipelines_import_reports_not_configured():
     r = client.post("/api/pipelines/import", json={"config": "x", "params": {}})
     assert r.status_code == 501
     assert "importer" in r.text.lower()
+
+
+def test_datasets_place_destination_reference_plugin(tmp_path):
+    # the dp_datasets_place reference destination goes through reg.add_destination (the DestinationBackend
+    # seam) and browses only dataset files, hiding clutter; path traversal is fenced to the root.
+    import importlib.util
+    from pathlib import Path
+
+    from hub import destinations
+    from hub.destinations import DestinationBackend
+
+    root = tmp_path / "place"
+    (root / "sub").mkdir(parents=True)
+    for fn in ("a.parquet", "b.csv", "notes.txt", ".hidden.parquet"):
+        (root / fn).write_text("x")
+
+    src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_datasets_place" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("dp_datasets_place_ref", src)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    b = mod.DatasetsPlace()
+    assert isinstance(b, DestinationBackend)                       # conforms to the formal Protocol
+    entries = b.browse(str(root), "")["entries"]
+    names = {e["name"]: e["kind"] for e in entries}
+    assert names == {"a.parquet": "file", "b.csv": "file", "sub": "dir"}  # .txt + dotfile hidden
+    assert b.target_uri(str(root), "sub", "../../etc/x.parquet").endswith("x.parquet")  # basename only
+    assert os.path.realpath(b.target_uri(str(root), "../..", "o.parquet")).startswith(os.path.realpath(str(root)))
+
+    # reg.add_destination registers the kind through the real Registry (not a module-level call)
+    (tmp_path / "ws").mkdir()
+    from hub.deps import Deps, Registry
+    reg = Registry(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    reg.add_destination(mod.DatasetsPlace())
+    assert "datasets" in destinations.backend_kinds()
 
 
 def test_layout_handles_large_reverse_ordered_graph():

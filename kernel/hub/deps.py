@@ -35,6 +35,27 @@ class Registry:
 
     def __init__(self, deps: "Deps"):
         self.deps = deps
+        self._pack: str | None = None  # the pack currently registering — set by the loader for reg.config
+
+    def config(self, key: str, default=None):
+        """Read a config value for the CURRENTLY-registering pack. Precedence: a UI-set value (metadb
+        setting `plugin.<pack>.<key>`) > the field's declared `env` var > its declared `default` > the
+        `default` arg. Fields are declared in the pack's dataplay.toml `[[config]]`. Call this inside
+        register() to configure the pack; a value changed in the UI takes effect on the next kernel
+        start (plugins register once at startup — same as the env vars it falls back to)."""
+        pack = self._pack
+        schema = self.deps._manifests.get(pack, {}).get("config", []) if pack else []
+        field = next((f for f in schema if isinstance(f, dict) and f.get("key") == key), None)
+        if pack:
+            from hub import metadb
+            v = metadb.get_setting(f"plugin.{pack}.{key}", "global", default=None)
+            if v not in (None, ""):
+                return v
+        if field and field.get("env") and os.environ.get(field["env"]) not in (None, ""):
+            return os.environ[field["env"]]
+        if field and field.get("default") is not None:
+            return field["default"]
+        return default
 
     def add_node(self, spec: NodeSpec, build: "NodeBuilder | None" = None) -> None:
         # `build` is the node's build callable — see hub.backends.NodeBuilder for its exact
@@ -76,6 +97,14 @@ class Registry:
         # /pipelines/import endpoint reports 'not configured' (501), not a broken 500.
         self.deps.importer = importer
 
+    def add_destination(self, backend) -> None:
+        # a save/open-dialog "place" backend (a storage/warehouse browser+writer). Should satisfy
+        # hub.destinations.DestinationBackend (kind + browse + target_uri); claims its `kind` so a
+        # target uri of that scheme can be browsed/picked. The built-in local/s3/gs go through the
+        # same registry — this seam just lets register(reg) add one instead of a module-level call.
+        from hub import destinations
+        destinations.register_backend(backend)
+
 
 def _persist_run(graph, target, status) -> None:
     """Runner on_complete hook: keep a finished run with its canvas (canvas id == graph.id)."""
@@ -102,6 +131,28 @@ def _result_get(key):
 def _result_put(key, doc) -> None:
     from hub import metadb
     metadb.put_result(key, doc)
+
+
+_CONFIG_TYPES = {"string", "text", "int", "float", "bool", "select", "password"}
+
+
+def _normalize_config(raw) -> list[dict]:
+    """dataplay.toml `[[config]]` → a clean list of UI fields. Keeps only entries with a non-empty string
+    `key`; fills `type` (default 'string'; unknown → 'string') and `label` (default = key); passes through
+    default/env/secret/options/help/placeholder. Malformed entries are dropped (never fatal)."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for f in raw:
+        if not isinstance(f, dict) or not isinstance(f.get("key"), str) or not f["key"]:
+            continue
+        field = {"key": f["key"], "type": f.get("type") if f.get("type") in _CONFIG_TYPES else "string",
+                 "label": str(f.get("label") or f["key"])}
+        for k in ("default", "env", "secret", "options", "help", "placeholder"):
+            if k in f:
+                field[k] = f[k]
+        out.append(field)
+    return out
 
 
 def _host_capacity() -> ResourceSpec:
@@ -261,10 +312,13 @@ class Deps:
             from importlib.metadata import entry_points
             for ep in entry_points(group="dataplay.plugins"):
                 try:
+                    reg._pack = ep.name
                     ep.load()(reg)
                     self.plugins.append({"name": ep.name, "source": "entry_point"})
                 except Exception as e:  # noqa: BLE001
                     print(f"[deps] entry-point plugin '{ep.name}' failed: {e}")
+                finally:
+                    reg._pack = None
         except Exception:  # noqa: BLE001
             pass
 
@@ -296,6 +350,7 @@ class Deps:
                     self.plugins.append({"name": name, "source": "drop-in",
                                          "error": f"requires core API >= {need}; this core is {CORE_API_VERSION}"})
                     return False
+            man["config"] = _normalize_config(man.get("config"))  # [[config]] → clean UI-field list (may be [])
             self._manifests[name] = man
             return True
         except Exception as e:  # noqa: BLE001
@@ -305,15 +360,21 @@ class Deps:
     def _register_module(self, mod: str, reg: Registry) -> None:
         try:
             m = importlib.import_module(mod)
+            reg._pack = mod  # so reg.config() resolves plugin.<mod>.<key> for THIS pack
             if hasattr(m, "register"):
                 m.register(reg)
             entry = {"name": mod, "source": "module", **({"version": self._manifests.get(mod, {}).get("version")} if mod in self._manifests else {})}
+            schema = self._manifests.get(mod, {}).get("config")  # dataplay.toml [[config]] → UI-configurable fields
+            if schema:
+                entry["config"] = schema
             self.plugins.append(entry)
         except Exception as e:  # noqa: BLE001
             import traceback
             print(f"[deps] failed to load plugin '{mod}': {e}")
             self.plugins.append({"name": mod, "source": "module", "error": f"{type(e).__name__}: {e}",
                                  "traceback": traceback.format_exc().splitlines()[-3:]})
+        finally:
+            reg._pack = None
 
     def _place(self, requires):
         """First (backend_name, worker_id) across the registered backends that satisfies `requires`,

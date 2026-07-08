@@ -11,17 +11,16 @@ declared keys, and `register_output` — from the parent's local side-store. So 
 no reimplementation of the lineage/ER/write machinery; it only maps its rows to `CatalogTable`s (columns
 + row count are probed from the `uri` by the inherited adapter path).
 
-Config (env): `DP_SQL_CATALOG_URL` = any SQLAlchemy URL (e.g. `postgresql+psycopg://…`, `sqlite:///…`);
-`DP_SQL_CATALOG_TABLE` = the table name (default `datasets`, columns `name`, `uri`). Unset → this plugin
-is a no-op and the default local catalog stands.
+Config: `url` = any SQLAlchemy URL (e.g. `postgresql+psycopg://…`, `sqlite:///…`); `table` = the table
+name (default `datasets`, columns `name`, `uri`). Both are declared in `dataplay.toml [[config]]`, so
+they're editable in Settings → Plugins AND fall back to the `DP_SQL_CATALOG_URL` / `DP_SQL_CATALOG_TABLE`
+env vars (headless). Unset → this plugin is a no-op and the default local catalog stands.
 
 Drop this folder into `<workspace>/plugins/` (or install it as a `dataplay.plugins` entry point).
 Requires SQLAlchemy, which the kernel already depends on — no extra install for SQLite/bundled drivers.
 """
 
 from __future__ import annotations
-
-import os
 
 from sqlalchemy import create_engine, text
 
@@ -69,8 +68,11 @@ class SqlCatalog(InMemoryCatalog):
 
 
 def register(reg) -> None:
-    url = os.environ.get("DP_SQL_CATALOG_URL")
+    # reg.config reads the dataplay.toml [[config]] fields: a UI-set value (Settings → Plugins) wins,
+    # else the declared env var (DP_SQL_CATALOG_URL / _TABLE), else the default. So it's configurable
+    # from the UI AND still works headless via env.
+    url = reg.config("url")
     if not url:
         return  # not configured → leave the default InMemoryCatalog in place
-    table = os.environ.get("DP_SQL_CATALOG_TABLE", "datasets")
+    table = reg.config("table", "datasets")
     reg.set_catalog(SqlCatalog(reg.deps.data_dir, reg.deps.resolve_adapter, url, table))

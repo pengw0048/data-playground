@@ -53,7 +53,25 @@ def list_nodes() -> list[dict]:
 
 @router.get("/plugins")
 def list_plugins() -> list[dict]:
-    return get_deps().plugins
+    # enrich each pack that declares a [[config]] schema with its CURRENT values (from settings), so the
+    # Settings UI can render + pre-fill a form. Secret fields never echo their value — only whether set.
+    out: list[dict] = []
+    for p in get_deps().plugins:
+        entry = dict(p)
+        schema = entry.get("config")
+        if schema:
+            values: dict = {}
+            is_set: list[str] = []
+            for f in schema:
+                stored = metadb.get_setting(f"plugin.{p['name']}.{f['key']}", "global", default=None)
+                if stored not in (None, ""):
+                    is_set.append(f["key"])
+                if not f.get("secret"):
+                    values[f["key"]] = stored
+            entry["config_values"] = values
+            entry["config_set"] = is_set
+        out.append(entry)
+    return out
 
 
 @router.get("/catalog/tables", response_model=list[CatalogTable])
