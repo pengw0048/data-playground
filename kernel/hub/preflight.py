@@ -25,22 +25,37 @@ def _lit(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
 
 
+def _object_store_configured() -> bool:
+    """Whether the workspace has object storage configured — we only probe object URIs when it is, so an
+    unconfigured/mistyped s3:// source can't hang the plan on a credential-less LIST to a real endpoint."""
+    try:
+        from hub import metadb
+        return bool(metadb.get_setting("objectStore", "global", default={}))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _count_fragments(uri: str, cap: int) -> "int | None":
     """How many files a scan of `uri` would touch, counted cheaply and CAPPED (we only need to know it
-    exceeds the threshold, not the exact huge number). None if it can't be determined."""
+    exceeds the threshold, not the exact huge number). None if it can't / shouldn't be determined."""
     if is_object_uri(uri):
-        # DuckDB's glob() over httpfs — the same path the engine reads through (no extra dependency)
+        if not _object_store_configured():
+            return None  # don't fire a credential-less LIST at a real endpoint on every plan call
+        # DuckDB's glob() over httpfs (the engine's own read path) — CAPPED so a huge bucket can't block
+        # the plan, and on the base connection's lock like every other base-conn access.
         pattern = uri if uri.endswith(_DATA_EXTS) else uri.rstrip("/") + "/**/*"
-        rel = db.conn().sql(f"SELECT count(*) FROM glob({_lit(pattern)})")
-        return int(rel.fetchone()[0])
+        q = f"SELECT count(*) FROM (SELECT 1 FROM glob({_lit(pattern)}) LIMIT {int(cap)})"
+        with db.lock():
+            return int(db.conn().sql(q).fetchone()[0])
     p = path_of(uri) if uri.startswith("file://") else uri
     if os.path.isdir(p):
-        n = 0
+        n = seen = 0
         for f in _glob.iglob(os.path.join(p, "**", "*"), recursive=True):
+            seen += 1
             if os.path.isfile(f):
                 n += 1
-                if n >= cap:  # only need to know it exceeds the threshold, not the exact huge count
-                    break
+            if n >= cap or seen >= cap * 4:  # bound BOTH the file count and the entries walked
+                break
         return n
     return 1 if os.path.exists(p) else None
 
@@ -48,8 +63,8 @@ def _count_fragments(uri: str, cap: int) -> "int | None":
 def _cold_objects(uri: str, cap: int) -> int:
     """Count objects under an s3:// prefix in a cold storage class. Best-effort via boto3 (NOT a core
     dep — skipped, returning 0, when boto3 is absent); uses the workspace's object-store credentials."""
-    if not uri.startswith("s3://"):
-        return 0
+    if not uri.startswith("s3://") or not _object_store_configured():
+        return 0  # only probe when object storage is configured — no credential-less round-trip per plan
     try:
         import boto3
     except ImportError:

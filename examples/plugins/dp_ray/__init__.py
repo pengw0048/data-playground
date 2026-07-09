@@ -123,7 +123,10 @@ class RayRunner:
         # DP_RAY_GPU_TYPE / DP_RAY_MEM. That advertised capacity feeds the topology view + the run-plan
         # pre-flight ("needs 4×a100 — backends advertise: 8×a100"). Defaults keep the engine=ray label.
         import os
-        gpu = int(os.environ.get("DP_RAY_GPUS", "0") or 0)
+        try:
+            gpu = int(os.environ.get("DP_RAY_GPUS", "0") or 0)
+        except ValueError:
+            gpu = 0  # a mistyped count shouldn't silently drop the whole capacity report
         cap = ResourceSpec(mem=os.environ.get("DP_RAY_MEM", "1000GB"),
                            gpu=gpu or None, gpu_type=(os.environ.get("DP_RAY_GPU_TYPE") or None) if gpu else None,
                            labels={"engine": "ray"})

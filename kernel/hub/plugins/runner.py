@@ -337,8 +337,14 @@ class LocalRunner:
             return
         from hub.executors.engine import _duck_type, declared_schema
         contract = declared_schema(node)
+        title = (node.data.get("title") if isinstance(node.data, dict) else None) or node.id
         if not contract:
-            return
+            # enforce is ON but there's no resolvable contract (a deleted/renamed ref, or none declared) —
+            # do NOT silently pass: a safety gate that quietly turns itself off is worse than no gate.
+            osc = cfg.get("outputSchema")
+            ref = osc.get("ref") if isinstance(osc, dict) else None
+            why = f"referenced contract '{ref}' not found" if ref else "no contract is declared"
+            raise RuntimeError(f"schema contract on '{title}' can't be enforced — {why}")
         from hub import metadb
         rel = engine.relation(node.id)
         actual = [{"name": n, "type": _duck_type(str(t))} for n, t in zip(rel.columns, rel.types)]
@@ -352,7 +358,6 @@ class LocalRunner:
                 parts.append(f"unexpected {d['added']}")
             if d["changed"]:
                 parts.append("type-changed " + str([f"{c['name']}:{c['from']}→{c['to']}" for c in d["changed"]]))
-            title = (node.data.get("title") if isinstance(node.data, dict) else None) or node.id
             raise RuntimeError(f"schema contract on '{title}' violated — {'; '.join(parts)}")
 
     def _commit_write(self, node, graph: Graph, engine: BuildEngine, status: RunStatus,

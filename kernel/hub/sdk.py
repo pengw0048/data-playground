@@ -38,7 +38,8 @@ __all__ = ["NodeSpec", "ParamSpec", "PortSpec", "WireType", "ctx", "close_resour
 
 _T = TypeVar("_T")
 _RESOURCES: dict[str, object] = {}   # process-global warm handles, kept alive across batches AND runs
-_RESOURCE_LOCK = threading.Lock()
+_RESOURCE_LOCK = threading.RLock()   # REENTRANT: a factory may itself call ctx.resource() for another key
+_MISSING = object()                  # sentinel so a factory returning None is still cached (not rebuilt)
 
 
 class _Ctx:
@@ -82,12 +83,12 @@ class _Ctx:
         constructed at most once. For PLUGIN nodes (trusted, run in the hub process) — NOT for the sandboxed
         `transform` cell. If the object holds an OS/GPU handle, give it a `close()`/`__exit__` and the kernel
         releases it on graceful shutdown (see close_resources); a hard kill relies on the OS to reclaim."""
-        r = _RESOURCES.get(key)
-        if r is None:
-            with _RESOURCE_LOCK:
-                r = _RESOURCES.get(key)
-                if r is None:
-                    r = factory()
+        r = _RESOURCES.get(key, _MISSING)
+        if r is _MISSING:
+            with _RESOURCE_LOCK:  # reentrant → a factory that calls ctx.resource() for another key won't deadlock
+                r = _RESOURCES.get(key, _MISSING)
+                if r is _MISSING:
+                    r = factory()  # cache even a None result, so "constructed at most once" holds
                     _RESOURCES[key] = r
         return r
 

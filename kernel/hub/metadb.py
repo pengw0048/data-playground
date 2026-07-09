@@ -460,14 +460,21 @@ def run_stalled(run_id: str, threshold_s: float) -> bool:
 
 def save_schema_contract(name: str, columns: list[dict]) -> int:
     """Save a named schema contract as a NEW version (max existing + 1). `columns` = [{name, type}, ...].
-    Returns the new version number."""
+    Returns the new version number. The max+1 read-then-insert isn't atomic, so a concurrent save of the
+    SAME name can collide on the (name, version) PK — retry a few times (each recomputes the next version)."""
     from sqlalchemy import func
-    with session() as s:
-        cur = s.query(func.max(SchemaContract.version)).filter(SchemaContract.name == name).scalar()
-        version = (cur or 0) + 1
-        s.add(SchemaContract(name=name, version=version,
-                             doc=json.dumps([{"name": c["name"], "type": c.get("type", "")} for c in columns])))
-        return version
+    from sqlalchemy.exc import IntegrityError
+    doc = json.dumps([{"name": c["name"], "type": c.get("type", "")} for c in columns])
+    for _ in range(5):
+        try:
+            with session() as s:
+                cur = s.query(func.max(SchemaContract.version)).filter(SchemaContract.name == name).scalar()
+                version = (cur or 0) + 1
+                s.add(SchemaContract(name=name, version=version, doc=doc))
+            return version
+        except IntegrityError:
+            continue  # someone else grabbed this version — recompute and retry
+    raise RuntimeError(f"could not save schema contract '{name}' after retries (version contention)")
 
 
 def get_schema_contract(name: str, version: int | None = None) -> dict | None:

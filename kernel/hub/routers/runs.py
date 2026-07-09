@@ -313,7 +313,10 @@ def _status_or_lost(run_id: str) -> RunStatus:
                          error="run not found — it was evicted or the kernel restarted")
 
 
-_STALL_S = float(os.environ.get("DP_STALL_S", "120"))  # a running run with no step completed for this long
+try:  # a malformed DP_STALL_S must degrade to the default, not crash the whole app at import
+    _STALL_S = float(os.environ.get("DP_STALL_S", "120"))  # a running run with no step completed for this long
+except ValueError:
+    _STALL_S = 120.0
 
 
 @router.get("/run/{run_id}", response_model=RunStatus)

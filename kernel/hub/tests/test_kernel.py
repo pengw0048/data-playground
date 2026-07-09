@@ -4072,13 +4072,18 @@ def test_source_preflight_fragments_cold_and_run_plan(tmp_path, monkeypatch):
     pytest.importorskip("moto")
     from moto import mock_aws
     from hub import metadb
-    metadb.set_setting("objectStore", {}, "global")  # empty → boto3 default chain (mock_aws intercepts)
-    with mock_aws():
-        s3 = boto3.client("s3", region_name="us-east-1")
-        s3.create_bucket(Bucket="bkt")
-        s3.put_object(Bucket="bkt", Key="d/a.parquet", Body=b"x", StorageClass="GLACIER")
-        s3.put_object(Bucket="bkt", Key="d/b.parquet", Body=b"y")  # STANDARD
-        assert preflight._cold_objects("s3://bkt/d", 1000) == 1
+    # object storage must be CONFIGURED for the probe to run (else it's skipped, avoiding a credential-less
+    # round-trip on every plan). A non-empty setting satisfies the guard; mock_aws intercepts boto3.
+    metadb.set_setting("objectStore", {"region": "us-east-1"}, "global")
+    try:
+        with mock_aws():
+            s3 = boto3.client("s3", region_name="us-east-1")
+            s3.create_bucket(Bucket="bkt")
+            s3.put_object(Bucket="bkt", Key="d/a.parquet", Body=b"x", StorageClass="GLACIER")
+            s3.put_object(Bucket="bkt", Key="d/b.parquet", Body=b"y")  # STANDARD
+            assert preflight._cold_objects("s3://bkt/d", 1000) == 1
+    finally:
+        metadb.set_setting("objectStore", {}, "global")  # restore for other tests
 
     # the run-plan surfaces the source pre-flight (low threshold → the 6-file dir trips it)
     monkeypatch.setattr(preflight, "_FRAGMENT_WARN", 5)
@@ -4129,6 +4134,14 @@ def test_named_schema_contracts_reference_enforce_and_diff():
     good = run_enforced([{"name": "id", "type": "int", "capabilities": []}, {"name": "user_id", "type": "int", "capabilities": []},
                          {"name": "event", "type": "string", "capabilities": []}, {"name": "amount", "type": "double", "capabilities": []}])
     assert good["status"] == "done"  # names + normalized types all match → no drift
+
+    # enforce must NOT silently no-op when the referenced contract can't resolve (deleted/typo'd ref) —
+    # a safety gate that quietly turns itself off is worse than none: the run fails with a clear reason.
+    g = {"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev}),
+         N("t", "transform", {"mode": "map", "code": "def fn(r): return r", "outputSchema": {"ref": "no_such_contract"}, "enforceSchema": True})],
+         "edges": [E("s", "t")]}
+    miss = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "t", "confirmed": True}).json()["runId"])
+    assert miss["status"] == "failed" and "can't be enforced" in (miss.get("error") or "")
 
 
 def test_warm_resource_reused_across_batches_and_runs(tmp_path):
@@ -4182,6 +4195,25 @@ def test_warm_resource_reused_across_batches_and_runs(tmp_path):
     sdk._RESOURCES["k"] = _H()
     sdk.close_resources()
     assert _H.closed is True and sdk._RESOURCES == {}
+
+    # a factory that itself calls ctx.resource() for ANOTHER key must NOT deadlock (reentrant lock)
+    from hub.sdk import ctx as _ctx
+    for k in ("nest:inner", "nest:outer"):
+        sdk._RESOURCES.pop(k, None)
+    def _outer():
+        inner = _ctx.resource("nest:inner", lambda: 41)  # nested resource() from inside a factory
+        return inner + 1
+    assert _ctx.resource("nest:outer", _outer) == 42  # returns (no hang) → reentrancy holds
+
+    # a factory returning None is CACHED (constructed at most once), not rebuilt every call
+    calls = []
+    def _none_factory():
+        calls.append(1)
+        return None
+    sdk._RESOURCES.pop("nest:none", None)
+    assert _ctx.resource("nest:none", _none_factory) is None
+    assert _ctx.resource("nest:none", _none_factory) is None
+    assert len(calls) == 1  # built once, then the cached None is returned
 
 
 def test_ir_unify_regressions(tmp_path):
