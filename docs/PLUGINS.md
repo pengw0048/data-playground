@@ -100,6 +100,7 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 | `reg.set_catalog(catalog)` | the whole dataset catalog provider | `CatalogProvider` Protocol (`backends.py`): `list_tables/get_table/lineage/relationships/resolve_ref/register/register_output/unregister/set_declared_key/add_relationship/remove_relationship`. **`get_table` MUST raise `KeyError` on a miss.** A read-only external catalog can subclass `InMemoryCatalog` and override only the reads (as `dp_sql_catalog` does). A catalog that *fully* replaces the built-in — not subclassing `InMemoryCatalog` — won't automatically receive run-completion `register_output` write-backs (runners hold the catalog they were built with), so either subclass `InMemoryCatalog` or forward `register_output` to your store. |
 | `reg.set_importer(importer)` | `/pipelines/import` (import a foreign pipeline format) | `Importer` Protocol (`plugins/importer.py`): `name` + `import_pipeline(config, params) -> PipelineImport`. Populate `PipelineImport.graph` with a runnable canvas `Graph` (nodes/edges of built-in or plugin kinds) and the SPA drops it onto a fresh canvas and runs it — this is what makes *import a pipeline → runnable canvas* real. Default is a `NullImporter` (501, honest). The core auto-lays-out an imported graph left unpositioned. |
 | `reg.add_destination(backend)` | a save/open-dialog **"place"** (a browsable/writable location) | `DestinationBackend` Protocol (`destinations.py`): `kind` + `browse(root, path)` (→ `{path, entries:[{name, kind, uri}], error?}`) + `target_uri(root, path, filename)`. Claims a place `kind`; a user adds a preset (backend + root) in Settings → Destinations. Built-in `local`/`s3`/`gs` go through the same registry. |
+| `reg.add_telemetry_sink(fn)` | run observability (export finished-run telemetry) | `fn(record: dict)` invoked once per FINISHED run with a normalized record: `canvas_id/run_id/status/rows/ms/error/output_table/placement/per_node` (`per_node` = `[{node_id, label, status, rows, ms}]`). Core ships **no** exporter (offline-first) — an OTel/StatsD/warehouse sink is a plugin; a sink that raises is caught + logged, never failing the run. See `dp_run_log`. |
 
 Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter; runners are picked
 by `pick_runner` (respects the Settings → Execution choice, else the first that `can_run`). **The
@@ -142,7 +143,7 @@ shows your node's schema the SPA renders from.
 
 ## Reference plugins
 
-`examples/plugins/` ships ten working plugins — each exercises a different seam end-to-end and has a
+`examples/plugins/` ships eleven working plugins — each exercises a different seam end-to-end and has a
 test in `kernel/hub/tests/test_kernel.py` you can copy:
 
 | plugin | seam | what it does | extra |
@@ -157,6 +158,7 @@ test in `kernel/hub/tests/test_kernel.py` you can copy:
 | [`dp_json_view`](../examples/plugins/dp_json_view/) | `add_capability` | tags JSON-doc columns (name-based detector) + declares `viewer={"kind":"json"}` → the SPA shows a JSON tab that pretty-prints those cells, no frontend code | — |
 | [`dp_upper`](../examples/plugins/dp_upper/) | `add_node` (+`ir`) | an `upper` node whose DuckDB build + engine-neutral `ir` hook share one generated operator, so it runs on Ray too (a clean `map`), not just DuckDB | — |
 | [`dp_similarity_dedup`](../examples/plugins/dp_similarity_dedup/) | `add_node` | a `similarity-dedup` node: cluster near-duplicate rows by embedding cosine distance → adds `dup_group` + `is_representative` (filter downstream to keep one per cluster). Brute-force O(n²) — preview on a `sample` first; honest scale/accuracy limits in its docstring | — |
+| [`dp_run_log`](../examples/plugins/dp_run_log/) | `add_telemetry_sink` | a telemetry sink that appends one JSON line per finished run to a log file (`DP_RUN_LOG`) — the reference for where an OTel/warehouse exporter plugs in (core ships none; offline-first) | — |
 
 The adapters are read-only sources (`write` raises) and import their heavy dependency lazily, so the
 pack loads even without the extra installed and only errors when its URI scheme is actually used. Both

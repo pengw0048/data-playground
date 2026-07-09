@@ -1,0 +1,13 @@
+# Reference plugin: a telemetry sink (reg.add_telemetry_sink) that appends each finished run to a
+# JSONL log. Demonstrates where an OTel/StatsD exporter would plug in. See __init__.py.
+name = "dp-run-log"
+version = "0.1.0"
+# min_core_api = 1
+
+[[config]]
+key = "path"
+type = "string"
+label = "Run-telemetry log file"
+default = "run-telemetry.jsonl"
+env = "DP_RUN_LOG"
+help = "Each finished run is appended here as one JSON line."

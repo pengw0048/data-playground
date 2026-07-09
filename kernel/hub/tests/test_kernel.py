@@ -1518,6 +1518,64 @@ def test_run_history_persisted_with_canvas(tmp_path):
         time.sleep(0.05)
     assert runs and runs[0]["status"] == "done" and runs[0]["outputTable"] == "hist_out"
     assert any(r["status"] == "done" for r in client.get("/api/canvas/hist_canvas/runs").json())
+    # durable per-node breakdown (telemetry) travels with the run record, not just the transient RunState
+    pn = runs[0]["perNode"]
+    assert pn and all("node_id" in p and "status" in p for p in pn)
+    assert any(p["node_id"] == "wr" and p["status"] == "done" for p in pn)
+
+
+def test_telemetry_sink_seam_fires_once_per_finished_run(tmp_path):
+    # reg.add_telemetry_sink registers a consumer that gets a normalized record on each finished run; a
+    # sink that raises is swallowed (never fails the run) and the other sinks still fire.
+    import hub.deps as dm
+    from hub.deps import Deps, Registry
+    from hub.models import Graph, PerNodeStatus, RunStatus
+
+    ws = tmp_path / "ws"; ws.mkdir()
+    d = Deps(str(ws), str(tmp_path / "data"))
+    got: list[dict] = []
+    Registry(d).add_telemetry_sink(lambda rec: (_ for _ in ()).throw(RuntimeError("boom")))  # bad sink first
+    Registry(d).add_telemetry_sink(got.append)  # good sink still fires
+    assert len(d.telemetry_sinks) == 2
+
+    g = Graph(**{"id": "no_such_canvas", "version": 1, "nodes": [], "edges": []})
+    st = RunStatus(run_id="r1", status="done", total_rows=5, ms=12, placement="local",
+                   per_node=[PerNodeStatus(node_id="n", status="done", rows=5, ms=12)])
+    dm._persist_run(d, g, "n", st)  # no canvas → record_run no-ops, but the sink seam still fans out
+
+    assert len(got) == 1
+    rec = got[0]
+    assert rec["run_id"] == "r1" and rec["status"] == "done" and rec["rows"] == 5 and rec["ms"] == 12
+    assert rec["per_node"] and rec["per_node"][0]["node_id"] == "n"
+
+
+def test_run_log_reference_plugin_appends_finished_runs(tmp_path, monkeypatch):
+    # dp_run_log registers a telemetry sink via reg.add_telemetry_sink that appends one JSON line per
+    # finished run — the reference for an OTel/warehouse exporter (offline-first: core ships none).
+    import json
+    import shutil
+    from pathlib import Path
+
+    import hub.deps as dm
+    from hub.deps import Deps
+    from hub.models import Graph, PerNodeStatus, RunStatus
+
+    log = tmp_path / "runs.jsonl"
+    monkeypatch.setenv("DP_RUN_LOG", str(log))  # the plugin reads path via reg.config (env fallback)
+    ws = tmp_path / "ws"; (ws / "plugins").mkdir(parents=True)
+    shutil.copytree(Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_run_log",
+                    ws / "plugins" / "dp_run_log")
+    d = Deps(str(ws), str(tmp_path / "data"))
+    assert len(d.telemetry_sinks) == 1  # the plugin registered its sink at load
+
+    g = Graph(**{"id": "no_such_canvas", "version": 1, "nodes": [], "edges": []})
+    for rid, status in [("r1", "done"), ("r2", "failed")]:
+        dm._persist_run(d, g, "n", RunStatus(run_id=rid, status=status, total_rows=3, ms=7, placement="local",
+                                             per_node=[PerNodeStatus(node_id="n", status=status, rows=3, ms=7)]))
+
+    lines = [json.loads(x) for x in log.read_text().splitlines() if x.strip()]
+    assert [x["run_id"] for x in lines] == ["r1", "r2"]  # one JSON line per finished run, in order
+    assert lines[0]["status"] == "done" and lines[1]["status"] == "failed"
 
 
 def test_collab_relay_broadcasts_and_leave():

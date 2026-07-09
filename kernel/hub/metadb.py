@@ -80,6 +80,7 @@ class RunRecord(Base):
     ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_table: Mapped[str | None] = mapped_column(String, nullable=True)
+    per_node: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON: durable per-node breakdown
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -369,7 +370,7 @@ def list_canvases_for(uid: str) -> list[dict]:
 
 def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
                rows: int | None = None, ms: int | None = None, error: str | None = None,
-               output_table: str | None = None) -> None:
+               output_table: str | None = None, per_node: list[dict] | None = None) -> None:
     """Persist a finished run under its canvas. No-op without a canvas id (e.g. ad-hoc API runs)."""
     if not canvas_id:
         return
@@ -377,7 +378,8 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
         if s.get(Canvas, canvas_id) is None:
             return  # ad-hoc / unsaved-canvas run → don't write a run row dangling off a missing canvas
         s.add(RunRecord(canvas_id=canvas_id, target_node_id=target_node_id, status=status,
-                        rows=rows, ms=ms, error=error, output_table=output_table))
+                        rows=rows, ms=ms, error=error, output_table=output_table,
+                        per_node=json.dumps(per_node, default=str) if per_node else None))
 
 
 def delete_canvas_cascade(canvas_id: str) -> None:
@@ -401,6 +403,7 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
                          .order_by(RunRecord.created_at.desc()).limit(limit)).all()
         return [{"id": r.id, "status": r.status, "targetNodeId": r.target_node_id, "rows": r.rows,
                  "ms": r.ms, "error": r.error, "outputTable": r.output_table,
+                 "perNode": json.loads(r.per_node) if r.per_node else None,
                  "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import logging
 import os
 import sys
 
@@ -78,6 +79,13 @@ class Registry:
         if ir is not None:
             self.deps.node_ir[spec.kind] = ir
 
+    def add_telemetry_sink(self, sink) -> None:
+        """Register a callback invoked once per FINISHED run with a normalized telemetry record (a dict:
+        canvas_id/run_id/status/rows/ms/error/output_table/placement/per_node). Core ships no exporter —
+        an OTel/StatsD/log sink is a plugin. A sink that raises is logged and swallowed, never failing a run."""
+        if callable(sink):
+            self.deps.telemetry_sinks.append(sink)
+
     def add_adapter(self, adapter) -> None:
         self.deps.adapters.insert(0, adapter)  # plugins claim uris before defaults
 
@@ -112,11 +120,32 @@ class Registry:
         destinations.register_backend(backend)
 
 
-def _persist_run(graph, target, status) -> None:
-    """Runner on_complete hook: keep a finished run with its canvas (canvas id == graph.id)."""
+def _persist_run(deps, graph, target, status) -> None:
+    """Runner on_complete hook (bound to the owning deps): keep a finished run with its canvas
+    (canvas id == graph.id), including the per-node breakdown (durable telemetry), then fan the
+    finished-run telemetry record out to any plugin sinks."""
     from hub import metadb
+    per_node = [p.model_dump() for p in (status.per_node or [])] or None
     metadb.record_run(canvas_id=getattr(graph, "id", None), target_node_id=target, status=status.status,
-                      rows=status.total_rows, ms=status.ms, error=status.error, output_table=status.output_table)
+                      rows=status.total_rows, ms=status.ms, error=status.error,
+                      output_table=status.output_table, per_node=per_node)
+    _emit_telemetry(deps, graph, target, status, per_node)
+
+
+def _emit_telemetry(deps, graph, target, status, per_node) -> None:
+    """Fan a finished run's normalized telemetry record out to registered sinks (reg.add_telemetry_sink).
+    Core ships NO exporter — an OTel/StatsD/etc. sink is a plugin. A broken sink never breaks a run."""
+    sinks = getattr(deps, "telemetry_sinks", None)
+    if not sinks:
+        return
+    record = {"canvas_id": getattr(graph, "id", None), "target_node_id": target, "run_id": status.run_id,
+              "status": status.status, "rows": status.total_rows, "ms": status.ms, "error": status.error,
+              "output_table": status.output_table, "placement": status.placement, "per_node": per_node}
+    for sink in sinks:
+        try:
+            sink(record)
+        except Exception:
+            logging.getLogger("hub").warning("telemetry sink failed", exc_info=True)
 
 
 def _persist_run_state(graph, status) -> None:
@@ -203,6 +232,7 @@ class Deps:
         self.builtin_kinds = {s.kind for s in BUILTIN_NODE_SPECS}
         self.node_builders: dict[str, object] = {}
         self.node_ir: dict[str, object] = {}  # kind -> ir(node) hook: an engine-neutral emit path (§ IR unify B)
+        self.telemetry_sinks: list = []  # reg.add_telemetry_sink — finished-run records fan out here (OTel = plugin)
         self.plugins: list[dict] = []
         self._manifests: dict[str, dict] = {}
         from hub.storage import make_storage
@@ -220,7 +250,10 @@ class Deps:
         self.runner = LocalRunner(self.resolve_adapter, self.registry, self.catalog, workspace,
                                   node_builders=self.node_builders, node_specs=self.node_specs,
                                   storage=self.storage)
-        self.runner.on_complete = _persist_run  # keep finished runs with their canvas (run history)
+        # on_complete is bound to THIS deps so the finished-run telemetry fans out to sinks registered on
+        # it (plugins load into the same deps/process — incl. the per-canvas kernel's own deps).
+        _on_complete = lambda g, t, s: _persist_run(self, g, t, s)  # noqa: E731
+        self.runner.on_complete = _on_complete  # keep finished runs with their canvas (run history)
         self.runner.on_status = _persist_run_state  # mirror live status to the DB (stateless-web reads)
         self.runner.result_get = _result_get  # DB-backed content-addressed result reuse (cross-run/restart)
         self.runner.result_put = _result_put
@@ -228,7 +261,7 @@ class Deps:
         # a second, real backend: run jobs in an isolated OS process (Settings → Execution). Selected
         # by name via pick_runner; pod/Ray runners install as plugins over the same protocol.
         sub = SubprocessRunner(workspace, data_dir, catalog=self.catalog)
-        sub.on_complete = _persist_run  # record cancelled/crashed isolated runs the child couldn't
+        sub.on_complete = _on_complete  # record cancelled/crashed isolated runs the child couldn't
         sub.on_status = _persist_run_state
         self.runners = [self.runner, sub]
         # opt-in reference multi-worker pool (DP_POOL_WORKERS): capability-based placement without a
@@ -238,7 +271,7 @@ class Deps:
         pool_cfg = pool_workers_from_env()
         if pool_cfg:
             pool = PoolRunner(workspace, data_dir, pool_cfg, node_specs=self.node_specs, catalog=self.catalog)
-            pool.on_complete = _persist_run
+            pool.on_complete = _on_complete
             pool.on_status = _persist_run_state
             self.runners.append(pool)
         # per-canvas kernel: runs go to a long-lived, restart-surviving kernel process (one per canvas).
@@ -258,7 +291,7 @@ class Deps:
         from hub.run_controller import RunController
         self.controller = RunController(self, self.runner, self._place)
         self.controller.on_status = _persist_run_state
-        self.controller.on_complete = _persist_run
+        self.controller.on_complete = _on_complete
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self._load_plugins()
 

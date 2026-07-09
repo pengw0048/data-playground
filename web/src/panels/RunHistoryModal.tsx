@@ -1,51 +1,126 @@
 import { useEffect, useState } from 'react'
-import { api, type RunRecordDto } from '../api/client'
+import { api, type PerNodeStat, type RunRecordDto } from '../api/client'
 import { useStore } from '../store/graph'
 import { status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
 
-// Persisted run history for the current canvas (survives restarts) — /canvas/{id}/runs.
+// Persisted run history + telemetry for the current canvas (survives restarts) — /canvas/{id}/runs.
+// Charts are native inline SVG (no external lib) so they work fully offline and theme-aware.
 export function RunHistoryModal({ onClose }: { onClose: () => void }) {
   const canvasId = useStore((s) => s.doc.id)
   const [runs, setRuns] = useState<RunRecordDto[] | null>(null)
   const [err, setErr] = useState('')
+  const [open, setOpen] = useState<string | null>(null)  // expanded run id → per-node breakdown
   useEffect(() => {
     api.listRuns(canvasId).then(setRuns).catch((e) => setErr((e as Error).message))
   }, [canvasId])
 
   return (
     <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
-      <DialogContent className="dp-modal-overlay flex max-h-[76vh] w-[560px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 [&>button]:hidden">
+      <DialogContent className="dp-modal-overlay flex max-h-[80vh] w-[620px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 [&>button]:hidden">
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
           <span className="text-muted-foreground"><Icon name="clock" size={15} /></span>
           <DialogTitle className="text-sm font-semibold text-foreground">Run history</DialogTitle>
           <span className="flex-1" />
           <button onClick={onClose} aria-label="Close" className="cursor-pointer border-0 bg-transparent p-0 text-muted-foreground hover:text-foreground"><Icon name="close" size={16} /></button>
         </div>
-        <div className="overflow-y-auto p-2">
+        <div className="overflow-y-auto">
           {err && <div className="p-4 text-[12.5px] text-destructive">Couldn’t load run history: {err}</div>}
           {!err && runs === null && <div className="p-4 text-[12.5px] text-muted-foreground">Loading…</div>}
           {!err && runs?.length === 0 && <div className="p-4 text-[12.5px] text-muted-foreground">No runs yet — run a pipeline and it’ll show here.</div>}
-          {runs?.map((r) => {
-            const st = statusTok[r.status as keyof typeof statusTok] ?? statusTok.draft
-            return (
-              <div key={r.id} className="flex items-center gap-2.5 border-b border-border px-2.5 py-2 text-[12.5px]">
-                <span className="w-3 text-center" style={{ color: st.color }}>{st.glyph}</span>
-                <Badge variant="secondary" className="w-[70px] justify-center">{r.status}</Badge>
-                <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-foreground">
-                  {r.outputTable ? `→ ${r.outputTable}` : r.targetNodeId ?? '—'}
-                  {r.error && <span className="text-destructive"> · {r.error}</span>}
-                </span>
-                {r.rows != null && <span className="text-muted-foreground">{r.rows.toLocaleString()} rows</span>}
-                {r.ms != null && <span className="w-14 text-right text-muted-foreground">{r.ms} ms</span>}
-                <span className="w-32 text-right text-[11px] text-muted-foreground">{r.createdAt ? new Date(r.createdAt).toLocaleString() : ''}</span>
-              </div>
-            )
-          })}
+          {runs && runs.length > 0 && <DurationTrend runs={runs} />}
+          <div className="p-2">
+            {runs?.map((r) => {
+              const st = statusTok[r.status as keyof typeof statusTok] ?? statusTok.draft
+              const hasNodes = !!r.perNode && r.perNode.length > 0
+              const isOpen = open === r.id
+              return (
+                <div key={r.id} className="border-b border-border">
+                  <div
+                    className={`flex items-center gap-2.5 px-2.5 py-2 text-[12.5px] ${hasNodes ? 'cursor-pointer hover:bg-muted/40' : ''}`}
+                    onClick={() => hasNodes && setOpen(isOpen ? null : r.id)}
+                  >
+                    <span className="w-3 text-center text-muted-foreground">{hasNodes ? (isOpen ? '▾' : '▸') : ''}</span>
+                    <span className="w-3 text-center" style={{ color: st.color }}>{st.glyph}</span>
+                    <Badge variant="secondary" className="w-[70px] justify-center">{r.status}</Badge>
+                    <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-foreground">
+                      {r.outputTable ? `→ ${r.outputTable}` : r.targetNodeId ?? '—'}
+                      {r.error && <span className="text-destructive"> · {r.error}</span>}
+                    </span>
+                    {r.rows != null && <span className="text-muted-foreground">{r.rows.toLocaleString()} rows</span>}
+                    {r.ms != null && <span className="w-16 text-right text-muted-foreground">{fmtMs(r.ms)}</span>}
+                    <span className="w-32 text-right text-[11px] text-muted-foreground">{r.createdAt ? new Date(r.createdAt).toLocaleString() : ''}</span>
+                  </div>
+                  {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
+                </div>
+              )
+            })}
+          </div>
         </div>
       </DialogContent>
     </Dialog>
+  )
+}
+
+export function fmtMs(ms: number): string {
+  if (ms < 1000) return `${ms} ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`
+  return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`
+}
+
+// A compact bar-per-run duration trend (oldest → newest), colored by status. Native SVG.
+export function DurationTrend({ runs }: { runs: RunRecordDto[] }) {
+  const chron = [...runs].reverse()  // list is newest-first; chart reads left→right in time
+  const max = Math.max(1, ...chron.map((r) => r.ms ?? 0))
+  const W = 6, GAP = 2, H = 44
+  const width = chron.length * (W + GAP)
+  return (
+    <div className="border-b border-border px-4 py-3">
+      <div className="mb-1.5 flex items-baseline justify-between text-[11px] text-muted-foreground">
+        <span>Run duration · last {chron.length}</span>
+        <span>max {fmtMs(max)}</span>
+      </div>
+      <svg width="100%" height={H} viewBox={`0 0 ${Math.max(width, 1)} ${H}`} preserveAspectRatio="none" role="img" aria-label="run duration trend">
+        {chron.map((r, i) => {
+          const st = statusTok[r.status as keyof typeof statusTok] ?? statusTok.draft
+          const h = Math.max(2, Math.round(((r.ms ?? 0) / max) * (H - 2)))
+          return (
+            <rect key={r.id} x={i * (W + GAP)} y={H - h} width={W} height={h} rx={1} fill={st.color} opacity={0.85}>
+              <title>{`${r.status} · ${fmtMs(r.ms ?? 0)}${r.rows != null ? ` · ${r.rows.toLocaleString()} rows` : ''}${r.createdAt ? `\n${new Date(r.createdAt).toLocaleString()}` : ''}`}</title>
+            </rect>
+          )
+        })}
+      </svg>
+    </div>
+  )
+}
+
+// Per-node time/row breakdown for one run — a horizontal bar chart (the slow node stands out). Native SVG.
+export function PerNodeBreakdown({ nodes }: { nodes: PerNodeStat[] }) {
+  const max = Math.max(1, ...nodes.map((n) => n.ms ?? 0))
+  return (
+    <div className="bg-muted/30 px-3 py-2.5">
+      <div className="mb-1.5 text-[11px] text-muted-foreground">Time per node</div>
+      <div className="flex flex-col gap-1">
+        {nodes.map((n) => {
+          const st = statusTok[n.status as keyof typeof statusTok] ?? statusTok.draft
+          const pct = Math.max(2, Math.round(((n.ms ?? 0) / max) * 100))
+          return (
+            <div key={n.node_id} className="flex items-center gap-2 text-[11.5px]">
+              <span className="w-28 shrink-0 overflow-hidden text-ellipsis whitespace-nowrap text-foreground" title={n.node_id}>
+                {n.label || n.node_id}
+              </span>
+              <div className="relative h-3.5 min-w-0 flex-1 rounded-sm bg-border/60">
+                <div className="absolute inset-y-0 left-0 rounded-sm" style={{ width: `${pct}%`, backgroundColor: st.color, opacity: 0.85 }} />
+              </div>
+              <span className="w-14 shrink-0 text-right text-muted-foreground">{n.ms != null ? fmtMs(n.ms) : '—'}</span>
+              <span className="w-16 shrink-0 text-right text-muted-foreground">{n.rows != null ? `${n.rows.toLocaleString()}` : ''}</span>
+            </div>
+          )
+        })}
+      </div>
+    </div>
   )
 }
