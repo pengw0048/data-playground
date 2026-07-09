@@ -47,8 +47,8 @@ class ExecutionBackend(Protocol):
         """Whether this backend will handle the given plan (e.g. by size/placement/capabilities)."""
         ...
 
-    def estimate(self, plan: CompilePlan, rows: int) -> RunEstimate:
-        """Rows/seconds/cost/placement + whether the run needs confirmation."""
+    def estimate(self, plan: CompilePlan, rows: int | None, byts: int | None = None) -> RunEstimate:
+        """Rows + estimated bytes + placement + whether the run needs confirmation (data-volume gate)."""
         ...
 
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None, placement: Placement) -> RunStatus:

@@ -192,18 +192,19 @@ def agent_act(req: AgentRequest) -> dict:
     return {"available": True, **out}
 
 
-def _row_estimate(req_graph, target_node_id, deps) -> int | None:
-    """The largest data volume this run moves — the MAX estimated rows across the target's cone (which
-    includes the source counts, and a downstream sample's smaller output). Uses hub.estimate so the
-    confirm-gate, the placement policy, and the UI hint all share ONE estimator. None (nothing countable
-    / all unknown) lets the gate err toward confirmation rather than a fabricated number."""
+def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None]":
+    """The largest data volume this run moves — the MAX estimated rows AND bytes across the target's cone
+    (source counts + a downstream sample's smaller output). Uses hub.estimate so the confirm-gate, the
+    placement policy, and the UI hint all share ONE estimator. (None, None) when nothing is countable —
+    the gate then errs toward NOT blocking (an uncountable source can't be scanned → fails fast anyway)."""
     from hub.estimate import estimate_sizes
     try:
         sizes = estimate_sizes(req_graph, deps.resolve_adapter, target=target_node_id)
     except Exception:  # noqa: BLE001 — a bad estimate must not block the gate
-        return None
+        return None, None
     rows = [s.rows for s in sizes.values() if s.rows is not None]
-    return max(rows) if rows else None
+    byts = [s.bytes for s in sizes.values() if s.bytes is not None]
+    return (max(rows) if rows else None), (max(byts) if byts else None)
 
 
 def _route_by_capability(deps, chosen, graph):
@@ -248,9 +249,9 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
-    rows = _row_estimate(req.graph, req.target_node_id, deps)
+    rows, byts = _cone_size(req.graph, req.target_node_id, deps)
     runner = deps.pick_runner(plan, uid)
-    est = runner.estimate(plan, rows)
+    est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and _cached_noop(runner, req.graph, req.target_node_id):
         est.needs_confirm = False  # reusing a cached result is a no-op, not a big pass
     return est
@@ -265,8 +266,8 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
     runner = _route_by_capability(deps, deps.pick_runner(plan, uid), req.graph)  # honor node requires
-    rows = _row_estimate(req.graph, req.target_node_id, deps)
-    est = runner.estimate(plan, rows)
+    rows, byts = _cone_size(req.graph, req.target_node_id, deps)
+    est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and not req.confirmed and not _cached_noop(runner, req.graph, req.target_node_id):
         raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
     # a run that splits across placement regions (a placed node / checkpoint / fan-out) is owned by the

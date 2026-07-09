@@ -207,6 +207,7 @@ class PipelineImport(Wire):
 # --------------------------------------------------------------------------- #
 class RunEstimate(Wire):
     rows: int | None = None   # real source-row count; None when no source is countable (size unknown)
+    bytes: int | None = None  # estimated peak data volume (rows × row width); the confirm gate's cost signal
     placement: Placement
     needs_confirm: bool
     breakdown: str | None = None

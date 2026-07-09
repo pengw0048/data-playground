@@ -97,8 +97,8 @@ class RayRunner:
     def can_run(self, plan) -> bool:
         return plan_is_clean(plan)
 
-    def estimate(self, plan, rows):
-        return self.base.estimate(plan, rows)  # reuse the hub-side confirm gate verbatim
+    def estimate(self, plan, rows, byts=None):
+        return self.base.estimate(plan, rows, byts)  # reuse the hub-side confirm gate verbatim
 
     def status(self, run_id: str) -> RunStatus:
         return self.runs[run_id]

@@ -817,7 +817,11 @@ def test_estimate_reports_real_rows_and_gates_only_large_runs(tmp_path):
     r = deps.runner
     assert r.estimate(plan, None).rows is None and r.estimate(plan, None).needs_confirm is False  # unknown → no fake, no gate
     assert r.estimate(plan, 10).needs_confirm is False and r.estimate(plan, 10).rows == 10          # small known
-    assert r.estimate(plan, 6_000_000).needs_confirm is True                                        # big known → gate
+    assert r.estimate(plan, 6_000_000).needs_confirm is True                                        # big rows, no bytes → row fallback gates
+    # the real cost model: DATA VOLUME (bytes) is the primary signal, not the raw row count —
+    assert r.estimate(plan, 6_000_000, 20 << 20).needs_confirm is False   # 6M skinny rows = ~20MB → trivial, NO gate
+    assert r.estimate(plan, 100_000, 3 << 30).needs_confirm is True       # 100k wide rows = ~3GB → gate
+    assert r.estimate(plan, 100_000, 3 << 30).bytes == 3 << 30 and "GB" in r.estimate(plan, 100_000, 3 << 30).breakdown
     # end-to-end: the endpoint returns the real count for a small source, no gate, and no ETA field
     est = client.post("/api/run/estimate", json={"graph": g.model_dump(), "targetNodeId": "s"}).json()
     assert est["rows"] == 10 and est["needsConfirm"] is False and "seconds" not in est
@@ -3496,15 +3500,18 @@ def test_move_tier_copies_a_region_parquet():
 
 def test_row_estimate_uses_the_shared_estimator():
     # the confirm-gate now shares hub.estimate: the "volume" of a source→sample(100) run is the source
-    # count (max across the cone), and an all-unknown run is None (→ err toward confirm), not fabricated.
-    from hub.routers.runs import _row_estimate
+    # count (max across the cone) + estimated bytes, and an all-unknown run is (None, None) (→ err toward
+    # confirm), not fabricated.
+    from hub.routers.runs import _cone_size
     from hub.models import Graph
     d = get_deps()
     ev = _uri("events")
     g1 = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev}), N("p", "sample", {"n": 100})], "edges": [E("s", "p")]})
-    assert _row_estimate(g1, "p", d) == d.resolve_adapter(ev).count(ev)  # max over cone = source count
+    rows, byts = _cone_size(g1, "p", d)
+    assert rows == d.resolve_adapter(ev).count(ev)  # max over cone = source count
+    assert byts is not None and byts > 0            # bytes estimate available whenever rows is
     g2 = Graph(**{"id": "c", "version": 1, "nodes": [N("t", "transform", {"code": "def fn(r): return r"})], "edges": []})
-    assert _row_estimate(g2, "t", d) is None  # all unknown → None (no fabricated number)
+    assert _cone_size(g2, "t", d) == (None, None)  # all unknown → (None, None) (no fabricated number)
 
 
 def test_storage_tier_selection():

@@ -119,6 +119,7 @@ export type Placement = 'local' | 'distributed'
 
 export interface RunEstimate {
   rows: number | null   // real source-row count; null when size is unknown (no countable source)
+  bytes?: number | null // estimated peak data volume — the confirm gate's cost signal
   placement: Placement
   needsConfirm: boolean
   breakdown?: string | null

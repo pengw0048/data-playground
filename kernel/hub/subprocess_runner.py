@@ -53,12 +53,16 @@ class SubprocessRunner:
     def can_run(self, plan: CompilePlan) -> bool:
         return plan.acyclic
 
-    def estimate(self, plan: CompilePlan, rows: int | None) -> RunEstimate:
-        if rows is None:  # unknown size (uncountable → unreadable → fails fast) — no fabricated ETA, no gate
-            return RunEstimate(rows=None, placement="local", needs_confirm=False,
+    def estimate(self, plan: CompilePlan, rows: int | None, byts: int | None = None) -> RunEstimate:
+        from hub.plugins.runner import _CONFIRM_BYTES, _fmt_bytes
+        if rows is None and byts is None:  # uncountable → unreadable → fails fast; no fabricated ETA, no gate
+            return RunEstimate(rows=None, bytes=None, placement="local", needs_confirm=False,
                                breakdown=f"size unknown · {len(plan.steps)} steps · isolated process")
-        return RunEstimate(rows=rows, placement="local", needs_confirm=rows >= _CONFIRM_ROWS,
-                           breakdown=f"{rows:,} rows · {len(plan.steps)} steps · isolated process")
+        needs = byts >= _CONFIRM_BYTES if byts is not None else (rows is not None and rows >= _CONFIRM_ROWS)
+        size = _fmt_bytes(byts) if byts is not None else "size unknown"
+        rowstr = f"{rows:,} rows" if rows is not None else "unknown rows"
+        return RunEstimate(rows=rows, bytes=byts, placement="local", needs_confirm=needs,
+                           breakdown=f"{size} · {rowstr} · {len(plan.steps)} steps · isolated process")
 
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
             placement: Placement) -> RunStatus:

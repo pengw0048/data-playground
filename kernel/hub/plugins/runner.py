@@ -27,7 +27,15 @@ from hub.models import (
     RunStatus,
 )
 
-_CONFIRM_ROWS = 5_000_000   # a full pass over this many rows is worth a heads-up before it runs
+_CONFIRM_ROWS = 5_000_000   # fallback gate when byte size is unknown but the row count is known
+_CONFIRM_BYTES = 2 << 30    # 2 GiB — the primary confirm signal: a full pass moving this much data
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit, scale in (("TB", 1 << 40), ("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= scale:
+            return f"~{n / scale:.1f} {unit}"
+    return f"{n} B"
 _MAX_RUNS = 100          # cap retained run history / cache so a long-lived kernel doesn't grow forever
 
 
@@ -63,18 +71,24 @@ class LocalRunner:
         return plan.acyclic
 
     # -- estimate ---------------------------------------------------------- #
-    def estimate(self, plan: CompilePlan, rows: int | None) -> RunEstimate:
-        # No fabricated ETA — a per-op seconds guess is uncalibrated and misleadingly precise. Report
-        # the real source-row count, or "unknown" (rather than the old rows=1000 that also slipped the
-        # confirm gate). Unknown means the source couldn't be counted, which for the built-in adapters
-        # means it can't be scanned either — the run will fail fast — so it needs no confirm gate; only
-        # a genuinely large, countable pass does.
+    def estimate(self, plan: CompilePlan, rows: int | None, byts: int | None = None) -> RunEstimate:
+        # No fabricated ETA — a per-op seconds guess is uncalibrated and misleadingly precise. The honest
+        # cost signal is DATA VOLUME: confirm on estimated bytes (primary), because a 5M-row pass over one
+        # int (~20 MB) is trivial while 200k wide rows can be gigabytes — the old pure row gate misfired on
+        # both. Fall back to the row count when byte size is unknown. Unknown-and-uncountable means the
+        # source can't be scanned either → the run fails fast → no confirm gate.
         placement: Placement = "local"  # the only backend today; a cluster runner (plugin) sets its own
-        if rows is None:
-            return RunEstimate(rows=None, placement=placement, needs_confirm=False,
+        if rows is None and byts is None:
+            return RunEstimate(rows=None, bytes=None, placement=placement, needs_confirm=False,
                                breakdown=f"size unknown · {len(plan.steps)} steps · out-of-core")
-        return RunEstimate(rows=rows, placement=placement, needs_confirm=rows >= _CONFIRM_ROWS,
-                           breakdown=f"{rows:,} rows · {len(plan.steps)} steps · out-of-core")
+        if byts is not None:
+            needs = byts >= _CONFIRM_BYTES
+        else:
+            needs = rows is not None and rows >= _CONFIRM_ROWS
+        size = _fmt_bytes(byts) if byts is not None else "size unknown"
+        rowstr = f"{rows:,} rows" if rows is not None else "unknown rows"
+        return RunEstimate(rows=rows, bytes=byts, placement=placement, needs_confirm=needs,
+                           breakdown=f"{size} · {rowstr} · {len(plan.steps)} steps · out-of-core")
 
     # -- plan hash (content addressing) — shared logic in hub.plan_key ------ #
     def _plan_hash(self, graph: Graph, target: str | None) -> str:

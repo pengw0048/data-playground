@@ -95,8 +95,8 @@ class KernelBackend:
     def can_run(self, plan: CompilePlan) -> bool:
         return True
 
-    def estimate(self, plan: CompilePlan, rows) -> RunEstimate:
-        return self.base.estimate(plan, rows)
+    def estimate(self, plan: CompilePlan, rows, byts=None) -> RunEstimate:
+        return self.base.estimate(plan, rows, byts)
 
     # -- kernel lifecycle -------------------------------------------------- #
     def _await_ready(self, canvas_id: str) -> dict:
