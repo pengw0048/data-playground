@@ -58,7 +58,7 @@ class SubprocessRunner:
         if rows is None and byts is None:  # uncountable → unreadable → fails fast; no fabricated ETA, no gate
             return RunEstimate(rows=None, bytes=None, placement="local", needs_confirm=False,
                                breakdown=f"size unknown · {len(plan.steps)} steps · isolated process")
-        needs = byts >= _CONFIRM_BYTES if byts is not None else (rows is not None and rows >= _CONFIRM_ROWS)
+        needs = (byts is not None and byts >= _CONFIRM_BYTES) or (rows is not None and rows >= _CONFIRM_ROWS)
         size = _fmt_bytes(byts) if byts is not None else "size unknown"
         rowstr = f"{rows:,} rows" if rows is not None else "unknown rows"
         return RunEstimate(rows=rows, bytes=byts, placement="local", needs_confirm=needs,

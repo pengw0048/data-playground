@@ -817,11 +817,12 @@ def test_estimate_reports_real_rows_and_gates_only_large_runs(tmp_path):
     r = deps.runner
     assert r.estimate(plan, None).rows is None and r.estimate(plan, None).needs_confirm is False  # unknown → no fake, no gate
     assert r.estimate(plan, 10).needs_confirm is False and r.estimate(plan, 10).rows == 10          # small known
-    assert r.estimate(plan, 6_000_000).needs_confirm is True                                        # big rows, no bytes → row fallback gates
-    # the real cost model: DATA VOLUME (bytes) is the primary signal, not the raw row count —
-    assert r.estimate(plan, 6_000_000, 20 << 20).needs_confirm is False   # 6M skinny rows = ~20MB → trivial, NO gate
-    assert r.estimate(plan, 100_000, 3 << 30).needs_confirm is True       # 100k wide rows = ~3GB → gate
-    assert r.estimate(plan, 100_000, 3 << 30).bytes == 3 << 30 and "GB" in r.estimate(plan, 100_000, 3 << 30).breakdown
+    assert r.estimate(plan, 6_000_000).needs_confirm is True                                        # big rows, no bytes → row gate
+    # the cost model gates on EITHER signal: large bytes OR a large row count (neither subsumes the other) —
+    assert r.estimate(plan, 200_000, 3 << 30).needs_confirm is True       # 200k WIDE rows = ~3GB → byte gate (row count wouldn't)
+    assert r.estimate(plan, 6_000_000, 20 << 20).needs_confirm is True    # 6M rows (only ~20MB) → row floor still gates
+    assert r.estimate(plan, 100_000, 50 << 20).needs_confirm is False     # few rows + small bytes → trivial, no gate
+    assert r.estimate(plan, 200_000, 3 << 30).bytes == 3 << 30 and "GB" in r.estimate(plan, 200_000, 3 << 30).breakdown
     # end-to-end: the endpoint returns the real count for a small source, no gate, and no ETA field
     est = client.post("/api/run/estimate", json={"graph": g.model_dump(), "targetNodeId": "s"}).json()
     assert est["rows"] == 10 and est["needsConfirm"] is False and "seconds" not in est
@@ -3388,6 +3389,30 @@ def test_window_fill_unnest_nodes(tmp_path):
         assert t.num_rows == 4 and sorted(t.column("tags").to_pylist()) == [10, 20, 30, 40]
         assert t.column("id").to_pylist().count(1) == 3  # id 1 repeated once per list element
 
+    # window is a blocking op (sorts/partitions the full input) → placement counts its working set
+    from hub import estimate as _est
+    assert _est.is_blocking("window") and not _est.is_blocking("fill") and not _est.is_blocking("unnest")
+
+    # a whitespace-only `as` must NOT produce an empty identifier (AS "") → crash; it defaults to "window"
+    pblank = str(tmp_path / "wb.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES (1,2.0)) t(user_id,amount)) TO '{pblank}' (FORMAT PARQUET)")
+    gb = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pblank}),
+        N("w", "window", {"expr": "row_number()", "as": "   "})], "edges": [E("s", "w")]})
+    with db.run_scope():
+        assert "window" in eng(gb).relation("w").to_arrow_table().column_names
+
+    # PREVIEW FAITHFULNESS: a window aggregate (sum OVER ()) previewed on a sampled input must reflect the
+    # FULL input, not the sample — build a source bigger than the preview sample and check the total.
+    pbig = str(tmp_path / "big.parquet")
+    duckdb.connect().execute(f"COPY (SELECT i AS x FROM range(1,101) t(i)) TO '{pbig}' (FORMAT PARQUET)")
+    gwin = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pbig}),
+        N("w", "window", {"expr": "sum(x)", "as": "total"})], "edges": [E("s", "w")]})
+    with db.run_scope():
+        prev = BuildEngine(gwin, d.resolve_adapter, d.registry, sample_k=10, full=False,
+                           node_specs=d.node_specs, node_builders=d.node_builders)
+        totals = set(prev.relation("w").to_arrow_table().column("total").to_pylist())
+        assert totals == {5050}  # sum(1..100), NOT sum of a 10-row sample — faithful despite sample_k=10
+
 
 def test_failed_run_attributes_error_to_a_node_with_a_hint():
     # a failed run names WHERE it broke (per-node error) + WHY (a fix hint for common error classes),
@@ -3415,9 +3440,13 @@ def test_failed_run_attributes_error_to_a_node_with_a_hint():
     failed = next((p for p in s.per_node if p.status == "failed" and p.error), None)
     assert failed is not None and "no_such_col" in failed.error and "💡" in failed.error
     # the diagnostic maps recognized error classes to a hint, and stays silent (None) on unknown ones
-    assert _diagnose("Binder Error: Referenced column x not found") is not None
+    assert "column references" in (_diagnose("Binder Error: Referenced column x not found") or "")
     assert _diagnose("Conversion Error: Could not convert") is not None
     assert _diagnose("some unrecognized failure") is None
+    # a binder error that is NOT an unknown-column (function/arg resolution) gets the general hint, NOT the
+    # "check column references" one that would send the user down the wrong path
+    fn_hint = _diagnose("Binder Error: No function matches the given name and argument types")
+    assert fn_hint is not None and "column references" not in fn_hint
 
 
 def test_estimate_sizes_is_conservative_and_honest():

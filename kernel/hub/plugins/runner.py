@@ -42,7 +42,7 @@ def _diagnose(msg: str) -> str | None:
     """Map a common engine error to ONE actionable hint (the run failure's 'how to fix'). Honest: only
     recognized patterns get a hint; anything else shows the raw error alone (never fabricate a cause)."""
     m = msg.lower()
-    if "binder error" in m or "referenced column" in m or "not found in from" in m:
+    if "referenced column" in m or "not found in from" in m:  # specifically an unknown COLUMN
         return "a column name doesn't match this step's input — check its column references (see the amber ⚠ hints)"
     if "conversion error" in m or "could not convert" in m or "cannot cast" in m or "type mismatch" in m:
         return "a value doesn't fit the column type — check the types or add an explicit cast"
@@ -50,6 +50,8 @@ def _diagnose(msg: str) -> str | None:
         return "a table or function name isn't recognized here — check the source/name"
     if "parser error" in m or "syntax error" in m:
         return "a SQL / expression syntax error — check this step's expression"
+    if "binder error" in m:  # a bind failure that ISN'T a plain unknown-column (function/arg-type resolution)
+        return "an expression didn't resolve — check the column names, functions, and argument types used here"
     return None
 _MAX_RUNS = 100          # cap retained run history / cache so a long-lived kernel doesn't grow forever
 
@@ -96,10 +98,10 @@ class LocalRunner:
         if rows is None and byts is None:
             return RunEstimate(rows=None, bytes=None, placement=placement, needs_confirm=False,
                                breakdown=f"size unknown · {len(plan.steps)} steps · out-of-core")
-        if byts is not None:
-            needs = byts >= _CONFIRM_BYTES
-        else:
-            needs = rows is not None and rows >= _CONFIRM_ROWS
+        # EITHER signal trips the gate: large estimated bytes (catches few-but-WIDE rows the row count
+        # misses) OR a large row count (the width estimate under-counts variable-length strings/blobs, so
+        # the row threshold stays a floor). Neither subsumes the other.
+        needs = (byts is not None and byts >= _CONFIRM_BYTES) or (rows is not None and rows >= _CONFIRM_ROWS)
         size = _fmt_bytes(byts) if byts is not None else "size unknown"
         rowstr = f"{rows:,} rows" if rows is not None else "unknown rows"
         return RunEstimate(rows=rows, bytes=byts, placement=placement, needs_confirm=needs,

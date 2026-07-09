@@ -25,7 +25,7 @@ from hub.models import Graph, GraphNode
 
 # ops whose result needs ~O(input) memory (a hash/sort build) → they set a region's working-set need;
 # streaming ops (scan/filter/select/map/sample/limit/write) need ~O(1) and don't.
-_BLOCKING = {"sort", "dedup", "aggregate", "join", "sql", "vector-search"}
+_BLOCKING = {"sort", "dedup", "aggregate", "join", "sql", "vector-search", "window"}
 # code ops: output cardinality can't be known without running them.
 _CODE = {"transform", "notebook", "opaque", "section", "loop"}
 

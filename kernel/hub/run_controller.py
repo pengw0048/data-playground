@@ -189,6 +189,12 @@ class RunController:
                         status.status = sub.status
                         status.error = sub.error
                         self._mark(status, region, "failed")
+                        # carry the sub-run's node-attributed error onto the logical per-node status, so the
+                        # per-node failure diagnosis shows in the distributed path too (not just the banner).
+                        by_id = {p.node_id: p for p in status.per_node}
+                        for sp in sub.per_node:
+                            if sp.error and sp.node_id in by_id:
+                                by_id[sp.node_id].error = sp.error
                         return
                 else:
                     ref_uri[region.output_node] = self._materialize(run_id, graph, region, ref_uri, regions)

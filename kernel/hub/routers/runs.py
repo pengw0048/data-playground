@@ -198,8 +198,13 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
     placement policy, and the UI hint all share ONE estimator. (None, None) when nothing is countable —
     the gate then errs toward NOT blocking (an uncountable source can't be scanned → fails fast anyway)."""
     from hub.estimate import estimate_sizes
+    try:  # per-node schemas sharpen the byte width (else a flat default/row makes the byte gate meaningless)
+        schemas = schema_for_graph(req_graph, deps.resolve_adapter, deps.registry,
+                                   deps.node_builders, deps.node_specs)
+    except Exception:  # noqa: BLE001 — schema inference is best-effort; fall back to default widths
+        schemas = None
     try:
-        sizes = estimate_sizes(req_graph, deps.resolve_adapter, target=target_node_id)
+        sizes = estimate_sizes(req_graph, deps.resolve_adapter, target=target_node_id, schemas=schemas)
     except Exception:  # noqa: BLE001 — a bad estimate must not block the gate
         return None, None
     rows = [s.rows for s in sizes.values() if s.rows is not None]

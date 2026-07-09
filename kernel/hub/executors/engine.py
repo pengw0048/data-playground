@@ -376,8 +376,12 @@ class BuildEngine:
             order = (cfg.get("orderBy") or "").strip()
             over = " ".join(x for x in [f"PARTITION BY {part}" if part else "",
                                         f"ORDER BY {order}" if order else ""] if x)
-            col = (cfg.get("as") or "window").strip()
-            v = self._view(parent, "w")
+            col = (cfg.get("as") or "").strip() or "window"  # strip THEN default (all-spaces → "window", not "")
+            # a window fn ranks/aggregates ACROSS rows, so a sample would lie (rank within the sample, a
+            # partial SUM) — compute over the full input in preview too, like sort (the preview LIMIT then
+            # just truncates the display).
+            src = parent if self.full else self._faithful_inputs(node)[0]
+            v = self._view(src, "w")
             return db.conn().sql(f'SELECT *, {expr} OVER ({over}) AS "{col}" FROM {v}')
 
         if t == "fill":
@@ -396,7 +400,10 @@ class BuildEngine:
                 agg = {"mean": "avg", "min": "min", "max": "max"}.get(method)
                 return f"COALESCE({q}, {agg}({q}) OVER ())" if agg else q
 
-            v = self._view(parent, "fl")
+            # mean/min/max impute from a WHOLE-COLUMN aggregate → a sample would compute the wrong fill
+            # value; run over the full input in preview (constant/zero are per-row, so stay on `parent`).
+            faithful = method in ("mean", "min", "max") and not self.full
+            v = self._view(self._faithful_inputs(node)[0] if faithful else parent, "fl")
             repl = ", ".join(f'{_fill(c)} AS "{c}"' for c in cols)
             return db.conn().sql(f"SELECT * REPLACE ({repl}) FROM {v}")
 
