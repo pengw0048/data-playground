@@ -3251,9 +3251,16 @@ def test_transform_batch_format_pandas_and_arrow():
                               node_specs=d.node_specs, node_builders=d.node_builders)
             return eng.relation("t").aggregate("count(*) AS n, sum(doubled) AS s").fetchone()
 
-    pytest.importorskip("pandas")
-    n_pd, s_pd = total("pandas", "def fn(df):\n    df['doubled'] = df['id'] * 2\n    return df")
+    # arrow needs no pandas → always exercised
     n_ar, s_ar = total("arrow", "def fn(t):\n    import pyarrow.compute as pc\n    return t.append_column('doubled', pc.multiply(t['id'], 2))")
+    assert n_ar > 0
+    # pandas is an OPTIONAL, user-declared runtime dep (not a core/dev dep) — skip if it isn't importable
+    # OR is only partially installed (pyarrow's to_pandas reads pandas.__version__; a partial install with
+    # no __version__ would fail there, which is an env problem, not a defect in this feature).
+    pd = pytest.importorskip("pandas")
+    if not getattr(pd, "__version__", None):
+        pytest.skip("pandas is importable but not functional in this environment (no __version__)")
+    n_pd, s_pd = total("pandas", "def fn(df):\n    df['doubled'] = df['id'] * 2\n    return df")
     assert n_pd > 0 and (n_pd, s_pd) == (n_ar, s_ar)  # both formats produce the same doubled column
 
 

@@ -393,10 +393,12 @@ test.describe('Data Playground canvas', () => {
     // the ER canvas mounts with the seeded datasets as draggable entities (with their columns)
     await expect(page.getByText('Relationships (ER)')).toBeVisible({ timeout: 10_000 })
     const entities = page.locator('.react-flow__node')
-    await expect(entities.filter({ hasText: 'events' }).first()).toBeVisible()
-    await expect(entities.filter({ hasText: 'images' }).first()).toBeVisible()
+    // the catalog is fetched + laid out async on a fresh e2e DB (first-boot seed) — a slow CI runner can
+    // take a beat to mount every entity node, so give these the same 10s headroom as the heading.
+    await expect(entities.filter({ hasText: 'events' }).first()).toBeVisible({ timeout: 10_000 })
+    await expect(entities.filter({ hasText: 'images' }).first()).toBeVisible({ timeout: 10_000 })
     // a key column is present in the entity (id) — the material for join hints
-    await expect(entities.filter({ hasText: 'events' }).first().getByText('user_id')).toBeVisible()
+    await expect(entities.filter({ hasText: 'events' }).first().getByText('user_id')).toBeVisible({ timeout: 10_000 })
   })
 
   test('a failing run surfaces an error toast (not a silent failure)', async ({ page }) => {
