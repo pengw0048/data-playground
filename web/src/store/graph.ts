@@ -10,6 +10,7 @@ import { getSpec } from '../nodes/registry'
 import { registerGenericNodes, nodeInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
 import { parseHash } from '../router'
+import { exampleDoc } from '../examples'
 import { api, KernelError, setApiUser, type AgentBackendNode, type AgentBackendEdge, type DpUser, type CanvasFile } from '../api/client'
 import { crdtUndo, crdtUndoActive, collabApply } from '../collab/undo'
 
@@ -217,6 +218,7 @@ interface Store {
   refreshUsers: () => Promise<void>
   openFile: (id: string) => Promise<boolean>
   newFile: () => Promise<void>
+  newFromExample: (key: string) => Promise<void>
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
   deleteFile: (id: string) => Promise<void>
@@ -796,6 +798,17 @@ export const useStore = create<Store>((set, get) => ({
 
   newFile: async () => {
     const doc = emptyDoc()
+    try { await api.createCanvas(doc); await get().refreshFiles() } catch { /* offline: PUT will create it */ }
+    get().loadDoc(doc)
+    const uid = get().currentUser?.id
+    if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
+    set({ view: 'canvas' })
+  },
+
+  newFromExample: async (key) => {
+    const id = `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
+    const doc = exampleDoc(key, id)  // a runnable starter on the seeded data; falls back to a blank file
+    if (!doc) { await get().newFile(); return }
     try { await api.createCanvas(doc); await get().refreshFiles() } catch { /* offline: PUT will create it */ }
     get().loadDoc(doc)
     const uid = get().currentUser?.id

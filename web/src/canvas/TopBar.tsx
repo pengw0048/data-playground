@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store/graph'
+import { examples } from '../examples'
 import { color } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
@@ -140,6 +141,7 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
   const files = useStore((s) => s.files)
   const openFile = useStore((s) => s.openFile)
   const newFile = useStore((s) => s.newFile)
+  const newFromExample = useStore((s) => s.newFromExample)
   const renameFile = useStore((s) => s.renameFile)
   const deleteFile = useStore((s) => s.deleteFile)
 
@@ -183,6 +185,13 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => setTimeout(onCanvasSettings)}><Icon name="settings" size={14} /> Canvas settings…</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
+        <div className="px-2.5 pb-1 pt-1.5 text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">New from example</div>
+        {examples.map((ex) => (
+          <DropdownMenuItem key={ex.key} onSelect={() => newFromExample(ex.key)} title={ex.blurb}>
+            <Icon name="grid" size={14} /> {ex.name}
+          </DropdownMenuItem>
+        ))}
+        <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> Delete this file</DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
