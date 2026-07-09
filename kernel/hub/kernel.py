@@ -154,6 +154,8 @@ def main() -> None:
     def shutdown(x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)
         metadb.drop_kernel(canvas, kid)
+        from hub.sdk import close_resources
+        close_resources()  # release warm resource handles (models/decoders/pools) before the hard exit
         threading.Timer(0.2, lambda: os._exit(0)).start()
         return {"ok": True}
 

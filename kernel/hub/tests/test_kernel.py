@@ -4050,6 +4050,59 @@ def test_similarity_dedup_plugin_clusters_and_marks_representatives(tmp_path):
     assert ragged_out.height == 2 and "dup_group" not in ragged_out.columns  # passthrough, no crash
 
 
+def test_warm_resource_reused_across_batches_and_runs(tmp_path):
+    # dp_warm_resource's `warm-map` node builds an expensive handle ONCE via ctx.resource and reuses the
+    # SAME instance across batches and across separate runs on the (warm) kernel — the pain being pipelines
+    # that reload a model per batch. We prove it by watching one instance accumulate work across two runs.
+    import shutil
+    from pathlib import Path
+
+    import duckdb
+
+    from hub import db, sdk
+    from hub.deps import Deps
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+
+    p = str(tmp_path / "t.parquet")
+    duckdb.connect().execute(f"COPY (SELECT 'Ab' AS name FROM range(1, 3001) t(i)) TO '{p}' (FORMAT PARQUET)")  # 3000 rows → multiple arrow batches
+    ws = tmp_path / "ws"; (ws / "plugins").mkdir(parents=True)
+    shutil.copytree(Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_warm_resource",
+                    ws / "plugins" / "dp_warm_resource")
+    d = Deps(str(ws), str(tmp_path / "data"))
+    assert "warm-map" in d.node_specs
+
+    G = Graph(**{"id": "c", "version": 1, "nodes": [
+        {"id": "s", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": p}}},
+        {"id": "wm", "type": "warm-map", "position": {"x": 0, "y": 0}, "data": {"config": {"column": "name"}}},
+    ], "edges": [{"id": "e", "source": "s", "target": "wm", "data": {"wire": "dataset"}}]})
+
+    sdk._RESOURCES.pop("dp_warm_resource:model", None)  # start from a cold cache for a deterministic count
+
+    def run_once():
+        with db.run_scope():
+            eng = BuildEngine(G, d.resolve_adapter, d.registry, full=True,
+                              node_specs=d.node_specs, node_builders=d.node_builders)
+            tbl = eng.relation("wm").to_arrow_table()
+        assert tbl.column("name").to_pylist()[0] == "ab"  # normalized (strip+lower)
+        return tbl.num_rows
+
+    n1 = run_once()
+    model = sdk._RESOURCES["dp_warm_resource:model"]  # the warm handle, cached process-globally
+    assert n1 == 3000 and model.calls == 3000            # one instance saw all rows of run 1
+    run_once()
+    assert sdk._RESOURCES["dp_warm_resource:model"] is model  # SAME instance (not rebuilt)
+    assert model.calls == 6000                                # it accumulated run 2 too → warm across runs
+
+    # close_resources releases handles that expose close()/__exit__ and clears the cache
+    class _H:
+        closed = False
+        def close(self): type(self).closed = True
+    sdk._RESOURCES["k"] = _H()
+    sdk.close_resources()
+    assert _H.closed is True and sdk._RESOURCES == {}
+
+
 def test_ir_unify_regressions(tmp_path):
     # three regressions the IR-unify adversarial pass caught, now fixed + locked:
     import duckdb

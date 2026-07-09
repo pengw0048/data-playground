@@ -25,14 +25,20 @@ Example plugin (`plugins/mypack/__init__.py`):
 
 from __future__ import annotations
 
-from typing import Callable
+import logging
+import threading
+from typing import Callable, TypeVar
 
 import pyarrow as pa
 
 from hub import db
 from hub.nodespecs import NodeSpec, ParamSpec, PortSpec, WireType  # re-export
 
-__all__ = ["NodeSpec", "ParamSpec", "PortSpec", "WireType", "ctx"]
+__all__ = ["NodeSpec", "ParamSpec", "PortSpec", "WireType", "ctx", "close_resources"]
+
+_T = TypeVar("_T")
+_RESOURCES: dict[str, object] = {}   # process-global warm handles, kept alive across batches AND runs
+_RESOURCE_LOCK = threading.Lock()
 
 
 class _Ctx:
@@ -65,6 +71,41 @@ class _Ctx:
         import polars as pl  # noqa: F401
         out = fn(rel.pl())
         return db.conn().from_arrow(out.to_arrow())
+
+    def resource(self, key: str, factory: Callable[[], _T]) -> _T:
+        """A WARM resource handle: an expensive-to-construct object built ONCE by `factory()` and reused
+        across batches AND across runs on the same (warm) per-canvas kernel — a loaded model, a media
+        decoder, a DB connection pool, a GPU context. Without this, a `build()` that constructs such a
+        thing per batch/run pays the cost every time (the exact fragility distributed media pipelines hit).
+
+        Keyed by `key`; NAMESPACE it (e.g. f"{pack}:{model_id}") so two plugins can't collide. Thread-safe,
+        constructed at most once. For PLUGIN nodes (trusted, run in the hub process) — NOT for the sandboxed
+        `transform` cell. If the object holds an OS/GPU handle, give it a `close()`/`__exit__` and the kernel
+        releases it on graceful shutdown (see close_resources); a hard kill relies on the OS to reclaim."""
+        r = _RESOURCES.get(key)
+        if r is None:
+            with _RESOURCE_LOCK:
+                r = _RESOURCES.get(key)
+                if r is None:
+                    r = factory()
+                    _RESOURCES[key] = r
+        return r
+
+
+def close_resources() -> None:
+    """Release warm resources that expose close()/__exit__ (called on graceful kernel shutdown). A broken
+    close never blocks teardown. A hard SIGKILL skips this — the OS reclaims the process's handles."""
+    with _RESOURCE_LOCK:
+        items = list(_RESOURCES.items())
+        _RESOURCES.clear()
+    for key, r in items:
+        closer = getattr(r, "close", None) or getattr(r, "__exit__", None)
+        if not callable(closer):
+            continue
+        try:
+            closer() if getattr(r, "close", None) else closer(None, None, None)
+        except Exception:  # noqa: BLE001
+            logging.getLogger("hub").warning("warm resource %s failed to close", key, exc_info=True)
 
 
 ctx = _Ctx()

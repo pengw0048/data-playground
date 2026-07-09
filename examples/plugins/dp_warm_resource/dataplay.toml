@@ -1,0 +1,5 @@
+# Reference plugin: a `warm-map` node reusing an expensive handle across batches/runs via ctx.resource
+# (load a model/decoder/pool ONCE, keep it warm on the per-canvas kernel). See __init__.py.
+name = "dp-warm-resource"
+version = "0.1.0"
+# min_core_api = 1

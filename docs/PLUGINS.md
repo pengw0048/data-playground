@@ -56,6 +56,11 @@ That's the whole plugin. Two pieces:
 - `ctx.arrow_map(rel, fn)` — apply a Python `fn(pa.RecordBatch) -> RecordBatch | list[dict]` over
   Arrow batches (the escape hatch when SQL isn't enough).
 - `ctx.polars(rel, fn)` — apply `fn(polars.DataFrame) -> polars.DataFrame`.
+- `ctx.resource(key, factory)` — a WARM handle: an expensive-to-construct object (a loaded model, a media
+  decoder, a DB connection pool, a GPU context) built ONCE by `factory()` and reused across batches AND
+  across runs on the same warm per-canvas kernel, instead of paying the cost per batch. Namespace `key`
+  (e.g. `f"{pack}:{model}"`); thread-safe; for trusted PLUGIN nodes, not the sandboxed `transform` cell.
+  Give the object a `close()`/`__exit__` and the kernel releases it on graceful shutdown. See `dp_warm_resource`.
 
 Prefer `ctx.sql` when it suffices — it stays in the engine and spills to disk.
 
@@ -143,7 +148,7 @@ shows your node's schema the SPA renders from.
 
 ## Reference plugins
 
-`examples/plugins/` ships eleven working plugins — each exercises a different seam end-to-end and has a
+`examples/plugins/` ships twelve working plugins — each exercises a different seam end-to-end and has a
 test in `kernel/hub/tests/test_kernel.py` you can copy:
 
 | plugin | seam | what it does | extra |
@@ -159,6 +164,7 @@ test in `kernel/hub/tests/test_kernel.py` you can copy:
 | [`dp_upper`](../examples/plugins/dp_upper/) | `add_node` (+`ir`) | an `upper` node whose DuckDB build + engine-neutral `ir` hook share one generated operator, so it runs on Ray too (a clean `map`), not just DuckDB | — |
 | [`dp_similarity_dedup`](../examples/plugins/dp_similarity_dedup/) | `add_node` | a `similarity-dedup` node: cluster near-duplicate rows by embedding cosine distance → adds `dup_group` + `is_representative` (filter downstream to keep one per cluster). Brute-force O(n²) — preview on a `sample` first; honest scale/accuracy limits in its docstring | — |
 | [`dp_run_log`](../examples/plugins/dp_run_log/) | `add_telemetry_sink` | a telemetry sink that appends one JSON line per finished run to a log file (`DP_RUN_LOG`) — the reference for where an OTel/warehouse exporter plugs in (core ships none; offline-first) | — |
+| [`dp_warm_resource`](../examples/plugins/dp_warm_resource/) | `add_node` (+`ctx.resource`) | a `warm-map` node that builds an expensive handle (a model / decoder / pool) ONCE via `ctx.resource` and reuses it across batches + runs on the warm kernel, instead of reconstructing per batch | — |
 
 The adapters are read-only sources (`write` raises) and import their heavy dependency lazily, so the
 pack loads even without the extra installed and only errors when its URI scheme is actually used. Both
