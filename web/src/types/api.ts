@@ -133,6 +133,7 @@ export interface PerNodeStatus {
   rows?: number | null
   ms?: number | null
   label?: string | null
+  error?: string | null   // set on the failed step — the error + a fix hint, attributed to its node
 }
 
 export interface RunStatus {

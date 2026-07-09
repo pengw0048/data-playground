@@ -98,18 +98,23 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   )
 }
 
-function PerNode({ st, compact }: { st: { perNode: { nodeId: string; status: string; label?: string | null; rows?: number | null }[] }; compact?: boolean }) {
+function PerNode({ st, compact }: { st: { perNode: { nodeId: string; status: string; label?: string | null; rows?: number | null; error?: string | null }[] }; compact?: boolean }) {
   const items = st.perNode.filter((p) => p.nodeId !== '__error_gate__' || !compact)
   return (
     <div className={cn('flex flex-col gap-1', compact ? 'mt-3' : 'mt-1.5')}>
       {items.map((p) => {
         const s = statusTok[(p.status as keyof typeof statusTok)] ?? statusTok.queued
         return (
-          <div key={p.nodeId} className="flex items-center gap-2 text-[11px]">
-            <span className={cn('w-2.5', p.status === 'running' && 'dp-running-glyph')} style={{ color: s.color }}>{s.glyph}</span>
-            <span className="text-muted-foreground">{p.label ?? p.nodeId}</span>
-            <span className="flex-1" />
-            {p.rows != null && p.status === 'done' && <span className="text-muted-foreground">{p.rows.toLocaleString()} rows</span>}
+          <div key={p.nodeId} className="flex flex-col gap-0.5">
+            <div className="flex items-center gap-2 text-[11px]">
+              <span className={cn('w-2.5', p.status === 'running' && 'dp-running-glyph')} style={{ color: s.color }}>{s.glyph}</span>
+              <span className={cn(p.status === 'failed' ? 'font-semibold text-destructive' : 'text-muted-foreground')}>{p.label ?? p.nodeId}</span>
+              <span className="flex-1" />
+              {p.rows != null && p.status === 'done' && <span className="text-muted-foreground">{p.rows.toLocaleString()} rows</span>}
+            </div>
+            {p.status === 'failed' && p.error && (
+              <div className="dp-mono ml-[18px] whitespace-pre-wrap rounded bg-destructive/10 px-2 py-1 text-[10.5px] text-muted-foreground">{p.error}</div>
+            )}
           </div>
         )
       })}

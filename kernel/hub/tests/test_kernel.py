@@ -3389,6 +3389,37 @@ def test_window_fill_unnest_nodes(tmp_path):
         assert t.column("id").to_pylist().count(1) == 3  # id 1 repeated once per list element
 
 
+def test_failed_run_attributes_error_to_a_node_with_a_hint():
+    # a failed run names WHERE it broke (per-node error) + WHY (a fix hint for common error classes),
+    # not just a global banner. A bad column reference → the target node carries the error + hint.
+    import time
+
+    from hub.compiler import compile_plan
+    from hub.models import Graph
+    from hub.plugins.runner import _diagnose
+    d = get_deps()
+    ev = _uri("events")
+    g = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": ev}), N("sel", "select", {"select": "no_such_col"})], "edges": [E("s", "sel")]})
+    st = d.runner.run(compile_plan(g, "sel", d.registry, d.node_specs), g, "sel", "local")
+    for _ in range(200):
+        s = d.runner.status(st.run_id)
+        if s.status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.05)
+    assert s.status == "failed"
+    assert (s.error or "").startswith("at '")  # the banner names WHERE it broke, not just a bare error
+    assert "💡" in (s.error or "")             # ...and WHY / how to fix (the diagnostic hint)
+    # the error is attributed to a specific node (which one may shift under source pushdown fusing the
+    # projection into the scan — the message + the amber column warnings still point at the bad reference)
+    failed = next((p for p in s.per_node if p.status == "failed" and p.error), None)
+    assert failed is not None and "no_such_col" in failed.error and "💡" in failed.error
+    # the diagnostic maps recognized error classes to a hint, and stays silent (None) on unknown ones
+    assert _diagnose("Binder Error: Referenced column x not found") is not None
+    assert _diagnose("Conversion Error: Could not convert") is not None
+    assert _diagnose("some unrecognized failure") is None
+
+
 def test_estimate_sizes_is_conservative_and_honest():
     # the per-node size estimate: conservative (never under-estimate), honest (unknown → None, not a
     # fabricated number), and measured-actuals override. Feeds placement + the confirm-gate + a UI hint.

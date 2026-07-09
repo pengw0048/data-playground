@@ -219,6 +219,7 @@ class PerNodeStatus(Wire):
     rows: int | None = None
     ms: int | None = None
     label: str | None = None
+    error: str | None = None  # set on the step that failed — the error (+ a fix hint) attributed to its node
 
 
 class RunStatus(Wire):

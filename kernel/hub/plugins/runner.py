@@ -36,6 +36,21 @@ def _fmt_bytes(n: int) -> str:
         if n >= scale:
             return f"~{n / scale:.1f} {unit}"
     return f"{n} B"
+
+
+def _diagnose(msg: str) -> str | None:
+    """Map a common engine error to ONE actionable hint (the run failure's 'how to fix'). Honest: only
+    recognized patterns get a hint; anything else shows the raw error alone (never fabricate a cause)."""
+    m = msg.lower()
+    if "binder error" in m or "referenced column" in m or "not found in from" in m:
+        return "a column name doesn't match this step's input — check its column references (see the amber ⚠ hints)"
+    if "conversion error" in m or "could not convert" in m or "cannot cast" in m or "type mismatch" in m:
+        return "a value doesn't fit the column type — check the types or add an explicit cast"
+    if "catalog error" in m or "does not exist" in m:
+        return "a table or function name isn't recognized here — check the source/name"
+    if "parser error" in m or "syntax error" in m:
+        return "a SQL / expression syntax error — check this step's expression"
+    return None
 _MAX_RUNS = 100          # cap retained run history / cache so a long-lived kernel doesn't grow forever
 
 
@@ -230,7 +245,23 @@ class LocalRunner:
                             p.status = "cancelled"
                 else:
                     status.status = "failed"
-                    status.error = f"{type(e).__name__}: {e}"
+                    msg = f"{type(e).__name__}: {e}"
+                    hint = _diagnose(str(e))
+                    tail = f"\n💡 {hint}" if hint else ""
+                    # steps run sequentially, so the one still 'running' is exactly where it broke — attribute
+                    # the error THERE (the card + per-node list show which node failed and why), not just a
+                    # global banner. Relational ops build lazily, so a bad-column/type error can instead
+                    # surface at the final forced count (all steps already 'done') → attribute to the target.
+                    # A diagnostic hint maps common error classes to an actionable next step.
+                    failed = next((p for p in status.per_node if p.status == "running"), None)
+                    if failed is None and target:
+                        failed = next((p for p in status.per_node if p.node_id == target), None)
+                    if failed is not None:
+                        failed.status = "failed"
+                        failed.error = msg + tail
+                        status.error = f"at '{failed.label or failed.node_id}': {msg}{tail}"
+                    else:
+                        status.error = msg + tail
                     for p in status.per_node:
                         if p.status == "running":
                             p.status = "failed"
