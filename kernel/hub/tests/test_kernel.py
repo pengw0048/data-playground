@@ -4050,6 +4050,44 @@ def test_similarity_dedup_plugin_clusters_and_marks_representatives(tmp_path):
     assert ragged_out.height == 2 and "dup_group" not in ragged_out.columns  # passthrough, no crash
 
 
+def test_source_preflight_fragments_cold_and_run_plan(tmp_path, monkeypatch):
+    # cluster 14: a cheap pre-run probe flags a huge fragment count / cold-tier source in the run-plan,
+    # so a full run fails fast (or warns) instead of hanging or OOMing.
+    import duckdb
+
+    from hub import preflight
+    from hub.models import Graph
+
+    d = tmp_path / "frags"; d.mkdir()
+    for i in range(6):
+        duckdb.connect().execute(f"COPY (SELECT {i} AS x) TO '{d}/part{i}.parquet' (FORMAT PARQUET)")
+    pf = preflight.source_preflight(str(d), fragment_warn=5)
+    assert pf["fragments"] == 6 and any("fragments" in w for w in pf["warnings"])   # 6 files > 5 → warn
+    single = str(d / "part0.parquet")
+    assert preflight.source_preflight(single, fragment_warn=5)["fragments"] == 1     # one file → no warn
+    assert not preflight.source_preflight(single, fragment_warn=5)["warnings"]
+
+    # cold-tier: an object in GLACIER is flagged (best-effort via boto3 — moto stands in for S3)
+    boto3 = pytest.importorskip("boto3")
+    pytest.importorskip("moto")
+    from moto import mock_aws
+    from hub import metadb
+    metadb.set_setting("objectStore", {}, "global")  # empty → boto3 default chain (mock_aws intercepts)
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="bkt")
+        s3.put_object(Bucket="bkt", Key="d/a.parquet", Body=b"x", StorageClass="GLACIER")
+        s3.put_object(Bucket="bkt", Key="d/b.parquet", Body=b"y")  # STANDARD
+        assert preflight._cold_objects("s3://bkt/d", 1000) == 1
+
+    # the run-plan surfaces the source pre-flight (low threshold → the 6-file dir trips it)
+    monkeypatch.setattr(preflight, "_FRAGMENT_WARN", 5)
+    dd = get_deps()
+    g = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": str(d)}), N("f", "filter", {"predicate": "x >= 0"})], "edges": [E("s", "f")]})
+    plan = dd.controller.plan_summary(g, "f")
+    assert any(w for r in plan for w in (r.get("preflight") or []))
+
+
 def test_named_schema_contracts_reference_enforce_and_diff():
     # cluster 4: schema contracts become NAMED + VERSIONED workspace artifacts multiple pipelines reference,
     # with enforced drift + a structural diff — not just per-node non-enforcing warnings.

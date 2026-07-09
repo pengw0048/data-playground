@@ -94,7 +94,8 @@ class RunController:
                      "nodeIds": [n.id for n in cone], "tier": None,
                      "rows": rows, "confidence": conf,
                      "requires": _req_str(greq) if unsat else "", "unsatisfied": unsat,
-                     "available": avail if unsat else ""}]
+                     "available": avail if unsat else "",
+                     "preflight": self._source_warnings(graph, [n.id for n in cone])}]
         out: list[dict] = []
         for i, r in enumerate(regions):
             final = i == len(regions) - 1
@@ -107,7 +108,29 @@ class RunController:
                         "nodeIds": sorted(r.node_ids), "tier": (tier.name if tier else None),
                         "rows": rows, "confidence": conf,
                         "requires": _req_str(r.requires), "unsatisfied": unsat,
-                        "available": avail if unsat else ""})
+                        "available": avail if unsat else "",
+                        "preflight": self._source_warnings(graph, r.node_ids)})
+        return out
+
+    def _source_warnings(self, graph: Graph, node_ids) -> list:
+        """Pre-flight the source nodes in a region: huge fragment count / cold-tier objects → warnings the
+        run-plan can show BEFORE a full run hangs or OOMs (see hub.preflight). Best-effort — never raises."""
+        from hub import preflight
+        nm = g.node_map(graph)
+        out: list = []
+        for nid in node_ids:
+            n = nm.get(nid)
+            if n is None or n.type != "source":
+                continue
+            cfg = n.data.get("config", {}) if isinstance(n.data, dict) else {}
+            ref = str(cfg.get("uri") or cfg.get("table") or "").strip()
+            if not ref:
+                continue
+            try:
+                uri = self.deps.catalog.resolve_ref(ref)
+                out.extend(preflight.source_preflight(uri)["warnings"])
+            except Exception:  # noqa: BLE001 — a preflight probe must never break the plan
+                continue
         return out
 
     def _available_summary(self) -> str:
