@@ -126,6 +126,14 @@ def resolve_config(node: GraphNode) -> dict:
         return {"by": cfg.get("by", "")}
     if t == "dedup":
         return {"on": cfg.get("on", "")}
+    if t == "window":
+        return {"expr": cfg.get("expr", ""), "partitionBy": cfg.get("partitionBy", ""),
+                "orderBy": cfg.get("orderBy", ""), "as": cfg.get("as") or "window"}
+    if t == "fill":
+        return {"columns": cfg.get("columns", ""), "method": cfg.get("method", "constant"),
+                "value": cfg.get("value", "")}
+    if t == "unnest":
+        return {"column": cfg.get("column", "")}
     if t == "sample":
         return {"n": cfg.get("n"), "seed": cfg.get("seed", 42)}  # n=None → the engine applies sample_k
     if t == "write":

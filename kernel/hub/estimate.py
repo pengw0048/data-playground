@@ -135,7 +135,7 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
             out[nid] = _sized(base, conf, w, is_blocking(t))
             continue
 
-        if t in ("select", "sort", "write", "chart"):  # row-preserving
+        if t in ("select", "sort", "write", "chart", "window", "fill"):  # row-preserving
             base = first.rows if first else None
             out[nid] = _sized(base, first.confidence if first else "unknown", w, is_blocking(t))
             continue
@@ -144,7 +144,7 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
             out[nid] = _sized(1, "bounded", w)
             continue
 
-        if t in ("aggregate", "join", "sql") or t in _CODE or t in ("vector-search",):
+        if t in ("aggregate", "join", "sql", "unnest") or t in _CODE or t in ("vector-search",):
             # genuinely unknown output cardinality — never fabricate. blocking per op type (drives placement).
             out[nid] = _sized(None, "unknown", w, is_blocking(t))
             continue

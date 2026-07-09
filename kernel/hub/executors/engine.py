@@ -368,6 +368,45 @@ class BuildEngine:
                 return db.conn().sql(f"SELECT DISTINCT ON ({cols}) * FROM {v}")
             return parent.distinct()
 
+        if t == "window":
+            expr = (cfg.get("expr") or "").strip()
+            if not expr:
+                return parent
+            part = (cfg.get("partitionBy") or "").strip()
+            order = (cfg.get("orderBy") or "").strip()
+            over = " ".join(x for x in [f"PARTITION BY {part}" if part else "",
+                                        f"ORDER BY {order}" if order else ""] if x)
+            col = (cfg.get("as") or "window").strip()
+            v = self._view(parent, "w")
+            return db.conn().sql(f'SELECT *, {expr} OVER ({over}) AS "{col}" FROM {v}')
+
+        if t == "fill":
+            cols = [c.strip() for c in (cfg.get("columns") or "").split(",") if c.strip()]
+            if not cols:
+                return parent
+            method = (cfg.get("method") or "constant").strip()
+            value = (cfg.get("value") or "").strip()
+
+            def _fill(c: str) -> str:
+                q = f'"{c}"'
+                if method == "constant":
+                    return f"COALESCE({q}, {value})" if value else q  # blank value → no-op replace
+                if method == "zero":
+                    return f"COALESCE({q}, 0)"
+                agg = {"mean": "avg", "min": "min", "max": "max"}.get(method)
+                return f"COALESCE({q}, {agg}({q}) OVER ())" if agg else q
+
+            v = self._view(parent, "fl")
+            repl = ", ".join(f'{_fill(c)} AS "{c}"' for c in cols)
+            return db.conn().sql(f"SELECT * REPLACE ({repl}) FROM {v}")
+
+        if t == "unnest":
+            col = (cfg.get("column") or "").strip()
+            if not col:
+                return parent
+            v = self._view(parent, "un")  # explode a list column → one row per element, others repeated
+            return db.conn().sql(f'SELECT * EXCLUDE ("{col}"), unnest("{col}") AS "{col}" FROM {v}')
+
         if t == "aggregate":
             if not self.full:
                 raise NotPreviewable(node, "global aggregate — needs a full pass (a sample would lie)")

@@ -123,6 +123,9 @@ function referencedColumns(node: CanvasNode): string[] {
     case 'dedup': return plain(str('on'))
     case 'aggregate': return plain(str('groupBy'))
     case 'filter': case 'assert': return exprColumns(str('predicate'))
+    case 'window': return [...plain(str('partitionBy')), ...plain(str('orderBy'))]
+    case 'fill': return plain(str('columns'))
+    case 'unnest': return plain(str('column'))
     default: return []
   }
 }

@@ -3342,6 +3342,53 @@ def test_assert_node_surfaces_violations_and_gates_the_run():
     assert run("no_such_col > 0", "error").status == "failed"
 
 
+def test_window_fill_unnest_nodes(tmp_path):
+    # the data-cleaning built-ins: window (add a partitioned analytic column), fill (impute nulls),
+    # unnest (explode a list column → one row per element).
+    import duckdb
+
+    from hub import db
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+    d = get_deps()
+
+    def eng(graph):
+        return BuildEngine(graph, d.resolve_adapter, d.registry, full=True,
+                           node_specs=d.node_specs, node_builders=d.node_builders)
+
+    # window: row_number() per user_id ordered by amount
+    pw = str(tmp_path / "w.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES (1,10.0),(1,5.0),(2,7.0)) t(user_id,amount)) TO '{pw}' (FORMAT PARQUET)")
+    gw = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pw}),
+        N("w", "window", {"expr": "row_number()", "partitionBy": "user_id", "orderBy": "amount", "as": "rn"})],
+        "edges": [E("s", "w")]})
+    with db.run_scope():
+        t = eng(gw).relation("w").order("user_id, amount").to_arrow_table()
+        assert "rn" in t.column_names
+        assert list(zip(t.column("user_id").to_pylist(), t.column("rn").to_pylist())) == [(1, 1), (1, 2), (2, 1)]
+
+    # fill: zero-fill + mean-fill the nulls in x
+    pf = str(tmp_path / "f.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES (1,10),(2,NULL),(3,NULL)) t(id,x)) TO '{pf}' (FORMAT PARQUET)")
+    with db.run_scope():
+        gz = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pf}),
+            N("f", "fill", {"columns": "x", "method": "zero"})], "edges": [E("s", "f")]})
+        assert eng(gz).relation("f").order("id").to_arrow_table().column("x").to_pylist() == [10, 0, 0]
+        gm = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pf}),
+            N("f", "fill", {"columns": "x", "method": "mean"})], "edges": [E("s", "f")]})
+        assert eng(gm).relation("f").order("id").to_arrow_table().column("x").to_pylist() == [10, 10, 10]
+
+    # unnest: explode the list column → 3 + 1 = 4 rows, id repeated per element
+    pu = str(tmp_path / "u.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES (1,[10,20,30]),(2,[40])) t(id,tags)) TO '{pu}' (FORMAT PARQUET)")
+    gu = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pu}),
+        N("u", "unnest", {"column": "tags"})], "edges": [E("s", "u")]})
+    with db.run_scope():
+        t = eng(gu).relation("u").order("id, tags").to_arrow_table()
+        assert t.num_rows == 4 and sorted(t.column("tags").to_pylist()) == [10, 20, 30, 40]
+        assert t.column("id").to_pylist().count(1) == 3  # id 1 repeated once per list element
+
+
 def test_estimate_sizes_is_conservative_and_honest():
     # the per-node size estimate: conservative (never under-estimate), honest (unknown → None, not a
     # fabricated number), and measured-actuals override. Feeds placement + the confirm-gate + a UI hint.

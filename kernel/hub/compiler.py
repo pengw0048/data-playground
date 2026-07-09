@@ -18,6 +18,7 @@ _STEP_KIND = {
     "transform": "op", "notebook": "op", "metric": "reduce", "write": "write",
     "opaque": "opaque", "loop": "loop", "variable": "op",
     "vector-search": "query", "assert": "assert",
+    "window": "op", "fill": "op", "unnest": "op",
 }
 
 
