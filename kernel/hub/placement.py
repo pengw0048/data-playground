@@ -57,14 +57,15 @@ def node_requires(node, node_specs: dict) -> ResourceSpec | None:
     return getattr(spec, "requires", None) if spec is not None else None
 
 
-def graph_requires(graph: Graph, node_specs: dict) -> ResourceSpec:
+def graph_requires(graph: Graph, node_specs: dict, nodes=None) -> ResourceSpec:
     """The aggregate requirement of a whole graph — the MAX over its nodes (a worker must satisfy the
-    heaviest step). Used for whole-run placement (C1); per-node placement (C2/C3) matches each unit."""
+    heaviest step). Used for whole-run placement (C1); per-node placement (C2/C3) matches each unit.
+    `nodes` scopes the aggregate to a subset (e.g. a target's upstream cone) — defaults to all nodes."""
     cpu = gpu = 0.0
     gpu_type: str | None = None
     mem_gb = 0.0
     labels: dict[str, str] = {}
-    for n in graph.nodes:
+    for n in (graph.nodes if nodes is None else nodes):
         r = node_requires(n, node_specs)
         if not r:
             continue

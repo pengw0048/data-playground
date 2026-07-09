@@ -1548,6 +1548,12 @@ def test_telemetry_sink_seam_fires_once_per_finished_run(tmp_path):
     assert rec["run_id"] == "r1" and rec["status"] == "done" and rec["rows"] == 5 and rec["ms"] == 12
     assert rec["per_node"] and rec["per_node"][0]["node_id"] == "n"
 
+    # an internal region sub-run (RunController._subgraph uses the sentinel id '_region') must NOT leak a
+    # phantom telemetry record to sinks — the controller fires the real completion once for the logical run
+    region = Graph(**{"id": "_region", "version": 1, "nodes": [], "edges": []})
+    dm._persist_run(d, region, "n", RunStatus(run_id="r_region", status="done", placement="local"))
+    assert len(got) == 1 and got[0]["run_id"] == "r1"
+
 
 def test_run_log_reference_plugin_appends_finished_runs(tmp_path, monkeypatch):
     # dp_run_log registers a telemetry sink via reg.add_telemetry_sink that appends one JSON line per
@@ -3321,6 +3327,16 @@ def test_assert_node_surfaces_violations_and_gates_the_run():
     assert run("id < 0", "warn").status == "done"   # same violations but warn → run succeeds
     assert run("id >= 0", "error").status == "done"  # no violations → error severity passes
 
+    # no predicate = ZERO violations (NOT "every row violates"): the relation is empty, not the passthrough
+    with db.run_scope():
+        eng3 = BuildEngine(graph(""), d.resolve_adapter, d.registry, full=True,
+                           node_specs=d.node_specs, node_builders=d.node_builders)
+        assert int(eng3.relation("a").aggregate("count(*) AS n").fetchone()[0]) == 0
+    assert run("", "error").status == "done"        # empty predicate + severity=error → must NOT fail the run
+    # a predicate that can't evaluate (missing column): warn is non-blocking (run succeeds); error fails clean
+    assert run("no_such_col > 0", "warn").status == "done"
+    assert run("no_such_col > 0", "error").status == "failed"
+
 
 def test_estimate_sizes_is_conservative_and_honest():
     # the per-node size estimate: conservative (never under-estimate), honest (unknown → None, not a
@@ -3436,6 +3452,19 @@ def test_run_plan_flags_unsatisfied_resource_requirement():
 
     g2 = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev}), N("f", "filter", {"predicate": "id > 0"})], "edges": [E("s", "f")]})
     assert all(not r.get("unsatisfied") for r in d.controller.plan_summary(g2, "f"))
+
+    # a GPU node on a DISCONNECTED pipeline must NOT flag the CPU-only target's run — the pre-flight is
+    # scoped to the target's upstream cone, not the whole canvas.
+    g3 = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": ev}), N("f", "filter", {"predicate": "id > 0"}),
+        N("s2", "source", {"uri": ev}), gpu], "edges": [E("s", "f"), E("s2", "a")]})
+    assert all(not r.get("unsatisfied") for r in d.controller.plan_summary(g3, "f"))
+
+    # a mem-only requirement is SOFT (the local out-of-core engine spills) → never "no backend provides it"
+    mem = {"id": "m", "type": "aggregate", "position": {"x": 0, "y": 0},
+           "data": {"title": "m", "config": {"groupBy": "user_id", "aggs": "count(*) AS n", "requires": {"mem": "999GB"}}}}
+    g4 = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev}), mem], "edges": [E("s", "m")]})
+    assert all(not r.get("unsatisfied") for r in d.controller.plan_summary(g4, "m"))
 
 
 def test_graph_estimate_endpoint():
@@ -3847,6 +3876,19 @@ def test_similarity_dedup_plugin_clusters_and_marks_representatives(tmp_path):
         assert sum(bool(x) for x in reps) == 3
         # a representative leads exactly the rows that carry its own group id
         assert reps[0] != reps[1]  # one of {0,1} leads, the other doesn't
+
+    # edge cases on _dedup directly: empty input still emits the columns (so downstream filter() works);
+    # a ragged/variable-length list column passes through without crashing (not a fixed-width vector).
+    import importlib.util
+    import polars as pl
+    src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_similarity_dedup" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("dp_simdedup_ref", src)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    base = pl.DataFrame({"embedding": [[1.0, 0.0, 0.0]]})
+    empty_out = mod._dedup(base.head(0), "embedding", 0.05)
+    assert empty_out.height == 0 and "dup_group" in empty_out.columns and "is_representative" in empty_out.columns
+    ragged_out = mod._dedup(pl.DataFrame({"embedding": [[1.0, 0.0], [1.0]]}), "embedding", 0.05)
+    assert ragged_out.height == 2 and "dup_group" not in ragged_out.columns  # passthrough, no crash
 
 
 def test_ir_unify_regressions(tmp_path):

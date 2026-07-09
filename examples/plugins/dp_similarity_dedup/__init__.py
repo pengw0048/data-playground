@@ -51,9 +51,17 @@ def _dedup(df, column: str, threshold: float):
     import polars as pl
 
     n = df.height
-    if n == 0 or column not in df.columns:
-        return df  # nothing to do / unconfigured → passthrough (no new columns)
-    vecs = np.asarray(df[column].to_list(), dtype="float64")
+    if column not in df.columns:
+        return df  # unconfigured → passthrough (the column-reference warning flags a bad column on the card)
+    if n == 0:  # correctly configured but empty → still emit the columns so downstream filter() finds them
+        return df.with_columns(
+            pl.Series("dup_group", [], dtype=pl.Int64),
+            pl.Series("is_representative", [], dtype=pl.Boolean),
+        )
+    try:
+        vecs = np.asarray(df[column].to_list(), dtype="float64")
+    except (ValueError, TypeError):
+        return df  # ragged / variable-length / non-numeric list column → can't compute, passthrough
     if vecs.ndim != 2 or vecs.shape[1] == 0:
         return df  # not a fixed-width vector column → passthrough rather than guess
 

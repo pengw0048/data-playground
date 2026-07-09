@@ -370,16 +370,18 @@ def list_canvases_for(uid: str) -> list[dict]:
 
 def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
                rows: int | None = None, ms: int | None = None, error: str | None = None,
-               output_table: str | None = None, per_node: list[dict] | None = None) -> None:
-    """Persist a finished run under its canvas. No-op without a canvas id (e.g. ad-hoc API runs)."""
+               output_table: str | None = None, per_node: list[dict] | None = None) -> bool:
+    """Persist a finished run under its canvas. No-op (returns False) without a real canvas — an ad-hoc
+    API run or an internal region sub-run (graph id '_region'). Returns True when a row was written."""
     if not canvas_id:
-        return
+        return False
     with session() as s:
         if s.get(Canvas, canvas_id) is None:
-            return  # ad-hoc / unsaved-canvas run → don't write a run row dangling off a missing canvas
+            return False  # ad-hoc / unsaved-canvas / internal region run → don't dangle a run row
         s.add(RunRecord(canvas_id=canvas_id, target_node_id=target_node_id, status=status,
                         rows=rows, ms=ms, error=error, output_table=output_table,
                         per_node=json.dumps(per_node, default=str) if per_node else None))
+        return True
 
 
 def delete_canvas_cascade(canvas_id: str) -> None:

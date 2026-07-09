@@ -11,6 +11,12 @@ describe('fmtMs — human-readable durations', () => {
     expect(fmtMs(42_000)).toBe('42 s')
     expect(fmtMs(125_000)).toBe('2m 5s')
   })
+  it('carries across unit boundaries instead of showing 60s / Xm 60s', () => {
+    expect(fmtMs(9_999)).toBe('10 s')      // not "10.0 s"
+    expect(fmtMs(59_999)).toBe('1m 0s')    // not "60 s"
+    expect(fmtMs(119_500)).toBe('2m 0s')   // not "1m 60s"
+    expect(fmtMs(60_000)).toBe('1m 0s')
+  })
 })
 
 describe('DurationTrend — a native SVG bar per run', () => {

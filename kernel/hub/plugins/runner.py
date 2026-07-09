@@ -198,8 +198,10 @@ class LocalRunner:
                     status.rows_processed = rows_seen
                     self._emit(graph, status)  # per-node progress → DB (cross-instance polling sees it advance)
 
-                # if the target is not a sink, force execution to a real row count
-                if target and nm.get(target) and nm[target].type not in ("write",):
+                # if the target is not a sink, force execution to a real row count. `assert` is excluded:
+                # its "rows" is the violation count from _check_assert (already set), and re-counting would
+                # rebuild — and re-raise — a warn-severity assert's un-evaluable predicate (defeating warn).
+                if target and nm.get(target) and nm[target].type not in ("write", "assert"):
                     rows_seen = self._count(engine, target, cached)
                     status.rows_processed = rows_seen
 
@@ -246,10 +248,18 @@ class LocalRunner:
         """A data-quality gate: the node's relation is the VIOLATING rows (predicate not TRUE). Count them;
         on severity='error' with any violation, raise so the run fails with an actionable message (the
         offending rows are inspectable by previewing the node). 'warn' just records the count."""
-        viol = int(engine.relation(node.id).aggregate("count(*) AS n").fetchone()[0])
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-        if cfg.get("severity") == "error" and viol > 0:
-            title = (node.data.get("title") if isinstance(node.data, dict) else None) or node.id
+        severity = cfg.get("severity")
+        title = (node.data.get("title") if isinstance(node.data, dict) else None) or node.id
+        try:
+            viol = int(engine.relation(node.id).aggregate("count(*) AS n").fetchone()[0])
+        except Exception as e:  # noqa: BLE001 — a predicate that isn't a per-row boolean (missing column,
+            # non-castable value, aggregate) can't evaluate. 'warn' is non-blocking, so it must NOT fail the
+            # run (the non-enforcing column-reference warning already flags a bad column on the card).
+            if severity == "error":
+                raise RuntimeError(f"assert '{title}' could not evaluate its predicate: {e}") from e
+            return 0
+        if severity == "error" and viol > 0:
             raise RuntimeError(f"assert '{title}' failed: {viol} row(s) violate the check")
         return viol
 

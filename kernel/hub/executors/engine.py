@@ -342,10 +342,10 @@ class BuildEngine:
             # runner fails the run on error-severity violations (see plugins/runner.py); no predicate =
             # nothing violates → passthrough. Same columns as the input (SELECT *), so its port stays typed.
             pred = (cfg.get("predicate") or "").strip()
-            if not pred:
-                return parent
             v = self._view(parent, "as")
-            return db.conn().sql(f"SELECT * FROM {v} WHERE ({pred}) IS NOT TRUE")
+            # no predicate → ZERO violations (NOT `return parent`: this relation is the VIOLATING rows, so
+            # passing the input through would count every row as a violation). `WHERE false` keeps the schema.
+            return db.conn().sql(f"SELECT * FROM {v} WHERE {f'({pred}) IS NOT TRUE' if pred else 'false'}")
 
         if t == "select":
             expr = (cfg.get("expr") or "").strip()  # resolver canonicalizes select/expr → 'expr'

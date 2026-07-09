@@ -64,8 +64,8 @@ class RunController:
 
         def _req_str(r) -> str:  # a compact "4×a100 · 64GB · zone=eu" for the UI
             parts = []
-            if getattr(r, "gpu", None):
-                parts.append(f"{r.gpu}×{r.gpu_type or 'gpu'}")
+            if getattr(r, "gpu", None) or getattr(r, "gpu_type", None):
+                parts.append(f"{r.gpu}×{r.gpu_type or 'gpu'}" if getattr(r, "gpu", None) else (r.gpu_type or "gpu"))
             if getattr(r, "cpu", None):
                 parts.append(f"{r.cpu} cpu")
             if getattr(r, "mem", None):
@@ -74,15 +74,22 @@ class RunController:
                 parts += [f"{k}={v}" for k, v in r.labels.items()]
             return " · ".join(parts)
 
+        def _hard_req(r) -> bool:
+            # a capability the local/default host cannot provide (gpu or a placement label). mem/cpu are
+            # SOFT: the local out-of-core engine spills/time-shares, so they're a perf concern, not "no
+            # backend provides it". Only a hard need forced onto the default backend is truly unsatisfied.
+            return bool(getattr(r, "gpu", None) or getattr(r, "gpu_type", None) or getattr(r, "labels", None))
+
         regions = self.plan(graph, target, sizes=sizes)
         collapses = (len(regions) <= 1 and (not regions or regions[0].backend == "default")) \
             or not self._safe_to_split(graph, target, regions)
         if collapses:  # what run() will actually do: one default whole-graph region
             rows, conf = _rows(target)
-            greq = placement.graph_requires(graph, self.deps.node_specs)  # unmet resource need on the local run?
-            unsat = planner._has_req(greq) and self.place_fn(greq) is None
+            cone = g.upstream_chain(graph, target)  # only the nodes THIS run executes — not the whole canvas
+            greq = placement.graph_requires(graph, self.deps.node_specs, nodes=cone)
+            unsat = _hard_req(greq)  # collapsing runs the whole cone on the local default → no gpu/labels there
             return [{"id": "r_all", "outputNode": target, "backend": "default", "worker": None,
-                     "nodeIds": [n.id for n in g.upstream_chain(graph, target)], "tier": None,
+                     "nodeIds": [n.id for n in cone], "tier": None,
                      "rows": rows, "confidence": conf,
                      "requires": _req_str(greq) if unsat else "", "unsatisfied": unsat}]
         out: list[dict] = []
@@ -90,8 +97,9 @@ class RunController:
             final = i == len(regions) - 1
             tier = None if final else self._boundary_tier(r, regions)  # the final region isn't materialized
             rows, conf = _rows(r.output_node)
-            # a real resource requirement that no backend satisfied → fell back to local (may lack it): flag it
-            unsat = planner._has_req(r.requires) and r.backend == "default"
+            # a HARD requirement (gpu/labels) that fell back to the local default (which lacks it): flag it.
+            # Same criterion as the collapse branch — mem/cpu are soft (local spills), so they don't count.
+            unsat = _hard_req(r.requires) and r.backend == "default"
             out.append({"id": r.id, "outputNode": r.output_node, "backend": r.backend, "worker": r.worker,
                         "nodeIds": sorted(r.node_ids), "tier": (tier.name if tier else None),
                         "rows": rows, "confidence": conf,

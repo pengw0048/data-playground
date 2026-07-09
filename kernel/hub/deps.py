@@ -129,7 +129,11 @@ def _persist_run(deps, graph, target, status) -> None:
     metadb.record_run(canvas_id=getattr(graph, "id", None), target_node_id=target, status=status.status,
                       rows=status.total_rows, ms=status.ms, error=status.error,
                       output_table=status.output_table, per_node=per_node)
-    _emit_telemetry(deps, graph, target, status, per_node)
+    # The RunController runs each region as an internal sub-graph with the sentinel id '_region' (see
+    # run_controller._subgraph); its base-runner completion must NOT leak to sinks as a phantom run — the
+    # controller fires the real, user-facing completion once for the whole logical run.
+    if getattr(graph, "id", None) != "_region":
+        _emit_telemetry(deps, graph, target, status, per_node)
 
 
 def _emit_telemetry(deps, graph, target, status, per_node) -> None:
