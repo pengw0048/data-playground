@@ -236,6 +236,10 @@ class LocalRunner:
                     rows_seen = self._count(engine, target, cached)
                     status.rows_processed = rows_seen
 
+                # set the final counts BEFORE flipping to 'done' — a client polls in another thread and
+                # reads a terminal status eagerly; the finally sets total_rows too late, so a poll could
+                # otherwise observe status='done' with total_rows still None (a flaky race).
+                status.total_rows = rows_seen
                 status.status = "done"
                 if cacheable:
                     self._cache_put(phash, {"rows": rows_seen, "uri": status.output_uri, "table": status.output_table})

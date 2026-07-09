@@ -200,7 +200,8 @@ class RunController:
                     ref_uri[region.output_node] = self._materialize(run_id, graph, region, ref_uri, regions)
                 self._mark(status, region, "done")
                 self._emit(graph, status)
-            status.status = "done"
+            status.total_rows = status.rows_processed  # set the count BEFORE 'done' (a poll reads terminal
+            status.status = "done"                     # status eagerly; the finally would set it too late)
         except Exception as e:  # noqa: BLE001
             status.status = "cancelled" if cancel.is_set() else "failed"
             if status.status == "failed":
