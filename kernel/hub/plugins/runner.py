@@ -38,6 +38,15 @@ def _fmt_bytes(n: int) -> str:
     return f"{n} B"
 
 
+def _step_progress(status) -> "float | None":
+    """0..1 fraction of the run's steps that have finished — a deterministic progress signal any backend
+    can report from its per-node states (no reliance on row counts, which many ops can't predict)."""
+    pn = status.per_node
+    if not pn:
+        return None
+    return sum(1 for p in pn if p.status in ("done", "failed")) / len(pn)
+
+
 def _diagnose(msg: str) -> str | None:
     """Map a common engine error to ONE actionable hint (the run failure's 'how to fix'). Honest: only
     recognized patterns get a hint; anything else shows the raw error alone (never fabricate a cause)."""
@@ -227,6 +236,7 @@ class LocalRunner:
                         pn.ms = int((time.time() - t0) * 1000)
                         pn.rows = rows_seen or None
                     status.rows_processed = rows_seen
+                    status.progress = _step_progress(status)  # fraction of steps complete (deterministic)
                     self._emit(graph, status)  # per-node progress → DB (cross-instance polling sees it advance)
 
                 # if the target is not a sink, force execution to a real row count. `assert` is excluded:
@@ -240,6 +250,7 @@ class LocalRunner:
                 # reads a terminal status eagerly; the finally sets total_rows too late, so a poll could
                 # otherwise observe status='done' with total_rows still None (a flaky race).
                 status.total_rows = rows_seen
+                status.progress = 1.0
                 status.status = "done"
                 if cacheable:
                     self._cache_put(phash, {"rows": rows_seen, "uri": status.output_uri, "table": status.output_table})

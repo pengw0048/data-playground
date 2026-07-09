@@ -392,7 +392,7 @@ function JoinHints({ nodeId }: { nodeId: string }) {
 // Run-plan preview: the regions this node's run splits into, each with its backend, boundary tier, and
 // estimated size. Self-hides for the trivial case (one local region) — it lights up only when placement
 // did something (a cluster backend, an engine=ray label, or a checkpoint), so the scheduler is legible.
-type PlanRegion = { id: string; outputNode: string; backend: string; tier: string | null; rows: number | null; confidence: string; requires?: string; unsatisfied?: boolean }
+type PlanRegion = { id: string; outputNode: string; backend: string; tier: string | null; rows: number | null; confidence: string; requires?: string; unsatisfied?: boolean; available?: string }
 function RunPlan({ nodeId }: { nodeId: string }) {
   const doc = useStore((s) => s.doc)
   const kernelUp = useStore((s) => s.kernelUp)
@@ -436,7 +436,7 @@ function RunPlan({ nodeId }: { nodeId: string }) {
             )}
             {r.unsatisfied && (
               <span className="w-full text-[10px] text-amber-700 dark:text-amber-300" title="no registered backend satisfies this — it will run locally, which may lack the resource">
-                ⚠ needs {r.requires || 'resources'} — no backend provides it
+                ⚠ needs {r.requires || 'resources'} — {r.available || 'no backend provides it'}
               </span>
             )}
           </div>

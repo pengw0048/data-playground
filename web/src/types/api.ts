@@ -145,6 +145,8 @@ export interface RunStatus {
   ms: number
   placement: Placement
   perNode: PerNodeStatus[]
+  progress?: number | null   // 0..1 fraction of steps complete
+  stalled?: boolean          // running but no step has completed for a while (a soft "stuck?" hint)
   error?: string | null
   outputUri?: string | null
   outputTable?: string | null

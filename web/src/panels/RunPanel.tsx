@@ -51,11 +51,18 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           <div className="mb-2.5 flex items-center gap-2">
             <span className="dp-running-glyph text-primary">●</span>
             <span className="text-[13px] font-semibold">running</span>
+            {st.progress != null && <span className="text-[11.5px] text-muted-foreground">{Math.round(st.progress * 100)}%</span>}
           </div>
-          <ProgressBar value={st.totalRows ? st.rowsProcessed / Math.max(1, st.totalRows) : 0.3} />
+          {/* step-progress (deterministic) when we have it, else the row-based fallback */}
+          <ProgressBar value={st.progress ?? (st.totalRows ? st.rowsProcessed / Math.max(1, st.totalRows) : 0.3)} />
           <div className="my-2 text-[11.5px] text-muted-foreground">
             {st.rowsProcessed.toLocaleString()}{st.totalRows ? ` / ${st.totalRows.toLocaleString()}` : ''} rows
           </div>
+          {st.stalled && (
+            <div className="mb-2 rounded bg-amber-500/10 px-2 py-1 text-[11px] text-amber-600 dark:text-amber-400">
+              ⚠ no step has completed recently — the run may be stuck (or on a long step)
+            </div>
+          )}
           <PerNode st={st} />
           <Button size="sm" variant="outline" onClick={() => cancel(nodeId)} className="mt-3 w-full">
             <Icon name="stop" size={12} /> Stop

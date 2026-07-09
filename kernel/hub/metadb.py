@@ -435,6 +435,18 @@ def get_run_state(run_id: str) -> dict | None:
         return json.loads(r.doc) if r else None
 
 
+def run_stalled(run_id: str, threshold_s: float) -> bool:
+    """True if a run's last status update (run_states.updated_at, bumped on every step transition) is
+    older than threshold_s — a soft 'stuck?' hint for a still-running run. A long single step can trip
+    it (no step completed recently ≠ dead), so it's advisory; a genuinely dead kernel is caught by the
+    heartbeat reaper, not this."""
+    with session() as s:
+        r = s.get(RunState, run_id)
+        if r is None or r.updated_at is None:
+            return False
+        return _stale_secs(r.updated_at) > threshold_s  # _stale_secs normalizes SQLite's naive datetimes
+
+
 _RESULT_CACHE_MAX = 1000  # persistent equivalent of the old in-process _MAX_RUNS cache cap
 
 

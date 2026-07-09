@@ -274,6 +274,30 @@ def test_run_write_and_lineage():
     assert st["totalRows"] and st["totalRows"] < 500  # filtered out invalids
     lin = client.get("/api/catalog/lineage", params={"uri": _uri("images")}).json()
     assert any(e["child"].endswith("images_valid.parquet") for e in lin["edges"])
+    assert st["progress"] == 1.0  # a finished run reports full progress
+
+
+def test_run_progress_and_stall_signal():
+    # a finished run reports progress=1.0; the stall hint fires for a running run whose last step
+    # completed longer ago than the (here, zero) threshold, and clears for a fresh one.
+    from hub import metadb
+    from hub.plugins.runner import _step_progress
+    from hub.models import PerNodeStatus, RunStatus
+    # _step_progress is a pure fraction of finished steps
+    st = RunStatus(run_id="p", status="running", placement="local", per_node=[
+        PerNodeStatus(node_id="a", status="done"), PerNodeStatus(node_id="b", status="running"),
+        PerNodeStatus(node_id="c", status="queued")])
+    assert _step_progress(st) == 1 / 3
+    # end-to-end: a real run's status carries a 0..1 progress that reaches 1.0 at done
+    g = {"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": _uri("events")}),
+         N("f", "filter", {"predicate": "amount > 0"})], "edges": [E("s", "f")]}
+    done = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "f", "confirmed": True}).json()["runId"])
+    assert done["status"] == "done" and done["progress"] == 1.0
+    # the stall hint: a running run whose run_state hasn't updated within the threshold is flagged
+    metadb.save_run_state("stall_run", RunStatus(run_id="stall_run", status="running", placement="local").model_dump())
+    assert metadb.run_stalled("stall_run", 0.0) is True     # threshold 0 → any age counts as stalled
+    assert metadb.run_stalled("stall_run", 10_000) is False  # generous threshold → not stalled
+    assert metadb.run_stalled("no_such_run", 0.0) is False   # unknown run → never stalled
 
 
 def test_write_not_previewable():
@@ -3567,6 +3591,20 @@ def test_run_plan_flags_unsatisfied_resource_requirement():
     g = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev}), gpu], "edges": [E("s", "a")]})
     plan = d.controller.plan_summary(g, "a")
     assert any(r.get("unsatisfied") and "a100" in (r.get("requires") or "") for r in plan)
+    # the pre-flight tells you WHAT is available, not just "no backend provides it"
+    assert all(r.get("available") for r in plan if r.get("unsatisfied"))
+
+    # _available_summary reflects whatever placement backends advertise via workers()
+    from hub.models import ResourceSpec, WorkerInfo
+    class _FakeGPUBackend:
+        def workers(self):
+            return [WorkerInfo(id="g", capacity=ResourceSpec(gpu=8, gpu_type="a100", labels={"engine": "ray"}), state="idle")]
+    d.runners.append(_FakeGPUBackend())
+    try:
+        summ = d.controller._available_summary()
+        assert "8×a100" in summ and "engine=ray" in summ
+    finally:
+        d.runners.pop()
 
     g2 = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev}), N("f", "filter", {"predicate": "id > 0"})], "edges": [E("s", "f")]})
     assert all(not r.get("unsatisfied") for r in d.controller.plan_summary(g2, "f"))

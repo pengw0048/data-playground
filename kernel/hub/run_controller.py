@@ -80,6 +80,8 @@ class RunController:
             # backend provides it". Only a hard need forced onto the default backend is truly unsatisfied.
             return bool(getattr(r, "gpu", None) or getattr(r, "gpu_type", None) or getattr(r, "labels", None))
 
+        avail = self._available_summary()  # what the registered placement backends actually advertise
+
         regions = self.plan(graph, target, sizes=sizes)
         collapses = (len(regions) <= 1 and (not regions or regions[0].backend == "default")) \
             or not self._safe_to_split(graph, target, regions)
@@ -91,7 +93,8 @@ class RunController:
             return [{"id": "r_all", "outputNode": target, "backend": "default", "worker": None,
                      "nodeIds": [n.id for n in cone], "tier": None,
                      "rows": rows, "confidence": conf,
-                     "requires": _req_str(greq) if unsat else "", "unsatisfied": unsat}]
+                     "requires": _req_str(greq) if unsat else "", "unsatisfied": unsat,
+                     "available": avail if unsat else ""}]
         out: list[dict] = []
         for i, r in enumerate(regions):
             final = i == len(regions) - 1
@@ -103,8 +106,35 @@ class RunController:
             out.append({"id": r.id, "outputNode": r.output_node, "backend": r.backend, "worker": r.worker,
                         "nodeIds": sorted(r.node_ids), "tier": (tier.name if tier else None),
                         "rows": rows, "confidence": conf,
-                        "requires": _req_str(r.requires), "unsatisfied": unsat})
+                        "requires": _req_str(r.requires), "unsatisfied": unsat,
+                        "available": avail if unsat else ""})
         return out
+
+    def _available_summary(self) -> str:
+        """A compact summary of what the registered placement backends advertise (via workers()) — so an
+        unsatisfied pre-flight can say WHAT is available, not just 'no backend provides it'."""
+        caps = []
+        for r in self.deps.runners:
+            wf = getattr(r, "workers", None)
+            if not callable(wf):
+                continue
+            try:
+                caps.extend(w.capacity for w in wf())
+            except Exception:  # noqa: BLE001 — a backend that can't report capacity just isn't counted
+                continue
+        if not caps:
+            return "no placement backend registered"
+        gpu = max((c.gpu or 0 for c in caps), default=0)
+        gtypes = sorted({c.gpu_type for c in caps if c.gpu_type})
+        labels = sorted({f"{k}={v}" for c in caps for k, v in (c.labels or {}).items()})
+        parts = []
+        if gpu:
+            parts.append(f"{gpu}×{'/'.join(gtypes) or 'gpu'}")
+        elif gtypes:
+            parts.append("/".join(gtypes))
+        if labels:
+            parts.append(", ".join(labels))
+        return f"backends advertise: {' · '.join(parts)}" if parts else "no GPU/label capacity advertised"
 
     def _cost_requires(self, graph: Graph, target: str, sizes: dict | None = None) -> dict:
         """Cost-based placement input: a BLOCKING region whose estimated working set exceeds the local
@@ -199,9 +229,12 @@ class RunController:
                 else:
                     ref_uri[region.output_node] = self._materialize(run_id, graph, region, ref_uri, regions)
                 self._mark(status, region, "done")
+                from hub.plugins.runner import _step_progress
+                status.progress = _step_progress(status)
                 self._emit(graph, status)
             status.total_rows = status.rows_processed  # set the count BEFORE 'done' (a poll reads terminal
-            status.status = "done"                     # status eagerly; the finally would set it too late)
+            status.progress = 1.0                      # status eagerly; the finally would set it too late)
+            status.status = "done"
         except Exception as e:  # noqa: BLE001
             status.status = "cancelled" if cancel.is_set() else "failed"
             if status.status == "failed":

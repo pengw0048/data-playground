@@ -231,6 +231,8 @@ class RunStatus(Wire):
     ms: int = 0
     placement: Placement = "local"
     per_node: list[PerNodeStatus] = []
+    progress: float | None = None       # 0..1 fraction of steps complete (deterministic; any backend can report)
+    stalled: bool = False               # running but no step has completed for a while (a soft "stuck?" hint)
     error: str | None = None
     output_uri: str | None = None
     output_table: str | None = None

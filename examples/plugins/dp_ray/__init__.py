@@ -118,7 +118,16 @@ class RayRunner:
     # silently routes here; a user opts a node into Ray deliberately. reachable_tiers: local Ray shares
     # the fs and can read object storage, so both (a real remote cluster would declare object-only).
     def workers(self) -> list:
-        return [WorkerInfo(id="ray", capacity=ResourceSpec(mem="1000GB", labels={"engine": "ray"}), state="idle")]
+        # The hub can't query a live Ray cluster (the driver runs in an isolated subprocess — see the
+        # DuckDB×Ray deadlock note), so an operator declares the cluster's shape via env: DP_RAY_GPUS /
+        # DP_RAY_GPU_TYPE / DP_RAY_MEM. That advertised capacity feeds the topology view + the run-plan
+        # pre-flight ("needs 4×a100 — backends advertise: 8×a100"). Defaults keep the engine=ray label.
+        import os
+        gpu = int(os.environ.get("DP_RAY_GPUS", "0") or 0)
+        cap = ResourceSpec(mem=os.environ.get("DP_RAY_MEM", "1000GB"),
+                           gpu=gpu or None, gpu_type=(os.environ.get("DP_RAY_GPU_TYPE") or None) if gpu else None,
+                           labels={"engine": "ray"})
+        return [WorkerInfo(id="ray", capacity=cap, state="idle")]
 
     def place(self, requires) -> "str | None":
         labels = getattr(requires, "labels", None) or {}

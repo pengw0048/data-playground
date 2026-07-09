@@ -4,11 +4,13 @@ the execution routes (and where a run writes). Split out of main.py; all authed 
 
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
-from hub import compiler, destinations, placement
+from hub import compiler, destinations, metadb, placement
 from hub import graph as graph_mod
 from hub.agent import agent_status, run_agent
 from hub.deps import get_deps
@@ -311,9 +313,15 @@ def _status_or_lost(run_id: str) -> RunStatus:
                          error="run not found — it was evicted or the kernel restarted")
 
 
+_STALL_S = float(os.environ.get("DP_STALL_S", "120"))  # a running run with no step completed for this long
+
+
 @router.get("/run/{run_id}", response_model=RunStatus)
 def run_status(run_id: str) -> RunStatus:
-    return _status_or_lost(run_id)
+    st = _status_or_lost(run_id)
+    if st.status == "running" and metadb.run_stalled(run_id, _STALL_S):
+        st = st.model_copy(update={"stalled": True})  # copy — don't mutate the runner's live object
+    return st
 
 
 @router.post("/run/{run_id}/cancel", response_model=RunStatus)
