@@ -694,7 +694,7 @@ export const useStore = create<Store>((set, get) => ({
       mode: (cfg.mode as string) ?? 'map',
       code: (cfg.code as string) ?? '',
       inputColumns: [],
-      outputSchema: (cfg.outputSchema as any) ?? [],
+      outputSchema: Array.isArray(cfg.outputSchema) ? (cfg.outputSchema as any) : [],  // a {ref} contract doesn't inline here
       blurb: 'promoted from an ad-hoc cell',
     })
     // KEEP the original code on the node (don't null it): the promote is in-memory server-side, so

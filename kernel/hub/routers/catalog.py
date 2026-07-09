@@ -74,6 +74,46 @@ def list_plugins() -> list[dict]:
     return out
 
 
+class SaveSchemaRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    name: str
+    columns: list[ColumnSchema]
+
+
+@router.get("/schemas")
+def list_schemas() -> list[dict]:
+    """Every named schema contract's latest version — the registry view + the reference picker."""
+    return metadb.list_schema_contracts()
+
+
+@router.post("/schemas")
+def save_schema(req: SaveSchemaRequest) -> dict:
+    """Save a named contract as a NEW version (drift is a diff between versions, never an overwrite)."""
+    if not req.name.strip():
+        raise HTTPException(400, "a schema contract needs a name")
+    cols = [{"name": c.name, "type": c.type} for c in req.columns]
+    version = metadb.save_schema_contract(req.name.strip(), cols)
+    return {"name": req.name.strip(), "version": version, "columns": cols}
+
+
+@router.get("/schemas/diff")
+def diff_schemas(name: str = Query(...), a: int = Query(...), b: int = Query(...)) -> dict:
+    """Structural diff of two versions of a named contract (which fields were added / removed / retyped)."""
+    ca, cb = metadb.get_schema_contract(name, a), metadb.get_schema_contract(name, b)
+    if ca is None or cb is None:
+        raise HTTPException(404, "unknown contract name or version")
+    return metadb.diff_columns(ca["columns"], cb["columns"])
+
+
+@router.get("/schemas/{name}")
+def get_schema(name: str) -> dict:
+    """A contract's latest columns + all its version numbers."""
+    c = metadb.get_schema_contract(name)
+    if c is None:
+        raise HTTPException(404, f"no schema contract named '{name}'")
+    return {**c, "versions": metadb.schema_contract_versions(name)}
+
+
 @router.get("/catalog/tables", response_model=list[CatalogTable])
 def list_tables(q: str | None = None) -> list[CatalogTable]:
     return get_deps().catalog.list_tables(q)

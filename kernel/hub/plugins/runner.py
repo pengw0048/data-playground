@@ -231,6 +231,7 @@ class LocalRunner:
                         rows_seen = self._check_assert(nm[step.node_id], engine)  # violation count; may raise
                     else:
                         engine.relation(step.node_id)  # build (lazy) — cheap
+                        self._check_schema(nm[step.node_id], engine)  # enforce a pinned contract (may raise)
                     if pn:
                         pn.status = "done"
                         pn.ms = int((time.time() - t0) * 1000)
@@ -324,6 +325,35 @@ class LocalRunner:
         if severity == "error" and viol > 0:
             raise RuntimeError(f"assert '{title}' failed: {viol} row(s) violate the check")
         return viol
+
+    def _check_schema(self, node, engine: BuildEngine) -> None:
+        """Enforce a pinned schema contract: when config.enforceSchema is set, compare the built relation's
+        ACTUAL columns to the declared/referenced contract and FAIL the run on drift (missing / unexpected
+        columns, or a coarse type change) — turning silent schema drift into an actionable error. Column
+        names are compared strictly; types are normalized to coarse DuckDB types so int/BIGINT aliases
+        don't false-flag. A node with no enforce flag or no contract is a no-op."""
+        cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+        if not cfg.get("enforceSchema"):
+            return
+        from hub.executors.engine import _duck_type, declared_schema
+        contract = declared_schema(node)
+        if not contract:
+            return
+        from hub import metadb
+        rel = engine.relation(node.id)
+        actual = [{"name": n, "type": _duck_type(str(t))} for n, t in zip(rel.columns, rel.types)]
+        want = [{"name": c["name"], "type": _duck_type(c.get("type", ""))} for c in contract]
+        d = metadb.diff_columns(want, actual)
+        if not d["match"]:
+            parts = []
+            if d["removed"]:
+                parts.append(f"missing {d['removed']}")
+            if d["added"]:
+                parts.append(f"unexpected {d['added']}")
+            if d["changed"]:
+                parts.append("type-changed " + str([f"{c['name']}:{c['from']}→{c['to']}" for c in d["changed"]]))
+            title = (node.data.get("title") if isinstance(node.data, dict) else None) or node.id
+            raise RuntimeError(f"schema contract on '{title}' violated — {'; '.join(parts)}")
 
     def _commit_write(self, node, graph: Graph, engine: BuildEngine, status: RunStatus,
                       cached: dict | None) -> int:

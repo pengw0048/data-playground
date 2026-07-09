@@ -511,11 +511,30 @@ function SchemaContract({ nodeId, runnable }: { nodeId: string; runnable: boolea
   const [err, setErr] = useState<string | null>(null)
   const cfg = (node?.data.config ?? {}) as Record<string, unknown>
   const declared = (Array.isArray(cfg.outputSchema) ? cfg.outputSchema : []) as ColumnSchema[]
+  // outputSchema can instead be {ref: name} → this node REFERENCES a named workspace contract
+  const os = cfg.outputSchema as { ref?: string } | undefined
+  const refName = os && !Array.isArray(os) && typeof os === 'object' ? os.ref : undefined
+  const enforce = !!cfg.enforceSchema
   const source = cfg.outputSchemaSource as string | undefined
   const code = cfg.code == null ? null : String(cfg.code)  // the cell this contract describes (transform)
   // the contract may be stale if the cell changed since it was pinned (only meaningful for a code cell)
   const stale = declared.length > 0 && code != null && !!cfg.outputSchemaCodeHash
     && cfg.outputSchemaCodeHash !== codeHash(code)
+  const [names, setNames] = useState<string[]>([])       // named contracts available to reference
+  const [refCols, setRefCols] = useState<ColumnSchema[]>([])
+  useEffect(() => { api.listSchemas().then((s) => setNames(s.map((x) => x.name))).catch(() => {}) }, [])
+  useEffect(() => {
+    if (!refName) { setRefCols([]); return }
+    api.listSchemas().then((s) => setRefCols(s.find((x) => x.name === refName)?.columns ?? [])).catch(() => setRefCols([]))
+  }, [refName])
+  const setEnforce = (on: boolean) => updateConfig(nodeId, { enforceSchema: on || undefined })
+  const reference = (name: string) => updateConfig(nodeId, { outputSchema: name ? { ref: name } : undefined, outputSchemaSource: undefined, outputSchemaCodeHash: undefined })
+  const saveAsNamed = async () => {
+    const name = window.prompt('Save these columns as a named contract:')?.trim()
+    if (!name) return
+    try { await api.saveSchema(name, declared); setNames((n) => Array.from(new Set([...n, name]))) }
+    catch (e) { setErr(e instanceof Error ? e.message : 'save failed') }
+  }
 
   // a manual edit (no explicit src) takes ownership → 'declared'; only "Infer from sample" sets 'inferred'.
   // pin the current cell's hash alongside, so a later cell edit can flag the contract as possibly stale.
@@ -540,44 +559,80 @@ function SchemaContract({ nodeId, runnable }: { nodeId: string; runnable: boolea
 
   return (
     <Section title="Output schema (contract)">
-      <div className="text-[10.5px] leading-relaxed text-muted-foreground">
-        {declared.length
-          ? (source === 'inferred' ? 'Inferred from a sample — edit to pin it as the contract.' : 'Declared — types this port and everything downstream.')
-          : 'Untyped until it runs. Declare a contract, or infer it from a sample. Leave empty to stay dynamic.'}
-      </div>
-      {stale && (
-        <div className="rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-[10px] leading-relaxed text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300">
-          ⚠ The cell changed since this contract was pinned — it may be stale. Re-infer or edit to re-pin.
-        </div>
+      {refName ? (
+        <>
+          <div className="text-[10.5px] leading-relaxed text-muted-foreground">
+            References the named contract <span className="dp-mono text-foreground">{refName}</span> — shared across pipelines; edit it in the schema registry.
+          </div>
+          {refCols.map((c, i) => (
+            <div key={i} className="flex items-center gap-2 text-[11px]">
+              <span className="dp-mono min-w-0 flex-1 overflow-hidden text-ellipsis text-foreground">{c.name}</span>
+              <span className="dp-mono w-[80px] flex-none text-muted-foreground">{c.type}</span>
+            </div>
+          ))}
+          <div className="mt-0.5 flex flex-wrap items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={() => reference('')}
+              className="h-auto px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none">Unlink</Button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="text-[10.5px] leading-relaxed text-muted-foreground">
+            {declared.length
+              ? (source === 'inferred' ? 'Inferred from a sample — edit to pin it as the contract.' : 'Declared — types this port and everything downstream.')
+              : 'Untyped until it runs. Declare a contract, infer it, or reference a named one. Leave empty to stay dynamic.'}
+          </div>
+          {stale && (
+            <div className="rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-[10px] leading-relaxed text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300">
+              ⚠ The cell changed since this contract was pinned — it may be stale. Re-infer or edit to re-pin.
+            </div>
+          )}
+          {declared.map((c, i) => (
+            <div key={i} className="flex items-center gap-1">
+              <Input value={c.name} placeholder="column"
+                onChange={(e) => commit(declared.map((x, j) => (j === i ? { ...x, name: e.target.value.replace(/\s+/g, '_') } : x)))}
+                className={cn(miniInputClass, 'dp-mono min-w-0 flex-1 text-[11px] md:text-[11px]')} />
+              <Input value={c.type} placeholder="type"
+                onChange={(e) => commit(declared.map((x, j) => (j === i ? { ...x, type: e.target.value } : x)))}
+                className={cn(miniInputClass, 'dp-mono w-[80px] flex-none text-[11px] md:text-[11px]')} />
+              <Button variant="ghost" size="icon" onClick={() => commit(declared.filter((_, j) => j !== i))} title="Remove column"
+                className="h-5 w-5 flex-none text-muted-foreground [&_svg]:size-3"><Icon name="close" size={11} /></Button>
+            </div>
+          ))}
+          <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+            <Button variant="outline" size="sm"
+              onClick={() => commit([...declared, { name: `col${declared.length + 1}`, type: 'string', capabilities: [] }])}
+              className="h-auto gap-1 self-start border-dashed px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none [&_svg]:size-3">
+              <Icon name="plus" size={11} /> add column
+            </Button>
+            <Button variant="outline" size="sm" disabled={busy || !runnable} onClick={infer}
+              title={runnable ? 'Run a bounded sample to resolve the output columns' : 'Wire a runnable input first'}
+              className="h-auto gap-1 px-2 py-1 text-[10.5px] font-medium text-primary shadow-none [&_svg]:size-3">
+              <Icon name="eye" size={11} /> {busy ? 'Inferring…' : 'Infer from sample'}
+            </Button>
+            {declared.length > 0 && (
+              <Button variant="ghost" size="sm" onClick={saveAsNamed}
+                className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none" title="Save these columns as a named, versioned workspace contract">Save as named…</Button>
+            )}
+            {declared.length > 0 && (
+              <Button variant="ghost" size="sm" onClick={() => commit([])}
+                className="h-auto px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none">Clear</Button>
+            )}
+          </div>
+          {names.length > 0 && (
+            <select value="" onChange={(e) => e.target.value && reference(e.target.value)}
+              className={cn(miniInputClass, 'mt-1 text-[10.5px] text-muted-foreground')} title="Reference a named workspace contract">
+              <option value="">Reference a named contract…</option>
+              {names.map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          )}
+        </>
       )}
-      {declared.map((c, i) => (
-        <div key={i} className="flex items-center gap-1">
-          <Input value={c.name} placeholder="column"
-            onChange={(e) => commit(declared.map((x, j) => (j === i ? { ...x, name: e.target.value.replace(/\s+/g, '_') } : x)))}
-            className={cn(miniInputClass, 'dp-mono min-w-0 flex-1 text-[11px] md:text-[11px]')} />
-          <Input value={c.type} placeholder="type"
-            onChange={(e) => commit(declared.map((x, j) => (j === i ? { ...x, type: e.target.value } : x)))}
-            className={cn(miniInputClass, 'dp-mono w-[80px] flex-none text-[11px] md:text-[11px]')} />
-          <Button variant="ghost" size="icon" onClick={() => commit(declared.filter((_, j) => j !== i))} title="Remove column"
-            className="h-5 w-5 flex-none text-muted-foreground [&_svg]:size-3"><Icon name="close" size={11} /></Button>
-        </div>
-      ))}
-      <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
-        <Button variant="outline" size="sm"
-          onClick={() => commit([...declared, { name: `col${declared.length + 1}`, type: 'string', capabilities: [] }])}
-          className="h-auto gap-1 self-start border-dashed px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none [&_svg]:size-3">
-          <Icon name="plus" size={11} /> add column
-        </Button>
-        <Button variant="outline" size="sm" disabled={busy || !runnable} onClick={infer}
-          title={runnable ? 'Run a bounded sample to resolve the output columns' : 'Wire a runnable input first'}
-          className="h-auto gap-1 px-2 py-1 text-[10.5px] font-medium text-primary shadow-none [&_svg]:size-3">
-          <Icon name="eye" size={11} /> {busy ? 'Inferring…' : 'Infer from sample'}
-        </Button>
-        {declared.length > 0 && (
-          <Button variant="ghost" size="sm" onClick={() => commit([])}
-            className="h-auto px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none">Clear</Button>
-        )}
-      </div>
+      {(declared.length > 0 || refName) && (
+        <label className="mt-1 flex items-center gap-1.5 text-[10.5px] text-muted-foreground" title="Fail the run if the actual output columns drift from this contract (missing / unexpected / retyped)">
+          <input type="checkbox" checked={enforce} onChange={(e) => setEnforce(e.target.checked)} /> Enforce (fail the run on drift)
+        </label>
+      )}
       {err && <div className="text-[10px] leading-relaxed text-amber-700 dark:text-amber-300">⚠ {err}</div>}
     </Section>
   )

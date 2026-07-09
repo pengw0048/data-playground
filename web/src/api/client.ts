@@ -190,6 +190,10 @@ export const api = {
     req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc), keepalive }),
   deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),
   listRuns: (canvasId: string) => req<RunRecordDto[]>(`/canvas/${canvasId}/runs`),
+  // named/versioned schema contracts (workspace artifacts a node can reference by name)
+  listSchemas: () => req<SchemaContractDto[]>('/schemas'),
+  saveSchema: (name: string, columns: ColumnSchema[]) =>
+    req<SchemaContractDto>('/schemas', { method: 'POST', body: JSON.stringify({ name, columns }) }),
   listVersions: (canvasId: string) => req<CanvasVersionDto[]>(`/canvas/${canvasId}/versions`),
   restoreCanvas: (canvasId: string, versionId: string) =>
     req<{ ok: boolean; id: string; doc: CanvasDoc }>(`/canvas/${canvasId}/restore`, { method: 'POST', body: JSON.stringify({ version_id: versionId }) }),
@@ -210,6 +214,7 @@ export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export interface PerNodeStat { node_id: string; status: string; rows?: number | null; ms?: number | null; label?: string | null }
 export interface RunRecordDto { id: string; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputTable?: string | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
+export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
 export interface CanvasVersionDto { id: string; version: number; label?: string | null; authorId?: string | null; createdAt?: string | null }
 export interface ShareInfo { userId: string; name: string; role: string }
 export interface DpUser { id: string; name: string; email?: string | null }

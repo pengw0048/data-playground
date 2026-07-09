@@ -84,8 +84,14 @@ _DUCK_TYPE = {
 
 def declared_schema(node: GraphNode) -> list | None:
     """A user-declared output-schema contract (config.outputSchema) on a code op, or None. Lets a
-    transform/plugin node carry a typed port + propagate types downstream without ever being run."""
+    transform/plugin node carry a typed port + propagate types downstream without ever being run.
+    Either an inline column list, OR {"ref": name[, "version": v]} referencing a named workspace contract
+    (so many pipelines share ONE contract) — the ref resolves to that contract's columns."""
     sch = _cfg(node).get("outputSchema")
+    if isinstance(sch, dict) and sch.get("ref"):
+        from hub import metadb
+        c = metadb.get_schema_contract(str(sch["ref"]), sch.get("version"))
+        return c["columns"] if c and c.get("columns") else None
     return sch if isinstance(sch, list) and sch else None
 
 

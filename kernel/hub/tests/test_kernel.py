@@ -4050,6 +4050,49 @@ def test_similarity_dedup_plugin_clusters_and_marks_representatives(tmp_path):
     assert ragged_out.height == 2 and "dup_group" not in ragged_out.columns  # passthrough, no crash
 
 
+def test_named_schema_contracts_reference_enforce_and_diff():
+    # cluster 4: schema contracts become NAMED + VERSIONED workspace artifacts multiple pipelines reference,
+    # with enforced drift + a structural diff — not just per-node non-enforcing warnings.
+    from hub import metadb
+    from hub.executors.engine import declared_schema
+    from hub.models import GraphNode
+
+    v1 = metadb.save_schema_contract("caption_v", [{"name": "id", "type": "int"}, {"name": "text", "type": "string"}])
+    v2 = metadb.save_schema_contract("caption_v", [{"name": "id", "type": "int"}, {"name": "text", "type": "string"}, {"name": "score", "type": "double"}])
+    assert (v1, v2) == (1, 2)
+    assert metadb.get_schema_contract("caption_v")["version"] == 2                     # latest by default
+    assert len(metadb.get_schema_contract("caption_v", 1)["columns"]) == 2             # a specific version
+    d = metadb.diff_columns(metadb.get_schema_contract("caption_v", 1)["columns"],
+                            metadb.get_schema_contract("caption_v", 2)["columns"])
+    assert d["added"] == ["score"] and not d["removed"] and d["match"] is False        # v1→v2 adds 'score'
+
+    # endpoints: save (new version), list, get-with-versions, diff
+    assert client.post("/api/schemas", json={"name": "ep", "columns": [{"name": "a", "type": "int", "capabilities": []}]}).json()["version"] == 1
+    assert any(s["name"] == "ep" for s in client.get("/api/schemas").json())
+    assert client.get("/api/schemas/ep").json()["versions"] == [1]
+    assert client.get("/api/schemas/diff", params={"name": "caption_v", "a": 1, "b": 2}).json()["added"] == ["score"]
+
+    # a node REFERENCES a named contract → declared_schema resolves it to the (latest) columns
+    node = GraphNode(id="t", type="transform", position={"x": 0, "y": 0},
+                     data={"config": {"outputSchema": {"ref": "caption_v"}}})
+    assert [c["name"] for c in declared_schema(node)] == ["id", "text", "score"]
+
+    # ENFORCE at run: a contract that doesn't match the actual output FAILS the run; a matching one passes
+    ev = _uri("events")  # id BIGINT, user_id BIGINT, event VARCHAR, amount DECIMAL→DOUBLE
+
+    def run_enforced(schema):
+        g = {"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev}),
+             N("t", "transform", {"mode": "map", "code": "def fn(r): return r", "outputSchema": schema, "enforceSchema": True})],
+             "edges": [E("s", "t")]}
+        return _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "t", "confirmed": True}).json()["runId"])
+
+    bad = run_enforced([{"name": "totally_wrong", "type": "int", "capabilities": []}])
+    assert bad["status"] == "failed" and "schema contract" in (bad.get("error") or "")
+    good = run_enforced([{"name": "id", "type": "int", "capabilities": []}, {"name": "user_id", "type": "int", "capabilities": []},
+                         {"name": "event", "type": "string", "capabilities": []}, {"name": "amount", "type": "double", "capabilities": []}])
+    assert good["status"] == "done"  # names + normalized types all match → no drift
+
+
 def test_warm_resource_reused_across_batches_and_runs(tmp_path):
     # dp_warm_resource's `warm-map` node builds an expensive handle ONCE via ctx.resource and reuses the
     # SAME instance across batches and across separate runs on the (warm) kernel — the pain being pipelines

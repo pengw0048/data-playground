@@ -111,6 +111,17 @@ class RunState(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
+class SchemaContract(Base):
+    """A named, versioned schema contract — a workspace artifact multiple pipelines reference by name
+    (a node's config.outputSchema = {"ref": name}) instead of each carrying a private inline copy.
+    Saving under an existing name mints a new version, so drift is a diff between versions."""
+    __tablename__ = "schema_contracts"
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    doc: Mapped[str] = mapped_column(Text)  # JSON: [{name, type}, ...]
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class Kernel(Base):
     """Lease for a per-canvas execution kernel (a long-lived process, or a pod). `canvas_id` PK makes
     the INSERT the single-spawner claim; `kernel_id` fences a replaced/zombie kernel out of
@@ -445,6 +456,55 @@ def run_stalled(run_id: str, threshold_s: float) -> bool:
         if r is None or r.updated_at is None:
             return False
         return _stale_secs(r.updated_at) > threshold_s  # _stale_secs normalizes SQLite's naive datetimes
+
+
+def save_schema_contract(name: str, columns: list[dict]) -> int:
+    """Save a named schema contract as a NEW version (max existing + 1). `columns` = [{name, type}, ...].
+    Returns the new version number."""
+    from sqlalchemy import func
+    with session() as s:
+        cur = s.query(func.max(SchemaContract.version)).filter(SchemaContract.name == name).scalar()
+        version = (cur or 0) + 1
+        s.add(SchemaContract(name=name, version=version,
+                             doc=json.dumps([{"name": c["name"], "type": c.get("type", "")} for c in columns])))
+        return version
+
+
+def get_schema_contract(name: str, version: int | None = None) -> dict | None:
+    """A contract by name — the latest version, or a specific one. None if unknown."""
+    with session() as s:
+        q = select(SchemaContract).where(SchemaContract.name == name)
+        q = q.where(SchemaContract.version == version) if version is not None \
+            else q.order_by(SchemaContract.version.desc()).limit(1)
+        r = s.scalars(q).first()
+        return {"name": r.name, "version": r.version, "columns": json.loads(r.doc)} if r else None
+
+
+def list_schema_contracts() -> list[dict]:
+    """Every contract's LATEST version (name/version/columns), for the registry view + a reference picker."""
+    with session() as s:
+        rows = s.scalars(select(SchemaContract).order_by(SchemaContract.name, SchemaContract.version)).all()
+        latest: dict[str, dict] = {}
+        for r in rows:  # ordered ascending → the last seen per name is the latest
+            latest[r.name] = {"name": r.name, "version": r.version, "columns": json.loads(r.doc)}
+        return list(latest.values())
+
+
+def schema_contract_versions(name: str) -> list[int]:
+    with session() as s:
+        return sorted(v for (v,) in s.query(SchemaContract.version).filter(SchemaContract.name == name).all())
+
+
+def diff_columns(a: list[dict], b: list[dict]) -> dict:
+    """Structural diff of two column lists (contract vs contract, or contract vs actual). Reports columns
+    added / removed / whose type changed, going a → b (b is the newer / actual)."""
+    am = {c["name"]: str(c.get("type", "")) for c in a}
+    bm = {c["name"]: str(c.get("type", "")) for c in b}
+    added = [n for n in bm if n not in am]
+    removed = [n for n in am if n not in bm]
+    changed = [{"name": n, "from": am[n], "to": bm[n]} for n in am if n in bm and am[n] != bm[n]]
+    return {"added": added, "removed": removed, "changed": changed,
+            "match": not (added or removed or changed)}
 
 
 _RESULT_CACHE_MAX = 1000  # persistent equivalent of the old in-process _MAX_RUNS cache cap
