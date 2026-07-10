@@ -22,6 +22,7 @@ const OPEN_KEY = (uid: string) => `dp-open-${uid}`  // last-opened file per user
 
 let _seq = 0
 let _cfgEdit = { id: '', t: 0 } // coalesces param-edit undo checkpoints
+let _extEditTimer: ReturnType<typeof setTimeout> | null = null // debounces external-edit refetches
 
 /** A canvas position near `base` that doesn't overlap any existing node (so added nodes never stack). */
 export function freePosition(nodes: CanvasNode[], base: { x: number; y: number }): { x: number; y: number } {
@@ -187,6 +188,7 @@ interface Store {
   // -- persistence --
   save: () => Promise<void>
   loadDoc: (doc: CanvasDoc) => void
+  applyExternalEdit: (canvasId?: string) => void
   applyAgentGraph: (graph: { nodes: AgentBackendNode[]; edges: AgentBackendEdge[] }) => void
 
   // -- app shell (Figma-style views) --
@@ -876,6 +878,23 @@ export const useStore = create<Store>((set, get) => ({
     const d = migrateDoc(doc)
     set({ doc: d, previews: {}, runs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [] })
     reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
+  },
+
+  // An MCP client (the user's own agent) edited THIS canvas out-of-band — the collab room relayed an
+  // 'external-edit' nudge. Debounce a burst of agent edits into one refetch, re-apply the server's doc
+  // (so nodes appear live, as if you watched it build), and tell the user. Guarded to the open canvas.
+  applyExternalEdit: (canvasId) => {
+    const cur = get().doc.id
+    if (!cur || (canvasId && canvasId !== cur)) return
+    if (_extEditTimer) clearTimeout(_extEditTimer)
+    _extEditTimer = setTimeout(async () => {
+      _extEditTimer = null
+      if (get().doc.id !== cur) return  // navigated away while debouncing
+      try {
+        get().loadDoc(await api.getCanvas(cur))
+        get().pushToast('Canvas updated by your agent', 'info')
+      } catch { /* offline / deleted — leave the current view untouched */ }
+    }, 250)
   },
 
   // Apply a graph the LLM agent built (extends the canvas). Undoable; preserves UI state of nodes

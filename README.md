@@ -194,16 +194,25 @@ unchanged — there is deliberately no rule-based stand-in pretending to be an L
 The mirror image of the built-in agent: instead of the kernel calling a model, point your **own
 Claude Code** (or any [MCP](https://modelcontextprotocol.io) client) at your workspace and have it
 build the whole pipeline — explore the catalog, open a canvas, wire typed nodes, **write the
-`transform` Python for you**, preview each step against real rows, and run it. Needs **no API key
-and no extra install** (stdlib-only, over stdio):
+`transform` Python for you**, preview each step against real rows, run it, and read the rows it
+produced. No API key required.
+
+The web app **serves the MCP endpoint itself** — connect over HTTP and every tool runs on the app's
+real engine and auth (no second process, no drift), and **an edit shows up live in an open browser
+tab** (watch the nodes land as the agent wires them):
 
 ```bash
-cd kernel && uv run dataplay          # serve the web app in one terminal
-claude mcp add dataplay -- uv run dataplay mcp   # register the MCP server
+cd kernel && uv run dataplay                              # serve the web app
+claude mcp add --transport http dataplay http://127.0.0.1:8471/mcp
 ```
 
-The canvas the agent builds is persisted like any other, so it shows up in the browser (reload to
-see changes). See **[docs/MCP.md](docs/MCP.md)** for the tool list and how it fits together.
+Or run it **standalone over stdio** — no server, stdlib-only — for a headless box or CI:
+
+```bash
+claude mcp add dataplay -- uv run dataplay mcp
+```
+
+See **[docs/MCP.md](docs/MCP.md)** for both transports, the tool list, and how it fits together.
 
 ---
 

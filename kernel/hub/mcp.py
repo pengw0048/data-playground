@@ -92,6 +92,9 @@ class Playground:
         self.deps = deps
         self.user_id = user_id
         self.base_url = base_url.rstrip("/")
+        # canvas ids this session mutated — the in-process HTTP transport drains this after each call to
+        # nudge any open browser tab to pick up the edit live (empty/ignored on the stdio transport).
+        self.changed_canvases: set[str] = set()
 
     # -- helpers ----------------------------------------------------------- #
     def _canvas_url(self, canvas_id: str) -> str:
@@ -135,6 +138,7 @@ class Playground:
             ws.put_canvas(canvas_id, doc, uid=self.user_id)
         except HTTPException as e:
             raise ToolError(f"canvas '{canvas_id}': {e.detail}")
+        self.changed_canvases.add(canvas_id)  # so the HTTP transport can nudge an open browser tab
 
     def _mutate(self, canvas_id: str, op: Callable[[dict], dict]) -> dict:
         """Load → apply one graph op → persist. A structural change (a node/edge added or removed)
@@ -338,67 +342,75 @@ class Playground:
             raise ToolError(f"{type(e).__name__}: {e}")
 
     def run_canvas(self, args: dict) -> dict:
-        """Execute the pipeline up to a sink node, IN-PROCESS on the local out-of-core runner, and
-        wait for it to finish. A large/unknown-size run returns needsConfirm:true unless confirm:true.
-        A run still going after the poll timeout returns timedOut:true with its runId — poll run_status
-        or cancel_run with that id (the run keeps executing in the background)."""
-        from hub import compiler
-        from hub import graph as gmod
+        """Execute the pipeline up to a sink node and wait for it to finish. Runs through the SAME
+        path as the web `POST /run` (`runs.start_run`): the same confirm gate on real size, the same
+        cost-based placement / capability routing, the same run ownership — so an agent-launched run
+        behaves identically to a browser-launched one (and, when served in-process, is visible to the
+        UI). A large/unknown run returns needsConfirm:true unless confirm:true; a run still going after
+        the poll timeout returns timedOut:true with its runId — poll run_status / cancel_run."""
+        from fastapi import HTTPException as HTTPExc
+
         from hub.models import Graph
-        from hub.routers.runs import _cached_noop, _cone_size
+        from hub.routers.runs import RunNeedsConfirm, start_run
         canvas_id = self._req(args, "canvasId")
-        d = self.deps
         doc = self._get_doc(canvas_id)
         graph = Graph.model_validate(doc)
-        gmod.resolve_source_refs(graph, d.catalog.resolve_ref)
-
         target = args.get("nodeId") or self._sole_sink(doc)
         if not graph_ops.find_node(doc, target):
             raise ToolError(f"node '{target}' not found on canvas '{canvas_id}'")
-        errs = gmod.type_errors(graph, d.node_specs)
-        if errs:
-            raise ToolError("incompatible connection: " + "; ".join(errs[:5]))
-        plan = compiler.compile_plan(graph, target, d.registry, d.node_specs, d.node_ir)
-        if not plan.acyclic:
-            raise ToolError(plan.error or "graph has a cycle")
-
-        runner = d.runner  # the local out-of-core runner — deterministic, no per-canvas kernel spawn
-        # Feed the SAME real size estimate the web /run path uses so the confirm gate actually trips on a
-        # big pass (estimate(None, None) would always say needs_confirm=False — the gate would be dead).
-        rows, byts = _cone_size(graph, target, d)
-        est = runner.estimate(plan, rows, byts)
-        if est.needs_confirm and _cached_noop(runner, graph, target):
-            est.needs_confirm = False  # re-running a cached result is a no-op, not a big pass
-        if est.needs_confirm and not args.get("confirm"):
+        try:
+            status, owner = start_run(self.deps, graph, target, self.user_id, bool(args.get("confirm")))
+        except RunNeedsConfirm as e:
+            est = e.estimate
             return {"needsConfirm": True, "targetNodeId": target, "estRows": est.rows,
                     "reason": est.breakdown or "large or unknown size — a full pass; pass confirm:true to run"}
-        status = runner.run(plan, graph, target, est.placement)
-        status = self._await_run(runner, status.run_id)
-        return self._run_envelope(status, target)
+        except HTTPExc as e:  # invalid/cyclic graph from start_run's server-side checks
+            raise ToolError(str(e.detail))
+        status = self._await_run(owner, status.run_id)
+        return self._run_envelope(status, status.target_node_id or target)
 
     def run_status(self, args: dict) -> dict:
         """Poll a run started by run_canvas (by its runId) — the way to follow a run that returned
-        timedOut:true to completion without blocking the tool call the whole time."""
-        try:
-            st = self.deps.runner.status(self._req(args, "runId"))
-        except KeyError:
-            raise ToolError(f"unknown runId '{args.get('runId')}' (not started this session, or evicted)")
+        timedOut:true to completion. Resolved like the web GET /run/{id}: an unknown/evicted id comes
+        back as a terminal 'failed' status (with a reason), not a hard error."""
+        from hub.routers.runs import _status_or_lost
+        st = _status_or_lost(self._req(args, "runId"))
         return self._run_envelope(st, st.target_node_id)
 
     def cancel_run(self, args: dict) -> dict:
-        """Cancel an in-flight run (by its runId). A finished run is returned unchanged."""
-        try:
-            st = self.deps.runner.cancel(self._req(args, "runId"))
-        except KeyError:
-            raise ToolError(f"unknown runId '{args.get('runId')}' (not started this session, or evicted)")
-        return self._run_envelope(st, st.target_node_id)
+        """Cancel an in-flight run (by its runId), routed like the web POST /run/{id}/cancel. A finished
+        run is returned unchanged; a truly unknown id is a tool error."""
+        from hub import metadb
+        run_id = self._req(args, "runId")
+        owner = self.deps.run_index.get(run_id)
+        if owner is not None:
+            return self._run_envelope(owner.cancel(run_id), None)
+        kb = self.deps.kernel_backend()
+        if kb is not None:
+            return self._run_envelope(kb.cancel(run_id), None)
+        persisted = metadb.get_run_state(run_id)
+        if persisted is None:
+            raise ToolError(f"unknown runId '{run_id}' (not started this session, or evicted)")
+        from hub.models import RunStatus
+        return self._run_envelope(RunStatus(**persisted), None)
+
+    def sample_result(self, args: dict) -> dict:
+        """Sample the OUTPUT dataset a run materialized (by its runId) — closes the author→run→inspect
+        loop so an agent can read the rows it produced without hand-reconstructing the output uri."""
+        from hub.routers.runs import _status_or_lost
+        st = _status_or_lost(self._req(args, "runId"))
+        if not st.output_uri:
+            raise ToolError(f"run '{st.run_id}' ({st.status}) produced no materialized output to sample")
+        return self.sample_dataset({"dataset": st.output_uri, "limit": args.get("limit"),
+                                    "columns": args.get("columns")})
 
     @staticmethod
     def _run_envelope(status, target: str | None) -> dict:
         """The wire shape for a run result. `timedOut` is set when the poll gave up before the run
         reached a terminal state — the run is still executing; follow it with run_status(runId)."""
         terminal = status.status in ("done", "failed", "cancelled")
-        env = {"runId": status.run_id, "status": status.status, "targetNodeId": target,
+        env = {"runId": status.run_id, "status": status.status,
+               "targetNodeId": target if target is not None else status.target_node_id,
                "rows": status.total_rows, "ms": status.ms, "outputTable": status.output_table,
                "outputUri": status.output_uri, "error": status.error}
         if not terminal:
@@ -416,10 +428,14 @@ class Playground:
                         + (f"{len(sinks)} sink nodes: {', '.join(sinks)}" if sinks else "no runnable sink"))
 
     @staticmethod
-    def _await_run(runner, run_id: str):
+    def _await_run(owner, run_id: str):
+        """Poll the owning runner (base runner OR the RunController) to a terminal state, bounded by the
+        poll timeout so a very long run doesn't block the caller forever (it keeps running; run_status
+        resumes following it)."""
+        from hub.routers.runs import _status_or_lost
         deadline = time.monotonic() + _RUN_POLL_TIMEOUT_S
         while True:
-            st = runner.status(run_id)
+            st = _status_or_lost(run_id)
             if st.status in ("done", "failed", "cancelled") or time.monotonic() > deadline:
                 return st
             time.sleep(0.1)
@@ -556,6 +572,11 @@ def _tool_specs(pg: Playground) -> list[dict]:
         {"name": "cancel_run", "handler": pg.cancel_run,
          "description": "Cancel an in-flight run by its runId. A finished run is returned unchanged.",
          "inputSchema": _schema({"runId": _STR}, ["runId"])},
+        {"name": "sample_result", "handler": pg.sample_result,
+         "description": "Sample the OUTPUT dataset a run materialized (by its runId): columns + real "
+                        "rows — read what the pipeline actually produced without rebuilding its uri.",
+         "inputSchema": _schema({"runId": _STR, "limit": {**_INT, "description": "max rows (default 20)"},
+                                 "columns": {"type": "array", "items": _STR}}, ["runId"])},
     ]
 
 
@@ -710,3 +731,13 @@ def build_server(base_url: str | None = None, user_id: str | None = None) -> MCP
         # --user would then act as the bootstrap admin. Fail loudly instead.
         raise SystemExit(f"--user '{user_id}' is not a known user id")
     return MCPServer(Playground(get_deps(), uid, base_url or settings.base_url))
+
+
+def build_http_server(user_id: str) -> MCPServer:
+    """An MCPServer for the IN-PROCESS HTTP transport (POST /mcp on the web app), bound to the deps
+    singleton the app already built and to the request's already-authenticated user. No init_db /
+    resolve_user here — the app boot and the `current_user` dependency did both. Built per request
+    (cheap); a mutating tool records touched canvases on `.pg.changed_canvases` for the live nudge."""
+    from hub.deps import get_deps
+    from hub.settings import settings
+    return MCPServer(Playground(get_deps(), user_id, settings.base_url))

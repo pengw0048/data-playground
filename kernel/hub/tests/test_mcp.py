@@ -396,9 +396,18 @@ def test_run_envelope_flags_a_non_terminal_run_as_timed_out():
     assert running["timedOut"] is True and running["runId"] == "r" and running["hint"]
 
 
-def test_run_status_unknown_id_is_a_tool_error():
-    res = call("run_status", {"runId": "run_does_not_exist"})
-    assert res["isError"] is True and "unknown runId" in res["content"][0]["text"]
+def test_run_status_unknown_id_reports_a_failed_status():
+    # resolved like the web GET /run/{id}: an unknown/evicted run comes back as a terminal 'failed'
+    # status with a reason, not a hard error, so the client resolves cleanly instead of retrying.
+    st = data("run_status", {"runId": "run_does_not_exist"})
+    assert st["status"] == "failed" and "not found" in (st["error"] or "").lower()
+
+
+def test_cancel_run_unknown_id_reports_a_failed_status():
+    # like the web POST /run/{id}/cancel: an unknown run resolves to a terminal 'failed' status via the
+    # DB-backed backend, not a hard error (the ToolError path is only for a workspace with no backend).
+    st = data("cancel_run", {"runId": "run_does_not_exist"})
+    assert st["status"] == "failed" and "not found" in (st["error"] or "").lower()
 
 
 def test_run_status_and_cancel_are_listed_tools():

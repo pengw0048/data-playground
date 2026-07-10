@@ -46,6 +46,7 @@ function openSocket(canvasId: string): void {
     const st = useStore.getState()
     if (msg.type === 'yjs' && typeof msg.update === 'string') { applyYUpdate(msg.update); return }
     if (msg.type === 'ysync') { if (hasYState()) send({ type: 'yjs', update: encodeYState(msg.sv) }); return }  // reply only if we have state (avoids empty-doc storms)
+    if (msg.type === 'external-edit') { st.applyExternalEdit(msg.canvasId); return }  // an MCP agent edited this canvas out-of-band → refetch + apply live
     if (msg.type === 'leave') { st.dropPeer(msg.clientId); return }
     if (msg.type === 'presence') {
       const prev = st.peers[msg.clientId]
