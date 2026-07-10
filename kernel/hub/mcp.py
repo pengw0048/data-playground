@@ -104,6 +104,12 @@ class Playground:
             raise ToolError(f"missing required argument '{key}'")
         return v
 
+    @staticmethod
+    def _limit(args: dict, default: int) -> int:
+        """A row-limit argument, honoring an explicit 0 (falsy-zero-safe) and never negative."""
+        v = args.get("limit")
+        return default if v is None else max(0, int(v))
+
     def _get_doc(self, canvas_id: str) -> dict:
         """Load a canvas doc through the SAME authorized read the HTTP API uses (404 → ToolError),
         guaranteeing the nodes/edges lists exist so the graph ops can append to them."""
@@ -132,20 +138,27 @@ class Playground:
 
     def _mutate(self, canvas_id: str, op: Callable[[dict], dict]) -> dict:
         """Load → apply one graph op → persist. A structural change (a node/edge added or removed)
-        re-tidies the whole canvas into a clean left-to-right topological layout — right for a
-        machine-built pipeline, and it means an incrementally-wired chain still flows across the
-        canvas rather than stacking. A pure config edit changes no structure, so positions are left
-        exactly as they were (a hand-moved node isn't snapped back)."""
+        re-tidies positions; a pure config edit changes no structure, so positions are left exactly
+        as they were (a hand-moved node isn't snapped back)."""
         doc = self._get_doc(canvas_id)
+        before = {n["id"] for n in doc["nodes"]}
         sig = (len(doc["nodes"]), len(doc["edges"]))
         result = op(doc)
         if (len(doc["nodes"]), len(doc["edges"])) != sig:
-            self._layout(doc)
+            self._relayout(doc, before)
         self._put_doc(canvas_id, doc)
         return result
 
     @staticmethod
-    def _layout(doc: dict) -> None:
+    def _relayout(doc: dict, before: set[str]) -> None:
+        """Re-tidy after a structural change. A flat pipeline gets a clean full left-to-right
+        topological layout (so an incrementally-wired chain flows across the canvas rather than
+        stacking). A canvas containing a `section` uses parent-RELATIVE child positions, which a full
+        (absolute) relayout would fling out of the frame — so there we only position the newly-added
+        (always top-level) nodes and leave everything else, section children included, untouched."""
+        if any(n.get("parentId") for n in doc["nodes"]):
+            graph_ops.layout_new(doc, before)
+            return
         from hub import graph as gmod
         from hub.models import Graph
         g = Graph.model_validate(doc)
@@ -186,7 +199,7 @@ class Playground:
         from hub.models import SampleRequest
         from hub.routers.catalog import data_sample
         uri = self._resolve_uri(self._req(args, "dataset"))
-        limit = int(args.get("limit") or 20)
+        limit = self._limit(args, 20)
         try:
             res = data_sample(SampleRequest(uri=uri, k=limit, columns=args.get("columns")))
         except HTTPException as e:
@@ -315,7 +328,7 @@ class Playground:
         result = self._mutate(canvas_id, op)
         # preview the freshly-saved doc so the client sees whether its code actually runs + its columns
         doc = self._get_doc(canvas_id)
-        result["preview"] = self._preview_doc(doc, result["nodeId"], int(args.get("limit") or 8))
+        result["preview"] = self._preview_doc(doc, result["nodeId"], self._limit(args, 8))
         return result
 
     # -- preview / validate / run ----------------------------------------- #
@@ -324,7 +337,7 @@ class Playground:
         doc = self._get_doc(canvas_id)
         if not graph_ops.find_node(doc, node_id):
             raise ToolError(f"node '{node_id}' not found on canvas '{canvas_id}'")
-        return self._preview_doc(doc, node_id, int(args.get("limit") or 10))
+        return self._preview_doc(doc, node_id, self._limit(args, 10))
 
     def validate_canvas(self, args: dict) -> dict:
         canvas_id = self._req(args, "canvasId")

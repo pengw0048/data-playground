@@ -100,6 +100,12 @@ def test_sample_dataset_bad_ref_is_a_tool_error_not_a_crash():
     assert res["isError"] is True and res["content"][0]["text"]
 
 
+def test_limit_zero_is_honored_not_replaced_by_default():
+    # falsy-zero regression: limit:0 must mean zero rows (schema-only), not silently become the default
+    s = data("sample_dataset", {"dataset": "events", "limit": 0})
+    assert s["rows"] == [] and s["columns"]
+
+
 def test_join_hints_measures_cardinality():
     j = data("join_hints", {"left": "images", "right": "events"})
     cards = {tuple(s["rightColumns"]): s["cardinality"] for s in j["suggestions"]}
@@ -124,6 +130,22 @@ def test_build_is_persisted_and_visible_through_the_http_api():
     gc = data("get_canvas", {"canvasId": cid})
     assert gc["url"] == f"http://test.local/#/canvas/{cid}"
     assert {n["type"] for n in gc["nodes"]} == {"source", "filter"}
+
+
+def test_structural_edit_preserves_section_child_positions():
+    # a canvas with a `section` uses parent-RELATIVE child positions; a structural MCP edit must not
+    # relayout them into absolute coords (which would fling them out of the frame). Seed such a canvas
+    # through the HTTP API (MCP can't set parentId), then add a top-level node via MCP.
+    cid = "canvas_section_pos"
+    doc = {"id": cid, "name": "sec", "version": 1, "edges": [],
+           "nodes": [{"id": "sec_1", "type": "section", "position": {"x": 0, "y": 0}, "data": {"config": {}}},
+                     {"id": "child_1", "type": "filter", "position": {"x": 10, "y": 20},
+                      "parentId": "sec_1", "data": {"config": {}}}]}
+    assert client.put(f"/api/canvas/{cid}", json=doc).status_code == 200
+    data("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})
+    after = {n["id"]: n for n in client.get(f"/api/canvas/{cid}").json()["nodes"]}
+    assert after["child_1"]["position"] == {"x": 10, "y": 20}     # relative child position untouched
+    assert after["child_1"]["parentId"] == "sec_1"
 
 
 def test_get_missing_canvas_is_a_tool_error():
