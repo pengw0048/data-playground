@@ -58,7 +58,10 @@ isn't in the browser's live collab room — that's the HTTP transport's advantag
   (`runs.start_run`): the same confirm gate on real size (a large full pass returns `needsConfirm`
   until you pass `confirm: true`), the same cost-based placement / capability routing, the same run
   ownership. An agent-launched run behaves identically to a browser-launched one — and over the HTTP
-  transport it's the *same process*, so the run is visible in the UI too.
+  transport it's the *same process*, so the run is visible in the UI too. That means a run uses the
+  workspace's configured execution backend — the **per-canvas kernel** (a spawned, warm, restart-
+  surviving process) by default; on a headless/one-shot box where you want a pure in-process run and
+  no lingering kernel, set `DP_EXECUTION=local-out-of-core`.
 - **Watch it build (HTTP).** When an MCP tool edits a canvas, the app nudges every open browser tab in
   that canvas's collab room to refetch and re-apply — nodes appear live, no reload. (stdio can't do
   this; reload to see its edits.)

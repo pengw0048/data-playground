@@ -359,14 +359,14 @@ class Playground:
         if not graph_ops.find_node(doc, target):
             raise ToolError(f"node '{target}' not found on canvas '{canvas_id}'")
         try:
-            status, owner = start_run(self.deps, graph, target, self.user_id, bool(args.get("confirm")))
+            status, _owner = start_run(self.deps, graph, target, self.user_id, bool(args.get("confirm")))
         except RunNeedsConfirm as e:
             est = e.estimate
             return {"needsConfirm": True, "targetNodeId": target, "estRows": est.rows,
                     "reason": est.breakdown or "large or unknown size — a full pass; pass confirm:true to run"}
         except HTTPExc as e:  # invalid/cyclic graph from start_run's server-side checks
             raise ToolError(str(e.detail))
-        status = self._await_run(owner, status.run_id)
+        status = self._await_run(status.run_id)
         return self._run_envelope(status, status.target_node_id or target)
 
     def run_status(self, args: dict) -> dict:
@@ -428,10 +428,10 @@ class Playground:
                         + (f"{len(sinks)} sink nodes: {', '.join(sinks)}" if sinks else "no runnable sink"))
 
     @staticmethod
-    def _await_run(owner, run_id: str):
-        """Poll the owning runner (base runner OR the RunController) to a terminal state, bounded by the
-        poll timeout so a very long run doesn't block the caller forever (it keeps running; run_status
-        resumes following it)."""
+    def _await_run(run_id: str):
+        """Poll the run (resolved to its owning runner via _status_or_lost, DB-backed so it survives an
+        eviction) to a terminal state, bounded by the poll timeout so a very long run doesn't block the
+        caller forever (it keeps running; run_status resumes following it)."""
         from hub.routers.runs import _status_or_lost
         deadline = time.monotonic() + _RUN_POLL_TIMEOUT_S
         while True:
@@ -559,8 +559,9 @@ def _tool_specs(pg: Playground) -> list[dict]:
                         "cardinality and fan-out warnings.",
          "inputSchema": _schema(dict(canvas), ["canvasId"])},
         {"name": "run_canvas", "handler": pg.run_canvas,
-         "description": "Run the pipeline up to a sink node (in-process, out-of-core) and wait for the "
-                        "result. Omit nodeId if the canvas has a single sink. A large/unknown run returns "
+         "description": "Run the pipeline up to a sink node (out-of-core, on the workspace's configured "
+                        "execution backend — the same one the web UI uses) and wait for the result. Omit "
+                        "nodeId if the canvas has a single sink. A large/unknown run returns "
                         "needsConfirm:true unless you pass confirm:true. A run still going after the poll "
                         "timeout returns timedOut:true + runId — then poll run_status / cancel_run.",
          "inputSchema": _schema({**canvas, "nodeId": {**_STR, "description": "the node to run to (a sink)"},
