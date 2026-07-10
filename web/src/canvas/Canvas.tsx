@@ -357,19 +357,24 @@ export function Canvas() {
         deleteKeyCode={null}
       >
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="var(--dots)" />  {/* themed: light/dark via --dots */}
-        {/* zoom controls sit ABOVE the minimap so they never overlap */}
-        <Controls showInteractive={false} position="bottom-left" style={{ marginBottom: 132, marginLeft: 12 }} />
-        {/* MiniMap paints to a 2D canvas where CSS vars don't resolve, so maskColor + the nodeColor
-            fallback are literals (a theme-neutral gray veil; not the now-var color.text3). */}
-        <MiniMap
-          pannable
-          position="bottom-left"
-          style={{ marginBottom: 12, marginLeft: 12, width: 168, height: 108 }}
-          maskColor="rgba(128,128,128,0.2)"
-          nodeColor={(n) => kindAccent[n.type ?? ''] ?? '#98a0ac'}
-          nodeStrokeWidth={0}
-          onClick={(_, pos) => setCenter(pos.x, pos.y, { zoom: getZoom(), duration: 350 })}
-        />
+        {/* zoom controls + minimap only once there's something to navigate — on an empty canvas they'd
+            just be stray boxes over the "add a source" prompt. (zoom controls sit ABOVE the minimap.) */}
+        {doc.nodes.length > 0 && (
+          <>
+            <Controls showInteractive={false} position="bottom-left" style={{ marginBottom: 132, marginLeft: 12 }} />
+            {/* MiniMap paints to a 2D canvas where CSS vars don't resolve, so maskColor + the nodeColor
+                fallback are literals (a theme-neutral gray veil; not the now-var color.text3). */}
+            <MiniMap
+              pannable
+              position="bottom-left"
+              style={{ marginBottom: 12, marginLeft: 12, width: 168, height: 108 }}
+              maskColor="rgba(128,128,128,0.2)"
+              nodeColor={(n) => kindAccent[n.type ?? ''] ?? '#98a0ac'}
+              nodeStrokeWidth={0}
+              onClick={(_, pos) => setCenter(pos.x, pos.y, { zoom: getZoom(), duration: 350 })}
+            />
+          </>
+        )}
       </ReactFlow>
 
       {doc.nodes.length === 0 && <EmptyState />}

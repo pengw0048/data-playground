@@ -987,6 +987,17 @@ useStore.subscribe((s) => {
 const _PERNODE_STATUS: Record<string, NodeStatus> = {
   queued: 'queued', running: 'running', done: 'latest', failed: 'failed', cancelled: 'stale',
 }
+
+// A user-facing toast message from a runner's raw error: drop the engine's exception-class noise
+// ("BinderException: Binder Error: …") and the internal "Candidate bindings" line, keeping the
+// "at '<node>':" attribution + the human "Hint:" line. The full raw error still shows in the run panel.
+function cleanRunError(raw?: string | null): string {
+  if (!raw) return 'Run failed'
+  const lines = raw.split('\n').map((l) => l.trim()).filter((l) => l && !/^candidate bindings/i.test(l))
+  if (!lines.length) return 'Run failed'
+  lines[0] = lines[0].replace(/((?:at '[^']+': )?)[A-Za-z]*(?:Exception|Error): (?:[A-Za-z]+ Error: )?/, '$1')
+  return lines.join(' — ')
+}
 // Flip every still-animating node (queued/running) to a terminal 'stale' — for when a run ends WITHOUT
 // a final per-node snapshot to settle them: a user cancel (the optimistic pre-poll window) or the poll
 // giving up because the kernel became unreachable. Without it an intermediate node animates forever.
@@ -1062,7 +1073,7 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
     if (status.status === 'done' || status.status === 'failed' || status.status === 'cancelled') {
       const phase = status.status === 'done' ? 'done' : status.status === 'failed' ? 'failed' : 'idle'
       set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase } as any), status, phase } } }))
-      if (status.status === 'failed') get().pushToast(status.error ?? 'Run failed', 'error')
+      if (status.status === 'failed') get().pushToast(cleanRunError(status.error), 'error')
       const g = get()
       g.updateData(nodeId, {
         status: status.status === 'done' ? 'latest' : status.status === 'failed' ? 'failed' : 'stale',

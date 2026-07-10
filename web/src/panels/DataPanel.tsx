@@ -190,22 +190,28 @@ function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<stri
   )
 }
 
+// a scalar numeric column → right-align its cells (matches the Stats tab; eases scanning). Lists excluded.
+const isNumericCol = (t: string) => !t.includes('[]') && /\b(?:u?int\w*|bigint|smallint|tinyint|hugeint|long|float\w*|double|real|decimal|numeric)\b/i.test(t)
+
 function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; rows: Record<string, unknown>[]; onRowClick: (i: number) => void }) {
   return (
     <div className="max-h-[440px] overflow-auto">
       <table className="w-full border-collapse text-[11px]">
         <thead>
           <tr>
-            {columns.map((c) => (
-              <th key={c.name} className="sticky top-0 whitespace-nowrap border-b border-border bg-muted px-2.5 py-[6px] text-left font-semibold text-muted-foreground">
-                <div className="flex items-center">
-                  {c.name}
-                  {c.capabilities.includes('media') && <span title="media column — thumbnails in the Media tab" className="ml-[5px] cursor-help opacity-60">▦</span>}
-                  {c.capabilities.includes('vector') && <span title="vector / embedding column" className="ml-[5px] cursor-help opacity-60">⋮⋮</span>}
-                </div>
-                <div className="dp-mono text-[9px] font-normal lowercase tracking-tight opacity-55" title={c.type}>{c.type}</div>
-              </th>
-            ))}
+            {columns.map((c) => {
+              const num = isNumericCol(c.type)
+              return (
+                <th key={c.name} className={cn('sticky top-0 whitespace-nowrap border-b border-border bg-muted px-2.5 py-[6px] font-semibold text-muted-foreground', num ? 'text-right' : 'text-left')}>
+                  <div className={cn('flex items-center', num && 'justify-end')}>
+                    {c.name}
+                    {c.capabilities.includes('media') && <span title="media column — thumbnails in the Media tab" className="ml-[5px] cursor-help opacity-60">▦</span>}
+                    {c.capabilities.includes('vector') && <span title="vector / embedding column" className="ml-[5px] cursor-help opacity-60">⋮⋮</span>}
+                  </div>
+                  <div className="dp-mono text-[9px] font-normal lowercase tracking-tight opacity-55" title={c.type}>{c.type}</div>
+                </th>
+              )
+            })}
           </tr>
         </thead>
         <tbody>
@@ -213,7 +219,7 @@ function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; row
             <tr key={i} onClick={() => onRowClick(i)} title="Click for row detail"
               className="cursor-pointer border-b border-border hover:bg-muted">
               {columns.map((c) => (
-                <td key={c.name} className={cn('max-w-[260px] overflow-hidden text-ellipsis whitespace-nowrap px-2.5 py-1.5', c.type.includes('[]') && 'dp-mono')}>
+                <td key={c.name} className={cn('max-w-[260px] overflow-hidden text-ellipsis whitespace-nowrap px-2.5 py-1.5', c.type.includes('[]') && 'dp-mono', isNumericCol(c.type) && 'text-right tabular-nums')}>
                   <Cell col={c} value={r[c.name]} />
                 </td>
               ))}

@@ -3465,11 +3465,11 @@ def test_failed_run_attributes_error_to_a_node_with_a_hint():
         time.sleep(0.05)
     assert s.status == "failed"
     assert (s.error or "").startswith("at '")  # the banner names WHERE it broke, not just a bare error
-    assert "💡" in (s.error or "")             # ...and WHY / how to fix (the diagnostic hint)
+    assert "Hint:" in (s.error or "")          # ...and WHY / how to fix (the diagnostic hint)
     # the error is attributed to a specific node (which one may shift under source pushdown fusing the
     # projection into the scan — the message + the amber column warnings still point at the bad reference)
     failed = next((p for p in s.per_node if p.status == "failed" and p.error), None)
-    assert failed is not None and "no_such_col" in failed.error and "💡" in failed.error
+    assert failed is not None and "no_such_col" in failed.error and "Hint:" in failed.error
     # the diagnostic maps recognized error classes to a hint, and stays silent (None) on unknown ones
     assert "column references" in (_diagnose("Binder Error: Referenced column x not found") or "")
     assert _diagnose("Conversion Error: Could not convert") is not None

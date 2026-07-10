@@ -17,7 +17,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 // canvas-scoped settings live in the separate CanvasSettingsModal (opened from the file menu).
 const CATS: { id: string; label: string; icon: IconName }[] = [
   { id: 'agent', label: 'Agent', icon: 'sparkle' },
-  { id: 'execution', label: 'Execution', icon: 'play' },
+  { id: 'execution', label: 'Execution', icon: 'db' },
   { id: 'destinations', label: 'Destinations', icon: 'export' },
   { id: 'plugins', label: 'Plugins', icon: 'grid' },
   { id: 'members', label: 'Members', icon: 'users' },

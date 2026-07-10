@@ -286,9 +286,12 @@ function CheckpointToggle({ nodeId }: { nodeId: string }) {
   return (
     <Section title="Materialization">
       <button data-testid="checkpoint-toggle" onClick={() => updateConfig(nodeId, { checkpoint: on ? undefined : true })}
-        className="flex w-full items-center gap-2 rounded-md border border-border px-2.5 py-1.5 text-left text-[11.5px] text-foreground hover:bg-accent">
-        <span className={cn('h-2 w-2 shrink-0 rounded-full', on ? 'bg-primary' : 'border border-muted-foreground')} />
-        {on ? 'Checkpointed — output materialized (inspectable + reused across runs)' : 'Checkpoint here (materialize this step’s output)'}
+        className="flex w-full items-start gap-2 rounded-md border border-border px-2.5 py-2 text-left hover:bg-accent">
+        <span className={cn('mt-[3px] h-2.5 w-2.5 shrink-0 rounded-full', on ? 'bg-primary' : 'border border-muted-foreground')} />
+        <span className="min-w-0 flex-1">
+          <span className="block text-[11.5px] font-medium text-foreground">{on ? 'Checkpointed' : 'Checkpoint here'}</span>
+          <span className="mt-0.5 block text-[10.5px] leading-snug text-muted-foreground">{on ? 'Output materialized — inspectable and reused across runs.' : 'Materialize this step’s output.'}</span>
+        </span>
       </button>
     </Section>
   )

@@ -138,6 +138,43 @@ function ViewHeader({ title, action }: { title: string; action?: React.ReactNode
   )
 }
 
+function relTime(iso?: string): string {
+  if (!iso) return ''
+  const t = Date.parse(iso)
+  if (Number.isNaN(t)) return ''
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000))
+  if (s < 60) return 'just now'
+  if (s < 3600) return `${Math.round(s / 60)}m ago`
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`
+  if (s < 604800) return `${Math.round(s / 86400)}d ago`
+  return `${Math.round(s / 604800)}w ago`
+}
+
+// A deterministic mini "pipeline" motif per canvas, so the Recents wall isn't a grid of identical
+// placeholders. Nodes are chained left→right at seeded heights — derived purely from the id hash
+// (stable across renders, no per-file fetch).
+function CanvasThumb({ seed }: { seed: string }) {
+  let h = 2166136261
+  for (let i = 0; i < seed.length; i++) { h ^= seed.charCodeAt(i); h = Math.imul(h, 16777619) }
+  const rand = () => { h = Math.imul(h ^ (h >>> 15), 2246822507); h ^= h >>> 13; return ((h >>> 0) % 1000) / 1000 }
+  const W = 240, H = 132, padX = 40, padY = 34
+  const n = 3 + Math.floor(rand() * 3)  // 3..5 nodes
+  const pts = Array.from({ length: n }, (_, i) => ({ x: padX + (i / (n - 1)) * (W - 2 * padX), y: padY + rand() * (H - 2 * padY) }))
+  return (
+    <svg width="100%" height="100%" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ display: 'block', position: 'absolute', inset: 0 }} aria-hidden>
+      {pts.slice(1).map((p, i) => (
+        <line key={i} x1={pts[i].x} y1={pts[i].y} x2={p.x} y2={p.y} stroke="hsl(var(--foreground))" strokeOpacity={0.16} strokeWidth={1.5} />
+      ))}
+      {pts.map((p, i) => (
+        <g key={i}>
+          <rect x={p.x - 11} y={p.y - 7} width={22} height={14} rx={4} fill="hsl(var(--card))" stroke="hsl(var(--foreground))" strokeOpacity={0.26} />
+          <circle cx={p.x - 5} cy={p.y} r={1.8} fill="hsl(var(--foreground))" fillOpacity={0.38} />
+        </g>
+      ))}
+    </svg>
+  )
+}
+
 function FilesContent() {
   const files = useStore((s) => s.files)
   const openFile = useStore((s) => s.openFile)
@@ -151,19 +188,25 @@ function FilesContent() {
         </button>
       } />
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 16, padding: '4px 28px 28px' }}>
-        {files.map((f) => (
+        {files.map((f) => {
+          const meta = [relTime(f.updatedAt), f.version != null ? `v${f.version}` : ''].filter(Boolean).join(' · ')
+          return (
           <div key={f.id} className="dp-file-card" onClick={() => openFile(f.id)}
             style={{ cursor: 'pointer', borderRadius: 12, border: `1px solid ${color.border}`, background: 'hsl(var(--card))', overflow: 'hidden', boxShadow: shadow.card }}>
-            <div style={{ height: 132, background: 'linear-gradient(135deg, hsl(var(--muted)), hsl(var(--accent)))', display: 'grid', placeItems: 'center', color: color.text3 }}>
-              <Icon name="grid" size={26} />
+            <div style={{ height: 132, background: 'linear-gradient(135deg, hsl(var(--muted)), hsl(var(--accent)))', position: 'relative' }}>
+              <CanvasThumb seed={f.id} />
             </div>
             <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 600, color: color.ink, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name || 'untitled'}</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: color.ink, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name || 'untitled'}</div>
+                {meta && <div style={{ fontSize: 11, color: color.text3, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{meta}</div>}
+              </div>
               <button title="Delete" onClick={(e) => { e.stopPropagation(); deleteFile(f.id) }}
                 style={{ border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer', padding: 2 }}><Icon name="trash" size={13} /></button>
             </div>
           </div>
-        ))}
+          )
+        })}
         {files.length === 0 && <div style={{ color: color.text3, fontSize: 13, padding: 20 }}>No files yet — create one with “New file”.</div>}
       </div>
     </>

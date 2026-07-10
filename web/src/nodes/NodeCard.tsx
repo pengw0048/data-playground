@@ -125,6 +125,11 @@ export function NodeCard({ id, data, children, metaOverride }: {
                   DISABLED
                 </span>
               )}
+              {bypassed && !disabled && (
+                <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[8.5px] font-bold tracking-[0.5px] text-muted-foreground" title="Bypassed — input flows straight through, this step is skipped">
+                  BYPASSED
+                </span>
+              )}
               {(data.config as Record<string, unknown>)?.checkpoint ? (
                 <span className="shrink-0 text-[9px] leading-none text-primary" title="Checkpointed — output materialized (inspectable + reused across runs)">●</span>
               ) : null}
@@ -147,8 +152,8 @@ export function NodeCard({ id, data, children, metaOverride }: {
 
             {/* last run stats — so a completed node carries its result (rows · time) at a glance */}
             {data.status === 'latest' && data.lastRun && (
-              <div className="mt-0.5 truncate text-[10.5px] tabular-nums text-muted-foreground/70">
-                {data.lastRun.rows.toLocaleString()} rows · {fmtMs(data.lastRun.ms)}
+              <div className="mt-0.5 truncate text-[10.5px] tabular-nums text-muted-foreground/85">
+                {data.lastRun.rows.toLocaleString()} {data.lastRun.rows === 1 ? 'row' : 'rows'} · {fmtMs(data.lastRun.ms)}
                 {data.lastRun.placement === 'distributed' && ' · distributed'}
               </div>
             )}
@@ -156,8 +161,8 @@ export function NodeCard({ id, data, children, metaOverride }: {
             {/* size hint — a conservative estimate before you run; only when confidently estimable and
                 the node has no real last-run count to show instead. Unknown counts show nothing. */}
             {!(data.status === 'latest' && data.lastRun) && sizeEst && sizeEst.rows != null && sizeEst.confidence !== 'unknown' && (
-              <div className="mt-0.5 truncate text-[10.5px] tabular-nums text-muted-foreground/55" title="Estimated output rows (before running)">
-                ~{sizeEst.rows.toLocaleString()} rows
+              <div className="mt-0.5 truncate text-[10.5px] tabular-nums text-muted-foreground/70" title="Estimated output rows (before running)">
+                ~{sizeEst.rows.toLocaleString()} {sizeEst.rows === 1 ? 'row' : 'rows'}
               </div>
             )}
 

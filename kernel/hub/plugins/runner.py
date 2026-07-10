@@ -265,7 +265,7 @@ class LocalRunner:
                     status.status = "failed"
                     msg = f"{type(e).__name__}: {e}"
                     hint = _diagnose(str(e))
-                    tail = f"\n💡 {hint}" if hint else ""
+                    tail = f"\nHint: {hint}" if hint else ""
                     # steps run sequentially, so the one still 'running' is exactly where it broke — attribute
                     # the error THERE (the card + per-node list show which node failed and why), not just a
                     # global banner. Relational ops build lazily, so a bad-column/type error can instead

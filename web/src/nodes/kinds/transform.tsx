@@ -41,7 +41,7 @@ function Transform({ id, data }: NodeComponentProps) {
           <Segmented<TransformSource>
             options={[{ value: 'library', label: 'Library' }, { value: 'adhoc', label: 'Ad-hoc' }]}
             value={src}
-            accent={src === 'adhoc' ? color.focus : '#2f9e8f'}
+            accent={color.focus}
             onChange={(v) => updateConfig(id, {
               source: v,
               code: v === 'adhoc' ? (data.config.code ?? DEFAULT_CODE) : data.config.code,
@@ -50,7 +50,7 @@ function Transform({ id, data }: NodeComponentProps) {
           {src === 'adhoc' && (
             <Segmented<'dataset' | 'sample'>
               options={[{ value: 'dataset', label: 'dataset' }, { value: 'sample', label: 'sample' }]}
-              value={scope} accent="#8a6d0b"
+              value={scope} accent={color.focus}
               onChange={(v) => updateConfig(id, { scope: v })}
             />
           )}
@@ -94,7 +94,7 @@ function Transform({ id, data }: NodeComponentProps) {
           <button
             onClick={(e) => { e.stopPropagation(); openFullscreen(id, 'code', 'python') }}
             title="Open the code editor"
-            className="block w-full cursor-text overflow-hidden text-ellipsis whitespace-pre rounded-md border border-border bg-[var(--code-bg)] px-2.5 py-2 text-left text-[10.5px] leading-[1.4]"
+            className="block max-h-[54px] w-full cursor-text overflow-hidden whitespace-pre-wrap rounded-md border border-border bg-[var(--code-bg)] px-2.5 py-2 text-left text-[10.5px] leading-[1.4]"
           >
             <CodeSnippet code={String(data.config.code ?? DEFAULT_CODE).split('\n').slice(0, 3).join('\n')} language="python" />
           </button>
