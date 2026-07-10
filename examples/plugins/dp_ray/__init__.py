@@ -32,7 +32,7 @@ opt-in only because it needs the `[ray]` extra + is slow. `DP_RAY_NUM_CPUS` opti
 pool. The Part B mechanism (a plugin node's `ir` hook → clean op → routed here) is also covered
 cluster-free by `test_plugin_node_ir_hook_runs_on_duckdb_and_ray`.
 
-Opt-in: `pip install 'data-playground[ray]'`, drop this folder in `<workspace>/plugins/`, and select it
+Opt-in: `uv pip install -e 'kernel[ray]'`, drop this folder in `<workspace>/plugins/`, and select it
 via Settings → Execution or `DP_EXECUTION=ray-data`. It never becomes the default (the kernel is), so a
 small graph won't spin up Ray unless you ask.
 """

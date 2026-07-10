@@ -37,6 +37,8 @@ kernel/_web/
 # metadata DB (dev + e2e)
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 
 # kernel e2e/pytest artifacts
 kernel/test-results/

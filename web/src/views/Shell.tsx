@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 import { useStore, type DpView } from '../store/graph'
 import { api } from '../api/client'
+import { examples } from '../examples'
 import { color, radius, shadow } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { SettingsModal } from '../panels/SettingsModal'
@@ -180,6 +181,7 @@ function FilesContent() {
   const openFile = useStore((s) => s.openFile)
   const newFile = useStore((s) => s.newFile)
   const deleteFile = useStore((s) => s.deleteFile)
+  const newFromExample = useStore((s) => s.newFromExample)
   return (
     <>
       <ViewHeader title="Recents" action={
@@ -207,7 +209,26 @@ function FilesContent() {
           </div>
           )
         })}
-        {files.length === 0 && <div style={{ color: color.text3, fontSize: 13, padding: 20 }}>No files yet — create one with “New file”.</div>}
+        {files.length === 0 && (
+          <>
+            {/* a fresh install lands here with nothing — offer runnable starters, not just a dead end */}
+            <div style={{ gridColumn: '1 / -1', color: color.text3, fontSize: 12.5, padding: '2px 2px 4px' }}>
+              No files yet — open a runnable example, or “New file”.
+            </div>
+            {examples.map((ex) => (
+              <div key={ex.key} className="dp-file-card" onClick={() => { void newFromExample(ex.key) }} title={ex.blurb}
+                style={{ cursor: 'pointer', borderRadius: 12, border: `1px solid ${color.border}`, background: 'hsl(var(--card))', overflow: 'hidden', boxShadow: shadow.card }}>
+                <div style={{ height: 132, background: 'linear-gradient(135deg, hsl(var(--muted)), hsl(var(--accent)))', position: 'relative' }}>
+                  <CanvasThumb seed={ex.key} />
+                </div>
+                <div style={{ padding: '10px 12px' }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: color.ink }}>{ex.name}</div>
+                  <div style={{ fontSize: 11, color: color.text3, marginTop: 2, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{ex.blurb}</div>
+                </div>
+              </div>
+            ))}
+          </>
+        )}
       </div>
     </>
   )

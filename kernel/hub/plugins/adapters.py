@@ -299,7 +299,7 @@ class LanceAdapter:
         try:
             import lance  # lazy — only if the optional `lance` extra is installed
         except ModuleNotFoundError as e:  # a clear remediation, not a raw "No module named 'lance'"
-            raise ModuleNotFoundError("Lance support is not installed — run: pip install 'data-playground[lance]'") from e
+            raise ModuleNotFoundError("Lance support is not installed — run: uv pip install -e 'kernel[lance]'") from e
         return lance.dataset(path_of(uri))
 
     def scan(self, uri: str, columns: list[str] | None = None,
@@ -342,7 +342,7 @@ class LanceAdapter:
         try:
             import lance
         except ModuleNotFoundError as e:
-            raise ModuleNotFoundError("Lance support is not installed — run: pip install 'data-playground[lance]'") from e
+            raise ModuleNotFoundError("Lance support is not installed — run: uv pip install -e 'kernel[lance]'") from e
         rows = int(rel.aggregate("count(*)").fetchone()[0])
         # stream RecordBatches into Lance (bounded memory) instead of materializing the whole table
         reader = rel.record_batch(1 << 16)

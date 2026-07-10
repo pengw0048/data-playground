@@ -40,7 +40,7 @@ def agent_status() -> dict:
         import pydantic_ai  # noqa: F401  — the in-process harness
     except Exception:  # noqa: BLE001
         return {"available": False, "model": model,
-                "reason": "install the agent extra: pip install 'data-playground[agent]'"}
+                "reason": "install the agent extra: uv pip install -e 'kernel[agent]'"}
     # a local/self-hosted endpoint OR an explicit key (env or UI setting) needs no env-var provider key
     preconfigured = bool(base_url) or bool(api_key)
     missing: list[str] = []

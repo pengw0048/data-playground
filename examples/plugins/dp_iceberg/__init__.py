@@ -10,7 +10,7 @@ claims `iceberg://`, `scan` returns a lazy DuckDB relation (column/limit applied
 version would push `row_filter`/`selected_fields` into pyiceberg's scan), `schema`/`count`/`fingerprint`
 round it out, `write` raises (read-only). `pyiceberg` is imported lazily, so the plugin loads without it.
 
-Install: `pip install 'data-playground[iceberg]'`. Verify against your own Iceberg catalog/warehouse —
+Install: `uv pip install -e 'kernel[iceberg]'`. Verify against your own Iceberg catalog/warehouse —
 the shipped test exercises the adapter's logic against a stand-in, not a live catalog.
 """
 
@@ -34,7 +34,7 @@ def _to_arrow(uri: str):
     try:
         from pyiceberg.catalog import load_catalog  # lazy — only when an iceberg:// uri is used
     except ModuleNotFoundError as e:
-        raise ModuleNotFoundError("Iceberg support is not installed — run: pip install 'data-playground[iceberg]'") from e
+        raise ModuleNotFoundError("Iceberg support is not installed — run: uv pip install -e 'kernel[iceberg]'") from e
     catalog, identifier = _parse(uri)
     table = load_catalog(catalog).load_table(identifier)
     return table.scan().to_arrow()

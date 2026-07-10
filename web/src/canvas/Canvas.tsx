@@ -10,6 +10,8 @@ import { WireEdge } from '../wires/WireEdge'
 import { canConnect, portWire, portMulti, getSpec } from '../nodes/registry'
 import { schemaWarnings } from '../nodes/schema'
 import { useStore, newId, freePosition } from '../store/graph'
+import { api } from '../api/client'
+import { examples } from '../examples'
 import { kindAccent, color } from '../theme/tokens'
 import type { WireType } from '../theme/tokens'
 import { ConnectMenu } from './ConnectMenu'
@@ -43,6 +45,11 @@ function EmptyState() {
   const { screenToFlowPosition } = useReactFlow()
   const addNode = useStore((s) => s.addNode)
   const setAgentOpen = useStore((s) => s.setAgentOpen)
+  const newFromExample = useStore((s) => s.newFromExample)
+  // gate the Agent CTA on a configured model — otherwise the most prominent first-run button leads
+  // straight to "Agent unavailable" (the default is no model).
+  const [agentOk, setAgentOk] = useState(false)
+  useEffect(() => { api.agentStatus().then((s) => setAgentOk(!!s.available)).catch(() => setAgentOk(false)) }, [])
   const add = () => {
     const c = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
     addNode('source', { x: c.x - 116, y: c.y - 40 })
@@ -51,12 +58,23 @@ function EmptyState() {
     <div className="pointer-events-none absolute inset-0 grid place-items-center">
       <div className="pointer-events-auto text-center">
         <div className="text-[15px] font-semibold text-foreground">Empty canvas</div>
-        <div className="mx-auto mt-1.5 max-w-[320px] text-[12.5px] leading-normal text-muted-foreground">
-          Add a dataset source to begin.
+        <div className="mx-auto mt-1.5 max-w-[340px] text-[12.5px] leading-normal text-muted-foreground">
+          Add a dataset source to begin — or open a runnable example.
         </div>
         <div className="mt-3.5 flex justify-center gap-2">
           <Button onClick={add} className="rounded-lg bg-foreground text-[12.5px] text-background hover:bg-foreground/90">+ Add a source</Button>
-          <Button variant="outline" onClick={() => setAgentOpen(true)} className="rounded-lg text-[12.5px] text-muted-foreground">Ask the Agent</Button>
+          {agentOk && <Button variant="outline" onClick={() => setAgentOpen(true)} className="rounded-lg text-[12.5px] text-muted-foreground">Ask the Agent</Button>}
+        </div>
+        {/* runnable starters on the seeded data — a first-timer never opens the file menu to find them */}
+        <div className="mx-auto mt-6 grid max-w-[460px] gap-2">
+          <div className="text-[10.5px] font-semibold uppercase tracking-[0.6px] text-muted-foreground/70">Start from an example</div>
+          {examples.map((ex) => (
+            <button key={ex.key} onClick={() => { void newFromExample(ex.key) }} title={ex.blurb}
+              className="rounded-lg border border-border bg-card px-3 py-2 text-left transition-colors hover:border-primary/50 hover:bg-accent">
+              <div className="text-[12px] font-semibold text-foreground">{ex.name}</div>
+              <div className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-muted-foreground">{ex.blurb}</div>
+            </button>
+          ))}
         </div>
       </div>
     </div>

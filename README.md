@@ -1,5 +1,8 @@
 # Data Playground
 
+[![CI](https://github.com/pengw0048/data-playground/actions/workflows/ci.yml/badge.svg)](https://github.com/pengw0048/data-playground/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 **Like ComfyUI, but for data.** It's a visual node-graph editor where every wire carries a *typed
 table*: connect datasets and operators into a graph, watch the **real rows come out of each step**,
 and run the **same graph over the full dataset** — out-of-core on your laptop, bigger-than-RAM and all.
@@ -300,6 +303,15 @@ is per-*canvas*: collaborators editing a **shared** canvas share one kernel, so 
 there can wedge a co-editor's runs (a restart clears it). Real tenant isolation needs OS-level
 sandboxing — containers, per-user accounts, or a pod-per-canvas `ExecutionBackend` plugin. (The
 in-process and subprocess runners stay selectable in Settings → Execution.)
+
+---
+
+## Contributing
+
+Bug reports, plugin ideas, and PRs are welcome — see [CONTRIBUTING.md](.github/CONTRIBUTING.md) for
+the dev loop and how to add a plugin, and [SECURITY.md](.github/SECURITY.md) to report a
+vulnerability privately. The core stays provider-agnostic and offline-first; vendor-specific work
+lives behind a plugin seam.
 
 ---
 

@@ -11,7 +11,7 @@ It's read-only (`write` raises) — HF datasets are sources. `datasets` is impor
 Lance adapter), so the plugin loads fine without it installed and only errors with a clear message when a
 `hf://` uri is actually used.
 
-Install: `pip install 'data-playground[hf]'` (adds the `datasets` optional extra). Drop this folder into
+Install: `uv pip install -e 'kernel[hf]'` (adds the `datasets` optional extra). Drop this folder into
 `<workspace>/plugins/` or install it as a `dataplay.plugins` entry point.
 """
 
@@ -36,7 +36,7 @@ def _load_arrow(uri: str):
     try:
         from datasets import load_dataset  # lazy — only when a hf:// uri is used
     except ModuleNotFoundError as e:
-        raise ModuleNotFoundError("Hugging Face support is not installed — run: pip install 'data-playground[hf]'") from e
+        raise ModuleNotFoundError("Hugging Face support is not installed — run: uv pip install -e 'kernel[hf]'") from e
     name, config, split = _parse(uri)
     ds = load_dataset(name, config, split=split)
     return ds.with_format("arrow")[:]  # the whole split as a pyarrow.Table
