@@ -144,7 +144,8 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('minimap and zoom controls are both present and do not overlap', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter') // minimap + zoom controls only mount once the canvas has a node to navigate
     const minimap = page.locator('.react-flow__minimap')
     const controls = page.locator('.react-flow__controls')
     await expect(minimap).toBeVisible()
