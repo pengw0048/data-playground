@@ -357,7 +357,9 @@ class RunController:
                 db.ensure_object_store()      # register object-store creds for whichever side is s3/gs
             if not dst_tier.is_object:
                 os.makedirs(dst_tier.prefix, exist_ok=True)  # DuckDB won't create a local file's parent dir
-            db.conn().read_parquet(src_uri).write_parquet(dst_uri)
+            # src may be a single file OR a directory of shards (a worker-direct write) — the adapter's
+            # scan handles both (local isdir → dir-scan, object prefix → glob); consolidate into dst.
+            self.deps.resolve_adapter(src_uri).scan(src_uri).write_parquet(dst_uri)
 
     def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], regions=None) -> str:
         """Materialize an intermediate region's output to a durable, content-addressed parquet — reused
@@ -396,6 +398,7 @@ class RunController:
             self._prune_regions(tier.prefix)  # bound the LOCAL handoff dir (coarse GC; TTL/refcount later)
         out_uri = tier.uri(f"{region.id}_{key}.parquet")
         backend = self._backend_runner(region)
+        result_uri = out_uri
         if backend is self.base:
             with db.run_scope():
                 eng = BuildEngine(subg, self.deps.resolve_adapter, self.deps.registry, full=True,
@@ -403,14 +406,18 @@ class RunController:
                                      pushdown=True, output_node=region.output_node)
                 eng.relation(region.output_node).write_parquet(out_uri)
         else:
-            sub = backend.run_unit(subg, region.output_node, out_uri)
+            # a placed backend may write a DIRECTORY of shards (worker-direct parallel write, e.g. Ray
+            # Data) rather than the single file we suggested — honor the uri it actually produced. The
+            # ref-read / _output_exists / _move_tier paths all accept a parts-dir as well as a file.
+            sub = backend.run_unit(subg, region.output_node, out_uri, requires=region.requires)
             with self._lock:
                 self._sub[run_id] = (backend, sub.run_id)
             s = self._await(backend, sub.run_id, cancel_run=run_id)
             if s.status != "done":
                 raise RuntimeError(f"region {region.id} on {region.backend} {s.status}: {s.error}")
-        self.base._cache_put(ckey, {"uri": out_uri, "table": region.id, "rows": None})
-        return out_uri
+            result_uri = s.output_uri or out_uri
+        self.base._cache_put(ckey, {"uri": result_uri, "table": region.id, "rows": None})
+        return result_uri
 
     def _run_final(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str]) -> RunStatus:
         """Run the final (target) region over the reduced graph, waiting for it — on the base runner

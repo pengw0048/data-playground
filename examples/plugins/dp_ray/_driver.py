@@ -19,6 +19,18 @@ def _log(m: str) -> None:
     print(f"[driver] {m}", flush=True)
 
 
+def _progress_writer(status_file: str):
+    """Rewrite the status file with an interim {running, progress} so the parent surfaces mid-run
+    progress for a placed region. The parent tolerates a partial read; main()'s finally writes the term."""
+    def emit(frac: float, rows: int | None = None) -> None:
+        try:
+            with open(status_file, "w") as f:
+                json.dump({"status": "running", "progress": float(frac), "rows": int(rows or 0)}, f)
+        except OSError:
+            pass
+    return emit
+
+
 def main() -> None:
     job = json.load(open(sys.argv[1]))
     status_file = job["status_file"]
@@ -50,8 +62,11 @@ def main() -> None:
         graph, target = Graph(**job["graph"]), job["target"]
         ir = lower_to_ir(graph, target, deps.node_specs, deps.node_ir)
         mat = job.get("materialize_uri")
-        _log(f"lowered; {'_run_ir_materialize' if mat else '_run_ir_sync'}")
-        result = runner._run_ir_materialize(ir, graph, target, mat) if mat else runner._run_ir_sync(ir, graph, target)
+        ray_opts = mod._ray_opts(job.get("requires"))  # region resource need → per-Ray-task placement
+        prog = _progress_writer(status_file)
+        _log(f"lowered; {'_run_ir_materialize' if mat else '_run_ir_sync'}; ray_opts={ray_opts}")
+        result = (runner._run_ir_materialize(ir, graph, target, mat, ray_opts, prog) if mat
+                  else runner._run_ir_sync(ir, graph, target, ray_opts, prog))
         _log(f"run done: {result.get('status')}")
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read
         result = {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}

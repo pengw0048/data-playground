@@ -152,6 +152,9 @@ class LocalRunner:
             return False
         if "://" not in uri or uri.startswith("file://"):
             p = uri[len("file://"):] if uri.startswith("file://") else uri
+            if os.path.isdir(p):  # a worker-direct write lands a DIRECTORY of shards — exists iff non-empty
+                import glob as _glob
+                return bool(_glob.glob(os.path.join(p, "**", "*.parquet"), recursive=True))
             return os.path.exists(p)
         try:
             self.resolve_adapter(uri).schema(uri)  # reads object metadata; missing → raises → recompute

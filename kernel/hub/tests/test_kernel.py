@@ -2282,7 +2282,7 @@ def test_placeable_backend_protocol():
     class FullPlaceable:
         def workers(self): return []
         def place(self, requires): return None
-        def run_unit(self, graph, output_node, output_uri): return None
+        def run_unit(self, graph, output_node, output_uri, requires=None): return None
 
     class Partial:
         def workers(self): return []
@@ -4662,6 +4662,103 @@ def test_ray_backend_live_differential(tmp_path):
     def rows(uri):
         return sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{uri}')").fetchall())
     assert rows(st_ray.output_uri) == rows(st_loc.output_uri) == [10, 12, 14, 16, 18, 20]
+
+
+def test_ray_opts_maps_region_requires_to_ray_task_placement():
+    # the planner's region `requires` → per-Ray-task placement options: gpu → num_gpus (each map task
+    # needs a GPU); a non-`engine` label value → a custom resource (declare it via `ray start --resources`);
+    # cpu/mem omitted (per-region aggregates, not the per-task cost Ray schedules on). No Ray needed.
+    ropts = _load_dp_ray()._ray_opts
+    assert ropts(None) == {} and ropts({}) == {}
+    assert ropts({"gpu": 2}) == {"num_gpus": 2.0}
+    assert ropts({"labels": {"engine": "ray"}}) == {}  # the claim label is not a placement resource
+    assert ropts({"labels": {"engine": "ray", "pool": "a100"}}) == {"resources": {"a100": 0.001}}
+    assert ropts({"cpu": 8, "mem": "64GB"}) == {}  # aggregates — not mapped to per-task options
+    both = ropts({"gpu": 1, "labels": {"pool": "gpu1"}})
+    assert both == {"num_gpus": 1.0, "resources": {"gpu1": 0.001}}
+
+
+def test_ray_region_worker_direct_write_and_progress(tmp_path):
+    # opt-in live Ray: run_unit (region mode) writes WORKER-DIRECT — the output is a DIRECTORY of parquet
+    # shards (each written in parallel by a Ray task, no driver collect/OOM), readable + correct; and the
+    # placed sub-run's progress reaches 1.0 (the seam that surfaces a placed region's progress).
+    if not os.environ.get("DP_TEST_RAY_LIVE"):
+        pytest.skip("set DP_TEST_RAY_LIVE=1 to run the live-Ray region test")
+    import glob as _glob
+    import time
+
+    import duckdb
+
+    from hub.deps import Deps
+    from hub.models import Graph
+    p = str(tmp_path / "nums.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM range(1,21) t(x)) TO '{p}' (FORMAT PARQUET)")
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+    # a small per-row busy loop (sandbox-safe — no import) widens the compute window so the interim-
+    # progress poll below can catch a mid-run value (the seam surfaces a placed region's progress, not
+    # just its terminal state).
+    g = Graph(**{"id": "c", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": p}),
+        _ray_node("m", "transform", {"mode": "map", "code": "def fn(row):\n    t = 0\n    for _i in range(400000):\n        t += _i\n    row['x'] = row['x'] * 2\n    return row"}),
+    ], "edges": [_ray_edge("src", "m")]})
+    suggested = str(tmp_path / "region_out.parquet")  # a single-file uri — worker-direct makes it a DIR
+    st = rr.run_unit(g, "m", suggested)
+    saw_interim = False
+    for _ in range(900):
+        s = rr.status(st.run_id)
+        if s.status == "running" and s.progress is not None and 0.0 < s.progress < 1.0:
+            saw_interim = True  # a placed region's progress advanced mid-run, before completion
+        if s.status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.1)
+    assert s.status == "done", s.error
+    assert s.progress == 1.0                                   # the placed sub-run reported terminal progress
+    assert saw_interim, "the placed sub-run's progress never surfaced an interim value to the parent"
+    d = s.output_uri
+    assert os.path.isdir(d), f"worker-direct write must produce a DIRECTORY of shards, got {d}"
+    assert _glob.glob(os.path.join(d, "**", "*.parquet"), recursive=True), "no parquet shards written"
+    got = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{d}/**/*.parquet')").fetchall())
+    assert got == [2 * i for i in range(1, 21)]
+
+
+def test_ray_region_requires_gates_scheduling(tmp_path):
+    # opt-in live Ray: the region `requires` is forwarded to Ray as per-task placement, so a region needing
+    # a custom resource the cluster does NOT have can't be scheduled → it does not complete (proof the
+    # requirement reached Ray and gates placement — cross-NODE routing to the right worker needs a real
+    # multi-node cluster, but enforcement is verified here on local multi-worker Ray).
+    if not os.environ.get("DP_TEST_RAY_LIVE"):
+        pytest.skip("set DP_TEST_RAY_LIVE=1 to run the live-Ray region test")
+    import time
+
+    import duckdb
+
+    from hub.deps import Deps
+    from hub.models import Graph, ResourceSpec
+    p = str(tmp_path / "nums.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM range(1,6) t(x)) TO '{p}' (FORMAT PARQUET)")
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+    g = Graph(**{"id": "c", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": p}),
+        _ray_node("m", "transform", {"mode": "map", "code": "def fn(row):\n    row['x'] = row['x'] + 1\n    return row"}),
+    ], "edges": [_ray_edge("src", "m")]})
+    # a resource no local Ray node advertises → the map task can never be placed
+    req = ResourceSpec(labels={"engine": "ray", "need": "gpu_pool_that_does_not_exist"})
+    st = rr.run_unit(g, "m", str(tmp_path / "b.parquet"), requires=req)
+    completed = False
+    for _ in range(50):  # ~5s: long enough that a schedulable region would have finished
+        s = rr.status(st.run_id)
+        if s.status == "done":
+            completed = True
+            break
+        if s.status in ("failed", "cancelled"):
+            break
+        time.sleep(0.1)
+    rr.cancel(st.run_id)  # tear down the pending Ray subprocess
+    assert not completed, "a region requiring an unavailable resource must NOT complete (Ray gates on it)"
 
 
 def test_ray_backend_placement_and_tiers(tmp_path):

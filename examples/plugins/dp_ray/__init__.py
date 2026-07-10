@@ -52,6 +52,23 @@ from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
 _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", ".json", ".lance")
 
 
+def _ray_opts(requires: dict | None) -> dict:
+    """Map the region's resolved resource need (the planner's `requires`) to per-Ray-task placement
+    options, so a Ray cluster schedules the region's map tasks onto a worker that has the resource:
+    `gpu` → num_gpus (each map task needs a GPU); a non-`engine` label `k=v` → a custom resource named
+    `v` (fractional so many tasks share one node — declare it on the node via `ray start --resources`).
+    cpu/mem are omitted: they're per-REGION aggregates, not the per-TASK cost Ray schedules on."""
+    if not requires:
+        return {}
+    opts: dict = {}
+    if requires.get("gpu"):
+        opts["num_gpus"] = float(requires["gpu"])
+    res = {str(v): 0.001 for k, v in (requires.get("labels") or {}).items() if k != "engine" and v}
+    if res:
+        opts["resources"] = res
+    return opts
+
+
 def _make_mapper(config: dict):
     """A Ray Data batch UDF that reuses the DuckDB engine's EXACT operator — so a transform produces the
     same rows on Ray as locally. Captures only plain strings, so it cloudpickles to Ray workers."""
@@ -139,10 +156,12 @@ class RayRunner:
     def reachable_tiers(self):
         return ("local", "object")
 
-    def run_unit(self, graph, output_node, output_uri, run_id=None) -> RunStatus:
+    def run_unit(self, graph, output_node, output_uri, requires=None, run_id=None) -> RunStatus:
         """Run ONE region's subgraph on Ray and materialize output_node → output_uri (the RunController
-        handoff contract). A clean region runs distributed on Ray (reads worker-direct); anything else
-        falls back to the base runner's run_unit (subprocess-materialize, always correct)."""
+        handoff contract). A clean region runs distributed on Ray: reads AND writes worker-direct (each
+        block written as its own parquet shard, no driver funnel — output_uri becomes a DIRECTORY of
+        shards). `requires` (the planner's resolved region need) is passed to Ray so its map tasks are
+        scheduled onto a matching worker. Anything non-clean falls back to the base subprocess-materialize."""
         ir = lower_to_ir(graph, output_node, self.node_specs, self.deps.node_ir)
         if not self._ray_runnable(ir):
             return self._materialize_local(graph, output_node, output_uri, run_id)  # non-clean → local engine
@@ -152,8 +171,9 @@ class RayRunner:
         with self._lock:
             self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()
+        req = requires.model_dump() if hasattr(requires, "model_dump") else requires
         threading.Thread(target=self._supervise, args=(run_id, graph, output_node, status),
-                         kwargs={"materialize_uri": output_uri}, daemon=True).start()
+                         kwargs={"materialize_uri": output_uri, "requires": req}, daemon=True).start()
         return status
 
     def _materialize_local(self, graph, output_node, output_uri, run_id=None) -> RunStatus:
@@ -217,10 +237,11 @@ class RayRunner:
             except Exception:  # noqa: BLE001 — never let persistence break a run
                 pass
 
-    def _supervise(self, run_id, graph, target, status, materialize_uri=None) -> None:
+    def _supervise(self, run_id, graph, target, status, materialize_uri=None, requires=None) -> None:
         """Parent side: spawn the isolated Ray driver, poll its status file, mirror the result. Touches
         NO DuckDB (only subprocess + files + the DB-backed on_status/on_complete hooks) → never deadlocks.
-        `materialize_uri` set = region mode (write target → that uri); else whole-graph mode (write node)."""
+        `materialize_uri` set = region mode (write target → that uri); else whole-graph mode (write node).
+        `requires` = the region's resource need, forwarded to the driver → per-task Ray placement."""
         import json
         import subprocess
         import tempfile
@@ -232,7 +253,7 @@ class RayRunner:
         job_file, status_file = os.path.join(work, "job.json"), os.path.join(work, "status.json")
         with open(job_file, "w") as f:
             json.dump({"workspace": self.deps.workspace, "data_dir": self.deps.data_dir, "target": target,
-                       "graph": graph.model_dump(), "module": os.path.abspath(__file__),
+                       "graph": graph.model_dump(), "module": os.path.abspath(__file__), "requires": requires,
                        "materialize_uri": materialize_uri, "status_file": status_file}, f)
         driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_driver.py")
         result = None
@@ -260,6 +281,20 @@ class RayRunner:
                     proc.terminate()
                     status.status = "cancelled"
                     break
+                # surface the driver's INTERIM progress (it rewrites the status file as it computes/writes)
+                # into the parent RunStatus, so a placed region's progress advances mid-run — not just at
+                # the region boundary. A partial read (mid-write) raises → skipped until the next tick.
+                try:
+                    if os.path.exists(status_file):
+                        with open(status_file) as f:
+                            interim = json.load(f)
+                        if interim.get("status") == "running" and interim.get("progress") is not None:
+                            status.progress = float(interim["progress"])
+                            if interim.get("rows"):
+                                status.rows_processed = int(interim["rows"])
+                            self._emit(graph, status)
+                except (ValueError, OSError):
+                    pass
                 time.sleep(0.2)
             if os.path.exists(status_file):
                 with open(status_file) as f:
@@ -272,6 +307,8 @@ class RayRunner:
                 status.error = result.get("error")
                 status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
                 status.rows_processed = status.total_rows = int(result.get("rows") or 0)
+                if status.status == "done":
+                    status.progress = 1.0
             elif status.status == "running":
                 status.status, status.error = "failed", "ray driver exited without writing a status"
         for p in status.per_node:  # settle per-node progress to the terminal state
@@ -285,7 +322,7 @@ class RayRunner:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _run_ir_sync(self, ir, graph, target) -> dict:
+    def _run_ir_sync(self, ir, graph, target, ray_opts=None, progress=None) -> dict:
         """Child side (in the driver subprocess, Ray already init'd): execute the clean IR synchronously
         and return a result dict for the parent. Reuses _build/_commit; the fresh-process DuckDB is safe
         because Ray was init'd before it was created."""
@@ -296,43 +333,46 @@ class RayRunner:
                 if step.op == "write":
                     rows, out_uri, out_table = self._commit(step, datasets, graph)
                 else:
-                    datasets[step.id] = self._build(step, datasets)
+                    datasets[step.id] = self._build(step, datasets, ray_opts)
             if target and target in datasets:  # a non-sink target → force a real row count
                 rows = datasets[target].count()
             return {"status": "done", "rows": rows, "output_uri": out_uri, "output_table": out_table}
         except Exception as e:  # noqa: BLE001
             return {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
 
-    def _run_ir_materialize(self, ir, graph, target, uri) -> dict:
-        """Child side, region mode: run the clean IR up to `target` on Ray (reads worker-direct) and
-        write that dataset to `uri` as a SINGLE parquet — the RunController handoff contract (a
-        downstream region's ref-source reads one file). The final collect matches run()'s sink funnel."""
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
-        from hub.plugins.adapters import is_object_uri
+    def _run_ir_materialize(self, ir, graph, target, uri, ray_opts=None, progress=None) -> dict:
+        """Child side, region mode: run the clean IR up to `target` on Ray and materialize it to `uri`.
+        WORKER-DIRECT WRITE: `uri` becomes a DIRECTORY of parquet shards, each written in parallel by a
+        Ray task — nothing funnels through the driver (the old collect→concat→single-file OOM'd on a big
+        region). The RunController's ref-read / _output_exists / _move_tier all accept a parts-dir. Reports
+        interim `progress` so the parent's placed-region progress advances mid-run."""
+        from hub.plugins.adapters import is_object_uri, object_fs
         try:
+            if progress:
+                progress(0.05)
             datasets: dict[str, object] = {}
             for step in ir.steps:
                 if step.op == "write":  # a region is cut BEFORE any write; ignore a stray one
                     continue
-                datasets[step.id] = self._build(step, datasets)
-            ds = datasets[target]
-            batches = list(ds.iter_batches(batch_format="pyarrow"))
-            tbl = pa.concat_tables(batches) if batches else pa.table({})
-            if is_object_uri(uri):
-                with db.base_guard():
-                    db.ensure_object_store()
-                    db.conn().from_arrow(tbl).write_parquet(uri)
+                datasets[step.id] = self._build(step, datasets, ray_opts)
+            ds = datasets[target].materialize()  # execute the read→map pipeline ONCE, in the cluster (spillable)
+            rows = ds.count()
+            if progress:
+                progress(0.6, rows)
+            out_dir = uri[:-len(".parquet")] if uri.lower().endswith(".parquet") else uri  # a DIR of shards
+            if is_object_uri(out_dir):
+                fs, p = object_fs(out_dir)               # creds-aware object filesystem (same as the adapter)
+                ds.write_parquet(p, filesystem=fs)       # each block → its own object, written by a worker
             else:
-                os.makedirs(os.path.dirname(uri) or ".", exist_ok=True)
-                pq.write_table(tbl, uri)
-            return {"status": "done", "rows": tbl.num_rows, "output_uri": uri, "output_table": None}
+                os.makedirs(out_dir, exist_ok=True)
+                ds.write_parquet(out_dir)                # WORKER-DIRECT: parallel shard write, no driver funnel
+            return {"status": "done", "rows": rows, "output_uri": out_dir, "output_table": None}
         except Exception as e:  # noqa: BLE001
             return {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
 
-    def _build(self, step, datasets):
+    def _build(self, step, datasets, ray_opts=None):
         import ray
+        opts = ray_opts or {}
 
         if step.op == "read":
             uri = step.config["uri"]
@@ -349,7 +389,9 @@ class RayRunner:
         if step.op == "passthrough":
             return parent
         if step.op in CLEAN_TRANSFORM_MODES:
-            return parent.map_batches(_make_mapper(step.config), batch_format="pyarrow")
+            # `opts` (num_gpus / custom resources from the region's requires) makes Ray schedule each map
+            # task onto a worker that has the resource — the planner's placement, honored on the cluster.
+            return parent.map_batches(_make_mapper(step.config), batch_format="pyarrow", **opts)
         raise RuntimeError(f"ray backend reached a non-clean op '{step.op}' (should have fallen back)")
 
     def _commit(self, step, datasets, graph) -> tuple[int, str, str]:

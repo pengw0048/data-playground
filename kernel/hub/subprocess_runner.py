@@ -71,10 +71,12 @@ class SubprocessRunner:
         status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=per)
         return self._spawn(status, {}, graph, target_node_id)
 
-    def run_unit(self, graph: Graph, output_node: str, output_uri: str) -> RunStatus:
+    def run_unit(self, graph: Graph, output_node: str, output_uri: str, requires=None) -> RunStatus:
         """Run a placement region's sub-graph in a worker PROCESS and materialize output_node's relation
         to output_uri (no catalog registration). This is how a placed region executes on its worker —
-        the seam a pod/Ray backend overrides to allocate a pod / submit a job."""
+        the seam a pod/Ray backend overrides to allocate a pod / submit a job. `requires` (the region's
+        resource need) is accepted for signature parity but ignored: a subprocess is one local process,
+        so there's no worker to place onto."""
         run_id = f"unit_{uuid.uuid4().hex[:10]}"
         status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=[])
         return self._spawn(status, {"materializeUri": output_uri}, graph, output_node)

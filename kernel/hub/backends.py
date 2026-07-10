@@ -85,10 +85,13 @@ class PlaceableBackend(Protocol):
     implements them ONLY if it supports placement — they are NOT part of the required ExecutionBackend
     contract. A Ray/k8s cluster backend implements all three; the built-in PoolRunner has workers/place
     and SubprocessRunner has run_unit. `place(requires)` picks a worker for a resource need (or None);
-    `workers()` advertises capacities (WorkerInfo); `run_unit` runs one region's subgraph to `output_uri`."""
+    `workers()` advertises capacities (WorkerInfo); `run_unit` runs one region's subgraph to `output_uri`
+    (returning the uri it actually wrote — a single file, or a DIRECTORY of shards for a worker-direct
+    parallel write). `requires` is the region's resource need (gpu/cpu/labels) the planner resolved, so
+    the backend can place the work on a matching worker / pass it to the cluster scheduler."""
     def workers(self) -> list: ...
     def place(self, requires: Any) -> "str | None": ...
-    def run_unit(self, graph: Graph, output_node: str, output_uri: str) -> RunStatus: ...
+    def run_unit(self, graph: Graph, output_node: str, output_uri: str, requires: Any = None) -> RunStatus: ...
 
 
 @runtime_checkable
