@@ -211,6 +211,53 @@ def test_join_and_sql():
     assert not r["notPreviewable"] and r["rows"][0]["n"] > 0
 
 
+def test_union_stacks_inputs_row_wise():
+    # union stacks its N inputs vertically. UNION ALL keeps every row (2 identical inputs → 2x); UNION
+    # (distinct) dedups back to one copy. A lone input passes straight through.
+    src = [N("a", "source", {"uri": _uri("events")}), N("b", "source", {"uri": _uri("events")})]
+    edges = [E("a", "u"), E("b", "u")]
+    n1 = _poll(client.post("/api/run", json={"graph": {"id": "c", "version": 1, "nodes": [src[0]], "edges": []},
+                                             "targetNodeId": "a", "confirmed": True}).json()["runId"])["totalRows"]
+    g_all = {"id": "c", "version": 1, "nodes": [*src, N("u", "union", {"mode": "all", "align": "name"})], "edges": edges}
+    allrows = _poll(client.post("/api/run", json={"graph": g_all, "targetNodeId": "u", "confirmed": True}).json()["runId"])["totalRows"]
+    assert allrows == 2 * n1
+    g_dist = {"id": "c", "version": 1, "nodes": [*src, N("u", "union", {"mode": "distinct", "align": "name"})], "edges": edges}
+    dist = _poll(client.post("/api/run", json={"graph": g_dist, "targetNodeId": "u", "confirmed": True}).json()["runId"])["totalRows"]
+    assert dist == n1  # identical inputs dedup back to one copy
+    g_one = {"id": "c", "version": 1, "nodes": [src[0], N("u", "union", {"mode": "all"})], "edges": [E("a", "u")]}
+    one = _poll(client.post("/api/run", json={"graph": g_one, "targetNodeId": "u", "confirmed": True}).json()["runId"])["totalRows"]
+    assert one == n1  # a single input just passes through
+
+
+def test_union_by_name_aligns_differing_column_order():
+    # BY NAME (the default) aligns columns by name across inputs, filling a missing one with NULL — so
+    # a same-schema dataset in a different column order (or with an extra column) stacks correctly.
+    g = {"id": "c", "version": 1, "nodes": [
+        N("a", "source", {"uri": _uri("events")}),
+        N("sa", "select", {"select": "user_id, event"}),      # (user_id, event)
+        N("b", "source", {"uri": _uri("events")}),
+        N("sb", "select", {"select": "event, user_id"}),      # same cols, reversed order
+        N("u", "union", {"mode": "all", "align": "name"}),
+    ], "edges": [E("a", "sa"), E("sa", "u"), E("b", "sb"), E("sb", "u")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "u", "k": 5}).json()
+    assert not r["notPreviewable"]
+    assert set(r["rows"][0].keys()) == {"user_id", "event"}  # aligned by name, not smashed by position
+
+
+def test_union_is_relational_not_clean_ir():
+    # union is a multi-input relational op → outside the map-style clean subset, so a distributed
+    # map-engine (dp_ray) falls back to DuckDB for any graph containing it.
+    from hub.ir import lower_to_ir
+    from hub.models import Graph
+    g = Graph(id="c", version=1, nodes=[
+        N("a", "source", {"uri": _uri("events")}), N("b", "source", {"uri": _uri("events")}),
+        N("u", "union", {"mode": "all"})], edges=[E("a", "u"), E("b", "u")])
+    ir = lower_to_ir(g, "u")
+    assert "union" in ir.unsupported() and not ir.is_clean()
+    u = ir.by_id()["u"]
+    assert u.op == "union" and u.config == {"mode": "all", "align": "name"} and len(u.inputs) == 2
+
+
 def test_preview_is_faithful_for_join_and_sort(tmp_path):
     # preview used to truncate each source to its first 2000 rows and THEN join/sort — so a join of
     # two non-overlapping prefixes showed 0 matches, and a sort showed the top of an arbitrary prefix.

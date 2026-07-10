@@ -13,6 +13,7 @@ export interface PortSpec {
   wire: WireType // primary type — decides the port's shape/color
   accepts?: WireType[] // input ports may accept a small compatible set (defaults to [wire])
   optional?: boolean
+  multi?: boolean // an input port that accepts MANY incoming edges (e.g. union stacks N inputs)
 }
 
 export interface NodeConfig {

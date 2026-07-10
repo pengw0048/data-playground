@@ -463,6 +463,22 @@ class BuildEngine:
             cols = ", ".join(f'"{c.strip()}"' for c in on.split(","))
             return db.conn().sql(f"SELECT * FROM {a} {how.upper()} JOIN {b} USING ({cols})")
 
+        if t == "union":
+            # stack every incoming input row-wise. BY NAME aligns columns by name (filling missing ones
+            # with NULL) — the safe default for same-shape datasets in a different column order; position
+            # mode requires matching column counts. UNION dedups, UNION ALL keeps every row. Unlike join,
+            # stacking truncated preview prefixes is still faithful (no cross-input matching), so this
+            # uses the ordinary (possibly-sampled) inputs — no expensive full pass.
+            if not inputs:
+                return parent
+            if len(inputs) == 1:
+                return inputs[0]  # a lone input just passes through
+            distinct = (cfg.get("mode") or "all").lower() == "distinct"
+            by_name = (cfg.get("align") or "name").lower() != "position"
+            op = ("UNION" if distinct else "UNION ALL") + (" BY NAME" if by_name else "")
+            views = [self._view(r, f"u{i}") for i, r in enumerate(inputs)]
+            return db.conn().sql(f" {op} ".join(f"SELECT * FROM {v}" for v in views))
+
         if t in _TRANSFORM_KINDS:
             return self._transform(node, parent)
 

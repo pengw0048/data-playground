@@ -85,6 +85,15 @@ export function portAccepts(kind: string, handleId: string | null | undefined): 
   return p.accepts ?? [p.wire]
 }
 
+/** Does the target port accept MANY incoming edges (e.g. union)? Then the one-edge-per-port rule
+ * doesn't apply and several wires can land on the same handle. */
+export function portMulti(kind: string, handleId: string | null | undefined): boolean {
+  const spec = specs.get(kind)
+  if (!spec || spec.inputs.length === 0) return false
+  const port = handleId ? spec.inputs.find((p) => p.id === handleId) : spec.inputs[0]
+  return !!(port ?? spec.inputs[0])?.multi
+}
+
 /** Is a connection from a source wire type into (kind, handle) valid? (§5.3 / FR-W1) */
 export function canConnect(sourceWire: WireType | null, targetKind: string, targetHandle: string | null | undefined): boolean {
   if (!sourceWire) return false

@@ -38,6 +38,7 @@ CLEAN_OPS = {"read", "write", "passthrough"} | CLEAN_TRANSFORM_MODES
 # `transform:<mode>` when not clean); anything not listed (incl. plugin kinds) → `opaque:<type>`.
 _NODE_OP = {
     "source": "read", "filter": "filter_sql", "select": "project_sql", "sql": "sql", "join": "join",
+    "union": "union",
     "aggregate": "aggregate", "sort": "sort", "dedup": "dedup", "sample": "sample", "write": "write",
     "metric": "metric", "chart": "chart", "vector-search": "vector_search", "section": "section",
     "opaque": "opaque", "loop": "loop", "variable": "variable",
@@ -120,6 +121,8 @@ def resolve_config(node: GraphNode) -> dict:
         return {"sql": cfg.get("sql", "")}
     if t == "join":
         return {"on": cfg.get("on", ""), "condition": cfg.get("condition", ""), "how": cfg.get("how", "inner")}
+    if t == "union":
+        return {"mode": cfg.get("mode", "all"), "align": cfg.get("align", "name")}
     if t == "aggregate":
         return {"groupBy": cfg.get("groupBy") or cfg.get("group") or "", "aggs": cfg.get("aggs", "")}
     if t == "sort":

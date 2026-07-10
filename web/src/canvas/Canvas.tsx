@@ -7,7 +7,7 @@ import {
 import { buildNodeTypes } from '../nodes'
 import { SECTION_W, SECTION_H } from '../nodes/kinds/section'
 import { WireEdge } from '../wires/WireEdge'
-import { canConnect, portWire, getSpec } from '../nodes/registry'
+import { canConnect, portWire, portMulti, getSpec } from '../nodes/registry'
 import { schemaWarnings } from '../nodes/schema'
 import { useStore, newId, freePosition } from '../store/graph'
 import { kindAccent, color } from '../theme/tokens'
@@ -203,7 +203,9 @@ export function Canvas() {
     const tgt = doc.nodes.find((n) => n.id === c.target)
     if (!tgt) return false
     if (!canConnect(sw, tgt.type, c.targetHandle)) return false
-    // one edge per input port (each handle is single-input; join has separate a/b handles)
+    // one edge per input port (each handle is single-input; join has separate a/b handles) — unless the
+    // port is `multi` (union), which stacks many incoming edges on the same handle.
+    if (portMulti(tgt.type, c.targetHandle)) return true
     const occupied = doc.edges.some((e) => e.target === c.target && (e.targetHandle ?? null) === (c.targetHandle ?? null))
     return !occupied
   }, [doc.nodes, doc.edges])
@@ -224,8 +226,8 @@ export function Canvas() {
     const sw = portWire(doc.nodes, c.source!, c.sourceHandle, 'source')
     const tgt = doc.nodes.find((n) => n.id === c.target)
     if (!tgt || !canConnect(sw, tgt.type, c.targetHandle)) return
-    const occupied = doc.edges.some((e) => e.id !== oldEdge.id && e.target === c.target
-      && (e.targetHandle ?? null) === (c.targetHandle ?? null))
+    const occupied = !portMulti(tgt.type, c.targetHandle) && doc.edges.some((e) => e.id !== oldEdge.id
+      && e.target === c.target && (e.targetHandle ?? null) === (c.targetHandle ?? null))
     if (occupied) return
     removeEdge(oldEdge.id)
     connect({ id: newId('e'), source: c.source!, target: c.target!,

@@ -26,6 +26,7 @@ class PortSpec(_M):
     label: str | None = None
     wire: WireType = "dataset"
     accepts: list[WireType] | None = None
+    multi: bool = False  # an input port that accepts MANY incoming edges (e.g. union stacks N inputs)
 
 
 class ParamSpec(_M):
@@ -55,8 +56,8 @@ class NodeSpec(_M):
     #                                          instance override lives in node config.requires (Phase B+)
 
 
-def _in(accepts=("dataset", "sample"), wire="dataset", id="in", label=None):
-    return PortSpec(id=id, label=label, wire=wire, accepts=list(accepts))
+def _in(accepts=("dataset", "sample"), wire="dataset", id="in", label=None, multi=False):
+    return PortSpec(id=id, label=label, wire=wire, accepts=list(accepts), multi=multi)
 
 
 def _out(wire="dataset", id="out", label=None):
@@ -104,6 +105,11 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
                      ParamSpec(name="condition", type="string", label="or ON expression (a.x = b.y)"),
                      ParamSpec(name="how", type="select", options=["inner", "left", "right", "outer"], default="inner")],
              blurb="out-of-core hash join — shared keys, or an ON expression across differing keys"),
+    NodeSpec(kind="union", title="union", category="compute", tag="union",
+             inputs=[_in(("dataset", "sample"), multi=True)], outputs=[_out()],
+             params=[ParamSpec(name="mode", type="select", options=["all", "distinct"], default="all", label="rows"),
+                     ParamSpec(name="align", type="select", options=["name", "position"], default="name", label="align by")],
+             blurb="stack inputs row-wise (UNION [ALL] BY NAME) — append same-shape datasets"),
     NodeSpec(kind="aggregate", title="aggregate", category="compute", tag="aggregate",
              inputs=[_in(("dataset",))], outputs=[_out()], previewable=False,
              params=[ParamSpec(name="groupBy", type="string", label="group by"),

@@ -15,6 +15,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const runPreview = useStore((s) => s.runPreview)
   const requestRun = useStore((s) => s.requestRun)
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
+  const pushToast = useStore((s) => s.pushToast)
   const [tab, setTab] = useState('rows')
   const [detail, setDetail] = useState<number | null>(null)  // index of the row whose detail is open
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
@@ -76,6 +77,10 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
                 <PageBtn dir="prev" disabled={offset === 0} onClick={() => page(Math.max(0, offset - PAGE))} />
                 <PageBtn dir="next" disabled={atEnd} onClick={() => page(offset + PAGE)} />
               </span>
+            )}
+            {activeTab === 'rows' && res.rows.length > 0 && (
+              <ExportCluster columns={columns as ColumnSchema[]} rows={res.rows}
+                name={String(node?.data.title || node?.id || 'data')} truncated={!!res.truncated} pushToast={pushToast} />
             )}
           </>
         )}
@@ -192,6 +197,44 @@ function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<stri
 
 // a scalar numeric column → right-align its cells (matches the Stats tab; eases scanning). Lists excluded.
 const isNumericCol = (t: string) => !t.includes('[]') && /\b(?:u?int\w*|bigint|smallint|tinyint|hugeint|long|float\w*|double|real|decimal|numeric)\b/i.test(t)
+
+// --- previewed-rows export (client-side; the rows are already in memory) --------------------------
+function _csvCell(v: unknown): string {
+  if (v == null) return ''
+  const s = typeof v === 'object' ? JSON.stringify(v) : String(v)  // list/struct cells → JSON
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+function rowsToCsv(cols: ColumnSchema[], rows: Record<string, unknown>[]): string {
+  const head = cols.map((c) => _csvCell(c.name)).join(',')
+  return [head, ...rows.map((r) => cols.map((c) => _csvCell(r[c.name])).join(','))].join('\n')
+}
+function _slug(s: string): string { return (s.replace(/[^\w.-]+/g, '_').replace(/^_+|_+$/g, '') || 'data') }
+function _download(name: string, text: string, mime: string): void {
+  const url = URL.createObjectURL(new Blob([text], { type: mime }))
+  const a = document.createElement('a')
+  a.href = url; a.download = name; a.click()
+  URL.revokeObjectURL(url)
+}
+
+function ExportCluster({ columns, rows, name, truncated, pushToast }: {
+  columns: ColumnSchema[]; rows: Record<string, unknown>[]; name: string; truncated: boolean
+  pushToast: (m: string, k?: 'error' | 'info' | 'success') => void
+}) {
+  const note = truncated ? ' (previewed sample only — use a write node for the full dataset)' : ''
+  const copy = () => {
+    navigator.clipboard.writeText(rowsToCsv(columns, rows))
+      .then(() => pushToast(`Copied ${rows.length} rows as CSV`, 'success'))
+      .catch(() => pushToast('Copy failed — clipboard unavailable', 'error'))
+  }
+  const btn = 'rounded px-1.5 py-1 text-[10.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground'
+  return (
+    <span className="ml-1.5 inline-flex items-center gap-0.5 border-l border-border pl-1.5">
+      <button className={btn} title={`Copy these rows as CSV to the clipboard${note}`} onClick={copy}>Copy</button>
+      <button className={btn} title={`Download these rows as CSV${note}`} onClick={() => _download(`${_slug(name)}.csv`, rowsToCsv(columns, rows), 'text/csv')}>CSV</button>
+      <button className={btn} title={`Download these rows as JSON${note}`} onClick={() => _download(`${_slug(name)}.json`, JSON.stringify(rows, null, 2), 'application/json')}>JSON</button>
+    </span>
+  )
+}
 
 function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; rows: Record<string, unknown>[]; onRowClick: (i: number) => void }) {
   return (
