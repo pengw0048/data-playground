@@ -17,6 +17,9 @@ class Settings:
     database_url: str = os.environ.get("DP_DATABASE_URL") or (
         "sqlite:///" + os.path.join(os.environ.get("DP_WORKSPACE", _KERNEL_ROOT), "dataplay.db"))
     preview_k: int = int(os.environ.get("DP_PREVIEW_K", "50"))
+    # base URL the running web app is served at — used only to build clickable canvas links for
+    # out-of-process clients (the MCP server), so "open this canvas" points at a real browser URL.
+    base_url: str = (os.environ.get("DP_BASE_URL") or "http://127.0.0.1:8471").rstrip("/")
     # cap on a single dataset upload (POST /catalog/upload). Streamed + enforced as bytes arrive, so a
     # too-large upload is rejected without buffering it. Default 2 GiB; raise for bigger local files.
     max_upload_bytes: int = int(os.environ.get("DP_MAX_UPLOAD_BYTES", str(2 * 1024**3)))

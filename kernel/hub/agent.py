@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from hub import graph as g
+from hub import graph_ops
 from hub.executors.preview import preview_node
 from hub.models import Graph
 from hub.settings import settings
@@ -92,21 +92,6 @@ Be concise. Prefer relational nodes (filter/select/sql/aggregate/join) over Pyth
 they suffice — they push down and run out-of-core."""
 
 
-def _node_kinds(deps) -> list[dict]:
-    out = []
-    for spec in deps.node_specs.values():
-        d = spec.model_dump(by_alias=False)
-        out.append({
-            "kind": d["kind"], "title": d.get("title"), "blurb": d.get("blurb", ""),
-            "previewable": d.get("previewable", True),
-            "inputs": [{"id": p["id"], "wire": p.get("wire"), "accepts": p.get("accepts")} for p in d.get("inputs", [])],
-            "outputs": [{"id": p["id"], "wire": p.get("wire")} for p in d.get("outputs", [])],
-            "params": [{"name": p["name"], "type": p["type"], "default": p.get("default"), "options": p.get("options")}
-                       for p in d.get("params", [])],
-        })
-    return out
-
-
 # --------------------------------------------------------------------------- #
 # The agent: a Pydantic AI tool-use loop over a working copy of the graph.
 # Deps carry the per-run state (the working graph + the kernel deps); the tools mutate it.
@@ -122,10 +107,6 @@ class _Ctx:
 def _new_id(ctx: _Ctx, kind: str) -> str:
     ctx.seq[0] += 1
     return f"{kind}_a{ctx.seq[0]}"
-
-
-def _find(wg: dict, nid: str):
-    return next((n for n in wg["nodes"] if n["id"] == nid), None)
 
 
 try:
@@ -152,25 +133,8 @@ try:
         MEASURED from the data (1:1 / 1:N / N:1 / N:M), plus any owner-declared relationship. Use this
         to pick the right join key and to know whether a join fans out (a 1:N/N:M join multiplies rows
         — aggregate afterward if you need the parent grain)."""
-        from hub import relationships as rel
-        d = ctx.deps.kdeps
-
-        # accept a uri OR a table name/id: resolve to the canonical uri so BOTH the column probe and
-        # the cardinality MEASUREMENT (which needs a real uri to scan) use the same, correct dataset.
-        def resolve(arg):
-            try:
-                t = d.catalog.get_table(arg)
-                return t.uri, t.columns
-            except KeyError:
-                return arg, d.resolve_adapter(arg).schema(arg)
         try:
-            (luri, lcols), (ruri, rcols) = resolve(left_uri), resolve(right_uri)
-            sugg = rel.suggest_joins(lcols, rcols,
-                                     rel.measured_unique(luri, d.resolve_adapter),
-                                     rel.measured_unique(ruri, d.resolve_adapter))
-            out = {"suggestions": [s.model_dump(by_alias=True) for s in sugg],
-                   "declared": [r.model_dump(by_alias=True) for r in d.catalog.relationships(luri)
-                                if ruri in (r.left_uri, r.right_uri)]}
+            out = graph_ops.join_hints(ctx.deps.kdeps, left_uri, right_uri)
         except Exception as e:  # noqa: BLE001
             out = {"error": f"{type(e).__name__}: {e}"}
         ctx.deps.transcript.append({"tool": "join_hints", "input": {"left_uri": left_uri, "right_uri": right_uri}, "result": out})
@@ -181,23 +145,8 @@ try:
         """Check the canvas you've built so far WITHOUT running it: typed-wire errors (incompatible
         connections) and, for each join node, its measured cardinality + a fan-out warning. Call this
         before you finish to confirm the graph is correct."""
-        from hub import graph as gmod
-        from hub import relationships as rel
-        from hub.executors.schema import schema_for_graph
-        from hub.models import Graph
-        d = ctx.deps.kdeps
-        out: dict = {}
         try:
-            g = Graph.model_validate(ctx.deps.wg)
-            out["type_errors"] = gmod.type_errors(g, d.node_specs)
-            cols = schema_for_graph(g, d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
-            joins = {}
-            for n in g.nodes:
-                if n.type == "join":
-                    ja = rel.analyze_join(g, n.id, cols, d.catalog, d.resolve_adapter)
-                    joins[n.id] = {"cardinality": (ja.suggestions[0].cardinality if ja.suggestions else "unknown"),
-                                   "warning": ja.warning, "note": ja.note}
-            out["joins"] = joins
+            out = graph_ops.validate_graph(ctx.deps.kdeps, ctx.deps.wg)
         except Exception as e:  # noqa: BLE001
             out = {"error": f"{type(e).__name__}: {e}"}
         ctx.deps.transcript.append({"tool": "validate", "input": {}, "result": out})
@@ -206,7 +155,7 @@ try:
     @_agent.tool
     def list_node_kinds(ctx: RunContext[_Ctx]) -> dict:
         """List available node kinds with their params and input/output ports."""
-        out = {"kinds": _node_kinds(ctx.deps.kdeps)}
+        out = {"kinds": graph_ops.node_kinds(ctx.deps.kdeps)}
         ctx.deps.transcript.append({"tool": "list_node_kinds", "input": {}, "result": out})
         return out
 
@@ -214,17 +163,11 @@ try:
     def add_node(ctx: RunContext[_Ctx], kind: str, title: str | None = None,
                  config: dict | None = None) -> dict:
         """Add a node to the canvas. Returns its node_id and port handles. `config` maps param name -> value."""
-        specs = ctx.deps.kdeps.node_specs
-        if kind not in specs:
-            out = {"error": f"unknown node kind '{kind}'. Call list_node_kinds."}
-        else:
-            spec = specs[kind]
-            nid = _new_id(ctx.deps, kind)
-            ctx.deps.wg["nodes"].append({"id": nid, "type": kind, "position": {"x": 0, "y": 0},
-                                         "data": {"title": title or kind, "config": config or {}}})
-            out = {"node_id": nid,
-                   "inputs": [{"id": p.id, "wire": p.wire} for p in spec.inputs],
-                   "outputs": [{"id": p.id, "wire": p.wire} for p in spec.outputs]}
+        try:
+            out = graph_ops.add_node(ctx.deps.wg, ctx.deps.kdeps.node_specs,
+                                     _new_id(ctx.deps, kind), kind, title, config)
+        except graph_ops.GraphOpError as e:
+            out = {"error": f"{e}. Call list_node_kinds."}
         ctx.deps.transcript.append({"tool": "add_node", "input": {"kind": kind, "title": title, "config": config}, "result": out})
         return out
 
@@ -232,30 +175,21 @@ try:
     def connect(ctx: RunContext[_Ctx], source_id: str, target_id: str,
                 target_handle: str | None = None) -> dict:
         """Connect one node's output to another node's input. target_handle picks a multi-input handle (e.g. join 'a'/'b')."""
-        wg = ctx.deps.wg
-        src, tgt = _find(wg, source_id), _find(wg, target_id)
-        if not src or not tgt:
-            out: dict = {"error": "source_id or target_id not found"}
-        elif any(e["target"] == tgt["id"] and (e.get("targetHandle") or None) == (target_handle or None) for e in wg["edges"]):
-            out = {"error": f"input {target_handle or 'in'} of {tgt['id']} is already connected"}
-        else:
-            sspec = ctx.deps.kdeps.node_specs.get(src["type"])
-            wire = sspec.outputs[0].wire if sspec and sspec.outputs else "dataset"
-            wg["edges"].append({"id": _new_id(ctx.deps, "e"), "source": src["id"], "target": tgt["id"],
-                                "sourceHandle": None, "targetHandle": target_handle, "data": {"wire": wire}})
-            out = {"ok": True}
+        try:
+            out = graph_ops.connect(ctx.deps.wg, ctx.deps.kdeps.node_specs, _new_id(ctx.deps, "e"),
+                                    source_id, target_id, target_handle)
+        except graph_ops.GraphOpError as e:
+            out = {"error": str(e)}
         ctx.deps.transcript.append({"tool": "connect", "input": {"source_id": source_id, "target_id": target_id, "target_handle": target_handle}, "result": out})
         return out
 
     @_agent.tool
     def set_config(ctx: RunContext[_Ctx], node_id: str, config: dict) -> dict:
         """Merge config values into an existing node."""
-        n = _find(ctx.deps.wg, node_id)
-        if not n:
-            out: dict = {"error": "node_id not found"}
-        else:
-            n["data"].setdefault("config", {}).update(config or {})
-            out = {"ok": True}
+        try:
+            out = graph_ops.set_config(ctx.deps.wg, node_id, config)
+        except graph_ops.GraphOpError as e:
+            out = {"error": str(e)}
         ctx.deps.transcript.append({"tool": "set_config", "input": {"node_id": node_id, "config": config}, "result": out})
         return out
 
@@ -263,7 +197,7 @@ try:
     def preview(ctx: RunContext[_Ctx], node_id: str) -> dict:
         """Preview a node over a small sample. Returns columns and up to 8 rows."""
         d = ctx.deps.kdeps
-        if not _find(ctx.deps.wg, node_id):
+        if not graph_ops.find_node(ctx.deps.wg, node_id):
             out: dict = {"error": "node_id not found"}
         else:
             try:
@@ -335,41 +269,5 @@ def run_agent(outcome: str, graph: dict, deps, model=None) -> dict:
     except UsageLimitExceeded:
         summary = (f"Stopped at the {settings.agent_max_steps}-step limit — returning the partial build "
                    "so far. Ask me to continue if it's incomplete.")
-    _layout(wg, existing_ids)
+    graph_ops.layout_new(wg, existing_ids)
     return {"graph": wg, "transcript": ctx.transcript, "summary": summary}
-
-
-def _layout(wg: dict, keep_ids: set) -> None:
-    """Assign positions to newly-added nodes via a left-to-right topological layering, placed
-    below any pre-existing content so the agent's build never overlaps the user's nodes."""
-    new = [n for n in wg["nodes"] if n["id"] not in keep_ids]
-    if not new:
-        return
-    old = [n for n in wg["nodes"] if n["id"] in keep_ids]
-    base_y = (max((n["position"]["y"] for n in old), default=0) + 280) if old else 80
-    base_x = (min((n["position"]["x"] for n in old), default=80)) if old else 80
-
-    # depth = longest path from a root, within the new nodes
-    parents: dict[str, list[str]] = {n["id"]: [] for n in new}
-    idset = {n["id"] for n in new}
-    for e in wg["edges"]:
-        if e["target"] in idset and e["source"] in idset:
-            parents[e["target"]].append(e["source"])
-    depth: dict[str, int] = {}
-
-    def d(nid: str, seen=None) -> int:
-        seen = seen or set()
-        if nid in depth:
-            return depth[nid]
-        if nid in seen or not parents.get(nid):
-            depth[nid] = 0
-            return 0
-        depth[nid] = 1 + max(d(p, seen | {nid}) for p in parents[nid])
-        return depth[nid]
-
-    per_col: dict[int, int] = {}
-    for n in new:
-        col = d(n["id"])
-        row = per_col.get(col, 0)
-        per_col[col] = row + 1
-        n["position"] = {"x": base_x + col * 280, "y": base_y + row * 170}
