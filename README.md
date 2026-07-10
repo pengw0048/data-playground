@@ -5,7 +5,8 @@
 
 **Like ComfyUI, but for data.** It's a visual node-graph editor where every wire carries a *typed
 table*: connect datasets and operators into a graph, watch the **real rows come out of each step**,
-and run the **same graph over the full dataset** — out-of-core on your laptop, bigger-than-RAM and all.
+and run the **same graph over the full dataset** — on your laptop, bigger than RAM and all (it streams
+from disk instead of loading everything into memory).
 
 Clone it and it works: **no cloud account, no external services, no mock mode.** Point it at your
 Parquet / CSV / JSON / Arrow / Lance files and you're doing real data work in five minutes.
@@ -39,9 +40,9 @@ seeded data, or take the **[5-minute tour](docs/TUTORIAL.md)**: events → keep 
 ## What you get, offline, out of the box
 
 - **Open real data** — Parquet, CSV, JSON, Arrow/Feather, Lance, and directories-of-files. The
-  workspace catalog starts as your local files; add more by registering a path (`POST /api/catalog/register`
-  or a `source` node), or **upload a file** — drag it onto the canvas to drop a bound `source` node, or use
-  the Upload button in a source node / the Tables view.
+  workspace catalog starts as your local files; add more from the **Tables** view — **Register** a path
+  already on disk, or **Upload** a file from your machine — or just **drag a file onto the canvas** to
+  drop a bound `source` node.
 - **Explore & transform** — `filter`, `select`, `join`, `aggregate`, `sort`, `dedup`, `window`, `fill`,
   `unnest`, `sql`, `sample`, `metric`, `chart`, `vector-search`, and `transform` (arbitrary Python) nodes
   that **actually execute**.
@@ -58,9 +59,13 @@ seeded data, or take the **[5-minute tour](docs/TUTORIAL.md)**: events → keep 
   (1:1 / 1:N / N:M), and suggests how two datasets join; declare keys/relationships by hand and view
   them as an ER/UML diagram.
 - **One graph, explore → scale** — the graph you explore with (instant sampled previews) is the *same*
-  one you run over the full dataset, out-of-core, with the runner chosen for you — no rewrite. The
-  default engine (DuckDB + Polars + Arrow) spills joins/sorts/aggregations to disk, so data bigger than
-  RAM doesn't OOM.
+  one you run over the full dataset, with the runner chosen for you — no rewrite. The default engine
+  (DuckDB + Polars + Arrow) streams and spills joins/sorts/aggregations to disk, so data bigger than
+  RAM doesn't run out of memory.
+- **Or don't build it by hand** — point your **own Claude Code** (or any
+  [MCP](https://modelcontextprotocol.io) client) at the workspace and
+  [watch it build the whole pipeline live in your browser](#drive-it-from-your-own-agent-mcp) — no API
+  key, no second process. (Or drive the built-in [agent](#the-agent-optional) with a model you choose.)
 - **Extend it with plugins** — drop a Python package in `<workspace>/plugins/` and your typed node
   appears in the Add-node menu, **rendered and wired with no frontend code** (see [Plugins](#plugins--add-a-typed-node-without-touching-the-core)).
 - **Save, undo, export** — the canvas is diff-friendly JSON, auto-persisted; `⌘Z`/`⌘⇧Z` undo/redo;
@@ -76,17 +81,19 @@ A node does **not** run Python row-by-row on the server. Instead it **builds one
 logical plan**:
 
 - a **relational op** (`filter` / `select` / `join` / `aggregate` / `sort` / `dedup` / `window` / `fill`
-  / `unnest` / `assert` / `sql`) becomes a DuckDB relation — pushed down, optimized, and out-of-core; or
+  / `unnest` / `assert` / `sql`) becomes a DuckDB relation — pushed down, optimized, and streamed from
+  disk; or
 - the `transform` escape hatch runs your own Python — and even this isn't row-by-row: it's a
   **batched** function over Arrow `RecordBatch`es, deferred into the same plan and portable to any
   runner. A `map_batches` cell picks how each batch arrives — row dicts (default), a **pandas
   DataFrame**, or a **pyarrow Table** (arrow-native, so column types are preserved).
 
 A **runner** executes that assembled plan. By default it's the canvas's **kernel** — a warm,
-restart-durable process (one per canvas, Jupyter-style) running the local out-of-core engine
-(DuckDB · Polars · Arrow). Because a graph is *just a plan*, the **same** graph runs three ways with no
-rewrite: on a small sample for an **instant preview**, over the **full dataset** out-of-core, or — via
-a cluster runner (a plugin) — across **many machines**.
+restart-durable process (one per canvas, Jupyter-style) running the local engine
+(DuckDB · Polars · Arrow) that streams and spills to disk. Because a graph is *just a plan*, the
+**same** graph runs three ways with no rewrite: on a small sample for an **instant preview**, over the
+**full dataset** (bigger than RAM and all), or — via a cluster runner (a plugin) — across
+**many machines**.
 
 ```mermaid
 flowchart LR
@@ -100,8 +107,8 @@ flowchart LR
 
 Because a wire carries a **typed table** (not raw bytes), the canvas knows every port's schema: it
 only lets you connect compatible ports, and the kernel independently re-checks the graph's types
-before running it. (Besides a full `dataset`, a wire can carry a `sample`, a column `selection`, or a
-computed `metric` / `value`.)
+before running it. (Most wires carry a table — a full `dataset` or a bounded `sample`; a `metric` node
+instead carries a single computed scalar.)
 
 The port **schema** is resolved metadata-only for a relational op (no data scanned), so you see its
 columns before running. A code op (`transform` / a plugin) is untyped until it runs — but you can
@@ -124,8 +131,8 @@ web/     React + React Flow + zustand — the canvas: node cards, typed wires, a
 
 kernel/  The `hub` package: one FastAPI server that serves the web app, the API, the WebSockets,
          and the engine. A graph is compiled to a logical plan; by default it runs on the canvas's
-         own kernel — a warm, restart-durable process running the local out-of-core engine
-         (DuckDB · Polars · Arrow). Everything else specific is a plugin.
+         own kernel — a warm, restart-durable process running the local engine (DuckDB · Polars ·
+         Arrow) that streams and spills to disk. Everything else specific is a plugin.
 ```
 
 ---
@@ -239,8 +246,8 @@ make e2e       # browser end-to-end tests (Playwright on the real UI)
 ## Running several instances (horizontal scale-out)
 
 One process is the default and is all most people need. This section is about the **web tier** — many
-instances behind a load balancer — not about data size (a single instance already runs out-of-core
-over huge datasets).
+instances behind a load balancer — not about data size (a single instance already handles datasets far
+bigger than RAM).
 
 The key fact: no durable state is kept inside a process — it's all in shared stores — so any instance
 can serve any request.
