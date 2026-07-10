@@ -82,6 +82,17 @@ def _spill_dir() -> str:
     return d
 
 
+_BYTE_UNITS = {"": 1, "K": 10 ** 3, "M": 10 ** 6, "G": 10 ** 9, "T": 10 ** 12,
+               "KI": 2 ** 10, "MI": 2 ** 20, "GI": 2 ** 30, "TI": 2 ** 40}
+
+
+def _parse_bytes(s: str) -> int | None:
+    """Parse a memory-size string ('300MB', '2GiB', '512') to bytes; None if unparseable."""
+    import re
+    m = re.fullmatch(r"\s*([0-9.]+)\s*([KMGT]?I?)B?\s*", str(s).upper())
+    return int(float(m.group(1)) * _BYTE_UNITS.get(m.group(2), 1)) if m else None
+
+
 def _apply_session(c: duckdb.DuckDBPyConnection) -> None:
     c.execute("SET enable_progress_bar = false")
     # Do NOT auto-install/auto-load extensions: that let ANY uri (e.g. https://evil/x.parquet)
@@ -98,6 +109,17 @@ def _apply_session(c: duckdb.DuckDBPyConnection) -> None:
         ml = os.environ.get("DP_MEMORY_LIMIT")
         if ml:
             c.execute("SET memory_limit = ?", [ml])
+            # Cap threads to a sane memory-per-thread ratio. The query pipeline spills, but the
+            # order-preserving write/COPY buffers per thread, so at a tight limit the default thread
+            # count (all cores) OOMs the write even though the sort/aggregate completes. We only LOWER
+            # threads (never raise RAM above the operator's cap — the cap is a hard multi-tenant limit).
+            mb = _parse_bytes(ml)
+            floor = int(os.environ.get("DP_MIN_MEM_PER_THREAD_MB", "96")) * 2 ** 20
+            if mb and floor:
+                want = max(1, mb // floor)
+                cur = int(c.execute("SELECT current_setting('threads')").fetchone()[0])
+                if cur > want:
+                    c.execute("SET threads = ?", [want])
     except Exception:  # noqa: BLE001 — never let a tuning knob block the connection
         pass
 

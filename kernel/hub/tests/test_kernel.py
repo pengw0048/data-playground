@@ -293,6 +293,30 @@ def test_sql_groupby_preview_refuses_the_sample():
     assert not r2["notPreviewable"] and not r2.get("error")
 
 
+def test_tight_memory_limit_caps_threads(monkeypatch, tmp_path):
+    # at a tight memory_limit the default (all-core) thread count OOMs the order-preserving write even
+    # though the query pipeline spills; _apply_session lowers threads to keep memory-per-thread sane and
+    # never raises RAM above the operator's cap. (The 20M-row OOM itself is verified out-of-band.)
+    import duckdb
+
+    from hub import db
+    from hub.db import _parse_bytes
+    assert _parse_bytes("300MB") == 300_000_000 and _parse_bytes("2GiB") == 2 * 2 ** 30
+    assert _parse_bytes("512") == 512 and _parse_bytes("nonsense") is None
+    monkeypatch.setenv("DP_SPILL_DIR", str(tmp_path / "spill"))
+    cores = int(duckdb.connect().execute("SELECT current_setting('threads')").fetchone()[0])
+
+    monkeypatch.setenv("DP_MEMORY_LIMIT", "300MB")
+    monkeypatch.delenv("DP_MIN_MEM_PER_THREAD_MB", raising=False)  # default 96MiB floor → ~2 threads
+    ct = duckdb.connect(); db._apply_session(ct)
+    t = int(ct.execute("SELECT current_setting('threads')").fetchone()[0])
+    assert 1 <= t <= 2 and t <= cores                       # capped, never above the machine's cores
+
+    monkeypatch.delenv("DP_MEMORY_LIMIT", raising=False)     # no limit → threads untouched
+    cn = duckdb.connect(); db._apply_session(cn)
+    assert int(cn.execute("SELECT current_setting('threads')").fetchone()[0]) == cores
+
+
 def test_preview_is_faithful_for_join_and_sort(tmp_path):
     # preview used to truncate each source to its first 2000 rows and THEN join/sort — so a join of
     # two non-overlapping prefixes showed 0 matches, and a sort showed the top of an arbitrary prefix.
