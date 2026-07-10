@@ -293,6 +293,29 @@ def test_sql_groupby_preview_refuses_the_sample():
     assert not r2["notPreviewable"] and not r2.get("error")
 
 
+def test_sql_accepts_input_placeholder_and_aggregate_message_reflects_groupby():
+    # the sql node accepts the documented {input}/{inputN} placeholder (not just the bare CTE name)
+    g = {"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("events")}),
+        N("q", "sql", {"sql": "SELECT event, amount FROM {input} WHERE amount > 0"}),
+    ], "edges": [E("s", "q")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 5}).json()
+    assert not r["notPreviewable"] and not r.get("error"), r.get("reason")   # {input} resolved, no ParserException
+    # the aggregate not-previewable reason is conditional on groupBy (was hardcoded 'global aggregate')
+    gg = {"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("events")}),
+        N("a", "aggregate", {"groupBy": "event", "aggs": "count(*) AS n"}),
+    ], "edges": [E("s", "a")]}
+    ra = client.post("/api/run/preview", json={"graph": gg, "nodeId": "a", "k": 5}).json()
+    assert ra["notPreviewable"] and "grouped" in (ra["reason"] or "")
+    g0 = {"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("events")}),
+        N("a", "aggregate", {"aggs": "count(*) AS n"}),
+    ], "edges": [E("s", "a")]}
+    r0 = client.post("/api/run/preview", json={"graph": g0, "nodeId": "a", "k": 5}).json()
+    assert r0["notPreviewable"] and "global" in (r0["reason"] or "")
+
+
 def test_tight_memory_limit_caps_threads(monkeypatch, tmp_path):
     # at a tight memory_limit the default (all-core) thread count OOMs the order-preserving write even
     # though the query pipeline spills; _apply_session lowers threads to keep memory-per-thread sane and

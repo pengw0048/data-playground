@@ -437,7 +437,7 @@ class BuildEngine:
             # just truncates the display).
             src = parent if self.full else self._faithful_inputs(node)[0]
             v = self._view(src, "w")
-            return db.conn().sql(f'SELECT *, {expr} OVER ({over}) AS "{col}" FROM {v}')
+            return db.conn().sql(f'SELECT *, {expr} OVER ({over}) AS "{_ident(col)}" FROM {v}')
 
         if t == "fill":
             cols = [c.strip() for c in (cfg.get("columns") or "").split(",") if c.strip()]
@@ -467,11 +467,13 @@ class BuildEngine:
             if not col:
                 return parent
             v = self._view(parent, "un")  # explode a list column → one row per element, others repeated
-            return db.conn().sql(f'SELECT * EXCLUDE ("{col}"), unnest("{col}") AS "{col}" FROM {v}')
+            cq = _ident(col)
+            return db.conn().sql(f'SELECT * EXCLUDE ("{cq}"), unnest("{cq}") AS "{cq}" FROM {v}')
 
         if t == "aggregate":
             if not self.full:
-                raise NotPreviewable(node, "global aggregate — needs a full pass (a sample would lie)")
+                grouped = (cfg.get("groupBy") or cfg.get("group") or "").strip()
+                raise NotPreviewable(node, f"{'grouped' if grouped else 'global'} aggregate — needs a full pass (a sample would lie)")
             aggs = (cfg.get("aggs") or "count(*) AS n").strip()
             group = (cfg.get("groupBy") or "").strip()  # resolver canonicalizes groupBy/group → 'groupBy'
             # include the group key(s) in the projection, else the aggregated rows are unlabeled
@@ -481,6 +483,9 @@ class BuildEngine:
             q = (cfg.get("sql") or "").strip()
             if not q:
                 return parent
+            # accept the documented `{input}` / `{inputN}` placeholder as well as the bare CTE name, so a
+            # user following the SDK/docs convention doesn't hit a raw ParserException.
+            q = re.sub(r"\{input(\d*)\}", r"input\1", q)
             # a GROUP BY / global aggregate over the 2000-row sample would present a PARTIAL result as
             # complete (the aggregate node already refuses a sample for exactly this reason) — refuse it.
             if not self.full and sql_reduces_rows(q):
@@ -754,7 +759,7 @@ class BuildEngine:
         else:
             qrow = max(0, int(cfg.get("queryRow", 0)))
             try:
-                q = con.sql(f'SELECT "{col}" AS q FROM {base} OFFSET {qrow} LIMIT 1').fetchone()
+                q = con.sql(f'SELECT "{_ident(col)}" AS q FROM {base} OFFSET {qrow} LIMIT 1').fetchone()
             except Exception as e:  # noqa: BLE001
                 raise NotPreviewable(node, f"no vector column '{col}': {e}") from e
             if not q or q[0] is None:
@@ -770,7 +775,7 @@ class BuildEngine:
                 pass
         qlit = "[" + ", ".join(str(x) for x in query) + "]::DOUBLE[]"
         return con.sql(
-            f'SELECT *, list_cosine_similarity("{col}", {qlit}) AS _score '
+            f'SELECT *, list_cosine_similarity("{_ident(col)}", {qlit}) AS _score '
             f'FROM {base} ORDER BY _score DESC LIMIT {k}'
         )
 
