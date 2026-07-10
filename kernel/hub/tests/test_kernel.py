@@ -201,14 +201,16 @@ def test_transform_arrow_batches():
 
 
 def test_join_and_sql():
+    # a row-preserving sql over a join previews faithfully (a GROUP BY / global aggregate would refuse
+    # the sample — see test_sql_groupby_preview_refuses_the_sample).
     g = {"id": "c", "version": 1, "nodes": [
         N("a", "source", {"uri": _uri("events")}),
         N("b", "source", {"uri": _uri("events")}),
         N("j", "join", {"on": "user_id", "how": "inner"}),
-        N("q", "sql", {"sql": "SELECT count(*) AS n FROM input"}),
+        N("q", "sql", {"sql": "SELECT user_id, amount FROM input WHERE amount > 0"}),
     ], "edges": [E("a", "j", None, "a"), E("b", "j", None, "b"), E("j", "q")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 5}).json()
-    assert not r["notPreviewable"] and r["rows"][0]["n"] > 0
+    assert not r["notPreviewable"] and not r.get("error") and len(r["rows"]) > 0
 
 
 def test_union_stacks_inputs_row_wise():
@@ -256,6 +258,35 @@ def test_union_is_relational_not_clean_ir():
     assert "union" in ir.unsupported() and not ir.is_clean()
     u = ir.by_id()["u"]
     assert u.op == "union" and u.config == {"mode": "all", "align": "name"} and len(u.inputs) == 2
+
+
+def test_sql_groupby_preview_refuses_the_sample():
+    # a sql GROUP BY / global aggregate over the 2000-row sample would present a PARTIAL aggregate as
+    # complete (the honesty hole the acceptance found). It must refuse the sample like the aggregate node.
+    from hub.executors.engine import sql_reduces_rows
+    assert sql_reduces_rows("SELECT user_id, count(*) FROM input GROUP BY user_id")
+    assert sql_reduces_rows("SELECT count(*) AS n FROM input")               # global aggregate
+    assert sql_reduces_rows("SELECT DISTINCT user_id FROM input")
+    assert not sql_reduces_rows("SELECT * FROM input WHERE amount > 0")      # row-preserving
+    assert not sql_reduces_rows("SELECT *, row_number() OVER (PARTITION BY user_id ORDER BY amount) r FROM input")  # window
+    assert not sql_reduces_rows("SELECT amount AS max FROM input")           # 'max' as an alias, not agg()
+
+    g = {"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("events")}),
+        N("q", "sql", {"sql": "SELECT event, count(*) AS n FROM input GROUP BY event"}),
+    ], "edges": [E("s", "q")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 50}).json()
+    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")   # honest, not a partial lie
+    # the SAME query is correct on a full run (not-previewable is a preview stance, not a run block)
+    done = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "q", "confirmed": True}).json()["runId"])
+    assert done["status"] == "done"
+    # a plain row-preserving sql still previews fine
+    g2 = {"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("events")}),
+        N("q", "sql", {"sql": "SELECT * FROM input WHERE event = 'purchase'"}),
+    ], "edges": [E("s", "q")]}
+    r2 = client.post("/api/run/preview", json={"graph": g2, "nodeId": "q", "k": 5}).json()
+    assert not r2["notPreviewable"] and not r2.get("error")
 
 
 def test_preview_is_faithful_for_join_and_sort(tmp_path):
@@ -633,6 +664,24 @@ def test_join_duplicate_columns_preserved():
     assert all(len(row) == len(names) for row in r["rows"])  # no column dropped
 
 
+def test_join_using_dedups_nonkey_clashes_and_survives_full_run():
+    # a USING join coalesces the KEY once, but two tables sharing a NON-key column (both events have
+    # amount/event/id besides user_id) used to emit ambiguous duplicate names — fine in preview, then a
+    # DuckDB ambiguity error on the full run. The projection now renames the right-side non-key clashes.
+    g = {"id": "c", "version": 1, "nodes": [
+        N("a", "source", {"uri": _uri("events")}),
+        N("b", "source", {"uri": _uri("events")}),
+        N("j", "join", {"on": "user_id", "how": "inner"}),
+        N("s", "select", {"select": "user_id, amount, amount_2"}),  # downstream ref that would break on a dup
+    ], "edges": [E("a", "j", None, "a"), E("b", "j", None, "b"), E("j", "s")]}
+    names = [c["name"] for c in client.post("/api/run/preview", json={"graph": g, "nodeId": "j", "k": 3}).json()["columns"]]
+    assert "user_id" in names and names.count("user_id") == 1   # key coalesced once
+    assert "amount" in names and "amount_2" in names            # non-key clash de-duped, not ambiguous
+    # the FULL run (where the ambiguity used to surface) completes, and the downstream select resolves
+    done = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "s", "confirmed": True}).json()["runId"])
+    assert done["status"] == "done", done.get("error")
+
+
 def test_cancel_finished_run_stays_done():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
@@ -831,6 +880,41 @@ def test_sandbox_blocks_dunder_escape():
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "xf", "k": 5}).json()
     assert r["error"] or r["notPreviewable"]  # blocked, not executed
     assert "__" in (r.get("reason") or "") or "allowed" in (r.get("reason") or "")
+
+
+def test_sandbox_pyarrow_root_cannot_do_file_io(tmp_path):
+    # The injected pyarrow root is I/O-guarded: a cell reached pyarrow.OSFile / output_stream /
+    # memory_map by ATTRIBUTE (no import, no dunder) → arbitrary local read/write. The proxy blocks the
+    # file/stream builders while keeping the safe arrow surface (Table/array/compute/types).
+    from hub import sandbox
+    secret = tmp_path / "secret.txt"
+    secret.write_text("top-secret")
+    out = tmp_path / "escaped.bin"
+
+    # 1) attribute-reach on the injected root is blocked
+    for expr in (f"pyarrow.OSFile('{secret}').read()",
+                 f"pyarrow.memory_map('{secret}').read()",
+                 f"pyarrow.output_stream('{out}').write(b'x')",
+                 f"pyarrow.input_stream('{secret}').read()"):
+        fn = sandbox.compile_operator(f"def fn(t):\n    return {expr}", "map_batches")
+        with pytest.raises(Exception):  # AttributeError('… is blocked …') surfaced through the op
+            fn(None)
+    assert not out.exists(), "a cell wrote a file via pyarrow.output_stream — escape not closed"
+
+    # 2) a re-`import pyarrow` inside the cell also gets the guarded proxy, not the raw module
+    fn = sandbox.compile_operator("def fn(t):\n    import pyarrow as pa\n    return pa.OSFile('/etc/hosts')", "map_batches")
+    with pytest.raises(Exception):
+        fn(None)
+
+    # 3) the legitimate arrow surface still works (constructors, types, compute, decimal)
+    import pyarrow as pa
+    ok = sandbox.compile_operator(
+        "def fn(t):\n    import pyarrow as pa\n    import pyarrow.compute as pc\n"
+        "    return pa.table({'y': pc.multiply(t['x'], 2)})", "map_batches")
+    res = ok(pa.table({"x": [1, 2, 3]}))
+    assert res.column("y").to_pylist() == [2, 4, 6]
+    dec = sandbox.compile_operator("def fn(t):\n    import pyarrow as pa\n    return pa.array([1,2], type=pa.decimal128(5,2))", "map_batches")
+    assert len(dec(None)) == 2  # decimal array construction doesn't abort
 
 
 def test_write_mode_append_builds_a_readable_directory_dataset():
@@ -3702,6 +3786,30 @@ def test_source_count_is_memoized_by_fingerprint():
     assert estimate._counted(lambda uri: Flaky(), "x.csv") is None
     fail["boom"] = False
     assert estimate._counted(lambda uri: Flaky(), "x.csv") == 7  # retried, not stuck on a cached None
+
+
+def test_source_width_probes_wide_list_columns(tmp_path):
+    # Parquet stores a fixed-size embedding as a VARIABLE list, so DuckDB reads it as bare 'float[]'
+    # (dimension lost on disk). The flat _col_width assumes 16 elems → a 512-wide embedding is undercounted
+    # ~128x and the byte confirm-gate misses the multi-GB table it targets. _source_width PROBES the real
+    # avg element count so the per-row bytes (and thus the gate's max-over-cone) are right.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub.estimate import _col_width, _source_width, estimate_sizes
+    from hub.models import Graph
+    d = get_deps()
+    p = str(tmp_path / "emb.parquet")
+    pq.write_table(pa.table({"id": list(range(64)),
+                             "emb": pa.array([[1.0] * 512] * 64, type=pa.list_(pa.float32(), 512))}), p)
+    cols = [{"name": "id", "type": "int"}, {"name": "emb", "type": "float[]"}]
+    assert _col_width("float[]") == 128                              # the flat (undercounting) default
+    w = _source_width(d.resolve_adapter, p, cols)
+    assert w >= 512 * 4, f"probe should score the ~512-wide embedding, got {w}"   # ~2056, not 8+128
+    # end-to-end: the source's byte estimate reflects the probed width (feeds the byte confirm-gate)
+    g = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": p})], "edges": []})
+    est = estimate_sizes(g, d.resolve_adapter, schemas={"s": cols})
+    assert est["s"].bytes and est["s"].bytes >= 64 * 512 * 4          # 64 rows × ~2KB, not 64 × 136
 
 
 def test_latest_actuals_feeds_estimator_only_for_latest_nodes():

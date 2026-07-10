@@ -28,6 +28,28 @@ Relation = duckdb.DuckDBPyRelation
 NOT_PREVIEWABLE_KINDS = {"aggregate", "write", "opaque", "loop", "section"}
 _TRANSFORM_KINDS = {"transform", "notebook"}
 
+# aggregate functions whose presence (outside a window) means a sql query REDUCES rows — so previewing
+# it over a 2000-row sample would present a partial aggregate as the complete result (a silent lie).
+_SQL_AGG_FNS = ("count", "sum", "avg", "mean", "min", "max", "median", "mode", "stddev", "stddev_pop",
+                "stddev_samp", "variance", "var_pop", "var_samp", "bool_and", "bool_or", "bit_and",
+                "bit_or", "arg_max", "arg_min", "approx_count_distinct", "quantile", "quantile_cont",
+                "quantile_disc", "list", "array_agg", "string_agg", "histogram", "first", "last")
+_SQL_AGG_RE = re.compile(r"\b(?:" + "|".join(_SQL_AGG_FNS) + r")\s*\(", re.I)
+
+
+def sql_reduces_rows(q: str) -> bool:
+    """Best-effort: does this SQL aggregate / reduce rows, so a sampled preview would mislead? Flags
+    GROUP BY / HAVING / SELECT DISTINCT, and a global aggregate (an aggregate fn with no window `OVER`
+    and no GROUP BY). Conservative — it may over-flag (→ 'run a full pass'), never under-flag."""
+    s = re.sub(r"\s+", " ", q or "").strip()
+    if not s:
+        return False
+    if re.search(r"\bgroup\s+by\b", s, re.I) or re.search(r"\bhaving\b", s, re.I):
+        return True
+    if re.search(r"\bselect\s+distinct\b", s, re.I):
+        return True
+    return bool(_SQL_AGG_RE.search(s)) and not re.search(r"\bover\s*\(", s, re.I)  # a global aggregate (not a window)
+
 
 class NotPreviewable(Exception):
     def __init__(self, node: GraphNode, reason: str):
@@ -216,13 +238,18 @@ class BuildEngine:
                               node_builders=self.node_builders, node_specs=self.node_specs)
         return [full.relation(e.source, e.source_handle) for e in g.incoming(self.graph, node.id)]
 
-    def _join_projection(self, left: Relation, right: Relation) -> str:
-        """SELECT list for an ON-expression join: all left columns as-is, right columns renamed with a
-        `_2` suffix where they clash with a left column, so the joined relation has no duplicate names."""
+    def _join_projection(self, left: Relation, right: Relation, using_keys=()) -> str:
+        """SELECT list for a join: all left columns as-is, right columns renamed with a `_2` suffix where
+        they clash with a left column, so the joined relation has NO duplicate names (an ambiguity that
+        otherwise passes preview but fails the full run). For a USING join the key columns are coalesced
+        (they appear ONCE) — pass them as `using_keys` so the key is kept from the left and skipped on the
+        right, while OTHER shared (non-key) columns are still de-duplicated."""
+        keys = {str(k).strip().strip('"') for k in using_keys}
         lcols = list(left.columns)
         lset = set(lcols)
-        parts = [f'a."{c}"' for c in lcols]
-        parts += [f'b."{c}" AS "{c}_2"' if c in lset else f'b."{c}"' for c in right.columns]
+        parts = [f'a."{c}"' for c in lcols]  # left cols (incl. any key) as-is
+        parts += [f'b."{c}" AS "{c}_2"' if (c in lset and c not in keys) else f'b."{c}"'
+                  for c in right.columns if c not in keys]  # skip right's key cols (USING merged them)
         return ", ".join(parts)
 
     def _view(self, rel: Relation, base: str = "v") -> str:
@@ -432,6 +459,10 @@ class BuildEngine:
             q = (cfg.get("sql") or "").strip()
             if not q:
                 return parent
+            # a GROUP BY / global aggregate over the 2000-row sample would present a PARTIAL result as
+            # complete (the aggregate node already refuses a sample for exactly this reason) — refuse it.
+            if not self.full and sql_reduces_rows(q):
+                raise NotPreviewable(node, "this SQL aggregates/reduces rows — a sample would mislead; run a full pass")
             # Expose inputs as query-scoped CTEs named input/input2/... backed by UNIQUE views,
             # so two sql nodes in one graph never clobber a shared literal 'input' view.
             aliases = ["input"] + [f"input{i + 1}" for i in range(1, len(inputs))]
@@ -453,15 +484,21 @@ class BuildEngine:
             ins = inputs if self.full else self._faithful_inputs(node)
             a, b = self._view(ins[0], "ja"), self._view(ins[1], "jb")
             if how == "cross" or (not on and not cond):
-                return db.conn().sql(f"SELECT a.*, b.* FROM {a} AS a CROSS JOIN {b} AS b")
+                # rename right-side name clashes so a cross join never emits ambiguous columns
+                proj = self._join_projection(ins[0], ins[1])
+                return db.conn().sql(f"SELECT {proj} FROM {a} AS a CROSS JOIN {b} AS b")
             if cond:
                 # an ON expression (e.g. `a.user_id = b.uid`, or a composite/inequality condition) —
                 # keep BOTH sides' columns but rename right-side name clashes, so a downstream select/sql
                 # isn't ambiguous (USING coalesces keys; a bare ON does not)
                 proj = self._join_projection(ins[0], ins[1])
                 return db.conn().sql(f"SELECT {proj} FROM {a} AS a {how.upper()} JOIN {b} AS b ON ({cond})")
-            cols = ", ".join(f'"{c.strip()}"' for c in on.split(","))
-            return db.conn().sql(f"SELECT * FROM {a} {how.upper()} JOIN {b} USING ({cols})")
+            keylist = [c.strip() for c in on.split(",") if c.strip()]
+            cols = ", ".join(f'"{c}"' for c in keylist)
+            # USING coalesces the keys (once); still rename OTHER shared columns so the result isn't
+            # ambiguous (e.g. joining two tables that both carry an `amount` column besides the key).
+            proj = self._join_projection(ins[0], ins[1], using_keys=keylist)
+            return db.conn().sql(f"SELECT {proj} FROM {a} AS a {how.upper()} JOIN {b} AS b USING ({cols})")
 
         if t == "union":
             # stack every incoming input row-wise. BY NAME aligns columns by name (filling missing ones

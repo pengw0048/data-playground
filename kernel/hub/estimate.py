@@ -81,6 +81,64 @@ def _row_width(cols) -> int:
     return max(total, 8)
 
 
+def _coltype(c) -> str:
+    return str((c.get("type") if isinstance(c, dict) else getattr(c, "type", "")) or "")
+
+
+def _colname(c) -> str:
+    return str((c.get("name") if isinstance(c, dict) else getattr(c, "name", "")) or "")
+
+
+_LISTLEN_CACHE: dict[tuple[str, str, str], int] = {}
+
+
+def _source_width(resolve_adapter, uri: str, cols) -> int:
+    """Bytes/row for a SOURCE — like _row_width, but for a variable-length list column (`float[]`) it
+    PROBES the real average element count from a bounded sample instead of assuming _LIST_ELEMS. Parquet
+    stores a fixed-size embedding as a variable list (the dimension is lost on disk), so a 4096-wide
+    embedding otherwise scores 16*w and the byte confirm-gate misses the multi-GB table it targets. The
+    byte gate takes the max over the cone, so getting the source right is what makes the gate fire. Memoized."""
+    if not cols:
+        return _DEFAULT_ROW_BYTES
+    total = 0
+    for c in cols:
+        t = _coltype(c).strip().lower()
+        base = t[:-2].strip() if t.endswith("[]") else ("list" if t.split("[")[0].split("(")[0] in ("list", "array") else None)
+        if base is not None and not _VEC_RE.search(t):  # a variable list with no known dimension → probe it
+            n = _probed_list_len(resolve_adapter, uri, _colname(c))
+            bw = _TYPE_W.get(base.split("[")[0].split("(")[0], 16)
+            total += (n if n is not None else _LIST_ELEMS) * bw
+        else:
+            total += _col_width(t)
+    return max(total, 8)
+
+
+def _probed_list_len(resolve_adapter, uri: str, col: str) -> int | None:
+    """Average element count of a LIST column over a bounded sample (DuckDB length()), memoized by the
+    adapter fingerprint. None on any failure → the caller falls back to the flat _LIST_ELEMS assumption."""
+    if not col:
+        return None
+    try:
+        adapter = resolve_adapter(uri)
+        fp = adapter.fingerprint(uri)
+    except Exception:  # noqa: BLE001
+        return None
+    key = (uri, fp, col)
+    if key in _LISTLEN_CACHE:
+        return _LISTLEN_CACHE[key]
+    try:
+        rel = adapter.scan(uri, columns=[col], limit=1024)
+        v = rel.aggregate(f'avg(length("{col.replace(chr(34), chr(34) * 2)}"))').fetchone()[0]
+        n = int(round(v)) if v is not None else None
+    except Exception:  # noqa: BLE001 — uncountable / not a list here → fall back
+        return None
+    if n is not None:
+        if len(_LISTLEN_CACHE) >= _COUNT_CACHE_MAX:
+            _LISTLEN_CACHE.pop(next(iter(_LISTLEN_CACHE)), None)
+        _LISTLEN_CACHE[key] = n
+    return n
+
+
 _COUNT_CACHE: dict[tuple[str, str], int] = {}
 _COUNT_CACHE_MAX = 256
 
@@ -160,7 +218,9 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
         if t == "source":
             uri = resolve_config(node).get("uri")
             n = _counted(resolve_adapter, uri) if uri else None
-            out[nid] = _sized(n, "exact" if n is not None else "unknown", w)
+            # probe list-column widths (embeddings) so the byte gate sees the real per-row size
+            sw = _source_width(resolve_adapter, uri, schemas.get(nid)) if uri else w
+            out[nid] = _sized(n, "exact" if n is not None else "unknown", sw)
             continue
 
         if t == "sample":

@@ -24,6 +24,9 @@ _ALLOWED_MODULES = {
     "itertools": __import__("itertools"),
     "collections": __import__("collections"),
     "string": __import__("string"),
+    "decimal": __import__("decimal"),  # a safe stdlib a data cell may want; also what pyarrow lazily
+    #                                    imports when building a decimal array — pre-allowing it keeps a
+    #                                    guarded import from ever raising inside pyarrow's C internals.
     # always installed (the engine's data layer) + needed for the transform `arrow` batch format
     # (a cell operating on a pyarrow.Table, e.g. `import pyarrow.compute`). Root "pyarrow" allows submodules.
     "pyarrow": __import__("pyarrow"),
@@ -68,18 +71,57 @@ def set_allowed(names) -> None:
         _KERNEL_ALLOWED.update(names)
 
 
-# file-I/O submodules that pyarrow being importable would otherwise expose — the soft baseline is kept
-# I/O-free on purpose (no `open`, no os/io), so the transform `arrow` format gets pyarrow core + compute
-# but NOT arbitrary local read/write. (`pyarrow.fs` etc. need an explicit import — they aren't reachable
-# via attribute access on the injected `pyarrow` — so denying the import fully closes the path.)
+# The soft baseline is kept I/O-free on purpose (no `open`, no os/io), so the transform `arrow` format
+# gets pyarrow core + compute but NOT arbitrary local read/write. Two layers enforce that:
+# (1) _DENY_IMPORTS blocks the file-I/O SUBMODULES a cell could `import`;
+# (2) _PYARROW_DENY blocks the file/stream builders reachable by ATTRIBUTE on the pyarrow ROOT (which is
+#     injected/importable) — the attribute-level counterpart, without which `pyarrow.OSFile(...)` /
+#     `pyarrow.output_stream('/path')` / `pyarrow.memory_map(...)` read or write arbitrary files with no
+#     import and no dunder. pyarrow is injected as a _ModuleProxy so both `pyarrow.X` and a re-`import
+#     pyarrow` see the guard. In-memory builders (BufferReader/BufferOutputStream) are path-free → allowed.
 _DENY_IMPORTS = {"pyarrow.fs", "pyarrow.dataset", "pyarrow.csv", "pyarrow.parquet", "pyarrow.orc",
                  "pyarrow.json", "pyarrow.feather", "pyarrow.flight", "pyarrow.ipc", "pyarrow.hdfs"}
+_PYARROW_DENY = frozenset({
+    # file / stream builders that take a filesystem path
+    "OSFile", "MemoryMappedFile", "memory_map", "create_memory_map", "PythonFile", "NativeFile",
+    "input_stream", "output_stream", "CompressedInputStream", "CompressedOutputStream",
+    # IPC file/stream readers+writers that open a path
+    "ipc", "RecordBatchFileReader", "RecordBatchFileWriter", "RecordBatchStreamReader",
+    "RecordBatchStreamWriter", "open_file", "open_stream",
+    # I/O submodules (also blocked at import; block attribute reach too)
+    "fs", "dataset", "csv", "parquet", "orc", "json", "feather", "flight", "hdfs",
+})
+
+
+class _ModuleProxy:
+    """An attribute-level guard over an injected module: forwards every attribute to the real module
+    EXCEPT a denylist (raises AttributeError). The counterpart to _DENY_IMPORTS for names reachable by
+    attribute on an already-injected module."""
+
+    def __init__(self, mod, deny):
+        object.__setattr__(self, "_mod", mod)
+        object.__setattr__(self, "_deny", frozenset(deny))
+
+    def __getattr__(self, name):
+        if name in object.__getattribute__(self, "_deny"):
+            raise AttributeError(f"'{object.__getattribute__(self, '_mod').__name__}.{name}' is blocked "
+                                 "in an ad-hoc cell (file I/O goes through source / write nodes)")
+        return getattr(object.__getattribute__(self, "_mod"), name)
+
+    def __dir__(self):
+        mod, deny = object.__getattribute__(self, "_mod"), object.__getattribute__(self, "_deny")
+        return [a for a in dir(mod) if a not in deny]
+
+
+_PYARROW_PROXY = _ModuleProxy(_ALLOWED_MODULES["pyarrow"], _PYARROW_DENY)
 
 
 def _guarded_import(name, *args, **kwargs):
     root = name.split(".")[0]
     if name in _DENY_IMPORTS or any(name.startswith(d + ".") for d in _DENY_IMPORTS):
         raise ImportError(f"import of '{name}' is not allowed (file I/O goes through source/write nodes)")
+    if root == "pyarrow":  # never hand back the raw root — return the I/O-guarded proxy (submodule attrs
+        return _PYARROW_PROXY  # like .compute resolve through it; denied ones raise AttributeError)
     if root in _ALLOWED_MODULES or root in _KERNEL_ALLOWED:
         return __import__(name, *args, **kwargs)
     raise ImportError(f"import of '{name}' is not allowed (add it to the canvas's requirements to enable)")
@@ -90,6 +132,7 @@ def _namespace() -> dict:
     builtins["__import__"] = _guarded_import
     ns: dict[str, Any] = {"__builtins__": builtins}
     ns.update(_ALLOWED_MODULES)
+    ns["pyarrow"] = _PYARROW_PROXY  # the injected pyarrow is the I/O-guarded proxy, not the raw module
     return ns
 
 
