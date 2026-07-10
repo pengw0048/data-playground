@@ -108,7 +108,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
         <div className="flex">
           {/* accent stripe (kind color → inline; tokens can't express per-node values) */}
           <div className="w-1.5 shrink-0" style={{ background: bypassed ? 'transparent' : accent }} />
-          <div className="min-w-0 flex-1 pt-[11px] pr-3 pl-2.5">
+          <div className="min-w-0 flex-1 pt-[11px] pr-3 pb-3 pl-2.5">
             {/* header */}
             <div className="flex items-center gap-[7px]">
               <span

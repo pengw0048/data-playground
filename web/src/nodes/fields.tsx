@@ -195,27 +195,32 @@ export function FilterBuilder({ nodeId }: { nodeId: string }) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-      {conds.map((c, i) => (
-        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <ColumnCombo value={c.col} columns={columns} placeholder="column"
-              onChange={(v) => commit(conds.map((x, j) => (j === i ? { ...x, col: v } : x)))} />
-          </div>
-          <select className={cn('nodrag', miniSelectClass, 'w-auto flex-none')} value={c.op} onClick={(e) => e.stopPropagation()}
-            onChange={(e) => commit(conds.map((x, j) => (j === i ? { ...x, op: e.target.value as Op } : x)))}>
-            {OPS.map((o) => <option key={o} value={o}>{o}</option>)}
-          </select>
-          {c.op !== 'IS NULL' && c.op !== 'IS NOT NULL' && (
-            <div style={{ flex: 1, minWidth: 0 }}>
-              {/* a literal value — no column suggestions (that would invite the value→column confusion) */}
+      {conds.map((c, i) => {
+        const hasVal = c.op !== 'IS NULL' && c.op !== 'IS NOT NULL'
+        return (
+          <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            {/* column + operator (+ remove) on one row; the value gets its OWN full-width row below so a
+                longer literal like 'purchase' isn't truncated on the narrow card */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <ColumnCombo value={c.col} columns={columns} placeholder="column"
+                  onChange={(v) => commit(conds.map((x, j) => (j === i ? { ...x, col: v } : x)))} />
+              </div>
+              <select className={cn('nodrag', miniSelectClass, 'w-auto flex-none')} value={c.op} onClick={(e) => e.stopPropagation()}
+                onChange={(e) => commit(conds.map((x, j) => (j === i ? { ...x, op: e.target.value as Op } : x)))}>
+                {OPS.map((o) => <option key={o} value={o}>{o}</option>)}
+              </select>
+              <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit(conds.filter((_, j) => j !== i)) }}
+                title="Remove" style={xBtn}><Icon name="close" size={11} /></button>
+            </div>
+            {hasVal && (
+              // a literal value — no column suggestions (that would invite the value→column confusion)
               <ColumnCombo value={c.val} columns={[]} placeholder="value"
                 onChange={(v) => commit(conds.map((x, j) => (j === i ? { ...x, val: v } : x)))} />
-            </div>
-          )}
-          <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit(conds.filter((_, j) => j !== i)) }}
-            title="Remove" style={xBtn}><Icon name="close" size={11} /></button>
-        </div>
-      ))}
+            )}
+          </div>
+        )
+      })}
       <div style={{ display: 'flex', gap: 6 }}>
         <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit([...conds, { col: columns[0]?.name ?? '', op: '=', val: '' }]) }}
           style={addBtn}><Icon name="plus" size={11} /> add condition</button>

@@ -38,7 +38,8 @@ export function Port({ spec, side, index, count, nodeId }: {
     display: 'grid',
     placeItems: 'center',
     transition: 'width .1s, height .1s, background .1s',
-    cursor: isSource ? 'copy' : 'crosshair',
+    // the hover "+" is the visible affordance; a plain pointer avoids the redundant OS "+"/crosshair cursor
+    cursor: 'pointer',
   }
 
   return (

@@ -36,9 +36,10 @@ function Transform({ id, data }: NodeComponentProps) {
   return (
     <NodeCard id={id} data={data} metaOverride={meta}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        {/* two segmented toggles — wrap (not clip) on the narrow card; the scope drops to its own row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
           <Segmented<TransformSource>
-            options={[{ value: 'library', label: 'Library' }, { value: 'adhoc', label: 'Ad-hoc code' }]}
+            options={[{ value: 'library', label: 'Library' }, { value: 'adhoc', label: 'Ad-hoc' }]}
             value={src}
             accent={src === 'adhoc' ? color.focus : '#2f9e8f'}
             onChange={(v) => updateConfig(id, {
@@ -46,7 +47,6 @@ function Transform({ id, data }: NodeComponentProps) {
               code: v === 'adhoc' ? (data.config.code ?? DEFAULT_CODE) : data.config.code,
             })}
           />
-          <span style={{ flex: 1 }} />
           {src === 'adhoc' && (
             <Segmented<'dataset' | 'sample'>
               options={[{ value: 'dataset', label: 'dataset' }, { value: 'sample', label: 'sample' }]}

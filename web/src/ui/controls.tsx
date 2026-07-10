@@ -20,7 +20,7 @@ export function Segmented<T extends string>({ options, value, onChange, accent =
             style={{
               fontSize: 11, fontWeight: 600, padding: '3px 9px', border: 'none', borderRadius: 6,
               background: active ? accent : 'transparent',
-              color: active ? '#fff' : color.text2, cursor: 'pointer',
+              color: active ? '#fff' : color.text2, cursor: 'pointer', whiteSpace: 'nowrap',
             }}
           >
             {o.label}

@@ -18,7 +18,11 @@ function Source({ id, data }: NodeComponentProps) {
   const uploadDataset = useStore((s) => s.uploadDataset)
   const updateConfig = useStore((s) => s.updateConfig)
   const rename = useStore((s) => s.rename)
-  const table = catalog.find((t) => t.uri === data.config.uri)
+  // show the bound dataset even when the source was configured by tableId or a bare catalog NAME (an
+  // agent/example/programmatic source), not only by an exact uri match.
+  const tid = data.config.tableId
+  const ref = String(data.config.uri ?? '')
+  const table = catalog.find((t) => (tid && t.id === tid) || t.uri === ref || t.name === ref)
 
   // upload a local file → store it + bind this source to it
   const onUpload = async (f: File | undefined) => {
