@@ -4722,6 +4722,18 @@ def test_ray_region_worker_direct_write_and_progress(tmp_path):
     got = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{d}/**/*.parquet')").fetchall())
     assert got == [2 * i for i in range(1, 21)]
 
+    # re-materialize the SAME region into the SAME dir (a recompute after cache loss / a prior partial
+    # write): the write must OVERWRITE, not append — else the downstream ref-source reads doubled rows.
+    st2 = rr.run_unit(g, "m", suggested)
+    for _ in range(900):
+        s2 = rr.status(st2.run_id)
+        if s2.status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.1)
+    assert s2.status == "done", s2.error
+    again = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{s2.output_uri}/**/*.parquet')").fetchall())
+    assert again == [2 * i for i in range(1, 21)], f"recompute must overwrite, not append (got {len(again)} rows)"
+
 
 def test_ray_region_requires_gates_scheduling(tmp_path):
     # opt-in live Ray: the region `requires` is forwarded to Ray as per-task placement, so a region needing

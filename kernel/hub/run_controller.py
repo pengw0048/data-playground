@@ -299,11 +299,12 @@ class RunController:
 
     @staticmethod
     def _prune_regions(d: str, keep: int = 500) -> None:
+        import shutil
         try:
             files = sorted((os.path.join(d, f) for f in os.listdir(d)), key=os.path.getmtime)
             for f in files[:-keep]:
-                try:
-                    os.remove(f)
+                try:  # a worker-direct handoff is a DIRECTORY of shards — os.remove can't delete a dir
+                    shutil.rmtree(f) if os.path.isdir(f) else os.remove(f)
                 except OSError:
                     pass
         except OSError:

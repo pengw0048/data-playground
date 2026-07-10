@@ -302,15 +302,19 @@ class RayRunner:
         except Exception as e:  # noqa: BLE001
             status.status, status.error = "failed", f"{type(e).__name__}: {e}"
         if status.status not in ("cancelled",):
-            if result:
-                status.status = result.get("status", "failed")
+            # only a TERMINAL status file is authoritative — the driver rewrites this same file with an
+            # interim {"status":"running",...} as it progresses, and a hard kill (OOM/SIGKILL/segfault)
+            # bypasses its finally, leaving that interim behind. Treating "running" as the result would
+            # peg the sub-run at running forever and hang RunController._await. A dead driver → fail.
+            if result and result.get("status") in ("done", "failed", "cancelled"):
+                status.status = result["status"]
                 status.error = result.get("error")
                 status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
                 status.rows_processed = status.total_rows = int(result.get("rows") or 0)
                 if status.status == "done":
                     status.progress = 1.0
             elif status.status == "running":
-                status.status, status.error = "failed", "ray driver exited without writing a status"
+                status.status, status.error = "failed", f"ray driver exited without a terminal status (rc={proc.returncode})"
         for p in status.per_node:  # settle per-node progress to the terminal state
             p.status = "done" if status.status == "done" else status.status
         self._emit(graph, status)
@@ -360,12 +364,16 @@ class RayRunner:
             if progress:
                 progress(0.6, rows)
             out_dir = uri[:-len(".parquet")] if uri.lower().endswith(".parquet") else uri  # a DIR of shards
+            # OVERWRITE (not Ray's default append): the dir name is content-addressed + stable, so a
+            # recompute after a cancelled/failed partial write (or a cache-pointer eviction) must REPLACE
+            # any leftover shards — appending beside them would double the downstream rows.
+            from ray.data import SaveMode
             if is_object_uri(out_dir):
                 fs, p = object_fs(out_dir)               # creds-aware object filesystem (same as the adapter)
-                ds.write_parquet(p, filesystem=fs)       # each block → its own object, written by a worker
+                ds.write_parquet(p, filesystem=fs, mode=SaveMode.OVERWRITE)  # each block → its own object, by a worker
             else:
                 os.makedirs(out_dir, exist_ok=True)
-                ds.write_parquet(out_dir)                # WORKER-DIRECT: parallel shard write, no driver funnel
+                ds.write_parquet(out_dir, mode=SaveMode.OVERWRITE)  # WORKER-DIRECT: parallel shard write, no funnel
             return {"status": "done", "rows": rows, "output_uri": out_dir, "output_table": None}
         except Exception as e:  # noqa: BLE001
             return {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
@@ -375,11 +383,17 @@ class RayRunner:
         opts = ray_opts or {}
 
         if step.op == "read":
+            import glob as _glob
+
             uri = step.config["uri"]
             from hub.plugins.adapters import is_object_uri
-            if uri.lower().endswith((".parquet", ".pq")) and not is_object_uri(uri):
+            # WORKER-DIRECT read for a local parquet FILE or a parts-DIRECTORY (an upstream region's
+            # worker-direct handoff has the .parquet suffix stripped) — Ray reads both natively, so a
+            # chained region doesn't re-funnel the whole upstream output through this driver.
+            is_parts_dir = os.path.isdir(uri) and _glob.glob(os.path.join(uri, "**", "*.parquet"), recursive=True)
+            if not is_object_uri(uri) and (uri.lower().endswith((".parquet", ".pq")) or is_parts_dir):
                 try:
-                    return ray.data.read_parquet(uri)  # WORKER-DIRECT: Ray reads parquet on workers, no driver funnel
+                    return ray.data.read_parquet(uri)  # Ray reads on workers, no driver funnel
                 except Exception:  # noqa: BLE001 — fall back to the always-works driver-Arrow path below
                     pass
             with db.base_guard():                              # any other source (Lance/HF/Iceberg/CSV/object/plugin)
