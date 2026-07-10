@@ -101,7 +101,7 @@ def graph_estimate(req: CompileRequest) -> dict:
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     try:
-        sizes = estimate_sizes(req.graph, deps.resolve_adapter)
+        sizes = estimate_sizes(req.graph, deps.resolve_adapter, actuals=_actuals_for(req.graph, deps))
     except Exception:  # noqa: BLE001 — a hint must never 500
         return {}
     return {nid: {"rows": s.rows, "confidence": s.confidence} for nid, s in sizes.items()}
@@ -194,6 +194,22 @@ def agent_act(req: AgentRequest) -> dict:
     return {"available": True, **out}
 
 
+def _actuals_for(graph, deps) -> dict[str, int]:  # noqa: ARG001 — deps kept for signature symmetry
+    """Measured per-node rows from the last successful run, kept ONLY for nodes still 'latest' — an
+    edited (now 'stale') node's old count would mislead the estimate. Lets a not-yet-run downstream node
+    inherit a real upstream count instead of 'unknown'. Best-effort: any hiccup → no actuals."""
+    from hub import metadb
+    try:
+        a = metadb.latest_actuals(getattr(graph, "id", None))
+        if not a:
+            return {}
+        latest = {n.id for n in graph.nodes
+                  if (n.data.get("status") if isinstance(n.data, dict) else getattr(n.data, "status", None)) == "latest"}
+        return {k: v for k, v in a.items() if k in latest}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None]":
     """The largest data volume this run moves — the MAX estimated rows AND bytes across the target's cone
     (source counts + a downstream sample's smaller output). Uses hub.estimate so the confirm-gate, the
@@ -206,7 +222,8 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
     except Exception:  # noqa: BLE001 — schema inference is best-effort; fall back to default widths
         schemas = None
     try:
-        sizes = estimate_sizes(req_graph, deps.resolve_adapter, target=target_node_id, schemas=schemas)
+        sizes = estimate_sizes(req_graph, deps.resolve_adapter, target=target_node_id, schemas=schemas,
+                               actuals=_actuals_for(req_graph, deps))
     except Exception:  # noqa: BLE001 — a bad estimate must not block the gate
         return None, None
     rows = [s.rows for s in sizes.values() if s.rows is not None]

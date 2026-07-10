@@ -17,6 +17,7 @@ single pass computed BEFORE placement — which is what lets the cost-based plac
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from hub import graph as g
@@ -37,6 +38,26 @@ _TYPE_W = {
     "string": 24, "str": 24, "text": 24, "varchar": 24, "char": 24, "json": 64, "blob": 64, "bytea": 64,
 }
 _DEFAULT_ROW_BYTES = 64
+_VEC_RE = re.compile(r"\[(\d+)\]")  # a fixed-size array/vector suffix — e.g. float[1024] (an embedding)
+_LIST_ELEMS = 16                    # assumed element count for a variable-length list (no length in the type)
+_NESTED_W = 128                     # a struct/map value — coarse, deliberately generous (stay conservative)
+
+
+def _col_width(t: str) -> int:
+    """Byte width for one (display-typed) column, honoring list/vector dimensionality. The plain scalar
+    map alone under-counts embeddings catastrophically: a float[1024] scored as base `float`=8B is a
+    ~500x undercount, which then mis-sizes a vector working set as 'tiny' and mis-places it local."""
+    t = t.strip().lower()
+    base = t.split("[")[0].split("(")[0].strip()
+    bw = _TYPE_W.get(base, 16)
+    m = _VEC_RE.search(t)
+    if m:                                       # fixed-size vector/array: N elements of the base type
+        return int(m.group(1)) * bw
+    if t.endswith("[]") or base in ("list", "array"):  # variable-length list — assume a modest length
+        return _LIST_ELEMS * bw
+    if base in ("struct", "map"):               # nested value with no flat width
+        return _NESTED_W
+    return bw
 
 
 @dataclass
@@ -55,12 +76,41 @@ def _row_width(cols) -> int:
     """Bytes/row from a node's (display-typed) column schema, or a default when the schema is unknown."""
     if not cols:
         return _DEFAULT_ROW_BYTES
-    total = 0
-    for c in cols:
-        t = str((c.get("type") if isinstance(c, dict) else getattr(c, "type", "")) or "").strip().lower()
-        base = t.split("[")[0].split("(")[0]
-        total += _TYPE_W.get(base, 16)
+    total = sum(_col_width(str((c.get("type") if isinstance(c, dict) else getattr(c, "type", "")) or ""))
+                for c in cols)
     return max(total, 8)
+
+
+_COUNT_CACHE: dict[tuple[str, str], int] = {}
+_COUNT_CACHE_MAX = 256
+
+
+def _counted(resolve_adapter, uri: str) -> int | None:
+    """adapter.count(uri), memoized by the adapter's fingerprint (size+mtime for a local file), so a
+    CSV/JSON source — whose count is a full parse — isn't re-scanned on every keystroke-triggered
+    estimate. Only real counts are cached (a transient failure retries); a changed file gets a new
+    fingerprint and recounts. Object-store uris can't be stat'd, so their count is keyed by the uri and
+    effectively cached for the process — acceptable for a hint (re-scanning an object every edit is worse)."""
+    try:
+        adapter = resolve_adapter(uri)
+        fp = adapter.fingerprint(uri)
+    except Exception:  # noqa: BLE001 — no adapter / can't fingerprint → count uncached (best-effort)
+        try:
+            return resolve_adapter(uri).count(uri)
+        except Exception:  # noqa: BLE001
+            return None
+    key = (uri, fp)
+    if key in _COUNT_CACHE:
+        return _COUNT_CACHE[key]
+    try:
+        n = adapter.count(uri)
+    except Exception:  # noqa: BLE001 — uncountable source → unknown, not a fabricated number
+        return None
+    if n is not None:
+        if len(_COUNT_CACHE) >= _COUNT_CACHE_MAX:
+            _COUNT_CACHE.pop(next(iter(_COUNT_CACHE)), None)
+        _COUNT_CACHE[key] = n
+    return n
 
 
 def _sized(rows: int | None, conf: str, width: int, blocking: bool = False) -> SizeEst:
@@ -109,12 +159,7 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
 
         if t == "source":
             uri = resolve_config(node).get("uri")
-            n = None
-            if uri:
-                try:
-                    n = resolve_adapter(uri).count(uri)
-                except Exception:  # noqa: BLE001 — uncountable source → unknown, not a fabricated number
-                    n = None
+            n = _counted(resolve_adapter, uri) if uri else None
             out[nid] = _sized(n, "exact" if n is not None else "unknown", w)
             continue
 

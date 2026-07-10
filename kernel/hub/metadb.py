@@ -428,6 +428,26 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             s.delete(c)
 
 
+def latest_actuals(canvas_id: str | None) -> dict[str, int]:
+    """Per-node measured row counts from the most recent SUCCESSFUL run of this canvas — feeds the size
+    estimator (as `actuals`) so nodes whose output is statically unknowable (join / aggregate / sql /
+    code) carry a real count on the next estimate instead of 'unknown'. The caller guards staleness (an
+    edited node's status is no longer 'latest')."""
+    if not canvas_id:
+        return {}
+    with session() as s:
+        r = s.scalar(select(RunRecord).where(RunRecord.canvas_id == canvas_id, RunRecord.status == "done")
+                     .order_by(RunRecord.created_at.desc()).limit(1))
+        if not r or not r.per_node:
+            return {}
+        try:
+            pn = json.loads(r.per_node)
+        except (ValueError, TypeError):
+            return {}
+        return {p["node_id"]: int(p["rows"]) for p in pn
+                if isinstance(p, dict) and p.get("node_id") and p.get("rows") is not None}
+
+
 def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
     with session() as s:
         rows = s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id)

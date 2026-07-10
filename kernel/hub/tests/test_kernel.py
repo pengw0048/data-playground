@@ -3631,6 +3631,68 @@ def test_estimate_sizes_is_conservative_and_honest():
     assert e4["b"].rows == e4["s"].rows  # bypassed → passthrough
 
 
+def test_row_width_accounts_for_vector_and_list_columns():
+    # a fixed-size embedding (float[1024]) must not be scored as its scalar base (float=8B) — that's a
+    # ~1000x undercount that mis-sizes a vector working set as tiny and mis-places it local.
+    from hub.estimate import _col_width, _row_width
+    assert _col_width("float") == 8
+    assert _col_width("float[1024]") == 1024 * 8   # the whole vector, not one element
+    assert _col_width("int[3]") == 3 * 8
+    assert _col_width("varchar[]") > 24            # variable-length list of strings > a single string
+    assert _col_width("struct") >= 64              # nested value, coarse
+    wide = _row_width([{"name": "id", "type": "int"}, {"name": "emb", "type": "float[1024]"}])
+    assert wide >= 1024 * 8 and wide > _row_width([{"name": "id", "type": "int"}]) * 100
+
+
+def test_source_count_is_memoized_by_fingerprint():
+    # count() on a CSV/JSON source is a full parse; memoize it by the adapter's fingerprint so an edit
+    # storm doesn't re-scan. A changed fingerprint recounts; a transient failure is NOT cached.
+    from hub import estimate
+    estimate._COUNT_CACHE.clear()
+    calls = {"n": 0}
+    fp = {"v": "fp1"}
+    class Stub:
+        def fingerprint(self, uri): return fp["v"]
+        def count(self, uri): calls["n"] += 1; return 123
+    resolve = lambda uri: Stub()  # noqa: E731
+    assert estimate._counted(resolve, "s3://x/a.csv") == 123
+    assert estimate._counted(resolve, "s3://x/a.csv") == 123
+    assert calls["n"] == 1          # 2nd call served from cache — no re-scan
+    fp["v"] = "fp2"                 # the file changed → new fingerprint → recount
+    assert estimate._counted(resolve, "s3://x/a.csv") == 123
+    assert calls["n"] == 2
+    estimate._COUNT_CACHE.clear()
+    fail = {"boom": True}
+    class Flaky:
+        def fingerprint(self, uri): return "fpf"
+        def count(self, uri):
+            if fail["boom"]: raise RuntimeError("io")
+            return 7
+    assert estimate._counted(lambda uri: Flaky(), "x.csv") is None
+    fail["boom"] = False
+    assert estimate._counted(lambda uri: Flaky(), "x.csv") == 7  # retried, not stuck on a cached None
+
+
+def test_latest_actuals_feeds_estimator_only_for_latest_nodes():
+    # the last successful run's per-node rows sharpen the estimate for a not-yet-run downstream node,
+    # but only while the producing node is still 'latest' (an edited/'stale' node's old count would lie).
+    from hub import metadb
+    from hub.routers.runs import _actuals_for
+    from hub.models import Graph
+    cid = "cv_actuals"
+    with metadb.session() as s:
+        if s.get(metadb.Canvas, cid) is None:
+            s.add(metadb.Canvas(id=cid, owner_id="local", name="a", doc="{}"))
+    metadb.record_run(cid, "j", "done", rows=None, per_node=[{"node_id": "j", "rows": 4321, "status": "done"}])
+    assert metadb.latest_actuals(cid) == {"j": 4321}
+    g_latest = Graph(id=cid, version=1, nodes=[N("j", "join", {})], edges=[])
+    g_latest.nodes[0].data["status"] = "latest"
+    assert _actuals_for(g_latest, get_deps()) == {"j": 4321}
+    g_stale = Graph(id=cid, version=1, nodes=[N("j", "join", {})], edges=[])
+    g_stale.nodes[0].data["status"] = "stale"
+    assert _actuals_for(g_stale, get_deps()) == {}  # edited node → don't trust its old count
+
+
 def test_cost_based_placement_routes_a_heavy_region_and_is_a_noop_without_a_backend():
     # Phase B: a blocking region whose estimated working set exceeds the local budget (here: unknown,
     # because its input is an opaque transform) 'wants' a bigger backend. With none registered it stays
