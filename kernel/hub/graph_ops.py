@@ -56,14 +56,24 @@ def connect(graph: dict, node_specs, edge_id: str, source_id: str, target_id: st
             target_handle: str | None = None) -> dict:
     """Wire `source_id`'s output to `target_id`'s input (a specific `target_handle` for a multi-input
     node like `join`). Refuses a duplicate wire into a single-fan-in port; a `multi` port (e.g.
-    `union`) accepts many. The edge carries the source port's wire type so the typed-wire checks and
-    the frontend agree on what flows down it."""
+    `union`) accepts many DISTINCT sources but still refuses the exact same source twice. The edge
+    carries the source port's wire type so the typed-wire checks and the frontend agree on what flows
+    down it."""
     src, tgt = find_node(graph, source_id), find_node(graph, target_id)
     if not src or not tgt:
         raise GraphOpError("source_id or target_id not found")
     port = _target_port(node_specs, tgt.get("type"), target_handle)
+    # a named handle that matches no input port would silently fall back to the first port — reject it
+    # so a mistyped handle surfaces instead of mis-wiring.
+    if target_handle and port is not None and port.id != target_handle:
+        raise GraphOpError(f"'{tgt.get('type')}' has no input handle '{target_handle}'")
     is_multi = bool(getattr(port, "multi", False))
     edges = graph.setdefault("edges", [])
+    # even a multi port rejects the EXACT same wire twice (same source → same target+handle) — feeding
+    # a source into a `union` twice would silently double that source's rows.
+    if any(e.get("source") == source_id and e.get("target") == target_id
+           and (e.get("targetHandle") or None) == (target_handle or None) for e in edges):
+        raise GraphOpError(f"{source_id} is already wired to {target_handle or 'in'} of {target_id}")
     if not is_multi and any(e.get("target") == target_id
                             and (e.get("targetHandle") or None) == (target_handle or None)
                             for e in edges):
@@ -146,8 +156,10 @@ def _resolve_uri_and_cols(deps, arg: str):
     uri matters because the cardinality MEASUREMENT scans it — a name wouldn't scan."""
     try:
         t = deps.catalog.get_table(arg)
-        return t.uri, t.columns
+        return t.uri, t.columns  # a registered table's uri was confined at register time — trusted
     except KeyError:
+        from hub import paths
+        paths.ensure_local_uri_allowed(arg)  # auth mode: don't probe an arbitrary local file's schema
         return arg, deps.resolve_adapter(arg).schema(arg)
 
 
@@ -198,7 +210,9 @@ def layout_new(graph: dict, keep_ids: set[str]) -> None:
     new = [n for n in nodes if n["id"] not in keep_ids]
     if not new:
         return
-    old = [n for n in nodes if n["id"] in keep_ids]
+    # base the placement on existing TOP-LEVEL nodes only — a section child's position is relative to
+    # its parent frame, so mixing it into these absolute-coordinate min/max would throw the anchor off.
+    old = [n for n in nodes if n["id"] in keep_ids and not n.get("parentId")]
     base_y = (max((n["position"]["y"] for n in old), default=0) + 280) if old else 80
     base_x = (min((n["position"]["x"] for n in old), default=80)) if old else 80
 

@@ -35,8 +35,11 @@ and save it"* — it will call the tools below to build a real, typed, runnable 
 
 > **Config (all optional).** `--workspace` / `--data-dir` pick the project dir (default: CWD).
 > `--base-url` is the URL the web app is served at, used only to build clickable canvas links
-> (default `$DP_BASE_URL` or `http://127.0.0.1:8471`). `--user` acts as a specific user id (default:
-> the local user). `--no-seed` skips first-run sample data.
+> (default `$DP_BASE_URL` or `http://127.0.0.1:8471`). `--user` selects which user id the server acts
+> as (default: the local user); it is an **identity selector, not an auth boundary** — it does no
+> password check, so it assumes whoever can run the command already has workspace access (the local
+> single-user model). An unknown id is rejected rather than silently falling back. `--no-seed` skips
+> first-run sample data.
 
 ## How it fits together
 
@@ -47,10 +50,16 @@ The MCP server shares the workspace's metadata DB, catalog, and storage with the
   have that canvas open, **reload** to pick up the agent's changes — live collaboration is a
   per-web-process room an out-of-process MCP client isn't part of.
 - `run_canvas` executes **in-process on the local out-of-core runner** (deterministic, no per-canvas
-  kernel spawn). Its output dataset + run history land in the shared stores, so the UI sees them too.
+  kernel spawn). It shares the web app's confirm gate — a large full pass returns `needsConfirm` until
+  you pass `confirm: true`. It does **not** apply the web app's cross-region placement / capability
+  routing, so a canvas the browser would push to a remote pool or GPU still runs locally here. Its
+  output dataset + run history land in the shared stores, so the UI sees them too.
+- A long run returns `timedOut: true` with a `runId` once the tool's poll window elapses (the run keeps
+  going in the background); follow it with `run_status` or stop it with `cancel_run`.
 
-Because the tools reuse the exact catalog, graph-edit, preview, and canvas-CRUD building blocks the
-HTTP API and the built-in agent use, behavior can't drift between the three surfaces.
+The graph-edit, preview, catalog, and canvas-CRUD tools reuse the exact building blocks the HTTP API
+and the built-in agent use, so those behaviors are inherited rather than re-implemented. (The one
+deliberate execution difference is the local-runner note above.)
 
 ## Tools
 
@@ -70,7 +79,9 @@ HTTP API and the built-in agent use, behavior can't drift between the three surf
 | `set_transform` | **Write (or update) a `transform` node's Python and immediately preview it** — the author-then-verify loop. |
 | `preview_node` | A node's output over a bounded real sample — verify each step (incl. transform code) works. |
 | `validate_canvas` | Typed-wire errors + per-join cardinality / fan-out warnings, without running. |
-| `run_canvas` | Run up to a sink, out-of-core, and wait for the result (large/unknown runs return `needsConfirm`). |
+| `run_canvas` | Run up to a sink, out-of-core, and wait for the result (large/unknown runs return `needsConfirm`; a long run returns `timedOut` + `runId`). |
+| `run_status` | Poll a run by its `runId` — follow a `timedOut` run to completion. |
+| `cancel_run` | Cancel an in-flight run by its `runId`. |
 
 Datasets and canvases are also exposed as MCP **resources** (`dataplay://dataset/<id>`,
 `dataplay://canvas/<id>`) for clients that pull context that way.

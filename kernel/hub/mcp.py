@@ -151,23 +151,13 @@ class Playground:
 
     @staticmethod
     def _relayout(doc: dict, before: set[str]) -> None:
-        """Re-tidy after a structural change. A flat pipeline gets a clean full left-to-right
-        topological layout (so an incrementally-wired chain flows across the canvas rather than
-        stacking). A canvas containing a `section` uses parent-RELATIVE child positions, which a full
-        (absolute) relayout would fling out of the frame — so there we only position the newly-added
-        (always top-level) nodes and leave everything else, section children included, untouched."""
-        if any(n.get("parentId") for n in doc["nodes"]):
-            graph_ops.layout_new(doc, before)
-            return
-        from hub import graph as gmod
-        from hub.models import Graph
-        g = Graph.model_validate(doc)
-        gmod.layout(g)
-        pos = {n.id: n.position for n in g.nodes}
-        for n in doc["nodes"]:
-            p = pos.get(n["id"])
-            if p is not None:
-                n["position"] = {"x": p.x, "y": p.y}
+        """Re-tidy after a structural change by positioning ONLY the newly-added nodes (placed below
+        any pre-existing content), leaving every existing node exactly where it was. A full topological
+        relayout would flow a fresh chain more prettily, but it rewrites ABSOLUTE positions for every
+        node — clobbering a layout a human arranged in the browser (the whole point of MCP is that the
+        canvas shows up there) and flinging a `section`'s parent-RELATIVE children out of their frame.
+        Preserving positions matches the in-process agent, which lays out only its new nodes."""
+        graph_ops.layout_new(doc, before)
 
     def _resolve_uri(self, ref: str) -> str:
         return self.deps.catalog.resolve_ref(ref)
@@ -349,10 +339,13 @@ class Playground:
 
     def run_canvas(self, args: dict) -> dict:
         """Execute the pipeline up to a sink node, IN-PROCESS on the local out-of-core runner, and
-        wait for it to finish. A large/unknown-size run returns needsConfirm:true unless confirm:true."""
+        wait for it to finish. A large/unknown-size run returns needsConfirm:true unless confirm:true.
+        A run still going after the poll timeout returns timedOut:true with its runId — poll run_status
+        or cancel_run with that id (the run keeps executing in the background)."""
         from hub import compiler
         from hub import graph as gmod
         from hub.models import Graph
+        from hub.routers.runs import _cached_noop, _cone_size
         canvas_id = self._req(args, "canvasId")
         d = self.deps
         doc = self._get_doc(canvas_id)
@@ -370,15 +363,48 @@ class Playground:
             raise ToolError(plan.error or "graph has a cycle")
 
         runner = d.runner  # the local out-of-core runner — deterministic, no per-canvas kernel spawn
-        est = runner.estimate(plan, None, None)
+        # Feed the SAME real size estimate the web /run path uses so the confirm gate actually trips on a
+        # big pass (estimate(None, None) would always say needs_confirm=False — the gate would be dead).
+        rows, byts = _cone_size(graph, target, d)
+        est = runner.estimate(plan, rows, byts)
+        if est.needs_confirm and _cached_noop(runner, graph, target):
+            est.needs_confirm = False  # re-running a cached result is a no-op, not a big pass
         if est.needs_confirm and not args.get("confirm"):
             return {"needsConfirm": True, "targetNodeId": target, "estRows": est.rows,
                     "reason": est.breakdown or "large or unknown size — a full pass; pass confirm:true to run"}
         status = runner.run(plan, graph, target, est.placement)
         status = self._await_run(runner, status.run_id)
-        return {"runId": status.run_id, "status": status.status, "targetNodeId": target,
-                "rows": status.total_rows, "ms": status.ms, "outputTable": status.output_table,
-                "outputUri": status.output_uri, "error": status.error}
+        return self._run_envelope(status, target)
+
+    def run_status(self, args: dict) -> dict:
+        """Poll a run started by run_canvas (by its runId) — the way to follow a run that returned
+        timedOut:true to completion without blocking the tool call the whole time."""
+        try:
+            st = self.deps.runner.status(self._req(args, "runId"))
+        except KeyError:
+            raise ToolError(f"unknown runId '{args.get('runId')}' (not started this session, or evicted)")
+        return self._run_envelope(st, st.target_node_id)
+
+    def cancel_run(self, args: dict) -> dict:
+        """Cancel an in-flight run (by its runId). A finished run is returned unchanged."""
+        try:
+            st = self.deps.runner.cancel(self._req(args, "runId"))
+        except KeyError:
+            raise ToolError(f"unknown runId '{args.get('runId')}' (not started this session, or evicted)")
+        return self._run_envelope(st, st.target_node_id)
+
+    @staticmethod
+    def _run_envelope(status, target: str | None) -> dict:
+        """The wire shape for a run result. `timedOut` is set when the poll gave up before the run
+        reached a terminal state — the run is still executing; follow it with run_status(runId)."""
+        terminal = status.status in ("done", "failed", "cancelled")
+        env = {"runId": status.run_id, "status": status.status, "targetNodeId": target,
+               "rows": status.total_rows, "ms": status.ms, "outputTable": status.output_table,
+               "outputUri": status.output_uri, "error": status.error}
+        if not terminal:
+            env["timedOut"] = True
+            env["hint"] = "run still in progress — poll run_status with this runId, or cancel_run to stop it"
+        return env
 
     @staticmethod
     def _sole_sink(doc: dict) -> str:
@@ -519,9 +545,17 @@ def _tool_specs(pg: Playground) -> list[dict]:
         {"name": "run_canvas", "handler": pg.run_canvas,
          "description": "Run the pipeline up to a sink node (in-process, out-of-core) and wait for the "
                         "result. Omit nodeId if the canvas has a single sink. A large/unknown run returns "
-                        "needsConfirm:true unless you pass confirm:true.",
+                        "needsConfirm:true unless you pass confirm:true. A run still going after the poll "
+                        "timeout returns timedOut:true + runId — then poll run_status / cancel_run.",
          "inputSchema": _schema({**canvas, "nodeId": {**_STR, "description": "the node to run to (a sink)"},
                                  "confirm": {"type": "boolean"}}, ["canvasId"])},
+        {"name": "run_status", "handler": pg.run_status,
+         "description": "Poll a run (by the runId from run_canvas) — follow a run that returned "
+                        "timedOut:true to completion. Returns the same shape as run_canvas.",
+         "inputSchema": _schema({"runId": _STR}, ["runId"])},
+        {"name": "cancel_run", "handler": pg.cancel_run,
+         "description": "Cancel an in-flight run by its runId. A finished run is returned unchanged.",
+         "inputSchema": _schema({"runId": _STR}, ["runId"])},
     ]
 
 
@@ -536,14 +570,23 @@ class MCPServer:
     # -- public: pure message → message (or None for a notification) ------- #
     def handle(self, msg: Any) -> Any:
         if isinstance(msg, list):  # JSON-RPC batch (pre-2025-06-18 clients) — reply to each in kind
+            if not msg:  # an empty batch is itself an Invalid Request (JSON-RPC 2.0 §6)
+                return _err_response(None, -32600, "invalid request — empty batch")
             out = [r for r in (self.handle(m) for m in msg) if r is not None]
             return out or None
         if not isinstance(msg, dict):
             return _err_response(None, -32600, "invalid request")
         is_notification = "id" not in msg
         mid = msg.get("id")
+        params = msg.get("params")
+        if params is None:
+            params = {}
+        elif not isinstance(params, dict):
+            # JSON-RPC permits positional (array) params, but every MCP method takes a by-name object;
+            # classify a non-object as Invalid params rather than letting a handler raise → -32603.
+            return None if is_notification else _err_response(mid, -32602, "params must be an object")
         try:
-            result = self._dispatch(msg.get("method"), msg.get("params") or {})
+            result = self._dispatch(msg.get("method"), params)
         except JsonRpcError as e:
             return None if is_notification else _err_response(mid, e.code, e.message, e.data)
         except Exception as e:  # noqa: BLE001 — never crash the loop; report as an internal error
@@ -571,7 +614,7 @@ class MCPServer:
             try:
                 return {"contents": [self.pg.read_resource(uri)]}
             except ToolError as e:
-                raise JsonRpcError(-32602, str(e))
+                raise JsonRpcError(-32002, str(e))  # MCP 'Resource not found' (distinct from bad params)
         raise JsonRpcError(-32601, f"method not found: {method}")
 
     def _initialize(self, params: dict) -> dict:
@@ -662,4 +705,8 @@ def build_server(base_url: str | None = None, user_id: str | None = None) -> MCP
     from hub.settings import settings
     metadb.init_db()  # create metadata tables (idempotent) — the web app does this in hub.main; we're standalone
     uid = metadb.resolve_user(user_id or metadb.DEFAULT_USER_ID)
+    if user_id and uid != user_id:
+        # resolve_user silently falls back to the default 'local' user for an unknown id — a typo'd
+        # --user would then act as the bootstrap admin. Fail loudly instead.
+        raise SystemExit(f"--user '{user_id}' is not a known user id")
     return MCPServer(Playground(get_deps(), uid, base_url or settings.base_url))

@@ -57,6 +57,38 @@ def test_connect_multi_input_port_accepts_many():
     assert len([e for e in g["edges"] if e["target"] == "union_1"]) == 2
 
 
+def test_connect_multi_port_still_rejects_the_exact_same_wire_twice():
+    # a `multi` port takes many DISTINCT sources but the same source twice would double its rows
+    g = _empty()
+    graph_ops.add_node(g, SPECS, "source_1", "source")
+    graph_ops.add_node(g, SPECS, "union_1", "union")
+    graph_ops.connect(g, SPECS, "e_1", "source_1", "union_1")
+    with pytest.raises(graph_ops.GraphOpError):
+        graph_ops.connect(g, SPECS, "e_2", "source_1", "union_1")
+
+
+def test_connect_unknown_target_handle_raises():
+    # a handle that matches no input port would silently fall back to the first port — reject it
+    g = _empty()
+    graph_ops.add_node(g, SPECS, "source_1", "source")
+    graph_ops.add_node(g, SPECS, "join_1", "join")
+    with pytest.raises(graph_ops.GraphOpError):
+        graph_ops.connect(g, SPECS, "e_1", "source_1", "join_1", target_handle="zzz")
+
+
+def test_layout_new_ignores_section_child_coords_for_anchor():
+    # a section child's position is parent-relative; it must not skew the absolute anchor for new nodes
+    g = _empty()
+    g["nodes"].append({"id": "sec", "type": "section", "position": {"x": 40, "y": 40}, "data": {}})
+    g["nodes"].append({"id": "child", "type": "filter", "position": {"x": -300, "y": 999},
+                       "parentId": "sec", "data": {}})
+    graph_ops.add_node(g, SPECS, "source_1", "source")
+    graph_ops.layout_new(g, {"sec", "child"})
+    pos = {n["id"]: n["position"] for n in g["nodes"]}
+    # anchored off the top-level section (x=40), NOT the child's relative x=-300
+    assert pos["source_1"]["x"] == 40
+
+
 def test_set_config_merges_leaving_other_params():
     g = _empty()
     graph_ops.add_node(g, SPECS, "filter_1", "filter", config={"predicate": "a > 0"})
