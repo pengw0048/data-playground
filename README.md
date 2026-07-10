@@ -121,28 +121,77 @@ also show a conservative **`~N rows`** size estimate before you run.
 
 ---
 
-## Architecture (one process)
+## Architecture — the pieces and how they fit
 
-```
-web/     React + React Flow + zustand — the canvas: node cards, typed wires, and panels
-         (data / run / history / code / lineage) plus the agent dock. It renders ANY node —
-         built-in or plugin — generically from the /api/nodes schema, so a new node type
-         needs no frontend code.
+One **hub** — a single FastAPI process — *is* the backend: it serves the web app (which renders any
+node, built-in or plugin, generically from `/api/nodes`), the REST + WebSocket API, and the `/mcp`
+endpoint; it checks auth and compiles a canvas graph into a typed logical plan. The hub keeps no
+durable state of its own — that lives in a **metadata DB** (canvases, settings, run history, and the
+dataset **catalog**; SQLite by default, Postgres via `DP_DATABASE_URL`) and in **storage** (your data,
+uploads, and run outputs; the local filesystem by default, an object store via `DP_STORAGE_URL`).
 
-kernel/  The `hub` package: one FastAPI server that serves the web app, the API, the WebSockets,
-         and the engine. A graph is compiled to a logical plan; by default it runs on the canvas's
-         own kernel — a warm, restart-durable process running the local engine (DuckDB · Polars ·
-         Arrow) that streams and spills to disk. Everything else specific is a plugin.
+The hub doesn't execute the plan — it hands it to a **kernel**: a warm, detached process, one per
+canvas, that outlives the hub so a redeploy never kills an in-flight run. Inside the kernel an
+**engine** turns the plan into DuckDB relations and a **runner** executes them — by default the local,
+streams-and-spills-to-disk runner, right there. That is the whole default, offline setup. Everything
+that changes *what a node does* or *where a plan runs* is a **plugin behind a typed SPI seam** — the
+same seam the built-ins go through, so the core never changes:
+
+- **node** (`NodeBuilder`) — a new node kind: its inputs → a DuckDB relation.
+- **adapter** (`DatasetAdapter`) — a new format or warehouse: a URI → columnar data (Iceberg, Delta, …).
+- **catalog** (`CatalogProvider`) — back the whole catalog with an external metadata service.
+- **backend** (`ExecutionBackend`) — *where* a plan runs. A distributed one also implements
+  `PlaceableBackend` (`workers()` / `place()` / `run_unit()`), so a run splits into **regions** that are
+  each placed on a fitting backend and handed off through shared **storage**. The bundled **`dp_ray`**
+  backend runs regions on a **Ray cluster** with worker-direct reads/writes; a **`KernelSpawner`**
+  likewise swaps the per-canvas kernel from a local process to a **k8s Pod** for cross-host scale.
+
+```mermaid
+flowchart TB
+  B["Web canvas · React Flow<br/>(renders any node from /api/nodes)"]
+  M["Your own agent<br/>Claude Code / any MCP client"]
+
+  subgraph hub["Hub — one FastAPI process (the backend)"]
+    API["REST /api · WebSocket · /mcp"]
+    CMP["Compiler → typed logical plan"]
+    API --> CMP
+  end
+
+  subgraph kernel["Per-canvas kernel — warm, detached, outlives the hub"]
+    ENG["Engine → DuckDB relations"]
+    RUN["Runner · ExecutionBackend"]
+    ENG --> RUN
+  end
+
+  DB[("Metadata DB · SQLite / Postgres<br/>canvases · settings · runs · catalog")]
+  ST[("Storage · local FS / object store<br/>data · uploads · outputs")]
+  DIST["Distributed backend — a plugin<br/>dp_ray → Ray cluster · k8s Pod<br/>workers() · place() · run_unit()"]
+
+  B <-->|"HTTP · WS"| API
+  M -->|"/mcp"| API
+  CMP -->|"command channel"| ENG
+  hub --> DB
+  kernel --> DB
+  ENG <-->|"scan · write"| ST
+  RUN -->|"placed regions"| DIST
+  DIST <-->|"worker-direct"| ST
 ```
+
+Both ways of driving the canvas ride on exactly these blocks: the built-in **agent** runs in-process in
+the hub, and your **own MCP client** drives the same tools over `/mcp`.
 
 ---
 
-## Control flow — sections, not branch/loop nodes
+## Control flow — a `section` runs a driver script over its nodes
 
-There are no `branch` / `loop` / `variable` node types. Control flow lives inside a **`section`**: a
-composite node whose body is a small **driver script** (Python) that calls the nodes inside it with
-real `for` / `while` / `if` and an `emit(...)` for its output. Iteration and branching are just code
-over typed nodes — bounded and inspectable.
+Loops and branches live inside a **`section`**: a composite node whose body is a short **driver
+script** (Python) that orchestrates the nodes it contains. The script reads the section's `inputs` and
+`params`, executes any contained node with `run(...)` (optionally feeding it a handle and overriding
+its config), and uses ordinary `for` / `while` / `if` to decide what runs and how often — pulling a
+scalar out with `value(...)`, stacking per-iteration results with `concat(...)`, and returning the
+section's output via `emit(...)`. So a retry-until-clean loop, a sweep over parameters, or a branch on
+a computed metric is just Python over typed nodes — bounded by a `maxRuns` cap, and inspectable because
+every `run(...)` is itself a real, typed step.
 
 ---
 
@@ -176,10 +225,17 @@ walks through it and the full plugin SPI (also see `kernel/README.md`).
 
 ## The agent (optional)
 
-Describe an outcome and the agent **builds real, typed nodes on the canvas** for you — it's an actor,
-not a chatbot. It's **provider-agnostic**: a tool-use loop runs in-process (via
-[Pydantic AI](https://ai.pydantic.dev)), so you point it at whatever model you have, and the API key
-stays in the kernel, never the browser.
+The vision is a **data agent that works like a local coding agent** — one that understands *your data*
+and *your building blocks* and **creates, debugs, and iterates** on a real pipeline for you. Describe
+an outcome and it reads your catalog (columns, keys, how tables join), lays out the flowchart of typed
+nodes, writes the `sql` / `transform` code each step needs, **previews the real rows** to check its
+work, and fixes and retries when a step is wrong. It's an actor *on* the canvas, not a chatbot beside
+it — every node it makes is the same inspectable, typed node you'd wire by hand, so you can take over
+at any point (and your own coding agent can drive the canvas the same way over
+[MCP](#drive-it-from-your-own-agent-mcp)).
+
+It's **provider-agnostic**: the tool-use loop runs in-process (via [Pydantic AI](https://ai.pydantic.dev)),
+so you point it at whatever model you have, and the API key stays in the kernel, never the browser.
 
 ```bash
 uv pip install -e 'kernel[agent]'     # from a clone
