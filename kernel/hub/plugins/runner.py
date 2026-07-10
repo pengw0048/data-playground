@@ -248,10 +248,12 @@ class LocalRunner:
                     status.rows_processed = rows_seen
 
                 # set the final counts BEFORE flipping to 'done' — a client polls in another thread and
-                # reads a terminal status eagerly; the finally sets total_rows too late, so a poll could
-                # otherwise observe status='done' with total_rows still None (a flaky race).
+                # reads a terminal status eagerly; the finally sets these too late, so a poll could
+                # otherwise observe status='done' with total_rows still None or ms still 0 (a flaky race).
                 status.total_rows = rows_seen
                 status.progress = 1.0
+                status.stalled = False
+                status.ms = int((time.time() - started) * 1000)
                 status.status = "done"
                 if cacheable:
                     self._cache_put(phash, {"rows": rows_seen, "uri": status.output_uri, "table": status.output_table})

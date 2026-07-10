@@ -216,9 +216,25 @@ class RunController:
         with self._lock:
             self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()
+            self._evict()
         self._emit(graph, status)
         threading.Thread(target=self._orchestrate, args=(run_id, graph, target, regions), daemon=True).start()
         return status
+
+    def _evict(self) -> None:
+        """Bound retained distributed-run state (called under self._lock). The sibling in-process
+        runners cap self.runs the same way; RunController did not, so a long-lived kernel accreted a
+        RunStatus per distributed run forever. Evict only TERMINAL runs (oldest first) so an in-flight
+        run submitted early isn't dropped by later submissions (which would 404 its status poll)."""
+        from hub.plugins.runner import _MAX_RUNS
+        _terminal = {"done", "failed", "cancelled"}
+        while len(self.runs) > _MAX_RUNS:
+            victim = next((rid for rid, st in self.runs.items() if st.status in _terminal), None)
+            if victim is None:
+                break  # everything retained is still in-flight — exceed the cap rather than drop a live run
+            self.runs.pop(victim, None)
+            self._cancel.pop(victim, None)
+            self._sub.pop(victim, None)
 
     def _orchestrate(self, run_id: str, graph: Graph, target: str, regions) -> None:
         status = self.runs[run_id]
@@ -257,6 +273,8 @@ class RunController:
                 self._emit(graph, status)
             status.total_rows = status.rows_processed  # set the count BEFORE 'done' (a poll reads terminal
             status.progress = 1.0                      # status eagerly; the finally would set it too late)
+            status.stalled = False
+            status.ms = int((time.time() - started) * 1000)
             status.status = "done"
         except Exception as e:  # noqa: BLE001
             status.status = "cancelled" if cancel.is_set() else "failed"

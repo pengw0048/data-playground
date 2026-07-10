@@ -298,6 +298,37 @@ def test_run_progress_and_stall_signal():
     assert metadb.run_stalled("stall_run", 0.0) is True     # threshold 0 → any age counts as stalled
     assert metadb.run_stalled("stall_run", 10_000) is False  # generous threshold → not stalled
     assert metadb.run_stalled("no_such_run", 0.0) is False   # unknown run → never stalled
+    # the terminal status carries a duration too (ms is set BEFORE the flip to 'done', not only in the
+    # finally) so a poll that reads 'done' isn't left with ms=0.
+    assert done["ms"] >= 0 and "ms" in done
+
+
+def test_sqlite_metadb_uses_wal():
+    # the bundled default is SQLite under concurrent daemon-thread writes + polling; WAL + busy_timeout
+    # keep those from raising SQLITE_BUSY. Assert the connect hook actually took (sqlite deployments only).
+    from hub import metadb
+    from sqlalchemy import text
+    eng = metadb.engine()
+    if not str(eng.url).startswith("sqlite"):
+        pytest.skip("metadb is not SQLite in this deployment")
+    with eng.connect() as c:
+        assert c.execute(text("PRAGMA journal_mode")).scalar().lower() == "wal"
+        assert int(c.execute(text("PRAGMA busy_timeout")).scalar()) >= 1000
+
+
+def test_run_controller_evicts_terminal_runs_only():
+    # RunController.self.runs grew unbounded (the in-process runners cap theirs); _evict now bounds it,
+    # dropping oldest TERMINAL runs while never evicting an in-flight one.
+    from hub.run_controller import RunController
+    from hub.plugins.runner import _MAX_RUNS
+    from hub.models import RunStatus
+    rc = RunController(None, None, None)
+    rc.runs["live"] = RunStatus(run_id="live", status="running", placement="distributed")  # oldest, in-flight
+    for i in range(_MAX_RUNS + 5):
+        rc.runs[f"r{i}"] = RunStatus(run_id=f"r{i}", status="done", placement="distributed")
+    rc._evict()
+    assert len(rc.runs) <= _MAX_RUNS
+    assert "live" in rc.runs  # the in-flight run is never dropped, even though it's the oldest key
 
 
 def test_write_not_previewable():

@@ -208,6 +208,24 @@ def engine():
         url = settings.database_url
         kw = {"connect_args": {"check_same_thread": False}} if url.startswith("sqlite") else {}
         _engine = create_engine(url, **kw)
+        if url.startswith("sqlite"):
+            # The bundled default is a local SQLite file, but run status is upserted from daemon runner
+            # threads on every per-node step, concurrent with autosave PUTs, catalog writes, and fast
+            # GET-run polling. With the default rollback journal + busy_timeout=0 that intermittently
+            # raises SQLITE_BUSY ("database is locked") → lost status updates / 500s. WAL lets readers
+            # and one writer proceed without blocking each other; busy_timeout makes a contended writer
+            # wait-and-retry instead of failing immediately. (No-op for the Postgres deployment path.)
+            from sqlalchemy import event
+
+            @event.listens_for(_engine, "connect")
+            def _sqlite_pragmas(dbapi_conn, _rec):  # noqa: ANN001
+                cur = dbapi_conn.cursor()
+                try:
+                    cur.execute("PRAGMA journal_mode=WAL")
+                    cur.execute("PRAGMA busy_timeout=5000")  # ms
+                    cur.execute("PRAGMA synchronous=NORMAL")  # safe with WAL; avoids fsync per commit
+                finally:
+                    cur.close()
         _Session = sessionmaker(_engine, expire_on_commit=False)
     return _engine
 
