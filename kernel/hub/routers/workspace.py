@@ -45,7 +45,7 @@ def auth_login(body: dict, response: Response) -> dict:
 
 
 @router.post("/auth/password")
-def change_password(body: dict, uid: str = Depends(current_user)) -> dict:
+def change_password(body: dict, response: Response, uid: str = Depends(current_user)) -> dict:
     """Set/rotate the CURRENT user's password. If one is already set, the old password must match."""
     current = metadb.user_password_hash(uid)
     if current and not auth.verify_password(body.get("oldPassword", ""), current):
@@ -53,7 +53,10 @@ def change_password(body: dict, uid: str = Depends(current_user)) -> dict:
     new = body.get("newPassword") or ""
     if len(new) < 6:
         raise HTTPException(400, "password must be at least 6 characters")
-    metadb.set_user_password(uid, auth.hash_password(new))
+    metadb.set_user_password(uid, auth.hash_password(new))  # bumps the token epoch → revokes OTHER sessions
+    if auth.auth_enabled():  # re-issue THIS session's cookie at the new epoch so the caller isn't logged out
+        response.set_cookie("dp_session", auth.sign(uid), httponly=True, samesite="lax",
+                            secure=bool(os.environ.get("DP_AUTH_SECURE_COOKIE")))
     return {"ok": True}
 
 

@@ -10,6 +10,7 @@ OS-level isolation. Honest about the limit rather than pretending otherwise.
 from __future__ import annotations
 
 import threading
+import types
 from typing import Any, Callable
 
 # Modules a cell may import (pre-bound in the namespace so `import` is optional).
@@ -88,25 +89,41 @@ _PYARROW_DENY = frozenset({
     # IPC file/stream readers+writers that open a path
     "ipc", "RecordBatchFileReader", "RecordBatchFileWriter", "RecordBatchStreamReader",
     "RecordBatchStreamWriter", "open_file", "open_stream",
-    # I/O submodules (also blocked at import; block attribute reach too)
-    "fs", "dataset", "csv", "parquet", "orc", "json", "feather", "flight", "hdfs",
+    # I/O submodules (also blocked at import; block attribute reach too). `lib`/`_compute` are the
+    # C-extension modules the top-level names are RE-EXPORTED from — `pyarrow.lib.OSFile` reaches the
+    # identical class, so they must be blocked as attributes too (not just the root spellings).
+    "fs", "dataset", "csv", "parquet", "orc", "json", "feather", "flight", "hdfs", "lib", "_lib",
+    "_compute", "_csv", "_parquet", "_dataset", "_fs",
 })
+# the ACTUAL objects behind the denied names (OSFile etc.), so an alias under ANY attribute/submodule
+# is blocked by identity — `pyarrow.lib.OSFile is pyarrow.OSFile`, so name-blocking alone isn't enough.
+_PYARROW_DENY_OBJS = tuple(o for o in (getattr(_ALLOWED_MODULES["pyarrow"], n, None) for n in _PYARROW_DENY)
+                           if o is not None and not isinstance(o, types.ModuleType))
 
 
 class _ModuleProxy:
     """An attribute-level guard over an injected module: forwards every attribute to the real module
-    EXCEPT a denylist (raises AttributeError). The counterpart to _DENY_IMPORTS for names reachable by
-    attribute on an already-injected module."""
+    EXCEPT (a) a denylisted NAME, (b) a value that IS one of the denied objects (an alias — e.g.
+    `pyarrow.lib.OSFile is pyarrow.OSFile`), or (c) a submodule, which is returned wrapped in the same
+    guard so `pyarrow.lib.OSFile` / `pyarrow._compute.*` can't reach the raw file-I/O builders. The
+    attribute-level counterpart to _DENY_IMPORTS."""
 
     def __init__(self, mod, deny):
         object.__setattr__(self, "_mod", mod)
         object.__setattr__(self, "_deny", frozenset(deny))
 
     def __getattr__(self, name):
-        if name in object.__getattribute__(self, "_deny"):
-            raise AttributeError(f"'{object.__getattribute__(self, '_mod').__name__}.{name}' is blocked "
-                                 "in an ad-hoc cell (file I/O goes through source / write nodes)")
-        return getattr(object.__getattribute__(self, "_mod"), name)
+        deny = object.__getattribute__(self, "_deny")
+        mod = object.__getattribute__(self, "_mod")
+        if name in deny:
+            raise AttributeError(f"'{mod.__name__}.{name}' is blocked in an ad-hoc cell "
+                                 "(file I/O goes through source / write nodes)")
+        val = getattr(mod, name)
+        if any(val is o for o in _PYARROW_DENY_OBJS):  # a denied builtin aliased under another name
+            raise AttributeError(f"'{mod.__name__}.{name}' is blocked in an ad-hoc cell (file I/O)")
+        if isinstance(val, types.ModuleType):  # wrap a submodule so its attrs are guarded too
+            return _ModuleProxy(val, deny)
+        return val
 
     def __dir__(self):
         mod, deny = object.__getattribute__(self, "_mod"), object.__getattribute__(self, "_deny")

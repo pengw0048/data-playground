@@ -267,8 +267,12 @@ def test_sql_groupby_preview_refuses_the_sample():
     assert sql_reduces_rows("SELECT user_id, count(*) FROM input GROUP BY user_id")
     assert sql_reduces_rows("SELECT count(*) AS n FROM input")               # global aggregate
     assert sql_reduces_rows("SELECT DISTINCT user_id FROM input")
+    assert sql_reduces_rows("SELECT any_value(event) FROM input")            # non-canonical reducing aggs
+    assert sql_reduces_rows("SELECT max_by(event, amount) FROM input")
+    # a windowed aggregate in a CTE/subquery must NOT cancel a genuine outer aggregate (per-aggregate OVER)
+    assert sql_reduces_rows("WITH r AS (SELECT *, row_number() OVER (ORDER BY amount) rn FROM input) SELECT count(*) FROM r")
     assert not sql_reduces_rows("SELECT * FROM input WHERE amount > 0")      # row-preserving
-    assert not sql_reduces_rows("SELECT *, row_number() OVER (PARTITION BY user_id ORDER BY amount) r FROM input")  # window
+    assert not sql_reduces_rows("SELECT *, row_number() OVER (PARTITION BY user_id ORDER BY amount) r FROM input")  # pure window
     assert not sql_reduces_rows("SELECT amount AS max FROM input")           # 'max' as an alias, not agg()
 
     g = {"id": "c", "version": 1, "nodes": [
@@ -682,6 +686,23 @@ def test_join_using_dedups_nonkey_clashes_and_survives_full_run():
     assert done["status"] == "done", done.get("error")
 
 
+def test_full_using_join_coalesces_key_for_right_only_rows(tmp_path):
+    # a USING join must COALESCE the key: for a RIGHT/FULL join a right-only row's key is the right value,
+    # not NULL. The projection emits the key unqualified (not a.key) so right-only rows keep their key.
+    import duckdb
+    left, right = str(tmp_path / "l.parquet"), str(tmp_path / "r.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,lval)) TO '{left}' (FORMAT PARQUET)")
+    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES (2,'x'),(3,'y')) t(id,rval)) TO '{right}' (FORMAT PARQUET)")
+    g = {"id": "c", "version": 1, "nodes": [
+        N("l", "source", {"uri": left}), N("r", "source", {"uri": right}),
+        N("j", "join", {"on": "id", "how": "full"}),
+    ], "edges": [E("l", "j", None, "a"), E("r", "j", None, "b")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "j", "k": 50}).json()
+    assert not r["notPreviewable"] and not r.get("error"), r.get("reason")
+    ids = sorted(row["id"] for row in r["rows"] if row.get("id") is not None)
+    assert ids == [1, 2, 3], f"right-only key (3) must be coalesced, not NULL — got {ids}"
+
+
 def test_cancel_finished_run_stays_done():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
@@ -891,11 +912,14 @@ def test_sandbox_pyarrow_root_cannot_do_file_io(tmp_path):
     secret.write_text("top-secret")
     out = tmp_path / "escaped.bin"
 
-    # 1) attribute-reach on the injected root is blocked
+    # 1) attribute-reach on the injected root is blocked — INCLUDING the pyarrow.lib.* re-export twins
+    #    (pyarrow.lib.OSFile is pyarrow.OSFile), which the first attempt at this fix missed
     for expr in (f"pyarrow.OSFile('{secret}').read()",
                  f"pyarrow.memory_map('{secret}').read()",
                  f"pyarrow.output_stream('{out}').write(b'x')",
-                 f"pyarrow.input_stream('{secret}').read()"):
+                 f"pyarrow.input_stream('{secret}').read()",
+                 f"pyarrow.lib.OSFile('{out}', 'w').write(b'x')",
+                 f"pyarrow.lib.memory_map('{secret}', 'r').read()"):
         fn = sandbox.compile_operator(f"def fn(t):\n    return {expr}", "map_batches")
         with pytest.raises(Exception):  # AttributeError('… is blocked …') surfaced through the op
             fn(None)
@@ -2759,6 +2783,27 @@ def test_password_change_revokes_outstanding_sessions(monkeypatch):
     assert auth.verify(auth.sign(uid)) == uid            # a freshly-signed token works
     assert auth.verify("ghost_u.0.9999999999.deadbeef") is None      # unknown user → revoked
     assert auth.verify(f"{uid}.0.9999999999.deadbeef") is None       # forged mac → rejected
+
+
+def test_change_password_keeps_the_acting_session(monkeypatch):
+    # bumping the epoch revokes OTHER sessions, but the caller changing their OWN password must not be
+    # logged out — /auth/password re-issues the acting cookie at the new epoch.
+    from hub import auth
+    from hub.metadb import User, session
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    client.cookies.clear()
+    uid = "chpw_u"
+    with session() as s:
+        if s.get(User, uid) is None:
+            s.add(User(id=uid, name="Chpw", password_hash=auth.hash_password("oldpw1")))
+    try:
+        assert client.post("/api/auth/login", json={"userId": uid, "password": "oldpw1"}).status_code == 200
+        assert client.get("/api/canvas").status_code == 200                       # logged in
+        r = client.post("/api/auth/password", json={"oldPassword": "oldpw1", "newPassword": "newpw2"})
+        assert r.status_code == 200
+        assert client.get("/api/canvas").status_code == 200                       # NOT logged out (cookie re-issued)
+    finally:
+        client.cookies.clear()
 
 
 def test_signed_session_auth(monkeypatch):

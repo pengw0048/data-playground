@@ -30,17 +30,36 @@ _TRANSFORM_KINDS = {"transform", "notebook"}
 
 # aggregate functions whose presence (outside a window) means a sql query REDUCES rows — so previewing
 # it over a 2000-row sample would present a partial aggregate as the complete result (a silent lie).
-_SQL_AGG_FNS = ("count", "sum", "avg", "mean", "min", "max", "median", "mode", "stddev", "stddev_pop",
-                "stddev_samp", "variance", "var_pop", "var_samp", "bool_and", "bool_or", "bit_and",
-                "bit_or", "arg_max", "arg_min", "approx_count_distinct", "quantile", "quantile_cont",
-                "quantile_disc", "list", "array_agg", "string_agg", "histogram", "first", "last")
-_SQL_AGG_RE = re.compile(r"\b(?:" + "|".join(_SQL_AGG_FNS) + r")\s*\(", re.I)
+_SQL_AGG_FNS = ("count", "count_star", "sum", "avg", "mean", "min", "max", "min_by", "max_by", "median",
+                "mode", "product", "any_value", "arbitrary", "stddev", "stddev_pop", "stddev_samp",
+                "variance", "var_pop", "var_samp", "bool_and", "bool_or", "bit_and", "bit_or", "arg_max",
+                "arg_min", "approx_count_distinct", "quantile", "quantile_cont", "quantile_disc", "list",
+                "array_agg", "string_agg", "geomean", "corr", "covar_pop", "covar_samp", "entropy",
+                "kurtosis", "skewness", "bitstring_agg", "histogram", "first", "last")
+# longest-first so `count_star`/`min_by` match before `count`/`min`
+_SQL_AGG_RE = re.compile(r"\b(?:" + "|".join(sorted(_SQL_AGG_FNS, key=len, reverse=True)) + r")\s*\(", re.I)
+_OVER_RE = re.compile(r"\s*over\b", re.I)
+
+
+def _has_reducing_aggregate(s: str) -> bool:
+    """True iff some aggregate-fn call is NOT a window (`agg(...)` not immediately followed by OVER). A
+    window function preserves rows, so a query where EVERY aggregate is windowed doesn't reduce; but a
+    genuine outer aggregate that merely COEXISTS with a windowed one (e.g. `SELECT count(*) FROM (… OVER …)`)
+    still reduces — so the OVER exemption must be per-aggregate, not applied to the whole string."""
+    for m in _SQL_AGG_RE.finditer(s):
+        depth, i = 1, m.end()  # m.end() is just past the '('; skip to the matching ')'
+        while i < len(s) and depth:
+            depth += (s[i] == "(") - (s[i] == ")")
+            i += 1
+        if not _OVER_RE.match(s[i:]):  # this aggregate is not windowed → it collapses rows
+            return True
+    return False
 
 
 def sql_reduces_rows(q: str) -> bool:
     """Best-effort: does this SQL aggregate / reduce rows, so a sampled preview would mislead? Flags
-    GROUP BY / HAVING / SELECT DISTINCT, and a global aggregate (an aggregate fn with no window `OVER`
-    and no GROUP BY). Conservative — it may over-flag (→ 'run a full pass'), never under-flag."""
+    GROUP BY / HAVING / SELECT DISTINCT, and a non-windowed aggregate. Conservative — it may over-flag
+    (→ 'run a full pass'), never under-flag."""
     s = re.sub(r"\s+", " ", q or "").strip()
     if not s:
         return False
@@ -48,7 +67,7 @@ def sql_reduces_rows(q: str) -> bool:
         return True
     if re.search(r"\bselect\s+distinct\b", s, re.I):
         return True
-    return bool(_SQL_AGG_RE.search(s)) and not re.search(r"\bover\s*\(", s, re.I)  # a global aggregate (not a window)
+    return _has_reducing_aggregate(s)
 
 
 class NotPreviewable(Exception):
@@ -247,7 +266,10 @@ class BuildEngine:
         keys = {str(k).strip().strip('"') for k in using_keys}
         lcols = list(left.columns)
         lset = set(lcols)
-        parts = [f'a."{c}"' for c in lcols]  # left cols (incl. any key) as-is
+        # a USING key is COALESCED by the join (b.key for a right-only row in a RIGHT/FULL join) — emit
+        # it UNQUALIFIED so we get the coalesced value, not a."key" (NULL for right-only rows). Non-key
+        # left columns stay a.-qualified.
+        parts = [f'"{c}"' if c in keys else f'a."{c}"' for c in lcols]
         parts += [f'b."{c}" AS "{c}_2"' if (c in lset and c not in keys) else f'b."{c}"'
                   for c in right.columns if c not in keys]  # skip right's key cols (USING merged them)
         return ", ".join(parts)
