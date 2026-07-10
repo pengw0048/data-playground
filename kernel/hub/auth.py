@@ -48,25 +48,41 @@ def _mac(payload: str) -> str:
 
 
 def sign(user_id: str, now: int | None = None) -> str:
-    """A time-limited session token: '<user_id>.<expiry>.<hmac>' — unforgeable without DP_AUTH_SECRET."""
+    """A time-limited session token: '<user_id>.<epoch>.<expiry>.<hmac>' — unforgeable without
+    DP_AUTH_SECRET. `epoch` is the user's session epoch at sign time; verify rejects the token once the
+    stored epoch moves past it (password change / disable / delete), so revocation is immediate rather
+    than waiting out the TTL."""
+    from hub import metadb  # function-local: metadb imports auth (avoid an import cycle)
+    epoch = metadb.user_token_epoch(user_id) or 0
     exp = (now if now is not None else int(time.time())) + _TTL_SECONDS
-    payload = f"{user_id}.{exp}"
+    payload = f"{user_id}.{epoch}.{exp}"
     return f"{payload}.{_mac(payload)}"
 
 
 def verify(token: str | None) -> str | None:
-    """Return the user id iff the token's signature is valid AND not expired, else None."""
+    """Return the user id iff the token's signature is valid, not expired, AND its epoch still matches
+    the user's current epoch (not revoked), else None. (Legacy 3-part tokens no longer verify → a
+    one-time re-login after this ships.)"""
     if not token:
         return None
     parts = token.split(".")
-    if len(parts) != 3:
+    if len(parts) != 4:
         return None
-    user_id, exp, mac = parts
-    if not user_id or not hmac.compare_digest(mac, _mac(f"{user_id}.{exp}")):
+    user_id, epoch, exp, mac = parts
+    if not user_id or not hmac.compare_digest(mac, _mac(f"{user_id}.{epoch}.{exp}")):
         return None
     try:
         if int(exp) < int(time.time()):
             return None  # expired
+    except ValueError:
+        return None
+    from hub import metadb  # function-local (import cycle)
+    current = metadb.user_token_epoch(user_id)
+    if current is None:  # user deleted / unknown → revoked
+        return None
+    try:
+        if int(epoch) != current:
+            return None  # a newer epoch was issued (password change / disable) → this token is revoked
     except ValueError:
         return None
     return user_id

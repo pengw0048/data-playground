@@ -44,6 +44,7 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String, nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String, nullable=True)  # per-user credential (auth mode)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)  # gates global settings + user management
+    token_epoch: Mapped[int] = mapped_column(Integer, default=0, server_default="0")  # bump → revoke sessions
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -316,7 +317,24 @@ def set_user_password(user_id: str, pw_hash: str | None) -> bool:
         if u is None:
             return False
         u.password_hash = pw_hash
+        u.token_epoch = (u.token_epoch or 0) + 1  # revoke every outstanding session on a password change
         return True
+
+
+def user_token_epoch(user_id: str) -> int | None:
+    """The user's current session epoch, or None if the user doesn't exist (→ a token for a deleted /
+    unknown user fails to verify). Read on each authed request by auth.verify."""
+    with session() as s:
+        u = s.get(User, user_id)
+        return (u.token_epoch or 0) if u is not None else None
+
+
+def bump_token_epoch(user_id: str) -> None:
+    """Invalidate all outstanding sessions for a user (call on disable / delete / forced logout)."""
+    with session() as s:
+        u = s.get(User, user_id)
+        if u is not None:
+            u.token_epoch = (u.token_epoch or 0) + 1
 
 
 def get_setting(key: str, scope: str = "global", scope_id: str = "", default=None):

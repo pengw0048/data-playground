@@ -109,15 +109,26 @@ def _maybe_sandbox_fs(c: duckdb.DuckDBPyConnection) -> None:
 
     Applied ONCE on the base connection (DuckDB's enable_external_access is a process-wide, one-way
     switch — it also propagates to cursors), and only when: auth is enabled (multi-user; open
-    single-user mode is a trusted local tool) AND no object store is configured (s3://gs:// need
-    httpfs + network, which enable_external_access=false blocks — a documented mutual exclusivity)."""
+    single-user mode is a trusted local tool) AND no object store is configured. The two are genuinely
+    mutually exclusive in DuckDB, not just by our choice: `enable_external_access` is the MASTER switch
+    for all off-database access (network AND local files beyond the DB), and `allowed_directories` only
+    takes effect while it is FALSE — with it TRUE (required for httpfs/s3) a `read_csv('/etc/passwd')`
+    is NOT confined by allowed_directories (verified). So when an object store is configured we cannot
+    also FS-sandbox; we WARN so the widening is never silent (real local-FS isolation alongside object
+    storage needs OS-level isolation — the pod/subprocess runner, see README)."""
     try:
         from hub import auth
         if not auth.auth_enabled():
             return
         from hub import metadb
         if metadb.get_setting("objectStore", "global", default={}):
-            return  # object storage needs external access → can't also FS-sandbox (documented boundary)
+            import logging
+            logging.getLogger("hub").warning(
+                "FS sandbox DISABLED: an object store is configured, so DuckDB runs with external access "
+                "enabled — a `sql` node can read arbitrary LOCAL files (the soft sandbox can't confine "
+                "local reads while network access is on). Run with OS-level isolation (the pod runner) "
+                "for untrusted multi-user use.")
+            return
         from hub import paths
         dirs = sorted({d for d in (*paths.allowed_roots(), _spill_dir()) if d})
         c.execute("SET allowed_directories = ?", [dirs])

@@ -95,7 +95,17 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
       ) : detail != null && res.rows[detail] ? (
         <RowDetail columns={columns as ColumnSchema[]} row={res.rows[detail]} />
       ) : activeTab === 'rows' ? (
-        <RowsTable columns={columns as ColumnSchema[]} rows={res.rows} onRowClick={setDetail} />
+        <>
+          {/* an empty result over a PREVIEWED SAMPLE isn't necessarily 'nothing matches' — a selective
+              filter whose matches are past the scanned prefix reads as empty. Say so, don't mislead. */}
+          {res.rows.length === 0 && res.truncated && offset === 0 && node?.type !== 'source' && node?.type !== 'note' && (
+            <div className="border-b border-border px-3 py-2 text-[11px] leading-snug text-muted-foreground">
+              No rows in the previewed sample. A selective step can match rows beyond the sampled prefix —
+              run this node to check the full dataset.
+            </div>
+          )}
+          <RowsTable columns={columns as ColumnSchema[]} rows={res.rows} onRowClick={setDetail} />
+        </>
       ) : activeTab === 'stats' ? (
         <StatsView nodeId={nodeId} />
       ) : (

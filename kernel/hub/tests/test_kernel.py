@@ -2554,9 +2554,13 @@ def test_collab_relay_gates_viewer_doc_updates(monkeypatch):
     from hub.metadb import Canvas, session
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
     cid = "cvs_viewer_gate"
+    from hub.metadb import User
     with session() as s:
         if s.get(Canvas, cid) is None:
             s.add(Canvas(id=cid, owner_id="owner_u", name="t", version=1, doc="{}", visibility="private"))
+        for u in ("owner_u", "editor_u", "viewer_u"):  # sessions require the user to exist (revocation check)
+            if s.get(User, u) is None:
+                s.add(User(id=u, name=u))
     metadb.share_canvas(cid, "editor_u", "editor")
     metadb.share_canvas(cid, "viewer_u", "viewer")
     ed_cookie = {"cookie": f"dp_session={auth.sign('editor_u')}"}
@@ -2735,6 +2739,26 @@ def test_nodespec_frontend_backend_parity():
             mismatches.append(f"{spec.kind} ({card['file']}) outputs: backend {be_out} != frontend {card['outputs']}")
     assert checked >= 8, f"parser matched too few kinds ({checked}) — frontend format may have changed"
     assert not mismatches, "backend/frontend node-spec drift:\n" + "\n".join(mismatches)
+
+
+def test_password_change_revokes_outstanding_sessions(monkeypatch):
+    # a signed token embeds the user's session epoch; a password change bumps the epoch, so every token
+    # issued before it stops verifying immediately (not after the 7-day TTL). A deleted/unknown user's
+    # token never verifies either.
+    from hub import auth, metadb
+    from hub.metadb import User, session
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    uid = "revoke_u"
+    with session() as s:
+        if s.get(User, uid) is None:
+            s.add(User(id=uid, name="Rev", password_hash=auth.hash_password("pw1")))
+    tok = auth.sign(uid)
+    assert auth.verify(tok) == uid                       # valid now
+    assert metadb.set_user_password(uid, auth.hash_password("pw2"))  # rotate → epoch bumps
+    assert auth.verify(tok) is None                      # the old token is revoked
+    assert auth.verify(auth.sign(uid)) == uid            # a freshly-signed token works
+    assert auth.verify("ghost_u.0.9999999999.deadbeef") is None      # unknown user → revoked
+    assert auth.verify(f"{uid}.0.9999999999.deadbeef") is None       # forged mac → rejected
 
 
 def test_signed_session_auth(monkeypatch):
