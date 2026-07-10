@@ -281,31 +281,54 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     return est
 
 
-@router.post("/run", response_model=RunStatus)
-def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
-    deps = get_deps()
-    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    _reject_invalid(req.graph, deps)
-    plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
+class RunNeedsConfirm(Exception):
+    """The confirm gate tripped (large/unknown size) and the caller didn't pass confirmed=True. Carries
+    the estimate so the caller can surface estRows/reason. HTTP maps it to 409; the MCP tool returns a
+    needsConfirm result. Raising (not returning) keeps `start_run` a single 'started, here's the owner'
+    contract for both surfaces."""
+
+    def __init__(self, estimate: RunEstimate):
+        super().__init__("run needs confirmation")
+        self.estimate = estimate
+
+
+def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool = False):
+    """Start a run — the ONE code path behind both POST /run and the MCP run_canvas tool, so a run an
+    agent launches is placed, gated, and owned exactly like one the browser launches. Resolves source
+    refs, rejects an invalid/cyclic graph (HTTPException), sizes + gates the run (RunNeedsConfirm), then
+    hands to the RunController (placement-splitting) or the base runner and records the owner in
+    run_index. Returns (status, owner); poll the owner via _status_or_lost / cancel via run_index."""
+    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    _reject_invalid(graph, deps)
+    plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
-    runner = _route_by_capability(deps, deps.pick_runner(plan, uid), req.graph)  # honor node requires
-    rows, byts = _cone_size(req.graph, req.target_node_id, deps)
+    runner = _route_by_capability(deps, deps.pick_runner(plan, uid), graph)  # honor node requires
+    rows, byts = _cone_size(graph, target_node_id, deps)
     est = runner.estimate(plan, rows, byts)
-    if est.needs_confirm and not req.confirmed and not _cached_noop(runner, req.graph, req.target_node_id):
-        raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
+    if est.needs_confirm and not confirmed and not _cached_noop(runner, graph, target_node_id):
+        raise RunNeedsConfirm(est)
     # a run that splits across placement regions (a placed node / checkpoint / fan-out) is owned by the
     # RunController; a single default region returns None → the base runner, exactly as before.
-    overall = deps.controller.run(req.graph, req.target_node_id)
+    overall = deps.controller.run(graph, target_node_id)
     if overall is not None:
         status, owner = overall, deps.controller
     else:
-        status, owner = runner.run(plan, req.graph, req.target_node_id, est.placement), runner
+        status, owner = runner.run(plan, graph, target_node_id, est.placement), runner
     deps.run_index[status.run_id] = owner  # so status/cancel/ws reach the right owner
     # bound run_index (insertion-ordered) so it can't grow for the process lifetime — the runners
     # themselves only retain the last _MAX_RUNS, and _status_or_lost already tolerates a missing id.
     while len(deps.run_index) > _RUN_INDEX_MAX:
         deps.run_index.pop(next(iter(deps.run_index)))
+    return status, owner
+
+
+@router.post("/run", response_model=RunStatus)
+def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
+    try:
+        status, _ = start_run(get_deps(), req.graph, req.target_node_id, uid, req.confirmed)
+    except RunNeedsConfirm:
+        raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
     return status
 
 

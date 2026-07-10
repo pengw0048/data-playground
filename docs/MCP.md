@@ -1,37 +1,48 @@
 # Drive Data Playground from your own agent (MCP)
 
-Data Playground ships an [MCP](https://modelcontextprotocol.io) server, so you can point your **own
-Claude Code** (or any MCP client) at your workspace and have it build the whole pipeline for you —
-explore the catalog, open a canvas, wire typed nodes, **write the `transform` Python**, preview each
-step against real rows, and run it. The canvas it builds shows up in the browser like any other.
+Data Playground speaks [MCP](https://modelcontextprotocol.io), so you can point your **own Claude
+Code** (or any MCP client) at your workspace and have it build the whole pipeline for you — explore
+the catalog, open a canvas, wire typed nodes, **write the `transform` Python**, preview each step
+against real rows, run it, and read the rows it produced. The canvas it builds shows up in the
+browser like any other.
 
 This is the mirror image of the [built-in agent](../README.md#the-agent-optional): there the kernel
-calls a model; here a model calls the kernel. It needs **no API key and no extra install** — the
-server is stdlib-only and talks over stdio.
+calls a model; here a model calls the kernel. No API key required.
 
-## Connect it
+## Two ways to connect
 
-Run the web app as usual in one terminal (so you have a browser to watch):
+There is **one** server (the same tools, the same code); pick the transport that fits.
+
+### HTTP — in the running web app (recommended: watch it build live)
+
+The web app itself serves the MCP endpoint at **`/mcp`**. Point your client at it and every tool
+runs on the app's *real* deps, runner, and auth — there is no second engine and no behavior can drift
+from the UI, and **an edit shows up live in an open browser tab** (nodes appear as the agent wires
+them). Run the app, then:
 
 ```bash
-cd kernel && uv run dataplay        # → http://127.0.0.1:8471
+cd kernel && uv run dataplay                              # → http://127.0.0.1:8471
+claude mcp add --transport http dataplay http://127.0.0.1:8471/mcp
 ```
 
-Then register the MCP server with your client. For Claude Code:
+Now open a canvas in the browser and ask your agent *"open a canvas, keep only purchase events, total
+the amount per user, and save it"* — watch the nodes land as it goes. Because the endpoint is gated
+exactly like the rest of the API, this is a **local / open-mode** feature today: a multi-user
+deployment (`DP_AUTH_SECRET` set) needs a real token a CLI can't present yet, so use stdio there.
+
+### stdio — standalone, no server (headless / CI)
+
+`dataplay mcp` runs the same server over stdio with **no web app running** — stdlib-only, zero extra
+install. Best for scripts, CI, or a no-browser box:
 
 ```bash
-# from the same workspace directory you serve from
-claude mcp add dataplay -- uv run dataplay mcp
-```
-
-or point it at any workspace explicitly:
-
-```bash
+claude mcp add dataplay -- uv run dataplay mcp                       # workspace = CWD
 claude mcp add dataplay -- uv run dataplay mcp --workspace /path/to/proj
 ```
 
-Now ask your agent things like *"open a canvas, keep only purchase events, total the amount per user,
-and save it"* — it will call the tools below to build a real, typed, runnable canvas.
+A canvas it builds is persisted to the shared workspace DB, so it appears in the browser's **Files**
+list; if that canvas is already open, **reload** to pick up the changes (an out-of-process client
+isn't in the browser's live collab room — that's the HTTP transport's advantage).
 
 > **Config (all optional).** `--workspace` / `--data-dir` pick the project dir (default: CWD).
 > `--base-url` is the URL the web app is served at, used only to build clickable canvas links
@@ -43,23 +54,23 @@ and save it"* — it will call the tools below to build a real, typed, runnable 
 
 ## How it fits together
 
-The MCP server shares the workspace's metadata DB, catalog, and storage with the running web app
-(the same "several instances, one shared state" model the README describes). So:
-
-- A canvas the agent builds is persisted and appears in the browser's **Files** list. If you already
-  have that canvas open, **reload** to pick up the agent's changes — live collaboration is a
-  per-web-process room an out-of-process MCP client isn't part of.
-- `run_canvas` executes **in-process on the local out-of-core runner** (deterministic, no per-canvas
-  kernel spawn). It shares the web app's confirm gate — a large full pass returns `needsConfirm` until
-  you pass `confirm: true`. It does **not** apply the web app's cross-region placement / capability
-  routing, so a canvas the browser would push to a remote pool or GPU still runs locally here. Its
-  output dataset + run history land in the shared stores, so the UI sees them too.
-- A long run returns `timedOut: true` with a `runId` once the tool's poll window elapses (the run keeps
-  going in the background); follow it with `run_status` or stop it with `cancel_run`.
-
-The graph-edit, preview, catalog, and canvas-CRUD tools reuse the exact building blocks the HTTP API
-and the built-in agent use, so those behaviors are inherited rather than re-implemented. (The one
-deliberate execution difference is the local-runner note above.)
+- **No drift.** `run_canvas` starts a run through the *same* code path as the web `POST /run`
+  (`runs.start_run`): the same confirm gate on real size (a large full pass returns `needsConfirm`
+  until you pass `confirm: true`), the same cost-based placement / capability routing, the same run
+  ownership. An agent-launched run behaves identically to a browser-launched one — and over the HTTP
+  transport it's the *same process*, so the run is visible in the UI too. That means a run uses the
+  workspace's configured execution backend — the **per-canvas kernel** (a spawned, warm, restart-
+  surviving process) by default; on a headless/one-shot box where you want a pure in-process run and
+  no lingering kernel, set `DP_EXECUTION=local-out-of-core`.
+- **Watch it build (HTTP).** When an MCP tool edits a canvas, the app nudges every open browser tab in
+  that canvas's collab room to refetch and re-apply — nodes appear live, no reload. (stdio can't do
+  this; reload to see its edits.)
+- **Long runs are recoverable.** `run_canvas` waits for the result, but a run still going after the
+  poll window returns `timedOut: true` with a `runId`; follow it with `run_status` or stop it with
+  `cancel_run`. Read the rows a run materialized with `sample_result`.
+- **One workspace.** Both transports share the workspace's metadata DB, catalog, and storage, and the
+  graph-edit / preview / catalog / canvas-CRUD tools reuse the exact building blocks the HTTP API and
+  the built-in agent use — behavior is inherited, not re-implemented.
 
 ## Tools
 
@@ -82,6 +93,7 @@ deliberate execution difference is the local-runner note above.)
 | `run_canvas` | Run up to a sink, out-of-core, and wait for the result (large/unknown runs return `needsConfirm`; a long run returns `timedOut` + `runId`). |
 | `run_status` | Poll a run by its `runId` — follow a `timedOut` run to completion. |
 | `cancel_run` | Cancel an in-flight run by its `runId`. |
+| `sample_result` | Sample the OUTPUT dataset a run materialized (by `runId`) — read what it produced. |
 
 Datasets and canvases are also exposed as MCP **resources** (`dataplay://dataset/<id>`,
 `dataplay://canvas/<id>`) for clients that pull context that way.

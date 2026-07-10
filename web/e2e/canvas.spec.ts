@@ -440,6 +440,26 @@ test.describe('Data Playground canvas', () => {
     await b.close()
   })
 
+  test('an MCP (HTTP) edit appears live in the open canvas — watch your agent build', async ({ page }) => {
+    // The user's own Claude Code drives this workspace over the in-process /mcp endpoint; an edit it
+    // makes must show up in the ALREADY-OPEN tab with no reload (the collab external-edit nudge).
+    await fresh(page)
+    await expect(page.getByTestId('autosave')).toHaveText(/saved/, { timeout: 8_000 }) // persisted → MCP can load it
+    const cid = (await page.evaluate(() => location.hash)).replace('#/canvas/', '')
+    expect(cid).toBeTruthy()
+    // add a node purely via MCP (no browser interaction) — the request is the agent's tool call
+    const res = await page.request.post('/mcp', {
+      headers: { 'X-DP-User': 'local' },
+      data: { jsonrpc: '2.0', id: 1, method: 'tools/call',
+              params: { name: 'add_node', arguments: { canvasId: cid, kind: 'filter' } } },
+    })
+    expect(res.ok()).toBeTruthy()
+    expect((await res.json()).result?.isError).not.toBe(true)
+    // the node materializes live, and the user is told their agent changed the canvas
+    await expect(page.locator('.react-flow__node')).toHaveCount(1, { timeout: 12_000 })
+    await expect(page.getByText('Canvas updated by your agent')).toBeVisible({ timeout: 8_000 })
+  })
+
   test('undo is CRDT-scoped — it never erases a peer\'s concurrent node', async ({ page }) => {
     // regression: undo used to push a stale full-doc snapshot into the CRDT, deleting any node a peer
     // added after the snapshot — for everyone. Undo must now revert only the local user's own edit.

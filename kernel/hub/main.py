@@ -26,7 +26,7 @@ import os
 import threading
 import time
 
-from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -175,6 +175,58 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
                     room.discard(peer)
         if not room:
             _collab_rooms.pop(canvas_id, None)
+
+
+async def _broadcast_external_edit(canvas_id: str) -> None:
+    """Nudge every browser tab in a canvas's collab room that the doc changed out-of-band (an MCP
+    client edited it). The tab refetches + applies. A plain relay message the collab client
+    understands; carries no clientId so a peer's own self-filter can't drop it."""
+    room = _collab_rooms.get(canvas_id)
+    if not room:
+        return
+    for peer in list(room):
+        try:
+            await peer.send_json({"type": "external-edit", "canvasId": canvas_id})
+        except Exception:  # noqa: BLE001 — a dead peer is dropped, exactly like ws_collab's fan-out
+            room.discard(peer)
+
+
+# --- MCP over HTTP: the SAME server as `dataplay mcp` (stdio), but served IN-PROCESS by the web app.
+# So a user's own Claude Code can drive this workspace via `claude mcp add --transport http <url>/mcp`
+# and every tool runs on the app's real deps / runner / auth — no separate engine, no behavior drift,
+# and an edit shows up LIVE in an open browser (the broadcast above). Gated by current_user like /api:
+# in open mode that's the local user (zero-config); a multi-user/auth deployment needs a real token
+# (MCP OAuth) a CLI can't present yet, so HTTP-MCP is a local-mode feature today (stdio covers the rest).
+@app.post("/mcp")
+async def mcp_http(request: Request, uid: str = Depends(current_user)):
+    from fastapi.concurrency import run_in_threadpool
+    from fastapi.responses import JSONResponse, Response
+
+    from hub import mcp as mcp_mod
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — malformed body → a JSON-RPC parse error, not a 500
+        return JSONResponse(mcp_mod._err_response(None, -32700, "parse error"))
+    server = mcp_mod.build_http_server(uid)
+    # handle() is sync and a tool (run_canvas) may block on a run — run it off the event loop so one
+    # client's long call can't stall the whole server (a freedom the single-threaded stdio loop lacks).
+    resp = await run_in_threadpool(server.handle, body)
+    for cid in server.pg.changed_canvases:  # live-nudge any open tab for a canvas this call mutated
+        await _broadcast_external_edit(cid)
+    if resp is None:
+        return Response(status_code=202)  # a notification / batch of only notifications — no reply body
+    return JSONResponse(resp)
+
+
+@app.get("/mcp")
+def mcp_http_get():
+    from fastapi.responses import Response
+    return Response(status_code=405)  # we push no server-initiated SSE stream on this endpoint
+
+
+@app.delete("/mcp")
+def mcp_http_delete():
+    return {"ok": True}  # stateless server — no session id to terminate
 
 
 @app.get("/api/health")
