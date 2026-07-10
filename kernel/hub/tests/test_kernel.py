@@ -1430,6 +1430,45 @@ def test_object_store_s3_roundtrip_and_browse(tmp_path):
         metadb.set_setting("objectStore", {}, "global")  # restore the default credential chain for other tests
 
 
+def test_object_store_feather_roundtrip(tmp_path):
+    # Arrow/Feather (IPC) has no DuckDB file reader/writer, so it goes through pyarrow's own S3
+    # filesystem. Previously a raw "s3://…" string was handed to pyarrow.feather → it wrote/read a
+    # LOCAL file of that literal name (silent corruption). Prove a real round-trip over the wire.
+    pytest.importorskip("moto")
+    pytest.importorskip("flask")
+    boto3 = pytest.importorskip("boto3")
+    from moto.server import ThreadedMotoServer
+
+    from hub import db, metadb
+    from hub.plugins.adapters import DuckDBAdapter, object_fs
+
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    try:
+        host, port = server.get_host_and_port()
+        endpoint = f"http://{host}:{port}"
+        boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
+                     region_name="us-east-1").create_bucket(Bucket="bkt")
+        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
+                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        db._obj_store_loaded = False
+        a = DuckDBAdapter()
+        p = _seq_parquet(tmp_path, n=17)
+        uri = "s3://bkt/data/out.feather"
+        with db.lock():
+            res = a.write(uri, db.conn().read_parquet(p), "overwrite")
+            assert res["rows"] == 17
+            # the wrong old path would have created a local file literally named "s3://bkt/data/out.feather"
+            assert not os.path.exists(uri), "feather must not have been written to the local FS"
+            got = a.scan(uri).aggregate("count(*) AS c").fetchone()[0]
+        assert got == 17  # read back the feather bytes over the wire
+        fs, key = object_fs(uri)
+        assert key == "bkt/data/out.feather"  # scheme stripped to bucket/key for the object filesystem
+    finally:
+        server.stop()
+        metadb.set_setting("objectStore", {}, "global")
+
+
 def test_upload_lands_bytes_in_object_store(tmp_path):
     # Object-store deployments (multi-instance): uploaded bytes must round-trip through DuckDB httpfs to
     # s3:// so every web instance can read them. _land_upload re-encodes to the SAME format at the target

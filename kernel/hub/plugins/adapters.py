@@ -60,6 +60,35 @@ def path_of(uri: str) -> str:
     return p.path if p.scheme in ("file", "") else uri
 
 
+def object_fs(uri: str):
+    """A pyarrow filesystem + in-bucket path for an object-store uri, honoring the SAME `objectStore`
+    credential setting DuckDB's httpfs uses (explicit keys / endpoint for MinIO·R2·any S3-compatible
+    store, else the standard AWS/GCS credential chain). Only needed for Arrow/Feather (IPC), which
+    DuckDB cannot read or write as files — parquet/csv/json go straight through DuckDB+httpfs. Returns
+    (filesystem, "bucket/key")."""
+    import pyarrow.fs as pafs
+
+    from hub import metadb
+    cfg = metadb.get_setting("objectStore", "global", default={}) or {}
+    scheme, _, rest = uri.partition("://")
+    scheme = scheme.lower()
+    if scheme in ("s3", "r2"):
+        kw: dict = {}
+        if cfg.get("accessKeyId") and cfg.get("secretAccessKey"):
+            kw["access_key"], kw["secret_key"] = cfg["accessKeyId"], cfg["secretAccessKey"]
+        if cfg.get("region"):
+            kw["region"] = cfg["region"]
+        endpoint = str(cfg.get("endpoint") or "").strip()
+        if endpoint:  # MinIO / R2 / custom S3-compatible endpoint
+            use_ssl = not endpoint.startswith("http://") if cfg.get("useSsl") is None else bool(cfg.get("useSsl"))
+            kw["endpoint_override"] = endpoint.split("://", 1)[-1].rstrip("/")
+            kw["scheme"] = "https" if use_ssl else "http"
+        return pafs.S3FileSystem(**kw), rest
+    if scheme in ("gs", "gcs"):
+        return pafs.GcsFileSystem(), rest
+    raise ValueError(f"unsupported object-store scheme for Arrow/Feather: {scheme}://")
+
+
 def _csv_kwargs(options: dict | None) -> dict:
     """Map a source node's CSV parse overrides to DuckDB read_csv kwargs. Empty → auto-detect (default).
     `delimiter` accepts a literal char or the words 'tab'/'\\t'; `header` is an explicit bool."""
@@ -136,6 +165,13 @@ class DuckDBAdapter:
                 return con.read_csv(uri, **csv)
             if low.endswith((".json", ".ndjson")):
                 return con.read_json(uri)
+            if low.endswith((".arrow", ".feather", ".ipc")):
+                # DuckDB has no Arrow-IPC file reader, so pull the object through pyarrow's own S3/GCS
+                # filesystem (same creds) rather than the httpfs path used for parquet/csv/json.
+                import pyarrow.feather as feather
+                fs, p = object_fs(uri)
+                with fs.open_input_file(p) as f:
+                    return con.from_arrow(feather.read_table(f))
             if low.endswith((".parquet", ".pq")):
                 return con.read_parquet(uri)
             return con.read_parquet(uri.rstrip("/") + "/**/*.parquet")  # a prefix of parts (append output)
@@ -223,8 +259,17 @@ class DuckDBAdapter:
                 # DuckDB writes JSON out-of-core via COPY; ARRAY true emits a top-level [] read_json reads back
                 rel.query("_w", f"COPY _w TO '{wtarget.replace(chr(39), chr(39) * 2)}' (FORMAT JSON, ARRAY true)")
             elif low.endswith((".arrow", ".feather", ".ipc")):
+                # Arrow-IPC has no DuckDB writer; go through pyarrow. On an object store pyarrow.feather
+                # given a raw "s3://…" string would write a LOCAL file of that name (silent corruption) —
+                # so open a real object stream via pyarrow's filesystem instead. (Materializes the table
+                # in RAM either way: feather is a whole-file format with no streaming writer here.)
                 import pyarrow.feather as feather
-                feather.write_feather(rel.to_arrow_table(), wtarget)
+                if obj:
+                    fs, p = object_fs(target)
+                    with fs.open_output_stream(p) as f:
+                        feather.write_feather(rel.to_arrow_table(), f)
+                else:
+                    feather.write_feather(rel.to_arrow_table(), wtarget)
             else:
                 rel.write_parquet(wtarget)
             if not obj:
