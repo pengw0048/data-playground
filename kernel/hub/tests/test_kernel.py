@@ -1511,8 +1511,39 @@ def test_object_store_feather_roundtrip(tmp_path):
         assert got == 17  # read back the feather bytes over the wire
         fs, key = object_fs(uri)
         assert key == "bkt/data/out.feather"  # scheme stripped to bucket/key for the object filesystem
+
+        # a failed overwrite must NOT destroy the prior good object (temp-key + move discipline) — the
+        # streamed multipart upload would otherwise finalize a partial/empty object onto the destination.
+        import pyarrow.feather as feather
+        orig = feather.write_feather
+        try:
+            feather.write_feather = lambda *a_, **k_: (_ for _ in ()).throw(RuntimeError("boom mid-write"))
+            with db.lock():
+                with pytest.raises(RuntimeError):
+                    a.write(uri, db.conn().read_parquet(p), "overwrite")
+                still = a.scan(uri).aggregate("count(*) AS c").fetchone()[0]
+            assert still == 17  # the previous good object survived the failed overwrite
+        finally:
+            feather.write_feather = orig
+        # and no temp key was left behind
+        left = [o["Key"] for o in boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k",
+                aws_secret_access_key="s", region_name="us-east-1").list_objects_v2(Bucket="bkt").get("Contents", [])]
+        assert not any(".tmp-" in k for k in left), left
     finally:
         server.stop()
+        metadb.set_setting("objectStore", {}, "global")
+
+
+def test_object_fs_gcs_hmac_keys_fail_clearly():
+    # pyarrow's GCS filesystem has no HMAC-key parameter, so feather over gs:// can't reuse the DuckDB
+    # HMAC creds — fail with a clear message instead of silently authenticating as a different identity.
+    from hub import metadb
+    from hub.plugins.adapters import object_fs
+    metadb.set_setting("objectStore", {"accessKeyId": "k", "secretAccessKey": "s"}, "global")
+    try:
+        with pytest.raises(NotImplementedError, match="ADC|Application Default|access token"):
+            object_fs("gs://bucket/x.feather")
+    finally:
         metadb.set_setting("objectStore", {}, "global")
 
 
@@ -3683,7 +3714,9 @@ def test_latest_actuals_feeds_estimator_only_for_latest_nodes():
     with metadb.session() as s:
         if s.get(metadb.Canvas, cid) is None:
             s.add(metadb.Canvas(id=cid, owner_id="local", name="a", doc="{}"))
-    metadb.record_run(cid, "j", "done", rows=None, per_node=[{"node_id": "j", "rows": 4321, "status": "done"}])
+    # realistic: the per_node breakdown leaves a lazy relation's own rows null, so the target count comes
+    # from RunRecord.rows (=total_rows) — latest_actuals must read that, not only per_node.
+    metadb.record_run(cid, "j", "done", rows=4321, per_node=[{"node_id": "j", "rows": None, "status": "done"}])
     assert metadb.latest_actuals(cid) == {"j": 4321}
     g_latest = Graph(id=cid, version=1, nodes=[N("j", "join", {})], edges=[])
     g_latest.nodes[0].data["status"] = "latest"

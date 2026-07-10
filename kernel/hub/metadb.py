@@ -429,23 +429,31 @@ def delete_canvas_cascade(canvas_id: str) -> None:
 
 
 def latest_actuals(canvas_id: str | None) -> dict[str, int]:
-    """Per-node measured row counts from the most recent SUCCESSFUL run of this canvas — feeds the size
-    estimator (as `actuals`) so nodes whose output is statically unknowable (join / aggregate / sql /
-    code) carry a real count on the next estimate instead of 'unknown'. The caller guards staleness (an
-    edited node's status is no longer 'latest')."""
+    """Node measured row counts from recent SUCCESSFUL runs of this canvas — feeds the size estimator (as
+    `actuals`) so nodes whose output is statically unknowable (join / aggregate / sql / code) carry a real
+    count on the next estimate instead of 'unknown'. The primary source is each run's TARGET count
+    (RunRecord.rows — the per_node breakdown leaves a lazy relation's own rows null); any per_node entry
+    that DID capture a count (a materialized checkpoint) is folded in too. Scans the last several runs so
+    different targets are covered, most-recent wins. The caller guards staleness (only nodes still
+    'latest')."""
     if not canvas_id:
         return {}
+    out: dict[str, int] = {}
     with session() as s:
-        r = s.scalar(select(RunRecord).where(RunRecord.canvas_id == canvas_id, RunRecord.status == "done")
-                     .order_by(RunRecord.created_at.desc()).limit(1))
-        if not r or not r.per_node:
-            return {}
-        try:
-            pn = json.loads(r.per_node)
-        except (ValueError, TypeError):
-            return {}
-        return {p["node_id"]: int(p["rows"]) for p in pn
-                if isinstance(p, dict) and p.get("node_id") and p.get("rows") is not None}
+        recs = s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id, RunRecord.status == "done")
+                         .order_by(RunRecord.created_at.desc()).limit(20)).all()
+        for r in recs:  # most-recent first — never let an older run overwrite a fresher measurement
+            if r.target_node_id and r.rows is not None and r.target_node_id not in out:
+                out[r.target_node_id] = int(r.rows)
+            if r.per_node:
+                try:
+                    pn = json.loads(r.per_node)
+                except (ValueError, TypeError):
+                    pn = []
+                for p in pn:
+                    if isinstance(p, dict) and p.get("node_id") and p.get("rows") is not None and p["node_id"] not in out:
+                        out[p["node_id"]] = int(p["rows"])
+    return out
 
 
 def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:

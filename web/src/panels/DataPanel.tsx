@@ -222,6 +222,9 @@ function ExportCluster({ columns, rows, name, truncated, pushToast }: {
 }) {
   const note = truncated ? ' (previewed sample only — use a write node for the full dataset)' : ''
   const copy = () => {
+    // navigator.clipboard is undefined in an insecure context (plain http on a LAN IP — a supported
+    // `--host 0.0.0.0` deployment), where `.writeText` would throw synchronously past the .catch.
+    if (!navigator.clipboard) { pushToast('Copy failed — clipboard needs https or localhost', 'error'); return }
     navigator.clipboard.writeText(rowsToCsv(columns, rows))
       .then(() => pushToast(`Copied ${rows.length} rows as CSV`, 'success'))
       .catch(() => pushToast('Copy failed — clipboard unavailable', 'error'))

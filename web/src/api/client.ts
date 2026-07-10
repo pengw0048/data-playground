@@ -53,7 +53,9 @@ function toGraph(doc: CanvasDoc) {
       type: n.type,
       position: n.position,
       parentId: n.parentId ?? null, // section containment — the backend runs parentId children
-      data: { title: n.data.title, config: n.data.config, bypassed: n.data.bypassed, disabled: n.data.disabled },
+      // `status` lets the server's size estimator trust a prior run's per-node row count only while the
+      // node is still 'latest' (an edited node's old count would mislead) — see routers/runs._actuals_for.
+      data: { title: n.data.title, config: n.data.config, bypassed: n.data.bypassed, disabled: n.data.disabled, status: n.data.status },
     })),
     edges: doc.edges.filter((e) => dataIds.has(e.source) && dataIds.has(e.target)).map((e) => ({
       id: e.id,

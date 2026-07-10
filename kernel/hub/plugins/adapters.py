@@ -61,31 +61,46 @@ def path_of(uri: str) -> str:
 
 
 def object_fs(uri: str):
-    """A pyarrow filesystem + in-bucket path for an object-store uri, honoring the SAME `objectStore`
-    credential setting DuckDB's httpfs uses (explicit keys / endpoint for MinIO·R2·any S3-compatible
-    store, else the standard AWS/GCS credential chain). Only needed for Arrow/Feather (IPC), which
-    DuckDB cannot read or write as files — parquet/csv/json go straight through DuckDB+httpfs. Returns
-    (filesystem, "bucket/key")."""
+    """A pyarrow filesystem + in-bucket path for an object-store uri, reading the SAME `objectStore`
+    setting DuckDB's httpfs uses. Only needed for Arrow/Feather (IPC), which DuckDB cannot read or write
+    as files — parquet/csv/json go straight through DuckDB+httpfs. Returns (filesystem, "bucket/key").
+
+    S3/R2 credential parity is full (explicit keys / endpoint for MinIO·R2·any S3-compatible store, else
+    the AWS chain). For GCS, pyarrow has NO HMAC-key parameter — only the GCP default chain
+    (ADC / GOOGLE_APPLICATION_CREDENTIALS) or an access token — so HMAC keys configured for DuckDB can't
+    be forwarded; rather than silently authenticate as a different (anonymous/ADC) identity, we fail with
+    a clear message. A custom GCS endpoint (emulator) IS forwarded."""
     import pyarrow.fs as pafs
 
     from hub import metadb
     cfg = metadb.get_setting("objectStore", "global", default={}) or {}
     scheme, _, rest = uri.partition("://")
     scheme = scheme.lower()
+    endpoint = str(cfg.get("endpoint") or "").strip()
     if scheme in ("s3", "r2"):
         kw: dict = {}
         if cfg.get("accessKeyId") and cfg.get("secretAccessKey"):
             kw["access_key"], kw["secret_key"] = cfg["accessKeyId"], cfg["secretAccessKey"]
         if cfg.get("region"):
             kw["region"] = cfg["region"]
-        endpoint = str(cfg.get("endpoint") or "").strip()
         if endpoint:  # MinIO / R2 / custom S3-compatible endpoint
             use_ssl = not endpoint.startswith("http://") if cfg.get("useSsl") is None else bool(cfg.get("useSsl"))
             kw["endpoint_override"] = endpoint.split("://", 1)[-1].rstrip("/")
             kw["scheme"] = "https" if use_ssl else "http"
         return pafs.S3FileSystem(**kw), rest
     if scheme in ("gs", "gcs"):
-        return pafs.GcsFileSystem(), rest
+        if cfg.get("accessKeyId") and cfg.get("secretAccessKey"):
+            raise NotImplementedError(
+                "Arrow/Feather (.arrow/.feather/.ipc) over gs:// can't use the configured HMAC keys — "
+                "pyarrow's GCS filesystem supports only Application Default Credentials "
+                "(GOOGLE_APPLICATION_CREDENTIALS / gcloud auth) or an access token. Use parquet/csv/json "
+                "on GCS (which do use the HMAC keys via DuckDB), or configure ADC.")
+        kw = {}
+        if endpoint:  # a GCS emulator (fake-gcs-server)
+            use_ssl = not endpoint.startswith("http://") if cfg.get("useSsl") is None else bool(cfg.get("useSsl"))
+            kw["endpoint_override"] = endpoint.split("://", 1)[-1].rstrip("/")
+            kw["scheme"] = "https" if use_ssl else "http"
+        return pafs.GcsFileSystem(**kw), rest
     raise ValueError(f"unsupported object-store scheme for Arrow/Feather: {scheme}://")
 
 
@@ -247,10 +262,12 @@ class DuckDBAdapter:
             raise NotImplementedError(f"write mode '{mode}' is not supported — use overwrite or append")
         if not obj:
             os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-        # Local overwrite: write to a temp sibling then os.replace, so a failed or cancelled write
-        # never truncates the existing dataset. (Object stores: a single-object PUT lands atomically;
-        # there's no cheap server-side rename, so write in place.) The format is chosen by `low` (the
-        # real extension) while the bytes go to `wtarget`, which is renamed to `target` on success.
+        # Local overwrite: write to a temp sibling then os.replace, so a failed or cancelled write never
+        # truncates the existing dataset. On object stores DuckDB writes parquet/csv/json as a single
+        # object (a PUT — the prior object is replaced only once the new one lands); feather goes through
+        # pyarrow and gets its own temp-key + server-side move below (its streamed multipart upload would
+        # otherwise finalize a partial object on close). The format is chosen by `low` (the real
+        # extension) while the bytes go to `wtarget`, renamed to `target` on success.
         wtarget = target if obj else f"{target}.tmp-{uuid.uuid4().hex[:8]}"
         try:
             if low.endswith((".csv", ".tsv")):
@@ -259,15 +276,25 @@ class DuckDBAdapter:
                 # DuckDB writes JSON out-of-core via COPY; ARRAY true emits a top-level [] read_json reads back
                 rel.query("_w", f"COPY _w TO '{wtarget.replace(chr(39), chr(39) * 2)}' (FORMAT JSON, ARRAY true)")
             elif low.endswith((".arrow", ".feather", ".ipc")):
-                # Arrow-IPC has no DuckDB writer; go through pyarrow. On an object store pyarrow.feather
-                # given a raw "s3://…" string would write a LOCAL file of that name (silent corruption) —
-                # so open a real object stream via pyarrow's filesystem instead. (Materializes the table
-                # in RAM either way: feather is a whole-file format with no streaming writer here.)
+                # Arrow-IPC has no DuckDB writer; go through pyarrow. On an object store, pyarrow.feather
+                # given a raw "s3://…" string would write a LOCAL file of that name (silent corruption),
+                # so open a real object stream via pyarrow's filesystem. open_output_stream finalizes its
+                # multipart upload on close() even on an error/cancel — so write to a TEMP key and promote
+                # with a server-side move only on success, leaving the prior object intact if the write
+                # (or to_arrow_table, which materializes the whole table in RAM) fails partway.
                 import pyarrow.feather as feather
                 if obj:
                     fs, p = object_fs(target)
-                    with fs.open_output_stream(p) as f:
-                        feather.write_feather(rel.to_arrow_table(), f)
+                    tmp = f"{p}.tmp-{uuid.uuid4().hex[:8]}"
+                    try:
+                        with fs.open_output_stream(tmp) as f:
+                            feather.write_feather(rel.to_arrow_table(), f)
+                        fs.move(tmp, p)  # server-side copy+delete; the destination is replaced only now
+                    except BaseException:
+                        import contextlib
+                        with contextlib.suppress(Exception):
+                            fs.delete_file(tmp)
+                        raise
                 else:
                     feather.write_feather(rel.to_arrow_table(), wtarget)
             else:
