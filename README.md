@@ -28,8 +28,8 @@ cd kernel && uv run dataplay --workspace ./my-proj --port 8471
 (A *workspace* is just a project directory — it holds your canvases, catalog, outputs, and plugins;
 it defaults to the current directory.)
 
-**New here?** The **[5-minute tour](docs/TUTORIAL.md)** builds a real pipeline on the seeded data:
-events → keep purchases → total per user → save.
+**New here?** Open the file menu → **New from example** for a one-click, runnable starter canvas on the
+seeded data, or take the **[5-minute tour](docs/TUTORIAL.md)**: events → keep purchases → total per user → save.
 
 ---
 
@@ -39,12 +39,18 @@ events → keep purchases → total per user → save.
   workspace catalog starts as your local files; add more by registering a path (`POST /api/catalog/register`
   or a `source` node), or **upload a file** — drag it onto the canvas to drop a bound `source` node, or use
   the Upload button in a source node / the Tables view.
-- **Explore & transform** — `filter`, `select`, `join`, `aggregate`, `sort`, `dedup`, `sql`, `sample`,
-  `metric`, `chart`, `vector-search`, and `transform` (arbitrary Python) nodes that **actually execute**.
+- **Explore & transform** — `filter`, `select`, `join`, `aggregate`, `sort`, `dedup`, `window`, `fill`,
+  `unnest`, `sql`, `sample`, `metric`, `chart`, `vector-search`, and `transform` (arbitrary Python) nodes
+  that **actually execute**.
+- **Check the data, not just the shape** — an `assert` node is a data-quality gate: a per-row SQL
+  predicate whose output *is* the violating rows (so you see exactly what failed), with `severity=error`
+  to fail the run. Pin an **output-schema contract** on a code node — inline, or a named/versioned
+  workspace contract many pipelines reference — and `enforce` it to fail the run on schema drift.
 - **See your pipeline three ways** — its **shape** (typed nodes and wires on the canvas), its **data**
   (click any node's eye for the real rows + schema flowing out of it on a bounded sample — media
-  thumbnails, a vector inspector, charts), and its **execution** (per-node run state, a run panel, and
-  persisted run history).
+  thumbnails, a vector inspector, charts), and its **execution** (live per-node progress + a stall hint,
+  a run panel, failure diagnosis that names the node that broke and suggests a fix, and persisted run
+  history with native charts of run duration + per-node time).
 - **See how tables relate** — the catalog detects join keys, measures cardinality on real data
   (1:1 / 1:N / N:M), and suggests how two datasets join; declare keys/relationships by hand and view
   them as an ER/UML diagram.
@@ -66,8 +72,8 @@ This is the one idea everything else follows from.
 A node does **not** run Python row-by-row on the server. Instead it **builds one step of a typed
 logical plan**:
 
-- a **relational op** (`filter` / `select` / `join` / `aggregate` / `sort` / `dedup` / `sql`) becomes a
-  DuckDB relation — pushed down, optimized, and out-of-core; or
+- a **relational op** (`filter` / `select` / `join` / `aggregate` / `sort` / `dedup` / `window` / `fill`
+  / `unnest` / `assert` / `sql`) becomes a DuckDB relation — pushed down, optimized, and out-of-core; or
 - the `transform` escape hatch runs your own Python — and even this isn't row-by-row: it's a
   **batched** function over Arrow `RecordBatch`es, deferred into the same plan and portable to any
   runner. A `map_batches` cell picks how each batch arrives — row dicts (default), a **pandas
@@ -97,10 +103,11 @@ computed `metric` / `value`.)
 The port **schema** is resolved metadata-only for a relational op (no data scanned), so you see its
 columns before running. A code op (`transform` / a plugin) is untyped until it runs — but you can
 **declare** its output columns, or **infer** them from a sample, as a contract that types its port and
-everything downstream (Inspector → *Output schema*). It's a **non-enforcing** type system: if a node's
-config references a column its input doesn't have, the node and the wire flag it amber — a hint, never a
-block, and only when the input schema is actually known. Cards also show a conservative **`~N rows`**
-size estimate before you run.
+everything downstream (Inspector → *Output schema*), or reference a shared named/versioned contract.
+Typing is **non-enforcing by default**: if a node's config references a column its input doesn't have,
+the node and the wire flag it amber — a hint, never a block, and only when the input schema is actually
+known. Opt a contract into `enforce` and it flips to a hard gate — the run fails on schema drift. Cards
+also show a conservative **`~N rows`** size estimate before you run.
 
 ---
 
@@ -259,8 +266,14 @@ must (a backend change, a fan-out, or a `checkpoint`). Each region:
   later run needs the result on a different tier, it's copied, not recomputed.
 
 The **run-plan preview** (a node's Inspector → *Run plan*) shows this before you run — the regions,
-each region's backend, its handoff tier, and its estimated rows. It appears only when placement actually
-splits or routes; a plain local graph just shows its `~N rows` estimate on the card.
+each region's backend, its handoff tier, and its estimated rows — plus two **pre-flight** checks: a
+resource need no backend can satisfy is flagged with what *is* available ("needs 4×a100 — backends
+advertise: 2×a100", from each backend's `workers()` capacity), and an object-store source with a huge
+fragment count or cold-tier (Glacier) objects is flagged before a full run hangs or OOMs on it. It
+appears only when placement splits/routes or a pre-flight warns; a plain local graph just shows its
+`~N rows` estimate on the card. Confirmation gates on estimated **data volume** (bytes, not just row
+count). A distributed backend that reports per-step progress also drives the live progress bar + stall
+hint — no fabricated ETA.
 
 **Adding a distributed backend is a plugin.** Implement the `ExecutionBackend` protocol, plus the
 optional `PlaceableBackend` — `workers()` / `place(requires)` / `run_unit(graph, output_node, output_uri)`
