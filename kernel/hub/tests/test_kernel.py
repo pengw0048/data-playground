@@ -356,6 +356,28 @@ def test_sql_join_and_window_preview_faithfully(tmp_path):
     assert sql_needs_full_input("SELECT *, row_number() OVER (ORDER BY x) FROM input")
     assert sql_needs_full_input("SELECT * FROM input QUALIFY row_number() OVER (ORDER BY x) = 1")
     assert not sql_needs_full_input("SELECT * FROM input WHERE x > 0")
+    # cross-input shapes that read a SECOND input CTE also lie on truncated prefixes (acceptance #1/#2):
+    assert sql_needs_full_input("SELECT * FROM input INTERSECT SELECT * FROM input2")   # set operator
+    assert sql_needs_full_input("SELECT * FROM input EXCEPT SELECT * FROM input2")
+    assert sql_needs_full_input("SELECT input.id FROM input, input2 WHERE input.id = input2.id")  # comma-join
+    assert sql_needs_full_input("SELECT * FROM input WHERE id IN (SELECT id FROM input2)")  # subquery-join
+    # the named-window form `OVER w … WINDOW w AS (…)` must be caught like the paren form (acceptance #3):
+    assert sql_needs_full_input("SELECT id, rank() OVER w AS r FROM input WINDOW w AS (ORDER BY id DESC)")
+    assert sql_needs_full_input("SELECT id, sum(x) OVER w FROM input WINDOW w AS (ORDER BY id)")
+    assert not sql_needs_full_input("SELECT overflow FROM input WHERE overflow > 0")  # no false-positive on 'over…'
+    # AST-parser wins the cases a regex misses (PR #35 review): a QUOTED window name, a self-join, a
+    # self-subquery-join — all caught; a mere COLUMN named `input2` is NOT a table ref → not flagged.
+    assert sql_needs_full_input('SELECT rank() OVER "w" AS r FROM input WINDOW "w" AS (ORDER BY id DESC)')
+    assert sql_needs_full_input("SELECT * FROM input a, input b WHERE a.id = b.id + 1000")   # self comma-join
+    assert sql_needs_full_input("SELECT * FROM input WHERE id IN (SELECT id - 1000 FROM input)")  # self subquery
+    assert not sql_needs_full_input("SELECT input2 FROM input")          # input2 here is a COLUMN, not a table
+    assert not sql_needs_full_input("WITH t AS (SELECT * FROM input) SELECT * FROM t")  # single-input CTE, faithful
+    # a statement-level ORDER BY / top-N is sorted within the prefix → unfaithful on a sample (like the
+    # sort node); a windowed / intra-aggregate ORDER BY is NOT a statement sort so it must NOT trip this:
+    assert sql_needs_full_input("SELECT id FROM input ORDER BY score DESC LIMIT 3")   # top-N
+    assert sql_needs_full_input("SELECT * FROM input ORDER BY x")                      # sorted preview
+    assert not sql_needs_full_input("SELECT * FROM input LIMIT 10")                    # a bare prefix IS faithful
+    assert not sql_needs_full_input("SELECT list(x ORDER BY x) FROM input GROUP BY k") # agg ORDER BY, not a sort
     left, right = str(tmp_path / "l.parquet"), str(tmp_path / "r.parquet")
     # matching keys live only past the 2000-row preview window of the left input
     duckdb.connect().execute(f"COPY (SELECT i AS id FROM range(0,3000) t(i)) TO '{left}' (FORMAT PARQUET)")
@@ -1291,6 +1313,15 @@ def test_schema_contract_type_model_is_specificity_faithful():
     # list<int> contract FALSE-FAILED against an int list (VARCHAR[] vs BIGINT[]). The type model now
     # honors the contract's specificity: coarse stays lenient, precise is enforced exactly.
     from hub.executors.engine import canonical_type as C, type_satisfies as S, _duck_type
+
+    # the COARSEST want — a typeless (name-only) contract column — asserts presence only, so it accepts
+    # any actual (acceptance #4: it used to FALSE-FAIL every real type because ("other","") hit no branch).
+    assert S(C(""), C("BIGINT")) and S(C(""), C("VARCHAR")) and S(C(""), C("STRUCT(a INTEGER)"))
+    assert not S(C("geometry"), C("BIGINT"))          # a NAMED unknown type still compares exactly
+    assert S(C("geometry"), C("geometry"))
+    # only a genuinely-EMPTY type is the wildcard — an unrecognized-but-NON-empty type (numpy dtype
+    # `<i8`, malformed `(int)`) must stay STRICT, else a precise contract silently widens (PR #35 review).
+    assert not S(C("<i8"), C("BIGINT")) and not S(C("<f8"), C("DOUBLE")) and not S(C("(int)"), C("BIGINT"))
 
     # coarse / inferred (display-coarse) contracts stay lenient against the precise actual
     assert S(C("float"), C("DECIMAL(38,9)"))          # a float contract accepts a decimal actual

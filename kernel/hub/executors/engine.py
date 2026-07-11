@@ -21,6 +21,11 @@ from hub.ir import resolve_config  # single source of built-in node config resol
 from hub.models import PREVIEWABLE_MODES, ColumnSchema, Graph, GraphNode
 from hub.plugins.adapters import display_type, relation_columns
 from hub.plugins.capabilities import tag_columns
+# The faithful-preview SQL gates parse with DuckDB's OWN parser (hub.sqlanalyze) rather than regex, so
+# detection matches execution exactly — handling quoting / string literals / a column named `input2` /
+# nested subqueries a regex cannot. Re-exported so callers + tests keep the `engine.sql_*` names.
+from hub.sqlanalyze import needs_full_input as sql_needs_full_input
+from hub.sqlanalyze import reduces_rows as sql_reduces_rows
 
 Relation = duckdb.DuckDBPyRelation
 
@@ -28,56 +33,6 @@ Relation = duckdb.DuckDBPyRelation
 NOT_PREVIEWABLE_KINDS = {"aggregate", "write", "opaque", "loop", "section"}
 _TRANSFORM_KINDS = {"transform", "notebook"}
 
-# aggregate functions whose presence (outside a window) means a sql query REDUCES rows — so previewing
-# it over a 2000-row sample would present a partial aggregate as the complete result (a silent lie).
-_SQL_AGG_FNS = ("count", "count_star", "sum", "avg", "mean", "min", "max", "min_by", "max_by", "median",
-                "mode", "product", "any_value", "arbitrary", "stddev", "stddev_pop", "stddev_samp",
-                "variance", "var_pop", "var_samp", "bool_and", "bool_or", "bit_and", "bit_or", "arg_max",
-                "arg_min", "approx_count_distinct", "quantile", "quantile_cont", "quantile_disc", "list",
-                "array_agg", "string_agg", "geomean", "corr", "covar_pop", "covar_samp", "entropy",
-                "kurtosis", "skewness", "bitstring_agg", "histogram", "first", "last")
-# longest-first so `count_star`/`min_by` match before `count`/`min`
-_SQL_AGG_RE = re.compile(r"\b(?:" + "|".join(sorted(_SQL_AGG_FNS, key=len, reverse=True)) + r")\s*\(", re.I)
-_OVER_RE = re.compile(r"\s*over\b", re.I)
-
-
-def _has_reducing_aggregate(s: str) -> bool:
-    """True iff some aggregate-fn call is NOT a window (`agg(...)` not immediately followed by OVER). A
-    window function preserves rows, so a query where EVERY aggregate is windowed doesn't reduce; but a
-    genuine outer aggregate that merely COEXISTS with a windowed one (e.g. `SELECT count(*) FROM (… OVER …)`)
-    still reduces — so the OVER exemption must be per-aggregate, not applied to the whole string."""
-    for m in _SQL_AGG_RE.finditer(s):
-        depth, i = 1, m.end()  # m.end() is just past the '('; skip to the matching ')'
-        while i < len(s) and depth:
-            depth += (s[i] == "(") - (s[i] == ")")
-            i += 1
-        if not _OVER_RE.match(s[i:]):  # this aggregate is not windowed → it collapses rows
-            return True
-    return False
-
-
-def sql_reduces_rows(q: str) -> bool:
-    """Best-effort: does this SQL aggregate / reduce rows, so a sampled preview would mislead? Flags
-    GROUP BY / HAVING / SELECT DISTINCT, and a non-windowed aggregate. Conservative — it may over-flag
-    (→ 'run a full pass'), never under-flag."""
-    s = re.sub(r"\s+", " ", q or "").strip()
-    if not s:
-        return False
-    if re.search(r"\bgroup\s+by\b", s, re.I) or re.search(r"\bhaving\b", s, re.I):
-        return True
-    if re.search(r"\bselect\s+distinct\b", s, re.I):
-        return True
-    return _has_reducing_aggregate(s)
-
-
-def sql_needs_full_input(q: str) -> bool:
-    """True if this SQL is row-preserving but reads its input NON-LOCALLY, so a per-input 2000-row sample
-    would lie even though it doesn't reduce rows: a JOIN (two truncated prefixes rarely match), a window
-    function (rank/running-agg computed within the sample), or QUALIFY. Such a query must run over the
-    full inputs in preview (display bounded by the preview LIMIT), like the join/window nodes."""
-    s = re.sub(r"\s+", " ", q or "")
-    return bool(re.search(r"\bjoin\b", s, re.I) or re.search(r"\bover\s*\(", s, re.I)
-                or re.search(r"\bqualify\b", s, re.I))
 
 
 class NotPreviewable(Exception):
@@ -181,10 +136,13 @@ def _split_field(f: str) -> tuple[str, str]:
 
 def canonical_type(t: object) -> tuple:
     """Parse a column type string (either dialect) into a canonical, comparable tuple. Unspecified detail
-    is None (a bare `list`/`struct`/`map`/`timestamp` from a coarse/inferred contract stays lenient)."""
+    is None (a bare `list`/`struct`/`map`/`timestamp` from a coarse/inferred contract stays lenient). A
+    genuinely EMPTY type gets the dedicated `("any",)` sentinel (a name-only contract → wildcard) — kept
+    distinct from `("other","")`, which an unrecognized but NON-empty type like `<i8` produces and which
+    must stay STRICT (a precise-but-unparsed contract, not a wildcard)."""
     s = str(t or "").strip()
     if not s:
-        return ("other", "")
+        return ("any",)
     if s.endswith("[]"):
         return ("list", canonical_type(s[:-2]))
     low = s.lower()
@@ -242,6 +200,9 @@ def type_satisfies(want: tuple, actual: tuple) -> bool:
     exactly. This is what makes a hand-written precise contract faithful without breaking inferred ones."""
     if want == actual:
         return True
+    if want == ("any",):  # a TYPELESS contract column (no type given) asserts NAME-ONLY presence — the
+        return True       # coarsest want, accepts any actual. (An unrecognized non-empty type is ("other",
+                          # head) and stays STRICT, so `<i8` never silently becomes a wildcard.)
     wk = want[0]
     if wk == "float":  # numeric coarse: a float contract also accepts a decimal actual
         return actual[0] in ("float", "decimal")
