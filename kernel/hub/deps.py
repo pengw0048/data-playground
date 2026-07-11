@@ -271,7 +271,7 @@ class Deps:
         # (they live in storage, separate from the seeded data_dir).
         for uri in self.storage.list_outputs():
             name = os.path.splitext(os.path.basename(uri.rstrip("/")))[0]
-            self.catalog.register_output(name=name, uri=uri, version="v1", parents=[], pipeline="canvas")
+            self.catalog.register_output(name=name, uri=uri, parents=[], pipeline="canvas")  # content-addressed version
         self.runner = LocalRunner(self.resolve_adapter, self.registry, self.catalog, workspace,
                                   node_builders=self.node_builders, node_specs=self.node_specs,
                                   storage=self.storage)

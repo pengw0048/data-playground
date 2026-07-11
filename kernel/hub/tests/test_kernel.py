@@ -1490,6 +1490,30 @@ def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
         metadb.set_setting("objectStore", {}, "global")
 
 
+def test_output_version_is_content_addressed_and_flags_schema_drift(tmp_path, caplog):
+    # ARC4 output-versioning: an output's catalog version is a CONTENT hash of (schema + rows + fingerprint),
+    # not a frozen 'v1' — the SAME data re-registers to the SAME version (a restart never spuriously bumps),
+    # a changed schema/rows yields a NEW version, and an overwrite whose schema DRIFTED logs a warning.
+    import logging
+
+    import duckdb
+    from hub.deps import Deps
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    cat = d.catalog
+    p = str(tmp_path / "out.parquet")
+    duckdb.connect().execute(f"COPY (SELECT 1 AS id, 10 AS v) TO '{p}' (FORMAT PARQUET)")
+    t1 = cat.register_output(name="out", uri=p, parents=[])
+    assert t1.version and t1.version != "v1" and t1.version.startswith("v")  # content-addressed, not 'v1'
+    t2 = cat.register_output(name="out", uri=p, parents=[])                    # same file, unchanged
+    assert t2.version == t1.version, "re-registering identical data must keep the version (no restart bump)"
+    # overwrite with a DRIFTED schema → new version + a schema-change warning
+    duckdb.connect().execute(f"COPY (SELECT 1 AS id, 'x' AS label, 2.0 AS score) TO '{p}' (FORMAT PARQUET)")
+    with caplog.at_level(logging.WARNING, logger="hub"):
+        t3 = cat.register_output(name="out", uri=p, parents=[])
+    assert t3.version != t1.version, "a changed schema must produce a new version"
+    assert any("schema changed" in r.getMessage() for r in caplog.records), "schema drift must be surfaced"
+
+
 def test_source_csv_parse_options(tmp_path):
     # the source node can override CSV auto-detection (delimiter + header) — needed for semicolon files,
     # headerless files, etc. Blank/'auto' keeps DuckDB's sniffer.

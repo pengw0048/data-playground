@@ -49,25 +49,47 @@ class InMemoryCatalog:
             if not (fn.endswith(self._EXTS) or is_lance):
                 continue
             name = fn[:-6] if is_lance else os.path.splitext(fn)[0]
-            self._add(name=name, uri=path, version="v1")
+            self._add(name=name, uri=path)  # content-addressed version
 
-    def _add(self, name: str, uri: str, version: str, meta: str | None = None) -> CatalogTable:
+    def _add(self, name: str, uri: str, version: str | None = None, meta: str | None = None) -> CatalogTable:
         # id from the uri (names collide across different files); fall back to name if uri is reused
         import hashlib as _h
-        # schema/count probe (may touch disk/network) OUTSIDE the lock so a slow adapter doesn't block
-        # concurrent catalog reads; only the dict mutation below is serialized.
+        # schema/count/fingerprint probe (may touch disk/network) OUTSIDE the lock so a slow adapter doesn't
+        # block concurrent catalog reads; only the dict mutation below is serialized.
         try:
             adapter = self.resolve(uri)
             columns = adapter.schema(uri)
             count = adapter.count(uri)
+            fp = adapter.fingerprint(uri)
         except Exception:
-            columns, count = [], None
+            columns, count, fp = [], None, "unknown"
         from hub.relationships import key_candidates
         keys = key_candidates(columns)  # inferred candidates; the declared key is OVERLAID on read (_overlay)
+        # CONTENT-ADDRESSED version (version=None): a stable hash of the schema + row count + storage
+        # fingerprint, so the SAME data always gets the SAME version — a restart / re-registration never
+        # spuriously bumps it — while a changed schema, row count, or (local) file content yields a NEW
+        # version. Real, comparable history instead of a frozen 'v1'. An explicit version (a plugin's
+        # register, or the seed) is honored as-is.
+        if version is None:
+            sig = "|".join(f"{c.name}:{c.type}" for c in columns) + f"|rows={count}|fp={fp}"
+            version = "v" + _h.sha256(sig.encode()).hexdigest()[:10]
         with self._lock:
             tid = f"tbl_{name}" if uri not in self._by_uri else self._by_uri[uri]
             if any(t.id == f"tbl_{name}" and t.uri != uri for t in self.tables.values()):
                 tid = f"tbl_{name}_{_h.sha1(uri.encode()).hexdigest()[:6]}"
+            prior = self.tables.get(tid)
+            # schema-change detection on overwrite: an output whose columns drifted from the prior write is
+            # a silent contract break for downstream consumers — surface it (a WARNING; overwrite is a
+            # deliberate replace, so we don't fail — enforceSchema on a node is the hard gate).
+            if prior and prior.columns and columns:
+                pc = [(c.name, c.type) for c in prior.columns]
+                cc = [(c.name, c.type) for c in columns]
+                if pc != cc:
+                    import logging
+                    logging.getLogger("hub").warning(
+                        "catalog output %r schema changed on overwrite (version %s→%s): added=%s removed=%s",
+                        name, prior.version, version,
+                        [c for c in cc if c not in pc], [c for c in pc if c not in cc])
             table = CatalogTable(
                 id=tid, name=name, uri=uri, row_count=count, version=version,
                 columns=columns, keys=keys, meta=meta,
@@ -213,8 +235,9 @@ class InMemoryCatalog:
         for parent in parents or []:
             self._add_edge(parent, table.uri, pipeline)
 
-    def register_output(self, name: str, uri: str, version: str, parents: list[str],
+    def register_output(self, name: str, uri: str, version: str | None = None, parents: list[str] | None = None,
                         pipeline: str | None = None) -> CatalogTable:
+        # version=None → content-addressed (computed from the written data); a caller no longer pins 'v1'.
         table = self._add(name=name, uri=uri, version=version, meta=pipeline)
         for parent in parents:
             self._add_edge(parent, uri, pipeline)
