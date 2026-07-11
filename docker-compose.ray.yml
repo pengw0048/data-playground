@@ -66,7 +66,10 @@ services:
     # JOIN the cluster as a node (so ray.init(address=auto) connects locally — an external, non-node
     # process can't attach by GCS address), then run the multi-node byte-identical differential.
     entrypoint: ["/bin/sh", "-c"]
-    command: ["ray start --address=ray-head:6379 --num-cpus=2 && python /app/kernel/hub/ray_multinode_check.py; rc=$?; ray stop >/dev/null 2>&1; exit $rc"]
+    # $$ escapes Compose's own variable interpolation so the SHELL sees $? / $rc (else Compose expands
+    # them to empty and `exit` returns 0 even when the differential FAILED — the check's real exit code
+    # must propagate so `docker compose run` is a trustworthy CI gate). OPS-12.
+    command: ["ray start --address=ray-head:6379 --num-cpus=2 && python /app/kernel/hub/ray_multinode_check.py; rc=$$?; ray stop >/dev/null 2>&1; exit $$rc"]
     volumes:
       - ./kernel/hub/ray_multinode_check.py:/app/kernel/hub/ray_multinode_check.py:ro
     networks: [dpray]
