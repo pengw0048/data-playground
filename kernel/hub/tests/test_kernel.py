@@ -786,7 +786,23 @@ def test_metric_edge_wire_does_not_422():
 def test_decimal_serialized_as_number():
     r = client.post("/api/data/sample", json={"uri": _uri("events"), "k": 3}).json()
     amounts = [row["amount"] for row in r["rows"]]
-    assert all(isinstance(a, (int, float)) for a in amounts)  # not strings
+    assert all(isinstance(a, (int, float)) for a in amounts)  # small decimals stay numeric
+
+
+def test_high_precision_decimal_previews_exactly():
+    # a DECIMAL whose value exceeds float64's ~15 exact digits must preview as the EXACT value the run
+    # writes, not a rounded float — otherwise preview disagrees with the written parquet.
+    import decimal
+
+    import pyarrow as pa
+    from hub.executors.engine import _table_to_rows
+    tbl = pa.table({
+        "big": pa.array([decimal.Decimal("12345678901234567.123456789")], type=pa.decimal128(38, 9)),
+        "price": pa.array([decimal.Decimal("9.99")], type=pa.decimal128(6, 2)),
+    })
+    row = _table_to_rows(tbl)[0]
+    assert row["big"] == "12345678901234567.123456789"        # exact string, not a rounded float
+    assert isinstance(row["price"], float) and row["price"] == 9.99  # small decimal stays numeric
 
 
 def test_plugin_run_applies_lowering(tmp_path):

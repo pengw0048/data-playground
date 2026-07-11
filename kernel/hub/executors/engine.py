@@ -852,7 +852,11 @@ def _table_to_rows(tbl: "pa.Table") -> list[dict]:
     for r in rows:
         for k, v in list(r.items()):
             if isinstance(v, decimal.Decimal):
-                r[k] = float(v)  # schema says float; don't ship a Decimal (serializes as string)
+                # ship a number when float round-trips the EXACT value (prices etc. — keeps grid
+                # sort/charts/numeric rendering), else an exact string, so the previewed value never
+                # disagrees with the exact value the run writes to parquet (faithful preview).
+                fv = float(v)
+                r[k] = fv if decimal.Decimal(repr(fv)) == v else str(v)
             elif isinstance(v, (bytes, bytearray)):
                 r[k] = f"<{len(v)} bytes>"
             elif hasattr(v, "isoformat"):
