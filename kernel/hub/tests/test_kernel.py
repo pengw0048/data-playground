@@ -1128,6 +1128,41 @@ def test_flat_map_streams_lazily_and_byte_estimate_tracks_payload():
     assert _est_row_bytes({"b": b"x" * 10_000}) > 100 * _est_row_bytes({"n": 1})
 
 
+def test_schema_contract_type_model_is_specificity_faithful():
+    # a schema contract used to compare types through a COARSE bucket — so a decimal(38,9) contract
+    # matched a plain double, a timestamp[ns] matched a us timestamp (false PASS on real drift), and a
+    # list<int> contract FALSE-FAILED against an int list (VARCHAR[] vs BIGINT[]). The type model now
+    # honors the contract's specificity: coarse stays lenient, precise is enforced exactly.
+    from hub.executors.engine import canonical_type as C, type_satisfies as S, _duck_type
+
+    # coarse / inferred (display-coarse) contracts stay lenient against the precise actual
+    assert S(C("float"), C("DECIMAL(38,9)"))          # a float contract accepts a decimal actual
+    assert S(C("list"), C("INTEGER[]"))               # bare list accepts a typed list (was a false FAIL)
+    assert S(C("struct"), C("STRUCT(a INTEGER)"))
+    assert S(C("map"), C("MAP(VARCHAR, BIGINT)"))
+    assert S(C("timestamp"), C("TIMESTAMP_NS"))
+    assert S(C("int"), C("BIGINT")) and S(C("string"), C("VARCHAR"))
+
+    # a PRECISE contract is now enforced faithfully — real drift no longer passes
+    assert S(C("decimal(38,9)"), C("DECIMAL(38,9)"))
+    assert not S(C("decimal(38,9)"), C("DECIMAL(10,2)"))
+    assert not S(C("decimal(38,9)"), C("DOUBLE"))
+    assert S(C("list<int>"), C("INTEGER[]")) and not S(C("list<int>"), C("VARCHAR[]"))
+    assert S(C("struct<a:int,b:string>"), C("STRUCT(a INTEGER, b VARCHAR)"))
+    assert not S(C("struct<a:int>"), C("STRUCT(a VARCHAR)"))
+    assert S(C("map<string,int>"), C("MAP(VARCHAR, BIGINT)"))
+    assert not S(C("map<string,int>"), C("MAP(VARCHAR, VARCHAR)"))
+    assert S(C("timestamp[ns]"), C("TIMESTAMP_NS")) and not S(C("timestamp[ns]"), C("TIMESTAMP"))
+    assert S(C("timestamp[us]"), C("TIMESTAMP"))       # microsecond is the unmarked DuckDB default
+    assert S(C("timestamp with time zone"), C("TIMESTAMP WITH TIME ZONE"))
+    assert not S(C("timestamp with time zone"), C("TIMESTAMP"))
+
+    # _duck_type now builds a PRECISE stand-in so a declared contract propagates faithfully downstream
+    assert _duck_type("decimal(38,9)") == "DECIMAL(38,9)"
+    assert _duck_type("list<int>") == "BIGINT[]"
+    assert _duck_type("int") == "BIGINT" and _duck_type("string") == "VARCHAR"  # coarse still coarse
+
+
 def test_write_mode_append_builds_a_readable_directory_dataset():
     # append is REAL: it writes a directory of part files that reads back as the accumulated rows
     def append_run():

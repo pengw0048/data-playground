@@ -132,6 +132,167 @@ _DUCK_TYPE = {
     "blob": "BLOB", "bytes": "BLOB", "json": "JSON",
 }
 
+# --- schema-contract type model -------------------------------------------------------------------- #
+# A column type is parsed to a canonical tuple so a declared contract can be compared to an actual
+# DuckDB type FAITHFULLY — preserving what matters (decimal precision/scale, timestamp unit/tz, and the
+# element types of list/struct/map) rather than collapsing everything to a coarse bucket. canonical_type
+# accepts BOTH the user dialect (`list<int>`, `struct<a:int>`, `decimal(38,9)`, `timestamp[ns]`) and the
+# DuckDB dialect (`INTEGER[]`, `STRUCT(a INTEGER)`, `DECIMAL(38,9)`, `TIMESTAMP_NS`).
+_INT_NAMES = {"int", "integer", "bigint", "long", "smallint", "tinyint", "hugeint", "ubigint",
+              "uinteger", "usmallint", "utinyint", "uint", "int2", "int4", "int8", "int16", "int32",
+              "int64", "uint8", "uint16", "uint32", "uint64"}
+_FLOAT_NAMES = {"float", "double", "real", "number", "float4", "float8", "double precision"}
+_STR_NAMES = {"string", "str", "text", "varchar", "char", "bpchar", "utf8", "uuid"}
+_BYTES_NAMES = {"blob", "bytes", "binary", "varbinary", "bytea"}
+
+
+def _split_top(s: str) -> list[str]:
+    """Split `s` on top-level commas, respecting <>, (), [] nesting (so a struct/map's inner commas
+    don't split the field list)."""
+    out, depth, cur = [], 0, []
+    for ch in s:
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur)); cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return [x.strip() for x in out if x.strip()]
+
+
+def _split_field(f: str) -> tuple[str, str]:
+    """A struct field spec → (name, type_str). Accepts `name:type` (user dialect) and `name type`
+    (DuckDB), including a double-quoted name that may contain spaces."""
+    f = f.strip()
+    if f.startswith('"'):
+        end = f.find('"', 1)
+        if end > 0:
+            rest = f[end + 1:].strip()
+            return f[1:end], (rest[1:].strip() if rest.startswith(":") else rest)
+    if ":" in f and " " not in f.split(":", 1)[0].strip():
+        name, _, ftype = f.partition(":")
+        return name.strip(), ftype.strip()
+    parts = f.split(None, 1)
+    return (parts[0], parts[1]) if len(parts) == 2 else (f, "")
+
+
+def canonical_type(t: object) -> tuple:
+    """Parse a column type string (either dialect) into a canonical, comparable tuple. Unspecified detail
+    is None (a bare `list`/`struct`/`map`/`timestamp` from a coarse/inferred contract stays lenient)."""
+    s = str(t or "").strip()
+    if not s:
+        return ("other", "")
+    if s.endswith("[]"):
+        return ("list", canonical_type(s[:-2]))
+    low = s.lower()
+    idxs = [i for i in (low.find("<"), low.find("(")) if i >= 0]
+    lb = min(idxs) if idxs else -1
+    head = (low[:lb] if lb >= 0 else low).strip()
+    inner = s[lb + 1:-1].strip() if (lb >= 0 and s[-1:] in ">)") else ""
+    if head in ("list", "array"):
+        return ("list", canonical_type(inner) if inner else None)
+    if head == "map":
+        parts = _split_top(inner) if inner else []
+        return ("map", canonical_type(parts[0]), canonical_type(parts[1])) if len(parts) == 2 else ("map", None, None)
+    if head in ("struct", "row"):
+        if not inner:
+            return ("struct", None)
+        return ("struct", tuple((n, canonical_type(ft)) for n, ft in (_split_field(f) for f in _split_top(inner))))
+    if head in ("decimal", "numeric"):
+        args = _split_top(inner) if inner else []
+        if args and args[0]:
+            try:
+                return ("decimal", int(args[0]), int(args[1]) if len(args) > 1 else 0)
+            except ValueError:
+                pass
+        return ("float",)  # bare decimal → numeric coarse (matches double/decimal), no precision asserted
+    if head.startswith("timestamp") or head == "datetime":
+        m = re.search(r"[\[_( ]\s*(ns|us|ms|s)\b", low)
+        unit = m.group(1) if m else None
+        if unit == "us":
+            unit = None  # microsecond is DuckDB's unmarked default → coarse, so `TIMESTAMP` == `timestamp[us]`
+        tz = True if ("time zone" in low or low.endswith("tz")) else None
+        return ("timestamp", unit, tz)
+    if head in _INT_NAMES:
+        return ("int",)
+    if head in _FLOAT_NAMES:
+        return ("float",)
+    if head in _STR_NAMES:
+        return ("string",)
+    if head in _BYTES_NAMES:
+        return ("bytes",)
+    if head in ("bool", "boolean"):
+        return ("bool",)
+    if head == "date":
+        return ("date",)
+    if head == "time":
+        return ("time",)
+    if head == "json":
+        return ("json",)
+    return ("other", head)
+
+
+def type_satisfies(want: tuple, actual: tuple) -> bool:
+    """Does `actual` satisfy the `want` contract type? The contract's SPECIFICITY sets the strictness: a
+    coarse want (bare `list`, `float`, `timestamp`) accepts any refinement, so a display-coarse/inferred
+    contract stays lenient; a precise want (`decimal(38,9)`, `list<int>`, `timestamp[ns]`) is enforced
+    exactly. This is what makes a hand-written precise contract faithful without breaking inferred ones."""
+    if want == actual:
+        return True
+    wk = want[0]
+    if wk == "float":  # numeric coarse: a float contract also accepts a decimal actual
+        return actual[0] in ("float", "decimal")
+    if wk == "decimal":
+        return (actual[0] == "decimal" and (want[1] is None or want[1] == actual[1])
+                and (want[2] is None or want[2] == actual[2]))
+    if wk == "timestamp":
+        return (actual[0] == "timestamp" and (want[1] is None or want[1] == actual[1])
+                and (want[2] is None or want[2] == actual[2]))
+    if wk == "list":
+        return actual[0] == "list" and (want[1] is None
+                                         or (actual[1] is not None and type_satisfies(want[1], actual[1])))
+    if wk == "map":
+        if actual[0] != "map" or want[1] is None:
+            return actual[0] == "map"
+        return (actual[1] is not None and type_satisfies(want[1], actual[1])
+                and type_satisfies(want[2], actual[2]))
+    if wk == "struct":
+        if actual[0] != "struct":
+            return False
+        if want[1] is None:
+            return True
+        if actual[1] is None:
+            return False
+        af = dict(actual[1])
+        return all(nm in af and type_satisfies(wt, af[nm]) for nm, wt in want[1])
+    return want == actual
+
+
+def _canon_to_duck(c: tuple) -> str:
+    """A canonical type → a DuckDB type string for the schema-only stand-in relation."""
+    k = c[0]
+    simple = {"int": "BIGINT", "float": "DOUBLE", "string": "VARCHAR", "bool": "BOOLEAN",
+              "date": "DATE", "time": "TIME", "bytes": "BLOB", "json": "JSON"}
+    if k in simple:
+        return simple[k]
+    if k == "decimal":
+        return f"DECIMAL({c[1] if c[1] is not None else 18},{c[2] if c[2] is not None else 3})"
+    if k == "timestamp":
+        base = {"ns": "TIMESTAMP_NS", "ms": "TIMESTAMP_MS", "s": "TIMESTAMP_S"}.get(c[1], "TIMESTAMP")
+        return base + (" WITH TIME ZONE" if c[2] else "")
+    if k == "list":
+        return f"{_canon_to_duck(c[1])}[]" if c[1] is not None else "VARCHAR[]"
+    if k == "map":
+        return "VARCHAR" if c[1] is None else f"MAP({_canon_to_duck(c[1])}, {_canon_to_duck(c[2])})"
+    if k == "struct":
+        if c[1] is None:
+            return "VARCHAR"
+        return "STRUCT(" + ", ".join(f'"{n}" {_canon_to_duck(t)}' for n, t in c[1]) + ")"
+    return _DUCK_TYPE.get(c[1] if len(c) > 1 else "", "VARCHAR")
+
 
 def declared_schema(node: GraphNode) -> list | None:
     """A user-declared output-schema contract (config.outputSchema) on a code op, or None. Lets a
@@ -147,13 +308,10 @@ def declared_schema(node: GraphNode) -> list | None:
 
 
 def _duck_type(t: object) -> str:
-    """Map a declared/display column type to a DuckDB type for a schema-only stand-in relation. Coarse
-    on purpose (column-NAME propagation is what matters; exact type rarely does) — unknown → VARCHAR."""
-    s = str(t or "").strip()
-    is_list = s.endswith("]") or "list" in s.lower()
-    base = re.sub(r"[\[(<].*$", "", s).strip().lower()
-    d = _DUCK_TYPE.get(base, "VARCHAR")
-    return f"{d}[]" if is_list else d
+    """Map a declared/display column type to a DuckDB type for a schema-only stand-in relation, PRESERVING
+    the detail that matters (decimal precision/scale, timestamp unit/tz, list/struct/map element types)
+    so a declared contract propagates faithfully to downstream ports. Unknown → VARCHAR."""
+    return _canon_to_duck(canonical_type(t))
 
 
 class BuildEngine:
