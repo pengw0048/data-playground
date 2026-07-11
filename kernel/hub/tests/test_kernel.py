@@ -4438,6 +4438,27 @@ def test_estimate_sizes_is_conservative_and_honest():
     assert e4["b"].rows == e4["s"].rows  # bypassed → passthrough
 
 
+def test_estimate_propagates_measured_vector_width_downstream():
+    # estimator-schema-derived: a column's MEASURED width (a real float[512] embedding, from the source
+    # schema) must survive downstream through row-preserving ops — not collapse to the coarse display-type
+    # width ("list" ≈ 128B) at the filter, which would mis-size a downstream region ~30x small and misplace
+    # it local. The estimator now propagates the input's width (conservative max) for pass-through ops.
+    from hub.estimate import estimate_sizes
+    from hub.models import Graph
+    d = get_deps()
+    ev = _uri("events")  # a real source (for the row count); the widths come from the provided schema
+    schemas = {"s": [{"name": "id", "type": "int"}, {"name": "emb", "type": "float[512]"}],
+               "f": [{"name": "id", "type": "int"}, {"name": "emb", "type": "list"}]}  # coarse display at f
+    nodes = [N("s", "source", {"uri": ev}), N("f", "filter", {"predicate": "id >= 0"})]
+    e = estimate_sizes(Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": [E("s", "f")]}),
+                       d.resolve_adapter, schemas=schemas)
+    sw = e["s"].bytes / e["s"].rows
+    assert abs(sw - (8 + 512 * 8)) < 2, f"source width should MEASURE the float[512] vector, got {sw}"
+    fw = e["f"].bytes / e["f"].rows
+    assert abs(fw - sw) < 2, f"filter must propagate the measured width {sw}, not the coarse display width {fw}"
+    assert fw > 1000  # sanity: not collapsed to the ~128B coarse 'list' width
+
+
 def test_row_width_accounts_for_vector_and_list_columns():
     # a fixed-size embedding (float[1024]) must not be scored as its scalar base (float=8B) — that's a
     # ~1000x undercount that mis-sizes a vector working set as tiny and mis-places it local.
