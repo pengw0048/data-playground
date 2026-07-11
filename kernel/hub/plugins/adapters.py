@@ -539,11 +539,21 @@ class LanceAdapter:
              options: dict | None = None) -> Relation:  # options (CSV knobs) don't apply to Lance — ignored
         # stream batches into DuckDB instead of ds.to_table() (which loads the ENTIRE dataset into RAM
         # before handing it over — a real-scale Lance run/write would OOM and defeat out-of-core).
-        reader = self._dataset(uri).scanner(columns=columns, limit=limit).to_reader()
-        rel = db.conn().from_arrow(reader)
+        ds = self._dataset(uri)
         if predicate:
-            rel = rel.filter(predicate)
-        return rel
+            try:
+                # PUSH the filter into Lance's scanner → fragment/scalar-index pruning, and the correct
+                # filter-THEN-limit order (a DuckDB-side filter after a scanner(limit=…) would limit
+                # BEFORE filtering → wrong rows). Lance's filter is a datafusion SQL dialect; on a
+                # predicate it can't parse, fall back to a DuckDB-side filter (correct, just no pushdown).
+                reader = ds.scanner(columns=columns, filter=predicate, limit=limit).to_reader()
+                return db.conn().from_arrow(reader)
+            except Exception:  # noqa: BLE001 — dialect gap → DuckDB filter, applied BEFORE the limit
+                reader = ds.scanner(columns=columns).to_reader()
+                rel = db.conn().from_arrow(reader).filter(predicate)
+                return rel.limit(int(limit)) if limit is not None else rel
+        reader = ds.scanner(columns=columns, limit=limit).to_reader()
+        return db.conn().from_arrow(reader)
 
     def nearest(self, uri: str, column: str, query, k: int = 10) -> Relation:
         """Top-k nearest rows to a query vector via Lance's native search (a vector index if one exists,
@@ -577,9 +587,16 @@ class LanceAdapter:
             import lance
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError("Lance support is not installed — run: uv pip install -e 'kernel[lance]'") from e
+        if mode not in ("overwrite", "append", None):
+            # NOT silently degraded to append (the old `"overwrite" if mode=="overwrite" else "append"`
+            # turned a typo — or an unimplemented merge/update/delete — into a stray append: a correctness
+            # landmine). Lance mutation modes (merge_insert/update/delete) are a future capability.
+            raise NotImplementedError(f"Lance write mode '{mode}' is not supported — use overwrite or append")
         rows = int(rel.aggregate("count(*)").fetchone()[0])
-        # stream RecordBatches into Lance (bounded memory) instead of materializing the whole table
-        reader = rel.record_batch(1 << 16)
+        # stream RecordBatches into Lance (bounded memory) instead of materializing the whole table.
+        # to_arrow_reader — NOT rel.record_batch, which does not exist on DuckDBPyRelation (it resolves as
+        # a column lookup → AttributeError, so the old code broke EVERY Lance write on DuckDB 1.5.x).
+        reader = rel.to_arrow_reader(1 << 16)
         lance.write_dataset(reader, path_of(uri), mode="overwrite" if mode == "overwrite" else "append")
         return {"uri": uri, "rows": rows}
 
