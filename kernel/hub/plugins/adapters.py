@@ -302,9 +302,10 @@ class DuckDBAdapter:
         tmp_dir = d + f".compact-{uuid.uuid4().hex[:8]}"
         os.makedirs(tmp_dir, exist_ok=True)
         try:
-            with db.run_scope() as sc:  # own cursor — compaction reads/writes off the base lock
-                rel = self._read_dir(sc.con, d)                      # union of all parts
-                self._write_part(rel, os.path.join(tmp_dir, f"part-compacted-{uuid.uuid4().hex[:12]}{ext}"), ext)
+            # use the CURRENT connection/cursor (db.conn() = the run's scope cursor if any, else base) —
+            # NOT a nested db.run_scope(), which would clobber the enclosing run's thread-local cursor.
+            rel = self._read_dir(db.conn(), d)                       # union of all parts
+            self._write_part(rel, os.path.join(tmp_dir, f"part-compacted-{uuid.uuid4().hex[:12]}{ext}"), ext)
             shutil.rmtree(d)                                          # originals fully read into the compacted part
             os.replace(tmp_dir, d)                                   # atomic swap; d is now ONE compacted part
         except BaseException:
