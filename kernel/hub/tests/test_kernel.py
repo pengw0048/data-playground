@@ -789,6 +789,25 @@ def test_decimal_serialized_as_number():
     assert all(isinstance(a, (int, float)) for a in amounts)  # small decimals stay numeric
 
 
+def test_ident_escapes_embedded_quotes_not_strips(tmp_path):
+    # _ident used to STRIP embedded quotes, so a real column named e.g. `a"b` silently addressed a
+    # different/nonexistent column; it must DOUBLE them (SQL escaping) so the right column resolves.
+    from hub.executors.engine import _ident
+    assert _ident('a"b') == 'a""b' and _ident("normal") == "normal"
+    # functional: a metric over a column whose real name contains a quote resolves to THAT column (the
+    # old strip would have addressed a different/nonexistent column or thrown a parser error).
+    import duckdb
+    p = str(tmp_path / "q.parquet")
+    duckdb.connect().execute('''COPY (SELECT 5 AS "wei""rd") TO '%s' (FORMAT PARQUET)''' % p)
+    g = {"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": p}),
+        N("m", "metric", {"agg": "max", "column": 'wei"rd'}),
+    ], "edges": [E("s", "m")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "m", "k": 5}).json()
+    assert not r.get("error") and not r.get("notPreviewable"), r.get("reason")
+    assert r["rows"][0]["value"] == 5
+
+
 def test_high_precision_decimal_previews_exactly():
     # a DECIMAL whose value exceeds float64's ~15 exact digits must preview as the EXACT value the run
     # writes, not a rounded float — otherwise preview disagrees with the written parquet.

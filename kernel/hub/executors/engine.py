@@ -447,7 +447,7 @@ class BuildEngine:
             value = (cfg.get("value") or "").strip()
 
             def _fill(c: str) -> str:
-                q = f'"{c}"'
+                q = f'"{_ident(c)}"'
                 if method == "constant":
                     return f"COALESCE({q}, {value})" if value else q  # blank value → no-op replace
                 if method == "zero":
@@ -888,7 +888,9 @@ def _agg_name(agg: str) -> str:
 
 
 def _ident(col: str) -> str:
-    return str(col).replace('"', '')  # strip quotes; the caller wraps in "..."
+    # DOUBLE embedded quotes (SQL identifier escaping) — the caller wraps the result in "...". Stripping
+    # them (the old behavior) silently addressed a DIFFERENT column when a real name contained a quote.
+    return str(col).replace('"', '""')
 
 
 def _sql_str(s: str) -> str:
