@@ -79,25 +79,42 @@ class InMemoryCatalog:
 
     def _persist(self, table: CatalogTable) -> None:
         """Mirror an entry to the shared catalog table. Best-effort: a DB hiccup must not break the
-        in-memory catalog, which still serves this instance."""
+        in-memory catalog, which still serves this instance. But since the DB is now authoritative for
+        cross-instance convergence (a read reconciles against it), a failed write means this entry is
+        local-only and WILL be dropped on the next reconcile — so log it loudly rather than silently."""
         try:
             metadb.catalog_upsert_entry(table.uri, table.name, table.model_dump(by_alias=True))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            import logging
+            logging.getLogger("hub").warning(
+                "catalog persist failed for %s (%s: %s) — entry is local-only until the DB write "
+                "succeeds; a reconcile may drop it", table.name, type(e).__name__, e)
 
     def _load_from_db(self) -> None:
-        """Merge catalog entries/edges registered by OTHER instances (or before a restart) into this
-        instance's in-memory view. Called at the start of each read so a dataset another stateless web
-        instance registered becomes visible here. Best-effort — a DB error just serves the local cache."""
+        """Reconcile this instance's in-memory view against the shared DB (the authoritative superset —
+        every register/register_output/seed write-throughs to it). Called at the start of each read so
+        an entry another stateless instance ADDED, UPDATED, or DELETED converges here, not just adds
+        (P0-CAT-01). Best-effort — a DB error serves the existing cache untouched rather than wiping it."""
         try:
-            for d in metadb.catalog_entries():
+            rows = metadb.catalog_entries()
+        except Exception:  # noqa: BLE001 — DB unreachable → keep serving the cache, don't wipe it
+            return
+        try:
+            tables: dict[str, CatalogTable] = {}
+            by_uri: dict[str, str] = {}
+            for d in rows:
                 uri = d.get("uri")
-                if uri and uri not in self._by_uri:
-                    t = CatalogTable.model_validate(d)
-                    self.tables[t.id] = t
-                    self._by_uri[uri] = t.id
+                if not uri:
+                    continue
+                t = CatalogTable.model_validate(d)  # re-materialize every row → additions AND updates land
+                tables[t.id] = t
+                by_uri[uri] = t.id
+            # rebind only after a clean full rebuild, so one malformed row can't half-wipe the cache;
+            # a uri now absent from the DB (a delete on another instance) falls out naturally.
+            self.tables = tables
+            self._by_uri = by_uri
             have = {(e.parent, e.child) for e in self.edges}
-            for e in metadb.catalog_edges():
+            for e in metadb.catalog_edges():  # edges are append-only (no delete API) — merge, don't rebuild
                 if (e["parent"], e["child"]) not in have:
                     self.edges.append(LineageEdge(parent=e["parent"], child=e["child"], pipeline=e.get("pipeline")))
         except Exception:  # noqa: BLE001
