@@ -4459,6 +4459,28 @@ def test_estimate_propagates_measured_vector_width_downstream():
     assert fw > 1000  # sanity: not collapsed to the ~128B coarse 'list' width
 
 
+def test_estimate_actual_path_keeps_measured_width():
+    # A node with a measured `actual` row count must STILL carry the sharpened (probed/propagated) per-row
+    # width — the earlier fast-path used the coarse display width, so `exact_rows x coarse_width` was a hard
+    # UNDER-estimate, and a source-with-an-actual skipped vector-width probing entirely (defeating the whole
+    # mechanism on the 2nd, ground-truth run). Now the width is measured once, before the actual short-circuit.
+    from hub.estimate import estimate_sizes
+    from hub.models import Graph
+    d = get_deps()
+    ev = _uri("events")
+    schemas = {"s": [{"name": "id", "type": "int"}, {"name": "emb", "type": "float[512]"}],
+               "f": [{"name": "id", "type": "int"}, {"name": "emb", "type": "list"}]}
+    nodes = [N("s", "source", {"uri": ev}), N("f", "filter", {"predicate": "id >= 0"})]
+    g = Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": [E("s", "f")]})
+    # source has a ground-truth actual → it must NOT skip vector probing.
+    e = estimate_sizes(g, d.resolve_adapter, schemas=schemas, actuals={"s": 1000})
+    sw = e["s"].bytes / e["s"].rows
+    assert e["s"].rows == 1000                                # actual wins the row count
+    assert abs(sw - (8 + 512 * 8)) < 2, f"actual source must still MEASURE the vector width, got {sw}"
+    fw = e["f"].bytes / e["f"].rows
+    assert abs(fw - sw) < 2, f"measured width must survive downstream of an already-run node, got {fw}"
+
+
 def test_row_width_accounts_for_vector_and_list_columns():
     # a fixed-size embedding (float[1024]) must not be scored as its scalar base (float=8B) — that's a
     # ~1000x undercount that mis-sizes a vector working set as tiny and mis-places it local.
@@ -4692,11 +4714,13 @@ def test_row_estimate_uses_the_shared_estimator():
     d = get_deps()
     ev = _uri("events")
     g1 = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": ev}), N("p", "sample", {"n": 100})], "edges": [E("s", "p")]})
-    rows, byts = _cone_size(g1, "p", d)
+    rows, byts, sizes = _cone_size(g1, "p", d)
     assert rows == d.resolve_adapter(ev).count(ev)  # max over cone = source count
     assert byts is not None and byts > 0            # bytes estimate available whenever rows is
+    assert sizes and "s" in sizes                   # full per-node estimate returned for placement reuse
     g2 = Graph(**{"id": "c", "version": 1, "nodes": [N("t", "transform", {"code": "def fn(r): return r"})], "edges": []})
-    assert _cone_size(g2, "t", d) == (None, None)  # all unknown → (None, None) (no fabricated number)
+    r2, b2, _ = _cone_size(g2, "t", d)
+    assert r2 is None and b2 is None  # all unknown → no fabricated rows/bytes number
 
 
 def test_storage_tier_selection():

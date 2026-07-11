@@ -235,11 +235,14 @@ def _actuals_for(graph, deps) -> dict[str, int]:  # noqa: ARG001 — deps kept f
         return {}
 
 
-def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None]":
+def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None, dict]":
     """The largest data volume this run moves — the MAX estimated rows AND bytes across the target's cone
     (source counts + a downstream sample's smaller output). Uses hub.estimate so the confirm-gate, the
-    placement policy, and the UI hint all share ONE estimator. (None, None) when nothing is countable —
-    the gate then errs toward NOT blocking (an uncountable source can't be scanned → fails fast anyway)."""
+    placement policy, and the UI hint all share ONE estimator: also returns the full per-node `sizes` so
+    the caller can hand THIS schema+actual-aware estimate to the RunController's placement (else placement
+    would re-estimate with coarse default widths and the measured vector/decimal widths would be inert
+    there). (None, None, {}) when nothing is countable — the gate then errs toward NOT blocking (an
+    uncountable source can't be scanned → fails fast anyway)."""
     from hub.estimate import estimate_sizes
     try:  # per-node schemas sharpen the byte width (else a flat default/row makes the byte gate meaningless)
         schemas = schema_for_graph(req_graph, deps.resolve_adapter, deps.registry,
@@ -250,10 +253,10 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
         sizes = estimate_sizes(req_graph, deps.resolve_adapter, target=target_node_id, schemas=schemas,
                                actuals=_actuals_for(req_graph, deps))
     except Exception:  # noqa: BLE001 — a bad estimate must not block the gate
-        return None, None
+        return None, None, {}
     rows = [s.rows for s in sizes.values() if s.rows is not None]
     byts = [s.bytes for s in sizes.values() if s.bytes is not None]
-    return (max(rows) if rows else None), (max(byts) if byts else None)
+    return (max(rows) if rows else None), (max(byts) if byts else None), sizes
 
 
 def _route_by_capability(deps, chosen, graph):
@@ -298,7 +301,7 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
-    rows, byts = _cone_size(req.graph, req.target_node_id, deps)
+    rows, byts, _ = _cone_size(req.graph, req.target_node_id, deps)
     runner = deps.pick_runner(plan, uid)
     est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and _cached_noop(runner, req.graph, req.target_node_id):
@@ -339,13 +342,15 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
     runner = _route_by_capability(deps, deps.pick_runner(plan, uid), graph)  # honor node requires
-    rows, byts = _cone_size(graph, target_node_id, deps)
+    rows, byts, sizes = _cone_size(graph, target_node_id, deps)
     est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and not confirmed and not _cached_noop(runner, graph, target_node_id):
         raise RunNeedsConfirm(est)
     # a run that splits across placement regions (a placed node / checkpoint / fan-out) is owned by the
-    # RunController; a single default region returns None → the base runner, exactly as before.
-    overall = deps.controller.run(graph, target_node_id, uid)
+    # RunController; a single default region returns None → the base runner, exactly as before. Hand it the
+    # schema+actual-aware `sizes` we just computed so cost-based placement routes on the SAME measured
+    # widths the gate saw — not a second, coarse re-estimate.
+    overall = deps.controller.run(graph, target_node_id, uid, sizes=sizes)
     if overall is not None:
         status, owner = overall, deps.controller
     else:

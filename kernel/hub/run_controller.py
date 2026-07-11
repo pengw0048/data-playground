@@ -63,7 +63,15 @@ class RunController:
         in-process whole-graph pass, so report THAT (not a plan the run won't use)."""
         from hub import estimate as est_mod, placement
         try:
-            sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target)  # once — reused by plan()
+            # schema-aware (measured vector/decimal widths), matching the real run's placement (start_run
+            # hands the same schema-aware estimate to run()); best-effort — coarse widths on failure.
+            try:
+                from hub.executors.schema import schema_for_graph
+                schemas = schema_for_graph(graph, self.deps.resolve_adapter, self.deps.registry,
+                                           self.deps.node_builders, self.deps.node_specs)
+            except Exception:  # noqa: BLE001
+                schemas = None
+            sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target, schemas=schemas)  # once — reused by plan()
         except Exception:  # noqa: BLE001
             sizes = {}
 
@@ -208,11 +216,14 @@ class RunController:
         return total
 
     # -- orchestration ----------------------------------------------------- #
-    def run(self, graph: Graph, target: str | None, uid: str | None = None) -> RunStatus | None:
+    def run(self, graph: Graph, target: str | None, uid: str | None = None,
+            sizes: dict | None = None) -> RunStatus | None:
         """Start a multi-region run; return None if the graph is a single default region (caller uses
         the base runner unchanged). `uid` carries the caller so a per-user backend preference routes
-        default regions to the isolated child too (P0-EXEC-01), not just the global default."""
-        regions = self.plan(graph, target)
+        default regions to the isolated child too (P0-EXEC-01), not just the global default. `sizes` is
+        the caller's already-computed schema+actual-aware estimate — reused for cost-based placement so
+        it routes on the SAME measured widths the confirm-gate saw (else placement re-estimates coarse)."""
+        regions = self.plan(graph, target, sizes=sizes)
         if len(regions) <= 1 and (not regions or regions[0].backend == "default"):
             return None
         if not self._safe_to_split(graph, target, regions):
