@@ -30,6 +30,10 @@ kubectl apply -f deploy/kuberay/raycluster.yaml
 kubectl apply -f deploy/kuberay/minio.yaml
 kubectl apply -f deploy/kuberay/differential-job.yaml
 kubectl logs -f job/dp-ray-multinode-check           # → "[multinode] PASS: … byte-identical …"
+
+# Make it a real GATE, not just a log tail: wait for the Job to actually SUCCEED (nonzero = FAIL).
+kubectl wait --for=condition=complete --timeout=600s job/dp-ray-multinode-check \
+  || { echo "multinode differential FAILED"; kubectl logs job/dp-ray-multinode-check; exit 1; }
 ```
 
 Both paths use the same `docker/ray/Dockerfile` image, which bakes in the Ray-2.56 hash-shuffle compat
@@ -40,5 +44,11 @@ shim (`hub.ray_compat`) via the worker-setup-hook env var, so no per-node tuning
 - `multi-node OK: N distinct Ray node ids executed work` — the shuffle really crossed nodes (N ≥ 2), not
   a single-host multiprocess stand-in.
 - `distributed GROUP BY byte-identical to DuckDB` — the Ray hash-aggregate over the object-store exchange
-  equals the DuckDB oracle (schema + rows as a sorted multiset, NULL group + count-null semantics
-  included), read back from the worker-direct object-store output.
+  equals the DuckDB oracle (column names + Arrow **types** AND rows as a sorted multiset, NULL group +
+  count-null semantics included), read back from the worker-direct object-store output.
+
+**Trusting a green run.** The check compares schema *and* rows and propagates its real exit code (the
+Compose driver escapes `$rc`; the KubeRay Job condition above gates on success). To prove the differential
+would actually *catch* a mismatch, run the deliberate failing control — it perturbs the oracle so the
+comparison must fail: `DP_MULTINODE_FAULT=1 docker compose -f docker-compose.ray.yml run --rm driver`
+should exit **nonzero**.

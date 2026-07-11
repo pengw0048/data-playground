@@ -67,6 +67,16 @@ print("NODES", len(nodes))
 """
 
 
+def _schema_diff(a, b) -> str | None:
+    """None if two Arrow tables have the same column set with the same types (order-independent — both
+    engines emit aggregate rows/columns in arbitrary order), else a human diff string."""
+    sa = {f.name: str(f.type) for f in a.schema}
+    sb = {f.name: str(f.type) for f in b.schema}
+    if sa == sb:
+        return None
+    return f"ray={sa} duck={sb}"
+
+
 def _load_dp_ray():
     path = os.environ.get("DP_RAY_MODULE", "/app/examples/plugins/dp_ray/__init__.py")
     spec = importlib.util.spec_from_file_location("dp_ray_ref", path)
@@ -136,6 +146,12 @@ def main() -> int:
         oracle = BuildEngine(g, deps.resolve_adapter, deps.registry, full=True,
                              node_specs=deps.node_specs, output_node="a").relation("a").to_arrow_table()
     ray_tbl = deps.resolve_adapter(st.output_uri).scan(st.output_uri).to_arrow_table()  # union_by_name in the adapter
+    # SCHEMA parity (not just row values, which DuckDB would coerce): the worker-direct Parquet must
+    # carry the same column names AND Arrow types as the single-node result (OPS-12).
+    serr = _schema_diff(ray_tbl, oracle)
+    if serr:
+        _log(f"FAIL: cluster aggregate SCHEMA != DuckDB — {serr}")
+        return 1
     import duckdb
     con = duckdb.connect()
     con.register("oracle", oracle)
@@ -143,6 +159,10 @@ def main() -> int:
     q = "SELECT cat, n, nv, lo, hi, sm, av FROM {t} ORDER BY cat NULLS FIRST, n, nv, lo, hi"
     ray_rows = con.execute(q.format(t="rayout")).fetchall()
     duck_rows = con.execute(q.format(t="oracle")).fetchall()
+    # a deliberate FAILING control (DP_MULTINODE_FAULT=1): perturb the oracle so a green run can only
+    # mean the differential actually compares — a run with the fault set MUST exit nonzero (OPS-12).
+    if os.environ.get("DP_MULTINODE_FAULT") == "1" and duck_rows:
+        duck_rows = duck_rows[1:]
     if ray_rows != duck_rows:
         _log(f"FAIL: cluster aggregate != DuckDB\nray ={ray_rows}\nduck={duck_rows}")
         return 1
