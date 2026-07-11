@@ -582,15 +582,17 @@ class BuildEngine:
             return parent.filter(pred) if pred else parent
 
         if t == "assert":
-            # a data-quality gate — the node's relation IS the VIOLATING rows (so "view data" shows exactly
-            # what failed). `IS NOT TRUE` catches both false AND null, so `x > 0` flags a null x too. The
-            # runner fails the run on error-severity violations (see plugins/runner.py); no predicate =
-            # nothing violates → passthrough. Same columns as the input (SELECT *), so its port stays typed.
+            # a data-quality gate with TWO outputs (P0-DATA-01): 'pass' forwards EVERY input row so the
+            # assert sits INLINE without corrupting the data (wire it to the next node / write), while the
+            # default 'out' port is the VIOLATING rows (so preview / "view data" shows exactly what failed).
+            # `IS NOT TRUE` catches both false AND null, so `x > 0` flags a null x too. The runner fails the
+            # run on error-severity violations (plugins/runner.py) BEFORE any downstream write commits.
             pred = (cfg.get("predicate") or "").strip()
             v = self._view(parent, "as")
-            # no predicate → ZERO violations (NOT `return parent`: this relation is the VIOLATING rows, so
-            # passing the input through would count every row as a violation). `WHERE false` keeps the schema.
-            return db.conn().sql(f"SELECT * FROM {v} WHERE {f'({pred}) IS NOT TRUE' if pred else 'false'}")
+            # no predicate → ZERO violations (`WHERE false`, not `return parent`: this port is the VIOLATING
+            # rows, so passing the input through would count every row as a violation). WHERE keeps the schema.
+            violations = db.conn().sql(f"SELECT * FROM {v} WHERE {f'({pred}) IS NOT TRUE' if pred else 'false'}")
+            return {"out": violations, "pass": parent}
 
         if t == "select":
             expr = (cfg.get("expr") or "").strip()  # resolver canonicalizes select/expr → 'expr'

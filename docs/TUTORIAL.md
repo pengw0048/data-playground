@@ -42,16 +42,19 @@ Preview the filter — now only purchase rows. (A `filter` builds SQL and pushes
 
 ## 4 · Catch bad rows before they skew the totals (assert — optional)
 
-A guard against silently-wrong data. From the filter's output port add an **assert**, and set its
-predicate to what *should* hold for every row — say `amount > 0`. The assert node's output **is the
-rows that violate it**, so previewing it shows exactly which purchases fail (ideally none) — not just a
-pass/fail. Set **severity** to `error` and any violation *fails the run*, so a bad batch can't flow into
-the aggregate; leave it `warn` to just record the count. (It checks *values*, unlike the schema hints,
-which only check that a column exists.)
+A guard against silently-wrong data, placed **inline** in the main path. From the filter's output port
+add an **assert**, and set its predicate to what *should* hold for every row — say `amount > 0`. The
+assert has two output ports: **passes** forwards *every* row through unchanged (wire this to the next
+node — the aggregate below), while the default **violations** port is the rows that fail, so *previewing*
+the assert shows exactly which purchases are bad (ideally none). Set **severity** to `error` and any
+violation *fails the run before the write commits*, so a bad batch can't flow downstream or be published;
+leave it `warn` to pass every row through and just record the count. (It checks *values*, unlike the
+schema hints, which only check that a column exists.)
 
 ## 5 · Total spend per user (aggregate)
 
-From the filter's output port, add an **aggregate** (or toolbar → **Compute** → `aggregate`). Set:
+From the filter's output port — or, if you added the assert in step 4, from its **passes** port — add
+an **aggregate** (or toolbar → **Compute** → `aggregate`). Set:
 
 - **group by**: `user_id`
 - **aggregations**: `sum(amount) AS spend, count(*) AS purchases`
