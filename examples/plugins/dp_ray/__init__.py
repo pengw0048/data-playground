@@ -46,10 +46,16 @@ import time
 import uuid
 
 from hub import db, graph as g
-from hub.ir import CLEAN_TRANSFORM_MODES, lower_to_ir, plan_is_clean
+from hub.ir import (CLEAN_TRANSFORM_MODES, lower_to_ir, parse_aggs, parse_group_keys,
+                    plan_is_clean, plan_is_distributable)
 from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
 
 _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", ".json", ".lance")
+
+# the relational ops THIS backend claims beyond the map-style clean subset — each proven byte-identical to
+# DuckDB on a real cluster before it's added (ARC3). `aggregate` = GROUP BY with count/min/max only (the
+# exact, order/dtype-independent subset; sum/mean/std stay on DuckDB until a float strategy is validated).
+RAY_RELATIONAL = frozenset({"aggregate"})
 
 
 def _ray_opts(requires: dict | None) -> dict:
@@ -112,7 +118,7 @@ class RayRunner:
     # gate on the clean subset from the CompilePlan alone (what the kernel hands can_run) — else the
     # DuckDB LocalRunner handles it. Conservative: unsure ⇒ fall back (always correct).
     def can_run(self, plan) -> bool:
-        return plan_is_clean(plan)
+        return plan_is_clean(plan) or plan_is_distributable(plan, RAY_RELATIONAL)
 
     def estimate(self, plan, rows, byts=None):
         return self.base.estimate(plan, rows, byts)  # reuse the hub-side confirm gate verbatim
@@ -205,10 +211,18 @@ class RayRunner:
         return status
 
     def _ray_runnable(self, ir) -> bool:
-        # every clean transform must carry inlined code (a Ray worker has no access to the driver's
-        # processor registry), else defer to the DuckDB engine.
-        return ir.is_clean() and all(
-            s.config.get("code") for s in ir.steps if s.op in CLEAN_TRANSFORM_MODES)
+        # (1) every step is clean OR a claimed relational op; (2) every clean transform carries inlined
+        # code (a Ray worker has no access to the driver's processor registry); (3) every aggregate parses
+        # into the proven-exact subset (bare group keys + count/min/max). Anything else ⇒ DuckDB fallback.
+        if not ir.is_distributable(RAY_RELATIONAL):
+            return False
+        if not all(s.config.get("code") for s in ir.steps if s.op in CLEAN_TRANSFORM_MODES):
+            return False
+        for s in ir.steps:
+            if s.op == "aggregate" and (parse_group_keys(s.config.get("groupBy", "")) is None
+                                        or parse_aggs(s.config.get("aggs", "")) is None):
+                return False
+        return True
 
     def run(self, plan, graph, target_node_id, placement, run_id=None) -> RunStatus:
         ir = lower_to_ir(graph, target_node_id, self.node_specs, self.deps.node_ir)
@@ -406,7 +420,38 @@ class RayRunner:
             # `opts` (num_gpus / custom resources from the region's requires) makes Ray schedule each map
             # task onto a worker that has the resource — the planner's placement, honored on the cluster.
             return parent.map_batches(_make_mapper(step.config), batch_format="pyarrow", **opts)
+        if step.op == "aggregate":
+            return self._build_aggregate(step, parent)
         raise RuntimeError(f"ray backend reached a non-clean op '{step.op}' (should have fallen back)")
+
+    def _build_aggregate(self, step, parent):
+        """A distributed GROUP BY via Ray Data's native HASH shuffle (the default strategy in 2.56): Ray
+        hash-partitions the input by the group keys across the cluster's object store, then reduces each
+        partition on its owning worker — no driver funnel. Restricted to count/min/max (order- and
+        dtype-independent → bit-identical to DuckDB regardless of shuffle order); the projection is
+        reordered to [group keys…, agg aliases…] to match DuckDB's `{group}, {aggs}` output exactly."""
+        from ray.data.aggregate import Count, Max, Min
+        cfg = step.config
+        keys = parse_group_keys(cfg.get("groupBy", "")) or []
+        specs = parse_aggs(cfg.get("aggs", ""))
+        aggs = []
+        for func, col, alias in specs:
+            if func == "count":
+                # count(*) counts every row (on=None); count(col) counts NON-NULL (ignore_nulls=True) to
+                # match DuckDB — Ray's Count defaults ignore_nulls=False, which would over-count nulls.
+                aggs.append(Count(alias_name=alias) if col is None
+                            else Count(on=col, ignore_nulls=True, alias_name=alias))
+            elif func == "min":
+                aggs.append(Min(on=col, alias_name=alias))     # ignore_nulls=True default = DuckDB min
+            elif func == "max":
+                aggs.append(Max(on=col, alias_name=alias))     # ignore_nulls=True default = DuckDB max
+        try:
+            parts = int(os.environ.get("DP_RAY_SHUFFLE_PARTITIONS", "0")) or None
+        except ValueError:
+            parts = None
+        ds = parent.groupby(keys or None, num_partitions=parts).aggregate(*aggs)
+        want = [*keys, *[alias for _f, _c, alias in specs]]     # DuckDB projection order: keys then aggs
+        return ds.select_columns(want)
 
     def _commit(self, step, datasets, graph) -> tuple[int, str, str]:
         import pyarrow as pa

@@ -45,9 +45,29 @@ def main() -> None:
         _log("import ray + init")
         import ray
         _ncpu = os.environ.get("DP_RAY_NUM_CPUS")
-        ray.init(ignore_reinit_error=True, configure_logging=False, log_to_driver=False,
-                 include_dashboard=False, num_cpus=int(_ncpu) if _ncpu else None)
-        _log("ray init done; set_workspace")
+        # RAY_ADDRESS set → ATTACH to a real multi-node cluster head (docker-compose / KubeRay); unset →
+        # start a local head (dev / single-host). num_cpus is ignored when attaching to an existing cluster.
+        _addr = os.environ.get("RAY_ADDRESS") or None
+        # Ray 2.56 + numpy 2.5 crashes every hash-shuffle (read-only hash array); patch it on the DRIVER
+        # here and on every WORKER. The shuffle runs in worker processes, and Ray Data's internal shuffle
+        # actors do NOT inherit the job runtime_env hook — but they DO inherit the raylet's env, so set the
+        # worker-setup-hook ENV VAR (default_worker.py reads it at startup) before ray.init on a LOCAL head.
+        # (On a remote cluster the worker containers set the same var — see docker/ray + deploy/kuberay.)
+        from ray._private import ray_constants
+        from hub.ray_compat import patch_hash_shuffle
+        patch_hash_shuffle()
+        if not _addr:
+            os.environ.setdefault(ray_constants.WORKER_PROCESS_SETUP_HOOK_ENV_VAR, "hub.ray_compat.patch_hash_shuffle")
+        ray.init(address=_addr, ignore_reinit_error=True, configure_logging=False, log_to_driver=False,
+                 include_dashboard=False, num_cpus=int(_ncpu) if (_ncpu and not _addr) else None)
+        # Pin the HASH shuffle so relational ops (groupby keys / later sort/join) partition predictably.
+        # Under a SORT strategy Ray silently ignores the group keys — fail loud instead of computing wrong.
+        from ray.data import DataContext
+        from ray.data.context import ShuffleStrategy
+        _strat = DataContext.get_current().shuffle_strategy
+        if _strat != ShuffleStrategy.HASH_SHUFFLE:
+            raise RuntimeError(f"dp_ray needs HASH_SHUFFLE, got {_strat} — unset RAY_DATA_DEFAULT_SHUFFLE_STRATEGY")
+        _log(f"ray init done (address={_addr or 'local'}); set_workspace")
 
         from hub.deps import set_workspace
         from hub.ir import lower_to_ir

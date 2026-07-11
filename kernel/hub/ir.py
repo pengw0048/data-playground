@@ -23,6 +23,7 @@ can gate WITHOUT re-deriving the IR.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from hub import graph as g
@@ -33,6 +34,53 @@ from hub.models import CompilePlan, Graph, GraphNode
 CLEAN_TRANSFORM_MODES = {"map", "map_batches", "filter", "flat_map", "flat_map_generator"}
 # ops a simple map-style engine (e.g. Ray Data) can run end-to-end
 CLEAN_OPS = {"read", "write", "passthrough"} | CLEAN_TRANSFORM_MODES
+
+# RELATIONAL ops a SHUFFLE-capable backend MAY additionally claim — beyond the map-style CLEAN_OPS. This
+# is an enumeration, NOT a global gate flip: capability is decided per-backend by passing its own subset
+# to plan_is_distributable, so the DuckDB fallback stays authoritative for everything a backend can't yet
+# run byte-identically. (ARC3 grows this as each op is validated on a real cluster.)
+DISTRIBUTABLE_RELATIONAL = frozenset({"aggregate"})
+
+# a group-key/aggregate spec parser shared by any distributed backend, so the SAME raw fragment DuckDB
+# consumes (resolve_config, untouched) is turned into structured, portable specs. Deliberately narrow and
+# conservative: anything it can't prove byte-identical to DuckDB returns None → the caller falls back to
+# DuckDB. Widening this is gated behind a new byte-identical differential test (see ARC3).
+_AGG_RE = re.compile(r"^\s*(count|min|max)\s*\(\s*(\*|[A-Za-z_][A-Za-z0-9_]*)\s*\)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", re.I)
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def parse_group_keys(group: str) -> list[str] | None:
+    """A GROUP BY fragment → the list of bare group-key columns ([] = a global/no-key aggregate), or None
+    if any key is an expression / quoted / parenthesized (⇒ not safely distributable ⇒ DuckDB)."""
+    s = (group or "").strip()
+    if not s:
+        return []  # global aggregate — valid (a single-partition reduce), distinct from unparseable (None)
+    keys = [p.strip() for p in s.split(",")]
+    return keys if all(_IDENT_RE.match(k) for k in keys) else None
+
+
+def parse_aggs(aggs: str) -> list[tuple[str, str | None, str]] | None:
+    """An aggregate-list fragment → [(func, column_or_None, alias)], or None if any term is outside the
+    proven-exact subset. Only count(*)/count(col)/min(col)/max(col) WITH an explicit `AS alias` — these are
+    order- and dtype-independent, so a distributed shuffle produces bit-identical results to DuckDB. Empty
+    → DuckDB's default `count(*) AS n` (engine.py:649). sum/mean/std (float non-associativity), DISTINCT,
+    arithmetic, and unaliased terms all → None (⇒ DuckDB)."""
+    s = (aggs or "").strip()
+    if not s:
+        return [("count", None, "n")]
+    out: list[tuple[str, str | None, str]] = []
+    for part in s.split(","):
+        m = _AGG_RE.match(part)
+        if not m:
+            return None
+        func, arg, alias = m.group(1).lower(), m.group(2), m.group(3)
+        if arg == "*":
+            if func != "count":
+                return None  # min(*)/max(*) is not valid
+            out.append((func, None, alias))
+        else:
+            out.append((func, arg, alias))
+    return out
 
 # canvas node type → IR op. `transform`/`notebook` resolve to their MODE (a clean transform mode, or
 # `transform:<mode>` when not clean); anything not listed (incl. plugin kinds) → `opaque:<type>`.
@@ -69,6 +117,13 @@ class CompiledIR:
     def is_clean(self) -> bool:
         """True iff every step is in the clean subset — a map-style engine can run the whole graph."""
         return bool(self.steps) and not self.unsupported()
+
+    def is_distributable(self, extra_ops: frozenset[str]) -> bool:
+        """True iff every step is in the clean subset OR in `extra_ops` — a shuffle-capable backend that
+        claims `extra_ops` (e.g. {'aggregate'}) can run the whole graph. Keeps `is_clean` intact; a
+        backend still re-checks per-op runnability (e.g. parse_aggs != None) before executing."""
+        allowed = CLEAN_OPS | extra_ops
+        return bool(self.steps) and all(s.op in allowed for s in self.steps)
 
     def by_id(self) -> dict[str, IRStep]:
         return {s.id: s for s in self.steps}
@@ -193,3 +248,12 @@ def plan_is_clean(plan: CompilePlan) -> bool:
     re-check `is_clean()` on the freshly-lowered IR before executing (dp_ray does); erring toward the
     DuckDB fallback is always safe."""
     return bool(plan.acyclic) and bool(plan.steps) and all(s.op in CLEAN_OPS for s in plan.steps)
+
+
+def plan_is_distributable(plan: CompilePlan, extra_ops: frozenset[str]) -> bool:
+    """Like `plan_is_clean`, but a shuffle-capable backend also admits the relational `extra_ops` it
+    claims (e.g. {'aggregate'}). Same op-derivation caveat as plan_is_clean — the backend re-checks the
+    freshly-lowered IR (and per-op runnability, e.g. parse_aggs) before executing; DuckDB fallback is
+    always the safe default."""
+    allowed = CLEAN_OPS | extra_ops
+    return bool(plan.acyclic) and bool(plan.steps) and all(s.op in allowed for s in plan.steps)

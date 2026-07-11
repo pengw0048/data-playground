@@ -189,7 +189,10 @@ class DuckDBAdapter:
                     return con.from_arrow(feather.read_table(f))
             if low.endswith((".parquet", ".pq")):
                 return con.read_parquet(uri)
-            return con.read_parquet(uri.rstrip("/") + "/**/*.parquet")  # a prefix of parts (append output)
+            # a prefix of parts (append / worker-direct shards): union_by_name reconciles per-shard schema
+            # drift — an all-null column in one shard degrades to parquet NULL type, and a plain multi-file
+            # read fails "cast X to NULL" depending on which shard is read first.
+            return con.read_parquet(uri.rstrip("/") + "/**/*.parquet", union_by_name=True)
         p = path_of(uri)
         low = p.lower()
         if os.path.isdir(p):
@@ -205,9 +208,12 @@ class DuckDBAdapter:
 
     def _read_dir(self, con: duckdb.DuckDBPyConnection, d: str) -> Relation:
         # cover every extension the append writer can emit (a dir of part-*.<ext>): parquet/pq, csv/tsv, json
-        readers = ((".parquet", con.read_parquet), (".pq", con.read_parquet), (".csv", con.read_csv),
-                   (".tsv", con.read_csv), (".json", con.read_json))
-        for ext, reader in readers:
+        # parquet uses union_by_name so per-shard schema drift (an all-null column degrading to NULL type in
+        # one worker-direct shard) reconciles by column name instead of failing on read order.
+        for ext in (".parquet", ".pq"):
+            if glob.glob(os.path.join(d, f"**/*{ext}"), recursive=True):
+                return con.read_parquet(os.path.join(d, f"**/*{ext}"), union_by_name=True)
+        for ext, reader in ((".csv", con.read_csv), (".tsv", con.read_csv), (".json", con.read_json)):
             if glob.glob(os.path.join(d, f"**/*{ext}"), recursive=True):
                 return reader(os.path.join(d, f"**/*{ext}"))
         raise ValueError(f"no parquet/csv/json files under {d}")

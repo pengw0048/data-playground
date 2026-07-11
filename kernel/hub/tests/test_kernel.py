@@ -260,6 +260,35 @@ def test_union_is_relational_not_clean_ir():
     assert u.op == "union" and u.config == {"mode": "all", "align": "name"} and len(u.inputs) == 2
 
 
+def test_ir_aggregate_parsers_and_distributable_gate():
+    # the shared, conservative parsers a shuffle-capable backend uses to decide what it can run
+    # byte-identically to DuckDB (everything else → None → DuckDB fallback).
+    from hub.ir import (DISTRIBUTABLE_RELATIONAL, lower_to_ir, parse_aggs, parse_group_keys,
+                        plan_is_clean, plan_is_distributable)
+    from hub.compiler import compile_plan
+    from hub.deps import get_deps
+    from hub.models import Graph
+    assert parse_group_keys("cat") == ["cat"] and parse_group_keys("a, b") == ["a", "b"]
+    assert parse_group_keys("") == [] and parse_group_keys("lower(x)") is None  # [] = global; expr → None
+    assert parse_aggs("") == [("count", None, "n")]                              # DuckDB default
+    assert parse_aggs("count(*) AS n, min(x) AS lo, max(y) AS hi") == [
+        ("count", None, "n"), ("min", "x", "lo"), ("max", "y", "hi")]
+    assert parse_aggs("count(id) as c") == [("count", "id", "c")]
+    for bad in ("sum(x) as s", "count(distinct x) as n", "count(*)", "min(*) as m", "avg(x) as a"):
+        assert parse_aggs(bad) is None, bad                                     # outside the exact subset
+    assert DISTRIBUTABLE_RELATIONAL == frozenset({"aggregate"})
+
+    d = get_deps()
+    gg = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("events")}),
+        N("a", "aggregate", {"groupBy": "event", "aggs": "count(*) AS n"}),
+        N("w", "write", {"name": "o"})], "edges": [E("s", "a"), E("a", "w")]})
+    plan = compile_plan(gg, "w", d.registry, d.node_specs, d.node_ir)
+    assert not plan_is_clean(plan)                                              # aggregate is not "clean"
+    assert plan_is_distributable(plan, frozenset({"aggregate"}))               # but a shuffle backend claims it
+    assert lower_to_ir(gg, "w", d.node_specs).is_distributable(frozenset({"aggregate"}))
+
+
 def test_sql_groupby_preview_refuses_the_sample():
     # a sql GROUP BY / global aggregate over the 2000-row sample would present a PARTIAL aggregate as
     # complete (the honesty hole the acceptance found). It must refuse the sample like the aggregate node.
@@ -5059,13 +5088,27 @@ def test_ray_backend_operator_gating_and_fallback(tmp_path):
 
     p = str(tmp_path / "nums.parquet")
     duckdb.connect().execute(f"COPY (SELECT * FROM range(1,6) t(x)) TO '{p}' (FORMAT PARQUET)")
-    dirty = G([_ray_node("src", "source", {"uri": p}),
-               _ray_node("a", "aggregate", {"aggs": "count(*) AS n"}),
-               _ray_node("w", "write", {"name": "agg_out"})], [_ray_edge("src", "a"), _ray_edge("a", "w")])
-    dplan = compile_plan(dirty, "w", deps.registry, deps.node_specs)
-    assert rr.can_run(dplan) is False  # (3) relational → not clean
+    # (3a) a GROUP BY with count/min/max is NOW Ray-runnable — a distributed hash-aggregate, byte-identical
+    # to DuckDB (count/min/max are order- and dtype-independent). can_run AND _ray_runnable both agree.
+    agg = G([_ray_node("src", "source", {"uri": p}),
+             _ray_node("a", "aggregate", {"groupBy": "x", "aggs": "count(*) AS n, min(x) AS lo"}),
+             _ray_node("w", "write", {"name": "agg_out"})], [_ray_edge("src", "a"), _ray_edge("a", "w")])
+    assert rr.can_run(compile_plan(agg, "w", deps.registry, deps.node_specs)) is True
+    assert rr._ray_runnable(lower_to_ir(agg, "w", deps.node_specs)) is True
+    # (3b) a FLOAT aggregate (sum) is NOT in the proven-exact subset → _ray_runnable False → DuckDB
+    summ = G([_ray_node("src", "source", {"uri": p}),
+              _ray_node("a", "aggregate", {"aggs": "sum(x) AS s"}),
+              _ray_node("w", "write", {"name": "sum_out"})], [_ray_edge("src", "a"), _ray_edge("a", "w")])
+    assert rr._ray_runnable(lower_to_ir(summ, "w", deps.node_specs)) is False
 
-    # …and run() delegates a non-clean graph to the DuckDB base runner (never touches Ray) → it completes
+    # (3c) a genuinely non-distributable op (sort) → can_run False → run() delegates to the DuckDB base
+    # runner (never touches Ray) → it completes.
+    dirty = G([_ray_node("src", "source", {"uri": p}),
+               _ray_node("s", "sort", {"by": "x"}),
+               _ray_node("w", "write", {"name": "sort_out"})], [_ray_edge("src", "s"), _ray_edge("s", "w")])
+    dplan = compile_plan(dirty, "w", deps.registry, deps.node_specs)
+    assert rr.can_run(dplan) is False
+
     st = rr.run(dplan, dirty, "w", "local")
     for _ in range(300):
         if deps.runner.status(st.run_id).status in ("done", "failed", "cancelled"):
@@ -5201,6 +5244,56 @@ def test_ray_region_worker_direct_write_and_progress(tmp_path):
     assert again == [2 * i for i in range(1, 21)], f"recompute must overwrite, not append (got {len(again)} rows)"
 
 
+def test_ray_aggregate_live_differential(tmp_path):
+    # opt-in live Ray: a distributed GROUP BY (count/min/max) via Ray Data's native HASH shuffle must be
+    # byte-identical to DuckDB's single-node aggregate. Canonical comparison: same schema + same rows as a
+    # SORTED multiset (both engines emit aggregate rows in arbitrary order), NULLs included. Forces a real
+    # multi-partition shuffle (DP_RAY_SHUFFLE_PARTITIONS=4) so the exchange actually crosses partitions.
+    if not os.environ.get("DP_TEST_RAY_LIVE"):
+        pytest.skip("set DP_TEST_RAY_LIVE=1 to run the live-Ray aggregate differential")
+    import time
+
+    import duckdb
+
+    from hub import db
+    from hub.deps import Deps
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+    os.environ["DP_RAY_SHUFFLE_PARTITIONS"] = "4"
+    p = str(tmp_path / "events.parquet")
+    # cat has ~5 groups incl. some NULLs (exercises count(*) vs count(col) null semantics); v is int.
+    duckdb.connect().execute(
+        f"COPY (SELECT (CASE WHEN i % 37 = 0 THEN NULL ELSE i % 5 END) AS cat, i AS v "
+        f"FROM range(0, 4000) t(i)) TO '{p}' (FORMAT PARQUET)")
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+    g = Graph(**{"id": "c", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": p}),
+        _ray_node("a", "aggregate", {"groupBy": "cat",
+                                     "aggs": "count(*) AS n, count(v) AS nv, min(v) AS lo, max(v) AS hi"}),
+    ], "edges": [_ray_edge("src", "a")]})
+    st = rr.run_unit(g, "a", str(tmp_path / "agg_out.parquet"))
+    for _ in range(900):
+        if rr.status(st.run_id).status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.1)
+    st = rr.status(st.run_id)
+    assert st.status == "done", st.error
+    # the DuckDB oracle: same graph on the single-node engine
+    with db.run_scope():
+        oracle = BuildEngine(g, deps.resolve_adapter, deps.registry, full=True,
+                             node_specs=deps.node_specs, output_node="a").relation("a").to_arrow_table()
+    con = duckdb.connect()
+    con.register("oracle", oracle)
+    q = "SELECT cat, n, nv, lo, hi FROM {src} ORDER BY cat NULLS FIRST, n, nv, lo, hi"
+    ray_src = f"read_parquet('{st.output_uri}/**/*.parquet', union_by_name=true)"  # reconcile per-shard drift
+    ray_rows = con.execute(q.format(src=ray_src)).fetchall()
+    duck_rows = con.execute(q.format(src="oracle")).fetchall()
+    assert ray_rows == duck_rows, f"Ray aggregate != DuckDB\nray={ray_rows}\nduck={duck_rows}"
+    assert len(ray_rows) >= 5  # the groups (incl. the NULL cat) are all present
+
+
 def test_ray_region_requires_gates_scheduling(tmp_path):
     # opt-in live Ray: the region `requires` is forwarded to Ray as per-task placement, so a region needing
     # a custom resource the cluster does NOT have can't be scheduled → it does not complete (proof the
@@ -5256,9 +5349,11 @@ def test_ray_backend_placement_and_tiers(tmp_path):
 
 
 def test_ray_backend_run_unit_falls_back_locally_for_a_nonclean_region(tmp_path):
-    # D fix: run_unit on a NON-clean region (aggregate) must NOT call the missing LocalRunner.run_unit —
-    # it materializes with the local DuckDB engine (correct, non-distributed). No Ray needed. Also guards
-    # _materialize_local creating a missing parent dir for the output uri.
+    # D fix: run_unit on a region the backend can't distribute must NOT call the missing
+    # LocalRunner.run_unit — it materializes with the local DuckDB engine (correct, non-distributed). No
+    # Ray needed. Also guards _materialize_local creating a missing parent dir for the output uri. Uses a
+    # SUM aggregate: op is 'aggregate' but sum is outside the proven-exact subset (float non-associativity)
+    # → _ray_runnable False → local fallback. (count/min/max WOULD distribute — see the live differential.)
     import duckdb
 
     from hub.deps import Deps
@@ -5270,7 +5365,7 @@ def test_ray_backend_run_unit_falls_back_locally_for_a_nonclean_region(tmp_path)
     rr = _load_dp_ray().RayRunner(deps)
     gr = Graph(**{"id": "c", "version": 1, "nodes": [
         _ray_node("s", "source", {"uri": p}),
-        _ray_node("a", "aggregate", {"groupBy": "x", "aggs": "count(*) AS n"}),
+        _ray_node("a", "aggregate", {"groupBy": "x", "aggs": "sum(x) AS s"}),
     ], "edges": [_ray_edge("s", "a")]})
     out = str(tmp_path / "sub" / "unit.parquet")  # parent dir missing → guards the local materialize makedirs
     st = rr.run_unit(gr, "a", out)
