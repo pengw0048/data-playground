@@ -1,19 +1,34 @@
-"""Default catalog provider — in-memory, seeded from a local data directory.
+"""Default catalog provider — DB-backed, built to browse thousands of tables.
 
-Tables discovered on disk become catalog entries; `write` nodes register their outputs
-as new children, so lineage grows as the canvas runs.
+Every read (browse / search / facet / get / lineage) PUSHES DOWN to the shared metadata DB
+(`hub.metadb`, SQLite locally / Postgres in a deployment) as an indexed, bounded query — the catalog
+never loads all entries into memory to filter in Python (the earlier model that fell over past a few
+hundred tables). Writes (`register` / `register_output`) write-through to the same DB, so a dataset
+registered on one stateless web instance is visible to every other + survives a restart.
+
+Organization is generic and owner-asserted: a `folder` path (the browse-hierarchy namespace), free-form
+`tags`, an `owner`, and a `description`. None of it is tied to any particular external system — but it
+maps 1:1 onto the namespace/tag/owner model mature catalogs expose, so an external `CatalogProvider`
+(the `reg.set_catalog` seam) can round-trip it. Semantic search is opt-in: when a plugin registers an
+embedder (`reg.add_embedder`), entries are embedded and `search(mode="semantic"|"hybrid")` lights up;
+with no embedder the catalog still does lexical + faceted search offline, zero extra dependencies.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 
-import json
-
 from hub import metadb
 from hub.models import (
+    CatalogBrowse,
+    CatalogPage,
+    CatalogQuery,
     CatalogTable,
+    Facets,
+    FacetValue,
+    FolderNode,
     KeyInfo,
     LineageEdge,
     LineageNode,
@@ -21,20 +36,31 @@ from hub.models import (
     Relationship,
 )
 
+log = logging.getLogger("hub")
+
+# Bounded defaults for lineage traversal — a large, densely-connected component is capped so the graph
+# a client renders (and the payload) stays sane; `truncated` tells the UI there was more.
+DEFAULT_LINEAGE_DEPTH = 6
+DEFAULT_LINEAGE_MAX_NODES = 500
+# `list_tables(None)` (the back-compat convenience the agent/MCP use) returns at most this many, so a
+# huge catalog can't produce an unbounded list; real browsing uses list_page (paginated) / search.
+LIST_TABLES_CAP = 5000
+
 
 class InMemoryCatalog:
+    """The default CatalogProvider. Named for history — it's now DB-backed (the DB is authoritative and
+    cross-instance); there is no in-memory table map to go stale."""
+
     name = "in-memory"
 
     def __init__(self, data_dir: str, resolve_adapter):
         self.data_dir = data_dir
         self.resolve = resolve_adapter
-        self.tables: dict[str, CatalogTable] = {}
-        self._by_uri: dict[str, str] = {}
-        self.edges: list[LineageEdge] = []
-        # this ONE catalog is shared across the process: register/register_output run on runner daemon
-        # threads + subprocess _watch threads + startup, while request threads iterate in list/get/lineage.
-        # An RLock serializes those (reentrant so register→_add_edge doesn't self-deadlock).
+        # a re-entrant lock serializes this instance's write-side read-modify-writes (version compute +
+        # schema-drift check + upsert). Reads don't take it — they're single indexed DB queries.
         self._lock = threading.RLock()
+        self._embedder = None          # callable(list[str]) -> list[list[float]] (set via reg.add_embedder)
+        self._embed_model = ""
         self._seed()
 
     # -- discovery --------------------------------------------------------- #
@@ -53,11 +79,8 @@ class InMemoryCatalog:
 
     @staticmethod
     def _object_stat_sig(uri: str) -> str:
-        """`:size:mtime` for a SINGLE object (so an object overwrite bumps the content-addressed version —
-        the object fingerprint is uri-only and can't tell two writes apart), or "" for a non-object uri, a
-        prefix/dir, gs:// with HMAC creds (no pyarrow filesystem), or any stat failure — the version then
-        falls back to schema+rows+uri (the residual object-collision case: identical schema+rows, same uri,
-        different data)."""
+        """`:size:mtime` for a SINGLE object (so an object overwrite bumps the content-addressed version),
+        or "" for a non-object uri / prefix / stat failure — the version then falls back to schema+rows+uri."""
         from hub.plugins.adapters import is_object_uri
         if not is_object_uri(uri):
             return ""
@@ -72,243 +95,322 @@ class InMemoryCatalog:
             pass
         return ""
 
-    def _add(self, name: str, uri: str, version: str | None = None, meta: str | None = None) -> CatalogTable:
-        # id from the uri (names collide across different files); fall back to name if uri is reused
+    def _add(self, name: str, uri: str, version: str | None = None, meta: str | None = None,
+             folder: str = "", tags: list[str] | None = None, owner: str | None = None,
+             description: str | None = None) -> CatalogTable:
         import hashlib as _h
         # schema/count probe (may touch disk/network) OUTSIDE the lock so a slow adapter doesn't block
-        # concurrent catalog reads; only the dict mutation below is serialized.
+        # concurrent catalog reads; only the version/collision compute + upsert below is serialized.
         try:
             adapter = self.resolve(uri)
             columns = adapter.schema(uri)
             count = adapter.count(uri)
         except Exception:  # noqa: BLE001 — an unresolvable/unreadable uri → empty schema (still registered)
             adapter, columns, count = None, [], None
-        # storage signature for the version — ISOLATED try so a plugin adapter whose fingerprint raises
-        # can't wipe the schema/count probed above. Local fingerprint = mtime+size; the object fingerprint
-        # is uri-only (can't tell two object writes of identical schema+rows apart), so augment it with the
-        # object's size+mtime via a cheap stat → an object OVERWRITE still bumps the version.
         fp = "unknown"
         try:
             fp = (adapter.fingerprint(uri) if adapter else "unknown") + self._object_stat_sig(uri)
         except Exception:  # noqa: BLE001
             pass
         from hub.relationships import key_candidates
-        keys = key_candidates(columns)  # inferred candidates; the declared key is OVERLAID on read (_overlay)
-        # CONTENT-ADDRESSED version (version=None): a stable hash of the schema + row count + storage
-        # signature, so the SAME data always gets the SAME version — a restart / re-registration never
-        # spuriously bumps it — while a changed schema, row count, or file (local mtime+size / object
-        # size+mtime) yields a NEW version. Real, comparable history instead of a frozen 'v1'. An explicit
-        # version (a plugin's register, or the seed) is honored as-is.
+        keys = key_candidates(columns)
         if version is None:
             sig = "|".join(f"{c.name}:{c.type}" for c in columns) + f"|rows={count}|fp={fp}"
             version = "v" + _h.sha256(sig.encode()).hexdigest()[:10]
+        folder = (folder or "").strip("/")
+        tags = [str(t).strip() for t in (tags or []) if str(t).strip()]
         with self._lock:
-            tid = f"tbl_{name}" if uri not in self._by_uri else self._by_uri[uri]
-            if any(t.id == f"tbl_{name}" and t.uri != uri for t in self.tables.values()):
-                tid = f"tbl_{name}_{_h.sha1(uri.encode()).hexdigest()[:6]}"
-            prior = self.tables.get(tid)
-            # schema-change detection on overwrite: an output whose columns drifted from the prior write is
-            # a silent contract break for downstream consumers — surface it (a WARNING; overwrite is a
-            # deliberate replace, so we don't fail — enforceSchema on a node is the hard gate).
-            if prior and prior.columns and columns:
-                pc = [(c.name, c.type) for c in prior.columns]
-                cc = [(c.name, c.type) for c in columns]
-                if pc != cc:
-                    import logging
-                    added, removed = [c for c in cc if c not in pc], [c for c in pc if c not in cc]
-                    detail = (f"added={added} removed={removed}" if (added or removed)
-                              else "columns reordered")  # same set, different order → an accurate message
-                    logging.getLogger("hub").warning(
-                        "catalog output %r schema changed on overwrite (version %s→%s): %s",
-                        name, prior.version, version, detail)
+            prior = metadb.catalog_get(uri)  # by uri (PK)
+            tid = (prior or {}).get("id") or f"tbl_{name}"
+            if prior is None:
+                other = metadb.catalog_get(f"tbl_{name}")  # id collision across different files
+                if other and other.get("uri") != uri:
+                    tid = f"tbl_{name}_{_h.sha1(uri.encode()).hexdigest()[:6]}"
+            # carry forward organization set previously (register shouldn't silently wipe a table's
+            # folder/tags/owner/description just because a re-run re-probed its schema)
+            if prior:
+                folder = folder or (prior.get("folder") or "")
+                tags = tags or list(prior.get("tags") or [])
+                owner = owner if owner is not None else prior.get("owner")
+                description = description if description is not None else prior.get("description")
+            self._warn_schema_drift(prior, name, columns, version)
             table = CatalogTable(
                 id=tid, name=name, uri=uri, row_count=count, version=version,
-                columns=columns, keys=keys, meta=meta,
+                columns=columns, keys=keys, meta=meta, folder=folder, tags=tags,
+                owner=owner, description=description,
             )
-            self.tables[tid] = table
-            self._by_uri[uri] = tid
-            self._persist(table)  # write-through to the shared DB (cross-instance / restart-durable)
-            return table
+            self._persist(table)
+        self._embed_one(table)  # best-effort semantic index (no-op without an embedder)
+        return table
+
+    @staticmethod
+    def _warn_schema_drift(prior: dict | None, name: str, columns: list, version: str) -> None:
+        """A written output whose columns drifted from the prior write is a silent contract break for
+        downstream consumers — log a WARNING (overwrite is deliberate, so we don't fail; enforceSchema
+        on a node is the hard gate)."""
+        if not (prior and prior.get("columns") and columns):
+            return
+        pc = [(c.get("name"), c.get("type")) for c in prior["columns"]]
+        cc = [(c.name, c.type) for c in columns]
+        if pc == cc:
+            return
+        added, removed = [c for c in cc if c not in pc], [c for c in pc if c not in cc]
+        detail = f"added={added} removed={removed}" if (added or removed) else "columns reordered"
+        log.warning("catalog output %r schema changed on overwrite (version %s→%s): %s",
+                    name, prior.get("version"), version, detail)
 
     def _persist(self, table: CatalogTable) -> None:
-        """Mirror an entry to the shared catalog table. Best-effort: a DB hiccup must not break the
-        in-memory catalog, which still serves this instance. But since the DB is now authoritative for
-        cross-instance convergence (a read reconciles against it), a failed write means this entry is
-        local-only and WILL be dropped on the next reconcile — so log it loudly rather than silently."""
         try:
             metadb.catalog_upsert_entry(table.uri, table.name, table.model_dump(by_alias=True))
         except Exception as e:  # noqa: BLE001
-            import logging
-            logging.getLogger("hub").warning(
-                "catalog persist failed for %s (%s: %s) — entry is local-only until the DB write "
-                "succeeds; a reconcile may drop it", table.name, type(e).__name__, e)
+            log.warning("catalog persist failed for %s (%s: %s)", table.name, type(e).__name__, e)
 
-    def _load_from_db(self) -> None:
-        """Reconcile this instance's in-memory view against the shared DB (the authoritative superset —
-        every register/register_output/seed write-throughs to it). Called at the start of each read so
-        an entry another stateless instance ADDED, UPDATED, or DELETED converges here, not just adds
-        (P0-CAT-01). Best-effort — a DB error serves the existing cache untouched rather than wiping it."""
-        try:
-            rows = metadb.catalog_entries()
-        except Exception:  # noqa: BLE001 — DB unreachable → keep serving the cache, don't wipe it
-            return
-        try:
-            tables: dict[str, CatalogTable] = {}
-            by_uri: dict[str, str] = {}
-            for d in rows:
-                uri = d.get("uri")
-                if not uri:
-                    continue
-                t = CatalogTable.model_validate(d)  # re-materialize every row → additions AND updates land
-                tables[t.id] = t
-                by_uri[uri] = t.id
-            # rebind only after a clean full rebuild, so one malformed row can't half-wipe the cache;
-            # a uri now absent from the DB (a delete on another instance) falls out naturally.
-            self.tables = tables
-            self._by_uri = by_uri
-            have = {(e.parent, e.child) for e in self.edges}
-            for e in metadb.catalog_edges():  # edges are append-only (no delete API) — merge, don't rebuild
-                if (e["parent"], e["child"]) not in have:
-                    self.edges.append(LineageEdge(parent=e["parent"], child=e["child"], pipeline=e.get("pipeline")))
-        except Exception:  # noqa: BLE001
-            pass
-
+    # -- read-side overlay ------------------------------------------------- #
     def _overlay(self, t: CatalogTable, dmap: dict[str, list[str]] | None = None) -> CatalogTable:
-        """Apply the owner-declared key (from Settings — the authoritative, cross-instance store) on
-        top of a table's inferred keys, freshly recomputed from its columns. Overlaying on READ (not
-        baking declared into the stored doc) is what makes a declared key: (a) visible on a peer that
-        already cached the dataset, and (b) cleanly reversible — clearing it restores the inferred key.
-        `dmap` lets list_tables read Settings once for the whole list."""
+        """Apply the owner-declared key on top of freshly-recomputed inferred keys, and flag a
+        local-path dataset whose file has vanished. Overlaying on READ keeps a declared key visible
+        cross-instance and cleanly reversible. `dmap` lets a page read declared keys once for the batch."""
         from hub.plugins.adapters import is_object_uri, path_of
         from hub.relationships import key_candidates
         declared = (dmap if dmap is not None else self._declared_keys()).get(t.uri)
         inferred = [k for k in key_candidates(t.columns) if list(k.columns) != list(declared or [])]
         keys = ([KeyInfo(columns=list(declared), confidence="declared")] if declared else []) + inferred
-        # flag a LOCAL-path dataset whose file no longer exists (e.g. `make clean` / a deleted temp),
-        # so the UI can grey it out + offer removal instead of surfacing a raw IOException on click.
-        # Skip object-store (s3/gs) and mem:// datasets — neither is an on-disk path.
         local = not is_object_uri(t.uri) and not t.uri.startswith("mem://")
         missing = local and not os.path.exists(path_of(t.uri))
         if keys == t.keys and missing == t.missing:
             return t
         return t.model_copy(update={"keys": keys, "missing": missing})
 
-    # -- CatalogProvider --------------------------------------------------- #
+    @staticmethod
+    def _to_table(doc: dict) -> CatalogTable:
+        return CatalogTable.model_validate(doc)
+
+    # -- CatalogProvider: browse / search --------------------------------- #
+    def list_page(self, query: CatalogQuery) -> CatalogPage:
+        """One filtered, sorted, paginated window of the catalog — the scalable browse primitive. The
+        page's items + total come from a single indexed DB query; memory/wire cost is bounded by the
+        window, never by the catalog size."""
+        docs, total = metadb.catalog_query(
+            q=query.q, folder=query.folder, tags=query.tags, owner=query.owner,
+            uris=query.uris, has_columns=query.has_columns, sort=query.sort, order=query.order,
+            limit=query.limit, offset=query.offset)
+        dmap = self._declared_keys()
+        items = [self._overlay(self._to_table(d), dmap) for d in docs]
+        return CatalogPage(items=items, total=total, offset=query.offset, limit=query.limit,
+                           has_more=query.offset + len(items) < total)
+
     def list_tables(self, q: str | None) -> list[CatalogTable]:
-        with self._lock:
-            self._load_from_db()  # pick up entries registered by other instances / before a restart
-            items = list(self.tables.values())  # snapshot under the lock; safe to filter after
-        dmap = self._declared_keys()  # one read for the whole list
-        items = [self._overlay(t, dmap) for t in items]
-        if q:
-            ql = q.lower()
-            items = [t for t in items if ql in t.name.lower() or ql in t.uri.lower()]
-        return items
+        """Back-compat convenience — a bare (bounded) list, matching one page of the browse query. The
+        agent/MCP call this; the UI uses list_page (paginated) + facets."""
+        return self.list_page(CatalogQuery(q=q, limit=LIST_TABLES_CAP)).items
+
+    def facets(self, query: CatalogQuery) -> Facets:
+        """Distinct folder/tag/owner values + counts over the active filter set (drill-down)."""
+        raw = metadb.catalog_facets(q=query.q, folder=query.folder, tags=query.tags,
+                                    owner=query.owner, has_columns=query.has_columns)
+        fv = lambda pairs: [FacetValue(value=v, count=c) for v, c in pairs]  # noqa: E731
+        return Facets(folders=fv(raw["folders"]), tags=fv(raw["tags"]), owners=fv(raw["owners"]))
+
+    def browse(self, prefix: str = "") -> CatalogBrowse:
+        """One level of the folder tree at `prefix`: immediate child folders (subtree counts) + the
+        tables filed directly here. Lets the UI lazily expand a tree of any size."""
+        children, table_docs = metadb.catalog_tree(prefix)
+        dmap = self._declared_keys()
+        return CatalogBrowse(
+            prefix=(prefix or "").strip("/"),
+            folders=[FolderNode(name=n, path=p, table_count=c) for n, p, c in children],
+            tables=[self._overlay(self._to_table(d), dmap) for d in table_docs])
 
     def get_table(self, id_or_name: str) -> CatalogTable:
-        with self._lock:
-            self._load_from_db()  # another instance may have registered it
-            if id_or_name in self.tables:
-                return self._overlay(self.tables[id_or_name])
-            if id_or_name in self._by_uri:
-                return self._overlay(self.tables[self._by_uri[id_or_name]])
-            for t in self.tables.values():
-                if t.name == id_or_name:
-                    return self._overlay(t)
-        raise KeyError(id_or_name)
+        doc = metadb.catalog_get(id_or_name)
+        if doc is None:
+            raise KeyError(id_or_name)
+        return self._overlay(self._to_table(doc))
 
-    def lineage(self, uri: str) -> LineageResult:
-        # collect the connected component around `uri` (over a snapshot so a concurrent register can't
-        # mutate tables/edges mid-traversal)
-        with self._lock:
-            self._load_from_db()  # include lineage recorded by other instances
-            tables = dict(self.tables)
-            by_uri = dict(self._by_uri)
-            all_edges = list(self.edges)
-        seen: set[str] = set()
+    # -- CatalogProvider: lineage ----------------------------------------- #
+    def lineage(self, uri: str, depth: int = DEFAULT_LINEAGE_DEPTH,
+                max_nodes: int = DEFAULT_LINEAGE_MAX_NODES) -> LineageResult:
+        """The connected component around `uri`, expanded breadth-first from the DB one frontier at a
+        time and CAPPED by `depth` + `max_nodes` (so a huge lineage graph can't blow up the payload).
+        `truncated` is set when the cap stopped the walk before the component was exhausted."""
+        seen: set[str] = {uri}
         frontier = [uri]
-        nodes: list[LineageNode] = []
-        while frontier:
-            cur = frontier.pop()
-            if cur in seen:
-                continue
-            seen.add(cur)
-            t = tables.get(by_uri.get(cur, ""))
-            nodes.append(LineageNode(
-                id=t.id if t else cur, name=t.name if t else cur, uri=cur,
-            ))
-            for e in all_edges:
-                if e.parent == cur and e.child not in seen:
-                    frontier.append(e.child)
-                if e.child == cur and e.parent not in seen:
-                    frontier.append(e.parent)
-        edges = [e for e in all_edges if e.parent in seen and e.child in seen]
-        return LineageResult(nodes=nodes, edges=edges)
+        edges: dict[tuple[str, str], LineageEdge] = {}
+        truncated = False
+        hops = 0
+        while frontier and hops < max(1, depth):
+            hops += 1
+            batch = metadb.catalog_edges_touching(frontier)
+            nxt: list[str] = []
+            for e in batch:
+                key = (e["parent"], e["child"])
+                if key not in edges:
+                    edges[key] = LineageEdge(parent=e["parent"], child=e["child"],
+                                             column=e.get("column"), pipeline=e.get("pipeline"))
+                for end in (e["parent"], e["child"]):
+                    if end in seen:
+                        continue
+                    if len(seen) >= max_nodes:
+                        truncated = True
+                        continue
+                    seen.add(end)
+                    nxt.append(end)
+            frontier = nxt
+        if frontier:  # depth budget ran out with more to explore
+            truncated = True
+        # keep only edges whose BOTH endpoints made it into the (capped) node set
+        kept = [e for e in edges.values() if e.parent in seen and e.child in seen]
+        names = metadb.catalog_get_many(list(seen))
+        nodes = [LineageNode(id=(names.get(u, {}).get("id") or u),
+                             name=(names.get(u, {}).get("name") or u.split("/")[-1]), uri=u)
+                 for u in seen]
+        return LineageResult(nodes=nodes, edges=kept, truncated=truncated)
 
-    def _add_edge(self, parent: str, child: str, pipeline: str | None) -> None:
+    # -- CatalogProvider: write-back -------------------------------------- #
+    def _add_edge(self, parent: str, child: str, pipeline: str | None, column: str | None = None) -> None:
         if parent == child:
             return
-        with self._lock:
-            if any(e.parent == parent and e.child == child for e in self.edges):
-                return  # dedupe: one edge per (parent, child)
-            self.edges.append(LineageEdge(parent=parent, child=child, pipeline=pipeline))
         try:
-            metadb.catalog_add_edge(parent, child, pipeline)  # write-through (best-effort)
+            metadb.catalog_add_edge(parent, child, pipeline, column)
         except Exception:  # noqa: BLE001
             pass
 
     def register(self, table: CatalogTable, parents: list[str] | None = None,
                  pipeline: str | None = None) -> None:
         with self._lock:
-            self.tables[table.id] = table
-            self._by_uri[table.uri] = table.id
             self._persist(table)
+        self._embed_one(table)
         for parent in parents or []:
             self._add_edge(parent, table.uri, pipeline)
 
-    def register_output(self, name: str, uri: str, version: str | None = None, parents: list[str] | None = None,
-                        pipeline: str | None = None) -> CatalogTable:
-        # version=None → content-addressed (computed from the written data); a caller no longer pins 'v1'.
-        table = self._add(name=name, uri=uri, version=version, meta=pipeline)
-        for parent in parents:
+    def register_output(self, name: str, uri: str, version: str | None = None,
+                        parents: list[str] | None = None, pipeline: str | None = None,
+                        folder: str = "", tags: list[str] | None = None, owner: str | None = None,
+                        description: str | None = None) -> CatalogTable:
+        table = self._add(name=name, uri=uri, version=version, meta=pipeline, folder=folder,
+                          tags=tags, owner=owner, description=description)
+        for parent in parents or []:
             self._add_edge(parent, uri, pipeline)
+            metadb.catalog_bump_usage(parent)  # a derived output READ its parent → popularity signal
         return table
 
+    def set_metadata(self, uri: str, *, folder: str | None = None, tags: list[str] | None = None,
+                     owner: str | None = None, description: str | None = None) -> CatalogTable:
+        """Update a dataset's organization (folder/tags/owner/description). Only provided fields change.
+        Raises KeyError if the uri isn't registered."""
+        cur = metadb.catalog_get(uri)
+        if cur is None:
+            raise KeyError(uri)
+        metadb.catalog_set_metadata(
+            uri,
+            folder=(folder if folder is not None else cur.get("folder") or "").strip("/"),
+            owner=owner if owner is not None else cur.get("owner"),
+            description=description if description is not None else cur.get("description"),
+            tags=[str(t).strip() for t in (tags if tags is not None else cur.get("tags") or []) if str(t).strip()],
+        )
+        t = self.get_table(uri)
+        self._embed_one(t)  # description/tags changed → refresh the semantic vector
+        return t
+
     def resolve_ref(self, ref: str) -> str:
-        """Resolve a source reference to a dataset URI: a real path or scheme'd uri passes through
-        unchanged; a bare catalog table NAME or ID resolves to its uri — so an API/agent client can
-        point a `source` node at 'events' or 'tbl_events' instead of the full path (F50)."""
+        """Resolve a source reference to a uri: a real path / scheme'd uri passes through; a bare
+        catalog NAME or ID resolves to its uri (so an API/agent client can point a source at 'events')."""
         if not ref or "://" in ref or "/" in ref or "\\" in ref:
-            return ref  # already a path / object-store uri
-        try:
-            return self.get_table(ref).uri
-        except KeyError:
-            return ref  # unknown token → leave it (the normal "cannot read" error will surface)
+            return ref
+        doc = metadb.catalog_get(ref)
+        return doc["uri"] if doc else ref
 
     def unregister(self, id_or_name: str) -> bool:
-        """Remove a dataset from the catalog (in-memory + the shared per-row store) — for pruning a
-        dead entry whose backing file is gone. Returns False if not found. Declared keys/relationships
-        keyed by the uri are left as-is (harmless dangling references)."""
         with self._lock:
-            self._load_from_db()
-            tid = id_or_name if id_or_name in self.tables else self._by_uri.get(id_or_name) \
-                or next((t.id for t in self.tables.values() if t.name == id_or_name), None)
-            t = self.tables.get(tid) if tid else None
-            if t is None:
+            doc = metadb.catalog_get(id_or_name)
+            if doc is None:
                 return False
-            self.tables.pop(tid, None)
-            self._by_uri.pop(t.uri, None)
-            # delete the DB row INSIDE the lock: doing it after releasing let a concurrent
-            # _load_from_db re-add the just-removed row (the delete wouldn't stick).
-            try:
-                metadb.catalog_delete_entry(t.uri)
-            except Exception:  # noqa: BLE001
-                pass
+            metadb.catalog_delete_entry(doc["uri"])
         return True
 
-    # -- declared keys & relationships (owner-asserted; per-ROW in the shared DB, cross-instance) --- #
-    # Stored one-row-each (metadb.catalog_declared_keys / catalog_relationships), NOT a single JSON
-    # blob, so two instances declaring different keys/relationships can't clobber each other.
+    # -- semantic search (opt-in via reg.add_embedder) -------------------- #
+    def set_embedder(self, fn, model: str = "custom") -> None:
+        """Install an embedder — `fn(list[str]) -> list[list[float]]`. Kicks off a best-effort
+        background reindex so already-registered datasets become semantically searchable too."""
+        self._embedder = fn
+        self._embed_model = model or "custom"
+        threading.Thread(target=self._reindex_embeddings, daemon=True).start()
+
+    @staticmethod
+    def _embed_text(t: CatalogTable) -> str:
+        cols = " ".join(c.name for c in t.columns[:64])
+        return " ".join(x for x in (t.name, t.folder, t.description or "", " ".join(t.tags), cols) if x)
+
+    def _embed_one(self, t: CatalogTable) -> None:
+        if self._embedder is None:
+            return
+        try:
+            import numpy as np
+            vec = self._embedder([self._embed_text(t)])[0]
+            arr = np.asarray(vec, dtype=np.float32)
+            metadb.catalog_set_embedding(t.uri, self._embed_model, int(arr.shape[0]), arr.tobytes())
+        except Exception:  # noqa: BLE001 — semantic index is best-effort; never break a register
+            log.debug("embed failed for %s", t.uri, exc_info=True)
+
+    def _reindex_embeddings(self) -> None:
+        if self._embedder is None:
+            return
+        try:
+            have = {u for u, _ in metadb.catalog_embeddings_for(self._embed_model)}
+            page = self.list_page(CatalogQuery(limit=LIST_TABLES_CAP))
+            for t in page.items:
+                if t.uri not in have:
+                    self._embed_one(t)
+        except Exception:  # noqa: BLE001
+            log.debug("catalog embedding reindex failed", exc_info=True)
+
+    def semantic_search(self, q: str, limit: int = 50) -> list[CatalogTable]:
+        """Rank datasets by cosine similarity of their embedding to the query's. Empty if no embedder."""
+        if self._embedder is None or not q.strip():
+            return []
+        try:
+            import numpy as np
+            qv = np.asarray(self._embedder([q])[0], dtype=np.float32)
+            qn = float(np.linalg.norm(qv)) or 1.0
+            rows = metadb.catalog_embeddings_for(self._embed_model)
+            if not rows:
+                return []
+            uris = [u for u, _ in rows]
+            mat = np.stack([np.frombuffer(v, dtype=np.float32) for _, v in rows])
+            norms = np.linalg.norm(mat, axis=1)
+            norms[norms == 0] = 1.0
+            scores = (mat @ qv) / (norms * qn)
+            order = np.argsort(-scores)[:limit]
+            ranked = [uris[i] for i in order]
+        except Exception:  # noqa: BLE001
+            log.debug("semantic search failed", exc_info=True)
+            return []
+        docs = metadb.catalog_get_many(ranked)
+        dmap = self._declared_keys()
+        return [self._overlay(self._to_table(docs[u]), dmap) for u in ranked if u in docs]
+
+    def search(self, q: str, mode: str = "hybrid", limit: int = 50) -> list[CatalogTable]:
+        """Search the catalog. `mode`: 'lexical' (name/folder/tag/column substring + facets),
+        'semantic' (embedding similarity — needs an embedder), or 'hybrid' (both, fused by reciprocal
+        rank). With no embedder, semantic/hybrid gracefully fall back to lexical, so search always works
+        offline."""
+        lexical = self.list_page(CatalogQuery(q=q, limit=limit)).items
+        if mode == "lexical" or self._embedder is None:
+            return lexical
+        semantic = self.semantic_search(q, limit=limit)
+        if mode == "semantic":
+            return semantic or lexical
+        # hybrid: reciprocal-rank fusion of the two orderings
+        k = 60.0
+        score: dict[str, float] = {}
+        keep: dict[str, CatalogTable] = {}
+        for lst in (lexical, semantic):
+            for rank, t in enumerate(lst):
+                score[t.uri] = score.get(t.uri, 0.0) + 1.0 / (k + rank)
+                keep[t.uri] = t
+        return [keep[u] for u in sorted(score, key=lambda u: -score[u])][:limit]
+
+    # -- declared keys & relationships (owner-asserted; per-ROW, cross-instance) --- #
     def _declared_keys(self) -> dict[str, list[str]]:
         try:
             return metadb.catalog_declared_keys()
@@ -316,16 +418,9 @@ class InMemoryCatalog:
             return {}
 
     def set_declared_key(self, uri: str, columns: list[str] | None) -> None:
-        """Set (or clear, columns=None/[]) the owner-declared primary key of a dataset — one DB row,
-        OVERLAID on read (_overlay), so it works cross-instance and a clear cleanly restores the
-        inferred key. The escape hatch for a dataset an opaque transform produced or whose key the
-        name heuristic missed."""
         metadb.catalog_set_declared_key(uri, list(columns or []))
 
     def relationships(self, uri: str | None = None) -> list[Relationship]:
-        """Owner-declared join edges; filtered to those touching `uri` when given. A malformed stored
-        row (a manual edit / version skew) is skipped, never fatal — otherwise one bad row would 500
-        the whole feature, including the delete path needed to remove it."""
         try:
             raw = metadb.catalog_relationships()
         except Exception:  # noqa: BLE001
@@ -342,8 +437,7 @@ class InMemoryCatalog:
 
     @staticmethod
     def _rel_key(r: Relationship) -> str:
-        # orientation-insensitive canonical key: A→B and B→A on swapped columns are ONE logical
-        # relationship (sorted endpoints), so re-declaring in reverse replaces its row, not adds one.
+        import json
         ends = sorted([[r.left_uri, list(r.left_columns)], [r.right_uri, list(r.right_columns)]])
         return json.dumps(ends)
 

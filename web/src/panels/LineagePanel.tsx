@@ -13,7 +13,7 @@ export function LineagePanel({ nodeId }: { nodeId: string }) {
 
   useEffect(() => {
     if (!uri) { setErr('this node has no registered dataset yet — run it first'); return }
-    api.lineage(uri).then(setLin).catch((e) => setErr(e.message))
+    api.lineage(uri, 6, 200).then(setLin).catch((e) => setErr(e.message))
   }, [uri])
 
   if (err) return <div style={{ padding: 16, fontSize: 12, color: color.text3 }}>{err}</div>

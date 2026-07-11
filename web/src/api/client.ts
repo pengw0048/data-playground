@@ -1,6 +1,7 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
-  CatalogTable, CompilePlan, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
+  CatalogBrowse, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
+  JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PluginInfo, ProcessorDescriptor, ProfileResult, Relationship, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
@@ -68,6 +69,40 @@ function toGraph(doc: CanvasDoc) {
   }
 }
 
+// Build the querystring for a catalog browse/facet request (lists → comma-joined; empties dropped).
+function catalogQuery(p: CatalogQueryParams): string {
+  const qs = new URLSearchParams()
+  if (p.q) qs.set('q', p.q)
+  if (p.folder) qs.set('folder', p.folder)
+  if (p.tags?.length) qs.set('tags', p.tags.join(','))
+  if (p.owner) qs.set('owner', p.owner)
+  if (p.uris?.length) for (const u of p.uris) qs.append('uris', u)  // repeated param (uris may contain commas)
+  if (p.hasColumns?.length) qs.set('hasColumns', p.hasColumns.join(','))
+  if (p.sort) qs.set('sort', p.sort)
+  if (p.order) qs.set('order', p.order)
+  if (p.limit != null) qs.set('limit', String(p.limit))
+  if (p.offset != null) qs.set('offset', String(p.offset))
+  const s = qs.toString()
+  return s ? `?${s}` : ''
+}
+
+// One page of the catalog: the item list (bare JSON body, backward-compatible) plus the TOTAL match
+// count + hasMore, which ride in X-Total-Count / X-Has-More headers so paging never loads everything.
+async function catalogPage(params: CatalogQueryParams): Promise<CatalogPage> {
+  const headers: Record<string, string> = {}
+  if (_userId) headers['X-DP-User'] = _userId
+  const res = await fetch(`${BASE}/catalog/tables${catalogQuery(params)}`, { headers })
+  if (!res.ok) {
+    let detail = res.statusText
+    try { detail = (await res.json()).detail ?? detail } catch { /* noop */ }
+    throw new KernelError(res.status, typeof detail === 'string' ? detail : JSON.stringify(detail))
+  }
+  const items = (await res.json()) as CatalogTable[]
+  const total = Number(res.headers.get('X-Total-Count') ?? items.length)
+  const hasMore = res.headers.get('X-Has-More') === '1'
+  return { items, total: Number.isFinite(total) ? total : items.length, hasMore }
+}
+
 export interface BackendPort { id: string; label?: string; wire: string; accepts?: string[] }
 export interface BackendParam { name: string; type: string; default?: unknown; options?: string[]; label?: string; lang?: string; required?: boolean; showWhen?: { param: string; in: string[] } }
 export interface BackendNodeSpec {
@@ -96,9 +131,23 @@ export const api = {
   uploadFile: (file: File) =>
     req<CatalogTable>('/catalog/upload', { method: 'POST', body: file, headers: { 'X-Upload-Filename': encodeURIComponent(file.name) } }),
 
+  // a bare (bounded) list — kept for callers that just want "some tables"; browsing uses tablesPage
   tables: (q?: string) => req<CatalogTable[]>(`/catalog/tables${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+  // one filtered/sorted page + the total match count + whether more follow (from response headers), so
+  // a UI can browse thousands of tables without ever loading them all
+  tablesPage: (params: CatalogQueryParams = {}) => catalogPage(params),
+  facets: (params: CatalogQueryParams = {}) =>
+    req<Facets>(`/catalog/facets${catalogQuery(params)}`),
+  catalogTree: (prefix = '') =>
+    req<CatalogBrowse>(`/catalog/tree${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`),
+  searchCatalog: (q: string, mode: 'lexical' | 'semantic' | 'hybrid' = 'hybrid', limit = 50) =>
+    req<CatalogTable[]>(`/catalog/search?q=${encodeURIComponent(q)}&mode=${mode}&limit=${limit}`),
   table: (id: string) => req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}`),
-  lineage: (uri: string) => req<LineageResult>(`/catalog/lineage?uri=${encodeURIComponent(uri)}`),
+  setTableMetadata: (id: string, meta: CatalogMetadata) =>
+    req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),
+  unregisterTable: (id: string) => req<{ ok: boolean }>(`/catalog/tables/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  lineage: (uri: string, depth = 6, maxNodes = 500) =>
+    req<LineageResult>(`/catalog/lineage?uri=${encodeURIComponent(uri)}&depth=${depth}&maxNodes=${maxNodes}`),
 
   sample: (uri: string, k = 50, columns?: string[]) =>
     req<SampleResult>('/data/sample', { method: 'POST', body: JSON.stringify({ uri, k, columns }) }),

@@ -15,7 +15,15 @@ export default defineConfig({
     baseURL: `http://127.0.0.1:${PORT}`,
     trace: 'on-first-retry',
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  // DP_E2E_CHROME lets an environment with a PREBUILT Chromium (a locked-down CI image, a dev
+  // container) point Playwright at it instead of downloading one; unset → Playwright's own browser.
+  projects: [{
+    name: 'chromium',
+    use: {
+      ...devices['Desktop Chrome'],
+      ...(process.env.DP_E2E_CHROME ? { launchOptions: { executablePath: process.env.DP_E2E_CHROME } } : {}),
+    },
+  }],
   webServer: {
     // fresh metadata DB per run (the dev DB persists canvases; tests need a clean slate)
     command: `cd ../kernel && rm -f e2e-test.db && DP_DATABASE_URL=sqlite:///e2e-test.db uv run dataplay --workspace "$PWD" --port ${PORT} --no-open`,

@@ -40,6 +40,7 @@ postgres = ["psycopg[binary]>=3.1"]  # metadata DB on Postgres for deployment (d
 pod = ["kubernetes>=27"]  # cross-host kernel substrate: a Pod + Service per canvas (DP_KERNEL_SPAWNER=pod)
 hf = ["datasets>=2.0"]  # the examples/plugins/dp_hf_datasets reference adapter (hf:// Hugging Face datasets)
 iceberg = ["pyiceberg>=0.6"]  # the examples/plugins/dp_iceberg reference adapter (iceberg:// Apache Iceberg)
+semantic = ["sentence-transformers>=2.2"]  # the examples/plugins/dp_semantic_catalog embedder (semantic/hybrid catalog search)
 ray = ["ray[data]>=2.9"]  # the examples/plugins/dp_ray reference execution backend (runs the clean IR subset on Ray Data)
 dev = ["pytest>=8.0", "httpx>=0.27", "moto[s3,server]>=5.0", "boto3>=1.34", "data-playground[agent]", "data-playground[lance]"]
 

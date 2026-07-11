@@ -127,6 +127,16 @@ class Registry:
     def set_catalog(self, catalog) -> None:
         self.deps.catalog = catalog
 
+    def add_embedder(self, fn, model: str = "custom") -> None:
+        """Register a text embedder — `fn(list[str]) -> list[list[float]]` — to power the catalog's
+        semantic + hybrid search over dataset name/description/columns. Core ships NONE (an embedding
+        model is a heavy, opinionated dependency); a plugin provides one (see examples/plugins/
+        dp_semantic_catalog). The catalog reindexes existing entries best-effort in the background. A
+        catalog provider that doesn't support embedding simply ignores this."""
+        setter = getattr(self.deps.catalog, "set_embedder", None)
+        if callable(setter):
+            setter(fn, model)
+
     def set_importer(self, importer) -> None:
         # a pipeline importer (§5.6/§7.5). Without one, deps.importer stays the NullImporter → the
         # /pipelines/import endpoint reports 'not configured' (501), not a broken 500.

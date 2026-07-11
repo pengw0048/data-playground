@@ -68,6 +68,17 @@ class CatalogTable(Wire):
     missing: bool = False  # a local-path dataset whose file no longer exists (grey out / offer removal)
     updated_at: str | None = None
     meta: str | None = None
+    # --- organization primitives (what makes a catalog of thousands of tables navigable) --------- #
+    # `folder` is a delimiter-joined path ("prod/images/curated") — the browse hierarchy (a namespace).
+    # `tags` are free-form labels for faceted filtering; `owner` and `description` are curation metadata.
+    # All are generic + owner-asserted; nothing here is tied to any particular external catalog — but
+    # they map cleanly onto the namespace/tag/owner model every mature catalog exposes, so an external
+    # provider (via the CatalogProvider seam) can round-trip them.
+    folder: str = ""
+    tags: list[str] = []
+    owner: str | None = None
+    description: str | None = None
+    usage: int = 0  # how often this dataset has been read (popularity signal; drives "most used" sort)
 
 
 Cardinality = Literal["1:1", "1:N", "N:1", "N:M", "unknown"]
@@ -133,6 +144,77 @@ class LineageEdge(Wire):
 class LineageResult(Wire):
     nodes: list[LineageNode] = []
     edges: list[LineageEdge] = []
+    truncated: bool = False  # the connected component was larger than max_nodes / deeper than depth
+
+
+# --------------------------------------------------------------------------- #
+# Catalog browse / search / facets — the discovery surface that scales to
+# thousands of tables (server-side filter + paginate + facet, never "load all").
+# --------------------------------------------------------------------------- #
+class CatalogQuery(Wire):
+    """A filter/sort/paginate request over the catalog. Every field is optional; the empty query is
+    'the first page of everything, by name'. This is the ONE shape a CatalogProvider answers for
+    browsing — a `q` substring, a `folder` subtree, `tags` (ALL must match), an `owner`, required
+    `has_columns`, plus sort + a bounded window. Pushed down to the store (indexed), never realized
+    into an in-memory list first."""
+    q: str | None = None
+    folder: str | None = None          # a folder path; matches that folder AND its subtree
+    tags: list[str] = []               # every listed tag must be present (AND)
+    owner: str | None = None
+    uris: list[str] = []               # restrict to these exact uris (a batch "get these", no 404 on a miss)
+    has_columns: list[str] = []        # dataset must expose every listed column (by name)
+    sort: Literal["name", "rows", "updated", "usage", "folder"] = "name"
+    order: Literal["asc", "desc"] = "asc"
+    limit: int = 50
+    offset: int = 0
+
+
+class FacetValue(Wire):
+    value: str
+    count: int
+
+
+class Facets(Wire):
+    """Distinct values + counts for each facetable dimension, computed over the ACTIVE filter set
+    (drill-down semantics) — what powers the facet rail's clickable, counted filters."""
+    folders: list[FacetValue] = []
+    tags: list[FacetValue] = []
+    owners: list[FacetValue] = []
+
+
+class CatalogPage(Wire):
+    """One window of a filtered catalog: the page's items plus the totals a UI needs to paginate
+    (total match count, whether more follow) — so the client shows '1–50 of 4,213' and loads the
+    next page on demand instead of holding every table in memory."""
+    items: list[CatalogTable] = []
+    total: int = 0
+    offset: int = 0
+    limit: int = 50
+    has_more: bool = False
+
+
+class FolderNode(Wire):
+    """A folder in the browse tree: its leaf name, full path, and how many tables live in its subtree."""
+    name: str
+    path: str
+    table_count: int = 0
+
+
+class CatalogBrowse(Wire):
+    """One level of the browse tree at a prefix: the immediate child folders (with subtree counts) and
+    the tables that live directly at this prefix. Lets the UI lazily expand a folder tree of any size."""
+    prefix: str = ""
+    folders: list[FolderNode] = []
+    tables: list[CatalogTable] = []
+
+
+class CatalogMetadata(Wire):
+    """The owner-editable organization fields of a dataset (everything but the probed schema/rows).
+    A PUT of this is how a table gets filed into a folder, tagged, owned, or described."""
+    folder: str | None = None
+    tags: list[str] | None = None
+    owner: str | None = None
+    description: str | None = None
 
 
 # --------------------------------------------------------------------------- #

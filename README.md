@@ -59,6 +59,13 @@ seeded data, or take the **[5-minute tour](docs/TUTORIAL.md)**: events → keep 
   workspace catalog starts as your local files; add more from the **Tables** view — **Register** a path
   already on disk, or **Upload** a file from your machine — or just **drag a file onto the canvas** to
   drop a bound `source` node.
+- **A catalog that scales to thousands of tables** — the **Tables** view browses the catalog
+  server-side: a **folder tree** (organize datasets into a namespace hierarchy), a **faceted rail**
+  (filter by tag / owner, each with live counts), and **search** across name / folder / description /
+  columns — all paginated + virtualized, so a catalog of thousands loads a page at a time, never all at
+  once. Curate any dataset's **folder, tags, owner, and description** in its detail drawer; sort by name,
+  size, recency, or **most-used**. Optional **semantic search** (a drop-in embedder plugin) ranks by
+  meaning, not just substring.
 - **Explore & transform** — `filter`, `select`, `join`, `aggregate`, `sort`, `dedup`, `window`, `fill`,
   `unnest`, `sql`, `sample`, `metric`, `chart`, `vector-search`, and `transform` (arbitrary Python) nodes
   that **actually execute**.
@@ -73,7 +80,9 @@ seeded data, or take the **[5-minute tour](docs/TUTORIAL.md)**: events → keep 
   history with native charts of run duration + per-node time).
 - **See how tables relate** — the catalog detects join keys, measures cardinality on real data
   (1:1 / 1:N / N:M), and suggests how two datasets join; declare keys/relationships by hand and view
-  them as an ER/UML diagram.
+  them as an ER/UML diagram (scoped to a folder so it stays readable at scale). **Lineage** traces a
+  dataset's upstream/downstream datasets (a run records the edges) — a bounded, depth-capped graph, so
+  even a densely-connected component stays fast to render.
 - **One graph, explore → scale** — the graph you explore with (instant sampled previews) is the *same*
   one you run over the full dataset, with the runner chosen for you — no rewrite. The default engine
   (DuckDB + Polars + Arrow) streams and spills joins/sorts/aggregations to disk, so data bigger than

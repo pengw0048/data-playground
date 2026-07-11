@@ -591,7 +591,8 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to files').click()
     await page.getByTestId('rail-tables').click()
-    await page.getByText('events', { exact: true }).click()
+    await page.getByText('events', { exact: true }).click()   // opens the dataset detail drawer
+    await page.getByTestId('detail-use').click()               // "Use" drops a source onto the canvas
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect(page.locator('.react-flow__node')).toHaveCount(1) // the events source landed
     // preview via the Inspector's View data (always visible for the selected node — no hover needed)
@@ -634,8 +635,9 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('rail-tables').click()
     await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
     await expect(page.getByTestId('register-dataset')).toBeVisible() // register lives here, not only in Settings
-    // clicking the seeded dataset row drops a source onto the canvas and navigates to it
+    // clicking a dataset row opens its detail drawer; "Use" drops a source onto the canvas
     await page.getByText('images', { exact: true }).click()
+    await page.getByTestId('detail-use').click()
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
   })

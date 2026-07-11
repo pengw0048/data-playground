@@ -16,7 +16,10 @@ import json
 import os
 import uuid
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
+from sqlalchemy import (
+    Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String, Text,
+    UniqueConstraint, create_engine, func, or_, select,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -148,20 +151,63 @@ class CatalogEntry(Base):
     """A registered dataset / written output, shared across instances. The in-memory catalog write-throughs
     here on register and loads from here on read, so a dataset registered on one (stateless) web instance
     is visible to the others + survives a restart without re-probing. Keyed by uri; `doc` is the full
-    CatalogTable (incl. probed schema) as JSON so no re-probe is needed to serve it."""
+    CatalogTable (incl. probed schema) as JSON so no re-probe is needed to serve it.
+
+    The `tbl_id`, `folder`, and `owner` columns are a filterable/sortable PROJECTION of `doc` (the doc
+    stays authoritative). Promoting + indexing them is what lets browse/search/facet PUSH DOWN to the
+    DB — the catalog answers a filtered page with an indexed query instead of loading every row into
+    memory and filtering in Python (the old O(n)-per-read model that didn't scale past a few hundred)."""
     __tablename__ = "catalog_entries"
     uri: Mapped[str] = mapped_column(String, primary_key=True)
     name: Mapped[str] = mapped_column(String, index=True)
     doc: Mapped[str] = mapped_column(Text)  # the full CatalogTable as JSON
+    tbl_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)  # CatalogTable.id (stable browse id)
+    folder: Mapped[str] = mapped_column(String, default="", server_default="", index=True)  # browse-path namespace
+    owner: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)  # promoted for sort/display
+    usage: Mapped[int] = mapped_column(Integer, default=0, server_default="0")  # read-count popularity signal
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class CatalogTag(Base):
+    """One (dataset uri → tag) membership. A join table (not a JSON blob on the entry) so a tag filter
+    / a tag facet is an indexed query, and two instances tagging concurrently can't clobber each other."""
+    __tablename__ = "catalog_tags"
+    uri: Mapped[str] = mapped_column(String, primary_key=True)
+    tag: Mapped[str] = mapped_column(String, primary_key=True)
+    __table_args__ = (Index("ix_catalog_tags_tag", "tag"),)
+
+
+class CatalogColumn(Base):
+    """One (dataset uri → column name) pair, mirrored from the probed schema. Powers 'has column X'
+    filtering + a column facet + full-text over column names without cracking every doc's JSON."""
+    __tablename__ = "catalog_columns"
+    uri: Mapped[str] = mapped_column(String, primary_key=True)
+    column: Mapped[str] = mapped_column(String, primary_key=True)
+    __table_args__ = (Index("ix_catalog_columns_column", "column"),)
+
+
+class CatalogEmbedding(Base):
+    """A dataset's semantic embedding (over name + description + columns), for semantic/hybrid search.
+    Written only when an embedder is registered (reg.add_embedder) — the vector is opaque float32
+    bytes + its dim, so the store stays engine-neutral and the search does cosine in the catalog."""
+    __tablename__ = "catalog_embeddings"
+    uri: Mapped[str] = mapped_column(String, primary_key=True)
+    model: Mapped[str] = mapped_column(String)
+    dim: Mapped[int] = mapped_column(Integer)
+    vec: Mapped[bytes] = mapped_column(LargeBinary)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
 class CatalogEdge(Base):
-    """A lineage edge (parent uri → child uri), shared like CatalogEntry so lineage is cross-instance."""
+    """A lineage edge (parent uri → child uri), shared like CatalogEntry so lineage is cross-instance.
+    `column` records column-level provenance when known (which output column derived from the input)."""
     __tablename__ = "catalog_edges"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     parent: Mapped[str] = mapped_column(String, index=True)
     child: Mapped[str] = mapped_column(String, index=True)
+    column: Mapped[str | None] = mapped_column(String, nullable=True)
     pipeline: Mapped[str | None] = mapped_column(String, nullable=True)
     __table_args__ = (UniqueConstraint("parent", "child", name="uq_catalog_edge"),)
 
@@ -708,47 +754,348 @@ def put_result(key: str, doc: dict) -> None:
                 s.delete(obj)
 
 
+def _doc_org(doc: dict) -> tuple[str, str, str | None, str | None, int | None, list[str], list[str]]:
+    """Pull the projectable/indexable fields out of a CatalogTable doc: (tbl_id, folder, owner,
+    description, row_count, tags, column-names). The doc stays authoritative; these are its mirror."""
+    tbl_id = doc.get("id")
+    folder = (doc.get("folder") or "").strip("/")
+    owner = doc.get("owner") or None
+    description = doc.get("description") or None
+    rows = doc.get("rowCount")
+    if rows is None:
+        rows = doc.get("row_count")
+    tags = [str(t) for t in (doc.get("tags") or []) if str(t).strip()]
+    cols = [c.get("name") for c in (doc.get("columns") or []) if isinstance(c, dict) and c.get("name")]
+    return tbl_id, folder, owner, description, rows, tags, cols
+
+
+def _sync_children(s, uri: str, tags: list[str], cols: list[str]) -> None:
+    """Replace a uri's tag + column rows (the indexable projections) in one transaction."""
+    for r in s.scalars(select(CatalogTag).where(CatalogTag.uri == uri)):
+        s.delete(r)
+    for r in s.scalars(select(CatalogColumn).where(CatalogColumn.uri == uri)):
+        s.delete(r)
+    s.flush()
+    for t in dict.fromkeys(tags):  # de-dupe, preserve order
+        s.add(CatalogTag(uri=uri, tag=t))
+    for c in dict.fromkeys(cols):
+        s.add(CatalogColumn(uri=uri, column=c))
+
+
 def catalog_upsert_entry(uri: str, name: str, doc: dict) -> None:
     """Write-through a catalog entry (registered dataset / written output) to the shared DB, keyed by
-    uri, so other instances + a restart see it. `doc` is the full CatalogTable model_dump."""
+    uri, so other instances + a restart see it. `doc` is the full CatalogTable model_dump; its folder /
+    owner / description / row_count / tags / column-names are mirrored to indexed columns + join tables
+    so browse/search/facet push down to the DB. `usage` (popularity) is owned by the column and NOT
+    overwritten from the doc — it's bumped independently on reads."""
+    tbl_id, folder, owner, description, rows, tags, cols = _doc_org(doc)
     with session() as s:
         r = s.get(CatalogEntry, uri)
         payload = json.dumps(doc, default=str)
         if r is None:
-            s.add(CatalogEntry(uri=uri, name=name, doc=payload))
+            s.add(CatalogEntry(uri=uri, name=name, doc=payload, tbl_id=tbl_id, folder=folder,
+                               owner=owner, description=description, row_count=rows))
         else:
-            r.name = name
-            r.doc = payload
+            r.name, r.doc, r.tbl_id = name, payload, tbl_id
+            r.folder, r.owner, r.description, r.row_count = folder, owner, description, rows
+        _sync_children(s, uri, tags, cols)
 
 
-def catalog_add_edge(parent: str, child: str, pipeline: str | None = None) -> None:
-    """Write-through a lineage edge; one row per (parent, child)."""
+def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: str | None,
+                         tags: list[str]) -> None:
+    """Update ONLY the organization fields of an entry (folder/owner/description/tags) — both the
+    indexed columns AND the mirrored fields inside the stored doc, so a re-read is consistent without
+    re-probing the dataset. No-op if the uri isn't registered."""
+    with session() as s:
+        r = s.get(CatalogEntry, uri)
+        if r is None:
+            return
+        try:
+            doc = json.loads(r.doc)
+        except (ValueError, TypeError):
+            doc = {}
+        doc["folder"], doc["owner"], doc["description"], doc["tags"] = folder, owner, description, list(tags)
+        r.folder, r.owner, r.description, r.doc = folder, owner, description, json.dumps(doc, default=str)
+        cols = [c.get("name") for c in doc.get("columns", []) if isinstance(c, dict) and c.get("name")]
+        _sync_children(s, uri, tags, cols)
+
+
+def catalog_bump_usage(uri: str, n: int = 1) -> None:
+    """Increment a dataset's read-count popularity (called best-effort when it's sampled / read in a
+    run). One indexed UPDATE; a missing row is a no-op (an un-registered uri isn't tracked)."""
+    with session() as s:
+        r = s.get(CatalogEntry, uri)
+        if r is not None:
+            r.usage = (r.usage or 0) + n
+
+
+def catalog_add_edge(parent: str, child: str, pipeline: str | None = None, column: str | None = None) -> None:
+    """Write-through a lineage edge; one row per (parent, child). `column` records column-level
+    provenance when known."""
     if parent == child:
         return
     with session() as s:
         exists = s.scalars(select(CatalogEdge).where(CatalogEdge.parent == parent, CatalogEdge.child == child)).first()
         if exists is None:
-            s.add(CatalogEdge(parent=parent, child=child, pipeline=pipeline))
+            s.add(CatalogEdge(parent=parent, child=child, pipeline=pipeline, column=column))
+        elif column and not exists.column:
+            exists.column = column
+
+
+def _row_to_doc(r: "CatalogEntry", tags: list[str]) -> dict:
+    """Materialize a CatalogTable-shaped dict from a row, overlaying the authoritative indexed
+    columns (id/folder/owner/description/usage) + the tag rows onto the stored doc."""
+    try:
+        d = json.loads(r.doc)
+    except (ValueError, TypeError):
+        d = {"id": r.tbl_id or f"tbl_{r.name}", "name": r.name, "uri": r.uri}
+    d["id"] = r.tbl_id or d.get("id") or f"tbl_{r.name}"
+    d["folder"] = r.folder or ""
+    d["owner"] = r.owner
+    d["description"] = r.description
+    d["usage"] = r.usage or 0
+    d["tags"] = tags
+    return d
+
+
+def _tags_for(s, uris: list[str]) -> dict[str, list[str]]:
+    """{uri: [tag, ...]} for a batch of uris — one query, so a page of N rows costs one round-trip."""
+    out: dict[str, list[str]] = {u: [] for u in uris}
+    if not uris:
+        return out
+    for row in s.scalars(select(CatalogTag).where(CatalogTag.uri.in_(uris))):
+        out.setdefault(row.uri, []).append(row.tag)
+    return out
+
+
+def _catalog_filters(q: str | None, folder: str | None, tags: list[str] | None,
+                     owner: str | None, has_columns: list[str] | None,
+                     uris: list[str] | None = None) -> list:
+    """The WHERE terms shared by catalog_query + catalog_facets, so a page and its facet counts always
+    describe the SAME filtered set."""
+    from sqlalchemy import exists
+    terms: list = []
+    if q:
+        like = f"%{q.lower()}%"
+        terms.append(or_(
+            func.lower(CatalogEntry.name).like(like),
+            func.lower(CatalogEntry.uri).like(like),
+            func.lower(CatalogEntry.folder).like(like),
+            func.lower(func.coalesce(CatalogEntry.description, "")).like(like),
+            exists().where(CatalogColumn.uri == CatalogEntry.uri, func.lower(CatalogColumn.column).like(like)),
+        ))
+    if uris:
+        terms.append(CatalogEntry.uri.in_(list(uris)))
+    if folder:
+        f = folder.strip("/")
+        terms.append(or_(CatalogEntry.folder == f, CatalogEntry.folder.like(f + "/%")))
+    for t in (tags or []):
+        terms.append(exists().where(CatalogTag.uri == CatalogEntry.uri, CatalogTag.tag == t))
+    if owner:
+        terms.append(CatalogEntry.owner == owner)
+    for c in (has_columns or []):
+        terms.append(exists().where(CatalogColumn.uri == CatalogEntry.uri, CatalogColumn.column == c))
+    return terms
+
+
+_SORT_COLS = {"name": CatalogEntry.name, "rows": CatalogEntry.row_count,
+              "updated": CatalogEntry.updated_at, "usage": CatalogEntry.usage,
+              "folder": CatalogEntry.folder}
+
+
+def catalog_query(q: str | None = None, folder: str | None = None, tags: list[str] | None = None,
+                  owner: str | None = None, has_columns: list[str] | None = None,
+                  uris: list[str] | None = None,
+                  sort: str = "name", order: str = "asc", limit: int = 50, offset: int = 0,
+                  ) -> tuple[list[dict], int]:
+    """A filtered, sorted, paginated window over the catalog PUSHED DOWN to the DB (indexed columns +
+    EXISTS subqueries), plus the total match count. Returns (docs, total). This is the scalable core:
+    memory + wire cost are bounded by `limit`, not by the catalog size."""
+    terms = _catalog_filters(q, folder, tags, owner, has_columns, uris)
+    col = _SORT_COLS.get(sort, CatalogEntry.name)
+    with session() as s:
+        total = s.scalar(select(func.count()).select_from(CatalogEntry).where(*terms)) or 0
+        stmt = select(CatalogEntry).where(*terms)
+        primary = col.desc() if order == "desc" else col.asc()
+        # a stable tiebreak (name, then uri) keeps paging deterministic when many rows share a sort key
+        stmt = stmt.order_by(primary, CatalogEntry.name.asc(), CatalogEntry.uri.asc())
+        rows = list(s.scalars(stmt.limit(max(0, limit)).offset(max(0, offset))))
+        tag_map = _tags_for(s, [r.uri for r in rows])
+        docs = [_row_to_doc(r, tag_map.get(r.uri, [])) for r in rows]
+    return docs, int(total)
+
+
+def catalog_facets(q: str | None = None, folder: str | None = None, tags: list[str] | None = None,
+                   owner: str | None = None, has_columns: list[str] | None = None, top: int = 100,
+                   ) -> dict[str, list[tuple[str, int]]]:
+    """Distinct values + counts for the folder / tag / owner dimensions over the ACTIVE filter set
+    (drill-down semantics). Each list is capped to the `top` most common. Powers the facet rail."""
+    terms = _catalog_filters(q, folder, tags, owner, has_columns)
+    with session() as s:
+        folders = [(v or "", int(c)) for v, c in s.execute(
+            select(CatalogEntry.folder, func.count()).where(*terms, CatalogEntry.folder != "")
+            .group_by(CatalogEntry.folder).order_by(func.count().desc()).limit(top)).all()]
+        owners = [(v, int(c)) for v, c in s.execute(
+            select(CatalogEntry.owner, func.count()).where(*terms, CatalogEntry.owner.is_not(None))
+            .group_by(CatalogEntry.owner).order_by(func.count().desc()).limit(top)).all()]
+        # tags live in a join table → count distinct entries per tag within the filtered set
+        uri_sq = select(CatalogEntry.uri).where(*terms).subquery()
+        tag_rows = s.execute(
+            select(CatalogTag.tag, func.count()).where(CatalogTag.uri.in_(select(uri_sq.c.uri)))
+            .group_by(CatalogTag.tag).order_by(func.count().desc()).limit(top)).all()
+        tag_counts = [(v, int(c)) for v, c in tag_rows]
+    return {"folders": folders, "tags": tag_counts, "owners": owners}
+
+
+def catalog_tree(prefix: str = "", table_limit: int = 100) -> tuple[list[tuple[str, str, int]], list[dict]]:
+    """One level of the browse tree at `prefix`: (child_folders, direct_tables). child_folders is a
+    list of (name, path, subtree_table_count) for the immediate sub-folders; direct_tables are the
+    tables filed exactly at `prefix`. Folder aggregation is over the (small) set of distinct folders,
+    so this scales with the number of FOLDERS, not tables."""
+    p = (prefix or "").strip("/")
+    depth = 0 if not p else p.count("/") + 1
+    with session() as s:
+        folder_counts = s.execute(
+            select(CatalogEntry.folder, func.count()).where(CatalogEntry.folder != "")
+            .group_by(CatalogEntry.folder)).all()
+        children: dict[str, int] = {}
+        for folder, cnt in folder_counts:
+            f = (folder or "").strip("/")
+            if p:
+                if f != p and not f.startswith(p + "/"):
+                    continue
+            segs = f.split("/")
+            if len(segs) <= depth:
+                continue  # this folder is AT the prefix (no deeper child segment)
+            child_path = "/".join(segs[: depth + 1])
+            children[child_path] = children.get(child_path, 0) + int(cnt)
+        child_list = sorted(
+            ((cp.split("/")[-1], cp, n) for cp, n in children.items()), key=lambda x: x[0].lower())
+        direct_rows = list(s.scalars(
+            select(CatalogEntry).where(CatalogEntry.folder == p).order_by(CatalogEntry.name).limit(table_limit)))
+        tag_map = _tags_for(s, [r.uri for r in direct_rows])
+        tables = [_row_to_doc(r, tag_map.get(r.uri, [])) for r in direct_rows]
+    return child_list, tables
+
+
+def catalog_get(token: str) -> dict | None:
+    """A single entry by uri (PK), then by tbl_id, then by name — all indexed. None if unknown.
+    Replaces the old 'load the whole catalog then look it up' path, so get_table is O(1), not O(n)."""
+    with session() as s:
+        r = s.get(CatalogEntry, token)
+        if r is None:
+            r = s.scalars(select(CatalogEntry).where(CatalogEntry.tbl_id == token).limit(1)).first()
+        if r is None:
+            r = s.scalars(select(CatalogEntry).where(CatalogEntry.name == token).limit(1)).first()
+        if r is None:
+            return None
+        return _row_to_doc(r, [t.tag for t in s.scalars(select(CatalogTag).where(CatalogTag.uri == r.uri))])
+
+
+def catalog_get_many(uris: list[str]) -> dict[str, dict]:
+    """{uri: doc} for a batch of uris — used to name lineage-graph nodes in one round-trip."""
+    if not uris:
+        return {}
+    with session() as s:
+        rows = list(s.scalars(select(CatalogEntry).where(CatalogEntry.uri.in_(uris))))
+        tag_map = _tags_for(s, [r.uri for r in rows])
+        return {r.uri: _row_to_doc(r, tag_map.get(r.uri, [])) for r in rows}
 
 
 def catalog_entries() -> list[dict]:
-    """Every persisted catalog entry, as CatalogTable-shaped dicts (for the in-memory catalog to load)."""
+    """Every persisted catalog entry, as CatalogTable-shaped dicts. Retained for tooling/back-compat;
+    the browse path uses catalog_query (bounded), not this (unbounded) scan."""
     with session() as s:
-        return [json.loads(r.doc) for r in s.scalars(select(CatalogEntry))]
+        rows = list(s.scalars(select(CatalogEntry)))
+        tag_map = _tags_for(s, [r.uri for r in rows])
+        return [_row_to_doc(r, tag_map.get(r.uri, [])) for r in rows]
 
 
 def catalog_delete_entry(uri: str) -> None:
-    """Remove a catalog entry (unregister) from the shared store."""
+    """Remove a catalog entry (unregister) + its mirrored tag/column/embedding rows."""
     with session() as s:
+        for model in (CatalogTag, CatalogColumn):
+            for r in s.scalars(select(model).where(model.uri == uri)):
+                s.delete(r)
+        emb = s.get(CatalogEmbedding, uri)
+        if emb is not None:
+            s.delete(emb)
         r = s.get(CatalogEntry, uri)
         if r is not None:
             s.delete(r)
 
 
+def catalog_delete_prefix(uri_prefix: str) -> int:
+    """Delete every entry (+ its tag/column/embedding rows) whose uri starts with `uri_prefix`. Returns
+    the count removed. For bulk teardown of demo/scale entries; a no-op for a prefix that matches none."""
+    like = uri_prefix + "%"
+    with session() as s:
+        uris = [u for (u,) in s.execute(select(CatalogEntry.uri).where(CatalogEntry.uri.like(like))).all()]
+        if not uris:
+            return 0
+        for model in (CatalogTag, CatalogColumn, CatalogEmbedding):
+            for r in s.scalars(select(model).where(model.uri.in_(uris))):
+                s.delete(r)
+        for r in s.scalars(select(CatalogEntry).where(CatalogEntry.uri.in_(uris))):
+            s.delete(r)
+    return len(uris)
+
+
 def catalog_edges() -> list[dict]:
     with session() as s:
-        return [{"parent": r.parent, "child": r.child, "pipeline": r.pipeline}
+        return [{"parent": r.parent, "child": r.child, "column": r.column, "pipeline": r.pipeline}
                 for r in s.scalars(select(CatalogEdge))]
+
+
+def catalog_edges_touching(uris: list[str]) -> list[dict]:
+    """Every edge with an endpoint in `uris` — the frontier expansion step of a bounded lineage BFS
+    (so lineage never loads the whole edge table)."""
+    if not uris:
+        return []
+    with session() as s:
+        rows = s.scalars(select(CatalogEdge).where(
+            or_(CatalogEdge.parent.in_(uris), CatalogEdge.child.in_(uris))))
+        return [{"parent": r.parent, "child": r.child, "column": r.column, "pipeline": r.pipeline} for r in rows]
+
+
+# -- semantic search (opt-in: only populated when an embedder is registered) ----------------------- #
+def catalog_set_embedding(uri: str, model: str, dim: int, vec: bytes) -> None:
+    with session() as s:
+        r = s.get(CatalogEmbedding, uri)
+        if r is None:
+            s.add(CatalogEmbedding(uri=uri, model=model, dim=dim, vec=vec))
+        else:
+            r.model, r.dim, r.vec = model, dim, vec
+
+
+def catalog_embeddings_for(model: str) -> list[tuple[str, bytes]]:
+    """(uri, vec-bytes) for every embedding under `model` — the candidate set semantic search scores."""
+    with session() as s:
+        return [(r.uri, r.vec) for r in s.scalars(select(CatalogEmbedding).where(CatalogEmbedding.model == model))]
+
+
+def catalog_bulk_seed(entries: list[dict]) -> int:
+    """Register many synthetic/pre-built entries in one transaction (skipping uris already present) —
+    for demos + the scale acceptance test. Each entry: {uri, name, doc, folder?, tags?, owner?,
+    description?, rowCount?}. Returns how many were inserted."""
+    n = 0
+    with session() as s:
+        existing = {u for (u,) in s.execute(select(CatalogEntry.uri).where(
+            CatalogEntry.uri.in_([e["uri"] for e in entries]))).all()}
+        for e in entries:
+            uri = e["uri"]
+            if uri in existing:
+                continue
+            doc = e.get("doc") or {}
+            tbl_id, folder, owner, description, rows, tags, cols = _doc_org(doc)
+            s.add(CatalogEntry(uri=uri, name=e["name"], doc=json.dumps(doc, default=str), tbl_id=tbl_id,
+                               folder=folder, owner=owner, description=description, row_count=rows))
+            for t in dict.fromkeys(tags):
+                s.add(CatalogTag(uri=uri, tag=t))
+            for c in dict.fromkeys(cols):
+                s.add(CatalogColumn(uri=uri, column=c))
+            n += 1
+    return n
 
 
 def catalog_relationships() -> list[dict]:

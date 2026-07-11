@@ -82,8 +82,8 @@ app.include_router(workspace.router, prefix="/api", dependencies=_GATE)
 auth.reject_weak_secret()  # fail fast on a shipped/known-weak DP_AUTH_SECRET (forgeable sessions)
 metadb.init_db()  # create metadata tables (idempotent) + seed the default local user
 # user-added datasets survive restart via the per-row catalog_entries store (register_output
-# write-throughs there); the catalog's _load_from_db restores them lazily on first read. No
-# import-time re-register loop (removed the blocking probe-per-dataset startup pass; F45/F24).
+# write-throughs there); the catalog serves them straight from the DB with indexed, paginated
+# queries (no import-time re-register loop, no load-everything-into-memory on read).
 
 
 # Periodic reaper — the "on a timer" half of reap_kernels' contract (boot is the other half). Every
