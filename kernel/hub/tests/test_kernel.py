@@ -3316,6 +3316,23 @@ def test_plan_hash_includes_bypass_and_disable_flags():
     assert base == r._plan_hash(graph_with({"bypassed": False}), "wr")  # explicit False == absent
 
 
+def test_plan_hash_includes_requirements():
+    # P0-CACHE-01: a transform can import a canvas requirement, so a package-version edit must change
+    # the plan hash — else the durable/warm cache serves a result computed against the old version.
+    from hub.models import Graph
+    r = get_deps().runner
+
+    def graph_with(reqs):
+        return Graph(**{"id": "c", "version": 1, "requirements": reqs, "nodes": [
+            N("src", "source", {"uri": _uri("events")}),
+            N("f", "filter", {"predicate": "amount > 0"}),
+            N("wr", "write", {"name": "o"}),
+        ], "edges": [E("src", "f"), E("f", "wr")]})
+
+    assert r._plan_hash(graph_with(["pkg==1"]), "wr") != r._plan_hash(graph_with(["pkg==2"]), "wr")
+    assert r._plan_hash(graph_with(["a", "b"]), "wr") == r._plan_hash(graph_with(["b", "a"]), "wr")  # order-free
+
+
 def test_completed_run_result_is_db_cached(tmp_path):
     # A2: a finished run persists its result pointer to the shared DB (result_cache), so it's reused
     # across a kernel restart / another stateless instance — not just the accepting process's dict.

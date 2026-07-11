@@ -5,11 +5,36 @@ durable result_cache and the kernel's warm relation cache, so both invalidate on
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
+import platform
 
 from hub import graph as g
 from hub.models import Graph
+
+# Bump when the KEYING SCHEME changes — old cache entries then fall out of the namespace and recompute
+# instead of being served stale. v1 folded requirements + runtime env into the key (P0-CACHE-01).
+CACHE_SCHEMA_VERSION = 1
+
+
+@functools.lru_cache(maxsize=1)
+def _env_digest() -> str:
+    """Digest of the code + runtime that PRODUCES a cached result, so a version bump can't serve a stale
+    hit: the core package (which ships the IR + DuckDB engine code), Python, and the DuckDB/PyArrow
+    runtimes that compute the output. Constant per process → computed once. Plugin / library-processor
+    versions are intentionally omitted — plan_cacheable already makes those nodes non-cacheable."""
+    try:
+        import duckdb
+        import pyarrow
+        try:
+            from importlib.metadata import version as _v
+            core = _v("data-playground")
+        except Exception:  # noqa: BLE001 — not installed as a dist (a bare source checkout)
+            core = "src"
+        return "|".join([core, platform.python_version(), duckdb.__version__, pyarrow.__version__])
+    except Exception:  # noqa: BLE001 — a missing __version__ must degrade the digest, never break a run
+        return f"src|{platform.python_version()}"
 
 
 def plan_hash(graph: Graph, target: str | None, resolve_adapter) -> str:
@@ -19,6 +44,12 @@ def plan_hash(graph: Graph, target: str | None, resolve_adapter) -> str:
     from hub.section import _descendants  # section's parent_id-contained nodes
     chain = g.upstream_chain(graph, target) if target else g.topo_order(graph)
     parts: list[str] = []
+    # P0-CACHE-01: identity must also cover the canvas's declared requirements (a package-version edit
+    # changes them, and a transform node can import them) and the code/runtime producing the result —
+    # else a bump silently serves a stale hit. Sorted so declared order doesn't matter.
+    parts.append(f"schema:{CACHE_SCHEMA_VERSION}")
+    parts.append(f"env:{_env_digest()}")
+    parts.append("reqs:" + json.dumps(sorted(getattr(graph, "requirements", None) or [])))
 
     def _fold(n, prefix=""):
         data = n.data if isinstance(n.data, dict) else {}
