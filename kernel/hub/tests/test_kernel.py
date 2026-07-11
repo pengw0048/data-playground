@@ -5031,6 +5031,35 @@ def test_ir_unify_regressions(tmp_path):
     assert not irmod.lower_to_ir(g3, "m", d.node_specs, node_ir).is_clean()  # opaque → not clean, no raise
 
 
+def test_unknown_node_kind_fails_closed():
+    # P0-DATA-02: a missing plugin / misspelled kind must NOT compile+run as a silent passthrough
+    # (which reports success while omitting the intended work). It fails closed everywhere, naming the
+    # offending node id + kind.
+    g = {"id": "c", "version": 1, "nodes": [
+        N("a", "source", {"uri": _uri("events")}),
+        N("x", "totally_not_a_real_kind", {}),
+    ], "edges": [E("a", "x")]}
+    # compile surfaces the error instead of a happy `opaque:` plan
+    plan = client.post("/api/graph/compile", json={"graph": g, "targetNodeId": "x"}).json()
+    assert plan.get("error") and "totally_not_a_real_kind" in plan["error"]
+    # preview / run / profile fail closed with a 400 naming the node id + kind
+    pv = client.post("/api/run/preview", json={"graph": g, "nodeId": "x", "k": 5})
+    assert pv.status_code == 400 and "totally_not_a_real_kind" in pv.text and "'x'" in pv.text
+    rn = client.post("/api/run", json={"graph": g, "targetNodeId": "x", "confirmed": True})
+    assert rn.status_code == 400 and "totally_not_a_real_kind" in rn.text
+    pf = client.post("/api/run/profile", json={"graph": g, "nodeId": "x"})
+    assert pf.status_code == 400
+    # and the engine itself refuses rather than passing through, even if the API gate is bypassed
+    from hub import db
+    from hub.executors.engine import BuildEngine, NotPreviewable
+    from hub.models import Graph
+    d = get_deps()
+    be = BuildEngine(Graph(**g), d.resolve_adapter, d.registry, full=True,
+                     node_builders=d.node_builders, node_specs=d.node_specs)
+    with db.run_scope(), pytest.raises(NotPreviewable):
+        be.relation("x")
+
+
 def test_resolve_config_is_the_shared_builtin_resolver():
     # hub.ir.resolve_config is the SINGLE resolver both the IR and the DuckDB engine (executors/engine.py
     # _lower) read built-in config through — canonicalizing keys so they can't diverge. Lock the contract.

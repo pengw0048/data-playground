@@ -790,6 +790,12 @@ class BuildEngine:
                 "loop": "each loop pass runs real work — needs a full pass",
             }[t])
 
+        if t == "variable":  # a named passthrough handle — carries its single input through unchanged
+            return parent if parent is not None else _empty()
+        # any other kind reaching here is unhandled — a missing plugin or a typo. Fail closed (P0-DATA-02):
+        # never silently pass the input through, which would omit the intended work yet report success.
+        if t not in self.node_specs and t not in self.node_builders:
+            raise NotPreviewable(node, f"unknown node kind '{t}' — is its plugin installed and compatible?")
         return parent if parent is not None else _empty()
 
     def _spec_previewable(self, kind: str) -> bool:
