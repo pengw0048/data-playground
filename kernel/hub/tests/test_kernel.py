@@ -706,6 +706,23 @@ def test_claim_kernel_takes_over_a_stale_lease():
     metadb.drop_kernel("cv_takeover", "k_new")
 
 
+def test_kernel_liveness_counts_in_process_preview_profile():
+    # acceptance #5: the idle-TTL watchdog must treat the kernel as BUSY while an in-process preview or
+    # profile runs — those don't appear in run_runner.runs (only offloaded /run does), so without the
+    # in-flight term a full-dataset profile longer than idle-ttl would recycle its own warm kernel mid-run.
+    from hub.kernel import _liveness_busy
+
+    class _R:
+        def __init__(self, s): self.status = s
+    assert _liveness_busy(0, {}) is False                       # nothing in flight, no runs → idle
+    assert _liveness_busy(1, {}) is True                        # an in-process preview/profile → BUSY
+    assert _liveness_busy(3, {}) is True                        # several concurrent previews → BUSY
+    assert _liveness_busy(0, {"r": _R("running")}) is True      # an offloaded run still counts
+    assert _liveness_busy(0, {"r": _R("queued")}) is True
+    assert _liveness_busy(0, {"a": _R("done"), "b": _R("failed")}) is False  # only terminal runs → idle
+    assert _liveness_busy(1, {"a": _R("done")}) is True         # in-flight work wins over a finished run
+
+
 def test_dp_execution_is_the_third_precedence_tier(tmp_path, monkeypatch):
     # precedence: per-user > workspace > DP_EXECUTION > kernel default. With no user/global setting,
     # DP_EXECUTION (settings.execution) is honored — the tier only incidentally covered before.
