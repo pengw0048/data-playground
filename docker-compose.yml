@@ -15,6 +15,12 @@ services:
       # per-user auth (signed session cookies). REQUIRED — compose refuses to start without it, so
       # sessions can't be forged with a shipped default. Generate one: `openssl rand -hex 32`.
       DP_AUTH_SECRET: "${DP_AUTH_SECRET:?set DP_AUTH_SECRET to a random secret, e.g. openssl rand -hex 32}"
+      # first-admin bootstrap: on first boot init_db (kernel/hub/metadb.py) seeds the built-in "local"
+      # admin's password from this. REQUIRED — else a fresh auth-on deploy has an admin with NO usable
+      # credential and no authenticated route to create one (a lockout). Log in as user `local` with
+      # this password, create per-user accounts, and each user rotates their own password in-app.
+      # Changing it later does NOT rotate the admin (rotation is via /auth/password); keep it set.
+      DP_AUTH_PASSWORD: "${DP_AUTH_PASSWORD:?set DP_AUTH_PASSWORD to a first-admin password so login isn't locked out}"
       # multi-user: confine dataset reads to these roots (see kernel/hub/paths.py). The workspace
       # volume is /data; add more host roots you mount if users load datasets from them.
       DP_DATASET_ROOTS: "/data"

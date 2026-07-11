@@ -1641,6 +1641,27 @@ def test_per_user_password_is_not_a_skeleton_key(monkeypatch):
     client.cookies.clear()
 
 
+def test_first_admin_bootstrap_from_env_password(monkeypatch):
+    # P0-DEPLOY-01: a fresh auth-on deploy (as Compose forces) seeds an admin with NO password →
+    # every login 401s and there's no authed route to set one (a lockout). DP_AUTH_PASSWORD closes it.
+    from hub import auth, metadb
+    client.cookies.clear()
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")     # auth on
+    metadb.set_user_password("local", None)            # simulate the fresh/pre-bootstrap admin
+    try:
+        # no DP_AUTH_PASSWORD → the deadlock: the seeded admin can't authenticate at all
+        assert client.post("/api/auth/login", json={"userId": "local", "password": "anything"}).status_code == 401
+        # wire the bootstrap and re-run the startup seed (init_db is idempotent)
+        monkeypatch.setenv("DP_AUTH_PASSWORD", "bootstrap-pw-123")
+        metadb.init_db()
+        assert metadb.is_admin("local")
+        assert client.post("/api/auth/login", json={"userId": "local", "password": "bootstrap-pw-123"}).status_code == 200
+        assert client.get("/api/canvas").status_code == 200  # a gated route is now reachable
+    finally:
+        client.cookies.clear()
+        metadb.set_user_password("local", None)        # restore open-mode-friendly state for other tests
+
+
 def test_api_routes_require_auth_when_enabled(monkeypatch):
     # SECURE DEFAULT: with auth enabled, the whole /api surface needs a session — the high-impact routes
     # (/run code-exec, /data file-read, POST /users self-registration) used to be wide open. Only the

@@ -334,8 +334,11 @@ Two *runtime* things still have **instance affinity** — they need routing, not
 **With Docker.** `docker compose up` builds one image (the web app baked in) and runs it against
 Postgres — the shared, restart-durable setup above. `Dockerfile` is the single-image build
 (`docker build -t dataplay .`); `docker-compose.yml` adds Postgres, volumes, and documents
-`deploy.replicas` + sticky routing for the multi-instance case. Set `DP_AUTH_SECRET` and
-`DP_DATASET_ROOTS` for a multi-user deployment; TLS is operator-specific (front it with nginx/Caddy).
+`deploy.replicas` + sticky routing for the multi-instance case. Set `DP_AUTH_SECRET`,
+`DP_AUTH_PASSWORD`, and `DP_DATASET_ROOTS` for a multi-user deployment; TLS is operator-specific
+(front it with nginx/Caddy). `DP_AUTH_PASSWORD` bootstraps the first admin on first boot — log in as
+user `local` with it, create per-user accounts, then each user rotates their own password in-app
+(changing the env var later does not rotate it). Without it a fresh auth-on deploy is locked out.
 
 ---
 
