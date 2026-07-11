@@ -104,7 +104,8 @@ def object_fs(uri: str):
     raise ValueError(f"unsupported object-store scheme for Arrow/Feather: {scheme}://")
 
 
-_ARROW_BATCH_ROWS = 65536  # rows per RecordBatch when streaming Arrow-IPC (bounds peak RAM, out-of-core)
+_ARROW_BATCH_TARGET_BYTES = 128 << 20  # ~128 MiB target per streamed RecordBatch
+_ARROW_BATCH_MAX_ROWS = 65536          # cap rows/batch (narrow rows); a byte target derives the actual count
 
 
 def _read_ipc(con: "duckdb.DuckDBPyConnection", source, filesystem=None) -> "Relation":
@@ -119,9 +120,14 @@ def _read_ipc(con: "duckdb.DuckDBPyConnection", source, filesystem=None) -> "Rel
 def _stream_ipc(rel: "Relation", sink) -> None:
     """Write a DuckDB relation to an Arrow-IPC file `sink` (a local path or an open output stream) by
     STREAMING RecordBatches — never draining the whole relation into one in-RAM Arrow table (out-of-core
-    WRITE). `sink` as a stream is used for the object-store temp-key upload."""
+    WRITE). `sink` as a stream is used for the object-store temp-key upload. The batch size is BYTE-budgeted
+    from the estimated row width (vectors/lists counted), so peak RAM is ~constant regardless of row width:
+    a wide 4096-dim embedding gets far fewer rows/batch than a narrow int table, not a fixed 65536 rows."""
     import pyarrow.ipc as ipc
-    reader = rel.to_arrow_reader(_ARROW_BATCH_ROWS)
+    from hub.estimate import _row_width
+    width = max(8, _row_width(relation_columns(rel)))  # bytes/row; relation_columns is schema-only (no scan)
+    batch_rows = max(1024, min(_ARROW_BATCH_MAX_ROWS, _ARROW_BATCH_TARGET_BYTES // width))
+    reader = rel.to_arrow_reader(batch_rows)
     with ipc.new_file(sink, reader.schema) as w:
         for batch in reader:
             w.write_batch(batch)
@@ -205,11 +211,12 @@ class DuckDBAdapter:
                 return con.read_json(uri)
             if low.endswith((".arrow", ".feather", ".ipc")):
                 # DuckDB has no Arrow-IPC file reader, so pull the object through pyarrow's own S3/GCS
-                # filesystem (same creds). Read EAGERLY here: a lazy pyarrow Dataset over the S3 filesystem
-                # triggers a region-resolution HeadObject that ignores the endpoint override (times out on
-                # MinIO / custom endpoints), and an object feather is network-fetched regardless — the
-                # out-of-core streaming READ win is on LOCAL files (below). The streaming WRITE applies to
-                # both (see _stream_ipc in write()).
+                # filesystem (same creds). Read EAGERLY here: a lazy pyarrow Dataset over an object store is
+                # unreliable two ways — a bare `s3://…` string makes pyarrow build its OWN filesystem that
+                # ignores the endpoint override (region-resolution HeadObject → ACCESS_DENIED on MinIO), and
+                # even with our explicit filesystem, DuckDB defers the arrow scan to its own thread where the
+                # S3 access fails (NETWORK_CONNECTION). An object feather is network-fetched regardless — the
+                # out-of-core streaming READ win is on LOCAL files (below); the streaming WRITE covers both.
                 import pyarrow.feather as feather
                 fs, p = object_fs(uri)
                 with fs.open_input_file(p) as f:
