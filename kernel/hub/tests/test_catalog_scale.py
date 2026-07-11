@@ -214,6 +214,34 @@ def test_list_page_provider_api(scale_catalog):
     assert len(page.items) == 10 and page.total == 2000 // 5 and page.has_more is True
 
 
+def test_default_catalog_is_loaded_as_a_plugin():
+    """The built-in catalog is not a privileged core instantiation — it's registered FIRST through the
+    public reg.set_catalog seam by a bundled plugin, so swapping in an external catalog is first-class."""
+    from hub.backends import CatalogProvider
+    from hub.plugins.catalog import InMemoryCatalog
+    deps = get_deps()
+    # it registered as a plugin (source=builtin), loaded before external plugins
+    assert any(p.get("name") == "default-catalog" and p.get("source") == "builtin" for p in deps.plugins)
+    # and it's the real provider, conforming to the protocol
+    assert isinstance(deps.catalog, InMemoryCatalog)
+    assert isinstance(deps.catalog, CatalogProvider)
+
+    # the bundled register() is exactly what a third-party catalog plugin would call
+    from hub.plugins import default_catalog
+
+    class _Reg:
+        def __init__(self, d):
+            self.deps = d
+            self.chosen = None
+
+        def set_catalog(self, c):
+            self.chosen = c
+
+    reg = _Reg(deps)
+    default_catalog.register(reg)
+    assert isinstance(reg.chosen, InMemoryCatalog)
+
+
 def test_semantic_plugin_registers_embedder():
     """The shipped dp_semantic_catalog plugin wires an embedder through reg.add_embedder when enabled,
     and is a no-op when disabled — without importing the heavy model (the embedder fn is lazy)."""

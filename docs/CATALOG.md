@@ -72,8 +72,12 @@ Larger organizations usually already run a central metadata service — a catalo
 owners, and a lineage graph. Data Playground is designed to sit in front of one **without forking the
 core**, because two things line up on purpose:
 
-1. **The whole catalog is one swappable provider.** `reg.set_catalog(obj)` replaces the built-in
-   provider with anything that implements the `CatalogProvider` protocol
+1. **The whole catalog is one swappable provider — and the default proves it.** The built-in catalog
+   is itself installed through the public seam: a bundled first-party plugin
+   (`hub/plugins/default_catalog.py`) calls `reg.set_catalog(InMemoryCatalog(...))`, loaded before any
+   workspace/entry-point plugin. So the default is not a privileged core instantiation — it's the first
+   implementation through the seam, and a plugin loaded afterwards simply calls `reg.set_catalog(obj)`
+   again to replace it with anything implementing the `CatalogProvider` protocol
    (`kernel/hub/backends.py`). The discovery surface a UI needs — `list_page(query)`, `facets(query)`,
    `browse(prefix)`, `search(q, mode)`, `lineage(uri, depth, max_nodes)`, `get_table`, `resolve_ref` —
    is exactly the set of **bounded, pushed-down** operations a remote metadata API also exposes, so a
