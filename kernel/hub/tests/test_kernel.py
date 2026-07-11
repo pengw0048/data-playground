@@ -3166,6 +3166,46 @@ def test_canvas_sharing_access_and_authz():
     assert client.post(f"/api/canvas/{cid}/share", json={"userId": "local", "role": "editor"}, headers=hb).status_code == 403
 
 
+def test_share_cannot_grant_owner_role():
+    # P0-AUTH-01: a share may only confer 'editor'|'viewer'. Granting the literal 'owner' role used to
+    # be accepted and canvas_role() then treated the recipient as owner (delete/reshare). It must 422,
+    # and even a pre-existing bad row must not escalate (canvas_role clamps it to viewer).
+    from hub import metadb
+    mallory = client.post("/api/users", json={"name": "Mallory"}).json()["id"]
+    cid = "escalate_cv"
+    client.put(f"/api/canvas/{cid}", json={"id": cid, "name": "c", "version": 1, "nodes": [], "edges": []})
+    # the API rejects an 'owner' (or junk) role outright
+    assert client.post(f"/api/canvas/{cid}/share", json={"userId": mallory, "role": "owner"}).status_code == 422
+    assert client.post(f"/api/canvas/{cid}/share", json={"userId": mallory, "role": "admin"}).status_code == 422
+    # the metadb write boundary rejects it too
+    import pytest
+    from sqlalchemy.exc import IntegrityError
+    with pytest.raises(ValueError):
+        metadb.share_canvas(cid, mallory, "owner")
+    # and the DB CHECK constraint is the last line of defense — an 'owner' row can't even be inserted
+    with pytest.raises(IntegrityError):
+        with metadb.session() as s:
+            s.add(metadb.CanvasShare(canvas_id=cid, user_id=mallory, role="owner"))
+    # a legitimately shared viewer cannot delete (ownership stays with owner_id)
+    client.post(f"/api/canvas/{cid}/share", json={"userId": mallory, "role": "viewer"})
+    hm = {"X-DP-User": mallory}
+    client.delete(f"/api/canvas/{cid}", headers=hm)
+    assert client.get(f"/api/canvas/{cid}").status_code == 200  # still there
+
+
+def test_kernel_restart_requires_edit_access():
+    # P0-AUTH-01: restarting a canvas's kernel is a disruptive action; a read-only viewer must not be
+    # able to kill a shared canvas's kernel.
+    viewer = client.post("/api/users", json={"name": "RestartViewer"}).json()["id"]
+    cid = "restart_authz_cv"
+    client.put(f"/api/canvas/{cid}", json={"id": cid, "name": "c", "version": 1, "nodes": [], "edges": []})
+    client.post(f"/api/canvas/{cid}/share", json={"visibility": "workspace_view"})  # everyone read-only
+    hv = {"X-DP-User": viewer}
+    assert client.get(f"/api/canvas/{cid}", headers=hv).status_code == 200        # viewer can read
+    assert client.post(f"/api/canvas/{cid}/kernel/restart", headers=hv).status_code == 403  # but not restart
+    assert client.post(f"/api/canvas/{cid}/kernel/restart").status_code == 200    # owner can
+
+
 def test_workspace_view_visibility_is_read_only():
     # 'workspace_view' opens a canvas to everyone but read-only (viewer); 'workspace' opens it editable.
     carol = client.post("/api/users", json={"name": "Carol"}).json()["id"]

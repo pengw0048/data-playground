@@ -215,7 +215,10 @@ def add_share(canvas_id: str, body: dict, uid: str = Depends(current_user)) -> d
             raise HTTPException(400, "invalid visibility")
         metadb.set_visibility(canvas_id, body["visibility"])
     if body.get("userId"):
-        metadb.share_canvas(canvas_id, body["userId"], body.get("role", "editor"))
+        role = body.get("role", "editor")
+        if role not in metadb.SHARE_ROLES:  # never let a share grant 'owner' — that's a privilege escalation
+            raise HTTPException(422, f"invalid role {role!r}; must be one of {list(metadb.SHARE_ROLES)}")
+        metadb.share_canvas(canvas_id, body["userId"], role)
     return {"ok": True}
 
 
@@ -259,8 +262,11 @@ def canvas_kernel(canvas_id: str, uid: str = Depends(current_user)) -> dict:
 def canvas_kernel_restart(canvas_id: str, uid: str = Depends(current_user)) -> dict:
     """Restart the canvas's kernel (Jupyter's 'Restart kernel'): shut the current one down; the next
     run/preview spawns a fresh one. A wedged transform or a stale warm state is cleared this way."""
-    if metadb.canvas_role(canvas_id, uid) is None:
+    role = metadb.canvas_role(canvas_id, uid)
+    if role is None:
         raise HTTPException(404, "not found")
+    if role not in ("owner", "editor"):  # a viewer must not be able to kill a shared canvas's kernel
+        raise HTTPException(403, "restart requires edit access")
     k = metadb.get_kernel(canvas_id)
     if not k or not k.get("endpoint"):
         return {"ok": True, "restarted": False}  # none live → next run spawns fresh anyway
