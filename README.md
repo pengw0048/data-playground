@@ -13,6 +13,17 @@ Parquet / CSV / JSON / Arrow / Lance files and you're doing real data work in fi
 
 ![The Data Playground canvas — datasets and operators wired into a node graph, with a data panel showing the real rows flowing out of a node.](docs/screenshot.png)
 
+## Scope & status
+
+Data Playground is a **local-first visual data workbench** for a **single user or a trusted team**. It
+runs fully offline on real data, and a multi-user deployment (auth + Postgres + object storage) is
+supported for a **trusted** team — see [Running several instances](#running-several-instances-horizontal-scale-out).
+It is **not** a hardened multi-tenant service: the code sandbox is a soft guard (not a security boundary between
+mutually-distrusting users), and hard workload isolation is future work — see
+[Execution isolation — and its limits](#execution-isolation--and-its-limits). Treat it as a capable
+alpha/beta for that scope; don't expose it to untrusted users without the OS-level isolation described
+there.
+
 ## Quickstart
 
 > **Prereqs:** [uv](https://docs.astral.sh/uv/) and Node 20+ (uv fetches the pinned Python 3.12
