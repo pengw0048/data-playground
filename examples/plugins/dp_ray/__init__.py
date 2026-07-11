@@ -240,9 +240,8 @@ class RayRunner:
             if s.op == "dedup" and (s.config.get("on") or "").strip():
                 return False  # only full-row DISTINCT distributes; keyed DISTINCT ON is order-dependent
             if s.op == "join":
-                how = (s.config.get("how") or "inner").lower()
-                how = "full" if how == "outer" else how
-                if how not in ("inner", "left", "cross"):
+                from hub.executors.engine import normalize_how
+                if normalize_how(s.config.get("how", "")) not in ("inner", "left", "cross"):
                     return False  # right/full must emit unmatched-RIGHT rows → broadcast-right can't → DuckDB
         return True
 
@@ -467,7 +466,12 @@ class RayRunner:
         from hub.executors.engine import join_sql
         left = datasets[step.inputs[0][0]]                     # incoming-edge order = engine's left, right
         right = datasets[step.inputs[1][0]]
-        right_tbl = pa.concat_tables(ray.get(right.to_arrow_refs()))  # broadcast side: driver → workers
+        refs = ray.get(right.to_arrow_refs())                  # broadcast side: driver → workers
+        if refs:
+            right_tbl = pa.concat_tables(refs)
+        else:                                                  # right produced ZERO blocks — keep its TYPED
+            sch = right.schema()                               # empty schema so a LEFT join emits correctly-
+            right_tbl = getattr(sch, "base_schema", sch).empty_table()  # typed NULLs (not a null-typed crash)
         cfg = step.config
         sql = join_sql(list(left.columns()), list(right_tbl.column_names), "_l", "_r",
                        cfg.get("on"), cfg.get("condition"), cfg.get("how"))

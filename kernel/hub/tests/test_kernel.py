@@ -5449,8 +5449,9 @@ def test_ray_join_live_differential(tmp_path):
     left_p, right_p = str(tmp_path / "fact.parquet"), str(tmp_path / "dim.parquet")
     duckdb.connect().execute(
         f"COPY (SELECT (i % 100) AS user_id, i AS amount FROM range(0, 4000) t(i)) TO '{left_p}' (FORMAT PARQUET)")
-    duckdb.connect().execute(  # a small dimension (the broadcast side); one row missing (user_id 99) to exercise LEFT
-        f"COPY (SELECT i AS user_id, ('u' || i) AS name FROM range(0, 99) t(i)) TO '{right_p}' (FORMAT PARQUET)")
+    duckdb.connect().execute(  # small dim (broadcast side); user_id 99 missing → exercises LEFT; a clashing
+        # `amount` column forces the _2-suffix naming so the differential also proves that on the Ray path
+        f"COPY (SELECT i AS user_id, ('u' || i) AS name, (i * 10) AS amount FROM range(0, 99) t(i)) TO '{right_p}' (FORMAT PARQUET)")
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
@@ -5476,7 +5477,13 @@ def test_ray_join_live_differential(tmp_path):
                                  node_specs=deps.node_specs, output_node="j").relation("j").to_arrow_table()
         con.register("oracle", oracle)
         ray_src = f"read_parquet('{st.output_uri}/**/*.parquet', union_by_name=true)"
-        q = "SELECT user_id, amount, name FROM {src} ORDER BY amount, user_id"
+        # (a) SCHEMA byte-identity: the output columns (incl. the coalesced key + the `_2`-suffixed right
+        # `amount`) must match the single-node engine exactly, in the same order.
+        ray_cols = [c[0] for c in con.execute(f"DESCRIBE SELECT * FROM {ray_src}").fetchall()]
+        duck_cols = [c[0] for c in con.execute("DESCRIBE SELECT * FROM oracle").fetchall()]
+        assert ray_cols == duck_cols == ["user_id", "amount", "name", "amount_2"], f"{how} schema: {ray_cols}"
+        # (b) VALUES: full-row multiset over the (deterministic) unique left amount
+        q = "SELECT user_id, amount, name, amount_2 FROM {src} ORDER BY amount, user_id"
         ray_rows = con.execute(q.format(src=ray_src)).fetchall()
         duck_rows = con.execute(q.format(src="oracle")).fetchall()
         con.unregister("oracle")
