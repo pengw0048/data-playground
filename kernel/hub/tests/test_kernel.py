@@ -293,6 +293,28 @@ def test_sql_groupby_preview_refuses_the_sample():
     assert not r2["notPreviewable"] and not r2.get("error")
 
 
+def test_sql_join_and_window_preview_faithfully(tmp_path):
+    # a JOIN / window in a sql node must run over FULL inputs in preview (like the join/window nodes),
+    # not two truncated 2000-row prefixes — else it silently returns wrong results with has_more=false.
+    import duckdb
+    from hub.executors.engine import sql_needs_full_input
+    assert sql_needs_full_input("SELECT * FROM input a JOIN input2 b USING(id)")
+    assert sql_needs_full_input("SELECT *, row_number() OVER (ORDER BY x) FROM input")
+    assert sql_needs_full_input("SELECT * FROM input QUALIFY row_number() OVER (ORDER BY x) = 1")
+    assert not sql_needs_full_input("SELECT * FROM input WHERE x > 0")
+    left, right = str(tmp_path / "l.parquet"), str(tmp_path / "r.parquet")
+    # matching keys live only past the 2000-row preview window of the left input
+    duckdb.connect().execute(f"COPY (SELECT i AS id FROM range(0,3000) t(i)) TO '{left}' (FORMAT PARQUET)")
+    duckdb.connect().execute(f"COPY (SELECT i AS id FROM range(2500,5500) t(i)) TO '{right}' (FORMAT PARQUET)")
+    g = {"id": "c", "version": 1, "nodes": [
+        N("l", "source", {"uri": left}), N("r", "source", {"uri": right}),
+        N("q", "sql", {"sql": "SELECT a.id FROM input a JOIN input2 b USING (id)"}),
+    ], "edges": [E("l", "q"), E("r", "q")]}
+    res = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 50}).json()
+    assert not res["notPreviewable"] and not res.get("error"), res.get("reason")
+    assert res["rowCount"] > 0, "sql join previewed two prefixes → 0 matches (the lie); must run full inputs"
+
+
 def test_sql_accepts_input_placeholder_and_aggregate_message_reflects_groupby():
     # the sql node accepts the documented {input}/{inputN} placeholder (not just the bare CTE name)
     g = {"id": "c", "version": 1, "nodes": [
@@ -787,6 +809,22 @@ def test_decimal_serialized_as_number():
     r = client.post("/api/data/sample", json={"uri": _uri("events"), "k": 3}).json()
     amounts = [row["amount"] for row in r["rows"]]
     assert all(isinstance(a, (int, float)) for a in amounts)  # small decimals stay numeric
+
+
+def test_sample_node_previews_a_real_sample_not_the_head(tmp_path):
+    # the sample node used to reservoir-sample the source-capped 2000-row PREFIX, so its "random sample"
+    # in preview only ever contained rows 0..1999. It must sample the FULL input.
+    import duckdb
+    p = str(tmp_path / "big.parquet")
+    duckdb.connect().execute(f"COPY (SELECT i AS id FROM range(0,10000) t(i)) TO '{p}' (FORMAT PARQUET)")
+    g = {"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": p}),
+        N("sm", "sample", {"n": 200, "seed": 1}),
+    ], "edges": [E("s", "sm")]}
+    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "sm", "k": 200}).json()
+    assert not r.get("error") and not r.get("notPreviewable"), r.get("reason")
+    ids = [row["id"] for row in r["rows"]]
+    assert max(ids) >= 2000, f"reservoir sample must reach past the first 2000 rows — got max {max(ids)}"
 
 
 def test_ident_escapes_embedded_quotes_not_strips(tmp_path):

@@ -70,6 +70,16 @@ def sql_reduces_rows(q: str) -> bool:
     return _has_reducing_aggregate(s)
 
 
+def sql_needs_full_input(q: str) -> bool:
+    """True if this SQL is row-preserving but reads its input NON-LOCALLY, so a per-input 2000-row sample
+    would lie even though it doesn't reduce rows: a JOIN (two truncated prefixes rarely match), a window
+    function (rank/running-agg computed within the sample), or QUALIFY. Such a query must run over the
+    full inputs in preview (display bounded by the preview LIMIT), like the join/window nodes."""
+    s = re.sub(r"\s+", " ", q or "")
+    return bool(re.search(r"\bjoin\b", s, re.I) or re.search(r"\bover\s*\(", s, re.I)
+                or re.search(r"\bqualify\b", s, re.I))
+
+
 class NotPreviewable(Exception):
     def __init__(self, node: GraphNode, reason: str):
         self.node = node
@@ -384,7 +394,11 @@ class BuildEngine:
             n = cfg.get("n")
             n = max(0, int(n if n is not None else (self.sample_k or 1000)))
             seed = int(cfg.get("seed", 42))
-            v = self._view(parent, "s")
+            # a reservoir sample must draw from the FULL input — over the source-capped 2000-row preview
+            # prefix it would just be a sample of the first 2000 rows, not a real sample of the dataset.
+            # Build the input unsampled (like join/sort/window); the reservoir size bounds the work.
+            src = parent if self.full else self._faithful_inputs(node)[0]
+            v = self._view(src, "s")
             return db.conn().sql(f"SELECT * FROM {v} USING SAMPLE {n} ROWS (reservoir, {seed})")
 
         if t == "filter":
@@ -490,10 +504,17 @@ class BuildEngine:
             # complete (the aggregate node already refuses a sample for exactly this reason) — refuse it.
             if not self.full and sql_reduces_rows(q):
                 raise NotPreviewable(node, "this SQL aggregates/reduces rows — a sample would mislead; run a full pass")
+            # a JOIN / window (OVER) / QUALIFY over two truncated 2000-row prefixes lies just like the
+            # dedicated join/window nodes do — build the CTE inputs UNSAMPLED (full) so the query is
+            # faithful; the preview LIMIT at the target then truncates the DISPLAY. Refuses honestly via
+            # _faithful_inputs if a Python transform is upstream.
+            sql_inputs = inputs
+            if not self.full and sql_needs_full_input(q):
+                sql_inputs = self._faithful_inputs(node)
             # Expose inputs as query-scoped CTEs named input/input2/... backed by UNIQUE views,
             # so two sql nodes in one graph never clobber a shared literal 'input' view.
-            aliases = ["input"] + [f"input{i + 1}" for i in range(1, len(inputs))]
-            ctes = [f"{a} AS (SELECT * FROM {self._view(rel)})" for a, rel in zip(aliases, inputs)]
+            aliases = ["input"] + [f"input{i + 1}" for i in range(1, len(sql_inputs))]
+            ctes = [f"{a} AS (SELECT * FROM {self._view(rel)})" for a, rel in zip(aliases, sql_inputs)]
             cte = "WITH " + ", ".join(ctes)
             wrapped = f"{cte}, {q[4:].lstrip()}" if q[:4].upper() == "WITH" else f"{cte} {q}"
             return db.conn().sql(wrapped)
