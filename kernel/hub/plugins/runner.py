@@ -243,11 +243,13 @@ class LocalRunner:
                     status.progress = _step_progress(status)  # fraction of steps complete (deterministic)
                     self._emit(graph, status)  # per-node progress → DB (cross-instance polling sees it advance)
 
-                # if the target is not a sink, force execution to a real row count. `assert` is excluded:
-                # its "rows" is the violation count from _check_assert (already set), and re-counting would
+                # if the target is not a sink, MATERIALIZE its full result to a durable artifact (not just
+                # count it) so the UI can page the exact rows a full pass produced — the aggregate/sort a
+                # sample can't preview — and it survives a restart (P0-UX-01). `assert` is excluded: its
+                # "rows" is the violation count from _check_assert (already set), and re-counting would
                 # rebuild — and re-raise — a warn-severity assert's un-evaluable predicate (defeating warn).
                 if target and nm.get(target) and nm[target].type not in ("write", "assert"):
-                    rows_seen = self._count(engine, target, cached)
+                    rows_seen = self._materialize_result(target, engine, status, cached, phash)
                     status.rows_processed = rows_seen
 
                 # set the final counts BEFORE flipping to 'done' — a client polls in another thread and
@@ -311,6 +313,33 @@ class LocalRunner:
         if cached and cached.get("rows") is not None:
             return cached["rows"]
         return int(engine.relation(node_id).aggregate("count(*) AS n").fetchone()[0])
+
+    def _materialize_result(self, node_id: str, engine: BuildEngine, status: RunStatus,
+                            cached: dict | None, phash: str) -> int:
+        """A non-write target's full result → a durable parquet artifact so the UI can page the exact
+        rows a full pass produced (an aggregate/sort a sample can't preview) and they survive a restart
+        (P0-UX-01). CONTENT-ADDRESSED by the plan hash (`__result_<phash>`): identical content shares one
+        artifact and re-running reuses it, while different content (another canvas, an edit) gets its own
+        file — so a stable per-node path can't collide across canvases or go stale after an edit. NOT
+        registered in the catalog — it's an ephemeral run result, not a user-published dataset.
+        Best-effort: a relation that can't serialize (a section/opaque) falls back to a plain count so the
+        run still reports a truthful total instead of failing."""
+        if cached and cached.get("uri") and self._output_exists(cached["uri"]):
+            status.output_uri = cached["uri"]
+            status.output_table = cached.get("table")
+            return int(cached.get("rows") or 0)
+        try:
+            rel = engine.relation(node_id)
+            uri = self.storage.output_uri(f"__result_{phash}", ".parquet")  # content-addressed run result
+            res = self.resolve_adapter(uri).write(uri, rel, "overwrite")
+            status.output_uri = res.get("uri", uri)
+            status.output_table = None  # a run result, not a catalog table (don't clutter the Tables view)
+            prune = getattr(self.storage, "prune_results", None)  # coarse newest-N GC so results don't pile up
+            if callable(prune):
+                prune()
+            return int(res.get("rows") or 0)
+        except Exception:  # noqa: BLE001 — can't serialize this relation → still report a truthful count
+            return self._count(engine, node_id, cached)
 
     def _check_assert(self, node, engine: BuildEngine) -> int:
         """A data-quality gate: the node's relation is the VIOLATING rows (predicate not TRUE). Count them;

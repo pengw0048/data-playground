@@ -12,6 +12,10 @@ from typing import Protocol
 from hub.plugins.adapters import is_object_uri
 
 _EXTS = (".parquet", ".csv", ".tsv", ".json", ".arrow", ".feather", ".ipc")
+# ephemeral full-pass run results (runner._materialize_result) share the outputs dir but are NOT
+# user-published datasets — exclude them from list_outputs so a restart doesn't re-catalog them into
+# the Tables view (P0-UX-01). Keyed by this basename prefix.
+RESULT_PREFIX = "__result_"
 
 
 class Storage(Protocol):
@@ -35,9 +39,24 @@ class LocalStorage:
         out: list[str] = []
         for fn in sorted(os.listdir(self.root)):
             p = os.path.join(self.root, fn)
+            if fn.startswith(RESULT_PREFIX):
+                continue  # an ephemeral run result, not a published output — never re-catalog it
             if fn.endswith(_EXTS) or (os.path.isdir(p) and fn.endswith(".lance")):
                 out.append(p)
         return out
+
+    def prune_results(self, keep: int = 200) -> None:
+        """Bound the ephemeral run-result artifacts (RESULT_PREFIX) — coarse newest-N GC so they can't
+        grow without limit (retention/refcount is later work). Best-effort; never raises."""
+        try:
+            files = [os.path.join(self.root, fn) for fn in os.listdir(self.root) if fn.startswith(RESULT_PREFIX)]
+            for p in sorted(files, key=lambda x: os.path.getmtime(x), reverse=True)[keep:]:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
 
 class ObjectStorage:
@@ -59,7 +78,8 @@ class ObjectStorage:
                 rows = db.conn().execute(f"SELECT file FROM glob('{self.root}/*')").fetchall()
         except Exception:  # noqa: BLE001
             return []
-        return [f for (f,) in rows if f.lower().endswith(_EXTS)]
+        return [f for (f,) in rows
+                if f.lower().endswith(_EXTS) and not os.path.basename(f.rstrip("/")).startswith(RESULT_PREFIX)]
 
 
 def make_storage(workspace: str) -> Storage:
