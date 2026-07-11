@@ -1061,6 +1061,32 @@ def test_sandbox_pyarrow_root_cannot_do_file_io(tmp_path):
     assert len(dec(None)) == 2  # decimal array construction doesn't abort
 
 
+def test_map_batches_skip_isolates_bad_rows_not_the_whole_batch():
+    # on_error='skip' used to DROP the entire batch when a batch UDF threw — so how many rows survived
+    # depended on the batch size (2048 in preview vs 8192 in the run), making preview disagree with the
+    # run. Skip now re-runs the UDF row-by-row and keeps the successes, dropping only the rows that fail.
+    import pyarrow as pa
+    from hub.executors.engine import _apply_fn, _apply_batch, NotPreviewable, _XF_BATCH
+    assert _XF_BATCH == _XF_BATCH  # single constant → preview and run read at the same batch size
+
+    def rows_fn(rows):
+        return [{"y": 100 // r["x"]} for r in rows]  # ZeroDivisionError on the x==0 row
+    batch = pa.RecordBatch.from_pylist([{"x": 1}, {"x": 0}, {"x": 2}, {"x": 4}])
+    out = _apply_fn(rows_fn, batch, "map_batches", "skip", None)
+    assert [r["y"] for r in out] == [100, 50, 25]  # bad row dropped; the other 3 kept (NOT the batch)
+    with pytest.raises(NotPreviewable):
+        _apply_fn(rows_fn, batch, "map_batches", "raise", None)
+
+    def arrow_fn(t):  # fails the whole batch when a zero is present; each good 1-row slice passes
+        if 0 in t.column("x").to_pylist():
+            raise ValueError("this batch has a zero")
+        return t
+    tbl = pa.table({"x": [1, 0, 2, 4]})
+    res = _apply_batch(arrow_fn, tbl, "arrow", "skip", None)
+    assert res.column("x").to_pylist() == [1, 2, 4]  # only the offending row dropped
+    assert _apply_batch(arrow_fn, pa.table({"x": [0]}), "arrow", "skip", None) is None  # all-bad → nothing
+
+
 def test_write_mode_append_builds_a_readable_directory_dataset():
     # append is REAL: it writes a directory of part files that reads back as the accumulated rows
     def append_run():

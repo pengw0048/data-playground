@@ -673,7 +673,7 @@ class BuildEngine:
             # preview: input is bounded (source sampled), so in-memory is fine and fast
             if fmt in ("pandas", "arrow"):
                 tables: list = []
-                for b in parent.to_arrow_reader(batch_size=2048):
+                for b in parent.to_arrow_reader(batch_size=_XF_BATCH):
                     t = _apply_batch(fn, pa.Table.from_batches([b]), fmt, on_error, node)
                     if t is None:  # on_error='skip' dropped this batch
                         continue
@@ -686,7 +686,7 @@ class BuildEngine:
                 table = pa.concat_tables(tables) if tables else parent.limit(0).to_arrow_table()
                 return db.conn().from_arrow(table)
             out: list[dict] = []
-            for batch in parent.to_arrow_reader(batch_size=2048):
+            for batch in parent.to_arrow_reader(batch_size=_XF_BATCH):
                 out.extend(_apply_fn(fn, batch, mode, on_error, node))
             table = pa.Table.from_pylist(out) if out else parent.limit(0).to_arrow_table()
             return db.conn().from_arrow(table)
@@ -727,12 +727,12 @@ class BuildEngine:
 
         try:
             if fmt in ("pandas", "arrow"):  # arrow-native: type-preserving, one table per input batch
-                for batch in parent.to_arrow_reader(batch_size=8192):
+                for batch in parent.to_arrow_reader(batch_size=_XF_BATCH):
                     t = _apply_batch(fn, pa.Table.from_batches([batch]), fmt, on_error, node)
                     if t is not None:  # on_error='skip' dropped this batch
                         write_tbl(t)
             else:
-                for batch in parent.to_arrow_reader(batch_size=8192):
+                for batch in parent.to_arrow_reader(batch_size=_XF_BATCH):
                     buf.extend(_apply_fn(fn, batch, mode, on_error, node))
                     if len(buf) >= FLUSH:
                         flush()
@@ -813,6 +813,11 @@ class BuildEngine:
         return uri if str(uri).lower().rstrip("/").endswith(".lance") else None
 
 
+# transform read batch size — IDENTICAL in preview and full run so on_error='skip' drops the same
+# rows in both (a batch-size-dependent skip would make the preview disagree with the run).
+_XF_BATCH = 8192
+
+
 def _apply_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node) -> list[dict]:
     rows = batch.to_pylist()
     out: list[dict] = []
@@ -821,7 +826,17 @@ def _apply_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node) -> li
             return list(fn(rows))
         except Exception as e:  # noqa: BLE001
             if on_error == "skip":
-                return []  # drop the failed batch (returning the untransformed input would lie)
+                # isolate the bad rows by re-running the UDF one row at a time and keeping the
+                # successes, so 'skip' drops only the rows that actually fail — NOT the whole batch
+                # (dropping the batch would make the result depend on batch size; this keeps it
+                # size-invariant so preview == run).
+                good: list[dict] = []
+                for r in rows:
+                    try:
+                        good.extend(fn([dict(r)]))
+                    except Exception:  # noqa: BLE001 — this row genuinely fails; drop just it
+                        continue
+                return good
             raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
     for r in rows:
         try:
@@ -847,24 +862,38 @@ def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node) -> "pa.Ta
     (The default `rows` format goes through _apply_fn.) pandas must be declared in the canvas requirements;
     pyarrow is always present."""
     try:
-        if fmt == "arrow":
-            res = fn(table)
-            if isinstance(res, pa.Table):
-                return res
-            if isinstance(res, pa.RecordBatch):
-                return pa.Table.from_batches([res])
-            raise TypeError(f"an arrow batch UDF must return a pyarrow.Table, got {type(res).__name__}")
-        import pandas as pd  # noqa: F401 — required only when the user picks the pandas format
-        res = fn(table.to_pandas())
-        if not isinstance(res, pd.DataFrame):
-            raise TypeError(f"a pandas batch UDF must return a DataFrame, got {type(res).__name__}")
-        return pa.Table.from_pandas(res, preserve_index=False)
+        return _run_batch(fn, table, fmt)
     except NotPreviewable:
         raise
     except Exception as e:  # noqa: BLE001
         if on_error == "skip":
-            return None  # drop the failed batch entirely — a good batch defines the output schema
+            # isolate the bad rows: re-run the UDF on 1-row slices and keep the ones that succeed,
+            # so 'skip' drops only the failing rows regardless of batch size (preview == run). None
+            # only if EVERY row failed (nothing to emit — a good row defines the output schema).
+            parts = []
+            for i in range(table.num_rows):
+                try:
+                    parts.append(_run_batch(fn, table.slice(i, 1), fmt))
+                except Exception:  # noqa: BLE001
+                    continue
+            return pa.concat_tables(parts) if parts else None
         raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
+
+
+def _run_batch(fn, table: "pa.Table", fmt: str) -> "pa.Table":
+    """Invoke a batch UDF once over `table` in the chosen representation and return a pyarrow.Table."""
+    if fmt == "arrow":
+        res = fn(table)
+        if isinstance(res, pa.Table):
+            return res
+        if isinstance(res, pa.RecordBatch):
+            return pa.Table.from_batches([res])
+        raise TypeError(f"an arrow batch UDF must return a pyarrow.Table, got {type(res).__name__}")
+    import pandas as pd  # noqa: F401 — required only when the user picks the pandas format
+    res = fn(table.to_pandas())
+    if not isinstance(res, pd.DataFrame):
+        raise TypeError(f"a pandas batch UDF must return a DataFrame, got {type(res).__name__}")
+    return pa.Table.from_pandas(res, preserve_index=False)
 
 
 def _table_to_rows(tbl: "pa.Table") -> list[dict]:
