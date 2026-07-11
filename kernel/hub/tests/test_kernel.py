@@ -1490,6 +1490,39 @@ def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
         metadb.set_setting("objectStore", {}, "global")
 
 
+def test_partitioned_write_hive_layout_and_pruned_read(tmp_path):
+    # ARC4 write-partitioned-merge: partitionBy → a Hive dir=val/ parquet directory, read back with the
+    # partition column present + partition pruning; overwrite is clean (temp dir + swap, no stale
+    # partitions); non-parquet / append / missing-column reject.
+    import glob
+
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter
+    a = DuckDBAdapter()
+    con = db.conn()
+    with db.lock():
+        rel = con.sql("SELECT i AS id, mod(i, 3) AS cat, i * 2 AS v FROM range(0, 30) r(i)")
+        out = str(tmp_path / "parted.parquet")
+        ds = a.write(out, rel, "overwrite", partition_by="cat")["uri"]
+        assert sorted(os.path.basename(p) for p in glob.glob(os.path.join(ds, "*"))) == ["cat=0", "cat=1", "cat=2"]
+        r = a.scan(ds)
+        assert set(r.columns) == {"id", "cat", "v"}, "partition column must be present on read"
+        assert r.aggregate("count(*)").fetchone()[0] == 30
+        assert a.scan(ds, predicate="cat = 1").aggregate("count(*)").fetchone()[0] == 10  # partition-pruned read
+        # a second overwrite (fewer rows, fewer partitions) must REPLACE cleanly — no stale cat=2 left over
+        rel2 = con.sql("SELECT i AS id, mod(i, 2) AS cat, i AS v FROM range(0, 4) r(i)")
+        ds2 = a.write(out, rel2, "overwrite", partition_by="cat")["uri"]
+        assert a.scan(ds2).aggregate("count(*)").fetchone()[0] == 4
+        assert sorted(os.path.basename(p) for p in glob.glob(os.path.join(ds2, "*"))) == ["cat=0", "cat=1"]
+        # rejects
+        with pytest.raises(NotImplementedError):
+            a.write(str(tmp_path / "x.csv"), rel, "overwrite", partition_by="cat")   # parquet-only
+        with pytest.raises(NotImplementedError):
+            a.write(out, rel, "append", partition_by="cat")                          # append unsupported
+        with pytest.raises(ValueError):
+            a.write(str(tmp_path / "y.parquet"), rel, "overwrite", partition_by="nope")  # column not in data
+
+
 def test_arrow_feather_is_streamed_out_of_core(tmp_path, monkeypatch):
     # ARC4 arrow-out-of-core: the feather/arrow WRITE streams RecordBatches via _stream_ipc (never
     # to_arrow_table's whole-table-in-RAM), and the local READ is a LAZY, re-scannable IPC dataset

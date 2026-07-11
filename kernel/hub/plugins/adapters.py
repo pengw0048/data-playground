@@ -223,10 +223,12 @@ class DuckDBAdapter:
                     return con.from_arrow(feather.read_table(f))
             if low.endswith((".parquet", ".pq")):
                 return con.read_parquet(uri)
-            # a prefix of parts (append / worker-direct shards): union_by_name reconciles per-shard schema
-            # drift — an all-null column in one shard degrades to parquet NULL type, and a plain multi-file
-            # read fails "cast X to NULL" depending on which shard is read first.
-            return con.read_parquet(uri.rstrip("/") + "/**/*.parquet", union_by_name=True)
+            # a prefix of parts (append / worker-direct shards / a Hive-partitioned write): union_by_name
+            # reconciles per-shard schema drift (an all-null column degrades to parquet NULL type, and a
+            # plain multi-file read fails "cast X to NULL"); hive_partitioning surfaces dir=val partition
+            # columns + prunes (a no-op on a flat part dir). union_by_name alone DISABLES hive detection,
+            # so it must be explicit.
+            return con.read_parquet(uri.rstrip("/") + "/**/*.parquet", union_by_name=True, hive_partitioning=True)
         p = path_of(uri)
         low = p.lower()
         if os.path.isdir(p):
@@ -245,7 +247,9 @@ class DuckDBAdapter:
         # one worker-direct shard) reconciles by column name instead of failing on read order.
         for ext in (".parquet", ".pq"):
             if glob.glob(os.path.join(d, f"**/*{ext}"), recursive=True):
-                return con.read_parquet(os.path.join(d, f"**/*{ext}"), union_by_name=True)
+                # hive_partitioning surfaces dir=val partition columns + prunes (no-op on a flat part dir);
+                # union_by_name alone disables hive detection, so it's explicit. See scan() object branch.
+                return con.read_parquet(os.path.join(d, f"**/*{ext}"), union_by_name=True, hive_partitioning=True)
         # csv/json parts ALSO union_by_name: appends can drift the column SET across parts (a later append
         # adds/drops a column), and a plain positional multi-file read would misalign or error — reconcile
         # by column name, exactly like the parquet path.
@@ -272,13 +276,16 @@ class DuckDBAdapter:
             return "obj:" + hashlib.sha256(uri.encode()).hexdigest()[:12]  # can't stat; key by uri
         return _fingerprint_path(path_of(uri))
 
-    def write(self, uri: str, rel: Relation, mode: str = "overwrite") -> dict:
+    def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None) -> dict:
         obj = is_object_uri(uri)
         if obj:
             db.ensure_object_store()  # load httpfs + credentials
         target = uri if obj else path_of(uri)  # object stores keep the full s3://… uri
         low = target.lower()
         rows = int(rel.aggregate("count(*)").fetchone()[0])
+        pcols = [c.strip() for c in (partition_by or "").split(",") if c.strip()]
+        if pcols:
+            return self._write_partitioned(target, rel, pcols, mode, low, obj, rows)
         if mode == "append":
             # append = a DIRECTORY / prefix of part files (out-of-core; the reader reads them all back via
             # _read_dir). Only for row formats that have a directory-scan reader — parquet/csv/tsv/json;
@@ -366,6 +373,45 @@ class DuckDBAdapter:
                     os.remove(wtarget)
             raise
         return {"uri": uri, "rows": rows}
+
+    def _write_partitioned(self, target: str, rel: Relation, pcols: list, mode: str, low: str,
+                           obj: bool, rows: int) -> dict:
+        """A Hive-partitioned parquet DIRECTORY (dir=val/… layout), read back partition-pruned (the read
+        path passes hive_partitioning=True). Parquet + overwrite only. Local: write a fresh temp dir then
+        atomically swap it in (a partitioned dir can't os.replace a non-empty target, so rmtree-then-rename
+        — a brief non-atomic window, but the temp dir is fully written first). Object: DuckDB httpfs writes
+        the prefix directly — a partitioned object write spans many objects, so it is NOT atomic (documented)."""
+        import contextlib
+        import shutil
+        if mode == "append":
+            raise NotImplementedError("partitioned write does not support append — use overwrite")
+        if not low.endswith((".parquet", ".pq")):
+            raise NotImplementedError("partitionBy is parquet-only (a Hive-partitioned directory)")
+        missing = [c for c in pcols if c not in rel.columns]
+        if missing:
+            raise ValueError(f"partitionBy columns not in the data: {missing}")
+        base = os.path.splitext(target)[0]  # a DIRECTORY (Hive layout), not a single file
+        cols_sql = ", ".join(f'"{c}"' for c in pcols)
+
+        def _copy(dst: str) -> None:
+            rel.query("_w", f"COPY _w TO '{dst.replace(chr(39), chr(39) * 2)}' "
+                            f"(FORMAT PARQUET, PARTITION_BY ({cols_sql}), OVERWRITE_OR_IGNORE)")
+        if obj:
+            _copy(base.rstrip("/"))  # httpfs writes the prefix directly (non-atomic across objects)
+            return {"uri": base, "rows": rows}
+        tmp = base + f".tmp-{uuid.uuid4().hex[:8]}"
+        try:
+            _copy(tmp)                                    # fully write the temp partitioned dir first
+            if os.path.isdir(base):
+                shutil.rmtree(base)
+            elif os.path.exists(base):
+                os.remove(base)                           # a prior single-file output at this base name
+            os.replace(tmp, base)                         # swap in (brief non-atomic window: rmtree→rename)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        return {"uri": base, "rows": rows}
 
     # -- append part-directory helpers (transactional; row formats only) ---------------------------- #
     @staticmethod
@@ -487,7 +533,9 @@ class LanceAdapter:
         except Exception:  # noqa: BLE001
             return _fingerprint_path(path_of(uri))
 
-    def write(self, uri: str, rel: Relation, mode: str = "overwrite") -> dict:
+    def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None) -> dict:
+        if partition_by and partition_by.strip():
+            raise NotImplementedError("partitionBy is not supported for Lance output (Hive partitioning is parquet-only)")
         try:
             import lance
         except ModuleNotFoundError as e:
