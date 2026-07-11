@@ -104,6 +104,35 @@ def object_fs(uri: str):
     raise ValueError(f"unsupported object-store scheme for Arrow/Feather: {scheme}://")
 
 
+_ARROW_BATCH_TARGET_BYTES = 128 << 20  # ~128 MiB target per streamed RecordBatch
+_ARROW_BATCH_MAX_ROWS = 65536          # cap rows/batch (narrow rows); a byte target derives the actual count
+
+
+def _read_ipc(con: "duckdb.DuckDBPyConnection", source, filesystem=None) -> "Relation":
+    """Read an Arrow-IPC (.arrow/.feather) file as a LAZY, re-scannable pyarrow Dataset → DuckDB relation.
+    DuckDB streams batches from the dataset on demand (out-of-core READ) — NOT feather.read_table, which
+    would load the whole file into RAM. A Dataset (unlike a one-shot RecordBatchReader) can be scanned
+    more than once, so a query that reads the source twice still works."""
+    import pyarrow.dataset as pds
+    return con.from_arrow(pds.dataset(source, format="ipc", filesystem=filesystem))
+
+
+def _stream_ipc(rel: "Relation", sink) -> None:
+    """Write a DuckDB relation to an Arrow-IPC file `sink` (a local path or an open output stream) by
+    STREAMING RecordBatches — never draining the whole relation into one in-RAM Arrow table (out-of-core
+    WRITE). `sink` as a stream is used for the object-store temp-key upload. The batch size is BYTE-budgeted
+    from the estimated row width (vectors/lists counted), so peak RAM is ~constant regardless of row width:
+    a wide 4096-dim embedding gets far fewer rows/batch than a narrow int table, not a fixed 65536 rows."""
+    import pyarrow.ipc as ipc
+    from hub.estimate import _row_width
+    width = max(8, _row_width(relation_columns(rel)))  # bytes/row; relation_columns is schema-only (no scan)
+    batch_rows = max(1024, min(_ARROW_BATCH_MAX_ROWS, _ARROW_BATCH_TARGET_BYTES // width))
+    reader = rel.to_arrow_reader(batch_rows)
+    with ipc.new_file(sink, reader.schema) as w:
+        for batch in reader:
+            w.write_batch(batch)
+
+
 def _csv_kwargs(options: dict | None) -> dict:
     """Map a source node's CSV parse overrides to DuckDB read_csv kwargs. Empty → auto-detect (default).
     `delimiter` accepts a literal char or the words 'tab'/'\\t'; `header` is an explicit bool."""
@@ -182,7 +211,12 @@ class DuckDBAdapter:
                 return con.read_json(uri)
             if low.endswith((".arrow", ".feather", ".ipc")):
                 # DuckDB has no Arrow-IPC file reader, so pull the object through pyarrow's own S3/GCS
-                # filesystem (same creds) rather than the httpfs path used for parquet/csv/json.
+                # filesystem (same creds). Read EAGERLY here: a lazy pyarrow Dataset over an object store is
+                # unreliable two ways — a bare `s3://…` string makes pyarrow build its OWN filesystem that
+                # ignores the endpoint override (region-resolution HeadObject → ACCESS_DENIED on MinIO), and
+                # even with our explicit filesystem, DuckDB defers the arrow scan to its own thread where the
+                # S3 access fails (NETWORK_CONNECTION). An object feather is network-fetched regardless — the
+                # out-of-core streaming READ win is on LOCAL files (below); the streaming WRITE covers both.
                 import pyarrow.feather as feather
                 fs, p = object_fs(uri)
                 with fs.open_input_file(p) as f:
@@ -202,8 +236,7 @@ class DuckDBAdapter:
         if low.endswith((".json", ".ndjson")):
             return con.read_json(p)
         if low.endswith((".arrow", ".feather", ".ipc")):
-            import pyarrow.feather as feather
-            return con.from_arrow(feather.read_table(p))
+            return _read_ipc(con, p)  # lazy IPC dataset — streamed, not the whole file into RAM
         return con.read_parquet(p)
 
     def _read_dir(self, con: duckdb.DuckDBPyConnection, d: str) -> Relation:
@@ -301,19 +334,19 @@ class DuckDBAdapter:
                 # DuckDB writes JSON out-of-core via COPY; ARRAY true emits a top-level [] read_json reads back
                 rel.query("_w", f"COPY _w TO '{wtarget.replace(chr(39), chr(39) * 2)}' (FORMAT JSON, ARRAY true)")
             elif low.endswith((".arrow", ".feather", ".ipc")):
-                # Arrow-IPC has no DuckDB writer; go through pyarrow. On an object store, pyarrow.feather
-                # given a raw "s3://…" string would write a LOCAL file of that name (silent corruption),
-                # so open a real object stream via pyarrow's filesystem. open_output_stream finalizes its
-                # multipart upload on close() even on an error/cancel — so write to a TEMP key and promote
-                # with a server-side move only on success, leaving the prior object intact if the write
-                # (or to_arrow_table, which materializes the whole table in RAM) fails partway.
-                import pyarrow.feather as feather
+                # Arrow-IPC has no DuckDB writer; go through pyarrow, STREAMING RecordBatches (not
+                # to_arrow_table, which materializes the whole result in RAM → OOM on a big write). On an
+                # object store, pyarrow.feather given a raw "s3://…" string would write a LOCAL file of that
+                # name (silent corruption), so open a real object stream via pyarrow's filesystem.
+                # open_output_stream finalizes its multipart upload on close() even on an error/cancel — so
+                # stream to a TEMP key and promote with a server-side move only on success, leaving the
+                # prior object intact if the write fails partway.
                 if obj:
                     fs, p = object_fs(target)
                     tmp = f"{p}.tmp-{uuid.uuid4().hex[:8]}"
                     try:
                         with fs.open_output_stream(tmp) as f:
-                            feather.write_feather(rel.to_arrow_table(), f)
+                            _stream_ipc(rel, f)
                         fs.move(tmp, p)  # server-side copy+delete; the destination is replaced only now
                     except BaseException:
                         import contextlib
@@ -321,7 +354,7 @@ class DuckDBAdapter:
                             fs.delete_file(tmp)
                         raise
                 else:
-                    feather.write_feather(rel.to_arrow_table(), wtarget)
+                    _stream_ipc(rel, wtarget)
             else:
                 rel.write_parquet(wtarget)
             if not obj:
