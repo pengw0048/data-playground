@@ -272,7 +272,10 @@ def test_ir_shuffle_key_parser_and_distributable_gate():
     assert parse_group_keys("cat") == ["cat"] and parse_group_keys("a, b") == ["a", "b"]
     assert parse_group_keys("") == []                                          # global aggregate → no key
     assert parse_group_keys("lower(x)") is None and parse_group_keys("x*2") is None  # expression → DuckDB
-    assert DISTRIBUTABLE_RELATIONAL == frozenset({"aggregate", "window", "dedup", "join"})
+    from hub.ir import parse_sort_keys
+    assert parse_sort_keys("a, b DESC") == [("a", False), ("b", True)]        # bare cols + per-key direction
+    assert parse_sort_keys("lower(a)") is None and parse_sort_keys("") is None  # expression / empty → DuckDB
+    assert DISTRIBUTABLE_RELATIONAL == frozenset({"aggregate", "window", "dedup", "join", "sort"})
 
     d = get_deps()
     gg = Graph(**{"id": "c", "version": 1, "nodes": [
@@ -5493,11 +5496,11 @@ def test_ray_backend_operator_gating_and_fallback(tmp_path):
               _ray_node("w", "write", {"name": "sum_out"})], [_ray_edge("src", "a"), _ray_edge("a", "w")])
     assert rr._ray_runnable(lower_to_ir(summ, "w", deps.node_specs)) is False
 
-    # (3c) a genuinely non-distributable op (sort) → can_run False → run() delegates to the DuckDB base
-    # runner (never touches Ray) → it completes.
+    # (3c) a genuinely non-distributable op (a raw sql node) → can_run False → run() delegates to the
+    # DuckDB base runner (never touches Ray) → it completes.
     dirty = G([_ray_node("src", "source", {"uri": p}),
-               _ray_node("s", "sort", {"by": "x"}),
-               _ray_node("w", "write", {"name": "sort_out"})], [_ray_edge("src", "s"), _ray_edge("s", "w")])
+               _ray_node("s", "sql", {"sql": "SELECT * FROM input WHERE x > 2"}),
+               _ray_node("w", "write", {"name": "sql_out"})], [_ray_edge("src", "s"), _ray_edge("s", "w")])
     dplan = compile_plan(dirty, "w", deps.registry, deps.node_specs)
     assert rr.can_run(dplan) is False
 
@@ -5905,6 +5908,55 @@ def test_ray_join_live_differential(tmp_path):
         con.unregister("oracle")
         assert ray_rows == duck_rows, f"{how} join Ray != DuckDB (n={len(ray_rows)} vs {len(duck_rows)})"
         assert len(ray_rows) == expect, f"{how}: expected {expect} rows, got {len(ray_rows)}"
+
+
+def test_ray_sort_live_differential(tmp_path):
+    # opt-in live Ray: a distributed SORT (Ray range-shuffle → repartition(1) → one ordered file) must,
+    # when READ IN FILE ORDER (pyarrow, which preserves it), match single-node DuckDB's ordered sequence
+    # exactly — including NULL placement. Key = (k, v): k has ties + NULLs, v is unique → a total order.
+    if not os.environ.get("DP_TEST_RAY_LIVE"):
+        pytest.skip("set DP_TEST_RAY_LIVE=1 to run the live-Ray sort differential")
+    import glob as _glob
+    import time
+
+    import duckdb
+    import pyarrow.parquet as _pq
+
+    from hub import db
+    from hub.deps import Deps
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+    os.environ["DP_RAY_SHUFFLE_PARTITIONS"] = "4"
+    p = str(tmp_path / "s.parquet")
+    duckdb.connect().execute(
+        f"COPY (SELECT (CASE WHEN i % 50 = 0 THEN NULL ELSE i % 100 END) AS k, i AS v "
+        f"FROM range(0, 4000) t(i)) TO '{p}' (FORMAT PARQUET)")
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+    g = Graph(**{"id": "c", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": p}),
+        _ray_node("s", "sort", {"by": "k, v"}),                 # k asc (ties + NULLs), v asc (unique tiebreak)
+    ], "edges": [_ray_edge("src", "s")]})
+    st = rr.run_unit(g, "s", str(tmp_path / "sort_out.parquet"))
+    for _ in range(900):
+        if rr.status(st.run_id).status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.1)
+    st = rr.status(st.run_id)
+    assert st.status == "done", st.error
+    # read the OUTPUT in physical file order (pyarrow preserves it; DuckDB read may reorder)
+    files = sorted(_glob.glob(os.path.join(st.output_uri, "**", "*.parquet"), recursive=True))
+    ray_seq = [(r["k"], r["v"]) for r in _pq.read_table(files).to_pylist()]
+    # DuckDB oracle: the same sort, single-node
+    with db.run_scope():
+        oracle = BuildEngine(g, deps.resolve_adapter, deps.registry, full=True,
+                             node_specs=deps.node_specs, output_node="s").relation("s").to_arrow_table()
+    duck_seq = [(r["k"], r["v"]) for r in oracle.to_pylist()]
+    assert ray_seq == duck_seq, (
+        f"Ray sort order != DuckDB\nray[:4]={ray_seq[:4]} ...tail={ray_seq[-4:]}\n"
+        f"duck[:4]={duck_seq[:4]} ...tail={duck_seq[-4:]}")
+    assert len(ray_seq) == 4000
 
 
 def test_ray_region_requires_gates_scheduling(tmp_path):
