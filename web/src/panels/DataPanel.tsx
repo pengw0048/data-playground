@@ -15,6 +15,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const runPreview = useStore((s) => s.runPreview)
   const requestRun = useStore((s) => s.requestRun)
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
+  const run = useStore((s) => s.runs[nodeId])
   const pushToast = useStore((s) => s.pushToast)
   const [tab, setTab] = useState('rows')
   const [detail, setDetail] = useState<number | null>(null)  // index of the row whose detail is open
@@ -30,7 +31,14 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   if (preview.error) return <ErrorState reason={preview.error} onRetry={() => runPreview(nodeId, offset)} />
   const res = preview.result!
   if (res.error) return <ErrorState reason={res.reason ?? 'preview failed'} onRetry={() => runPreview(nodeId, offset)} />
-  if (res.notPreviewable) return <NotPreviewable reason={res.reason ?? 'needs a full pass'} onRun={() => requestRun(nodeId)} />
+  if (res.notPreviewable) {
+    // P0-UX-01: a sample can't preview this node (an aggregate/sort), but a full run MATERIALIZES the
+    // result to a durable artifact — so if this node's last run is done and produced one, show the exact
+    // Full result (restorable after a restart via the persisted run status) instead of a dead end.
+    const done = run?.status?.status === 'done' ? run.status : undefined
+    if (done?.outputUri) return <FullResult uri={done.outputUri} total={done.totalRows ?? null} />
+    return <NotPreviewable reason={res.reason ?? 'needs a full pass'} onRun={() => requestRun(nodeId)} />
+  }
 
   const columns = res.columns
   const caps = capabilitiesFor(columns as ColumnSchema[])
@@ -413,6 +421,48 @@ function ErrorState({ reason, onRetry }: { reason: string; onRetry: () => void }
       <div className="text-[13px] font-semibold text-destructive">Preview failed</div>
       <div className="dp-mono mx-auto mt-2 max-w-[380px] whitespace-pre-wrap rounded-lg border border-destructive/20 bg-destructive/10 p-2.5 text-left text-[11px] leading-normal text-muted-foreground">{reason}</div>
       <Button variant="outline" size="sm" onClick={onRetry} className="mt-3.5">Retry</Button>
+    </div>
+  )
+}
+
+// P0-UX-01: page the DURABLE artifact a full run materialized for a not-sample-previewable target
+// (an aggregate/sort). Read back over the normal sample-by-uri API, so it's restorable after a restart.
+function FullResult({ uri, total }: { uri: string; total: number | null }) {
+  const [data, setData] = useState<import('../types/api').SampleResult | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [detail, setDetail] = useState<number | null>(null)
+  const pushToast = useStore((s) => s.pushToast)
+  useEffect(() => {
+    let live = true
+    setData(null); setErr(null); setDetail(null)
+    api.sample(uri, PAGE).then((r) => { if (live) setData(r) }).catch((e) => { if (live) setErr((e as Error).message) })
+    return () => { live = false }
+  }, [uri])
+  if (err) return <ErrorState reason={err} onRetry={() => { setData(null); api.sample(uri, PAGE).then(setData).catch((e) => setErr((e as Error).message)) }} />
+  if (!data) return <Skeleton />
+  const cols = (data.columns ?? []) as ColumnSchema[]
+  const rows = data.rows ?? []
+  const more = total != null && total > rows.length  // the artifact is bigger than this first page
+  return (
+    <div className="dp-dark text-foreground">
+      <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
+        <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">Full result</span>
+        <span className="text-[10.5px] text-muted-foreground">
+          {more ? `first ${rows.length} of ${total} rows` : `${total ?? rows.length} rows`}
+        </span>
+        {detail != null && (
+          <button onClick={() => setDetail(null)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-semibold text-primary">
+            <Icon name="chevronLeft" size={12} /> Row {detail}
+          </button>
+        )}
+        <span className="flex-1" />
+        {detail == null && rows.length > 0 && (
+          <ExportCluster columns={cols} rows={rows} name="result" truncated={more} pushToast={pushToast} />
+        )}
+      </div>
+      {detail != null && rows[detail]
+        ? <RowDetail columns={cols} row={rows[detail]} />
+        : <RowsTable columns={cols} rows={rows} onRowClick={setDetail} />}
     </div>
   )
 }

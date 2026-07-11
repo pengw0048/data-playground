@@ -189,6 +189,32 @@ def test_aggregate_not_previewable():
     assert r["notPreviewable"] is True and "full pass" in r["reason"]
 
 
+def test_full_run_of_a_non_write_target_materializes_an_inspectable_result():
+    # P0-UX-01: a full pass over a non-write target (an aggregate the sample refuses to preview) must
+    # produce a DURABLE, inspectable result artifact — not just a row count — and it must survive a
+    # restart (the uri persists in run_states, readable by any instance).
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        N("agg", "aggregate", {"groupBy": "event", "aggs": "count(*) AS n"}),
+    ], "edges": [E("src", "agg")]}
+    st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "agg", "confirmed": True}).json()["runId"])
+    assert st["status"] == "done"
+    uri = st["outputUri"]
+    assert uri, "a non-write target's full result must be materialized to a durable artifact"
+    # the artifact holds the EXACT grouped rows (the aggregate a sample can't preview), inspectable via
+    # the normal sample-by-uri API — the same way the UI pages a Full result
+    out = client.post("/api/data/sample", json={"uri": uri, "k": 100}).json()
+    assert {c["name"] for c in out["columns"]} == {"event", "n"}
+    assert out["rowCount"] == st["totalRows"] and out["rowCount"] > 0
+    # durability: re-fetching the run status (served from run_states, i.e. after a restart / on another
+    # instance) still carries the artifact uri, so the Full result is restorable
+    assert client.get(f"/api/run/{st['runId']}").json()["outputUri"] == uri
+    # but the ephemeral result artifact must NOT be re-cataloged into the Tables view on restart
+    from hub.deps import get_deps
+    assert not any("__result_" in t.uri for t in get_deps().catalog.list_tables(None))
+    assert not any(t.uri == uri for t in get_deps().catalog.list_tables(None))
+
+
 def test_transform_arrow_batches():
     code = "def fn(row):\n    row['area'] = row['width'] * row['height']\n    return row"
     g = {"id": "c", "version": 1, "nodes": [
