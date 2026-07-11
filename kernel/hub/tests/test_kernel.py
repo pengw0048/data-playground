@@ -1514,6 +1514,41 @@ def test_output_version_is_content_addressed_and_flags_schema_drift(tmp_path, ca
     assert any("schema changed" in r.getMessage() for r in caplog.records), "schema drift must be surfaced"
 
 
+def test_object_output_version_bumps_on_overwrite(tmp_path):
+    # ARC4 output-versioning on an object store (#41 review): the object fingerprint is uri-only, so two
+    # writes of identical schema+row-count but different DATA would collide to the same version. _add now
+    # folds the object's size+mtime (a cheap stat) into the version, so an overwrite bumps it.
+    pytest.importorskip("moto")
+    pytest.importorskip("flask")
+    boto3 = pytest.importorskip("boto3")
+    from moto.server import ThreadedMotoServer
+
+    from hub import db, metadb
+    from hub.deps import Deps
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    try:
+        host, port = server.get_host_and_port()
+        endpoint = f"http://{host}:{port}"
+        boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
+                     region_name="us-east-1").create_bucket(Bucket="bkt")
+        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
+                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        db._obj_store_loaded = False
+        d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+        uri = "s3://bkt/out.parquet"
+        with db.lock():
+            # v1 and v2 share schema (id:int, label:str) + row count (1), but differ in bytes
+            d.resolve_adapter(uri).write(uri, db.conn().sql("SELECT 1 AS id, 'aaaa' AS label"), "overwrite")
+            a = d.catalog.register_output(name="oout", uri=uri, parents=[])
+            d.resolve_adapter(uri).write(uri, db.conn().sql("SELECT 1 AS id, 'zzzzzzzzzzzzzzzz' AS label"), "overwrite")
+            b = d.catalog.register_output(name="oout", uri=uri, parents=[])
+        assert a.version != b.version, "an object overwrite (same schema+rows, different data) must bump the version"
+    finally:
+        server.stop()
+        metadb.set_setting("objectStore", {}, "global")
+
+
 def test_source_csv_parse_options(tmp_path):
     # the source node can override CSV auto-detection (delimiter + header) — needed for semicolon files,
     # headerless files, etc. Blank/'auto' keeps DuckDB's sniffer.
