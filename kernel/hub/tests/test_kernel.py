@@ -4069,6 +4069,51 @@ def test_assert_node_surfaces_violations_and_gates_the_run():
     assert run("no_such_col > 0", "error").status == "failed"
 
 
+def test_assert_node_is_a_transparent_gate_before_a_write(tmp_path):
+    # P0-DATA-01: assert must be usable INLINE as a real gate — its 'pass' output forwards EVERY row (so a
+    # downstream write gets the data, not the violations), while severity=error still blocks the write.
+    import time
+
+    from hub import db
+    from hub.compiler import compile_plan
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+    d = get_deps()
+    ev = _uri("events")  # 2000 rows, 'id' = 0..1999
+
+    def graph(pred, sev):
+        return Graph(**{"id": "c", "version": 1, "nodes": [
+            N("s", "source", {"uri": ev}),
+            N("a", "assert", {"predicate": pred, "severity": sev}),
+            N("wr", "write", {"filename": str(tmp_path / "asserted.parquet")}),
+        ], "edges": [E("s", "a"), E("a", "wr", "pass")]})  # write reads the PASSTHROUGH handle
+
+    # the two ports are distinct: 'out' (default) = violations, 'pass' = every input row
+    with db.run_scope():
+        eng = BuildEngine(graph("id >= 5", "warn"), d.resolve_adapter, d.registry, full=True,
+                          node_specs=d.node_specs, node_builders=d.node_builders)
+        total = int(eng.relation("s").aggregate("count(*) AS n").fetchone()[0])
+        viol = int(eng.relation("a").aggregate("count(*) AS n").fetchone()[0])          # default = violations
+        passed = int(eng.relation("a", "pass").aggregate("count(*) AS n").fetchone()[0])  # passthrough
+        assert 0 < viol < total and passed == total  # 'pass' is EVERY row, not the 5 violations
+
+    def run(pred, sev):
+        g = graph(pred, sev)
+        st = d.runner.run(compile_plan(g, "wr", d.registry, d.node_specs), g, "wr", "local")
+        for _ in range(200):
+            s = d.runner.status(st.run_id)
+            if s.status in ("done", "failed", "cancelled"):
+                return s
+            time.sleep(0.05)
+        return s
+
+    warned = run("id >= 5", "warn")   # warn → run succeeds and writes ALL rows (via 'pass'), not violations
+    assert warned.status == "done" and warned.total_rows == total and warned.output_uri
+    errored = run("id >= 5", "error")  # error → run fails at the assert, BEFORE the write commits
+    assert errored.status == "failed" and "assert" in (errored.error or "").lower()
+    assert not errored.output_uri     # no sink side effect
+
+
 def test_window_fill_unnest_nodes(tmp_path):
     # the data-cleaning built-ins: window (add a partitioned analytic column), fill (impute nulls),
     # unnest (explode a list column → one row per element).
