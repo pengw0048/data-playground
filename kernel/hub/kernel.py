@@ -60,7 +60,7 @@ def main() -> None:
     import uvicorn
     from fastapi import FastAPI, Header, HTTPException
 
-    from hub import compiler, metadb
+    from hub import compiler, db, metadb
     from hub.deps import set_workspace
     from hub.models import Graph
 
@@ -102,6 +102,17 @@ def main() -> None:
         mods = kernel_deps.ensure(reqs, kernel_deps.deps_dir(args.workspace, canvas)) if reqs else set()
         sandbox.set_allowed(mods)
 
+    # wedge watchdog: a healthy warm kernel completes a trivial query fast (runs are offloaded to child
+    # processes, so nothing long-running blocks the kernel itself). If it CAN'T for several cycles it's
+    # wedged (deadlocked engine / held lock) — drop the lease and exit so the next run respawns a fresh
+    # kernel. A GIL-starved wedge is caught for free: the heartbeat thread can't run, so the lease goes
+    # stale and the hub reaper recycles it. Tie liveness to real responsiveness, not a blind timer.
+    try:
+        _probe_timeout = float(os.environ.get("DP_KERNEL_PROBE_TIMEOUT", "5"))
+    except ValueError:
+        _probe_timeout = 5.0
+    _probe_fails = [0]
+
     def _heartbeat_loop() -> None:
         while True:
             time.sleep(5.0)
@@ -113,6 +124,13 @@ def main() -> None:
             elif time.monotonic() - last_activity[0] > args.idle_ttl:
                 metadb.drop_kernel(canvas, kid)  # fenced delete — releases only if still ours
                 os._exit(0)
+            if db.responsive(_probe_timeout):
+                _probe_fails[0] = 0
+            else:
+                _probe_fails[0] += 1
+                if _probe_fails[0] >= 3:  # ~3 cycles of unresponsiveness (< KERNEL_STALE_S) → recycle
+                    metadb.drop_kernel(canvas, kid)
+                    os._exit(1)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

@@ -449,6 +449,16 @@ def test_run_progress_and_stall_signal():
     assert metadb.run_stalled("stall_run", 0.0) is True     # threshold 0 → any age counts as stalled
     assert metadb.run_stalled("stall_run", 10_000) is False  # generous threshold → not stalled
     assert metadb.run_stalled("no_such_run", 0.0) is False   # unknown run → never stalled
+    # wedge watchdog probe: a healthy engine answers a trivial query fast; a HELD base lock (a wedge)
+    # makes the probe hang past its budget → reported unresponsive, which the kernel uses to self-recycle.
+    from hub import db
+    import threading as _th
+    assert db.responsive(5.0) is True                        # healthy engine → responsive
+    got: list = []
+    with db.lock():                                          # hold the base lock (simulates a wedge)
+        w = _th.Thread(target=lambda: got.append(db.responsive(1.0)))
+        w.start(); w.join(6)
+    assert got == [False]                                    # couldn't complete while wedged → recycle signal
     # the terminal status carries a duration too (ms is set BEFORE the flip to 'done', not only in the
     # finally) so a poll that reads 'done' isn't left with ms=0.
     assert done["ms"] >= 0 and "ms" in done

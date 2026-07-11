@@ -269,6 +269,28 @@ def ensure_object_store() -> None:
                 pass
 
 
+def responsive(timeout_s: float = 5.0) -> bool:
+    """True if the engine can complete a trivial query within `timeout_s`. A wedged process — the base
+    lock held forever, a deadlocked base connection, GIL starvation — can't. The kernel watchdog uses
+    this to recycle a wedged kernel: since runs now execute in child processes, a healthy warm kernel
+    ALWAYS passes quickly, so a persistent timeout means it's genuinely stuck. An ERROR still counts as
+    responsive (the engine answered); only a HANG (no result within the budget) is a wedge."""
+    ok: list[bool] = []
+
+    def _probe() -> None:
+        try:
+            with run_scope() as sc:
+                sc.con.execute("SELECT 1").fetchone()
+        except Exception:  # noqa: BLE001 — an error is still a live, responsive engine
+            pass
+        ok.append(True)
+
+    t = threading.Thread(target=_probe, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    return bool(ok)
+
+
 def interrupt() -> None:
     """Abort the in-flight DuckDB query. Safe to call from ANOTHER thread (that's the point): it lets
     a cancel or a preview timeout actually stop a long-running query so the worker thread unwinds and
