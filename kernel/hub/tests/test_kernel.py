@@ -2286,6 +2286,14 @@ def test_lance_scan_streams_with_pushdown(tmp_path):
         with pytest.raises(NotImplementedError, match="not supported"):
             a.write(wp, con.sql("SELECT CAST(1 AS BIGINT) AS id, CAST(0 AS BIGINT) AS cat"), "merge")
         assert a.count(wp) == 31  # the rejected write did NOT append
+        # #44 review (HIGH): a DOUBLE-QUOTED identifier predicate must not be silently miscomputed by
+        # Lance's datafusion dialect (which reads "col" as a string literal) — it routes to the DuckDB
+        # fallback + returns correct rows. Use a reserved-word column that REQUIRES quoting.
+        qp = str(tmp_path / "q.lance")
+        a.write(qp, con.sql('SELECT CAST(i AS BIGINT) AS id, CAST(mod(i, 2) AS BIGINT) AS "select" FROM range(0, 10) r(i)'), "overwrite")
+        assert a.scan(qp, predicate='"select" = 1').aggregate("count(*)").fetchone()[0] == 5
+        proj = a.scan(qp, columns=["id"], predicate='"select" = 1')  # predicate on a PROJECTED-OUT column
+        assert list(proj.columns) == ["id"] and proj.aggregate("count(*)").fetchone()[0] == 5
 
 
 def test_vector_search_lance_ann_and_external_query(tmp_path):
