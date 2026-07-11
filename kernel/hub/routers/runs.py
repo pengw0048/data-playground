@@ -37,8 +37,26 @@ router = APIRouter()
 _RUN_INDEX_MAX = 1000  # cap deps.run_index (run_id -> owning runner); well above either runner's own cap
 
 
+def _unknown_kind_error(graph, deps) -> str | None:
+    """P0-DATA-02: a node whose kind isn't registered (a missing plugin, a misspelling) used to compile
+    and execute as a silent passthrough — the pipeline reports success while omitting the work. Return a
+    human error naming the first offender, or None if every kind is recognized."""
+    unknown = graph_mod.unknown_kinds(graph, set(deps.node_specs) | set(deps.node_builders))
+    if not unknown:
+        return None
+    nid, t = unknown[0]
+    return f"unknown node kind '{t}' (node '{nid}') — install its plugin or remove the node"
+
+
+def _reject_unknown_kinds(graph, deps) -> None:
+    err = _unknown_kind_error(graph, deps)
+    if err:
+        raise HTTPException(400, err)
+
+
 def _reject_invalid(graph, deps) -> None:
     """400 on a graph the type system forbids (server-side; the frontend blocks these too)."""
+    _reject_unknown_kinds(graph, deps)  # fail closed on a missing plugin / typo before doing any work
     errs = graph_mod.type_errors(graph, deps.node_specs)
     if errs:
         raise HTTPException(400, "incompatible connection: " + "; ".join(errs[:5]))
@@ -48,6 +66,9 @@ def _reject_invalid(graph, deps) -> None:
 def compile_graph(req: CompileRequest) -> CompilePlan:
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    unknown = _unknown_kind_error(req.graph, deps)  # P0-DATA-02: a missing plugin / typo is not a valid plan
+    if unknown:
+        return CompilePlan(target_node_id=req.target_node_id, steps=[], acyclic=True, error=unknown)
     errs = graph_mod.type_errors(req.graph, deps.node_specs)
     if errs:
         return CompilePlan(target_node_id=req.target_node_id, steps=[], acyclic=True,
@@ -59,6 +80,7 @@ def compile_graph(req: CompileRequest) -> CompilePlan:
 def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> SampleResult:
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    _reject_unknown_kinds(req.graph, deps)  # P0-DATA-02: don't preview a missing-plugin node as passthrough
     k = req.k if req.k is not None else settings.preview_k
     if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
         try:
@@ -76,6 +98,7 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
     WHOLE dataset (a full pass) when `full` is set."""
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    _reject_unknown_kinds(req.graph, deps)  # P0-DATA-02
     if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
         try:
             return ProfileResult(**kb.profile(req.graph, req.node_id, full=req.full))  # on the canvas's warm kernel
@@ -90,6 +113,7 @@ def graph_schema(req: CompileRequest) -> dict:
     """Per-node output columns (metadata-only) for editor column suggestions — see executors/schema."""
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    _reject_unknown_kinds(req.graph, deps)  # P0-DATA-02
     return schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
                             deps.node_builders, deps.node_specs)
 

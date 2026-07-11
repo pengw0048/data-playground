@@ -121,6 +121,19 @@ def nearest_source(graph: Graph, chain: list[GraphNode]) -> GraphNode | None:
     return None
 
 
+# Node types the engine executes natively even though they carry no NodeSpec (legacy / intrinsic).
+# Any type outside node_specs ∪ node_builders ∪ these is unknown — a missing plugin or a typo — and
+# must fail closed rather than silently pass its input through (which would omit the intended work
+# yet report success). See executors/engine.py's catch-all and routers/runs._reject_unknown_kinds.
+INTRINSIC_KINDS = frozenset({"notebook", "loop", "variable", "opaque"})
+
+
+def unknown_kinds(graph: Graph, known) -> list[tuple[str, str]]:
+    """[(node_id, type), ...] for nodes whose type is neither a registered kind nor an intrinsic one."""
+    allow = set(known) | INTRINSIC_KINDS
+    return [(n.id, n.type) for n in graph.nodes if n.type not in allow]
+
+
 def type_errors(graph: Graph, node_specs: dict) -> list[str]:
     """Server-side typed-wire validation (defense-in-depth; the frontend also blocks these).
 
