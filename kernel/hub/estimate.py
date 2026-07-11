@@ -191,8 +191,13 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
         cone = {n.id for n in g.upstream_chain(graph, target)}
         order = [n for n in order if n.id in cone]
 
+    widths: dict[str, int] = {}  # per-node per-row byte width, propagated from the MEASURED source width
+
     def width(nid: str) -> int:
         return _row_width(schemas.get(nid))
+
+    def in_width(nid: str) -> int:  # widest input's per-row width (0 if no sized input yet)
+        return max((widths[e.source] for e in g.incoming(graph, nid) if e.source in widths), default=0)
 
     def inputs(nid: str) -> list[SizeEst]:
         return [out[e.source] for e in g.incoming(graph, nid) if e.source in out]
@@ -200,7 +205,31 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
     for node in order:
         nid = node.id
         t = node.type
-        w = width(nid)
+        w = width(nid)  # coarse display-derived width; SHARPENED per node type just below
+        uri = resolve_config(node).get("uri") if t == "source" else None
+        bypassed = node.data.get("bypassed") if isinstance(node.data, dict) else False
+
+        # a row-preserving/reducing op keeps its columns' widths — PROPAGATE the input's measured width
+        # (max, conservative: never under-estimate) rather than re-derive from coarse display types, which
+        # lose vector dims / decimal / nested widths. So a measured embedding width survives downstream to
+        # the blocking op that actually sets a region's working set. (select stays here on PURPOSE: its
+        # post-projection display width would UNDER-count a KEPT probed vector column whose display type
+        # lost its dim, so we err wide — a full fix needs per-column width lineage. union: same-schema
+        # concat → the widest input width is correct.)
+        pass_through = t in ("filter", "dedup", "assert", "select", "sort", "write", "chart",
+                             "window", "fill", "sample", "union")
+        # MEASURE the per-row width ONCE, here — EVERY branch below (a measured actual, a source that
+        # already ran, a pass-through) reuses it, so the sharpened width is never dropped to a coarse
+        # default and always survives to the downstream blocking op / the byte gate / placement.
+        if bypassed:                                        # passes its input through unchanged
+            w = in_width(nid) or w
+        elif t == "source" and uri:
+            # MEASURE list/vector-column widths (embeddings) from the real schema so the byte gate sees the
+            # true per-row size — a float[1024] scored as base `float`=8B mis-sizes a region ~1000x small.
+            w = _source_width(resolve_adapter, uri, schemas.get(nid))
+        elif pass_through:
+            w = max(w, in_width(nid))
+        widths[nid] = w
 
         # 1) a measured actual always wins (the canvas is iterative — the 2nd run has ground truth)
         if actuals.get(nid) is not None:
@@ -210,17 +239,14 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
         ins = inputs(nid)
         first = ins[0] if ins else None
 
-        # 2) a bypassed node passes its input through unchanged; disabled produces nothing downstream
-        if node.data.get("bypassed") if isinstance(node.data, dict) else False:
+        # 2) a bypassed node passes its input through; disabled produces nothing downstream
+        if bypassed:
             out[nid] = first or _sized(None, "unknown", w)
             continue
 
         if t == "source":
-            uri = resolve_config(node).get("uri")
             n = _counted(resolve_adapter, uri) if uri else None
-            # probe list-column widths (embeddings) so the byte gate sees the real per-row size
-            sw = _source_width(resolve_adapter, uri, schemas.get(nid)) if uri else w
-            out[nid] = _sized(n, "exact" if n is not None else "unknown", sw)
+            out[nid] = _sized(n, "exact" if n is not None else "unknown", w)
             continue
 
         if t == "sample":
