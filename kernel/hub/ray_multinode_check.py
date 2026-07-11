@@ -114,7 +114,9 @@ def main() -> int:
     g = Graph(**{"id": "c", "version": 1, "nodes": [
         {"id": "src", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": src}}},
         {"id": "a", "type": "aggregate", "position": {"x": 0, "y": 0},
-         "data": {"config": {"groupBy": "cat", "aggs": "count(*) AS n, count(v) AS nv, min(v) AS lo, max(v) AS hi"}}},
+         "data": {"config": {"groupBy": "cat",
+                             "aggs": "count(*) AS n, count(v) AS nv, min(v) AS lo, max(v) AS hi, "
+                                     "sum(v) AS sm, avg(v) AS av"}}},
     ], "edges": [{"id": "e", "source": "src", "target": "a", "data": {"wire": "dataset"}}]})
 
     rr = _load_dp_ray().RayRunner(deps)
@@ -138,7 +140,7 @@ def main() -> int:
     con = duckdb.connect()
     con.register("oracle", oracle)
     con.register("rayout", ray_tbl)
-    q = "SELECT cat, n, nv, lo, hi FROM {t} ORDER BY cat NULLS FIRST, n, nv, lo, hi"
+    q = "SELECT cat, n, nv, lo, hi, sm, av FROM {t} ORDER BY cat NULLS FIRST, n, nv, lo, hi"
     ray_rows = con.execute(q.format(t="rayout")).fetchall()
     duck_rows = con.execute(q.format(t="oracle")).fetchall()
     if ray_rows != duck_rows:

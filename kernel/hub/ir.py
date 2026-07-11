@@ -41,46 +41,23 @@ CLEAN_OPS = {"read", "write", "passthrough"} | CLEAN_TRANSFORM_MODES
 # run byte-identically. (ARC3 grows this as each op is validated on a real cluster.)
 DISTRIBUTABLE_RELATIONAL = frozenset({"aggregate"})
 
-# a group-key/aggregate spec parser shared by any distributed backend, so the SAME raw fragment DuckDB
-# consumes (resolve_config, untouched) is turned into structured, portable specs. Deliberately narrow and
-# conservative: anything it can't prove byte-identical to DuckDB returns None → the caller falls back to
-# DuckDB. Widening this is gated behind a new byte-identical differential test (see ARC3).
-_AGG_RE = re.compile(r"^\s*(count|min|max)\s*\(\s*(\*|[A-Za-z_][A-Za-z0-9_]*)\s*\)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", re.I)
+# A distributed backend runs relational ops by SHUFFLING on a key (Ray) then computing with DuckDB per
+# partition (see dp_ray) — so the only thing it parses is the shuffle KEY, not the operation. This keeps
+# the hand-written surface tiny and conservative: an un-parseable key returns None → the backend falls
+# back to single-node DuckDB. The aggregates/expressions themselves are never parsed — DuckDB runs the
+# same SQL fragment the single-node engine does, so the result is identical by construction.
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def parse_group_keys(group: str) -> list[str] | None:
-    """A GROUP BY fragment → the list of bare group-key columns ([] = a global/no-key aggregate), or None
-    if any key is an expression / quoted / parenthesized (⇒ not safely distributable ⇒ DuckDB)."""
+    """A GROUP BY fragment → the list of bare group-key columns to hash-shuffle on ([] = a global/no-key
+    aggregate), or None if any key is an expression / quoted / parenthesized (no plain shuffle key ⇒ not
+    distributable ⇒ DuckDB single-node)."""
     s = (group or "").strip()
     if not s:
         return []  # global aggregate — valid (a single-partition reduce), distinct from unparseable (None)
     keys = [p.strip() for p in s.split(",")]
     return keys if all(_IDENT_RE.match(k) for k in keys) else None
-
-
-def parse_aggs(aggs: str) -> list[tuple[str, str | None, str]] | None:
-    """An aggregate-list fragment → [(func, column_or_None, alias)], or None if any term is outside the
-    proven-exact subset. Only count(*)/count(col)/min(col)/max(col) WITH an explicit `AS alias` — these are
-    order- and dtype-independent, so a distributed shuffle produces bit-identical results to DuckDB. Empty
-    → DuckDB's default `count(*) AS n` (engine.py:649). sum/mean/std (float non-associativity), DISTINCT,
-    arithmetic, and unaliased terms all → None (⇒ DuckDB)."""
-    s = (aggs or "").strip()
-    if not s:
-        return [("count", None, "n")]
-    out: list[tuple[str, str | None, str]] = []
-    for part in s.split(","):
-        m = _AGG_RE.match(part)
-        if not m:
-            return None
-        func, arg, alias = m.group(1).lower(), m.group(2), m.group(3)
-        if arg == "*":
-            if func != "count":
-                return None  # min(*)/max(*) is not valid
-            out.append((func, None, alias))
-        else:
-            out.append((func, arg, alias))
-    return out
 
 # canvas node type → IR op. `transform`/`notebook` resolve to their MODE (a clean transform mode, or
 # `transform:<mode>` when not clean); anything not listed (incl. plugin kinds) → `opaque:<type>`.

@@ -46,15 +46,19 @@ import time
 import uuid
 
 from hub import db, graph as g
-from hub.ir import (CLEAN_TRANSFORM_MODES, lower_to_ir, parse_aggs, parse_group_keys,
+from hub.ir import (CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys,
                     plan_is_clean, plan_is_distributable)
 from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
 
 _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", ".json", ".lance")
 
-# the relational ops THIS backend claims beyond the map-style clean subset — each proven byte-identical to
-# DuckDB on a real cluster before it's added (ARC3). `aggregate` = GROUP BY with count/min/max only (the
-# exact, order/dtype-independent subset; sum/mean/std stay on DuckDB until a float strategy is validated).
+# the relational ops THIS backend claims beyond the map-style clean subset (ARC3). The engine does NOT
+# reimplement these on Ray operators — it lets RAY do only the SHUFFLE (hash-partition rows by the op's
+# key) and lets DUCKDB do the compute on each COMPLETE partition, running the SAME SQL the single-node
+# engine runs. So the result is byte-identical BY CONSTRUCTION (it's DuckDB, on partitions holding every
+# row of their key-groups — nothing combined across partitions), ANY DuckDB aggregate works, the output
+# carries DuckDB's exact schema, and the only thing parsed is the shuffle KEY (bare columns). `aggregate`
+# = a GROUPED aggregate; a global aggregate (no key) is cheap + falls back to the single-node engine.
 RAY_RELATIONAL = frozenset({"aggregate"})
 
 
@@ -212,16 +216,16 @@ class RayRunner:
 
     def _ray_runnable(self, ir) -> bool:
         # (1) every step is clean OR a claimed relational op; (2) every clean transform carries inlined
-        # code (a Ray worker has no access to the driver's processor registry); (3) every aggregate parses
-        # into the proven-exact subset (bare group keys + count/min/max). Anything else ⇒ DuckDB fallback.
+        # code (a Ray worker has no access to the driver's processor registry); (3) every aggregate has a
+        # GROUPED, bare-column key we can hash-shuffle on (a global aggregate — empty keys — or an
+        # expression key has no shuffle key → DuckDB single-node, which is cheap for a global reduce).
         if not ir.is_distributable(RAY_RELATIONAL):
             return False
         if not all(s.config.get("code") for s in ir.steps if s.op in CLEAN_TRANSFORM_MODES):
             return False
         for s in ir.steps:
-            if s.op == "aggregate" and (parse_group_keys(s.config.get("groupBy", "")) is None
-                                        or parse_aggs(s.config.get("aggs", "")) is None):
-                return False
+            if s.op == "aggregate" and not parse_group_keys(s.config.get("groupBy", "")):
+                return False  # None (expression key) or [] (global) → not shuffle-distributable
         return True
 
     def run(self, plan, graph, target_node_id, placement, run_id=None) -> RunStatus:
@@ -425,33 +429,33 @@ class RayRunner:
         raise RuntimeError(f"ray backend reached a non-clean op '{step.op}' (should have fallen back)")
 
     def _build_aggregate(self, step, parent):
-        """A distributed GROUP BY via Ray Data's native HASH shuffle (the default strategy in 2.56): Ray
-        hash-partitions the input by the group keys across the cluster's object store, then reduces each
-        partition on its owning worker — no driver funnel. Restricted to count/min/max (order- and
-        dtype-independent → bit-identical to DuckDB regardless of shuffle order); the projection is
-        reordered to [group keys…, agg aliases…] to match DuckDB's `{group}, {aggs}` output exactly."""
-        from ray.data.aggregate import Count, Max, Min
+        """A distributed GROUP BY where RAY does only the SHUFFLE and DUCKDB does the compute. Ray
+        hash-partitions the input by the group keys (its default HASH_SHUFFLE) so every row of a group
+        lands in ONE partition; then the SAME `SELECT {group}, {aggs} GROUP BY {group}` the single-node
+        engine runs is executed on each partition by DuckDB. Because each group is complete within its
+        partition, nothing is combined across partitions — the union of the per-partition results equals
+        the single-node result BYTE-FOR-BYTE (it IS DuckDB, on complete groups), with DuckDB's exact
+        schema + naming. So any DuckDB aggregate works (count/min/max/sum/avg/stddev/count(distinct)/…);
+        only the shuffle KEY is parsed. batch_size=None makes each map_batches call the WHOLE partition,
+        so groups are never split across DuckDB calls."""
         cfg = step.config
-        keys = parse_group_keys(cfg.get("groupBy", "")) or []
-        specs = parse_aggs(cfg.get("aggs", ""))
-        aggs = []
-        for func, col, alias in specs:
-            if func == "count":
-                # count(*) counts every row (on=None); count(col) counts NON-NULL (ignore_nulls=True) to
-                # match DuckDB — Ray's Count defaults ignore_nulls=False, which would over-count nulls.
-                aggs.append(Count(alias_name=alias) if col is None
-                            else Count(on=col, ignore_nulls=True, alias_name=alias))
-            elif func == "min":
-                aggs.append(Min(on=col, alias_name=alias))     # ignore_nulls=True default = DuckDB min
-            elif func == "max":
-                aggs.append(Max(on=col, alias_name=alias))     # ignore_nulls=True default = DuckDB max
+        keys = parse_group_keys(cfg.get("groupBy", "")) or []   # gating guarantees a non-empty bare-col key
+        group = (cfg.get("groupBy") or "").strip()
+        aggs = (cfg.get("aggs") or "count(*) AS n").strip()     # DuckDB default (mirrors engine.py:649)
+        sql = f"SELECT {group}, {aggs} FROM _blk GROUP BY {group}"
+
+        def _agg_block(tbl):                                    # runs on a WORKER, one complete-groups partition
+            import duckdb
+            con = duckdb.connect()
+            con.register("_blk", tbl)
+            return con.execute(sql).fetch_arrow_table()
+
         try:
             parts = int(os.environ.get("DP_RAY_SHUFFLE_PARTITIONS", "0")) or None
         except ValueError:
             parts = None
-        ds = parent.groupby(keys or None, num_partitions=parts).aggregate(*aggs)
-        want = [*keys, *[alias for _f, _c, alias in specs]]     # DuckDB projection order: keys then aggs
-        return ds.select_columns(want)
+        shuffled = parent.repartition(parts, keys=keys) if parts else parent.repartition(keys=keys)
+        return shuffled.map_batches(_agg_block, batch_format="pyarrow", batch_size=None)
 
     def _commit(self, step, datasets, graph) -> tuple[int, str, str]:
         import pyarrow as pa
