@@ -260,17 +260,21 @@ class RunController:
             # in parallel — a wave scheduler where no task ever blocks on another, so the pool can't
             # deadlock. `regions` is topo-ordered; the last is the target's (final) region, run afterward.
             intermediates, final_region = list(regions[:-1]), regions[-1]
-            by_out = {r.output_node: r for r in regions}
+            interm_outs = {r.output_node for r in intermediates}
 
-            def _region_deps(r):  # the output_nodes of the intermediate regions this region reads
-                return {ci[0] for ci in r.cut_inputs
-                        if ci[0] in by_out and by_out[ci[0]].id != r.id and by_out[ci[0]] in intermediates}
+            def _region_deps(r):  # the intermediate-region output_nodes this region reads (O(1) membership)
+                return {ci[0] for ci in r.cut_inputs if ci[0] in interm_outs and ci[0] != r.output_node}
 
             done_nodes: set[str] = set()
             pending = list(intermediates)
             cap = max(1, min(len(pending) or 1, _region_concurrency()))
             inflight: dict = {}
-            with cf.ThreadPoolExecutor(max_workers=cap, thread_name_prefix="dp-region") as ex:
+            # explicit executor lifecycle (not `with`): on a region failure we shutdown(wait=False,
+            # cancel_futures=True) so a fast failure isn't delayed by the slowest still-running sibling
+            # (the `with`'s __exit__ would join them). A failure sets the local flag, not the cancel event
+            # (the outer except uses cancel.is_set() to distinguish cancel from failure).
+            ex = cf.ThreadPoolExecutor(max_workers=cap, thread_name_prefix="dp-region")
+            try:
                 while (pending or inflight) and not cancel.is_set():
                     for r in [r for r in pending if _region_deps(r) <= done_nodes]:
                         pending.remove(r)
@@ -282,13 +286,15 @@ class RunController:
                         break  # nothing ready and nothing running → an unsatisfiable dep (defensive; topo rules it out)
                     for fut in cf.wait(list(inflight), return_when=cf.FIRST_COMPLETED).done:
                         r = inflight.pop(fut)
-                        uri = fut.result()  # a region failure raises → outer except fails the run
+                        uri = fut.result()  # a region failure raises → finally aborts the pool, outer except fails the run
                         with ref_lock:
                             ref_uri[r.output_node] = uri
                         done_nodes.add(r.output_node)
                         self._mark(status, r, "done")
                         status.progress = _step_progress(status)
                         self._emit(graph, status)
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)  # drop queued regions; don't block on running ones
             if cancel.is_set():
                 status.status = "cancelled"
                 return

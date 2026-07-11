@@ -4516,9 +4516,12 @@ def test_parallel_regions_run_independent_regions_concurrently(monkeypatch):
     monkeypatch.setattr(ctrl, "on_status", None)
     monkeypatch.setattr(ctrl, "on_complete", None)
     monkeypatch.setenv("DP_REGION_CONCURRENCY", "4")
-    ctrl._orchestrate(rid, Graph(id="c", version=1, nodes=[], edges=[]), "f", regs)
-    assert ctrl.runs[rid].status == "done", ctrl.runs[rid].error
-    assert peak[0] >= 2, f"independent regions did not run concurrently (peak in-flight = {peak[0]})"
+    try:
+        ctrl._orchestrate(rid, Graph(id="c", version=1, nodes=[], edges=[]), "f", regs)
+        assert ctrl.runs[rid].status == "done", ctrl.runs[rid].error
+        assert peak[0] >= 2, f"independent regions did not run concurrently (peak in-flight = {peak[0]})"
+    finally:
+        ctrl.runs.pop(rid, None)  # don't leak this synthetic run onto the shared controller
 
 
 def test_declared_keys_and_relationships_are_independent_rows():
