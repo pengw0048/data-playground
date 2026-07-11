@@ -193,8 +193,8 @@ class SubprocessRunner:
         # it shows up in the parent's live catalog, just like an in-process run.
         if st and st.status == "done" and st.output_uri and st.output_table and self.catalog is not None:
             try:
-                self.catalog.register_output(name=st.output_table, uri=st.output_uri, version="v1",
-                                             parents=[], pipeline="canvas")
+                self.catalog.register_output(name=st.output_table, uri=st.output_uri,
+                                             parents=[], pipeline="canvas")  # content-addressed version
             except Exception:  # noqa: BLE001
                 pass
         # Persist run history here (the child disables its own on_complete to avoid a daemon-thread

@@ -49,9 +49,30 @@ class InMemoryCatalog:
             if not (fn.endswith(self._EXTS) or is_lance):
                 continue
             name = fn[:-6] if is_lance else os.path.splitext(fn)[0]
-            self._add(name=name, uri=path, version="v1")
+            self._add(name=name, uri=path)  # content-addressed version
 
-    def _add(self, name: str, uri: str, version: str, meta: str | None = None) -> CatalogTable:
+    @staticmethod
+    def _object_stat_sig(uri: str) -> str:
+        """`:size:mtime` for a SINGLE object (so an object overwrite bumps the content-addressed version —
+        the object fingerprint is uri-only and can't tell two writes apart), or "" for a non-object uri, a
+        prefix/dir, gs:// with HMAC creds (no pyarrow filesystem), or any stat failure — the version then
+        falls back to schema+rows+uri (the residual object-collision case: identical schema+rows, same uri,
+        different data)."""
+        from hub.plugins.adapters import is_object_uri
+        if not is_object_uri(uri):
+            return ""
+        try:
+            import pyarrow.fs as pafs
+            from hub.plugins.adapters import object_fs
+            fs, p = object_fs(uri)
+            info = fs.get_file_info(p)
+            if info.type == pafs.FileType.File:
+                return f":{info.size}:{info.mtime_ns}"
+        except Exception:  # noqa: BLE001 — no stat available → fall back to the uri-only fingerprint
+            pass
+        return ""
+
+    def _add(self, name: str, uri: str, version: str | None = None, meta: str | None = None) -> CatalogTable:
         # id from the uri (names collide across different files); fall back to name if uri is reused
         import hashlib as _h
         # schema/count probe (may touch disk/network) OUTSIDE the lock so a slow adapter doesn't block
@@ -60,14 +81,46 @@ class InMemoryCatalog:
             adapter = self.resolve(uri)
             columns = adapter.schema(uri)
             count = adapter.count(uri)
-        except Exception:
-            columns, count = [], None
+        except Exception:  # noqa: BLE001 — an unresolvable/unreadable uri → empty schema (still registered)
+            adapter, columns, count = None, [], None
+        # storage signature for the version — ISOLATED try so a plugin adapter whose fingerprint raises
+        # can't wipe the schema/count probed above. Local fingerprint = mtime+size; the object fingerprint
+        # is uri-only (can't tell two object writes of identical schema+rows apart), so augment it with the
+        # object's size+mtime via a cheap stat → an object OVERWRITE still bumps the version.
+        fp = "unknown"
+        try:
+            fp = (adapter.fingerprint(uri) if adapter else "unknown") + self._object_stat_sig(uri)
+        except Exception:  # noqa: BLE001
+            pass
         from hub.relationships import key_candidates
         keys = key_candidates(columns)  # inferred candidates; the declared key is OVERLAID on read (_overlay)
+        # CONTENT-ADDRESSED version (version=None): a stable hash of the schema + row count + storage
+        # signature, so the SAME data always gets the SAME version — a restart / re-registration never
+        # spuriously bumps it — while a changed schema, row count, or file (local mtime+size / object
+        # size+mtime) yields a NEW version. Real, comparable history instead of a frozen 'v1'. An explicit
+        # version (a plugin's register, or the seed) is honored as-is.
+        if version is None:
+            sig = "|".join(f"{c.name}:{c.type}" for c in columns) + f"|rows={count}|fp={fp}"
+            version = "v" + _h.sha256(sig.encode()).hexdigest()[:10]
         with self._lock:
             tid = f"tbl_{name}" if uri not in self._by_uri else self._by_uri[uri]
             if any(t.id == f"tbl_{name}" and t.uri != uri for t in self.tables.values()):
                 tid = f"tbl_{name}_{_h.sha1(uri.encode()).hexdigest()[:6]}"
+            prior = self.tables.get(tid)
+            # schema-change detection on overwrite: an output whose columns drifted from the prior write is
+            # a silent contract break for downstream consumers — surface it (a WARNING; overwrite is a
+            # deliberate replace, so we don't fail — enforceSchema on a node is the hard gate).
+            if prior and prior.columns and columns:
+                pc = [(c.name, c.type) for c in prior.columns]
+                cc = [(c.name, c.type) for c in columns]
+                if pc != cc:
+                    import logging
+                    added, removed = [c for c in cc if c not in pc], [c for c in pc if c not in cc]
+                    detail = (f"added={added} removed={removed}" if (added or removed)
+                              else "columns reordered")  # same set, different order → an accurate message
+                    logging.getLogger("hub").warning(
+                        "catalog output %r schema changed on overwrite (version %s→%s): %s",
+                        name, prior.version, version, detail)
             table = CatalogTable(
                 id=tid, name=name, uri=uri, row_count=count, version=version,
                 columns=columns, keys=keys, meta=meta,
@@ -213,8 +266,9 @@ class InMemoryCatalog:
         for parent in parents or []:
             self._add_edge(parent, table.uri, pipeline)
 
-    def register_output(self, name: str, uri: str, version: str, parents: list[str],
+    def register_output(self, name: str, uri: str, version: str | None = None, parents: list[str] | None = None,
                         pipeline: str | None = None) -> CatalogTable:
+        # version=None → content-addressed (computed from the written data); a caller no longer pins 'v1'.
         table = self._add(name=name, uri=uri, version=version, meta=pipeline)
         for parent in parents:
             self._add_edge(parent, uri, pipeline)

@@ -230,7 +230,7 @@ def catalog_register(req: RegisterRequest) -> CatalogTable:
     # register_output write-throughs per-row to catalog_entries (metadb), which _load_from_db restores
     # on every read + across restart — so no separate 'datasets' settings blob (its read-modify-write
     # dropped a concurrent registration; F45). The per-row store is authoritative + cross-instance.
-    return deps.catalog.register_output(name=name, uri=uri, version="v1", parents=[])
+    return deps.catalog.register_output(name=name, uri=uri, parents=[])  # content-addressed version
 
 
 # --------------------------------------------------------------------------- #
@@ -278,7 +278,7 @@ def _finalize_upload(deps, tmp: str, target: str, name: str) -> CatalogTable:
         raise HTTPException(400, f"uploaded file is not readable: {e}")
     final = _land_upload(deps, tmp, target)
     with db.run_scope():  # own cursor — register's count(*) full-scan (CSV/JSON) must not hold the base lock
-        return deps.catalog.register_output(name=name, uri=final, version="v1", parents=[])
+        return deps.catalog.register_output(name=name, uri=final, parents=[])  # content-addressed version
 
 
 @router.post("/catalog/upload", response_model=CatalogTable)

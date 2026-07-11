@@ -438,7 +438,7 @@ class LocalRunner:
         out_uri = res.get("uri", uri)  # append writes into a directory of parts — register THAT
 
         parent_uris = [u for e in inc for u in [self._source_uri(nm_node=e.source, graph=graph)] if u]
-        self.catalog.register_output(name=name, uri=out_uri, version="v1", parents=parent_uris, pipeline="canvas")
+        self.catalog.register_output(name=name, uri=out_uri, parents=parent_uris, pipeline="canvas")  # content-addressed version
         status.output_uri = out_uri
         status.output_table = name
         return rows
