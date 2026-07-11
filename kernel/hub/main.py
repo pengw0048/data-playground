@@ -261,9 +261,54 @@ def mcp_http_delete():
     return {"ok": True}  # stateless server — no session id to terminate
 
 
-@app.get("/api/health")
-def health() -> dict:
-    return {"ok": True}
+@app.get("/api/health")     # back-compat alias for /api/livez
+@app.get("/api/livez")
+def livez() -> dict:
+    return {"ok": True}     # the process is up and serving — a pure liveness signal (no dep checks)
+
+
+@app.get("/api/readyz")
+def readyz():
+    # readiness = can this instance actually serve? Real dep checks (not a static ok): the metadata DB
+    # answers, and the DuckDB engine is responsive (not wedged). 503 (not 200) when not ready, so a load
+    # balancer / k8s readiness probe pulls the instance out of rotation instead of routing to a dead one.
+    from fastapi.responses import JSONResponse
+
+    from hub import db, metadb
+    checks = {"db": metadb.ping(), "engine": db.responsive(3.0)}
+    ready = all(checks.values())
+    return JSONResponse({"ready": ready, "checks": checks}, status_code=200 if ready else 503)
+
+
+@app.get("/api/version")
+def version() -> dict:
+    # deployment identity for operability — sha + the pluggable-backend choices + core lib versions.
+    # SECRETS ARE REDACTED: the DB is reported as its dialect only (never the DP_DATABASE_URL creds).
+    import platform
+
+    import duckdb
+    import pyarrow
+
+    from hub import auth
+    from hub.settings import settings
+    sha = os.environ.get("DP_GIT_SHA", "").strip()
+    if not sha:
+        try:
+            import subprocess
+            sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                                 timeout=2, cwd=os.path.dirname(__file__)).stdout.strip() or "unknown"
+        except Exception:  # noqa: BLE001 — no git in a wheel deploy → set DP_GIT_SHA at build time
+            sha = "unknown"
+    return {
+        "sha": sha,
+        "spawner": settings.kernel_spawner,
+        "db": (settings.database_url.split("://", 1)[0] or "sqlite"),  # dialect only — never the creds
+        "storage": (os.environ.get("DP_STORAGE_URL", "").split("://", 1)[0] or "local"),
+        "auth": "enabled" if auth.auth_enabled() else "open",
+        "python": platform.python_version(),
+        "duckdb": duckdb.__version__,
+        "pyarrow": pyarrow.__version__,
+    }
 
 
 # Serve the built SPA (P6, single process). Prefer the bundled copy shipped in the wheel

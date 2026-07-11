@@ -14,6 +14,20 @@ from hub.main import app
 client = TestClient(app)
 
 
+def test_observability_livez_readyz_version():
+    # ARC8 observability: livez (pure liveness), readyz (REAL dep checks → 200/503), version (redacted
+    # deployment identity). All are pre-auth probes (app-level, outside the /api auth gate).
+    assert client.get("/api/livez").json()["ok"] is True
+    assert client.get("/api/health").status_code == 200  # back-compat alias for livez
+    r = client.get("/api/readyz")
+    body = r.json()
+    assert r.status_code == 200 and body["ready"] is True
+    assert body["checks"]["db"] is True and body["checks"]["engine"] is True  # real checks, not static ok
+    v = client.get("/api/version").json()
+    assert v["auth"] in ("enabled", "open") and v["spawner"] and v["duckdb"] and v["python"]
+    assert v["db"] and "://" not in v["db"], "DB reported as dialect only — no creds leaked"
+
+
 def _uri(name: str) -> str:
     return get_deps().catalog.get_table(f"tbl_{name}").uri
 
