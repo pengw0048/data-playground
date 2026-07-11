@@ -14,6 +14,7 @@ function Source({ id, data }: NodeComponentProps) {
   const btnRef = useRef<HTMLButtonElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const catalog = useStore((s) => s.catalog)
+  const kernelUp = useStore((s) => s.kernelUp)
   const refreshCatalog = useStore((s) => s.refreshCatalog)
   const uploadDataset = useStore((s) => s.uploadDataset)
   const updateConfig = useStore((s) => s.updateConfig)
@@ -45,7 +46,8 @@ function Source({ id, data }: NodeComponentProps) {
   }
 
   const meta = table
-    ? `${(table.rowCount ?? 0).toLocaleString()} rows · ${table.columns.length} cols · ${table.version ?? 'v1'}`
+    // an UNKNOWN count (null/undefined) shows "—", not a fake "0 rows" (UX-14)
+    ? `${table.rowCount == null ? '—' : table.rowCount.toLocaleString()} rows · ${table.columns.length} cols · ${table.version ?? 'v1'}`
     : 'pick a table'
 
   return (
@@ -77,7 +79,11 @@ function Source({ id, data }: NodeComponentProps) {
 
       <Popover anchorRef={btnRef} open={open} onClose={() => setOpen(false)} width={230}>
         {catalog.length === 0 && (
-          <div className="p-2 text-[11.5px] text-muted-foreground">kernel offline — no catalog</div>
+          // distinguish a healthy-but-empty catalog from a down kernel (UX-14) — don't cry "offline" on
+          // a fresh install with zero datasets
+          <div className="p-2 text-[11.5px] text-muted-foreground">
+            {kernelUp ? 'No datasets yet — upload or browse below' : 'Kernel offline — no catalog'}
+          </div>
         )}
         {catalog.map((t) => (
           <button
@@ -92,7 +98,7 @@ function Source({ id, data }: NodeComponentProps) {
           >
             <span className="text-xs font-semibold text-foreground">{t.name}</span>
             <span className="text-[10px] text-muted-foreground">
-              {(t.rowCount ?? 0).toLocaleString()} rows · {t.columns.length} cols
+              {t.rowCount == null ? '—' : t.rowCount.toLocaleString()} rows · {t.columns.length} cols
             </span>
           </button>
         ))}
