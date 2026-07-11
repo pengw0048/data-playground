@@ -1399,9 +1399,95 @@ def test_write_formats_round_trip(tmp_path):
         rel = con.sql("SELECT 1 AS a, 'x' AS b UNION ALL SELECT 2 AS a, 'y' AS b")
         a.write(str(tmp_path / "out.json"), rel, "overwrite")
         assert sorted(a.scan(str(tmp_path / "out.json")).fetchall()) == [(1, "x"), (2, "y")]
-        for ext in (".pq", ".tsv", ".json"):
-            res = a.write(str(tmp_path / f"app{ext}"), con.sql("SELECT 3 AS a, 'z' AS b"), "append")
+        for i, ext in enumerate((".pq", ".tsv", ".json")):  # distinct bases — one format per dataset
+            res = a.write(str(tmp_path / f"app{i}{ext}"), con.sql("SELECT 3 AS a, 'z' AS b"), "append")
             assert a.scan(res["uri"]).fetchall() == [(3, "z")], ext  # part-*.<ext> read back from the dir
+
+
+def test_append_is_transactional_and_lossless(tmp_path, monkeypatch):
+    # ARC4 transactional append (blocks-production data-safety): (1) a crashed/failed part write leaves NO
+    # readable partial part; (2) overwrite→append folds the prior single file in (no orphaned data);
+    # (3) csv parts with a drifted column set reconcile by name; (4) mixing formats in one dataset is
+    # rejected (would silently drop the non-winning parts on read).
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter
+    a = DuckDBAdapter()
+    con = db.conn()
+    with db.lock():
+        base = str(tmp_path / "ds.parquet")
+        # (2) overwrite writes a single FILE; a later append must fold it in, not orphan it. The dataset uri
+        # then becomes the part DIRECTORY (r2["uri"] = "…/ds"), which is what a consumer reads.
+        a.write(base, con.sql("SELECT 1 AS id, 10 AS v"), "overwrite")
+        assert os.path.isfile(base)
+        r2 = a.write(base, con.sql("SELECT 2 AS id, 20 AS v"), "append")
+        ds = r2["uri"]
+        assert sorted(a.scan(ds).fetchall()) == [(1, 10), (2, 20)], "overwrite→append orphaned the prior file"
+        assert not os.path.isfile(base), "the single file should have been migrated into the part dir"
+
+        # (1) a failed append (partial part written, then a crash) must not corrupt the committed dataset
+        def _boom(rel_, path_, ext_):
+            with open(path_, "w") as f:
+                f.write("PARTIAL-CORRUPT")   # a half-written part at the .tmp path
+            raise RuntimeError("boom mid-write")
+        monkeypatch.setattr(DuckDBAdapter, "_write_part", staticmethod(_boom))
+        with pytest.raises(RuntimeError):
+            a.write(base, con.sql("SELECT 3 AS id, 30 AS v"), "append")
+        monkeypatch.undo()
+        assert sorted(a.scan(ds).fetchall()) == [(1, 10), (2, 20)], "a failed append corrupted the dataset"
+
+        # (3) csv appends with a DRIFTED column set reconcile by name (union_by_name), not misalign
+        cbase = str(tmp_path / "cds.csv")
+        a.write(cbase, con.sql("SELECT 1 AS id, 10 AS x"), "append")
+        cr = a.write(cbase, con.sql("SELECT 2 AS id, 20 AS y"), "append")
+        rel = a.scan(cr["uri"])   # the part directory
+        assert set(rel.columns) == {"id", "x", "y"} and rel.aggregate("count(*)").fetchone()[0] == 2
+
+        # (4) mixing extensions under one dataset base is rejected up-front — cross-format (.csv into a
+        # .parquet dataset) AND same-format aliases (.pq into a .parquet dataset), since _read_dir globs
+        # each concrete extension separately and would silently drop the non-winning parts.
+        mbase = str(tmp_path / "mds.parquet")
+        a.write(mbase, con.sql("SELECT 1 AS id"), "append")
+        with pytest.raises(NotImplementedError, match="one file extension per output"):
+            a.write(str(tmp_path / "mds.csv"), con.sql("SELECT 2 AS id"), "append")
+        with pytest.raises(NotImplementedError, match="one file extension per output"):
+            a.write(str(tmp_path / "mds.pq"), con.sql("SELECT 3 AS id"), "append")  # same format, still rejected
+
+
+def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
+    # ARC4 transactional append on a REAL object store (moto): overwrite writes s3://…/out.parquet (a single
+    # object); a subsequent append writes into the out/ prefix. The prior object must be MIGRATED into the
+    # prefix (server-side move) so switching overwrite→append doesn't silently orphan it.
+    pytest.importorskip("moto")
+    pytest.importorskip("flask")
+    boto3 = pytest.importorskip("boto3")
+    from moto.server import ThreadedMotoServer
+
+    from hub import db, metadb
+    from hub.plugins.adapters import DuckDBAdapter
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    try:
+        host, port = server.get_host_and_port()
+        endpoint = f"http://{host}:{port}"
+        boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
+                     region_name="us-east-1").create_bucket(Bucket="bkt")
+        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
+                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        db._obj_store_loaded = False
+        a = DuckDBAdapter()
+        uri = "s3://bkt/data/out.parquet"
+        with db.lock():
+            a.write(uri, db.conn().sql("SELECT 1 AS id, 10 AS v"), "overwrite")
+            r = a.write(uri, db.conn().sql("SELECT 2 AS id, 20 AS v"), "append")
+            rows = sorted(a.scan(r["uri"]).fetchall())
+            # object-store csv/json append is REJECTED (the object reader reads a prefix as parquet → the
+            # parts would be unreadable), rather than silently producing a write-only dataset.
+            with pytest.raises(NotImplementedError, match="object-store append supports parquet only"):
+                a.write("s3://bkt/data/out.csv", db.conn().sql("SELECT 1 AS id"), "append")
+        assert rows == [(1, 10), (2, 20)], f"object overwrite→append orphaned the prior object: {rows}"
+    finally:
+        server.stop()
+        metadb.set_setting("objectStore", {}, "global")
 
 
 def test_source_csv_parse_options(tmp_path):
