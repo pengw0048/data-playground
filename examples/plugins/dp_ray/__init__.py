@@ -46,7 +46,7 @@ import time
 import uuid
 
 from hub import db, graph as g
-from hub.ir import (CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys,
+from hub.ir import (CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
                     plan_is_clean, plan_is_distributable)
 from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
 
@@ -68,7 +68,16 @@ _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", "
 # output). inner/left/cross are correct block-by-block; right/full (need unmatched-right rows) fall back,
 # and — like Spark's broadcast hint — the right is assumed small enough to broadcast (a large-large join
 # should not pin engine=ray).
-RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join"})
+# `sort` = a native Ray range-shuffle sort on plain-column keys, then repartition(1) so the ordered output
+# is a SINGLE file (matching the single-node engine's single ordered writer — a sharded read wouldn't
+# preserve global order). FAITHFULNESS is exact only for a TOTAL (unique) key: the sequence then equals
+# DuckDB's, incl. NULL placement (both NULLS LAST on DuckDB 1.5.x). For a NON-unique key, ties are
+# unstable in BOTH engines → correctly sorted but tie-order may differ from single-node (not
+# byte-identical); a float/double DESC with NaN also differs (Ray puts NaN last, DuckDB treats it as
+# largest). SCALE: repartition(1) gathers the whole sorted set onto ONE worker — fine for this reference
+# backend, but a sort exceeding one node's memory should not pin engine=ray (a production backend would
+# write ordered shards + stitch on read).
+RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join", "sort"})
 
 
 def _ray_opts(requires: dict | None) -> dict:
@@ -249,6 +258,8 @@ class RayRunner:
                 from hub.executors.engine import normalize_how
                 if normalize_how(s.config.get("how", "")) not in ("inner", "left", "cross"):
                     return False  # right/full must emit unmatched-RIGHT rows → broadcast-right can't → DuckDB
+            if s.op == "sort" and parse_sort_keys(s.config.get("by", "")) is None:
+                return False  # only a bare-column ORDER BY is distributable; expressions → DuckDB
         return True
 
     def run(self, plan, graph, target_node_id, placement, run_id=None) -> RunStatus:
@@ -458,6 +469,15 @@ class RayRunner:
             return self._shuffle_duckdb(parent, list(parent.columns()), "SELECT DISTINCT * FROM _blk")
         if step.op == "join":
             return self._build_join(step, datasets)
+        if step.op == "sort":
+            keys = parse_sort_keys(step.config.get("by", ""))
+            cols = [c for c, _d in keys]
+            desc = [d for _c, d in keys]
+            # Ray's native sort IS the distributed range-shuffle; repartition(1) then coalesces the ordered
+            # range-partitions into ONE block → a single ordered output file (a sharded write's parts read
+            # back in arbitrary order would lose the global order). Matches the single-node engine, which
+            # also writes one ordered file. `descending` is per-key.
+            return parent.sort(cols, descending=desc).repartition(1)
         raise RuntimeError(f"ray backend reached a non-clean op '{step.op}' (should have fallen back)")
 
     def _build_join(self, step, datasets):

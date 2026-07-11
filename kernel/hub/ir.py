@@ -39,7 +39,7 @@ CLEAN_OPS = {"read", "write", "passthrough"} | CLEAN_TRANSFORM_MODES
 # is an enumeration, NOT a global gate flip: capability is decided per-backend by passing its own subset
 # to plan_is_distributable, so the DuckDB fallback stays authoritative for everything a backend can't yet
 # run byte-identically. (ARC3 grows this as each op is validated on a real cluster.)
-DISTRIBUTABLE_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join"})
+DISTRIBUTABLE_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join", "sort"})
 
 # A distributed backend runs relational ops by SHUFFLING on a key (Ray) then computing with DuckDB per
 # partition (see dp_ray) — so the only thing it parses is the shuffle KEY, not the operation. This keeps
@@ -58,6 +58,25 @@ def parse_group_keys(group: str) -> list[str] | None:
         return []  # global aggregate — valid (a single-partition reduce), distinct from unparseable (None)
     keys = [p.strip() for p in s.split(",")]
     return keys if all(_IDENT_RE.match(k) for k in keys) else None
+
+
+_SORT_TERM = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(asc|desc)?\s*$", re.I)
+
+
+def parse_sort_keys(by: str) -> list[tuple[str, bool]] | None:
+    """An ORDER BY fragment → [(column, descending)], or None if any term is not a bare column with an
+    optional ASC/DESC (an expression / NULLS clause / quoted name → None → DuckDB single-node). A
+    distributed sort is only claimed for a plain-column key; ties + NULL placement are checked per-op."""
+    s = (by or "").strip()
+    if not s:
+        return None
+    out: list[tuple[str, bool]] = []
+    for part in s.split(","):
+        m = _SORT_TERM.match(part)
+        if not m:
+            return None
+        out.append((m.group(1), (m.group(2) or "asc").lower() == "desc"))
+    return out
 
 # canvas node type → IR op. `transform`/`notebook` resolve to their MODE (a clean transform mode, or
 # `transform:<mode>` when not clean); anything not listed (incl. plugin kinds) → `opaque:<type>`.
