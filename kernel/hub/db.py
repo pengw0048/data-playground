@@ -143,7 +143,11 @@ def _maybe_sandbox_fs(c: duckdb.DuckDBPyConnection) -> None:
         if not auth.auth_enabled():
             return
         from hub import metadb
-        if metadb.get_setting("objectStore", "global", default={}):
+        from hub.plugins.adapters import is_object_uri
+        # an object store may be configured EITHER via the DB setting OR the DP_STORAGE_URL env var
+        # (creds then from the AWS chain) — both need external access on, or httpfs/s3 fails closed (P0-STOR-01)
+        storage_url = (os.environ.get("DP_STORAGE_URL") or "").strip()
+        if metadb.get_setting("objectStore", "global", default={}) or is_object_uri(storage_url):
             import logging
             logging.getLogger("hub").warning(
                 "FS sandbox DISABLED: an object store is configured, so DuckDB runs with external access "
