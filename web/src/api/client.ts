@@ -219,7 +219,7 @@ export interface RunRecordDto { id: string; status: string; targetNodeId?: strin
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
 export interface CanvasVersionDto { id: string; version: number; label?: string | null; authorId?: string | null; createdAt?: string | null }
 export interface ShareInfo { userId: string; name: string; role: string }
-export interface DpUser { id: string; name: string; email?: string | null }
+export interface DpUser { id: string; name: string; email?: string | null; capabilities?: string[] }
 export interface CanvasFile { id: string; name: string; version: number; updatedAt?: string; role?: string; shared?: boolean; visibility?: string }
 
 export { toGraph }

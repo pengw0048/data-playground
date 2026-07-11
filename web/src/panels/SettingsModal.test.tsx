@@ -54,4 +54,13 @@ describe('SettingsModal — plugin config form', () => {
     await waitFor(() => expect(putSetting).toHaveBeenCalledWith('global', 'plugin.dp_x.url', 'new-url'))
     expect(putSetting).not.toHaveBeenCalledWith('global', 'plugin.dp_x.tok', expect.anything())
   })
+
+  it('surfaces a save failure instead of a false "Saved" (UX-01)', async () => {
+    putSetting.mockRejectedValueOnce(new Error('save failed'))  // first write rejects
+    render(<SettingsModal onClose={vi.fn()} />)
+    await screen.findByDisplayValue('existing')  // wait for load
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(state.pushToast).toHaveBeenCalledWith('save failed', 'error'))
+    expect(screen.queryByText('Saved')).toBeNull()  // no false success
+  })
 })

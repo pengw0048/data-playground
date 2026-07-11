@@ -88,10 +88,16 @@ def list_users() -> list[dict]:
         return [{"id": u.id, "name": u.name} for u in s.scalars(_sa_select(metadb.User))]
 
 
+def _can_manage_global(uid: str) -> bool:
+    """Whether uid may write instance-wide config (global settings, user management). Open single-user
+    mode has no privilege boundary; auth mode requires admin."""
+    return (not auth.auth_enabled()) or metadb.is_admin(uid)
+
+
 def _require_admin(uid: str) -> None:
     """Instance-wide config (global settings, user management) is admin-only in multi-user mode.
     Open single-user mode has no privilege boundary — the single local user keeps full control."""
-    if auth.auth_enabled() and not metadb.is_admin(uid):
+    if not _can_manage_global(uid):
         raise HTTPException(403, "admin only")
 
 
@@ -110,7 +116,10 @@ def create_user(body: UserBody, uid: str = Depends(current_user)) -> dict:  # ad
 def whoami(uid: str = Depends(current_user)) -> dict:
     with metadb.session() as s:
         u = s.get(metadb.User, uid)
-        return {"id": u.id, "name": u.name, "email": u.email}
+        # capabilities let the UI hide/disable what this user can't do (e.g. global settings), instead
+        # of showing controls that then fail — so the client never lies about a doomed action (UX-01).
+        caps = ["global_settings"] if _can_manage_global(uid) else []
+        return {"id": u.id, "name": u.name, "email": u.email, "capabilities": caps}
 
 
 @router.get("/canvas")
