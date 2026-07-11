@@ -5670,7 +5670,8 @@ def test_ray_backend_operator_gating_and_fallback(tmp_path):
     assert _agg("list(x) AS xs") is False                       # unordered list → reorders → fall back
     assert _agg("string_agg(CAST(x AS VARCHAR), ',') AS s") is False
     assert _agg("count(*) AS n, first(x) AS f") is False        # a 2nd agg being fine doesn't save `first`
-    assert _agg("list(x ORDER BY x) AS xs") is True             # ORDER BY pins the element order → deterministic
+    assert _agg("list(x ORDER BY x) AS xs") is False            # conservatively rejected by name (AST can't
+                                                                # see the ORDER BY — DuckDB rewrites it out)
     assert _agg("sum(x) AS s, count(*) AS n") is True           # plain reducing aggs are order-free
 
     # (3b-ii) a window needs a non-empty ORDER BY to distribute faithfully — a no-ORDER-BY window

@@ -47,6 +47,7 @@ import time
 import uuid
 
 from hub import db, graph as g
+from hub.sqlanalyze import agg_has_order_sensitive  # AST-based (DuckDB's own parser), shared with the engine
 from hub.ir import (CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
                     plan_is_clean, plan_is_distributable)
 from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
@@ -60,9 +61,11 @@ _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", "
 # row of their key-groups — nothing combined across partitions), MOST DuckDB aggregates work, the output
 # carries DuckDB's exact schema, and the only thing parsed is the shuffle KEY (bare columns). `aggregate`
 # = a GROUPED aggregate; a global aggregate (no key) is cheap + falls back to the single-node engine. An
-# ORDER-SENSITIVE aggregate used WITHOUT an intra-aggregate ORDER BY (list/string_agg/first/last/
-# any_value/arg_max/…) depends on intra-group row order, which the hash-shuffle does not preserve, so it
-# too falls back (byte-identity would break otherwise). `window` = a PARTITION BY window (shuffle by the
+# ORDER-SENSITIVE aggregate (list/string_agg/first/last/any_value/arg_max/…) depends on intra-group row
+# order, which the hash-shuffle does not preserve, so it falls back — detected by name via the shared
+# AST analyzer (hub.sqlanalyze.agg_has_order_sensitive), conservatively including an ORDER-BY'd form like
+# `list(x ORDER BY x)` (DuckDB rewrites the ORDER BY out of the parsed AST, so we can't prove it safe).
+# `window` = a PARTITION BY window (shuffle by the
 # partition key → DuckDB window per complete partition); requires a non-empty ORDER BY (a no-ORDER-BY
 # window like row_number is intra-partition-order-dependent → falls back), and is exact up to ORDER BY
 # ties (the same inherent tie-ceiling as sort — single-node is itself unstable there). `dedup` = full-row
@@ -85,33 +88,6 @@ _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", "
 # backend, but a sort exceeding one node's memory should not pin engine=ray (a production backend would
 # write ordered shards + stitch on read).
 RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join", "sort"})
-
-# aggregate functions whose per-group result depends on ROW ORDER within the group. A hash-shuffle does
-# NOT preserve intra-group row order, so a distributed GROUP BY using one of these WITHOUT an explicit
-# intra-aggregate ORDER BY would diverge from single-node DuckDB (e.g. `list(x)` emits elements in a
-# different order; `first`/`any_value`/`arg_max` on ties pick a different row). Such an aggregate falls
-# back to the single-node engine (see _has_unordered_order_sensitive_agg). `arg_min`/`arg_max`/`min_by`/
-# `max_by` take a comparison arg (not ORDER BY) and are tie-nondeterministic → always treated as unordered.
-_ORDER_SENSITIVE_AGG = ("array_agg", "string_agg", "group_concat", "listagg", "list",
-                        "first", "last", "any_value", "arbitrary",
-                        "arg_min", "arg_max", "min_by", "max_by")
-_ORDER_SENS_RE = re.compile(r"\b(?:" + "|".join(sorted(_ORDER_SENSITIVE_AGG, key=len, reverse=True)) + r")\s*\(", re.I)
-
-
-def _has_unordered_order_sensitive_agg(aggs: str) -> bool:
-    """True iff some order-sensitive aggregate is applied WITHOUT an intra-aggregate ORDER BY — per-call
-    (paren-matched, mirroring engine._has_reducing_aggregate) so `list(x ORDER BY x) AS a, first(y) AS b`
-    is still rejected (the `first` lacks an ORDER BY). Conservative — over-rejects (→ single-node), never
-    lets an order-divergent aggregate distribute."""
-    s = re.sub(r"\s+", " ", aggs or "")
-    for m in _ORDER_SENS_RE.finditer(s):
-        depth, i = 1, m.end()          # m.end() is just past the '('; walk to the matching ')'
-        while i < len(s) and depth:
-            depth += (s[i] == "(") - (s[i] == ")")
-            i += 1
-        if not re.search(r"\border\s+by\b", s[m.end():i], re.I):  # no ORDER BY inside this call → order-dependent
-            return True
-    return False
 
 
 def _ray_opts(requires: dict | None) -> dict:
@@ -285,8 +261,10 @@ class RayRunner:
             if s.op == "aggregate":
                 if not parse_group_keys(s.config.get("groupBy", "")):
                     return False  # None (expression key) or [] (global) → not shuffle-distributable
-                if _has_unordered_order_sensitive_agg(s.config.get("aggs", "")):
-                    return False  # list/first/any_value/arg_max without ORDER BY → hash-shuffle reorders → diverges
+                if agg_has_order_sensitive(s.config.get("aggs", "")):
+                    return False  # list/string_agg/first/any_value/arg_max → intra-group order matters, the
+                                  # hash-shuffle doesn't preserve it → single-node (conservative: even an
+                                  # ORDER-BY'd list, whose ORDER BY DuckDB rewrites out of the parsed AST)
             if s.op == "window":
                 if not parse_group_keys(s.config.get("partitionBy", "")):
                     return False  # a window needs a bare-column PARTITION BY to be the shuffle key
