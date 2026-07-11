@@ -3116,6 +3116,22 @@ def test_plugin_version_negotiation(tmp_path):
     assert gerr and "version number" in gerr[0]["error"]
 
 
+def test_core_api_range_check(monkeypatch):
+    # OSS-01: the plugin-API check is a semantic RANGE (min ≤ need ≤ core), not just a floor — a plugin
+    # built for a now-dropped OLDER major is rejected up front, not registered then crashed. Also proves
+    # the shared helper handles the too-new and non-version cases (used by all three load paths).
+    from hub import deps as deps_mod
+    assert deps_mod._core_api_error(None) is None                       # undeclared → loads (unchanged)
+    assert deps_mod._core_api_error(deps_mod.CORE_API_VERSION) is None  # exactly this core → ok
+    assert "requires core API" in deps_mod._core_api_error(deps_mod.CORE_API_VERSION + 1)  # too new
+    assert "version number" in deps_mod._core_api_error("abc")          # non-version → clear error
+    # simulate a future core that dropped major 1: a plugin targeting the now-unsupported major is rejected
+    monkeypatch.setattr(deps_mod, "MIN_SUPPORTED_API", 2)
+    monkeypatch.setattr(deps_mod, "CORE_API_VERSION", 3)
+    assert "breaking SPI change" in deps_mod._core_api_error(1)         # below the supported floor
+    assert deps_mod._core_api_error(2) is None and deps_mod._core_api_error(3) is None  # in range
+
+
 def test_nodespec_frontend_backend_parity():
     # backend nodespecs (/api/nodes) and the frontend hand-built cards (web/src/nodes/kinds/*.tsx)
     # define every built-in kind twice; this guards against the two silently drifting on ports/accepts
