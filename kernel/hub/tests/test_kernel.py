@@ -1442,11 +1442,15 @@ def test_append_is_transactional_and_lossless(tmp_path, monkeypatch):
         rel = a.scan(cr["uri"])   # the part directory
         assert set(rel.columns) == {"id", "x", "y"} and rel.aggregate("count(*)").fetchone()[0] == 2
 
-        # (4) mixing formats under one dataset base is rejected up-front
+        # (4) mixing extensions under one dataset base is rejected up-front — cross-format (.csv into a
+        # .parquet dataset) AND same-format aliases (.pq into a .parquet dataset), since _read_dir globs
+        # each concrete extension separately and would silently drop the non-winning parts.
         mbase = str(tmp_path / "mds.parquet")
         a.write(mbase, con.sql("SELECT 1 AS id"), "append")
-        with pytest.raises(NotImplementedError, match="one format per output"):
+        with pytest.raises(NotImplementedError, match="one file extension per output"):
             a.write(str(tmp_path / "mds.csv"), con.sql("SELECT 2 AS id"), "append")
+        with pytest.raises(NotImplementedError, match="one file extension per output"):
+            a.write(str(tmp_path / "mds.pq"), con.sql("SELECT 3 AS id"), "append")  # same format, still rejected
 
 
 def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
@@ -1476,6 +1480,10 @@ def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
             a.write(uri, db.conn().sql("SELECT 1 AS id, 10 AS v"), "overwrite")
             r = a.write(uri, db.conn().sql("SELECT 2 AS id, 20 AS v"), "append")
             rows = sorted(a.scan(r["uri"]).fetchall())
+            # object-store csv/json append is REJECTED (the object reader reads a prefix as parquet → the
+            # parts would be unreadable), rather than silently producing a write-only dataset.
+            with pytest.raises(NotImplementedError, match="object-store append supports parquet only"):
+                a.write("s3://bkt/data/out.csv", db.conn().sql("SELECT 1 AS id"), "append")
         assert rows == [(1, 10), (2, 20)], f"object overwrite→append orphaned the prior object: {rows}"
     finally:
         server.stop()

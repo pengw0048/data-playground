@@ -257,7 +257,14 @@ class DuckDBAdapter:
             if not low.endswith((".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson")):
                 raise NotImplementedError(f"append is only supported for parquet/csv/json outputs, not {os.path.splitext(target)[1] or 'this'}")
             base, ext = os.path.splitext(target)  # name.parquet -> prefix "name", ext ".parquet"
-            self._reject_mixed_part_format(base, ext, obj)   # a dir of csv parts + a parquet append → read
+            if obj and ext.lower() in (".csv", ".tsv", ".json", ".ndjson"):
+                # the object read dispatches a bare prefix to read_parquet, so a csv/json part prefix would
+                # write fine but read back as an IOException — reject up front rather than silently produce
+                # an unreadable dataset. Object-store append is parquet-only; csv/json append is local.
+                raise NotImplementedError(
+                    "object-store append supports parquet only (a csv/json part prefix reads back as parquet"
+                    " → unreadable) — use parquet for object-store append, or append on the local FS")
+            self._reject_mixed_part_format(base, ext, obj)   # one exact extension per dataset (read picks one)
             self._migrate_singlefile_into_dir(target, base, ext, obj)  # overwrite→append: fold prior file in
             part_name = f"part-{uuid.uuid4().hex[:12]}{ext}"
             if obj:
@@ -339,13 +346,14 @@ class DuckDBAdapter:
         else:
             rel.write_parquet(path)
 
-    _PART_FAMILY = {".pq": ".parquet", ".tsv": ".csv", ".ndjson": ".json"}  # read the same way
+    _PART_EXTS = (".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson")
 
-    def _existing_part_families(self, base: str, obj: bool) -> set:
-        """The row-format families (parquet/csv/json) that already have COMMITTED parts under this
-        dir/prefix — a `.tmp-*` part in flight is ignored (it doesn't match the *.<ext> suffix)."""
-        fams: set = set()
-        exts = (".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson")
+    def _existing_part_exts(self, base: str, obj: bool) -> set:
+        """The EXACT part-file extensions already committed under this dir/prefix (a `.tmp-*` part in
+        flight is ignored — it doesn't match the *.<ext> suffix). Exact, NOT collapsed into a format
+        family: _read_dir globs each concrete extension SEPARATELY and returns on the first match, so a
+        dir holding both `.parquet` and `.pq` (same format!) would silently read back only the .parquet
+        parts — the .pq data lost."""
         if obj:
             try:
                 import pyarrow.fs as pafs
@@ -354,25 +362,20 @@ class DuckDBAdapter:
                 names = [i.path for i in infos if i.type == pafs.FileType.File]
             except Exception:  # noqa: BLE001 — can't list → treat as empty (append proceeds)
                 names = []
-            for e in exts:
-                if any(n.endswith(e) for n in names):
-                    fams.add(self._PART_FAMILY.get(e, e))
-        else:
-            d = base.rstrip("/")
-            for e in exts:
-                if glob.glob(os.path.join(d, f"**/*{e}"), recursive=True):
-                    fams.add(self._PART_FAMILY.get(e, e))
-        return fams
+            return {e for e in self._PART_EXTS if any(n.endswith(e) for n in names)}
+        d = base.rstrip("/")
+        return {e for e in self._PART_EXTS if glob.glob(os.path.join(d, f"**/*{e}"), recursive=True)}
 
     def _reject_mixed_part_format(self, base: str, ext: str, obj: bool) -> None:
-        """_read_dir picks ONE format by precedence (parquet > csv > json), so mixing formats in one part
-        dir silently DROPS the non-winning parts' data on read. Reject an append whose format differs from
-        the parts already there — one format per output dataset."""
-        want = self._PART_FAMILY.get(ext.lower(), ext.lower())
-        others = self._existing_part_families(base, obj) - {want}
+        """_read_dir globs each concrete extension separately and returns on the FIRST match, so a dataset
+        dir holding more than one extension silently DROPS the non-winning parts on read. Enforce ONE exact
+        extension per dataset — reject an append whose extension differs from the committed parts (incl.
+        same-format aliases like .parquet vs .pq, which the reader still globs separately)."""
+        others = self._existing_part_exts(base, obj) - {ext.lower()}
         if others:
             raise NotImplementedError(
-                f"cannot append {ext} to a dataset that already holds {sorted(others)} parts — one format per output")
+                f"cannot append {ext} to a dataset that already holds {sorted(others)} parts — "
+                "one file extension per output dataset")
 
     def _migrate_singlefile_into_dir(self, target: str, base: str, ext: str, obj: bool) -> None:
         """overwrite writes a single FILE (name.parquet, registered uri=name.parquet); append writes into a
@@ -381,18 +384,16 @@ class DuckDBAdapter:
         that file in as the first part so no data is lost. No-op if there's no pre-existing single file."""
         part = f"part-migrated-{uuid.uuid4().hex[:12]}{ext}"
         if obj:
+            import pyarrow.fs as pafs
             try:
-                import pyarrow.fs as pafs
                 fs, src = object_fs(target)
                 info = fs.get_file_info(src)
-                if info.type != pafs.FileType.File:
-                    return
-                _, dst = object_fs(base.rstrip("/") + "/" + part)
-                fs.move(src, dst)  # server-side; the single object becomes the first part of the dir
-            except FileNotFoundError:
+            except Exception:  # noqa: BLE001 — can't PROBE the prior object → nothing to migrate; append proceeds
                 return
-            except Exception:  # noqa: BLE001 — pafs raises its own not-found types; nothing to migrate
-                return
+            if info.type != pafs.FileType.File:
+                return  # no pre-existing single object at this exact key
+            _, dst = object_fs(base.rstrip("/") + "/" + part)
+            fs.move(src, dst)  # a real MOVE failure PROPAGATES — silently orphaning the prior data is worse
         elif os.path.isfile(target):  # target == name.parquet (a file), base == name (a dir): coexist OK
             os.makedirs(base, exist_ok=True)
             os.replace(target, os.path.join(base, part))
