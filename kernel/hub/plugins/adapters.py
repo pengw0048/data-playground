@@ -280,6 +280,37 @@ class DuckDBAdapter:
                 return reader(os.path.join(d, f"**/*{ext}"), union_by_name=True)
         raise ValueError(f"no parquet/csv/json files under {d}")
 
+    def _maybe_compact(self, base: str, ext: str) -> None:
+        """When a LOCAL append part dir accumulates more than DP_APPEND_COMPACT_PARTS committed parts,
+        rewrite them into ONE compacted part — bounding the unbounded small-file growth of a repeatedly-
+        appended dataset (many tiny parts kill read performance and inode/list budgets). Atomic via a temp
+        dir + swap, the same discipline as the partitioned/overwrite paths: read ALL parts (union_by_name →
+        schema-drift safe) into one compacted part in base.compact-*, then rmtree(base) + rename. The full
+        read completes (materialized by the write) before the rmtree, so no read-after-delete; a reader in
+        the brief rmtree→rename window sees no files, never doubled/partial data."""
+        try:
+            threshold = int(os.environ.get("DP_APPEND_COMPACT_PARTS", "200") or 200)
+        except ValueError:
+            threshold = 200
+        if threshold <= 0:
+            return  # 0/negative disables auto-compaction
+        d = base.rstrip("/")
+        parts = [x for e in self._PART_EXTS for x in glob.glob(os.path.join(d, f"**/*{e}"), recursive=True)]
+        if len(parts) <= threshold:
+            return
+        import shutil
+        tmp_dir = d + f".compact-{uuid.uuid4().hex[:8]}"
+        os.makedirs(tmp_dir, exist_ok=True)
+        try:
+            with db.run_scope() as sc:  # own cursor — compaction reads/writes off the base lock
+                rel = self._read_dir(sc.con, d)                      # union of all parts
+                self._write_part(rel, os.path.join(tmp_dir, f"part-compacted-{uuid.uuid4().hex[:12]}{ext}"), ext)
+            shutil.rmtree(d)                                          # originals fully read into the compacted part
+            os.replace(tmp_dir, d)                                   # atomic swap; d is now ONE compacted part
+        except BaseException:
+            shutil.rmtree(tmp_dir, ignore_errors=True)               # a failed compaction leaves the parts intact
+            raise
+
     def schema(self, uri: str) -> list[ColumnSchema]:
         with db.base_guard():  # executes on the base connection when off a run_scope (catalog probe)
             return relation_columns(self.scan(uri, limit=0))
@@ -344,6 +375,7 @@ class DuckDBAdapter:
                     with contextlib.suppress(OSError):
                         os.remove(tmp)
                     raise
+                self._maybe_compact(base, ext)                # bound unbounded small-part growth
             return {"uri": base, "rows": rows}
         if mode not in ("overwrite", None):
             raise NotImplementedError(f"write mode '{mode}' is not supported — use overwrite or append")

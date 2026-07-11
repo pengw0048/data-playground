@@ -1509,6 +1509,27 @@ def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
         metadb.set_setting("objectStore", {}, "global")
 
 
+def test_append_auto_compacts_at_threshold(tmp_path, monkeypatch):
+    # ARC4 append-compaction: once a local append part dir exceeds DP_APPEND_COMPACT_PARTS committed parts,
+    # it rewrites them into ONE part (bounding small-file growth), all rows preserved.
+    import glob
+
+    monkeypatch.setenv("DP_APPEND_COMPACT_PARTS", "3")
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter
+    a = DuckDBAdapter()
+    con = db.conn()
+    base = str(tmp_path / "acc.parquet")
+    with db.lock():
+        ds = None
+        for i in range(4):  # after the 4th append, 4 parts > threshold(3) → compact to 1
+            ds = a.write(base, con.sql(f"SELECT {i} AS id, {i} * 10 AS v"), "append")["uri"]
+        parts = glob.glob(os.path.join(ds, "**/*.parquet"), recursive=True)
+        assert len(parts) == 1, f"expected 1 compacted part, got {len(parts)}: {parts}"
+        rows = sorted(a.scan(ds).fetchall())
+    assert rows == [(0, 0), (1, 10), (2, 20), (3, 30)], f"compaction lost/changed data: {rows}"
+
+
 def test_partitioned_write_hive_layout_and_pruned_read(tmp_path):
     # ARC4 write-partitioned-merge: partitionBy → a Hive dir=val/ parquet directory, read back with the
     # partition column present + partition pruning; overwrite is clean (temp dir + swap, no stale
