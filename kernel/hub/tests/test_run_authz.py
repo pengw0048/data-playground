@@ -6,6 +6,8 @@ no-ops in open mode (single trusted user), so the rest of the suite (which runs 
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -96,6 +98,13 @@ def test_deleting_a_canvas_severs_its_runs(authed):
     # a run bound to a REAL canvas must not survive the canvas's deletion into a reusable id namespace:
     # if B later re-creates a canvas with the freed id, B must NOT inherit A's old runs.
     rid = _start_run(_hdr("authz_a"), "authz_canvas").json()["runId"]
+    # wait for the run to reach a terminal state BEFORE deleting — else the still-running run's async
+    # status-persist can re-create the run_states row after the cascade delete (a mid-run delete is a
+    # separate lifecycle concern, ARCH-10). Deterministic: no race between delete and persist.
+    for _ in range(200):
+        if client.get(f"/api/run/{rid}", headers=_hdr("authz_a")).json()["status"] in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.05)
     assert client.get(f"/api/run/{rid}", headers=_hdr("authz_a")).status_code == 200
     metadb.delete_canvas_cascade("authz_canvas")
     claim = client.post("/api/canvas", json={"id": "authz_canvas", "name": "reclaim"},
