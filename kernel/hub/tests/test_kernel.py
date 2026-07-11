@@ -356,6 +356,15 @@ def test_sql_join_and_window_preview_faithfully(tmp_path):
     assert sql_needs_full_input("SELECT *, row_number() OVER (ORDER BY x) FROM input")
     assert sql_needs_full_input("SELECT * FROM input QUALIFY row_number() OVER (ORDER BY x) = 1")
     assert not sql_needs_full_input("SELECT * FROM input WHERE x > 0")
+    # cross-input shapes that read a SECOND input CTE also lie on truncated prefixes (acceptance #1/#2):
+    assert sql_needs_full_input("SELECT * FROM input INTERSECT SELECT * FROM input2")   # set operator
+    assert sql_needs_full_input("SELECT * FROM input EXCEPT SELECT * FROM input2")
+    assert sql_needs_full_input("SELECT input.id FROM input, input2 WHERE input.id = input2.id")  # comma-join
+    assert sql_needs_full_input("SELECT * FROM input WHERE id IN (SELECT id FROM input2)")  # subquery-join
+    # the named-window form `OVER w … WINDOW w AS (…)` must be caught like the paren form (acceptance #3):
+    assert sql_needs_full_input("SELECT id, rank() OVER w AS r FROM input WINDOW w AS (ORDER BY id DESC)")
+    assert sql_needs_full_input("SELECT id, sum(x) OVER w FROM input WINDOW w AS (ORDER BY id)")
+    assert not sql_needs_full_input("SELECT overflow FROM input WHERE overflow > 0")  # no false-positive on 'over…'
     left, right = str(tmp_path / "l.parquet"), str(tmp_path / "r.parquet")
     # matching keys live only past the 2000-row preview window of the left input
     duckdb.connect().execute(f"COPY (SELECT i AS id FROM range(0,3000) t(i)) TO '{left}' (FORMAT PARQUET)")
@@ -1291,6 +1300,12 @@ def test_schema_contract_type_model_is_specificity_faithful():
     # list<int> contract FALSE-FAILED against an int list (VARCHAR[] vs BIGINT[]). The type model now
     # honors the contract's specificity: coarse stays lenient, precise is enforced exactly.
     from hub.executors.engine import canonical_type as C, type_satisfies as S, _duck_type
+
+    # the COARSEST want — a typeless (name-only) contract column — asserts presence only, so it accepts
+    # any actual (acceptance #4: it used to FALSE-FAIL every real type because ("other","") hit no branch).
+    assert S(C(""), C("BIGINT")) and S(C(""), C("VARCHAR")) and S(C(""), C("STRUCT(a INTEGER)"))
+    assert not S(C("geometry"), C("BIGINT"))          # a NAMED unknown type still compares exactly
+    assert S(C("geometry"), C("geometry"))
 
     # coarse / inferred (display-coarse) contracts stay lenient against the precise actual
     assert S(C("float"), C("DECIMAL(38,9)"))          # a float contract accepts a decimal actual

@@ -72,11 +72,22 @@ def sql_reduces_rows(q: str) -> bool:
 
 def sql_needs_full_input(q: str) -> bool:
     """True if this SQL is row-preserving but reads its input NON-LOCALLY, so a per-input 2000-row sample
-    would lie even though it doesn't reduce rows: a JOIN (two truncated prefixes rarely match), a window
-    function (rank/running-agg computed within the sample), or QUALIFY. Such a query must run over the
-    full inputs in preview (display bounded by the preview LIMIT), like the join/window nodes."""
+    would lie even though it doesn't reduce rows. Such a query must run over the full inputs in preview
+    (display bounded by the preview LIMIT), like the join/window nodes. Refuses honestly via
+    _faithful_inputs if a Python transform is upstream. The non-local shapes:
+      - a JOIN — explicit `JOIN`, or a comma/subquery/set-op join, ALL detectable as a reference to a
+        SECOND input CTE (`input2`/`input3`/…): two truncated prefixes rarely match, and INTERSECT/EXCEPT
+        remove rows based on the (truncated) other side;
+      - a window — `OVER (…)` OR the named form `OVER w … WINDOW w AS (…)` (rank/running-agg over a sample);
+      - QUALIFY.
+    Conservative — over-flags (→ full pass), never under-flags (a sampled prefix silently lying is the
+    exact ARC1 faithful-preview violation this guards)."""
     s = re.sub(r"\s+", " ", q or "")
-    return bool(re.search(r"\bjoin\b", s, re.I) or re.search(r"\bover\s*\(", s, re.I)
+    return bool(re.search(r"\bjoin\b", s, re.I)
+                or re.search(r"\binput(?:[2-9]|\d{2,})\b", s, re.I)   # a 2nd+ input CTE → comma/subquery/set-op join
+                or re.search(r"\b(?:intersect|except)\b", s, re.I)    # set operators match/remove rows across selects
+                or re.search(r"\bover\b\s*(?:\(|\w)", s, re.I)        # window: OVER (…) or the named OVER w
+                or re.search(r"\bwindow\b\s+\w+\s+as\b", s, re.I)     # a named-window definition
                 or re.search(r"\bqualify\b", s, re.I))
 
 
@@ -242,6 +253,8 @@ def type_satisfies(want: tuple, actual: tuple) -> bool:
     exactly. This is what makes a hand-written precise contract faithful without breaking inferred ones."""
     if want == actual:
         return True
+    if want == ("other", ""):  # a TYPELESS contract column (no type given) asserts NAME-ONLY presence —
+        return True            # the coarsest possible want, so it accepts any actual type (stays lenient).
     wk = want[0]
     if wk == "float":  # numeric coarse: a float contract also accepts a decimal actual
         return actual[0] in ("float", "decimal")
