@@ -267,6 +267,9 @@ class Deps:
         # engine. InMemoryCatalog is a per-instance CACHE that write-throughs to + loads from the shared
         # DB (catalog_entries/edges), so multiple stateless web instances stay consistent.
         self.catalog = InMemoryCatalog(data_dir, self.resolve_adapter)
+        # recover/clean any temp siblings an interrupted append/compaction left behind BEFORE re-cataloging,
+        # so a crash can't surface a half-written staging file as a dataset or leave a compacting one absent.
+        self.storage.recover_orphans()
         # re-register previously written outputs so committed tables survive a kernel restart
         # (they live in storage, separate from the seeded data_dir).
         for uri in self.storage.list_outputs():
