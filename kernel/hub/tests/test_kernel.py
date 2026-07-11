@@ -4455,10 +4455,23 @@ def test_materialize_refuses_a_handoff_with_no_shared_tier(monkeypatch):
     from hub.models import Graph, ResourceSpec
     from hub.planner import Region
     d = get_deps()
+    # (a) FAITHFUL: the real backend_reach→pick_tier chain actually returns None for a remote (object-only)
+    # consumer with NO object store configured — this is the condition the fail-fast guards.
+    old = os.environ.pop("DP_STORAGE_URL", None)
+    try:
+        prod = Region(id="rp", node_ids={"s"}, output_node="s", backend="default", worker=None,
+                      requires=ResourceSpec(), cut_inputs=[])
+        cons = Region(id="rc", node_ids={"z"}, output_node="z", backend="big", worker="w1",
+                      requires=ResourceSpec(), cut_inputs=[("s", None, "z", None)])
+        assert d.controller._boundary_tier(prod, [prod, cons]) is None  # object-only consumer, no store
+    finally:
+        if old is not None:
+            os.environ["DP_STORAGE_URL"] = old
+    # (b) and _materialize fails fast on that None (rather than the old silent local fallback)
     g = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": _uri("events")})], "edges": []})
     region = Region(id="r", node_ids={"s"}, output_node="s", backend="default", worker=None,
                     requires=ResourceSpec(), cut_inputs=[])
-    monkeypatch.setattr(d.controller, "_boundary_tier", lambda *a, **k: None)  # simulate no shared tier
+    monkeypatch.setattr(d.controller, "_boundary_tier", lambda *a, **k: None)
     with pytest.raises(RuntimeError, match="no storage tier reachable"):
         d.controller._materialize("run_x", g, region, {}, [region])
 

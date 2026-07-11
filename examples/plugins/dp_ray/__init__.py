@@ -173,7 +173,13 @@ class RayRunner:
         return "ray" if labels.get("engine") == "ray" else None
 
     def reachable_tiers(self):
-        return ("local", "object")
+        # A same-host reference cluster (worker-direct LOCAL reads) reaches local + object. But an
+        # OFF-HOST cluster's workers can't read the hub's local disk — declaring local there would let the
+        # controller route a region handoff to local and silently produce a result the remote workers
+        # can't read. So when the operator marks the cluster remote (DP_RAY_REMOTE), reach is object-only,
+        # and the controller correctly refuses a handoff with no shared object store.
+        remote = os.environ.get("DP_RAY_REMOTE", "").strip().lower() in ("1", "true", "yes", "on")
+        return ("object",) if remote else ("local", "object")
 
     def run_unit(self, graph, output_node, output_uri, requires=None, run_id=None) -> RunStatus:
         """Run ONE region's subgraph on Ray and materialize output_node → output_uri (the RunController
