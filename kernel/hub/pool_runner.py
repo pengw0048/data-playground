@@ -51,6 +51,9 @@ class PoolRunner(SubprocessRunner):
                                                 labels=w.get("labels") or {})
         self._assigned: dict[str, str] = {}  # run_id -> worker id (advisory busy tracking)
 
+    # reachable_tiers = ("local","object") is inherited from SubprocessRunner (a pool worker is a same-host
+    # child sharing the workspace FS), so a local pool handoff isn't refused as if it were object-only.
+
     def workers(self) -> list[WorkerInfo]:
         busy = set(self._assigned.values())
         return [WorkerInfo(id=wid, capacity=cap, state="busy" if wid in busy else "idle")

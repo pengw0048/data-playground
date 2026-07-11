@@ -56,6 +56,13 @@ class SubprocessRunner:
             except Exception:  # noqa: BLE001
                 pass
 
+    def reachable_tiers(self) -> tuple:
+        # every subprocess backend is a SAME-HOST child sharing the workspace filesystem, so it reaches the
+        # local tier (a same-host handoff needs no object store) as well as a configured object store.
+        # Declared on the base so any same-host subprocess subclass (e.g. PoolRunner) is covered — a named
+        # backend otherwise defaults to object-only and the controller would refuse a valid local handoff.
+        return ("local", "object")
+
     def can_run(self, plan: CompilePlan) -> bool:
         return plan.acyclic
 
