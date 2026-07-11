@@ -4886,6 +4886,47 @@ def test_parallel_regions_run_independent_regions_concurrently(monkeypatch):
         ctrl.runs.pop(rid, None)  # don't leak this synthetic run onto the shared controller
 
 
+def test_dist_cancel_cancels_every_concurrent_subrun_and_await_survives_dropped_event():
+    # acceptance #9: with the parallel wave scheduler, several regions' sub-runs are in flight at once.
+    # cancel() must cancel EVERY one (the old single _sub slot cancelled only the last-registered → the
+    # siblings leaked), and _await must not KeyError when a sibling failure pops self._cancel mid-poll.
+    import threading as _th
+
+    from hub.models import RunStatus
+    ctrl = get_deps().controller
+
+    class _Backend:
+        def __init__(self): self.cancelled = []
+        def cancel(self, sub_id): self.cancelled.append(sub_id)
+
+    rid = "run_cancel_all"
+    be_a, be_b = _Backend(), _Backend()
+    ctrl.runs[rid] = RunStatus(run_id=rid, status="running", placement="distributed", target_node_id="f", per_node=[])
+    ctrl._cancel[rid] = _th.Event()
+    try:
+        ctrl._track_sub(rid, be_a, "sub_a")     # two regions in flight concurrently on different backends
+        ctrl._track_sub(rid, be_b, "sub_b")
+        ctrl.cancel(rid)
+        assert ctrl._cancel[rid].is_set()
+        assert be_a.cancelled == ["sub_a"] and be_b.cancelled == ["sub_b"], "cancel must reach BOTH sub-runs"
+
+        # _await captures the Event once, so it does not KeyError if self._cancel[cancel_run] is gone (a
+        # sibling failure pops it while this orphaned poll is still running). cancel_run points at a key
+        # that isn't in self._cancel → the old `self._cancel[cancel_run]` would raise on the first poll.
+        polls = ["running", "running", "done"]
+
+        class _Poller:
+            def status(self, _sid):
+                return RunStatus(run_id=_sid, status=polls.pop(0), placement="distributed", per_node=[])
+            def cancel(self, _sid): pass
+        s = ctrl._await(_Poller(), "sub_x", cancel_run="run_no_such_key")
+        assert s.status == "done"  # polled to completion without KeyError
+    finally:
+        ctrl.runs.pop(rid, None)
+        ctrl._cancel.pop(rid, None)
+        ctrl._sub.pop(rid, None)
+
+
 def test_declared_keys_and_relationships_are_independent_rows():
     # #9 fix: each declared key / relationship is its OWN DB row (not one shared JSON blob), so setting
     # one never rewrites/clobbers another — the mechanism that stops cross-instance lost updates.
