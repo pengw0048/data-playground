@@ -1530,6 +1530,48 @@ def test_append_auto_compacts_at_threshold(tmp_path, monkeypatch):
     assert rows == [(0, 0), (1, 10), (2, 20), (3, 30)], f"compaction lost/changed data: {rows}"
 
 
+def test_append_concurrent_same_base_no_data_loss(tmp_path, monkeypatch):
+    # ARC4 concurrency (regression for the per-base-lock fix): many appends to the SAME base, each in its
+    # OWN run_scope (the runner's model — a per-thread cursor, NO outer db.lock()), running concurrently
+    # while compaction fires must not lose a committed row or raise. Before the fix, an unlocked
+    # rmtree(base)+swap in compaction raced other appends' publish → ~35% failures + lost rows. The part
+    # is now staged as a sibling of base (compaction's rmtree can't destroy it) and makedirs+publish+
+    # compaction run under a per-base lock.
+    import threading as _th
+
+    monkeypatch.setenv("DP_APPEND_COMPACT_PARTS", "3")  # compact aggressively → maximize the race window
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter
+    a = DuckDBAdapter()
+    base = str(tmp_path / "cc.parquet")
+    errors: list[str] = []
+    uris: list[str] = []
+    n_threads, per_thread = 5, 20
+
+    def worker(t: int):
+        try:
+            for i in range(per_thread):
+                with db.run_scope() as sc:
+                    res = a.write(base, sc.con.sql(f"SELECT {t * 1000 + i} AS id"), "append")
+                    uris.append(res["uri"])
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    threads = [_th.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert not errors, f"concurrent append raised: {errors[:3]}"
+    ds = uris[0]  # every append returns the same part-dir uri (name sans extension)
+    with db.run_scope() as sc:
+        got = a.scan(ds).aggregate("count(*)").fetchone()[0]
+        distinct = a.scan(ds).aggregate("count(distinct id)").fetchone()[0]
+    assert got == n_threads * per_thread, f"lost rows under concurrent append+compaction: {got} != {n_threads * per_thread}"
+    assert distinct == n_threads * per_thread, f"duplicated/corrupted ids under concurrency: {distinct}"
+
+
 def test_partitioned_write_hive_layout_and_pruned_read(tmp_path):
     # ARC4 write-partitioned-merge: partitionBy → a Hive dir=val/ parquet directory, read back with the
     # partition column present + partition pruning; overwrite is clean (temp dir + swap, no stale

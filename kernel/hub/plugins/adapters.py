@@ -13,6 +13,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import os
+import threading
 import uuid
 from urllib.parse import urlparse
 
@@ -177,6 +178,23 @@ class DuckDBAdapter:
     name = "duckdb"
     _EXTS = (".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson", ".arrow", ".feather", ".ipc")
 
+    # per-output-base locks (process-wide) serializing the shared-DIRECTORY mutations of a local append —
+    # the publish + compaction dir-swap — across concurrent runs (kernel /run spawns daemon threads, and a
+    # fan-in appends several pipelines to ONE output). Without this, a compaction's rmtree+swap races
+    # another append's publish/read → lost/failed writes. Same-process only; cross-process (pod) append to
+    # one base needs a directory lease / table format — documented as out of scope for the file adapter.
+    _base_locks_guard = threading.Lock()
+    _base_locks: "dict[str, threading.Lock]" = {}
+
+    @classmethod
+    def _base_lock(cls, base: str) -> "threading.Lock":
+        key = os.path.abspath(base.rstrip("/"))
+        with cls._base_locks_guard:
+            lk = cls._base_locks.get(key)
+            if lk is None:
+                lk = cls._base_locks[key] = threading.Lock()
+            return lk
+
     def matches(self, uri: str) -> bool:
         if uri.startswith("mem://") or is_object_uri(uri):
             return True
@@ -283,11 +301,16 @@ class DuckDBAdapter:
     def _maybe_compact(self, base: str, ext: str) -> None:
         """When a LOCAL append part dir accumulates more than DP_APPEND_COMPACT_PARTS committed parts,
         rewrite them into ONE compacted part — bounding the unbounded small-file growth of a repeatedly-
-        appended dataset (many tiny parts kill read performance and inode/list budgets). Atomic via a temp
-        dir + swap, the same discipline as the partitioned/overwrite paths: read ALL parts (union_by_name →
-        schema-drift safe) into one compacted part in base.compact-*, then rmtree(base) + rename. The full
-        read completes (materialized by the write) before the rmtree, so no read-after-delete; a reader in
-        the brief rmtree→rename window sees no files, never doubled/partial data."""
+        appended dataset (many tiny parts kill read performance + inode/list budgets). Read ALL parts
+        (union_by_name → schema-drift safe) into one part in base.compact-*, then swap via TWO atomic
+        renames (base→base.old, tmp→base) + rmtree the old — so the window where `base` is absent is two
+        renames wide (microseconds), NOT a whole rmtree. The full read is materialized by the write BEFORE
+        any rename (no read-after-delete). MUST be called under _base_lock(base): that serializes it against
+        concurrent same-base appends (a compaction swap racing another append's publish/read would lose or
+        fail writes). Same-process only — a concurrent READER in the tiny two-rename window still gets a
+        transient 'no files' error (retryable); cross-process append/compaction of one base needs a
+        directory lease or a table format (out of scope for the file adapter). If the process crashes
+        between the two renames, data survives in base.old (recoverable), not lost."""
         try:
             threshold = int(os.environ.get("DP_APPEND_COMPACT_PARTS", "200") or 200)
         except ValueError:
@@ -300,17 +323,19 @@ class DuckDBAdapter:
             return
         import shutil
         tmp_dir = d + f".compact-{uuid.uuid4().hex[:8]}"
+        old_dir = d + f".old-{uuid.uuid4().hex[:8]}"
         os.makedirs(tmp_dir, exist_ok=True)
         try:
             # use the CURRENT connection/cursor (db.conn() = the run's scope cursor if any, else base) —
             # NOT a nested db.run_scope(), which would clobber the enclosing run's thread-local cursor.
-            rel = self._read_dir(db.conn(), d)                       # union of all parts
+            rel = self._read_dir(db.conn(), d)                       # union of all parts (fully read by the write)
             self._write_part(rel, os.path.join(tmp_dir, f"part-compacted-{uuid.uuid4().hex[:12]}{ext}"), ext)
-            shutil.rmtree(d)                                          # originals fully read into the compacted part
-            os.replace(tmp_dir, d)                                   # atomic swap; d is now ONE compacted part
         except BaseException:
-            shutil.rmtree(tmp_dir, ignore_errors=True)               # a failed compaction leaves the parts intact
+            shutil.rmtree(tmp_dir, ignore_errors=True)               # a failed read/write leaves the parts intact
             raise
+        os.replace(d, old_dir)                                       # base → base.old (base briefly absent…
+        os.replace(tmp_dir, d)                                       # …until this rename — a two-rename window)
+        shutil.rmtree(old_dir, ignore_errors=True)                   # the originals, now safely superseded
 
     def schema(self, uri: str) -> list[ColumnSchema]:
         with db.base_guard():  # executes on the base connection when off a run_scope (catalog probe)
@@ -359,24 +384,34 @@ class DuckDBAdapter:
                     "object-store append supports parquet only (a csv/json part prefix reads back as parquet"
                     " → unreadable) — use parquet for object-store append, or append on the local FS")
             self._reject_mixed_part_format(base, ext, obj)   # one exact extension per dataset (read picks one)
-            self._migrate_singlefile_into_dir(target, base, ext, obj)  # overwrite→append: fold prior file in
             part_name = f"part-{uuid.uuid4().hex[:12]}{ext}"
             if obj:
+                self._migrate_singlefile_into_dir(target, base, ext, obj)  # overwrite→append: fold prior file in
                 part = base.rstrip("/") + "/" + part_name
                 self._write_part(rel, part, ext)
             else:
-                os.makedirs(base, exist_ok=True)
-                final = os.path.join(base, part_name)
-                tmp = final + f".tmp-{uuid.uuid4().hex[:8]}"  # NOT matched by the reader glob until promoted
+                import contextlib
+                # stage the part as a SIBLING of base (NOT inside it) so a concurrent compaction's rmtree of
+                # base can't destroy this thread's unpublished part. The slow write is UNLOCKED (unique name,
+                # no contention); makedirs + migrate + publish + compaction run under the per-base lock, so
+                # they're serialized against a concurrent same-base compaction's dir swap.
+                staging = base + f".parttmp-{uuid.uuid4().hex[:10]}{ext}"
                 try:
-                    self._write_part(rel, tmp, ext)
-                    os.replace(tmp, final)                    # only a COMPLETE part ever becomes visible
+                    self._write_part(rel, staging, ext)
                 except BaseException:
-                    import contextlib
                     with contextlib.suppress(OSError):
-                        os.remove(tmp)
+                        os.remove(staging)
                     raise
-                self._maybe_compact(base, ext)                # bound unbounded small-part growth
+                with self._base_lock(base):
+                    try:
+                        os.makedirs(base, exist_ok=True)
+                        self._migrate_singlefile_into_dir(target, base, ext, obj)  # overwrite→append fold-in
+                        os.replace(staging, os.path.join(base, part_name))  # publish INTO base (a committed part)
+                    except BaseException:
+                        with contextlib.suppress(OSError):
+                            os.remove(staging)
+                        raise
+                    self._maybe_compact(base, ext)            # bound unbounded small-part growth (under the lock)
             return {"uri": base, "rows": rows}
         if mode not in ("overwrite", None):
             raise NotImplementedError(f"write mode '{mode}' is not supported — use overwrite or append")
