@@ -4,7 +4,9 @@
 # section for running several stateless web instances behind a load balancer.
 
 # --- 1. build the SPA (Vite) ---
-FROM node:20-slim AS web
+# Base images pinned to a digest (not a mutable :tag) so a rebuild is reproducible and can't silently
+# pull a changed base — resolve a new digest with `docker buildx imagetools inspect <img>:<tag>` (OPS-10).
+FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS web
 WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
@@ -12,7 +14,7 @@ COPY web/ ./
 RUN npm run build          # → /web/dist
 
 # --- 2. kernel + the bundled SPA ---
-FROM python:3.12-slim AS app
+FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf AS app
 RUN pip install --no-cache-dir uv
 WORKDIR /app
 COPY kernel/ ./kernel/
@@ -20,7 +22,9 @@ COPY kernel/ ./kernel/
 # hub/_web at build time (so the served SPA matches the packaged kernel)
 COPY --from=web /web/dist ./web/dist
 WORKDIR /app/kernel
-RUN uv sync --extra pod --extra postgres  # builds the package (force-includes ../web/dist) + runtime deps + psycopg + k8s client
+# --frozen: install EXACTLY the checked-in uv.lock (fail if drifted) → reproducible. --no-dev: no test
+# tooling in the runtime image. pod+postgres extras = k8s client + psycopg for the deployed topology.
+RUN uv sync --frozen --no-dev --extra pod --extra postgres
 
 # Put the uv venv on PATH so a bare `python` / `dataplay` resolves to it. REQUIRED for the pod kernel
 # substrate: PodSpawner launches a kernel pod with `python -m hub.kernel …`, and without this that bare
@@ -37,6 +41,14 @@ ENV DP_WORKSPACE=/data
 ENV DP_ALLOW_INSECURE_BIND=1
 EXPOSE 8471
 VOLUME ["/data"]
+
+# Run as a non-root user (OPS-10): defence in depth — canvas code runs as this user, not root. /data is
+# created + owned here so the mounted named volume initializes writable; a host bind-mount's ownership
+# is the operator's to set. The venv + app tree are chowned so `uv run` works without root.
+RUN useradd --create-home --uid 10001 dp \
+    && mkdir -p /data \
+    && chown -R dp:dp /app /data
+USER dp
 
 # --no-open: no browser in a container. Bind all interfaces; workspace (canvases/outputs/plugins +
 # the SQLite fallback DB) + seeded sample data live on the mounted /data volume. Point DP_DATABASE_URL
