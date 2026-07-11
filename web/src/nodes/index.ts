@@ -3,8 +3,11 @@
 import type { ComponentType } from 'react'
 import { allSpecs, getComponent } from './registry'
 
-// eager side-effect imports — every kind + capability registers on load
-import.meta.glob('./kinds/*.tsx', { eager: true })
+// eager side-effect imports — every kind + capability registers on load. EXCLUDE colocated *.test.tsx:
+// a bare './kinds/*.tsx' also matches join.test.tsx / source.test.tsx, pulling vitest + @testing-library
+// into the PRODUCTION bundle — `vi.mock()` then throws "Vitest mocker was not initialized" on load and
+// the app renders a blank page (and every e2e spec fails). The negative glob keeps tests out of the app.
+import.meta.glob(['./kinds/*.tsx', '!./kinds/*.test.tsx'], { eager: true })
 import './capabilities'
 
 /** React Flow nodeTypes map, derived from the registry. */
