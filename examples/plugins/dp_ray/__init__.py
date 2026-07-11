@@ -59,7 +59,8 @@ _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", "
 # row of their key-groups — nothing combined across partitions), ANY DuckDB aggregate works, the output
 # carries DuckDB's exact schema, and the only thing parsed is the shuffle KEY (bare columns). `aggregate`
 # = a GROUPED aggregate; a global aggregate (no key) is cheap + falls back to the single-node engine.
-RAY_RELATIONAL = frozenset({"aggregate"})
+# `window` = a PARTITION BY window (shuffle by the partition key → DuckDB window per complete partition).
+RAY_RELATIONAL = frozenset({"aggregate", "window"})
 
 
 def _ray_opts(requires: dict | None) -> dict:
@@ -226,6 +227,8 @@ class RayRunner:
         for s in ir.steps:
             if s.op == "aggregate" and not parse_group_keys(s.config.get("groupBy", "")):
                 return False  # None (expression key) or [] (global) → not shuffle-distributable
+            if s.op == "window" and not parse_group_keys(s.config.get("partitionBy", "")):
+                return False  # a window needs a bare-column PARTITION BY to be the shuffle key
         return True
 
     def run(self, plan, graph, target_node_id, placement, run_id=None) -> RunStatus:
@@ -426,25 +429,19 @@ class RayRunner:
             return parent.map_batches(_make_mapper(step.config), batch_format="pyarrow", **opts)
         if step.op == "aggregate":
             return self._build_aggregate(step, parent)
+        if step.op == "window":
+            return self._build_window(step, parent)
         raise RuntimeError(f"ray backend reached a non-clean op '{step.op}' (should have fallen back)")
 
-    def _build_aggregate(self, step, parent):
-        """A distributed GROUP BY where RAY does only the SHUFFLE and DUCKDB does the compute. Ray
-        hash-partitions the input by the group keys (its default HASH_SHUFFLE) so every row of a group
-        lands in ONE partition; then the SAME `SELECT {group}, {aggs} GROUP BY {group}` the single-node
-        engine runs is executed on each partition by DuckDB. Because each group is complete within its
-        partition, nothing is combined across partitions — the union of the per-partition results equals
-        the single-node result BYTE-FOR-BYTE (it IS DuckDB, on complete groups), with DuckDB's exact
-        schema + naming. So any DuckDB aggregate works (count/min/max/sum/avg/stddev/count(distinct)/…);
-        only the shuffle KEY is parsed. batch_size=None makes each map_batches call the WHOLE partition,
-        so groups are never split across DuckDB calls."""
-        cfg = step.config
-        keys = parse_group_keys(cfg.get("groupBy", "")) or []   # gating guarantees a non-empty bare-col key
-        group = (cfg.get("groupBy") or "").strip()
-        aggs = (cfg.get("aggs") or "count(*) AS n").strip()     # DuckDB default (mirrors engine.py:649)
-        sql = f"SELECT {group}, {aggs} FROM _blk GROUP BY {group}"
-
-        def _agg_block(tbl):                                    # runs on a WORKER, one complete-groups partition
+    def _shuffle_duckdb(self, parent, keys, sql):
+        """The shared distributed-relational mechanism: RAY hash-shuffles `parent` by `keys` so every row
+        of a key-group lands in ONE partition (its default HASH_SHUFFLE), then DUCKDB runs `sql` (reading
+        the partition as `_blk`) on each WHOLE partition (batch_size=None → the batch IS the partition, so
+        groups are never split). Because each group is complete in its partition, the union of the
+        per-partition results equals the single-node DuckDB result BYTE-FOR-BYTE — it IS DuckDB, running
+        the same SQL the single-node engine runs, with DuckDB's exact schema. This one mechanism backs
+        aggregate/window (and extends to join/dedup) — no operator is reimplemented on Ray."""
+        def _run(tbl):                                          # runs on a WORKER, one complete-groups partition
             import duckdb
             con = duckdb.connect()
             con.register("_blk", tbl)
@@ -455,7 +452,31 @@ class RayRunner:
         except ValueError:
             parts = None
         shuffled = parent.repartition(parts, keys=keys) if parts else parent.repartition(keys=keys)
-        return shuffled.map_batches(_agg_block, batch_format="pyarrow", batch_size=None)
+        return shuffled.map_batches(_run, batch_format="pyarrow", batch_size=None)
+
+    def _build_aggregate(self, step, parent):
+        """Distributed GROUP BY: hash-shuffle by the group key, DuckDB `GROUP BY` per complete partition
+        (see _shuffle_duckdb). Any DuckDB aggregate works; only the shuffle key is parsed."""
+        cfg = step.config
+        keys = parse_group_keys(cfg.get("groupBy", "")) or []   # gating guarantees a non-empty bare-col key
+        group = (cfg.get("groupBy") or "").strip()
+        aggs = (cfg.get("aggs") or "count(*) AS n").strip()     # DuckDB default (mirrors engine.py:649)
+        return self._shuffle_duckdb(parent, keys, f"SELECT {group}, {aggs} FROM _blk GROUP BY {group}")
+
+    def _build_window(self, step, parent):
+        """Distributed window: hash-shuffle by PARTITION BY so each window-partition is complete in one Ray
+        partition, then DuckDB runs the SAME `expr OVER (…)` per partition — exact, because the window's
+        own ORDER BY (applied by DuckDB on the complete group) sets rank/lag, not the shuffle order.
+        Mirrors engine.py's window SQL. Gating guarantees a bare-column PARTITION BY as the shuffle key."""
+        cfg = step.config
+        keys = parse_group_keys(cfg.get("partitionBy", "")) or []
+        part = (cfg.get("partitionBy") or "").strip()
+        order = (cfg.get("orderBy") or "").strip()
+        expr = (cfg.get("expr") or "").strip()
+        col = ((cfg.get("as") or "").strip() or "window").replace('"', '""')
+        over = " ".join(x for x in [f"PARTITION BY {part}" if part else "",
+                                    f"ORDER BY {order}" if order else ""] if x)
+        return self._shuffle_duckdb(parent, keys, f'SELECT *, {expr} OVER ({over}) AS "{col}" FROM _blk')
 
     def _commit(self, step, datasets, graph) -> tuple[int, str, str]:
         import pyarrow as pa

@@ -272,7 +272,7 @@ def test_ir_shuffle_key_parser_and_distributable_gate():
     assert parse_group_keys("cat") == ["cat"] and parse_group_keys("a, b") == ["a", "b"]
     assert parse_group_keys("") == []                                          # global aggregate → no key
     assert parse_group_keys("lower(x)") is None and parse_group_keys("x*2") is None  # expression → DuckDB
-    assert DISTRIBUTABLE_RELATIONAL == frozenset({"aggregate"})
+    assert DISTRIBUTABLE_RELATIONAL == frozenset({"aggregate", "window"})     # both: shuffle by key → DuckDB
 
     d = get_deps()
     gg = Graph(**{"id": "c", "version": 1, "nodes": [
@@ -5298,6 +5298,52 @@ def test_ray_aggregate_live_differential(tmp_path):
         # stddev accumulates squared deviations in float; within-group row order can differ across the
         # shuffle, so it matches within float tolerance (not bit-for-bit) — still DuckDB's own function.
         assert abs((rr_[7] or 0.0) - (dr[7] or 0.0)) <= 1e-9 * max(1.0, abs(dr[7] or 0.0)), f"stddev tol cat={k}"
+
+
+def test_ray_window_live_differential(tmp_path):
+    # opt-in live Ray: a distributed WINDOW (row_number PARTITION BY cat ORDER BY v) via the SAME
+    # shuffle+DuckDB mechanism — hash-shuffle by the partition key so each window-partition is complete on
+    # one node, DuckDB runs the window per partition — must be byte-identical to single-node DuckDB. v is
+    # globally unique, so the row_number within each cat is deterministic (no ties).
+    if not os.environ.get("DP_TEST_RAY_LIVE"):
+        pytest.skip("set DP_TEST_RAY_LIVE=1 to run the live-Ray window differential")
+    import time
+
+    import duckdb
+
+    from hub import db
+    from hub.deps import Deps
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+    os.environ["DP_RAY_SHUFFLE_PARTITIONS"] = "4"
+    p = str(tmp_path / "events.parquet")
+    duckdb.connect().execute(
+        f"COPY (SELECT (i % 5) AS cat, i AS v FROM range(0, 4000) t(i)) TO '{p}' (FORMAT PARQUET)")
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+    g = Graph(**{"id": "c", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": p}),
+        _ray_node("w", "window", {"expr": "row_number()", "partitionBy": "cat", "orderBy": "v", "as": "rn"}),
+    ], "edges": [_ray_edge("src", "w")]})
+    st = rr.run_unit(g, "w", str(tmp_path / "win_out.parquet"))
+    for _ in range(900):
+        if rr.status(st.run_id).status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.1)
+    st = rr.status(st.run_id)
+    assert st.status == "done", st.error
+    with db.run_scope():
+        oracle = BuildEngine(g, deps.resolve_adapter, deps.registry, full=True,
+                             node_specs=deps.node_specs, output_node="w").relation("w").to_arrow_table()
+    con = duckdb.connect()
+    con.register("oracle", oracle)
+    ray_src = f"read_parquet('{st.output_uri}/**/*.parquet', union_by_name=true)"
+    q = "SELECT v, cat, rn FROM {src} ORDER BY v"        # v is unique → deterministic total order
+    ray_rows = con.execute(q.format(src=ray_src)).fetchall()
+    duck_rows = con.execute(q.format(src="oracle")).fetchall()
+    assert ray_rows == duck_rows, f"Ray window != DuckDB\nray[:5]={ray_rows[:5]}\nduck[:5]={duck_rows[:5]}"
+    assert len(ray_rows) == 4000 and max(r[2] for r in ray_rows) == 800  # 5 cats × 800 rows each
 
 
 def test_ray_region_requires_gates_scheduling(tmp_path):
