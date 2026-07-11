@@ -701,7 +701,9 @@ class BuildEngine:
         path = os.path.join(spill_dir, f"{db.unique_view('xf')}.parquet")
         writer: "pq.ParquetWriter | None" = None
         buf: list[dict] = []
-        FLUSH = 50_000
+        nbytes = 0
+        FLUSH_BYTES = _SPILL_FLUSH_BYTES
+        FLUSH_ROWS = _SPILL_FLUSH_ROWS
 
         def write_tbl(tbl: "pa.Table") -> None:
             nonlocal writer
@@ -714,10 +716,11 @@ class BuildEngine:
             writer.write_table(tbl)
 
         def flush():
-            nonlocal buf
+            nonlocal buf, nbytes
             if buf:
                 write_tbl(pa.Table.from_pylist(buf))
                 buf = []
+                nbytes = 0
 
         try:
             if fmt in ("pandas", "arrow"):  # arrow-native: type-preserving, one table per input batch
@@ -726,10 +729,14 @@ class BuildEngine:
                     if t is not None:  # on_error='skip' dropped this batch
                         write_tbl(t)
             else:
+                # stream output rows and flush on a BYTE budget (with a hard row cap as a backstop), so a
+                # flat_map with a huge per-row fan-out never balloons the buffer — memory stays bounded.
                 for batch in parent.to_arrow_reader(batch_size=_XF_BATCH):
-                    buf.extend(_apply_fn(fn, batch, mode, on_error, node))
-                    if len(buf) >= FLUSH:
-                        flush()
+                    for r in _iter_fn(fn, batch, mode, on_error, node):
+                        buf.append(r)
+                        nbytes += _est_row_bytes(r)
+                        if nbytes >= FLUSH_BYTES or len(buf) >= FLUSH_ROWS:
+                            flush()
                 flush()
         except BaseException:
             # close + delete the partial spill so we never leak a handle or a truncated file
@@ -810,42 +817,72 @@ class BuildEngine:
 # transform read batch size — IDENTICAL in preview and full run so on_error='skip' drops the same
 # rows in both (a batch-size-dependent skip would make the preview disagree with the run).
 _XF_BATCH = 8192
+# spill buffer bounds for the full-run transform: flush the row buffer to Parquet when it reaches this
+# many BYTES (primary — one big row shouldn't need 50k siblings to trigger a flush) or this many rows
+# (a hard backstop so tiny rows still flush).
+_SPILL_FLUSH_BYTES = 128 * 1024 * 1024
+_SPILL_FLUSH_ROWS = 500_000
 
 
-def _apply_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node) -> list[dict]:
+def _iter_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node):
+    """Yield the transform's output rows for one input batch. flat_map/flat_map_generator are STREAMED
+    (yield from — no per-row list()), so a large per-row fan-out never materializes here; the spill
+    caller flushes on a BYTE budget, keeping memory bounded regardless of fan-out."""
     rows = batch.to_pylist()
-    out: list[dict] = []
     if mode == "map_batches":
         try:
-            return list(fn(rows))
+            yield from fn(rows)
+            return
         except Exception as e:  # noqa: BLE001
             if on_error == "skip":
                 # isolate the bad rows by re-running the UDF one row at a time and keeping the
                 # successes, so 'skip' drops only the rows that actually fail — NOT the whole batch
-                # (dropping the batch would make the result depend on batch size; this keeps it
-                # size-invariant so preview == run).
-                good: list[dict] = []
+                # (dropping the batch would make the result depend on batch size; size-invariant → preview == run).
                 for r in rows:
                     try:
-                        good.extend(fn([dict(r)]))
+                        yield from fn([dict(r)])
                     except Exception:  # noqa: BLE001 — this row genuinely fails; drop just it
                         continue
-                return good
+                return
             raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
     for r in rows:
         try:
             if mode == "map":
-                out.append(fn(dict(r)))
+                yield fn(dict(r))
             elif mode == "filter":
                 if fn(dict(r)):
-                    out.append(r)
+                    yield r
             elif mode in ("flat_map", "flat_map_generator"):
-                out.extend(list(fn(dict(r))))
+                yield from fn(dict(r))
         except Exception as e:  # noqa: BLE001
             if on_error == "skip":
                 continue
             raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
-    return out
+
+
+def _apply_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node) -> list[dict]:
+    return list(_iter_fn(fn, batch, mode, on_error, node))
+
+
+def _est_row_bytes(v, _depth: int = 0) -> int:
+    """Cheap approximate in-memory size of a row/value — used to bound the spill buffer by BYTES rather
+    than a fixed row count: one row can be a big blob or embedding, so 50k such rows is nothing like 50k
+    small dicts. Recursion is depth-capped so a pathological nesting can't make this expensive."""
+    if v is None:
+        return 8
+    if isinstance(v, (bytes, bytearray, str)):
+        return len(v) + 16
+    if isinstance(v, bool):  # before int — bool is a subclass of int
+        return 8
+    if isinstance(v, (int, float)):
+        return 8
+    if _depth >= 5:
+        return 64
+    if isinstance(v, dict):
+        return 24 + sum(_est_row_bytes(x, _depth + 1) for x in v.values())
+    if isinstance(v, (list, tuple)):
+        return 24 + sum(_est_row_bytes(x, _depth + 1) for x in v)
+    return 32
 
 
 def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node) -> "pa.Table | None":

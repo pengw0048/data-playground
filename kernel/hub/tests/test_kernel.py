@@ -1108,6 +1108,26 @@ def test_batch_schema_drift_widens_safely_and_fails_loudly_not_silently():
         _conform(pa.table({"z": [1]}), pa.schema([("x", pa.int64())]), None)
 
 
+def test_flat_map_streams_lazily_and_byte_estimate_tracks_payload():
+    # flat_map must be STREAMED, not list()-materialized per row — else a large (or unbounded) per-row
+    # fan-out balloons memory. Proof: an INFINITE generator per row; taking the first few must return
+    # promptly. If the executor did list(fn(row)) it would hang forever here.
+    import itertools
+    import pyarrow as pa
+    from hub.executors.engine import _iter_fn, _est_row_bytes
+
+    def fan(r):
+        i = 0
+        while True:
+            yield {"v": r["x"] * 1_000_000 + i}
+            i += 1
+    batch = pa.RecordBatch.from_pylist([{"x": 1}, {"x": 2}])
+    first5 = list(itertools.islice(_iter_fn(fan, batch, "flat_map", "raise", None), 5))
+    assert [r["v"] for r in first5] == [1_000_000, 1_000_001, 1_000_002, 1_000_003, 1_000_004]
+    # the spill flush budget is bytes-first: a 10KB-blob row estimates far larger than a small int row
+    assert _est_row_bytes({"b": b"x" * 10_000}) > 100 * _est_row_bytes({"n": 1})
+
+
 def test_write_mode_append_builds_a_readable_directory_dataset():
     # append is REAL: it writes a directory of part files that reads back as the accumulated rows
     def append_run():
