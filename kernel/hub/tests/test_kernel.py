@@ -2727,8 +2727,11 @@ def test_coordination_tables_pruned_to_cap(monkeypatch):
     for i in range(7):
         assert metadb.record_run(cid, None, "done", rows=i) is True
     with metadb.session() as s:
-        n_hist = s.scalar(_select(func.count()).select_from(metadb.RunRecord).where(metadb.RunRecord.canvas_id == cid))
-    assert n_hist == 3, f"run_records not capped per canvas: {n_hist}"
+        surviving = sorted(r.rows for r in s.scalars(_select(metadb.RunRecord).where(metadb.RunRecord.canvas_id == cid)))
+    # exactly the cap, and the NEWEST 3 (rows 4,5,6) survive — pins keep-newest, not merely the count
+    # (a reversed keep-oldest impl would pass a count-only assertion). Each record_run is its own DB
+    # transaction (ms apart) so created_at is strictly increasing → deterministic, no timestamp ties.
+    assert surviving == [4, 5, 6], f"run_records prune must keep the newest {3}: {surviving}"
 
     # run_states: global terminal cap, live rows never pruned. Clean slate first (other tests leave rows).
     with metadb.session() as s:
@@ -2739,9 +2742,10 @@ def test_coordination_tables_pruned_to_cap(monkeypatch):
     for i in range(6):
         metadb.save_run_state(f"done_run_{i}", {"run_id": f"done_run_{i}", "status": "done"})
     with metadb.session() as s:
-        n_term = s.scalar(_select(func.count()).select_from(metadb.RunState).where(metadb.RunState.status.in_(metadb._TERMINAL_RUN)))
+        term_ids = {r.run_id for r in s.scalars(_select(metadb.RunState).where(metadb.RunState.status.in_(metadb._TERMINAL_RUN)))}
         n_live = s.scalar(_select(func.count()).select_from(metadb.RunState).where(~metadb.RunState.status.in_(metadb._TERMINAL_RUN)))
-    assert n_term == 3, f"terminal run_states not capped: {n_term}"
+    # terminal capped to the newest 3 (done_run_3/4/5); live rows (running/queued) never pruned
+    assert term_ids == {"done_run_3", "done_run_4", "done_run_5"}, f"terminal prune must keep newest: {term_ids}"
     assert n_live == 2, f"live run_states must never be pruned: {n_live}"
     assert metadb.get_run_state("live_run_a") and metadb.get_run_state("live_run_b")
 
