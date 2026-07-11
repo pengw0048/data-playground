@@ -5673,31 +5673,43 @@ def test_ray_backend_operator_gating_and_fallback(tmp_path):
     assert _agg("list(x ORDER BY x) AS xs") is False            # conservatively rejected by name (AST can't
                                                                 # see the ORDER BY — DuckDB rewrites it out)
     assert _agg("sum(x) AS s, count(*) AS n") is True           # plain reducing aggs are order-free
+    # #39 review: every alias the parser can emit + mode (arbitrary among ties) are caught; value-keyed
+    # aggregates (median/quantile/histogram) are order-free and still distribute.
+    assert _agg("argmax(x, y) AS a") is False and _agg("argmin(x, y) AS a") is False   # no-underscore alias
+    assert _agg("mode(x) AS m") is False
+    assert _agg("max_by(x, y) AS a") is False
+    assert _agg("median(x) AS md, quantile(x, 0.5) AS q") is True
 
-    # (3b-ii) a window needs a non-empty ORDER BY to distribute faithfully — a no-ORDER-BY window
-    # (row_number over an arbitrary intra-partition order) diverges (acceptance #7).
+    # (3b-ii) a RANKING/OFFSET window needs a non-empty ORDER BY to distribute faithfully; a pure-AGGREGATE
+    # window (sum/count OVER (PARTITION BY k)) is whole-partition → byte-identical even with no ORDER BY,
+    # so it must NOT be over-rejected (acceptance #7 + #39 review).
     def _win(cfg):
         gg = G([_ray_node("src", "source", {"uri": p}),
                 _ray_node("wn", "window", cfg),
                 _ray_node("w", "write", {"name": "o"})], [_ray_edge("src", "wn"), _ray_edge("wn", "w")])
         return rr._ray_runnable(lower_to_ir(gg, "w", deps.node_specs))
-    assert _win({"partitionBy": "x", "expr": "row_number()", "as": "rn"}) is False          # no ORDER BY
+    assert _win({"partitionBy": "x", "expr": "row_number()", "as": "rn"}) is False          # ranking, no ORDER BY
     assert _win({"partitionBy": "x", "orderBy": "x", "expr": "row_number()", "as": "rn"}) is True
+    assert _win({"partitionBy": "x", "expr": "first_value(x)", "as": "f"}) is False         # offset, no ORDER BY
+    assert _win({"partitionBy": "x", "expr": "sum(x)", "as": "s"}) is True                  # aggregate window → OK
+    assert _win({"partitionBy": "x", "expr": "count(*)", "as": "c"}) is True                # no ORDER BY needed
 
     # (3b-iii) full-row dedup over a FLOAT column falls back — the shuffle's raw-byte equality splits
-    # -0.0/0.0 (and NaN payloads) that DuckDB DISTINCT coalesces, so a distributed run keeps an extra
-    # row (acceptance #12). An all-int dedup still distributes.
-    pf = str(tmp_path / "floats.parquet")
-    duckdb.connect().execute(f"COPY (SELECT x::DOUBLE AS d, x AS i FROM range(1,6) t(x)) TO '{pf}' (FORMAT PARQUET)")
-    ddf = G([_ray_node("src", "source", {"uri": pf}), _ray_node("d", "dedup", {}),
-             _ray_node("w", "write", {"name": "o"})], [_ray_edge("src", "d"), _ray_edge("d", "w")])
-    assert rr._ray_runnable(lower_to_ir(ddf, "w", deps.node_specs)) is True   # config-only gate: full-row dedup ok
-    assert rr._dedup_needs_single_node(ddf, lower_to_ir(ddf, "w", deps.node_specs)) is True  # but float schema → local
-    pi = str(tmp_path / "ints.parquet")
-    duckdb.connect().execute(f"COPY (SELECT x AS i FROM range(1,6) t(x)) TO '{pi}' (FORMAT PARQUET)")
-    ddi = G([_ray_node("src", "source", {"uri": pi}), _ray_node("d", "dedup", {}),
-             _ray_node("w", "write", {"name": "o"})], [_ray_edge("src", "d"), _ray_edge("d", "w")])
-    assert rr._dedup_needs_single_node(ddi, lower_to_ir(ddi, "w", deps.node_specs)) is False  # int-only → distributes
+    # -0.0/0.0 (and NaN payloads) that DuckDB DISTINCT coalesces (acceptance #12). Uses RAW DuckDB types,
+    # so NESTED floats (struct/list of double) also fall back, while DECIMAL (exact) + int still distribute.
+    def _dedup(select_sql):
+        pth = str(tmp_path / f"d_{abs(hash(select_sql))}.parquet")
+        duckdb.connect().execute(f"COPY (SELECT {select_sql} FROM range(1,6) t(x)) TO '{pth}' (FORMAT PARQUET)")
+        gg = G([_ray_node("src", "source", {"uri": pth}), _ray_node("d", "dedup", {}),
+                _ray_node("w", "write", {"name": "o"})], [_ray_edge("src", "d"), _ray_edge("d", "w")])
+        ir = lower_to_ir(gg, "w", deps.node_specs)
+        assert rr._ray_runnable(ir) is True                     # config-only gate: full-row dedup is fine
+        return rr._dedup_needs_single_node(gg, ir)
+    assert _dedup("x::DOUBLE AS d, x AS i") is True             # scalar double → local
+    assert _dedup("{'a': x::DOUBLE} AS s, x AS i") is True      # NESTED double in a struct → local (raw types)
+    assert _dedup("[x::DOUBLE] AS lst, x AS i") is True         # list of double → local
+    assert _dedup("x AS i, (x*10) AS j") is False              # int-only → distributes
+    assert _dedup("x::DECIMAL(18,2) AS dec, x AS i") is False   # DECIMAL is exact (no -0.0/NaN) → distributes
 
     # (3c) a genuinely non-distributable op (a raw sql node) → can_run False → run() delegates to the
     # DuckDB base runner (never touches Ray) → it completes.

@@ -47,7 +47,7 @@ import time
 import uuid
 
 from hub import db, graph as g
-from hub.sqlanalyze import agg_has_order_sensitive  # AST-based (DuckDB's own parser), shared with the engine
+from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (DuckDB's own parser), shared
 from hub.ir import (CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
                     plan_is_clean, plan_is_distributable)
 from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
@@ -261,17 +261,20 @@ class RayRunner:
             if s.op == "aggregate":
                 if not parse_group_keys(s.config.get("groupBy", "")):
                     return False  # None (expression key) or [] (global) → not shuffle-distributable
-                if agg_has_order_sensitive(s.config.get("aggs", "")):
-                    return False  # list/string_agg/first/any_value/arg_max → intra-group order matters, the
-                                  # hash-shuffle doesn't preserve it → single-node (conservative: even an
-                                  # ORDER-BY'd list, whose ORDER BY DuckDB rewrites out of the parsed AST)
+                # pass the EFFECTIVE aggs (default matches _build_aggregate) so a node with no aggs isn't
+                # spuriously rejected by the empty-fragment conservative default.
+                if agg_has_order_sensitive(s.config.get("aggs") or "count(*) AS n"):
+                    return False  # list/string_agg/first/any_value/arg_max/mode/argmax → intra-group order
+                                  # matters, the hash-shuffle doesn't preserve it → single-node (conservative:
+                                  # even an ORDER-BY'd list, whose ORDER BY DuckDB rewrites out of the AST)
             if s.op == "window":
                 if not parse_group_keys(s.config.get("partitionBy", "")):
                     return False  # a window needs a bare-column PARTITION BY to be the shuffle key
-                if not (s.config.get("orderBy") or "").strip():
-                    return False  # a window with NO ORDER BY (e.g. row_number) is intra-partition-order-dependent
-                                  # → the shuffle reorders the partition → diverges. With ORDER BY, exact up to
-                                  # ties (same inherent tie-ceiling as sort). → single-node keeps it faithful.
+                if window_needs_order(s.config.get("expr", "")) and not (s.config.get("orderBy") or "").strip():
+                    return False  # a RANKING/OFFSET window (row_number/rank/lag/first_value/…) is
+                                  # intra-partition-order-dependent → needs a total ORDER BY (exact up to
+                                  # ties — the sort tie-ceiling); a pure-AGGREGATE window (sum/count OVER
+                                  # (PARTITION BY k)) is whole-partition → byte-identical with no ORDER BY.
             if s.op == "dedup" and (s.config.get("on") or "").strip():
                 return False  # only full-row DISTINCT distributes; keyed DISTINCT ON is order-dependent
             if s.op == "join":
@@ -287,26 +290,29 @@ class RayRunner:
         partition. But Ray's hash-shuffle equality is RAW-BYTE, which distinguishes values DuckDB DISTINCT
         coalesces: -0.0 vs 0.0, and distinct NaN bit-patterns. So two rows differing only in signed-zero /
         NaN-payload hash to DIFFERENT partitions and BOTH survive → one extra row vs single-node DuckDB.
-        Fall back to the single-node engine whenever a dedup's schema carries any floating-point column
-        (scalar or nested). Needs the input schema (the IR carries none), so this is separate from the
-        config-only _ray_runnable gate; only pays the schema-inference cost when a dedup is present."""
+        Fall back to the single-node engine whenever a dedup's schema carries any floating-point column,
+        SCALAR OR NESTED. Inspects the RAW DuckDB column types (`rel.types`) — NOT the display type, which
+        normalizes STRUCT/MAP/LIST to a bare `struct`/`map`/`list` and would hide a nested double (and maps
+        DECIMAL→float, wrongly forcing an exact-decimal dedup local). Needs the schema (the IR carries
+        none), so it's separate from the config-only _ray_runnable gate; only paid when a dedup is present."""
         dedups = [s for s in ir.steps if s.op == "dedup"]
         if not dedups:
             return False
-        try:
-            from hub.executors.schema import schema_for_graph
-            schemas = schema_for_graph(graph, self.resolve_adapter, self.deps.registry,
-                                       self.deps.node_builders, self.node_specs)
-        except Exception:  # noqa: BLE001 — can't prove the schema is float-free → don't distribute (safe)
-            return True
+        from hub.executors.engine import BuildEngine
+        # a raw DuckDB type string carries nested element types (STRUCT(a DOUBLE), DOUBLE[], MAP(…, DOUBLE))
+        # so this catches nested floats; DECIMAL(…) / HUGEINT don't match, so exact types still distribute.
+        float_re = re.compile(r"\b(?:float|double|real)\b", re.I)
         for s in dedups:
-            cols = schemas.get(s.id)
-            if not cols:                    # unknown schema for this dedup → can't prove float-free → single-node
+            try:
+                with db.run_scope():
+                    rel = BuildEngine(graph, self.resolve_adapter, self.deps.registry, full=True,
+                                      node_builders=self.deps.node_builders, node_specs=self.node_specs,
+                                      output_node=s.id).relation(s.id)
+                    types = [str(t) for t in rel.types]  # RAW DuckDB types (schema-only; no data scan)
+            except Exception:  # noqa: BLE001 — can't prove the schema is float-free → don't distribute (safe)
                 return True
-            for c in cols:
-                t = str((c.get("type") if isinstance(c, dict) else getattr(c, "type", "")) or "")
-                if re.search(r"\b(?:float|double|real)", t, re.I):  # scalar or nested (float[]/struct<…double…>)
-                    return True
+            if any(float_re.search(t) for t in types):
+                return True
         return False
 
     def run(self, plan, graph, target_node_id, placement, run_id=None) -> RunStatus:
