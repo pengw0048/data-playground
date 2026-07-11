@@ -272,7 +272,7 @@ def test_ir_shuffle_key_parser_and_distributable_gate():
     assert parse_group_keys("cat") == ["cat"] and parse_group_keys("a, b") == ["a", "b"]
     assert parse_group_keys("") == []                                          # global aggregate → no key
     assert parse_group_keys("lower(x)") is None and parse_group_keys("x*2") is None  # expression → DuckDB
-    assert DISTRIBUTABLE_RELATIONAL == frozenset({"aggregate", "window", "dedup"})  # all: shuffle by key → DuckDB
+    assert DISTRIBUTABLE_RELATIONAL == frozenset({"aggregate", "window", "dedup", "join"})
 
     d = get_deps()
     gg = Graph(**{"id": "c", "version": 1, "nodes": [
@@ -5430,6 +5430,58 @@ def test_ray_dedup_live_differential(tmp_path):
     ray_rows = con.execute(q.format(src=ray_src)).fetchall()
     duck_rows = con.execute(q.format(src="oracle")).fetchall()
     assert ray_rows == duck_rows and len(ray_rows) == 200, f"dedup differs: {len(ray_rows)} vs {len(duck_rows)}"
+
+
+def test_ray_join_live_differential(tmp_path):
+    # opt-in live Ray: a BROADCAST join (big LEFT fact ⋈ small RIGHT dim on user_id) must equal single-node
+    # DuckDB — same join_sql, so the coalesced USING key + _2-suffix naming match exactly. Join output
+    # order is arbitrary, so compare as a sorted multiset.
+    if not os.environ.get("DP_TEST_RAY_LIVE"):
+        pytest.skip("set DP_TEST_RAY_LIVE=1 to run the live-Ray join differential")
+    import time
+
+    import duckdb
+
+    from hub import db
+    from hub.deps import Deps
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+    left_p, right_p = str(tmp_path / "fact.parquet"), str(tmp_path / "dim.parquet")
+    duckdb.connect().execute(
+        f"COPY (SELECT (i % 100) AS user_id, i AS amount FROM range(0, 4000) t(i)) TO '{left_p}' (FORMAT PARQUET)")
+    duckdb.connect().execute(  # a small dimension (the broadcast side); one row missing (user_id 99) to exercise LEFT
+        f"COPY (SELECT i AS user_id, ('u' || i) AS name FROM range(0, 99) t(i)) TO '{right_p}' (FORMAT PARQUET)")
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+
+    def mk(how):
+        return Graph(**{"id": "c", "version": 1, "nodes": [
+            _ray_node("l", "source", {"uri": left_p}), _ray_node("r", "source", {"uri": right_p}),
+            _ray_node("j", "join", {"on": "user_id", "how": how}),
+        ], "edges": [_ray_edge("l", "j"), _ray_edge("r", "j")]})
+
+    con = duckdb.connect()
+    for how, expect in (("inner", 3960), ("left", 4000)):        # 40 rows have user_id 99 (no dim match)
+        g = mk(how)
+        st = rr.run_unit(g, "j", str(tmp_path / f"join_{how}.parquet"))
+        for _ in range(900):
+            if rr.status(st.run_id).status in ("done", "failed", "cancelled"):
+                break
+            time.sleep(0.1)
+        st = rr.status(st.run_id)
+        assert st.status == "done", f"{how}: {st.error}"
+        with db.run_scope():
+            oracle = BuildEngine(g, deps.resolve_adapter, deps.registry, full=True,
+                                 node_specs=deps.node_specs, output_node="j").relation("j").to_arrow_table()
+        con.register("oracle", oracle)
+        ray_src = f"read_parquet('{st.output_uri}/**/*.parquet', union_by_name=true)"
+        q = "SELECT user_id, amount, name FROM {src} ORDER BY amount, user_id"
+        ray_rows = con.execute(q.format(src=ray_src)).fetchall()
+        duck_rows = con.execute(q.format(src="oracle")).fetchall()
+        con.unregister("oracle")
+        assert ray_rows == duck_rows, f"{how} join Ray != DuckDB (n={len(ray_rows)} vs {len(duck_rows)})"
+        assert len(ray_rows) == expect, f"{how}: expected {expect} rows, got {len(ray_rows)}"
 
 
 def test_ray_region_requires_gates_scheduling(tmp_path):
