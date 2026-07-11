@@ -15,6 +15,14 @@ from hub.sandbox import run_with_timeout
 PREVIEW_SCAN = 2000       # rows read at each source during preview (bounds transforms too)
 PREVIEW_BUDGET_S = 8.0
 
+# node kinds that run an ARBITRARY user Python cell in-process — the thread-based preview timeout can
+# interrupt an in-flight DuckDB query but CANNOT kill a runaway `while True:` in such a cell (no
+# thread-kill in Python), so in multi-user mode we refuse to preview/profile them (P0-EXEC-02). Runs
+# execute in a killable, deadline-bounded child instead. `section` runs a user driver script via exec
+# (section.run_section), so it belongs here too. (vector-search is pure SQL/Lance — interruptible — so
+# it is NOT here.)
+_CODE_CELL_KINDS = ("transform", "notebook", "opaque", "loop", "section")
+
 
 def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                  node_builders=None, node_specs=None, offset: int = 0, cache=None) -> SampleResult:
@@ -25,6 +33,12 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
         errs = g.type_errors(graph, node_specs)
         if errs:
             return SampleResult(error=True, reason="incompatible connection: " + "; ".join(errs[:3]))
+
+    from hub import auth
+    if auth.auth_enabled() and any(n.type in _CODE_CELL_KINDS for n in g.upstream_chain(graph, node_id)):
+        return SampleResult(not_previewable=True, reason=(
+            "preview of a Python cell is disabled in multi-user mode — the in-process timeout can't kill "
+            "a runaway cell; run it (runs execute in a killable, deadline-bounded child)"))
 
     engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
                             node_builders=node_builders, node_specs=node_specs,

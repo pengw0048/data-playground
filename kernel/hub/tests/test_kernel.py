@@ -759,6 +759,50 @@ def test_full_profile_covers_the_whole_dataset_not_the_sample(tmp_path):
     assert 7500 <= (byname["id"].distinct or 0) <= 12500             # HLL distinct ≈ 10000 (whole set, not ~2000)
 
 
+def test_code_cell_preview_profile_disabled_in_auth_mode(monkeypatch):
+    # P0-EXEC-02: in multi-user (auth) mode, previewing/profiling a node whose cone runs an arbitrary
+    # Python cell is refused — the thread-based timeout can't kill a runaway cell. Open mode is unchanged.
+    from hub.deps import get_deps
+    from hub.executors.preview import preview_node
+    from hub.executors.profile import profile_node
+    from hub.models import Graph
+    d = get_deps()
+    g = Graph(**{"id": "cx", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("images")}),
+        N("xf", "transform", {"mode": "map", "code": "def fn(row):\n    return row"}),
+    ], "edges": [E("s", "xf")]})
+    # open mode: a trivial cell previews fine (behavior unchanged)
+    ok = preview_node(g, "xf", 5, d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
+    assert not ok.not_previewable and not ok.error
+    # auth mode: refused with an honest reason, for BOTH preview and profile
+    monkeypatch.setenv("DP_AUTH_SECRET", "x" * 40)
+    pv = preview_node(g, "xf", 5, d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
+    assert pv.not_previewable and "multi-user" in (pv.reason or "")
+    pf = profile_node(g, "xf", d.resolve_adapter, d.registry, d.node_builders, d.node_specs, full=True)
+    assert pf.not_previewable and "multi-user" in (pf.reason or "")
+
+
+def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch):
+    # P0-EXEC-02: a full profile must be deadline-bounded + interruptible, so a huge pure-SQL aggregate
+    # can't pin the warm kernel forever. A ~5e10-row cross join can't finish in 0.5s → it's interrupted.
+    import time as _t
+
+    from hub.deps import get_deps
+    from hub.executors import profile as profile_mod
+    from hub.executors.profile import profile_node
+    from hub.models import Graph
+    monkeypatch.setattr(profile_mod, "PROFILE_FULL_BUDGET_S", 0.5)
+    d = get_deps()
+    g = Graph(**{"id": "cD", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("images")}),
+        N("q", "sql", {"sql": "SELECT r.x FROM input, range(50000000) r(x)"}),
+    ], "edges": [E("s", "q")]})
+    t0 = _t.time()
+    r = profile_node(g, "q", d.resolve_adapter, d.registry, d.node_builders, d.node_specs, full=True)
+    assert _t.time() - t0 < 20  # interrupted, not pinned for the whole scan
+    assert r.error and "budget" in (r.reason or "").lower()
+
+
 # --------------------------------------------------------------------------- #
 # Regression tests for adversarial-acceptance findings
 # --------------------------------------------------------------------------- #
