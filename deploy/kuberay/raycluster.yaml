@@ -1,0 +1,64 @@
+# A KubeRay RayCluster for validating the dp_ray distributed backend on Kubernetes (e.g. kind) — the
+# same multi-node byte-identical check as docker-compose.ray.yml, on real pods. Two workers, each its own
+# pod/filesystem, so the worker-direct object-store handoff is exercised across nodes.
+#
+# Prereqs: a cluster (kind create cluster) + the KubeRay operator:
+#   helm repo add kuberay https://ray-project.github.io/kuberay-helm/ && helm repo update
+#   helm install kuberay-operator kuberay/kuberay-operator
+# Load the image into kind (built by docker/ray/Dockerfile), apply this, then run the check as a Job:
+#   docker build -f docker/ray/Dockerfile -t dp-ray:local .
+#   kind load docker-image dp-ray:local
+#   kubectl apply -f deploy/kuberay/raycluster.yaml
+#   kubectl apply -f deploy/kuberay/minio.yaml        # object store (below)
+#   kubectl apply -f deploy/kuberay/differential-job.yaml
+#   kubectl logs -f job/dp-ray-multinode-check        # expect "[multinode] PASS: … byte-identical …"
+#
+# The image already sets RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 and the hash-shuffle worker-setup-hook env var,
+# so KubeRay's pods carry the Ray 2.56 compat shim without extra config.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: dp-ray
+spec:
+  rayVersion: "2.56.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "2"
+      resources: '"{\"engine_ray\": 100}"'
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: dp-ray:local
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests: { cpu: "1", memory: "2Gi" }
+              limits: { cpu: "2", memory: "3Gi" }
+            volumeMounts:
+              - { name: dshm, mountPath: /dev/shm }
+        volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 2Gi }
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 2
+      minReplicas: 2
+      maxReplicas: 2
+      rayStartParams:
+        num-cpus: "2"
+        resources: '"{\"engine_ray\": 100}"'
+      template:
+        spec:
+          containers:
+            - name: ray-worker
+              image: dp-ray:local
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests: { cpu: "1", memory: "2Gi" }
+                limits: { cpu: "2", memory: "3Gi" }
+              volumeMounts:
+                - { name: dshm, mountPath: /dev/shm }
+          volumes:
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 2Gi }

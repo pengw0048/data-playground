@@ -1,0 +1,32 @@
+# The multi-node byte-identical differential as a k8s Job — joins the KubeRay RayCluster as a node, then
+# runs hub/ray_multinode_check.py. Expect the log to end with "[multinode] PASS: … byte-identical …".
+apiVersion: batch/v1
+kind: Job
+metadata: { name: dp-ray-multinode-check }
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: driver
+          image: dp-ray:local
+          imagePullPolicy: IfNotPresent
+          workingDir: /app/kernel
+          # join the cluster (KubeRay's head Service is <clustername>-head-svc), then run the differential
+          command: ["/bin/sh", "-c", "ray start --address=dp-ray-head-svc:6379 --num-cpus=2 && python /app/kernel/hub/ray_multinode_check.py; rc=$?; ray stop >/dev/null 2>&1; exit $rc"]
+          env:
+            - { name: RAY_ADDRESS, value: "auto" }
+            - { name: RAY_ENABLE_UV_RUN_RUNTIME_ENV, value: "0" }
+            - { name: __RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR, value: "hub.ray_compat.patch_hash_shuffle" }
+            - { name: DP_TEST_RAY_LIVE, value: "1" }
+            - { name: DP_RAY_SHUFFLE_PARTITIONS, value: "4" }
+            - { name: DP_S3_ENDPOINT, value: "http://minio:9000" }
+            - { name: DP_S3_KEY, value: "dpminio" }
+            - { name: DP_S3_SECRET, value: "dpminio123" }
+            - { name: DP_S3_BUCKET, value: "dpray" }
+          volumeMounts:
+            - { name: dshm, mountPath: /dev/shm }
+      volumes:
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 2Gi }

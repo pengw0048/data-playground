@@ -1,0 +1,75 @@
+# Multi-node validation for the dp_ray distributed backend (ARC3).
+#
+# A REAL Ray cluster — a head + 2 workers, each its OWN container (own filesystem), plus MinIO as the
+# shared object store the worker-direct handoff writes to (local-dir shards would scatter per-node and be
+# invisible across containers — the multi-node-correct handoff MUST go to object storage). The `driver`
+# service runs the byte-identical differential INSIDE the network so the Ray Client version always matches
+# the cluster and it reaches minio/ray-head by DNS.
+#
+#   docker compose -f docker-compose.ray.yml up -d --scale ray-worker=2 --build
+#   docker compose -f docker-compose.ray.yml run --rm driver    # runs the differential; exits 0 on PASS
+#   docker compose -f docker-compose.ray.yml down -v
+#
+# Kill-a-worker recovery: while a run is in flight, `docker kill <a ray-worker container>` and re-run the
+# differential — Ray Data reconstructs the lost blocks from lineage and the output stays byte-identical.
+
+x-ray-env: &ray-env
+  RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+  __RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR: "hub.ray_compat.patch_hash_shuffle"
+
+services:
+  ray-head:
+    image: dp-ray:local
+    build: { context: ., dockerfile: docker/ray/Dockerfile }
+    # exec form (not a folded scalar) so the resources JSON keeps its quotes; engine_ray = the placement
+    # label a node opts into (dp_ray.place), declared here so a pinned region schedules onto the cluster.
+    command: ["ray", "start", "--head", "--port=6379", "--num-cpus=2", "--dashboard-host=0.0.0.0", '--resources={"engine_ray":100}', "--block"]
+    environment: *ray-env
+    networks: [dpray]
+
+  ray-worker:
+    image: dp-ray:local
+    depends_on: [ray-head]
+    command: ["ray", "start", "--address=ray-head:6379", "--num-cpus=2", '--resources={"engine_ray":100}', "--block"]
+    environment: *ray-env
+    networks: [dpray]
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: dpminio
+      MINIO_ROOT_PASSWORD: dpminio123
+    networks: [dpray]
+
+  createbucket:
+    image: minio/mc
+    depends_on: [minio]
+    entrypoint: ["/bin/sh", "-c", "until mc alias set m http://minio:9000 dpminio dpminio123; do sleep 1; done; mc mb -p m/dpray; exit 0"]
+    networks: [dpray]
+
+  driver:
+    image: dp-ray:local
+    depends_on:
+      ray-head: { condition: service_started }
+      createbucket: { condition: service_completed_successfully }
+    working_dir: /app/kernel
+    environment:
+      <<: *ray-env
+      RAY_ADDRESS: "auto"                 # connect to the LOCAL raylet after joining the cluster below
+      DP_TEST_RAY_LIVE: "1"
+      DP_RAY_SHUFFLE_PARTITIONS: "4"
+      DP_S3_ENDPOINT: "http://minio:9000"
+      DP_S3_KEY: "dpminio"
+      DP_S3_SECRET: "dpminio123"
+      DP_S3_BUCKET: "dpray"
+    # JOIN the cluster as a node (so ray.init(address=auto) connects locally — an external, non-node
+    # process can't attach by GCS address), then run the multi-node byte-identical differential.
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ray start --address=ray-head:6379 --num-cpus=2 && python /app/kernel/hub/ray_multinode_check.py; rc=$?; ray stop >/dev/null 2>&1; exit $rc"]
+    volumes:
+      - ./kernel/hub/ray_multinode_check.py:/app/kernel/hub/ray_multinode_check.py:ro
+    networks: [dpray]
+
+networks:
+  dpray: {}

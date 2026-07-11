@@ -1,0 +1,38 @@
+# MinIO object store + a bucket-create Job for the KubeRay multi-node validation (deploy/kuberay/README).
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: minio }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: minio } }
+  template:
+    metadata: { labels: { app: minio } }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - { name: MINIO_ROOT_USER, value: dpminio }
+            - { name: MINIO_ROOT_PASSWORD, value: dpminio123 }
+          ports: [{ containerPort: 9000 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: minio }
+spec:
+  selector: { app: minio }
+  ports: [{ port: 9000, targetPort: 9000 }]
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: dp-ray-createbucket }
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc
+          command: ["/bin/sh", "-c", "until mc alias set m http://minio:9000 dpminio dpminio123; do sleep 2; done; mc mb -p m/dpray; exit 0"]
