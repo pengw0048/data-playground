@@ -501,7 +501,10 @@ class RunController:
                     edges.append(GraphEdge(id=f"__e_{rid}_{nid}_{e.target_handle or 'in'}", source=rid,
                                            target=nid, source_handle=None, target_handle=e.target_handle,
                                            data=GraphEdgeData()))
-        return Graph(id="_region", version=1, nodes=nodes, edges=edges)
+        # carry the canvas's requirements so a region's cache key reflects a package-version edit
+        # (a transform in a locally-run region can import them) — plan_hash folds them (P0-CACHE-01).
+        return Graph(id="_region", version=1, nodes=nodes, edges=edges,
+                     requirements=getattr(graph, "requirements", None) or [])
 
     # -- status / cancel (a logical run, keyed by the overall run_id) ------- #
     def _mark(self, status: RunStatus, region, state: str) -> None:
