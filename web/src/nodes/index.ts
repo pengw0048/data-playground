@@ -3,8 +3,10 @@
 import type { ComponentType } from 'react'
 import { allSpecs, getComponent } from './registry'
 
-// eager side-effect imports — every kind + capability registers on load
-import.meta.glob('./kinds/*.tsx', { eager: true })
+// eager side-effect imports — every kind + capability registers on load.
+// Exclude colocated *.test.tsx: they pull in vitest (vi.mock at module top level), which is
+// forbidden outside the test runner and would crash the SPA at load if bundled into production.
+import.meta.glob(['./kinds/*.tsx', '!./kinds/*.test.tsx'], { eager: true })
 import './capabilities'
 
 /** React Flow nodeTypes map, derived from the registry. */

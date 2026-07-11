@@ -85,6 +85,11 @@ class LocalProcessSpawner:
              "--canvas", canvas_id, "--kernel-id", kernel_id, "--token", token,
              "--workspace", self.workspace, "--data-dir", self.data_dir, "--port", str(port)],
             env=_kernel_child_env(),  # keep the forgeable signing secret out of the child (P0-SEC-01)
+            # Detach stdio: a DETACHED kernel that inherits the hub's stdout/stderr keeps those handles
+            # open after the hub exits, so anything reading the hub's stream to EOF (a supervisor, or
+            # Playwright's `webServer` teardown) blocks forever on the orphan. The kernel's real output
+            # is the shared DB (run_states) + its HTTP port, never stdout — so point stdio at /dev/null.
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True)  # own process group → a hub SIGTERM/exit doesn't take it down
 
     def kill(self, canvas_id: str, kernel_id: str) -> None:

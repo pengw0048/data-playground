@@ -52,10 +52,12 @@ def _run_mcp(argv: list[str]) -> None:
     _prepare_workspace(args.workspace, args.data_dir, args.seed)
 
     from hub.deps import set_workspace
-    from hub import mcp
-    # Build deps (plugin discovery prints to stdout) BEFORE the stdio loop, with stdout diverted to
-    # stderr so none of it lands on the protocol channel.
+    from hub import mcp, metadb
+    # Migrate the metadata DB BEFORE set_workspace builds deps + seeds the catalog, so the seed's
+    # catalog_entries write-throughs land instead of failing against a not-yet-created schema (which
+    # would drop the seeded datasets on first read). build_server's init_db then no-ops.
     with contextlib.redirect_stdout(sys.stderr):
+        metadb.init_db()
         set_workspace(os.environ["DP_WORKSPACE"], os.environ["DP_DATA_DIR"])
         server = mcp.build_server(base_url=args.base_url, user_id=args.user)
     print("Data Playground MCP server ready (stdio).", file=sys.stderr)
@@ -104,6 +106,12 @@ def main() -> None:
         if seed_if_empty(data_dir):
             print(f"seeded sample datasets → {data_dir}")
 
+    # Migrate the metadata DB BEFORE building deps. set_workspace eagerly constructs Deps, which seeds
+    # the catalog and write-throughs each seeded dataset to catalog_entries; if the schema isn't there
+    # yet those writes fail and the seed is silently dropped on the first catalog read (hub.main's own
+    # init_db at import runs too late — after the seed). Idempotent: hub.main re-runs it harmlessly.
+    from hub import metadb
+    metadb.init_db()
     # configure the workspace BEFORE the app imports/builds deps (get_deps is lazy)
     from hub.deps import set_workspace
     set_workspace(workspace, data_dir)
