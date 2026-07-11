@@ -4448,6 +4448,21 @@ def test_boundary_tier_is_local_for_default_handoff_object_for_remote():
         os.environ.pop("DP_STORAGE_URL", None) if old is None else os.environ.__setitem__("DP_STORAGE_URL", old)
 
 
+def test_materialize_refuses_a_handoff_with_no_shared_tier(monkeypatch):
+    # dist-refuse-split-no-tier: when a region hands off to a backend with NO shared reachable tier,
+    # materializing to local would silently route data to a dead end (a remote backend can't read it).
+    # The controller now FAILS FAST with an actionable message instead of the old warn-and-use-local.
+    from hub.models import Graph, ResourceSpec
+    from hub.planner import Region
+    d = get_deps()
+    g = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": _uri("events")})], "edges": []})
+    region = Region(id="r", node_ids={"s"}, output_node="s", backend="default", worker=None,
+                    requires=ResourceSpec(), cut_inputs=[])
+    monkeypatch.setattr(d.controller, "_boundary_tier", lambda *a, **k: None)  # simulate no shared tier
+    with pytest.raises(RuntimeError, match="no storage tier reachable"):
+        d.controller._materialize("run_x", g, region, {}, [region])
+
+
 def test_declared_keys_and_relationships_are_independent_rows():
     # #9 fix: each declared key / relationship is its OWN DB row (not one shared JSON blob), so setting
     # one never rewrites/clobbers another — the mechanism that stops cross-instance lost updates.

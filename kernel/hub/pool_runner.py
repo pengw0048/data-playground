@@ -51,6 +51,13 @@ class PoolRunner(SubprocessRunner):
                                                 labels=w.get("labels") or {})
         self._assigned: dict[str, str] = {}  # run_id -> worker id (advisory busy tracking)
 
+    def reachable_tiers(self) -> tuple:
+        # a pool "worker" is a LOCAL subprocess sharing the host filesystem, so it reaches the LOCAL tier
+        # (a same-host handoff needs no object store) — plus a configured object store. Without this, the
+        # default assumption for a named backend is "object only", which would wrongly refuse a valid
+        # local pool handoff once the controller fails fast on a no-shared-tier boundary.
+        return ("local", "object")
+
     def workers(self) -> list[WorkerInfo]:
         busy = set(self._assigned.values())
         return [WorkerInfo(id=wid, capacity=cap, state="busy" if wid in busy else "idle")

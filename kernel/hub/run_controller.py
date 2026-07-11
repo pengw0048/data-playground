@@ -371,12 +371,15 @@ class RunController:
         subg = self._subgraph(graph, region, ref_uri)
         key = self.base._plan_hash(subg, region.output_node)
         picked = self._boundary_tier(region, regions or [])
-        tier = picked or tier_mod.Tier("local", os.path.join(self.deps.workspace, "regions"), 0)
-        if picked is None:  # remote handoff with no object store configured → local + a warning
-            import logging
-            logging.getLogger("hub").warning(
-                "region handoff: no shared tier reachable by producer+consumer — using local (a remote "
-                "backend will not see it; set DP_STORAGE_URL to a shared object store)")
+        if picked is None:
+            # A remote handoff with NO shared tier: materializing to local would silently produce a result
+            # the consuming (remote) backend cannot read — a wrong run dressed up as success. Fail fast with
+            # the fix, instead of the old warn-and-use-local (which routed data to a dead end).
+            raise RuntimeError(
+                f"region '{region.output_node}' hands off to a backend with no storage tier reachable by "
+                "both sides — a remote backend can't see a local file. Configure a shared object store "
+                "(DP_STORAGE_URL=s3://…) or keep the producing and consuming nodes on one backend.")
+        tier = picked
         ckey = f"{key}@{tier.name}"  # tier in the cache key: a local vs object copy are distinct entries
         cached = self.base._cache_get(ckey)
         if cached and cached.get("uri") and self.base._output_exists(cached["uri"]):
