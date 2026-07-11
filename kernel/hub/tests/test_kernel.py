@@ -3526,6 +3526,25 @@ def test_run_controller_executes_checkpointed_regions(tmp_path):
     assert out["rowCount"] == 400  # v in [100, 500) → 400 rows, split across two regions
 
 
+def test_default_region_runs_isolated_when_kernel_is_selected():
+    # P0-EXEC-01: a multi-region run's DEFAULT (unplaced) region must NOT execute in the hub PID when the
+    # per-canvas kernel is the selected backend — it routes to the isolated, deadline-bounded, sandboxed
+    # child (hub.subprocess_runner). Only an explicit in-process (local-out-of-core) selection keeps the base.
+    from hub import metadb
+    from hub.models import ResourceSpec
+    from hub.planner import Region
+    d = get_deps()
+    region = Region(id="r", node_ids={"a"}, output_node="a", backend="default", worker=None,
+                    requires=ResourceSpec(), cut_inputs=[])
+    metadb.set_setting("backend", "kernel", scope="global")
+    try:
+        assert d.controller._backend_runner(region).name == "local-subprocess"  # isolated, not the hub PID
+        metadb.set_setting("backend", "local-out-of-core", scope="global")
+        assert d.controller._backend_runner(region) is d.runner                  # explicit in-process wins
+    finally:
+        metadb.set_setting("backend", "", scope="global")  # restore the suite default
+
+
 def test_run_controller_places_a_region_on_a_pool_worker(tmp_path, monkeypatch):
     # C3: a GPU-requiring transform in the middle physically runs in the pool WORKER's process
     # (subprocess run_unit), the rest on the default backend; the joined result is correct.
@@ -4585,7 +4604,7 @@ def test_parallel_regions_run_independent_regions_concurrently(monkeypatch):
     ctrl._cancel[rid] = _th.Event()
     inflight, peak, lock = [0], [0], _th.Lock()
 
-    def fake_mat(run_id, graph, region, ref_uri, regions=None):
+    def fake_mat(run_id, graph, region, ref_uri, regions=None, uid=None):
         with lock:
             inflight[0] += 1
             peak[0] = max(peak[0], inflight[0])

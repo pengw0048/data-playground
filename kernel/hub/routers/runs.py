@@ -345,7 +345,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         raise RunNeedsConfirm(est)
     # a run that splits across placement regions (a placed node / checkpoint / fan-out) is owned by the
     # RunController; a single default region returns None → the base runner, exactly as before.
-    overall = deps.controller.run(graph, target_node_id)
+    overall = deps.controller.run(graph, target_node_id, uid)
     if overall is not None:
         status, owner = overall, deps.controller
     else:

@@ -208,9 +208,10 @@ class RunController:
         return total
 
     # -- orchestration ----------------------------------------------------- #
-    def run(self, graph: Graph, target: str | None) -> RunStatus | None:
+    def run(self, graph: Graph, target: str | None, uid: str | None = None) -> RunStatus | None:
         """Start a multi-region run; return None if the graph is a single default region (caller uses
-        the base runner unchanged)."""
+        the base runner unchanged). `uid` carries the caller so a per-user backend preference routes
+        default regions to the isolated child too (P0-EXEC-01), not just the global default."""
         regions = self.plan(graph, target)
         if len(regions) <= 1 and (not regions or regions[0].backend == "default"):
             return None
@@ -227,7 +228,7 @@ class RunController:
             self._cancel[run_id] = threading.Event()
             self._evict()
         self._emit(graph, status)
-        threading.Thread(target=self._orchestrate, args=(run_id, graph, target, regions), daemon=True).start()
+        threading.Thread(target=self._orchestrate, args=(run_id, graph, target, regions, uid), daemon=True).start()
         return status
 
     def _evict(self) -> None:
@@ -245,7 +246,7 @@ class RunController:
             self._cancel.pop(victim, None)
             self._sub.pop(victim, None)
 
-    def _orchestrate(self, run_id: str, graph: Graph, target: str, regions) -> None:
+    def _orchestrate(self, run_id: str, graph: Graph, target: str, regions, uid: str | None = None) -> None:
         status = self.runs[run_id]
         cancel = self._cancel[run_id]
         status.status = "running"
@@ -281,7 +282,7 @@ class RunController:
                         self._mark(status, r, "running")  # status mutated only on THIS thread
                         with ref_lock:
                             snap = dict(ref_uri)  # a per-region snapshot → _materialize reads never race a write
-                        inflight[ex.submit(self._materialize, run_id, graph, r, snap, regions)] = r
+                        inflight[ex.submit(self._materialize, run_id, graph, r, snap, regions, uid)] = r
                     if not inflight:
                         break  # nothing ready and nothing running → an unsatisfiable dep (defensive; topo rules it out)
                     for fut in cf.wait(list(inflight), return_when=cf.FIRST_COMPLETED).done:
@@ -301,7 +302,7 @@ class RunController:
             # the FINAL (target) region, now that every upstream region it reads is materialized
             region = final_region
             self._mark(status, region, "running")
-            sub = self._run_final(run_id, graph, region, ref_uri)
+            sub = self._run_final(run_id, graph, region, ref_uri, uid)
             status.output_uri, status.output_table = sub.output_uri, sub.output_table
             status.rows_processed = sub.rows_processed
             if sub.status != "done":
@@ -365,10 +366,19 @@ class RunController:
             return False
         return not any(nm[nid].type == "write" and nid != target for r in regions for nid in r.node_ids)
 
-    def _backend_runner(self, region):
-        """The runner that executes a region: the in-process base for 'default', else the named backend
-        (a pool / pod / Ray runner) — so a PLACED region physically runs on its worker (C3)."""
+    def _backend_runner(self, region, uid: str | None = None):
+        """The runner that executes a region: for a 'default' (unplaced) region, the isolated child the
+        kernel uses when the kernel is the selected backend — else the in-process base; for a named
+        region, that backend (pool / pod / Ray) so a PLACED region physically runs on its worker (C3).
+        `uid` honors a per-user backend preference on the execution path (tier callers pass none = the
+        global/default selection, which is fine — tier reachability is identical for base vs subprocess)."""
         if region.backend == "default":
+            # P0-EXEC-01: don't run a default region's user code / heavy ops in the HUB pid when the
+            # per-canvas kernel is selected — route it to the SAME killable, deadline-bounded, sandboxed
+            # child (local-subprocess) a single-region kernel run uses. An explicit in-process selection
+            # (local-out-of-core) or a pool/Ray default keeps the base, unchanged.
+            if self.deps.chosen_backend(uid) == "kernel":
+                return next((r for r in self.deps.runners if r.name == "local-subprocess"), self.base)
             return self.base
         return next((r for r in self.deps.runners if r.name == region.backend), self.base)
 
@@ -407,7 +417,7 @@ class RunController:
             # scan handles both (local isdir → dir-scan, object prefix → glob); consolidate into dst.
             self.deps.resolve_adapter(src_uri).scan(src_uri).write_parquet(dst_uri)
 
-    def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], regions=None) -> str:
+    def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], regions=None, uid: str | None = None) -> str:
         """Materialize an intermediate region's output to a durable, content-addressed parquet — reused
         across runs when the region's plan hash is unchanged. Runs in-process for a default region, or
         in the target worker's PROCESS for a placed region (C3). The output lands on the tier reachable
@@ -446,7 +456,7 @@ class RunController:
             os.makedirs(tier.prefix, exist_ok=True)
             self._prune_regions(tier.prefix)  # bound the LOCAL handoff dir (coarse GC; TTL/refcount later)
         out_uri = tier.uri(f"{region.id}_{key}.parquet")
-        backend = self._backend_runner(region)
+        backend = self._backend_runner(region, uid)
         result_uri = out_uri
         if backend is self.base:
             with db.run_scope():
@@ -468,12 +478,12 @@ class RunController:
         self.base._cache_put(ckey, {"uri": result_uri, "table": region.id, "rows": None})
         return result_uri
 
-    def _run_final(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str]) -> RunStatus:
+    def _run_final(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], uid: str | None = None) -> RunStatus:
         """Run the final (target) region over the reduced graph, waiting for it — on the base runner
         (default) or on the region's target backend (a placed final region), so writes commit normally."""
         subg = self._subgraph(graph, region, ref_uri)
         plan = compiler.compile_plan(subg, region.output_node, self.deps.registry, self.deps.node_specs, self.deps.node_ir)
-        backend = self._backend_runner(region)
+        backend = self._backend_runner(region, uid)
         sub = backend.run(plan, subg, region.output_node, "local")
         with self._lock:
             self._sub[run_id] = (backend, sub.run_id)
