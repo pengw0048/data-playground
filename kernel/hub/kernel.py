@@ -34,6 +34,15 @@ class PreviewBody(BaseModel):
     full: bool = False   # profile only: whole-dataset stats (full pass) instead of the sample
 
 
+def _liveness_busy(inflight_count: int, runs) -> bool:
+    """The idle-TTL watchdog treats the kernel as BUSY while an in-process preview/profile is in flight
+    (`inflight_count`) OR any offloaded run is queued/running. In-process preview/profile don't appear in
+    `runs` (only offloaded /run does), so without the inflight term a full-dataset profile longer than the
+    idle-ttl would be recycled out from under itself. Module-level + pure so it's unit-testable."""
+    return inflight_count > 0 or any(
+        getattr(s, "status", None) in ("queued", "running") for s in runs.values())
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="hub.kernel")
     p.add_argument("--canvas", required=True)
@@ -55,7 +64,7 @@ def main() -> None:
 
     import threading
     import time
-    from contextlib import asynccontextmanager
+    from contextlib import asynccontextmanager, contextmanager
 
     import uvicorn
     from fastapi import FastAPI, Header, HTTPException
@@ -84,6 +93,24 @@ def main() -> None:
         st.run_id, st.model_dump(), canvas_id=getattr(g, "id", None), kernel_id=kid)
 
     last_activity = [time.monotonic()]
+    # in-process preview/profile run IN this kernel (not offloaded to a child), so — unlike /run — they
+    # don't show up in run_runner.runs. Count them explicitly so the idle-TTL watchdog treats the kernel
+    # as BUSY for the WHOLE duration of a long full-dataset profile, not just the instant it started
+    # (else a profile longer than idle-ttl gets its warm kernel recycled out from under it).
+    _inflight = [0]
+    _inflight_lock = threading.Lock()
+
+    @contextmanager
+    def _inflight_work():
+        with _inflight_lock:
+            _inflight[0] += 1
+        last_activity[0] = time.monotonic()
+        try:
+            yield
+        finally:
+            with _inflight_lock:
+                _inflight[0] -= 1
+            last_activity[0] = time.monotonic()  # restart the idle clock from completion, not from start
 
     def _auth(tok: str | None) -> None:
         if tok != token:
@@ -118,7 +145,7 @@ def main() -> None:
             time.sleep(5.0)
             if not metadb.heartbeat_kernel(canvas, kid):
                 os._exit(0)  # fenced out — a newer kernel took over this canvas
-            busy = any(s.status in ("queued", "running") for s in run_runner.runs.values())
+            busy = _liveness_busy(_inflight[0], run_runner.runs)
             if busy:
                 last_activity[0] = time.monotonic()
             elif time.monotonic() - last_activity[0] > args.idle_ttl:
@@ -155,22 +182,22 @@ def main() -> None:
     @app.post("/preview")
     def preview(body: PreviewBody, x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)
-        last_activity[0] = time.monotonic()
         from hub.executors.preview import preview_node
         graph = Graph(**body.graph)
         _ensure_deps(graph)
-        return preview_node(graph, body.node_id, body.k, deps.resolve_adapter,
-                            deps.registry, deps.node_builders, deps.node_specs, offset=body.offset, cache=warm).model_dump()
+        with _inflight_work():
+            return preview_node(graph, body.node_id, body.k, deps.resolve_adapter,
+                                deps.registry, deps.node_builders, deps.node_specs, offset=body.offset, cache=warm).model_dump()
 
     @app.post("/profile")
     def profile(body: PreviewBody, x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)
-        last_activity[0] = time.monotonic()
         from hub.executors.profile import profile_node
         graph = Graph(**body.graph)
         _ensure_deps(graph)
-        return profile_node(graph, body.node_id, deps.resolve_adapter, deps.registry,
-                            deps.node_builders, deps.node_specs, cache=warm, full=body.full).model_dump()
+        with _inflight_work():
+            return profile_node(graph, body.node_id, deps.resolve_adapter, deps.registry,
+                                deps.node_builders, deps.node_specs, cache=warm, full=body.full).model_dump()
 
     @app.post("/cancel")
     def cancel(body: dict, x_dp_kernel_token: str = Header(None)):
