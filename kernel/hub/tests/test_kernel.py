@@ -4536,6 +4536,7 @@ def test_sql_fs_sandbox_confines_reads_in_auth_mode(monkeypatch, tmp_path):
     from hub import db
     monkeypatch.setenv("DP_AUTH_SECRET", "x" * 40)          # auth on
     monkeypatch.setenv("DP_DATASET_ROOTS", str(tmp_path))   # allowed root
+    monkeypatch.delenv("DP_STORAGE_URL", raising=False)     # no object store → the FS sandbox must apply
     inside = tmp_path / "ok.csv"
     inside.write_text("a\n1\n")
     outside_dir = tempfile.mkdtemp()                        # a dir NOT under any allowed root
@@ -4547,6 +4548,19 @@ def test_sql_fs_sandbox_confines_reads_in_auth_mode(monkeypatch, tmp_path):
     assert c.execute(f"SELECT count(*) FROM read_csv('{inside}')").fetchone()[0] == 1  # inside a root: OK
     with pytest.raises(Exception):
         c.execute(f"SELECT count(*) FROM read_csv('{outside}')").fetchall()            # outside: blocked
+
+
+def test_object_store_via_env_keeps_external_access_enabled(monkeypatch):
+    # P0-STOR-01: auth ON + DP_STORAGE_URL=s3:// (object store via env, creds from the AWS chain, no DB
+    # objectStore setting) must NOT disable external access — else ensure_object_store()'s httpfs load +
+    # s3 read/write fail closed. The object store wins over the FS sandbox (external access stays on).
+    import duckdb
+    from hub import db
+    monkeypatch.setenv("DP_AUTH_SECRET", "x" * 40)            # auth on
+    monkeypatch.setenv("DP_STORAGE_URL", "s3://bucket/out")   # object store via env, no DB setting
+    c = duckdb.connect(":memory:")
+    db._maybe_sandbox_fs(c)
+    assert c.execute("SELECT current_setting('enable_external_access')").fetchone()[0] is True
 
 
 def test_catalog_missing_flag_and_unregister(tmp_path):
