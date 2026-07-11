@@ -60,7 +60,10 @@ _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", "
 # carries DuckDB's exact schema, and the only thing parsed is the shuffle KEY (bare columns). `aggregate`
 # = a GROUPED aggregate; a global aggregate (no key) is cheap + falls back to the single-node engine.
 # `window` = a PARTITION BY window (shuffle by the partition key → DuckDB window per complete partition).
-RAY_RELATIONAL = frozenset({"aggregate", "window"})
+# `dedup` = full-row DISTINCT (shuffle by ALL columns → DuckDB DISTINCT; identical rows colocate). A
+# keyed DISTINCT ON keeps the first row in an arbitrary order (non-deterministic even single-node) → it
+# needs an explicit order key before it's reproducible, so it falls back to the single-node engine.
+RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup"})
 
 
 def _ray_opts(requires: dict | None) -> dict:
@@ -229,6 +232,8 @@ class RayRunner:
                 return False  # None (expression key) or [] (global) → not shuffle-distributable
             if s.op == "window" and not parse_group_keys(s.config.get("partitionBy", "")):
                 return False  # a window needs a bare-column PARTITION BY to be the shuffle key
+            if s.op == "dedup" and (s.config.get("on") or "").strip():
+                return False  # only full-row DISTINCT distributes; keyed DISTINCT ON is order-dependent
         return True
 
     def run(self, plan, graph, target_node_id, placement, run_id=None) -> RunStatus:
@@ -431,6 +436,11 @@ class RayRunner:
             return self._build_aggregate(step, parent)
         if step.op == "window":
             return self._build_window(step, parent)
+        if step.op == "dedup":
+            # full-row DISTINCT: shuffle by ALL columns so identical rows colocate in one partition, then
+            # DuckDB DISTINCT per partition. Every surviving row is identical to the dups it replaces, so
+            # the result is deterministic + byte-identical (unlike keyed DISTINCT ON — gated out above).
+            return self._shuffle_duckdb(parent, list(parent.columns()), "SELECT DISTINCT * FROM _blk")
         raise RuntimeError(f"ray backend reached a non-clean op '{step.op}' (should have fallen back)")
 
     def _shuffle_duckdb(self, parent, keys, sql):

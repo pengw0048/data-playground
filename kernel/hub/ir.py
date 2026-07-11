@@ -39,7 +39,7 @@ CLEAN_OPS = {"read", "write", "passthrough"} | CLEAN_TRANSFORM_MODES
 # is an enumeration, NOT a global gate flip: capability is decided per-backend by passing its own subset
 # to plan_is_distributable, so the DuckDB fallback stays authoritative for everything a backend can't yet
 # run byte-identically. (ARC3 grows this as each op is validated on a real cluster.)
-DISTRIBUTABLE_RELATIONAL = frozenset({"aggregate", "window"})
+DISTRIBUTABLE_RELATIONAL = frozenset({"aggregate", "window", "dedup"})
 
 # A distributed backend runs relational ops by SHUFFLING on a key (Ray) then computing with DuckDB per
 # partition (see dp_ray) — so the only thing it parses is the shuffle KEY, not the operation. This keeps
