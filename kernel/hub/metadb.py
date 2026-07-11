@@ -113,6 +113,8 @@ class RunState(Base):
     status: Mapped[str] = mapped_column(String, index=True)  # queued | running | done | failed | cancelled
     doc: Mapped[str] = mapped_column(Text)  # the full RunStatus as JSON
     kernel_id: Mapped[str | None] = mapped_column(String, nullable=True)  # owning kernel (None = in-process/subprocess run, dies with the hub)
+    created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # the run's creator uid (durable owner, for authz)
+    auth_canvas_id: Mapped[str | None] = mapped_column(String, nullable=True)  # the real canvas it was authorized against (None = ad-hoc)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
@@ -370,6 +372,42 @@ def canvas_role(canvas_id: str, uid: str) -> str | None:
         return None
 
 
+def canvas_exists(canvas_id: str) -> bool:
+    """True if a canvas row exists (regardless of who can reach it). Used to tell an authorized run
+    against a real canvas apart from an ad-hoc, never-saved graph id."""
+    with session() as s:
+        return s.get(Canvas, canvas_id) is not None
+
+
+def run_canvas_id(run_id: str) -> str | None:
+    """The canvas a run was launched against (from its persisted run_state), or None if the run is
+    unknown / was an ad-hoc graph. This is the DB-backed owner signal for run-object authorization."""
+    with session() as s:
+        r = s.get(RunState, run_id)
+        return r.canvas_id if r else None
+
+
+def bind_run_owner(run_id: str, uid: str, auth_canvas_id: str | None) -> None:
+    """Persist a run's creator (authoritative, unspoofable owner) and the real canvas it was authorized
+    against (None for an ad-hoc graph). Upserts so it works whether the run_state row exists yet."""
+    with session() as s:
+        r = s.get(RunState, run_id)
+        if r is None:
+            s.add(RunState(run_id=run_id, canvas_id=auth_canvas_id, status="queued", doc="{}",
+                           created_by=uid, auth_canvas_id=auth_canvas_id))
+        else:
+            r.created_by = uid
+            r.auth_canvas_id = auth_canvas_id
+
+
+def run_auth(run_id: str) -> tuple[str | None, str | None]:
+    """(creator uid, authorized real-canvas id) for a run, or (None, None) if unknown / a legacy run
+    persisted before these columns existed."""
+    with session() as s:
+        r = s.get(RunState, run_id)
+        return (r.created_by, r.auth_canvas_id) if r else (None, None)
+
+
 def share_canvas(canvas_id: str, user_id: str, role: str = "editor") -> None:
     if role not in SHARE_ROLES:  # reject 'owner' or any junk at the write boundary, not just the API layer
         raise ValueError(f"invalid share role {role!r}; must be one of {SHARE_ROLES}")
@@ -452,6 +490,11 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             s.delete(r)
         for v in s.scalars(select(CanvasVersion).where(CanvasVersion.canvas_id == canvas_id)):
             s.delete(v)
+        # also drop this canvas's run_states — else auth_canvas_id/canvas_id dangle into a reusable id
+        # namespace and a later canvas re-created under the same id could re-grant its old runs (P0-AUTH-02)
+        for rs in s.scalars(select(RunState).where(
+                (RunState.canvas_id == canvas_id) | (RunState.auth_canvas_id == canvas_id))):
+            s.delete(rs)
         c = s.get(Canvas, canvas_id)
         if c:
             s.delete(c)
