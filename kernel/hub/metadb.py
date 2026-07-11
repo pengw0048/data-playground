@@ -291,6 +291,26 @@ def session():
         s.close()
 
 
+def ping(timeout_s: float = 3.0) -> bool:
+    """True if the metadata DB answers a trivial query within the budget — the readiness probe's DB check.
+    A timeout/failure (DB down, connection pool exhausted, migrations never ran) returns False."""
+    import threading
+    from sqlalchemy import text
+    ok: list[bool] = []
+
+    def _q() -> None:
+        try:
+            with session() as s:
+                s.execute(text("SELECT 1"))
+            ok.append(True)
+        except Exception:  # noqa: BLE001 — any failure = not-ready
+            pass
+    t = threading.Thread(target=_q, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    return bool(ok)
+
+
 def is_admin(user_id: str | None) -> bool:
     """Whether this user may change instance-wide config (global settings, user management)."""
     if not user_id:
