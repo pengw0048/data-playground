@@ -5628,6 +5628,66 @@ def test_ray_aggregate_live_differential(tmp_path):
         assert abs((rr_[7] or 0.0) - (dr[7] or 0.0)) <= 1e-9 * max(1.0, abs(dr[7] or 0.0)), f"stddev tol cat={k}"
 
 
+def test_ray_aggregate_float_nan_and_allnull_parity(tmp_path):
+    # P0-DIST-01: the audit found Ray's NATIVE Min/Max aggregators diverged from DuckDB on FLOAT columns
+    # (NaN treated as largest by DuckDB but skipped by Ray; signed-zero not preserved) and lost the type
+    # on an all-null column. The backend now hash-shuffles by the group key and runs DuckDB GROUP BY per
+    # COMPLETE partition, so min/max are computed by DuckDB — byte-identical by construction. Prove it on
+    # the exact divergent fixtures, comparing VALUES (NaN-safe via a string cast) AND schema.
+    if not os.environ.get("DP_TEST_RAY_LIVE"):
+        pytest.skip("set DP_TEST_RAY_LIVE=1 to run the live-Ray float/null aggregate parity differential")
+    import time
+
+    import duckdb
+
+    from hub import db
+    from hub.deps import Deps
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+    os.environ["DP_RAY_SHUFFLE_PARTITIONS"] = "4"
+    p = str(tmp_path / "floats.parquet")
+    # group g; f is DOUBLE with NaN, -0.0/+0.0, and normal values; an all-null DOUBLE column `an`
+    duckdb.connect().execute(
+        "COPY (SELECT * FROM (VALUES "
+        "(0, 'nan'::DOUBLE, NULL::DOUBLE), (0, 1.0, NULL), (0, 2.0, NULL), "
+        "(1, '-0.0'::DOUBLE, NULL), (1, '0.0'::DOUBLE, NULL), "
+        "(2, -5.0, NULL), (2, 'nan'::DOUBLE, NULL)) t(g, f, an)) "
+        f"TO '{p}' (FORMAT PARQUET)")
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+    g = Graph(**{"id": "c", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": p}),
+        _ray_node("a", "aggregate", {"groupBy": "g", "aggs": "min(f) AS lo, max(f) AS hi, "
+                                     "min(an) AS anlo, max(an) AS anhi"}),
+    ], "edges": [_ray_edge("src", "a")]})
+    st = rr.run_unit(g, "a", str(tmp_path / "f_out.parquet"))
+    for _ in range(900):
+        if rr.status(st.run_id).status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.1)
+    st = rr.status(st.run_id)
+    assert st.status == "done", st.error
+    with db.run_scope():
+        oracle = BuildEngine(g, deps.resolve_adapter, deps.registry, full=True,
+                             node_specs=deps.node_specs, output_node="a").relation("a").to_arrow_table()
+    con = duckdb.connect()
+    con.register("oracle", oracle)
+    ray_src = f"read_parquet('{st.output_uri}/**/*.parquet', union_by_name=true)"
+    # cast the floats to VARCHAR so NaN ('nan') and signed zero ('-0.0'/'0.0') compare faithfully
+    q = ("SELECT g, CAST(lo AS VARCHAR), CAST(hi AS VARCHAR), "
+         "CAST(anlo AS VARCHAR), CAST(anhi AS VARCHAR) FROM {src}")
+    rmap = {r[0]: r for r in con.execute(q.format(src=ray_src)).fetchall()}
+    dmap = {r[0]: r for r in con.execute(q.format(src="oracle")).fetchall()}
+    assert set(rmap) == set(dmap) == {0, 1, 2}
+    for k in dmap:
+        assert rmap[k] == dmap[k], f"float min/max diverged for g={k}: ray={rmap[k]} duck={dmap[k]}"
+    # schema parity: the all-null column keeps DuckDB's DOUBLE type on both sides (not an untyped null)
+    rsch = con.execute(f"SELECT anlo, anhi FROM {ray_src} LIMIT 0").description
+    osch = con.execute("SELECT anlo, anhi FROM oracle LIMIT 0").description
+    assert [c[1] for c in rsch] == [c[1] for c in osch]  # same declared column types
+
+
 def test_ray_window_live_differential(tmp_path):
     # opt-in live Ray: a distributed WINDOW (row_number PARTITION BY cat ORDER BY v) via the SAME
     # shuffle+DuckDB mechanism — hash-shuffle by the partition key so each window-partition is complete on
