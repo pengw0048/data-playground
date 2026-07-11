@@ -16,7 +16,7 @@ import json
 import os
 import uuid
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -66,8 +66,12 @@ class CanvasShare(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
     canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), index=True)
     user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), index=True)
-    role: Mapped[str] = mapped_column(String, default="editor")  # 'editor' | 'viewer'
-    __table_args__ = (UniqueConstraint("canvas_id", "user_id", name="uq_share"),)
+    role: Mapped[str] = mapped_column(String, default="editor")  # 'editor' | 'viewer' — never 'owner'
+    # keep this in lockstep with migration 0015; ownership is by Canvas.owner_id alone, never a share
+    __table_args__ = (
+        UniqueConstraint("canvas_id", "user_id", name="uq_share"),
+        CheckConstraint("role IN ('editor', 'viewer')", name="ck_share_role"),
+    )
 
 
 class RunRecord(Base):
@@ -343,6 +347,9 @@ def get_setting(key: str, scope: str = "global", scope_id: str = "", default=Non
         return json.loads(row.value) if row else default
 
 
+SHARE_ROLES = ("editor", "viewer")  # the ONLY roles a share may grant; ownership is by owner_id alone
+
+
 def canvas_role(canvas_id: str, uid: str) -> str | None:
     """The user's access to a canvas: 'owner' | 'editor' | 'viewer' | None."""
     with session() as s:
@@ -355,13 +362,17 @@ def canvas_role(canvas_id: str, uid: str) -> str | None:
             return "editor"  # any user of this instance can edit a workspace-visible canvas
         sh = s.scalar(select(CanvasShare).where(CanvasShare.canvas_id == canvas_id, CanvasShare.user_id == uid))
         if sh:
-            return sh.role
+            # a share can NEVER confer ownership — owner is decided by owner_id above. Clamp any legacy
+            # /out-of-band role (e.g. a pre-fix 'owner' row) down to 'viewer' so it can't escalate.
+            return sh.role if sh.role in SHARE_ROLES else "viewer"
         if c.visibility == "workspace_view":
             return "viewer"  # workspace-visible but read-only, unless explicitly shared as editor above
         return None
 
 
 def share_canvas(canvas_id: str, user_id: str, role: str = "editor") -> None:
+    if role not in SHARE_ROLES:  # reject 'owner' or any junk at the write boundary, not just the API layer
+        raise ValueError(f"invalid share role {role!r}; must be one of {SHARE_ROLES}")
     with session() as s:
         sh = s.scalar(select(CanvasShare).where(CanvasShare.canvas_id == canvas_id, CanvasShare.user_id == user_id))
         if sh:
