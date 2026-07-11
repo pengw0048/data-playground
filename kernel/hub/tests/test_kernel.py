@@ -1087,6 +1087,27 @@ def test_map_batches_skip_isolates_bad_rows_not_the_whole_batch():
     assert _apply_batch(arrow_fn, pa.table({"x": [0]}), "arrow", "skip", None) is None  # all-bad → nothing
 
 
+def test_batch_schema_drift_widens_safely_and_fails_loudly_not_silently():
+    # across batches a transform's output dtype can drift. The old code cast to the first batch with
+    # safe=False, SILENTLY corrupting values (e.g. an out-of-range int64 wrapped into an int32). It now
+    # casts safely: a widening passes; a lossy narrowing fails loudly instead of writing garbage.
+    import pyarrow as pa
+    from hub.executors.engine import _conform, NotPreviewable
+    # safe WIDENING int32 -> int64 (first batch was int64): keep going
+    assert _conform(pa.table({"x": pa.array([1, 2], pa.int32())}),
+                    pa.schema([("x", pa.int64())]), None).column("x").to_pylist() == [1, 2]
+    # a value that CANNOT fit the first batch's narrower type: loud, not a silent wrap
+    with pytest.raises(NotPreviewable):
+        _conform(pa.table({"x": pa.array([5_000_000_000], pa.int64())}),
+                 pa.schema([("x", pa.int32())]), None)
+    # a non-integral float can't be stored as the first batch's int without loss: loud
+    with pytest.raises(NotPreviewable):
+        _conform(pa.table({"x": pa.array([3.5])}), pa.schema([("x", pa.int64())]), None)
+    # a structurally different batch (renamed column) is drift, not a cast: loud
+    with pytest.raises(NotPreviewable):
+        _conform(pa.table({"z": [1]}), pa.schema([("x", pa.int64())]), None)
+
+
 def test_write_mode_append_builds_a_readable_directory_dataset():
     # append is REAL: it writes a directory of part files that reads back as the accumulated rows
     def append_run():

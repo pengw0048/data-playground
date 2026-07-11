@@ -677,11 +677,8 @@ class BuildEngine:
                     t = _apply_batch(fn, pa.Table.from_batches([b]), fmt, on_error, node)
                     if t is None:  # on_error='skip' dropped this batch
                         continue
-                    if tables:  # tolerate per-batch dtype drift by casting to the first (matches the spill path)
-                        try:
-                            t = t.cast(tables[0].schema)
-                        except Exception:  # noqa: BLE001
-                            t = t.cast(tables[0].schema, safe=False)
+                    if tables:  # conform each later batch to the first (safe cast; loud on lossy drift)
+                        t = _conform(t, tables[0].schema, node)
                     tables.append(t)
                 table = pa.concat_tables(tables) if tables else parent.limit(0).to_arrow_table()
                 return db.conn().from_arrow(table)
@@ -713,10 +710,7 @@ class BuildEngine:
             if writer is None:
                 writer = pq.ParquetWriter(path, tbl.schema)
             else:
-                try:
-                    tbl = tbl.cast(writer.schema)
-                except Exception:  # noqa: BLE001 — schema drift across batches; keep going best-effort
-                    tbl = tbl.cast(writer.schema, safe=False)
+                tbl = _conform(tbl, writer.schema, node)  # safe cast; loud on lossy drift (no silent corruption)
             writer.write_table(tbl)
 
         def flush():
@@ -894,6 +888,31 @@ def _run_batch(fn, table: "pa.Table", fmt: str) -> "pa.Table":
     if not isinstance(res, pd.DataFrame):
         raise TypeError(f"a pandas batch UDF must return a DataFrame, got {type(res).__name__}")
     return pa.Table.from_pandas(res, preserve_index=False)
+
+
+def _conform(tbl: "pa.Table", schema: "pa.Schema", node) -> "pa.Table":
+    """Cast a transform's output batch to the schema the FIRST batch established, with a SAFE cast — it
+    raises on a lossy narrowing (e.g. a int64 value that won't fit the first batch's int32) instead of
+    silently corrupting it. If the batch can't be safely reconciled, fail loudly and name the drift: a
+    transform must emit ONE consistent schema, and the old safe=False down-cast corrupted values the
+    preview never showed. A safe WIDENING (int32→int64) still passes."""
+    if tbl.schema.equals(schema):
+        return tbl
+    try:
+        return tbl.cast(schema)
+    except Exception as e:  # noqa: BLE001
+        try:
+            drift = ", ".join(f"{f.name}: {tbl.schema.field(f.name).type}→{f.type}" for f in schema
+                              if tbl.schema.get_field_index(f.name) >= 0
+                              and not tbl.schema.field(f.name).type.equals(f.type))
+            missing = [f.name for f in schema if tbl.schema.get_field_index(f.name) < 0]
+            extra = [f.name for f in tbl.schema if schema.get_field_index(f.name) < 0]
+            detail = "; ".join(x for x in (drift, f"missing {missing}" if missing else "",
+                                           f"extra {extra}" if extra else "") if x)
+        except Exception:  # noqa: BLE001 — never let message-building mask the real drift error
+            detail = ""
+        raise NotPreviewable(node, f"a transform batch's schema drifted from the first batch and can't be "
+                             f"safely reconciled ({detail or e}); a transform must emit one schema") from e
 
 
 def _table_to_rows(tbl: "pa.Table") -> list[dict]:
