@@ -213,9 +213,12 @@ class DuckDBAdapter:
         for ext in (".parquet", ".pq"):
             if glob.glob(os.path.join(d, f"**/*{ext}"), recursive=True):
                 return con.read_parquet(os.path.join(d, f"**/*{ext}"), union_by_name=True)
+        # csv/json parts ALSO union_by_name: appends can drift the column SET across parts (a later append
+        # adds/drops a column), and a plain positional multi-file read would misalign or error — reconcile
+        # by column name, exactly like the parquet path.
         for ext, reader in ((".csv", con.read_csv), (".tsv", con.read_csv), (".json", con.read_json)):
             if glob.glob(os.path.join(d, f"**/*{ext}"), recursive=True):
-                return reader(os.path.join(d, f"**/*{ext}"))
+                return reader(os.path.join(d, f"**/*{ext}"), union_by_name=True)
         raise ValueError(f"no parquet/csv/json files under {d}")
 
     def schema(self, uri: str) -> list[ColumnSchema]:
@@ -244,25 +247,34 @@ class DuckDBAdapter:
         low = target.lower()
         rows = int(rel.aggregate("count(*)").fetchone()[0])
         if mode == "append":
-            # append = a DIRECTORY / prefix of part files (out-of-core; the reader reads them all
-            # back via _read_dir). Only for row formats that have a directory-scan reader —
-            # parquet/csv/tsv/json; feather/arrow have no directory-scan reader.
+            # append = a DIRECTORY / prefix of part files (out-of-core; the reader reads them all back via
+            # _read_dir). Only for row formats that have a directory-scan reader — parquet/csv/tsv/json;
+            # feather/arrow have no directory-scan reader. Each part is written TRANSACTIONALLY: locally to
+            # a `.tmp-<uuid>` sibling the reader glob (`**/*.<ext>`) can't match, then os.replace'd to the
+            # committed name — so a crashed/cancelled/OOM'd append never leaves a partial part the next read
+            # would pick up. (Object stores write direct: DuckDB's httpfs upload finalizes only on the
+            # multipart Complete, so no partial object is visible — same guarantee the overwrite path uses.)
             if not low.endswith((".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson")):
                 raise NotImplementedError(f"append is only supported for parquet/csv/json outputs, not {os.path.splitext(target)[1] or 'this'}")
             base, ext = os.path.splitext(target)  # name.parquet -> prefix "name", ext ".parquet"
+            self._reject_mixed_part_format(base, ext, obj)   # a dir of csv parts + a parquet append → read
+            self._migrate_singlefile_into_dir(target, base, ext, obj)  # overwrite→append: fold prior file in
             part_name = f"part-{uuid.uuid4().hex[:12]}{ext}"
             if obj:
                 part = base.rstrip("/") + "/" + part_name
+                self._write_part(rel, part, ext)
             else:
                 os.makedirs(base, exist_ok=True)
-                part = os.path.join(base, part_name)
-            el = ext.lower()
-            if el in (".csv", ".tsv"):
-                rel.write_csv(part)
-            elif el in (".json", ".ndjson"):  # same out-of-core COPY as the overwrite path, one part file
-                rel.query("_w", f"COPY _w TO '{part.replace(chr(39), chr(39) * 2)}' (FORMAT JSON, ARRAY true)")
-            else:
-                rel.write_parquet(part)
+                final = os.path.join(base, part_name)
+                tmp = final + f".tmp-{uuid.uuid4().hex[:8]}"  # NOT matched by the reader glob until promoted
+                try:
+                    self._write_part(rel, tmp, ext)
+                    os.replace(tmp, final)                    # only a COMPLETE part ever becomes visible
+                except BaseException:
+                    import contextlib
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp)
+                    raise
             return {"uri": base, "rows": rows}
         if mode not in ("overwrite", None):
             raise NotImplementedError(f"write mode '{mode}' is not supported — use overwrite or append")
@@ -314,6 +326,76 @@ class DuckDBAdapter:
                     os.remove(wtarget)
             raise
         return {"uri": uri, "rows": rows}
+
+    # -- append part-directory helpers (transactional; row formats only) ---------------------------- #
+    @staticmethod
+    def _write_part(rel: Relation, path: str, ext: str) -> None:
+        """Write ONE append part (parquet/csv/json — the row formats _read_dir can scan back)."""
+        el = ext.lower()
+        if el in (".csv", ".tsv"):
+            rel.write_csv(path)
+        elif el in (".json", ".ndjson"):  # out-of-core COPY, ARRAY true → a top-level [] read_json reads back
+            rel.query("_w", f"COPY _w TO '{path.replace(chr(39), chr(39) * 2)}' (FORMAT JSON, ARRAY true)")
+        else:
+            rel.write_parquet(path)
+
+    _PART_FAMILY = {".pq": ".parquet", ".tsv": ".csv", ".ndjson": ".json"}  # read the same way
+
+    def _existing_part_families(self, base: str, obj: bool) -> set:
+        """The row-format families (parquet/csv/json) that already have COMMITTED parts under this
+        dir/prefix — a `.tmp-*` part in flight is ignored (it doesn't match the *.<ext> suffix)."""
+        fams: set = set()
+        exts = (".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson")
+        if obj:
+            try:
+                import pyarrow.fs as pafs
+                fs, p = object_fs(base.rstrip("/") + "/")
+                infos = fs.get_file_info(pafs.FileSelector(p, recursive=True, allow_not_found=True))
+                names = [i.path for i in infos if i.type == pafs.FileType.File]
+            except Exception:  # noqa: BLE001 — can't list → treat as empty (append proceeds)
+                names = []
+            for e in exts:
+                if any(n.endswith(e) for n in names):
+                    fams.add(self._PART_FAMILY.get(e, e))
+        else:
+            d = base.rstrip("/")
+            for e in exts:
+                if glob.glob(os.path.join(d, f"**/*{e}"), recursive=True):
+                    fams.add(self._PART_FAMILY.get(e, e))
+        return fams
+
+    def _reject_mixed_part_format(self, base: str, ext: str, obj: bool) -> None:
+        """_read_dir picks ONE format by precedence (parquet > csv > json), so mixing formats in one part
+        dir silently DROPS the non-winning parts' data on read. Reject an append whose format differs from
+        the parts already there — one format per output dataset."""
+        want = self._PART_FAMILY.get(ext.lower(), ext.lower())
+        others = self._existing_part_families(base, obj) - {want}
+        if others:
+            raise NotImplementedError(
+                f"cannot append {ext} to a dataset that already holds {sorted(others)} parts — one format per output")
+
+    def _migrate_singlefile_into_dir(self, target: str, base: str, ext: str, obj: bool) -> None:
+        """overwrite writes a single FILE (name.parquet, registered uri=name.parquet); append writes into a
+        DIRECTORY (name/, registered uri=name). Switching a write node overwrite→append repoints the catalog
+        at the dir and would ORPHAN the prior single file (a sibling of the dir, not under its prefix). Fold
+        that file in as the first part so no data is lost. No-op if there's no pre-existing single file."""
+        part = f"part-migrated-{uuid.uuid4().hex[:12]}{ext}"
+        if obj:
+            try:
+                import pyarrow.fs as pafs
+                fs, src = object_fs(target)
+                info = fs.get_file_info(src)
+                if info.type != pafs.FileType.File:
+                    return
+                _, dst = object_fs(base.rstrip("/") + "/" + part)
+                fs.move(src, dst)  # server-side; the single object becomes the first part of the dir
+            except FileNotFoundError:
+                return
+            except Exception:  # noqa: BLE001 — pafs raises its own not-found types; nothing to migrate
+                return
+        elif os.path.isfile(target):  # target == name.parquet (a file), base == name (a dir): coexist OK
+            os.makedirs(base, exist_ok=True)
+            os.replace(target, os.path.join(base, part))
 
 
 class LanceAdapter:
