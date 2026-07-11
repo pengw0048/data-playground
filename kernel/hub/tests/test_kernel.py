@@ -2272,6 +2272,28 @@ def test_lance_scan_streams_with_pushdown(tmp_path):
         lim = a.scan(p, columns=["id"], limit=5)
         assert lim.columns == ["id"] and lim.fetchall() == [(0,), (1,), (2,), (3,), (4,)]  # pushdown
         assert a.scan(p, predicate="v >= 596").fetchall() == [(298, 596), (299, 598)]
+        # ARC4 lance-mutable-pushdown: the adapter's OWN write must work (the old rel.record_batch was
+        # broken on DuckDB 1.5.x → AttributeError on every Lance write), the predicate pushes into Lance
+        # with correct filter-THEN-limit, and an unknown mode is rejected (not silently degraded to append).
+        con = db.conn()
+        wp = str(tmp_path / "w.lance")
+        a.write(wp, con.sql("SELECT CAST(i AS BIGINT) AS id, CAST(mod(i, 3) AS BIGINT) AS cat FROM range(0, 30) r(i)"), "overwrite")
+        assert a.count(wp) == 30 and a.scan(wp).aggregate("count(*)").fetchone()[0] == 30
+        assert a.scan(wp, predicate="cat = 1").aggregate("count(*)").fetchone()[0] == 10
+        assert a.scan(wp, predicate="cat = 1", limit=3).aggregate("count(*)").fetchone()[0] == 3  # filter, THEN limit
+        a.write(wp, con.sql("SELECT CAST(99 AS BIGINT) AS id, CAST(0 AS BIGINT) AS cat"), "append")
+        assert a.count(wp) == 31
+        with pytest.raises(NotImplementedError, match="not supported"):
+            a.write(wp, con.sql("SELECT CAST(1 AS BIGINT) AS id, CAST(0 AS BIGINT) AS cat"), "merge")
+        assert a.count(wp) == 31  # the rejected write did NOT append
+        # #44 review (HIGH): a DOUBLE-QUOTED identifier predicate must not be silently miscomputed by
+        # Lance's datafusion dialect (which reads "col" as a string literal) — it routes to the DuckDB
+        # fallback + returns correct rows. Use a reserved-word column that REQUIRES quoting.
+        qp = str(tmp_path / "q.lance")
+        a.write(qp, con.sql('SELECT CAST(i AS BIGINT) AS id, CAST(mod(i, 2) AS BIGINT) AS "select" FROM range(0, 10) r(i)'), "overwrite")
+        assert a.scan(qp, predicate='"select" = 1').aggregate("count(*)").fetchone()[0] == 5
+        proj = a.scan(qp, columns=["id"], predicate='"select" = 1')  # predicate on a PROJECTED-OUT column
+        assert list(proj.columns) == ["id"] and proj.aggregate("count(*)").fetchone()[0] == 5
 
 
 def test_vector_search_lance_ann_and_external_query(tmp_path):
