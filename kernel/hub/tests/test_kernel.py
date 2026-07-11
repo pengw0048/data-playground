@@ -372,6 +372,12 @@ def test_sql_join_and_window_preview_faithfully(tmp_path):
     assert sql_needs_full_input("SELECT * FROM input WHERE id IN (SELECT id - 1000 FROM input)")  # self subquery
     assert not sql_needs_full_input("SELECT input2 FROM input")          # input2 here is a COLUMN, not a table
     assert not sql_needs_full_input("WITH t AS (SELECT * FROM input) SELECT * FROM t")  # single-input CTE, faithful
+    # a statement-level ORDER BY / top-N is sorted within the prefix → unfaithful on a sample (like the
+    # sort node); a windowed / intra-aggregate ORDER BY is NOT a statement sort so it must NOT trip this:
+    assert sql_needs_full_input("SELECT id FROM input ORDER BY score DESC LIMIT 3")   # top-N
+    assert sql_needs_full_input("SELECT * FROM input ORDER BY x")                      # sorted preview
+    assert not sql_needs_full_input("SELECT * FROM input LIMIT 10")                    # a bare prefix IS faithful
+    assert not sql_needs_full_input("SELECT list(x ORDER BY x) FROM input GROUP BY k") # agg ORDER BY, not a sort
     left, right = str(tmp_path / "l.parquet"), str(tmp_path / "r.parquet")
     # matching keys live only past the 2000-row preview window of the left input
     duckdb.connect().execute(f"COPY (SELECT i AS id FROM range(0,3000) t(i)) TO '{left}' (FORMAT PARQUET)")

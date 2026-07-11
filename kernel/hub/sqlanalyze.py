@@ -102,7 +102,11 @@ def needs_full_input(q: str) -> bool:
       - a JOIN — explicit, a comma-join, a subquery-join, or a self-join — detected as >=2 references to
         the input CTEs (input/input2/…); a truncated prefix rarely matches;
       - a set operation (INTERSECT/EXCEPT/UNION) — matches/removes rows across its selects;
-      - a window function (`OVER (…)`, the named `OVER "w"`, or QUALIFY) — computed within the sample.
+      - a window function (`OVER (…)`, the named `OVER "w"`, or QUALIFY) — computed within the sample;
+      - an ORDER BY (± LIMIT) — a sorted / top-N result ordered within the 2000-row prefix would show
+        entirely different rows than the globally-ordered full run (the dedicated sort node runs full in
+        preview for exactly this reason). A windowed / intra-aggregate ORDER BY is NOT a SELECT modifier,
+        so it does not trip this.
     A column merely NAMED `input2` is a COLUMN_REF, not a BASE_TABLE, so it is correctly not counted.
     Conservative: over-flags (→ full pass), never under-flags (a silently-wrong sample is the ARC1
     faithful-preview violation this guards)."""
@@ -118,8 +122,11 @@ def needs_full_input(q: str) -> bool:
             return True
         if typ == "SET_OPERATION_NODE":
             return True
-        if typ == "SELECT_NODE" and n.get("qualify") is not None:
-            return True
+        if typ == "SELECT_NODE":
+            if n.get("qualify") is not None:
+                return True
+            if any(isinstance(m, dict) and m.get("type") == "ORDER_MODIFIER" for m in (n.get("modifiers") or [])):
+                return True  # a statement/subquery ORDER BY → sorted/top-N result, unfaithful on a prefix
         if typ == "BASE_TABLE" and _INPUT_CTE.match(str(n.get("table_name") or "")):
             input_refs += 1
             if input_refs >= 2:
