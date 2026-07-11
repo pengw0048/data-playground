@@ -144,7 +144,10 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
     NodeSpec(kind="write", title="write", category="io", tag="write",
              inputs=[_in(("dataset", "sample", "selection"))], outputs=[_out()], previewable=False,
              # filename (its extension picks the format) + destination are edited on the card / panel
-             params=[ParamSpec(name="writeMode", type="select", options=["overwrite", "append"], default="overwrite")],
+             params=[ParamSpec(name="writeMode", type="select", options=["overwrite", "append"], default="overwrite"),
+                     # comma-separated columns → a Hive-partitioned parquet directory (dir=val/…), read back
+                     # partition-pruned. Parquet + overwrite only (blank = a single file / append parts).
+                     ParamSpec(name="partitionBy", type="string", label="partition by (optional)")],
              blurb="materialize to Parquet/CSV/Lance (streaming sink)"),
     NodeSpec(kind="metric", title="metric", category="inspect", tag="metric",
              inputs=[_in()], outputs=[_out("metric", label="value")],

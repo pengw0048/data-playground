@@ -433,7 +433,9 @@ class LocalRunner:
         # persist that port's data, not the default/first one. Mirrors BuildEngine._inputs.
         parent_rel = engine.relation(inc[0].source, inc[0].source_handle)
         adapter = self.resolve_adapter(uri)
-        res = adapter.write(uri, parent_rel, mode)
+        # pass partition_by ONLY when set, so a plugin adapter whose write() lacks the kwarg is unaffected
+        pb = (cfg.get("partitionBy") or "").strip()
+        res = adapter.write(uri, parent_rel, mode, **({"partition_by": pb} if pb else {}))
         rows = int(res.get("rows") or 0)
         out_uri = res.get("uri", uri)  # append writes into a directory of parts — register THAT
 

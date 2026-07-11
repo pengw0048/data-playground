@@ -1490,6 +1490,85 @@ def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
         metadb.set_setting("objectStore", {}, "global")
 
 
+def test_partitioned_write_hive_layout_and_pruned_read(tmp_path):
+    # ARC4 write-partitioned-merge: partitionBy → a Hive dir=val/ parquet directory, read back with the
+    # partition column present + partition pruning; overwrite is clean (temp dir + swap, no stale
+    # partitions); non-parquet / append / missing-column reject.
+    import glob
+
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter
+    a = DuckDBAdapter()
+    con = db.conn()
+    with db.lock():
+        rel = con.sql("SELECT i AS id, mod(i, 3) AS cat, i * 2 AS v FROM range(0, 30) r(i)")
+        out = str(tmp_path / "parted.parquet")
+        ds = a.write(out, rel, "overwrite", partition_by="cat")["uri"]
+        assert sorted(os.path.basename(p) for p in glob.glob(os.path.join(ds, "*"))) == ["cat=0", "cat=1", "cat=2"]
+        r = a.scan(ds)
+        assert set(r.columns) == {"id", "cat", "v"}, "partition column must be present on read"
+        assert r.aggregate("count(*)").fetchone()[0] == 30
+        assert a.scan(ds, predicate="cat = 1").aggregate("count(*)").fetchone()[0] == 10  # partition-pruned read
+        # a second overwrite (fewer rows, fewer partitions) must REPLACE cleanly — no stale cat=2 left over
+        rel2 = con.sql("SELECT i AS id, mod(i, 2) AS cat, i AS v FROM range(0, 4) r(i)")
+        ds2 = a.write(out, rel2, "overwrite", partition_by="cat")["uri"]
+        assert a.scan(ds2).aggregate("count(*)").fetchone()[0] == 4
+        assert sorted(os.path.basename(p) for p in glob.glob(os.path.join(ds2, "*"))) == ["cat=0", "cat=1"]
+        # rejects
+        with pytest.raises(NotImplementedError):
+            a.write(str(tmp_path / "x.csv"), rel, "overwrite", partition_by="cat")   # parquet-only
+        with pytest.raises(NotImplementedError):
+            a.write(out, rel, "append", partition_by="cat")                          # append unsupported
+        with pytest.raises(ValueError):
+            a.write(str(tmp_path / "y.parquet"), rel, "overwrite", partition_by="nope")  # column not in data
+        # #1 regression guard: a FLAT append dir whose PATH contains a `key=val` segment must NOT get a
+        # spurious partition column — hive parsing is scoped to real key=val partition SUBDIRS.
+        eqbase = str(tmp_path / "run=abc" / "flat.parquet")
+        os.makedirs(os.path.dirname(eqbase), exist_ok=True)
+        fr = a.write(eqbase, con.sql("SELECT 1 AS id, 9 AS v"), "append")
+        frel = a.scan(fr["uri"])
+        assert "run" not in frel.columns and set(frel.columns) == {"id", "v"}, "flat dir got a spurious partition col"
+
+
+def test_partitioned_object_overwrite_is_clean(tmp_path):
+    # ARC4 #43 review #5: an object-store partitioned OVERWRITE must clear the prefix first, else a re-run
+    # whose partition set shrank leaves stale partition objects that the read merges in → wrong row count.
+    pytest.importorskip("moto")
+    pytest.importorskip("flask")
+    boto3 = pytest.importorskip("boto3")
+    from moto.server import ThreadedMotoServer
+
+    from hub import db, metadb
+    from hub.plugins.adapters import DuckDBAdapter
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    try:
+        host, port = server.get_host_and_port()
+        endpoint = f"http://{host}:{port}"
+        boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
+                     region_name="us-east-1").create_bucket(Bucket="bkt")
+        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
+                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        db._obj_store_loaded = False
+        cli = boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
+                           region_name="us-east-1")
+        a = DuckDBAdapter()
+        uri = "s3://bkt/parted.parquet"
+        with db.lock():
+            a.write(uri, db.conn().sql("SELECT i AS id, mod(i, 3) AS cat FROM range(0, 30) r(i)"), "overwrite", partition_by="cat")
+            keys1 = [o["Key"] for o in cli.list_objects_v2(Bucket="bkt", Prefix="parted/").get("Contents", [])]
+            assert any("cat=1" in k for k in keys1) and any("cat=2" in k for k in keys1)  # first write: 3 partitions
+            a.write(uri, db.conn().sql("SELECT i AS id, 0 AS cat FROM range(0, 4) r(i)"), "overwrite", partition_by="cat")
+        # the shrinking overwrite must have CLEARED the prefix — only cat=0 survives (no stale cat=1/cat=2).
+        # Verified via boto3 (not a DuckDB httpfs glob, which is flaky against moto's 0.0.0.0 endpoint).
+        keys2 = [o["Key"] for o in cli.list_objects_v2(Bucket="bkt", Prefix="parted/").get("Contents", [])]
+        data = [k for k in keys2 if k.endswith(".parquet")]  # DATA files (empty S3 dir-markers are harmless — the read globs *.parquet)
+        assert data and all("cat=0" in k for k in data), f"stale DATA partitions survived the overwrite: {data}"
+    finally:
+        server.stop()
+        metadb.set_setting("objectStore", {}, "global")
+
+
 def test_arrow_feather_is_streamed_out_of_core(tmp_path, monkeypatch):
     # ARC4 arrow-out-of-core: the feather/arrow WRITE streams RecordBatches via _stream_ipc (never
     # to_arrow_table's whole-table-in-RAM), and the local READ is a LAZY, re-scannable IPC dataset
