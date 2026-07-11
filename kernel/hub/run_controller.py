@@ -46,7 +46,7 @@ class RunController:
         self.on_complete = None
         self.runs: dict[str, RunStatus] = {}
         self._cancel: dict[str, threading.Event] = {}
-        self._sub: dict[str, tuple] = {}  # overall run_id -> (backend, sub_run_id) currently executing
+        self._sub: dict[str, dict] = {}  # overall run_id -> {sub_run_id: backend} for ALL concurrent sub-runs
         self._lock = threading.Lock()
 
     def plan(self, graph: Graph, target: str | None, sizes: dict | None = None):
@@ -393,12 +393,23 @@ class RunController:
             return self.base
         return next((r for r in self.deps.runners if r.name == region.backend), self.base)
 
+    def _track_sub(self, run_id: str, backend, sub_id: str) -> None:
+        with self._lock:
+            self._sub.setdefault(run_id, {})[sub_id] = backend  # ALL concurrent sub-runs, so cancel() reaches each
+
+    def _untrack_sub(self, run_id: str, sub_id: str) -> None:
+        with self._lock:
+            self._sub.get(run_id, {}).pop(sub_id, None)
+
     def _await(self, backend, sub_id: str, cancel_run: str | None = None) -> RunStatus:
+        # capture the cancel Event ONCE (don't subscript self._cancel each poll): a sibling region's
+        # failure can pop self._cancel[cancel_run] while this orphaned poll is still running → KeyError.
+        ev = self._cancel.get(cancel_run) if cancel_run else None
         while True:
             s = backend.status(sub_id)
             if s.status in ("done", "failed", "cancelled"):
                 return s
-            if cancel_run and self._cancel[cancel_run].is_set():
+            if ev is not None and ev.is_set():
                 backend.cancel(sub_id)
                 return backend.status(sub_id)
             time.sleep(0.1)
@@ -480,9 +491,11 @@ class RunController:
             # Data) rather than the single file we suggested — honor the uri it actually produced. The
             # ref-read / _output_exists / _move_tier paths all accept a parts-dir as well as a file.
             sub = backend.run_unit(subg, region.output_node, out_uri, requires=region.requires)
-            with self._lock:
-                self._sub[run_id] = (backend, sub.run_id)
-            s = self._await(backend, sub.run_id, cancel_run=run_id)
+            self._track_sub(run_id, backend, sub.run_id)
+            try:
+                s = self._await(backend, sub.run_id, cancel_run=run_id)
+            finally:
+                self._untrack_sub(run_id, sub.run_id)
             if s.status != "done":
                 raise RuntimeError(f"region {region.id} on {region.backend} {s.status}: {s.error}")
             result_uri = s.output_uri or out_uri
@@ -496,9 +509,11 @@ class RunController:
         plan = compiler.compile_plan(subg, region.output_node, self.deps.registry, self.deps.node_specs, self.deps.node_ir)
         backend = self._backend_runner(region, uid)
         sub = backend.run(plan, subg, region.output_node, "local")
-        with self._lock:
-            self._sub[run_id] = (backend, sub.run_id)
-        return self._await(backend, sub.run_id, cancel_run=run_id)
+        self._track_sub(run_id, backend, sub.run_id)
+        try:
+            return self._await(backend, sub.run_id, cancel_run=run_id)
+        finally:
+            self._untrack_sub(run_id, sub.run_id)
 
     def _subgraph(self, graph: Graph, region, ref_uri: dict[str, str]) -> Graph:
         # Rebuild the region as a graph, preserving each node's ORIGINAL incoming-edge order (the engine
@@ -546,10 +561,10 @@ class RunController:
     def cancel(self, run_id: str) -> RunStatus:
         ev = self._cancel.get(run_id)
         if ev:
-            ev.set()
-        pair = self._sub.get(run_id)
-        if pair:
-            backend, sub_id = pair  # cancel on the backend that OWNS the in-flight region (pool, not base)
+            ev.set()  # every in-flight region's _await sees this (captured once) and cancels its own sub too
+        with self._lock:
+            subs = list(self._sub.get(run_id, {}).items())  # snapshot: ALL concurrent sub-runs, not just one
+        for sub_id, backend in subs:  # cancel on the backend that OWNS each in-flight region (pool/Ray, not base)
             try:
                 backend.cancel(sub_id)
             except Exception:  # noqa: BLE001
