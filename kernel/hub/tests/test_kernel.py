@@ -4476,6 +4476,51 @@ def test_materialize_refuses_a_handoff_with_no_shared_tier(monkeypatch):
         d.controller._materialize("run_x", g, region, {}, [region])
 
 
+def test_parallel_regions_run_independent_regions_concurrently(monkeypatch):
+    # dist-parallel-regions: the RunController materialized regions in a strict sequential loop; it now
+    # runs INDEPENDENT regions concurrently (a DAG wave scheduler) while respecting dependencies. Two
+    # independent intermediate regions feeding a final must overlap in flight; results stay correct.
+    import threading as _th
+    import time as _t
+
+    from hub.models import Graph, PerNodeStatus, ResourceSpec, RunStatus
+    from hub.planner import Region
+    ctrl = get_deps().controller
+    regs = [
+        Region(id="ra", node_ids={"a"}, output_node="a", backend="default", worker=None,
+               requires=ResourceSpec(), cut_inputs=[]),
+        Region(id="rb", node_ids={"b"}, output_node="b", backend="default", worker=None,
+               requires=ResourceSpec(), cut_inputs=[]),
+        Region(id="rf", node_ids={"f"}, output_node="f", backend="default", worker=None,
+               requires=ResourceSpec(), cut_inputs=[("a", None, "f", None), ("b", None, "f", None)]),
+    ]
+    rid = "run_parallel_regions"
+    ctrl.runs[rid] = RunStatus(run_id=rid, status="queued", placement="distributed", target_node_id="f",
+                               per_node=[PerNodeStatus(node_id=n, status="queued", label=n) for n in ("a", "b", "f")])
+    ctrl._cancel[rid] = _th.Event()
+    inflight, peak, lock = [0], [0], _th.Lock()
+
+    def fake_mat(run_id, graph, region, ref_uri, regions=None):
+        with lock:
+            inflight[0] += 1
+            peak[0] = max(peak[0], inflight[0])
+        _t.sleep(0.2)
+        with lock:
+            inflight[0] -= 1
+        return f"/tmp/{region.output_node}.parquet"
+
+    monkeypatch.setattr(ctrl, "_materialize", fake_mat)
+    monkeypatch.setattr(ctrl, "_run_final", lambda *a, **k: RunStatus(
+        run_id="x", status="done", placement="distributed", per_node=[], output_uri="/tmp/f",
+        output_table="f", rows_processed=1))
+    monkeypatch.setattr(ctrl, "on_status", None)
+    monkeypatch.setattr(ctrl, "on_complete", None)
+    monkeypatch.setenv("DP_REGION_CONCURRENCY", "4")
+    ctrl._orchestrate(rid, Graph(id="c", version=1, nodes=[], edges=[]), "f", regs)
+    assert ctrl.runs[rid].status == "done", ctrl.runs[rid].error
+    assert peak[0] >= 2, f"independent regions did not run concurrently (peak in-flight = {peak[0]})"
+
+
 def test_declared_keys_and_relationships_are_independent_rows():
     # #9 fix: each declared key / relationship is its OWN DB row (not one shared JSON blob), so setting
     # one never rewrites/clobbers another — the mechanism that stops cross-instance lost updates.

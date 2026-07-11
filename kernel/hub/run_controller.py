@@ -14,6 +14,7 @@ process (real cross-worker placement, GPU isolation) is Phase C3 — the region 
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import os
 import threading
 import time
@@ -24,6 +25,14 @@ from hub import graph as g
 from hub import planner
 from hub.executors.engine import BuildEngine
 from hub.models import (Graph, GraphEdge, GraphEdgeData, GraphNode, PerNodeStatus, Position, RunStatus)
+
+
+def _region_concurrency() -> int:
+    """Max intermediate regions materialized concurrently (DP_REGION_CONCURRENCY, default 4)."""
+    try:
+        return max(1, int(os.environ.get("DP_REGION_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
 
 
 class RunController:
@@ -243,34 +252,64 @@ class RunController:
         self._emit(graph, status)
         started = time.time()
         ref_uri: dict[str, str] = {}
+        ref_lock = threading.Lock()
+        from hub.plugins.runner import _step_progress
         try:
-            for i, region in enumerate(regions):
-                if cancel.is_set():
-                    status.status = "cancelled"
-                    return
-                final = i == len(regions) - 1
-                self._mark(status, region, "running")
-                if final:
-                    sub = self._run_final(run_id, graph, region, ref_uri)
-                    status.output_uri, status.output_table = sub.output_uri, sub.output_table
-                    status.rows_processed = sub.rows_processed
-                    if sub.status != "done":
-                        status.status = sub.status
-                        status.error = sub.error
-                        self._mark(status, region, "failed")
-                        # carry the sub-run's node-attributed error onto the logical per-node status, so the
-                        # per-node failure diagnosis shows in the distributed path too (not just the banner).
-                        by_id = {p.node_id: p for p in status.per_node}
-                        for sp in sub.per_node:
-                            if sp.error and sp.node_id in by_id:
-                                by_id[sp.node_id].error = sp.error
-                        return
-                else:
-                    ref_uri[region.output_node] = self._materialize(run_id, graph, region, ref_uri, regions)
-                self._mark(status, region, "done")
-                from hub.plugins.runner import _step_progress
-                status.progress = _step_progress(status)
-                self._emit(graph, status)
+            # Materialize the INTERMEDIATE regions concurrently, respecting the region DAG: a region is
+            # ready once every region it reads (via cut_inputs) has materialized. Independent regions run
+            # in parallel — a wave scheduler where no task ever blocks on another, so the pool can't
+            # deadlock. `regions` is topo-ordered; the last is the target's (final) region, run afterward.
+            intermediates, final_region = list(regions[:-1]), regions[-1]
+            by_out = {r.output_node: r for r in regions}
+
+            def _region_deps(r):  # the output_nodes of the intermediate regions this region reads
+                return {ci[0] for ci in r.cut_inputs
+                        if ci[0] in by_out and by_out[ci[0]].id != r.id and by_out[ci[0]] in intermediates}
+
+            done_nodes: set[str] = set()
+            pending = list(intermediates)
+            cap = max(1, min(len(pending) or 1, _region_concurrency()))
+            inflight: dict = {}
+            with cf.ThreadPoolExecutor(max_workers=cap, thread_name_prefix="dp-region") as ex:
+                while (pending or inflight) and not cancel.is_set():
+                    for r in [r for r in pending if _region_deps(r) <= done_nodes]:
+                        pending.remove(r)
+                        self._mark(status, r, "running")  # status mutated only on THIS thread
+                        with ref_lock:
+                            snap = dict(ref_uri)  # a per-region snapshot → _materialize reads never race a write
+                        inflight[ex.submit(self._materialize, run_id, graph, r, snap, regions)] = r
+                    if not inflight:
+                        break  # nothing ready and nothing running → an unsatisfiable dep (defensive; topo rules it out)
+                    for fut in cf.wait(list(inflight), return_when=cf.FIRST_COMPLETED).done:
+                        r = inflight.pop(fut)
+                        uri = fut.result()  # a region failure raises → outer except fails the run
+                        with ref_lock:
+                            ref_uri[r.output_node] = uri
+                        done_nodes.add(r.output_node)
+                        self._mark(status, r, "done")
+                        status.progress = _step_progress(status)
+                        self._emit(graph, status)
+            if cancel.is_set():
+                status.status = "cancelled"
+                return
+            # the FINAL (target) region, now that every upstream region it reads is materialized
+            region = final_region
+            self._mark(status, region, "running")
+            sub = self._run_final(run_id, graph, region, ref_uri)
+            status.output_uri, status.output_table = sub.output_uri, sub.output_table
+            status.rows_processed = sub.rows_processed
+            if sub.status != "done":
+                status.status = sub.status
+                status.error = sub.error
+                self._mark(status, region, "failed")
+                by_id = {p.node_id: p for p in status.per_node}
+                for sp in sub.per_node:
+                    if sp.error and sp.node_id in by_id:
+                        by_id[sp.node_id].error = sp.error
+                return
+            self._mark(status, region, "done")
+            status.progress = _step_progress(status)
+            self._emit(graph, status)
             status.total_rows = status.rows_processed  # set the count BEFORE 'done' (a poll reads terminal
             status.progress = 1.0                      # status eagerly; the finally would set it too late)
             status.stalled = False
