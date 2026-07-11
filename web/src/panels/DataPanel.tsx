@@ -138,15 +138,26 @@ const fmtNum = (n: number) => n.toLocaleString(undefined, { maximumFractionDigit
 function StatsView({ nodeId }: { nodeId: string }) {
   const doc = useStore((s) => s.doc)
   const requestRun = useStore((s) => s.requestRun)
+  const [full, setFull] = useState(false)
   const [st, setSt] = useState<{ loading: boolean; res?: ProfileResult; err?: string }>({ loading: true })
-  const load = () => {
+  const load = (asFull = full) => {
     setSt({ loading: true })
-    api.profile(doc, nodeId)
+    api.profile(doc, nodeId, asFull)
       .then((res) => setSt({ loading: false, res }))
       .catch((e) => setSt({ loading: false, err: e?.message ?? String(e) }))
   }
-  useEffect(load, [nodeId])  // eslint-disable-line react-hooks/exhaustive-deps
-  if (st.loading) return <Skeleton />
+  useEffect(() => load(full), [nodeId, full])  // eslint-disable-line react-hooks/exhaustive-deps
+  const toggle = (
+    <div className="flex items-center gap-1 rounded-md border border-border p-0.5 text-[10px]">
+      {([['sample', false], ['full dataset', true]] as const).map(([label, v]) => (
+        <button key={label} onClick={() => setFull(v)}
+          className={`rounded px-1.5 py-0.5 ${full === v ? 'bg-muted font-semibold text-foreground' : 'text-muted-foreground'}`}>
+          {label}
+        </button>
+      ))}
+    </div>
+  )
+  if (st.loading) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><Skeleton /></div>
   if (st.err) return <ErrorState reason={st.err} onRetry={load} />
   const res = st.res!
   if (res.error) return <ErrorState reason={res.reason ?? 'profile failed'} onRetry={load} />
@@ -154,8 +165,13 @@ function StatsView({ nodeId }: { nodeId: string }) {
   const pct = (n: number) => (res.rowCount ? Math.round((n / res.rowCount) * 100) : 0)
   return (
     <div className="max-h-[360px] overflow-auto">
-      <div className="px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
-        stats over the previewed sample · {res.rowCount.toLocaleString()} rows
+      <div className="flex items-center justify-between px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
+        <span>
+          {res.sampled
+            ? `stats over the previewed sample · ${res.rowCount.toLocaleString()} rows`
+            : `whole dataset · ${res.rowCount.toLocaleString()} rows · distinct is an estimate`}
+        </span>
+        {toggle}
       </div>
       <table className="w-full text-[11.5px] tabular-nums">
         <thead className="sticky top-0 bg-card text-[10px] uppercase tracking-wide text-muted-foreground">

@@ -696,6 +696,34 @@ def test_profile_handles_nested_type_column():
     assert "embedding" in [c.name for c in r.columns]  # nested column present, count-only, no crash
 
 
+def test_full_profile_covers_the_whole_dataset_not_the_sample(tmp_path):
+    # a FULL profile is a real full pass: exact count/nulls/min/max/mean over EVERY row and an HLL
+    # distinct — where the sampled profile only sees the bounded preview prefix. Build a dataset whose
+    # true min/max live PAST the 2000-row sample so the two profiles must disagree.
+    import duckdb
+    from hub.deps import get_deps
+    from hub.executors.profile import profile_node
+    from hub.models import Graph
+    p = str(tmp_path / "big.parquet")
+    # v = 0..9999 (true max 9999, all past the sample); id has 10000 distinct; 1000 nulls in w
+    duckdb.connect().execute(
+        f"COPY (SELECT i AS v, i AS id, CASE WHEN i < 1000 THEN NULL ELSE i END AS w "
+        f"FROM range(0,10000) t(i)) TO '{p}' (FORMAT PARQUET)")
+    d = get_deps()
+    g = Graph(**{"id": "cF", "version": 1, "nodes": [N("s", "source", {"uri": p})], "edges": []})
+
+    sm = profile_node(g, "s", d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
+    assert sm.sampled and sm.row_count <= 2000                 # sampled: bounded prefix
+
+    fl = profile_node(g, "s", d.resolve_adapter, d.registry, d.node_builders, d.node_specs, full=True)
+    assert not fl.sampled and fl.row_count == 10000            # full: every row
+    byname = {c.name: c for c in fl.columns}
+    assert byname["v"].min == "0" and byname["v"].max == "9999"        # true extents, past the sample
+    assert abs((byname["v"].mean or 0) - 4999.5) < 1e-6               # exact mean over all rows
+    assert byname["w"].nulls == 1000                                  # exact null count
+    assert 7500 <= (byname["id"].distinct or 0) <= 12500             # HLL distinct ≈ 10000 (whole set, not ~2000)
+
+
 # --------------------------------------------------------------------------- #
 # Regression tests for adversarial-acceptance findings
 # --------------------------------------------------------------------------- #

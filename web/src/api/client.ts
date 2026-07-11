@@ -117,8 +117,8 @@ export const api = {
 
   preview: (doc: CanvasDoc, nodeId: string, k = 50, offset = 0) =>
     req<SampleResult>('/run/preview', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, k, offset }) }),
-  profile: (doc: CanvasDoc, nodeId: string) =>
-    req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
+  profile: (doc: CanvasDoc, nodeId: string, full = false) =>
+    req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, full }) }),
 
   // per-node output columns (metadata only) → editor column suggestions; null = untyped port
   schema: (doc: CanvasDoc) =>

@@ -131,9 +131,10 @@ class KernelBackend:
         return _post(endpoint, "/preview", token,
                      {"graph": graph.model_dump(), "node_id": node_id, "k": k, "offset": offset})
 
-    def profile(self, graph: Graph, node_id: str) -> dict:
+    def profile(self, graph: Graph, node_id: str, full: bool = False) -> dict:
         endpoint, token = self._ensure_kernel(getattr(graph, "id", None) or "canvas")
-        return _post(endpoint, "/profile", token, {"graph": graph.model_dump(), "node_id": node_id})
+        return _post(endpoint, "/profile", token,
+                     {"graph": graph.model_dump(), "node_id": node_id, "full": full})
 
     def status(self, run_id: str) -> RunStatus:
         d = metadb.get_run_state(run_id)  # the kernel is the writer; the DB is the source of truth

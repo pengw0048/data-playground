@@ -1,10 +1,12 @@
-"""Column profiling — per-column stats over the bounded preview sample.
+"""Column profiling — per-column stats, over the bounded preview sample OR the whole dataset.
 
-Uses the SAME build as a preview (source scan bounded), so it's instant and always available where a
-preview is. Stats are computed over the sampled Arrow table with pyarrow.compute — robust to
-duplicate column names (join outputs) and nested types. The result is explicitly `sampled=True`:
-these are stats over the previewed rows, not the whole dataset (a full-dataset profile would be a
-full pass, like a run).
+SAMPLED (default): the SAME build as a preview (source scan bounded), computed over the sampled Arrow
+table with pyarrow.compute — instant and always available where a preview is, marked `sampled=True`.
+
+FULL (`full=True`): a full pass, like a run — builds the real relation (`full=True`, no source cap) and
+computes the stats out-of-core in DuckDB with one aggregate scan: exact count/nulls/min/max/mean over
+EVERY row, and an HLL estimate for distinct (`approx_count_distinct`). Marked `sampled=False` so the UI
+can say so. This also profiles nodes a sampled profile refuses (aggregate/sql that reduce rows).
 """
 
 from __future__ import annotations
@@ -49,14 +51,72 @@ def _stat(arr: pa.ChunkedArray, n: int, t: pa.DataType) -> dict:
     return out
 
 
+def _full_stats(engine: BuildEngine, node_id: str) -> ProfileResult:
+    """Whole-dataset stats via one out-of-core DuckDB aggregate scan: exact count/nulls/min/max/mean,
+    HLL distinct. Column refs use the view's DuckDB-deduped names (join outputs can share a name)."""
+    rel = engine.relation(node_id)
+    fields = list(rel.limit(0).to_arrow_table().schema)  # arrow types, positional — no row scan
+    display = _dedupe_names([f.name for f in fields])
+    con = db.conn()
+    v = engine._view(rel, "prof")                        # unique view; DuckDB auto-dedupes its columns
+    vcols = con.sql(f"SELECT * FROM {v} LIMIT 0").columns
+    sel = ["count(*) AS n_all"]
+    plan = []
+    for i, f in enumerate(fields):
+        t = f.type
+        q = '"' + str(vcols[i]).replace('"', '""') + '"'
+        nested = pa.types.is_nested(t) or pa.types.is_binary(t) or pa.types.is_large_binary(t)
+        numeric = pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_decimal(t)
+        has_mm = not nested and (numeric or pa.types.is_temporal(t) or pa.types.is_string(t)
+                                 or pa.types.is_boolean(t))
+        sel.append(f"count({q}) AS c{i}_nn")
+        if not nested:
+            sel.append(f"approx_count_distinct({q}) AS c{i}_d")
+        if has_mm:
+            sel += [f"min({q}) AS c{i}_mn", f"max({q}) AS c{i}_mx"]
+        if numeric:
+            sel.append(f"avg({q}) AS c{i}_av")
+        plan.append((i, display[i], t, has_mm, numeric))
+    r = con.sql(f"SELECT {', '.join(sel)} FROM {v}")
+    d = dict(zip(r.columns, r.fetchone()))
+    n = int(d["n_all"] or 0)
+    cols = []
+    for (i, name, t, has_mm, numeric) in plan:
+        nn = int(d.get(f"c{i}_nn") or 0)
+        prof: dict = {"non_null": nn, "nulls": n - nn}
+        if d.get(f"c{i}_d") is not None:
+            prof["distinct"] = int(d[f"c{i}_d"])
+        if has_mm:
+            lo, hi = d.get(f"c{i}_mn"), d.get(f"c{i}_mx")
+            prof["min"] = None if lo is None else str(lo)
+            prof["max"] = None if hi is None else str(hi)
+        if numeric and d.get(f"c{i}_av") is not None:
+            prof["mean"] = float(d[f"c{i}_av"])
+        cols.append(ColumnProfile(name=name, type=display_type(str(t)), **prof))
+    return ProfileResult(columns=cols, row_count=n, sampled=False)
+
+
 def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
-                 node_builders=None, node_specs=None, cache=None) -> ProfileResult:
+                 node_builders=None, node_specs=None, cache=None, full: bool = False) -> ProfileResult:
     if not g.is_acyclic(graph):
         return ProfileResult(error=True, reason="graph has a cycle — control flow must be encapsulated")
     if node_specs:
         errs = g.type_errors(graph, node_specs)
         if errs:
             return ProfileResult(error=True, reason="incompatible connection: " + "; ".join(errs[:3]))
+
+    if full:
+        # a full-dataset profile is an intentional full pass (like a run) — no short preview budget, and
+        # it profiles reducing nodes (aggregate/sql) that a sampled profile refuses.
+        eng = BuildEngine(graph, resolve_adapter, registry, sample_k=None, full=True,
+                          node_builders=node_builders, node_specs=node_specs, warm=cache, warm_scope="full")
+        try:
+            with db.run_scope():
+                return _full_stats(eng, node_id)
+        except NotPreviewable as e:
+            return ProfileResult(not_previewable=True, reason=e.reason)
+        except Exception as e:  # noqa: BLE001
+            return ProfileResult(error=True, reason=f"{type(e).__name__}: {e}")
 
     engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
                          node_builders=node_builders, node_specs=node_specs,

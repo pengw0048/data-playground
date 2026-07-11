@@ -31,6 +31,7 @@ class PreviewBody(BaseModel):
     node_id: str
     k: int = 50
     offset: int = 0
+    full: bool = False   # profile only: whole-dataset stats (full pass) instead of the sample
 
 
 def main() -> None:
@@ -142,8 +143,8 @@ def main() -> None:
         from hub.executors.profile import profile_node
         graph = Graph(**body.graph)
         _ensure_deps(graph)
-        return profile_node(graph, body.node_id, deps.resolve_adapter,
-                            deps.registry, deps.node_builders, deps.node_specs, cache=warm).model_dump()
+        return profile_node(graph, body.node_id, deps.resolve_adapter, deps.registry,
+                            deps.node_builders, deps.node_specs, cache=warm, full=body.full).model_dump()
 
     @app.post("/cancel")
     def cancel(body: dict, x_dp_kernel_token: str = Header(None)):

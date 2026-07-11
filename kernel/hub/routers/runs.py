@@ -72,16 +72,17 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
 
 @router.post("/run/profile", response_model=ProfileResult)
 def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> ProfileResult:
-    """Per-column stats (null/distinct/min/max/mean) over the previewed sample of a node's output."""
+    """Per-column stats (null/distinct/min/max/mean) over a node's output — the previewed sample, or the
+    WHOLE dataset (a full pass) when `full` is set."""
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
         try:
-            return ProfileResult(**kb.profile(req.graph, req.node_id))   # on the canvas's warm kernel
+            return ProfileResult(**kb.profile(req.graph, req.node_id, full=req.full))  # on the canvas's warm kernel
         except Exception as e:  # noqa: BLE001 — kernel unreachable → a clean error, not a raw 500
             return ProfileResult(error=True, reason=f"kernel unavailable: {type(e).__name__}: {e}")
-    return profile_node(req.graph, req.node_id,
-                        deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs)
+    return profile_node(req.graph, req.node_id, deps.resolve_adapter, deps.registry,
+                        deps.node_builders, deps.node_specs, full=req.full)
 
 
 @router.post("/graph/schema")
