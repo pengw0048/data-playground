@@ -314,6 +314,41 @@ def _duck_type(t: object) -> str:
     return _canon_to_duck(canonical_type(t))
 
 
+def normalize_how(how: str) -> str:
+    """A join's `how` → the canonical DuckDB keyword (outer→full; unknown→inner)."""
+    h = (how or "inner").lower()
+    h = h if h in ("inner", "left", "right", "full", "outer", "cross") else "inner"
+    return "full" if h == "outer" else h
+
+
+def join_projection(lcols: list, rcols: list, using_keys=()) -> str:
+    """SELECT list for a join: all left columns as-is, right columns renamed with a `_2` suffix where they
+    clash with a left column (no duplicate names). For a USING join the key columns are coalesced (kept
+    once, unqualified) — pass them as `using_keys` so the key comes from the coalesced value (not a."key",
+    which is NULL for a right-only row) and the right's key columns are skipped."""
+    keys = {str(k).strip().strip('"') for k in using_keys}
+    lset = set(lcols)
+    parts = [f'"{c}"' if c in keys else f'a."{c}"' for c in lcols]
+    parts += [f'b."{c}" AS "{c}_2"' if (c in lset and c not in keys) else f'b."{c}"'
+              for c in rcols if c not in keys]
+    return ", ".join(parts)
+
+
+def join_sql(lcols: list, rcols: list, a: str, b: str, on: str, condition: str, how: str) -> str:
+    """The DuckDB join SQL over two views `a`,`b` — the SINGLE source of truth for join semantics + output
+    naming, so the single-node engine and the distributed backend (dp_ray) never diverge. `on` = a
+    comma-separated USING key list; `condition` = a raw ON expression (a.x = b.y); else a CROSS join."""
+    on, cond, how = (on or "").strip(), (condition or "").strip(), normalize_how(how)
+    if how == "cross" or (not on and not cond):
+        return f"SELECT {join_projection(lcols, rcols)} FROM {a} AS a CROSS JOIN {b} AS b"
+    if cond:
+        return f"SELECT {join_projection(lcols, rcols)} FROM {a} AS a {how.upper()} JOIN {b} AS b ON ({cond})"
+    keylist = [c.strip() for c in on.split(",") if c.strip()]
+    cols = ", ".join(f'"{c}"' for c in keylist)
+    return (f"SELECT {join_projection(lcols, rcols, using_keys=keylist)} "
+            f"FROM {a} AS a {how.upper()} JOIN {b} AS b USING ({cols})")
+
+
 class BuildEngine:
     def __init__(self, graph: Graph, resolve_adapter, registry, sample_k: int | None = None,
                  full: bool = False, node_builders: dict | None = None, node_specs: dict | None = None,
@@ -424,23 +459,6 @@ class BuildEngine:
         full = BuildEngine(self.graph, self.resolve_adapter, self.registry, sample_k=None, full=True,
                               node_builders=self.node_builders, node_specs=self.node_specs)
         return [full.relation(e.source, e.source_handle) for e in g.incoming(self.graph, node.id)]
-
-    def _join_projection(self, left: Relation, right: Relation, using_keys=()) -> str:
-        """SELECT list for a join: all left columns as-is, right columns renamed with a `_2` suffix where
-        they clash with a left column, so the joined relation has NO duplicate names (an ambiguity that
-        otherwise passes preview but fails the full run). For a USING join the key columns are coalesced
-        (they appear ONCE) — pass them as `using_keys` so the key is kept from the left and skipped on the
-        right, while OTHER shared (non-key) columns are still de-duplicated."""
-        keys = {str(k).strip().strip('"') for k in using_keys}
-        lcols = list(left.columns)
-        lset = set(lcols)
-        # a USING key is COALESCED by the join (b.key for a right-only row in a RIGHT/FULL join) — emit
-        # it UNQUALIFIED so we get the coalesced value, not a."key" (NULL for right-only rows). Non-key
-        # left columns stay a.-qualified.
-        parts = [f'"{c}"' if c in keys else f'a."{c}"' for c in lcols]
-        parts += [f'b."{c}" AS "{c}_2"' if (c in lset and c not in keys) else f'b."{c}"'
-                  for c in right.columns if c not in keys]  # skip right's key cols (USING merged them)
-        return ", ".join(parts)
 
     def _view(self, rel: Relation, base: str = "v") -> str:
         # process-globally-unique name so concurrent engines never clobber each other's views
@@ -680,31 +698,13 @@ class BuildEngine:
         if t == "join":
             if len(inputs) < 2:
                 return parent
-            on = (cfg.get("on") or "").strip()
-            cond = (cfg.get("condition") or "").strip()  # raw ON expression, aliases a.<col> / b.<col>
-            how = (cfg.get("how") or "inner").lower()
-            how = how if how in ("inner", "left", "right", "full", "outer", "cross") else "inner"
-            how = "full" if how == "outer" else how
             # joining two independently-truncated prefixes finds few/no real matches — join the FULL
-            # inputs even in preview (bounded by the preview limit + budget)
+            # inputs even in preview (bounded by the preview limit + budget). The join SQL (projection +
+            # clause + naming) is the shared join_sql used by the distributed backend too, so they agree.
             ins = inputs if self.full else self._faithful_inputs(node)
             a, b = self._view(ins[0], "ja"), self._view(ins[1], "jb")
-            if how == "cross" or (not on and not cond):
-                # rename right-side name clashes so a cross join never emits ambiguous columns
-                proj = self._join_projection(ins[0], ins[1])
-                return db.conn().sql(f"SELECT {proj} FROM {a} AS a CROSS JOIN {b} AS b")
-            if cond:
-                # an ON expression (e.g. `a.user_id = b.uid`, or a composite/inequality condition) —
-                # keep BOTH sides' columns but rename right-side name clashes, so a downstream select/sql
-                # isn't ambiguous (USING coalesces keys; a bare ON does not)
-                proj = self._join_projection(ins[0], ins[1])
-                return db.conn().sql(f"SELECT {proj} FROM {a} AS a {how.upper()} JOIN {b} AS b ON ({cond})")
-            keylist = [c.strip() for c in on.split(",") if c.strip()]
-            cols = ", ".join(f'"{c}"' for c in keylist)
-            # USING coalesces the keys (once); still rename OTHER shared columns so the result isn't
-            # ambiguous (e.g. joining two tables that both carry an `amount` column besides the key).
-            proj = self._join_projection(ins[0], ins[1], using_keys=keylist)
-            return db.conn().sql(f"SELECT {proj} FROM {a} AS a {how.upper()} JOIN {b} AS b USING ({cols})")
+            return db.conn().sql(join_sql(list(ins[0].columns), list(ins[1].columns), a, b,
+                                          cfg.get("on"), cfg.get("condition"), cfg.get("how")))
 
         if t == "union":
             # stack every incoming input row-wise. BY NAME aligns columns by name (filling missing ones

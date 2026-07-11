@@ -63,7 +63,12 @@ _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", "
 # `dedup` = full-row DISTINCT (shuffle by ALL columns → DuckDB DISTINCT; identical rows colocate). A
 # keyed DISTINCT ON keeps the first row in an arbitrary order (non-deterministic even single-node) → it
 # needs an explicit order key before it's reproducible, so it falls back to the single-node engine.
-RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup"})
+# `join` = a BROADCAST join: collect the RIGHT side to the driver + broadcast it, then DuckDB-join each
+# LEFT block against the full right per worker (the SAME join_sql the single-node engine uses → identical
+# output). inner/left/cross are correct block-by-block; right/full (need unmatched-right rows) fall back,
+# and — like Spark's broadcast hint — the right is assumed small enough to broadcast (a large-large join
+# should not pin engine=ray).
+RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join"})
 
 
 def _ray_opts(requires: dict | None) -> dict:
@@ -234,6 +239,10 @@ class RayRunner:
                 return False  # a window needs a bare-column PARTITION BY to be the shuffle key
             if s.op == "dedup" and (s.config.get("on") or "").strip():
                 return False  # only full-row DISTINCT distributes; keyed DISTINCT ON is order-dependent
+            if s.op == "join":
+                from hub.executors.engine import normalize_how
+                if normalize_how(s.config.get("how", "")) not in ("inner", "left", "cross"):
+                    return False  # right/full must emit unmatched-RIGHT rows → broadcast-right can't → DuckDB
         return True
 
     def run(self, plan, graph, target_node_id, placement, run_id=None) -> RunStatus:
@@ -441,7 +450,40 @@ class RayRunner:
             # DuckDB DISTINCT per partition. Every surviving row is identical to the dups it replaces, so
             # the result is deterministic + byte-identical (unlike keyed DISTINCT ON — gated out above).
             return self._shuffle_duckdb(parent, list(parent.columns()), "SELECT DISTINCT * FROM _blk")
+        if step.op == "join":
+            return self._build_join(step, datasets)
         raise RuntimeError(f"ray backend reached a non-clean op '{step.op}' (should have fallen back)")
+
+    def _build_join(self, step, datasets):
+        """Distributed BROADCAST join. Collect the RIGHT (small/dimension) side to the driver and broadcast
+        it into the map closure, then DuckDB-joins each LEFT block against the FULL right on its worker,
+        using the SHARED join_sql — so semantics, output schema, and the `_2`-suffix / USING-coalesce
+        naming are byte-identical to the single-node engine. Each left row joins independently against the
+        complete right, so inner/left/cross are correct block-by-block (right/full are gated out)."""
+        import pyarrow as pa
+        import ray
+
+        from hub.executors.engine import join_sql
+        left = datasets[step.inputs[0][0]]                     # incoming-edge order = engine's left, right
+        right = datasets[step.inputs[1][0]]
+        refs = ray.get(right.to_arrow_refs())                  # broadcast side: driver → workers
+        if refs:
+            right_tbl = pa.concat_tables(refs)
+        else:                                                  # right produced ZERO blocks — keep its TYPED
+            sch = right.schema()                               # empty schema so a LEFT join emits correctly-
+            right_tbl = getattr(sch, "base_schema", sch).empty_table()  # typed NULLs (not a null-typed crash)
+        cfg = step.config
+        sql = join_sql(list(left.columns()), list(right_tbl.column_names), "_l", "_r",
+                       cfg.get("on"), cfg.get("condition"), cfg.get("how"))
+
+        def _join_block(tbl):                                  # each LEFT block ⋈ the full broadcast right
+            import duckdb
+            con = duckdb.connect()
+            con.register("_l", tbl)
+            con.register("_r", right_tbl)
+            return con.execute(sql).fetch_arrow_table()
+
+        return left.map_batches(_join_block, batch_format="pyarrow", batch_size=None)
 
     def _shuffle_duckdb(self, parent, keys, sql):
         """The shared distributed-relational mechanism: RAY hash-shuffles `parent` by `keys` so every row

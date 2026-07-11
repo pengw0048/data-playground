@@ -148,6 +148,38 @@ def main() -> int:
         return 1
     _log(f"PASS: distributed GROUP BY byte-identical to DuckDB across {n_nodes} nodes "
          f"({len(ray_rows)} groups incl. NULL); worker-direct output in object storage")
+
+    # (3) a BROADCAST join across nodes: the big fact (cat, v) ⋈ a small dim (cat, name), right side
+    # broadcast to every worker, output written worker-direct to the object store — byte-identical to DuckDB.
+    dim = f"s3://{bucket}/dim.parquet"
+    db.conn().execute(f"COPY (SELECT i AS cat, ('g'||i) AS name FROM range(0,5) t(i)) TO '{dim}' (FORMAT PARQUET)")
+    jout = f"s3://{bucket}/join_out.parquet"
+    jg = Graph(**{"id": "c", "version": 1, "nodes": [
+        {"id": "l", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": src}}},
+        {"id": "r", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": dim}}},
+        {"id": "j", "type": "join", "position": {"x": 0, "y": 0}, "data": {"config": {"on": "cat", "how": "inner"}}},
+    ], "edges": [{"id": "e1", "source": "l", "target": "j", "data": {"wire": "dataset"}},
+                 {"id": "e2", "source": "r", "target": "j", "data": {"wire": "dataset"}}]})
+    stj = rr.run_unit(jg, "j", jout)
+    for _ in range(1800):
+        if rr.status(stj.run_id).status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.2)
+    stj = rr.status(stj.run_id)
+    if stj.status != "done":
+        _log(f"FAIL: cluster join did not complete: {stj.status} — {stj.error}")
+        return 1
+    with db.run_scope():
+        joracle = BuildEngine(jg, deps.resolve_adapter, deps.registry, full=True,
+                              node_specs=deps.node_specs, output_node="j").relation("j").to_arrow_table()
+    jray = deps.resolve_adapter(stj.output_uri).scan(stj.output_uri).to_arrow_table()
+    con.register("joracle", joracle)
+    con.register("jrayout", jray)
+    jq = "SELECT cat, v, name FROM {t} ORDER BY v, cat"
+    if con.execute(jq.format(t="jrayout")).fetchall() != con.execute(jq.format(t="joracle")).fetchall():
+        _log("FAIL: cluster broadcast join != DuckDB")
+        return 1
+    _log(f"PASS: broadcast join byte-identical to DuckDB across {n_nodes} nodes")
     return 0
 
 
