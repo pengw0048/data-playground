@@ -17,9 +17,10 @@ from __future__ import annotations
 import hashlib
 import os
 
-# DP_* env the kernel pod needs to share the hub's DB / storage / auth / dataset roots. Object-store
-# creds ride along too so the pod's DuckDB can read s3://gs:// data.
-_FORWARD_ENV = ("DP_DATABASE_URL", "DP_DATASET_ROOTS", "DP_AUTH_SECRET", "DP_STORAGE_URL",
+# DP_* env the kernel pod needs to share the hub's DB / storage / dataset roots. Object-store creds ride
+# along too so the pod's DuckDB can read s3://gs:// data. NOT the session-signing secret (DP_AUTH_SECRET)
+# — the pod runs arbitrary canvas Python; it gets the auth-mode SIGNAL via DP_AUTH_MODE instead (P0-SEC-01).
+_FORWARD_ENV = ("DP_DATABASE_URL", "DP_DATASET_ROOTS", "DP_STORAGE_URL",
                 "DP_MEMORY_LIMIT", "DP_SPILL_DIR", "DP_KERNEL_IDLE_TTL", "DP_CANVAS_PIP_DEPS",
                 "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION",
                 "GOOGLE_APPLICATION_CREDENTIALS")
@@ -63,6 +64,9 @@ class PodSpawner:
                 raise
 
     def _pod_body(self, name: str, cmd: list[str]) -> dict:
+        env = [{"name": k, "value": os.environ[k]} for k in _FORWARD_ENV if os.environ.get(k)]
+        if os.environ.get("DP_AUTH_SECRET") or os.environ.get("DP_AUTH_MODE") == "1":
+            env.append({"name": "DP_AUTH_MODE", "value": "1"})  # auth-mode signal, not the signing secret
         return {
             "metadata": {"name": name, "labels": {"app": "dp-kernel", "dp-canvas": name}},
             "spec": {
@@ -70,7 +74,7 @@ class PodSpawner:
                 "containers": [{
                     "name": "kernel", "image": self.image, "command": cmd,
                     "ports": [{"containerPort": _PORT}],
-                    "env": [{"name": k, "value": os.environ[k]} for k in _FORWARD_ENV if os.environ.get(k)],
+                    "env": env,
                     # liveness reinforces the lease heartbeat: a wedged kernel is restarted... no —
                     # restartPolicy Never means it's just killed; the lease goes stale → reaped.
                     "readinessProbe": {"tcpSocket": {"port": _PORT}, "initialDelaySeconds": 1},

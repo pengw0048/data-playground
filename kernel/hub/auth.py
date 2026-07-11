@@ -28,7 +28,10 @@ def _secret() -> str:
 
 
 def auth_enabled() -> bool:
-    return bool(_secret())
+    # DP_AUTH_MODE is an internal marker the kernel spawner sets so a kernel CHILD knows it is in
+    # auth/production mode (→ turns on the DuckDB FS sandbox + local-path confinement) WITHOUT carrying
+    # the forgeable signing secret's value. It is NEVER used as crypto material (see _secret/sign/verify).
+    return bool(_secret()) or os.environ.get("DP_AUTH_MODE") == "1"
 
 
 # Known-weak defaults that must never guard real sessions — the secret is public (repo/docs), so a

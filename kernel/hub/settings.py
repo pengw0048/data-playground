@@ -8,6 +8,17 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _KERNEL_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
 
 
+def _canvas_pip_deps_default() -> bool:
+    """Whether per-canvas pip installs are allowed by default. Explicit DP_CANVAS_PIP_DEPS wins;
+    otherwise OFF in auth/production mode (DP_AUTH_SECRET or the kernel-child DP_AUTH_MODE marker),
+    ON for the open local tool. Kept out of `auth` to avoid importing it into this foundational module."""
+    v = os.environ.get("DP_CANVAS_PIP_DEPS", "").strip().lower()
+    if v:
+        return v not in ("0", "false", "no", "off")   # explicit operator choice always wins
+    auth_on = bool(os.environ.get("DP_AUTH_SECRET", "").strip()) or os.environ.get("DP_AUTH_MODE") == "1"
+    return not auth_on   # open local tool → on; auth/production → off (rely on a pre-baked image)
+
+
 class Settings:
     # workspace holds canvases/, outputs/, plugins/, and the local catalog
     workspace: str = os.environ.get("DP_WORKSPACE", _KERNEL_ROOT)
@@ -40,9 +51,10 @@ class Settings:
     # preserved (a class path is case-sensitive); the local/pod keywords are matched case-insensitively.
     kernel_spawner: str = os.environ.get("DP_KERNEL_SPAWNER", "local").strip()
     # per-canvas pip deps (kernel installs a canvas's declared requirements). Arbitrary code + egress, so
-    # a locked-down deployment can turn it OFF here: the kernel then installs nothing and allows no extra
-    # imports (canvases must rely on a pre-baked image instead). Default on (trusted/local tool).
-    canvas_pip_deps: bool = os.environ.get("DP_CANVAS_PIP_DEPS", "1").strip().lower() not in ("0", "false", "no", "off")
+    # per-canvas pip installs = arbitrary code + network egress. An explicit DP_CANVAS_PIP_DEPS always
+    # wins; otherwise it defaults OFF once auth/production mode is on (use a pre-baked image), ON for the
+    # open local tool. A locked-down deploy can still force it either way via the env var.
+    canvas_pip_deps: bool = _canvas_pip_deps_default()
 
 
 settings = Settings()

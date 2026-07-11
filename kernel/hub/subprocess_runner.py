@@ -102,7 +102,10 @@ class SubprocessRunner:
         with open(job_file, "w") as f:
             json.dump({"workspace": self.workspace, "dataDir": self.data_dir, "graph": graph.model_dump(),
                        "target": target, "statusFile": status_file, **job_extra}, f)
-        proc = subprocess.Popen([sys.executable, "-m", "hub.subrun", job_file])
+        # keep the forgeable signing secret out of the subrun child too (defense in depth for the case
+        # where the subprocess runner is selected directly on the hub, not parented by a kernel) — P0-SEC-01
+        from hub.kernel_backend import _kernel_child_env
+        proc = subprocess.Popen([sys.executable, "-m", "hub.subrun", job_file], env=_kernel_child_env())
         with self._lock:
             self.runs[run_id] = status
             self._procs[run_id] = proc
