@@ -42,7 +42,7 @@ export interface NodeConfig {
   outputSchemaCodeHash?: string           // hash of the cell when the contract was pinned → detect drift
   // join
   on?: string
-  how?: 'inner' | 'left'
+  how?: 'inner' | 'left' | 'right' | 'outer'
   // sql
   sql?: string
   // metric / chart
