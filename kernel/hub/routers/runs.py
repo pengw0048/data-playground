@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
-from hub import compiler, destinations, metadb, placement
+from hub import auth, compiler, destinations, metadb, placement
 from hub import graph as graph_mod
 from hub.agent import agent_status, run_agent
 from hub.deps import get_deps
@@ -300,6 +300,16 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     hands to the RunController (placement-splitting) or the base runner and records the owner in
     run_index. Returns (status, owner); poll the owner via _status_or_lost / cancel via run_index."""
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    # P0-AUTH-02: a run against an EXISTING canvas must be one the caller can reach — else it would
+    # attribute the run/history to someone else's canvas. An id that names no saved canvas is the
+    # caller's own ad-hoc workspace (allowed, owned by uid below). Open mode: single trusted user.
+    auth_canvas = None
+    if auth.auth_enabled():
+        cid = getattr(graph, "id", None) or ""
+        if cid and metadb.canvas_exists(cid):
+            if metadb.canvas_role(cid, uid) is None:
+                raise HTTPException(404, f"canvas '{cid}' not found")
+            auth_canvas = cid  # a real canvas the caller can reach → collaborators may see this run
     _reject_invalid(graph, deps)
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
@@ -317,10 +327,15 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     else:
         status, owner = runner.run(plan, graph, target_node_id, est.placement), runner
     deps.run_index[status.run_id] = owner  # so status/cancel/ws reach the right owner
-    # bound run_index (insertion-ordered) so it can't grow for the process lifetime — the runners
+    deps.run_owner[status.run_id] = uid  # creator, so an ad-hoc (no-canvas) run stays private to them
+    if auth.auth_enabled():  # persist the owner so authz survives restart / other stateless instances
+        metadb.bind_run_owner(status.run_id, uid, auth_canvas)
+    # bound both (insertion-ordered) so they can't grow for the process lifetime — the runners
     # themselves only retain the last _MAX_RUNS, and _status_or_lost already tolerates a missing id.
     while len(deps.run_index) > _RUN_INDEX_MAX:
         deps.run_index.pop(next(iter(deps.run_index)))
+    while len(deps.run_owner) > _RUN_INDEX_MAX:
+        deps.run_owner.pop(next(iter(deps.run_owner)))
     return status, owner
 
 
@@ -331,6 +346,33 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
     except RunNeedsConfirm:
         raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
     return status
+
+
+def _run_access(run_id: str, uid: str | None) -> bool:
+    """Whether `uid` may see or act on this run (P0-AUTH-02). Open mode (no auth): always, since the
+    instance is a single trusted user — matches the run/preview endpoints and ws_collab. Auth mode:
+    the run's creator (authoritative, persisted so it survives restart / another stateless instance)
+    OR anyone with a role on the REAL canvas the run was authorized against (never an ad-hoc id, which
+    a stranger could later create to hijack ownership)."""
+    if not auth.auth_enabled():
+        return True
+    if not uid:
+        return False
+    if get_deps().run_owner.get(run_id) == uid:  # fast in-process path (before the DB bind lands)
+        return True
+    creator, auth_canvas = metadb.run_auth(run_id)
+    if creator is not None:
+        if creator == uid:
+            return True
+        return bool(auth_canvas and metadb.canvas_role(auth_canvas, uid) is not None)
+    # a legacy run persisted before the creator column existed → best-effort canvas grant
+    cid = metadb.run_canvas_id(run_id)
+    return bool(cid and metadb.canvas_role(cid, uid) is not None)
+
+
+def _require_run_access(run_id: str, uid: str) -> None:
+    if not _run_access(run_id, uid):  # 404, not 403 — don't reveal that someone else's run id exists
+        raise HTTPException(404, f"run '{run_id}' not found")
 
 
 def _runner_for(run_id: str):
@@ -361,7 +403,8 @@ except ValueError:
 
 
 @router.get("/run/{run_id}", response_model=RunStatus)
-def run_status(run_id: str) -> RunStatus:
+def run_status(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
+    _require_run_access(run_id, uid)  # a run's status carries row counts, paths in errors, output names
     st = _status_or_lost(run_id)
     if st.status == "running" and metadb.run_stalled(run_id, _STALL_S):
         st = st.model_copy(update={"stalled": True})  # copy — don't mutate the runner's live object
@@ -369,7 +412,8 @@ def run_status(run_id: str) -> RunStatus:
 
 
 @router.post("/run/{run_id}/cancel", response_model=RunStatus)
-def run_cancel(run_id: str) -> RunStatus:
+def run_cancel(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
+    _require_run_access(run_id, uid)  # only the run's owner may cancel it (else any user can DoS a run)
     deps = get_deps()
     owner = deps.run_index.get(run_id)
     if owner is not None:

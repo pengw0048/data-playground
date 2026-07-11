@@ -297,6 +297,7 @@ class Deps:
         self.controller.on_status = _persist_run_state
         self.controller.on_complete = _on_complete
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
+        self.run_owner: dict[str, str] = {}  # run_id -> creator uid, to authorize ad-hoc (no-canvas) runs
         self._load_plugins()
 
     def resolve_adapter(self, uri: str):

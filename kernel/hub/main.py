@@ -103,8 +103,15 @@ def _cross_site_ws(ws: WebSocket) -> bool:
 async def ws_run(ws: WebSocket, run_id: str):
     # gate the status stream like the HTTP GET /run/{id} (which is behind the auth router) and ws_collab:
     # a run's status carries row counts, per-node state, error text (may embed paths) and output names.
-    if _cross_site_ws(ws) or (auth.auth_enabled() and not auth.verify(ws.cookies.get("dp_session"))):
+    uid = auth.verify(ws.cookies.get("dp_session")) if auth.auth_enabled() else None
+    if _cross_site_ws(ws) or (auth.auth_enabled() and not uid):
         await ws.close(code=1008)  # policy violation — cross-site origin or no valid session
+        return
+    # P0-AUTH-02: and, in auth mode, only for a run the caller may reach (its creator or a role on its
+    # canvas) — mirrors GET /run/{id}. Off the event loop: it does small DB reads.
+    from hub.routers.runs import _run_access
+    if not await asyncio.to_thread(_run_access, run_id, uid):
+        await ws.close(code=1008)
         return
     await ws.accept()
     try:
