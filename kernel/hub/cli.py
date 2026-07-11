@@ -123,7 +123,9 @@ def main() -> None:
     print(f"\n  Data Playground  →  {url}\n  workspace: {workspace}\n  data:      {data_dir}\n")
     if args.open:
         threading.Timer(1.3, lambda: webbrowser.open(url)).start()
-    uvicorn.run("hub.main:app", host=args.host, port=args.port, log_level=level)
+    from hub.settings import settings
+    uvicorn.run("hub.main:app", host=args.host, port=args.port, log_level=level,
+                ws_max_size=settings.max_body_bytes)  # SEC-10: explicit/tunable WebSocket frame cap
 
 
 if __name__ == "__main__":

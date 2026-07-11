@@ -6,9 +6,9 @@ snake_case in Python. These shapes ARE the contract.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
 # dataset/selection/sample/sql-view are the data wires; metric/value are leaf/value wires
@@ -324,12 +324,31 @@ class Position(Wire):
     y: float
 
 
+# SEC-10: bound graph complexity + per-node code/SQL so one request can't carry a runaway blob or a
+# pathological graph. Generous vs. any real canvas; raise via a new release if a real workload needs more.
+MAX_GRAPH_NODES = 5000
+MAX_GRAPH_EDGES = 10000
+MAX_CODE_LEN = 200_000  # chars, per code/SQL field on a node
+
+
 class GraphNode(Wire):
     id: str
     type: str
     position: Position = Position(x=0, y=0)
     data: dict[str, Any] = {}
     parent_id: str | None = None  # visual containment: this node lives inside a section (its parent)
+
+    @field_validator("data")
+    @classmethod
+    def _cap_embedded_code(cls, v):
+        if isinstance(v, dict):
+            cfg = v.get("config")
+            if isinstance(cfg, dict):
+                for key in ("code", "sql"):
+                    val = cfg.get(key)
+                    if isinstance(val, str) and len(val) > MAX_CODE_LEN:
+                        raise ValueError(f"node {key} exceeds the {MAX_CODE_LEN}-char limit")
+        return v
 
 
 class GraphEdgeData(Wire):
@@ -348,8 +367,8 @@ class GraphEdge(Wire):
 class Graph(Wire):
     id: str = "canvas"
     version: int = 1
-    nodes: list[GraphNode] = []
-    edges: list[GraphEdge] = []
+    nodes: Annotated[list[GraphNode], Field(max_length=MAX_GRAPH_NODES)] = []
+    edges: Annotated[list[GraphEdge], Field(max_length=MAX_GRAPH_EDGES)] = []
     requirements: list[str] = []  # pip specs the canvas needs; the kernel installs them + allows importing them
 
 

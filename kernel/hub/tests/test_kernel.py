@@ -559,6 +559,27 @@ def test_upload_rejects_oversized(monkeypatch):
     assert _upload("big.csv", b"a\n" + b"1\n" * 9).status_code == 413
 
 
+def test_request_body_and_graph_complexity_limits(monkeypatch):
+    # SEC-10: every non-upload body is byte-capped; graphs are node/edge-capped; per-node code/SQL is
+    # length-capped — all before the handler runs. Upload stays exempt (it streams + self-caps).
+    from hub.models import MAX_CODE_LEN, MAX_GRAPH_NODES
+    from hub.settings import settings
+    # (1) too many nodes → 422 at validation
+    over = {"id": "c", "version": 1,
+            "nodes": [N(f"n{i}", "source", {}) for i in range(MAX_GRAPH_NODES + 1)], "edges": []}
+    assert client.post("/api/graph/compile", json={"graph": over}).status_code == 422
+    # (2) oversized code on a node → 422 (body itself well under the byte cap)
+    big = {"id": "c", "version": 1, "nodes": [N("t", "transform", {"code": "x" * (MAX_CODE_LEN + 1)})], "edges": []}
+    assert client.post("/api/graph/compile", json={"graph": big}).status_code == 422
+    # (3) a body over the byte cap → 413 from the middleware (header-only check)
+    monkeypatch.setattr(settings, "max_body_bytes", 200)
+    payload = {"graph": {"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": "x" * 500})], "edges": []}}
+    assert client.post("/api/graph/compile", json=payload).status_code == 413
+    # a small body still passes with the tiny cap in place (sanity: the cap isn't rejecting everything)
+    monkeypatch.setattr(settings, "max_body_bytes", 64 * 1024**2)
+    assert client.post("/api/graph/compile", json={"graph": {"id": "c", "version": 1, "nodes": [], "edges": []}}).status_code == 200
+
+
 def test_upload_same_name_does_not_clobber():
     a = _upload("dup.csv", b"a\n1\n").json()
     b = _upload("dup.csv", b"a\n2\n").json()

@@ -44,6 +44,31 @@ app.add_middleware(
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_methods=["*"], allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _limit_request_body(request: Request, call_next):
+    # SEC-10: cap every request body so a single JSON/graph/canvas/MCP payload can't exhaust memory.
+    # /catalog/upload STREAMS + self-caps at DP_MAX_UPLOAD_BYTES, so it's exempt. Reads only the
+    # Content-Length header — never consumes the body — so upload streaming is untouched. NOTE: header-
+    # based; a Transfer-Encoding: chunked request with NO Content-Length isn't capped here (normal
+    # fetch/JSON clients always set Content-Length). Graph routes still bound node/edge count + code/SQL
+    # length at Pydantic parse. A hard byte budget for chunked bodies needs a pure-ASGI receive wrapper —
+    # deferred (all routes are authed; local-first tool).
+    from fastapi.responses import JSONResponse
+    from hub.settings import settings
+    if request.url.path != "/api/catalog/upload":
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                over = int(cl) > settings.max_body_bytes
+            except ValueError:
+                over = False
+            if over:
+                return JSONResponse(
+                    {"detail": f"request body exceeds the {settings.max_body_bytes}-byte limit (raise DP_MAX_BODY_BYTES)"},
+                    status_code=413)
+    return await call_next(request)
 # EVERY /api route requires a resolved user (open mode → local; auth mode → a valid session). Only the
 # workspace PUBLIC router (auth status/login/logout + the login roster) is reachable pre-login. This
 # keeps auth the SECURE DEFAULT — a route is gated unless it is explicitly put on the public router —
