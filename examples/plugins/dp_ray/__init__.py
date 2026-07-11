@@ -40,6 +40,7 @@ small graph won't spin up Ray unless you ask.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
@@ -56,13 +57,19 @@ _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", "
 # reimplement these on Ray operators — it lets RAY do only the SHUFFLE (hash-partition rows by the op's
 # key) and lets DUCKDB do the compute on each COMPLETE partition, running the SAME SQL the single-node
 # engine runs. So the result is byte-identical BY CONSTRUCTION (it's DuckDB, on partitions holding every
-# row of their key-groups — nothing combined across partitions), ANY DuckDB aggregate works, the output
+# row of their key-groups — nothing combined across partitions), MOST DuckDB aggregates work, the output
 # carries DuckDB's exact schema, and the only thing parsed is the shuffle KEY (bare columns). `aggregate`
-# = a GROUPED aggregate; a global aggregate (no key) is cheap + falls back to the single-node engine.
-# `window` = a PARTITION BY window (shuffle by the partition key → DuckDB window per complete partition).
-# `dedup` = full-row DISTINCT (shuffle by ALL columns → DuckDB DISTINCT; identical rows colocate). A
-# keyed DISTINCT ON keeps the first row in an arbitrary order (non-deterministic even single-node) → it
-# needs an explicit order key before it's reproducible, so it falls back to the single-node engine.
+# = a GROUPED aggregate; a global aggregate (no key) is cheap + falls back to the single-node engine. An
+# ORDER-SENSITIVE aggregate used WITHOUT an intra-aggregate ORDER BY (list/string_agg/first/last/
+# any_value/arg_max/…) depends on intra-group row order, which the hash-shuffle does not preserve, so it
+# too falls back (byte-identity would break otherwise). `window` = a PARTITION BY window (shuffle by the
+# partition key → DuckDB window per complete partition); requires a non-empty ORDER BY (a no-ORDER-BY
+# window like row_number is intra-partition-order-dependent → falls back), and is exact up to ORDER BY
+# ties (the same inherent tie-ceiling as sort — single-node is itself unstable there). `dedup` = full-row
+# DISTINCT (shuffle by ALL columns → DuckDB DISTINCT; identical rows colocate). A keyed DISTINCT ON keeps
+# the first row in an arbitrary order (non-deterministic even single-node) → needs an explicit order key,
+# so it falls back; and a dedup whose schema has any FLOAT/DOUBLE column falls back too, because the
+# shuffle's raw-byte equality distinguishes -0.0/0.0 and NaN payloads that DuckDB DISTINCT coalesces.
 # `join` = a BROADCAST join: collect the RIGHT side to the driver + broadcast it, then DuckDB-join each
 # LEFT block against the full right per worker (the SAME join_sql the single-node engine uses → identical
 # output). inner/left/cross are correct block-by-block; right/full (need unmatched-right rows) fall back,
@@ -78,6 +85,33 @@ _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", "
 # backend, but a sort exceeding one node's memory should not pin engine=ray (a production backend would
 # write ordered shards + stitch on read).
 RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join", "sort"})
+
+# aggregate functions whose per-group result depends on ROW ORDER within the group. A hash-shuffle does
+# NOT preserve intra-group row order, so a distributed GROUP BY using one of these WITHOUT an explicit
+# intra-aggregate ORDER BY would diverge from single-node DuckDB (e.g. `list(x)` emits elements in a
+# different order; `first`/`any_value`/`arg_max` on ties pick a different row). Such an aggregate falls
+# back to the single-node engine (see _has_unordered_order_sensitive_agg). `arg_min`/`arg_max`/`min_by`/
+# `max_by` take a comparison arg (not ORDER BY) and are tie-nondeterministic → always treated as unordered.
+_ORDER_SENSITIVE_AGG = ("array_agg", "string_agg", "group_concat", "listagg", "list",
+                        "first", "last", "any_value", "arbitrary",
+                        "arg_min", "arg_max", "min_by", "max_by")
+_ORDER_SENS_RE = re.compile(r"\b(?:" + "|".join(sorted(_ORDER_SENSITIVE_AGG, key=len, reverse=True)) + r")\s*\(", re.I)
+
+
+def _has_unordered_order_sensitive_agg(aggs: str) -> bool:
+    """True iff some order-sensitive aggregate is applied WITHOUT an intra-aggregate ORDER BY — per-call
+    (paren-matched, mirroring engine._has_reducing_aggregate) so `list(x ORDER BY x) AS a, first(y) AS b`
+    is still rejected (the `first` lacks an ORDER BY). Conservative — over-rejects (→ single-node), never
+    lets an order-divergent aggregate distribute."""
+    s = re.sub(r"\s+", " ", aggs or "")
+    for m in _ORDER_SENS_RE.finditer(s):
+        depth, i = 1, m.end()          # m.end() is just past the '('; walk to the matching ')'
+        while i < len(s) and depth:
+            depth += (s[i] == "(") - (s[i] == ")")
+            i += 1
+        if not re.search(r"\border\s+by\b", s[m.end():i], re.I):  # no ORDER BY inside this call → order-dependent
+            return True
+    return False
 
 
 def _ray_opts(requires: dict | None) -> dict:
@@ -197,7 +231,7 @@ class RayRunner:
         shards). `requires` (the planner's resolved region need) is passed to Ray so its map tasks are
         scheduled onto a matching worker. Anything non-clean falls back to the base subprocess-materialize."""
         ir = lower_to_ir(graph, output_node, self.node_specs, self.deps.node_ir)
-        if not self._ray_runnable(ir):
+        if not self._ray_runnable(ir) or self._dedup_needs_single_node(graph, ir):
             return self._materialize_local(graph, output_node, output_uri, run_id)  # non-clean → local engine
         run_id = run_id or f"unit_{uuid.uuid4().hex[:10]}"
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", target_node_id=output_node,
@@ -248,10 +282,18 @@ class RayRunner:
         if not all(s.config.get("code") for s in ir.steps if s.op in CLEAN_TRANSFORM_MODES):
             return False
         for s in ir.steps:
-            if s.op == "aggregate" and not parse_group_keys(s.config.get("groupBy", "")):
-                return False  # None (expression key) or [] (global) → not shuffle-distributable
-            if s.op == "window" and not parse_group_keys(s.config.get("partitionBy", "")):
-                return False  # a window needs a bare-column PARTITION BY to be the shuffle key
+            if s.op == "aggregate":
+                if not parse_group_keys(s.config.get("groupBy", "")):
+                    return False  # None (expression key) or [] (global) → not shuffle-distributable
+                if _has_unordered_order_sensitive_agg(s.config.get("aggs", "")):
+                    return False  # list/first/any_value/arg_max without ORDER BY → hash-shuffle reorders → diverges
+            if s.op == "window":
+                if not parse_group_keys(s.config.get("partitionBy", "")):
+                    return False  # a window needs a bare-column PARTITION BY to be the shuffle key
+                if not (s.config.get("orderBy") or "").strip():
+                    return False  # a window with NO ORDER BY (e.g. row_number) is intra-partition-order-dependent
+                                  # → the shuffle reorders the partition → diverges. With ORDER BY, exact up to
+                                  # ties (same inherent tie-ceiling as sort). → single-node keeps it faithful.
             if s.op == "dedup" and (s.config.get("on") or "").strip():
                 return False  # only full-row DISTINCT distributes; keyed DISTINCT ON is order-dependent
             if s.op == "join":
@@ -262,9 +304,36 @@ class RayRunner:
                 return False  # only a bare-column ORDER BY is distributable; expressions → DuckDB
         return True
 
+    def _dedup_needs_single_node(self, graph, ir) -> bool:
+        """Full-row dedup shuffles by ALL columns so identical rows colocate, then DuckDB DISTINCT per
+        partition. But Ray's hash-shuffle equality is RAW-BYTE, which distinguishes values DuckDB DISTINCT
+        coalesces: -0.0 vs 0.0, and distinct NaN bit-patterns. So two rows differing only in signed-zero /
+        NaN-payload hash to DIFFERENT partitions and BOTH survive → one extra row vs single-node DuckDB.
+        Fall back to the single-node engine whenever a dedup's schema carries any floating-point column
+        (scalar or nested). Needs the input schema (the IR carries none), so this is separate from the
+        config-only _ray_runnable gate; only pays the schema-inference cost when a dedup is present."""
+        dedups = [s for s in ir.steps if s.op == "dedup"]
+        if not dedups:
+            return False
+        try:
+            from hub.executors.schema import schema_for_graph
+            schemas = schema_for_graph(graph, self.resolve_adapter, self.deps.registry,
+                                       self.deps.node_builders, self.node_specs)
+        except Exception:  # noqa: BLE001 — can't prove the schema is float-free → don't distribute (safe)
+            return True
+        for s in dedups:
+            cols = schemas.get(s.id)
+            if not cols:                    # unknown schema for this dedup → can't prove float-free → single-node
+                return True
+            for c in cols:
+                t = str((c.get("type") if isinstance(c, dict) else getattr(c, "type", "")) or "")
+                if re.search(r"\b(?:float|double|real)", t, re.I):  # scalar or nested (float[]/struct<…double…>)
+                    return True
+        return False
+
     def run(self, plan, graph, target_node_id, placement, run_id=None) -> RunStatus:
         ir = lower_to_ir(graph, target_node_id, self.node_specs, self.deps.node_ir)
-        if not self._ray_runnable(ir):
+        if not self._ray_runnable(ir) or self._dedup_needs_single_node(graph, ir):
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)  # safe fallback
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]

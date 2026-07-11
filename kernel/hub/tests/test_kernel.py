@@ -5659,6 +5659,45 @@ def test_ray_backend_operator_gating_and_fallback(tmp_path):
               _ray_node("w", "write", {"name": "sum_out"})], [_ray_edge("src", "a"), _ray_edge("a", "w")])
     assert rr._ray_runnable(lower_to_ir(summ, "w", deps.node_specs)) is False
 
+    # (3b-i) an ORDER-SENSITIVE aggregate (list/first/…) WITHOUT an intra-aggregate ORDER BY is NOT
+    # byte-identical distributed (hash-shuffle reorders intra-group rows) → _ray_runnable False; WITH an
+    # ORDER BY inside the call it IS deterministic → True (acceptance #6).
+    def _agg(aggs):
+        gg = G([_ray_node("src", "source", {"uri": p}),
+                _ray_node("a", "aggregate", {"groupBy": "x", "aggs": aggs}),
+                _ray_node("w", "write", {"name": "o"})], [_ray_edge("src", "a"), _ray_edge("a", "w")])
+        return rr._ray_runnable(lower_to_ir(gg, "w", deps.node_specs))
+    assert _agg("list(x) AS xs") is False                       # unordered list → reorders → fall back
+    assert _agg("string_agg(CAST(x AS VARCHAR), ',') AS s") is False
+    assert _agg("count(*) AS n, first(x) AS f") is False        # a 2nd agg being fine doesn't save `first`
+    assert _agg("list(x ORDER BY x) AS xs") is True             # ORDER BY pins the element order → deterministic
+    assert _agg("sum(x) AS s, count(*) AS n") is True           # plain reducing aggs are order-free
+
+    # (3b-ii) a window needs a non-empty ORDER BY to distribute faithfully — a no-ORDER-BY window
+    # (row_number over an arbitrary intra-partition order) diverges (acceptance #7).
+    def _win(cfg):
+        gg = G([_ray_node("src", "source", {"uri": p}),
+                _ray_node("wn", "window", cfg),
+                _ray_node("w", "write", {"name": "o"})], [_ray_edge("src", "wn"), _ray_edge("wn", "w")])
+        return rr._ray_runnable(lower_to_ir(gg, "w", deps.node_specs))
+    assert _win({"partitionBy": "x", "expr": "row_number()", "as": "rn"}) is False          # no ORDER BY
+    assert _win({"partitionBy": "x", "orderBy": "x", "expr": "row_number()", "as": "rn"}) is True
+
+    # (3b-iii) full-row dedup over a FLOAT column falls back — the shuffle's raw-byte equality splits
+    # -0.0/0.0 (and NaN payloads) that DuckDB DISTINCT coalesces, so a distributed run keeps an extra
+    # row (acceptance #12). An all-int dedup still distributes.
+    pf = str(tmp_path / "floats.parquet")
+    duckdb.connect().execute(f"COPY (SELECT x::DOUBLE AS d, x AS i FROM range(1,6) t(x)) TO '{pf}' (FORMAT PARQUET)")
+    ddf = G([_ray_node("src", "source", {"uri": pf}), _ray_node("d", "dedup", {}),
+             _ray_node("w", "write", {"name": "o"})], [_ray_edge("src", "d"), _ray_edge("d", "w")])
+    assert rr._ray_runnable(lower_to_ir(ddf, "w", deps.node_specs)) is True   # config-only gate: full-row dedup ok
+    assert rr._dedup_needs_single_node(ddf, lower_to_ir(ddf, "w", deps.node_specs)) is True  # but float schema → local
+    pi = str(tmp_path / "ints.parquet")
+    duckdb.connect().execute(f"COPY (SELECT x AS i FROM range(1,6) t(x)) TO '{pi}' (FORMAT PARQUET)")
+    ddi = G([_ray_node("src", "source", {"uri": pi}), _ray_node("d", "dedup", {}),
+             _ray_node("w", "write", {"name": "o"})], [_ray_edge("src", "d"), _ray_edge("d", "w")])
+    assert rr._dedup_needs_single_node(ddi, lower_to_ir(ddi, "w", deps.node_specs)) is False  # int-only → distributes
+
     # (3c) a genuinely non-distributable op (a raw sql node) → can_run False → run() delegates to the
     # DuckDB base runner (never touches Ray) → it completes.
     dirty = G([_ray_node("src", "source", {"uri": p}),
