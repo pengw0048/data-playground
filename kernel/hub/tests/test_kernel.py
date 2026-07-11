@@ -1617,6 +1617,37 @@ def test_users_create_and_list():
     assert created["id"] in ids and "local" in ids and created["id"] not in before
 
 
+def test_kernel_child_env_strips_signing_secret_but_keeps_auth_mode(monkeypatch):
+    # P0-SEC-01: the kernel child runs arbitrary canvas Python; it must NOT inherit the forgeable
+    # session-signing secret, but must still know it's in auth mode (via DP_AUTH_MODE) so its FS/path
+    # confinement stays on. Data-plane creds (DB, object store) necessarily remain — it IS the engine.
+    from hub import auth, kernel_backend
+    monkeypatch.setenv("DP_AUTH_SECRET", "x" * 40)
+    monkeypatch.setenv("DP_DATABASE_URL", "postgresql+psycopg://u:p@h/db")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s3cr3t-key")
+    env = kernel_backend._kernel_child_env()
+    assert "DP_AUTH_SECRET" not in env          # the forgeable signing secret is stripped
+    assert env["DP_AUTH_MODE"] == "1"           # but the auth-mode signal survives
+    assert env["DP_DATABASE_URL"] and env["AWS_SECRET_ACCESS_KEY"]  # data-plane creds remain (necessary)
+    # the signal alone enables auth mode with NO usable signing material in the child
+    monkeypatch.delenv("DP_AUTH_SECRET")
+    monkeypatch.setenv("DP_AUTH_MODE", "1")
+    assert auth.auth_enabled() is True and auth._secret() == ""
+
+
+def test_canvas_pip_deps_default_off_under_auth(monkeypatch):
+    # P0-SEC-01 / SEC-04: per-canvas pip installs (arbitrary code + egress) default OFF in auth mode;
+    # an explicit DP_CANVAS_PIP_DEPS always wins; open local tool defaults ON.
+    from hub.settings import _canvas_pip_deps_default
+    for k in ("DP_CANVAS_PIP_DEPS", "DP_AUTH_SECRET", "DP_AUTH_MODE"):
+        monkeypatch.delenv(k, raising=False)
+    assert _canvas_pip_deps_default() is True             # open tool → on
+    monkeypatch.setenv("DP_AUTH_SECRET", "x" * 40)
+    assert _canvas_pip_deps_default() is False            # auth/production → off by default
+    monkeypatch.setenv("DP_CANVAS_PIP_DEPS", "1")
+    assert _canvas_pip_deps_default() is True             # explicit opt-in wins
+
+
 def test_per_user_password_is_not_a_skeleton_key(monkeypatch):
     # with auth on, a password authenticates ONLY its own user — no shared/skeleton password.
     from hub import auth, metadb

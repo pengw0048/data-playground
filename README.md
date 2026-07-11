@@ -397,6 +397,14 @@ there can wedge a co-editor's runs (a restart clears it). Real tenant isolation 
 sandboxing — containers, per-user accounts, or a pod-per-canvas `ExecutionBackend` plugin. (The
 in-process and subprocess runners stay selectable in Settings → Execution.)
 
+**Credentials in the kernel.** Because the kernel *is* the data engine, it necessarily holds the
+metadata-DB and object-store credentials — canvas code can read them, so treat those as available to
+anyone who can run a canvas. It does **not** receive the session-signing secret (`DP_AUTH_SECRET`): the
+kernel authenticates its own channel with a per-kernel token, so a canvas can't forge login sessions.
+Once auth is on (`DP_AUTH_SECRET` set), **per-canvas pip installs default OFF** — arbitrary installs +
+network egress don't belong in a shared deployment; ship a pre-baked image, or opt back in explicitly
+with `DP_CANVAS_PIP_DEPS=1`.
+
 ---
 
 ## Contributing
