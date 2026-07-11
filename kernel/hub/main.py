@@ -299,11 +299,15 @@ def version() -> dict:
                                  timeout=2, cwd=os.path.dirname(__file__)).stdout.strip() or "unknown"
         except Exception:  # noqa: BLE001 — no git in a wheel deploy → set DP_GIT_SHA at build time
             sha = "unknown"
+    # SCHEME only, never the full value: a scheme'd url → its scheme; a bare value (a SQLAlchemy url always
+    # has "://"; DP_STORAGE_URL MAY be a bare absolute path) → a category, so an internal FS path is never
+    # echoed to an unauthenticated caller.
+    _db, _storage = settings.database_url, os.environ.get("DP_STORAGE_URL", "").strip()
     return {
         "sha": sha,
         "spawner": settings.kernel_spawner,
-        "db": (settings.database_url.split("://", 1)[0] or "sqlite"),  # dialect only — never the creds
-        "storage": (os.environ.get("DP_STORAGE_URL", "").split("://", 1)[0] or "local"),
+        "db": (_db.split("://", 1)[0] if "://" in _db else "sqlite"),   # dialect only — never the creds
+        "storage": (_storage.split("://", 1)[0] if "://" in _storage else "local"),  # scheme only — never a path
         "auth": "enabled" if auth.auth_enabled() else "open",
         "python": platform.python_version(),
         "duckdb": duckdb.__version__,

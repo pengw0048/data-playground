@@ -14,7 +14,7 @@ from hub.main import app
 client = TestClient(app)
 
 
-def test_observability_livez_readyz_version():
+def test_observability_livez_readyz_version(monkeypatch):
     # ARC8 observability: livez (pure liveness), readyz (REAL dep checks → 200/503), version (redacted
     # deployment identity). All are pre-auth probes (app-level, outside the /api auth gate).
     assert client.get("/api/livez").json()["ok"] is True
@@ -26,6 +26,11 @@ def test_observability_livez_readyz_version():
     v = client.get("/api/version").json()
     assert v["auth"] in ("enabled", "open") and v["spawner"] and v["duckdb"] and v["python"]
     assert v["db"] and "://" not in v["db"], "DB reported as dialect only — no creds leaked"
+    # a BARE-PATH storage override must NOT echo the internal path to an unauthenticated caller
+    monkeypatch.setenv("DP_STORAGE_URL", "/mnt/secret-internal/customer-data")
+    assert client.get("/api/version").json()["storage"] == "local", "bare storage path leaked"
+    monkeypatch.setenv("DP_STORAGE_URL", "s3://bucket/prefix")
+    assert client.get("/api/version").json()["storage"] == "s3"  # a scheme'd url → its scheme
 
 
 def _uri(name: str) -> str:
