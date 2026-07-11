@@ -1715,6 +1715,35 @@ def test_subprocess_runner_executes_in_isolation(tmp_path):
         metadb.set_setting("backend", "", "global")  # restore the default in-process runner
 
 
+def test_run_deadline_hard_kills_a_runaway_child(tmp_path):
+    # cell-crash-isolation: a runaway cell (`while True`) in an isolated run must be HARD-KILLED at the
+    # wall-clock deadline and resolve to 'failed' with a deadline message — never pin the worker forever.
+    import time as _t
+
+    from hub import compiler
+    from hub.deps import get_deps
+    from hub.models import Graph
+    from hub.settings import settings
+    from hub.subprocess_runner import SubprocessRunner
+    d = get_deps()
+    p = _seq_parquet(tmp_path, n=10)
+    g = Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": p}),
+        N("xf", "transform", {"source": "adhoc", "mode": "map", "code": "def fn(row):\n    while True:\n        pass"}),
+        N("wr", "write", {"name": "deadline_out", "writeMode": "overwrite"}),
+    ], "edges": [E("src", "xf"), E("xf", "wr")]})
+    plan = compiler.compile_plan(g, "wr", d.registry, d.node_specs, d.node_ir)
+    runner = SubprocessRunner(settings.workspace, settings.data_dir, catalog=d.catalog, deadline_s=2)
+    st = runner.run(plan, g, "wr", "local")
+    end = _t.time() + 30
+    while _t.time() < end and runner.status(st.run_id).status not in ("done", "failed", "cancelled"):
+        _t.sleep(0.2)
+    final = runner.status(st.run_id)
+    assert final.status == "failed", f"a runaway run should fail at the deadline, got {final.status}"
+    assert "deadline" in (final.error or "").lower(), final.error
+    assert st.run_id not in runner._procs or runner._procs[st.run_id].poll() is not None  # child reaped
+
+
 def test_subprocess_run_is_recorded_in_history(tmp_path):
     # run history must be captured for the isolated-process backend too. The PARENT records it (the
     # child disables its own on_complete to avoid a daemon-thread race that dropped records): a run

@@ -69,10 +69,18 @@ def main() -> None:
     canvas, kid, token = args.canvas, args.kernel_id, args.token
     deps = set_workspace(args.workspace, args.data_dir)
     warm = RelationCache()  # per-kernel warm cache of preview intermediate relations (dropped on restart)
+    # cell-crash-isolation: full RUNS execute in a killable, deadline-bounded child PROCESS by default, so
+    # a runaway/segfaulting/OOM cell kills only that run — the warm kernel (and its live previews) survive.
+    # Previews/profile stay in-process on the warm engine (fast, interactive), protected by the reaper.
+    # Opt out with DP_KERNEL_ISOLATE_RUNS=0 (runs on the warm in-process engine = the old behavior).
+    _isolate = os.environ.get("DP_KERNEL_ISOLATE_RUNS", "1").strip().lower() not in ("0", "false", "no", "off")
+    run_runner = deps.runner
+    if _isolate:
+        run_runner = next((r for r in deps.runners if getattr(r, "name", "") == "local-subprocess"), deps.runner)
     # single-writer: the kernel persists run_states stamped with OUR kernel_id (so the boot-time reaper
-    # spares this run while we're alive). on_complete (run history) stays wired — we're long-lived, so
-    # its daemon-thread commit isn't racing a process exit the way the one-shot subprocess child was.
-    deps.runner.on_status = lambda g, st: metadb.save_run_state(
+    # spares this run while we're alive). Wire it onto the runner that OWNS runs (the isolated child
+    # manager when isolating), since that's what emits queued/progress/terminal for /run.
+    run_runner.on_status = lambda g, st: metadb.save_run_state(
         st.run_id, st.model_dump(), canvas_id=getattr(g, "id", None), kernel_id=kid)
 
     last_activity = [time.monotonic()]
@@ -99,7 +107,7 @@ def main() -> None:
             time.sleep(5.0)
             if not metadb.heartbeat_kernel(canvas, kid):
                 os._exit(0)  # fenced out — a newer kernel took over this canvas
-            busy = any(s.status in ("queued", "running") for s in deps.runner.runs.values())
+            busy = any(s.status in ("queued", "running") for s in run_runner.runs.values())
             if busy:
                 last_activity[0] = time.monotonic()
             elif time.monotonic() - last_activity[0] > args.idle_ttl:
@@ -123,7 +131,7 @@ def main() -> None:
         graph = Graph(**body.graph)
         _ensure_deps(graph)
         plan = compiler.compile_plan(graph, body.target, deps.registry, deps.node_specs, deps.node_ir)
-        st = deps.runner.run(plan, graph, body.target, body.placement, run_id=body.run_id)
+        st = run_runner.run(plan, graph, body.target, body.placement, run_id=body.run_id)
         return st.model_dump()
 
     @app.post("/preview")
@@ -149,7 +157,7 @@ def main() -> None:
     @app.post("/cancel")
     def cancel(body: dict, x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)
-        return deps.runner.cancel(body["run_id"]).model_dump()
+        return run_runner.cancel(body["run_id"]).model_dump()  # the runner that OWNS the run (isolated child mgr)
 
     @app.post("/shutdown")
     def shutdown(x_dp_kernel_token: str = Header(None)):

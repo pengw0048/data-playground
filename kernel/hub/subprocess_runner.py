@@ -28,7 +28,7 @@ from hub.plugins.runner import _CONFIRM_ROWS, _MAX_RUNS
 class SubprocessRunner:
     name = "local-subprocess"
 
-    def __init__(self, workspace: str, data_dir: str, catalog=None):
+    def __init__(self, workspace: str, data_dir: str, catalog=None, deadline_s: float | None = None):
         self.workspace = workspace
         self.data_dir = data_dir
         self.catalog = catalog  # register outputs written by children into the parent's live catalog
@@ -38,6 +38,12 @@ class SubprocessRunner:
         self._procs: dict[str, subprocess.Popen] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.Lock()
+        # wall-clock deadline: a child that runs longer than this is hard-killed and the run fails, so a
+        # runaway cell (`while True`, a livelocked native op) can't pin a worker forever. <=0 disables.
+        try:
+            self.deadline_s = deadline_s if deadline_s is not None else float(os.environ.get("DP_RUN_DEADLINE_S", "3600"))
+        except ValueError:
+            self.deadline_s = 3600.0
         atexit.register(self._terminate_all)  # don't orphan running children when the kernel exits
 
     def _terminate_all(self) -> None:
@@ -65,8 +71,8 @@ class SubprocessRunner:
                            breakdown=f"{size} · {rowstr} · {len(plan.steps)} steps · isolated process")
 
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
-            placement: Placement) -> RunStatus:
-        run_id = f"run_{uuid.uuid4().hex[:10]}"
+            placement: Placement, run_id: str | None = None) -> RunStatus:
+        run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
         per = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=per)
         return self._spawn(status, {}, graph, target_node_id)
@@ -131,20 +137,45 @@ class SubprocessRunner:
 
     def _watch(self, run_id: str, proc: subprocess.Popen, status_file: str, job_dir: str,
                graph: Graph, target: str | None) -> None:
+        start = time.monotonic()
+        deadline_hit = False
+        last = None
         while True:
             if self._read(run_id, status_file):
                 break
+            # mirror INTERMEDIATE progress to the DB: the kernel poll path reads run_states (not our
+            # in-memory dict), so without this the row would sit at 'queued' for the whole run body.
+            cur = self.runs.get(run_id)
+            if cur is not None:
+                dump = cur.model_dump()
+                if dump != last:
+                    self._emit(graph, cur)
+                    last = dump
             if proc.poll() is not None:      # child exited — do a final read then stop
                 time.sleep(0.1)
                 self._read(run_id, status_file)
                 break
+            if self.deadline_s and self.deadline_s > 0 and time.monotonic() - start > self.deadline_s:
+                deadline_hit = True           # runaway — hard-kill the child and fail the run
+                if proc.poll() is None:
+                    proc.terminate()
+                time.sleep(0.1)
+                self._read(run_id, status_file)
+                break
             time.sleep(0.15)
-        proc.wait()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()  # SIGTERM ignored (e.g. a C-level DuckDB loop) → force-reap so _watch can't hang
+            proc.wait()
         st = self.runs.get(run_id)
         forced = bool(st and st.status in ("queued", "running"))  # exited without a terminal status
         if forced:
             if run_id in self._cancelled:
-                st.status = "cancelled"                 # a hard-killed cancel, not a failure
+                st.status = "cancelled"                 # a hard-killed cancel, not a failure (user intent wins)
+            elif deadline_hit:
+                st.status = "failed"
+                st.error = st.error or f"run exceeded the wall-clock deadline of {self.deadline_s:.0f}s — killed"
             else:
                 st.status = "failed"                    # crash / OOM / unexpected exit
                 st.error = st.error or f"execution process exited (code {proc.returncode})"

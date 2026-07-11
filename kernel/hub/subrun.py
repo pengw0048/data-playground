@@ -30,11 +30,24 @@ def main() -> int:
         from hub.deps import set_workspace
         from hub.models import Graph
         deps = set_workspace(job["workspace"], job["dataDir"])
-        # the PARENT (SubprocessRunner) owns run-history recording — it reads our terminal status file
-        # and persists it. Recording here would race: on_complete runs in a daemon thread AFTER status
-        # flips to "done", and this process can exit (or be hard-killed on cancel) before it commits.
+        # the PARENT (SubprocessRunner) owns ALL run_states writes and run-history recording: it reads our
+        # status file and persists under the authoritative (hub) run_id. If we also wrote, we'd emit orphan
+        # rows keyed by the child's own id (and race a hard-kill on cancel). Silence both hooks here.
         deps.runner.on_complete = None
+        deps.runner.on_status = None
         graph = Graph(**job["graph"])
+        # deps parity with the warm kernel's _ensure_deps: install the canvas's declared pip deps and let
+        # the sandbox import EXACTLY them (and put the deps dir on THIS process's sys.path). A fresh child
+        # doesn't inherit the kernel's sys.path/allow-list, so without this a run-time import in a cell
+        # would fail in isolation though it works in-kernel.
+        from hub import kernel_deps, sandbox
+        from hub.settings import settings as _s
+        if _s.canvas_pip_deps:
+            reqs = getattr(graph, "requirements", None) or []
+            mods = kernel_deps.ensure(reqs, kernel_deps.deps_dir(job["workspace"], getattr(graph, "id", "canvas"))) if reqs else set()
+            sandbox.set_allowed(mods)
+        else:
+            sandbox.set_allowed(set())
         # region-materialize mode (RunController C3): run this sub-graph in THIS worker process and
         # write the target node's relation to a given uri — how a placed region executes on its worker.
         mat_uri = job.get("materializeUri")
