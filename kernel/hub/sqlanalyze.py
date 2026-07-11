@@ -23,7 +23,8 @@ import duckdb
 # correctly NOT counted here (a window preserves rows).
 _AGG_FNS = frozenset({
     "count", "count_star", "sum", "fsum", "kahan_sum", "sumkahan", "avg", "mean", "min", "max",
-    "min_by", "max_by", "arg_min", "arg_max", "median", "mode", "product", "any_value", "arbitrary",
+    "min_by", "max_by", "arg_min", "arg_max", "argmin", "argmax", "median", "mode", "product",
+    "any_value", "arbitrary",
     "stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp", "bool_and", "bool_or",
     "bit_and", "bit_or", "bit_xor", "approx_count_distinct", "approx_quantile", "quantile",
     "quantile_cont", "quantile_disc", "reservoir_quantile", "list", "array_agg", "string_agg",
@@ -36,10 +37,12 @@ _AGG_FNS = frozenset({
 # (conservative): DuckDB rewrites an ORDER-BY'd `list(x ORDER BY x)` into `list_sort(list(x))`, so the
 # intra-aggregate ORDER BY is not reliably visible in the AST; over-rejecting the ordered form to
 # single-node is safe (correctness preserved), and the common divergent forms (first/any_value/arg_max)
-# are never determinizable anyway.
+# are never determinizable anyway. Includes every ALIAS the parser can emit (arg_max/argmax/max_by are
+# the same fn; the AST reports the alias the user WROTE, so all must be listed) plus `mode` (arbitrary
+# among ties). Value-keyed aggregates (median/quantile/histogram) are NOT here — they are order-free.
 _ORDER_SENSITIVE_AGG = frozenset({
     "list", "array_agg", "string_agg", "group_concat", "listagg", "first", "last",
-    "any_value", "arbitrary", "arg_min", "arg_max", "min_by", "max_by",
+    "any_value", "arbitrary", "arg_min", "arg_max", "argmin", "argmax", "min_by", "max_by", "mode",
 })
 
 _INPUT_CTE = re.compile(r"^input\d*$", re.I)  # the sql node's input CTE names: input, input2, input3, …
@@ -146,3 +149,26 @@ def agg_has_order_sensitive(select_list: str) -> bool:
         return True
     return any(n.get("class") == "FUNCTION" and (n.get("function_name") or "").lower() in _ORDER_SENSITIVE_AGG
                for n in _nodes(ast))
+
+
+def window_needs_order(expr: str) -> bool:
+    """Does this window EXPRESSION require an explicit ORDER BY to be faithfully distributable? A RANKING
+    or OFFSET window (row_number/rank/dense_rank/ntile/percent_rank/cume_dist/lag/lead/first_value/
+    last_value/nth_value) is meaningless / arbitrary without an ORDER BY, so distributing it over a
+    shuffled partition diverges from single-node DuckDB. A pure-AGGREGATE window (`sum/count/avg/… OVER
+    (PARTITION BY k)`) computes over the WHOLE partition regardless of intra-partition order → it is
+    byte-identical distributed even with no ORDER BY, so it does NOT need one. Detected by the window
+    node's AST type (WINDOW_AGGREGATE vs the ranking/offset variants). `expr` is a bare window call like
+    `row_number()` / `sum(x)` (the window node assembles the OVER clause separately); wrapped in `OVER ()`
+    to parse. Unparseable / no window node → True (conservative: require the ORDER BY)."""
+    if not (expr or "").strip():
+        return True
+    ast = _parse(f"SELECT {expr} OVER () FROM _dp_win_probe")
+    if ast is None:
+        return True
+    wins = [n for n in _nodes(ast) if n.get("class") == "WINDOW"]
+    if not wins:
+        return True
+    # a pure-aggregate window (every window node is WINDOW_AGGREGATE) is order-free; any ranking/offset
+    # window type needs an ORDER BY.
+    return not all((w.get("type") or "") == "WINDOW_AGGREGATE" for w in wins)
