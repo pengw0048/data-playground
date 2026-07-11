@@ -2793,6 +2793,29 @@ def test_catalog_entries_are_shared_across_instances(tmp_path):
     assert other.get_table("shared_out_x").uri == uri
 
 
+def test_catalog_reflects_updates_and_deletions_across_instances(tmp_path):
+    # P0-CAT-01: a peer's cache must converge on UPDATES and DELETES another instance made — not just
+    # additions. The shared DB is authoritative; each read reconciles against it.
+    from hub.deps import get_deps
+    from hub.models import CatalogTable
+    from hub.plugins.catalog import InMemoryCatalog
+    deps = get_deps()
+    uri = str(tmp_path / "conv.parquet")
+    deps.catalog.register_output(name="conv_ds", uri=uri, version="v1", parents=[], pipeline="canvas")
+    tid = deps.catalog.get_table("conv_ds").id
+    peer = InMemoryCatalog(str(tmp_path / "peer_dir"), deps.resolve_adapter)
+    assert peer.get_table("conv_ds").version == "v1"  # peer now has it cached
+    # UPDATE on the first instance → peer converges (previously it kept the stale v1 forever)
+    deps.catalog.register(CatalogTable(id=tid, name="conv_ds", uri=uri, version="v2", row_count=99))
+    assert peer.get_table("conv_ds").version == "v2"
+    assert peer.get_table("conv_ds").row_count == 99
+    # DELETE on the first instance → peer drops it (previously it kept serving the removed dataset)
+    assert deps.catalog.unregister("conv_ds") is True
+    with pytest.raises(KeyError):
+        peer.get_table("conv_ds")
+    assert "conv_ds" not in [t.name for t in peer.list_tables(None)]
+
+
 def test_pipelines_import_reports_not_configured():
     # with no importer plugin, the endpoint must HONESTLY report 501 not-configured — it used to 400
     # with an AttributeError because Deps had no .importer attr (dead scaffolding). Now deps.importer
