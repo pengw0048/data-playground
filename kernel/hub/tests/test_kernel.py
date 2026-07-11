@@ -1572,6 +1572,46 @@ def test_append_concurrent_same_base_no_data_loss(tmp_path, monkeypatch):
     assert distinct == n_threads * per_thread, f"duplicated/corrupted ids under concurrency: {distinct}"
 
 
+def test_recover_orphans_restores_interrupted_compaction_and_cleans_staging(tmp_path):
+    # ARC4 crash safety: startup recovery of temp siblings an interrupted append/compaction leaves behind.
+    # (1) compaction cut between its two renames → base absent, data in `<base>.old-*` → restored;
+    # (2) stale `.old-*` with base intact, an in-flight `.parttmp-*` part, a partial `.compact-*` → all
+    # dropped; (3) a real output is untouched and staging junk never surfaces via list_outputs.
+    import glob as _glob
+
+    from hub.storage import LocalStorage
+    root = str(tmp_path / "outputs")
+    os.makedirs(root)
+
+    # (1) interrupted compaction: originals parked in ds1.old-*, ds1 itself gone
+    import duckdb
+    old1 = os.path.join(root, "ds1.old-abc12345")
+    os.makedirs(old1)
+    duckdb.sql("SELECT 42 AS id").write_parquet(os.path.join(old1, "part-0.parquet"))
+    # (2a) stale .old-* with the base dir present → superseded, should be dropped
+    os.makedirs(os.path.join(root, "ds2"))
+    duckdb.sql("SELECT 1 AS id").write_parquet(os.path.join(root, "ds2", "part-0.parquet"))
+    os.makedirs(os.path.join(root, "ds2.old-def45678"))
+    # (2b) in-flight append staging (a file, no data suffix) + (2c) partial compaction output (a dir)
+    duckdb.sql("SELECT 9 AS id").write_parquet(os.path.join(root, "ds3.parttmp-0011223344"))
+    os.makedirs(os.path.join(root, "ds4.compact-55667788"))
+    # (3) a genuine published output must be left alone
+    duckdb.sql("SELECT 7 AS id").write_parquet(os.path.join(root, "keep.parquet"))
+
+    LocalStorage(root).recover_orphans()
+
+    # ds1 restored from its .old-*, with the original data intact
+    assert os.path.isdir(os.path.join(root, "ds1")), "interrupted compaction was not restored"
+    parts = _glob.glob(os.path.join(root, "ds1", "*.parquet"))
+    assert len(parts) == 1 and duckdb.read_parquet(parts[0]).fetchone()[0] == 42
+    # every temp sibling is gone; the real output and restored base remain
+    leftovers = [f for f in os.listdir(root) if any(s in f for s in (".old-", ".parttmp-", ".compact-"))]
+    assert not leftovers, f"temp siblings not cleaned: {leftovers}"
+    assert os.path.exists(os.path.join(root, "keep.parquet")) and os.path.isdir(os.path.join(root, "ds2"))
+    names = {os.path.basename(u.rstrip("/")) for u in LocalStorage(root).list_outputs()}
+    assert "keep.parquet" in names and not any(".parttmp-" in n or ".compact-" in n for n in names)
+
+
 def test_partitioned_write_hive_layout_and_pruned_read(tmp_path):
     # ARC4 write-partitioned-merge: partitionBy → a Hive dir=val/ parquet directory, read back with the
     # partition column present + partition pruning; overwrite is clean (temp dir + swap, no stale

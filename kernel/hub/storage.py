@@ -7,9 +7,18 @@ the same DuckDB path the adapters use). Selected by DP_STORAGE_URL.
 from __future__ import annotations
 
 import os
+import re
+import shutil
 from typing import Protocol
 
 from hub.plugins.adapters import is_object_uri
+
+# temp siblings an interrupted local append/compaction can leave next to a base dir (see adapters.py):
+# `<base>.parttmp-<hex10>` (an in-flight append part), `<base>.old-<hex8>` (pre-compaction originals, briefly
+# holding the data while the two-rename swap is in flight), `<base>.compact-<hex8>` (the compaction output).
+# The hex lengths are matched EXACTLY (what the adapter emits) so a real output can't accidentally collide
+# with the suffix and be renamed/deleted at startup.
+_TEMP_SUFFIX = re.compile(r"\.(parttmp)-[0-9a-f]{10}$|\.(old|compact)-[0-9a-f]{8}$")
 
 _EXTS = (".parquet", ".csv", ".tsv", ".json", ".arrow", ".feather", ".ipc")
 # ephemeral full-pass run results (runner._materialize_result) share the outputs dir but are NOT
@@ -21,6 +30,7 @@ RESULT_PREFIX = "__result_"
 class Storage(Protocol):
     def output_uri(self, name: str, ext: str) -> str: ...
     def list_outputs(self) -> list[str]: ...
+    def recover_orphans(self) -> None: ...
 
 
 class LocalStorage:
@@ -44,6 +54,47 @@ class LocalStorage:
             if fn.endswith(_EXTS) or (os.path.isdir(p) and fn.endswith(".lance")):
                 out.append(p)
         return out
+
+    def recover_orphans(self) -> None:
+        """Recover/clean temp siblings an interrupted local append or compaction left under ``root`` — run
+        once at startup (before re-cataloging outputs). Two hazards it closes: (1) a SIGKILL/OOM/power-loss
+        mid append-part write leaves a ``<base>.parttmp-*`` that must NOT surface as a dataset; (2) a crash
+        between compaction's two renames leaves ``<base>`` momentarily absent with the data in ``<base>.old-*``
+        — restore it so the dataset stays readable. Best-effort; never raises.
+
+        Pass 1 restores any interrupted compaction: for each ``<base>.old-*``, if ``<base>`` is gone the swap
+        was cut between its renames → rename the originals back; if ``<base>`` exists the ``.old-*`` is a stale
+        leftover → drop it. Pass 2 drops in-flight staging: ``<base>.parttmp-*`` (a partial, never-published
+        part) and ``<base>.compact-*`` (a partial or now-superseded compaction output) are always removable —
+        a compaction only removes the originals AFTER ``<base>`` holds the compacted part, so neither is ever
+        the sole copy."""
+        if not os.path.isdir(self.root):
+            return
+        try:
+            entries = os.listdir(self.root)
+        except OSError:
+            return
+        for fn in entries:  # pass 1: restore a compaction cut between its two renames
+            m = _TEMP_SUFFIX.search(fn)
+            if not m or (m.group(1) or m.group(2)) != "old":
+                continue
+            old, base = os.path.join(self.root, fn), os.path.join(self.root, fn[: m.start()])
+            try:
+                if os.path.exists(base):
+                    shutil.rmtree(old, ignore_errors=True)  # base intact → superseded originals
+                else:
+                    os.replace(old, base)                   # base gone mid-swap → restore the originals
+            except OSError:
+                pass
+        for fn in entries:  # pass 2: drop partial/superseded in-flight staging
+            m = _TEMP_SUFFIX.search(fn)
+            if not m or (m.group(1) or m.group(2)) not in ("parttmp", "compact"):
+                continue
+            p = os.path.join(self.root, fn)
+            try:
+                shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
+            except OSError:
+                pass
 
     def prune_results(self, keep: int = 200) -> None:
         """Bound the ephemeral run-result artifacts (RESULT_PREFIX) — coarse newest-N GC so they can't
@@ -69,6 +120,9 @@ class ObjectStorage:
 
     def output_uri(self, name: str, ext: str) -> str:
         return f"{self.root}/{name}{ext}"
+
+    def recover_orphans(self) -> None:
+        return  # object append writes unique part names directly (no temp-sibling staging, no compaction)
 
     def list_outputs(self) -> list[str]:
         from hub import db

@@ -307,10 +307,12 @@ class DuckDBAdapter:
         renames wide (microseconds), NOT a whole rmtree. The full read is materialized by the write BEFORE
         any rename (no read-after-delete). MUST be called under _base_lock(base): that serializes it against
         concurrent same-base appends (a compaction swap racing another append's publish/read would lose or
-        fail writes). Same-process only — a concurrent READER in the tiny two-rename window still gets a
-        transient 'no files' error (retryable); cross-process append/compaction of one base needs a
+        fail writes) — note the potentially large rewrite runs while holding that lock, so same-base appends
+        block for its duration. Same-process only — a concurrent READER in the tiny two-rename window still
+        gets a transient 'no files' error (retryable); cross-process append/compaction of one base needs a
         directory lease or a table format (out of scope for the file adapter). If the process crashes
-        between the two renames, data survives in base.old (recoverable), not lost."""
+        between the two renames, `base` is momentarily absent and the data sits in base.old-* — recovered
+        automatically at next startup by LocalStorage.recover_orphans() (or manually renaming it back)."""
         try:
             threshold = int(os.environ.get("DP_APPEND_COMPACT_PARTS", "200") or 200)
         except ValueError:
@@ -318,7 +320,9 @@ class DuckDBAdapter:
         if threshold <= 0:
             return  # 0/negative disables auto-compaction
         d = base.rstrip("/")
-        parts = [x for e in self._PART_EXTS for x in glob.glob(os.path.join(d, f"**/*{e}"), recursive=True)]
+        # one exact extension per dataset (enforced by _reject_mixed_part_format), so count only THIS ext —
+        # a single glob, not one per _PART_EXTS, since this runs under the lock on every append.
+        parts = glob.glob(os.path.join(d, f"**/*{ext}"), recursive=True)
         if len(parts) <= threshold:
             return
         import shutil
@@ -394,8 +398,11 @@ class DuckDBAdapter:
                 # stage the part as a SIBLING of base (NOT inside it) so a concurrent compaction's rmtree of
                 # base can't destroy this thread's unpublished part. The slow write is UNLOCKED (unique name,
                 # no contention); makedirs + migrate + publish + compaction run under the per-base lock, so
-                # they're serialized against a concurrent same-base compaction's dir swap.
-                staging = base + f".parttmp-{uuid.uuid4().hex[:10]}{ext}"
+                # they're serialized against a concurrent same-base compaction's dir swap. The staging name
+                # carries NO data extension (format is chosen by the `ext` arg, not the path) — so a crash-
+                # orphaned staging file can't be mistaken for a published dataset by list_outputs / a source
+                # glob / destination browse (same `.tmp-*`-not-`.parquet` discipline as overwrite/partitioned).
+                staging = base + f".parttmp-{uuid.uuid4().hex[:10]}"
                 try:
                     self._write_part(rel, staging, ext)
                 except BaseException:
