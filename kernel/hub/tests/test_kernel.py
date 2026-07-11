@@ -1628,6 +1628,9 @@ def test_plugin_node_lowering():
 def test_me_defaults_to_local_user():
     me = client.get("/api/me").json()
     assert me["id"] == "local"
+    # UX-01: /me carries capabilities so the UI can hide controls a user can't use. Open single-user
+    # mode → the local user can manage global settings.
+    assert "global_settings" in me.get("capabilities", [])
 
 
 def test_users_create_and_list():

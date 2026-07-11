@@ -75,22 +75,32 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const obj = (g.objectStore && typeof g.objectStore === 'object' ? g.objectStore : {}) as Record<string, string>
   const setObj = (k: string, v: string) => setG((prev) => ({ ...prev, objectStore: { ...(prev.objectStore as object ?? {}), [k]: v } }))
   const save = async () => {
-    for (const k of ['agentModel', 'agentApiKey', 'agentBaseUrl']) {
-      await api.putSetting('global', k, g[k] ?? '').catch(() => {})
-    }
-    await api.putSetting('global', 'destinations', dests).catch(() => {})
-    await api.putSetting('global', 'objectStore', obj).catch(() => {})
-    // the runner is a per-user preference; the sentinel means "inherit the workspace default"
-    await api.putSetting('user', 'backend', u.backend === INHERIT ? '' : (u.backend ?? '')).catch(() => {})
-    // edited plugin config → plugin.<pack>.<key> (skip a blank secret so it keeps its existing value)
-    for (const [pack, fields] of Object.entries(pcfg)) {
-      const schema = plugins.find((p) => p.name === pack)?.config ?? []
-      for (const [key, v] of Object.entries(fields)) {
-        if (schema.find((f) => f.key === key)?.secret && !v) continue
-        await api.putSetting('global', `plugin.${pack}.${key}`, v).catch(() => {})
+    // only admins may write global settings (auth mode); default true keeps single-user + older
+    // backends unchanged. Skipping the global writes a non-admin can't do avoids doomed 403s for
+    // settings they never touched — their own per-user runner still saves.
+    const canGlobal = currentUser?.capabilities?.includes('global_settings') ?? true
+    try {
+      if (canGlobal) {
+        for (const k of ['agentModel', 'agentApiKey', 'agentBaseUrl']) {
+          await api.putSetting('global', k, g[k] ?? '')
+        }
+        await api.putSetting('global', 'destinations', dests)
+        await api.putSetting('global', 'objectStore', obj)
+        // edited plugin config → plugin.<pack>.<key> (skip a blank secret so it keeps its existing value)
+        for (const [pack, fields] of Object.entries(pcfg)) {
+          const schema = plugins.find((p) => p.name === pack)?.config ?? []
+          for (const [key, v] of Object.entries(fields)) {
+            if (schema.find((f) => f.key === key)?.secret && !v) continue
+            await api.putSetting('global', `plugin.${pack}.${key}`, v)
+          }
+        }
       }
+      // the runner is a per-user preference (everyone may set it); the sentinel = "inherit the default"
+      await api.putSetting('user', 'backend', u.backend === INHERIT ? '' : (u.backend ?? ''))
+      setSavedMsg('Saved'); setTimeout(() => setSavedMsg(''), 1400)
+    } catch (e) {
+      pushToast((e as Error).message, 'error')  // a real failure is surfaced, never a false "Saved"
     }
-    setSavedMsg('Saved'); setTimeout(() => setSavedMsg(''), 1400)
   }
   const addDest = () => {
     const name = dest.name.trim(), root = dest.root.trim()
@@ -152,8 +162,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   {((u.backend && u.backend !== INHERIT ? String(u.backend) : (g.backend ? String(g.backend) : runners[0])) === 'kernel') && (
                     <div className="mt-2 flex items-center gap-2">
                       <Button variant="outline" size="sm" onClick={async () => {
-                        const r = await api.restartKernel(canvasId).catch(() => null)
-                        pushToast(r?.restarted ? 'Kernel restarting…' : 'No live kernel — a fresh one starts on the next run', 'success')
+                        try {
+                          const r = await api.restartKernel(canvasId)
+                          pushToast(r.restarted ? 'Kernel restarting…' : 'No live kernel — a fresh one starts on the next run', 'success')
+                        } catch (e) { pushToast((e as Error).message, 'error') }  // a failed restart is an error, not success
                       }}>Restart kernel</Button>
                       <span className="text-[10.5px] text-muted-foreground">Clears this canvas's warm kernel (a wedged transform / stale state); the next run starts fresh.</span>
                     </div>
