@@ -5926,7 +5926,6 @@ def test_ray_sort_live_differential(tmp_path):
     from hub.deps import Deps
     from hub.executors.engine import BuildEngine
     from hub.models import Graph
-    os.environ["DP_RAY_SHUFFLE_PARTITIONS"] = "4"
     p = str(tmp_path / "s.parquet")
     duckdb.connect().execute(
         f"COPY (SELECT (CASE WHEN i % 50 = 0 THEN NULL ELSE i % 100 END) AS k, i AS v "
@@ -5934,29 +5933,43 @@ def test_ray_sort_live_differential(tmp_path):
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
-    g = Graph(**{"id": "c", "version": 1, "nodes": [
-        _ray_node("src", "source", {"uri": p}),
-        _ray_node("s", "sort", {"by": "k, v"}),                 # k asc (ties + NULLs), v asc (unique tiebreak)
-    ], "edges": [_ray_edge("src", "s")]})
-    st = rr.run_unit(g, "s", str(tmp_path / "sort_out.parquet"))
-    for _ in range(900):
-        if rr.status(st.run_id).status in ("done", "failed", "cancelled"):
-            break
-        time.sleep(0.1)
-    st = rr.status(st.run_id)
-    assert st.status == "done", st.error
-    # read the OUTPUT in physical file order (pyarrow preserves it; DuckDB read may reorder)
-    files = sorted(_glob.glob(os.path.join(st.output_uri, "**", "*.parquet"), recursive=True))
-    ray_seq = [(r["k"], r["v"]) for r in _pq.read_table(files).to_pylist()]
-    # DuckDB oracle: the same sort, single-node
-    with db.run_scope():
-        oracle = BuildEngine(g, deps.resolve_adapter, deps.registry, full=True,
-                             node_specs=deps.node_specs, output_node="s").relation("s").to_arrow_table()
-    duck_seq = [(r["k"], r["v"]) for r in oracle.to_pylist()]
-    assert ray_seq == duck_seq, (
-        f"Ray sort order != DuckDB\nray[:4]={ray_seq[:4]} ...tail={ray_seq[-4:]}\n"
-        f"duck[:4]={duck_seq[:4]} ...tail={duck_seq[-4:]}")
-    assert len(ray_seq) == 4000
+
+    def run_sort(by, out):
+        g = Graph(**{"id": "c", "version": 1, "nodes": [
+            _ray_node("src", "source", {"uri": p}), _ray_node("s", "sort", {"by": by}),
+        ], "edges": [_ray_edge("src", "s")]})
+        st = rr.run_unit(g, "s", out)
+        for _ in range(900):
+            if rr.status(st.run_id).status in ("done", "failed", "cancelled"):
+                break
+            time.sleep(0.1)
+        st = rr.status(st.run_id)
+        assert st.status == "done", f"{by}: {st.error}"
+        files = sorted(_glob.glob(os.path.join(st.output_uri, "**", "*.parquet"), recursive=True))
+        ray_rows = _pq.read_table(files).to_pylist()      # physical file order (pyarrow preserves it)
+        with db.run_scope():
+            oracle = BuildEngine(g, deps.resolve_adapter, deps.registry, full=True,
+                                 node_specs=deps.node_specs, output_node="s").relation("s").to_arrow_table()
+        return ray_rows, oracle.to_pylist()
+
+    # (1) TOTAL key, ascending: (k, v) with v unique → exact sequence == DuckDB, incl. NULLS LAST placement
+    ray_rows, duck_rows = run_sort("k, v", str(tmp_path / "asc.parquet"))
+    assert [(r["k"], r["v"]) for r in ray_rows] == [(r["k"], r["v"]) for r in duck_rows] and len(ray_rows) == 4000
+
+    # (2) TOTAL key, DESCENDING (v unique): exact reversed sequence — confirms DESC + NULLS placement match
+    ray_rows, duck_rows = run_sort("v DESC", str(tmp_path / "desc.parquet"))
+    assert [r["v"] for r in ray_rows] == [r["v"] for r in duck_rows] == list(range(3999, -1, -1))
+
+    # (3) NON-total key (k alone, ties + NULLs): the honest contract — CORRECTLY sorted (k monotonic
+    # non-decreasing, NULLS last) + the SAME multiset as DuckDB, but tie-order is NOT asserted equal
+    # (unstable in both engines — the "byte-identical" promise holds only for a total key).
+    ray_rows, duck_rows = run_sort("k", str(tmp_path / "ties.parquet"))
+    ks = [r["k"] for r in ray_rows]
+    non_null = [x for x in ks if x is not None]
+    assert non_null == sorted(non_null), "non-NULL keys not ascending in file order"
+    assert ks[len(non_null):] == [None] * (len(ks) - len(non_null)), "NULLs not placed LAST"
+    assert sorted((r["k"] is None, r["k"] or 0, r["v"]) for r in ray_rows) == \
+           sorted((r["k"] is None, r["k"] or 0, r["v"]) for r in duck_rows)  # same multiset of rows
 
 
 def test_ray_region_requires_gates_scheduling(tmp_path):

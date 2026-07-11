@@ -70,7 +70,13 @@ _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", "
 # should not pin engine=ray).
 # `sort` = a native Ray range-shuffle sort on plain-column keys, then repartition(1) so the ordered output
 # is a SINGLE file (matching the single-node engine's single ordered writer — a sharded read wouldn't
-# preserve global order). Same rows/order as DuckDB for a total (unique) key; ties are unstable in BOTH.
+# preserve global order). FAITHFULNESS is exact only for a TOTAL (unique) key: the sequence then equals
+# DuckDB's, incl. NULL placement (both NULLS LAST on DuckDB 1.5.x). For a NON-unique key, ties are
+# unstable in BOTH engines → correctly sorted but tie-order may differ from single-node (not
+# byte-identical); a float/double DESC with NaN also differs (Ray puts NaN last, DuckDB treats it as
+# largest). SCALE: repartition(1) gathers the whole sorted set onto ONE worker — fine for this reference
+# backend, but a sort exceeding one node's memory should not pin engine=ray (a production backend would
+# write ordered shards + stitch on read).
 RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join", "sort"})
 
 
