@@ -29,6 +29,27 @@ from hub.settings import settings
 # (an int); a pack requiring a newer core than this is skipped at load with a clear error instead of
 # being registered and crashing later. Bump when a breaking SPI change lands.
 CORE_API_VERSION = 1
+# The OLDEST plugin API major this core still supports. Bump alongside CORE_API_VERSION when an old
+# major is dropped, so the check is a semantic RANGE (min ≤ need ≤ core), not just a floor: a plugin
+# built for a now-removed major is rejected up front instead of registering and crashing later (OSS-01).
+MIN_SUPPORTED_API = 1
+
+
+def _core_api_error(min_core) -> str | None:
+    """Validate a plugin's declared `min_core_api` against this core's supported range. Returns a
+    human error string if incompatible, or None if OK / undeclared (an undeclared plugin loads, as
+    before). Shared by all three load paths (drop-in manifest, DP_PLUGINS module, entry point)."""
+    if min_core is None:
+        return None
+    try:
+        need = int(str(min_core).split(".")[0])  # accept 1, "1", or the documented "1.0" (major only)
+    except ValueError:
+        return f"min_core_api must be a version number, got {min_core!r}"
+    if need > CORE_API_VERSION:
+        return f"requires core API >= {need}; this core is {CORE_API_VERSION}"
+    if need < MIN_SUPPORTED_API:
+        return f"targets core API {need}; this core supports core API >= {MIN_SUPPORTED_API} (breaking SPI change)"
+    return None
 
 
 class Registry:
@@ -363,8 +384,14 @@ class Deps:
             from importlib.metadata import entry_points
             for ep in entry_points(group="dataplay.plugins"):
                 try:
+                    fn = ep.load()
+                    mod = sys.modules.get(getattr(fn, "__module__", "") or "")
+                    err = _core_api_error(getattr(mod, "MIN_CORE_API", getattr(mod, "min_core_api", None))) if mod else None
+                    if err:  # entry-point plugin declares an unsupported core → skip before register (OSS-01)
+                        self.plugins.append({"name": ep.name, "source": "entry_point", "error": err})
+                        continue
                     reg._pack = ep.name
-                    ep.load()(reg)
+                    fn(reg)
                     self.plugins.append({"name": ep.name, "source": "entry_point"})
                 except Exception as e:  # noqa: BLE001
                     print(f"[deps] entry-point plugin '{ep.name}' failed: {e}")
@@ -389,18 +416,10 @@ class Deps:
             if missing:
                 self.plugins.append({"name": name, "source": "drop-in", "error": f"dataplay.toml missing: {', '.join(missing)}"})
                 return False
-            min_core = man.get("min_core_api")
-            if min_core is not None:
-                try:
-                    need = int(str(min_core).split(".")[0])  # accept 1, "1", or the documented "1.0" (major only)
-                except ValueError:
-                    self.plugins.append({"name": name, "source": "drop-in",
-                                         "error": f"min_core_api must be a version number, got {min_core!r}"})
-                    return False
-                if need > CORE_API_VERSION:
-                    self.plugins.append({"name": name, "source": "drop-in",
-                                         "error": f"requires core API >= {need}; this core is {CORE_API_VERSION}"})
-                    return False
+            err = _core_api_error(man.get("min_core_api"))
+            if err:
+                self.plugins.append({"name": name, "source": "drop-in", "error": err})
+                return False
             man["config"] = _normalize_config(man.get("config"))  # [[config]] → clean UI-field list (may be [])
             self._manifests[name] = man
             return True
@@ -411,6 +430,13 @@ class Deps:
     def _register_module(self, mod: str, reg: Registry) -> None:
         try:
             m = importlib.import_module(mod)
+            # a DP_PLUGINS module (pip package, no dataplay.toml) declares compat via a module attribute;
+            # gate it through the same range check so it can't register against an unsupported core (OSS-01).
+            # Harmless no-op for a drop-in pack (already manifest-gated; sets no such attr).
+            err = _core_api_error(getattr(m, "MIN_CORE_API", getattr(m, "min_core_api", None)))
+            if err:
+                self.plugins.append({"name": mod, "source": "module", "error": err})
+                return
             reg._pack = mod  # so reg.config() resolves plugin.<mod>.<key> for THIS pack
             if hasattr(m, "register"):
                 m.register(reg)
