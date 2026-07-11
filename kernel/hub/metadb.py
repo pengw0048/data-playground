@@ -484,11 +484,16 @@ def list_canvases_for(uid: str) -> list[dict]:
         return sorted(out.values(), key=lambda r: r["updatedAt"] or "", reverse=True)
 
 
+_RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (older history is pruned)
+
+
 def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
                rows: int | None = None, ms: int | None = None, error: str | None = None,
                output_table: str | None = None, per_node: list[dict] | None = None) -> bool:
     """Persist a finished run under its canvas. No-op (returns False) without a real canvas — an ad-hoc
-    API run or an internal region sub-run (graph id '_region'). Returns True when a row was written."""
+    API run or an internal region sub-run (graph id '_region'). Returns True when a row was written.
+    Prunes this canvas's history to the newest _RUN_HISTORY_MAX rows so the local DB can't grow without
+    bound (one row per run, forever) — mirrors the ResultCache / CanvasVersion caps."""
     if not canvas_id:
         return False
     with session() as s:
@@ -497,6 +502,13 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
         s.add(RunRecord(canvas_id=canvas_id, target_node_id=target_node_id, status=status,
                         rows=rows, ms=ms, error=error, output_table=output_table,
                         per_node=json.dumps(per_node, default=str) if per_node else None))
+        s.flush()
+        stale = s.scalars(select(RunRecord.id).where(RunRecord.canvas_id == canvas_id)
+                          .order_by(RunRecord.created_at.desc()).offset(_RUN_HISTORY_MAX)).all()
+        for rid in stale:
+            obj = s.get(RunRecord, rid)
+            if obj:
+                s.delete(obj)
         return True
 
 
@@ -558,10 +570,18 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
                  "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
 
 
+_RUN_STATE_MAX = 2000  # cap on TERMINAL run_states — live (queued/running) rows are never pruned
+_TERMINAL_RUN = ("done", "failed", "cancelled")
+
+
 def save_run_state(run_id: str, status: dict, canvas_id: str | None = None, kernel_id: str | None = None) -> None:
     """Upsert a run's live status (the runner calls this on each transition). `status` is a RunStatus
     model_dump; stored whole as JSON so GET /run/{id} can rebuild it on any instance. `kernel_id`
-    stamps the owning kernel so the boot-time reaper fails a run only when its kernel is gone."""
+    stamps the owning kernel so the boot-time reaper fails a run only when its kernel is gone. When a run
+    reaches a terminal status, prunes finished run_states to the newest _RUN_STATE_MAX (each row holds a
+    full RunStatus JSON, so unbounded growth is a real local-DB leak) — live rows are never touched, so
+    the reaper and in-flight status lookups are unaffected; an evicted OLD run just 404s on GET /run/{id}
+    (its durable per-canvas history lives in run_records)."""
     with session() as s:
         r = s.get(RunState, run_id)
         st = str(status.get("status", "running"))
@@ -575,6 +595,14 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None, kern
                 r.canvas_id = canvas_id
             if kernel_id and not r.kernel_id:
                 r.kernel_id = kernel_id
+        if st in _TERMINAL_RUN:  # once per run at completion (not every transition) → prune finished rows
+            s.flush()
+            stale = s.scalars(select(RunState.run_id).where(RunState.status.in_(_TERMINAL_RUN))
+                              .order_by(RunState.updated_at.desc()).offset(_RUN_STATE_MAX)).all()
+            for rid in stale:
+                obj = s.get(RunState, rid)
+                if obj:
+                    s.delete(obj)
 
 
 def get_run_state(run_id: str) -> dict | None:
