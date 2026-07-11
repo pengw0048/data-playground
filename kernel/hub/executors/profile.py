@@ -11,17 +11,24 @@ can say so. This also profiles nodes a sampled profile refuses (aggregate/sql th
 
 from __future__ import annotations
 
+import os
+
 import pyarrow as pa
 import pyarrow.compute as pc
 
 from hub import db, graph as g
 from hub.executors.engine import BuildEngine, NotPreviewable, _dedupe_names
-from hub.executors.preview import PREVIEW_BUDGET_S, PREVIEW_SCAN
+from hub.executors.preview import _CODE_CELL_KINDS, PREVIEW_BUDGET_S, PREVIEW_SCAN
 from hub.models import ColumnProfile, Graph, ProfileResult
 from hub.plugins.adapters import display_type
 from hub.sandbox import run_with_timeout
 
 PROFILE_ROWS = 10000   # cap the rows pulled into Arrow for stats (source scan is already bounded)
+
+try:  # a full profile is a full pass "like a run" — bound it by the SAME deadline knob (P0-EXEC-02)
+    PROFILE_FULL_BUDGET_S = float(os.environ.get("DP_RUN_DEADLINE_S", "3600"))
+except ValueError:
+    PROFILE_FULL_BUDGET_S = 3600.0
 
 
 def _stat(arr: pa.ChunkedArray, n: int, t: pa.DataType) -> dict:
@@ -105,14 +112,32 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
         if errs:
             return ProfileResult(error=True, reason="incompatible connection: " + "; ".join(errs[:3]))
 
+    from hub import auth
+    if auth.auth_enabled() and any(n.type in _CODE_CELL_KINDS for n in g.upstream_chain(graph, node_id)):
+        return ProfileResult(not_previewable=True, reason=(
+            "profiling a Python cell is disabled in multi-user mode — the in-process timeout can't kill "
+            "a runaway cell; run it (runs execute in a killable, deadline-bounded child)"))
+
     if full:
-        # a full-dataset profile is an intentional full pass (like a run) — no short preview budget, and
-        # it profiles reducing nodes (aggregate/sql) that a sampled profile refuses.
+        # a full-dataset profile is an intentional full pass (like a run) — no short preview budget, but
+        # a deadline + interruptible cursor so a huge/runaway pure-SQL aggregate can't pin the warm kernel
+        # forever (P0-EXEC-02). Mirrors the sampled path: scope opened on the WORKER thread (thread-local
+        # cursor), on_timeout interrupts it. It profiles reducing nodes (aggregate/sql) a sample refuses.
         eng = BuildEngine(graph, resolve_adapter, registry, sample_k=None, full=True,
                           node_builders=node_builders, node_specs=node_specs, warm=cache, warm_scope="full")
-        try:
-            with db.run_scope():
+        holder: dict = {}
+
+        def work() -> ProfileResult:
+            with db.run_scope() as scope:
+                holder["scope"] = scope
                 return _full_stats(eng, node_id)
+
+        def on_timeout() -> None:
+            sc = holder.get("scope")
+            (sc.interrupt() if sc is not None else db.interrupt())
+
+        try:
+            return run_with_timeout(work, PROFILE_FULL_BUDGET_S, on_timeout=on_timeout)
         except NotPreviewable as e:
             return ProfileResult(not_previewable=True, reason=e.reason)
         except Exception as e:  # noqa: BLE001
