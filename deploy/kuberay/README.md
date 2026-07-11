@@ -39,16 +39,33 @@ kubectl wait --for=condition=complete --timeout=600s job/dp-ray-multinode-check 
 Both paths use the same `docker/ray/Dockerfile` image, which bakes in the Ray-2.56 hash-shuffle compat
 shim (`hub.ray_compat`) via the worker-setup-hook env var, so no per-node tuning is needed.
 
-## What "PASS" proves
+## What "PASS" proves (and what it doesn't)
 
-- `multi-node OK: N distinct Ray node ids executed work` — the shuffle really crossed nodes (N ≥ 2), not
-  a single-host multiprocess stand-in.
-- `distributed GROUP BY byte-identical to DuckDB` — the Ray hash-aggregate over the object-store exchange
-  equals the DuckDB oracle (column names + Arrow **types** AND rows as a sorted multiset, NULL group +
-  count-null semantics included), read back from the worker-direct object-store output.
+- `multi-node OK: a hash-shuffle exchange spanned N distinct Ray node ids` — the **cluster** runs the
+  aggregate's exact mechanism (repartition-by-key → per-partition map) across N ≥ 2 nodes, not a
+  single-host multiprocess stand-in.
+- `distributed GROUP BY (placement=distributed) byte-identical to DuckDB` — the tested query ran on the
+  **Ray path** (`status.placement == "distributed"`, *not* dp_ray's silent single-node fallback — without
+  this a local fallback would match the DuckDB oracle trivially and the gate would prove nothing), and its
+  worker-direct object-store output equals the DuckDB oracle (column names + Arrow **types** AND rows as a
+  sorted multiset, NULL group + count-null semantics included). Same for the broadcast join.
+
+**Honest scope of "N nodes".** N is credited to the **cluster/shuffle** (measured by the probe), not to
+the specific GROUP BY/join — a query's own per-task node spread isn't observable from the driver process
+(the dp_ray run executes in its own subprocess). `placement=distributed` is what proves the tested query
+ran distributed; the probe proves the cluster genuinely spreads a shuffle across nodes.
 
 **Trusting a green run.** The check compares schema *and* rows and propagates its real exit code (the
-Compose driver escapes `$rc`; the KubeRay Job condition above gates on success). To prove the differential
-would actually *catch* a mismatch, run the deliberate failing control — it perturbs the oracle so the
-comparison must fail: `DP_MULTINODE_FAULT=1 docker compose -f docker-compose.ray.yml run --rm driver`
-should exit **nonzero**.
+Compose driver escapes `$rc`; the KubeRay Job condition above gates on success). Each of the **three
+oracles** (schema parity, aggregate rows, join rows) has its own fault-injection control, so none can be
+silently inert. Run the harness once per fault target — each **must exit nonzero** — plus once clean
+(**must pass**):
+
+```bash
+for f in schema rows join; do
+  DP_MULTINODE_FAULT=$f docker compose -f docker-compose.ray.yml run --rm driver   # expect NONZERO each
+done
+docker compose -f docker-compose.ray.yml run --rm driver                            # clean → PASS (exit 0)
+```
+
+(`DP_MULTINODE_FAULT=1` is accepted as an alias for `rows`, back-compat.)
