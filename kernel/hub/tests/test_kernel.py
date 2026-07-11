@@ -1490,6 +1490,27 @@ def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
         metadb.set_setting("objectStore", {}, "global")
 
 
+def test_arrow_feather_is_streamed_out_of_core(tmp_path, monkeypatch):
+    # ARC4 arrow-out-of-core: the feather/arrow WRITE streams RecordBatches via _stream_ipc (never
+    # to_arrow_table's whole-table-in-RAM), and the local READ is a LAZY, re-scannable IPC dataset
+    # (not feather.read_table). Prove the write goes through _stream_ipc + the read re-scans + round-trips.
+    import hub.plugins.adapters as _ad
+    from hub import db
+    a = _ad.DuckDBAdapter()
+    con = db.conn()
+    calls = []
+    orig = _ad._stream_ipc
+    monkeypatch.setattr(_ad, "_stream_ipc", lambda rel, sink: (calls.append(1), orig(rel, sink))[1])
+    with db.lock():
+        rel = con.sql("SELECT i AS id, i * 2 AS v FROM range(0, 5000) t(i)")  # spans several 65536-row batches trivially
+        out = str(tmp_path / "big.feather")
+        a.write(out, rel, "overwrite")
+        assert calls, "feather write must go through the streaming _stream_ipc path (not to_arrow_table)"
+        r = a.scan(out)
+        assert r.aggregate("count(*)").fetchone()[0] == 5000
+        assert r.aggregate("count(*)").fetchone()[0] == 5000  # re-scannable (a one-shot reader would give 0)
+
+
 def test_output_version_is_content_addressed_and_flags_schema_drift(tmp_path, caplog):
     # ARC4 output-versioning: an output's catalog version is a CONTENT hash of (schema + rows + fingerprint),
     # not a frozen 'v1' — the SAME data re-registers to the SAME version (a restart never spuriously bumps),
@@ -2278,17 +2299,17 @@ def test_object_store_feather_roundtrip(tmp_path):
 
         # a failed overwrite must NOT destroy the prior good object (temp-key + move discipline) — the
         # streamed multipart upload would otherwise finalize a partial/empty object onto the destination.
-        import pyarrow.feather as feather
-        orig = feather.write_feather
+        import hub.plugins.adapters as _ad
+        orig = _ad._stream_ipc  # the arrow-IPC streamed writer used by the feather write path
         try:
-            feather.write_feather = lambda *a_, **k_: (_ for _ in ()).throw(RuntimeError("boom mid-write"))
+            _ad._stream_ipc = lambda *a_, **k_: (_ for _ in ()).throw(RuntimeError("boom mid-write"))
             with db.lock():
                 with pytest.raises(RuntimeError):
                     a.write(uri, db.conn().read_parquet(p), "overwrite")
                 still = a.scan(uri).aggregate("count(*) AS c").fetchone()[0]
             assert still == 17  # the previous good object survived the failed overwrite
         finally:
-            feather.write_feather = orig
+            _ad._stream_ipc = orig
         # and no temp key was left behind
         left = [o["Key"] for o in boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k",
                 aws_secret_access_key="s", region_name="us-east-1").list_objects_v2(Bucket="bkt").get("Contents", [])]
