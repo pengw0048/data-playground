@@ -270,7 +270,12 @@ class RayRunner:
             if s.op == "window":
                 if not parse_group_keys(s.config.get("partitionBy", "")):
                     return False  # a window needs a bare-column PARTITION BY to be the shuffle key
-                if window_needs_order(s.config.get("expr", "")) and not (s.config.get("orderBy") or "").strip():
+                expr = s.config.get("expr", "")
+                if agg_has_order_sensitive(expr):
+                    return False  # list/string_agg/array_agg/arg_max/mode OVER (PARTITION BY k) is
+                                  # intra-partition-ORDER-dependent even though its window AST type is
+                                  # WINDOW_AGGREGATE → the shuffle scrambles the partition → single-node.
+                if window_needs_order(expr) and not (s.config.get("orderBy") or "").strip():
                     return False  # a RANKING/OFFSET window (row_number/rank/lag/first_value/…) is
                                   # intra-partition-order-dependent → needs a total ORDER BY (exact up to
                                   # ties — the sort tie-ceiling); a pure-AGGREGATE window (sum/count OVER

@@ -5693,6 +5693,12 @@ def test_ray_backend_operator_gating_and_fallback(tmp_path):
     assert _win({"partitionBy": "x", "expr": "first_value(x)", "as": "f"}) is False         # offset, no ORDER BY
     assert _win({"partitionBy": "x", "expr": "sum(x)", "as": "s"}) is True                  # aggregate window → OK
     assert _win({"partitionBy": "x", "expr": "count(*)", "as": "c"}) is True                # no ORDER BY needed
+    # an ORDER-SENSITIVE aggregate used AS a window (list/string_agg OVER (PARTITION BY k)) parses to a
+    # WINDOW_AGGREGATE type but its result still depends on intra-partition row order → must fall back even
+    # WITH no orderBy (the shuffle scrambles the partition). Regression from the #7 over-reject fix.
+    assert _win({"partitionBy": "x", "expr": "list(x)", "as": "l"}) is False
+    assert _win({"partitionBy": "x", "expr": "string_agg(CAST(x AS VARCHAR), ',')", "as": "s"}) is False
+    assert _win({"partitionBy": "x", "orderBy": "x", "expr": "list(x)", "as": "l"}) is False  # even with orderBy
 
     # (3b-iii) full-row dedup over a FLOAT column falls back — the shuffle's raw-byte equality splits
     # -0.0/0.0 (and NaN payloads) that DuckDB DISTINCT coalesces (acceptance #12). Uses RAW DuckDB types,
