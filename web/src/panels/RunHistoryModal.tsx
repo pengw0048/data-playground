@@ -98,12 +98,18 @@ export function DurationTrend({ runs }: { runs: RunRecordDto[] }) {
   )
 }
 
-// Per-node time/row breakdown for one run — a horizontal bar chart (the slow node stands out). Native SVG.
+// Per-node plan-build-time/row breakdown for one run — a horizontal bar chart. Native SVG.
 export function PerNodeBreakdown({ nodes }: { nodes: PerNodeStat[] }) {
   const max = Math.max(1, ...nodes.map((n) => n.ms ?? 0))
   return (
     <div className="bg-muted/30 px-3 py-2.5">
-      <div className="mb-1.5 text-[11px] text-muted-foreground">Time per node</div>
+      {/* honest label (DATA-05): this is the time to BUILD each node's lazy plan step, not to
+          materialize it — the out-of-core engine defers the heavy work to the target's single pass,
+          so don't read these as each node's share of the run. */}
+      <div className="mb-1.5 text-[11px] text-muted-foreground"
+           title="Time to build each node's lazy plan step — not its materialization time (the engine defers the heavy work to the target's single pass).">
+        Plan build time per node
+      </div>
       <div className="flex flex-col gap-1">
         {nodes.map((n) => {
           const st = statusTok[n.status as keyof typeof statusTok] ?? statusTok.draft

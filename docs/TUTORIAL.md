@@ -84,9 +84,11 @@ answer). When it finishes, the output is registered in the catalog: open **Table
 
 Each node **built one logical plan** (a DuckDB relation); the identical plan ran on a bounded
 sample for each preview and over the full dataset out-of-core for the run — with live per-node progress,
-and the finished run kept in **Run history** (native charts of run duration + per-node time). If a run
-fails, the panel names the node that broke and suggests a fix. Edit any node and it — plus everything
-downstream — goes **stale** (a re-run recomputes only what changed).
+and the finished run kept in **Run history** (native charts of run duration + per-node *plan-build* time —
+the out-of-core engine defers the heavy work to the target's single pass, so those bars are plan
+construction, not each node's share of the run). If a run fails, the panel names the node that broke and
+suggests a fix. Edit any node and it — plus everything downstream — goes **stale**; re-running a target
+whose inputs are unchanged reuses its content-addressed cached result rather than recomputing it.
 
 ## Where to go next
 

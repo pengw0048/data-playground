@@ -41,7 +41,7 @@ describe('PerNodeBreakdown — per-node horizontal bars', () => {
     render(<PerNodeBreakdown nodes={nodes} />)
     expect(screen.getByText('source')).toBeInTheDocument()
     expect(screen.getByText('write')).toBeInTheDocument()
-    expect(screen.getByText('Time per node')).toBeInTheDocument()
+    expect(screen.getByText('Plan build time per node')).toBeInTheDocument()
     expect(screen.getByText('90 ms')).toBeInTheDocument()
   })
 })
