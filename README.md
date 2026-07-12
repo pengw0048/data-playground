@@ -171,9 +171,11 @@ same seam the built-ins go through, so the core never changes:
 - **backend** (`ExecutionBackend`) — *where* a plan runs. A distributed one also implements
   `PlaceableBackend` (`workers()` / `place()` / `run_unit()`), so a run splits into **regions** that are
   each placed on a fitting backend and handed off through shared **storage**. The bundled **`dp_ray`**
-  reference backend runs eligible regions on a **Ray cluster** and writes region outputs directly from
-  workers. Object-store/non-Parquet reads and whole-graph sinks are still driver-funneled today; see the
-  [Ray support and readiness matrix](docs/RAY.md). A **`KernelSpawner`** likewise swaps the per-canvas
+  reference backend runs eligible regions on a pinned **Ray 2.56.0 cluster** and writes region outputs
+  directly from workers. A startup handshake rejects mixed driver/worker versions, and an explicit
+  `engine=ray` pin fails rather than silently falling back when its shape or advertised resources are
+  unsupported. Object-store/non-Parquet reads and whole-graph sinks are still driver-funneled today; see
+  the [Ray support and readiness matrix](docs/RAY.md). A **`KernelSpawner`** likewise swaps the per-canvas
   kernel from a local process to a **k8s Pod** for cross-host scale.
 
 ```mermaid

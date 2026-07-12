@@ -50,9 +50,10 @@ import uuid
 from hub import db, graph as g
 from hub.sinks import SinkSpec, commit_sink, preflight_sink
 from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (DuckDB's own parser), shared
-from hub.ir import (CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
+from hub.ir import (CLEAN_OPS, CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
                     plan_is_clean, plan_is_distributable)
 from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
+from hub.placement import satisfies
 from hub.workload_env import build_workload_env, prepare_workload_graph
 
 # the relational ops THIS backend claims beyond the map-style clean subset (ARC3). The engine does NOT
@@ -161,8 +162,8 @@ class RayRunner:
         self._cancel: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
 
-    # gate on the clean subset from the CompilePlan alone (what the kernel hands can_run) — else the
-    # DuckDB LocalRunner handles it. Conservative: unsure ⇒ fall back (always correct).
+    # Gate on the declared subset from the CompilePlan alone. An unpinned whole-backend choice can use
+    # DuckDB for unsupported work; run()/run_unit() separately enforce explicit engine=ray placement.
     def can_run(self, plan) -> bool:
         return plan_is_clean(plan) or plan_is_distributable(plan, RAY_RELATIONAL)
 
@@ -196,7 +197,11 @@ class RayRunner:
             gpu = int(os.environ.get("DP_RAY_GPUS", "0") or 0)
         except ValueError:
             gpu = 0  # a mistyped count shouldn't silently drop the whole capacity report
-        cap = ResourceSpec(mem=os.environ.get("DP_RAY_MEM", "1000GB"),
+        try:
+            cpu = float(os.environ.get("DP_RAY_NUM_CPUS", "0") or 0)
+        except ValueError:
+            cpu = 0
+        cap = ResourceSpec(cpu=cpu or None, mem=os.environ.get("DP_RAY_MEM", "1000GB"),
                            gpu=gpu or None, gpu_type=(os.environ.get("DP_RAY_GPU_TYPE") or None) if gpu else None,
                            labels={"engine": "ray"})
         return [WorkerInfo(id="ray", capacity=cap, state="idle")]
@@ -219,9 +224,14 @@ class RayRunner:
         handoff contract). A clean region runs distributed on Ray: reads AND writes worker-direct (each
         block written as its own parquet shard, no driver funnel — output_uri becomes a DIRECTORY of
         shards). `requires` (the planner's resolved region need) is passed to Ray so its map tasks are
-        scheduled onto a matching worker. Anything non-clean falls back to the base subprocess-materialize."""
+        scheduled onto a matching worker. An unpinned unsupported region may fall back locally; an
+        explicit ``engine=ray`` contract fails with the precise unsupported shape/resource reason."""
         ir = lower_to_ir(graph, output_node, self.node_specs, self.deps.node_ir)
-        if not self._ray_runnable(ir) or self._dedup_needs_single_node(graph, ir):
+        reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
+        reason = reason or self._resource_unsupported_reason(requires)
+        if reason and self._requires_ray(requires, graph, output_node):
+            return self._unsupported_status(graph, output_node, reason, run_id=run_id)
+        if reason:
             return self._materialize_local(graph, output_node, output_uri, run_id)  # non-clean → local engine
         run_id = run_id or f"unit_{uuid.uuid4().hex[:10]}"
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", target_node_id=output_node,
@@ -262,52 +272,100 @@ class RayRunner:
             p.status = status.status
         return status
 
-    def _ray_runnable(self, ir) -> bool:
+    def _ray_unsupported_reason(self, ir) -> str | None:
         # (1) every step is clean OR a claimed relational op; (2) every clean transform carries inlined
         # code (a Ray worker has no access to the driver's processor registry); (3) every aggregate has a
         # GROUPED, bare-column key we can hash-shuffle on (a global aggregate — empty keys — or an
         # expression key has no shuffle key → DuckDB single-node, which is cheap for a global reduce).
         if not ir.is_distributable(RAY_RELATIONAL):
-            return False
-        if not all(s.config.get("code") for s in ir.steps if s.op in CLEAN_TRANSFORM_MODES):
-            return False
+            unsupported = [f"{step.id}:{step.op}" for step in ir.steps
+                           if step.op not in CLEAN_OPS and step.op not in RAY_RELATIONAL]
+            return "unsupported operator(s): " + ", ".join(unsupported or ["empty graph"])
+        missing_code = [s.id for s in ir.steps
+                        if s.op in CLEAN_TRANSFORM_MODES and not s.config.get("code")]
+        if missing_code:
+            return "worker-portable transform code is missing for node(s): " + ", ".join(missing_code)
         for s in ir.steps:
             if s.op == "write":
                 try:
                     SinkSpec.from_config(s.config, s.config.get("title"))
-                except (TypeError, ValueError):
-                    return False  # invalid sink semantics must not be silently ignored by Ray
+                except (TypeError, ValueError) as exc:
+                    return f"write node '{s.id}' has unsupported sink semantics: {exc}"
             if s.op == "aggregate":
                 if not parse_group_keys(s.config.get("groupBy", "")):
-                    return False  # None (expression key) or [] (global) → not shuffle-distributable
+                    return f"aggregate node '{s.id}' needs a non-empty bare-column GROUP BY"
                 # pass the EFFECTIVE aggs (default matches _build_aggregate) so a node with no aggs isn't
                 # spuriously rejected by the empty-fragment conservative default.
                 if agg_has_order_sensitive(s.config.get("aggs") or "count(*) AS n"):
-                    return False  # list/string_agg/first/any_value/arg_max/mode/argmax → intra-group order
-                                  # matters, the hash-shuffle doesn't preserve it → single-node (conservative:
-                                  # even an ORDER-BY'd list, whose ORDER BY DuckDB rewrites out of the AST)
+                    return f"aggregate node '{s.id}' contains an order-sensitive aggregate"
             if s.op == "window":
                 if not parse_group_keys(s.config.get("partitionBy", "")):
-                    return False  # a window needs a bare-column PARTITION BY to be the shuffle key
+                    return f"window node '{s.id}' needs a bare-column PARTITION BY"
                 expr = s.config.get("expr", "")
                 if agg_has_order_sensitive(expr):
-                    return False  # list/string_agg/array_agg/arg_max/mode OVER (PARTITION BY k) is
-                                  # intra-partition-ORDER-dependent even though its window AST type is
-                                  # WINDOW_AGGREGATE → the shuffle scrambles the partition → single-node.
+                    return f"window node '{s.id}' contains an order-sensitive aggregate"
                 if window_needs_order(expr) and not (s.config.get("orderBy") or "").strip():
-                    return False  # a RANKING/OFFSET window (row_number/rank/lag/first_value/…) is
-                                  # intra-partition-order-dependent → needs a total ORDER BY (exact up to
-                                  # ties — the sort tie-ceiling); a pure-AGGREGATE window (sum/count OVER
-                                  # (PARTITION BY k)) is whole-partition → byte-identical with no ORDER BY.
+                    return f"window node '{s.id}' needs ORDER BY for deterministic distributed execution"
             if s.op == "dedup" and (s.config.get("on") or "").strip():
-                return False  # only full-row DISTINCT distributes; keyed DISTINCT ON is order-dependent
+                return f"dedup node '{s.id}' uses order-dependent keyed DISTINCT"
             if s.op == "join":
                 from hub.executors.engine import normalize_how
                 if normalize_how(s.config.get("how", "")) not in ("inner", "left", "cross"):
-                    return False  # right/full must emit unmatched-RIGHT rows → broadcast-right can't → DuckDB
+                    return f"join node '{s.id}' uses an unsupported right/full broadcast join"
             if s.op == "sort" and parse_sort_keys(s.config.get("by", "")) is None:
-                return False  # only a bare-column ORDER BY is distributable; expressions → DuckDB
-        return True
+                return f"sort node '{s.id}' needs a non-empty bare-column sort key"
+        return None
+
+    def _ray_runnable(self, ir) -> bool:
+        return self._ray_unsupported_reason(ir) is None
+
+    @staticmethod
+    def _requires_ray(requires, graph=None, target=None) -> bool:
+        raw = requires.model_dump() if hasattr(requires, "model_dump") else (requires or {})
+        if (raw.get("labels") or {}).get("engine") == "ray":
+            return True
+        if graph is None:
+            return False
+        nodes = g.upstream_chain(graph, target) if target else graph.nodes
+        return any(((node.data.get("config", {}).get("requires", {}).get("labels", {})
+                     if isinstance(node.data, dict) else {}).get("engine") == "ray") for node in nodes)
+
+    def _resource_unsupported_reason(self, requires) -> str | None:
+        if requires is None:
+            return None
+        try:
+            req = requires if isinstance(requires, ResourceSpec) else ResourceSpec(**requires)
+        except Exception as exc:  # noqa: BLE001
+            return f"invalid Ray resource requirement: {exc}"
+        workers = self.workers()
+        if any(satisfies(worker.capacity, req) for worker in workers):
+            return None
+        wanted = req.model_dump(by_alias=True, exclude_none=True)
+        offered = [worker.capacity.model_dump(by_alias=True, exclude_none=True) for worker in workers]
+        return f"requested resources {wanted} exceed advertised Ray capacity {offered}"
+
+    def _unsupported_status(self, graph, target, reason, *, run_id=None, plan=None) -> RunStatus:
+        run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"
+        per_node = ([PerNodeStatus(node_id=s.node_id, status="failed", label=s.label) for s in plan.steps]
+                    if plan is not None else
+                    [PerNodeStatus(node_id=target, status="failed", label=target)])
+        status = RunStatus(
+            run_id=run_id,
+            status="failed",
+            placement="distributed",
+            target_node_id=target,
+            per_node=per_node,
+            error=f"Ray execution was explicitly required but is unsupported: {reason}",
+        )
+        with self._lock:
+            self.runs[run_id] = status
+        self._emit(graph, status)
+        if self.on_complete:
+            try:
+                self.on_complete(graph, target, status)
+            except Exception:  # noqa: BLE001
+                pass
+        return status
 
     def _resolve_sink_targets(self, ir) -> dict[str, str]:
         """Resolve and validate logical sinks on the hub, before the isolated driver is dispatched."""
@@ -327,7 +385,7 @@ class RayRunner:
         except Exception:  # noqa: BLE001 — unknown destination/incompatible adapter ⇒ safe local fallback
             return False
 
-    def _dedup_needs_single_node(self, graph, ir) -> bool:
+    def _dedup_unsupported_reason(self, graph, ir) -> str | None:
         """Full-row dedup shuffles by ALL columns so identical rows colocate, then DuckDB DISTINCT per
         partition. But Ray's hash-shuffle equality is RAW-BYTE, which distinguishes values DuckDB DISTINCT
         coalesces: -0.0 vs 0.0, and distinct NaN bit-patterns. So two rows differing only in signed-zero /
@@ -339,7 +397,7 @@ class RayRunner:
         none), so it's separate from the config-only _ray_runnable gate; only paid when a dedup is present."""
         dedups = [s for s in ir.steps if s.op == "dedup"]
         if not dedups:
-            return False
+            return None
         from hub.executors.engine import BuildEngine
         # a raw DuckDB type string carries nested element types (STRUCT(a DOUBLE), DOUBLE[], MAP(…, DOUBLE))
         # so this catches nested floats; DECIMAL(…) / HUGEINT don't match, so exact types still distribute.
@@ -352,18 +410,29 @@ class RayRunner:
                                       output_node=s.id).relation(s.id)
                     types = [str(t) for t in rel.types]  # RAW DuckDB types (schema-only; no data scan)
             except Exception:  # noqa: BLE001 — can't prove the schema is float-free → don't distribute (safe)
-                return True
+                return f"could not prove dedup node '{s.id}' has Ray-safe equality semantics"
             if any(float_re.search(t) for t in types):
-                return True
-        return False
+                return f"dedup node '{s.id}' contains floating-point values with incompatible hash equality"
+        return None
+
+    def _dedup_needs_single_node(self, graph, ir) -> bool:
+        return self._dedup_unsupported_reason(graph, ir) is not None
 
     def run(self, plan, graph, target_node_id, placement, run_id=None) -> RunStatus:
         ir = lower_to_ir(graph, target_node_id, self.node_specs, self.deps.node_ir)
-        if not self._ray_runnable(ir) or self._dedup_needs_single_node(graph, ir):
+        reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
+        if reason and self._requires_ray(None, graph, target_node_id):
+            return self._unsupported_status(graph, target_node_id, reason, run_id=run_id, plan=plan)
+        if reason:
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)  # safe fallback
         try:
             sink_targets = self._resolve_sink_targets(ir)
-        except Exception:  # noqa: BLE001 — resolve/adapter uncertainty ⇒ local, never a partial Ray commit
+        except Exception as exc:  # noqa: BLE001 — resolve/adapter uncertainty ⇒ local or explicit failure
+            if self._requires_ray(None, graph, target_node_id):
+                return self._unsupported_status(
+                    graph, target_node_id, f"sink preflight failed: {type(exc).__name__}: {exc}",
+                    run_id=run_id, plan=plan,
+                )
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]

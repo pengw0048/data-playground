@@ -13,8 +13,8 @@
 #   kubectl apply -f deploy/kuberay/differential-job.yaml
 #   kubectl logs -f job/dp-ray-multinode-check        # expect "[multinode] PASS: … byte-identical …"
 #
-# The image already sets RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 and the hash-shuffle worker-setup-hook env var,
-# so KubeRay's pods carry the Ray 2.56 compat shim without extra config.
+# The image, this rayVersion field, and kernel[ray] are all pinned to 2.56.0. The driver rejects an
+# unsupported/mixed cluster before data execution, and every worker validates the private shuffle ABI.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:

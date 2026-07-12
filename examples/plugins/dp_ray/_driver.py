@@ -54,12 +54,14 @@ def main() -> None:
         # worker-setup-hook ENV VAR (default_worker.py reads it at startup) before ray.init on a LOCAL head.
         # (On a remote cluster the worker containers set the same var — see docker/ray + deploy/kuberay.)
         from ray._private import ray_constants
-        from hub.ray_compat import patch_hash_shuffle
+        from hub.ray_compat import patch_hash_shuffle, validate_ray_cluster
         patch_hash_shuffle()
         if not _addr:
             os.environ.setdefault(ray_constants.WORKER_PROCESS_SETUP_HOOK_ENV_VAR, "hub.ray_compat.patch_hash_shuffle")
         ray.init(address=_addr, ignore_reinit_error=True, configure_logging=False, log_to_driver=False,
                  include_dashboard=False, num_cpus=int(_ncpu) if (_ncpu and not _addr) else None)
+        versions = validate_ray_cluster(ray)
+        _log("version handshake OK: " + ", ".join(f"{node}={version}" for node, version in versions.items()))
         # Pin the HASH shuffle so relational ops (groupby keys / later sort/join) partition predictably.
         # Under a SORT strategy Ray silently ignores the group keys — fail loud instead of computing wrong.
         from ray.data import DataContext
