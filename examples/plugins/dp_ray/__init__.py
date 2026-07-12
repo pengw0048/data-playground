@@ -16,11 +16,12 @@ collects to the driver and writes via the adapter; cancellation is cooperative b
 no cheap mid-Dataset abort).
 
 EXECUTION MODEL — an isolated subprocess driver. Running Ray inline in the kernel process deadlocks: the
-source read / sink write / `register_output` go through the app's SHARED DuckDB base connection, and a
-materialization on that pre-existing connection wedges once `ray.init()` has run in the same process. So
-`run()` spawns a fresh subprocess (`_driver.py`) whose OWN process holds its DuckDB + Ray (`ray.init`
-before any DuckDB), and the parent only polls a status file — no DuckDB in the parent, no in-process
-coexistence. This is the production-correct shape (same isolation the built-in SubprocessRunner uses).
+source read / sink write go through a DuckDB base connection, and a materialization on the hub's
+pre-existing connection wedges once `ray.init()` has run in the same process. So `run()` spawns a fresh
+subprocess (`_driver.py`) whose OWN process holds its DuckDB + Ray (`ray.init` before any DuckDB). The hub
+resolves logical destinations before dispatch and owns catalog registration after the driver returns;
+the driver receives physical sink URIs and never reads that control-plane state. This is the
+production-correct isolation shape (the same boundary the built-in SubprocessRunner uses).
 
 The `uv` fix. If the kernel is launched via `uv run` (common), Ray's default behavior
 (`RAY_ENABLE_UV_RUN_RUNTIME_ENV`) re-launches its WORKERS through `uv` too — which builds a fresh,
@@ -47,12 +48,11 @@ import time
 import uuid
 
 from hub import db, graph as g
+from hub.sinks import SinkSpec, commit_sink, preflight_sink
 from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (DuckDB's own parser), shared
 from hub.ir import (CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
                     plan_is_clean, plan_is_distributable)
 from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
-
-_KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", ".json", ".lance")
 
 # the relational ops THIS backend claims beyond the map-style clean subset (ARC3). The engine does NOT
 # reimplement these on Ray operators — it lets RAY do only the SHUFFLE (hash-partition rows by the op's
@@ -258,6 +258,11 @@ class RayRunner:
         if not all(s.config.get("code") for s in ir.steps if s.op in CLEAN_TRANSFORM_MODES):
             return False
         for s in ir.steps:
+            if s.op == "write":
+                try:
+                    SinkSpec.from_config(s.config, s.config.get("title"))
+                except (TypeError, ValueError):
+                    return False  # invalid sink semantics must not be silently ignored by Ray
             if s.op == "aggregate":
                 if not parse_group_keys(s.config.get("groupBy", "")):
                     return False  # None (expression key) or [] (global) → not shuffle-distributable
@@ -289,6 +294,24 @@ class RayRunner:
             if s.op == "sort" and parse_sort_keys(s.config.get("by", "")) is None:
                 return False  # only a bare-column ORDER BY is distributable; expressions → DuckDB
         return True
+
+    def _resolve_sink_targets(self, ir) -> dict[str, str]:
+        """Resolve and validate logical sinks on the hub, before the isolated driver is dispatched."""
+        targets: dict[str, str] = {}
+        for step in ir.steps:
+            if step.op == "write":
+                spec = SinkSpec.from_config(step.config, step.config.get("title"))
+                targets[step.id] = preflight_sink(
+                    spec, self.deps.workspace, self.base.storage, self.resolve_adapter
+                )
+        return targets
+
+    def _sink_targets_runnable(self, ir) -> bool:
+        try:
+            self._resolve_sink_targets(ir)
+            return True
+        except Exception:  # noqa: BLE001 — unknown destination/incompatible adapter ⇒ safe local fallback
+            return False
 
     def _dedup_needs_single_node(self, graph, ir) -> bool:
         """Full-row dedup shuffles by ALL columns so identical rows colocate, then DuckDB DISTINCT per
@@ -324,6 +347,10 @@ class RayRunner:
         ir = lower_to_ir(graph, target_node_id, self.node_specs, self.deps.node_ir)
         if not self._ray_runnable(ir) or self._dedup_needs_single_node(graph, ir):
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)  # safe fallback
+        try:
+            sink_targets = self._resolve_sink_targets(ir)
+        except Exception:  # noqa: BLE001 — resolve/adapter uncertainty ⇒ local, never a partial Ray commit
+            return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=per_node,
@@ -337,6 +364,7 @@ class RayRunner:
         # spawns + polls a status file (no DuckDB here), so it can't deadlock. (Ray inline in-process
         # deadlocks against the shared DuckDB connection — see the module docstring.)
         threading.Thread(target=self._supervise, args=(run_id, graph, target_node_id, status),
+                         kwargs={"sink_targets": sink_targets},
                          daemon=True).start()
         return status
 
@@ -347,11 +375,24 @@ class RayRunner:
             except Exception:  # noqa: BLE001 — never let persistence break a run
                 pass
 
-    def _supervise(self, run_id, graph, target, status, materialize_uri=None, requires=None) -> None:
+    def _register_outputs(self, graph, result) -> None:
+        """Publish driver-written outputs through the hub-owned catalog/control plane."""
+        for output in result.get("outputs") or []:
+            step_id, name, uri = output.get("step_id"), output.get("name"), output.get("uri")
+            if not (step_id and name and uri):
+                raise RuntimeError("ray driver returned an incomplete sink result")
+            parents = [u for edge in g.incoming(graph, step_id)
+                       for u in [self.base._source_uri(nm_node=edge.source, graph=graph)] if u]
+            self.catalog.register_output(name=name, uri=uri, version=None,
+                                         parents=parents, pipeline="canvas")
+
+    def _supervise(self, run_id, graph, target, status, materialize_uri=None, requires=None,
+                   sink_targets=None) -> None:
         """Parent side: spawn the isolated Ray driver, poll its status file, mirror the result. Touches
         NO DuckDB (only subprocess + files + the DB-backed on_status/on_complete hooks) → never deadlocks.
         `materialize_uri` set = region mode (write target → that uri); else whole-graph mode (write node).
-        `requires` = the region's resource need, forwarded to the driver → per-task Ray placement."""
+        `requires` = the region's resource need, forwarded to the driver → per-task Ray placement.
+        `sink_targets` is the hub-resolved write-step-id → physical URI map; region mode omits it."""
         import json
         import subprocess
         import tempfile
@@ -361,10 +402,13 @@ class RayRunner:
         self._emit(graph, status)
         work = tempfile.mkdtemp(prefix="dp_ray_")
         job_file, status_file = os.path.join(work, "job.json"), os.path.join(work, "status.json")
+        job = {"workspace": self.deps.workspace, "data_dir": self.deps.data_dir, "target": target,
+               "graph": graph.model_dump(), "module": os.path.abspath(__file__), "requires": requires,
+               "materialize_uri": materialize_uri, "status_file": status_file}
+        if sink_targets is not None:  # whole-graph run only; region materialization has no write sink
+            job["sink_targets"] = sink_targets
         with open(job_file, "w") as f:
-            json.dump({"workspace": self.deps.workspace, "data_dir": self.deps.data_dir, "target": target,
-                       "graph": graph.model_dump(), "module": os.path.abspath(__file__), "requires": requires,
-                       "materialize_uri": materialize_uri, "status_file": status_file}, f)
+            json.dump(job, f)
         driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_driver.py")
         result = None
         try:
@@ -417,6 +461,15 @@ class RayRunner:
             # bypasses its finally, leaving that interim behind. Treating "running" as the result would
             # peg the sub-run at running forever and hang RunController._await. A dead driver → fail.
             if result and result.get("status") in ("done", "failed", "cancelled"):
+                if result.get("outputs"):
+                    try:
+                        self._register_outputs(graph, result)
+                    except Exception as e:  # noqa: BLE001 — local parity: catalog commit failure fails the run
+                        prior = f"{result.get('error')}; " if result.get("error") else ""
+                        result = dict(
+                            result, status="failed",
+                            error=f"{prior}catalog registration failed: {type(e).__name__}: {e}",
+                        )
                 status.status = result["status"]
                 status.error = result.get("error")
                 status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
@@ -436,23 +489,31 @@ class RayRunner:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _run_ir_sync(self, ir, graph, target, ray_opts=None, progress=None) -> dict:
+    def _run_ir_sync(self, ir, graph, target, ray_opts=None, progress=None, sink_targets=None) -> dict:
         """Child side (in the driver subprocess, Ray already init'd): execute the clean IR synchronously
         and return a result dict for the parent. Reuses _build/_commit; the fresh-process DuckDB is safe
-        because Ray was init'd before it was created."""
+        because Ray was init'd before it was created. Sink targets are physical URIs resolved by the hub;
+        the isolated driver never reads destination settings."""
+        outputs: list[dict[str, str]] = []
         try:
             datasets: dict[str, object] = {}
             rows, out_uri, out_table = 0, None, None
             for step in ir.steps:
                 if step.op == "write":
-                    rows, out_uri, out_table = self._commit(step, datasets, graph)
+                    target_uri = (sink_targets or {}).get(step.id)
+                    if not target_uri:
+                        raise RuntimeError(f"missing hub-resolved target URI for write step '{step.id}'")
+                    rows, out_uri, out_table = self._commit(step, datasets, target_uri)
+                    outputs.append({"step_id": step.id, "name": out_table, "uri": out_uri})
                 else:
                     datasets[step.id] = self._build(step, datasets, ray_opts)
             if target and target in datasets:  # a non-sink target → force a real row count
                 rows = datasets[target].count()
-            return {"status": "done", "rows": rows, "output_uri": out_uri, "output_table": out_table}
+            return {"status": "done", "rows": rows, "output_uri": out_uri,
+                    "output_table": out_table, "outputs": outputs}
         except Exception as e:  # noqa: BLE001
-            return {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
+            return {"status": "failed", "error": f"{type(e).__name__}: {e}",
+                    "rows": 0, "outputs": outputs}
 
     def _run_ir_materialize(self, ir, graph, target, uri, ray_opts=None, progress=None) -> dict:
         """Child side, region mode: run the clean IR up to `target` on Ray and materialize it to `uri`.
@@ -614,29 +675,30 @@ class RayRunner:
                                     f"ORDER BY {order}" if order else ""] if x)
         return self._shuffle_duckdb(parent, keys, f'SELECT *, {expr} OVER ({over}) AS "{col}" FROM _blk')
 
-    def _commit(self, step, datasets, graph) -> tuple[int, str, str]:
-        import pyarrow as pa
-
+    def _commit(self, step, datasets, target_uri: str) -> tuple[int, str, str]:
         cfg = step.config
-        raw = cfg.get("filename") or cfg.get("name") or cfg.get("title") or "output"  # match LocalRunner
-        fname = "".join(c if c.isalnum() or c in "_-." else "_" for c in str(raw)).strip(".") or "output"
-        base, ext = os.path.splitext(fname)
-        if ext.lower() not in _KNOWN_EXT:
-            ext = {"parquet": ".parquet", "csv": ".csv", "lance": ".lance"}.get(
-                (cfg.get("format") or "parquet").lower(), ".parquet")
-            base = fname
-        name, mode = base, cfg.get("writeMode", "overwrite")
-        uri = self.base.storage.output_uri(base, ext)          # reference: default storage (no destId)
+        spec = SinkSpec.from_config(cfg, cfg.get("title"))
         ds = datasets[step.inputs[0][0]]
-        batches = list(ds.iter_batches(batch_format="pyarrow"))  # collect blocks to the driver
-        tbl = pa.concat_tables(batches) if batches else pa.table({})
+        tbl = _collect_arrow(ds)                                # collect blocks to the driver, typed when empty
         with db.base_guard():
             rel = db.conn().from_arrow(tbl)
-            res = self.resolve_adapter(uri).write(uri, rel, mode)  # same write + catalog contract as local
-        out_uri = res.get("uri", uri)
-        parents = [u for (sid, _h) in step.inputs for u in [self.base._source_uri(nm_node=sid, graph=graph)] if u]
-        self.catalog.register_output(name=name, uri=out_uri, version="v1", parents=parents, pipeline="canvas")
-        return int(res.get("rows") or 0), out_uri, name
+            committed = commit_sink(spec, rel, self.deps.workspace, self.base.storage,
+                                    self.resolve_adapter, target_uri=target_uri)
+        return committed.rows, committed.uri, committed.name
+
+
+def _collect_arrow(dataset):
+    """Collect a Ray Dataset without erasing the schema when it contains zero output blocks."""
+    import pyarrow as pa
+
+    batches = list(dataset.iter_batches(batch_format="pyarrow"))
+    if batches:
+        return pa.concat_tables(batches)
+    schema = dataset.schema()
+    arrow_schema = getattr(schema, "base_schema", schema)
+    if not isinstance(arrow_schema, pa.Schema):
+        raise RuntimeError("an empty Ray result did not expose an Arrow schema")
+    return pa.Table.from_batches([], schema=arrow_schema)
 
 
 def register(reg) -> None:

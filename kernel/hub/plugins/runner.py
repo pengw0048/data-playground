@@ -402,29 +402,13 @@ class LocalRunner:
     def _commit_write(self, node, graph: Graph, engine: BuildEngine, status: RunStatus,
                       cached: dict | None) -> int:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-        mode = cfg.get("writeMode", "overwrite")
+        from hub.sinks import SinkSpec, commit_sink
+        spec = SinkSpec.from_config(cfg, node.data.get("title") if isinstance(node.data, dict) else None)
         # content-addressed skip: an identical overwrite plan already wrote this, so re-running is a
         # no-op. append is NOT idempotent (it must add a part every run), so it never uses the cache.
-        if mode != "append" and cached and cached.get("table") and cached.get("uri") and self._output_exists(cached["uri"]):
+        if spec.mode != "append" and cached and cached.get("table") and cached.get("uri") and self._output_exists(cached["uri"]):
             status.output_uri, status.output_table = cached["uri"], cached["table"]
             return int(cached.get("rows") or 0)
-        # the output file name (the extension picks the format); `name` (its base) is the catalog table.
-        raw = cfg.get("filename") or cfg.get("name") or node.data.get("title") or "output"
-        fname = "".join(c if c.isalnum() or c in "_-." else "_" for c in str(raw)).strip(".") or "output"
-        base, ext = os.path.splitext(fname)
-        _KNOWN = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", ".json", ".lance")
-        if ext.lower() not in _KNOWN:  # no/unknown extension → apply the format (default parquet)
-            ext = {"parquet": ".parquet", "csv": ".csv", "lance": ".lance"}.get((cfg.get("format") or "parquet").lower(), ".parquet")
-            base, fname = fname, f"{fname}{ext}"
-        name = base
-        # a write node may target a chosen destination (a preset place — local dir / object-store
-        # prefix); otherwise fall back to the default local outputs storage.
-        dest_id = cfg.get("destId")
-        if dest_id:
-            from hub import destinations
-            uri = destinations.target_uri(self.workspace, dest_id, cfg.get("destPath", ""), fname)
-        else:
-            uri = self.storage.output_uri(base, ext)
 
         inc = g.incoming(graph, node.id)
         if not inc:
@@ -432,18 +416,14 @@ class LocalRunner:
         # route by the wired output PORT (source_handle) — a write off a multi-output node must
         # persist that port's data, not the default/first one. Mirrors BuildEngine._inputs.
         parent_rel = engine.relation(inc[0].source, inc[0].source_handle)
-        adapter = self.resolve_adapter(uri)
-        # pass partition_by ONLY when set, so a plugin adapter whose write() lacks the kwarg is unaffected
-        pb = (cfg.get("partitionBy") or "").strip()
-        res = adapter.write(uri, parent_rel, mode, **({"partition_by": pb} if pb else {}))
-        rows = int(res.get("rows") or 0)
-        out_uri = res.get("uri", uri)  # append writes into a directory of parts — register THAT
+        committed = commit_sink(spec, parent_rel, self.workspace, self.storage, self.resolve_adapter)
 
         parent_uris = [u for e in inc for u in [self._source_uri(nm_node=e.source, graph=graph)] if u]
-        self.catalog.register_output(name=name, uri=out_uri, parents=parent_uris, pipeline="canvas")  # content-addressed version
-        status.output_uri = out_uri
-        status.output_table = name
-        return rows
+        self.catalog.register_output(name=committed.name, uri=committed.uri, parents=parent_uris,
+                                     pipeline="canvas")  # content-addressed version
+        status.output_uri = committed.uri
+        status.output_table = committed.name
+        return committed.rows
 
     def _source_uri(self, nm_node: str, graph: Graph) -> str | None:
         for n in g.upstream_chain(graph, nm_node):

@@ -194,7 +194,9 @@ def resolve_config(node: GraphNode) -> dict:
     if t == "write":
         return {"name": cfg.get("name"), "filename": cfg.get("filename"),
                 "title": node.data.get("title") if isinstance(node.data, dict) else None,
-                "format": cfg.get("format", "parquet"), "writeMode": cfg.get("writeMode", "overwrite")}
+                "format": cfg.get("format", "parquet"), "writeMode": cfg.get("writeMode", "overwrite"),
+                "destId": cfg.get("destId"), "destPath": cfg.get("destPath", ""),
+                "partitionBy": cfg.get("partitionBy", "")}
     return dict(cfg)  # metric/chart/vector-search/section/opaque/loop/variable — carry cfg verbatim
 
 
