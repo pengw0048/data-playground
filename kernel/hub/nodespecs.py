@@ -95,7 +95,8 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
                      ParamSpec(name="code", type="code", lang="python")],
              blurb="Python over Arrow batches — library preset or ad-hoc cell"),
     NodeSpec(kind="sql", title="sql", category="query", tag="sql",
-             inputs=[_in()], outputs=[_out("dataset")],  # a SQL view is a queryable relation → chains like any dataset
+             # SQL exposes its incoming relations as input/input2/… and therefore accepts many wires.
+             inputs=[_in(multi=True)], outputs=[_out("dataset")],  # a SQL view is a queryable relation → chains like any dataset
              params=[ParamSpec(name="sql", type="code", lang="sql", default="SELECT * FROM input LIMIT 100")],
              blurb="DuckDB SQL over inputs (references `input`)"),
     NodeSpec(kind="join", title="join", category="compute", tag="join",
