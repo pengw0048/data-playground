@@ -27,6 +27,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({
       kernelUp: true,
+      canvasRole: 'owner',
       doc: { id: 'c', name: 'test', version: 1, nodes: [], edges: [] },
       catalog: [{ id: 't1', name: 'orders', uri: 'mem://orders', rowCount: null, version: 'v1', columns: [{ name: 'a', type: 'int', capabilities: [] }] }],
       past: [], future: [], selectedIds: [],
