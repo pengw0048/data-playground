@@ -2768,6 +2768,60 @@ def test_headless_run_kernel_failure_is_a_clean_exit(tmp_path, monkeypatch):
     assert "cannot run canvas 'kf_canvas'" in str(ei.value)
 
 
+def test_headless_run_canvas_params(tmp_path):
+    # ARC7 canvas parameters: ${NAME} tokens in a canvas's configs are bound per run via --param (cron/CI);
+    # an UNBOUND token must fail loudly, not run against the literal "${src}" path.
+    import pytest
+
+    from hub.cli import _apply_params, _headless_run, _load_canvas_graph
+    from hub.deps import get_deps
+    p = _seq_parquet(tmp_path)
+    doc = {"id": "param_canvas", "name": "pc", "version": 1,
+           "nodes": [N("src", "source", {"uri": "${src}"}), N("wr", "write", {"name": "param_out"})],
+           "edges": [E("src", "wr")]}
+    client.put("/api/canvas/param_canvas", json=doc)
+
+    # bound: ${src} → the real parquet path → runs to done + materializes the output
+    code = _headless_run(get_deps(), "param_canvas", None, 30.0, as_json=False, params={"src": p})
+    assert code == 0
+    assert any(t["name"] == "param_out" for t in client.get("/api/catalog/tables").json())
+
+    # unbound: no --param → loud failure BEFORE the run (not a run against a literal "${src}" path)
+    with pytest.raises(SystemExit) as ei:
+        _headless_run(get_deps(), "param_canvas", None, 30.0, as_json=False, params={})
+    assert "unbound canvas parameter" in str(ei.value) and "src" in str(ei.value)
+
+    # _apply_params substitutes within config; a bound token is replaced verbatim, title left untouched
+    g, _ = _load_canvas_graph("param_canvas")
+    _apply_params(g, {"src": "/data/x.parquet"})
+    assert g.nodes[0].data["config"]["uri"] == "/data/x.parquet"
+
+    # M1: a token whose name has a '-'/'.' still binds (regex is [^}]+), and is NEVER left as a silent
+    # literal — an unbound one of these errors just like a plain name (the review's silent-hole fix)
+    doc2 = {"id": "pc2", "name": "pc2", "version": 1,
+            "nodes": [N("src", "source", {"uri": "d/${my-date}/x"})], "edges": []}
+    client.put("/api/canvas/pc2", json=doc2)
+    g2, _ = _load_canvas_graph("pc2")
+    _apply_params(g2, {"my-date": "2026-07-12"})
+    assert g2.nodes[0].data["config"]["uri"] == "d/2026-07-12/x"
+    with pytest.raises(SystemExit) as ei2:
+        _apply_params(_load_canvas_graph("pc2")[0], {})  # unbound hyphen token must fail loudly
+    assert "my-date" in str(ei2.value)
+
+    # m2: targeting one node must NOT require params from an UNRELATED branch. Branch A (src_a→wr_a) needs
+    # no param; branch B has an unbound ${dev}. Running --node wr_a substitutes/checks only A's cone.
+    doc3 = {"id": "pc3", "name": "pc3", "version": 1,
+            "nodes": [N("src_a", "source", {"uri": p}), N("wr_a", "write", {"name": "pc3_a"}),
+                      N("src_b", "source", {"uri": "${dev}"}), N("wr_b", "write", {"name": "pc3_b"})],
+            "edges": [E("src_a", "wr_a"), E("src_b", "wr_b")]}
+    client.put("/api/canvas/pc3", json=doc3)
+    ga, _ = _load_canvas_graph("pc3")
+    _apply_params(ga, {}, node="wr_a")  # only wr_a's cone (src_a, wr_a) — the unbound ${dev} in B is not in scope
+    # (no SystemExit) — and the whole-canvas view WOULD flag it:
+    with pytest.raises(SystemExit):
+        _apply_params(_load_canvas_graph("pc3")[0], {})
+
+
 def test_coordination_tables_pruned_to_cap(monkeypatch):
     # ARC5 coordination-table-prune: run_records (per-canvas history) and run_states (one full-JSON row
     # per run) must NOT grow without bound in the local DB. record_run caps per-canvas history; a run

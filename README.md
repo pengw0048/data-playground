@@ -39,11 +39,14 @@ make setup && make run          # → http://127.0.0.1:8471 (seeds sample data o
 cd kernel && uv run dataplay                      # serve the canvas + engine, open the browser
 cd kernel && uv run dataplay --workspace ./my-proj --port 8471
 cd kernel && uv run dataplay run <canvas>         # run a saved canvas to completion, headless (cron/CI)
+cd kernel && uv run dataplay run <canvas> --param date=2026-07-12   # bind ${date} in the canvas's configs
 ```
 
 `dataplay run` executes a saved canvas (by id or unique name) with no browser, prints a per-node
 summary (or `--json`), and exits non-zero if the run fails — so a pipeline you built in the canvas
 drops straight into cron, CI, or a shell script. It shares the workspace/DB with the web app.
+Parameterize a run with `--param NAME=VALUE` (repeatable): any `${NAME}` token in a node's config
+(a source uri, a filter predicate, SQL…) is substituted per run; an unbound token fails loudly.
 
 (A *workspace* is just a project directory — it holds your canvases, catalog, outputs, and plugins;
 it defaults to the current directory.)
