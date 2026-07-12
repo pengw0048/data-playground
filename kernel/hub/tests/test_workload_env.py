@@ -113,6 +113,18 @@ def test_readable_malformed_job_artifact_is_corruption_not_missing(tmp_path):
         read_json_artifact(str(tmp_path / "missing.dpjob"))
 
 
+def test_job_artifact_size_bound_applies_to_writes_and_reads(tmp_path, monkeypatch):
+    from hub import job_artifacts
+
+    monkeypatch.setattr(job_artifacts, "JSON_ARTIFACT_MAX_BYTES", 16)
+    oversized = tmp_path / "oversized.dpjob"
+    with pytest.raises(ValueError, match="16-byte limit"):
+        job_artifacts.write_json_artifact(str(oversized), {"payload": "x" * 32})
+    oversized.write_bytes(b'{' + b'"x":1,' * 8 + b'}')
+    with pytest.raises(job_artifacts.ArtifactCorrupt, match="16-byte limit"):
+        job_artifacts.read_json_artifact(str(oversized))
+
+
 def test_pod_manifest_uses_the_same_explicit_profile(monkeypatch):
     from hub.pod_spawner import PodSpawner
 

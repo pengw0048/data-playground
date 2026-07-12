@@ -15,6 +15,12 @@ from urllib.parse import urlparse
 
 
 _OBJECT_SCHEMES = ("s3://", "r2://", "gs://", "gcs://")
+JSON_ARTIFACT_MAX_BYTES = 64 * 1024**2
+# Keep the recoverable SQL copy comfortably below the object/request cap. The repository's maximum
+# 5,000-node/10,000-edge topology with ordinary transforms is about 1.4 MiB; 32 individually max-sized
+# code nodes are about 6.4 MiB. Larger valid canvases must be split before durable Jobs submission rather
+# than placing a tens-of-megabytes value in one metadata row.
+JOB_SQL_ENVELOPE_MAX_BYTES = 8 * 1024**2
 
 RAY_JOB_CONTRACT_VERSION = 2
 RAY_JOB_CANONICAL_FIELDS = (
@@ -42,6 +48,16 @@ class ArtifactCorrupt(ValueError):
 def canonical_json(value: object) -> bytes:
     """Stable JSON bytes used by the Ray Jobs content-binding contract."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+
+
+def json_artifact_payload(value: object, *, label: str = "JSON artifact") -> bytes:
+    """Return canonical bytes within the same bound used by object and SQL artifact copies."""
+    payload = canonical_json(value)
+    if len(payload) > JSON_ARTIFACT_MAX_BYTES:
+        raise ValueError(
+            f"{label} exceeds the {JSON_ARTIFACT_MAX_BYTES}-byte limit"
+        )
+    return payload
 
 
 def require_exact_object(value: object, fields: Iterable[str], *, label: str) -> dict:
@@ -107,7 +123,7 @@ def _object_fs(uri: str):
 
 
 def write_json_artifact(uri: str, value: dict) -> None:
-    payload = canonical_json(value)
+    payload = json_artifact_payload(value)
     if _is_object_uri(uri):
         fs, path = _object_fs(uri)
         # Object stores have a flat key namespace. Opening bucket/prefix/key is sufficient and avoids
@@ -156,12 +172,16 @@ def read_json_artifact(uri: str) -> dict:
             if info.type == pafs.FileType.NotFound:
                 raise ArtifactNotFound(uri)
             with fs.open_input_file(path) as stream:
-                payload = stream.read()
+                payload = stream.read(JSON_ARTIFACT_MAX_BYTES + 1)
         else:
             with open(_local_path(uri), "rb") as stream:
-                payload = stream.read()
+                payload = stream.read(JSON_ARTIFACT_MAX_BYTES + 1)
     except FileNotFoundError as e:
         raise ArtifactNotFound(uri) from e
+    if len(payload) > JSON_ARTIFACT_MAX_BYTES:
+        raise ArtifactCorrupt(
+            f"artifact {uri!r} exceeds the {JSON_ARTIFACT_MAX_BYTES}-byte limit"
+        )
     try:
         value = json.loads(payload.decode())
     except (UnicodeDecodeError, json.JSONDecodeError) as e:

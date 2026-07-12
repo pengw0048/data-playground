@@ -76,7 +76,8 @@ from hub.ir import (CLEAN_OPS, CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_k
                     plan_is_clean, plan_is_distributable)
 from hub.job_artifacts import (RAY_JOB_CANONICAL_FIELDS, RAY_JOB_CONTRACT_VERSION,
                                RAY_JOB_ENVELOPE_FIELDS, RAY_JOB_RESULT_FIELDS, ArtifactCorrupt,
-                               ArtifactNotFound, JsonArtifactStore, canonical_json, require_exact_object)
+                               ArtifactNotFound, JsonArtifactStore, canonical_json,
+                               json_artifact_payload, require_exact_object)
 from hub.models import (CatalogPublicationReceipt, PerNodeStatus, ResourceSpec, RunBackendRef,
                         RunStatus, WorkerInfo)
 from hub.placement import node_requires, satisfies
@@ -1383,8 +1384,34 @@ class RayRunner:
                     f"Ray Jobs {key} changed; restore the original image contract before reattaching"
                 )
 
-    @staticmethod
-    def _validate_job_result(job: dict, result: dict) -> dict:
+    def _read_or_materialize_job_artifact(
+            self, ref: RunBackendRef, status: RunStatus) -> dict:
+        """Read the object artifact, recreating the exact canonical bytes after a post-bind crash."""
+        from hub import metadb
+
+        durable_payload = metadb.backend_job_artifact_payload(status.run_id)
+        try:
+            candidate = self._artifacts.read(ref.job_uri)
+        except (ArtifactNotFound, FileNotFoundError):
+            if durable_payload is None:  # nullable keeps pre-upgrade/manual rows recoverable when object exists
+                raise
+            try:
+                candidate = json.loads(durable_payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                raise ArtifactCorrupt("durable SQL job envelope is not valid JSON") from e
+            if not isinstance(candidate, dict):
+                raise ArtifactCorrupt("durable SQL job envelope must contain a JSON object")
+            # The payload was bounded and hash-bound before the SQL commit. Rewriting that exact object
+            # identity is safe for concurrent replacement supervisors; they all carry identical bytes.
+            self._artifacts.write(ref.job_uri, candidate)
+            candidate = self._artifacts.read(ref.job_uri)
+        if durable_payload is not None and canonical_json(candidate) != durable_payload:
+            raise ArtifactContractError(
+                "Ray job artifact does not match its durable SQL envelope"
+            )
+        return candidate
+
+    def _validate_job_result(self, job: dict, result: dict) -> dict:
         try:
             require_exact_object(result, _JOB_RESULT_FIELDS, label="Ray result artifact")
         except ArtifactCorrupt as e:
@@ -1408,15 +1435,16 @@ class RayRunner:
         for key in ("error", "output_uri", "output_table"):
             if result.get(key) is not None and not isinstance(result[key], str):
                 raise ArtifactContractError(f"Ray result {key} must be a string or null")
-        if result["status"] != "done":
-            if result.get("outputs") or result.get("output_uri") or result.get("output_table"):
-                raise ArtifactContractError("failed/cancelled Ray results cannot expose partial outputs")
-            return result
-        if result.get("error"):
-            raise ArtifactContractError("successful Ray results cannot contain an error")
-
         sink_targets = job.get("sink_targets") or {}
         if job.get("materialize_uri"):
+            if result["status"] != "done":
+                if outputs or result.get("output_uri") or result.get("output_table"):
+                    raise ArtifactContractError(
+                        "failed/cancelled Ray region results cannot expose partial outputs"
+                    )
+                return result
+            if result.get("error"):
+                raise ArtifactContractError("successful Ray results cannot contain an error")
             requested = str(job["materialize_uri"])
             expected_uri = requested[:-len(".parquet")] if requested.lower().endswith(".parquet") else requested
             if result.get("output_uri") != expected_uri or outputs:
@@ -1428,10 +1456,17 @@ class RayRunner:
         graph = Graph.model_validate(job["graph"])
         nodes = {node.id: node for node in graph.nodes}
         expected: dict[str, tuple[str, str]] = {}
-        for step_id, uri in sink_targets.items():
+        for step_id, logical_uri in sink_targets.items():
             node = nodes.get(step_id)
             config = (node.data.get("config") if node and isinstance(node.data, dict) else None) or {}
-            expected[step_id] = (SinkSpec.from_config(config, config.get("title")).name, uri)
+            spec = SinkSpec.from_config(config, config.get("title"))
+            adapter = self.resolve_adapter(logical_uri)
+            physical_uri = (
+                _attempt_handoff_uri(logical_uri, job["attempt_id"], scope=step_id)
+                if _worker_direct_parquet_sink(spec, logical_uri, adapter)
+                else logical_uri
+            )
+            expected[step_id] = (spec.name, physical_uri)
         actual: dict[str, tuple[str, str]] = {}
         for output in outputs:
             if (not isinstance(output, dict) or set(output) != {"step_id", "name", "uri"}
@@ -1441,6 +1476,22 @@ class RayRunner:
             if step_id in actual:
                 raise ArtifactContractError(f"Ray result repeats write step '{step_id}'")
             actual[step_id] = (str(output["name"]), str(output["uri"]))
+        if result["status"] != "done":
+            # A driver can fail after one immutable sink committed. Keep exact, hash-bound sink evidence
+            # private in the result artifact for later cleanup, but never project it into public status or
+            # catalog. Unknown/mismatched URIs remain contract corruption.
+            if result.get("output_uri") or result.get("output_table"):
+                raise ArtifactContractError(
+                    "failed/cancelled Ray results cannot expose a primary output"
+                )
+            if any(step_id not in expected or expected[step_id] != value
+                   for step_id, value in actual.items()):
+                raise ArtifactContractError(
+                    "Ray partial outputs do not match the hash-bound job sinks"
+                )
+            return result
+        if result.get("error"):
+            raise ArtifactContractError("successful Ray results cannot contain an error")
         if actual != expected:
             raise ArtifactContractError("Ray result catalog outputs do not match the hash-bound job sinks")
         if expected:
@@ -2198,7 +2249,7 @@ class RayRunner:
 
     def _start_jobs(self, status: RunStatus, graph, target, *, sink_targets=None,
                     materialize_uri=None, requires=None) -> RunStatus:
-        """Persist the hash-bound job contract before submitting or reattaching the deterministic ID."""
+        """Bind the hash-bound job contract before materializing or submitting its deterministic ID."""
         from hub import metadb
 
         ref, job = self._make_jobs_artifacts(
@@ -2215,26 +2266,25 @@ class RayRunner:
                 f"run id '{status.run_id}' is already bound to a different Ray Jobs execution contract"
             )
         self._jobs_client(ref["control_address"])  # validate SDK + endpoint before persisting a queued run
-        # The hash-bound input exists before the backend binding. A crash after the queued state is emitted
-        # but before submit is recoverable: the next supervisor reads this artifact and submits the same ID.
-        try:
-            existing_artifact = self._artifacts.read(ref["job_uri"])
-        except (ArtifactNotFound, FileNotFoundError):
-            self._artifacts.write(ref["job_uri"], job)
-            existing_artifact = self._artifacts.read(ref["job_uri"])
-        if canonical_json(existing_artifact) != canonical_json(job):
-            raise ArtifactContractError(
-                "Ray job artifact key already contains a different execution envelope"
-            )
-        self._validate_job_artifact(self._ref_model(ref), status, existing_artifact)
+        job_payload = json_artifact_payload(job, label="Ray job artifact")
         status.backend_ref = self._ref_model(ref)
         stored, created = metadb.bind_backend_job(
-            status.run_id, ref, status.model_dump(), canvas_id=getattr(graph, "id", None)
+            status.run_id, ref, status.model_dump(), canvas_id=getattr(graph, "id", None),
+            job_payload=job_payload,
         )
         if any(stored.get(key) != ref.get(key) for key in binding_fields):
             raise RuntimeError(
                 f"run id '{status.run_id}' is already bound to a different Ray Jobs execution contract"
             )
+        stored_payload = metadb.backend_job_artifact_payload(status.run_id)
+        if stored_payload is not None and stored_payload != job_payload:
+            raise ArtifactContractError(
+                "Ray durable SQL binding contains a different execution envelope"
+            )
+        existing_artifact = self._read_or_materialize_job_artifact(
+            self._ref_model(stored), status
+        )
+        self._validate_job_artifact(self._ref_model(stored), status, existing_artifact)
         persisted = metadb.get_run_state(status.run_id)
         current = self.runs.get(status.run_id)
         if not created and current is not None:
@@ -2777,7 +2827,6 @@ class RayRunner:
             client = self._jobs_client(binding.get("control_address"))
             state = self._find_job(client, ref.submission_id)
             self._note_jobs_control_observed(status, ref)
-            status.error = None
             cancel_fenced = binding.get("submission_state") == "stop_fenced"
             if state is None:
                 state, accepted_fence = self._fence_missing_stop(
@@ -2849,7 +2898,7 @@ class RayRunner:
                     time.sleep(self._jobs_poll_s)
                     continue
                 try:
-                    candidate = self._artifacts.read(ref.job_uri)
+                    candidate = self._read_or_materialize_job_artifact(ref, status)
                 except (ArtifactNotFound, FileNotFoundError) as e:
                     if cancelling and state == "STOPPED":
                         self._publish_cancelled_binding(status, binding)
@@ -2860,7 +2909,7 @@ class RayRunner:
                     )
                     time.sleep(self._jobs_poll_s)
                     continue
-                except ArtifactCorrupt as e:
+                except (ArtifactCorrupt, ArtifactContractError) as e:
                     if self._quarantine_invalid_job(status, ref, e):
                         return
                     time.sleep(self._jobs_poll_s)
@@ -2943,9 +2992,8 @@ class RayRunner:
                         return
                     time.sleep(self._jobs_poll_s)
                     continue
-                previous_live_error = status.error
+                cleared_live_error = False
                 cancelling, cancel_client, cancel_state = self._cancel_control_state(status, ref, binding)
-                cleared_live_error = previous_live_error is not None and status.error is None
                 if cancelling:
                     client = cancel_client or client
                     if cancel_state in ("STOPPED", "MISSING"):

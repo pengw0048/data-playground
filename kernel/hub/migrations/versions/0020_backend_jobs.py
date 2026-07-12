@@ -54,6 +54,7 @@ def upgrade() -> None:
         sa.Column("publication_lease_until", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_control_observed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("recovery_blocked_reason", sa.Text(), nullable=True),
+        sa.Column("job_doc", sa.Text(), nullable=True),
         sa.Column("result_doc", sa.Text(), nullable=True),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
         sa.UniqueConstraint("backend", "submission_id", name="uq_run_backend_submission"),

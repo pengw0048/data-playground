@@ -84,7 +84,11 @@ API keys are never sent to the driver.
    a write-once job envelope. A future workload-identity provider observes that principal in the hub-side
    launch context; raw principal/canvas identity is not copied into Ray artifacts or submission metadata.
 2. One SQL transaction binds `run_id` to backend, cluster, submission, attempt, object URIs, code ref,
-   and the non-secret Jobs control address while updating the prebound queued `run_states` row.
+   the non-secret Jobs control address, and a private canonical copy of the hash-bound job envelope while
+   updating the prebound queued `run_states` row. The JSON artifact is capped at 64 MiB; its metadata-row
+   copy has a separate 8 MiB ceiling and contains neither raw owner/auth identity nor data credentials.
+   Oversized jobs fail before the binding transaction. Only after that commit does the hub materialize
+   `job.dpjob`; a replacement supervisor recreates the exact bytes if the first hub crashes between phases.
 3. Status plus a successful Jobs listing distinguish an absent job from an ambiguous API failure. Only
    authoritative absence opens submission/replay. SQL then linearizes exactly one request with a
    DB-clock lease and a CAS that requires `cancel_requested=false`; an expired-owner reclaim moves
@@ -96,7 +100,9 @@ API keys are never sent to the driver.
    or successful listing proves the job absent. A valid hash-bound result is terminal evidence when Ray's
    job metadata is authoritatively gone.
 5. On `SUCCEEDED`, the hub reads and verifies the exact result envelope. Missing results receive a bounded
-   consistency grace period; transport/auth failures remain non-terminal and retry.
+   consistency grace period; transport/auth failures remain non-terminal and retry. A failed/cancelled
+   envelope may retain a hash-bound subset of committed sink URIs as private cleanup evidence, but it must
+   not name a primary output and those URIs never enter public status or catalog publication.
 6. Supervisors compete for a renewable SQL publication lease. Catalog projection is a required,
    idempotent effect and is retried on failure. Every output must return a durable receipt only after its
    catalog reference is readable; a method return without that receipt cannot publish terminal success.
@@ -120,8 +126,9 @@ resurrecting a completed run even when no history row exists or bounded history 
 
 ## Recovery and cancellation
 
-The SQL binding stores the original control address and `cancel_requested`. Restart recovery does not
-depend on a PID, local temp directory, or process-local event. Missing local Jobs configuration is reported
+The SQL binding stores the original control address, canonical job envelope, and `cancel_requested`.
+Restart recovery does not depend on a PID, local temp directory, or process-local event. Missing local
+Jobs configuration is reported
 as a non-terminal configuration-unavailable state; it is never reclassified as artifact tampering and does
 not stop or replay a real job. A malformed active binding or `RunStatus` document is also fail-closed: the
 hub persists a bounded `recovery blocked` diagnosis, emits a structured warning, exposes the run as

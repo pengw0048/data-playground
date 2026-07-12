@@ -163,6 +163,9 @@ class RunBackendJob(Base):
         DateTime(timezone=True), nullable=True
     )
     recovery_blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Private control-plane copy of the immutable workload envelope. It lets recovery materialize the
+    # object artifact after a crash between the SQL binding commit and object-store creation.
+    job_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
     __table_args__ = (UniqueConstraint("backend", "submission_id", name="uq_run_backend_submission"),)
@@ -1463,13 +1466,21 @@ def get_run_state(run_id: str) -> dict | None:
 
 
 def bind_backend_job(run_id: str, ref: dict, status: dict,
-                     canvas_id: str | None = None) -> tuple[dict, bool]:
+                     canvas_id: str | None = None,
+                     job_payload: bytes | None = None) -> tuple[dict, bool]:
     """Atomically bind a logical run to one external attempt and its recoverable queued state.
 
     Returns ``(stored_ref, created)``. A caller whose deterministic attempt differs from ``stored_ref``
     must not submit: another request already owns this logical run id. The backend row and ``run_states``
     handoff commit together, so a process cannot die in between and leave a binding recovery cannot join.
     """
+    if job_payload is not None:
+        from hub.job_artifacts import JOB_SQL_ENVELOPE_MAX_BYTES
+
+        if len(job_payload) > JOB_SQL_ENVELOPE_MAX_BYTES:
+            raise ValueError(
+                f"Ray durable SQL job envelope exceeds the {JOB_SQL_ENVELOPE_MAX_BYTES}-byte limit"
+            )
     row = RunBackendJob(
         run_id=run_id,
         backend=str(ref["backend"]),
@@ -1486,6 +1497,7 @@ def bind_backend_job(run_id: str, ref: dict, status: dict,
         # Allocation starts the liveness grace period. Only successful control observations advance it;
         # RunState error writes deliberately do not.
         last_control_observed_at=_now(),
+        job_doc=job_payload.decode("utf-8") if job_payload is not None else None,
     )
     try:
         with session() as s:
@@ -1557,6 +1569,13 @@ def backend_job(run_id: str) -> dict | None:
     with session() as s:
         row = s.get(RunBackendJob, run_id)
         return _backend_job_doc(row) if row else None
+
+
+def backend_job_artifact_payload(run_id: str) -> bytes | None:
+    """Private canonical envelope bytes used only to recover the external job artifact."""
+    with session() as s:
+        row = s.get(RunBackendJob, run_id)
+        return row.job_doc.encode("utf-8") if row and row.job_doc else None
 
 
 def note_backend_control_observed(

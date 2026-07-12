@@ -10845,6 +10845,9 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
         def size_bytes(self):
             return 8
 
+        def count(self):
+            return 1
+
         def repartition(self, *args, **kwargs):
             return self
 
