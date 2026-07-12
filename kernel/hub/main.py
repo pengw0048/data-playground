@@ -114,6 +114,22 @@ def _reaper_loop() -> None:
 threading.Thread(target=_reaper_loop, daemon=True, name="dp-reaper").start()
 
 
+def _object_attempt_reaper_loop() -> None:
+    """Keep provider I/O off startup and the kernel/substrate reaper's progress path."""
+    from hub.handoff import reap_attempts
+    while True:
+        time.sleep(metadb.KERNEL_STALE_S)
+        try:
+            reap_attempts()
+        except Exception:  # noqa: BLE001 — provider failure must not stop future GC cycles
+            logging.getLogger("hub").warning("object attempt GC cycle failed (continuing)", exc_info=True)
+
+
+threading.Thread(
+    target=_object_attempt_reaper_loop, daemon=True, name="dp-object-attempt-reaper"
+).start()
+
+
 def _cross_site_ws(ws: WebSocket) -> bool:
     """A browser page from ANOTHER origin opening this socket (cross-site WebSocket hijacking): the
     browser still attaches our cookies, so a signed session would be replayed. Reject when the Origin

@@ -96,7 +96,7 @@ def main() -> None:
         ) if mat
                   else runner._run_ir_sync(
                       ir, graph, target, ray_opts, prog, job.get("sink_targets"),
-                      job.get("attempt_id"),
+                      job.get("attempt_id"), job.get("sink_attempts"),
                   ))
         _log(f"run done: {result.get('status')}")
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read

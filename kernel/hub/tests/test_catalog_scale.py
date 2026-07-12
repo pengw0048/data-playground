@@ -458,6 +458,38 @@ def test_migration_0018_preserves_legacy_run_history(tmp_path, monkeypatch):
     eng.dispose()
 
 
+def test_migration_0019_adds_stable_object_attempt_identity(tmp_path, monkeypatch):
+    """The GC registry upgrade preserves existing pointers and seeds one durable deployment owner."""
+    import sqlalchemy as sa
+    from alembic import command
+
+    from hub.settings import settings as live_settings
+
+    url = f"sqlite:///{tmp_path}/object-attempts.db"
+    monkeypatch.setattr(live_settings, "database_url", url)
+    cfg = metadb._alembic_cfg()
+    command.upgrade(cfg, "0018_run_result_links")
+    eng = sa.create_engine(url)
+    with eng.begin() as c:
+        c.execute(sa.text(
+            "INSERT INTO result_cache (key, doc, created_at) "
+            "VALUES ('legacy-result', '{\"uri\":\"s3://bucket/old\"}', CURRENT_TIMESTAMP)"
+        ))
+    command.upgrade(cfg, "head")
+    with eng.connect() as c:
+        owner = c.execute(sa.text("SELECT owner_token FROM installation_identity WHERE id=1")).scalar_one()
+        assert len(owner) == 32
+        assert c.execute(sa.text("SELECT doc FROM result_cache WHERE key='legacy-result'")).scalar_one() == \
+            '{"uri":"s3://bucket/old"}'
+        indexes = {row[1] for row in c.execute(sa.text("PRAGMA index_list('object_attempts')"))}
+        assert {"ix_object_attempts_gc", "ix_object_attempts_sink_target"} <= indexes
+    command.upgrade(cfg, "head")
+    with eng.connect() as c:
+        assert c.execute(sa.text("SELECT count(*) FROM installation_identity")).scalar_one() == 1
+        assert c.execute(sa.text("SELECT owner_token FROM installation_identity WHERE id=1")).scalar_one() == owner
+    eng.dispose()
+
+
 def test_semantic_plugin_registers_embedder():
     """The shipped dp_semantic_catalog plugin wires an embedder through reg.add_embedder when enabled,
     and is a no-op when disabled — without importing the heavy model (the embedder fn is lazy)."""
