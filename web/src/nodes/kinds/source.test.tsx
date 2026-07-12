@@ -59,12 +59,16 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(screen.queryByText(/offline/i)).toBeNull()
   })
 
-  it('says "Kernel offline" only when the kernel is actually down', () => {
+  it('prefers the friendly offline state over a redundant raw request error', async () => {
+    mocks.tablesPage.mockRejectedValueOnce(new Error('Failed to fetch'))
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({ kernelUp: false, catalog: [] } as any)
     render1({ title: 'source', status: 'draft', config: {} })
     fireEvent.click(screen.getByText(/select dataset/i))
-    expect(screen.getByText(/Kernel offline/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Kernel offline/i)).toBeInTheDocument()
+    await waitFor(() => expect(mocks.tablesPage).toHaveBeenCalledTimes(1))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByText(/Failed to fetch/i)).toBeNull()
   })
 
   it('surfaces a catalog search failure and retries instead of reporting no matches', async () => {
