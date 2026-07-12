@@ -7567,6 +7567,7 @@ def test_ray_opts_maps_region_requires_to_ray_task_placement():
     assert ropts({"gpu": 2}) == {"num_gpus": 2.0}
     assert ropts({"labels": {"engine": "ray"}}) == {}  # the claim label is not a placement resource
     assert ropts({"labels": {"engine": "ray", "pool": "a100"}}) == {"resources": {"a100": 0.001}}
+    assert ropts({"gpu_type": "a100"}) == {"num_gpus": 1.0}
     assert ropts({"cpu": 8, "mem": "64GB"}) == {}  # aggregates — not mapped to per-task options
     both = ropts({"gpu": 1, "labels": {"pool": "gpu1"}})
     assert both == {"num_gpus": 1.0, "resources": {"gpu1": 0.001}}
@@ -7607,6 +7608,9 @@ def test_ray_whole_run_enforces_and_forwards_final_region_resources(tmp_path, mo
     failed = rr.run(compile_plan(rejected, "src", rr.deps.registry, rr.node_specs),
                     rejected, "src", "local")
     assert failed.status == "failed" and "exceed advertised" in (failed.error or "")
+    failed_whole = rr.run(compile_plan(rejected, None, rr.deps.registry, rr.node_specs),
+                          rejected, None, "local")
+    assert failed_whole.status == "failed" and "exceed advertised" in (failed_whole.error or "")
 
     monkeypatch.setenv("DP_RAY_LABELS", "pool=a100")
     accepted = graph("a100")
@@ -7620,10 +7624,22 @@ def test_ray_whole_run_enforces_and_forwards_final_region_resources(tmp_path, mo
             pass
 
     monkeypatch.setattr(mod.threading, "Thread", _Thread)
-    queued = rr.run(compile_plan(accepted, "src", rr.deps.registry, rr.node_specs),
-                    accepted, "src", "local")
+    queued = rr.run(compile_plan(accepted, None, rr.deps.registry, rr.node_specs),
+                    accepted, None, "local")
     assert queued.status == "queued"
     assert dispatched["kwargs"]["requires"]["labels"] == {"engine": "ray", "pool": "a100"}
+
+    # A plugin NodeSpec default is a real placement pin even when node config has no requires override.
+    from hub.models import ResourceSpec
+    rr.node_specs["sql"] = rr.node_specs["sql"].model_copy(
+        update={"requires": ResourceSpec(labels={"engine": "ray"})})
+    spec_pinned = Graph(**{"id": "ray-spec-pin", "version": 1, "nodes": [
+        _ray_node("src2", "source", {"uri": "unused.parquet"}),
+        _ray_node("sql", "sql", {"sql": "SELECT * FROM input"}),
+    ], "edges": [_ray_edge("src2", "sql")]})
+    pinned = rr.run(compile_plan(spec_pinned, "sql", rr.deps.registry, rr.node_specs),
+                    spec_pinned, "sql", "local")
+    assert pinned.status == "failed" and "explicitly required" in (pinned.error or "")
 
 
 def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(tmp_path, monkeypatch):

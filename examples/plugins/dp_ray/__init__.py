@@ -114,8 +114,10 @@ def _ray_opts(requires: dict | None) -> dict:
     if not requires:
         return {}
     opts: dict = {}
-    if requires.get("gpu"):
-        opts["num_gpus"] = float(requires["gpu"])
+    gpu_type = requires.get("gpu_type") or requires.get("gpuType")
+    if requires.get("gpu") or gpu_type:
+        # A type-only requirement means "one GPU of this type" throughout placement/UI semantics.
+        opts["num_gpus"] = float(requires.get("gpu") or 1)
     res = {str(v): 0.001 for k, v in (requires.get("labels") or {}).items() if k != "engine" and v}
     if res:
         opts["resources"] = res
@@ -360,7 +362,8 @@ class RayRunner:
             offered = [worker.capacity.model_dump(by_alias=True, exclude_none=True) for worker in workers]
             return f"requested resources {wanted} exceed advertised Ray capacity {offered}"
         labels = {k: v for k, v in (req.labels or {}).items() if k != "engine"}
-        if ir is not None and (req.gpu or labels) and any(step.op == "sort" for step in ir.steps):
+        if ir is not None and (req.gpu or req.gpu_type or labels) and any(
+                step.op == "sort" for step in ir.steps):
             # Ray 2.56 Dataset.sort/repartition expose no ray_remote_args. Claiming the region while its
             # range-shuffle ignores the requested GPU/custom pool would be false placement.
             return "sort cannot honor GPU/custom-resource placement with the supported Ray 2.56 API"
@@ -448,16 +451,17 @@ class RayRunner:
         # A final placed region reaches this whole-backend seam (not run_unit). Aggregate the target cone's
         # requirements here so it gets the same fail-loud admission and Ray task options as an intermediate
         # region; otherwise final GPU/custom-resource pins silently bypass placement enforcement.
-        requires = graph_requires(graph, self.node_specs, nodes=g.upstream_chain(graph, target_node_id))
+        cone = g.upstream_chain(graph, target_node_id) if target_node_id else graph.nodes
+        requires = graph_requires(graph, self.node_specs, nodes=cone)
         reason = reason or self._resource_unsupported_reason(requires, ir)
-        if reason and self._requires_ray(None, graph, target_node_id):
+        if reason and self._requires_ray(requires, graph, target_node_id):
             return self._unsupported_status(graph, target_node_id, reason, run_id=run_id, plan=plan)
         if reason:
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)  # safe fallback
         try:
             sink_targets = self._resolve_sink_targets(ir)
         except Exception as exc:  # noqa: BLE001 — resolve/adapter uncertainty ⇒ local or explicit failure
-            if self._requires_ray(None, graph, target_node_id):
+            if self._requires_ray(requires, graph, target_node_id):
                 return self._unsupported_status(
                     graph, target_node_id, f"sink preflight failed: {type(exc).__name__}: {exc}",
                     run_id=run_id, plan=plan,
