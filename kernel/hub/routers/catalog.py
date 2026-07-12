@@ -7,6 +7,7 @@ Split out of main.py. All routes are authed: main includes this router with
 from __future__ import annotations
 
 import contextlib
+import glob
 import os
 import re
 import tempfile
@@ -449,22 +450,35 @@ def data_sample(req: SampleRequest) -> SampleResult:
     deps = get_deps()
     if req.k is not None and req.k < 0:
         raise HTTPException(400, "k must be >= 0")
+    if req.offset < 0:
+        raise HTTPException(400, "offset must be >= 0")
     from hub import paths
     try:
         paths.ensure_local_uri_allowed(req.uri)  # multi-user: don't sample an arbitrary local file
     except PermissionError as e:
         raise HTTPException(403, str(e))
+    # A persisted run-history link can outlive its coarse file retention. Give the UI a stable signal
+    # for that lifecycle state instead of folding it into the same 400 as a malformed query or a
+    # temporary object-store failure. Remote existence remains adapter-owned and retryable.
+    if "://" not in req.uri or req.uri.startswith("file://"):
+        local = path_of(req.uri)
+        if not os.path.exists(local) and not glob.glob(local, recursive=True):
+            raise HTTPException(410, "dataset artifact is missing or expired")
     try:
         adapter = deps.resolve_adapter(req.uri)
         with db.run_scope():  # own cursor — a big sample doesn't block other users' runs/previews
-            rel = adapter.scan(req.uri, req.columns, limit=req.k)
+            # Keep the adapter contract unchanged: request a bounded prefix, then page that lazy
+            # relation. Fetch one extra row so `has_more` is exact even when count() is unavailable.
+            rel = adapter.scan(req.uri, req.columns, limit=req.offset + req.k + 1)
             cols = relation_columns(rel)          # schema is metadata — no second scan needed
-            rows = _table_to_rows(rel.to_arrow_table())
+            page = _table_to_rows(rel.limit(req.k + 1, req.offset).to_arrow_table())
+            rows = page[:req.k]
             total = adapter.count(req.uri)
         with contextlib.suppress(Exception):
             metadb.catalog_bump_usage(req.uri)  # someone looked at this data → popularity signal (best-effort)
-        return SampleResult(columns=cols, rows=rows, row_count=total,
-                            truncated=(total is None or total > len(rows)))
+        has_more = len(page) > req.k or (total is not None and total > req.offset + len(rows))
+        return SampleResult(columns=cols, rows=rows, row_count=total, has_more=has_more,
+                            truncated=(total is None or total > req.offset + len(rows)))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"{type(e).__name__}: {e}")
 
@@ -513,4 +527,3 @@ def promote_processor(req: PromoteRequest) -> ProcessorDescriptor:
         input_columns=req.input_columns, output_schema=req.output_schema, blurb=req.blurb,
     )
     return p.descriptor()
-

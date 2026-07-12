@@ -82,12 +82,16 @@ class RunRecord(Base):
     __tablename__ = "run_records"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
     canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), index=True)
+    # The runner's real id links durable history back to the logical run. Nullable for records written
+    # before migration 0018; `id` remains the history row's own primary key.
+    run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String)
     rows: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_table: Mapped[str | None] = mapped_column(String, nullable=True)
+    output_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
     per_node: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON: durable per-node breakdown
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
@@ -535,7 +539,8 @@ _RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (old
 
 def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
                rows: int | None = None, ms: int | None = None, error: str | None = None,
-               output_table: str | None = None, per_node: list[dict] | None = None) -> bool:
+               output_table: str | None = None, per_node: list[dict] | None = None,
+               run_id: str | None = None, output_uri: str | None = None) -> bool:
     """Persist a finished run under its canvas. No-op (returns False) without a real canvas — an ad-hoc
     API run or an internal region sub-run (graph id '_region'). Returns True when a row was written.
     Prunes this canvas's history to the newest _RUN_HISTORY_MAX rows so the local DB can't grow without
@@ -545,8 +550,9 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
     with session() as s:
         if s.get(Canvas, canvas_id) is None:
             return False  # ad-hoc / unsaved-canvas / internal region run → don't dangle a run row
-        s.add(RunRecord(canvas_id=canvas_id, target_node_id=target_node_id, status=status,
+        s.add(RunRecord(canvas_id=canvas_id, run_id=run_id, target_node_id=target_node_id, status=status,
                         rows=rows, ms=ms, error=error, output_table=output_table,
+                        output_uri=output_uri,
                         per_node=json.dumps(per_node, default=str) if per_node else None))
         s.flush()
         stale = s.scalars(select(RunRecord.id).where(RunRecord.canvas_id == canvas_id)
@@ -610,8 +616,10 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
     with session() as s:
         rows = s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id)
                          .order_by(RunRecord.created_at.desc()).limit(limit)).all()
-        return [{"id": r.id, "status": r.status, "targetNodeId": r.target_node_id, "rows": r.rows,
+        return [{"id": r.id, "runId": r.run_id, "status": r.status,
+                 "targetNodeId": r.target_node_id, "rows": r.rows,
                  "ms": r.ms, "error": r.error, "outputTable": r.output_table,
+                 "outputUri": r.output_uri,
                  "perNode": json.loads(r.per_node) if r.per_node else None,
                  "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
 

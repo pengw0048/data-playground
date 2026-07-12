@@ -164,7 +164,8 @@ def _persist_run(deps, graph, target, status) -> None:
     per_node = [p.model_dump() for p in (status.per_node or [])] or None
     metadb.record_run(canvas_id=getattr(graph, "id", None), target_node_id=target, status=status.status,
                       rows=status.total_rows, ms=status.ms, error=status.error,
-                      output_table=status.output_table, per_node=per_node)
+                      output_table=status.output_table, per_node=per_node,
+                      run_id=status.run_id, output_uri=status.output_uri)
     # The RunController runs each region as an internal sub-graph with the sentinel id '_region' (see
     # run_controller._subgraph); its base-runner completion must NOT leak to sinks as a phantom run — the
     # controller fires the real, user-facing completion once for the whole logical run.

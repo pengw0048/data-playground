@@ -149,8 +149,8 @@ export const api = {
   lineage: (uri: string, depth = 6, maxNodes = 500) =>
     req<LineageResult>(`/catalog/lineage?uri=${encodeURIComponent(uri)}&depth=${depth}&maxNodes=${maxNodes}`),
 
-  sample: (uri: string, k = 50, columns?: string[]) =>
-    req<SampleResult>('/data/sample', { method: 'POST', body: JSON.stringify({ uri, k, columns }) }),
+  sample: (uri: string, k = 50, columns?: string[], offset = 0) =>
+    req<SampleResult>('/data/sample', { method: 'POST', body: JSON.stringify({ uri, k, columns, offset }) }),
 
   processors: () => req<ProcessorDescriptor[]>('/processors'),
   promote: (body: {
@@ -264,7 +264,7 @@ export interface DestinationPreset { id: string; name: string; backend: string; 
 export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export interface PerNodeStat { node_id: string; status: string; rows?: number | null; ms?: number | null; label?: string | null }
-export interface RunRecordDto { id: string; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputTable?: string | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
+export interface RunRecordDto { id: string; runId?: string | null; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputTable?: string | null; outputUri?: string | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
 export interface CanvasVersionDto { id: string; version: number; label?: string | null; authorId?: string | null; createdAt?: string | null }
 export interface ShareInfo { userId: string; name: string; role: string }
