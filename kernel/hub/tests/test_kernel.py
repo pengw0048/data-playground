@@ -2768,6 +2768,35 @@ def test_headless_run_kernel_failure_is_a_clean_exit(tmp_path, monkeypatch):
     assert "cannot run canvas 'kf_canvas'" in str(ei.value)
 
 
+def test_headless_run_canvas_params(tmp_path):
+    # ARC7 canvas parameters: ${NAME} tokens in a canvas's configs are bound per run via --param (cron/CI);
+    # an UNBOUND token must fail loudly, not run against the literal "${src}" path.
+    import pytest
+
+    from hub.cli import _apply_params, _headless_run, _load_canvas_graph
+    from hub.deps import get_deps
+    p = _seq_parquet(tmp_path)
+    doc = {"id": "param_canvas", "name": "pc", "version": 1,
+           "nodes": [N("src", "source", {"uri": "${src}"}), N("wr", "write", {"name": "param_out"})],
+           "edges": [E("src", "wr")]}
+    client.put("/api/canvas/param_canvas", json=doc)
+
+    # bound: ${src} → the real parquet path → runs to done + materializes the output
+    code = _headless_run(get_deps(), "param_canvas", None, 30.0, as_json=False, params={"src": p})
+    assert code == 0
+    assert any(t["name"] == "param_out" for t in client.get("/api/catalog/tables").json())
+
+    # unbound: no --param → loud failure BEFORE the run (not a run against a literal "${src}" path)
+    with pytest.raises(SystemExit) as ei:
+        _headless_run(get_deps(), "param_canvas", None, 30.0, as_json=False, params={})
+    assert "unbound canvas parameter" in str(ei.value) and "src" in str(ei.value)
+
+    # _apply_params substitutes nested string config values; a bound token is replaced verbatim
+    g, _ = _load_canvas_graph("param_canvas")
+    _apply_params(g, {"src": "/data/x.parquet"})
+    assert g.nodes[0].data["config"]["uri"] == "/data/x.parquet"
+
+
 def test_coordination_tables_pruned_to_cap(monkeypatch):
     # ARC5 coordination-table-prune: run_records (per-canvas history) and run_states (one full-JSON row
     # per run) must NOT grow without bound in the local DB. record_run caps per-canvas history; a run

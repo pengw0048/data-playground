@@ -85,8 +85,35 @@ def _load_canvas_graph(canvas_ref: str):
         return Graph.model_validate(json.loads(c.doc)), c.id
 
 
+def _apply_params(graph, params: dict) -> None:
+    """Substitute ${NAME} tokens in every string config value of a canvas with the given params — headless
+    parameterization for cron/CI (e.g. a source uri / filter predicate / sql templated per run). Mutates
+    the graph in place. Fails LOUDLY on an unbound ${NAME} rather than silently running with the literal
+    token (which would e.g. read a path named "${date}")."""
+    import re
+
+    tok = re.compile(r"\$\{(\w+)\}")
+    unbound: set[str] = set()
+
+    def sub(v):
+        if isinstance(v, str):  # set.add returns None → the `or` keeps the original token for the error
+            return tok.sub(lambda m: params[m.group(1)] if m.group(1) in params
+                           else (unbound.add(m.group(1)) or m.group(0)), v)
+        if isinstance(v, dict):
+            return {k: sub(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [sub(x) for x in v]
+        return v
+
+    for n in graph.nodes:
+        if isinstance(n.data, dict):
+            n.data = sub(n.data)
+    if unbound:
+        raise SystemExit(f"unbound canvas parameter(s): {', '.join(sorted(unbound))} — pass --param NAME=value")
+
+
 def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_json: bool,
-                  uid: str | None = None) -> int:
+                  uid: str | None = None, params: dict | None = None) -> int:
     """Run a saved canvas to completion in-process (no browser) and return a shell exit code:
     0=done, 1=failed, 2=cancelled, 124=timeout. Reuses the exact start_run path the UI + MCP use, so
     placement/gating/ownership are identical; `confirmed=True` because a headless invocation is itself
@@ -103,6 +130,7 @@ def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_
     from hub.models import RunStatus
     from hub.routers.runs import start_run
     graph, cid = _load_canvas_graph(canvas_ref)
+    _apply_params(graph, params or {})  # ${NAME} → --param values (raises SystemExit on an unbound token)
     uid = uid or metadb.DEFAULT_USER_ID
     with contextlib.redirect_stdout(sys.stderr):  # protect stdout during the run (node print() → stderr)
         try:
@@ -171,9 +199,18 @@ def _run_canvas(argv: list[str]) -> None:
     p.add_argument("--no-seed", dest="seed", action="store_false", default=True)
     p.add_argument("--user", default=None, help="run as this user id (default: the local user). In auth "
                                                 "mode this must own/share the canvas (mirrors `dataplay mcp`).")
+    p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
+                   help="bind a ${NAME} token in the canvas's configs (repeatable) — e.g. --param date=2026-07-12")
     p.add_argument("--timeout", type=float, default=3600.0, help="max seconds to wait for completion (default 3600)")
     p.add_argument("--json", dest="as_json", action="store_true", help="print the final RunStatus as JSON")
     args = p.parse_args(argv)
+
+    params: dict[str, str] = {}
+    for kv in args.param:
+        k, sep, v = kv.partition("=")
+        if not sep or not k.strip():
+            raise SystemExit(f"--param must be NAME=VALUE, got '{kv}'")
+        params[k.strip()] = v
 
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr,  # keep stdout clean for the summary / --json
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -184,7 +221,7 @@ def _run_canvas(argv: list[str]) -> None:
         metadb.init_db()  # schema to head before Deps builds + registers the catalog (fresh-DB first run)
         from hub.deps import set_workspace
         deps = set_workspace(os.environ["DP_WORKSPACE"], os.environ["DP_DATA_DIR"])
-    raise SystemExit(_headless_run(deps, args.canvas, args.node, args.timeout, args.as_json, args.user))
+    raise SystemExit(_headless_run(deps, args.canvas, args.node, args.timeout, args.as_json, args.user, params))
 
 
 def main() -> None:
