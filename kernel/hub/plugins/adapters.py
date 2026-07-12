@@ -479,10 +479,10 @@ class DuckDBAdapter:
     def _write_partitioned(self, target: str, rel: Relation, pcols: list, mode: str, low: str,
                            obj: bool, rows: int) -> dict:
         """A Hive-partitioned parquet DIRECTORY (dir=val/… layout), read back partition-pruned (the read
-        path passes hive_partitioning=True). Parquet + overwrite only. Local: write a fresh temp dir then
-        atomically swap it in (a partitioned dir can't os.replace a non-empty target, so rmtree-then-rename
-        — a brief non-atomic window, but the temp dir is fully written first). Object: DuckDB httpfs writes
-        the prefix directly — a partitioned object write spans many objects, so it is NOT atomic (documented).
+        path passes hive_partitioning=True). Parquet + overwrite only. Local publication uses a recoverable
+        old/new directory swap: the previous version is parked before the staged version is published, and
+        startup recovery restores or removes those siblings based on whether the base exists. Object-store
+        partition overwrite is rejected because this file adapter has no atomic multi-object commit primitive.
         NB: per the Hive layout, a partition column's type is RE-INFERRED from the string dir name on read —
         an int widens to BIGINT, and a boolean / all-numeric-string partition key comes back as VARCHAR /
         BIGINT. This is inherent to Hive partitioning (the interop point); partition by a low-cardinality
@@ -503,31 +503,43 @@ class DuckDBAdapter:
             rel.query("_w", f"COPY _w TO '{dst.replace(chr(39), chr(39) * 2)}' "
                             f"(FORMAT PARQUET, PARTITION_BY ({cols_sql}), OVERWRITE_OR_IGNORE)")
         if obj:
-            # CLEAN overwrite: delete the target prefix first, else a re-run whose partition set SHRANK
-            # would leave stale partition objects (cat=2 from a prior write) that the read then merges in
-            # → wrong row count. Not atomic (delete-then-write; a mid-failure loses the prior data — the
-            # inherent limitation of a multi-object partitioned overwrite without a table format), but
-            # CORRECT on success, unlike OVERWRITE_OR_IGNORE-into-a-live-prefix which is wrong even on success.
-            import pyarrow.fs as pafs
-            fs, p = object_fs(base.rstrip("/") + "/")
-            infos = fs.get_file_info(pafs.FileSelector(p.rstrip("/"), recursive=True, allow_not_found=True))
-            for i in infos:  # explicit per-object delete (delete_dir_contents no-ops on S3's synthetic dirs)
-                if i.type == pafs.FileType.File:
-                    fs.delete_file(i.path)
-            _copy(base.rstrip("/"))  # httpfs writes the prefix
-            return {"uri": base, "rows": rows}
-        tmp = base + f".tmp-{uuid.uuid4().hex[:8]}"
+            # Replacing a Hive prefix spans many independent objects. Delete-then-write loses the old
+            # version on failure; writing in place mixes old and new partitions when the partition set
+            # shrinks. Without an immutable version prefix plus an atomic catalog pointer, neither path is
+            # an overwrite. Fail before listing, deleting, or writing any object.
+            raise NotImplementedError(
+                "object-store partition overwrite requires an atomic table format or catalog commit; "
+                "this file adapter supports unpartitioned object-store overwrite and append only")
+
+        token = uuid.uuid4().hex[:8]
+        tmp = base + f".partition-new-{token}"
+        old = base + f".partition-old-{token}"
+        parked = False
         try:
-            _copy(tmp)                                    # fully write the temp partitioned dir first
-            if os.path.isdir(base):
-                shutil.rmtree(base)
-            elif os.path.exists(base):
-                os.remove(base)                           # a prior single-file output at this base name
-            os.replace(tmp, base)                         # swap in (brief non-atomic window: rmtree→rename)
+            _copy(tmp)                                    # fully write and validate the staged version first
+            with self._base_lock(base):
+                if os.path.lexists(base):
+                    os.replace(base, old)                 # preserve the complete prior version for rollback
+                    parked = True
+                try:
+                    os.replace(tmp, base)                 # publish the complete staged version
+                except BaseException:
+                    # Restore synchronously for ordinary write/cancellation failures. A hard process crash
+                    # between the two renames is handled by LocalStorage.recover_orphans() at startup.
+                    if parked and not os.path.lexists(base) and os.path.lexists(old):
+                        with contextlib.suppress(OSError):
+                            os.replace(old, base)
+                    raise
         except BaseException:
             with contextlib.suppress(Exception):
                 shutil.rmtree(tmp, ignore_errors=True)
             raise
+        if parked:
+            with contextlib.suppress(OSError):
+                if os.path.isdir(old) and not os.path.islink(old):
+                    shutil.rmtree(old)
+                else:
+                    os.remove(old)
         return {"uri": base, "rows": rows}
 
     # -- append part-directory helpers (transactional; row formats only) ---------------------------- #

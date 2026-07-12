@@ -13,12 +13,16 @@ from typing import Protocol
 
 from hub.plugins.adapters import is_object_uri
 
-# temp siblings an interrupted local append/compaction can leave next to a base dir (see adapters.py):
+# temp siblings an interrupted local append/compaction/partition overwrite can leave next to a base dir
+# (see adapters.py):
 # `<base>.parttmp-<hex10>` (an in-flight append part), `<base>.old-<hex8>` (pre-compaction originals, briefly
-# holding the data while the two-rename swap is in flight), `<base>.compact-<hex8>` (the compaction output).
+# holding the data while the two-rename swap is in flight), `<base>.compact-<hex8>` (the compaction output),
+# and `<base>.partition-{old,new}-<hex8>` (the same recoverable protocol for partition overwrite).
 # The hex lengths are matched EXACTLY (what the adapter emits) so a real output can't accidentally collide
 # with the suffix and be renamed/deleted at startup.
-_TEMP_SUFFIX = re.compile(r"\.(parttmp)-[0-9a-f]{10}$|\.(old|compact)-[0-9a-f]{8}$")
+_TEMP_SUFFIX = re.compile(
+    r"\.(?:(?P<parttmp>parttmp)-[0-9a-f]{10}|"
+    r"(?P<kind>old|compact|partition-old|partition-new)-[0-9a-f]{8})$")
 
 _EXTS = (".parquet", ".csv", ".tsv", ".json", ".arrow", ".feather", ".ipc")
 # ephemeral full-pass run results (runner._materialize_result) share the outputs dir but are NOT
@@ -56,43 +60,51 @@ class LocalStorage:
         return out
 
     def recover_orphans(self) -> None:
-        """Recover/clean temp siblings an interrupted local append or compaction left under ``root`` — run
-        once at startup (before re-cataloging outputs). Two hazards it closes: (1) a SIGKILL/OOM/power-loss
+        """Recover/clean temp siblings an interrupted local write left under ``root`` — run once at startup
+        (before re-cataloging outputs). Three hazards it closes: (1) a SIGKILL/OOM/power-loss
         mid append-part write leaves a ``<base>.parttmp-*`` that must NOT surface as a dataset; (2) a crash
         between compaction's two renames leaves ``<base>`` momentarily absent with the data in ``<base>.old-*``
-        — restore it so the dataset stays readable. Best-effort; never raises.
+        — restore it so the dataset stays readable; (3) partition overwrite uses the same old/new protocol,
+        with ``partition-old`` as the rollback version and ``partition-new`` as unpublished staging.
+        Best-effort; never raises.
 
-        Pass 1 restores any interrupted compaction: for each ``<base>.old-*``, if ``<base>`` is gone the swap
-        was cut between its renames → rename the originals back; if ``<base>`` exists the ``.old-*`` is a stale
-        leftover → drop it. Pass 2 drops in-flight staging: ``<base>.parttmp-*`` (a partial, never-published
-        part) and ``<base>.compact-*`` (a partial or now-superseded compaction output) are always removable —
-        a compaction only removes the originals AFTER ``<base>`` holds the compacted part, so neither is ever
-        the sole copy."""
+        Pass 1 restores parked prior versions: if ``<base>`` is gone, the swap was cut between renames and
+        the prior version is renamed back; if ``<base>`` exists, publication completed and the old sibling is
+        stale. Pass 2 drops append, compaction, and partition staging, which is never the committed copy."""
         if not os.path.isdir(self.root):
             return
         try:
             entries = os.listdir(self.root)
         except OSError:
             return
-        for fn in entries:  # pass 1: restore a compaction cut between its two renames
+        def _kind(m: re.Match) -> str:
+            return m.group("parttmp") or m.group("kind")
+
+        def _remove(path: str) -> None:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+
+        for fn in entries:  # pass 1: restore a swap cut between its two renames
             m = _TEMP_SUFFIX.search(fn)
-            if not m or (m.group(1) or m.group(2)) != "old":
+            if not m or _kind(m) not in ("old", "partition-old"):
                 continue
             old, base = os.path.join(self.root, fn), os.path.join(self.root, fn[: m.start()])
             try:
-                if os.path.exists(base):
-                    shutil.rmtree(old, ignore_errors=True)  # base intact → superseded originals
+                if os.path.lexists(base):
+                    _remove(old)                           # base intact → superseded prior version
                 else:
-                    os.replace(old, base)                   # base gone mid-swap → restore the originals
+                    os.replace(old, base)                  # base gone mid-swap → restore prior version
             except OSError:
                 pass
         for fn in entries:  # pass 2: drop partial/superseded in-flight staging
             m = _TEMP_SUFFIX.search(fn)
-            if not m or (m.group(1) or m.group(2)) not in ("parttmp", "compact"):
+            if not m or _kind(m) not in ("parttmp", "compact", "partition-new"):
                 continue
             p = os.path.join(self.root, fn)
             try:
-                shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
+                _remove(p)
             except OSError:
                 pass
 
