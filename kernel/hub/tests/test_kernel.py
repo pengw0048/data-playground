@@ -2485,6 +2485,60 @@ def test_object_store_s3_roundtrip_and_browse(tmp_path):
         metadb.set_setting("objectStore", {}, "global")  # restore the default credential chain for other tests
 
 
+def test_object_store_destination_browse_binds_untrusted_prefix(monkeypatch):
+    from contextlib import nullcontext
+
+    from hub import db, destinations
+
+    class Result:
+        def fetchall(self):
+            return [("s3://other-bucket/secret.parquet",)]
+
+    class Connection:
+        calls = []
+
+        def execute(self, query, parameters=None):
+            self.calls.append((query, parameters))
+            return Result()
+
+    con = Connection()
+    monkeypatch.setattr(db, "ensure_object_store", lambda: None)
+    monkeypatch.setattr(db, "lock", nullcontext)
+    monkeypatch.setattr(db, "conn", lambda: con)
+
+    path = "data'); SELECT 'outside/secret.parquet' AS file; --"
+    result = destinations.ObjectStoreBackend("s3").browse("s3://bkt/root", path)
+
+    assert not result.get("error")
+    assert result["entries"] == []
+    assert con.calls == [
+        ("SELECT file FROM glob(?)", [f"s3://bkt/root/{path}/*"]),
+    ]
+
+
+@pytest.mark.parametrize("path", [
+    "../outside", "nested/../../outside", "%2e%2e/outside", "%252e%252e/outside",
+    "%25252525252e%25252525252e/outside", "s3://other-bucket/data", "data/*",
+    "nested\\..\\outside",
+])
+def test_object_store_destination_browse_rejects_paths_outside_root(monkeypatch, path):
+    from hub import db, destinations
+
+    called = False
+
+    def ensure_object_store():
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(db, "ensure_object_store", ensure_object_store)
+
+    result = destinations.ObjectStoreBackend("s3").browse("s3://bkt/root", path)
+
+    assert result["entries"] == []
+    assert result.get("error")
+    assert not called
+
+
 def test_object_store_feather_roundtrip(tmp_path):
     # Arrow/Feather (IPC) has no DuckDB file reader/writer, so it goes through pyarrow's own S3
     # filesystem. Previously a raw "s3://…" string was handed to pyarrow.feather → it wrote/read a
