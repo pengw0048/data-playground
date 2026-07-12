@@ -62,6 +62,7 @@ def main() -> None:
     os.environ.setdefault("DP_WORKSPACE", args.workspace)
     os.environ.setdefault("DP_DATA_DIR", args.data_dir)
 
+    import logging
     import threading
     import time
     from contextlib import asynccontextmanager, contextmanager
@@ -143,21 +144,28 @@ def main() -> None:
     def _heartbeat_loop() -> None:
         while True:
             time.sleep(5.0)
-            if not metadb.heartbeat_kernel(canvas, kid):
-                os._exit(0)  # fenced out — a newer kernel took over this canvas
-            busy = _liveness_busy(_inflight[0], run_runner.runs)
-            if busy:
-                last_activity[0] = time.monotonic()
-            elif time.monotonic() - last_activity[0] > args.idle_ttl:
-                metadb.drop_kernel(canvas, kid)  # fenced delete — releases only if still ours
-                os._exit(0)
-            if db.responsive(_probe_timeout):
-                _probe_fails[0] = 0
-            else:
-                _probe_fails[0] += 1
-                if _probe_fails[0] >= 3:  # ~3 cycles of unresponsiveness (< KERNEL_STALE_S) → recycle
-                    metadb.drop_kernel(canvas, kid)
-                    os._exit(1)
+            # A raise here (a transient DB error in heartbeat_kernel / db.responsive) would SILENTLY kill
+            # this daemon thread → the lease goes stale → the hub reaps our runs and we zombie, with no
+            # trace of why. Catch + log + retry next cycle; the os._exit paths below still exit the process
+            # (os._exit doesn't raise), so fencing/idle/unresponsive recycling is unaffected.
+            try:
+                if not metadb.heartbeat_kernel(canvas, kid):
+                    os._exit(0)  # fenced out — a newer kernel took over this canvas
+                busy = _liveness_busy(_inflight[0], run_runner.runs)
+                if busy:
+                    last_activity[0] = time.monotonic()
+                elif time.monotonic() - last_activity[0] > args.idle_ttl:
+                    metadb.drop_kernel(canvas, kid)  # fenced delete — releases only if still ours
+                    os._exit(0)
+                if db.responsive(_probe_timeout):
+                    _probe_fails[0] = 0
+                else:
+                    _probe_fails[0] += 1
+                    if _probe_fails[0] >= 3:  # ~3 cycles of unresponsiveness (< KERNEL_STALE_S) → recycle
+                        metadb.drop_kernel(canvas, kid)
+                        os._exit(1)
+            except Exception:  # noqa: BLE001
+                logging.getLogger("hub").warning("kernel heartbeat cycle failed (continuing)", exc_info=True)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

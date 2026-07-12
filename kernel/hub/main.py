@@ -22,6 +22,7 @@ in hub.security so the routers can depend on it without importing this module.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import threading
 import time
@@ -105,8 +106,9 @@ def _reaper_loop() -> None:
             for canvas_id, kernel_id in reaped:
                 if kb is not None:
                     kb.kill(canvas_id, kernel_id)
-        except Exception:  # noqa: BLE001 — a transient DB hiccup must not kill the reaper
-            pass
+        except Exception:  # noqa: BLE001 — a transient DB hiccup must not kill the reaper, but log it:
+            # a SILENTLY failing reaper leaves stale kernels/runs un-reaped with no trace of why.
+            logging.getLogger("hub").warning("reaper cycle failed (continuing)", exc_info=True)
 
 
 threading.Thread(target=_reaper_loop, daemon=True, name="dp-reaper").start()
