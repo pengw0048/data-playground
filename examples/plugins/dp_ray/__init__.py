@@ -544,7 +544,7 @@ def _remember_ray_schema(dataset, schema):
 
 
 def _known_ray_schema(dataset):
-    """Return already-known schema metadata without asking Ray to execute or sample the Dataset."""
+    """Return empty-result schema lineage without asking Ray to execute or sample the Dataset."""
     hint = getattr(dataset, _RAY_SCHEMA_HINT_ATTR, _NO_RAY_SCHEMA_HINT)
     if hint is _UNKNOWN_RAY_SCHEMA:
         return None
@@ -555,6 +555,14 @@ def _known_ray_schema(dataset):
     except TypeError:  # lightweight unit-test stand-ins expose the older no-argument shape
         schema = dataset.schema()
     return schema
+
+
+def _runtime_ray_schema(dataset):
+    """Return Ray's materialized schema, ignoring empty-result lineage hints."""
+    try:
+        return _arrow_schema(dataset.schema(fetch_if_missing=False))
+    except TypeError:  # lightweight unit-test stand-ins expose the older no-argument shape
+        return _arrow_schema(dataset.schema())
 
 
 def _ray_schema_explicitly_unknown(dataset) -> bool:
@@ -621,7 +629,7 @@ def _write_worker_direct_parquet(dataset, uri: str, *, attempt_id: str,
         declared_schema = _known_ray_schema(dataset)
         materialized = dataset.materialize()
         rows = materialized.count()
-        materialized_schema = _known_ray_schema(materialized)
+        materialized_schema = _runtime_ray_schema(materialized)
         unknown_schema = _ray_schema_explicitly_unknown(dataset)
         schema = (
             declared_schema if rows == 0 and declared_schema is not None
@@ -1402,8 +1410,11 @@ class RayRunner:
             # full-row DISTINCT: shuffle by ALL columns so identical rows colocate in one partition, then
             # DuckDB DISTINCT per partition. Every surviving row is identical to the dups it replaces, so
             # the result is deterministic + byte-identical (unlike keyed DISTINCT ON — gated out above).
-            parent_schema = _arrow_schema(_known_ray_schema(parent))
-            keys = parent_schema.names if parent_schema is not None else list(parent.columns())
+            lineage_schema = _arrow_schema(_known_ray_schema(parent))
+            parent = parent.materialize()
+            runtime_schema = _runtime_ray_schema(parent)
+            schema = runtime_schema or lineage_schema
+            keys = schema.names if schema is not None else list(parent.columns())
             return self._shuffle_duckdb(parent, keys, "SELECT DISTINCT * FROM _blk", opts)
         if step.op == "join":
             return self._build_join(step, datasets, opts)
@@ -1460,12 +1471,15 @@ class RayRunner:
         cfg = step.config
         left_schema = _known_ray_schema(left)
         left_arrow_schema = _arrow_schema(left_schema)
-        left_columns = left_arrow_schema.names if left_arrow_schema is not None else list(left.columns())
-        sql = join_sql(left_columns, list(right_tbl.column_names), "_l", "_r",
-                       cfg.get("on"), cfg.get("condition"), cfg.get("how"))
+        right_columns = list(right_tbl.column_names)
 
         def _join_block(tbl):                                  # each LEFT block ⋈ the full broadcast right
             import duckdb
+            # A declared outputSchema is empty-result lineage, not an instruction to project a non-empty
+            # runtime batch. Build the worker SQL from the actual Arrow block so a stale/narrow contract
+            # cannot silently drop columns that the UDF really produced.
+            sql = join_sql(list(tbl.column_names), right_columns, "_l", "_r",
+                           cfg.get("on"), cfg.get("condition"), cfg.get("how"))
             con = duckdb.connect()
             con.register("_l", tbl)
             con.register("_r", right_tbl)
@@ -1474,7 +1488,11 @@ class RayRunner:
         result = left.map_batches(
             _join_block, batch_format="pyarrow", batch_size=None, **(ray_opts or {})
         )
-        schema = _duckdb_empty_result_schema(sql, _l=left_schema, _r=right_tbl.schema)
+        empty_sql = join_sql(
+            left_arrow_schema.names if left_arrow_schema is not None else [], right_columns, "_l", "_r",
+            cfg.get("on"), cfg.get("condition"), cfg.get("how"),
+        )
+        schema = _duckdb_empty_result_schema(empty_sql, _l=left_schema, _r=right_tbl.schema)
         return _remember_ray_schema(result, schema)
 
     def _shuffle_duckdb(self, parent, keys, sql, ray_opts=None):

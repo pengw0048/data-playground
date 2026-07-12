@@ -7632,13 +7632,17 @@ def test_ray_typed_empty_collect_and_broadcast_join_keep_declared_schema(monkeyp
 
     class LeftDataset:
         def columns(self):
-            return ["k", "left_value"]
+            return ["k", "left_value", "extra"]
 
         def schema(self, fetch_if_missing=True):
-            return pa.schema([("k", pa.int64()), ("left_value", pa.string())])
+            return pa.schema([
+                ("k", pa.int64()), ("left_value", pa.string()), ("extra", pa.int64()),
+            ])
 
         def map_batches(self, fn, **_kwargs):
-            return ResultDataset(fn(pa.table({"k": [1], "left_value": ["left"]})))
+            return ResultDataset(fn(pa.table({
+                "k": [1], "left_value": ["left"], "extra": [11],
+            })))
 
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda _refs: []))
     right_schema = pa.schema([("k", pa.int64()), ("right_value", pa.string())])
@@ -7646,13 +7650,17 @@ def test_ray_typed_empty_collect_and_broadcast_join_keep_declared_schema(monkeyp
         inputs=[("left", None), ("right", None)],
         config={"on": "k", "how": "left"},
     )
+    left = mod._remember_ray_schema(LeftDataset(), pa.schema([("k", pa.int64())]))
     joined = object.__new__(mod.RayRunner)._build_join(
-        step, {"left": LeftDataset(), "right": ZeroBlockDataset(right_schema)}
+        step, {"left": left, "right": ZeroBlockDataset(right_schema)}
     )
     assert joined.schema() == pa.schema([
-        ("k", pa.int64()), ("left_value", pa.string()), ("right_value", pa.string()),
+        ("k", pa.int64()), ("left_value", pa.string()), ("extra", pa.int64()),
+        ("right_value", pa.string()),
     ])
-    assert joined.to_pylist() == [{"k": 1, "left_value": "left", "right_value": None}]
+    assert joined.to_pylist() == [{
+        "k": 1, "left_value": "left", "extra": 11, "right_value": None,
+    }]
 
 
 def test_ray_empty_schema_lineage_covers_supported_ops_and_declared_udfs(monkeypatch):
@@ -8282,6 +8290,30 @@ def test_ray_typed_empty_paths_live_keep_pre_materialization_schema(tmp_path, mo
         assert joined_empty.num_rows == 0
         assert joined_empty.schema.names == ["k", "v", "right_value"]
 
+        # outputSchema is empty-result lineage, not a projection contract for non-empty data. A narrow
+        # declaration must not make Ray silently drop columns that the UDF actually returned.
+        narrow_map = SimpleNamespace(
+            op="map", inputs=[("src", None)],
+            config={
+                "mode": "map",
+                "code": "def fn(row):\n    return {'k': row['k'], 'extra': row['v'] + 1}",
+                "onError": "raise", "outputSchema": [{"name": "k", "type": "int"}],
+            },
+        )
+        mapped = runner._build(narrow_map, {"src": mod._read_native_parquet(ray, source_plan)})
+        joined_nonempty = mod._collect_arrow(
+            runner._build_join(
+                left_empty_join,
+                {"left": mapped, "right": mod._read_native_parquet(ray, right_plan)},
+            ),
+            purpose="live non-empty join with narrow schema lineage",
+        )
+        assert joined_nonempty.schema.names == ["k", "extra", "right_value"]
+        assert sorted(joined_nonempty.to_pylist(), key=lambda row: row["k"]) == [
+            {"k": 1, "extra": 11, "right_value": "right"},
+            {"k": 2, "extra": 21, "right_value": None},
+        ]
+
         declared_flat_map = SimpleNamespace(
             op="flat_map", inputs=[("src", None)],
             config={
@@ -8710,6 +8742,8 @@ def test_ray_whole_run_enforces_and_forwards_final_region_resources(tmp_path, mo
 
 
 def test_ray_shuffle_without_partition_override_uses_materialized_block_count(monkeypatch):
+    import pyarrow as pa
+
     mod = _load_dp_ray()
     rr = object.__new__(mod.RayRunner)
     calls = []
@@ -8722,6 +8756,9 @@ def test_ray_shuffle_without_partition_override_uses_materialized_block_count(mo
 
         def num_blocks(self):
             return 3
+
+        def schema(self, fetch_if_missing=True):
+            return pa.schema([("k", pa.int64())])
 
         def repartition(self, *args, **kwargs):
             calls.append((args, kwargs))
