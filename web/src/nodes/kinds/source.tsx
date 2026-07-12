@@ -29,22 +29,28 @@ function Source({ id, data }: NodeComponentProps) {
   const table = catalog.find((t) => (tid && t.id === tid) || t.uri === ref || t.name === ref)
 
   // Server-side search picker — the catalog can be thousands of tables, so we never render them all.
-  // Empty query shows recently-used tables (the working set); typing searches the whole catalog.
+  // Empty query shows the working-set recents PLUS a top-usage page from the server (a fresh session
+  // has an empty working set — without the fetch a full catalog would look empty); typing searches
+  // the whole catalog.
   useEffect(() => {
     if (!open) return
     const term = q.trim()
-    if (!term) { setResults(null); return }
+    setResults(null)
     let live = true
     const timer = setTimeout(async () => {
       try {
-        const r = await api.tablesPage({ q: term, limit: 12, sort: 'usage', order: 'desc' })
+        const r = await api.tablesPage({ q: term || undefined, limit: 12, sort: 'usage', order: 'desc' })
         if (live) setResults(Array.isArray(r.items) ? r.items : [])
       } catch { if (live) setResults([]) }
-    }, 200)
+    }, term ? 200 : 0)
     return () => { live = false; clearTimeout(timer) }
   }, [q, open])
 
-  const shown = (q.trim() ? (results ?? []) : catalog).slice(0, 12)
+  const recentIds = new Set(catalog.map((t) => t.id))
+  const shown = (q.trim()
+    ? (results ?? [])
+    : [...catalog, ...(results ?? []).filter((t) => !recentIds.has(t.id))]  // recents first, deduped
+  ).slice(0, 12)
   const pick = (t: CatalogTable) => {
     rememberTables([t])  // warm the cache so the card resolves this immediately
     updateConfig(id, { uri: t.uri, tableId: t.id })
@@ -115,7 +121,8 @@ function Source({ id, data }: NodeComponentProps) {
           <div className="p-2 text-[11.5px] text-muted-foreground">
             {!kernelUp ? 'Kernel offline — no catalog'
               : q.trim() ? (results === null ? 'Searching…' : 'No matches')
-              : 'No datasets yet — search, upload, or browse below'}
+              : results === null ? 'Loading…'
+              : 'Catalog is empty — upload or browse below'}
           </div>
         )}
         {shown.map((t) => (

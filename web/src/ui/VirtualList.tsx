@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 // "clone it and it works" keeps holding. Calls onEndReached near the bottom to drive infinite scroll.
 export function VirtualList<T>({
   items, rowHeight, overscan = 8, renderRow, onEndReached, endThreshold = 400,
-  className, style, emptyNote,
+  className, style, emptyNote, resetKey,
 }: {
   items: T[]
   rowHeight: number
@@ -16,11 +16,20 @@ export function VirtualList<T>({
   className?: string
   style?: React.CSSProperties
   emptyNote?: React.ReactNode
+  resetKey?: unknown  // a new query: re-arm the end-reached guard + scroll back to the top
 }) {
   const ref = useRef<HTMLDivElement>(null)
   const [scrollTop, setScrollTop] = useState(0)
   const [height, setHeight] = useState(0)
   const firedAt = useRef(-1)
+
+  useEffect(() => {
+    firedAt.current = -1
+    setScrollTop(0)
+    if (ref.current) ref.current.scrollTop = 0
+  }, [resetKey])
+  // new content (an appended page, or a replaced array after a retry) re-arms the guard
+  useEffect(() => { firedAt.current = -1 }, [items])
 
   useEffect(() => {
     const el = ref.current
@@ -40,10 +49,13 @@ export function VirtualList<T>({
   const onScroll = (e: React.UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget
     setScrollTop(el.scrollTop)
-    if (onEndReached && el.scrollHeight - el.scrollTop - el.clientHeight < endThreshold) {
-      // guard so a burst of scroll events fires onEndReached once per new content length
+    if (!onEndReached) return
+    const nearEnd = el.scrollHeight - el.scrollTop - el.clientHeight < endThreshold
+    // fire once per end-zone entry per content set (re-entrancy is the PARENT's in-flight flag);
+    // leaving the zone re-arms, so a failed page load can be retried by scrolling
+    if (nearEnd) {
       if (firedAt.current !== total) { firedAt.current = total; onEndReached() }
-    }
+    } else firedAt.current = -1
   }
 
   if (total === 0 && emptyNote) return <div ref={ref} className={className} style={style}>{emptyNote}</div>

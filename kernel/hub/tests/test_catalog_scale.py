@@ -242,6 +242,175 @@ def test_default_catalog_is_loaded_as_a_plugin():
     assert isinstance(reg.chosen, InMemoryCatalog)
 
 
+def test_search_multi_token_and_tags(scale_catalog):
+    # every whitespace token must match SOMEWHERE — "team0 gold" means folder team0 AND tag gold,
+    # even though the words never appear adjacent in any single field
+    both = int(client.get("/api/catalog/tables", params={"q": "team0 gold", "limit": 1}).headers["X-Total-Count"])
+    gold_in_team0 = int(client.get("/api/catalog/tables",
+                                   params={"folder": "team0", "tags": "gold", "limit": 1}).headers["X-Total-Count"])
+    assert both == gold_in_team0 > 0
+    # a tag term matches through plain q too (the documented search contract)
+    by_q = int(client.get("/api/catalog/tables", params={"q": "pii", "limit": 1}).headers["X-Total-Count"])
+    by_tag = int(client.get("/api/catalog/tables", params={"tags": "pii", "limit": 1}).headers["X-Total-Count"])
+    assert by_q >= by_tag > 0
+    # LIKE metacharacters in q are literal, not wildcards
+    assert int(client.get("/api/catalog/tables", params={"q": "%", "limit": 1}).headers["X-Total-Count"]) == 0
+
+
+def test_set_metadata_partial_and_clear(scale_catalog):
+    tid = "tbl_scale_00043"
+    base = client.put(f"/api/catalog/tables/{tid}/metadata",
+                      json={"folder": "curated/x", "tags": ["keep"], "owner": "erin", "description": "d1"}).json()
+    assert base["owner"] == "erin" and base["tags"] == ["keep"]
+    # a partial body touches ONLY the fields present
+    part = client.put(f"/api/catalog/tables/{tid}/metadata", json={"description": "d2"}).json()
+    assert part["description"] == "d2"
+    assert part["owner"] == "erin" and part["tags"] == ["keep"] and part["folder"] == "curated/x"
+    # an explicit null clears
+    cleared = client.put(f"/api/catalog/tables/{tid}/metadata", json={"owner": None, "description": None}).json()
+    assert cleared["owner"] is None and cleared["description"] is None
+    assert cleared["tags"] == ["keep"], "tags were absent from the body, so they survive"
+
+
+def test_unregister_cleans_edges_keys_relationships():
+    """A deleted table must not haunt lineage/ER as a ghost node, and a NEW dataset re-registered at
+    the same uri must not inherit the old declared key or parents."""
+    a, b = f"{_SCALE}orph/a", f"{_SCALE}orph/b"
+    try:
+        metadb.catalog_bulk_seed([_doc("orph_a", a, cols=["id"]), _doc("orph_b", b, cols=["id"])])
+        metadb.catalog_add_edge(a, b, pipeline="p")
+        metadb.catalog_set_declared_key(b, ["id"])
+        client.post("/api/catalog/relationships", json={
+            "leftUri": a, "leftColumns": ["id"], "rightUri": b, "rightColumns": ["id"],
+            "kind": "one_to_one"})
+        assert client.delete("/api/catalog/tables/tbl_orph_b").json() == {"ok": True}
+        lin = client.get("/api/catalog/lineage", params={"uri": a}).json()
+        assert all(n["uri"] != b for n in lin["nodes"]) and not lin["edges"]
+        assert metadb.catalog_declared_keys([b]) == {}
+        assert all(b not in (r["leftUri"], r["rightUri"])
+                   for r in client.get("/api/catalog/relationships").json())
+    finally:
+        metadb.catalog_delete_prefix(_SCALE)
+
+
+def test_browse_tree_truncation_flag():
+    folder = "trunctest/big"
+    try:
+        metadb.catalog_bulk_seed([_doc(f"tr_{i:03d}", f"{_SCALE}tr/{i}", folder=folder) for i in range(120)])
+        level = client.get("/api/catalog/tree", params={"prefix": folder}).json()
+        assert level["totalTables"] == 120 and level["truncated"] is True
+        assert len(level["tables"]) < 120, "the tree returns a bounded sample, not the full folder"
+    finally:
+        metadb.catalog_delete_prefix(_SCALE)
+
+
+def test_lineage_edges_export_page():
+    uris = [f"{_SCALE}exp/{i}" for i in range(4)]
+    try:
+        metadb.catalog_bulk_seed([_doc(f"exp_{i}", u) for i, u in enumerate(uris)])
+        for a, b in zip(uris, uris[1:]):
+            metadb.catalog_add_edge(a, b, pipeline="exp")
+        r = client.get("/api/catalog/edges", params={"limit": 2, "offset": 0})
+        assert r.status_code == 200 and len(r.json()) == 2
+        assert int(r.headers["X-Total-Count"]) >= 3
+        page2 = client.get("/api/catalog/edges", params={"limit": 2, "offset": 2}).json()
+        assert {(e["parent"], e["child"]) for e in r.json()}.isdisjoint(
+            {(e["parent"], e["child"]) for e in page2})
+    finally:
+        metadb.catalog_delete_prefix(_SCALE)
+
+
+def test_facets_advertise_semantic_availability():
+    cat = get_deps().catalog
+    assert client.get("/api/catalog/facets").json()["semanticAvailable"] is False
+    try:
+        cat._embedder = lambda texts: [[1.0] for _ in texts]
+        assert client.get("/api/catalog/facets").json()["semanticAvailable"] is True
+    finally:
+        cat._embedder = None
+
+
+def test_old_protocol_provider_still_works_via_compat():
+    """A provider written against the PRE-scale protocol (only list_tables/get_table) keeps working
+    behind the new discovery surface: reg.set_catalog wraps it in CatalogCompat."""
+    from hub.models import CatalogTable
+    from hub.plugins.catalog import CatalogCompat
+
+    class OldProvider:
+        name = "old"
+
+        def __init__(self):
+            self._tables = [
+                CatalogTable(id="tbl_x", name="x", uri="mem://old/x", folder="f1", tags=["t1"],
+                             owner="ann", columns=[], keys=[]),
+                CatalogTable(id="tbl_y", name="y", uri="mem://old/y", folder="f1/sub", tags=[],
+                             owner=None, columns=[], keys=[]),
+                CatalogTable(id="tbl_z", name="z", uri="mem://old/z", folder="", tags=["t1"],
+                             owner="ann", columns=[], keys=[]),
+            ]
+
+        def list_tables(self, q=None):
+            return [t for t in self._tables if not q or q in t.name]
+
+        def get_table(self, id_or_name):
+            for t in self._tables:
+                if id_or_name in (t.id, t.name, t.uri):
+                    return t
+            raise KeyError(id_or_name)
+
+    class _FakeDeps:
+        catalog = None
+    from hub.deps import Registry
+    reg = Registry.__new__(Registry)
+    reg.deps = _FakeDeps()
+    reg.set_catalog(OldProvider())
+    cat = reg.deps.catalog
+    assert isinstance(cat, CatalogCompat)
+    page = cat.list_page(CatalogQuery(folder="f1", limit=10))
+    assert {t.name for t in page.items} == {"x", "y"} and page.total == 2
+    f = cat.facets(CatalogQuery())
+    assert {v.value for v in f.owners} == {"ann"} and {v.value for v in f.tags} == {"t1"}
+    tree = cat.browse("")
+    assert {fo.name for fo in tree.folders} == {"f1"} and {t.name for t in tree.tables} == {"z"}
+    assert [t.name for t in cat.search("x")] == ["x"]
+    assert cat.search_modes() == ["lexical"]
+    assert cat.get_table("tbl_y").name == "y"  # passthrough still works
+
+
+def test_migration_0017_backfills_pre_existing_docs(tmp_path, monkeypatch):
+    """An UPGRADED install (catalog rows written before 0017) is immediately filterable: the backfill
+    promotes folder/owner/rows out of each stored doc and populates the tag/column join tables. Run
+    against a THROWAWAY sqlite db so the suite's own DB is untouched."""
+    import json as _json
+
+    import sqlalchemy as sa
+    from alembic import command
+
+    from hub.settings import settings as live_settings
+
+    url = f"sqlite:///{tmp_path}/mig.db"
+    monkeypatch.setattr(live_settings, "database_url", url)
+    cfg = metadb._alembic_cfg()
+    command.upgrade(cfg, "0016_run_state_owner")
+    eng = sa.create_engine(url)
+    doc = {"id": "tbl_events", "name": "events", "uri": "/data/events.parquet",
+           "folder": "prod/web", "tags": ["gold", "web"], "owner": "growth",
+           "description": "click events", "rowCount": 123,
+           "columns": [{"name": "user_id", "type": "BIGINT"}, {"name": "ts", "type": "TIMESTAMP"}]}
+    with eng.begin() as c:
+        c.execute(sa.text("INSERT INTO catalog_entries (uri, name, doc, updated_at) "
+                          "VALUES (:u, :n, :d, CURRENT_TIMESTAMP)"),
+                  {"u": doc["uri"], "n": "events", "d": _json.dumps(doc)})
+    command.upgrade(cfg, "head")
+    with eng.connect() as c:
+        row = c.execute(sa.text("SELECT tbl_id, folder, owner, row_count FROM catalog_entries")).one()
+        assert tuple(row) == ("tbl_events", "prod/web", "growth", 123)
+        tags = {t for (t,) in c.execute(sa.text("SELECT tag FROM catalog_tags"))}
+        cols = {t for (t,) in c.execute(sa.text('SELECT "column" FROM catalog_columns'))}
+        assert tags == {"gold", "web"} and cols == {"user_id", "ts"}
+    eng.dispose()
+
+
 def test_semantic_plugin_registers_embedder():
     """The shipped dp_semantic_catalog plugin wires an embedder through reg.add_embedder when enabled,
     and is a no-op when disabled — without importing the heavy model (the embedder fn is lazy)."""

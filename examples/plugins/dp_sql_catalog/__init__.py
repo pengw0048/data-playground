@@ -36,6 +36,7 @@ class SqlCatalog(InMemoryCatalog):
     def __init__(self, data_dir: str, resolve_adapter, db_url: str, table: str = "datasets"):
         self._engine = create_engine(db_url)
         self._table = table
+        self._last_sync = 0.0  # throttle: browse fires list_page + facets per keystroke
         super().__init__(data_dir, resolve_adapter)  # __init__ calls _seed() → our SQL sync
 
     def _rows(self) -> list[tuple[str, str]]:
@@ -44,7 +45,13 @@ class SqlCatalog(InMemoryCatalog):
 
     def _sync(self) -> None:
         """Register any SQL row not yet in the catalog (probes the uri for columns/row-count via the
-        inherited adapter path). Cheap + idempotent: known names are skipped."""
+        inherited adapter path). Cheap + idempotent: known names are skipped, and back-to-back reads
+        within a couple of seconds reuse the last sync (a browse keystroke = list + facets)."""
+        import time
+        now = time.monotonic()
+        if now - self._last_sync < 2.0:
+            return
+        self._last_sync = now
         for name, uri in self._rows():
             try:
                 super().get_table(name)
@@ -58,13 +65,32 @@ class SqlCatalog(InMemoryCatalog):
         super()._seed()  # keep local data_dir discovery too (harmless if the dir is empty)
         self._sync()
 
-    def list_tables(self, q=None):  # override: sync from SQL first, then serve from the cache
+    # sync-then-delegate on EVERY read surface, including the paginated browse/search/facet/tree
+    # endpoints the Tables view uses — not just the legacy list_tables (else a row added in SQL never
+    # shows up while browsing).
+    def list_tables(self, q=None):
         self._sync()
         return super().list_tables(q)
 
-    def get_table(self, id_or_name):  # override: sync then delegate (inherits the KeyError-on-miss contract)
+    def get_table(self, id_or_name):  # inherits the KeyError-on-miss contract
         self._sync()
         return super().get_table(id_or_name)
+
+    def list_page(self, query):
+        self._sync()
+        return super().list_page(query)
+
+    def facets(self, query):
+        self._sync()
+        return super().facets(query)
+
+    def browse(self, prefix=""):
+        self._sync()
+        return super().browse(prefix)
+
+    def search(self, q, mode="hybrid", limit=50):
+        self._sync()
+        return super().search(q, mode=mode, limit=limit)
 
 
 def register(reg) -> None:

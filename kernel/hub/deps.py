@@ -125,6 +125,11 @@ class Registry:
         self.deps.registry.register(proc)
 
     def set_catalog(self, catalog) -> None:
+        # a provider written against the pre-scale protocol (no list_page/facets/browse/search) still
+        # works behind the new discovery routes: wrap it in the compat shim (see CatalogCompat)
+        if not hasattr(catalog, "list_page"):
+            from hub.plugins.catalog import CatalogCompat
+            catalog = CatalogCompat(catalog)
         self.deps.catalog = catalog
 
     def add_embedder(self, fn, model: str = "custom") -> None:

@@ -11,10 +11,12 @@ catalog is.
 
 ## What you can do
 
-- **Browse** a paginated, virtualized list — filter by folder, tag, owner, or "has column X"; sort by
-  name, size, recency, or **most-used**.
-- **Search** across name / folder / description / column names (lexical), or by meaning
-  (**semantic**, when an embedder plugin is installed), or both (**hybrid**).
+- **Browse** a paginated, virtualized list — filter by folder, tag, owner, or "has column X" (click a
+  column in the detail drawer); sort by name, size, recency, or **most-used**.
+- **Search** across name / folder / description / tags / column names (lexical — every whitespace
+  token must match somewhere, so `curated images` finds `demo/images/curated`; `%`/`_` are literal),
+  or by meaning (**semantic**, when an embedder plugin is installed — the search box grows a
+  "match: text | meaning" toggle), or both (**hybrid**).
 - **Organize** into a folder hierarchy (a namespace path like `prod/images/curated`), tag datasets,
   assign an owner, and write a description — all from a dataset's detail drawer.
 - **Facet** — the right-hand rail shows each tag/owner with a live count, scoped to the current
@@ -48,14 +50,18 @@ Key endpoints (all under `/api`):
 
 - `GET /catalog/tables?q&folder&tags&owner&hasColumns&uris&sort&order&limit&offset` → a page (bare list
   body; `X-Total-Count` / `X-Has-More` headers)
-- `GET /catalog/facets?<same filters>` → folder / tag / owner values + counts
-- `GET /catalog/tree?prefix=` → one level of the folder tree
+- `GET /catalog/facets?<same filters>` → folder / tag / owner values + counts (+ `semanticAvailable`)
+- `GET /catalog/tree?prefix=` → one level of the folder tree (direct tables are a bounded sample;
+  `totalTables`/`truncated` signal more)
 - `GET /catalog/search?q&mode=lexical|semantic|hybrid&limit`
-- `GET /catalog/lineage?uri&depth&maxNodes`
-- `PUT /catalog/tables/{id}/metadata` → set folder / tags / owner / description
+- `GET /catalog/lineage?uri&depth&maxNodes` · `GET /catalog/edges?limit&offset` (bulk edge export)
+- `PUT /catalog/tables/{id}/metadata` → set folder / tags / owner / description. Only the fields
+  present in the body change; an explicit `null` clears owner/description.
+- `DELETE /catalog/tables/{id}` → unregister (also removes its lineage edges, declared key, and
+  relationships, so nothing haunts the graph)
 
 Try it at scale: `dataplay seed-catalog --count 5000` registers synthetic datasets across a
-folder/tag/owner space, then open the **Tables** view.
+folder/tag/owner space, then open the **Tables** view (`--remove` cleans them up again).
 
 ## Semantic search (opt-in)
 
@@ -85,11 +91,13 @@ core**, because two things line up on purpose:
    runs on every preview/run). A read-only external catalog can subclass the built-in provider and
    override only how rows are fetched, inheriting browse/search/lineage/curation machinery.
 
-2. **Lineage is URI-keyed and OpenLineage-shaped.** An edge is
-   `{parent_uri, child_uri, column, pipeline}` plus a free-form `metadata` map — the same shape as the
-   emerging cross-tool lineage standards. Because datasets are identified by URI (not an internal id),
-   the edges a canvas produces can be pushed to an external lineage store, and edges that store already
-   holds can be read back, with no translation of identity.
+2. **Lineage is URI-keyed, so it maps cleanly onto OpenLineage-style stores.** An edge is
+   `{parent_uri, child_uri, column, pipeline}`. Because datasets are identified by URI (not an
+   internal id), the edges a canvas produces translate 1:1 onto the dataset identities cross-tool
+   lineage standards use — a bridge plugin syncs them out via the paginated `GET /catalog/edges`
+   export (or pushes on `register_output`), and edges an external store already holds can be
+   written back through the same provider seam, with no translation of identity. (The core does
+   not emit the OpenLineage event envelope itself — that's a bridge plugin's job.)
 
 The organization primitives are intentionally generic — `folder` (a delimiter-joined namespace path),
 `tags`, `owner`, `description` — precisely so they round-trip cleanly onto the namespace/tag/owner model

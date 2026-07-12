@@ -5,7 +5,7 @@ import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { VirtualList } from '../ui/VirtualList'
 import { FileDialog } from '../ui/FileDialog'
-import type { CatalogQueryParams, CatalogTable, Facets, FolderNode, LineageResult } from '../types/api'
+import type { CatalogQueryParams, CatalogTable, Facets, FolderNode, LineageResult, SampleResult } from '../types/api'
 
 // The Tables catalog — built to browse thousands of datasets. Nothing is loaded up front: a left
 // FOLDER TREE (lazy), a center VIRTUALIZED list fed by a server-side filtered/sorted/paginated query
@@ -19,6 +19,7 @@ type Sort = NonNullable<CatalogQueryParams['sort']>
 
 export function CatalogView() {
   const addToCanvas = useStore((s) => s.addToCanvas)
+  const rememberTables = useStore((s) => s.rememberTables)
   const uploadDataset = useStore((s) => s.uploadDataset)
   const pushToast = useStore((s) => s.pushToast)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -29,59 +30,76 @@ export function CatalogView() {
   const [folder, setFolder] = useState('')
   const [tags, setTags] = useState<string[]>([])
   const [owner, setOwner] = useState('')
+  const [hasColumns, setHasColumns] = useState<string[]>([])
   const [sort, setSort] = useState<Sort>('name')
   const [order, setOrder] = useState<'asc' | 'desc'>('asc')
+  const [match, setMatch] = useState<'text' | 'meaning'>('text')
 
   // results + facets
   const [items, setItems] = useState<CatalogTable[]>([])
   const [total, setTotal] = useState(0)
   const [hasMore, setHasMore] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const [facets, setFacets] = useState<Facets>({ folders: [], tags: [], owners: [] })
   const [selected, setSelected] = useState<CatalogTable | null>(null)
   const [dialog, setDialog] = useState(false)
   const [uri, setUri] = useState('')
   const seq = useRef(0)
+  const loadingMore = useRef(false)
 
   // debounce the search box into the query
   useEffect(() => { const t = setTimeout(() => setQ(rawQ.trim()), 250); return () => clearTimeout(t) }, [rawQ])
 
   const params = useMemo<CatalogQueryParams>(
-    () => ({ q: q || undefined, folder: folder || undefined, tags, owner: owner || undefined, sort, order, limit: PAGE }),
-    [q, folder, tags, owner, sort, order])
+    () => ({ q: q || undefined, folder: folder || undefined, tags, owner: owner || undefined, hasColumns, sort, order, limit: PAGE }),
+    [q, folder, tags, owner, hasColumns, sort, order])
+  const semantic = match === 'meaning' && !!q  // "meaning" mode: ranked hybrid search instead of paging
 
   const loadFirst = useCallback(async () => {
     const s = ++seq.current
-    setLoading(true)
+    setLoading(true); setError(null)
     try {
+      // the facet rail stays driven by the lexical facets call in both match modes
       const [page, fc] = await Promise.all([
-        api.tablesPage({ ...params, offset: 0 }),
+        semantic
+          ? api.searchCatalog(q, 'hybrid', 100).then((hits) => ({ items: hits, total: hits.length, hasMore: false }))
+          : api.tablesPage({ ...params, offset: 0 }),
         api.facets(params),
       ])
       if (s !== seq.current) return  // a newer query superseded this one
       setItems(page.items); setTotal(page.total); setHasMore(page.hasMore); setFacets(fc)
     } catch (e) {
-      if (s === seq.current) pushToast(`Catalog: ${(e as Error).message}`, 'error')
+      if (s !== seq.current) return
+      setItems([]); setTotal(0); setHasMore(false); setError((e as Error).message)  // never show stale results under new filters
     } finally {
       if (s === seq.current) setLoading(false)
     }
-  }, [params, pushToast])
+  }, [params, semantic, q])
 
   useEffect(() => { void loadFirst() }, [loadFirst])
 
   const loadMore = useCallback(async () => {
-    if (!hasMore || loading) return
+    if (!hasMore || loading || loadingMore.current) return
+    loadingMore.current = true
     const s = seq.current
     try {
       const page = await api.tablesPage({ ...params, offset: items.length })
       if (s !== seq.current) return
-      setItems((cur) => [...cur, ...page.items]); setHasMore(page.hasMore)
-    } catch { /* keep what we have */ }
+      // dedupe by id: offsets drift when the catalog changes between pages
+      setItems((cur) => {
+        const seen = new Set(cur.map((t) => t.id))
+        const fresh = page.items.filter((t) => !seen.has(t.id))
+        return fresh.length ? [...cur, ...fresh] : cur
+      })
+      setHasMore(page.hasMore)
+    } catch { /* keep what we have; the cleared flag lets a later scroll retry */ }
+    finally { loadingMore.current = false }
   }, [hasMore, loading, params, items.length])
 
   const toggleTag = (t: string) => setTags((cur) => cur.includes(t) ? cur.filter((x) => x !== t) : [...cur, t])
-  const clearFilters = () => { setFolder(''); setTags([]); setOwner(''); setRawQ(''); setQ('') }
-  const hasFilters = !!(folder || tags.length || owner || q)
+  const clearFilters = () => { setFolder(''); setTags([]); setOwner(''); setHasColumns([]); setRawQ(''); setQ('') }
+  const hasFilters = !!(folder || tags.length || owner || hasColumns.length || q)
 
   const register = async () => {
     const u = uri.trim(); if (!u) return
@@ -89,7 +107,8 @@ export function CatalogView() {
     catch (e) { pushToast((e as Error).message, 'error') }
   }
   const onUpload = async (f?: File) => { if (f && await uploadDataset(f)) await loadFirst() }
-  const use = (t: CatalogTable) => addToCanvas('source', { uri: t.uri, tableId: t.id }, t.name)
+  // warm the working set first, or the new source node can't resolve its table and shows "Select dataset"
+  const use = (t: CatalogTable) => { rememberTables([t]); addToCanvas('source', { uri: t.uri, tableId: t.id }, t.name) }
 
   return (
     <div className="flex h-full flex-col">
@@ -118,8 +137,17 @@ export function CatalogView() {
             placeholder="Search by name, folder, description, or column…"
             className="w-full rounded-lg border border-border bg-card py-1.5 pl-8 pr-3 text-[13px] outline-none focus:border-primary" />
         </div>
+        {q && facets.semanticAvailable && (
+          <div className="flex items-center rounded-lg border border-border bg-card p-0.5 text-[11.5px]">
+            <span className="px-1.5 text-muted-foreground">Match:</span>
+            {(['text', 'meaning'] as const).map((m) => (
+              <button key={m} onClick={() => setMatch(m)} data-testid={`match-${m}`}
+                className={`rounded-md px-2 py-1 ${match === m ? 'bg-accent font-semibold text-accent-foreground' : 'text-muted-foreground hover:text-foreground'}`}>{m}</button>
+            ))}
+          </div>
+        )}
         <select value={`${sort}:${order}`} onChange={(e) => { const [s, o] = e.target.value.split(':'); setSort(s as Sort); setOrder(o as 'asc' | 'desc') }}
-          className="rounded-lg border border-border bg-card px-2 py-1.5 text-[12.5px] outline-none" data-testid="catalog-sort">
+          disabled={semantic} className="rounded-lg border border-border bg-card px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-50" data-testid="catalog-sort">
           <option value="name:asc">Name A–Z</option>
           <option value="name:desc">Name Z–A</option>
           <option value="rows:desc">Most rows</option>
@@ -133,6 +161,7 @@ export function CatalogView() {
           {folder && <Chip label={`📁 ${folder}`} onClear={() => setFolder('')} />}
           {tags.map((t) => <Chip key={t} label={`#${t}`} onClear={() => toggleTag(t)} />)}
           {owner && <Chip label={`@${owner}`} onClear={() => setOwner('')} />}
+          {hasColumns.map((c) => <Chip key={c} label={`has column ${c}`} onClear={() => setHasColumns((cur) => cur.filter((x) => x !== c))} />)}
           {q && <Chip label={`"${q}"`} onClear={() => { setRawQ(''); setQ('') }} />}
           <button onClick={clearFilters} className="text-[11px] text-muted-foreground underline">clear all</button>
         </div>
@@ -145,18 +174,31 @@ export function CatalogView() {
         </div>
 
         <div className="flex min-w-0 flex-1 flex-col">
-          <VirtualList
-            items={items}
-            rowHeight={ROW_H}
-            onEndReached={loadMore}
-            className="flex-1 px-3 py-2"
-            emptyNote={<div className="grid h-full place-items-center text-[13px] text-muted-foreground">
-              {loading ? 'Loading…' : hasFilters ? 'No datasets match these filters.' : 'No datasets registered — add one above.'}
-            </div>}
-            renderRow={(t) => <TableRow t={t} onOpen={() => setSelected(t)} onUse={() => use(t)} onFolder={setFolder} />}
-          />
+          {error ? (
+            <div className="grid flex-1 place-items-center px-3 py-2">
+              <div className="flex flex-col items-center gap-2 text-[13px] text-muted-foreground">
+                <span>Couldn't load the catalog: {error}</span>
+                <button onClick={() => void loadFirst()} data-testid="catalog-retry"
+                  className="rounded-md border border-border bg-card px-3 py-1 text-[12px] font-semibold text-foreground hover:bg-accent">Retry</button>
+              </div>
+            </div>
+          ) : (
+            <VirtualList
+              items={items}
+              rowHeight={ROW_H}
+              onEndReached={semantic ? undefined : loadMore}
+              resetKey={semantic ? `meaning:${q}` : params}
+              className="flex-1 px-3 py-2"
+              emptyNote={<div className="grid h-full place-items-center text-[13px] text-muted-foreground">
+                {loading ? 'Loading…' : hasFilters ? 'No datasets match these filters.' : 'No datasets registered — add one above.'}
+              </div>}
+              renderRow={(t) => <TableRow t={t} onOpen={() => setSelected(t)} onUse={() => use(t)} onFolder={setFolder} />}
+            />
+          )}
           <div className="border-t border-border px-4 py-1.5 text-[11px] text-muted-foreground">
-            Showing {items.length.toLocaleString()} of {total.toLocaleString()}{hasMore ? ' — scroll for more' : ''}
+            {semantic
+              ? `Top ${items.length.toLocaleString()} by relevance`
+              : `Showing ${items.length.toLocaleString()} of ${total.toLocaleString()}${hasMore ? ' — scroll for more' : ''}`}
           </div>
         </div>
 
@@ -179,8 +221,10 @@ export function CatalogView() {
       </div>
 
       {selected && (
-        <CatalogDetail table={selected} onClose={() => setSelected(null)} onUse={use}
-          onChanged={(t) => { setSelected(t); void loadFirst() }} onFolder={(f) => { setFolder(f); setSelected(null) }} />
+        <CatalogDetail key={selected.id} table={selected} onClose={() => setSelected(null)} onUse={use}
+          onChanged={(t) => { setSelected(t); void loadFirst() }} onFolder={(f) => { setFolder(f); setSelected(null) }}
+          onDeleted={() => { setSelected(null); void loadFirst() }} onOpenTable={setSelected}
+          onColumn={(c) => { setHasColumns((cur) => cur.includes(c) ? cur : [...cur, c]); setSelected(null) }} />
       )}
       {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)}
         onPick={async (r) => { setDialog(false); try { await api.registerFile(r.uri); await loadFirst() } catch { /* noop */ } }} />}
@@ -220,7 +264,8 @@ function FacetRow({ label, count, active, onClick }: { label: string; count: num
 
 function TableRow({ t, onOpen, onUse, onFolder }: { t: CatalogTable; onOpen: () => void; onUse: () => void; onFolder: (f: string) => void }) {
   return (
-    <div onClick={onOpen}
+    <div onClick={onOpen} role="button" tabIndex={0}
+      onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onOpen() } }}
       className="group mx-1 flex h-[54px] cursor-pointer items-center gap-3 rounded-lg border border-border bg-card px-3 hover:border-primary/40 hover:bg-accent"
       style={{ opacity: t.missing ? 0.55 : 1 }}>
       <Icon name="db" size={16} style={{ color: color.text3 }} />
@@ -294,9 +339,10 @@ function FolderBranch({ node, depth, selected, onSelect }: { node: FolderNode; d
 }
 
 // ---- detail drawer: columns + metadata editor + lineage ---------------------
-function CatalogDetail({ table, onClose, onUse, onChanged, onFolder }: {
+function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, onOpenTable, onColumn }: {
   table: CatalogTable; onClose: () => void; onUse: (t: CatalogTable) => void
   onChanged: (t: CatalogTable) => void; onFolder: (f: string) => void
+  onDeleted: () => void; onOpenTable: (t: CatalogTable) => void; onColumn: (name: string) => void
 }) {
   const pushToast = useStore((s) => s.pushToast)
   const [folder, setFolder] = useState(table.folder ?? '')
@@ -305,8 +351,34 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder }: {
   const [description, setDescription] = useState(table.description ?? '')
   const [lin, setLin] = useState<LineageResult | null>(null)
   const [busy, setBusy] = useState(false)
+  const [previewOpen, setPreviewOpen] = useState(false)
+  const [preview, setPreview] = useState<SampleResult | null>(null)  // lazy: fetched on first expand only
+  const closeRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => { api.lineage(table.uri, 4, 60).then(setLin).catch(() => setLin(null)) }, [table.uri])
+  useEffect(() => { closeRef.current?.focus() }, [])
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const togglePreview = () => {
+    setPreviewOpen((v) => !v)
+    if (!previewOpen && !preview) {
+      api.sample(table.uri, 30).then(setPreview).catch(() =>
+        setPreview({ columns: [], rows: [], truncated: false, notPreviewable: true, wire: 'dataset' }))
+    }
+  }
+  const unregister = async () => {
+    if (!window.confirm(`Remove "${table.name}" from the catalog?`)) return
+    try { await api.unregisterTable(table.id); pushToast('Removed from catalog', 'success'); onDeleted() }
+    catch (e) { pushToast((e as Error).message, 'error') }
+  }
+  const openLinked = async (ref: string) => {
+    try { onOpenTable(await api.table(ref)) }
+    catch { pushToast('Dataset is not in the catalog', 'error') }
+  }
 
   const save = async () => {
     setBusy(true)
@@ -325,7 +397,8 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder }: {
 
   return (
     <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
-      <div className="flex h-full w-[420px] flex-col overflow-y-auto border-l border-border bg-card shadow-xl" onClick={(e) => e.stopPropagation()}>
+      <div role="dialog" aria-modal="true" aria-label={table.name}
+        className="flex h-full w-[420px] flex-col overflow-y-auto border-l border-border bg-card shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
           <Icon name="db" size={16} />
           <div className="min-w-0 flex-1">
@@ -333,7 +406,7 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder }: {
             <div className="truncate text-[10.5px] text-muted-foreground">{table.uri}</div>
           </div>
           <button onClick={() => onUse(table)} data-testid="detail-use" className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary"><Icon name="plus" size={12} /> Use</button>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
+          <button ref={closeRef} onClick={onClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
         </div>
 
         <div className="flex flex-col gap-4 p-4 text-[12.5px]">
@@ -356,35 +429,67 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder }: {
             </div>
           </section>
 
-          {/* columns */}
+          {/* columns — click one to browse every table that has it */}
           <section>
             <div className="mb-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Columns</div>
             <div className="max-h-[220px] overflow-y-auto rounded-lg border border-border">
               {table.columns.map((c) => (
-                <div key={c.name} className="flex items-center gap-2 border-b border-border/60 px-3 py-1 last:border-0">
+                <button key={c.name} onClick={() => onColumn(c.name)} title={`Filter the list to tables with column "${c.name}"`}
+                  className="flex w-full items-center gap-2 border-b border-border/60 px-3 py-1 text-left last:border-0 hover:bg-accent">
                   <span className="w-3 text-center text-[10px]">{c.capabilities?.includes('key') ? '🔑' : ''}</span>
                   <span className="dp-mono flex-1 truncate text-[11.5px]">{c.name}</span>
                   <span className="text-[10px] text-muted-foreground">{c.type}</span>
-                </div>
+                </button>
               ))}
             </div>
           </section>
 
-          {/* lineage */}
+          {/* preview (lazy — a sample is only fetched when the section is first expanded) */}
+          <section>
+            <button onClick={togglePreview} data-testid="detail-preview"
+              className="mb-1 flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground hover:text-foreground">
+              <Icon name={previewOpen ? 'chevronDown' : 'chevronRight'} size={11} /> Preview
+            </button>
+            {previewOpen && (
+              !preview ? <div className="px-1 py-1 text-[11px] text-muted-foreground">Loading…</div>
+              : preview.error || preview.notPreviewable || !preview.rows.length
+                ? <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">No preview available for this dataset</div>
+                : <div className="max-h-[240px] overflow-auto rounded-lg border border-border">
+                    <table className="dp-mono w-max text-[10.5px]">
+                      <thead><tr>{preview.columns.map((c) => (
+                        <th key={c.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold">{c.name}</th>
+                      ))}</tr></thead>
+                      <tbody>{preview.rows.slice(0, 30).map((r, i) => (
+                        <tr key={i}>{preview.columns.map((c) => (
+                          <td key={c.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5">{cell(r[c.name])}</td>
+                        ))}</tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+            )}
+          </section>
+
+          {/* lineage — click a row to open that dataset */}
           <section>
             <div className="mb-1 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wide text-muted-foreground"><Icon name="lineage" size={12} /> Lineage{lin?.truncated ? ' (truncated)' : ''}</div>
-            <LineageMini label="Parents" empty="no upstream datasets" rows={parents.map((e) => ({ name: nameOf(e.parent), sub: e.pipeline ?? undefined }))} />
-            <LineageMini label="Children" empty="no downstream datasets" rows={children.map((e) => ({ name: nameOf(e.child), sub: e.pipeline ?? undefined }))} />
+            <LineageMini label="Parents" empty="no upstream datasets" onOpen={openLinked}
+              rows={parents.map((e) => ({ name: nameOf(e.parent), sub: e.pipeline ?? undefined, uri: e.parent }))} />
+            <LineageMini label="Children" empty="no downstream datasets" onOpen={openLinked}
+              rows={children.map((e) => ({ name: nameOf(e.child), sub: e.pipeline ?? undefined, uri: e.child }))} />
           </section>
 
           {table.folder && (
             <button onClick={() => onFolder(table.folder!)} className="self-start text-[11.5px] text-primary hover:underline">Browse folder “{table.folder}” →</button>
           )}
+          <button onClick={unregister} data-testid="detail-unregister"
+            className="self-start text-[11.5px] text-destructive opacity-70 hover:underline hover:opacity-100">Remove from catalog…</button>
         </div>
       </div>
     </div>
   )
 }
+
+const cell = (v: unknown) => v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v)
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -395,12 +500,19 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   )
 }
 
-function LineageMini({ label, empty, rows }: { label: string; empty: string; rows: { name: string; sub?: string }[] }) {
+function LineageMini({ label, empty, rows, onOpen }: {
+  label: string; empty: string; rows: { name: string; sub?: string; uri: string }[]; onOpen: (uri: string) => void
+}) {
   return (
     <div className="mb-1.5">
       <div className="text-[9.5px] font-bold uppercase tracking-wide text-muted-foreground">{label}</div>
       {rows.length
-        ? rows.map((r, i) => <div key={i} className="flex items-center gap-1.5 py-0.5 text-[12px] text-foreground"><Icon name="arrow" size={11} /> {r.name}{r.sub && <span className="text-[10px] text-muted-foreground">· {r.sub}</span>}</div>)
+        ? rows.map((r, i) => (
+            <button key={i} onClick={() => onOpen(r.uri)} title={r.uri}
+              className="flex w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-[12px] text-foreground hover:bg-accent hover:underline">
+              <Icon name="arrow" size={11} /> {r.name}{r.sub && <span className="text-[10px] text-muted-foreground">· {r.sub}</span>}
+            </button>
+          ))
         : <div className="py-0.5 text-[11px] text-muted-foreground">{empty}</div>}
     </div>
   )

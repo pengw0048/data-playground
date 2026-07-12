@@ -34,6 +34,7 @@ from hub.models import (
     ImportRequest,
     JoinSuggestion,
     KernelInfo,
+    LineageEdge,
     LineageResult,
     PipelineImport,
     ProcessorDescriptor,
@@ -49,9 +50,11 @@ def _csv(v: str | None) -> list[str]:
 
 
 def _catalog_query(q, folder, tags, owner, has_columns, sort, order, limit, offset, uris=None) -> CatalogQuery:
+    # list params are capped like `limit` is — an unbounded ?uris=/tags= list would otherwise become
+    # an arbitrarily large IN clause / EXISTS chain
     return CatalogQuery(
-        q=q or None, folder=folder or None, tags=_csv(tags), owner=owner or None,
-        uris=list(uris or []), has_columns=_csv(has_columns),
+        q=q or None, folder=folder or None, tags=_csv(tags)[:50], owner=owner or None,
+        uris=list(uris or [])[:500], has_columns=_csv(has_columns)[:50],
         sort=sort if sort in ("name", "rows", "updated", "usage", "folder") else "name",
         order="desc" if order == "desc" else "asc",
         limit=max(1, min(int(limit), 500)), offset=max(0, int(offset)))
@@ -168,9 +171,14 @@ def catalog_facets(
 ) -> Facets:
     """Distinct folder / tag / owner values + counts over the active filter set — powers the facet rail
     (each value is a one-click, counted filter). Computed with the SAME filters as the list, so the
-    counts always describe what a click would show."""
+    counts always describe what a click would show. `semanticAvailable` rides along so the UI knows
+    whether a search-by-meaning mode exists (an embedder plugin is installed)."""
     query = _catalog_query(q, folder, tags, owner, has_columns, "name", "asc", 1, 0)
-    return get_deps().catalog.facets(query)
+    cat = get_deps().catalog
+    out = cat.facets(query)
+    modes = getattr(cat, "search_modes", None)
+    out.semantic_available = "semantic" in modes() if callable(modes) else False
+    return out
 
 
 @router.get("/catalog/tree", response_model=CatalogBrowse)
@@ -199,14 +207,21 @@ def get_table(table_id: str) -> CatalogTable:
 @router.put("/catalog/tables/{table_id}/metadata", response_model=CatalogTable)
 def set_table_metadata(table_id: str, req: CatalogMetadata) -> CatalogTable:
     """Curate a dataset's organization — file it into a `folder`, set `tags`, an `owner`, a
-    `description`. Only the fields present in the body change; the probed schema/rows are untouched."""
+    `description`. Only the fields PRESENT in the body change (absent → untouched); an explicit
+    null (or "") on owner/description CLEARS it. The probed schema/rows are untouched."""
     cat = get_deps().catalog
     try:
         table = cat.get_table(table_id)
     except KeyError:
         raise HTTPException(404, f"table '{table_id}' not found")
-    return cat.set_metadata(table.uri, folder=req.folder, tags=req.tags,
-                            owner=req.owner, description=req.description)
+    sent = req.model_fields_set
+    # absent field → None (provider preserves); explicit null → "" (provider clears)
+    return cat.set_metadata(
+        table.uri,
+        folder=(req.folder or "") if "folder" in sent else None,
+        tags=req.tags if "tags" in sent else None,
+        owner=(req.owner or "") if "owner" in sent else None,
+        description=(req.description or "") if "description" in sent else None)
 
 
 @router.get("/catalog/lineage", response_model=LineageResult)
@@ -215,6 +230,17 @@ def lineage(uri: str = Query(...), depth: int = 6, max_nodes: int = Query(500, a
     + `max_nodes` so a large graph can't blow up the payload (`truncated` flags that the cap hit)."""
     return get_deps().catalog.lineage(uri, depth=max(1, min(int(depth), 20)),
                                       max_nodes=max(1, min(int(max_nodes), 5000)))
+
+
+@router.get("/catalog/edges", response_model=list[LineageEdge])
+def lineage_edges(response: Response, limit: int = 500, offset: int = 0) -> list[LineageEdge]:
+    """A page of the WHOLE lineage edge set (`X-Total-Count` rides in a header) — the bulk-export
+    surface an external lineage store syncs from. Edges are URI-keyed `{parent, child, column,
+    pipeline}`, so a bridge plugin can map them onto OpenLineage-style datasets 1:1."""
+    rows, total = metadb.catalog_edges_page(limit=max(1, min(int(limit), 2000)), offset=max(0, int(offset)))
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
+    return [LineageEdge(**r) for r in rows]
 
 
 @router.delete("/catalog/tables/{table_id}")

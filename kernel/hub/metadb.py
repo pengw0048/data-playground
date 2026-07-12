@@ -17,8 +17,8 @@ import os
 import uuid
 
 from sqlalchemy import (
-    Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String, Text,
-    UniqueConstraint, create_engine, func, or_, select,
+    BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String,
+    Text, UniqueConstraint, create_engine, func, or_, select, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -165,9 +165,9 @@ class CatalogEntry(Base):
     folder: Mapped[str] = mapped_column(String, default="", server_default="", index=True)  # browse-path namespace
     owner: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)  # promoted for sort/display
-    usage: Mapped[int] = mapped_column(Integer, default=0, server_default="0")  # read-count popularity signal
-    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    row_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)  # promoted for sort/display
+    usage: Mapped[int] = mapped_column(Integer, default=0, server_default="0", index=True)  # read-count popularity signal
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, index=True)
 
 
 class CatalogTag(Base):
@@ -822,11 +822,11 @@ def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: 
 
 def catalog_bump_usage(uri: str, n: int = 1) -> None:
     """Increment a dataset's read-count popularity (called best-effort when it's sampled / read in a
-    run). One indexed UPDATE; a missing row is a no-op (an un-registered uri isn't tracked)."""
+    run). An atomic `usage = usage + n` (concurrent bumps can't lose increments) that explicitly
+    carries updated_at, so a READ never masquerades as an update in the 'Recently updated' sort."""
     with session() as s:
-        r = s.get(CatalogEntry, uri)
-        if r is not None:
-            r.usage = (r.usage or 0) + n
+        s.execute(update(CatalogEntry).where(CatalogEntry.uri == uri)
+                  .values(usage=CatalogEntry.usage + n, updated_at=CatalogEntry.updated_at))
 
 
 def catalog_add_edge(parent: str, child: str, pipeline: str | None = None, column: str | None = None) -> None:
@@ -868,6 +868,11 @@ def _tags_for(s, uris: list[str]) -> dict[str, list[str]]:
     return out
 
 
+def _like_escape(s: str) -> str:
+    """Escape LIKE metacharacters in user input so a literal % / _ matches itself (used with ESCAPE '\\')."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _catalog_filters(q: str | None, folder: str | None, tags: list[str] | None,
                      owner: str | None, has_columns: list[str] | None,
                      uris: list[str] | None = None) -> list:
@@ -875,20 +880,26 @@ def _catalog_filters(q: str | None, folder: str | None, tags: list[str] | None,
     describe the SAME filtered set."""
     from sqlalchemy import exists
     terms: list = []
-    if q:
-        like = f"%{q.lower()}%"
+    # every whitespace token must match SOMEWHERE (name/uri/folder/description/column/tag), so
+    # "curated images" finds demo/images/curated even though the words never appear adjacent
+    for token in (q or "").lower().split():
+        like = f"%{_like_escape(token)}%"
         terms.append(or_(
-            func.lower(CatalogEntry.name).like(like),
-            func.lower(CatalogEntry.uri).like(like),
-            func.lower(CatalogEntry.folder).like(like),
-            func.lower(func.coalesce(CatalogEntry.description, "")).like(like),
-            exists().where(CatalogColumn.uri == CatalogEntry.uri, func.lower(CatalogColumn.column).like(like)),
+            func.lower(CatalogEntry.name).like(like, escape="\\"),
+            func.lower(CatalogEntry.uri).like(like, escape="\\"),
+            func.lower(CatalogEntry.folder).like(like, escape="\\"),
+            func.lower(func.coalesce(CatalogEntry.description, "")).like(like, escape="\\"),
+            exists().where(CatalogColumn.uri == CatalogEntry.uri,
+                           func.lower(CatalogColumn.column).like(like, escape="\\")),
+            exists().where(CatalogTag.uri == CatalogEntry.uri,
+                           func.lower(CatalogTag.tag).like(like, escape="\\")),
         ))
     if uris:
         terms.append(CatalogEntry.uri.in_(list(uris)))
     if folder:
         f = folder.strip("/")
-        terms.append(or_(CatalogEntry.folder == f, CatalogEntry.folder.like(f + "/%")))
+        terms.append(or_(CatalogEntry.folder == f,
+                         CatalogEntry.folder.like(_like_escape(f) + "/%", escape="\\")))
     for t in (tags or []):
         terms.append(exists().where(CatalogTag.uri == CatalogEntry.uri, CatalogTag.tag == t))
     if owner:
@@ -947,11 +958,13 @@ def catalog_facets(q: str | None = None, folder: str | None = None, tags: list[s
     return {"folders": folders, "tags": tag_counts, "owners": owners}
 
 
-def catalog_tree(prefix: str = "", table_limit: int = 100) -> tuple[list[tuple[str, str, int]], list[dict]]:
-    """One level of the browse tree at `prefix`: (child_folders, direct_tables). child_folders is a
-    list of (name, path, subtree_table_count) for the immediate sub-folders; direct_tables are the
-    tables filed exactly at `prefix`. Folder aggregation is over the (small) set of distinct folders,
-    so this scales with the number of FOLDERS, not tables."""
+def catalog_tree(prefix: str = "", table_limit: int = 100
+                 ) -> tuple[list[tuple[str, str, int]], list[dict], int]:
+    """One level of the browse tree at `prefix`: (child_folders, direct_tables, direct_total).
+    child_folders is a list of (name, path, subtree_table_count) for the immediate sub-folders;
+    direct_tables are the first `table_limit` tables filed exactly at `prefix` (direct_total says how
+    many exist, so a caller can signal truncation). Folder aggregation is over the (small) set of
+    distinct folders, so this scales with the number of FOLDERS, not tables."""
     p = (prefix or "").strip("/")
     depth = 0 if not p else p.count("/") + 1
     with session() as s:
@@ -971,11 +984,13 @@ def catalog_tree(prefix: str = "", table_limit: int = 100) -> tuple[list[tuple[s
             children[child_path] = children.get(child_path, 0) + int(cnt)
         child_list = sorted(
             ((cp.split("/")[-1], cp, n) for cp, n in children.items()), key=lambda x: x[0].lower())
+        direct_total = int(s.scalar(select(func.count()).select_from(CatalogEntry)
+                                    .where(CatalogEntry.folder == p)) or 0)
         direct_rows = list(s.scalars(
             select(CatalogEntry).where(CatalogEntry.folder == p).order_by(CatalogEntry.name).limit(table_limit)))
         tag_map = _tags_for(s, [r.uri for r in direct_rows])
         tables = [_row_to_doc(r, tag_map.get(r.uri, [])) for r in direct_rows]
-    return child_list, tables
+    return child_list, tables, direct_total
 
 
 def catalog_get(token: str) -> dict | None:
@@ -1011,31 +1026,49 @@ def catalog_entries() -> list[dict]:
         return [_row_to_doc(r, tag_map.get(r.uri, [])) for r in rows]
 
 
+def _delete_catalog_children(s, uris: list[str]) -> None:
+    """Remove EVERY row keyed to `uris` alongside the entries themselves — tags/columns/embeddings,
+    lineage edges (either endpoint), declared keys, and relationships. Otherwise a deleted table
+    haunts lineage/ER as a ghost node, and a NEW dataset re-registered at the same uri silently
+    inherits the old declared key + parents."""
+    for model in (CatalogTag, CatalogColumn, CatalogEmbedding, CatalogDeclaredKey):
+        for r in s.scalars(select(model).where(model.uri.in_(uris))):
+            s.delete(r)
+    for r in s.scalars(select(CatalogEdge).where(
+            or_(CatalogEdge.parent.in_(uris), CatalogEdge.child.in_(uris)))):
+        s.delete(r)
+    # relationship endpoints live inside the JSON doc — relationships are curated (small), so scan them
+    gone = set(uris)
+    for r in s.scalars(select(CatalogRelationship)):
+        try:
+            doc = json.loads(r.doc)
+        except (ValueError, TypeError):
+            continue
+        if doc.get("leftUri") in gone or doc.get("rightUri") in gone \
+                or doc.get("left_uri") in gone or doc.get("right_uri") in gone:
+            s.delete(r)
+
+
 def catalog_delete_entry(uri: str) -> None:
-    """Remove a catalog entry (unregister) + its mirrored tag/column/embedding rows."""
+    """Remove a catalog entry (unregister) + everything keyed to it (tags/columns/embedding/edges/
+    declared key/relationships)."""
     with session() as s:
-        for model in (CatalogTag, CatalogColumn):
-            for r in s.scalars(select(model).where(model.uri == uri)):
-                s.delete(r)
-        emb = s.get(CatalogEmbedding, uri)
-        if emb is not None:
-            s.delete(emb)
+        _delete_catalog_children(s, [uri])
         r = s.get(CatalogEntry, uri)
         if r is not None:
             s.delete(r)
 
 
 def catalog_delete_prefix(uri_prefix: str) -> int:
-    """Delete every entry (+ its tag/column/embedding rows) whose uri starts with `uri_prefix`. Returns
-    the count removed. For bulk teardown of demo/scale entries; a no-op for a prefix that matches none."""
-    like = uri_prefix + "%"
+    """Delete every entry (+ everything keyed to it) whose uri starts with `uri_prefix`. Returns the
+    count removed. For bulk teardown of demo/scale entries; a no-op for a prefix that matches none."""
+    like = _like_escape(uri_prefix) + "%"
     with session() as s:
-        uris = [u for (u,) in s.execute(select(CatalogEntry.uri).where(CatalogEntry.uri.like(like))).all()]
+        uris = [u for (u,) in s.execute(select(CatalogEntry.uri).where(
+            CatalogEntry.uri.like(like, escape="\\"))).all()]
         if not uris:
             return 0
-        for model in (CatalogTag, CatalogColumn, CatalogEmbedding):
-            for r in s.scalars(select(model).where(model.uri.in_(uris))):
-                s.delete(r)
+        _delete_catalog_children(s, uris)
         for r in s.scalars(select(CatalogEntry).where(CatalogEntry.uri.in_(uris))):
             s.delete(r)
     return len(uris)
@@ -1047,15 +1080,31 @@ def catalog_edges() -> list[dict]:
                 for r in s.scalars(select(CatalogEdge))]
 
 
-def catalog_edges_touching(uris: list[str]) -> list[dict]:
+def catalog_edges_touching(uris: list[str], limit: int | None = None) -> list[dict]:
     """Every edge with an endpoint in `uris` — the frontier expansion step of a bounded lineage BFS
-    (so lineage never loads the whole edge table)."""
+    (so lineage never loads the whole edge table). `limit` caps a pathologically-connected frontier
+    (a hub node with 100k children) so one expansion can't load unbounded rows; the caller treats a
+    full batch as truncation."""
     if not uris:
         return []
     with session() as s:
-        rows = s.scalars(select(CatalogEdge).where(
-            or_(CatalogEdge.parent.in_(uris), CatalogEdge.child.in_(uris))))
+        stmt = select(CatalogEdge).where(
+            or_(CatalogEdge.parent.in_(uris), CatalogEdge.child.in_(uris)))
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        rows = s.scalars(stmt)
         return [{"parent": r.parent, "child": r.child, "column": r.column, "pipeline": r.pipeline} for r in rows]
+
+
+def catalog_edges_page(limit: int = 500, offset: int = 0) -> tuple[list[dict], int]:
+    """One page of the whole lineage edge set + the total count — the bulk-export surface an external
+    lineage store (e.g. an OpenLineage bridge plugin) syncs from."""
+    with session() as s:
+        total = s.scalar(select(func.count()).select_from(CatalogEdge)) or 0
+        rows = s.scalars(select(CatalogEdge).order_by(CatalogEdge.id.asc())
+                         .limit(max(0, limit)).offset(max(0, offset)))
+        return ([{"parent": r.parent, "child": r.child, "column": r.column, "pipeline": r.pipeline}
+                 for r in rows], int(total))
 
 
 # -- semantic search (opt-in: only populated when an embedder is registered) ----------------------- #
@@ -1123,10 +1172,16 @@ def catalog_delete_relationship(rel_key: str) -> None:
             s.delete(r)
 
 
-def catalog_declared_keys() -> dict[str, list]:
-    """{uri: [column, ...]} for every declared primary key."""
+def catalog_declared_keys(uris: list[str] | None = None) -> dict[str, list]:
+    """{uri: [column, ...]} for the declared primary keys of `uris` (an indexed PK batch lookup — the
+    read path passes the page's uris so this stays O(page), never O(catalog)). None → all keys."""
     with session() as s:
-        return {r.uri: json.loads(r.columns) for r in s.scalars(select(CatalogDeclaredKey))}
+        stmt = select(CatalogDeclaredKey)
+        if uris is not None:
+            if not uris:
+                return {}
+            stmt = stmt.where(CatalogDeclaredKey.uri.in_(uris))
+        return {r.uri: json.loads(r.columns) for r in s.scalars(stmt)}
 
 
 def catalog_set_declared_key(uri: str, columns: list) -> None:

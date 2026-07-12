@@ -176,10 +176,13 @@ class FacetValue(Wire):
 
 class Facets(Wire):
     """Distinct values + counts for each facetable dimension, computed over the ACTIVE filter set
-    (drill-down semantics) — what powers the facet rail's clickable, counted filters."""
+    (drill-down semantics) — what powers the facet rail's clickable, counted filters.
+    `semantic_available` rides along so a UI knows whether search-by-meaning exists (an embedder
+    plugin is installed) without a separate capability round-trip."""
     folders: list[FacetValue] = []
     tags: list[FacetValue] = []
     owners: list[FacetValue] = []
+    semantic_available: bool = False
 
 
 class CatalogPage(Wire):
@@ -202,10 +205,14 @@ class FolderNode(Wire):
 
 class CatalogBrowse(Wire):
     """One level of the browse tree at a prefix: the immediate child folders (with subtree counts) and
-    the tables that live directly at this prefix. Lets the UI lazily expand a folder tree of any size."""
+    the tables filed directly at this prefix — a bounded sample (`total_tables`/`truncated` signal
+    when there are more; the full listing is the paginated list query with folder=prefix). Lets the
+    UI lazily expand a folder tree of any size."""
     prefix: str = ""
     folders: list[FolderNode] = []
     tables: list[CatalogTable] = []
+    total_tables: int = 0
+    truncated: bool = False
 
 
 class CatalogMetadata(Wire):

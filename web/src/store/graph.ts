@@ -868,17 +868,30 @@ export const useStore = create<Store>((set, get) => ({
 
   ensureCanvasTables: async (doc, opts) => {
     const force = (opts as { force?: boolean } | undefined)?.force
-    const have = new Set(get().catalog.map((t) => t.uri))
+    // a source ref can be a uri, a bare catalog name, or a tableId — count all three as "have"
+    const have = new Set(get().catalog.flatMap((t) => [t.uri, t.name, t.id]))
     const wanted = Array.from(new Set(
       doc.nodes.filter((n) => n.type === 'source' && n.data.config.uri).map((n) => String(n.data.config.uri)),
     ))
     const need = force ? wanted : wanted.filter((u) => !have.has(u))
     if (!need.length) return
+    // bare names/ids (no path separator or scheme — agent/MCP/example sources) can't match the exact
+    // `uris` filter, so they resolve via individual lookups instead
+    const bare = need.filter((u) => !u.includes('/') && !u.includes('\\'))
+    const uris = need.filter((u) => u.includes('/') || u.includes('\\'))
     try {
-      // ONE batched request (repeated ?uris=…); an unregistered source uri is simply absent from the
-      // result — never a per-uri 404 (which would pollute the console + cost N round-trips).
-      const page = await api.tablesPage({ uris: need, limit: need.length })
-      if (page.items.length) mergeIntoCatalog(set, page.items)
+      const found: CatalogTable[] = []
+      if (uris.length) {
+        // ONE batched request (repeated ?uris=…); an unregistered source uri is simply absent from the
+        // result — never a per-uri 404 (which would pollute the console + cost N round-trips).
+        const page = await api.tablesPage({ uris, limit: uris.length })
+        found.push(...page.items)
+      }
+      if (bare.length) {
+        const results = await Promise.allSettled(bare.map((r) => api.table(r)))
+        for (const r of results) if (r.status === 'fulfilled') found.push(r.value)
+      }
+      if (found.length) mergeIntoCatalog(set, found)
     } catch { /* offline: canvas still resolves columns from server schema + last preview */ }
   },
 

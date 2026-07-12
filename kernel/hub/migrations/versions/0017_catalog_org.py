@@ -29,11 +29,15 @@ def upgrade() -> None:
     op.add_column("catalog_entries", sa.Column("folder", sa.String(), nullable=False, server_default=""))
     op.add_column("catalog_entries", sa.Column("owner", sa.String(), nullable=True))
     op.add_column("catalog_entries", sa.Column("description", sa.Text(), nullable=True))
-    op.add_column("catalog_entries", sa.Column("row_count", sa.Integer(), nullable=True))
+    op.add_column("catalog_entries", sa.Column("row_count", sa.BigInteger(), nullable=True))
     op.add_column("catalog_entries", sa.Column("usage", sa.Integer(), nullable=False, server_default="0"))
     op.create_index("ix_catalog_entries_tbl_id", "catalog_entries", ["tbl_id"])
     op.create_index("ix_catalog_entries_folder", "catalog_entries", ["folder"])
     op.create_index("ix_catalog_entries_owner", "catalog_entries", ["owner"])
+    # the promoted sort keys ("Most rows / Most used / Recently updated") get indexes too
+    op.create_index("ix_catalog_entries_row_count", "catalog_entries", ["row_count"])
+    op.create_index("ix_catalog_entries_usage", "catalog_entries", ["usage"])
+    op.create_index("ix_catalog_entries_updated_at", "catalog_entries", ["updated_at"])
 
     op.add_column("catalog_edges", sa.Column("column", sa.String(), nullable=True))
 
@@ -69,7 +73,8 @@ def _backfill_from_docs() -> None:
     conn = op.get_bind()
     rows = conn.execute(sa.text("SELECT uri, doc FROM catalog_entries")).fetchall()
     tags_ins = sa.text("INSERT INTO catalog_tags (uri, tag) VALUES (:uri, :tag)")
-    cols_ins = sa.text("INSERT INTO catalog_columns (uri, column) VALUES (:uri, :col)")
+    # "column" is a fully reserved word on Postgres — the identifier must be quoted in raw SQL
+    cols_ins = sa.text('INSERT INTO catalog_columns (uri, "column") VALUES (:uri, :col)')
     upd = sa.text("UPDATE catalog_entries SET tbl_id=:tid, folder=:folder, owner=:owner, "
                   "description=:descr, row_count=:rows WHERE uri=:uri")
     for uri, doc_json in rows:
@@ -106,6 +111,9 @@ def downgrade() -> None:
     op.drop_index("ix_catalog_tags_tag", table_name="catalog_tags")
     op.drop_table("catalog_tags")
     op.drop_column("catalog_edges", "column")
+    op.drop_index("ix_catalog_entries_updated_at", table_name="catalog_entries")
+    op.drop_index("ix_catalog_entries_usage", table_name="catalog_entries")
+    op.drop_index("ix_catalog_entries_row_count", table_name="catalog_entries")
     op.drop_index("ix_catalog_entries_owner", table_name="catalog_entries")
     op.drop_index("ix_catalog_entries_folder", table_name="catalog_entries")
     op.drop_index("ix_catalog_entries_tbl_id", table_name="catalog_entries")

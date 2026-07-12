@@ -61,6 +61,9 @@ class InMemoryCatalog:
         self._lock = threading.RLock()
         self._embedder = None          # callable(list[str]) -> list[list[float]] (set via reg.add_embedder)
         self._embed_model = ""
+        self._emb_dirty = 0            # bumped on local embedding writes → invalidates _emb_cache
+        self._emb_cache: tuple | None = None  # (dirty_stamp, monotonic_ts, (uris, matrix, norms) | None)
+        self._reindex_lock = threading.Lock()  # one reindex walk at a time (set_embedder + explicit calls)
         self._seed()
 
     # -- discovery --------------------------------------------------------- #
@@ -194,7 +197,7 @@ class InMemoryCatalog:
             q=query.q, folder=query.folder, tags=query.tags, owner=query.owner,
             uris=query.uris, has_columns=query.has_columns, sort=query.sort, order=query.order,
             limit=query.limit, offset=query.offset)
-        dmap = self._declared_keys()
+        dmap = self._declared_keys([d["uri"] for d in docs])
         items = [self._overlay(self._to_table(d), dmap) for d in docs]
         return CatalogPage(items=items, total=total, offset=query.offset, limit=query.limit,
                            has_more=query.offset + len(items) < total)
@@ -213,19 +216,21 @@ class InMemoryCatalog:
 
     def browse(self, prefix: str = "") -> CatalogBrowse:
         """One level of the folder tree at `prefix`: immediate child folders (subtree counts) + the
-        tables filed directly here. Lets the UI lazily expand a tree of any size."""
-        children, table_docs = metadb.catalog_tree(prefix)
-        dmap = self._declared_keys()
+        tables filed directly here (a bounded sample; truncated/total signal more). Lets the UI
+        lazily expand a tree of any size."""
+        children, table_docs, direct_total = metadb.catalog_tree(prefix)
+        dmap = self._declared_keys([d["uri"] for d in table_docs])
         return CatalogBrowse(
             prefix=(prefix or "").strip("/"),
             folders=[FolderNode(name=n, path=p, table_count=c) for n, p, c in children],
-            tables=[self._overlay(self._to_table(d), dmap) for d in table_docs])
+            tables=[self._overlay(self._to_table(d), dmap) for d in table_docs],
+            total_tables=direct_total, truncated=direct_total > len(table_docs))
 
     def get_table(self, id_or_name: str) -> CatalogTable:
         doc = metadb.catalog_get(id_or_name)
         if doc is None:
             raise KeyError(id_or_name)
-        return self._overlay(self._to_table(doc))
+        return self._overlay(self._to_table(doc), self._declared_keys([doc["uri"]]))
 
     # -- CatalogProvider: lineage ----------------------------------------- #
     def lineage(self, uri: str, depth: int = DEFAULT_LINEAGE_DEPTH,
@@ -238,9 +243,13 @@ class InMemoryCatalog:
         edges: dict[tuple[str, str], LineageEdge] = {}
         truncated = False
         hops = 0
+        # cap one frontier expansion too — a hub node with 100k children must not load them all
+        edge_cap = max(2000, max_nodes * 4)
         while frontier and hops < max(1, depth):
             hops += 1
-            batch = metadb.catalog_edges_touching(frontier)
+            batch = metadb.catalog_edges_touching(frontier, limit=edge_cap)
+            if len(batch) >= edge_cap:
+                truncated = True
             nxt: list[str] = []
             for e in batch:
                 key = (e["parent"], e["child"])
@@ -296,16 +305,19 @@ class InMemoryCatalog:
 
     def set_metadata(self, uri: str, *, folder: str | None = None, tags: list[str] | None = None,
                      owner: str | None = None, description: str | None = None) -> CatalogTable:
-        """Update a dataset's organization (folder/tags/owner/description). Only provided fields change.
+        """Update a dataset's organization (folder/tags/owner/description). None → field unchanged;
+        for owner/description an empty string CLEARS the field (there's no meaningful empty owner),
+        so a client can unset without a sentinel. folder='' files at the root; tags=[] clears tags.
         Raises KeyError if the uri isn't registered."""
         cur = metadb.catalog_get(uri)
         if cur is None:
             raise KeyError(uri)
+        own = cur.get("owner") if owner is None else (owner.strip() or None)
+        desc = cur.get("description") if description is None else (description.strip() or None)
         metadb.catalog_set_metadata(
             uri,
             folder=(folder if folder is not None else cur.get("folder") or "").strip("/"),
-            owner=owner if owner is not None else cur.get("owner"),
-            description=description if description is not None else cur.get("description"),
+            owner=own, description=desc,
             tags=[str(t).strip() for t in (tags if tags is not None else cur.get("tags") or []) if str(t).strip()],
         )
         t = self.get_table(uri)
@@ -326,9 +338,15 @@ class InMemoryCatalog:
             if doc is None:
                 return False
             metadb.catalog_delete_entry(doc["uri"])
+            self._emb_dirty += 1  # its embedding row went with it
         return True
 
     # -- semantic search (opt-in via reg.add_embedder) -------------------- #
+    def search_modes(self) -> list[str]:
+        """Which search modes are live: lexical always; semantic/hybrid once an embedder is installed.
+        Surfaced through /catalog/facets so the UI can offer a search-by-meaning toggle."""
+        return ["lexical", "semantic", "hybrid"] if self._embedder is not None else ["lexical"]
+
     def set_embedder(self, fn, model: str = "custom") -> None:
         """Install an embedder — `fn(list[str]) -> list[list[float]]`. Kicks off a best-effort
         background reindex so already-registered datasets become semantically searchable too."""
@@ -349,20 +367,66 @@ class InMemoryCatalog:
             vec = self._embedder([self._embed_text(t)])[0]
             arr = np.asarray(vec, dtype=np.float32)
             metadb.catalog_set_embedding(t.uri, self._embed_model, int(arr.shape[0]), arr.tobytes())
+            self._emb_dirty += 1  # invalidate the in-process score matrix
         except Exception:  # noqa: BLE001 — semantic index is best-effort; never break a register
             log.debug("embed failed for %s", t.uri, exc_info=True)
 
+    _REINDEX_PAGE = 500     # DB page per reindex step
+    _REINDEX_CHUNK = 128    # texts per embedder call (models batch far better than 1-at-a-time)
+
     def _reindex_embeddings(self) -> None:
+        """Walk the WHOLE catalog page by page (not just the first page) and embed every entry that
+        has no vector yet, in chunks — so a 50k-table catalog converges instead of silently stopping.
+        Serialized by a lock (set_embedder's background thread + explicit calls), and one failed chunk
+        (a bad row, a concurrent write) skips forward instead of aborting the walk."""
         if self._embedder is None:
             return
-        try:
-            have = {u for u, _ in metadb.catalog_embeddings_for(self._embed_model)}
-            page = self.list_page(CatalogQuery(limit=LIST_TABLES_CAP))
-            for t in page.items:
-                if t.uri not in have:
-                    self._embed_one(t)
-        except Exception:  # noqa: BLE001
-            log.debug("catalog embedding reindex failed", exc_info=True)
+        with self._reindex_lock:
+            try:
+                import numpy as np
+                have = {u for u, _ in metadb.catalog_embeddings_for(self._embed_model)}
+                offset = 0
+                while True:
+                    page = self.list_page(CatalogQuery(limit=self._REINDEX_PAGE, offset=offset))
+                    todo = [t for t in page.items if t.uri not in have]
+                    for i in range(0, len(todo), self._REINDEX_CHUNK):
+                        chunk = todo[i:i + self._REINDEX_CHUNK]
+                        try:
+                            vecs = self._embedder([self._embed_text(t) for t in chunk])
+                            for t, vec in zip(chunk, vecs):
+                                arr = np.asarray(vec, dtype=np.float32)
+                                metadb.catalog_set_embedding(t.uri, self._embed_model,
+                                                             int(arr.shape[0]), arr.tobytes())
+                        except Exception:  # noqa: BLE001
+                            log.debug("embed chunk failed (skipping)", exc_info=True)
+                    if todo:
+                        self._emb_dirty += 1
+                    if not page.has_more:
+                        break
+                    offset += len(page.items)
+            except Exception:  # noqa: BLE001
+                log.debug("catalog embedding reindex failed", exc_info=True)
+
+    def _embedding_matrix(self):
+        """(uris, matrix, norms) for the current model, cached in-process: reloading + re-stacking
+        every vector per query is the expensive part of semantic search (megabytes at 10k tables).
+        Invalidated by local writes (`_emb_dirty`) and a short TTL (cross-instance writes)."""
+        import time
+        import numpy as np
+        cached = self._emb_cache
+        if cached and cached[0] == self._emb_dirty and time.monotonic() - cached[1] < 30.0:
+            return cached[2]
+        rows = metadb.catalog_embeddings_for(self._embed_model)
+        if not rows:
+            data = None
+        else:
+            uris = [u for u, _ in rows]
+            mat = np.stack([np.frombuffer(v, dtype=np.float32) for _, v in rows])
+            norms = np.linalg.norm(mat, axis=1)
+            norms[norms == 0] = 1.0
+            data = (uris, mat, norms)
+        self._emb_cache = (self._emb_dirty, time.monotonic(), data)
+        return data
 
     def semantic_search(self, q: str, limit: int = 50) -> list[CatalogTable]:
         """Rank datasets by cosine similarity of their embedding to the query's. Empty if no embedder."""
@@ -372,13 +436,10 @@ class InMemoryCatalog:
             import numpy as np
             qv = np.asarray(self._embedder([q])[0], dtype=np.float32)
             qn = float(np.linalg.norm(qv)) or 1.0
-            rows = metadb.catalog_embeddings_for(self._embed_model)
-            if not rows:
+            data = self._embedding_matrix()
+            if data is None:
                 return []
-            uris = [u for u, _ in rows]
-            mat = np.stack([np.frombuffer(v, dtype=np.float32) for _, v in rows])
-            norms = np.linalg.norm(mat, axis=1)
-            norms[norms == 0] = 1.0
+            uris, mat, norms = data
             scores = (mat @ qv) / (norms * qn)
             order = np.argsort(-scores)[:limit]
             ranked = [uris[i] for i in order]
@@ -386,7 +447,7 @@ class InMemoryCatalog:
             log.debug("semantic search failed", exc_info=True)
             return []
         docs = metadb.catalog_get_many(ranked)
-        dmap = self._declared_keys()
+        dmap = self._declared_keys(ranked)
         return [self._overlay(self._to_table(docs[u]), dmap) for u in ranked if u in docs]
 
     def search(self, q: str, mode: str = "hybrid", limit: int = 50) -> list[CatalogTable]:
@@ -411,9 +472,11 @@ class InMemoryCatalog:
         return [keep[u] for u in sorted(score, key=lambda u: -score[u])][:limit]
 
     # -- declared keys & relationships (owner-asserted; per-ROW, cross-instance) --- #
-    def _declared_keys(self) -> dict[str, list[str]]:
+    def _declared_keys(self, uris: list[str] | None = None) -> dict[str, list[str]]:
+        """Declared keys for `uris` (the page being served) — an indexed batch lookup, so the browse
+        read path stays O(page) even with many declared keys."""
         try:
-            return metadb.catalog_declared_keys()
+            return metadb.catalog_declared_keys(uris)
         except Exception:  # noqa: BLE001
             return {}
 
@@ -446,3 +509,112 @@ class InMemoryCatalog:
 
     def remove_relationship(self, rel: Relationship) -> None:
         metadb.catalog_delete_relationship(self._rel_key(rel))
+
+
+class CatalogCompat:
+    """Adapter that lets a provider written against the PRE-scale CatalogProvider protocol (only
+    list_tables/get_table/… — no list_page/facets/browse/search/set_metadata) keep working behind the
+    new discovery routes. `reg.set_catalog` wraps such providers automatically. The fallbacks realize
+    one bounded list_tables() call and filter in Python — the OLD provider's own cost model, so
+    nothing regresses; a provider that wants pushdown implements the new methods and skips the shim.
+    Everything the inner provider DOES have passes straight through (__getattr__)."""
+
+    _FALLBACK_CAP = 5000  # matches LIST_TABLES_CAP — the old surface was already bounded by this
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.name = getattr(inner, "name", "catalog")
+
+    def __getattr__(self, attr):
+        return getattr(self._inner, attr)
+
+    def _all(self, q: str | None) -> list[CatalogTable]:
+        return list(self._inner.list_tables(q) or [])[: self._FALLBACK_CAP]
+
+    @staticmethod
+    def _matches(t: CatalogTable, query: CatalogQuery) -> bool:
+        if query.folder:
+            f = query.folder.strip("/")
+            tf = (t.folder or "").strip("/")
+            if tf != f and not tf.startswith(f + "/"):
+                return False
+        if query.uris and t.uri not in query.uris:
+            return False
+        if query.owner and t.owner != query.owner:
+            return False
+        have_tags = set(t.tags or [])
+        if any(tag not in have_tags for tag in query.tags):
+            return False
+        have_cols = {c.name for c in (t.columns or [])}
+        return not any(c not in have_cols for c in query.has_columns)
+
+    def list_page(self, query: CatalogQuery) -> CatalogPage:
+        if hasattr(self._inner, "list_page"):
+            return self._inner.list_page(query)
+        items = [t for t in self._all(query.q) if self._matches(t, query)]
+        keys = {"name": lambda t: (t.name or "").lower(), "rows": lambda t: t.row_count or 0,
+                "usage": lambda t: getattr(t, "usage", 0) or 0, "folder": lambda t: (t.folder or "").lower(),
+                "updated": lambda t: getattr(t, "updated_at", None) or ""}
+        items.sort(key=keys.get(query.sort, keys["name"]), reverse=query.order == "desc")
+        window = items[query.offset:query.offset + query.limit]
+        return CatalogPage(items=window, total=len(items), offset=query.offset, limit=query.limit,
+                           has_more=query.offset + len(window) < len(items))
+
+    def facets(self, query: CatalogQuery) -> Facets:
+        if hasattr(self._inner, "facets"):
+            return self._inner.facets(query)
+        from collections import Counter
+        items = [t for t in self._all(query.q) if self._matches(t, query)]
+        folders = Counter((t.folder or "").strip("/") for t in items if t.folder)
+        owners = Counter(t.owner for t in items if t.owner)
+        tags = Counter(tag for t in items for tag in (t.tags or []))
+        fv = lambda c: [FacetValue(value=v, count=n) for v, n in c.most_common(100)]  # noqa: E731
+        return Facets(folders=fv(folders), tags=fv(tags), owners=fv(owners))
+
+    def browse(self, prefix: str = "") -> CatalogBrowse:
+        if hasattr(self._inner, "browse"):
+            return self._inner.browse(prefix)
+        p = (prefix or "").strip("/")
+        depth = 0 if not p else p.count("/") + 1
+        items = self._all(None)
+        children: dict[str, int] = {}
+        direct: list[CatalogTable] = []
+        for t in items:
+            f = (t.folder or "").strip("/")
+            if f == p:
+                direct.append(t)
+                continue
+            if p and not f.startswith(p + "/"):
+                continue
+            segs = f.split("/") if f else []
+            if len(segs) > depth:
+                cp = "/".join(segs[: depth + 1])
+                children[cp] = children.get(cp, 0) + 1
+        return CatalogBrowse(
+            prefix=p,
+            folders=[FolderNode(name=cp.split("/")[-1], path=cp, table_count=n)
+                     for cp, n in sorted(children.items(), key=lambda kv: kv[0].lower())],
+            tables=sorted(direct, key=lambda t: (t.name or "").lower())[:100],
+            total_tables=len(direct), truncated=len(direct) > 100)
+
+    def search(self, q: str, mode: str = "hybrid", limit: int = 50) -> list[CatalogTable]:
+        if hasattr(self._inner, "search"):
+            return self._inner.search(q, mode=mode, limit=limit)
+        return self._all(q)[:limit]
+
+    def search_modes(self) -> list[str]:
+        fn = getattr(self._inner, "search_modes", None)
+        return fn() if callable(fn) else ["lexical"]
+
+    def set_metadata(self, uri: str, **kwargs) -> CatalogTable:
+        fn = getattr(self._inner, "set_metadata", None)
+        if callable(fn):
+            return fn(uri, **kwargs)
+        raise NotImplementedError(f"catalog provider '{self.name}' does not support curation")
+
+    def lineage(self, uri: str, depth: int = DEFAULT_LINEAGE_DEPTH,
+                max_nodes: int = DEFAULT_LINEAGE_MAX_NODES) -> LineageResult:
+        try:
+            return self._inner.lineage(uri, depth=depth, max_nodes=max_nodes)
+        except TypeError:  # old signature: lineage(uri)
+            return self._inner.lineage(uri)

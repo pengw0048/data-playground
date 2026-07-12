@@ -190,17 +190,23 @@ def _run_canvas(argv: list[str]) -> None:
 def _run_seed_catalog(argv: list[str]) -> None:
     """`dataplay seed-catalog --count N` — register N synthetic datasets across a folder/tag/owner
     space, so you can see the catalog's browse/search/facet UX at scale without real files. Writes to
-    the same workspace DB the server reads, so they show up live in the Tables view."""
+    the same workspace DB the server reads, so they show up live in the Tables view.
+    `--remove` deletes everything a previous seed with the same --prefix created."""
     p = argparse.ArgumentParser(prog="dataplay seed-catalog", description="Seed synthetic catalog entries (demo/scale).")
     p.add_argument("--count", type=int, default=1000, help="how many synthetic datasets to register")
     p.add_argument("--workspace", default=None, help="working dir (default: CWD)")
     p.add_argument("--data-dir", default=None)
     p.add_argument("--prefix", default="demo", help="uri + name prefix (also the top-level folder)")
+    p.add_argument("--remove", action="store_true", help="remove previously-seeded entries for --prefix instead of seeding")
     args = p.parse_args(argv)
     _prepare_workspace(args.workspace, args.data_dir, seed=False)
 
     from hub import metadb
     metadb.init_db()
+    if args.remove:
+        n = metadb.catalog_delete_prefix(f"mem://{args.prefix}/")
+        print(f"removed {n} seeded catalog entries (prefix '{args.prefix}').", file=sys.stderr)
+        return
     owners = ["data-platform", "growth", "ml-research", "finance", "ops"]
     modalities = ["images", "video", "audio", "text", "tabular"]
     entries = []
@@ -218,7 +224,7 @@ def _run_seed_catalog(argv: list[str]) -> None:
         }})
     n = metadb.catalog_bulk_seed(entries)
     print(f"seeded {n} synthetic catalog entries (prefix '{args.prefix}'). Remove with: "
-          f"prefix uri 'mem://{args.prefix}/'.", file=sys.stderr)
+          f"dataplay seed-catalog --remove --prefix {args.prefix}", file=sys.stderr)
 
 
 def main() -> None:
