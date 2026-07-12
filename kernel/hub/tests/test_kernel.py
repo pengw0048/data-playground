@@ -7572,6 +7572,22 @@ def test_ray_opts_maps_region_requires_to_ray_task_placement():
     assert both == {"num_gpus": 1.0, "resources": {"gpu1": 0.001}}
 
 
+def test_ray_custom_labels_are_advertised_to_the_pre_dispatch_gate(tmp_path, monkeypatch):
+    from hub.deps import Deps
+    from hub.models import ResourceSpec
+
+    monkeypatch.setenv("DP_RAY_LABELS", "pool=a100, zone=use1, malformed, engine=other")
+    (tmp_path / "ws").mkdir()
+    rr = _load_dp_ray().RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+
+    labels = rr.workers()[0].capacity.labels
+    assert labels == {"engine": "ray", "pool": "a100", "zone": "use1"}
+    assert rr._resource_unsupported_reason(
+        ResourceSpec(labels={"engine": "ray", "pool": "a100"})) is None
+    assert "exceed advertised" in rr._resource_unsupported_reason(
+        ResourceSpec(labels={"engine": "ray", "pool": "h100"}))
+
+
 def test_ray_explicit_placement_fails_unsupported_shape_while_unpinned_falls_back(tmp_path, monkeypatch):
     from hub.deps import Deps
     from hub.models import Graph, ResourceSpec

@@ -122,6 +122,22 @@ def _ray_opts(requires: dict | None) -> dict:
     return opts
 
 
+def _advertised_ray_labels() -> dict[str, str]:
+    """Operator-declared placement labels, e.g. ``DP_RAY_LABELS=pool=a100,zone=use1``.
+
+    A non-engine label value is also the Ray custom-resource name used by ``_ray_opts``. Keeping the
+    same declaration in the hub capacity and the cluster's ``ray start --resources`` configuration
+    makes pre-dispatch admission agree with Ray's task scheduler.
+    """
+    labels = {"engine": "ray"}
+    for item in os.environ.get("DP_RAY_LABELS", "").split(","):
+        key, sep, value = item.partition("=")
+        key, value = key.strip(), value.strip()
+        if sep and key and value and key != "engine":
+            labels[key] = value
+    return labels
+
+
 def _make_mapper(config: dict):
     """A Ray Data batch UDF that reuses the DuckDB engine's EXACT operator — so a transform produces the
     same rows on Ray as locally. Captures only plain strings, so it cloudpickles to Ray workers."""
@@ -190,7 +206,8 @@ class RayRunner:
     def workers(self) -> list:
         # The hub can't query a live Ray cluster (the driver runs in an isolated subprocess — see the
         # DuckDB×Ray deadlock note), so an operator declares the cluster's shape via env: DP_RAY_GPUS /
-        # DP_RAY_GPU_TYPE / DP_RAY_MEM. That advertised capacity feeds the topology view + the run-plan
+        # DP_RAY_GPU_TYPE / DP_RAY_MEM / DP_RAY_LABELS. That advertised capacity feeds the topology view
+        # + the run-plan
         # pre-flight ("needs 4×a100 — backends advertise: 8×a100"). Defaults keep the engine=ray label.
         import os
         try:
@@ -203,7 +220,7 @@ class RayRunner:
             cpu = 0
         cap = ResourceSpec(cpu=cpu or None, mem=os.environ.get("DP_RAY_MEM", "1000GB"),
                            gpu=gpu or None, gpu_type=(os.environ.get("DP_RAY_GPU_TYPE") or None) if gpu else None,
-                           labels={"engine": "ray"})
+                           labels=_advertised_ray_labels())
         return [WorkerInfo(id="ray", capacity=cap, state="idle")]
 
     def place(self, requires) -> "str | None":
