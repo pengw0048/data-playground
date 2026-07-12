@@ -2242,18 +2242,21 @@ def test_users_create_and_list():
     assert created["id"] in ids and "local" in ids and created["id"] not in before
 
 
-def test_kernel_child_env_strips_signing_secret_but_keeps_auth_mode(monkeypatch):
-    # P0-SEC-01: the kernel child runs arbitrary canvas Python; it must NOT inherit the forgeable
-    # session-signing secret, but must still know it's in auth mode (via DP_AUTH_MODE) so its FS/path
-    # confinement stays on. Data-plane creds (DB, object store) necessarily remain — it IS the engine.
+def test_kernel_child_env_is_allowlisted_but_keeps_auth_mode(monkeypatch):
+    # The long-lived kernel still owns DB-backed lease/run-state writes and data access, but it must not
+    # inherit unrelated hub control/provider secrets. DP_AUTH_MODE preserves its FS/path confinement.
     from hub import auth, kernel_backend
     monkeypatch.setenv("DP_AUTH_SECRET", "x" * 40)
+    monkeypatch.setenv("DP_AUTH_PASSWORD", "bootstrap-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    monkeypatch.setenv("UNRELATED_DEPLOY_TOKEN", "control-secret")
     monkeypatch.setenv("DP_DATABASE_URL", "postgresql+psycopg://u:p@h/db")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s3cr3t-key")
     env = kernel_backend._kernel_child_env()
     assert "DP_AUTH_SECRET" not in env          # the forgeable signing secret is stripped
+    assert not {"DP_AUTH_PASSWORD", "OPENAI_API_KEY", "UNRELATED_DEPLOY_TOKEN"} & env.keys()
     assert env["DP_AUTH_MODE"] == "1"           # but the auth-mode signal survives
-    assert env["DP_DATABASE_URL"] and env["AWS_SECRET_ACCESS_KEY"]  # data-plane creds remain (necessary)
+    assert env["DP_DATABASE_URL"] and env["AWS_SECRET_ACCESS_KEY"]  # explicit residual capabilities
     # the signal alone enables auth mode with NO usable signing material in the child
     monkeypatch.delenv("DP_AUTH_SECRET")
     monkeypatch.setenv("DP_AUTH_MODE", "1")
@@ -2310,6 +2313,7 @@ def test_first_admin_bootstrap_from_env_password(monkeypatch):
         # wire the bootstrap and re-run the startup seed (init_db is idempotent)
         monkeypatch.setenv("DP_AUTH_PASSWORD", "bootstrap-pw-123")
         metadb.init_db()
+        assert "DP_AUTH_PASSWORD" not in os.environ  # one-time input, not ambient runtime configuration
         assert metadb.is_admin("local")
         assert client.post("/api/auth/login", json={"userId": "local", "password": "bootstrap-pw-123"}).status_code == 200
         assert client.get("/api/canvas").status_code == 200  # a gated route is now reachable
@@ -2484,6 +2488,87 @@ def test_subprocess_runner_executes_in_isolation(tmp_path):
         assert any(t["name"] == "subproc_out" for t in tables)
     finally:
         metadb.set_setting("backend", "", "global")  # restore the default in-process runner
+
+
+def test_subprocess_runner_enforces_named_schema_contract_without_hub_db_access(tmp_path):
+    from hub import metadb
+
+    metadb.save_schema_contract("subprocess_value_contract", [{"name": "v", "type": "int"}])
+    metadb.set_setting("backend", "local-subprocess", "global")
+    try:
+        p = _seq_parquet(tmp_path, n=10)
+        g = {"id": "c", "version": 1, "nodes": [
+            N("src", "source", {"uri": p}),
+            N("xf", "transform", {
+                "mode": "map",
+                "code": "def fn(row): return row",
+                "outputSchema": {"ref": "subprocess_value_contract"},
+                "enforceSchema": True,
+            }),
+        ], "edges": [E("src", "xf")]}
+        run = client.post(
+            "/api/run", json={"graph": g, "targetNodeId": "xf", "confirmed": True}
+        ).json()
+
+        status = _poll(run["runId"], tries=400)
+
+        assert status["status"] == "done", status.get("error")
+        assert (status["totalRows"] or status["rowsProcessed"]) == 10
+    finally:
+        metadb.set_setting("backend", "", "global")
+
+
+def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_path):
+    import json
+    import threading
+
+    from hub.models import Graph, RunStatus
+    from hub.subprocess_runner import SubprocessRunner
+
+    registration_started = threading.Event()
+    allow_registration = threading.Event()
+
+    class BlockingCatalog:
+        def register_output(self, **_kwargs):
+            registration_started.set()
+            assert allow_registration.wait(timeout=5)
+
+    class FinishedProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    runner = SubprocessRunner("test", str(tmp_path), catalog=BlockingCatalog())
+    run_id = "run_catalog_gate"
+    runner.runs[run_id] = RunStatus(run_id=run_id, status="running", per_node=[])
+    status_file = tmp_path / "status.json"
+    status_file.write_text(json.dumps(RunStatus(
+        run_id="child",
+        status="done",
+        per_node=[],
+        output_uri=str(tmp_path / "result.parquet"),
+        output_table="result",
+    ).model_dump()))
+    graph = Graph.model_validate({"id": "c", "version": 1, "nodes": [], "edges": []})
+
+    watcher = threading.Thread(target=runner._watch, args=(
+        run_id, FinishedProcess(), str(status_file), str(tmp_path), graph, None
+    ))
+    watcher.start()
+    assert registration_started.wait(timeout=5)
+
+    assert runner.status(run_id).status == "running"
+
+    allow_registration.set()
+    watcher.join(timeout=5)
+    assert not watcher.is_alive()
+    assert runner.status(run_id).status == "done"
 
 
 def test_run_deadline_hard_kills_a_runaway_child(tmp_path):

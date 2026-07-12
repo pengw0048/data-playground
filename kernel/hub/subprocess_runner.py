@@ -25,6 +25,12 @@ from hub.models import CompilePlan, Graph, PerNodeStatus, Placement, RunEstimate
 from hub.plugins.runner import _CONFIRM_ROWS, _MAX_RUNS
 
 
+def _subrun_child_env() -> dict[str, str]:
+    """A one-shot worker does not own control-plane persistence and receives no metadata identity."""
+    from hub.workload_env import build_workload_env
+    return build_workload_env(include_metadata_db=False)
+
+
 class SubprocessRunner:
     name = "local-subprocess"
 
@@ -95,17 +101,20 @@ class SubprocessRunner:
         return self._spawn(status, {"materializeUri": output_uri}, graph, output_node)
 
     def _spawn(self, status: RunStatus, job_extra: dict, graph: Graph, target: str | None) -> RunStatus:
+        from hub.workload_env import prepare_workload_graph
+
         run_id = status.run_id
         job_dir = tempfile.mkdtemp(prefix="dp-run-")
         status_file = os.path.join(job_dir, "status.json")
         job_file = os.path.join(job_dir, "job.json")
         with open(job_file, "w") as f:
-            json.dump({"workspace": self.workspace, "dataDir": self.data_dir, "graph": graph.model_dump(),
+            json.dump({"workspace": self.workspace, "dataDir": self.data_dir,
+                       "graph": prepare_workload_graph(graph),
                        "target": target, "statusFile": status_file, **job_extra}, f)
-        # keep the forgeable signing secret out of the subrun child too (defense in depth for the case
-        # where the subprocess runner is selected directly on the hub, not parented by a kernel) — P0-SEC-01
-        from hub.kernel_backend import _kernel_child_env
-        proc = subprocess.Popen([sys.executable, "-m", "hub.subrun", job_file], env=_kernel_child_env())
+        # A one-shot worker gets only runtime/data capabilities, never the hub metadata identity or
+        # ambient signing/bootstrap/provider secrets. It creates a disposable local metadata DB itself.
+        proc = subprocess.Popen([sys.executable, "-m", "hub.subrun", job_file],
+                                env=_subrun_child_env())
         with self._lock:
             self.runs[run_id] = status
             self._procs[run_id] = proc
@@ -133,25 +142,30 @@ class SubprocessRunner:
             self._cancelled.discard(victim)
             self._procs.pop(victim, None)
 
-    def _read(self, run_id: str, status_file: str) -> bool:
-        """Merge the child's latest status; return True once it's terminal."""
+    def _read(self, run_id: str, status_file: str) -> RunStatus | None:
+        """Merge progress, but hold a child terminal status for parent-side finalization."""
         if run_id in self._cancelled:
-            return True  # cancel already set the terminal state; don't let a stale 'running' file overwrite it
+            return self.runs[run_id]  # don't let a stale child 'running' status overwrite cancellation
         try:
             with open(status_file) as f:
                 payload = json.load(f)
         except (OSError, ValueError):
-            return False
-        self.runs[run_id] = RunStatus(**{**payload, "run_id": run_id})  # the child had its own run id
-        return self.runs[run_id].status in ("done", "failed", "cancelled")
+            return None
+        observed = RunStatus(**{**payload, "run_id": run_id})  # the child had its own run id
+        if observed.status in ("done", "failed", "cancelled"):
+            return observed
+        self.runs[run_id] = observed
+        return None
 
     def _watch(self, run_id: str, proc: subprocess.Popen, status_file: str, job_dir: str,
                graph: Graph, target: str | None) -> None:
         start = time.monotonic()
         deadline_hit = False
         last = None
+        terminal = None
         while True:
-            if self._read(run_id, status_file):
+            terminal = self._read(run_id, status_file)
+            if terminal is not None:
                 break
             # mirror INTERMEDIATE progress to the DB: the kernel poll path reads run_states (not our
             # in-memory dict), so without this the row would sit at 'queued' for the whole run body.
@@ -163,14 +177,14 @@ class SubprocessRunner:
                     last = dump
             if proc.poll() is not None:      # child exited — do a final read then stop
                 time.sleep(0.1)
-                self._read(run_id, status_file)
+                terminal = self._read(run_id, status_file)
                 break
             if self.deadline_s and self.deadline_s > 0 and time.monotonic() - start > self.deadline_s:
                 deadline_hit = True           # runaway — hard-kill the child and fail the run
                 if proc.poll() is None:
                     proc.terminate()
                 time.sleep(0.1)
-                self._read(run_id, status_file)
+                terminal = self._read(run_id, status_file)
                 break
             time.sleep(0.15)
         try:
@@ -178,7 +192,8 @@ class SubprocessRunner:
         except subprocess.TimeoutExpired:
             proc.kill()  # SIGTERM ignored (e.g. a C-level DuckDB loop) → force-reap so _watch can't hang
             proc.wait()
-        st = self.runs.get(run_id)
+        current = self.runs.get(run_id)
+        st = terminal or (current.model_copy(deep=True) if current is not None else None)
         forced = bool(st and st.status in ("queued", "running"))  # exited without a terminal status
         if forced:
             if run_id in self._cancelled:
@@ -197,17 +212,17 @@ class SubprocessRunner:
                                              parents=[], pipeline="canvas")  # content-addressed version
             except Exception:  # noqa: BLE001
                 pass
-        # Persist run history here (the child disables its own on_complete to avoid a daemon-thread
-        # race). We read the terminal status from the child's atomically-written status file, or the
-        # status we forced above on a crash/cancel — recording every terminal run, like the in-process
-        # backend, with no double-write.
+        # Finalize before publishing the terminal status. Otherwise a caller can observe `done` and query
+        # the catalog while parent-side output registration is still in flight.
         if st is not None and st.status in ("done", "failed", "cancelled"):
-            self._emit(graph, st)  # persist the terminal status to the DB (cross-instance / restart-safe)
             if self.on_complete:
                 try:
                     self.on_complete(graph, target, st)
                 except Exception:  # noqa: BLE001
                     pass
+            self._emit(graph, st)  # persist only after registration/history finalization
+            with self._lock:
+                self.runs[run_id] = st
         shutil.rmtree(job_dir, ignore_errors=True)
         with self._lock:
             self._procs.pop(run_id, None)

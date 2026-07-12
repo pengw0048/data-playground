@@ -69,6 +69,10 @@ def main() -> None:
             raise RuntimeError(f"dp_ray needs HASH_SHUFFLE, got {_strat} — unset RAY_DATA_DEFAULT_SHUFFLE_STRATEGY")
         _log(f"ray init done (address={_addr or 'local'}); set_workspace")
 
+        # Deps expects catalog tables, but a Ray driver does not own hub control state. Use a private
+        # disposable metadata DB rather than receiving the hub's unrestricted database identity.
+        from hub.workload_env import initialize_ephemeral_metadata
+        initialize_ephemeral_metadata(os.path.dirname(status_file))
         from hub.deps import set_workspace
         from hub.ir import lower_to_ir
         from hub.models import Graph

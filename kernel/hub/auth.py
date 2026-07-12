@@ -1,15 +1,15 @@
 """Session auth — a signed, non-spoofable identity, opt-in via env.
 
 DEFAULT (no DP_AUTH_SECRET): open, internal-tool mode — identity is the X-DP-User header (dev). Set
-DP_AUTH_SECRET (+ DP_AUTH_PASSWORD) to REQUIRE a signed session cookie: /auth/login checks the shared
-password and issues an HMAC-signed, time-limited token; a raw header is no longer trusted, and tokens
-can't be forged without the secret.
+DP_AUTH_SECRET to require a signed session cookie; DP_AUTH_PASSWORD may seed the first admin on startup.
+/auth/login checks the user's stored password hash and issues an HMAC-signed, time-limited token; a raw
+header is no longer trusted, and tokens can't be forged without the secret.
 
 Identity is PER-USER: /auth/login verifies the submitted password against that user's own scrypt hash
 (users.password_hash), so knowing the shared instance password no longer lets you sign in as someone
-else. DP_AUTH_PASSWORD survives only as a BOOTSTRAP: on first init it seeds the default user's hash so
-an existing deployment keeps working; admins then create users with their own passwords and everyone
-can rotate their own. SSO/OIDC would slot into the same /auth/login + session plumbing later.
+else. DP_AUTH_PASSWORD is one-time BOOTSTRAP input: initialization consumes it after seeding the default
+user's hash (or confirming a hash already exists). Admins then create users with their own passwords and
+everyone can rotate their own. SSO/OIDC would slot into the same /auth/login + session plumbing later.
 """
 
 from __future__ import annotations
