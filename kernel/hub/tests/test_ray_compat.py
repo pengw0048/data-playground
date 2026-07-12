@@ -190,6 +190,12 @@ def test_kuberay_validation_profile_fits_a_four_cpu_kind_node_and_recreates_work
 
     script = (_ROOT / "deploy/kuberay/validate.sh").read_text()
     assert "dp-ray:kuberay-$(date +%Y%m%d%H%M%S)-$$" in script
+    assert 'kind get kubeconfig --name "${KIND_CLUSTER}"' in script
+    assert 'kubectl --kubeconfig "${KIND_KUBECONFIG}"' in script
     assert "delete job dp-ray-multinode-check dp-ray-createbucket" in script
     assert "delete raycluster dp-ray" in script
+    assert script.count("--cascade=foreground") == 2
+    assert 'wait_for_no_pods "ray.io/cluster=dp-ray"' in script
+    assert 'wait_for_no_pods "batch.kubernetes.io/job-name=dp-ray-multinode-check"' in script
+    assert 'if (( ${failed:-0} >= 1 ))' in script
     assert 'sed "s|image: dp-ray:local|image: ${IMAGE}|g"' in script

@@ -5,14 +5,61 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KIND_CLUSTER="${KIND_CLUSTER:-kind}"
-CONTEXT="kind-${KIND_CLUSTER}"
 IMAGE="${DP_RAY_VALIDATION_IMAGE:-dp-ray:kuberay-$(date +%Y%m%d%H%M%S)-$$}"
-TIMEOUT="${DP_RAY_VALIDATION_TIMEOUT:-600s}"
-KUBECTL=(kubectl --context "${CONTEXT}")
+TIMEOUT_SECONDS="${DP_RAY_VALIDATION_TIMEOUT_SECONDS:-600}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
+case "${TIMEOUT_SECONDS}" in
+  ''|*[!0-9]*|0) echo "DP_RAY_VALIDATION_TIMEOUT_SECONDS must be a positive integer" >&2; exit 2 ;;
+esac
+
+# Bind kubectl to the exact cluster that `kind load` targets. A user's same-named kubeconfig context may
+# have been redirected; using it while deleting fixed validation resource names would be unsafe.
+KIND_KUBECONFIG="${TMP}/kind-kubeconfig"
+kind get kubeconfig --name "${KIND_CLUSTER}" > "${KIND_KUBECONFIG}"
+KUBECTL=(kubectl --kubeconfig "${KIND_KUBECONFIG}")
+
 say() { printf '\n== %s\n' "$*"; }
+
+wait_for_no_pods() {
+  local selector="$1" label="$2" deadline=$((SECONDS + 180)) remaining
+  while (( SECONDS < deadline )); do
+    remaining="$("${KUBECTL[@]}" get pods -l "${selector}" -o name 2>/dev/null || true)"
+    [ -z "${remaining}" ] && return 0
+    sleep 2
+  done
+  "${KUBECTL[@]}" get pods -l "${selector}" -o wide || true
+  echo "timed out waiting for old ${label} pods to disappear" >&2
+  return 1
+}
+
+job_diagnostics() {
+  "${KUBECTL[@]}" logs job/dp-ray-multinode-check --tail=500 || true
+  "${KUBECTL[@]}" describe job dp-ray-multinode-check || true
+}
+
+wait_for_differential() {
+  local deadline=$((SECONDS + TIMEOUT_SECONDS)) succeeded failed
+  while (( SECONDS < deadline )); do
+    succeeded="$("${KUBECTL[@]}" get job dp-ray-multinode-check \
+      -o jsonpath='{.status.succeeded}' 2>/dev/null || true)"
+    failed="$("${KUBECTL[@]}" get job dp-ray-multinode-check \
+      -o jsonpath='{.status.failed}' 2>/dev/null || true)"
+    if (( ${succeeded:-0} >= 1 )); then
+      return 0
+    fi
+    if (( ${failed:-0} >= 1 )); then
+      echo "multi-node differential failed" >&2
+      job_diagnostics
+      return 1
+    fi
+    sleep 2
+  done
+  echo "timed out waiting for the multi-node differential" >&2
+  job_diagnostics
+  return 1
+}
 
 say "Build and load fresh Ray image ${IMAGE}"
 docker build --provenance=false -f "${ROOT}/docker/ray/Dockerfile" -t "${IMAGE}" "${ROOT}"
@@ -20,8 +67,14 @@ kind load docker-image "${IMAGE}" --name "${KIND_CLUSTER}"
 
 say "Delete prior immutable validation resources"
 "${KUBECTL[@]}" delete job dp-ray-multinode-check dp-ray-createbucket \
-  --ignore-not-found --wait=true --timeout=180s
-"${KUBECTL[@]}" delete raycluster dp-ray --ignore-not-found --wait=true --timeout=180s
+  --ignore-not-found --cascade=foreground --wait=true --timeout=180s
+"${KUBECTL[@]}" delete raycluster dp-ray \
+  --ignore-not-found --cascade=foreground --wait=true --timeout=180s
+# Foreground deletion should reap dependents, but make stale execution impossible even if an operator or
+# garbage collector violates that expectation. KubeRay selects same-named pods by label, not owner UID.
+wait_for_no_pods "ray.io/cluster=dp-ray" "RayCluster"
+wait_for_no_pods "batch.kubernetes.io/job-name=dp-ray-multinode-check" "differential Job"
+wait_for_no_pods "batch.kubernetes.io/job-name=dp-ray-createbucket" "bucket Job"
 
 # Render the checked-in local placeholder to this invocation's immutable-in-practice tag. Re-applying
 # dp-ray:local with IfNotPresent can otherwise run an old image even after `kind load`, and an existing
@@ -53,9 +106,7 @@ fi
 
 say "Run the multi-node differential"
 "${KUBECTL[@]}" apply -f "${TMP}/differential-job.yaml"
-if ! "${KUBECTL[@]}" wait --for=condition=complete --timeout="${TIMEOUT}" job/dp-ray-multinode-check; then
-  "${KUBECTL[@]}" logs job/dp-ray-multinode-check --tail=500 || true
-  "${KUBECTL[@]}" describe job dp-ray-multinode-check || true
+if ! wait_for_differential; then
   exit 1
 fi
 "${KUBECTL[@]}" logs job/dp-ray-multinode-check

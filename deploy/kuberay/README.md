@@ -29,9 +29,10 @@ docker compose -f docker-compose.ray.yml run --rm --no-deps driver
 ## 2. KubeRay on Kubernetes (e.g. kind — the pods path)
 
 These manifests are a disposable validation environment: fixed workers, ephemeral MinIO, and test
-credentials. They are not a secure or highly available production deployment. Their CPU/memory values
-are deliberately sized so one head, two workers, MinIO, and the driver fit on a typical 4-CPU/8-GiB
-single-node kind cluster; they are **not** production capacity guidance.
+credentials. They are not a secure or highly available production deployment. Their CPU/memory
+**requests** let a scheduler place one head, two workers, MinIO, and the driver on the validated
+4-CPU/8-GiB single-node kind profile; limits and Ray logical capacity can exceed those requests, so this
+is neither a peak-capacity guarantee nor production sizing guidance.
 
 ```bash
 kind create cluster
@@ -43,11 +44,14 @@ KIND_CLUSTER=kind ./deploy/kuberay/validate.sh
 # → "[multinode] PASS: … byte-identical …"
 ```
 
-The script is intentionally re-runnable. Each invocation builds and loads a unique image tag, deletes
-the prior RayCluster and immutable Jobs, and then creates fresh pod templates. Reusing `dp-ray:local`
-with `imagePullPolicy: IfNotPresent` plus `kubectl apply` can otherwise leave old cluster pods and an old
-Job running even after a new image was loaded. Set `KIND_CLUSTER=<name>` for a non-default kind cluster;
-`DP_RAY_VALIDATION_IMAGE=<unique-tag>` can override the generated tag.
+The script is intentionally re-runnable. Each invocation obtains an isolated kubeconfig directly from
+the named kind cluster, builds and loads a unique image tag, foreground-deletes the prior RayCluster and
+immutable Jobs, proves their pods are gone, and then creates fresh pod templates. Reusing
+`dp-ray:local` with `imagePullPolicy: IfNotPresent` plus `kubectl apply` can otherwise leave old cluster
+pods and an old Job running even after a new image was loaded. Set `KIND_CLUSTER=<name>` for a
+non-default kind cluster; `DP_RAY_VALIDATION_IMAGE=<unique-tag>` can override the generated tag, and
+`DP_RAY_VALIDATION_TIMEOUT_SECONDS=<seconds>` controls the differential deadline. A failed Job is
+reported immediately with its logs instead of waiting through the deadline.
 
 Both paths use the same `docker/ray/Dockerfile` image. The optional dependency, image, and KubeRay
 `rayVersion` are pinned to **Ray 2.56.0**, the only version currently validated against dp_ray's private
