@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ReactFlow, Background, BackgroundVariant, Controls, Handle, Position, MarkerType,
   type Node, type Edge, type Connection, type NodeChange,
@@ -82,30 +82,84 @@ export function ERDiagram() {
   const [folders, setFolders] = useState<string[]>([])
   const [total, setTotal] = useState(0)
   const [rels, setRels] = useState<Relationship[]>([])
-  const [pending, setPending] = useState<{ left: CatalogTable; right: CatalogTable; suggestions: JoinSuggestion[] } | null>(null)
+  const [catalogLoading, setCatalogLoading] = useState(true)
+  const [catalogError, setCatalogError] = useState<string | null>(null)
+  const [foldersLoading, setFoldersLoading] = useState(true)
+  const [foldersError, setFoldersError] = useState<string | null>(null)
+  const [relsLoading, setRelsLoading] = useState(true)
+  const [relsError, setRelsError] = useState<string | null>(null)
+  const [pending, setPending] = useState<{
+    left: CatalogTable; right: CatalogTable; suggestions: JoinSuggestion[]
+    suggestionsLoading: boolean; suggestionsError: string | null
+  } | null>(null)
   // node layout survives navigation (the view unmounts) via localStorage, keyed by table id
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>(loadPositions)
+  const catalogRequest = useRef(0)
+  const foldersRequest = useRef(0)
+  const relsRequest = useRef(0)
+  const loadedFolder = useRef<string | null>(null)
 
-  const reload = useCallback(() =>
-    api.tablesPage({ folder: folder || undefined, limit: ER_CAP, sort: 'usage', order: 'desc' })
-      .then((p) => { setCatalog(p.items); setTotal(p.total) })
-      .catch(() => { setCatalog([]); setTotal(0) }),
-  [folder])
+  const reload = useCallback(async () => {
+    const s = ++catalogRequest.current
+    // Rows from another folder are not a valid stale view for the newly selected folder. A same-
+    // folder refresh failure (for example after declaring a key) keeps the last graph and labels it.
+    if (loadedFolder.current !== folder) { setCatalog([]); setTotal(0) }
+    setCatalogLoading(true); setCatalogError(null)
+    try {
+      const page = await api.tablesPage({ folder: folder || undefined, limit: ER_CAP, sort: 'usage', order: 'desc' })
+      if (s !== catalogRequest.current) return
+      setCatalog(page.items); setTotal(page.total); loadedFolder.current = folder
+    } catch (e) {
+      if (s === catalogRequest.current) setCatalogError(errorMessage(e))
+    } finally {
+      if (s === catalogRequest.current) setCatalogLoading(false)
+    }
+  }, [folder])
+
+  const loadRelationships = useCallback(async () => {
+    const s = ++relsRequest.current
+    setRelsLoading(true); setRelsError(null)
+    try {
+      const next = await api.relationships()
+      if (s === relsRequest.current) setRels(next)
+    } catch (e) {
+      if (s === relsRequest.current) setRelsError(errorMessage(e))
+    } finally {
+      if (s === relsRequest.current) setRelsLoading(false)
+    }
+  }, [])
+
+  const loadFolders = useCallback(async () => {
+    const s = ++foldersRequest.current
+    setFoldersLoading(true); setFoldersError(null)
+    try {
+      const next = await api.facets()
+      if (s === foldersRequest.current) setFolders(next.folders.map((x) => x.value))
+    } catch (e) {
+      if (s === foldersRequest.current) setFoldersError(errorMessage(e))
+    } finally {
+      if (s === foldersRequest.current) setFoldersLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
-    api.relationships().then(setRels).catch(() => setRels([]))
-    api.facets().then((f) => setFolders(f.folders.map((x) => x.value))).catch(() => setFolders([]))
-  }, [])
-  useEffect(() => { reload() }, [reload])
+    void loadRelationships(); void loadFolders()
+    return () => { relsRequest.current += 1; foldersRequest.current += 1 }
+  }, [loadRelationships, loadFolders])
+  useEffect(() => {
+    void reload()
+    return () => { catalogRequest.current += 1 }
+  }, [reload])
   const refreshCatalog = reload  // local reload after a key/relationship edit
+  const visibleCatalog = loadedFolder.current === folder ? catalog : []
 
-  const byUri = useMemo(() => Object.fromEntries(catalog.map((t) => [t.uri, t.id])), [catalog])
+  const byUri = useMemo(() => Object.fromEntries(visibleCatalog.map((t) => [t.uri, t.id])), [visibleCatalog])
   const pkOf = (t: CatalogTable) => t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
 
   // clicking a column toggles its membership in the declared primary key — so clicking several
   // columns builds a COMPOSITE key (in click order); clicking a member again removes it.
   const toggleCol = useCallback(async (tableId: string, col: string) => {
-    const t = catalog.find((x) => x.id === tableId)
+    const t = visibleCatalog.find((x) => x.id === tableId)
     if (!t) return
     const cur = t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
     const next = cur.includes(col) ? cur.filter((c) => c !== col) : [...cur, col]
@@ -113,13 +167,13 @@ export function ERDiagram() {
       await api.declareKey(tableId, next)
       await refreshCatalog()
     } catch (e) { pushToast(String((e as Error).message || e), 'error') }
-  }, [catalog, refreshCatalog, pushToast])
+  }, [visibleCatalog, refreshCatalog, pushToast])
 
-  const nodes: Node[] = useMemo(() => catalog.map((t, i) => ({
+  const nodes: Node[] = useMemo(() => visibleCatalog.map((t, i) => ({
     id: t.id, type: 'entity',
     position: positions[t.id] ?? { x: (i % 3) * 300, y: Math.floor(i / 3) * 300 },
     data: { table: t, pk: pkOf(t), onToggle: (col: string) => toggleCol(t.id, col) } satisfies EntityData,
-  })), [catalog, positions, toggleCol])
+  })), [visibleCatalog, positions, toggleCol])
 
   const edges: Edge[] = useMemo(() => {
     const out: Edge[] = []
@@ -135,9 +189,9 @@ export function ERDiagram() {
         style: { stroke: 'var(--primary)', strokeWidth: 1.5 }, data: { rel: r },
       })
     })
-    for (let a = 0; a < catalog.length; a++)
-      for (let b = a + 1; b < catalog.length; b++) {
-        const ta = catalog[a], tb = catalog[b]
+    for (let a = 0; a < visibleCatalog.length; a++)
+      for (let b = a + 1; b < visibleCatalog.length; b++) {
+        const ta = visibleCatalog[a], tb = visibleCatalog[b]
         if (declared.has([ta.id, tb.id].sort().join('|')) || !sharesKey(ta, tb)) continue
         out.push({
           id: `c-${ta.id}-${tb.id}`, source: ta.id, target: tb.id, selectable: false,
@@ -145,16 +199,30 @@ export function ERDiagram() {
         })
       }
     return out
-  }, [rels, catalog, byUri])
+  }, [rels, visibleCatalog, byUri])
 
   // dragging between two entities opens the picker (choose a suggested key or set columns/cardinality
   // by hand) rather than blindly declaring the top suggestion — needed for tables with several FKs.
-  const onConnect = useCallback(async (c: Connection) => {
-    const s = catalog.find((t) => t.id === c.source), t = catalog.find((x) => x.id === c.target)
+  const loadSuggestions = useCallback(async (left: CatalogTable, right: CatalogTable) => {
+    setPending((cur) => cur?.left.id === left.id && cur.right.id === right.id
+      ? { ...cur, suggestionsLoading: true, suggestionsError: null }
+      : { left, right, suggestions: [], suggestionsLoading: true, suggestionsError: null })
+    try {
+      const suggestions = await api.joinSuggestions(left.uri, right.uri)
+      setPending((cur) => cur?.left.id === left.id && cur.right.id === right.id
+        ? { ...cur, suggestions, suggestionsLoading: false }
+        : cur)
+    } catch (e) {
+      setPending((cur) => cur?.left.id === left.id && cur.right.id === right.id
+        ? { ...cur, suggestionsLoading: false, suggestionsError: errorMessage(e) }
+        : cur)
+    }
+  }, [])
+  const onConnect = useCallback((c: Connection) => {
+    const s = visibleCatalog.find((t) => t.id === c.source), t = visibleCatalog.find((x) => x.id === c.target)
     if (!s || !t || s.id === t.id) return
-    const suggestions = await api.joinSuggestions(s.uri, t.uri).catch(() => [])
-    setPending({ left: s, right: t, suggestions })
-  }, [catalog])
+    void loadSuggestions(s, t)
+  }, [visibleCatalog, loadSuggestions])
 
   const onEdgeClick = useCallback(async (_e: React.MouseEvent, edge: Edge) => {
     const rel = (edge.data as { rel?: Relationship } | undefined)?.rel
@@ -171,7 +239,7 @@ export function ERDiagram() {
     })
   }, [])
 
-  const capped = total > catalog.length
+  const capped = total > visibleCatalog.length
 
   return (
     <div className="relative h-full w-full">
@@ -185,9 +253,30 @@ export function ERDiagram() {
           </select>
         </div>
         🔑 click column(s) to declare the primary key · drag between two tables to declare a join · click a solid edge to remove · dashed = possible join
-        {capped && <span className="text-[10px] text-amber-600">Showing {catalog.length} of {total} — pick a folder to focus the diagram.</span>}
+        {catalogLoading && <span data-testid="er-catalog-loading">Loading datasets…</span>}
+        {catalogError && (
+          <span role="alert" className="text-destructive">
+            Couldn't load datasets: {catalogError}{visibleCatalog.length ? ' (showing stale graph)' : ''}{' '}
+            <button onClick={() => void reload()} data-testid="er-catalog-retry" className="font-semibold underline">Retry</button>
+          </span>
+        )}
+        {foldersLoading && <span>Loading folders…</span>}
+        {foldersError && (
+          <span role="alert" className="text-destructive">
+            Couldn't load folders: {foldersError}{folders.length ? ' (showing stale folders)' : ''}{' '}
+            <button onClick={() => void loadFolders()} data-testid="er-folders-retry" className="font-semibold underline">Retry</button>
+          </span>
+        )}
+        {relsLoading && <span>Loading declared relationships…</span>}
+        {relsError && (
+          <span role="alert" className="text-destructive">
+            Couldn't load declared relationships: {relsError}{rels.length ? ' (showing stale relationships)' : ''}{' '}
+            <button onClick={() => void loadRelationships()} data-testid="er-relationships-retry" className="font-semibold underline">Retry</button>
+          </span>
+        )}
+        {capped && <span className="text-[10px] text-amber-600">Showing {visibleCatalog.length} of {total} — pick a folder to focus the diagram.</span>}
       </div>
-      {catalog.length === 0 && (
+      {!catalogLoading && !catalogError && visibleCatalog.length === 0 && (
         <div className="pointer-events-none absolute inset-0 z-[5] grid place-items-center text-[13px] text-muted-foreground">
           {total === 0 && !folder ? 'No datasets registered yet — add some in Tables.' : 'No datasets in this folder.'}
         </div>
@@ -203,6 +292,8 @@ export function ERDiagram() {
         // rapid second drag would reuse the dialog with the first pair's stale columns
         <RelationshipDialog key={`${pending.left.id}|${pending.right.id}`}
           left={pending.left} right={pending.right} suggestions={pending.suggestions}
+          suggestionsLoading={pending.suggestionsLoading} suggestionsError={pending.suggestionsError}
+          onRetrySuggestions={() => void loadSuggestions(pending.left, pending.right)}
           onClose={() => setPending(null)}
           onDeclared={(next) => { setRels(next); setPending(null) }} />
       )}
@@ -211,11 +302,13 @@ export function ERDiagram() {
 }
 
 const CARDINALITIES: Cardinality[] = ['1:1', '1:N', 'N:1', 'N:M', 'unknown']
+const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
 
 // Pick the join key(s) + cardinality when declaring a relationship: seed from the ranked suggestions,
 // or toggle columns on each side by hand (equal counts) and choose the cardinality.
-function RelationshipDialog({ left, right, suggestions, onClose, onDeclared }: {
+function RelationshipDialog({ left, right, suggestions, suggestionsLoading, suggestionsError, onRetrySuggestions, onClose, onDeclared }: {
   left: CatalogTable; right: CatalogTable; suggestions: JoinSuggestion[]
+  suggestionsLoading: boolean; suggestionsError: string | null; onRetrySuggestions: () => void
   onClose: () => void; onDeclared: (rels: Relationship[]) => void
 }) {
   const pushToast = useStore((s) => s.pushToast)
@@ -223,13 +316,22 @@ function RelationshipDialog({ left, right, suggestions, onClose, onDeclared }: {
   const [lc, setLc] = useState<string[]>(top?.leftColumns ?? [])
   const [rc, setRc] = useState<string[]>(top?.rightColumns ?? [])
   const [card, setCard] = useState<Cardinality>(top?.cardinality ?? 'unknown')
+  const [keysTouched, setKeysTouched] = useState(false)
   const [busy, setBusy] = useState(false)
 
+  // Suggestions now load inside the open dialog. Preserve the old top-suggestion seeding behavior,
+  // but never overwrite columns/cardinality the user already chose while that request was pending.
+  useEffect(() => {
+    if (!top || keysTouched) return
+    setLc(top.leftColumns); setRc(top.rightColumns); setCard(top.cardinality)
+  }, [top, keysTouched])
+
   const toggle = (arr: string[], set: (v: string[]) => void, col: string) => {
+    setKeysTouched(true)
     set(arr.includes(col) ? arr.filter((c) => c !== col) : [...arr, col])
     setCard('unknown')  // hand-editing the key invalidates a cardinality that was MEASURED for another key
   }
-  const pick = (s: JoinSuggestion) => { setLc(s.leftColumns); setRc(s.rightColumns); setCard(s.cardinality) }
+  const pick = (s: JoinSuggestion) => { setKeysTouched(true); setLc(s.leftColumns); setRc(s.rightColumns); setCard(s.cardinality) }
   const ok = lc.length > 0 && lc.length === rc.length
   const declare = async () => {
     setBusy(true)
@@ -257,6 +359,13 @@ function RelationshipDialog({ left, right, suggestions, onClose, onDeclared }: {
     <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
       <DialogContent className="max-w-[480px]">
         <DialogHeader><DialogTitle className="text-[14px]">Declare a join: {left.name} → {right.name}</DialogTitle></DialogHeader>
+        {suggestionsLoading && <div className="text-[11px] text-muted-foreground">Loading join suggestions…</div>}
+        {suggestionsError && (
+          <div role="alert" className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
+            <span>Join suggestions unavailable: {suggestionsError}. You can still choose keys manually.</span>
+            <button onClick={onRetrySuggestions} data-testid="er-suggestions-retry" className="shrink-0 font-semibold underline">Retry</button>
+          </div>
+        )}
         {suggestions.length > 0 && (
           <div className="flex flex-col gap-1">
             <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Suggested (measured)</div>
@@ -277,7 +386,7 @@ function RelationshipDialog({ left, right, suggestions, onClose, onDeclared }: {
         </div>
         <div className="flex items-center justify-between gap-2">
           <label className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground">Cardinality
-            <MiniSelect value={card} options={CARDINALITIES.map((c) => ({ value: c, label: c }))} onChange={(v) => setCard(v as Cardinality)} />
+            <MiniSelect value={card} options={CARDINALITIES.map((c) => ({ value: c, label: c }))} onChange={(v) => { setKeysTouched(true); setCard(v as Cardinality) }} />
           </label>
           <div className="flex gap-2">
             <Button variant="outline" size="sm" onClick={onClose}>Cancel</Button>

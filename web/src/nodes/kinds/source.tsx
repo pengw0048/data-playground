@@ -14,6 +14,8 @@ function Source({ id, data }: NodeComponentProps) {
   const [uploading, setUploading] = useState(false)
   const [q, setQ] = useState('')
   const [results, setResults] = useState<CatalogTable[] | null>(null)  // null = not yet searched
+  const [resultsError, setResultsError] = useState<string | null>(null)
+  const [searchRevision, setSearchRevision] = useState(0)
   const btnRef = useRef<HTMLButtonElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const catalog = useStore((s) => s.catalog)
@@ -40,16 +42,18 @@ function Source({ id, data }: NodeComponentProps) {
   useEffect(() => {
     if (!open) return
     const term = q.trim()
-    setResults(null)
+    setResults(null); setResultsError(null)
     let live = true
     const timer = setTimeout(async () => {
       try {
         const r = await api.tablesPage({ q: term || undefined, limit: 12, sort: 'usage', order: 'desc' })
         if (live) setResults(Array.isArray(r.items) ? r.items : [])
-      } catch { if (live) setResults([]) }
+      } catch (e) {
+        if (live) setResultsError(e instanceof Error ? e.message : String(e))
+      }
     }, term ? 200 : 0)
     return () => { live = false; clearTimeout(timer) }
-  }, [q, open])
+  }, [q, open, searchRevision])
 
   const recentIds = new Set(catalog.map((t) => t.id))
   const shown = (q.trim()
@@ -74,15 +78,11 @@ function Source({ id, data }: NodeComponentProps) {
   }
 
   // pick a file from a destination (local dir / object store) → register it + use it as this source
-  const pickFile = async (uri: string, fname: string) => {
+  const pickFile = async (uri: string) => {
     if (!canEdit) return
+    const t = await api.registerFile(uri)
+    rememberTables([t]); updateConfig(id, { uri: t.uri, tableId: t.id }); rename(id, t.name)
     setDialog(false); setOpen(false)
-    try {
-      const t = await api.registerFile(uri)
-      rememberTables([t]); updateConfig(id, { uri: t.uri, tableId: t.id }); rename(id, t.name)
-    } catch {
-      updateConfig(id, { uri }); rename(id, fname.replace(/\.[^.]+$/, ''))  // offline / unreadable: still wire the uri
-    }
   }
 
   const meta = table
@@ -122,11 +122,19 @@ function Source({ id, data }: NodeComponentProps) {
         <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} onClick={(e) => e.stopPropagation()}
           placeholder="Search datasets…" data-testid="source-search"
           className="mb-1 w-full rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] outline-none focus:border-primary" />
+        {resultsError && kernelUp && (
+          <div role="alert" className="m-1 flex items-center justify-between gap-2 rounded-md border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
+            <span>Couldn't load catalog: {resultsError}{shown.length ? ' (showing recent datasets)' : ''}</span>
+            <button onClick={(e) => { e.stopPropagation(); setSearchRevision((v) => v + 1) }} data-testid="source-search-retry"
+              className="shrink-0 font-semibold underline">Retry</button>
+          </div>
+        )}
         {shown.length === 0 && (
           // distinguish a healthy-but-empty result from a down kernel (UX-14) — don't cry "offline" on
           // a fresh install with zero datasets
           <div className="p-2 text-[11.5px] text-muted-foreground">
             {!kernelUp ? 'Kernel offline — no catalog'
+              : resultsError ? 'Catalog results unavailable'
               : q.trim() ? (results === null ? 'Searching…' : 'No matches')
               : results === null ? 'Loading…'
               : 'Catalog is empty — upload or browse below'}
@@ -160,7 +168,7 @@ function Source({ id, data }: NodeComponentProps) {
       {uploading && <div className="mt-1 text-[10.5px] text-muted-foreground">Uploading…</div>}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
-      {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)} onPick={(r) => pickFile(r.uri, r.name)} />}
+      {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)} onPick={(r) => pickFile(r.uri)} />}
     </NodeCard>
   )
 }
