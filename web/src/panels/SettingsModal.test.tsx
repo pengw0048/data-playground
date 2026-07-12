@@ -1,7 +1,6 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const putSetting = vi.fn(async (..._a: unknown[]) => ({ ok: true }))
 const PACK = {
   name: 'dp_x', source: 'drop-in', version: '0.1.0',
   config: [
@@ -11,10 +10,13 @@ const PACK = {
   config_values: { url: 'existing' },   // non-secret current value (secret never sent)
   config_set: ['url'],
 }
+const getSettings = vi.fn()
+const plugins = vi.fn()
+const putSetting = vi.fn()
 vi.mock('../api/client', () => ({
   api: {
-    getSettings: async () => ({ global: {}, user: {} }),
-    plugins: async () => [PACK],
+    getSettings: () => getSettings(),
+    plugins: () => plugins(),
     putSetting: (...a: unknown[]) => putSetting(...a),
     createUser: async () => ({}),
     restartKernel: async () => ({}),
@@ -23,7 +25,7 @@ vi.mock('../api/client', () => ({
 
 const state = {
   kernelInfo: { runners: ['local-out-of-core'], backends: [] },
-  users: [], currentUser: { id: 'u1', name: 'me' }, authEnabled: false,
+  users: [], currentUser: { id: 'u1', name: 'me', capabilities: ['global_settings'] }, authEnabled: false,
   refreshUsers: vi.fn(), pushToast: vi.fn(), doc: { id: 'canvas' },
 }
 vi.mock('../store/graph', () => ({ useStore: (sel: (s: unknown) => unknown) => sel(state) }))
@@ -31,7 +33,13 @@ vi.mock('../store/graph', () => ({ useStore: (sel: (s: unknown) => unknown) => s
 import { SettingsModal } from './SettingsModal'
 
 describe('SettingsModal — plugin config form', () => {
-  beforeEach(() => vi.clearAllMocks())
+  beforeEach(() => {
+    vi.clearAllMocks()
+    getSettings.mockReset().mockResolvedValue({ global: {}, user: {} })
+    plugins.mockReset().mockResolvedValue([PACK])
+    putSetting.mockReset().mockResolvedValue({ ok: true })
+    state.currentUser.capabilities = ['global_settings']
+  })
 
   it('renders declared fields, saves them as plugin.<pack>.<key>, and skips a blank secret', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
@@ -60,7 +68,78 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByDisplayValue('existing')  // wait for load
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
-    await waitFor(() => expect(state.pushToast).toHaveBeenCalledWith('save failed', 'error'))
+    await waitFor(() => expect(state.pushToast).toHaveBeenCalledWith('Could not save global setting "agentModel": save failed', 'error'))
+    expect(screen.getByRole('alert')).toHaveTextContent('No update was confirmed. Your edits remain here.')
     expect(screen.queryByText('Saved')).toBeNull()  // no false success
+  })
+
+  it.each([
+    'HTTP 401: authentication required',
+    'HTTP 403: admin only',
+    'HTTP 500: database unavailable',
+    'network unavailable',
+  ])('blocks editing on a settings load failure and retries (%s)', async (reason) => {
+    getSettings.mockRejectedValueOnce(new Error(reason))
+    render(<SettingsModal onClose={vi.fn()} />)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Settings could not be loaded')
+    expect(alert).toHaveTextContent(reason)
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(screen.queryByPlaceholderText('anthropic/claude-opus-4-8')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry loading' }))
+    expect(await screen.findByDisplayValue('existing')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+  })
+
+  it('treats a plugin metadata failure as a blocking load failure for admins', async () => {
+    plugins.mockRejectedValueOnce(new Error('HTTP 500: plugin registry unavailable'))
+    render(<SettingsModal onClose={vi.fn()} />)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Plugins request failed: HTTP 500: plugin registry unavailable')
+    expect(screen.queryByText('No plugins loaded.')).toBeNull()
+  })
+
+  it('hides admin-only controls and saves only the user runner for a non-admin', async () => {
+    state.currentUser.capabilities = []
+    render(<SettingsModal onClose={vi.fn()} />)
+
+    expect(await screen.findByText('Workspace-wide settings are managed by an administrator. You can still change your runner preference.')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Agent' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Destinations' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Plugins' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Members' })).toBeNull()
+    expect(screen.queryByPlaceholderText('anthropic/claude-opus-4-8')).toBeNull()
+    expect(screen.queryByPlaceholderText('access key id')).toBeNull()
+    expect(screen.queryByPlaceholderText('Name')).toBeNull()
+    expect(plugins).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(putSetting).toHaveBeenCalledWith('user', 'backend', ''))
+    expect(putSetting).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports a partial sequential save, keeps edits, and retries without claiming success', async () => {
+    putSetting.mockImplementation(async () => {
+      if (putSetting.mock.calls.length === 2) throw new Error('HTTP 500: write failed')
+      return { ok: true }
+    })
+    render(<SettingsModal onClose={vi.fn()} />)
+    await screen.findByDisplayValue('existing')
+    const model = screen.getByPlaceholderText('anthropic/claude-opus-4-8')
+    fireEvent.change(model, { target: { value: 'edited-model' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Could not save global setting "agentApiKey": HTTP 500: write failed')
+    expect(alert).toHaveTextContent('1 of 6 updates completed before the failure. Server settings may be partially updated; your edits remain here.')
+    expect(screen.getByDisplayValue('edited-model')).toBeVisible()
+    expect(screen.queryByText('Saved')).toBeNull()
+
+    putSetting.mockResolvedValue({ ok: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry save' }))
+    expect(await screen.findByText('Saved')).toBeVisible()
   })
 })

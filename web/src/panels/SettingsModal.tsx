@@ -27,6 +27,14 @@ const CATS: { id: string; label: string; icon: IconName }[] = [
 // empty-string value); on save it maps back to '' so the per-user setting clears the override.
 const INHERIT = '__default__'
 
+type SaveFailure = {
+  message: string
+  completed: number
+  total: number
+}
+
+const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
+
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const kernelInfo = useStore((s) => s.kernelInfo)
   const users = useStore((s) => s.users)
@@ -38,6 +46,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [g, setG] = useState<Record<string, unknown>>({})
   const [u, setU] = useState<Record<string, unknown>>({})  // per-user settings (scope='user')
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
+  const [loadAttempt, setLoadAttempt] = useState(0)
+  const [saving, setSaving] = useState(false)
+  const [saveFailure, setSaveFailure] = useState<SaveFailure | null>(null)
   const [savedMsg, setSavedMsg] = useState('')
   const [dest, setDest] = useState({ name: '', backend: 'local', root: '' })
   const [newUser, setNewUser] = useState({ name: '', password: '' })
@@ -45,6 +57,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [pcfg, setPcfg] = useState<Record<string, Record<string, string>>>({})  // pack → edited { key: value }
   const [active, setActive] = useState('agent')
   const scrollRef = useRef<HTMLDivElement>(null)
+  // /api/me is authoritative. Missing capabilities must fail closed: open/single-user mode also
+  // receives global_settings, so there is no need for a permissive fallback while identity loads.
+  const canGlobal = currentUser?.capabilities?.includes('global_settings') === true
+  const categories = canGlobal ? CATS : CATS.filter((c) => c.id === 'execution')
 
   const addUser = async () => {
     const name = newUser.name.trim()
@@ -58,9 +74,32 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   }
 
   useEffect(() => {
-    api.getSettings().then((s) => { setG(s.global); setU(s.user) }).catch(() => {}).finally(() => setLoading(false))
-    api.plugins().then(setPlugins).catch(() => {})
-  }, [])
+    let cancelled = false
+    setLoading(true)
+    setLoadError('')
+    const settings = api.getSettings().catch((error) => {
+      throw new Error(`Settings request failed: ${errorMessage(error)}`)
+    })
+    const pluginPacks = canGlobal
+      ? api.plugins().catch((error) => { throw new Error(`Plugins request failed: ${errorMessage(error)}`) })
+      : Promise.resolve([] as PluginInfo[])
+    Promise.all([settings, pluginPacks]).then(([nextSettings, nextPlugins]) => {
+      if (cancelled) return
+      setG(nextSettings.global)
+      setU(nextSettings.user)
+      setPlugins(nextPlugins)
+      setLoading(false)
+    }).catch((error) => {
+      if (cancelled) return
+      setLoadError(errorMessage(error))
+      setLoading(false)
+    })
+    return () => { cancelled = true }
+  }, [canGlobal, loadAttempt])
+
+  useEffect(() => {
+    if (!canGlobal && active !== 'execution') setActive('execution')
+  }, [active, canGlobal])
 
   // a plugin config field's currently-shown value: the user's edit, else the stored (non-secret) value
   const pval = (pack: string, key: string, stored: unknown) =>
@@ -75,31 +114,44 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const obj = (g.objectStore && typeof g.objectStore === 'object' ? g.objectStore : {}) as Record<string, string>
   const setObj = (k: string, v: string) => setG((prev) => ({ ...prev, objectStore: { ...(prev.objectStore as object ?? {}), [k]: v } }))
   const save = async () => {
-    // only admins may write global settings (auth mode); default true keeps single-user + older
-    // backends unchanged. Skipping the global writes a non-admin can't do avoids doomed 403s for
-    // settings they never touched — their own per-user runner still saves.
-    const canGlobal = currentUser?.capabilities?.includes('global_settings') ?? true
-    try {
-      if (canGlobal) {
-        for (const k of ['agentModel', 'agentApiKey', 'agentBaseUrl']) {
-          await api.putSetting('global', k, g[k] ?? '')
-        }
-        await api.putSetting('global', 'destinations', dests)
-        await api.putSetting('global', 'objectStore', obj)
-        // edited plugin config → plugin.<pack>.<key> (skip a blank secret so it keeps its existing value)
-        for (const [pack, fields] of Object.entries(pcfg)) {
-          const schema = plugins.find((p) => p.name === pack)?.config ?? []
-          for (const [key, v] of Object.entries(fields)) {
-            if (schema.find((f) => f.key === key)?.secret && !v) continue
-            await api.putSetting('global', `plugin.${pack}.${key}`, v)
-          }
+    if (loading || loadError || saving) return
+    const updates: { scope: 'global' | 'user'; key: string; value: unknown }[] = []
+    // Only admins may write global settings. Non-admins see just their per-user runner preference,
+    // so the request list mirrors exactly what the UI says they can change.
+    if (canGlobal) {
+      for (const key of ['agentModel', 'agentApiKey', 'agentBaseUrl']) {
+        updates.push({ scope: 'global', key, value: g[key] ?? '' })
+      }
+      updates.push({ scope: 'global', key: 'destinations', value: dests })
+      updates.push({ scope: 'global', key: 'objectStore', value: obj })
+      for (const [pack, fields] of Object.entries(pcfg)) {
+        const schema = plugins.find((p) => p.name === pack)?.config ?? []
+        for (const [key, value] of Object.entries(fields)) {
+          if (schema.find((f) => f.key === key)?.secret && !value) continue
+          updates.push({ scope: 'global', key: `plugin.${pack}.${key}`, value })
         }
       }
-      // the runner is a per-user preference (everyone may set it); the sentinel = "inherit the default"
-      await api.putSetting('user', 'backend', u.backend === INHERIT ? '' : (u.backend ?? ''))
+    }
+    updates.push({ scope: 'user', key: 'backend', value: u.backend === INHERIT ? '' : (u.backend ?? '') })
+
+    setSaving(true)
+    setSavedMsg('')
+    setSaveFailure(null)
+    let completed = 0
+    try {
+      for (const update of updates) {
+        await api.putSetting(update.scope, update.key, update.value)
+        completed += 1
+      }
       setSavedMsg('Saved'); setTimeout(() => setSavedMsg(''), 1400)
     } catch (e) {
-      pushToast((e as Error).message, 'error')  // a real failure is surfaced, never a false "Saved"
+      const failed = updates[completed]
+      const target = failed ? `${failed.scope} setting "${failed.key}"` : 'settings'
+      const message = `Could not save ${target}: ${errorMessage(e)}`
+      setSaveFailure({ message, completed, total: updates.length })
+      pushToast(message, 'error')
+    } finally {
+      setSaving(false)
     }
   }
   const addDest = () => {
@@ -121,14 +173,28 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <DialogTitle className="text-[15px] font-bold">Settings</DialogTitle>
           <span className="flex-1" />
           <span className="text-[11.5px] text-green-600">{savedMsg}</span>
-          <Button size="sm" onClick={save}>Save</Button>
+          <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving}>{saving ? 'Saving…' : 'Save'}</Button>
         </div>
         <DialogDescription className="sr-only">Application and workspace settings: the agent model, execution backend, and output destinations.</DialogDescription>
+
+        {saveFailure && (
+          <div role="alert" className="flex items-center gap-3 border-b border-destructive/30 bg-destructive/5 px-[18px] py-2 text-[11.5px] text-destructive">
+            <div className="min-w-0 flex-1">
+              <div>{saveFailure.message}</div>
+              <div className="mt-0.5 text-[10.5px]">
+                {saveFailure.completed > 0
+                  ? `${saveFailure.completed} of ${saveFailure.total} updates completed before the failure. Server settings may be partially updated; your edits remain here.`
+                  : 'No update was confirmed. Your edits remain here.'}
+              </div>
+            </div>
+            <Button variant="outline" size="sm" onClick={save} disabled={saving}>Retry save</Button>
+          </div>
+        )}
 
         <div className="flex min-h-0 flex-1">
           {/* left category nav */}
           <nav className="flex w-[190px] shrink-0 flex-col gap-0.5 border-r border-border p-3">
-            {CATS.map((c) => (
+            {categories.map((c) => (
               <button key={c.id} onClick={() => go(c.id)}
                 className={cn('flex items-center gap-[9px] rounded-md px-2.5 py-2 text-left text-[12.5px] font-medium transition-colors',
                   active === c.id ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/50')}>
@@ -139,16 +205,24 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
           {/* content — all sections rendered; the nav scroll-jumps to them */}
           <div ref={scrollRef} className="min-w-0 flex-1 overflow-y-auto px-[22px] py-[18px]">
-            {loading ? <div className="text-[12.5px] text-muted-foreground">loading…</div> : (
+            {loading ? <div className="text-[12.5px] text-muted-foreground">loading…</div> : loadError ? (
+              <div role="alert" className="mx-auto flex h-full max-w-[440px] flex-col items-center justify-center text-center">
+                <div className="text-[13px] font-semibold text-foreground">Settings could not be loaded</div>
+                <div className="mt-1.5 text-[11.5px] leading-relaxed text-destructive">{loadError}</div>
+                <div className="mt-2 text-[10.5px] leading-relaxed text-muted-foreground">The editor is blocked so unavailable data is never replaced with empty defaults.</div>
+                <Button variant="outline" size="sm" className="mt-4" onClick={() => setLoadAttempt((n) => n + 1)}>Retry loading</Button>
+              </div>
+            ) : (
               <div className="flex flex-col gap-[26px]">
-                <Section id="agent" title="Agent (LLM)">
+                {canGlobal && <Section id="agent" title="Agent (LLM)">
                   <Field label="Model"><Input value={val('agentModel')} placeholder="anthropic/claude-opus-4-8" onChange={(e) => set('agentModel', e.target.value)} /></Field>
                   <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">e.g. anthropic/claude-opus-4-8 · openai/gpt-5 · google/gemini-2.5-pro · ollama/llama3.3</div>
                   <Field label="API key"><Input type="password" value={val('agentApiKey')} placeholder="sk-… (or blank to use an env var)" onChange={(e) => set('agentApiKey', e.target.value)} /></Field>
                   <Field label="Base URL"><Input value={val('agentBaseUrl')} placeholder="http://localhost:11434 (optional)" onChange={(e) => set('agentBaseUrl', e.target.value)} /></Field>
-                </Section>
+                </Section>}
 
                 <Section id="execution" title="Execution backend">
+                  {!canGlobal && <div className="mb-3 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] text-muted-foreground">Workspace-wide settings are managed by an administrator. You can still change your runner preference.</div>}
                   <Field label="Runner">
                     <Select value={(u.backend ? String(u.backend) : INHERIT)} onValueChange={(v) => setU((p) => ({ ...p, backend: v }))}>
                       <SelectTrigger><SelectValue /></SelectTrigger>
@@ -194,7 +268,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   </div>
                 </Section>
 
-                <Section id="destinations" title="Destinations">
+                {canGlobal && <Section id="destinations" title="Destinations">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
                     Named places to save outputs / open files: a local directory, or an object-store prefix (s3://, gs://).
                   </p>
@@ -235,9 +309,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     <Input value={obj.region ?? ''} placeholder="region (e.g. us-east-1)" onChange={(e) => setObj('region', e.target.value)} />
                     <Input value={obj.endpoint ?? ''} placeholder="endpoint (MinIO/R2, optional)" onChange={(e) => setObj('endpoint', e.target.value)} />
                   </div>
-                </Section>
+                </Section>}
 
-                <Section id="plugins" title="Plugins">
+                {canGlobal && <Section id="plugins" title="Plugins">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
                     Loaded plugin packs. A pack that declares config fields (in its <code>dataplay.toml</code>) can be set here.
                     Changes take effect on the next kernel start.
@@ -291,9 +365,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     </div>
                   ))}
                   {configurable.length === 0 && <div className="text-[11.5px] text-muted-foreground">No plugin declares configurable settings.</div>}
-                </Section>
+                </Section>}
 
-                <Section id="members" title="Members">
+                {canGlobal && <Section id="members" title="Members">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
                     People who can sign in and be added as collaborators.
                     {authEnabled
@@ -316,7 +390,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                       placeholder={authEnabled ? 'Initial password (optional)' : 'Password (unused until auth is on)'} className="min-w-0 flex-1" />
                     <Button onClick={addUser} disabled={!newUser.name.trim()} className="shrink-0">Add member</Button>
                   </div>
-                </Section>
+                </Section>}
               </div>
             )}
           </div>
