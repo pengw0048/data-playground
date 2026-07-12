@@ -13,7 +13,6 @@ from hub import auth, metadb
 from hub.main import app
 
 
-client = TestClient(app)
 OWNER_ID = "effective_role_owner"
 USER_ID = "effective_role_user"
 AUTH_SECRET = "effective-role-test-secret-0123456789"
@@ -91,8 +90,10 @@ def test_workspace_explicit_viewer_is_read_only_in_list_put_and_collab(monkeypat
         monkeypatch.setenv("DP_AUTH_SECRET", AUTH_SECRET)
         owner_headers = {"Cookie": f"dp_session={auth.sign(OWNER_ID)}"}
         viewer_headers = {"Cookie": f"dp_session={auth.sign(USER_ID)}"}
-        client.cookies.clear()
-        try:
+        # Entering TestClient once gives both websocket sessions the same ASGI portal/event loop.
+        # Without this context, each nested websocket_connect() can create its own portal; a relay
+        # that yields for role revalidation may then never reach the peer on Linux CI.
+        with TestClient(app) as client:
             listed = client.get("/api/canvas", headers=viewer_headers)
             assert listed.status_code == 200
             row = next(item for item in listed.json() if item["id"] == canvas_id)
@@ -114,5 +115,3 @@ def test_workspace_explicit_viewer_is_read_only_in_list_put_and_collab(monkeypat
                     # Presence remains visible, but the preceding Yjs write is dropped by the same
                     # effective viewer role used by list_canvas and put_canvas.
                     assert owner_ws.receive_json()["type"] == "presence"
-        finally:
-            client.cookies.clear()

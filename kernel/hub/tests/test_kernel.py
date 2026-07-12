@@ -96,8 +96,12 @@ def test_nodes_endpoint():
 
 
 def test_catalog_and_capabilities():
-    tabs = {t["name"]: t for t in client.get("/api/catalog/tables").json()}
-    assert {"images", "movies", "events"} <= set(tabs)
+    # The catalog is persistent and paginated. Query each fixture by name so unrelated local or
+    # earlier-suite entries cannot push a fixture off the first page.
+    tabs = {}
+    for name in ("images", "movies", "events"):
+        matches = client.get("/api/catalog/tables", params={"q": name}).json()
+        tabs[name] = next(t for t in matches if t["name"] == name)
     caps = {c["name"]: c["capabilities"] for c in tabs["images"]["columns"]}
     assert "media" in caps["image_url"] and "vector" in caps["embedding"]
     assert tabs["images"]["rowCount"] == 500
@@ -614,7 +618,9 @@ def test_upload_registers_and_is_readable():
     assert t["name"] == "cities"
     assert {c["name"] for c in t["columns"]} == {"id", "city"} and t["rowCount"] == 3
     # visible in the (cross-instance) catalog and sampleable via its uri
-    assert "cities" in {x["name"] for x in client.get("/api/catalog/tables").json()}
+    assert "cities" in {x["name"] for x in client.get(
+        "/api/catalog/tables", params={"q": "cities"}
+    ).json()}
     s = client.post("/api/data/sample", json={"uri": t["uri"], "k": 10}).json()
     assert len(s["rows"]) == 3
 
@@ -2484,7 +2490,10 @@ def test_subprocess_runner_executes_in_isolation(tmp_path):
         assert st["outputTable"] == "subproc_out"
         assert (st["totalRows"] or st["rowsProcessed"]) == 40
         # the child wrote in its own (discarded) catalog — the parent must still register it live
-        tables = client.get("/api/catalog/tables").json()
+        # The catalog endpoint is paginated; query the exact artifact so earlier suite outputs cannot
+        # push this table off the first page and turn a registration assertion into an order-dependent
+        # false failure.
+        tables = client.get("/api/catalog/tables", params={"uris": st["outputUri"]}).json()
         assert any(t["name"] == "subproc_out" for t in tables)
     finally:
         metadb.set_setting("backend", "", "global")  # restore the default in-process runner
@@ -3112,7 +3121,9 @@ def test_headless_run_executes_a_saved_canvas(tmp_path, capsys):
     assert code == 0, f"headless run exited {code}; stdout:\n{out}"
     assert "DONE" in out and "hr_out" in out
     # the write actually materialized a queryable output table
-    assert any(t["name"] == "hr_out" for t in client.get("/api/catalog/tables").json())
+    assert any(t["name"] == "hr_out" for t in client.get(
+        "/api/catalog/tables", params={"q": "hr_out"}
+    ).json())
 
 
 def test_headless_run_resolves_by_name_and_reports_failure(tmp_path):
@@ -3172,7 +3183,9 @@ def test_headless_run_canvas_params(tmp_path):
     # bound: ${src} → the real parquet path → runs to done + materializes the output
     code = _headless_run(get_deps(), "param_canvas", None, 30.0, as_json=False, params={"src": p})
     assert code == 0
-    assert any(t["name"] == "param_out" for t in client.get("/api/catalog/tables").json())
+    assert any(t["name"] == "param_out" for t in client.get(
+        "/api/catalog/tables", params={"q": "param_out"}
+    ).json())
 
     # unbound: no --param → loud failure BEFORE the run (not a run against a literal "${src}" path)
     with pytest.raises(SystemExit) as ei:
