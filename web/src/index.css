@@ -165,6 +165,18 @@ input, textarea, select { font-family: inherit; }
 .dp-mono { font-family: var(--font-mono); }
 .dp-panel { animation: dp-fade .12s ease-out; }
 .dp-no-select { user-select: none; }
+/* a compact form input matching the app's borders/radius (catalog detail editor, etc.) */
+.dp-input {
+  width: 100%;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--card));
+  padding: 6px 9px;
+  font-size: 12.5px;
+  color: hsl(var(--foreground));
+  outline: none;
+}
+.dp-input:focus { border-color: hsl(var(--primary)); }
 
 /* connect-from-port menu + floating chrome sit above the canvas */
 .dp-float { position: absolute; z-index: 20; }

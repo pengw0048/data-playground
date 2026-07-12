@@ -125,7 +125,22 @@ class Registry:
         self.deps.registry.register(proc)
 
     def set_catalog(self, catalog) -> None:
+        # a provider written against the pre-scale protocol (no list_page/facets/browse/search) still
+        # works behind the new discovery routes: wrap it in the compat shim (see CatalogCompat)
+        if not hasattr(catalog, "list_page"):
+            from hub.plugins.catalog import CatalogCompat
+            catalog = CatalogCompat(catalog)
         self.deps.catalog = catalog
+
+    def add_embedder(self, fn, model: str = "custom") -> None:
+        """Register a text embedder — `fn(list[str]) -> list[list[float]]` — to power the catalog's
+        semantic + hybrid search over dataset name/description/columns. Core ships NONE (an embedding
+        model is a heavy, opinionated dependency); a plugin provides one (see examples/plugins/
+        dp_semantic_catalog). The catalog reindexes existing entries best-effort in the background. A
+        catalog provider that doesn't support embedding simply ignores this."""
+        setter = getattr(self.deps.catalog, "set_embedder", None)
+        if callable(setter):
+            setter(fn, model)
 
     def set_importer(self, importer) -> None:
         # a pipeline importer (§5.6/§7.5). Without one, deps.importer stays the NullImporter → the
@@ -264,9 +279,15 @@ class Deps:
         self.storage = make_storage(workspace)
         # The catalog is shared by every user (by design — one workspace, not one kernel per session);
         # per-user boundaries are enforced at the canvas/share/settings layer, not by isolating the data
-        # engine. InMemoryCatalog is a per-instance CACHE that write-throughs to + loads from the shared
-        # DB (catalog_entries/edges), so multiple stateless web instances stay consistent.
-        self.catalog = InMemoryCatalog(data_dir, self.resolve_adapter)
+        # engine. The DEFAULT catalog (the DB-backed InMemoryCatalog) is not instantiated directly here —
+        # it is registered through the public reg.set_catalog seam by a bundled FIRST-PARTY plugin
+        # (hub.plugins.default_catalog), loaded before any workspace/entry-point plugin. So the built-in
+        # is the first implementation through the seam (not a privileged core path), and a plugin loaded
+        # later can still replace it (set_catalog). See _load_bundled.
+        self.catalog = None  # set by the bundled default-catalog plugin immediately below
+        self._load_bundled()
+        if self.catalog is None:  # defensive: a catalog must always exist (clone-it-and-it-works)
+            self.catalog = InMemoryCatalog(data_dir, self.resolve_adapter)
         # recover/clean any temp siblings an interrupted append/compaction left behind BEFORE re-cataloging,
         # so a crash can't surface a half-written staging file as a dataset or leave a compacting one absent.
         self.storage.recover_orphans()
@@ -368,6 +389,23 @@ class Deps:
         return self.runner
 
     # -- plugin discovery (§8.0) ------------------------------------------- #
+    def _load_bundled(self) -> None:
+        """Register the first-party DEFAULTS through the public plugin seam, BEFORE any external plugin.
+        Today that's the default catalog: the built-in installs itself via reg.set_catalog exactly like a
+        third-party catalog would, so it's the first implementation through the seam — not a privileged
+        core instantiation — and a plugin loaded later can still replace it. Kept minimal + never fatal:
+        a bundled default that fails to register falls back to the defensive path in __init__."""
+        reg = Registry(self)
+        from hub.plugins import default_catalog
+        reg._pack = "default-catalog"
+        try:
+            default_catalog.register(reg)
+            self.plugins.append({"name": "default-catalog", "source": "builtin"})
+        except Exception as e:  # noqa: BLE001
+            print(f"[deps] bundled default-catalog failed to register: {e}")
+        finally:
+            reg._pack = None
+
     def _load_plugins(self) -> None:
         reg = Registry(self)
         # 1) drop-in folder: <workspace>/plugins/<pack>/ (a package with register(reg))

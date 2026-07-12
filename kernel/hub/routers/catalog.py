@@ -13,7 +13,7 @@ import tempfile
 import uuid
 from urllib.parse import unquote
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
@@ -25,11 +25,16 @@ from hub.plugins.adapters import is_object_uri, path_of, relation_columns
 from hub.plugins.importer import ImporterNotConfigured
 from hub.settings import settings
 from hub.models import (
+    CatalogBrowse,
+    CatalogMetadata,
+    CatalogQuery,
     CatalogTable,
     ColumnSchema,
+    Facets,
     ImportRequest,
     JoinSuggestion,
     KernelInfo,
+    LineageEdge,
     LineageResult,
     PipelineImport,
     ProcessorDescriptor,
@@ -37,6 +42,22 @@ from hub.models import (
     SampleRequest,
     SampleResult,
 )
+
+
+def _csv(v: str | None) -> list[str]:
+    """A comma-separated query param → a clean list (['a','b'] from 'a, b, ')."""
+    return [x.strip() for x in (v or "").split(",") if x.strip()]
+
+
+def _catalog_query(q, folder, tags, owner, has_columns, sort, order, limit, offset, uris=None) -> CatalogQuery:
+    # list params are capped like `limit` is — an unbounded ?uris=/tags= list would otherwise become
+    # an arbitrarily large IN clause / EXISTS chain
+    return CatalogQuery(
+        q=q or None, folder=folder or None, tags=_csv(tags)[:50], owner=owner or None,
+        uris=list(uris or [])[:500], has_columns=_csv(has_columns)[:50],
+        sort=sort if sort in ("name", "rows", "updated", "usage", "folder") else "name",
+        order="desc" if order == "desc" else "asc",
+        limit=max(1, min(int(limit), 500)), offset=max(0, int(offset)))
 
 router = APIRouter()
 
@@ -115,8 +136,64 @@ def get_schema(name: str) -> dict:
 
 
 @router.get("/catalog/tables", response_model=list[CatalogTable])
-def list_tables(q: str | None = None) -> list[CatalogTable]:
-    return get_deps().catalog.list_tables(q)
+def list_tables(
+    response: Response,
+    q: str | None = None,
+    folder: str | None = None,
+    tags: str | None = None,          # comma-separated; ALL must match
+    owner: str | None = None,
+    uris: list[str] | None = Query(None),  # repeated ?uris=…&uris=… — batch "get these exact uris" (no 404 on a miss)
+    has_columns: str | None = Query(None, alias="hasColumns"),  # comma-separated
+    sort: str = "name",               # name | rows | updated | usage | folder
+    order: str = "asc",               # asc | desc
+    limit: int = 50,
+    offset: int = 0,
+) -> list[CatalogTable]:
+    """A filtered, sorted, paginated page of the catalog. Backward-compatible on the wire: the body is
+    still a bare `list[CatalogTable]` (so existing callers keep working), while the TOTAL match count +
+    whether more follow ride along in `X-Total-Count` / `X-Has-More` headers for a paginating UI. This
+    is what lets the Tables view browse thousands of datasets without ever loading them all."""
+    query = _catalog_query(q, folder, tags, owner, has_columns, sort, order, limit, offset, uris=uris)
+    page = get_deps().catalog.list_page(query)
+    response.headers["X-Total-Count"] = str(page.total)
+    response.headers["X-Has-More"] = "1" if page.has_more else "0"
+    response.headers["Access-Control-Expose-Headers"] = "X-Total-Count, X-Has-More"
+    return page.items
+
+
+@router.get("/catalog/facets", response_model=Facets)
+def catalog_facets(
+    q: str | None = None,
+    folder: str | None = None,
+    tags: str | None = None,
+    owner: str | None = None,
+    has_columns: str | None = Query(None, alias="hasColumns"),
+) -> Facets:
+    """Distinct folder / tag / owner values + counts over the active filter set — powers the facet rail
+    (each value is a one-click, counted filter). Computed with the SAME filters as the list, so the
+    counts always describe what a click would show. `semanticAvailable` rides along so the UI knows
+    whether a search-by-meaning mode exists (an embedder plugin is installed)."""
+    query = _catalog_query(q, folder, tags, owner, has_columns, "name", "asc", 1, 0)
+    cat = get_deps().catalog
+    out = cat.facets(query)
+    modes = getattr(cat, "search_modes", None)
+    out.semantic_available = "semantic" in modes() if callable(modes) else False
+    return out
+
+
+@router.get("/catalog/tree", response_model=CatalogBrowse)
+def catalog_tree(prefix: str = "") -> CatalogBrowse:
+    """One level of the folder/browse tree at `prefix`: immediate child folders (with subtree counts) +
+    the tables filed directly here. Lets a UI lazily expand a folder tree of any size."""
+    return get_deps().catalog.browse(prefix)
+
+
+@router.get("/catalog/search", response_model=list[CatalogTable])
+def catalog_search(q: str = Query(...), mode: str = "hybrid", limit: int = 50) -> list[CatalogTable]:
+    """Search the catalog. `mode`: 'lexical' (name/folder/tag/column substring), 'semantic' (embedding
+    similarity — active only when a plugin registered an embedder), or 'hybrid' (both, rank-fused).
+    Falls back to lexical when no embedder is installed, so search always works offline."""
+    return get_deps().catalog.search(q, mode=mode, limit=max(1, min(int(limit), 200)))
 
 
 @router.get("/catalog/tables/{table_id}", response_model=CatalogTable)
@@ -127,9 +204,43 @@ def get_table(table_id: str) -> CatalogTable:
         raise HTTPException(404, f"table '{table_id}' not found")
 
 
+@router.put("/catalog/tables/{table_id}/metadata", response_model=CatalogTable)
+def set_table_metadata(table_id: str, req: CatalogMetadata) -> CatalogTable:
+    """Curate a dataset's organization — file it into a `folder`, set `tags`, an `owner`, a
+    `description`. Only the fields PRESENT in the body change (absent → untouched); an explicit
+    null (or "") on owner/description CLEARS it. The probed schema/rows are untouched."""
+    cat = get_deps().catalog
+    try:
+        table = cat.get_table(table_id)
+    except KeyError:
+        raise HTTPException(404, f"table '{table_id}' not found")
+    sent = req.model_fields_set
+    # absent field → None (provider preserves); explicit null → "" (provider clears)
+    return cat.set_metadata(
+        table.uri,
+        folder=(req.folder or "") if "folder" in sent else None,
+        tags=req.tags if "tags" in sent else None,
+        owner=(req.owner or "") if "owner" in sent else None,
+        description=(req.description or "") if "description" in sent else None)
+
+
 @router.get("/catalog/lineage", response_model=LineageResult)
-def lineage(uri: str = Query(...)) -> LineageResult:
-    return get_deps().catalog.lineage(uri)
+def lineage(uri: str = Query(...), depth: int = 6, max_nodes: int = Query(500, alias="maxNodes")) -> LineageResult:
+    """The lineage component around `uri`, expanded breadth-first from the store and CAPPED by `depth`
+    + `max_nodes` so a large graph can't blow up the payload (`truncated` flags that the cap hit)."""
+    return get_deps().catalog.lineage(uri, depth=max(1, min(int(depth), 20)),
+                                      max_nodes=max(1, min(int(max_nodes), 5000)))
+
+
+@router.get("/catalog/edges", response_model=list[LineageEdge])
+def lineage_edges(response: Response, limit: int = 500, offset: int = 0) -> list[LineageEdge]:
+    """A page of the WHOLE lineage edge set (`X-Total-Count` rides in a header) — the bulk-export
+    surface an external lineage store syncs from. Edges are URI-keyed `{parent, child, column,
+    pipeline}`, so a bridge plugin can map them onto OpenLineage-style datasets 1:1."""
+    rows, total = metadb.catalog_edges_page(limit=max(1, min(int(limit), 2000)), offset=max(0, int(offset)))
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
+    return [LineageEdge(**r) for r in rows]
 
 
 @router.delete("/catalog/tables/{table_id}")
@@ -210,6 +321,10 @@ class RegisterRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
     uri: str
     name: str | None = None
+    folder: str | None = None          # optional: file it into a browse folder at register time
+    tags: list[str] | None = None
+    owner: str | None = None
+    description: str | None = None
 
 
 @router.post("/catalog/register", response_model=CatalogTable)
@@ -227,10 +342,11 @@ def catalog_register(req: RegisterRequest) -> CatalogTable:
         deps.resolve_adapter(uri).schema(uri)  # validate readable
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"cannot read '{uri}': {e}")
-    # register_output write-throughs per-row to catalog_entries (metadb), which _load_from_db restores
-    # on every read + across restart — so no separate 'datasets' settings blob (its read-modify-write
-    # dropped a concurrent registration; F45). The per-row store is authoritative + cross-instance.
-    return deps.catalog.register_output(name=name, uri=uri, parents=[])  # content-addressed version
+    # register_output write-throughs per-row to catalog_entries (metadb) — authoritative + cross-instance;
+    # organization (folder/tags/owner/description) is optional and set here or later via PUT .../metadata.
+    return deps.catalog.register_output(
+        name=name, uri=uri, parents=[], folder=(req.folder or "").strip("/"),
+        tags=req.tags, owner=req.owner, description=req.description)
 
 
 # --------------------------------------------------------------------------- #
@@ -345,6 +461,8 @@ def data_sample(req: SampleRequest) -> SampleResult:
             cols = relation_columns(rel)          # schema is metadata — no second scan needed
             rows = _table_to_rows(rel.to_arrow_table())
             total = adapter.count(req.uri)
+        with contextlib.suppress(Exception):
+            metadb.catalog_bump_usage(req.uri)  # someone looked at this data → popularity signal (best-effort)
         return SampleResult(columns=cols, rows=rows, row_count=total,
                             truncated=(total is None or total > len(rows)))
     except Exception as e:  # noqa: BLE001

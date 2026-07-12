@@ -15,8 +15,8 @@ from typing import Any, Protocol, runtime_checkable
 import duckdb
 
 from hub.models import (
-    CatalogTable, ColumnSchema, CompilePlan, Graph, GraphNode, LineageResult, Placement,
-    Relationship, RunEstimate, RunStatus,
+    CatalogBrowse, CatalogPage, CatalogQuery, CatalogTable, ColumnSchema, CompilePlan, Facets, Graph,
+    GraphNode, LineageResult, Placement, Relationship, RunEstimate, RunStatus,
 )
 
 # The `dataset` wire is a lazy DuckDB relation — the currency a node's build produces/consumes.
@@ -115,20 +115,41 @@ class DatasetAdapter(Protocol):
 
 @runtime_checkable
 class CatalogProvider(Protocol):
-    """The dataset catalog — browse/resolve/lineage + write-back. Swap the WHOLE provider via
-    `reg.set_catalog(obj)` to back it with an external metadata service; the built-in InMemoryCatalog
-    (DB-backed, cross-instance) conforms. Contract notes: `get_table` MUST raise `KeyError` on a miss
-    (`resolve_ref` and `declare_key` depend on it); `resolve_ref` maps a source's bare name/id → a real
-    uri (and passes a path/scheme'd uri through unchanged) — it runs on every run/preview, so a remote
-    provider should cache. A read-only external catalog can subclass InMemoryCatalog and inherit the
-    write/declared-key/relationship methods (local side-store) while overriding only the reads."""
-    def list_tables(self, q: "str | None") -> list[CatalogTable]: ...
+    """The dataset catalog — browse/search/resolve/lineage + write-back, built to scale to thousands of
+    tables. Swap the WHOLE provider via `reg.set_catalog(obj)` to back it with an external metadata
+    service; the built-in InMemoryCatalog (DB-backed, cross-instance) conforms.
+
+    Contract notes: `get_table` MUST raise `KeyError` on a miss (`resolve_ref` and `declare_key` depend
+    on it); `resolve_ref` maps a source's bare name/id → a real uri (path/scheme'd uris pass through) —
+    it runs on every run/preview, so a remote provider should cache. The discovery surface — `list_page`
+    (filter+sort+paginate), `facets`, `browse` (folder tree), `search` (lexical/semantic/hybrid) — is
+    what a UI uses; every one is expected to PUSH DOWN to the backing store as a bounded query, never
+    to realize the whole catalog. A read-only external catalog can subclass InMemoryCatalog and inherit
+    the write/browse/search/lineage machinery while overriding only how rows are fetched.
+
+    A provider written against the PRE-scale protocol (no list_page/facets/browse/search) still works:
+    `reg.set_catalog` wraps it in `hub.plugins.catalog.CatalogCompat`, which synthesizes the discovery
+    surface from bounded `list_tables()` calls (the old provider's own cost model)."""
+    # discovery (bounded, pushed-down)
+    def list_page(self, query: CatalogQuery) -> CatalogPage: ...
+    def facets(self, query: CatalogQuery) -> Facets: ...
+    def browse(self, prefix: str = "") -> CatalogBrowse: ...
+    def search(self, q: str, mode: str = "hybrid", limit: int = 50) -> list[CatalogTable]: ...
+    def search_modes(self) -> list[str]: ...  # ["lexical"] (+ "semantic", "hybrid" once an embedder is live)
+    def list_tables(self, q: "str | None") -> list[CatalogTable]: ...  # bounded back-compat convenience
     def get_table(self, id_or_name: str) -> CatalogTable: ...
-    def lineage(self, uri: str) -> LineageResult: ...
+    def lineage(self, uri: str, depth: int = 6, max_nodes: int = 500) -> LineageResult: ...
     def relationships(self, uri: "str | None" = None) -> list[Relationship]: ...
     def resolve_ref(self, ref: str) -> str: ...
+    # write-back + curation. register_output's organization kwargs (folder/tags/owner/description) are
+    # optional: None/"" → keep whatever the entry already has (a re-run must not wipe curation).
     def register(self, table: CatalogTable, parents: "list[str] | None" = None, pipeline: str = "canvas") -> None: ...
-    def register_output(self, name: str, uri: str, version: str, parents: list[str], pipeline: str = "canvas") -> CatalogTable: ...
+    def register_output(self, name: str, uri: str, version: "str | None" = None,
+                        parents: "list[str] | None" = None, pipeline: "str | None" = "canvas",
+                        folder: str = "", tags: "list[str] | None" = None, owner: "str | None" = None,
+                        description: "str | None" = None) -> CatalogTable: ...
+    def set_metadata(self, uri: str, *, folder: "str | None" = None, tags: "list[str] | None" = None,
+                     owner: "str | None" = None, description: "str | None" = None) -> CatalogTable: ...
     def unregister(self, id_or_name: str) -> bool: ...
     def set_declared_key(self, uri: str, columns: "list[str] | None") -> None: ...
     def add_relationship(self, rel: Relationship) -> None: ...

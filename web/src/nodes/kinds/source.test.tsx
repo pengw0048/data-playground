@@ -37,12 +37,14 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(screen.getByText(/\b0\s*rows/)).toBeInTheDocument()
   })
 
-  it('says "No datasets yet" when the kernel is up but the catalog is empty (not "offline")', () => {
+  it('cold start: kernel up + no recents fetches a server page, then says the catalog is empty (not "offline")', async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({ kernelUp: true, catalog: [] } as any)
     render1({ title: 'source', status: 'draft', config: {} })
     fireEvent.click(screen.getByText(/select dataset/i))
-    expect(screen.getByText(/No datasets yet/i)).toBeInTheDocument()
+    // the stubbed api resolves the top-usage page to an empty list → the honest "empty catalog" copy
+    expect(await screen.findByText(/Catalog is empty/i)).toBeInTheDocument()
+    expect(screen.queryByText(/offline/i)).toBeNull()
   })
 
   it('says "Kernel offline" only when the kernel is actually down', () => {

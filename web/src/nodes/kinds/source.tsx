@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useStore } from '../../store/graph'
@@ -6,17 +6,20 @@ import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
 import { api } from '../../api/client'
+import type { CatalogTable } from '../../types/api'
 
 function Source({ id, data }: NodeComponentProps) {
   const [open, setOpen] = useState(false)
   const [dialog, setDialog] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [q, setQ] = useState('')
+  const [results, setResults] = useState<CatalogTable[] | null>(null)  // null = not yet searched
   const btnRef = useRef<HTMLButtonElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const catalog = useStore((s) => s.catalog)
   const kernelUp = useStore((s) => s.kernelUp)
-  const refreshCatalog = useStore((s) => s.refreshCatalog)
   const uploadDataset = useStore((s) => s.uploadDataset)
+  const rememberTables = useStore((s) => s.rememberTables)
   const updateConfig = useStore((s) => s.updateConfig)
   const rename = useStore((s) => s.rename)
   // show the bound dataset even when the source was configured by tableId or a bare catalog NAME (an
@@ -24,6 +27,36 @@ function Source({ id, data }: NodeComponentProps) {
   const tid = data.config.tableId
   const ref = String(data.config.uri ?? '')
   const table = catalog.find((t) => (tid && t.id === tid) || t.uri === ref || t.name === ref)
+
+  // Server-side search picker — the catalog can be thousands of tables, so we never render them all.
+  // Empty query shows the working-set recents PLUS a top-usage page from the server (a fresh session
+  // has an empty working set — without the fetch a full catalog would look empty); typing searches
+  // the whole catalog.
+  useEffect(() => {
+    if (!open) return
+    const term = q.trim()
+    setResults(null)
+    let live = true
+    const timer = setTimeout(async () => {
+      try {
+        const r = await api.tablesPage({ q: term || undefined, limit: 12, sort: 'usage', order: 'desc' })
+        if (live) setResults(Array.isArray(r.items) ? r.items : [])
+      } catch { if (live) setResults([]) }
+    }, term ? 200 : 0)
+    return () => { live = false; clearTimeout(timer) }
+  }, [q, open])
+
+  const recentIds = new Set(catalog.map((t) => t.id))
+  const shown = (q.trim()
+    ? (results ?? [])
+    : [...catalog, ...(results ?? []).filter((t) => !recentIds.has(t.id))]  // recents first, deduped
+  ).slice(0, 12)
+  const pick = (t: CatalogTable) => {
+    rememberTables([t])  // warm the cache so the card resolves this immediately
+    updateConfig(id, { uri: t.uri, tableId: t.id })
+    rename(id, t.name)
+    setOpen(false); setQ('')
+  }
 
   // upload a local file → store it + bind this source to it
   const onUpload = async (f: File | undefined) => {
@@ -39,7 +72,7 @@ function Source({ id, data }: NodeComponentProps) {
     setDialog(false); setOpen(false)
     try {
       const t = await api.registerFile(uri)
-      updateConfig(id, { uri: t.uri, tableId: t.id }); rename(id, t.name); void refreshCatalog()
+      rememberTables([t]); updateConfig(id, { uri: t.uri, tableId: t.id }); rename(id, t.name)
     } catch {
       updateConfig(id, { uri }); rename(id, fname.replace(/\.[^.]+$/, ''))  // offline / unreadable: still wire the uri
     }
@@ -77,26 +110,31 @@ function Source({ id, data }: NodeComponentProps) {
         </button>
       )}
 
-      <Popover anchorRef={btnRef} open={open} onClose={() => setOpen(false)} width={230}>
-        {catalog.length === 0 && (
-          // distinguish a healthy-but-empty catalog from a down kernel (UX-14) — don't cry "offline" on
+      <Popover anchorRef={btnRef} open={open} onClose={() => setOpen(false)} width={250}>
+        {/* search the whole catalog server-side (it can be thousands of tables) */}
+        <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} onClick={(e) => e.stopPropagation()}
+          placeholder="Search datasets…" data-testid="source-search"
+          className="mb-1 w-full rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] outline-none focus:border-primary" />
+        {shown.length === 0 && (
+          // distinguish a healthy-but-empty result from a down kernel (UX-14) — don't cry "offline" on
           // a fresh install with zero datasets
           <div className="p-2 text-[11.5px] text-muted-foreground">
-            {kernelUp ? 'No datasets yet — upload or browse below' : 'Kernel offline — no catalog'}
+            {!kernelUp ? 'Kernel offline — no catalog'
+              : q.trim() ? (results === null ? 'Searching…' : 'No matches')
+              : results === null ? 'Loading…'
+              : 'Catalog is empty — upload or browse below'}
           </div>
         )}
-        {catalog.map((t) => (
+        {shown.map((t) => (
           <button
             key={t.id}
-            onClick={(e) => {
-              e.stopPropagation()
-              updateConfig(id, { uri: t.uri, tableId: t.id })
-              rename(id, t.name)
-              setOpen(false)
-            }}
+            onClick={(e) => { e.stopPropagation(); pick(t) }}
             className="flex w-full flex-col gap-px rounded-md px-[9px] py-[7px] text-left hover:bg-accent"
           >
-            <span className="text-xs font-semibold text-foreground">{t.name}</span>
+            <span className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+              <span className="truncate">{t.name}</span>
+              {t.folder && <span className="truncate text-[9.5px] font-normal text-muted-foreground">📁 {t.folder}</span>}
+            </span>
             <span className="text-[10px] text-muted-foreground">
               {t.rowCount == null ? '—' : t.rowCount.toLocaleString()} rows · {t.columns.length} cols
             </span>

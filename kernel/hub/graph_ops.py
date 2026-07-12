@@ -147,6 +147,8 @@ def catalog_tables(deps) -> list[dict]:
             "name": t.name, "uri": t.uri, "id": t.id, "rowCount": t.row_count,
             "columns": [{"name": c.name, "type": c.type} for c in t.columns],
             "keys": [k.columns for k in t.keys],
+            # organization, so an agent can filter/pick by folder/tags/owner the way a human browses
+            "folder": t.folder, "tags": t.tags, "owner": t.owner,
         })
     return out
 

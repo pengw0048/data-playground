@@ -35,9 +35,37 @@ export interface CatalogTable {
   version?: string | null
   columns: ColumnSchema[]
   keys?: KeyInfo[]
+  missing?: boolean
   updatedAt?: string | null
   meta?: string | null
+  // organization primitives (browse hierarchy + faceting + curation)
+  folder?: string
+  tags?: string[]
+  owner?: string | null
+  description?: string | null
+  usage?: number
 }
+
+// filter/sort/paginate params for the catalog browse query (mirrors CatalogQuery on the server)
+export interface CatalogQueryParams {
+  q?: string
+  folder?: string
+  tags?: string[]
+  owner?: string
+  uris?: string[]
+  hasColumns?: string[]
+  sort?: 'name' | 'rows' | 'updated' | 'usage' | 'folder'
+  order?: 'asc' | 'desc'
+  limit?: number
+  offset?: number
+}
+
+export interface CatalogPage { items: CatalogTable[]; total: number; hasMore: boolean }
+export interface FacetValue { value: string; count: number }
+export interface Facets { folders: FacetValue[]; tags: FacetValue[]; owners: FacetValue[]; semanticAvailable?: boolean }
+export interface FolderNode { name: string; path: string; tableCount: number }
+export interface CatalogBrowse { prefix: string; folders: FolderNode[]; tables: CatalogTable[] }
+export interface CatalogMetadata { folder?: string; tags?: string[]; owner?: string | null; description?: string | null }
 
 export type Cardinality = '1:1' | '1:N' | 'N:1' | 'N:M' | 'unknown'
 
@@ -67,7 +95,7 @@ export interface Relationship {
 
 export interface LineageNode { id: string; name: string; uri: string; kind: string }
 export interface LineageEdge { parent: string; child: string; column?: string | null; pipeline?: string | null }
-export interface LineageResult { nodes: LineageNode[]; edges: LineageEdge[] }
+export interface LineageResult { nodes: LineageNode[]; edges: LineageEdge[]; truncated?: boolean }
 
 export interface SampleResult {
   columns: ColumnSchema[]

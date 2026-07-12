@@ -1,0 +1,21 @@
+# Reference plugin: semantic + hybrid catalog search via a local embedding model. See __init__.py.
+name = "dp-semantic-catalog"
+version = "0.1.0"
+# min_core_api = 1
+
+# UI-configurable fields (Settings → Plugins). A UI value wins; else the `env` var; else `default`.
+[[config]]
+key = "model"
+type = "string"
+label = "Embedding model"
+default = "sentence-transformers/all-MiniLM-L6-v2"
+env = "DP_SEMANTIC_MODEL"
+help = "Any sentence-transformers model id. Downloaded on first use; runs locally (no API key, no egress)."
+
+[[config]]
+key = "enabled"
+type = "bool"
+label = "Enable semantic search"
+default = true
+env = "DP_SEMANTIC_ENABLED"
+help = "When off, the plugin is a no-op and the catalog uses lexical + faceted search only."

@@ -187,12 +187,54 @@ def _run_canvas(argv: list[str]) -> None:
     raise SystemExit(_headless_run(deps, args.canvas, args.node, args.timeout, args.as_json, args.user))
 
 
+def _run_seed_catalog(argv: list[str]) -> None:
+    """`dataplay seed-catalog --count N` — register N synthetic datasets across a folder/tag/owner
+    space, so you can see the catalog's browse/search/facet UX at scale without real files. Writes to
+    the same workspace DB the server reads, so they show up live in the Tables view.
+    `--remove` deletes everything a previous seed with the same --prefix created."""
+    p = argparse.ArgumentParser(prog="dataplay seed-catalog", description="Seed synthetic catalog entries (demo/scale).")
+    p.add_argument("--count", type=int, default=1000, help="how many synthetic datasets to register")
+    p.add_argument("--workspace", default=None, help="working dir (default: CWD)")
+    p.add_argument("--data-dir", default=None)
+    p.add_argument("--prefix", default="demo", help="uri + name prefix (also the top-level folder)")
+    p.add_argument("--remove", action="store_true", help="remove previously-seeded entries for --prefix instead of seeding")
+    args = p.parse_args(argv)
+    _prepare_workspace(args.workspace, args.data_dir, seed=False)
+
+    from hub import metadb
+    metadb.init_db()
+    if args.remove:
+        n = metadb.catalog_delete_prefix(f"mem://{args.prefix}/")
+        print(f"removed {n} seeded catalog entries (prefix '{args.prefix}').", file=sys.stderr)
+        return
+    owners = ["data-platform", "growth", "ml-research", "finance", "ops"]
+    modalities = ["images", "video", "audio", "text", "tabular"]
+    entries = []
+    for i in range(max(0, args.count)):
+        modality = modalities[i % len(modalities)]
+        folder = f"{args.prefix}/{modality}/{'raw' if i % 3 == 0 else 'curated'}"
+        tags = [modality, "gold" if i % 4 == 0 else "silver"] + (["pii"] if i % 11 == 0 else [])
+        name = f"{args.prefix}_{modality}_{i:05d}"
+        cols = ["id", "created_at", f"{modality}_ref"] + (["embedding"] if i % 2 == 0 else [])
+        entries.append({"uri": f"mem://{args.prefix}/{i}", "name": name, "doc": {
+            "id": f"tbl_{name}", "name": name, "uri": f"mem://{args.prefix}/{i}", "folder": folder,
+            "tags": tags, "owner": owners[i % len(owners)], "rowCount": (i + 1) * 137,
+            "description": f"synthetic {modality} dataset #{i} for catalog demo",
+            "columns": [{"name": c, "type": "VARCHAR"} for c in cols],
+        }})
+    n = metadb.catalog_bulk_seed(entries)
+    print(f"seeded {n} synthetic catalog entries (prefix '{args.prefix}'). Remove with: "
+          f"dataplay seed-catalog --remove --prefix {args.prefix}", file=sys.stderr)
+
+
 def main() -> None:
     argv = sys.argv[1:]
     if argv and argv[0] == "mcp":
         return _run_mcp(argv[1:])
     if argv and argv[0] == "run":
         return _run_canvas(argv[1:])
+    if argv and argv[0] == "seed-catalog":
+        return _run_seed_catalog(argv[1:])
     p = argparse.ArgumentParser(prog="dataplay", description="Data Playground — a node canvas for data.")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8471)

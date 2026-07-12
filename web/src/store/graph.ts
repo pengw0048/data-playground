@@ -98,6 +98,17 @@ function cloneSubgraph(nodes: CanvasNode[], edges: CanvasEdge[], dx = 40, dy = 4
   return { nodes: clones, edges: clonedEdges }
 }
 
+// Merge tables into the bounded working-set catalog (dedupe by uri; the fetched copy wins so an edit
+// elsewhere refreshes here). Never grows unbounded in practice — it holds canvas refs + recent lookups.
+function mergeIntoCatalog(set: (fn: (s: Store) => Partial<Store>) => void, tables: CatalogTable[]): void {
+  if (!tables.length) return
+  set((s) => {
+    const byUri = new Map(s.catalog.map((t) => [t.uri, t]))
+    for (const t of tables) byUri.set(t.uri, t)
+    return { catalog: Array.from(byUri.values()) }
+  })
+}
+
 interface PreviewState { loading?: boolean; result?: SampleResult; error?: string; offset?: number }
 interface RunState {
   estimate?: RunEstimate
@@ -175,8 +186,16 @@ interface Store {
   restoreVersion: (id: string, versionId: string) => void
 
   // -- kernel + catalog --
+  // `catalog` is a bounded WORKING SET — the tables referenced by the open canvas + recently
+  // fetched/searched ones — NOT the whole catalog (which can be thousands of tables and is browsed
+  // server-side, paginated, in the Tables view). It exists so canvas source nodes can resolve their
+  // columns and pickers have a warm cache; it is never assumed to be complete.
   bootstrap: () => Promise<void>
   refreshCatalog: () => Promise<void>
+  // ensure the tables a canvas's source nodes point at are in the working set (fetched on demand)
+  ensureCanvasTables: (doc: CanvasDoc, opts?: { force?: boolean }) => Promise<void>
+  // remember tables the user just picked/searched so the canvas + pickers resolve them from the cache
+  rememberTables: (tables: CatalogTable[]) => void
   refreshSchemas: () => Promise<void>
   // upload a dataset file → shared storage + catalog; returns the new table (null on failure/offline)
   uploadDataset: (file: File) => Promise<CatalogTable | null>
@@ -736,11 +755,14 @@ export const useStore = create<Store>((set, get) => ({
   bootstrap: async () => {
     setApiUser(localStorage.getItem(USER_KEY))  // restore chosen user (server defaults to 'local')
     try {
-      const [kernelInfo, catalog, processors, nodes] = await Promise.all([
-        api.kernel(), api.tables(), api.processors(), api.nodes(),
+      // NOTE: we deliberately do NOT load the whole catalog here — it can be thousands of tables. The
+      // Tables view browses it server-side (paginated + faceted); the working set is filled on demand
+      // (ensureCanvasTables when a canvas opens, search results, uploads).
+      const [kernelInfo, processors, nodes] = await Promise.all([
+        api.kernel(), api.processors(), api.nodes(),
       ])
       const added = registerGenericNodes(nodes)
-      set((s) => ({ kernelInfo, kernelUp: true, catalog, processors,
+      set((s) => ({ kernelInfo, kernelUp: true, processors,
         specsVersion: added ? s.specsVersion + 1 : s.specsVersion }))
     } catch {
       set({ kernelUp: false })
@@ -835,18 +857,49 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
+  // Refresh the WORKING SET (not the whole catalog): re-fetch the tables the open canvas references,
+  // so declared-key / schema / organization edits made elsewhere show up. The Tables view + ER view
+  // do their own server-side paginated fetches — they don't depend on this.
   refreshCatalog: async () => {
+    await get().ensureCanvasTables(get().doc, { force: true })
+  },
+
+  rememberTables: (tables) => mergeIntoCatalog(set, tables),
+
+  ensureCanvasTables: async (doc, opts) => {
+    const force = (opts as { force?: boolean } | undefined)?.force
+    // a source ref can be a uri, a bare catalog name, or a tableId — count all three as "have"
+    const have = new Set(get().catalog.flatMap((t) => [t.uri, t.name, t.id]))
+    const wanted = Array.from(new Set(
+      doc.nodes.filter((n) => n.type === 'source' && n.data.config.uri).map((n) => String(n.data.config.uri)),
+    ))
+    const need = force ? wanted : wanted.filter((u) => !have.has(u))
+    if (!need.length) return
+    // bare names/ids (no path separator or scheme — agent/MCP/example sources) can't match the exact
+    // `uris` filter, so they resolve via individual lookups instead
+    const bare = need.filter((u) => !u.includes('/') && !u.includes('\\'))
+    const uris = need.filter((u) => u.includes('/') || u.includes('\\'))
     try {
-      const catalog = await api.tables()
-      set({ catalog })
-    } catch { /* noop */ }
+      const found: CatalogTable[] = []
+      if (uris.length) {
+        // ONE batched request (repeated ?uris=…); an unregistered source uri is simply absent from the
+        // result — never a per-uri 404 (which would pollute the console + cost N round-trips).
+        const page = await api.tablesPage({ uris, limit: uris.length })
+        found.push(...page.items)
+      }
+      if (bare.length) {
+        const results = await Promise.allSettled(bare.map((r) => api.table(r)))
+        for (const r of results) if (r.status === 'fulfilled') found.push(r.value)
+      }
+      if (found.length) mergeIntoCatalog(set, found)
+    } catch { /* offline: canvas still resolves columns from server schema + last preview */ }
   },
 
   uploadDataset: async (file) => {
     if (!get().kernelUp) { get().pushToast('Kernel offline — cannot upload a file', 'error'); return null }
     try {
       const t = await api.uploadFile(file)
-      await get().refreshCatalog()  // so the new dataset appears in the catalog + pickers
+      mergeIntoCatalog(set, [t])  // so the new dataset appears in pickers / the open canvas immediately
       return t
     } catch (e) {
       get().pushToast(`Upload failed: ${e instanceof Error ? e.message : String(e)}`, 'error')
@@ -878,6 +931,7 @@ export const useStore = create<Store>((set, get) => ({
     const d = migrateDoc(doc)
     set({ doc: d, previews: {}, runs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [] })
     reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
+    void get().ensureCanvasTables(d)  // warm the working set for this canvas's source nodes (on demand)
   },
 
   // An MCP client (the user's own agent) edited THIS canvas out-of-band — the collab room relayed an

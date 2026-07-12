@@ -71,19 +71,33 @@ function sharesKey(a: CatalogTable, b: CatalogTable): boolean {
   return sharedNonBare || fk(ka, kb) || fk(kb, ka)
 }
 
+// The ER view renders one ENTITY per table + O(n²) join hints, so it operates on a BOUNDED set — a
+// single folder (or all), capped — rather than the whole catalog (which can be thousands of tables).
+const ER_CAP = 60
+
 export function ERDiagram() {
-  const catalog = useStore((s) => s.catalog)
-  const refreshCatalog = useStore((s) => s.refreshCatalog)
   const pushToast = useStore((s) => s.pushToast)
+  const [catalog, setCatalog] = useState<CatalogTable[]>([])
+  const [folder, setFolder] = useState('')
+  const [folders, setFolders] = useState<string[]>([])
+  const [total, setTotal] = useState(0)
   const [rels, setRels] = useState<Relationship[]>([])
   const [pending, setPending] = useState<{ left: CatalogTable; right: CatalogTable; suggestions: JoinSuggestion[] } | null>(null)
   // node layout survives navigation (the view unmounts) via localStorage, keyed by table id
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>(loadPositions)
 
+  const reload = useCallback(() =>
+    api.tablesPage({ folder: folder || undefined, limit: ER_CAP, sort: 'usage', order: 'desc' })
+      .then((p) => { setCatalog(p.items); setTotal(p.total) })
+      .catch(() => { setCatalog([]); setTotal(0) }),
+  [folder])
+
   useEffect(() => {
     api.relationships().then(setRels).catch(() => setRels([]))
-    refreshCatalog()  // show current keys (another view / instance may have changed them)
-  }, [refreshCatalog])
+    api.facets().then((f) => setFolders(f.folders.map((x) => x.value))).catch(() => setFolders([]))
+  }, [])
+  useEffect(() => { reload() }, [reload])
+  const refreshCatalog = reload  // local reload after a key/relationship edit
 
   const byUri = useMemo(() => Object.fromEntries(catalog.map((t) => [t.uri, t.id])), [catalog])
   const pkOf = (t: CatalogTable) => t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
@@ -157,15 +171,27 @@ export function ERDiagram() {
     })
   }, [])
 
-  if (catalog.length === 0)
-    return <div className="grid h-full place-items-center text-[13px] text-muted-foreground">No datasets registered yet — add some in Tables.</div>
+  const capped = total > catalog.length
 
   return (
     <div className="relative h-full w-full">
-      <div className="pointer-events-none absolute left-3 top-3 z-10 max-w-[320px] rounded-md border border-border bg-card/90 px-3 py-2 text-[10.5px] leading-relaxed text-muted-foreground backdrop-blur">
-        <div className="mb-0.5 text-[12px] font-semibold text-foreground">Relationships (ER)</div>
-        🔑 click column(s) to declare the primary key (click several for a composite key) · drag between two tables to declare a join (keys + cardinality measured) · click a solid edge to remove · dashed = possible join
+      <div className="absolute left-3 top-3 z-10 flex max-w-[360px] flex-col gap-1.5 rounded-md border border-border bg-card/90 px-3 py-2 text-[10.5px] leading-relaxed text-muted-foreground backdrop-blur">
+        <div className="flex items-center gap-2">
+          <span className="text-[12px] font-semibold text-foreground">Relationships (ER)</span>
+          <select value={folder} onChange={(e) => setFolder(e.target.value)}
+            className="ml-auto rounded border border-border bg-card px-1.5 py-0.5 text-[10.5px] outline-none" data-testid="er-folder">
+            <option value="">All folders</option>
+            {folders.map((f) => <option key={f} value={f}>{f}</option>)}
+          </select>
+        </div>
+        🔑 click column(s) to declare the primary key · drag between two tables to declare a join · click a solid edge to remove · dashed = possible join
+        {capped && <span className="text-[10px] text-amber-600">Showing {catalog.length} of {total} — pick a folder to focus the diagram.</span>}
       </div>
+      {catalog.length === 0 && (
+        <div className="pointer-events-none absolute inset-0 z-[5] grid place-items-center text-[13px] text-muted-foreground">
+          {total === 0 && !folder ? 'No datasets registered yet — add some in Tables.' : 'No datasets in this folder.'}
+        </div>
+      )}
       <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange}
         onConnect={onConnect} onEdgeClick={onEdgeClick} fitView minZoom={0.2} colorMode={resolvedTheme()}
         proOptions={{ hideAttribution: true }}>
