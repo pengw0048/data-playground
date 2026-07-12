@@ -55,6 +55,7 @@ jobs:
 
       - name: Build and start head, two workers, and MinIO
         run: |
+          set -o pipefail
           mkdir -p ray-diagnostics
           # Finish the shared image first. Building while `up` creates multiple services can leave a
           # running head on an earlier image ID; a later `compose run` may then recreate the head and
@@ -83,10 +84,12 @@ jobs:
 
       - name: Require a clean distributed PASS
         run: |
+          set -o pipefail
           DP_MULTINODE_FAULT= docker compose -f docker-compose.ray.yml run --rm --no-deps driver 2>&1 | tee ray-diagnostics/clean.log
 
       - name: Require the default shuffle-partition path
         run: |
+          set -o pipefail
           docker compose -f docker-compose.ray.yml run --rm --no-deps \
             -e DP_RAY_SHUFFLE_PARTITIONS=0 -e DP_MULTINODE_FAULT= driver 2>&1 \
             | tee ray-diagnostics/default-shuffle.log
@@ -107,6 +110,7 @@ jobs:
 
       - name: Require a degraded-cluster rerun after one worker stops
         run: |
+          set -o pipefail
           workers=$(docker compose -f docker-compose.ray.yml ps -q ray-worker)
           worker_count=$(printf '%s\n' "$workers" | sed '/^$/d' | wc -l)
           if [ "$worker_count" -ne 2 ]; then
