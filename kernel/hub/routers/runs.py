@@ -35,6 +35,7 @@ from hub.models import (
 router = APIRouter()
 
 _RUN_INDEX_MAX = 1000  # cap deps.run_index (run_id -> owning runner); well above either runner's own cap
+_RUN_MUTATE_ROLES = ("owner", "editor")
 
 
 def _unknown_kind_error(graph, deps) -> str | None:
@@ -326,17 +327,21 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     refs, rejects an invalid/cyclic graph (HTTPException), sizes + gates the run (RunNeedsConfirm), then
     hands to the RunController (placement-splitting) or the base runner and records the owner in
     run_index. Returns (status, owner); poll the owner via _status_or_lost / cancel via run_index."""
-    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    # P0-AUTH-02: a run against an EXISTING canvas must be one the caller can reach — else it would
-    # attribute the run/history to someone else's canvas. An id that names no saved canvas is the
-    # caller's own ad-hoc workspace (allowed, owned by uid below). Open mode: single trusted user.
+    # A run against an EXISTING canvas is a mutation of that canvas's operational state/history, so it
+    # requires owner/editor rather than mere visibility. An id that names no saved canvas is the caller's
+    # own ad-hoc workspace (allowed, owned by uid below). Authorize before resolving or compiling the
+    # caller-supplied graph so a read-only collaborator cannot make the server touch its sources first.
     auth_canvas = None
     if auth.auth_enabled():
         cid = getattr(graph, "id", None) or ""
         if cid and metadb.canvas_exists(cid):
-            if metadb.canvas_role(cid, uid) is None:
+            role = metadb.canvas_role(cid, uid)
+            if role is None:
                 raise HTTPException(404, f"canvas '{cid}' not found")
-            auth_canvas = cid  # a real canvas the caller can reach → collaborators may see this run
+            if role not in _RUN_MUTATE_ROLES:
+                raise HTTPException(403, f"canvas '{cid}' requires owner or editor to run")
+            auth_canvas = cid  # a real writable canvas → all collaborators may observe this run
+    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(graph, deps)
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
@@ -377,12 +382,13 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
     return status
 
 
-def _run_access(run_id: str, uid: str | None) -> bool:
-    """Whether `uid` may see or act on this run (P0-AUTH-02). Open mode (no auth): always, since the
-    instance is a single trusted user — matches the run/preview endpoints and ws_collab. Auth mode:
-    the run's creator (authoritative, persisted so it survives restart / another stateless instance)
-    OR anyone with a role on the REAL canvas the run was authorized against (never an ad-hoc id, which
-    a stranger could later create to hijack ownership)."""
+def _run_read_access(run_id: str, uid: str | None) -> bool:
+    """Whether `uid` may observe this run.
+
+    Open mode is one trusted user. In auth mode, the creator or any current collaborator on the REAL
+    canvas may read status/output. Ad-hoc runs remain private to their creator, and a later canvas that
+    reuses the graph id cannot claim them.
+    """
     if not auth.auth_enabled():
         return True
     if not uid:
@@ -399,9 +405,42 @@ def _run_access(run_id: str, uid: str | None) -> bool:
     return bool(cid and metadb.canvas_role(cid, uid) is not None)
 
 
-def _require_run_access(run_id: str, uid: str) -> None:
-    if not _run_access(run_id, uid):  # 404, not 403 — don't reveal that someone else's run id exists
+def _run_mutate_access(run_id: str, uid: str | None) -> bool:
+    """Whether `uid` may cancel this run.
+
+    A real-canvas run follows the caller's CURRENT canvas role: owner/editor may mutate; viewer may
+    only observe. An ad-hoc run has no canvas role, so its creator remains its sole operator. Legacy
+    rows without durable creator metadata fall back to the persisted canvas role, then the in-process
+    owner only when there is no persisted canvas association at all.
+    """
+    if not auth.auth_enabled():
+        return True
+    if not uid:
+        return False
+    creator, auth_canvas = metadb.run_auth(run_id)
+    if creator is not None:
+        if auth_canvas:
+            return metadb.canvas_role(auth_canvas, uid) in _RUN_MUTATE_ROLES
+        return creator == uid
+    cid = metadb.run_canvas_id(run_id)
+    if cid:
+        return metadb.canvas_role(cid, uid) in _RUN_MUTATE_ROLES
+    return get_deps().run_owner.get(run_id) == uid
+
+
+def _require_run_read_access(run_id: str, uid: str) -> None:
+    if not _run_read_access(run_id, uid):  # 404, not 403 — don't reveal that someone else's run id exists
         raise HTTPException(404, f"run '{run_id}' not found")
+
+
+def _require_run_mutate_access(run_id: str, uid: str) -> None:
+    if _run_mutate_access(run_id, uid):
+        return
+    # A viewer can already enumerate this shared run through status/history, so distinguish read-only
+    # from not-found. A stranger still gets 404 and learns nothing about the run id.
+    if _run_read_access(run_id, uid):
+        raise HTTPException(403, f"run '{run_id}' requires canvas owner or editor to cancel")
+    raise HTTPException(404, f"run '{run_id}' not found")
 
 
 def _runner_for(run_id: str):
@@ -433,7 +472,7 @@ except ValueError:
 
 @router.get("/run/{run_id}", response_model=RunStatus)
 def run_status(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
-    _require_run_access(run_id, uid)  # a run's status carries row counts, paths in errors, output names
+    _require_run_read_access(run_id, uid)  # status carries row counts, paths in errors, output names
     st = _status_or_lost(run_id)
     if st.status == "running" and metadb.run_stalled(run_id, _STALL_S):
         st = st.model_copy(update={"stalled": True})  # copy — don't mutate the runner's live object
@@ -442,7 +481,7 @@ def run_status(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
 
 @router.post("/run/{run_id}/cancel", response_model=RunStatus)
 def run_cancel(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
-    _require_run_access(run_id, uid)  # only the run's owner may cancel it (else any user can DoS a run)
+    _require_run_mutate_access(run_id, uid)  # only owner/editor may disrupt a shared canvas run
     deps = get_deps()
     owner = deps.run_index.get(run_id)
     if owner is not None:
@@ -458,4 +497,3 @@ def run_cancel(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
     if persisted is not None:
         return RunStatus(**persisted)
     raise HTTPException(404, f"run '{run_id}' not found")
-

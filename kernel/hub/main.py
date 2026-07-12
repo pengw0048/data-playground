@@ -136,8 +136,8 @@ async def ws_run(ws: WebSocket, run_id: str):
         return
     # P0-AUTH-02: and, in auth mode, only for a run the caller may reach (its creator or a role on its
     # canvas) — mirrors GET /run/{id}. Off the event loop: it does small DB reads.
-    from hub.routers.runs import _run_access
-    if not await asyncio.to_thread(_run_access, run_id, uid):
+    from hub.routers.runs import _run_read_access
+    if not await asyncio.to_thread(_run_read_access, run_id, uid):
         await ws.close(code=1008)
         return
     await ws.accept()
