@@ -28,10 +28,20 @@ spec:
       resources: '"{\"engine_ray\": 100}"'
     template:
       spec:
+        automountServiceAccountToken: false
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          fsGroup: 10001
+          seccompProfile: { type: RuntimeDefault }
         containers:
           - name: ray-head
             image: dp-ray:local
             imagePullPolicy: IfNotPresent
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities: { drop: ["ALL"] }
             resources:
               requests: { cpu: "1", memory: "2Gi" }
               limits: { cpu: "2", memory: "3Gi" }
@@ -50,10 +60,20 @@ spec:
         resources: '"{\"engine_ray\": 100}"'
       template:
         spec:
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile: { type: RuntimeDefault }
           containers:
             - name: ray-worker
               image: dp-ray:local
               imagePullPolicy: IfNotPresent
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: { drop: ["ALL"] }
               resources:
                 requests: { cpu: "1", memory: "2Gi" }
                 limits: { cpu: "2", memory: "3Gi" }

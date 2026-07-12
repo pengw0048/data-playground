@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from hub import ray_compat
 
@@ -105,3 +106,33 @@ def test_ray_dependency_image_and_kuberay_manifest_share_one_version_contract():
     assert "uv pip install 'ray" not in dockerfile
     manifest = (_ROOT / "deploy/kuberay/raycluster.yaml").read_text()
     assert f'rayVersion: "{ray_compat.SUPPORTED_RAY_VERSION}"' in manifest
+
+
+def _assert_restricted_pod(pod: dict, container_name: str) -> None:
+    assert pod["automountServiceAccountToken"] is False
+    pod_security = pod["securityContext"]
+    assert pod_security["runAsNonRoot"] is True
+    assert (pod_security["runAsUser"], pod_security["runAsGroup"], pod_security["fsGroup"]) == (
+        10001, 10001, 10001,
+    )
+    assert pod_security["seccompProfile"] == {"type": "RuntimeDefault"}
+    container = next(item for item in pod["containers"] if item["name"] == container_name)
+    assert container["securityContext"] == {
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+    }
+
+
+def test_ray_image_and_validation_pods_enforce_a_non_root_security_boundary():
+    dockerfile = (_ROOT / "docker/ray/Dockerfile").read_text()
+    assert "USER 10001:10001" in dockerfile
+    assert 'ENV HOME="/home/dataplay"' in dockerfile
+    assert "ln -s /app/kernel/.venv/bin/ray /usr/local/bin/ray" in dockerfile
+
+    cluster = yaml.safe_load((_ROOT / "deploy/kuberay/raycluster.yaml").read_text())
+    _assert_restricted_pod(cluster["spec"]["headGroupSpec"]["template"]["spec"], "ray-head")
+    for worker in cluster["spec"]["workerGroupSpecs"]:
+        _assert_restricted_pod(worker["template"]["spec"], "ray-worker")
+
+    job = yaml.safe_load((_ROOT / "deploy/kuberay/differential-job.yaml").read_text())
+    _assert_restricted_pod(job["spec"]["template"]["spec"], "driver")
