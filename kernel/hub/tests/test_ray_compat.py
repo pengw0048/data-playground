@@ -127,6 +127,7 @@ def test_ray_image_and_validation_pods_enforce_a_non_root_security_boundary():
     dockerfile = (_ROOT / "docker/ray/Dockerfile").read_text()
     assert "USER 10001:10001" in dockerfile
     assert 'ENV HOME="/home/dataplay"' in dockerfile
+    assert "ln -s /app/kernel/.venv/bin/ray /usr/local/bin/ray" in dockerfile
 
     cluster = yaml.safe_load((_ROOT / "deploy/kuberay/raycluster.yaml").read_text())
     _assert_restricted_pod(cluster["spec"]["headGroupSpec"]["template"]["spec"], "ray-head")

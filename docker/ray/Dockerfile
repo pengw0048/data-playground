@@ -21,6 +21,11 @@ USER 10001:10001
 RUN touch ./web/dist/.keep
 WORKDIR /app/kernel
 RUN uv sync --extra ray
+# KubeRay starts raylets through a login shell, which resets PATH on Debian.
+# Keep the venv-owned interpreter but expose the Ray CLI from the standard login-shell PATH.
+USER root
+RUN ln -s /app/kernel/.venv/bin/ray /usr/local/bin/ray
+USER 10001:10001
 ENV PATH="/app/kernel/.venv/bin:$PATH"
 ENV HOME="/home/dataplay"
 ENV PYTHONUNBUFFERED=1
