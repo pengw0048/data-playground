@@ -129,8 +129,8 @@ metadata databases, and a full shared-prefix listing is not bounded at productio
 
 Local region handoffs are retained for the same correctness reason. The hub does not evict files by age or
 directory count: an mtime cannot prove that a cache entry, catalog version, concurrent hub, or active reader
-no longer references an artifact. Monitor local region capacity until the ownership-aware artifact ledger and
-exact-key cleanup described in the production roadmap are available.
+no longer references an artifact. Monitor local region capacity until an ownership-aware artifact ledger with
+exact-key cleanup is implemented.
 
 `run_unit` mints a random attempt ID by default and enforces one owner per ID inside a runner. A caller that
 supplies deterministic IDs must fence ownership in its durable control plane. A committed retry reattaches;
