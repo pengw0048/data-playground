@@ -1,8 +1,8 @@
-"""P0-AUTH-02: run-object authorization.
+"""Run action authorization.
 
-With auth enabled, a run's status/cancel/output must be reachable ONLY by the run's creator or by
-someone with a role on the run's canvas — never by any other authenticated account. These checks are
-no-ops in open mode (single trusted user), so the rest of the suite (which runs open) is unaffected.
+With auth enabled, status/output are readable by every collaborator, while submit/cancel require an
+owner/editor role. Unrelated authenticated accounts cannot enumerate the run. These checks are no-ops
+in open mode (single trusted user), so the rest of the suite (which runs open) is unaffected.
 """
 from __future__ import annotations
 
@@ -10,10 +10,12 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from hub import auth, metadb
 from hub.deps import get_deps
 from hub.main import app
+from hub.mcp import build_http_server
 
 client = TestClient(app)
 
@@ -32,9 +34,10 @@ def _hdr(uid: str) -> dict:
 
 @pytest.fixture
 def authed(monkeypatch):
-    """Two users (A owns a private canvas, B is a stranger) with auth turned on for the test only."""
+    """An owner, editor, viewer, and stranger with auth turned on for the test only."""
     with metadb.session() as s:
-        for uid, name in [("authz_a", "A"), ("authz_b", "B")]:
+        for uid, name in [("authz_a", "Owner"), ("authz_editor", "Editor"),
+                          ("authz_viewer", "Viewer"), ("authz_b", "Stranger")]:
             if s.get(metadb.User, uid) is None:
                 s.add(metadb.User(id=uid, name=name))
     # reset the canvas to owned-by-A each time so tests are order-independent (the module shares one DB,
@@ -48,15 +51,42 @@ def authed(monkeypatch):
     client.cookies.clear()
 
 
+def _graph(canvas_id: str) -> dict:
+    return {"id": canvas_id, "version": 1,
+            "nodes": [{"id": "s", "type": "source", "position": {"x": 0, "y": 0},
+                       "data": {"title": "s", "config": {"uri": _uri("events")}}}],
+            "edges": []}
+
+
 def _start_run(hdr: dict, canvas_id: str):
-    g = {"id": canvas_id, "version": 1,
-         "nodes": [{"id": "s", "type": "source", "position": {"x": 0, "y": 0},
-                    "data": {"title": "s", "config": {"uri": _uri("events")}}}],
-         "edges": []}
-    return client.post("/api/run", json={"graph": g, "targetNodeId": "s", "confirmed": True}, headers=hdr)
+    return client.post("/api/run", json={"graph": _graph(canvas_id), "targetNodeId": "s", "confirmed": True},
+                       headers=hdr)
 
 
-def test_run_status_and_cancel_are_owner_only(authed):
+def _share_editor_and_viewer() -> None:
+    metadb.share_canvas("authz_canvas", "authz_editor", "editor")
+    metadb.share_canvas("authz_canvas", "authz_viewer", "viewer")
+
+
+def _wait_for_terminal(run_id: str) -> dict:
+    for _ in range(200):
+        response = client.get(f"/api/run/{run_id}", headers=_hdr("authz_a"))
+        assert response.status_code == 200, response.text
+        status = response.json()
+        if status["status"] in ("done", "failed", "cancelled"):
+            return status
+        time.sleep(0.05)
+    pytest.fail(f"run '{run_id}' did not finish")
+
+
+def _mcp_tool(uid: str, name: str, arguments: dict) -> dict:
+    server = build_http_server(uid)
+    response = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": name, "arguments": arguments}})
+    return response["result"]
+
+
+def test_private_run_is_hidden_from_a_stranger(authed):
     r = _start_run(_hdr("authz_a"), "authz_canvas")
     assert r.status_code == 200, r.text
     rid = r.json()["runId"]
@@ -121,3 +151,80 @@ def test_shared_editor_can_read_the_runs_of_a_shared_canvas(authed):
         assert client.get(f"/api/run/{rid}", headers=_hdr("authz_b")).status_code == 200
     finally:
         metadb.unshare_canvas("authz_canvas", "authz_b")
+
+
+@pytest.mark.parametrize(("uid", "expected"), [
+    ("authz_a", 200),
+    ("authz_editor", 200),
+    ("authz_viewer", 403),
+    ("authz_b", 404),
+])
+def test_run_submit_requires_canvas_write_role(authed, uid, expected):
+    """Submitting a canvas run is a mutation: owner/editor may; viewer/stranger may not."""
+    _share_editor_and_viewer()
+    response = _start_run(_hdr(uid), "authz_canvas")
+    assert response.status_code == expected, response.text
+
+
+def test_run_read_and_cancel_use_different_role_policies(authed):
+    """All collaborators may inspect a run, but only owner/editor may cancel it."""
+    _share_editor_and_viewer()
+    response = _start_run(_hdr("authz_a"), "authz_canvas")
+    assert response.status_code == 200, response.text
+    run_id = response.json()["runId"]
+
+    for uid, expected in [("authz_a", 200), ("authz_editor", 200),
+                          ("authz_viewer", 200), ("authz_b", 404)]:
+        assert client.get(f"/api/run/{run_id}", headers=_hdr(uid)).status_code == expected
+
+    # A viewer already knows the shared run exists, so 403 is honest; a stranger still gets a
+    # non-enumerating 404. Editors and owners retain their existing cancellation behavior.
+    assert client.post(f"/api/run/{run_id}/cancel", headers=_hdr("authz_viewer")).status_code == 403
+    assert client.post(f"/api/run/{run_id}/cancel", headers=_hdr("authz_b")).status_code == 404
+    assert client.post(f"/api/run/{run_id}/cancel", headers=_hdr("authz_editor")).status_code == 200
+    assert client.post(f"/api/run/{run_id}/cancel", headers=_hdr("authz_a")).status_code == 200
+
+
+def test_viewer_can_read_completed_output_history_mcp_and_websocket(authed):
+    """Read-only collaborators keep every run observation surface, including MCP and the status WS."""
+    _share_editor_and_viewer()
+    response = _start_run(_hdr("authz_a"), "authz_canvas")
+    assert response.status_code == 200, response.text
+    run_id = response.json()["runId"]
+    owner_status = _wait_for_terminal(run_id)
+    assert owner_status["status"] == "done" and owner_status["outputUri"]
+
+    viewer_status = client.get(f"/api/run/{run_id}", headers=_hdr("authz_viewer"))
+    assert viewer_status.status_code == 200
+    assert viewer_status.json()["outputUri"] == owner_status["outputUri"]
+    history = client.get("/api/canvas/authz_canvas/runs", headers=_hdr("authz_viewer"))
+    assert history.status_code == 200
+    assert any(row["status"] == "done" and row["targetNodeId"] == "s" for row in history.json())
+
+    mcp_status = _mcp_tool("authz_viewer", "run_status", {"runId": run_id})
+    assert mcp_status.get("isError") is not True
+    assert mcp_status["structuredContent"]["outputUri"] == owner_status["outputUri"]
+    mcp_sample = _mcp_tool("authz_viewer", "sample_result", {"runId": run_id, "limit": 1})
+    assert mcp_sample.get("isError") is not True and len(mcp_sample["structuredContent"]["rows"]) == 1
+
+    with client.websocket_connect(f"/ws/run/{run_id}", headers={"cookie": _hdr("authz_viewer")["Cookie"]}) as ws:
+        assert ws.receive_json()["runId"] == run_id
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect(f"/ws/run/{run_id}", headers={"cookie": _hdr("authz_b")["Cookie"]}):
+            pass
+    assert exc.value.code == 1008
+
+
+def test_mcp_reuses_submit_and_cancel_mutation_policy(authed):
+    _share_editor_and_viewer()
+    saved = client.put("/api/canvas/authz_canvas", json=_graph("authz_canvas"), headers=_hdr("authz_a"))
+    assert saved.status_code == 200, saved.text
+    viewer_submit = _mcp_tool("authz_viewer", "run_canvas",
+                              {"canvasId": "authz_canvas", "nodeId": "s", "confirm": True})
+    assert viewer_submit["isError"] is True and "owner or editor" in viewer_submit["content"][0]["text"]
+
+    run_id = _start_run(_hdr("authz_a"), "authz_canvas").json()["runId"]
+    viewer_cancel = _mcp_tool("authz_viewer", "cancel_run", {"runId": run_id})
+    assert viewer_cancel["isError"] is True and "owner or editor" in viewer_cancel["content"][0]["text"]
+    editor_cancel = _mcp_tool("authz_editor", "cancel_run", {"runId": run_id})
+    assert editor_cancel.get("isError") is not True

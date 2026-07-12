@@ -373,9 +373,9 @@ class Playground:
         """Poll a run started by run_canvas (by its runId) — the way to follow a run that returned
         timedOut:true to completion. Resolved like the web GET /run/{id}: an unknown/evicted id comes
         back as a terminal 'failed' status (with a reason), not a hard error."""
-        from hub.routers.runs import _run_access, _status_or_lost
+        from hub.routers.runs import _run_read_access, _status_or_lost
         run_id = self._req(args, "runId")
-        if not _run_access(run_id, self.user_id):  # P0-AUTH-02: only the caller's own / their canvas's run
+        if not _run_read_access(run_id, self.user_id):  # creator or any collaborator may observe
             raise ToolError(f"unknown runId '{run_id}'")
         st = _status_or_lost(run_id)
         return self._run_envelope(st, st.target_node_id)
@@ -383,11 +383,15 @@ class Playground:
     def cancel_run(self, args: dict) -> dict:
         """Cancel an in-flight run (by its runId), routed like the web POST /run/{id}/cancel. A finished
         run is returned unchanged; a truly unknown id is a tool error."""
+        from fastapi import HTTPException as HTTPExc
+
         from hub import metadb
-        from hub.routers.runs import _run_access
+        from hub.routers.runs import _require_run_mutate_access
         run_id = self._req(args, "runId")
-        if not _run_access(run_id, self.user_id):  # P0-AUTH-02: can't cancel someone else's run
-            raise ToolError(f"unknown runId '{run_id}'")
+        try:
+            _require_run_mutate_access(run_id, self.user_id)
+        except HTTPExc as e:
+            raise ToolError(str(e.detail))
         owner = self.deps.run_index.get(run_id)
         if owner is not None:
             return self._run_envelope(owner.cancel(run_id), None)
@@ -403,9 +407,9 @@ class Playground:
     def sample_result(self, args: dict) -> dict:
         """Sample the OUTPUT dataset a run materialized (by its runId) — closes the author→run→inspect
         loop so an agent can read the rows it produced without hand-reconstructing the output uri."""
-        from hub.routers.runs import _run_access, _status_or_lost
+        from hub.routers.runs import _run_read_access, _status_or_lost
         run_id = self._req(args, "runId")
-        if not _run_access(run_id, self.user_id):  # P0-AUTH-02: don't read another user's output rows
+        if not _run_read_access(run_id, self.user_id):  # don't read an unrelated user's output rows
             raise ToolError(f"unknown runId '{run_id}'")
         st = _status_or_lost(run_id)
         if not st.output_uri:
