@@ -90,6 +90,41 @@ from hub.workload_env import build_workload_env, prepare_workload_graph
 # backend, but a sort exceeding one node's memory should not pin engine=ray (a production backend would
 # write ordered shards + stitch on read).
 RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join", "sort"})
+_HANDOFF_MANIFEST = "_DP_SUCCESS.json"
+
+
+def _attempt_handoff_uri(uri: str, run_id: str) -> str:
+    """Return an immutable region-output prefix for one execution attempt.
+
+    The controller suggests a stable, content-addressed URI. Writing a multi-object Ray result directly
+    to that prefix lets a retry race a still-running/failed attempt and expose a mixture of shards. Keep
+    the stable URI as the cache key, but publish a unique physical prefix only after the attempt succeeds.
+    """
+    base = uri[:-len(".parquet")] if uri.lower().endswith(".parquet") else uri.rstrip("/")
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", run_id).strip("._-") or uuid.uuid4().hex
+    return f"{base}.attempt-{safe}"
+
+
+def _write_handoff_manifest(uri: str, *, run_id: str, rows: int, schema: object) -> None:
+    """Write the commit marker last; the controller publishes ``uri`` only after this returns."""
+    import json
+
+    from hub.plugins.adapters import is_object_uri, object_fs
+
+    body = json.dumps({
+        "format": "data-playground-ray-handoff-v1",
+        "runId": run_id,
+        "rows": int(rows),
+        "schema": str(getattr(schema, "base_schema", schema)),
+    }, sort_keys=True).encode()
+    if is_object_uri(uri):
+        fs, path = object_fs(uri)
+        with fs.open_output_stream(path.rstrip("/") + "/" + _HANDOFF_MANIFEST) as stream:
+            stream.write(body)
+        return
+    os.makedirs(uri, exist_ok=True)
+    with open(os.path.join(uri, _HANDOFF_MANIFEST), "wb") as f:
+        f.write(body)
 
 
 def _ray_child_env() -> dict[str, str]:
@@ -259,8 +294,12 @@ class RayRunner:
             self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()
         req = requires.model_dump() if hasattr(requires, "model_dump") else requires
+        # Never let retries/concurrent attempts overwrite the same multi-object prefix. The controller
+        # caches the returned URI only after this sub-run is terminal, so this physical attempt prefix is
+        # the atomic publication boundary; an interrupted attempt can leave only an unreferenced orphan.
+        attempt_uri = _attempt_handoff_uri(output_uri, run_id)
         threading.Thread(target=self._supervise, args=(run_id, graph, output_node, status),
-                         kwargs={"materialize_uri": output_uri, "requires": req}, daemon=True).start()
+                         kwargs={"materialize_uri": attempt_uri, "requires": req}, daemon=True).start()
         return status
 
     def _materialize_local(self, graph, output_node, output_uri, run_id=None) -> RunStatus:
@@ -520,7 +559,7 @@ class RayRunner:
         job_file, status_file = os.path.join(work, "job.json"), os.path.join(work, "status.json")
         job = {"workspace": self.deps.workspace, "data_dir": self.deps.data_dir, "target": target,
                "graph": prepare_workload_graph(graph), "module": os.path.abspath(__file__), "requires": requires,
-               "materialize_uri": materialize_uri, "status_file": status_file}
+               "materialize_uri": materialize_uri, "attempt_id": run_id, "status_file": status_file}
         if sink_targets is not None:  # whole-graph run only; region materialization has no write sink
             job["sink_targets"] = sink_targets
         with open(job_file, "w") as f:
@@ -625,7 +664,8 @@ class RayRunner:
             return {"status": "failed", "error": f"{type(e).__name__}: {e}",
                     "rows": 0, "outputs": outputs}
 
-    def _run_ir_materialize(self, ir, graph, target, uri, ray_opts=None, progress=None) -> dict:
+    def _run_ir_materialize(self, ir, graph, target, uri, ray_opts=None, progress=None,
+                            attempt_id: str = "driver") -> dict:
         """Child side, region mode: run the clean IR up to `target` on Ray and materialize it to `uri`.
         WORKER-DIRECT WRITE: `uri` becomes a DIRECTORY of parquet shards, each written in parallel by a
         Ray task — nothing funnels through the driver (the old collect→concat→single-file OOM'd on a big
@@ -645,9 +685,8 @@ class RayRunner:
             if progress:
                 progress(0.6, rows)
             out_dir = uri[:-len(".parquet")] if uri.lower().endswith(".parquet") else uri  # a DIR of shards
-            # OVERWRITE (not Ray's default append): the dir name is content-addressed + stable, so a
-            # recompute after a cancelled/failed partial write (or a cache-pointer eviction) must REPLACE
-            # any leftover shards — appending beside them would double the downstream rows.
+            # OVERWRITE (not Ray's default append) makes a retry of this SAME attempt idempotent. Distinct
+            # attempts already have distinct immutable prefixes, so they can never mix their shards.
             from ray.data import SaveMode
             if is_object_uri(out_dir):
                 fs, p = object_fs(out_dir)               # creds-aware object filesystem (same as the adapter)
@@ -657,6 +696,7 @@ class RayRunner:
                 os.makedirs(out_dir, exist_ok=True)
                 ds.write_parquet(out_dir, mode=SaveMode.OVERWRITE,
                                  ray_remote_args=ray_opts or None)  # WORKER-DIRECT: parallel shard write, no funnel
+            _write_handoff_manifest(out_dir, run_id=attempt_id, rows=rows, schema=ds.schema())
             return {"status": "done", "rows": rows, "output_uri": out_dir, "output_table": None}
         except Exception as e:  # noqa: BLE001
             return {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}

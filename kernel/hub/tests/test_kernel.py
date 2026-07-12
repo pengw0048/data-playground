@@ -7744,6 +7744,16 @@ def test_ray_explicit_placement_fails_unadvertised_resources_before_dispatch(tmp
     assert status.status == "failed"
     assert "requested resources" in (status.error or "")
     assert "advertised Ray capacity" in (status.error or "")
+def test_ray_region_handoff_uses_an_immutable_attempt_prefix():
+    attempt_uri = _load_dp_ray()._attempt_handoff_uri
+
+    first = attempt_uri("s3://bucket/regions/node_hash.parquet", "unit_first")
+    second = attempt_uri("s3://bucket/regions/node_hash.parquet", "unit_second")
+
+    assert first == "s3://bucket/regions/node_hash.attempt-unit_first"
+    assert second == "s3://bucket/regions/node_hash.attempt-unit_second"
+    assert first != second
+    assert attempt_uri("/tmp/out.parquet", "../../unsafe run") == "/tmp/out.attempt-unsafe_run"
 
 
 def test_ray_region_worker_direct_write_and_progress(tmp_path):
@@ -7786,12 +7796,20 @@ def test_ray_region_worker_direct_write_and_progress(tmp_path):
     assert saw_interim, "the placed sub-run's progress never surfaced an interim value to the parent"
     d = s.output_uri
     assert os.path.isdir(d), f"worker-direct write must produce a DIRECTORY of shards, got {d}"
+    assert d != suggested and ".attempt-" in d
+    manifest_path = os.path.join(d, "_DP_SUCCESS.json")
+    assert os.path.isfile(manifest_path), "completed handoff has no commit manifest"
+    import json as _json
+    with open(manifest_path) as manifest_file:
+        manifest = _json.load(manifest_file)
+    assert manifest["format"] == "data-playground-ray-handoff-v1"
+    assert manifest["runId"] == st.run_id and manifest["rows"] == 20
     assert _glob.glob(os.path.join(d, "**", "*.parquet"), recursive=True), "no parquet shards written"
     got = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{d}/**/*.parquet')").fetchall())
     assert got == [2 * i for i in range(1, 21)]
 
-    # re-materialize the SAME region into the SAME dir (a recompute after cache loss / a prior partial
-    # write): the write must OVERWRITE, not append — else the downstream ref-source reads doubled rows.
+    # Re-materializing the same content-addressed suggestion publishes a NEW immutable physical prefix.
+    # A concurrent/failed attempt can therefore never mix its shards into the committed result.
     st2 = rr.run_unit(g, "m", suggested)
     for _ in range(900):
         s2 = rr.status(st2.run_id)
@@ -7799,8 +7817,12 @@ def test_ray_region_worker_direct_write_and_progress(tmp_path):
             break
         time.sleep(0.1)
     assert s2.status == "done", s2.error
+    assert s2.output_uri != d
+    assert os.path.isfile(os.path.join(s2.output_uri, "_DP_SUCCESS.json"))
     again = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{s2.output_uri}/**/*.parquet')").fetchall())
-    assert again == [2 * i for i in range(1, 21)], f"recompute must overwrite, not append (got {len(again)} rows)"
+    assert again == [2 * i for i in range(1, 21)]
+    original = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{d}/**/*.parquet')").fetchall())
+    assert original == again, "publishing a retry mutated the previously committed attempt"
 
 
 def test_ray_aggregate_live_differential(tmp_path):
