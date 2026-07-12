@@ -629,10 +629,15 @@ class BuildEngine:
                 return parent  # nothing chosen to fold → pass through
             name_col = (cfg.get("nameColumn") or "name").strip() or "name"
             value_col = (cfg.get("valueColumn") or "value").strip() or "value"
+            # keep NULL cells by DEFAULT so wide→long loses NO rows — DuckDB's bare UNPIVOT drops them
+            # (a row whose folded columns are all NULL would silently vanish). Opt out with includeNulls=false.
+            kn = cfg.get("includeNulls", True)
+            keep_nulls = kn if isinstance(kn, bool) else str(kn).strip().lower() not in ("false", "0", "no", "off", "")
+            nulls = "INCLUDE NULLS" if keep_nulls else "EXCLUDE NULLS"
             v = self._view(parent, "up")  # wide → long: each chosen column becomes (name, value) rows
-            on = ", ".join(f'"{_ident(c)}"' for c in cols)
+            on = ", ".join(f'"{_ident(c)}"' for c in cols)  # the SQL-standard FROM-form takes the NULLS mode
             return db.conn().sql(
-                f'UNPIVOT {v} ON {on} INTO NAME "{_ident(name_col)}" VALUE "{_ident(value_col)}"')
+                f'SELECT * FROM {v} UNPIVOT {nulls} ("{_ident(value_col)}" FOR "{_ident(name_col)}" IN ({on}))')
 
         if t == "pivot":
             on_col = (cfg.get("pivotOn") or cfg.get("on") or "").strip()

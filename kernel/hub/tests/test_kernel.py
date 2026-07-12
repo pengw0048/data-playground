@@ -4935,16 +4935,30 @@ def test_pivot_unpivot_nodes(tmp_path):
     with db.run_scope(), pytest.raises(NotPreviewable):
         eng(gp, full=False, sample_k=1).relation("p")
 
-    # unpivot: wide (uid, a, b) → long (uid, name, value); previewable (row-wise, no aggregate)
+    # unpivot: wide (uid, a, b) → long (uid, name, value); previewable (row-wise, no aggregate). Data has a
+    # NULL cell in EACH row → default (includeNulls) must keep every (row × column) cell — DuckDB's bare
+    # UNPIVOT would silently drop the NULL cells (and a fully-NULL row would vanish entirely).
     pw = str(tmp_path / "wide.parquet")
-    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES ('u1',10,20),('u2',5,0)) t(uid,a,b)) TO '{pw}' (FORMAT PARQUET)")
+    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES ('u1',10,NULL),('u2',NULL,5)) t(uid,a,b)) TO '{pw}' (FORMAT PARQUET)")
     gu = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pw}),
         N("u", "unpivot", {"columns": "a, b", "nameColumn": "name", "valueColumn": "value"})], "edges": [E("s", "u")]})
     with db.run_scope():
         t2 = eng(gu, full=True).relation("u").order("uid, name").to_arrow_table()
         assert set(t2.column_names) == {"uid", "name", "value"}
         assert sorted((r["uid"], r["name"], r["value"]) for r in t2.to_pylist()) == \
-            [("u1", "a", 10), ("u1", "b", 20), ("u2", "a", 5), ("u2", "b", 0)]
+            [("u1", "a", 10), ("u1", "b", None), ("u2", "a", None), ("u2", "b", 5)]  # NULLs kept, no row loss
+
+    # includeNulls=false → drop the NULL cells (the compact form)
+    gd = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pw}),
+        N("u", "unpivot", {"columns": "a, b", "includeNulls": False})], "edges": [E("s", "u")]})
+    with db.run_scope():
+        t3 = eng(gd, full=True).relation("u").to_arrow_table()
+        assert sorted((r["uid"], r["name"], r["value"]) for r in t3.to_pylist()) == [("u1", "a", 10), ("u2", "b", 5)]
+
+    # pivot's columns are data-dependent → its schema_only port is UNTYPED (not a misleading [uid] subset)
+    from hub.executors.schema import schema_for_graph
+    ports = schema_for_graph(gp, d.resolve_adapter, d.registry, node_builders=d.node_builders, node_specs=d.node_specs)
+    assert ports.get("p") is None, f"pivot port should be untyped (data-dependent columns), got {ports.get('p')}"
 
     # pivot aggregates the full input → blocking (drives region placement); unpivot is row-wise → not
     from hub import estimate as _est

@@ -275,7 +275,7 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
             out[nid] = _sized(1, "bounded", w)
             continue
 
-        if t in ("aggregate", "join", "sql", "unnest") or t in _CODE or t in ("vector-search",):
+        if t in ("aggregate", "join", "sql", "unnest", "pivot") or t in _CODE or t in ("vector-search",):
             # genuinely unknown output cardinality — never fabricate. blocking per op type (drives placement).
             out[nid] = _sized(None, "unknown", w, is_blocking(t))
             continue
