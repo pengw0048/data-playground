@@ -13,7 +13,7 @@ there are two access modes:
   run — each scope drops only the temp views IT minted. Cursor ops are thread-confined, so they
   need no lock. This is what stops a single long run from freezing every other user's preview/run.
 
-Temp view names are still process-globally unique so names never collide across scopes/threads.
+Temp view names are unique across process lifetimes so names and derived spill files never collide.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import itertools
 import os
 import tempfile
 import threading
+import uuid
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -30,6 +31,7 @@ import duckdb
 _lock = threading.RLock()  # serializes access to the shared BASE connection (not per-run cursors)
 _conn: duckdb.DuckDBPyConnection | None = None
 _view_seq = itertools.count(1)
+_view_namespace = uuid.uuid4().hex[:12]
 _created_views: set[str] = set()
 _local = threading.local()  # per-thread run scope: .con (the cursor) + .scope (the _Scope)
 
@@ -310,10 +312,13 @@ def interrupt() -> None:
 
 
 def unique_view(prefix: str = "v") -> str:
-    """A process-globally-unique temp view name (never collides across engines/threads). Inside a
-    run_scope the name is tracked on the SCOPE (dropped when the scope exits, on its own cursor);
-    otherwise on the global set (dropped by drop_created_views under the base connection)."""
-    name = f"dp_{prefix}_{next(_view_seq)}"  # itertools.count.__next__ is atomic under the GIL
+    """A temp view name unique across process lifetimes, engines, and threads. Inside a run_scope
+    the name is tracked on the SCOPE (dropped when the scope exits, on its own cursor); otherwise on
+    the global set (dropped by drop_created_views under the base connection). The process namespace
+    also makes derived spill filenames safe when independent kernels share DP_SPILL_DIR."""
+    # The PID separates forked processes; the nonce prevents stale files from a previous process with
+    # a reused PID from colliding. itertools.count.__next__ is atomic under the GIL within a process.
+    name = f"dp_{prefix}_{os.getpid()}_{_view_namespace}_{next(_view_seq)}"
     scope = getattr(_local, "scope", None)
     if scope is not None:
         scope.views.add(name)

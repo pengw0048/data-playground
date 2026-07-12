@@ -1896,6 +1896,30 @@ def test_run_scope_tracks_views_on_the_scope_not_globally():
     assert set(db._created_views) == before
 
 
+def test_spill_names_are_unique_across_processes(tmp_path):
+    # Independent kernels commonly share DP_SPILL_DIR. Both used to start at dp_sec_1.parquet, so
+    # one run could overwrite or delete another kernel's spill file.
+    import subprocess
+    import sys
+
+    spill_root = tmp_path / "shared-spill"
+    env = {**os.environ, "DP_SPILL_DIR": str(spill_root)}
+    code = (
+        "import os\n"
+        "from hub import db\n"
+        "from hub.executors.engine import _spill_root\n"
+        "print(os.path.join(_spill_root(), 'section', db.unique_view('sec') + '.parquet'))\n"
+    )
+    paths = [
+        subprocess.check_output([sys.executable, "-c", code], env=env, text=True).strip()
+        for _ in range(2)
+    ]
+
+    assert len(set(paths)) == 2
+    assert all(os.path.dirname(path) == str(spill_root / "section") for path in paths)
+    assert all(os.path.basename(path).startswith("dp_sec_") for path in paths)
+
+
 def test_metric_over_transform_upstream_not_previewable():
     # a metric whose upstream has a Python transform must refuse preview, not spill all rows (finding #6)
     code = "def fn(row):\n    row['w2'] = row['width'] * 2\n    return row"
