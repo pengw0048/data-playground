@@ -8211,6 +8211,12 @@ def test_ray_typed_empty_paths_live_keep_pre_materialization_schema(tmp_path, mo
 
     monkeypatch.setenv("RAY_DATA_DISABLE_PROGRESS_BARS", "1")
     monkeypatch.setenv("DP_RAY_SHUFFLE_PARTITIONS", "2")
+    from ray._private import ray_constants
+    from hub.ray_compat import patch_hash_shuffle
+    patch_hash_shuffle()
+    monkeypatch.setenv(
+        ray_constants.WORKER_PROCESS_SETUP_HOOK_ENV_VAR, "hub.ray_compat.patch_hash_shuffle"
+    )
     ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
     try:
         # A source that is already empty keeps its native logical schema.
@@ -8313,6 +8319,35 @@ def test_ray_typed_empty_paths_live_keep_pre_materialization_schema(tmp_path, mo
             {"k": 1, "extra": 11, "right_value": "right"},
             {"k": 2, "extra": 21, "right_value": None},
         ]
+
+        drop_all = SimpleNamespace(
+            op="filter", inputs=[("src", None)],
+            config={"mode": "filter", "code": "def fn(row):\n    return False", "onError": "raise"},
+        )
+        filtered_actual = mod._collect_arrow(
+            runner._build(drop_all, {"src": mapped}),
+            purpose="live runtime-schema filter-to-empty",
+        )
+        assert filtered_actual.num_rows == 0
+        assert filtered_actual.schema.names == ["k", "extra"]
+
+        runtime_relational = [
+            (SimpleNamespace(
+                op="aggregate", inputs=[("src", None)],
+                config={"groupBy": "extra", "aggs": "count(*) AS n"},
+            ), ["extra", "n"]),
+            (SimpleNamespace(
+                op="window", inputs=[("src", None)],
+                config={"partitionBy": "extra", "orderBy": "k",
+                        "expr": "row_number()", "as": "rn"},
+            ), ["k", "extra", "rn"]),
+        ]
+        for step, names in runtime_relational:
+            actual = mod._collect_arrow(
+                runner._build(step, {"src": mapped}), purpose=f"live runtime-schema {step.op}"
+            )
+            assert actual.schema.names == names
+            assert actual.num_rows == 2
 
         declared_flat_map = SimpleNamespace(
             op="flat_map", inputs=[("src", None)],

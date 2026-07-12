@@ -80,6 +80,8 @@ they are not silently converted into overwrite Parquet. Empty Parquet results pu
 shard plus the manifest so their schema remains readable. Filters, relational operators, and full-row
 deduplication preserve or derive empty-result schemas. Schema-changing Python transforms must declare
 `outputSchema`; without that contract, an empty result fails instead of publishing a misleading schema.
+These transforms materialize once inside Ray so non-empty downstream operators use the actual runtime
+schema rather than a stale declaration; this adds a stage boundary but does not collect data to the driver.
 
 ## What the validation gate proves
 

@@ -1396,12 +1396,19 @@ class RayRunner:
             # task onto a worker that has the resource — the planner's placement, honored on the cluster.
             result = parent.map_batches(_make_mapper(step.config), batch_format="pyarrow", **opts)
             if step.op == "filter":
-                empty_schema = _known_ray_schema(parent)
-            else:
-                # map/flat-map/batch UDFs may change columns. Only an explicit portable contract can
-                # type an all-empty result without re-running user code; otherwise terminal paths fail.
-                empty_schema = _declared_ray_schema(step.config)
-            return _remember_ray_schema(result, empty_schema)
+                return _remember_ray_schema(result, _known_ray_schema(parent))
+            # A schema-changing UDF's outputSchema is only an empty-result fallback unless enforcement is
+            # requested elsewhere. Materialize once in the cluster so non-empty downstream operators use
+            # the actual runtime schema; otherwise a stale/narrow declaration could change their semantics.
+            result = result.materialize()
+            rows = result.count()
+            runtime_schema = _runtime_ray_schema(result)
+            if rows > 0 and runtime_schema is None:
+                raise RuntimeError("a non-empty Ray transform did not expose an Arrow schema")
+            # Ray 2.56 can report the parent's schema after a schema-changing UDF emits zero rows. That
+            # metadata is stale by construction, so only the portable contract may type an empty result.
+            schema = runtime_schema if rows > 0 else _declared_ray_schema(step.config)
+            return _remember_ray_schema(result, schema)
         if step.op == "aggregate":
             return self._build_aggregate(step, parent, opts)
         if step.op == "window":
