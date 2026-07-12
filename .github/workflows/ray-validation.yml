@@ -85,6 +85,12 @@ jobs:
         run: |
           DP_MULTINODE_FAULT= docker compose -f docker-compose.ray.yml run --rm --no-deps driver 2>&1 | tee ray-diagnostics/clean.log
 
+      - name: Require the default shuffle-partition path
+        run: |
+          docker compose -f docker-compose.ray.yml run --rm --no-deps \
+            -e DP_RAY_SHUFFLE_PARTITIONS=0 -e DP_MULTINODE_FAULT= driver 2>&1 \
+            | tee ray-diagnostics/default-shuffle.log
+
       - name: Require every fault control to fail
         run: |
           for fault in schema rows join; do
