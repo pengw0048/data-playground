@@ -67,18 +67,31 @@ def _unknown_kind_error(graph, deps) -> str | None:
     return f"unknown node kind '{t}' (node '{nid}') — install its plugin or remove the node"
 
 
-def _reject_unknown_kinds(graph, deps) -> None:
-    err = _unknown_kind_error(graph, deps)
-    if err:
-        raise HTTPException(400, err)
+def _invalid_graph(graph, deps, target_node_id: str | None = None) -> tuple[str, bool] | None:
+    """The single validation path for every API that consumes a caller-supplied graph.
 
-
-def _reject_invalid(graph, deps) -> None:
-    """400 on a graph the type system forbids (server-side; the frontend blocks these too)."""
-    _reject_unknown_kinds(graph, deps)  # fail closed on a missing plugin / typo before doing any work
+    Returns ``(message, acyclic)`` so compile can preserve its error-plan contract while the other
+    endpoints consistently reject the same malformed graph with HTTP 400.
+    """
+    unknown = _unknown_kind_error(graph, deps)
+    if unknown:
+        return unknown, True  # preserve P0-DATA-02's existing error text and compile semantics
+    structural = graph_mod.structural_errors(graph, deps.node_specs, target_node_id)
+    if structural:
+        return "invalid graph: " + "; ".join(structural[:5]), True
     errs = graph_mod.type_errors(graph, deps.node_specs)
     if errs:
-        raise HTTPException(400, "incompatible connection: " + "; ".join(errs[:5]))
+        return "incompatible connection: " + "; ".join(errs[:5]), True
+    if not graph_mod.is_acyclic(graph):
+        return "graph has a cycle — control flow must be encapsulated (§5.7)", False
+    return None
+
+
+def _reject_invalid(graph, deps, target_node_id: str | None = None) -> None:
+    """400 on any graph that compile would reject."""
+    invalid = _invalid_graph(graph, deps, target_node_id)
+    if invalid:
+        raise HTTPException(400, invalid[0])
 
 
 @router.post("/graph/compile", response_model=CompilePlan)
@@ -86,13 +99,10 @@ def compile_graph(req: CompileRequest, uid: str = Depends(current_user)) -> Comp
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    unknown = _unknown_kind_error(req.graph, deps)  # P0-DATA-02: a missing plugin / typo is not a valid plan
-    if unknown:
-        return CompilePlan(target_node_id=req.target_node_id, steps=[], acyclic=True, error=unknown)
-    errs = graph_mod.type_errors(req.graph, deps.node_specs)
-    if errs:
-        return CompilePlan(target_node_id=req.target_node_id, steps=[], acyclic=True,
-                           error="incompatible connection: " + "; ".join(errs[:5]))
+    invalid = _invalid_graph(req.graph, deps, req.target_node_id)
+    if invalid:
+        error, acyclic = invalid
+        return CompilePlan(target_node_id=req.target_node_id, steps=[], acyclic=acyclic, error=error)
     return compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
 
 
@@ -101,7 +111,7 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    _reject_unknown_kinds(req.graph, deps)  # P0-DATA-02: don't preview a missing-plugin node as passthrough
+    _reject_invalid(req.graph, deps, req.node_id)
     k = req.k if req.k is not None else settings.preview_k
     if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
         try:
@@ -120,7 +130,7 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    _reject_unknown_kinds(req.graph, deps)  # P0-DATA-02
+    _reject_invalid(req.graph, deps, req.node_id)
     if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
         try:
             return ProfileResult(**kb.profile(req.graph, req.node_id, full=req.full))  # on the canvas's warm kernel
@@ -136,7 +146,7 @@ def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    _reject_unknown_kinds(req.graph, deps)  # P0-DATA-02
+    _reject_invalid(req.graph, deps, req.target_node_id)
     return schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
                             deps.node_builders, deps.node_specs)
 
@@ -149,6 +159,7 @@ def graph_estimate(req: CompileRequest, uid: str = Depends(current_user)) -> dic
     from hub.estimate import estimate_sizes
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
+    _reject_invalid(req.graph, deps, req.target_node_id)
     try:
         sizes = estimate_sizes(req.graph, deps.resolve_adapter, actuals=_actuals_for(req.graph, deps))
     except Exception:  # noqa: BLE001 — a hint must never 500
@@ -164,6 +175,7 @@ def graph_plan(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
     splits it. Never 500s."""
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
+    _reject_invalid(req.graph, deps, req.target_node_id)
     if not req.target_node_id:
         return {"regions": []}
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
@@ -180,6 +192,7 @@ def join_analysis(req: CompileRequest, uid: str = Depends(current_user)) -> Join
     _require_graph_read_access(req.graph, uid)
     from hub import relationships as rel
     deps = get_deps()
+    _reject_invalid(req.graph, deps, req.target_node_id)
     if not req.target_node_id:
         return JoinAnalysis(note="no join node selected")
     cols = schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
@@ -327,7 +340,7 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    _reject_invalid(req.graph, deps)
+    _reject_invalid(req.graph, deps, req.target_node_id)
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
@@ -368,7 +381,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             raise HTTPException(403, f"canvas '{cid}' requires owner or editor to run")
         auth_canvas = cid  # a real writable canvas → all collaborators may observe this run
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    _reject_invalid(graph, deps)
+    _reject_invalid(graph, deps, target_node_id)
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")

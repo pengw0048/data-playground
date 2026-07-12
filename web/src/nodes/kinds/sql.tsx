@@ -28,7 +28,7 @@ register(
     tag: 'sql',
     // accepts matches the backend spec (nodespecs.py `sql`): dataset + sample. No node emits a
     // 'sql-view' wire, so accepting it here only let frontend canConnect diverge from backend validation.
-    inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'] }],
+    inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'], multi: true }],
     outputs: [{ id: 'out', wire: 'dataset' }],
     canBypass: false,
     blurb: 'SQL over a table → a queryable view',
