@@ -7588,6 +7588,95 @@ def test_ray_custom_labels_are_advertised_to_the_pre_dispatch_gate(tmp_path, mon
         ResourceSpec(labels={"engine": "ray", "pool": "h100"}))
 
 
+def test_ray_whole_run_enforces_and_forwards_final_region_resources(tmp_path, monkeypatch):
+    from hub.compiler import compile_plan
+    from hub.deps import Deps
+    from hub.models import Graph
+
+    (tmp_path / "ws").mkdir()
+    mod = _load_dp_ray()
+    rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+
+    def graph(pool):
+        return Graph(**{"id": "ray-final-placement", "version": 1, "nodes": [
+            _ray_node("src", "source", {"uri": "unused.parquet", "requires": {
+                "labels": {"engine": "ray", "pool": pool}}}),
+        ], "edges": []})
+
+    rejected = graph("h100")
+    failed = rr.run(compile_plan(rejected, "src", rr.deps.registry, rr.node_specs),
+                    rejected, "src", "local")
+    assert failed.status == "failed" and "exceed advertised" in (failed.error or "")
+
+    monkeypatch.setenv("DP_RAY_LABELS", "pool=a100")
+    accepted = graph("a100")
+    dispatched = {}
+
+    class _Thread:
+        def __init__(self, *, target, args, kwargs, daemon):
+            dispatched.update(target=target, args=args, kwargs=kwargs, daemon=daemon)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(mod.threading, "Thread", _Thread)
+    queued = rr.run(compile_plan(accepted, "src", rr.deps.registry, rr.node_specs),
+                    accepted, "src", "local")
+    assert queued.status == "queued"
+    assert dispatched["kwargs"]["requires"]["labels"] == {"engine": "ray", "pool": "a100"}
+
+
+def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    import pyarrow as pa
+
+    from hub.deps import Deps
+    from hub.models import Graph, ResourceSpec
+
+    monkeypatch.setenv("DP_RAY_LABELS", "pool=a100")
+    (tmp_path / "ws").mkdir()
+    mod = _load_dp_ray()
+    rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    opts = {"num_gpus": 1.0, "resources": {"a100": 0.001}}
+    calls = []
+
+    class _Data:
+        def __init__(self, refs=None):
+            self.refs = refs or []
+
+        def columns(self):
+            return ["k"]
+
+        def repartition(self, *args, **kwargs):
+            return self
+
+        def map_batches(self, fn, **kwargs):
+            calls.append(kwargs)
+            return self
+
+        def to_arrow_refs(self):
+            return self.refs
+
+    rr._shuffle_duckdb(_Data(), ["k"], "SELECT DISTINCT * FROM _blk", opts)
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda refs: [pa.table({"k": [1]})]))
+    step = SimpleNamespace(inputs=[("left", None), ("right", None)],
+                           config={"how": "inner", "on": "k"})
+    rr._build_join(step, {"left": _Data(), "right": _Data(["ref"])}, opts)
+    assert len(calls) == 2
+    assert all(call["num_gpus"] == 1.0 and call["resources"] == {"a100": 0.001} for call in calls)
+
+    graph = Graph(**{"id": "ray-pinned-sort", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": "unused.parquet"}),
+        _ray_node("sort", "sort", {"by": "k"}),
+    ], "edges": [_ray_edge("src", "sort")]})
+    status = rr.run_unit(
+        graph, "sort", str(tmp_path / "sort.parquet"),
+        requires=ResourceSpec(labels={"engine": "ray", "pool": "a100"}))
+    assert status.status == "failed" and "sort cannot honor" in (status.error or "")
+
+
 def test_ray_explicit_placement_fails_unsupported_shape_while_unpinned_falls_back(tmp_path, monkeypatch):
     from hub.deps import Deps
     from hub.models import Graph, ResourceSpec

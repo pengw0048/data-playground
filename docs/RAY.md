@@ -31,7 +31,7 @@ safe to distribute.
 | `window` | yes, for a bare-column partition key | order-sensitive forms without a sufficient order fall back |
 | full-row `dedup` | yes | keyed dedup and schemas containing floating-point values fall back |
 | `join` | broadcast `inner`, `left`, and `cross` | the complete right side is collected by the driver and must be bounded |
-| `sort` | plain-column keys | the final ordered result is coalesced to one worker |
+| `sort` | plain-column keys | the final ordered result is coalesced to one worker; Ray 2.56 cannot resource-pin its range shuffle, so GPU/custom-resource sorts fail before dispatch |
 | SQL, sections, metrics/charts, opaque plugin nodes | no | local fallback |
 
 ### Data movement
