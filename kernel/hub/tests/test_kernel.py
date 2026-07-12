@@ -1612,6 +1612,47 @@ def test_recover_orphans_restores_interrupted_compaction_and_cleans_staging(tmp_
     assert "keep.parquet" in names and not any(".parttmp-" in n or ".compact-" in n for n in names)
 
 
+def test_recover_orphans_resolves_partition_overwrite_crash_points(tmp_path):
+    """Before/during/after the two-rename commit, recovery exposes one complete version."""
+    import duckdb
+
+    from hub.storage import LocalStorage
+
+    root = str(tmp_path / "outputs")
+    os.makedirs(root)
+
+    def write_version(path: str, value: int) -> None:
+        part = os.path.join(path, f"cat={value}")
+        os.makedirs(part)
+        duckdb.sql(f"SELECT {value} AS id").write_parquet(os.path.join(part, "data.parquet"))
+
+    def ids(path: str) -> list[int]:
+        rows = duckdb.read_parquet(os.path.join(path, "**/*.parquet"), hive_partitioning=True).fetchall()
+        return [row[0] for row in rows]
+
+    # Crash before commit: the old base is still live and the unpublished staging dir is discarded.
+    before = os.path.join(root, "before")
+    write_version(before, 1)
+    write_version(before + ".partition-new-11111111", 2)
+
+    # Crash during commit: the old base has been parked but the staged version is not published yet.
+    during = os.path.join(root, "during")
+    write_version(during + ".partition-old-22222222", 3)
+    write_version(during + ".partition-new-22222222", 4)
+
+    # Crash after commit: the new base is live and only cleanup of the parked old version remains.
+    after = os.path.join(root, "after")
+    write_version(after, 6)
+    write_version(after + ".partition-old-33333333", 5)
+
+    LocalStorage(root).recover_orphans()
+
+    assert ids(before) == [1]
+    assert ids(during) == [3]
+    assert ids(after) == [6]
+    assert not [name for name in os.listdir(root) if ".partition-old-" in name or ".partition-new-" in name]
+
+
 def test_partitioned_write_hive_layout_and_pruned_read(tmp_path):
     # ARC4 write-partitioned-merge: partitionBy → a Hive dir=val/ parquet directory, read back with the
     # partition column present + partition pruning; overwrite is clean (temp dir + swap, no stale
@@ -1652,9 +1693,44 @@ def test_partitioned_write_hive_layout_and_pruned_read(tmp_path):
         assert "run" not in frel.columns and set(frel.columns) == {"id", "v"}, "flat dir got a spurious partition col"
 
 
-def test_partitioned_object_overwrite_is_clean(tmp_path):
-    # ARC4 #43 review #5: an object-store partitioned OVERWRITE must clear the prefix first, else a re-run
-    # whose partition set shrank leaves stale partition objects that the read merges in → wrong row count.
+def test_partitioned_local_overwrite_rolls_back_when_publish_fails(tmp_path, monkeypatch):
+    from hub import db
+    from hub.plugins import adapters as adapter_module
+    from hub.plugins.adapters import DuckDBAdapter
+
+    a = DuckDBAdapter()
+    out = str(tmp_path / "parted.parquet")
+    with db.lock():
+        a.write(out, db.conn().sql("SELECT i AS id, mod(i, 3) AS cat FROM range(0, 30) r(i)"),
+                "overwrite", partition_by="cat")
+
+        base = os.path.splitext(out)[0]
+        real_replace = os.replace
+        failed = False
+
+        def fail_publish_once(src: str, dst: str) -> None:
+            nonlocal failed
+            if not failed and src.startswith(base + ".partition-new-") and dst == base:
+                failed = True
+                raise OSError("injected publish failure")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(adapter_module.os, "replace", fail_publish_once)
+        with pytest.raises(OSError, match="injected publish failure"):
+            a.write(out, db.conn().sql("SELECT i AS id, 0 AS cat FROM range(0, 4) r(i)"),
+                    "overwrite", partition_by="cat")
+
+        # The failed replacement synchronously restores the complete old version; no restart is needed.
+        old = a.scan(base)
+        assert old.aggregate("count(*)").fetchone()[0] == 30
+        assert old.aggregate("count(DISTINCT cat)").fetchone()[0] == 3
+        assert not [name for name in os.listdir(tmp_path)
+                    if ".partition-old-" in name or ".partition-new-" in name]
+
+
+def test_partitioned_object_overwrite_is_rejected_without_mutation():
+    # A multi-object Hive prefix cannot be atomically replaced by the file adapter. Reject before deleting
+    # any existing object; ordinary single-object overwrite remains supported.
     pytest.importorskip("moto")
     pytest.importorskip("flask")
     boto3 = pytest.importorskip("boto3")
@@ -1676,16 +1752,15 @@ def test_partitioned_object_overwrite_is_clean(tmp_path):
                            region_name="us-east-1")
         a = DuckDBAdapter()
         uri = "s3://bkt/parted.parquet"
+        cli.put_object(Bucket="bkt", Key="parted/cat=9/old.parquet", Body=b"complete-old-version")
         with db.lock():
-            a.write(uri, db.conn().sql("SELECT i AS id, mod(i, 3) AS cat FROM range(0, 30) r(i)"), "overwrite", partition_by="cat")
-            keys1 = [o["Key"] for o in cli.list_objects_v2(Bucket="bkt", Prefix="parted/").get("Contents", [])]
-            assert any("cat=1" in k for k in keys1) and any("cat=2" in k for k in keys1)  # first write: 3 partitions
-            a.write(uri, db.conn().sql("SELECT i AS id, 0 AS cat FROM range(0, 4) r(i)"), "overwrite", partition_by="cat")
-        # the shrinking overwrite must have CLEARED the prefix — only cat=0 survives (no stale cat=1/cat=2).
-        # Verified via boto3 (not a DuckDB httpfs glob, which is flaky against moto's 0.0.0.0 endpoint).
-        keys2 = [o["Key"] for o in cli.list_objects_v2(Bucket="bkt", Prefix="parted/").get("Contents", [])]
-        data = [k for k in keys2 if k.endswith(".parquet")]  # DATA files (empty S3 dir-markers are harmless — the read globs *.parquet)
-        assert data and all("cat=0" in k for k in data), f"stale DATA partitions survived the overwrite: {data}"
+            with pytest.raises(NotImplementedError, match="atomic table format or catalog commit"):
+                a.write(uri, db.conn().sql("SELECT i AS id, mod(i, 3) AS cat FROM range(0, 30) r(i)"),
+                        "overwrite", partition_by="cat")
+            a.write("s3://bkt/plain.parquet", db.conn().sql("SELECT 7 AS id"), "overwrite")
+
+        assert cli.get_object(Bucket="bkt", Key="parted/cat=9/old.parquet")["Body"].read() == b"complete-old-version"
+        assert cli.head_object(Bucket="bkt", Key="plain.parquet")["ContentLength"] > 0
     finally:
         server.stop()
         metadb.set_setting("objectStore", {}, "global")
