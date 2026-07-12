@@ -38,6 +38,24 @@ _RUN_INDEX_MAX = 1000  # cap deps.run_index (run_id -> owning runner); well abov
 _RUN_MUTATE_ROLES = ("owner", "editor")
 
 
+def _require_graph_read_access(graph, uid: str) -> tuple[str | None, str | None]:
+    """Authorize a caller-supplied graph by its saved-canvas identity before touching its sources.
+
+    In shared/auth mode, graph analysis is only meaningful inside a real canvas the caller can read;
+    owner, editor, and viewer are all read roles. Unknown ids and private canvases both return 404 so
+    the endpoint does not become a canvas-enumeration oracle. Open single-user mode keeps supporting
+    ad-hoc graphs. This is an identity check only: pinning the payload to a saved revision is separate.
+    """
+    if not auth.auth_enabled():
+        return None, None
+    cid = graph.get("id") if isinstance(graph, dict) else getattr(graph, "id", None)
+    cid = str(cid or "")
+    role = metadb.canvas_role(cid, uid) if cid else None
+    if role is None:
+        raise HTTPException(404, f"canvas '{cid}' not found")
+    return cid, role
+
+
 def _unknown_kind_error(graph, deps) -> str | None:
     """P0-DATA-02: a node whose kind isn't registered (a missing plugin, a misspelling) used to compile
     and execute as a silent passthrough — the pipeline reports success while omitting the work. Return a
@@ -64,7 +82,8 @@ def _reject_invalid(graph, deps) -> None:
 
 
 @router.post("/graph/compile", response_model=CompilePlan)
-def compile_graph(req: CompileRequest) -> CompilePlan:
+def compile_graph(req: CompileRequest, uid: str = Depends(current_user)) -> CompilePlan:
+    _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     unknown = _unknown_kind_error(req.graph, deps)  # P0-DATA-02: a missing plugin / typo is not a valid plan
@@ -79,6 +98,7 @@ def compile_graph(req: CompileRequest) -> CompilePlan:
 
 @router.post("/run/preview", response_model=SampleResult)
 def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> SampleResult:
+    _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_unknown_kinds(req.graph, deps)  # P0-DATA-02: don't preview a missing-plugin node as passthrough
@@ -97,6 +117,7 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
 def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> ProfileResult:
     """Per-column stats (null/distinct/min/max/mean) over a node's output — the previewed sample, or the
     WHOLE dataset (a full pass) when `full` is set."""
+    _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_unknown_kinds(req.graph, deps)  # P0-DATA-02
@@ -110,8 +131,9 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
 
 
 @router.post("/graph/schema")
-def graph_schema(req: CompileRequest) -> dict:
+def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
     """Per-node output columns (metadata-only) for editor column suggestions — see executors/schema."""
+    _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_unknown_kinds(req.graph, deps)  # P0-DATA-02
@@ -120,9 +142,10 @@ def graph_schema(req: CompileRequest) -> dict:
 
 
 @router.post("/graph/estimate")
-def graph_estimate(req: CompileRequest) -> dict:
+def graph_estimate(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
     """Per-node output-SIZE estimate (rows + confidence) for the card size hint — see hub.estimate.
     Conservative + honest: an unknown count comes back rows=null so the UI shows nothing, not a guess."""
+    _require_graph_read_access(req.graph, uid)
     from hub.estimate import estimate_sizes
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
@@ -134,11 +157,12 @@ def graph_estimate(req: CompileRequest) -> dict:
 
 
 @router.post("/graph/plan")
-def graph_plan(req: CompileRequest) -> dict:
+def graph_plan(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
     """The execution plan for a target: the regions it splits into, each with backend + boundary tier +
     estimated size — the UI 'run plan' preview that makes cost-based placement + tiering visible. A plain
     graph is one 'default' region (runs locally); placement (a cluster backend / engine label / checkpoint)
     splits it. Never 500s."""
+    _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     if not req.target_node_id:
         return {"regions": []}
@@ -150,9 +174,10 @@ def graph_plan(req: CompileRequest) -> dict:
 
 
 @router.post("/graph/join-analysis", response_model=JoinAnalysis)
-def join_analysis(req: CompileRequest) -> JoinAnalysis:
+def join_analysis(req: CompileRequest, uid: str = Depends(current_user)) -> JoinAnalysis:
     """Catalog-driven join hints for a join node (target_node_id): ranked key suggestions for its
     two inputs (cardinality from measured/grain-derived key uniqueness) + a fan-out warning."""
+    _require_graph_read_access(req.graph, uid)
     from hub import relationships as rel
     deps = get_deps()
     if not req.target_node_id:
@@ -209,7 +234,10 @@ def agent_get_status() -> dict:
 
 
 @router.post("/agent")
-def agent_act(req: AgentRequest) -> dict:
+def agent_act(req: AgentRequest, uid: str = Depends(current_user)) -> dict:
+    # The agent's preview/validate tools can execute the caller-supplied graph, so apply the same
+    # read boundary as the explicit graph-analysis routes before checking provider availability.
+    _require_graph_read_access(req.graph, uid)
     st = agent_status()
     if not st["available"]:
         return {"available": False, "reason": st["reason"]}
@@ -296,6 +324,7 @@ def _cached_noop(runner, graph, target) -> bool:
 
 @router.post("/run/estimate", response_model=RunEstimate)
 def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunEstimate:
+    _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps)
@@ -327,20 +356,17 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     refs, rejects an invalid/cyclic graph (HTTPException), sizes + gates the run (RunNeedsConfirm), then
     hands to the RunController (placement-splitting) or the base runner and records the owner in
     run_index. Returns (status, owner); poll the owner via _status_or_lost / cancel via run_index."""
-    # A run against an EXISTING canvas is a mutation of that canvas's operational state/history, so it
-    # requires owner/editor rather than mere visibility. An id that names no saved canvas is the caller's
-    # own ad-hoc workspace (allowed, owned by uid below). Authorize before resolving or compiling the
-    # caller-supplied graph so a read-only collaborator cannot make the server touch its sources first.
+    # A run is a mutation of a saved canvas's operational state/history, so auth mode requires a REAL
+    # reachable canvas plus owner/editor (viewer is read-only). Only open single-user mode keeps ad-hoc
+    # graph execution. Authorize before resolving or compiling so an invented/private id cannot make the
+    # server touch caller-selected sources through POST /run after the read routes have been closed.
     auth_canvas = None
     if auth.auth_enabled():
-        cid = getattr(graph, "id", None) or ""
-        if cid and metadb.canvas_exists(cid):
-            role = metadb.canvas_role(cid, uid)
-            if role is None:
-                raise HTTPException(404, f"canvas '{cid}' not found")
-            if role not in _RUN_MUTATE_ROLES:
-                raise HTTPException(403, f"canvas '{cid}' requires owner or editor to run")
-            auth_canvas = cid  # a real writable canvas → all collaborators may observe this run
+        cid, role = _require_graph_read_access(graph, uid)
+        assert cid is not None and role is not None  # auth mode returns one authoritative role read
+        if role not in _RUN_MUTATE_ROLES:
+            raise HTTPException(403, f"canvas '{cid}' requires owner or editor to run")
+        auth_canvas = cid  # a real writable canvas → all collaborators may observe this run
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(graph, deps)
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
@@ -361,7 +387,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     else:
         status, owner = runner.run(plan, graph, target_node_id, est.placement), runner
     deps.run_index[status.run_id] = owner  # so status/cancel/ws reach the right owner
-    deps.run_owner[status.run_id] = uid  # creator, so an ad-hoc (no-canvas) run stays private to them
+    deps.run_owner[status.run_id] = uid  # fast in-process creator lookup; auth-mode runs are canvas-bound
     if auth.auth_enabled():  # persist the owner so authz survives restart / other stateless instances
         metadb.bind_run_owner(status.run_id, uid, auth_canvas)
     # bound both (insertion-ordered) so they can't grow for the process lifetime — the runners
@@ -386,8 +412,8 @@ def _run_read_access(run_id: str, uid: str | None) -> bool:
     """Whether `uid` may observe this run.
 
     Open mode is one trusted user. In auth mode, the creator or any current collaborator on the REAL
-    canvas may read status/output. Ad-hoc runs remain private to their creator, and a later canvas that
-    reuses the graph id cannot claim them.
+    canvas may read status/output. A legacy ad-hoc run remains private to its creator, and a later
+    canvas that reuses the graph id cannot claim it.
     """
     if not auth.auth_enabled():
         return True
@@ -409,8 +435,8 @@ def _run_mutate_access(run_id: str, uid: str | None) -> bool:
     """Whether `uid` may cancel this run.
 
     A real-canvas run follows the caller's CURRENT canvas role: owner/editor may mutate; viewer may
-    only observe. An ad-hoc run has no canvas role, so its creator remains its sole operator. Legacy
-    rows without durable creator metadata fall back to the persisted canvas role, then the in-process
+    only observe. A legacy ad-hoc run has no canvas role, so its creator remains its sole operator.
+    Rows without durable creator metadata fall back to the persisted canvas role, then the in-process
     owner only when there is no persisted canvas association at all.
     """
     if not auth.auth_enabled():
