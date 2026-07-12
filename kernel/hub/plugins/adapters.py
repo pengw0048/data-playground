@@ -15,6 +15,7 @@ import hashlib
 import os
 import threading
 import uuid
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 import duckdb
@@ -24,6 +25,14 @@ from hub.models import ColumnSchema
 from hub.plugins.capabilities import tag_columns
 
 Relation = duckdb.DuckDBPyRelation
+CancelCheck = Callable[[], bool]
+
+
+def _raise_if_cancelled(cancelled: CancelCheck | None) -> None:
+    """Fence a staged write before its externally visible publish point."""
+    if cancelled is not None and cancelled():
+        raise RuntimeError("run cancelled before output commit")
+
 
 _TYPE_MAP = {
     "VARCHAR": "string", "BIGINT": "int", "INTEGER": "int", "HUGEINT": "int", "UBIGINT": "int",
@@ -359,16 +368,18 @@ class DuckDBAdapter:
             return "obj:" + hashlib.sha256(uri.encode()).hexdigest()[:12]  # can't stat; key by uri
         return _fingerprint_path(path_of(uri))
 
-    def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None) -> dict:
+    def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None,
+              cancelled: CancelCheck | None = None) -> dict:
         obj = is_object_uri(uri)
         if obj:
             db.ensure_object_store()  # load httpfs + credentials
         target = uri if obj else path_of(uri)  # object stores keep the full s3://… uri
         low = target.lower()
         rows = int(rel.aggregate("count(*)").fetchone()[0])
+        _raise_if_cancelled(cancelled)
         pcols = [c.strip() for c in (partition_by or "").split(",") if c.strip()]
         if pcols:
-            return self._write_partitioned(target, rel, pcols, mode, low, obj, rows)
+            return self._write_partitioned(target, rel, pcols, mode, low, obj, rows, cancelled)
         if mode == "append":
             # append = a DIRECTORY / prefix of part files (out-of-core; the reader reads them all back via
             # _read_dir). Only for row formats that have a directory-scan reader — parquet/csv/tsv/json;
@@ -390,6 +401,7 @@ class DuckDBAdapter:
             part_name = f"part-{uuid.uuid4().hex[:12]}{ext}"
             if obj:
                 self._reject_mixed_part_format(base, ext, obj)  # one exact extension per dataset (read picks one)
+                _raise_if_cancelled(cancelled)  # enter the object append commit phase before moving/publishing
                 self._migrate_singlefile_into_dir(target, base, ext, obj)  # overwrite→append: fold prior file in
                 part = base.rstrip("/") + "/" + part_name
                 self._write_part(rel, part, ext)
@@ -416,6 +428,7 @@ class DuckDBAdapter:
                         # the first may publish, and the second must observe that committed extension before
                         # its os.replace. Staging stays outside the lock so same-format writes remain parallel.
                         self._reject_mixed_part_format(base, ext, obj=False)
+                        _raise_if_cancelled(cancelled)  # staging complete; fence before any visible mutation
                         os.makedirs(base, exist_ok=True)
                         self._migrate_singlefile_into_dir(target, base, ext, obj)  # overwrite→append fold-in
                         os.replace(staging, os.path.join(base, part_name))  # publish INTO base (a committed part)
@@ -437,6 +450,7 @@ class DuckDBAdapter:
         # extension) while the bytes go to `wtarget`, renamed to `target` on success.
         wtarget = target if obj else f"{target}.tmp-{uuid.uuid4().hex[:8]}"
         try:
+            _raise_if_cancelled(cancelled)
             if low.endswith((".csv", ".tsv")):
                 rel.write_csv(wtarget)
             elif low.endswith((".json", ".ndjson")):
@@ -456,6 +470,7 @@ class DuckDBAdapter:
                     try:
                         with fs.open_output_stream(tmp) as f:
                             _stream_ipc(rel, f)
+                        _raise_if_cancelled(cancelled)
                         fs.move(tmp, p)  # server-side copy+delete; the destination is replaced only now
                     except BaseException:
                         import contextlib
@@ -467,6 +482,7 @@ class DuckDBAdapter:
             else:
                 rel.write_parquet(wtarget)
             if not obj:
+                _raise_if_cancelled(cancelled)
                 os.replace(wtarget, target)
         except BaseException:
             if not obj:
@@ -477,7 +493,7 @@ class DuckDBAdapter:
         return {"uri": uri, "rows": rows}
 
     def _write_partitioned(self, target: str, rel: Relation, pcols: list, mode: str, low: str,
-                           obj: bool, rows: int) -> dict:
+                           obj: bool, rows: int, cancelled: CancelCheck | None = None) -> dict:
         """A Hive-partitioned parquet DIRECTORY (dir=val/… layout), read back partition-pruned (the read
         path passes hive_partitioning=True). Parquet + overwrite only. Local publication uses a recoverable
         old/new directory swap: the previous version is parked before the staged version is published, and
@@ -518,6 +534,7 @@ class DuckDBAdapter:
         try:
             _copy(tmp)                                    # fully write and validate the staged version first
             with self._base_lock(base):
+                _raise_if_cancelled(cancelled)             # fence before parking the visible prior version
                 if os.path.lexists(base):
                     os.replace(base, old)                 # preserve the complete prior version for rollback
                     parked = True
@@ -681,7 +698,8 @@ class LanceAdapter:
         except Exception:  # noqa: BLE001
             return _fingerprint_path(path_of(uri))
 
-    def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None) -> dict:
+    def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None,
+              cancelled: CancelCheck | None = None) -> dict:
         if partition_by and partition_by.strip():
             raise NotImplementedError("partitionBy is not supported for Lance output (Hive partitioning is parquet-only)")
         try:
@@ -695,10 +713,12 @@ class LanceAdapter:
             # landmine). Lance mutation modes (merge_insert/update/delete) are a future capability.
             raise NotImplementedError(f"Lance write mode '{mode}' is not supported — use overwrite or append")
         rows = int(rel.aggregate("count(*)").fetchone()[0])
+        _raise_if_cancelled(cancelled)
         # stream RecordBatches into Lance (bounded memory) instead of materializing the whole table.
         # to_arrow_reader — NOT rel.record_batch, which does not exist on DuckDBPyRelation (it resolves as
         # a column lookup → AttributeError, so the old code broke EVERY Lance write on DuckDB 1.5.x).
         reader = rel.to_arrow_reader(1 << 16)
+        _raise_if_cancelled(cancelled)
         lance.write_dataset(reader, path_of(uri), mode=mode)
         return {"uri": uri, "rows": rows}
 

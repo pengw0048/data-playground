@@ -23,6 +23,26 @@ from hub.models import (
 Relation = duckdb.DuckDBPyRelation
 
 
+def stop_acknowledged(backend, status: RunStatus) -> bool:
+    """Whether a terminal-looking backend status proves execution can no longer publish.
+
+    ``done``/``failed`` are ordinary completed outcomes. A backend must explicitly opt into cancelled
+    acknowledgement after it has unwound/reaped its worker; legacy/plugin backends that relabel eagerly
+    remain unacknowledged so a CLI never mistakes their optimistic status for a safe stop.
+    """
+    if status.status in ("done", "failed"):
+        return True
+    if status.status != "cancelled":
+        return False
+    probe = getattr(backend, "cancel_acknowledged", None)
+    if callable(probe):
+        try:
+            return bool(probe(status.run_id))
+        except Exception:  # noqa: BLE001 — fail closed on a broken plugin acknowledgement probe
+            return False
+    return bool(getattr(backend, "cancel_acknowledges_stop", False))
+
+
 @runtime_checkable
 class NodeBuilder(Protocol):
     """The build callable a plugin passes to `reg.add_node(spec, build)` — how a custom node kind
@@ -41,6 +61,12 @@ class NodeBuilder(Protocol):
 
 @runtime_checkable
 class ExecutionBackend(Protocol):
+    """Run ownership contract.
+
+    A backend whose terminal ``cancelled`` means its worker is genuinely unable to publish may expose
+    ``cancel_acknowledges_stop = True`` or ``cancel_acknowledged(run_id)``. Without that optional seam,
+    cancellation is treated as unacknowledged even if a legacy backend eagerly relabels its status.
+    """
     name: str
 
     def can_run(self, plan: CompilePlan) -> bool:
@@ -101,7 +127,10 @@ class DatasetAdapter(Protocol):
     inserted FIRST, so it claims a URI before the built-ins. The built-in DuckDBAdapter (parquet/csv/
     json/arrow/dir/object-store) and LanceAdapter both conform — i.e. the built-ins are just the first
     adapters through this same seam. `scan` MUST be LAZY (return a relation; the runner materializes at
-    the end). An optional `nearest(uri, column, query, k)` adds native ANN (LanceAdapter has it)."""
+    the end). An adapter may optionally accept a `cancelled` callable in `write`; LocalRunner feature-
+    detects it, and the adapter should call it immediately before any externally visible publish point.
+    Adapters without that optional argument retain the legacy pre-call-only cancellation behavior. An
+    optional `nearest(uri, column, query, k)` adds native ANN (LanceAdapter has it)."""
     name: str
 
     def matches(self, uri: str) -> bool: ...

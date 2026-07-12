@@ -100,6 +100,7 @@ class LocalProcessSpawner:
 class KernelBackend:
     """ExecutionBackend that runs on a per-canvas kernel process (name 'kernel')."""
     name = "kernel"
+    cancel_acknowledges_stop = True  # persisted cancelled follows local runner/child acknowledgement
 
     def __init__(self, base, spawner: LocalProcessSpawner):
         self.base = base          # the in-process LocalRunner — hub-side estimate/can_run only

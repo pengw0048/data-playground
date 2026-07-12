@@ -117,10 +117,45 @@ def _apply_params(graph, params: dict, node: str | None = None) -> None:
         raise SystemExit(f"unbound canvas parameter(s): {', '.join(sorted(unbound))} — pass --param NAME=value")
 
 
+_CANCEL_ACK_TIMEOUT_S = 10.0
+
+
+def _cancel_and_wait(owner, run_id: str, status, metadb, timeout_s: float = _CANCEL_ACK_TIMEOUT_S):
+    """Request cancellation and wait a bounded interval for a truthful terminal acknowledgement."""
+    import time
+    from hub.backends import stop_acknowledged
+
+    cancel_error = None
+    try:
+        requested = owner.cancel(run_id)
+        if requested is not None:
+            status = requested
+    except Exception as e:  # noqa: BLE001 — still poll durable state; the request may have reached the worker
+        cancel_error = f"{type(e).__name__}: {e}"
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while not stop_acknowledged(owner, status) and time.monotonic() < deadline:
+        time.sleep(0.05)
+        try:
+            status = owner.status(run_id)
+        except KeyError:
+            persisted = metadb.get_run_state(run_id)
+            if persisted is not None:
+                from hub.models import RunStatus
+                status = RunStatus(**persisted)
+        except Exception as e:  # noqa: BLE001 — a durable row may still acknowledge a remote owner
+            cancel_error = cancel_error or f"{type(e).__name__}: {e}"
+            persisted = metadb.get_run_state(run_id)
+            if persisted is not None:
+                from hub.models import RunStatus
+                status = RunStatus(**persisted)
+    return status, stop_acknowledged(owner, status), cancel_error
+
+
 def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_json: bool,
                   uid: str | None = None, params: dict | None = None) -> int:
     """Run a saved canvas to completion in-process (no browser) and return a shell exit code:
-    0=done, 1=failed, 2=cancelled, 124=timeout. Reuses the exact start_run path the UI + MCP use, so
+    0=done, 1=failed, 2=cancelled, 124=timeout, 130=SIGINT. Timeout/SIGINT request cancellation and wait
+    for bounded terminal acknowledgement. Reuses the exact start_run path the UI + MCP use, so
     placement/gating/ownership are identical; `confirmed=True` because a headless invocation is itself
     the confirmation for a full pass. `node` targets one node (its upstream cone); default = whole canvas.
     Runs the run + poll with stdout diverted to stderr so a node's own print() can't corrupt the summary
@@ -137,6 +172,10 @@ def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_
     graph, cid = _load_canvas_graph(canvas_ref)
     _apply_params(graph, params or {}, node)  # ${NAME} → --param values (raises SystemExit on an unbound token)
     uid = uid or metadb.DEFAULT_USER_ID
+    abort_reason = None
+    abort_code = None
+    cancel_acknowledged = False
+    cancel_error = None
     with contextlib.redirect_stdout(sys.stderr):  # protect stdout during the run (node print() → stderr)
         try:
             status, owner = start_run(deps, graph, node, uid, confirmed=True)
@@ -147,27 +186,49 @@ def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_
         run_id = status.run_id
         deadline = time.monotonic() + timeout_s
         last_reap = time.monotonic()
-        while status.status in ("queued", "running"):
-            if time.monotonic() > deadline:
-                print(f"timeout: run {run_id} still {status.status} after {timeout_s:g}s", file=sys.stderr)
-                return 124
-            time.sleep(0.25)
-            # No hub process runs the periodic reaper here, so a run whose kernel died would otherwise poll
-            # until --timeout. Reap dead-kernel runs ourselves (only_kernel_runs=True leaves a live kernel's
-            # run — and any in-process/subprocess run — untouched) so a crashed kernel fails fast.
-            if time.monotonic() - last_reap > 5:
-                try:
-                    metadb.reap_orphaned_runs(only_kernel_runs=True)
-                except Exception:  # noqa: BLE001 — reaping is best-effort; never crash the run on it
-                    pass
-                last_reap = time.monotonic()
-            try:
-                status = owner.status(run_id)
-            except KeyError:  # evicted from the owner's in-memory ring → read the durable state
-                persisted = metadb.get_run_state(run_id)
-                if persisted is None:
+        try:
+            while status.status in ("queued", "running"):
+                if time.monotonic() > deadline:
+                    abort_reason = f"timeout after {timeout_s:g}s"
+                    abort_code = 124
                     break
-                status = RunStatus(**persisted)
+                time.sleep(0.25)
+                # No hub process runs the periodic reaper here, so a run whose kernel died would otherwise poll
+                # until --timeout. Reap dead-kernel runs ourselves (only_kernel_runs=True leaves a live kernel's
+                # run — and any in-process/subprocess run — untouched) so a crashed kernel fails fast.
+                if time.monotonic() - last_reap > 5:
+                    try:
+                        metadb.reap_orphaned_runs(only_kernel_runs=True)
+                    except Exception:  # noqa: BLE001 — reaping is best-effort; never crash the run on it
+                        pass
+                    last_reap = time.monotonic()
+                try:
+                    status = owner.status(run_id)
+                except KeyError:  # evicted from the owner's in-memory ring → read the durable state
+                    persisted = metadb.get_run_state(run_id)
+                    if persisted is None:
+                        break
+                    status = RunStatus(**persisted)
+        except KeyboardInterrupt:
+            abort_reason = "interrupted by SIGINT"
+            abort_code = 130
+        if abort_code is not None:
+            status, cancel_acknowledged, cancel_error = _cancel_and_wait(owner, run_id, status, metadb)
+    if abort_code is not None:
+        state = status.status
+        if cancel_acknowledged:
+            detail = f"stop acknowledged with terminal status {state}"
+        else:
+            detail = (f"cancellation not acknowledged within {_CANCEL_ACK_TIMEOUT_S:g}s; "
+                      f"last status {state}")
+        if cancel_error:
+            detail += f"; cancel error: {cancel_error}"
+        print(f"{abort_reason}: run {run_id}; {detail}", file=sys.stderr)
+        if as_json:
+            payload = status.model_dump()
+            payload.update({"exit_reason": abort_reason, "cancel_acknowledged": cancel_acknowledged})
+            print(json.dumps(payload, default=str))
+        return abort_code
     if as_json:
         print(json.dumps(status.model_dump(), default=str))
     else:
@@ -206,7 +267,8 @@ def _run_canvas(argv: list[str]) -> None:
                                                 "mode this must own/share the canvas (mirrors `dataplay mcp`).")
     p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                    help="bind a ${NAME} token in the canvas's configs (repeatable) — e.g. --param date=2026-07-12")
-    p.add_argument("--timeout", type=float, default=3600.0, help="max seconds to wait for completion (default 3600)")
+    p.add_argument("--timeout", type=float, default=3600.0,
+                   help="max seconds to wait; cancels the run and exits 124 on timeout (default 3600)")
     p.add_argument("--json", dest="as_json", action="store_true", help="print the final RunStatus as JSON")
     args = p.parse_args(argv)
 
