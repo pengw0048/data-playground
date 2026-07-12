@@ -53,7 +53,7 @@ from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (D
 from hub.ir import (CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
                     plan_is_clean, plan_is_distributable)
 from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
-from hub.workload_env import build_workload_env
+from hub.workload_env import build_workload_env, prepare_workload_graph
 
 # the relational ops THIS backend claims beyond the map-style clean subset (ARC3). The engine does NOT
 # reimplement these on Ray operators — it lets RAY do only the SHUFFLE (hash-partition rows by the op's
@@ -417,7 +417,7 @@ class RayRunner:
         work = tempfile.mkdtemp(prefix="dp_ray_")
         job_file, status_file = os.path.join(work, "job.json"), os.path.join(work, "status.json")
         job = {"workspace": self.deps.workspace, "data_dir": self.deps.data_dir, "target": target,
-               "graph": graph.model_dump(), "module": os.path.abspath(__file__), "requires": requires,
+               "graph": prepare_workload_graph(graph), "module": os.path.abspath(__file__), "requires": requires,
                "materialize_uri": materialize_uri, "status_file": status_file}
         if sink_targets is not None:  # whole-graph run only; region materialization has no write sink
             job["sink_targets"] = sink_targets
