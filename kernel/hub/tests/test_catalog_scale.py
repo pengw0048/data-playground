@@ -189,18 +189,37 @@ def test_semantic_and_hybrid_search():
         return out
 
     metadb.catalog_bulk_seed([
-        _doc("customers", f"{_SEM}c", description="people who buy and purchase products", cols=["email"]),
-        _doc("shipments", f"{_SEM}s", description="packages parcels in transit tracking delivery"),
-        _doc("invoices", f"{_SEM}i", description="billing payments money owed amounts due"),
+        _doc("customers", f"{_SEM}c", folder="semantic/sales", tags=["silver"], owner="crm",
+             description="people who buy and purchase products", cols=["email"]),
+        _doc("shipments", f"{_SEM}s", folder="semantic/ops",
+             description="packages parcels in transit tracking delivery"),
+        _doc("invoices", f"{_SEM}i", folder="semantic/finance", tags=["gold"], owner="finance",
+             description="billing payments money owed amounts due", cols=["amount"]),
+        # This is the unfiltered semantic winner. A filter applied only AFTER top-k would return an
+        # empty page instead of continuing to the best candidate inside semantic/finance.
+        _doc("billing_archive", f"{_SEM}a", folder="semantic/archive", tags=["gold"], owner="finance",
+             description="billing payments money billing payments money", cols=["amount"]),
     ])
     try:
         cat.set_embedder(embed, "test")
         cat._reindex_embeddings()  # synchronous embed of the seeded docs (idempotent)
         sem = client.get("/api/catalog/search", params={"q": "billing payments money", "mode": "semantic"}).json()
         sem_uris = [t["uri"] for t in sem if t["uri"].startswith(_SEM)]
-        assert sem_uris and sem_uris[0] == f"{_SEM}i", "invoices is the closest to a billing query"
+        assert sem_uris and sem_uris[0] == f"{_SEM}a"
+        filtered = client.get("/api/catalog/search", params={
+            "q": "billing payments money", "mode": "semantic", "limit": 1,
+            "folder": "semantic/finance", "tags": "gold", "owner": "finance",
+            "hasColumns": "amount",
+        }).json()
+        assert [t["uri"] for t in filtered] == [f"{_SEM}i"]
+        assert client.get("/api/catalog/search", params={
+            "q": "billing payments money", "mode": "semantic", "folder": "semantic/finance",
+            "tags": "missing",
+        }).json() == []
         # hybrid returns results and still surfaces the semantic winner among the top
-        hyb = client.get("/api/catalog/search", params={"q": "billing payments", "mode": "hybrid"}).json()
+        hyb = client.get("/api/catalog/search", params={
+            "q": "billing payments", "mode": "hybrid", "folder": "semantic/finance",
+        }).json()
         assert any(t["uri"] == f"{_SEM}i" for t in hyb)
     finally:
         cat._embedder = None
@@ -373,6 +392,7 @@ def test_old_protocol_provider_still_works_via_compat():
     tree = cat.browse("")
     assert {fo.name for fo in tree.folders} == {"f1"} and {t.name for t in tree.tables} == {"z"}
     assert [t.name for t in cat.search("x")] == ["x"]
+    assert {t.name for t in cat.search("", query=CatalogQuery(folder="f1", owner="ann"))} == {"x"}
     assert cat.search_modes() == ["lexical"]
     assert cat.get_table("tbl_y").name == "y"  # passthrough still works
 

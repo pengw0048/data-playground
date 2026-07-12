@@ -88,9 +88,9 @@ class SqlCatalog(InMemoryCatalog):
         self._sync()
         return super().browse(prefix)
 
-    def search(self, q, mode="hybrid", limit=50):
+    def search(self, q, mode="hybrid", limit=50, *, query=None):
         self._sync()
-        return super().search(q, mode=mode, limit=limit)
+        return super().search(q, mode=mode, limit=limit, query=query)
 
 
 def register(reg) -> None:

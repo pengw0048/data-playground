@@ -124,7 +124,10 @@ class CatalogProvider(Protocol):
     it runs on every run/preview, so a remote provider should cache. The discovery surface — `list_page`
     (filter+sort+paginate), `facets`, `browse` (folder tree), `search` (lexical/semantic/hybrid) — is
     what a UI uses; every one is expected to PUSH DOWN to the backing store as a bounded query, never
-    to realize the whole catalog. A read-only external catalog can subclass InMemoryCatalog and inherit
+    to realize the whole catalog. ``search(..., query=CatalogQuery(...))`` carries the same structured
+    folder/tag/owner/column filters into semantic and hybrid ranking; providers may keep accepting the
+    legacy three-argument form, in which case the router applies a bounded compatibility filter. A
+    read-only external catalog can subclass InMemoryCatalog and inherit
     the write/browse/search/lineage machinery while overriding only how rows are fetched.
 
     A provider written against the PRE-scale protocol (no list_page/facets/browse/search) still works:
@@ -134,7 +137,8 @@ class CatalogProvider(Protocol):
     def list_page(self, query: CatalogQuery) -> CatalogPage: ...
     def facets(self, query: CatalogQuery) -> Facets: ...
     def browse(self, prefix: str = "") -> CatalogBrowse: ...
-    def search(self, q: str, mode: str = "hybrid", limit: int = 50) -> list[CatalogTable]: ...
+    def search(self, q: str, mode: str = "hybrid", limit: int = 50,
+               *, query: "CatalogQuery | None" = None) -> list[CatalogTable]: ...
     def search_modes(self) -> list[str]: ...  # ["lexical"] (+ "semantic", "hybrid" once an embedder is live)
     def list_tables(self, q: "str | None") -> list[CatalogTable]: ...  # bounded back-compat convenience
     def get_table(self, id_or_name: str) -> CatalogTable: ...

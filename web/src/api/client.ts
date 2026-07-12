@@ -86,6 +86,11 @@ function catalogQuery(p: CatalogQueryParams): string {
   return s ? `?${s}` : ''
 }
 
+function catalogSearchQuery(p: CatalogQueryParams, mode: 'lexical' | 'semantic' | 'hybrid'): string {
+  const query = catalogQuery(p)
+  return `${query || '?'}${query ? '&' : ''}mode=${encodeURIComponent(mode)}`
+}
+
 // One page of the catalog: the item list (bare JSON body, backward-compatible) plus the TOTAL match
 // count + hasMore, which ride in X-Total-Count / X-Has-More headers so paging never loads everything.
 async function catalogPage(params: CatalogQueryParams): Promise<CatalogPage> {
@@ -140,8 +145,8 @@ export const api = {
     req<Facets>(`/catalog/facets${catalogQuery(params)}`),
   catalogTree: (prefix = '') =>
     req<CatalogBrowse>(`/catalog/tree${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`),
-  searchCatalog: (q: string, mode: 'lexical' | 'semantic' | 'hybrid' = 'hybrid', limit = 50) =>
-    req<CatalogTable[]>(`/catalog/search?q=${encodeURIComponent(q)}&mode=${mode}&limit=${limit}`),
+  searchCatalog: (params: CatalogQueryParams, mode: 'lexical' | 'semantic' | 'hybrid' = 'hybrid') =>
+    req<CatalogTable[]>(`/catalog/search${catalogSearchQuery(params, mode)}`),
   table: (id: string) => req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}`),
   setTableMetadata: (id: string, meta: CatalogMetadata) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),

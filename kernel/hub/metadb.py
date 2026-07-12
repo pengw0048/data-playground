@@ -936,6 +936,22 @@ def catalog_query(q: str | None = None, folder: str | None = None, tags: list[st
     return docs, int(total)
 
 
+def catalog_filter_uris(folder: str | None = None, tags: list[str] | None = None,
+                        owner: str | None = None, has_columns: list[str] | None = None,
+                        uris: list[str] | None = None) -> set[str] | None:
+    """URIs allowed by structured catalog filters, or ``None`` when there are no such filters.
+
+    Semantic search already scores the complete embedding matrix.  Restricting that matrix with one
+    URI-only DB query keeps ranking exact without loading catalog documents or applying filters after
+    the top-k cutoff (which can incorrectly return too few matches).
+    """
+    if not (folder or tags or owner or has_columns or uris):
+        return None
+    terms = _catalog_filters(None, folder, tags, owner, has_columns, uris)
+    with session() as s:
+        return set(s.scalars(select(CatalogEntry.uri).where(*terms)))
+
+
 def catalog_facets(q: str | None = None, folder: str | None = None, tags: list[str] | None = None,
                    owner: str | None = None, has_columns: list[str] | None = None, top: int = 100,
                    ) -> dict[str, list[tuple[str, int]]]:

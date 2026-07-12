@@ -189,11 +189,24 @@ def catalog_tree(prefix: str = "") -> CatalogBrowse:
 
 
 @router.get("/catalog/search", response_model=list[CatalogTable])
-def catalog_search(q: str = Query(...), mode: str = "hybrid", limit: int = 50) -> list[CatalogTable]:
+def catalog_search(
+    q: str = Query(...),
+    mode: str = "hybrid",
+    limit: int = 50,
+    folder: str | None = None,
+    tags: str | None = None,
+    owner: str | None = None,
+    uris: list[str] | None = Query(None),
+    has_columns: str | None = Query(None, alias="hasColumns"),
+) -> list[CatalogTable]:
     """Search the catalog. `mode`: 'lexical' (name/folder/tag/column substring), 'semantic' (embedding
     similarity — active only when a plugin registered an embedder), or 'hybrid' (both, rank-fused).
-    Falls back to lexical when no embedder is installed, so search always works offline."""
-    return get_deps().catalog.search(q, mode=mode, limit=max(1, min(int(limit), 200)))
+    Structured filters use the same CatalogQuery contract in every mode. Falls back to lexical when no
+    embedder is installed, so search always works offline."""
+    bounded = max(1, min(int(limit), 200))
+    query = _catalog_query(q, folder, tags, owner, has_columns, "name", "asc", bounded, 0, uris=uris)
+    from hub.plugins.catalog import search_with_query
+    return search_with_query(get_deps().catalog, query, mode, bounded)
 
 
 @router.get("/catalog/tables/{table_id}", response_model=CatalogTable)
@@ -513,4 +526,3 @@ def promote_processor(req: PromoteRequest) -> ProcessorDescriptor:
         input_columns=req.input_columns, output_schema=req.output_schema, blurb=req.blurb,
     )
     return p.descriptor()
-
