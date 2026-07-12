@@ -85,14 +85,17 @@ def _load_canvas_graph(canvas_ref: str):
         return Graph.model_validate(json.loads(c.doc)), c.id
 
 
-def _apply_params(graph, params: dict) -> None:
-    """Substitute ${NAME} tokens in every string config value of a canvas with the given params — headless
+def _apply_params(graph, params: dict, node: str | None = None) -> None:
+    """Substitute ${NAME} tokens in the CONFIG values of a canvas with the given params — headless
     parameterization for cron/CI (e.g. a source uri / filter predicate / sql templated per run). Mutates
-    the graph in place. Fails LOUDLY on an unbound ${NAME} rather than silently running with the literal
-    token (which would e.g. read a path named "${date}")."""
+    the graph in place. ANY ${...} is a token: it's bound to a param or it fails LOUDLY — never left as a
+    silent literal (which would e.g. read a path named "${date}"). Only the nodes that actually run are
+    considered — the whole canvas, or `node`'s upstream cone when a single node is targeted — so an unbound
+    token in an unrelated branch doesn't block a targeted run."""
     import re
 
-    tok = re.compile(r"\$\{(\w+)\}")
+    from hub import graph as g
+    tok = re.compile(r"\$\{([^}]+)\}")  # [^}]+ so names with -/./space bind too, and are never silently kept
     unbound: set[str] = set()
 
     def sub(v):
@@ -105,9 +108,11 @@ def _apply_params(graph, params: dict) -> None:
             return [sub(x) for x in v]
         return v
 
-    for n in graph.nodes:
-        if isinstance(n.data, dict):
-            n.data = sub(n.data)
+    scope = g.upstream_chain(graph, node) if node else graph.nodes  # only the nodes that will actually run
+    for n in scope:
+        cfg = n.data.get("config") if isinstance(n.data, dict) else None
+        if isinstance(cfg, dict):  # substitute only within config (leave title/id/type untouched)
+            n.data = {**n.data, "config": sub(cfg)}
     if unbound:
         raise SystemExit(f"unbound canvas parameter(s): {', '.join(sorted(unbound))} — pass --param NAME=value")
 
@@ -130,7 +135,7 @@ def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_
     from hub.models import RunStatus
     from hub.routers.runs import start_run
     graph, cid = _load_canvas_graph(canvas_ref)
-    _apply_params(graph, params or {})  # ${NAME} → --param values (raises SystemExit on an unbound token)
+    _apply_params(graph, params or {}, node)  # ${NAME} → --param values (raises SystemExit on an unbound token)
     uid = uid or metadb.DEFAULT_USER_ID
     with contextlib.redirect_stdout(sys.stderr):  # protect stdout during the run (node print() → stderr)
         try:
