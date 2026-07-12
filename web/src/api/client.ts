@@ -253,8 +253,8 @@ export const api = {
   logout: () => req<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
   changePassword: (oldPassword: string, newPassword: string) =>
     req<{ ok: boolean }>('/auth/password', { method: 'POST', body: JSON.stringify({ oldPassword, newPassword }) }),
-  getShares: (canvasId: string) => req<{ visibility: string; shares: ShareInfo[] }>(`/canvas/${canvasId}/shares`),
-  addShare: (canvasId: string, body: { userId?: string; role?: string; visibility?: string }) =>
+  getShares: (canvasId: string) => req<{ visibility: CanvasVisibility; shares: ShareInfo[] }>(`/canvas/${canvasId}/shares`),
+  addShare: (canvasId: string, body: { userId?: string; role?: ShareRole; visibility?: CanvasVisibility }) =>
     req<{ ok: boolean }>(`/canvas/${canvasId}/share`, { method: 'POST', body: JSON.stringify(body) }),
   removeShare: (canvasId: string, userId: string) =>
     req<{ ok: boolean }>(`/canvas/${canvasId}/share/${userId}`, { method: 'DELETE' }),
@@ -267,8 +267,11 @@ export interface PerNodeStat { node_id: string; status: string; rows?: number | 
 export interface RunRecordDto { id: string; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputTable?: string | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
 export interface CanvasVersionDto { id: string; version: number; label?: string | null; authorId?: string | null; createdAt?: string | null }
-export interface ShareInfo { userId: string; name: string; role: string }
+export type CanvasRole = 'owner' | 'editor' | 'viewer'
+export type ShareRole = Exclude<CanvasRole, 'owner'>
+export type CanvasVisibility = 'private' | 'workspace' | 'workspace_view'
+export interface ShareInfo { userId: string; name: string; role: ShareRole }
 export interface DpUser { id: string; name: string; email?: string | null; capabilities?: string[] }
-export interface CanvasFile { id: string; name: string; version: number; updatedAt?: string; role?: string; shared?: boolean; visibility?: string }
+export interface CanvasFile { id: string; name: string; version: number; updatedAt?: string; role?: CanvasRole; shared?: boolean; visibility?: CanvasVisibility }
 
 export { toGraph }

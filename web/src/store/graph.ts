@@ -11,7 +11,10 @@ import { registerGenericNodes, nodeInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
 import { parseHash } from '../router'
 import { exampleDoc } from '../examples'
-import { api, KernelError, setApiUser, type AgentBackendNode, type AgentBackendEdge, type DpUser, type CanvasFile } from '../api/client'
+import {
+  api, KernelError, setApiUser,
+  type AgentBackendNode, type AgentBackendEdge, type CanvasFile, type CanvasRole, type DpUser,
+} from '../api/client'
 import { crdtUndo, crdtUndoActive, collabApply } from '../collab/undo'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
@@ -19,10 +22,35 @@ export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 const LS_KEY = 'dp-canvas'       // offline cache of the open doc
 const USER_KEY = 'dp-user'       // last-selected user id
 const OPEN_KEY = (uid: string) => `dp-open-${uid}`  // last-opened file per user
+const ROLE_KEY = (userId: string, canvasId: string) => `dp-canvas-role-${encodeURIComponent(userId)}-${encodeURIComponent(canvasId)}`
+
+export function roleCanEdit(role: CanvasRole | null | undefined): role is 'owner' | 'editor' {
+  return role === 'owner' || role === 'editor'
+}
+
+function cachedRole(userId: string | null | undefined, canvasId: string): CanvasRole | null {
+  if (!userId) return null
+  try {
+    const value = localStorage.getItem(ROLE_KEY(userId, canvasId))
+    return value === 'owner' || value === 'editor' || value === 'viewer' ? value : null
+  } catch {
+    return null
+  }
+}
+
+function rememberRole(userId: string | null | undefined, canvasId: string, role: CanvasRole | null | undefined): void {
+  if (!userId) return
+  try {
+    if (role) localStorage.setItem(ROLE_KEY(userId, canvasId), role)
+    else localStorage.removeItem(ROLE_KEY(userId, canvasId))
+  } catch { /* storage unavailable */ }
+}
 
 let _seq = 0
 let _cfgEdit = { id: '', t: 0 } // coalesces param-edit undo checkpoints
 let _extEditTimer: ReturnType<typeof setTimeout> | null = null // debounces external-edit refetches
+let _fileNavigationGeneration = 0 // latest file-open/new navigation wins across async requests
+let _fileListGeneration = 0       // stale same-user list responses cannot overwrite a newer refresh
 
 /** A canvas position near `base` that doesn't overlap any existing node (so added nodes never stack). */
 export function freePosition(nodes: CanvasNode[], base: { x: number; y: number }): { x: number; y: number } {
@@ -121,9 +149,10 @@ export interface AgentMsg { role: 'user' | 'agent'; text: string; plan?: string[
 
 interface Store {
   doc: CanvasDoc
+  canvasRole: CanvasRole | null     // authoritative role for the open canvas; null fails closed
   kernelInfo: KernelInfo | null
   kernelUp: boolean
-  accessDenied: boolean  // server rejected the save with 403 (view-only / access revoked) — NOT offline
+  accessDenied: boolean  // server rejected the save with 401/403 (session/access changed) — NOT offline
   catalog: CatalogTable[]
   processors: ProcessorDescriptor[]
   specsVersion: number
@@ -206,7 +235,7 @@ interface Store {
 
   // -- persistence --
   save: () => Promise<void>
-  loadDoc: (doc: CanvasDoc) => void
+  loadDoc: (doc: CanvasDoc, role?: CanvasRole | null) => void
   applyExternalEdit: (canvasId?: string) => void
   applyAgentGraph: (graph: { nodes: AgentBackendNode[]; edges: AgentBackendEdge[] }) => void
 
@@ -235,7 +264,7 @@ interface Store {
   currentUser: DpUser | null
   users: DpUser[]
   files: CanvasFile[]
-  refreshFiles: () => Promise<void>
+  refreshFiles: () => Promise<boolean>  // true only when this user's authoritative list was refreshed
   refreshUsers: () => Promise<void>
   openFile: (id: string) => Promise<boolean>
   newFile: () => Promise<void>
@@ -309,9 +338,14 @@ function downstream(doc: CanvasDoc, id: string): Set<string> {
 
 export const useStore = create<Store>((set, get) => ({
   doc: emptyDoc(),
+  canvasRole: null,
   view: 'canvas',
   setView: (view) => set({ view }),
   addToCanvas: (kind, config, title) => {
+    if (!roleCanEdit(get().canvasRole)) {
+      get().pushToast('This canvas is view-only', 'info')
+      return
+    }
     const pos = freePosition(get().doc.nodes, { x: 160, y: 160 })
     get().addNode(kind, pos, config, title)  // commits + selects the new node
     set({ view: 'canvas' })
@@ -354,14 +388,19 @@ export const useStore = create<Store>((set, get) => ({
   agentOpen: false,
   agentLog: [],
 
-  setNodes: (nodes) => set((s) => ({ doc: { ...s.doc, nodes } })),
-  setEdges: (edges) => set((s) => ({ doc: { ...s.doc, edges } })),
+  setNodes: (nodes) => { if (roleCanEdit(get().canvasRole)) set((s) => ({ doc: { ...s.doc, nodes } })) },
+  setEdges: (edges) => { if (roleCanEdit(get().canvasRole)) set((s) => ({ doc: { ...s.doc, edges } })) },
 
   // push the current doc onto the undo stack (called before a structural mutation). While co-editing,
   // also mark a checkpoint in the CRDT UndoManager so undo granularity matches these boundaries.
-  commit: () => { crdtUndo.boundary?.(); set((s) => ({ past: [...s.past, s.doc].slice(-50), future: [] })) },
+  commit: () => {
+    if (!roleCanEdit(get().canvasRole)) return
+    crdtUndo.boundary?.()
+    set((s) => ({ past: [...s.past, s.doc].slice(-50), future: [] }))
+  },
 
   undo: () => {
+    if (!roleCanEdit(get().canvasRole)) return
     _cfgEdit = { id: '', t: 0 }  // a following edit starts a fresh undo checkpoint
     // co-editing: undo via the CRDT manager, scoped to MY edits — never deletes a peer's concurrent
     // node/edge (the full-doc snapshot below would). The Y→store bridge updates the doc.
@@ -374,6 +413,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   redo: () => {
+    if (!roleCanEdit(get().canvasRole)) return
     _cfgEdit = { id: '', t: 0 }
     if (crdtUndoActive()) { crdtUndo.redo!(); set({ openPanels: {} }); return }
     set((s) => {
@@ -384,6 +424,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   addNode: (kind, position, config, title) => {
+    if (!roleCanEdit(get().canvasRole)) return null
     const spec = getSpec(kind)
     if (!spec) return null
     get().commit()
@@ -403,6 +444,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   updateConfig: (id, patch) => {
+    if (!roleCanEdit(get().canvasRole)) return
     // coalesced undo checkpoint: one per editing burst (new node, or >700ms idle) so a param
     // edit is its own undo step instead of discarding an unrelated earlier change.
     const now = performance.now()
@@ -432,12 +474,15 @@ export const useStore = create<Store>((set, get) => ({
     })
   },
 
-  updateData: (id, patch) =>
+  updateData: (id, patch) => {
+    if (!roleCanEdit(get().canvasRole)) return
     set((s) => ({
       doc: { ...s.doc, nodes: s.doc.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, ...patch } } : n)) },
-    })),
+    }))
+  },
 
   removeNode: (id) => {
+    if (!roleCanEdit(get().canvasRole)) return
     get().commit()
     set((s) => {
       const previews = { ...s.previews }; delete previews[id]
@@ -457,6 +502,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   connect: (edge) => {
+    if (!roleCanEdit(get().canvasRole)) return
     get().commit()
     set((s) => {
       // one edge per (target, targetHandle) for single-input ports; joins allow two.
@@ -470,11 +516,16 @@ export const useStore = create<Store>((set, get) => ({
     })
   },
 
-  removeEdge: (id) => { get().commit(); set((s) => ({ doc: { ...s.doc, edges: s.doc.edges.filter((e) => e.id !== id) } })) },
+  removeEdge: (id) => {
+    if (!roleCanEdit(get().canvasRole)) return
+    get().commit()
+    set((s) => ({ doc: { ...s.doc, edges: s.doc.edges.filter((e) => e.id !== id) } }))
+  },
 
   // Move a node into a section (parentId set, position now relative to the section) or back out to
   // the top-level canvas (parentId null, position absolute). Marks the section + downstream stale.
   setParent: (id, parentId, position) => {
+    if (!roleCanEdit(get().canvasRole)) return
     get().commit()
     set((s) => {
       const stale = parentId ? downstream(s.doc, parentId) : new Set<string>()
@@ -509,9 +560,14 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  cutSelection: () => { get().copySelection(); get().removeSelected() },
+  cutSelection: () => {
+    if (!roleCanEdit(get().canvasRole)) return
+    get().copySelection()
+    get().removeSelected()
+  },
 
   paste: () => {
+    if (!roleCanEdit(get().canvasRole)) return
     if (!_clipboard || !_clipboard.nodes.length) return
     get().commit()
     const { nodes, edges } = cloneSubgraph(_clipboard.nodes, _clipboard.edges)
@@ -522,6 +578,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   duplicateSelected: () => {
+    if (!roleCanEdit(get().canvasRole)) return
     const s = get()
     const ids = s.selectedIds.length ? s.selectedIds : (s.selectedId ? [s.selectedId] : [])
     if (ids.length <= 1) { if (ids[0]) get().duplicate(ids[0]); return }  // single → reuse the existing path
@@ -538,6 +595,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   removeSelected: () => {
+    if (!roleCanEdit(get().canvasRole)) return
     const ids = get().selectedIds.length ? get().selectedIds : (get().selectedId ? [get().selectedId!] : [])
     if (!ids.length) return
     get().commit()
@@ -559,6 +617,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   bypass: (id) => {
+    if (!roleCanEdit(get().canvasRole)) return
     get().commit()
     set((s) => ({
       doc: {
@@ -569,6 +628,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   disable: (id) => {
+    if (!roleCanEdit(get().canvasRole)) return
     get().commit()
     set((s) => ({
       doc: {
@@ -578,9 +638,14 @@ export const useStore = create<Store>((set, get) => ({
     }))
   },
 
-  rename: (id, title) => { get().commit(); get().updateData(id, { title }) },
+  rename: (id, title) => {
+    if (!roleCanEdit(get().canvasRole)) return
+    get().commit()
+    get().updateData(id, { title })
+  },
 
   duplicate: (id) => {
+    if (!roleCanEdit(get().canvasRole)) return
     const n = get().doc.nodes.find((x) => x.id === id)
     if (!n) return
     get().commit()
@@ -625,6 +690,7 @@ export const useStore = create<Store>((set, get) => ({
   // runs (FR-E3). Do NOT auto-open the run panel — the card shows status; the user opens details
   // if interested. A confirm gate is the one exception (it needs the panel to show the button).
   requestRun: async (id) => {
+    if (!roleCanEdit(get().canvasRole)) return
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } } }))
     let estimate
     try {
@@ -655,6 +721,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   run: async (id, confirmed = false) => {
+    if (!roleCanEdit(get().canvasRole)) return
     // no openPanels here — status shows on the card; the user opens the run panel if they want detail
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'running' } } }))
     get().updateData(id, { status: 'running' })
@@ -677,6 +744,7 @@ export const useStore = create<Store>((set, get) => ({
   // Re-run the whole graph: kick every runnable sink (a node with no outgoing edge); each pulls
   // its upstream, so the full pipeline re-executes. Notes/unconnected nodes aren't runnable → skipped.
   rerunAll: () => {
+    if (!roleCanEdit(get().canvasRole)) return
     const { doc } = get()
     const hasOutgoing = new Set(doc.edges.map((e) => e.source))
     // a section's contained children are run by the section, not as top-level sinks
@@ -689,6 +757,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   cancelRun: async (id) => {
+    if (!roleCanEdit(get().canvasRole)) return
     const st = get().runs[id]?.status
     if (!st) return
     await api.cancelRun(st.runId).catch(() => {})
@@ -705,6 +774,7 @@ export const useStore = create<Store>((set, get) => ({
     }),
 
   promote: async (id) => {
+    if (!roleCanEdit(get().canvasRole)) return
     const n = get().doc.nodes.find((x) => x.id === id)
     if (!n) return
     const cfg = n.data.config
@@ -730,6 +800,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   restoreVersion: (id, versionId) => {
+    if (!roleCanEdit(get().canvasRole)) return
     get().commit()  // Restore is undoable
     set((s) => {
       const stale = downstream(s.doc, id)
@@ -771,8 +842,11 @@ export const useStore = create<Store>((set, get) => ({
       // resolve identity, load this user's files, open the last-opened (or newest, or a fresh one)
       const me = await api.me()
       setApiUser(me.id); localStorage.setItem(USER_KEY, me.id)
+      // Identity is server-confirmed now. Set it before the remaining calls so an offline failure may
+      // use only THIS user's cached canvas role; an unknown identity always stays fail-closed.
+      set({ currentUser: me })
       const users = await api.users()
-      set({ currentUser: me, users })
+      set({ users })
       await get().refreshFiles()
       const files = get().files
       // honor a deep link (#/canvas/<id>, incl. a shared canvas resolved server-side); else the
@@ -793,57 +867,175 @@ export const useStore = create<Store>((set, get) => ({
       // offline / no kernel: fall back to the local cached doc so work survives a refresh
       try {
         const saved = localStorage.getItem(LS_KEY)
-        if (saved) { const doc = JSON.parse(saved) as CanvasDoc; if (doc?.nodes) set({ doc: migrateDoc(doc) }) }
+        if (saved) {
+          const doc = JSON.parse(saved) as CanvasDoc
+          if (doc?.nodes) {
+            const role = cachedRole(get().currentUser?.id, doc.id)
+            set({ doc: migrateDoc(doc), canvasRole: role, agentOpen: false })
+          }
+        }
       } catch { /* ignore corrupt state */ }
     }
     _bootstrapped = true  // now the real doc is loaded → autosave may persist edits (not the throwaway empty doc)
     void get().refreshSchemas()
   },
 
-  refreshFiles: async () => { try { set({ files: await api.listCanvases() }) } catch { /* offline */ } },
+  refreshFiles: async () => {
+    const generation = ++_fileListGeneration
+    const userId = get().currentUser?.id
+    if (!userId) {
+      set({ canvasRole: null, agentOpen: false })
+      return false
+    }
+    try {
+      const files = await api.listCanvases()
+      // A response started under another identity must never populate this user's files or role cache.
+      if (generation !== _fileListGeneration || get().currentUser?.id !== userId) return false
+      for (const file of files) rememberRole(userId, file.id, file.role)
+      const currentId = get().doc.id
+      if (!files.some((file) => file.id === currentId)) rememberRole(userId, currentId, null)
+      set((state) => {
+        if (generation !== _fileListGeneration || state.currentUser?.id !== userId) return {}
+        const open = files.find((file) => file.id === state.doc.id)
+        // The list is the server's current authority. Missing means deleted or access revoked; keep
+        // rendering the snapshot for inspection, but close the local edit window immediately.
+        if (!open) return { files, canvasRole: null, agentOpen: false }
+        const role = open.role ?? null
+        return { files, canvasRole: role, agentOpen: roleCanEdit(role) ? state.agentOpen : false }
+      })
+      return true
+    } catch {
+      // A transport/server failure is not an authoritative revocation. Retain the last confirmed
+      // files, open role, and per-user role cache; callers decide whether an individual action must
+      // fail closed until a fresh role can be obtained.
+      return false
+    }
+  },
   refreshUsers: async () => { try { set({ users: await api.users() }) } catch { /* offline */ } },
 
   openFile: async (id) => {
+    const generation = ++_fileNavigationGeneration
+    const userId = get().currentUser?.id
+    if (!userId) {
+      get().pushToast('Your identity is not available yet', 'error')
+      return false
+    }
+    const isCurrent = () => generation === _fileNavigationGeneration && get().currentUser?.id === userId
     try {
       const doc = await api.getCanvas(id)
-      get().loadDoc(doc)
+      if (!isCurrent()) return false
+
+      // getCanvas proves read access to the document, but does not return the effective role. Refresh
+      // the list now rather than trusting a stale editor/owner entry left from an earlier session.
+      const roleRefreshed = await get().refreshFiles()
+      if (!isCurrent()) return false
+      const file = roleRefreshed ? get().files.find((candidate) => candidate.id === id) : undefined
+      const role = file?.role ?? null
+      const accessRemoved = roleRefreshed && !file
+      if (accessRemoved) rememberRole(userId, id, null) // authoritative revoke/delete
+      get().loadDoc(doc, role)
       const uid = get().currentUser?.id
       if (uid) localStorage.setItem(OPEN_KEY(uid), id)
       set({ view: 'canvas' })  // opening a file navigates to the editor
+      if (accessRemoved) get().pushToast('This canvas is no longer in your accessible files. Opened the fetched snapshot read-only.', 'error')
+      else if (!roleRefreshed || !role) get().pushToast('Opened read-only because your current access could not be confirmed', 'error')
       return true
     } catch {
+      if (!isCurrent()) return false
       // not found / no access / deleted elsewhere → leave the current canvas & view untouched, prune
       // the stale card, and tell the user. The caller decides where to land (never a silent blank).
       await get().refreshFiles()
+      if (!isCurrent()) return false
       get().pushToast('That canvas could not be opened (not found or no access)', 'error')
       return false
     }
   },
 
   newFile: async () => {
+    const generation = ++_fileNavigationGeneration
+    const userId = get().currentUser?.id ?? null
     const doc = emptyDoc()
-    try { await api.createCanvas(doc); await get().refreshFiles() } catch { /* offline: PUT will create it */ }
-    get().loadDoc(doc)
+    try {
+      await api.createCanvas(doc)
+      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+      rememberRole(userId, doc.id, 'owner') // create response confirms ownership
+      await get().refreshFiles()
+    } catch (e) {
+      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+      if (e instanceof KernelError) {
+        if (e.status === 401) {
+          rememberRole(userId, get().doc.id, null)
+          set({ canvasRole: null, agentOpen: false, accessDenied: true, kernelUp: true })
+          get().pushToast('Your session no longer permits creating canvases. The current canvas is now read-only.', 'error')
+        } else if (e.status === 403) {
+          set({ kernelUp: true })
+          get().pushToast('You do not have permission to create a canvas.', 'error')
+        } else {
+          set({ kernelUp: true })
+          get().pushToast(`Could not create canvas: ${e.message}`, 'error')
+        }
+        return
+      }
+      // A transport failure is the one case where local-first creation is truthful: this is a new,
+      // collision-resistant local draft and a later PUT can create it as the current user's canvas.
+    }
+    if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+    get().loadDoc(doc, 'owner')
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
     set({ view: 'canvas' })
   },
 
   newFromExample: async (key) => {
+    const generation = ++_fileNavigationGeneration
+    const userId = get().currentUser?.id ?? null
     const id = `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
     const doc = exampleDoc(key, id)  // a runnable starter on the seeded data; falls back to a blank file
     if (!doc) { await get().newFile(); return }
-    try { await api.createCanvas(doc); await get().refreshFiles() } catch { /* offline: PUT will create it */ }
-    get().loadDoc(doc)
+    try {
+      await api.createCanvas(doc)
+      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+      rememberRole(userId, doc.id, 'owner') // create response confirms ownership
+      await get().refreshFiles()
+    } catch (e) {
+      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+      if (e instanceof KernelError) {
+        if (e.status === 401) {
+          rememberRole(userId, get().doc.id, null)
+          set({ canvasRole: null, agentOpen: false, accessDenied: true, kernelUp: true })
+          get().pushToast('Your session no longer permits creating canvases. The current canvas is now read-only.', 'error')
+        } else if (e.status === 403) {
+          set({ kernelUp: true })
+          get().pushToast('You do not have permission to create a canvas.', 'error')
+        } else {
+          set({ kernelUp: true })
+          get().pushToast(`Could not create canvas: ${e.message}`, 'error')
+        }
+        return
+      }
+      // Transport failure: keep the runnable example as an offline local-first draft.
+    }
+    if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+    get().loadDoc(doc, 'owner')
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
     set({ view: 'canvas' })
   },
 
-  renameFile: (name) => set((s) => ({ doc: { ...s.doc, name } })),  // autosave PUTs + refreshes the list
-  setRequirements: (reqs) => set((s) => ({ doc: { ...s.doc, requirements: reqs } })),  // canvas pip deps; autosave persists
+  renameFile: (name) => {
+    if (roleCanEdit(get().canvasRole)) set((s) => ({ doc: { ...s.doc, name } }))
+  },  // autosave PUTs + refreshes the list
+  setRequirements: (reqs) => {
+    if (roleCanEdit(get().canvasRole)) set((s) => ({ doc: { ...s.doc, requirements: reqs } }))
+  },  // canvas pip deps; autosave persists
 
   deleteFile: async (id) => {
+    const targetRole = get().files.find((file) => file.id === id)?.role
+      ?? (get().doc.id === id ? get().canvasRole : null)
+    if (targetRole !== 'owner') {
+      get().pushToast('Only the canvas owner can delete it', 'error')
+      return
+    }
     // permanent + not undoable → confirm first (guards both the file menu and the Recents trash)
     const f = get().files.find((x) => x.id === id)
     if (typeof window !== 'undefined' && !window.confirm(`Delete "${f?.name || 'this canvas'}"? This can't be undone.`)) return
@@ -917,19 +1109,30 @@ export const useStore = create<Store>((set, get) => ({
     catch { /* offline / no sources countable: keep last-known */ }
   },
 
-  setAgentOpen: (v) => set({ agentOpen: v }),
+  setAgentOpen: (v) => {
+    if (v && !roleCanEdit(get().canvasRole)) return
+    set({ agentOpen: v })
+  },
   pushAgent: (m) => set((s) => ({ agentLog: [...s.agentLog, m] })),
 
   save: async () => {
+    if (!roleCanEdit(get().canvasRole)) return
     try {
       await api.saveCanvas(get().doc)
     } catch { /* offline: keep in memory */ }
   },
 
-  loadDoc: (doc) => {
+  loadDoc: (doc, role = get().canvasRole) => {
     _cfgEdit = { id: '', t: 0 }
     const d = migrateDoc(doc)
-    set({ doc: d, previews: {}, runs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [] })
+    set({
+      doc: d,
+      canvasRole: role,
+      accessDenied: false,
+      saved: true,
+      agentOpen: roleCanEdit(role) ? get().agentOpen : false,
+      previews: {}, runs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
+    })
     reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
     void get().ensureCanvasTables(d)  // warm the working set for this canvas's source nodes (on demand)
   },
@@ -954,6 +1157,7 @@ export const useStore = create<Store>((set, get) => ({
   // Apply a graph the LLM agent built (extends the canvas). Undoable; preserves UI state of nodes
   // whose ids already exist, and marks touched nodes stale so the user can preview/run them.
   applyAgentGraph: (bg) => {
+    if (!roleCanEdit(get().canvasRole)) return
     get().commit()
     set((s) => {
       const existing = new Map(s.doc.nodes.map((n) => [n.id, n]))
@@ -967,6 +1171,18 @@ export const useStore = create<Store>((set, get) => ({
     })
   },
 }))
+
+// A role belongs to (user, canvas), never just the canvas. Any identity transition invalidates the
+// open role synchronously; refreshFiles/openFile must then install the new user's server-reported role.
+let _roleUserId = useStore.getState().currentUser?.id ?? null
+useStore.subscribe((state) => {
+  const userId = state.currentUser?.id ?? null
+  if (userId === _roleUserId) return
+  _roleUserId = userId
+  _fileNavigationGeneration += 1
+  _fileListGeneration += 1
+  if (state.canvasRole !== null || state.agentOpen) useStore.setState({ canvasRole: null, agentOpen: false })
+})
 
 // Auto-persist the canvas to localStorage (debounced) so a refresh keeps your work.
 let _saveTimer: ReturnType<typeof setTimeout> | undefined
@@ -988,10 +1204,22 @@ useStore.subscribe((s) => {
   // PUT it. Without this guard, N co-editors each write the whole doc on every edit (N-way amplification).
   // Local edits + local undo/redo (collabApply.remote === false) still PUT. (Cache above is unconditional.)
   if (collabApply.remote) return
+  // Viewer/unknown access is fail-closed before any PUT. Store-level mutation guards mean this is
+  // normally just a safety net for a server/external document refresh or a role changing mid-debounce.
+  if (!roleCanEdit(s.canvasRole)) {
+    clearTimeout(_saveTimer)
+    if (!s.saved) useStore.setState({ saved: true })
+    return
+  }
   if (s.saved) useStore.setState({ saved: false })  // dirty → "saving…"
   clearTimeout(_saveTimer)
   _saveTimer = setTimeout(async () => {
-    const doc = useStore.getState().doc
+    const state = useStore.getState()
+    if (!roleCanEdit(state.canvasRole)) {
+      useStore.setState({ saved: true })
+      return
+    }
+    const doc = state.doc
     try {
       await api.saveCanvas(doc)  // PUT to the metadata DB (per-user, upsert)
       useStore.setState((st) => ({
@@ -1001,11 +1229,18 @@ useStore.subscribe((s) => {
         files: st.files.map((f) => (f.id === doc.id ? { ...f, name: doc.name ?? f.name, version: doc.version } : f)),
       }))
     } catch (e) {
-      if (e instanceof KernelError && e.status === 403) {
-        // permission, NOT connectivity: the kernel is up but rejected the write (view-only / access
-        // revoked). Don't show the "offline" banner or pretend it synced — say so, once.
-        if (!useStore.getState().accessDenied) useStore.getState().pushToast('You have view-only access — changes are kept in this browser but not saved to the server', 'error')
-        useStore.setState({ saved: true, kernelUp: true, accessDenied: true })
+      if (e instanceof KernelError && (e.status === 401 || e.status === 403)) {
+        // Permission/session rejection, NOT connectivity. Fail closed immediately; refreshFiles may
+        // then recover the precise viewer/editor role without allowing another local edit first.
+        if (!useStore.getState().accessDenied) useStore.getState().pushToast(
+          e.status === 401
+            ? 'Your session no longer permits editing. This canvas is now read-only.'
+            : 'Your editing access changed. This canvas is now read-only and the last change was not saved.',
+          'error',
+        )
+        rememberRole(useStore.getState().currentUser?.id, doc.id, null)
+        useStore.setState({ saved: true, kernelUp: true, accessDenied: true, canvasRole: null, agentOpen: false })
+        void useStore.getState().refreshFiles()
       } else {
         // offline: the localStorage cache still holds it; flag the kernel down so the banner shows
         useStore.setState({ saved: true, kernelUp: false })
@@ -1021,8 +1256,9 @@ useStore.subscribe((s) => {
 // request outlive the unloading page.
 if (typeof window !== 'undefined') {
   window.addEventListener('pagehide', () => {
-    if (!_bootstrapped || useStore.getState().saved) return
-    const doc = useStore.getState().doc
+    const state = useStore.getState()
+    if (!_bootstrapped || state.saved || !roleCanEdit(state.canvasRole)) return
+    const doc = state.doc
     try { localStorage.setItem(LS_KEY, JSON.stringify(doc)) } catch { /* quota */ }
     void api.saveCanvas(doc, true).catch(() => {})  // best-effort; can't await on unload
   })

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api, type CanvasVersionDto } from '../api/client'
-import { useStore } from '../store/graph'
+import { roleCanEdit, useStore } from '../store/graph'
 import { Icon } from '../ui/Icon'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
@@ -12,6 +12,7 @@ export function VersionHistoryModal({ onClose }: { onClose: () => void }) {
   const canvasId = useStore((s) => s.doc.id)
   const loadDoc = useStore((s) => s.loadDoc)
   const pushToast = useStore((s) => s.pushToast)
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const [versions, setVersions] = useState<CanvasVersionDto[] | null>(null)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState('')
@@ -20,6 +21,7 @@ export function VersionHistoryModal({ onClose }: { onClose: () => void }) {
   useEffect(() => { load() }, [canvasId])
 
   const restore = async (v: CanvasVersionDto) => {
+    if (!roleCanEdit(useStore.getState().canvasRole)) return
     setBusy(v.id)
     try {
       const r = await api.restoreCanvas(canvasId, v.id)
@@ -53,7 +55,8 @@ export function VersionHistoryModal({ onClose }: { onClose: () => void }) {
                 {v.label ?? `Snapshot · v${v.version}`}
               </span>
               <span className="text-[11px] text-muted-foreground">{v.createdAt ? new Date(v.createdAt).toLocaleString() : ''}</span>
-              <Button type="button" variant="outline" size="sm" onClick={() => restore(v)} disabled={!!busy}
+              <Button type="button" variant="outline" size="sm" onClick={() => restore(v)} disabled={!!busy || !canEdit}
+                title={canEdit ? 'Restore this version' : 'View-only canvas'}
                 className={cn('text-[11.5px]', busy === v.id && 'disabled:opacity-100')}>
                 {busy === v.id ? 'Restoring…' : 'Restore'}
               </Button>

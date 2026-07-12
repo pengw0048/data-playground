@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
-import { useStore } from '../../store/graph'
+import { roleCanEdit, useStore } from '../../store/graph'
 import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
@@ -22,11 +22,16 @@ function Source({ id, data }: NodeComponentProps) {
   const rememberTables = useStore((s) => s.rememberTables)
   const updateConfig = useStore((s) => s.updateConfig)
   const rename = useStore((s) => s.rename)
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   // show the bound dataset even when the source was configured by tableId or a bare catalog NAME (an
   // agent/example/programmatic source), not only by an exact uri match.
   const tid = data.config.tableId
   const ref = String(data.config.uri ?? '')
   const table = catalog.find((t) => (tid && t.id === tid) || t.uri === ref || t.name === ref)
+
+  useEffect(() => {
+    if (!canEdit) { setOpen(false); setDialog(false) }
+  }, [canEdit])
 
   // Server-side search picker — the catalog can be thousands of tables, so we never render them all.
   // Empty query shows the working-set recents PLUS a top-usage page from the server (a fresh session
@@ -52,6 +57,7 @@ function Source({ id, data }: NodeComponentProps) {
     : [...catalog, ...(results ?? []).filter((t) => !recentIds.has(t.id))]  // recents first, deduped
   ).slice(0, 12)
   const pick = (t: CatalogTable) => {
+    if (!canEdit) return
     rememberTables([t])  // warm the cache so the card resolves this immediately
     updateConfig(id, { uri: t.uri, tableId: t.id })
     rename(id, t.name)
@@ -60,7 +66,7 @@ function Source({ id, data }: NodeComponentProps) {
 
   // upload a local file → store it + bind this source to it
   const onUpload = async (f: File | undefined) => {
-    if (!f) return
+    if (!f || !canEdit) return
     setOpen(false); setUploading(true)
     const t = await uploadDataset(f)  // uploads + refreshes catalog; toasts on failure
     setUploading(false)
@@ -69,6 +75,7 @@ function Source({ id, data }: NodeComponentProps) {
 
   // pick a file from a destination (local dir / object store) → register it + use it as this source
   const pickFile = async (uri: string, fname: string) => {
+    if (!canEdit) return
     setDialog(false); setOpen(false)
     try {
       const t = await api.registerFile(uri)

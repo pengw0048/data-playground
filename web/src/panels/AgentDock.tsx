@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useStore } from '../store/graph'
+import { roleCanEdit, useStore } from '../store/graph'
 import { api } from '../api/client'
 import { color, kindAccent } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
@@ -16,22 +16,25 @@ export function AgentDock() {
   const setOpen = useStore((s) => s.setAgentOpen)
   const log = useStore((s) => s.agentLog)
   const push = useStore((s) => s.pushAgent)
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [llm, setLlm] = useState<{ available: boolean; model?: string; reason?: string } | null>(null)
 
   useEffect(() => {
     if (!open) return
+    if (!canEdit) { setOpen(false); return }
     api.agentStatus().then((s) => setLlm({ available: s.available, model: s.model, reason: s.reason })).catch(() => setLlm({ available: false, reason: 'kernel offline' }))
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }  // Esc closes the dock
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open, setOpen])
+  }, [canEdit, open, setOpen])
 
-  if (!open) return null
+  if (!open || !canEdit) return null
 
   const ready = !!llm?.available
   const submit = async () => {
+    if (!roleCanEdit(useStore.getState().canvasRole)) return
     const intent = text.trim()
     if (!intent || busy || !ready) return
     push({ role: 'user', text: intent })

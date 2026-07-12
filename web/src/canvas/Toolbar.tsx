@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react'
 import { useReactFlow } from '@xyflow/react'
 import { allSpecs } from '../nodes'
-import { useStore, freePosition } from '../store/graph'
+import { useStore, freePosition, roleCanEdit } from '../store/graph'
 import { categoryOrder, color, kindAccent, type Category } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
@@ -21,6 +21,7 @@ export function Toolbar() {
   const addNode = useStore((s) => s.addNode)
   const setAgentOpen = useStore((s) => s.setAgentOpen)
   const agentOpen = useStore((s) => s.agentOpen)
+  const canvasRole = useStore((s) => s.canvasRole)
   const [open, setOpen] = useState<Category | null>(null)
 
   const specs = allSpecs()
@@ -31,6 +32,14 @@ export function Toolbar() {
     const pos = freePosition(useStore.getState().doc.nodes, { x: c.x - 116, y: c.y - 40 })
     addNode(kind, pos)
     setOpen(null)
+  }
+
+  if (!roleCanEdit(canvasRole)) {
+    return (
+      <div data-testid="view-only-badge" className="absolute bottom-[22px] left-1/2 z-[16] -translate-x-1/2 rounded-full border border-border bg-card px-3 py-1.5 text-[11.5px] font-medium text-muted-foreground shadow-sm">
+        {canvasRole === 'viewer' ? 'View-only canvas' : 'Checking canvas access…'}
+      </div>
+    )
   }
 
   return (

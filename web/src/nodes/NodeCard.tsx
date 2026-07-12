@@ -15,7 +15,7 @@ import { Port } from './Port'
 import { getSpec, nodeOutputs, type NodeSpec } from './registry'
 import { nodeInvalidReason } from './generic'
 import { useSchemaWarnings } from './fields'
-import { useStore, nodeRunnable, isDisabled, type PanelKind } from '../store/graph'
+import { useStore, nodeRunnable, isDisabled, roleCanEdit, type PanelKind } from '../store/graph'
 import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
 
@@ -31,6 +31,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === id))
   const spec = getSpec(node?.type ?? 'transform') as NodeSpec | undefined
   const selected = useStore((s) => s.selectedIds.includes(id))
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   // the action shelf carries SINGLE-node actions, so only show it for a lone selection — a marquee/
   // shift-select of many cards must not float (and strand) one shelf per card
   const soleSelected = useStore((s) => s.selectedIds.length <= 1 && s.selectedIds.includes(id))
@@ -118,7 +119,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
               >
                 {st.glyph}
               </span>
-              <EditableTitle id={id} title={data.title} onRename={rename} selected={selected} />
+              <EditableTitle id={id} title={data.title} onRename={rename} selected={selected} canEdit={canEdit} />
               <span className="flex-1" />
               {disabled && (
                 <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[8.5px] font-bold tracking-[0.5px] text-amber-700 dark:bg-amber-500/15 dark:text-amber-300">
@@ -176,7 +177,11 @@ export function NodeCard({ id, data, children, metaOverride }: {
             )}
 
             {/* compact body (kind-specific, kept small — P5) */}
-            {children && <div className="mt-2">{children}</div>}
+            {children && (
+              <fieldset disabled={!canEdit} className="contents">
+                <div className="mt-2">{children}</div>
+              </fieldset>
+            )}
 
           </div>
         </div>
@@ -200,13 +205,13 @@ export function NodeCard({ id, data, children, metaOverride }: {
               name={busy ? 'stop' : 'play'}
               label={invalid ?? (!runnable ? 'Connect a source to run' : busy ? 'Stop' : 'Run up to here')}
               active={openPanel === 'run'}
-              disabled={(!runnable || !!invalid) && !busy}
+              disabled={!canEdit || ((!runnable || !!invalid) && !busy)}
               onClick={() => (busy ? cancelRun(id) : requestRun(id))}
             />
           )}
           <ActionIcon name="clock" label="History" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
-          {hasCode && <ActionIcon name="code" label="Edit code" onClick={() => openCodeFullscreen(id, kind === 'sql' ? 'sql' : 'code', kind === 'sql' ? 'sql' : 'python')} />}
-          <MoreMenu id={id} kind={kind} />
+          {hasCode && <ActionIcon name="code" label={canEdit ? 'Edit code' : 'View code'} onClick={() => openCodeFullscreen(id, kind === 'sql' ? 'sql' : 'code', kind === 'sql' ? 'sql' : 'python')} />}
+          <MoreMenu id={id} kind={kind} canEdit={canEdit} />
         </div>
       )}
     </div>
@@ -237,16 +242,17 @@ function ActionIcon({ name, label, active, onClick, disabled }: {
   )
 }
 
-function EditableTitle({ id, title, onRename, selected }: { id: string; title: string; onRename: (id: string, t: string) => void; selected?: boolean }) {
+function EditableTitle({ id, title, onRename, selected, canEdit }: { id: string; title: string; onRename: (id: string, t: string) => void; selected?: boolean; canEdit: boolean }) {
   const [editing, setEditing] = useState(false)
   const [val, setVal] = useState(title)
   useEffect(() => setVal(title), [title])
+  useEffect(() => { if (!canEdit) setEditing(false) }, [canEdit])
   // let the ⋯-menu "Rename" (and any external trigger) enter edit mode for this node
   useEffect(() => {
-    const onRenameEvt = (e: Event) => { if ((e as CustomEvent).detail?.id === id) setEditing(true) }
+    const onRenameEvt = (e: Event) => { if (canEdit && (e as CustomEvent).detail?.id === id) setEditing(true) }
     window.addEventListener('dp-rename', onRenameEvt)
     return () => window.removeEventListener('dp-rename', onRenameEvt)
-  }, [id])
+  }, [canEdit, id])
   if (editing) {
     return (
       <input
@@ -263,17 +269,17 @@ function EditableTitle({ id, title, onRename, selected }: { id: string; title: s
   return (
     <span
       // click the name of an already-selected node to rename (Figma-style); double-click always works
-      onClick={(e) => { if (selected) { e.stopPropagation(); setEditing(true) } }}
-      onDoubleClick={(e) => { e.stopPropagation(); setEditing(true) }}
-      title="Click (when selected) or double-click to rename"
-      className="cursor-text truncate text-[13.5px] font-semibold text-foreground"
+      onClick={(e) => { if (canEdit && selected) { e.stopPropagation(); setEditing(true) } }}
+      onDoubleClick={(e) => { if (canEdit) { e.stopPropagation(); setEditing(true) } }}
+      title={canEdit ? 'Click (when selected) or double-click to rename' : 'View-only'}
+      className={cn('truncate text-[13.5px] font-semibold text-foreground', canEdit && 'cursor-text')}
     >
       {title}
     </span>
   )
 }
 
-function MoreMenu({ id, kind }: { id: string; kind: string }) {
+function MoreMenu({ id, kind, canEdit }: { id: string; kind: string; canEdit: boolean }) {
   const [open, setOpen] = useState(false)
   const { bypass, disable, duplicate, removeNode, openPanel } = useStore.getState()
   const canBypass = getSpec(kind)?.canBypass
@@ -314,15 +320,15 @@ function MoreMenu({ id, kind }: { id: string; kind: string }) {
         onCloseAutoFocus={(e) => e.preventDefault()}
         onClick={(e) => e.stopPropagation()}
       >
-        {item('rename', 'Rename', () => window.dispatchEvent(new CustomEvent('dp-rename', { detail: { id } })))}
+        {canEdit && item('rename', 'Rename', () => window.dispatchEvent(new CustomEvent('dp-rename', { detail: { id } })))}
         {item('play', 'Run details', () => openPanel(id, 'run'))}
-        {item('duplicate', 'Duplicate', () => duplicate(id))}
-        {canBypass && item('power', 'Bypass (pass data through)', () => bypass(id))}
-        {item('mute', 'Disable (+ downstream)', () => disable(id))}
+        {canEdit && item('duplicate', 'Duplicate', () => duplicate(id))}
+        {canEdit && canBypass && item('power', 'Bypass (pass data through)', () => bypass(id))}
+        {canEdit && item('mute', 'Disable (+ downstream)', () => disable(id))}
         {item('export', 'Export data', () => exportNode(id))}
         {item('lineage', 'Lineage', () => openPanel(id, 'lineage'))}
-        <DropdownMenuSeparator />
-        {item('trash', 'Delete', () => removeNode(id), true)}
+        {canEdit && <DropdownMenuSeparator />}
+        {canEdit && item('trash', 'Delete', () => removeNode(id), true)}
       </DropdownMenuContent>
     </DropdownMenu>
   )

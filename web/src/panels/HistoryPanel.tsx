@@ -1,4 +1,4 @@
-import { useStore } from '../store/graph'
+import { roleCanEdit, useStore } from '../store/graph'
 import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 
@@ -11,6 +11,7 @@ export function HistoryPanel({ nodeId }: { nodeId: string }) {
   // returning a fresh array from the selector, which loops useSyncExternalStore (React #185).
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const restore = useStore((s) => s.restoreVersion)
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const history = node?.data.history ?? EMPTY
   const items = [...history].reverse()
 
@@ -35,8 +36,10 @@ export function HistoryPanel({ nodeId }: { nodeId: string }) {
             </div>
           </div>
           <button
+            disabled={!canEdit}
+            title={canEdit ? 'Restore this version' : 'View-only canvas'}
             onClick={() => restore(nodeId, v.id)}
-            style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 10px', border: `1px solid ${color.border}`, borderRadius: 7, background: 'hsl(var(--card))', color: color.focus, fontSize: 11, fontWeight: 600 }}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 10px', border: `1px solid ${color.border}`, borderRadius: 7, background: 'hsl(var(--card))', color: color.focus, fontSize: 11, fontWeight: 600, opacity: canEdit ? 1 : 0.55, cursor: canEdit ? 'pointer' : 'not-allowed' }}
           >
             <Icon name="refresh" size={12} /> Restore
           </button>

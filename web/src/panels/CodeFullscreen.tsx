@@ -1,5 +1,5 @@
 import { Suspense, lazy, useEffect } from 'react'
-import { useStore, nodeRunnable } from '../store/graph'
+import { useStore, nodeRunnable, roleCanEdit } from '../store/graph'
 import { useInputColumns } from '../nodes/fields'
 import { Icon } from '../ui/Icon'
 import { MiniSelect } from '../ui/controls'
@@ -17,6 +17,7 @@ export function CodeFullscreen() {
   const runnable = useStore((s) => (fs ? nodeRunnable(s.doc, fs.nodeId) : false))
   const previews = useStore((s) => s.previews)
   const processors = useStore((s) => s.processors)
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const inputCols = useInputColumns(fs?.nodeId ?? '')  // THIS node's input schema — the precise completions
   const { updateConfig, closeCodeFullscreen: close, runPreview, promote } = useStore.getState()
   useEffect(() => {
@@ -49,7 +50,7 @@ export function CodeFullscreen() {
           <span className="flex items-center text-muted-foreground"><Icon name="code" size={14} /></span>
           <span className="text-[13px] font-semibold text-foreground">{node.data.title}</span>
           <span className="text-[12.5px] text-muted-foreground">· {fs.param} · {language}</span>
-          {isLibrary && <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">· read-only · {proc?.title} {proc?.version} (registry)</span>}
+          {(isLibrary || !canEdit) && <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">· read-only{isLibrary ? ` · ${proc?.title ?? ''} ${proc?.version ?? ''} (registry)` : ''}</span>}
           <span className="flex-1" />
           <button onClick={close} aria-label="Close" title="Close (Esc)"
             className="grid h-[26px] w-7 place-items-center rounded-md border-0 bg-transparent text-muted-foreground hover:text-foreground">
@@ -59,7 +60,7 @@ export function CodeFullscreen() {
         <div className="flex min-h-0 flex-1">
           <div className="min-h-0 flex-1">
             <Suspense fallback={<div className="grid h-full place-items-center text-xs text-muted-foreground">loading editor…</div>}>
-              <CodeEditor language={language} height="100%" value={value} readOnly={isLibrary} completions={completions}
+              <CodeEditor language={language} height="100%" value={value} readOnly={isLibrary || !canEdit} completions={completions}
                 onChange={(v) => updateConfig(fs.nodeId, { [fs.param]: v })} />
             </Suspense>
           </div>
@@ -72,9 +73,9 @@ export function CodeFullscreen() {
         </div>
 
         {/* operator controls — Python transforms get mode/on_error/Promote; anything runnable gets Preview */}
-        {(isTransform && !isLibrary) || canPreview ? (
+        {(canEdit && isTransform && !isLibrary) || canPreview ? (
           <div className="flex items-center gap-2.5 border-t border-border px-3.5 py-2.5">
-            {isTransform && !isLibrary && (
+            {canEdit && isTransform && !isLibrary && (
               <>
                 <span className="text-[10.5px] text-muted-foreground">mode</span>
                 <div className="w-[130px]">
@@ -89,7 +90,7 @@ export function CodeFullscreen() {
               </>
             )}
             <span className="flex-1" />
-            {isTransform && !isLibrary && (
+            {canEdit && isTransform && !isLibrary && (
               <button onClick={() => promote(fs.nodeId)}
                 className="inline-flex items-center gap-[5px] rounded-md border border-border bg-background px-3.5 py-2 text-xs font-semibold text-primary hover:bg-accent">
                 Promote to library <Icon name="external" size={12} />
