@@ -58,12 +58,13 @@ manual and uses the same differential; see [`deploy/kuberay/README.md`](../deplo
 Run the Compose gate locally:
 
 ```bash
-docker compose -f docker-compose.ray.yml up -d --build --scale ray-worker=2 \
+docker compose -f docker-compose.ray.yml build ray-head
+docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 \
   ray-head ray-worker minio createbucket
-docker compose -f docker-compose.ray.yml run --rm driver
+docker compose -f docker-compose.ray.yml run --rm --no-deps driver
 
 for fault in schema rows join; do
-  if DP_MULTINODE_FAULT="$fault" docker compose -f docker-compose.ray.yml run --rm driver; then
+  if DP_MULTINODE_FAULT="$fault" docker compose -f docker-compose.ray.yml run --rm --no-deps driver; then
     echo "ERROR: $fault control unexpectedly passed"
     exit 1
   fi
@@ -71,9 +72,13 @@ done
 
 worker="$(docker compose -f docker-compose.ray.yml ps -q ray-worker | tail -1)"
 docker kill "$worker"
-docker compose -f docker-compose.ray.yml run --rm driver  # fresh degraded-cluster run
+docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # fresh degraded-cluster run
 docker compose -f docker-compose.ray.yml down -v
 ```
+
+Build the shared image before creating any cluster container, and keep `--no-deps` on every ephemeral
+driver run. This prevents a differential from recreating the head service and replacing the GCS cluster
+identity underneath the persistent workers.
 
 ## Production-readiness matrix
 

@@ -8,9 +8,10 @@ operation or make `dp_ray` production-capable; see the [support/readiness matrix
 ## 1. docker-compose (fastest — a head + 2 worker containers + MinIO)
 
 ```bash
-docker compose -f docker-compose.ray.yml up -d --scale ray-worker=2 --build \
+docker compose -f docker-compose.ray.yml build ray-head
+docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 \
   ray-head ray-worker minio createbucket
-docker compose -f docker-compose.ray.yml run --rm driver     # → "[multinode] PASS: … byte-identical …"
+docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # → "[multinode] PASS: … byte-identical …"
 docker compose -f docker-compose.ray.yml down -v
 ```
 
@@ -22,7 +23,7 @@ reconstruction for that job.
 ```bash
 worker="$(docker compose -f docker-compose.ray.yml ps -q ray-worker | tail -1)"
 docker kill "$worker"
-docker compose -f docker-compose.ray.yml run --rm driver
+docker compose -f docker-compose.ray.yml run --rm --no-deps driver
 ```
 
 ## 2. KubeRay on Kubernetes (e.g. kind — the pods path)
@@ -75,9 +76,9 @@ silently inert. Run the harness once per fault target — each **must exit nonze
 
 ```bash
 for f in schema rows join; do
-  DP_MULTINODE_FAULT=$f docker compose -f docker-compose.ray.yml run --rm driver   # expect NONZERO each
+  DP_MULTINODE_FAULT=$f docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # expect NONZERO each
 done
-docker compose -f docker-compose.ray.yml run --rm driver                            # clean → PASS (exit 0)
+docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # clean → PASS (exit 0)
 ```
 
 (`DP_MULTINODE_FAULT=1` is accepted as an alias for `rows`, back-compat.)
