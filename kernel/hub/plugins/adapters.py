@@ -387,9 +387,9 @@ class DuckDBAdapter:
                 raise NotImplementedError(
                     "object-store append supports parquet only (a csv/json part prefix reads back as parquet"
                     " → unreadable) — use parquet for object-store append, or append on the local FS")
-            self._reject_mixed_part_format(base, ext, obj)   # one exact extension per dataset (read picks one)
             part_name = f"part-{uuid.uuid4().hex[:12]}{ext}"
             if obj:
+                self._reject_mixed_part_format(base, ext, obj)  # one exact extension per dataset (read picks one)
                 self._migrate_singlefile_into_dir(target, base, ext, obj)  # overwrite→append: fold prior file in
                 part = base.rstrip("/") + "/" + part_name
                 self._write_part(rel, part, ext)
@@ -411,6 +411,11 @@ class DuckDBAdapter:
                     raise
                 with self._base_lock(base):
                     try:
+                        # This is the authoritative format check: it MUST share the publish lock. Two
+                        # different-format appends may both finish staging while the dataset is empty; only
+                        # the first may publish, and the second must observe that committed extension before
+                        # its os.replace. Staging stays outside the lock so same-format writes remain parallel.
+                        self._reject_mixed_part_format(base, ext, obj=False)
                         os.makedirs(base, exist_ok=True)
                         self._migrate_singlefile_into_dir(target, base, ext, obj)  # overwrite→append fold-in
                         os.replace(staging, os.path.join(base, part_name))  # publish INTO base (a committed part)

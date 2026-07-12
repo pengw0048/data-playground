@@ -1472,6 +1472,64 @@ def test_append_is_transactional_and_lossless(tmp_path, monkeypatch):
             a.write(str(tmp_path / "mds.pq"), con.sql("SELECT 3 AS id"), "append")  # same format, still rejected
 
 
+def test_concurrent_mixed_format_append_publishes_exactly_one_part(tmp_path, monkeypatch):
+    # Both writers finish their lock-free staging while the dataset is still empty, then race to publish.
+    # The format check must run under the SAME per-base lock as os.replace: one writer commits, while the
+    # loser reports the stable mixed-format conflict and removes its unpublished staging file.
+    import glob as _glob
+    import threading as _th
+
+    monkeypatch.setenv("DP_APPEND_COMPACT_PARTS", "0")
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter
+
+    a = DuckDBAdapter()
+    base = str(tmp_path / "mixed")
+    staged = _th.Barrier(2)
+    original_write_part = DuckDBAdapter._write_part
+
+    def _stage_then_race(rel, path, ext):
+        original_write_part(rel, path, ext)
+        staged.wait(timeout=10)
+
+    monkeypatch.setattr(DuckDBAdapter, "_write_part", staticmethod(_stage_then_race))
+    successes: list[tuple[str, dict]] = []
+    failures: list[tuple[str, BaseException]] = []
+
+    def worker(ext: str, row_id: int) -> None:
+        try:
+            with db.run_scope() as sc:
+                result = a.write(base + ext, sc.con.sql(f"SELECT {row_id} AS id"), "append")
+            successes.append((ext, result))
+        except BaseException as exc:  # capture the exact commit-time conflict from the worker thread
+            failures.append((ext, exc))
+
+    threads = [
+        _th.Thread(target=worker, args=(".parquet", 1)),
+        _th.Thread(target=worker, args=(".csv", 2)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+    assert not any(thread.is_alive() for thread in threads), "mixed-format append race deadlocked"
+
+    assert len(successes) == 1, successes
+    assert len(failures) == 1, failures
+    winner_ext, result = successes[0]
+    loser_ext, error = failures[0]
+    assert isinstance(error, NotImplementedError)
+    assert "one file extension per output dataset" in str(error)
+    assert result["uri"] == base and winner_ext != loser_ext
+
+    committed = _glob.glob(os.path.join(base, "part-*"))
+    assert len(committed) == 1 and committed[0].endswith(winner_ext), committed
+    assert not any(path.endswith(loser_ext) for path in committed), "the conflicting writer published a part"
+    assert not _glob.glob(base + ".parttmp-*"), "the conflicting writer leaked its staging file"
+    with db.run_scope():
+        assert a.scan(base).aggregate("count(*)").fetchone()[0] == 1
+
+
 def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
     # ARC4 transactional append on a REAL object store (moto): overwrite writes s3://…/out.parquet (a single
     # object); a subsequent append writes into the out/ prefix. The prior object must be MIGRATED into the
