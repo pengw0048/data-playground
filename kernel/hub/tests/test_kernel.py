@@ -7744,6 +7744,94 @@ def test_ray_explicit_placement_fails_unadvertised_resources_before_dispatch(tmp
     assert status.status == "failed"
     assert "requested resources" in (status.error or "")
     assert "advertised Ray capacity" in (status.error or "")
+def test_ray_region_handoff_uses_an_immutable_attempt_prefix():
+    attempt_uri = _load_dp_ray()._attempt_handoff_uri
+
+    first = attempt_uri("s3://bucket/regions/node_hash.parquet", "unit_first")
+    second = attempt_uri("s3://bucket/regions/node_hash.parquet", "unit_second")
+
+    assert first == "s3://bucket/regions/node_hash.attempt-unit_first"
+    assert second == "s3://bucket/regions/node_hash.attempt-unit_second"
+    assert first != second
+    assert attempt_uri("/tmp/out.parquet", "../../unsafe run") == "/tmp/out.attempt-unsafe_run"
+
+
+def test_ray_region_reattaches_committed_attempt_and_refuses_partial_retry(tmp_path):
+    import duckdb
+
+    from hub.deps import Deps
+    from hub.handoff import write_manifest
+    from hub.models import Graph
+
+    (tmp_path / "ws").mkdir()
+    mod = _load_dp_ray()
+    rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    graph = Graph(**{"id": "reattach", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": "unused.parquet"}),
+    ], "edges": []})
+
+    suggested = str(tmp_path / "region.parquet")
+    run_id = "unit_committed"
+    attempt = mod._attempt_handoff_uri(suggested, run_id)
+    os.makedirs(attempt)
+    duckdb.connect().execute(
+        f"COPY (SELECT 1 AS x) TO '{attempt}/part-0.parquet' (FORMAT PARQUET)")
+    write_manifest(attempt, run_id=run_id, rows=1, schema="x: int64")
+    rr._acknowledge_cancel(run_id)  # a prior owner reused this explicit ID; registration must clear it
+    done = rr.run_unit(graph, "src", suggested, run_id=run_id)
+    assert done.status == "done" and done.output_uri == attempt and done.rows_processed == 1
+    assert not rr.cancel_acknowledged(run_id)
+
+    partial_id = "unit_partial"
+    partial = mod._attempt_handoff_uri(suggested, partial_id)
+    os.makedirs(partial)
+    duckdb.connect().execute(
+        f"COPY (SELECT 2 AS x) TO '{partial}/part-0.parquet' (FORMAT PARQUET)")
+    failed = rr.run_unit(graph, "src", suggested, run_id=partial_id)
+    assert failed.status == "failed" and "refusing to overwrite" in (failed.error or "")
+
+
+def test_region_attempt_requires_a_valid_commit_manifest(tmp_path):
+    # Shards alone are not a published handoff. The controller must reject a partial/corrupt attempt and
+    # accept it only after the writer's last operation installs a valid success manifest.
+    import duckdb
+
+    from hub.handoff import MANIFEST_NAME, write_manifest
+
+    attempt = tmp_path / "region.attempt-unit_1"
+    attempt.mkdir()
+    duckdb.connect().execute(
+        f"COPY (SELECT 1 AS x) TO '{attempt / 'part-0.parquet'}' (FORMAT PARQUET)")
+    ctrl = get_deps().controller
+    assert ctrl._region_output_exists(str(attempt)) is False
+    (attempt / MANIFEST_NAME).write_text("{broken")
+    assert ctrl._region_output_exists(str(attempt)) is False
+    write_manifest(str(attempt), run_id="unit_1", rows=1, schema="x: int64")
+    assert ctrl._region_output_exists(str(attempt)) is True
+    duckdb.connect().execute(
+        f"COPY (SELECT 2 AS x) TO '{attempt / 'unexpected.parquet'}' (FORMAT PARQUET)")
+    assert ctrl._region_output_exists(str(attempt)) is False  # extra shard is also a partial/mixed attempt
+    os.remove(attempt / "unexpected.parquet")
+    assert ctrl._region_output_exists(str(attempt)) is True
+    os.remove(attempt / "part-0.parquet")
+    assert ctrl._region_output_exists(str(attempt)) is False  # lifecycle/manual shard loss => recompute
+
+
+def test_region_attempt_cleanup_is_scoped_to_an_attempt(tmp_path):
+    from hub import handoff
+
+    assert handoff._object_manifest_path("bucket/base/regions/out.attempt-a") == \
+        "bucket/base/regions/_dp_commits/out.attempt-a/_DP_SUCCESS.json"
+
+    stable = tmp_path / "stable"
+    failed = tmp_path / "region.attempt-failed"
+    stable.mkdir()
+    failed.mkdir()
+    (stable / "keep").write_text("stable")
+    (failed / "part.parquet").write_text("partial")
+    handoff.discard_attempt(str(stable))
+    handoff.discard_attempt(str(failed))
+    assert stable.exists() and not failed.exists()  # the cleanup API can never delete a stable prefix
 
 
 def test_ray_region_worker_direct_write_and_progress(tmp_path):
@@ -7786,12 +7874,21 @@ def test_ray_region_worker_direct_write_and_progress(tmp_path):
     assert saw_interim, "the placed sub-run's progress never surfaced an interim value to the parent"
     d = s.output_uri
     assert os.path.isdir(d), f"worker-direct write must produce a DIRECTORY of shards, got {d}"
+    assert d != suggested and ".attempt-" in d
+    manifest_path = os.path.join(d, "_DP_SUCCESS.json")
+    assert os.path.isfile(manifest_path), "completed handoff has no commit manifest"
+    import json as _json
+    with open(manifest_path) as manifest_file:
+        manifest = _json.load(manifest_file)
+    assert manifest["format"] == "data-playground-ray-handoff-v2"
+    assert manifest["runId"] == st.run_id and manifest["rows"] == 20
+    assert manifest["shards"] and all(x["path"].endswith(".parquet") for x in manifest["shards"])
     assert _glob.glob(os.path.join(d, "**", "*.parquet"), recursive=True), "no parquet shards written"
     got = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{d}/**/*.parquet')").fetchall())
     assert got == [2 * i for i in range(1, 21)]
 
-    # re-materialize the SAME region into the SAME dir (a recompute after cache loss / a prior partial
-    # write): the write must OVERWRITE, not append — else the downstream ref-source reads doubled rows.
+    # Re-materializing the same content-addressed suggestion publishes a NEW immutable physical prefix.
+    # A concurrent/failed attempt can therefore never mix its shards into the committed result.
     st2 = rr.run_unit(g, "m", suggested)
     for _ in range(900):
         s2 = rr.status(st2.run_id)
@@ -7799,8 +7896,12 @@ def test_ray_region_worker_direct_write_and_progress(tmp_path):
             break
         time.sleep(0.1)
     assert s2.status == "done", s2.error
+    assert s2.output_uri != d
+    assert os.path.isfile(os.path.join(s2.output_uri, "_DP_SUCCESS.json"))
     again = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{s2.output_uri}/**/*.parquet')").fetchall())
-    assert again == [2 * i for i in range(1, 21)], f"recompute must overwrite, not append (got {len(again)} rows)"
+    assert again == [2 * i for i in range(1, 21)]
+    original = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{d}/**/*.parquet')").fetchall())
+    assert original == again, "publishing a retry mutated the previously committed attempt"
 
 
 def test_ray_aggregate_live_differential(tmp_path):
@@ -8171,6 +8272,29 @@ def test_ray_backend_placement_and_tiers(tmp_path):
     assert hasattr(rr, "run_unit")                                     # PlaceableBackend region entry present
 
 
+def test_ray_cancel_is_acknowledged_only_after_driver_reap(tmp_path):
+    import threading as _threading
+
+    from hub.backends import stop_acknowledged
+    from hub.deps import Deps
+    from hub.models import RunStatus
+
+    (tmp_path / "ws").mkdir()
+    rr = _load_dp_ray().RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    run_id = "unit_cancel_ack"
+    rr.runs[run_id] = RunStatus(run_id=run_id, status="cancelled", placement="distributed", per_node=[])
+    assert not rr.cancel_acknowledged(run_id)
+    assert not stop_acknowledged(rr, rr.status(run_id))
+
+    timer = _threading.Timer(0.02, rr._acknowledge_cancel, args=(run_id,))
+    timer.start()
+    try:
+        settled = get_deps().controller._await(rr, run_id)
+    finally:
+        timer.cancel()
+    assert settled.status == "cancelled" and rr.cancel_acknowledged(run_id)
+
+
 def test_ray_backend_run_unit_falls_back_locally_for_a_nonclean_region(tmp_path):
     # D fix: run_unit on a region the backend can't distribute must NOT call the missing
     # LocalRunner.run_unit — it materializes with the local DuckDB engine (correct, non-distributed). No
@@ -8190,11 +8314,21 @@ def test_ray_backend_run_unit_falls_back_locally_for_a_nonclean_region(tmp_path)
         _ray_node("s", "source", {"uri": p}),
         _ray_node("a", "aggregate", {"groupBy": "x*2", "aggs": "count(*) AS n"}),
     ], "edges": [_ray_edge("s", "a")]})
-    out = str(tmp_path / "sub" / "unit.parquet")  # parent dir missing → guards the local materialize makedirs
-    st = rr.run_unit(gr, "a", out)
+    out = str(tmp_path / "sub" / "unit.parquet")
+    st = rr.run_unit(gr, "a", out, run_id="unit_local_fallback")
     assert st.status == "done", st.error
     assert st.placement == "local"  # a non-clean region fell back to the local engine, not Ray
-    assert duckdb.connect().execute(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0] == 2
+    assert st.output_uri != out and st.output_uri.endswith(".attempt-unit_local_fallback")
+    assert not os.path.exists(out), "the fallback wrote the stable controller suggestion"
+    assert os.path.isfile(os.path.join(st.output_uri, "_DP_SUCCESS.json"))
+    assert duckdb.connect().execute(
+        f"SELECT count(*) FROM read_parquet('{st.output_uri}/**/*.parquet')").fetchone()[0] == 2
+
+    # Reattaching the same explicit attempt is read-only and returns the committed physical prefix.
+    manifest_mtime = os.path.getmtime(os.path.join(st.output_uri, "_DP_SUCCESS.json"))
+    again = rr.run_unit(gr, "a", out, run_id="unit_local_fallback")
+    assert again.status == "done" and again.output_uri == st.output_uri
+    assert os.path.getmtime(os.path.join(st.output_uri, "_DP_SUCCESS.json")) == manifest_mtime
 
 
 @pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="live Ray run — opt-in (needs [ray] + a real executor). Enable: DP_TEST_RAY_LIVE=1.")
@@ -8227,7 +8361,10 @@ def test_ray_backend_run_unit_live(tmp_path):
         time.sleep(0.1)
     st = rr.status(st.run_id)
     assert st.status == "done", st.error
-    got = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{out}')").fetchall())
+    assert st.output_uri != out and ".attempt-" in st.output_uri
+    assert os.path.isfile(os.path.join(st.output_uri, "_DP_SUCCESS.json"))
+    got = sorted(r[0] for r in duckdb.connect().execute(
+        f"SELECT x FROM read_parquet('{st.output_uri}/**/*.parquet')").fetchall())
     assert got == [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
 
 

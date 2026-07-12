@@ -91,7 +91,9 @@ def main() -> None:
         ray_opts = mod._ray_opts(job.get("requires"))  # region resource need → per-Ray-task placement
         prog = _progress_writer(status_file)
         _log(f"lowered; {'_run_ir_materialize' if mat else '_run_ir_sync'}; ray_opts={ray_opts}")
-        result = (runner._run_ir_materialize(ir, graph, target, mat, ray_opts, prog) if mat
+        result = (runner._run_ir_materialize(
+            ir, graph, target, mat, ray_opts, prog, job.get("attempt_id") or "driver"
+        ) if mat
                   else runner._run_ir_sync(ir, graph, target, ray_opts, prog, job.get("sink_targets")))
         _log(f"run done: {result.get('status')}")
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read

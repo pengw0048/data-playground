@@ -93,7 +93,7 @@ identity underneath the persistent workers.
 | selected-operator semantic parity | partial | extend multi-node differentials to every claimed operator and edge type |
 | object-store scale-out reads | missing | worker-direct distributed reads, plus bounded fallback for adapters without that capability |
 | durable job lifecycle | missing | persisted Ray submission/attempt ID, restart reconciliation, acknowledged cancel, timeout, and fencing |
-| atomic region publication | missing | immutable attempt prefixes and a validated success manifest/pointer before readers see output |
+| atomic region publication | implemented | distributed and local-fallback handoffs use immutable per-attempt prefixes; the controller validates the success manifest before cache publication |
 | workload isolation | missing | explicit environment allowlist, scoped storage identity, per-run namespace, and cluster policy boundary |
 | cluster health and placement truth | missing | live resource/health discovery, backpressure, and fail-loud behavior for an explicit Ray pin |
 | runtime compatibility | partial | one supported Ray range and a driver/worker/core/plugin version handshake |
@@ -109,15 +109,27 @@ The following changes are required before calling the backend production-capable
    for adapters, with a fail-loud or size-bounded fallback.
 2. Replace local subprocess ownership with a durable Ray job lifecycle that survives kernel/hub restarts
    and supports idempotent submission, cancellation, timeout, retry, and attempt fencing.
-3. Publish region output through an immutable attempt prefix plus a success manifest or atomic pointer;
-   never expose a partially overwritten shard directory.
-4. Scope each workload's environment and storage identity. Arbitrary canvas code must not inherit
+3. Scope each workload's environment and storage identity. Arbitrary canvas code must not inherit
    control-plane credentials or another tenant's object prefix.
-5. Discover live cluster capacity and health, enforce admission/backpressure, and reject an explicit Ray
+4. Discover live cluster capacity and health, enforce admission/backpressure, and reject an explicit Ray
    placement when its requirements cannot be honored.
-6. Pin and verify the supported Ray/runtime image contract across the submitting process and every worker.
-7. Pass staging gates on the intended production topology: active-job failure injection, representative
+5. Pin and verify the supported Ray/runtime image contract across the submitting process and every worker.
+6. Pass staging gates on the intended production topology: active-job failure injection, representative
    large workloads, SLOs/alerts, upgrade/rollback, and recovery runbooks.
+
+Object-store data attempts live under `<DP_STORAGE_URL>/regions/`; their authoritative commit records live
+under the sibling `regions/_dp_commits/` subprefix. The manifest contains the exact shard path and size
+inventory, and every cache lookup verifies it. Configure two native lifecycle rules: expire
+`regions/_dp_commits/` first, then expire all `regions/` data after an additional grace period longer than
+the maximum run duration plus the storage provider's lifecycle-evaluation skew. Once the commit disappears,
+new readers recompute; already-resolved readers retain every shard throughout the grace window. Failed
+attempts have no commit and leave with the later data rule. The hub deliberately does not recursively scan
+and delete a shared bucket in the foreground: it cannot prove ownership across deployments with separate
+metadata databases, and a full shared-prefix listing is not bounded at production fragment counts.
+
+`run_unit` mints a random attempt ID by default and enforces one owner per ID inside a runner. A caller that
+supplies deterministic IDs must fence ownership in its durable control plane. A committed retry reattaches;
+an existing partial/mismatched prefix fails closed and is never overwritten.
 
 Repository changes can make the backend production-capable and provide repeatable validation. A specific
 deployment is production-ready only after its IAM, network, storage, KubeRay, capacity, and operational

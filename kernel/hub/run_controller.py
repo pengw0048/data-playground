@@ -372,6 +372,19 @@ class RunController:
         except OSError:
             pass
 
+    def _region_output_exists(self, uri: str) -> bool:
+        """A Ray attempt is reusable only when its last-written commit manifest is valid.
+
+        Stable/legacy handoffs keep the runner's ordinary existence contract. This scopes the manifest
+        requirement to immutable attempt prefixes, so other placed backends remain compatible.
+        """
+        from hub.handoff import is_attempt_uri, read_manifest, validate_shards
+        if is_attempt_uri(uri):
+            manifest = read_manifest(uri)
+            if manifest is None or not validate_shards(uri, manifest):
+                return False
+        return self.base._output_exists(uri)
+
     def _safe_to_split(self, graph: Graph, target: str, regions) -> bool:
         """Refuse to split (→ run the whole graph in-process, correct but unplaced) for shapes the
         single-port parquet handoff can't represent yet, rather than silently corrupt data:
@@ -470,7 +483,7 @@ class RunController:
         tier = picked
         ckey = f"{key}@{tier.name}"  # tier in the cache key: a local vs object copy are distinct entries
         cached = self.base._cache_get(ckey)
-        if cached and cached.get("uri") and self.base._output_exists(cached["uri"]):
+        if cached and cached.get("uri") and self._region_output_exists(cached["uri"]):
             return cached["uri"]  # reuse — the upstream region didn't change (on this tier)
         # C3 auto data-movement: a prior run materialized this exact region on ANOTHER tier → COPY it to
         # the tier this run needs (cheaper than recomputing), e.g. a local result now feeding a remote step.
@@ -478,7 +491,7 @@ class RunController:
             if other.name == tier.name:
                 continue
             alt = self.base._cache_get(f"{key}@{other.name}")
-            if alt and alt.get("uri") and self.base._output_exists(alt["uri"]):
+            if alt and alt.get("uri") and self._region_output_exists(alt["uri"]):
                 dst = tier.uri(f"{region.id}_{key}.parquet")
                 self._move_tier(alt["uri"], dst, tier, cancel)
                 self.base._cache_put(ckey, {"uri": dst, "table": region.id, "rows": None})
@@ -511,6 +524,10 @@ class RunController:
             if s.status != "done":
                 raise RuntimeError(f"region {region.id} on {region.backend} {s.status}: {s.error}")
             result_uri = s.output_uri or out_uri
+        if not self._region_output_exists(result_uri):
+            raise RuntimeError(
+                f"region {region.id} on {region.backend} returned an unreadable or uncommitted handoff: "
+                f"{result_uri}")
         self.base._cache_put(ckey, {"uri": result_uri, "table": region.id, "rows": None})
         return result_uri
 
