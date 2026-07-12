@@ -49,8 +49,11 @@ kubectl wait --for=condition=complete --timeout=600s job/dp-ray-multinode-check 
   || { echo "multinode differential FAILED"; kubectl logs job/dp-ray-multinode-check; exit 1; }
 ```
 
-Both paths use the same `docker/ray/Dockerfile` image, which bakes in the Ray-2.56 hash-shuffle compat
-shim (`hub.ray_compat`) via the worker-setup-hook env var, so no per-node tuning is needed.
+Both paths use the same `docker/ray/Dockerfile` image. The optional dependency, image, and KubeRay
+`rayVersion` are pinned to **Ray 2.56.0**, the only version currently validated against dp_ray's private
+hash-shuffle ABI. At startup the driver runs a node-affine version handshake against every alive node;
+an unsupported or mixed cluster fails before any Dataset source or operator executes. Every worker also
+validates the private shuffle attributes before installing the compatibility shim.
 
 ## What "PASS" proves (and what it doesn't)
 

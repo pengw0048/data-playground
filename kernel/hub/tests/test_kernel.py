@@ -7567,9 +7567,183 @@ def test_ray_opts_maps_region_requires_to_ray_task_placement():
     assert ropts({"gpu": 2}) == {"num_gpus": 2.0}
     assert ropts({"labels": {"engine": "ray"}}) == {}  # the claim label is not a placement resource
     assert ropts({"labels": {"engine": "ray", "pool": "a100"}}) == {"resources": {"a100": 0.001}}
+    assert ropts({"gpu_type": "a100"}) == {"num_gpus": 1.0}
     assert ropts({"cpu": 8, "mem": "64GB"}) == {}  # aggregates — not mapped to per-task options
     both = ropts({"gpu": 1, "labels": {"pool": "gpu1"}})
     assert both == {"num_gpus": 1.0, "resources": {"gpu1": 0.001}}
+
+
+def test_ray_custom_labels_are_advertised_to_the_pre_dispatch_gate(tmp_path, monkeypatch):
+    from hub.deps import Deps
+    from hub.models import ResourceSpec
+
+    monkeypatch.setenv("DP_RAY_LABELS", "pool=a100, zone=use1, malformed, engine=other")
+    (tmp_path / "ws").mkdir()
+    rr = _load_dp_ray().RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+
+    labels = rr.workers()[0].capacity.labels
+    assert labels == {"engine": "ray", "pool": "a100", "zone": "use1"}
+    assert rr._resource_unsupported_reason(
+        ResourceSpec(labels={"engine": "ray", "pool": "a100"})) is None
+    assert "exceed advertised" in rr._resource_unsupported_reason(
+        ResourceSpec(labels={"engine": "ray", "pool": "h100"}))
+
+
+def test_ray_whole_run_enforces_and_forwards_final_region_resources(tmp_path, monkeypatch):
+    from hub.compiler import compile_plan
+    from hub.deps import Deps
+    from hub.models import Graph
+
+    (tmp_path / "ws").mkdir()
+    mod = _load_dp_ray()
+    rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+
+    def graph(pool):
+        return Graph(**{"id": "ray-final-placement", "version": 1, "nodes": [
+            _ray_node("src", "source", {"uri": "unused.parquet", "requires": {
+                "labels": {"engine": "ray", "pool": pool}}}),
+        ], "edges": []})
+
+    rejected = graph("h100")
+    failed = rr.run(compile_plan(rejected, "src", rr.deps.registry, rr.node_specs),
+                    rejected, "src", "local")
+    assert failed.status == "failed" and "exceed advertised" in (failed.error or "")
+    failed_whole = rr.run(compile_plan(rejected, None, rr.deps.registry, rr.node_specs),
+                          rejected, None, "local")
+    assert failed_whole.status == "failed" and "exceed advertised" in (failed_whole.error or "")
+
+    monkeypatch.setenv("DP_RAY_LABELS", "pool=a100")
+    accepted = graph("a100")
+    dispatched = {}
+
+    class _Thread:
+        def __init__(self, *, target, args, kwargs, daemon):
+            dispatched.update(target=target, args=args, kwargs=kwargs, daemon=daemon)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(mod.threading, "Thread", _Thread)
+    queued = rr.run(compile_plan(accepted, None, rr.deps.registry, rr.node_specs),
+                    accepted, None, "local")
+    assert queued.status == "queued"
+    assert dispatched["kwargs"]["requires"]["labels"] == {"engine": "ray", "pool": "a100"}
+
+    # A plugin NodeSpec default is a real placement pin even when node config has no requires override.
+    from hub.models import ResourceSpec
+    rr.node_specs["sql"] = rr.node_specs["sql"].model_copy(
+        update={"requires": ResourceSpec(labels={"engine": "ray"})})
+    spec_pinned = Graph(**{"id": "ray-spec-pin", "version": 1, "nodes": [
+        _ray_node("src2", "source", {"uri": "unused.parquet"}),
+        _ray_node("sql", "sql", {"sql": "SELECT * FROM input"}),
+    ], "edges": [_ray_edge("src2", "sql")]})
+    pinned = rr.run(compile_plan(spec_pinned, "sql", rr.deps.registry, rr.node_specs),
+                    spec_pinned, "sql", "local")
+    assert pinned.status == "failed" and "explicitly required" in (pinned.error or "")
+
+
+def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    import pyarrow as pa
+
+    from hub.deps import Deps
+    from hub.models import Graph, ResourceSpec
+
+    monkeypatch.setenv("DP_RAY_LABELS", "pool=a100")
+    (tmp_path / "ws").mkdir()
+    mod = _load_dp_ray()
+    rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    opts = {"num_gpus": 1.0, "resources": {"a100": 0.001}}
+    calls = []
+
+    class _Data:
+        def __init__(self, refs=None):
+            self.refs = refs or []
+
+        def columns(self):
+            return ["k"]
+
+        def repartition(self, *args, **kwargs):
+            return self
+
+        def map_batches(self, fn, **kwargs):
+            calls.append(kwargs)
+            return self
+
+        def to_arrow_refs(self):
+            return self.refs
+
+    rr._shuffle_duckdb(_Data(), ["k"], "SELECT DISTINCT * FROM _blk", opts)
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda refs: [pa.table({"k": [1]})]))
+    step = SimpleNamespace(inputs=[("left", None), ("right", None)],
+                           config={"how": "inner", "on": "k"})
+    rr._build_join(step, {"left": _Data(), "right": _Data(["ref"])}, opts)
+    assert len(calls) == 2
+    assert all(call["num_gpus"] == 1.0 and call["resources"] == {"a100": 0.001} for call in calls)
+
+    graph = Graph(**{"id": "ray-pinned-sort", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": "unused.parquet"}),
+        _ray_node("sort", "sort", {"by": "k"}),
+    ], "edges": [_ray_edge("src", "sort")]})
+    status = rr.run_unit(
+        graph, "sort", str(tmp_path / "sort.parquet"),
+        requires=ResourceSpec(labels={"engine": "ray", "pool": "a100"}))
+    assert status.status == "failed" and "sort cannot honor" in (status.error or "")
+
+
+def test_ray_explicit_placement_fails_unsupported_shape_while_unpinned_falls_back(tmp_path, monkeypatch):
+    from hub.deps import Deps
+    from hub.models import Graph, ResourceSpec
+
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+    graph = Graph(**{"id": "ray-placement", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": "unused.parquet"}),
+        _ray_node("sql", "sql", {"sql": "SELECT * FROM input"}),
+    ], "edges": [_ray_edge("src", "sql")]})
+    sentinel = object()
+    monkeypatch.setattr(rr, "_materialize_local", lambda *_args, **_kwargs: sentinel)
+
+    assert rr.run_unit(graph, "sql", str(tmp_path / "fallback.parquet"), requires=None) is sentinel
+
+    explicit = rr.run_unit(
+        graph,
+        "sql",
+        str(tmp_path / "must-ray.parquet"),
+        requires=ResourceSpec(labels={"engine": "ray"}),
+    )
+    assert explicit.status == "failed"
+    assert explicit.placement == "distributed"
+    assert "explicitly required" in (explicit.error or "")
+    assert "sql" in (explicit.error or "")
+
+
+def test_ray_explicit_placement_fails_unadvertised_resources_before_dispatch(tmp_path, monkeypatch):
+    from hub.deps import Deps
+    from hub.models import Graph, ResourceSpec
+
+    monkeypatch.setenv("DP_RAY_GPUS", "1")
+    monkeypatch.setenv("DP_RAY_GPU_TYPE", "a100")
+    (tmp_path / "ws").mkdir()
+    deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    rr = _load_dp_ray().RayRunner(deps)
+    graph = Graph(**{"id": "ray-resource-placement", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": "unused.parquet"}),
+    ], "edges": []})
+
+    status = rr.run_unit(
+        graph,
+        "src",
+        str(tmp_path / "must-ray.parquet"),
+        requires=ResourceSpec(gpu=2, gpu_type="a100", labels={"engine": "ray"}),
+    )
+
+    assert status.status == "failed"
+    assert "requested resources" in (status.error or "")
+    assert "advertised Ray capacity" in (status.error or "")
 
 
 def test_ray_region_worker_direct_write_and_progress(tmp_path):
@@ -7962,42 +8136,23 @@ def test_ray_sort_live_differential(tmp_path):
            sorted((r["k"] is None, r["k"] or 0, r["v"]) for r in duck_rows)  # same multiset of rows
 
 
-def test_ray_region_requires_gates_scheduling(tmp_path):
-    # opt-in live Ray: the region `requires` is forwarded to Ray as per-task placement, so a region needing
-    # a custom resource the cluster does NOT have can't be scheduled → it does not complete (proof the
-    # requirement reached Ray and gates placement — cross-NODE routing to the right worker needs a real
-    # multi-node cluster, but enforcement is verified here on local multi-worker Ray).
-    if not os.environ.get("DP_TEST_RAY_LIVE"):
-        pytest.skip("set DP_TEST_RAY_LIVE=1 to run the live-Ray region test")
-    import time
-
-    import duckdb
-
+def test_ray_region_requires_fail_before_dispatch(tmp_path):
+    # An explicit Ray region whose declared resources are not advertised fails before driver dispatch;
+    # it never becomes a permanently pending Ray task that looks like a hung run.
     from hub.deps import Deps
     from hub.models import Graph, ResourceSpec
-    p = str(tmp_path / "nums.parquet")
-    duckdb.connect().execute(f"COPY (SELECT * FROM range(1,6) t(x)) TO '{p}' (FORMAT PARQUET)")
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
     g = Graph(**{"id": "c", "version": 1, "nodes": [
-        _ray_node("src", "source", {"uri": p}),
+        _ray_node("src", "source", {"uri": "unused.parquet"}),
         _ray_node("m", "transform", {"mode": "map", "code": "def fn(row):\n    row['x'] = row['x'] + 1\n    return row"}),
     ], "edges": [_ray_edge("src", "m")]})
-    # a resource no local Ray node advertises → the map task can never be placed
+    # A resource the configured Ray capacity does not advertise is a terminal placement error.
     req = ResourceSpec(labels={"engine": "ray", "need": "gpu_pool_that_does_not_exist"})
     st = rr.run_unit(g, "m", str(tmp_path / "b.parquet"), requires=req)
-    completed = False
-    for _ in range(50):  # ~5s: long enough that a schedulable region would have finished
-        s = rr.status(st.run_id)
-        if s.status == "done":
-            completed = True
-            break
-        if s.status in ("failed", "cancelled"):
-            break
-        time.sleep(0.1)
-    rr.cancel(st.run_id)  # tear down the pending Ray subprocess
-    assert not completed, "a region requiring an unavailable resource must NOT complete (Ray gates on it)"
+    assert st.status == "failed"
+    assert "advertised Ray capacity" in (st.error or "")
 
 
 def test_ray_backend_placement_and_tiers(tmp_path):

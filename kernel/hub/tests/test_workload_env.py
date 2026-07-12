@@ -24,6 +24,7 @@ def _source() -> dict[str, str]:
     return {
         "PATH": "/runtime/bin",
         "DP_MEMORY_LIMIT": "2GB",
+        "DP_RAY_LABELS": "pool=a100",
         "DP_DATABASE_URL": "postgresql+psycopg://worker:secret@db/dataplay",
         "DP_STORAGE_URL": "s3://data/output",
         "AWS_ACCESS_KEY_ID": "data-key",
@@ -42,6 +43,7 @@ def test_one_shot_workload_environment_is_allowlisted_without_metadata_identity(
     _assert_control_secrets_absent(env)
     assert env["PATH"] == "/runtime/bin" and env["DP_MEMORY_LIMIT"] == "2GB"
     assert env["DP_STORAGE_URL"] == "s3://data/output"
+    assert env["DP_RAY_LABELS"] == "pool=a100"
     assert env["AWS_SECRET_ACCESS_KEY"] == "data-secret"
     assert "DP_DATABASE_URL" not in env
     assert env["DP_AUTH_MODE"] == "1"  # derived confinement signal, never signing material

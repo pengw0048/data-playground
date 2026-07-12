@@ -15,6 +15,12 @@ Install the Ray extra, load [`examples/plugins/dp_ray`](../examples/plugins/dp_r
 requirements contain `labels.engine=ray`. Set `DP_RAY_REMOTE=1` when Ray workers do not share the
 kernel's filesystem; remote placement then requires a configured object-storage tier.
 
+The hub cannot inspect cluster resources without connecting a driver, so operators declare admission
+capacity with `DP_RAY_NUM_CPUS`, `DP_RAY_MEM`, `DP_RAY_GPUS`, `DP_RAY_GPU_TYPE`, and optional labels such
+as `DP_RAY_LABELS=pool=a100,zone=use1`. Each non-engine label value must also exist as a Ray custom
+resource on the matching node (for example `--resources='{"a100": 1}'`). An explicit Ray placement that
+does not match this advertised capacity fails before dispatch instead of becoming an unschedulable task.
+
 The backend conservatively falls back to the local DuckDB runner when it cannot prove that a graph is
 safe to distribute.
 
@@ -25,7 +31,7 @@ safe to distribute.
 | `window` | yes, for a bare-column partition key | order-sensitive forms without a sufficient order fall back |
 | full-row `dedup` | yes | keyed dedup and schemas containing floating-point values fall back |
 | `join` | broadcast `inner`, `left`, and `cross` | the complete right side is collected by the driver and must be bounded |
-| `sort` | plain-column keys | the final ordered result is coalesced to one worker |
+| `sort` | plain-column keys | the final ordered result is coalesced to one worker; Ray 2.56 cannot resource-pin its range shuffle, so GPU/custom-resource sorts fail before dispatch |
 | SQL, sections, metrics/charts, opaque plugin nodes | no | local fallback |
 
 ### Data movement
