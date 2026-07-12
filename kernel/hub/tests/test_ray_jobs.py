@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import datetime
 import os
 import shlex
 import sys
@@ -13,6 +14,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 from hub import metadb
 from hub.compiler import compile_plan
@@ -63,6 +65,7 @@ class FakeJobsClient:
         self.stop_calls: list[str] = []
         self.status_calls: list[str] = []
         self.log_calls: list[str] = []
+        self.events: list[str] = []
         self.lock = threading.Lock()
 
     def __call__(self, _address: str):
@@ -71,17 +74,20 @@ class FakeJobsClient:
     def get_job_status(self, submission_id: str):
         with self.lock:
             self.status_calls.append(submission_id)
+            self.events.append("status")
             if submission_id not in self.jobs:
                 raise RuntimeError(f"job {submission_id} does not exist")
             return self.jobs[submission_id]["status"]
 
     def list_jobs(self):
         with self.lock:
+            self.events.append("list")
             return {job_id: dict(info) for job_id, info in self.jobs.items()}
 
     def submit_job(self, **kwargs):
         submission_id = kwargs["submission_id"]
         with self.lock:
+            self.events.append("submit")
             self.submit_calls.append(kwargs)
             if submission_id in self.jobs:
                 raise RuntimeError("submission id already exists")
@@ -116,6 +122,8 @@ class CountingCatalog:
     def __init__(self):
         self.calls: list[dict] = []
         self.keys: set[str] = set()
+        self.usage_calls: list[dict] = []
+        self.usage_keys: set[str] = set()
         self.lock = threading.Lock()
 
     def register_output(self, **kwargs):
@@ -128,6 +136,14 @@ class CountingCatalog:
                 return
             self.keys.add(idempotency_key)
             self.calls.append({"idempotency_key": idempotency_key, **kwargs})
+
+    def record_usage_idempotent(self, idempotency_key: str, parents: list[str]):
+        with self.lock:
+            if idempotency_key in self.usage_keys:
+                return False
+            self.usage_keys.add(idempotency_key)
+            self.usage_calls.append({"idempotency_key": idempotency_key, "parents": parents})
+            return True
 
 
 class RecoveringCatalog(CountingCatalog):
@@ -155,6 +171,7 @@ def jobs_config(monkeypatch, tmp_path):
     monkeypatch.setenv("DP_RAY_JOBS_POLL_S", "0.01")
     monkeypatch.setenv("DP_RAY_JOBS_CANCEL_TIMEOUT_S", "0.2")
     monkeypatch.setenv("DP_RAY_JOBS_RESULT_TIMEOUT_S", "0.2")
+    monkeypatch.setenv("DP_RAY_JOBS_SUBMISSION_LEASE_S", "5")
     monkeypatch.setenv("DP_RAY_JOBS_PUBLICATION_LEASE_S", "5")
     workspace, data = tmp_path / "workspace", tmp_path / "data"
     workspace.mkdir()
@@ -210,6 +227,13 @@ def _wait_submitted(client: FakeJobsClient, submission_id: str, timeout=2.0):
                 return
         time.sleep(0.01)
     raise AssertionError(f"job {submission_id} was not submitted")
+
+
+def _retire_inert_test_run(status) -> None:
+    """Keep disabled-supervisor fixtures from leaking active SQL rows into later recovery tests."""
+    doc = status.model_dump() if hasattr(status, "model_dump") else dict(status)
+    doc.update(status="failed", error="test fixture retired without a live supervisor")
+    metadb.save_run_state(status.run_id, doc)
 
 
 def _write_success(store: MemoryArtifacts, status, rows=3):
@@ -359,6 +383,273 @@ def test_ray_jobs_cancel_timeout_never_claims_a_live_job_is_cancelled(jobs_confi
     assert _wait(runner, status.run_id).status == "cancelled"
 
 
+def test_cancel_before_sql_submission_claim_forbids_submit(jobs_config):
+    _module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_cancel_before_claim_{uuid.uuid4().hex}")
+    job = store.read(status.backend_ref.job_uri)
+
+    assert metadb.request_backend_cancel(status.run_id) is True
+    assert runner._ensure_job_submitted(client, job) == "CANCEL_REQUESTED"
+    binding = metadb.backend_job(status.run_id)
+    assert binding["submission_state"] == "queued"
+    assert binding["cancel_requested"] is True
+    assert client.submit_calls == []
+    runner._publish_cancelled_binding(status, binding)
+
+
+def test_sql_submission_claim_linearizes_before_concurrent_cancel(jobs_config):
+    _module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_claim_before_cancel_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    job = store.read(ref.job_uri)
+    entered_submit, release_submit = threading.Event(), threading.Event()
+    original_submit = client.submit_job
+
+    def _paused_submit(**kwargs):
+        entered_submit.set()
+        assert release_submit.wait(2), "test did not release the linearized submit"
+        return original_submit(**kwargs)
+
+    client.submit_job = _paused_submit
+    outcome: list[str] = []
+    thread = threading.Thread(target=lambda: outcome.append(runner._ensure_job_submitted(client, job)))
+    thread.start()
+    assert entered_submit.wait(2)
+    claimed = metadb.backend_job(status.run_id)
+    assert claimed["submission_state"] == "submitting" and claimed["submission_owner"]
+
+    assert metadb.request_backend_cancel(status.run_id) is True
+    # The submit already linearized. It is allowed to finish, but cancellation must then observe and stop it.
+    release_submit.set()
+    thread.join(2)
+    assert not thread.is_alive() and outcome == ["PENDING"]
+    submitted = metadb.backend_job(status.run_id)
+    assert submitted["submission_state"] == "submitted" and submitted["cancel_requested"] is True
+    requested, _control, state = runner._cancel_control_state(status, ref, submitted)
+    assert requested is True and state == "STOPPED"
+    assert client.submit_calls and client.stop_calls == [ref.submission_id]
+    runner._publish_cancelled_binding(status, metadb.backend_job(status.run_id))
+
+
+def test_submit_timeout_keeps_fence_until_late_job_is_stopped(jobs_config):
+    _module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_late_accept_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    assert ref is not None
+    job = store.read(ref.job_uri)
+    release_late, accepted = threading.Event(), threading.Event()
+    original_submit = client.submit_job
+
+    def _timeout_then_accept(**kwargs):
+        def _late_accept():
+            assert release_late.wait(2)
+            original_submit(**kwargs)
+            accepted.set()
+
+        threading.Thread(target=_late_accept).start()
+        raise TimeoutError("response timed out while request remained in flight")
+
+    client.submit_job = _timeout_then_accept
+    with pytest.raises(TimeoutError, match="remained in flight"):
+        runner._ensure_job_submitted(client, job)
+    binding = metadb.backend_job(status.run_id)
+    assert binding["submission_state"] == "submitting", "ambiguous submit must retain its fence"
+
+    assert metadb.request_backend_cancel(status.run_id) is True
+    requested, _control, state = runner._cancel_control_state(status, ref, metadb.backend_job(status.run_id))
+    assert requested is True and state == "SUBMITTING"
+    assert client.stop_calls == []
+
+    release_late.set()
+    assert accepted.wait(2)
+    requested, _control, state = runner._cancel_control_state(status, ref, metadb.backend_job(status.run_id))
+    assert requested is True and state == "STOPPED"
+    assert client.stop_calls == [ref.submission_id]
+    runner._publish_cancelled_binding(status, metadb.backend_job(status.run_id))
+
+
+def test_recovery_queries_ray_before_reclaiming_expired_submission_claim(jobs_config):
+    _module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_expired_claim_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    job = store.read(ref.job_uri)
+    assert metadb.claim_backend_submission_after_missing(
+        status.run_id, ref.attempt_id, "dead-owner", 5
+    ) == "claimed"
+    with metadb.session() as session:
+        row = session.get(metadb.RunBackendJob, status.run_id)
+        row.submission_lease_until = metadb._now() - datetime.timedelta(seconds=1)
+    client.put(ref.submission_id, "RUNNING")
+    client.events.clear()
+
+    assert runner._ensure_job_submitted(client, job) == "RUNNING"
+    assert client.events[0] == "status"
+    assert "submit" not in client.events
+    binding = metadb.backend_job(status.run_id)
+    assert binding["submission_state"] == "submitted" and binding["submission_owner"] is None
+    _retire_inert_test_run(status)
+
+
+def test_expired_submission_reclaim_and_cancel_have_one_sql_winner(jobs_config):
+    _module, deps, runner, client, _store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+
+    def _expired_claim(label: str):
+        status = runner.run(
+            plan, graph, "write", "distributed",
+            run_id=f"run_jobs_expired_{label}_{uuid.uuid4().hex}",
+        )
+        ref = status.backend_ref
+        assert ref is not None
+        assert metadb.claim_backend_submission_after_missing(
+            status.run_id, ref.attempt_id, f"old-{label}", 5
+        ) == "claimed"
+        with metadb.session() as session:
+            row = session.get(metadb.RunBackendJob, status.run_id)
+            row.submission_lease_until = metadb._now() - datetime.timedelta(seconds=1)
+        return status, ref
+
+    cancelled, cancelled_ref = _expired_claim("cancel-wins")
+    assert metadb.request_backend_cancel(cancelled.run_id) is True
+    assert metadb.claim_backend_submission_after_missing(
+        cancelled.run_id, cancelled_ref.attempt_id, "new-after-cancel", 5
+    ) == "cancelled"
+    binding = metadb.backend_job(cancelled.run_id)
+    assert binding["submission_state"] == "submitting"
+    assert binding["submission_owner"] == "old-cancel-wins"
+    requested, _control, state = runner._cancel_control_state(cancelled, cancelled_ref, binding)
+    assert requested is True and state == "STOPPED"
+    binding = metadb.backend_job(cancelled.run_id)
+    assert binding["submission_state"] == "stop_fenced"
+    assert client.submit_calls[-1]["entrypoint"] == "sleep 86400"
+    assert client.stop_calls == [cancelled_ref.submission_id]
+    with client.lock:
+        client.jobs.pop(cancelled_ref.submission_id)
+    requested, _control, state = runner._cancel_control_state(
+        cancelled, cancelled_ref, metadb.backend_job(cancelled.run_id)
+    )
+    assert requested is True and state == "STOPPED", "accepted stop fence makes absence terminal evidence"
+    runner._publish_cancelled_binding(cancelled, metadb.backend_job(cancelled.run_id))
+
+    reclaimed, reclaimed_ref = _expired_claim("reclaim-wins")
+    assert metadb.claim_backend_submission_after_missing(
+        reclaimed.run_id, reclaimed_ref.attempt_id, "new-before-cancel", 5
+    ) == "claimed"
+    assert metadb.request_backend_cancel(reclaimed.run_id) is True
+    binding = metadb.backend_job(reclaimed.run_id)
+    assert binding["submission_state"] == "submitting"
+    assert binding["submission_owner"] == "new-before-cancel"
+    assert binding["cancel_requested"] is True
+    requested, _control, state = runner._cancel_control_state(reclaimed, reclaimed_ref, binding)
+    assert requested is True and state == "SUBMITTING", "the unexpired CAS winner must settle first"
+    with metadb.session() as session:
+        session.get(metadb.RunBackendJob, reclaimed.run_id).submission_lease_until = (
+            metadb._now() - datetime.timedelta(seconds=1)
+        )
+    requested, _control, state = runner._cancel_control_state(
+        reclaimed, reclaimed_ref, metadb.backend_job(reclaimed.run_id)
+    )
+    assert requested is True and state == "STOPPED"
+    runner._publish_cancelled_binding(reclaimed, metadb.backend_job(reclaimed.run_id))
+
+
+def test_cancel_fence_timeout_still_stops_its_late_remote_job(jobs_config):
+    _module, deps, runner, client, _store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_late_fence_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    assert ref is not None
+    assert metadb.claim_backend_submission_after_missing(
+        status.run_id, ref.attempt_id, "crashed-owner", 5
+    ) == "claimed"
+    with metadb.session() as session:
+        session.get(metadb.RunBackendJob, status.run_id).submission_lease_until = (
+            metadb._now() - datetime.timedelta(seconds=1)
+        )
+    assert metadb.request_backend_cancel(status.run_id) is True
+
+    release_late, accepted = threading.Event(), threading.Event()
+    original_submit = client.submit_job
+
+    def _timeout_then_accept(**kwargs):
+        def _late_accept():
+            assert release_late.wait(2)
+            original_submit(**kwargs)
+            accepted.set()
+
+        threading.Thread(target=_late_accept).start()
+        raise TimeoutError("cancel fence response lost")
+
+    client.submit_job = _timeout_then_accept
+    requested, _control, state = runner._cancel_control_state(
+        status, ref, metadb.backend_job(status.run_id)
+    )
+    assert requested is True and state == "FENCING"
+    assert metadb.backend_job(status.run_id)["submission_state"] == "fencing"
+
+    release_late.set()
+    assert accepted.wait(2)
+    requested, _control, state = runner._cancel_control_state(
+        status, ref, metadb.backend_job(status.run_id)
+    )
+    assert requested is True and state == "STOPPED"
+    assert client.stop_calls == [ref.submission_id]
+    runner._publish_cancelled_binding(status, metadb.backend_job(status.run_id))
+
+
+def test_quarantine_fences_an_expired_submit_before_terminal_failure(jobs_config):
+    _module, deps, runner, client, _store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_quarantine_fence_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    assert ref is not None
+    assert metadb.claim_backend_submission_after_missing(
+        status.run_id, ref.attempt_id, "crashed-owner", 5
+    ) == "claimed"
+    assert metadb.request_backend_quarantine(status.run_id, "tampered envelope") is True
+    binding = metadb.backend_job(status.run_id)
+    assert runner._resume_quarantined_job(status, ref, binding) is False
+    assert "already-linearized submit" in (status.error or "")
+    assert client.submit_calls == [] and client.stop_calls == []
+
+    with metadb.session() as session:
+        session.get(metadb.RunBackendJob, status.run_id).submission_lease_until = (
+            metadb._now() - datetime.timedelta(seconds=1)
+        )
+
+    binding = metadb.backend_job(status.run_id)
+    assert runner._resume_quarantined_job(status, ref, binding) is False
+    assert client.stop_calls == [ref.submission_id]
+    binding = metadb.backend_job(status.run_id)
+    assert binding["submission_state"] == "stop_fenced"
+    assert runner._resume_quarantined_job(status, ref, binding) is True
+    assert status.status == "failed" and "tampered envelope" in (status.error or "")
+
+
 def test_ray_jobs_restart_reattaches_and_catalog_publication_has_one_winner(jobs_config):
     catalog = CountingCatalog()
     module, deps, original, client, store = _runner(jobs_config, catalog=catalog)
@@ -394,6 +685,49 @@ def test_ray_jobs_restart_reattaches_and_catalog_publication_has_one_winner(jobs
     assert binding and binding["publication_state"] == "published"
     assert metadb.get_run_state(run_id)["status"] == "done"
     metadb.drop_kernel(graph.id, "new-kernel")
+
+
+def test_ray_jobs_multi_sink_usage_is_one_event_per_run(jobs_config):
+    catalog = CountingCatalog()
+    _module, _deps, runner, _client, _store = _runner(jobs_config, catalog=catalog)
+    left_source = "s3://shared/left-parent.parquet"
+    right_source = "s3://shared/right-parent.parquet"
+    graph = Graph.model_validate({
+        "id": f"canvas_{uuid.uuid4().hex}", "version": 1,
+        "nodes": [
+            {"id": "left", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": left_source}}},
+            {"id": "right", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": right_source}}},
+            {"id": "join", "type": "join", "position": {"x": 0, "y": 0},
+             "data": {"config": {"how": "inner", "on": "id"}}},
+            {"id": "write-a", "type": "write", "position": {"x": 0, "y": 0},
+             "data": {"config": {"filename": "a.parquet"}}},
+            {"id": "write-b", "type": "write", "position": {"x": 0, "y": 0},
+             "data": {"config": {"filename": "b.parquet"}}},
+        ],
+        "edges": [
+            {"id": "left-join", "source": "left", "target": "join",
+             "data": {"wire": "dataset", "inputName": "left"}},
+            {"id": "right-join", "source": "right", "target": "join",
+             "data": {"wire": "dataset", "inputName": "right"}},
+            {"id": "a", "source": "join", "target": "write-a", "data": {"wire": "dataset"}},
+            {"id": "b", "source": "join", "target": "write-b", "data": {"wire": "dataset"}},
+        ],
+    })
+    result = {"outputs": [
+        {"step_id": "write-a", "name": "a", "uri": "s3://shared/a.parquet"},
+        {"step_id": "write-b", "name": "b", "uri": "s3://shared/b.parquet"},
+    ]}
+
+    runner._register_outputs(graph, result, {"attempt_id": "attempt-multi"})
+    runner._register_outputs(graph, result, {"attempt_id": "attempt-multi"})
+
+    assert len(catalog.calls) == 2, "each output remains independently idempotent"
+    assert len(catalog.usage_calls) == 1
+    assert catalog.usage_calls[0]["idempotency_key"] == "ray-jobs:attempt-multi"
+    assert set(catalog.usage_calls[0]["parents"]) == {left_source, right_source}
+    assert all(set(call["parents"]) == {left_source, right_source} for call in catalog.calls)
 
 
 def test_ray_jobs_failure_uses_official_info_and_keeps_logs_out_of_shared_status(jobs_config, monkeypatch):
@@ -451,6 +785,7 @@ def test_ray_jobs_atomic_handoff_is_recoverable_without_status_hook(jobs_config)
     active = {doc[1]["run_id"] for doc in metadb.active_backend_jobs("ray-jobs")}
     assert status.run_id in active
     assert metadb.get_run_state(status.run_id)["backend_ref"]["attempt_id"] == status.backend_ref.attempt_id
+    _retire_inert_test_run(status)
 
 
 def test_ray_jobs_terminal_artifact_wins_before_missing_job_replay(jobs_config):
@@ -466,6 +801,27 @@ def test_ray_jobs_terminal_artifact_wins_before_missing_job_replay(jobs_config):
 
     assert _wait(recovered, status.run_id).status == "done"
     assert client.submit_calls == [] and len(recovered.catalog.calls) == 1
+
+
+def test_cancel_preserves_trusted_success_after_submitted_metadata_disappears(jobs_config):
+    module, deps, original, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    original._ensure_jobs_supervisor = lambda _run_id: None
+    status = original.run(plan, graph, "write", "distributed",
+                          run_id=f"run_jobs_result_cancel_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    assert ref is not None
+    assert metadb.note_backend_submission_observed(status.run_id, ref.attempt_id) is True
+    _write_success(store, status, rows=9)
+    assert metadb.request_backend_cancel(status.run_id) is True
+
+    recovered = module.RayRunner(deps, jobs_client_factory=client, artifact_store=store, recover=True)
+    final = _wait(recovered, status.run_id)
+
+    assert final.status == "done" and final.total_rows == 9
+    assert all(call.get("submission_id") != ref.submission_id for call in client.submit_calls)
+    assert ref.submission_id not in client.stop_calls
 
 
 def test_ray_jobs_replays_same_attempt_after_authoritative_metadata_loss(jobs_config):
@@ -544,7 +900,8 @@ def test_ray_jobs_configuration_drift_never_resubmits_to_another_cluster(jobs_co
     while "configuration drift" not in (recovered.status(status.run_id).error or "") and time.monotonic() < deadline:
         time.sleep(0.01)
     assert recovered.status(status.run_id).status == "queued"
-    assert client.submit_calls == [] and client.stop_calls == []
+    assert all(call.get("submission_id") != ref.submission_id for call in client.submit_calls)
+    assert ref.submission_id not in client.stop_calls
 
     monkeypatch.setenv("DP_RAY_JOBS_CLUSTER_REF", "test-ray-cluster")
     _complete(store, client, status)
@@ -699,6 +1056,7 @@ def test_jobs_semantic_environment_is_frozen_while_credentials_rotate(jobs_confi
         "write": "s3://shared/outputs/jobs_out.parquet",
     })
     assert job_a["semantic_env"]["DP_MEMORY_LIMIT"] == "4GB"
+    assert job_a["semantic_env"]["DP_RAY_GPU_BATCH_ROWS"] == str(module._GPU_BATCH_ROWS_DEFAULT)
     assert "AWS_SECRET_ACCESS_KEY" not in job_a["semantic_env"]
 
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "rotated-secret")
@@ -710,6 +1068,13 @@ def test_jobs_semantic_environment_is_frozen_while_credentials_rotate(jobs_confi
     launch_env = module._ray_jobs_env(job_a)
     assert launch_env["DP_MEMORY_LIMIT"] == "4GB"
     assert launch_env["AWS_SECRET_ACCESS_KEY"] == "rotated-secret"
+
+    monkeypatch.setenv("DP_RAY_GPU_BATCH_ROWS", "8192")
+    ref_c, job_c = runner._make_jobs_artifacts("semantic-run", graph, "write", sink_targets={
+        "write": "s3://shared/outputs/jobs_out.parquet",
+    })
+    assert ref_c["attempt_id"] != ref_a["attempt_id"]
+    assert job_c["semantic_env"]["DP_RAY_GPU_BATCH_ROWS"] == "8192"
 
 
 def test_jobs_whole_graph_uses_target_cone_resources_and_forwards_ray_options(jobs_config, monkeypatch):
@@ -737,9 +1102,18 @@ def test_jobs_whole_graph_uses_target_cone_resources_and_forwards_ray_options(jo
     assert job["requires"]["gpu_type"] == "a100"
     assert job["requires"]["labels"] == {"engine": "ray", "pool": "a100"}
     assert module._ray_opts(job["requires"]) == {
-        "num_gpus": 1.0, "resources": {"a100": 0.001},
+        "num_gpus": 1.0, "accelerator_type": "A100", "resources": {"a100": 0.001},
     }
     assert client.submit_calls == []
+    _retire_inert_test_run(status)
+
+    conflict = _graph()
+    conflict.nodes[0].data["config"]["requires"] = {"gpuType": "h100"}
+    conflict.nodes[1].data["config"]["requires"] = {"gpuType": "a100"}
+    conflict_plan = compile_plan(conflict, "write", deps.registry, deps.node_specs, deps.node_ir)
+    conflicted = runner.run(conflict_plan, conflict, "write", "distributed",
+                            run_id=f"run_jobs_gpu_conflict_{uuid.uuid4().hex}")
+    assert conflicted.status == "failed" and "multiple GPU types" in (conflicted.error or "")
 
     sort_graph = _graph()
     sort_graph.nodes[1].type = "sort"
@@ -787,6 +1161,98 @@ def test_backend_publication_atomically_updates_state_and_history(jobs_config, m
         )
     assert metadb.backend_job(rollback_id)["publication_state"] == "pending"
     assert metadb.get_run_state(rollback_id)["status"] == "running"
+
+
+def test_backend_publication_prunes_terminal_state_and_binding_but_keeps_history(jobs_config, monkeypatch):
+    graph = _graph()
+    with metadb.session() as session:
+        session.add(metadb.Canvas(id=graph.id, owner_id=metadb.DEFAULT_USER_ID,
+                                  name="retention", version=1, doc="{}"))
+    monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 2)
+    run_ids = []
+    refs = []
+    for index in range(3):
+        run_id = f"retained_history_{index}_{uuid.uuid4().hex}"
+        run_ids.append(run_id)
+        status_doc = {"run_id": run_id, "status": "running", "target_node_id": "write", "per_node": []}
+        ref = {
+            "backend": "ray-jobs", "cluster_ref": "cluster", "attempt_id": f"attempt-{index}",
+            "submission_id": f"submission-{uuid.uuid4().hex}", "job_uri": f"s3://b/{index}/job",
+            "result_uri": f"s3://b/{index}/result", "code_ref": "sha256:test",
+            "control_address": "http://ray:8265",
+        }
+        refs.append(ref)
+        metadb.bind_backend_job(run_id, ref, status_doc, canvas_id=graph.id)
+        assert metadb.claim_backend_publication(run_id, ref["attempt_id"], "owner", 10) == "claimed"
+        assert metadb.finish_backend_publication(
+            run_id, ref["attempt_id"], "owner",
+            {**status_doc, "status": "done", "total_rows": index + 1},
+        ) is True
+        time.sleep(0.002)
+
+    assert metadb.get_run_state(run_ids[0]) is None
+    assert metadb.backend_job(run_ids[0]) is None
+    assert all(metadb.get_run_state(run_id)["status"] == "done" for run_id in run_ids[1:])
+    assert all(metadb.backend_job(run_id)["publication_state"] == "published" for run_id in run_ids[1:])
+    history_ids = {row["runId"] for row in metadb.list_runs(graph.id, limit=10)}
+    assert set(run_ids) <= history_ids, "run_records survive terminal status/backend retention pruning"
+
+    # A duplicate supervisor can finish after terminal detail was pruned. The compact permanent fence,
+    # not optional/bounded history, prevents stale status or a duplicate bind from resurrecting it.
+    metadb.save_run_state(run_ids[0], {
+        "run_id": run_ids[0], "status": "running", "per_node": [], "error": "stale supervisor",
+    })
+    assert metadb.get_run_state(run_ids[0]) is None
+    with pytest.raises(metadb.TerminalRunIdError, match="already terminal"):
+        metadb.bind_backend_job(run_ids[0], refs[0], {
+            "run_id": run_ids[0], "status": "queued", "per_node": [],
+        })
+
+
+def test_terminal_fence_survives_ad_hoc_pruning_without_run_history(jobs_config, monkeypatch):
+    monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 0)
+    run_id = f"adhoc_terminal_fence_{uuid.uuid4().hex}"
+    ref = {
+        "backend": "ray-jobs", "cluster_ref": "cluster", "attempt_id": "attempt",
+        "submission_id": f"submission-{uuid.uuid4().hex}", "job_uri": "s3://b/job",
+        "result_uri": "s3://b/result", "code_ref": "sha256:test",
+        "control_address": "http://ray:8265",
+    }
+    status = {"run_id": run_id, "status": "running", "per_node": []}
+    metadb.bind_backend_job(run_id, ref, status)
+    assert metadb.claim_backend_publication(run_id, "attempt", "owner", 10) == "claimed"
+    assert metadb.finish_backend_publication(
+        run_id, "attempt", "owner", {**status, "status": "done", "total_rows": 1},
+    ) is True
+
+    assert metadb.get_run_state(run_id) is None and metadb.backend_job(run_id) is None
+    with metadb.session() as session:
+        assert session.get(metadb.RunTerminalFence, run_id).status == "done"
+        assert session.scalar(select(metadb.RunRecord.id).where(
+            metadb.RunRecord.run_id == run_id
+        )) is None
+
+    metadb.save_run_state(run_id, {**status, "error": "stale"})
+    assert metadb.get_run_state(run_id) is None
+    with pytest.raises(metadb.TerminalRunIdError, match="already terminal"):
+        metadb.bind_run_owner(run_id, "local", None)
+    with pytest.raises(metadb.TerminalRunIdError, match="already terminal"):
+        metadb.bind_backend_job(run_id, ref, {**status, "status": "queued"})
+
+
+def test_fast_terminal_run_can_bind_owner_while_detail_still_exists(jobs_config):
+    run_id = f"fast_terminal_owner_{uuid.uuid4().hex}"
+    metadb.save_run_state(run_id, {
+        "run_id": run_id, "status": "failed", "per_node": [], "error": "pre-dispatch rejection",
+    })
+
+    metadb.bind_run_owner(run_id, "fast-user", None)
+
+    with metadb.session() as session:
+        state = session.get(metadb.RunState, run_id)
+        assert state.status == "failed"
+        assert state.created_by == "fast-user" and state.auth_canvas_id is None
+        assert session.get(metadb.RunTerminalFence, run_id).status == "failed"
 
 
 def test_catalog_is_required_and_retried_before_terminal_publication(jobs_config):

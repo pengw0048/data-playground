@@ -110,6 +110,11 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 | `reg.add_destination(backend)` | a save/open-dialog **"place"** (a browsable/writable location) | `DestinationBackend` Protocol (`destinations.py`): `kind` + `browse(root, path)` (→ `{path, entries:[{name, kind, uri}], error?}`) + `target_uri(root, path, filename)`. Claims a place `kind`; a user adds a preset (backend + root) in Settings → Destinations. Built-in `local`/`s3`/`gs` go through the same registry. |
 | `reg.add_telemetry_sink(fn)` | run observability (export finished-run telemetry) | `fn(record: dict)` invoked once per FINISHED run with a normalized record: `canvas_id/run_id/status/rows/ms/error/output_table/placement/per_node` (`per_node` = `[{node_id, label, status, rows, ms}]`). Core ships **no** exporter (offline-first) — an OTel/StatsD/warehouse sink is a plugin; a sink that raises is caught + logged, never failing the run. See `dp_run_log`. |
 
+Catalogs used by an at-least-once durable runner additionally implement the runtime-checkable
+`DurableCatalogPublisher` capability from `backends.py`: one idempotency key per output through
+`register_output_idempotent`, plus one run-level `record_usage_idempotent` call over all distinct source
+parents. Providers that do not need popularity can make the latter a durable idempotent no-op.
+
 Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter; runners are picked
 by `pick_runner` (respects the Settings → Execution choice, else the first that `can_run`). **The
 built-ins go through these same seams — the DuckDB/Lance adapters, the InMemoryCatalog, and the local

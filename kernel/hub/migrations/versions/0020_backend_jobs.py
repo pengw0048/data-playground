@@ -46,6 +46,9 @@ def upgrade() -> None:
         sa.Column("control_address", sa.Text(), nullable=True),
         sa.Column("cancel_requested", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("quarantine_reason", sa.Text(), nullable=True),
+        sa.Column("submission_state", sa.String(), nullable=False, server_default="queued"),
+        sa.Column("submission_owner", sa.String(), nullable=True),
+        sa.Column("submission_lease_until", sa.DateTime(timezone=True), nullable=True),
         sa.Column("publication_state", sa.String(), nullable=False, server_default="pending"),
         sa.Column("publication_owner", sa.String(), nullable=True),
         sa.Column("publication_lease_until", sa.DateTime(timezone=True), nullable=True),
@@ -54,9 +57,30 @@ def upgrade() -> None:
         sa.UniqueConstraint("backend", "submission_id", name="uq_run_backend_submission"),
     )
     op.create_index("ix_run_backend_jobs_backend", "run_backend_jobs", ["backend"])
+    op.create_table(
+        "run_terminal_fences",
+        sa.Column("run_id", sa.String(), primary_key=True),
+        sa.Column("status", sa.String(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+    )
+    # Existing terminal detail is already authoritative. Backfill its compact identity before any future
+    # retention pass can prune run_states; otherwise a stale supervisor could resurrect an upgraded run.
+    op.execute(sa.text("""
+        INSERT INTO run_terminal_fences (run_id, status, created_at)
+        SELECT run_id, status, CURRENT_TIMESTAMP
+        FROM run_states
+        WHERE status IN ('done', 'failed', 'cancelled')
+    """))
+    op.create_table(
+        "catalog_publication_events",
+        sa.Column("event_key", sa.String(), primary_key=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+    )
 
 
 def downgrade() -> None:
+    op.drop_table("catalog_publication_events")
+    op.drop_table("run_terminal_fences")
     op.drop_index("ix_run_backend_jobs_backend", table_name="run_backend_jobs")
     op.drop_table("run_backend_jobs")
     with op.batch_alter_table("run_records") as batch:

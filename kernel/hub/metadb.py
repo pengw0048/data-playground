@@ -23,7 +23,7 @@ from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String,
-    Text, UniqueConstraint, create_engine, exists, func, or_, select, update,
+    Text, UniqueConstraint, and_, create_engine, exists, func, or_, select, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
@@ -151,6 +151,11 @@ class RunBackendJob(Base):
     control_address: Mapped[str | None] = mapped_column(Text, nullable=True)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     quarantine_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submission_state: Mapped[str] = mapped_column(String, default="queued", server_default="queued")
+    submission_owner: Mapped[str | None] = mapped_column(String, nullable=True)
+    submission_lease_until: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     publication_state: Mapped[str] = mapped_column(String, default="pending")
     publication_owner: Mapped[str | None] = mapped_column(String, nullable=True)
     publication_lease_until: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -159,8 +164,20 @@ class RunBackendJob(Base):
     __table_args__ = (UniqueConstraint("backend", "submission_id", name="uq_run_backend_submission"),)
 
 
+class RunTerminalFence(Base):
+    """Compact permanent identity fence; terminal status/history detail is retained separately."""
+    __tablename__ = "run_terminal_fences"
+    run_id: Mapped[str] = mapped_column(String, primary_key=True)
+    status: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class ActiveBackendJobsError(RuntimeError):
     """A canvas cannot be deleted while external work can still produce side effects."""
+
+
+class TerminalRunIdError(RuntimeError):
+    """A completed logical run id cannot be rebound after its retained detail is pruned."""
 
 
 class SchemaContract(Base):
@@ -253,6 +270,13 @@ class CatalogEdge(Base):
     column: Mapped[str | None] = mapped_column(String, nullable=True)
     pipeline: Mapped[str | None] = mapped_column(String, nullable=True)
     __table_args__ = (UniqueConstraint("parent", "child", name="uq_catalog_edge"),)
+
+
+class CatalogPublicationEvent(Base):
+    """One durable usage-accounting effect from an idempotent external-run publication."""
+    __tablename__ = "catalog_publication_events"
+    event_key: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class ResultCache(Base):
@@ -1022,6 +1046,9 @@ def bind_run_owner(run_id: str, uid: str, auth_canvas_id: str | None) -> None:
     with session() as s:
         r = s.get(RunState, run_id)
         if r is None:
+            fenced = _terminal_fence_status(s, run_id)
+            if fenced is not None:
+                raise TerminalRunIdError(f"run '{run_id}' is already terminal ({fenced})")
             s.add(RunState(run_id=run_id, canvas_id=auth_canvas_id, status="queued", doc="{}",
                            created_by=uid, auth_canvas_id=auth_canvas_id))
         else:
@@ -1264,6 +1291,21 @@ class RunStatePublicationRejected(RuntimeError):
     """A definitive owner-row race loss, never an unknown database commit outcome."""
 
 
+def _terminal_fence_status(s, run_id: str) -> str | None:
+    return s.scalar(select(RunTerminalFence.status).where(RunTerminalFence.run_id == run_id))
+
+
+def _record_terminal_fence(s, run_id: str, status: str) -> None:
+    current = _terminal_fence_status(s, run_id)
+    if current is not None and current != status:
+        raise RuntimeError(
+            f"run '{run_id}' is permanently fenced as {current}, not {status}"
+        )
+    if current is None:
+        s.add(RunTerminalFence(run_id=run_id, status=status))
+        s.flush()
+
+
 def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                    kernel_id: str | None = None, *, publish_region: bool = False) -> None:
     """Upsert a run's live status (the runner calls this on each transition). `status` is a RunStatus
@@ -1272,7 +1314,7 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
     reaches a terminal status, prunes finished run_states to the newest _RUN_STATE_MAX (each row holds a
     full RunStatus JSON, so unbounded growth is a real local-DB leak) — live rows are never touched, so
     the reaper and in-flight status lookups are unaffected; an evicted OLD run just 404s on GET /run/{id}
-    (its durable per-canvas history lives in run_records)."""
+    (its durable per-canvas history and compact terminal identity fence remain)."""
     status = dict(status)
     st = str(status.get("status", "running"))
     if st != "done" and _local_result_candidate(_result_doc_uri(status)) is not None:
@@ -1310,20 +1352,29 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                 raise RunStatePublicationRejected(
                     "run state was deleted before terminal publication")
         payload = json.dumps(status, default=str)
+        fenced = _terminal_fence_status(s, run_id)
+        if fenced is not None and (r is None or st != fenced):
+            return
         if r is None:
             s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload, kernel_id=kernel_id))
         else:
-            # Terminal state is monotonic. Two restart-recovered supervisors may observe the same external
-            # job at slightly different times; a delayed RUNNING update must never regress a published result.
-            if r.status in _TERMINAL_RUN and st != r.status:
+            # Make terminal monotonicity an UPDATE predicate, not a prior ORM read. A transaction can load
+            # queued, pause while another supervisor atomically publishes done, then otherwise flush its
+            # stale queued object over the terminal result.
+            values = {"status": st, "doc": payload}
+            if canvas_id:
+                values["canvas_id"] = func.coalesce(RunState.canvas_id, canvas_id)
+            if kernel_id:
+                values["kernel_id"] = func.coalesce(RunState.kernel_id, kernel_id)
+            updated = s.execute(update(RunState).where(
+                RunState.run_id == run_id,
+                or_(RunState.status.not_in(_TERMINAL_RUN), RunState.status == st),
+            ).values(**values))
+            if not updated.rowcount:
                 return
-            r.status = st
-            r.doc = payload
-            if canvas_id and not r.canvas_id:
-                r.canvas_id = canvas_id
-            if kernel_id and not r.kernel_id:
-                r.kernel_id = kernel_id
         s.flush()
+        if st in _TERMINAL_RUN:
+            _record_terminal_fence(s, run_id, st)
         stale = []
         if st in _TERMINAL_RUN:
             # Re-evaluate age after every candidate lock; delete only rows included in the one
@@ -1423,12 +1474,22 @@ def bind_backend_job(run_id: str, ref: dict, status: dict,
         code_ref=str(ref.get("code_ref") or "") or None,
         control_address=str(ref.get("control_address") or "") or None,
         cancel_requested=bool(ref.get("cancel_requested", False)),
+        submission_state="queued",
         publication_state="pending",
     )
     try:
         with session() as s:
+            fenced = _terminal_fence_status(s, run_id)
+            if fenced is not None:
+                raise TerminalRunIdError(f"run '{run_id}' is already terminal ({fenced})")
             s.add(row)
             s.flush()
+            # Re-check after the insert fence: a concurrent terminal transaction may have deleted the
+            # previous backend detail and committed its permanent run-id fence while this insert waited.
+            s.expire_all()
+            fenced = _terminal_fence_status(s, run_id)
+            if fenced is not None:
+                raise TerminalRunIdError(f"run '{run_id}' is already terminal ({fenced})")
             state = s.get(RunState, run_id)
             st = str(status.get("status") or "queued")
             payload = json.dumps(status, default=str)
@@ -1440,6 +1501,10 @@ def bind_backend_job(run_id: str, ref: dict, status: dict,
                     state.canvas_id = canvas_id
         return backend_job(run_id), True
     except IntegrityError:
+        with session() as s:
+            fenced = _terminal_fence_status(s, run_id)
+        if fenced is not None:
+            raise TerminalRunIdError(f"run '{run_id}' is already terminal ({fenced})")
         existing = backend_job(run_id)
         if existing is None:
             raise
@@ -1463,6 +1528,11 @@ def _backend_job_doc(row: RunBackendJob) -> dict:
         "control_address": row.control_address,
         "cancel_requested": bool(row.cancel_requested),
         "quarantine_reason": row.quarantine_reason,
+        "submission_state": row.submission_state,
+        "submission_owner": row.submission_owner,
+        "submission_lease_until": (
+            row.submission_lease_until.isoformat() if row.submission_lease_until else None
+        ),
         "durable": True,
         "publication_state": row.publication_state,
         "result": json.loads(row.result_doc) if row.result_doc else None,
@@ -1508,6 +1578,130 @@ def request_backend_quarantine(run_id: str, reason: str) -> bool:
         updated = s.execute(
             update(RunBackendJob).where(RunBackendJob.run_id == run_id)
             .values(quarantine_reason=str(reason)[:4000])
+        )
+        return bool(updated.rowcount)
+
+
+def claim_backend_submission_after_missing(run_id: str, attempt_id: str, owner: str,
+                                           lease_seconds: float = 30.0) -> str:
+    """Linearize or reclaim one submit after Ray status+list authoritatively report it missing.
+
+    A single CAS claims a fresh queued attempt, a metadata-lost submitted attempt, or an expired
+    submitting owner. Reclaim never exposes an intermediate queued state where concurrent cancellation
+    could forget that an older, already-linearized request may still arrive at Ray.
+    """
+    with session() as s:
+        now = s.scalar(select(func.current_timestamp()))
+        lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                RunBackendJob.cancel_requested.is_(False),
+                RunBackendJob.quarantine_reason.is_(None),
+                or_(
+                    RunBackendJob.submission_state == "queued",
+                    RunBackendJob.submission_state == "submitted",
+                    and_(
+                        RunBackendJob.submission_state == "submitting",
+                        or_(RunBackendJob.submission_lease_until.is_(None),
+                            RunBackendJob.submission_lease_until < now),
+                    ),
+                ),
+            ).values(submission_state="submitting", submission_owner=owner,
+                     submission_lease_until=lease)
+        )
+        if updated.rowcount:
+            return "claimed"
+        row = s.get(RunBackendJob, run_id)
+        if row is None or row.attempt_id != attempt_id:
+            return "lost"
+        if row.quarantine_reason:
+            return "quarantined"
+        if row.cancel_requested:
+            return "cancelled"
+        return "busy"
+
+
+def renew_backend_submission(run_id: str, attempt_id: str, owner: str,
+                             lease_seconds: float = 30.0) -> bool:
+    """Keep a live, already-linearized external submit from being reclaimed mid-request."""
+    with session() as s:
+        now = s.scalar(select(func.current_timestamp()))
+        lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                RunBackendJob.submission_state == "submitting",
+                RunBackendJob.submission_owner == owner,
+            ).values(submission_lease_until=lease)
+        )
+        return bool(updated.rowcount)
+
+
+def note_backend_submission_observed(run_id: str, attempt_id: str) -> bool:
+    """Persist that Ray authoritatively exposes the deterministic submission ID."""
+    with session() as s:
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                RunBackendJob.submission_state != "stop_fenced",
+            ).values(submission_state="submitted", submission_owner=None,
+                     submission_lease_until=None)
+        )
+        return bool(updated.rowcount)
+
+
+def claim_backend_stop_fence(run_id: str, attempt_id: str, owner: str,
+                             lease_seconds: float = 30.0) -> str:
+    """Claim an expired uncertain submit so stop intent can reserve its deterministic Ray ID.
+
+    The fixed remote fence job and a delayed original submit race on the same Ray submission ID; only
+    one can be accepted. This turns an otherwise unknowable crashed-owner state into stoppable evidence.
+    """
+    with session() as s:
+        now = s.scalar(select(func.current_timestamp()))
+        lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                or_(RunBackendJob.cancel_requested.is_(True),
+                    RunBackendJob.quarantine_reason.is_not(None)),
+                RunBackendJob.submission_state.in_(("submitting", "fencing")),
+                or_(RunBackendJob.submission_lease_until.is_(None),
+                    RunBackendJob.submission_lease_until < now),
+            ).values(submission_state="fencing", submission_owner=owner,
+                     submission_lease_until=lease)
+        )
+        if updated.rowcount:
+            return "claimed"
+        row = s.get(RunBackendJob, run_id)
+        if row is None or row.attempt_id != attempt_id:
+            return "lost"
+        if not (row.cancel_requested or row.quarantine_reason):
+            return "lost"
+        if row.submission_state == "queued":
+            return "not_needed"
+        if row.submission_state in ("submitted", "stop_fenced"):
+            return "settled_missing"
+        return "busy"
+
+
+def note_backend_stop_fence_accepted(run_id: str, attempt_id: str) -> bool:
+    """Record that the fixed stop fence, rather than the original workload, reserved the Ray ID."""
+    with session() as s:
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                or_(RunBackendJob.cancel_requested.is_(True),
+                    RunBackendJob.quarantine_reason.is_not(None)),
+                RunBackendJob.submission_state == "fencing",
+            ).values(submission_state="stop_fenced", submission_owner=None,
+                     submission_lease_until=None)
         )
         return bool(updated.rowcount)
 
@@ -1581,7 +1775,15 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
         canvas_id = s.scalar(select(RunState.canvas_id).where(RunState.run_id == run_id))
         if canvas_id and s.get(Canvas, canvas_id, with_for_update=True) is None:
             return False
-        state = s.get(RunState, run_id, with_for_update=True)
+        stale_candidate_ids = list(s.scalars(select(RunState.run_id).where(
+            RunState.status.in_(_TERMINAL_RUN), RunState.run_id != str(run_id)
+        ).order_by(RunState.updated_at.desc(), RunState.run_id.desc())
+          .offset(max(0, _RUN_STATE_MAX - 1))))
+        lock_ids = sorted({str(run_id), *stale_candidate_ids})
+        locked = {row.run_id: row for row in s.scalars(select(RunState).where(
+            RunState.run_id.in_(lock_ids)
+        ).order_by(RunState.run_id).with_for_update())}
+        state = locked.get(str(run_id))
         if state is None:
             return False
         updated = s.execute(
@@ -1597,8 +1799,25 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
             return False
         payload = json.dumps(published, default=str)
         state.status, state.doc = terminal, payload
+        s.flush()
+        _record_terminal_fence(s, run_id, terminal)
+        stale_now = set(s.scalars(select(RunState.run_id).where(
+            RunState.status.in_(_TERMINAL_RUN)
+        ).order_by(RunState.updated_at.desc(), RunState.run_id.desc())
+          .offset(_RUN_STATE_MAX)))
+        prune_current = str(run_id) in stale_now
+        stale = [locked[key] for key in sorted(stale_now & set(stale_candidate_ids))
+                 if key != str(run_id) and key in locked
+                 and locked[key].status in _TERMINAL_RUN]
+        pruned = [*stale, *([state] if prune_current else [])]
         output_uri = _result_doc_uri(published)
         _replace_attempt_ref(s, "run_state", run_id, output_uri)
+        for obj in pruned:
+            job = s.get(RunBackendJob, obj.run_id)
+            if job is not None:
+                s.delete(job)
+            _replace_attempt_ref(s, "run_state", obj.run_id, None)
+            s.delete(obj)
         per_node = published.get("per_node") or None
         _upsert_run_record(
             s, canvas_id=state.canvas_id, target_node_id=published.get("target_node_id"),
@@ -1606,10 +1825,18 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
             error=published.get("error"), output_table=published.get("output_table"),
             per_node=per_node, run_id=run_id, output_uri=output_uri,
         )
-        sync_local_result_owner(s, "run_state", run_id, published)
-        if terminal == "done":
+        if pruned:
+            _lock_local_result_registry(s)
+        if not prune_current:
+            sync_local_result_owner(s, "run_state", run_id, published)
+        if terminal == "done" and not prune_current:
             _release_terminal_local_result_writers(
                 s, run_id, allow_unreferenced=False)
+        elif terminal == "done":
+            _release_terminal_local_result_writers(
+                s, run_id, allow_unreferenced=True)
+        for obj in pruned:
+            _drop_local_result_owner_locked(s, "run_state", obj.run_id)
         return True
 
 
@@ -3942,6 +4169,26 @@ def catalog_bump_usage(uri: str, n: int = 1) -> None:
             logical.usage += n
 
 
+def catalog_bump_usage_once(event_key: str, uris: list[str]) -> bool:
+    """Apply one durable publication event to every distinct parent URI exactly once."""
+    if not event_key:
+        raise ValueError("catalog publication event_key is required")
+    try:
+        with session() as s:
+            if s.get(CatalogPublicationEvent, event_key) is not None:
+                return False
+            s.add(CatalogPublicationEvent(event_key=event_key))
+            s.flush()  # unique PK is the cross-process idempotency fence
+            for uri in dict.fromkeys(str(value) for value in uris if value):
+                s.execute(
+                    update(CatalogEntry).where(CatalogEntry.uri == uri)
+                    .values(usage=CatalogEntry.usage + 1, updated_at=CatalogEntry.updated_at)
+                )
+            return True
+    except IntegrityError:
+        return False
+
+
 def catalog_add_edge(parent: str, child: str, pipeline: str | None = None,
                      column: str | None = None) -> bool:
     """Write-through a lineage edge; one row per (parent, child). `column` records column-level
@@ -4684,6 +4931,7 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
             r.status = "failed"
             r.doc = json.dumps(d, default=str)
             _replace_attempt_ref(s, "run_state", r.run_id, None)
+            _record_terminal_fence(s, r.run_id, "failed")
             reaped_run_ids.append(r.run_id)
             n += 1
         if reaped_run_ids:

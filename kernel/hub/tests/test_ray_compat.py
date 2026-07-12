@@ -110,6 +110,13 @@ def test_ray_dependency_image_and_kuberay_manifest_share_one_version_contract():
     assert f'rayVersion: "{ray_compat.SUPPORTED_RAY_VERSION}"' in manifest
 
 
+def test_ray_validation_runs_the_logical_gpu_contract_without_mutating_cpu_clusters():
+    workflow = (_ROOT / ".github/workflows/ray-validation.yml").read_text()
+    assert "python -m hub.ray_gpu_contract_check" in workflow
+    assert "--gpus" not in workflow
+    assert "NVIDIA_VISIBLE_DEVICES" not in workflow
+
+
 def _assert_restricted_pod(pod: dict, container_name: str) -> None:
     assert pod["automountServiceAccountToken"] is False
     pod_security = pod["securityContext"]

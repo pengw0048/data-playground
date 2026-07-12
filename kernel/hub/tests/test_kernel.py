@@ -764,6 +764,8 @@ def test_stale_kernel_is_reaped_and_its_run_failed():
     assert metadb.get_kernel("cv_stale") is None
     metadb.reap_orphaned_runs()
     assert metadb.get_run_state("run_stale")["status"] == "failed"
+    with metadb.session() as session:
+        assert session.get(metadb.RunTerminalFence, "run_stale").status == "failed"
 
 
 def test_claim_kernel_takes_over_a_stale_lease():
@@ -1930,6 +1932,62 @@ def test_output_version_is_content_addressed_and_flags_schema_drift(tmp_path, ca
         t3 = cat.register_output(name="out", uri=p, parents=[])
     assert t3.version != t1.version, "a changed schema must produce a new version"
     assert any("schema changed" in r.getMessage() for r in caplog.records), "schema drift must be surfaced"
+
+
+def test_catalog_usage_counts_runs_and_deduplicates_one_publication_event(tmp_path, monkeypatch):
+    import duckdb
+
+    from hub import metadb
+    from hub.backends import DurableCatalogPublisher
+    from hub.deps import Deps
+
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    assert isinstance(d.catalog, DurableCatalogPublisher)
+    source = str(tmp_path / "source.parquet")
+    output = str(tmp_path / "output.parquet")
+    output_two = str(tmp_path / "output-two.parquet")
+    duckdb.connect().execute(f"COPY (SELECT 1 AS id) TO '{source}' (FORMAT PARQUET)")
+    duckdb.connect().execute(f"COPY (SELECT 2 AS id) TO '{output}' (FORMAT PARQUET)")
+    duckdb.connect().execute(f"COPY (SELECT 3 AS id) TO '{output_two}' (FORMAT PARQUET)")
+    d.catalog.register_output(name="source", uri=source, parents=[])
+
+    d.catalog.register_output_idempotent(
+        "attempt-a:write-one", name="output", uri=output, parents=[source], pipeline="canvas"
+    )
+    d.catalog.register_output_idempotent(
+        "attempt-a:write-two", name="output-two", uri=output_two, parents=[source], pipeline="canvas"
+    )
+    assert metadb.catalog_get(source)["usage"] == 0, "output count is not run popularity"
+    d.catalog.record_usage_idempotent("attempt-a", [source, source])
+    d.catalog.record_usage_idempotent("attempt-a", [source])
+    assert metadb.catalog_get(source)["usage"] == 1, "one multi-sink run counts its parent once"
+
+    d.catalog.register_output_idempotent(
+        "attempt-b:write", name="output", uri=output, parents=[source], pipeline="canvas"
+    )
+    d.catalog.record_usage_idempotent("attempt-b", [source])
+    assert metadb.catalog_get(source)["usage"] == 2, "two real runs sharing one lineage edge count twice"
+
+    original = metadb.catalog_bump_usage_once
+    crashed = False
+
+    def _commit_then_crash(event_key, uris):
+        nonlocal crashed
+        applied = original(event_key, uris)
+        if not crashed:
+            crashed = True
+            raise ConnectionError("publisher crashed after usage commit")
+        return applied
+
+    monkeypatch.setattr(metadb, "catalog_bump_usage_once", _commit_then_crash)
+    with pytest.raises(ConnectionError, match="after usage commit"):
+        d.catalog.record_usage_idempotent("attempt-c", [source])
+    d.catalog.record_usage_idempotent("attempt-c", [source])
+    assert metadb.catalog_get(source)["usage"] == 3
+
+    d.catalog.register_output(name="output", uri=output, parents=[source], pipeline="canvas")
+    d.catalog.register_output(name="output", uri=output, parents=[source], pipeline="canvas")
+    assert metadb.catalog_get(source)["usage"] == 5, "legacy/local run calls retain per-run popularity"
 
 
 def test_object_output_version_bumps_on_overwrite(tmp_path):
@@ -10628,10 +10686,24 @@ def test_ray_opts_maps_region_requires_to_ray_task_placement():
     assert ropts({"gpu": 2}) == {"num_gpus": 2.0}
     assert ropts({"labels": {"engine": "ray"}}) == {}  # the claim label is not a placement resource
     assert ropts({"labels": {"engine": "ray", "pool": "a100"}}) == {"resources": {"a100": 0.001}}
-    assert ropts({"gpu_type": "a100"}) == {"num_gpus": 1.0}
+    assert ropts({"gpu_type": "a100"}) == {"num_gpus": 1.0, "accelerator_type": "A100"}
     assert ropts({"cpu": 8, "mem": "64GB"}) == {}  # aggregates — not mapped to per-task options
     both = ropts({"gpu": 1, "labels": {"pool": "gpu1"}})
     assert both == {"num_gpus": 1.0, "resources": {"gpu1": 0.001}}
+
+
+def test_ray_gpu_batch_rows_are_validated_capped_and_frozen(monkeypatch):
+    mod = _load_dp_ray()
+    monkeypatch.delenv("DP_RAY_GPU_BATCH_ROWS", raising=False)
+    assert mod._gpu_batch_rows() == mod._GPU_BATCH_ROWS_DEFAULT
+    monkeypatch.setenv("DP_RAY_GPU_BATCH_ROWS", "8192")
+    assert mod._gpu_batch_rows() == 8192
+    monkeypatch.setenv("DP_RAY_GPU_BATCH_ROWS", str(mod._GPU_BATCH_ROWS_MAX * 10))
+    assert mod._gpu_batch_rows() == mod._GPU_BATCH_ROWS_MAX
+    for invalid in ("0", "-1", "many"):
+        monkeypatch.setenv("DP_RAY_GPU_BATCH_ROWS", invalid)
+        with pytest.raises(ValueError, match="positive integer"):
+            mod._gpu_batch_rows()
 
 
 def test_ray_custom_labels_are_advertised_to_the_pre_dispatch_gate(tmp_path, monkeypatch):
@@ -10752,7 +10824,7 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
     mod = _load_dp_ray()
     rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
     monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
-    opts = {"num_gpus": 1.0, "resources": {"a100": 0.001}}
+    gpu_opts = {"num_gpus": 1.0, "accelerator_type": "A100", "resources": {"a100": 0.001}}
     calls = []
     monkeypatch.setenv("DP_RAY_SHUFFLE_PARTITIONS", "4")
 
@@ -10782,13 +10854,39 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
         def to_arrow_refs(self):
             return self.refs
 
-    rr._shuffle_duckdb(_Data(), ["k"], "SELECT DISTINCT * FROM _blk", opts)
+    with pytest.raises(RuntimeError, match="whole hash partition"):
+        rr._shuffle_duckdb(_Data(), ["k"], "SELECT DISTINCT * FROM _blk", gpu_opts)
+    rr._shuffle_duckdb(_Data(), ["k"], "SELECT DISTINCT * FROM _blk", {"resources": {"a100": 0.001}})
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda refs: [pa.table({"k": [1]})]))
     step = SimpleNamespace(inputs=[("left", None), ("right", None)],
                            config={"how": "inner", "on": "k"})
-    rr._build_join(step, {"left": _Data(), "right": _Data(["ref"])}, opts)
+    rr._build_join(step, {"left": _Data(), "right": _Data(["ref"])}, gpu_opts)
     assert len(calls) == 2
-    assert all(call["num_gpus"] == 1.0 and call["resources"] == {"a100": 0.001} for call in calls)
+    assert calls[0]["batch_size"] is None and calls[0]["resources"] == {"a100": 0.001}
+    assert calls[1]["batch_size"] == mod._GPU_BATCH_ROWS_DEFAULT
+    assert calls[1]["num_gpus"] == 1.0 and calls[1]["accelerator_type"] == "A100"
+    transform = SimpleNamespace(
+        op="map", inputs=[("parent", None)],
+        config={"mode": "map", "code": "def fn(row): return row"},
+    )
+    rr._build(transform, {"parent": _Data()}, gpu_opts)
+    assert calls[2]["batch_size"] == mod._GPU_BATCH_ROWS_DEFAULT
+    assert calls[2]["accelerator_type"] == "A100"
+
+    monkeypatch.setenv("DP_RAY_GPUS", "2")
+    monkeypatch.setenv("DP_RAY_GPU_TYPE", "a100")
+    gpu_req = ResourceSpec(gpu_type="a100", labels={"engine": "ray"})
+    for op in ("aggregate", "window", "dedup"):
+        reason = rr._resource_unsupported_reason(
+            gpu_req, SimpleNamespace(steps=[SimpleNamespace(op=op)])
+        )
+        assert "whole-partition" in reason and op in reason
+    monkeypatch.setenv("DP_RAY_GPU_BATCH_ROWS", "0")
+    reason = rr._resource_unsupported_reason(
+        gpu_req, SimpleNamespace(steps=[SimpleNamespace(op="map")])
+    )
+    assert "positive integer" in reason
+    monkeypatch.delenv("DP_RAY_GPU_BATCH_ROWS")
 
     graph = Graph(**{"id": "ray-pinned-sort", "version": 1, "nodes": [
         _ray_node("src", "source", {"uri": "unused.parquet"}),
@@ -10838,6 +10936,18 @@ def test_ray_explicit_placement_fails_unsupported_shape_while_unpinned_falls_bac
     with metadb.session() as session:
         assert session.scalar(select(func.count()).select_from(metadb.ObjectAttempt).where(
             metadb.ObjectAttempt.run_id == object_run)) == 0
+
+    # A GPU claim is itself a hard Ray placement pin. Omitting labels.engine must never turn it
+    # into a local DuckDB execution that silently ignores the requested accelerator.
+    gpu_explicit = rr.run_unit(
+        graph,
+        "src",
+        str(tmp_path / "must-gpu.parquet"),
+        requires=ResourceSpec(gpu=1),
+    )
+    assert gpu_explicit.status == "failed"
+    assert gpu_explicit.placement == "distributed"
+    assert "requested resources" in (gpu_explicit.error or "")
 
 
 def test_ray_explicit_placement_fails_unadvertised_resources_before_dispatch(tmp_path, monkeypatch):

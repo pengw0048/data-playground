@@ -66,6 +66,7 @@ import uuid
 from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 from hub import db, graph as g
+from hub.backends import DurableCatalogPublisher
 from hub.handoff import (allocate_attempt, attempt_has_commit_record, attempt_has_contents,
                          discard_attempt, is_attempt_uri, lookup_attempt, read_manifest,
                          validate_shards, write_manifest)
@@ -77,7 +78,7 @@ from hub.job_artifacts import (RAY_JOB_CANONICAL_FIELDS, RAY_JOB_CONTRACT_VERSIO
                                RAY_JOB_ENVELOPE_FIELDS, RAY_JOB_RESULT_FIELDS, ArtifactCorrupt,
                                ArtifactNotFound, JsonArtifactStore, canonical_json, require_exact_object)
 from hub.models import PerNodeStatus, ResourceSpec, RunBackendRef, RunStatus, WorkerInfo
-from hub.placement import satisfies
+from hub.placement import node_requires, satisfies
 from hub.sqlpolicy import (
     FragmentKind,
     SQLPolicyError,
@@ -131,7 +132,10 @@ _PARQUET_EXTENSIONS = (".parquet", ".pq")
 _HIVE_DEFAULT_PARTITION = "__HIVE_DEFAULT_PARTITION__"
 _JOBS_BACKEND = "ray-jobs"
 _JOB_TERMINAL = frozenset({"SUCCEEDED", "FAILED", "STOPPED"})
+_CANCEL_FENCE_ENTRYPOINT = "sleep 86400"
 _JOBS_CLIENT_ENV_LOCK = threading.Lock()
+_GPU_BATCH_ROWS_DEFAULT = 4096
+_GPU_BATCH_ROWS_MAX = 65536
 _JOB_CONTRACT_VERSION = RAY_JOB_CONTRACT_VERSION
 _JOB_CANONICAL_FIELDS = RAY_JOB_CANONICAL_FIELDS
 _JOB_ENVELOPE_FIELDS = RAY_JOB_ENVELOPE_FIELDS
@@ -159,6 +163,25 @@ def _float_env(name: str, default: float, minimum: float = 0.01) -> float:
         return max(minimum, float(os.environ.get(name, str(default))))
     except ValueError:
         return default
+
+
+def _gpu_batch_rows() -> int:
+    """Validated finite GPU batch size; large operator values are capped to bound task memory."""
+    raw = os.environ.get("DP_RAY_GPU_BATCH_ROWS", "").strip()
+    if not raw:
+        return _GPU_BATCH_ROWS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError("DP_RAY_GPU_BATCH_ROWS must be a positive integer") from e
+    if value <= 0:
+        raise ValueError("DP_RAY_GPU_BATCH_ROWS must be a positive integer")
+    return min(value, _GPU_BATCH_ROWS_MAX)
+
+
+def _canonical_accelerator_type(value: object) -> str:
+    """Match Ray's canonical ``accelerator_type:<TYPE>`` resource names for operator input."""
+    return str(value or "").strip().upper()
 
 
 def _job_status_name(value) -> str:
@@ -846,6 +869,7 @@ def _ray_child_env() -> dict[str, str]:
     child["PATH"] = os.path.dirname(sys.executable) + os.pathsep + child.get("PATH", "")
     child["RAY_DATA_DISABLE_PROGRESS_BARS"] = "1"
     child["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+    child["DP_RAY_GPU_BATCH_ROWS"] = str(_gpu_batch_rows())
     return child
 
 
@@ -859,8 +883,9 @@ def _ray_jobs_env(job: dict) -> dict[str, str]:
 def _ray_opts(requires: dict | None) -> dict:
     """Map the region's resolved resource need (the planner's `requires`) to per-Ray-task placement
     options, so a Ray cluster schedules the region's map tasks onto a worker that has the resource:
-    `gpu` → num_gpus (each map task needs a GPU); a non-`engine` label `k=v` → a custom resource named
-    `v` (fractional so many tasks share one node — declare it on the node via `ray start --resources`).
+    `gpu` → num_gpus (each map task needs a GPU), `gpuType` → Ray's exact accelerator_type fence; a
+    non-`engine` label `k=v` → a custom resource named `v` (fractional so many tasks share one node —
+    declare it on the node via `ray start --resources`).
     cpu/mem are omitted: they're per-REGION aggregates, not the per-TASK cost Ray schedules on."""
     if not requires:
         return {}
@@ -869,10 +894,19 @@ def _ray_opts(requires: dict | None) -> dict:
     if requires.get("gpu") or gpu_type:
         # A type-only requirement means "one GPU of this type" throughout placement/UI semantics.
         opts["num_gpus"] = float(requires.get("gpu") or 1)
+    if gpu_type:
+        # Ray's typed accelerator option adds the canonical ``accelerator_type:<type>`` resource fence.
+        # num_gpus alone can otherwise land an A100-pinned task on any available GPU model.
+        opts["accelerator_type"] = _canonical_accelerator_type(gpu_type)
     res = {str(v): 0.001 for k, v in (requires.get("labels") or {}).items() if k != "engine" and v}
     if res:
         opts["resources"] = res
     return opts
+
+
+def _gpu_batch_size(ray_opts: dict | None) -> int | None:
+    opts = ray_opts or {}
+    return _gpu_batch_rows() if (opts.get("num_gpus") or opts.get("accelerator_type")) else None
 
 
 def _advertised_ray_labels() -> dict[str, str]:
@@ -953,6 +987,7 @@ class RayRunner:
         self._jobs_poll_s = _float_env("DP_RAY_JOBS_POLL_S", 1.0)
         self._jobs_cancel_timeout_s = _float_env("DP_RAY_JOBS_CANCEL_TIMEOUT_S", 30.0)
         self._jobs_result_timeout_s = _float_env("DP_RAY_JOBS_RESULT_TIMEOUT_S", 30.0)
+        self._submission_lease_s = _float_env("DP_RAY_JOBS_SUBMISSION_LEASE_S", 30.0, 1.0)
         self._publication_lease_s = _float_env("DP_RAY_JOBS_PUBLICATION_LEASE_S", 60.0, 5.0)
         atexit.register(self._terminate_all)
         if recover:
@@ -1224,6 +1259,7 @@ class RayRunner:
             "DP_DATA_DIR": cfg["data_dir"],
             "RAY_DATA_DISABLE_PROGRESS_BARS": "1",
             "RAY_ENABLE_UV_RUN_RUNTIME_ENV": "0",
+            "DP_RAY_GPU_BATCH_ROWS": str(_gpu_batch_rows()),
         })
         canonical = {
             "contract_version": _JOB_CONTRACT_VERSION,
@@ -1485,7 +1521,9 @@ class RayRunner:
         except ValueError:
             cpu = 0
         cap = ResourceSpec(cpu=cpu or None, mem=os.environ.get("DP_RAY_MEM", "1000GB"),
-                           gpu=gpu or None, gpu_type=(os.environ.get("DP_RAY_GPU_TYPE") or None) if gpu else None,
+                           gpu=gpu or None,
+                           gpu_type=(_canonical_accelerator_type(os.environ.get("DP_RAY_GPU_TYPE"))
+                                     or None) if gpu else None,
                            labels=_advertised_ray_labels())
         return [WorkerInfo(id="ray", capacity=cap, state="idle")]
 
@@ -1534,6 +1572,8 @@ class RayRunner:
         reason = self._source_unsupported_reason(graph, output_node, ir)
         reason = reason or self._ray_unsupported_reason(ir)
         reason = reason or self._dedup_unsupported_reason(graph, ir)
+        cone = g.upstream_chain(graph, output_node) if output_node else graph.nodes
+        reason = reason or self._gpu_type_conflict_reason(graph, cone)
         reason = reason or self._resource_unsupported_reason(requires, ir)
         if _remote_ray():
             from hub.plugins.adapters import is_object_uri
@@ -1738,7 +1778,8 @@ class RayRunner:
     @staticmethod
     def _requires_ray(requires, graph=None, target=None) -> bool:
         raw = requires.model_dump() if hasattr(requires, "model_dump") else (requires or {})
-        if (raw.get("labels") or {}).get("engine") == "ray":
+        if raw.get("gpu") or raw.get("gpu_type") or raw.get("gpuType") \
+                or (raw.get("labels") or {}).get("engine") == "ray":
             return True
         if graph is None:
             return False
@@ -1753,12 +1794,32 @@ class RayRunner:
             req = requires if isinstance(requires, ResourceSpec) else ResourceSpec(**requires)
         except Exception as exc:  # noqa: BLE001
             return f"invalid Ray resource requirement: {exc}"
+        if req.gpu_type:
+            req = req.model_copy(update={"gpu_type": _canonical_accelerator_type(req.gpu_type)})
         workers = self.workers()
         if not any(satisfies(worker.capacity, req) for worker in workers):
             wanted = req.model_dump(by_alias=True, exclude_none=True)
             offered = [worker.capacity.model_dump(by_alias=True, exclude_none=True) for worker in workers]
             return f"requested resources {wanted} exceed advertised Ray capacity {offered}"
         labels = {k: v for k, v in (req.labels or {}).items() if k != "engine"}
+        gpu_pinned = bool(req.gpu or req.gpu_type)
+        if gpu_pinned:
+            try:
+                _gpu_batch_rows()
+            except ValueError as exc:
+                return str(exc)
+        if ir is not None and gpu_pinned:
+            whole_partition = sorted({
+                step.op for step in ir.steps if step.op in {"aggregate", "window", "dedup"}
+            })
+            if whole_partition:
+                # These operators deliberately run one complete hash partition per DuckDB UDF call.
+                # Giving that call a GPU claim while leaving batch_size=None is an unbounded-memory lie;
+                # splitting it into finite GPU batches would break group/window/distinct correctness.
+                return (
+                    "GPU placement cannot safely batch whole-partition operator(s): "
+                    + ", ".join(whole_partition)
+                )
         if ir is not None and (req.gpu or req.gpu_type or labels) and any(
                 step.op == "sort" for step in ir.steps):
             # Ray 2.56 Dataset.sort/repartition expose no ray_remote_args. Claiming the region while its
@@ -1819,6 +1880,19 @@ class RayRunner:
                 _require_driver_fallback(_physical_source_bytes(uri), f"source '{uri}'")
             except RuntimeError as exc:
                 return str(exc)
+
+    def _gpu_type_conflict_reason(self, graph, nodes) -> str | None:
+        types = {
+            _canonical_accelerator_type(requirement.gpu_type)
+            for node in nodes
+            for requirement in [node_requires(node, self.node_specs)]
+            if requirement is not None and requirement.gpu_type
+        }
+        if len(types) > 1:
+            return (
+                "one Ray execution region cannot satisfy multiple GPU types: "
+                + ", ".join(sorted(types))
+            )
         return None
 
     def _unsupported_status(self, graph, target, reason, *, run_id=None, plan=None) -> RunStatus:
@@ -1960,6 +2034,7 @@ class RayRunner:
         # region; otherwise final GPU/custom-resource pins silently bypass placement enforcement.
         cone = g.upstream_chain(graph, target_node_id) if target_node_id else graph.nodes
         requires = graph_requires(graph, self.node_specs, nodes=cone)
+        reason = reason or self._gpu_type_conflict_reason(graph, cone)
         reason = reason or self._resource_unsupported_reason(requires, ir)
         if reason and self._requires_ray(requires, graph, target_node_id):
             return self._unsupported_status(graph, target_node_id, reason, run_id=run_id, plan=plan)
@@ -2087,13 +2162,24 @@ class RayRunner:
             except Exception:  # noqa: BLE001 — never let persistence break a run
                 pass
 
-    def _register_outputs(self, graph, result, *, expected_targets=None, expected_attempts=None) -> None:
+    def _register_outputs(self, graph, result, job: dict | None = None, *,
+                          expected_targets=None, expected_attempts=None) -> None:
         """Publish driver-written outputs through the hub-owned catalog/control plane."""
         from hub.plugins.adapters import is_object_uri
         from hub.plugins.catalog import (
             core_managed_publisher,
             publish_unmanaged_output_attested,
         )
+        durable_catalog = self.catalog if job and isinstance(
+            self.catalog, DurableCatalogPublisher
+        ) else None
+        register_once = getattr(durable_catalog, "register_output_idempotent", None)
+        usage_once = getattr(durable_catalog, "record_usage_idempotent", None)
+        if job and durable_catalog is None:
+            raise RuntimeError(
+                "Ray Jobs requires the DurableCatalogPublisher capability: "
+                "register_output_idempotent(...) and record_usage_idempotent(idempotency_key, parents)"
+            )
         nodes = {node.id: node for node in graph.nodes}
         outputs = result.get("outputs") or []
         if expected_targets is not None:
@@ -2124,10 +2210,12 @@ class RayRunner:
                     raise RuntimeError(
                         f"ray driver returned an unexpected physical URI for sink '{step_id}'")
 
+        run_parents: list[str] = []
         for output in outputs:
             step_id, name, uri = output["step_id"], output["name"], output["uri"]
             logical_uri = output.get("logical_uri")
-            parents = g.all_upstream_publication_uris(graph, step_id)
+            parents = list(dict.fromkeys(g.all_upstream_publication_uris(graph, step_id)))
+            run_parents.extend(parents)
             managed_attempt = bool(logical_uri and is_object_uri(uri) and is_attempt_uri(uri))
             if managed_attempt:
                 publish = core_managed_publisher(self.catalog)
@@ -2145,10 +2233,20 @@ class RayRunner:
                 if not isinstance(receipt, dict) or receipt.get("uri") != uri:
                     raise RuntimeError(
                         f"core publisher returned an invalid receipt for sink '{step_id}'")
+            elif register_once is not None:
+                register_once(
+                    idempotency_key=f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}",
+                    name=name, uri=uri, version=None, parents=parents, pipeline="canvas",
+                )
             else:
                 publish_unmanaged_output_attested(
                     self.catalog, name=name, uri=uri, version=None,
                     parents=parents, pipeline="canvas")
+        if usage_once and (result.get("outputs") or []):
+            usage_once(
+                idempotency_key=f"{_JOBS_BACKEND}:{job['attempt_id']}",
+                parents=list(dict.fromkeys(run_parents)),
+            )
 
     @staticmethod
     def _listed_job_status(jobs, submission_id: str) -> str | None:
@@ -2191,10 +2289,18 @@ class RayRunner:
         submission_id = job["submission_id"]
         existing = self._find_job(client, submission_id)
         if existing:
+            metadb.note_backend_submission_observed(job["run_id"], job["attempt_id"])
             return existing
-        binding = metadb.backend_job(job["run_id"])
-        if binding and binding.get("cancel_requested"):
+        owner = uuid.uuid4().hex
+        claim = metadb.claim_backend_submission_after_missing(
+            job["run_id"], job["attempt_id"], owner, self._submission_lease_s
+        )
+        if claim == "cancelled":
             return "CANCEL_REQUESTED"
+        if claim in ("busy", "submitted"):
+            return "SUBMITTING"
+        if claim != "claimed":
+            raise RuntimeError(f"Ray Jobs submission claim is {claim}")
         child_env = _ray_jobs_env(job)
         child_env.pop("DP_DATABASE_URL", None)  # defense in depth: workload profile already excludes it
         entrypoint = " ".join((
@@ -2207,6 +2313,20 @@ class RayRunner:
             "dataplay_attempt_id": job["attempt_id"],
             "dataplay_code_ref": job["code_ref"],
         }
+        keepalive_done = threading.Event()
+
+        def _keepalive() -> None:
+            interval = max(0.25, self._submission_lease_s / 3)
+            while not keepalive_done.wait(interval):
+                try:
+                    if not metadb.renew_backend_submission(
+                            job["run_id"], job["attempt_id"], owner, self._submission_lease_s):
+                        return
+                except Exception:  # noqa: BLE001 — the owner CAS remains authoritative
+                    pass
+
+        threading.Thread(target=_keepalive, daemon=True,
+                         name=f"dp-ray-submit-{job['run_id']}").start()
         try:
             returned = client.submit_job(
                 entrypoint=entrypoint,
@@ -2218,12 +2338,18 @@ class RayRunner:
                 raise RuntimeError(
                     f"Ray Jobs returned submission id {returned!r}, expected deterministic id {submission_id!r}"
                 )
+            metadb.note_backend_submission_observed(job["run_id"], job["attempt_id"])
             return "PENDING"
         except Exception:  # noqa: BLE001 — an accepted submit can race the response; re-check before failing
             existing = self._find_job(client, submission_id)
             if existing:
+                metadb.note_backend_submission_observed(job["run_id"], job["attempt_id"])
                 return existing
+            # A timeout/disconnect can return before the server accepts the still-in-flight HTTP request.
+            # Preserve the linearized claim; lease-based replay or the cancel-fence path will reconcile it.
             raise
+        finally:
+            keepalive_done.set()
 
     def _job_failure(self, client, submission_id: str) -> str:
         details: list[str] = []
@@ -2401,6 +2527,14 @@ class RayRunner:
         try:
             client = self._jobs_client(binding.get("control_address"))
             state = self._find_job(client, ref.submission_id)
+            if state is None:
+                state, _accepted_fence = self._fence_missing_stop(
+                    client, status, ref, reason="quarantine"
+                )
+                if state in ("SUBMITTING", "FENCING"):
+                    return False
+                if state == "MISSING":
+                    state = None
             if state and state not in _JOB_TERMINAL:
                 if status.run_id not in self._cancel_stop_sent:
                     client.stop_job(ref.submission_id)
@@ -2439,6 +2573,69 @@ class RayRunner:
             self._cancel[run_id].set()
         return binding
 
+    def _fence_missing_stop(self, client, status: RunStatus, ref: RunBackendRef,
+                            *, reason: str) -> tuple[str, bool]:
+        """Reserve an expired uncertain submission ID with a fixed stoppable job.
+
+        A delayed original request and this fence use the same Ray submission ID, so Ray accepts at
+        most one. Whichever wins becomes visible and can be stopped without local job artifacts/config.
+        """
+        from hub import metadb
+
+        owner = uuid.uuid4().hex
+        claim = metadb.claim_backend_stop_fence(
+            status.run_id, ref.attempt_id, owner, self._submission_lease_s
+        )
+        if claim == "not_needed":
+            return "MISSING", False
+        if claim == "settled_missing":
+            # The remote ID was previously accepted (real job or fixed stop fence). Authoritative
+            # metadata loss ends execution, but a trusted result artifact may still prove completion.
+            return "STOPPED", False
+        if claim == "busy":
+            self._persist_jobs_live_error(
+                status, f"Ray {reason} is waiting for an already-linearized submit to settle"
+            )
+            return "SUBMITTING", False
+        if claim != "claimed":
+            raise RuntimeError(f"Ray cancellation submission fence is {claim}")
+
+        try:
+            returned = client.submit_job(
+                entrypoint=_CANCEL_FENCE_ENTRYPOINT,
+                submission_id=ref.submission_id,
+                runtime_env={},
+                metadata={
+                    "job_name": f"Data Playground {reason} fence {status.run_id}",
+                    "dataplay_run_id": status.run_id,
+                    "dataplay_attempt_id": ref.attempt_id,
+                    "dataplay_stop_fence": reason,
+                },
+            )
+            if returned and str(returned) != ref.submission_id:
+                raise RuntimeError(
+                    f"Ray Jobs returned submission id {returned!r}, expected {ref.submission_id!r}"
+                )
+        except Exception as submit_error:  # the original workload may have won the same remote ID
+            existing = self._find_job(client, ref.submission_id)
+            if existing is not None:
+                return existing, False
+            self._persist_jobs_live_error(
+                status,
+                f"Ray {reason} fence submission is uncertain; retrying after its DB lease: "
+                f"{type(submit_error).__name__}: {self._safe_job_error(submit_error)}",
+            )
+            return "FENCING", False
+
+        metadb.note_backend_stop_fence_accepted(status.run_id, ref.attempt_id)
+        state = self._find_job(client, ref.submission_id)
+        if state is None:
+            self._persist_jobs_live_error(
+                status, f"Ray accepted the {reason} fence; waiting for it to become stoppable"
+            )
+            return "FENCING", True
+        return state, True
+
     def _cancel_control_state(self, status: RunStatus, ref: RunBackendRef,
                               binding: dict) -> tuple[bool, object | None, str | None]:
         """Drive persisted cancel intent using only the durable SQL routing handle.
@@ -2451,12 +2648,20 @@ class RayRunner:
         try:
             client = self._jobs_client(binding.get("control_address"))
             state = self._find_job(client, ref.submission_id)
+            cancel_fenced = binding.get("submission_state") == "stop_fenced"
             if state is None:
-                return True, client, "MISSING"
+                state, accepted_fence = self._fence_missing_stop(
+                    client, status, ref, reason="cancellation"
+                )
+                cancel_fenced = cancel_fenced or accepted_fence
+                if state in ("MISSING", "SUBMITTING", "FENCING"):
+                    return True, client, state
             if state not in _JOB_TERMINAL and status.run_id not in self._cancel_stop_sent:
                 client.stop_job(ref.submission_id)
                 self._cancel_stop_sent.add(status.run_id)
                 state = self._find_job(client, ref.submission_id)
+            if cancel_fenced and state in _JOB_TERMINAL:
+                state = "STOPPED"  # the fixed fence carries no user result to reconcile
             return True, client, state
         except Exception as e:  # noqa: BLE001 — ambiguity can hide a still-running remote attempt
             self._persist_jobs_live_error(
@@ -3109,7 +3314,11 @@ class RayRunner:
         if step.op in CLEAN_TRANSFORM_MODES:
             # `opts` (num_gpus / custom resources from the region's requires) makes Ray schedule each map
             # task onto a worker that has the resource — the planner's placement, honored on the cluster.
-            result = parent.map_batches(_make_mapper(step.config), batch_format="pyarrow", **opts)
+            batch_size = _gpu_batch_size(opts)
+            batch_kwargs = {"batch_size": batch_size} if batch_size is not None else {}
+            result = parent.map_batches(
+                _make_mapper(step.config), batch_format="pyarrow", **batch_kwargs, **opts
+            )
             if step.op == "filter":
                 return _remember_ray_schema(result, _known_ray_schema(parent))
             # A schema-changing UDF's outputSchema is only an empty-result fallback unless enforcement is
@@ -3215,7 +3424,8 @@ class RayRunner:
                 con.close()
 
         result = left.map_batches(
-            _join_block, batch_format="pyarrow", batch_size=None, **(ray_opts or {})
+            _join_block, batch_format="pyarrow", batch_size=_gpu_batch_size(ray_opts),
+            **(ray_opts or {})
         )
         empty_sql = join_sql(
             left_arrow_schema.names if left_arrow_schema is not None else [], right_columns, "_l", "_r",
@@ -3238,6 +3448,11 @@ class RayRunner:
         per-partition results equals the single-node DuckDB result BYTE-FOR-BYTE — it IS DuckDB, running
         the same SQL the single-node engine runs, with DuckDB's exact schema. This one mechanism backs
         aggregate/window (and extends to join/dedup) — no operator is reimplemented on Ray."""
+        if _gpu_batch_size(ray_opts) is not None:
+            raise RuntimeError(
+                "GPU placement cannot execute a whole hash partition without breaking batch bounds"
+            )
+
         def _run(tbl):                                          # runs on a WORKER, one complete-groups partition
             con = _secure_duckdb_connection()
             try:

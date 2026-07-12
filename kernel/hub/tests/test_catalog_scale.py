@@ -614,10 +614,14 @@ def test_migration_0020_adds_backend_job_binding_without_rewriting_run_state(
     command.upgrade(cfg, "0019_object_attempts")
     eng = sa.create_engine(url)
     legacy = {"run_id": "legacy-live", "status": "running", "per_node": []}
+    legacy_terminal = {"run_id": "legacy-done", "status": "done", "per_node": []}
     with eng.begin() as connection:
         connection.execute(sa.text(
             "INSERT INTO run_states (run_id, status, doc) VALUES (:run_id, 'running', :doc)"
         ), {"run_id": legacy["run_id"], "doc": _json.dumps(legacy)})
+        connection.execute(sa.text(
+            "INSERT INTO run_states (run_id, status, doc) VALUES (:run_id, 'done', :doc)"
+        ), {"run_id": legacy_terminal["run_id"], "doc": _json.dumps(legacy_terminal)})
     command.upgrade(cfg, "head")
     with eng.connect() as connection:
         assert _json.loads(connection.execute(
@@ -625,7 +629,18 @@ def test_migration_0020_adds_backend_job_binding_without_rewriting_run_state(
         ).scalar_one()) == legacy
         columns = {row[1] for row in connection.execute(sa.text("PRAGMA table_info('run_backend_jobs')"))}
         assert {"run_id", "attempt_id", "submission_id", "control_address", "cancel_requested",
-                "quarantine_reason", "publication_state", "result_doc"} <= columns
+                "quarantine_reason", "submission_state", "submission_owner",
+                "submission_lease_until", "publication_state", "result_doc"} <= columns
+        tables = {row[0] for row in connection.execute(
+            sa.text("SELECT name FROM sqlite_master WHERE type='table'")
+        )}
+        assert {"catalog_publication_events", "run_terminal_fences"} <= tables
+        assert connection.execute(sa.text(
+            "SELECT status FROM run_terminal_fences WHERE run_id='legacy-done'"
+        )).scalar_one() == "done"
+        assert connection.execute(sa.text(
+            "SELECT COUNT(*) FROM run_terminal_fences WHERE run_id='legacy-live'"
+        )).scalar_one() == 0
     eng.dispose()
 
 

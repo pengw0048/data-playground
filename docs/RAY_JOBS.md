@@ -83,7 +83,11 @@ API keys are never sent to the driver.
 2. One SQL transaction binds `run_id` to backend, cluster, submission, attempt, object URIs, code ref,
    and the non-secret Jobs control address while creating the queued `run_states` row.
 3. Status plus a successful Jobs listing distinguish an absent job from an ambiguous API failure. Only
-   authoritative absence permits deterministic submission or replay.
+   authoritative absence opens submission/replay. SQL then linearizes exactly one request with a
+   DB-clock lease and a CAS that requires `cancel_requested=false`; an expired-owner reclaim moves
+   directly to the new owner in that same CAS, and recovery must query Ray again before attempting it.
+   A timeout/disconnect never releases the claim after one immediate missing check because the HTTP
+   request may still be accepted later.
 4. A result cannot beat an explicit `PENDING`/`RUNNING` Jobs status. Readable result corruption while the
    job is live triggers stop/quarantine, and terminal failure is published only after Ray reports terminal
    or successful listing proves the job absent. A valid hash-bound result is terminal evidence when Ray's
@@ -94,9 +98,18 @@ API keys are never sent to the driver.
    idempotent effect and is retried on failure. One database transaction then CAS-publishes the backend
    result, public terminal `RunState`, and run-history row. Telemetry is best-effort after that barrier.
 
-External catalog providers must implement
-`register_output_idempotent(idempotency_key, ...)` with durable idempotency. Publication is at-least-once
-at that provider boundary; multiple independent sinks are not one cross-dataset transaction.
+External catalog providers must implement the runtime-checkable `DurableCatalogPublisher` capability:
+`register_output_idempotent(idempotency_key, ...)` and
+`record_usage_idempotent(idempotency_key, parents)` with durable idempotency. Publication is at-least-once
+at that provider boundary; multiple independent sinks are not one cross-dataset transaction. Output keys
+remain per sink, while one separate run-level usage event aggregates every distinct parent across all
+sinks. Thus two real runs increment popularity twice, a two-sink run increments a shared parent once, and
+a crash/retry does not increment it again. Permanent lineage-edge existence is not a run-usage event.
+
+Terminal `RunState` and backend-detail rows share the normal bounded retention policy. Pruning happens in
+the same terminal publication transaction and leaves `run_records` history intact. A separate compact,
+permanent terminal run-ID fence is not pruned; it prevents stale supervisors or duplicate binds from
+resurrecting a completed run even when no history row exists or bounded history has aged out.
 
 ## Recovery and cancellation
 
@@ -107,9 +120,17 @@ not stop or replay a real job.
 
 Cancellation is the exception: it uses the durable SQL address/submission ID even while local config or
 the job artifact is missing/unavailable. Intent is committed before the process-local event. Once intent
-exists, supervisors never submit or replay that attempt. `stop_job` is followed until Ray is terminal; an
-ambiguous control failure remains non-terminal. `STOPPED`, or an authoritative proof that no job exists,
-publishes `cancelled`. A concurrent `SUCCEEDED`/`FAILED` is reconciled normally.
+exists, a not-yet-claimed attempt cannot submit. If the submit CAS linearized first, that already-authorized
+request may finish; cancellation waits for it to appear, then stops and polls it rather than publishing a
+prematurely cancelled terminal. `stop_job` is followed until Ray is terminal; an ambiguous control failure
+remains non-terminal. `STOPPED`, or authoritative proof that neither a job nor an already-linearized submit
+exists, publishes `cancelled`. Lease expiry permits idempotent takeover of the deterministic submission ID;
+it does not prove an earlier HTTP request can no longer arrive. For a crashed owner plus concurrent cancel,
+the hub therefore submits a fixed, inert, stoppable fence job under that exact same ID after lease expiry.
+Ray accepts either the delayed workload or the fence, never both; the winner is then stopped and observed.
+A concurrent real `SUCCEEDED`/`FAILED` is reconciled normally. If metadata disappears for a previously
+accepted ID, cancellation still verifies the hash-bound terminal result; trusted completion wins over a
+later cancel request, while a never-linearized queued attempt can cancel directly from authoritative absence.
 
 Cancellation cannot undo a sink committed before stop. `cancelled` means execution was authoritatively
 stopped, not that no physical side effect occurred.
@@ -119,6 +140,7 @@ stopped, not that no physical side effect occurred.
 | `DP_RAY_JOBS_POLL_S` | `1` | Jobs/control/artifact retry interval |
 | `DP_RAY_JOBS_CANCEL_TIMEOUT_S` | `30` | Synchronous wait for durable stop acknowledgement |
 | `DP_RAY_JOBS_RESULT_TIMEOUT_S` | `30` | Missing-result grace period after `SUCCEEDED` |
+| `DP_RAY_JOBS_SUBMISSION_LEASE_S` | `30` | DB-clock lease around an already-linearized Jobs submit |
 | `DP_RAY_JOBS_PUBLICATION_LEASE_S` | `60` | Renewable single-publisher lease |
 
 ## Logs and operator access
@@ -135,6 +157,9 @@ boundary. Do not expose port 8265 directly to end users.
 - Object-store reads and whole-graph file sinks remain driver-funneled in several paths.
 - Live capacity/health discovery, admission backpressure, scoped per-attempt identity, active-job fault
   injection, HA/upgrade runbooks, and production observability remain open readiness gates.
+- Every hub that loads the durable backend currently supervises every active Jobs row. At larger hub ×
+  active-job counts this amplifies Jobs API/object-store polling; sharded ownership/backoff is remaining
+  control-plane operations work.
 - Job/result artifacts are retained until operator lifecycle rules remove them. No foreground recursive
   cleanup scans a shared bucket.
 - Dynamic `working_dir` and per-run pip upload are intentionally unsupported; code is image-baked and

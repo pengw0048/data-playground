@@ -310,12 +310,16 @@ class InMemoryCatalog:
     def register_output(self, name: str, uri: str, version: str | None = None,
                         parents: list[str] | None = None, pipeline: str | None = None,
                         folder: str = "", tags: list[str] | None = None, owner: str | None = None,
-                        description: str | None = None) -> CatalogTable:
+                        description: str | None = None,
+                        _bump_usage: bool = True) -> CatalogTable:
         table = self._add(name=name, uri=uri, version=version, meta=pipeline, folder=folder,
                           tags=tags, owner=owner, description=description,
                           parents=parents, pipeline=pipeline)
-        for parent in parents or []:
-            metadb.catalog_bump_usage(parent)  # a derived output READ its parent → popularity signal
+        parent_uris = list(dict.fromkeys(parents or []))
+        if _bump_usage:
+            # Local/legacy calls are one completed run each and retain their per-call popularity bump.
+            for parent in parent_uris:
+                metadb.catalog_bump_usage(parent)
         return table
 
     def publish_output_strict(self, name: str, uri: str, version: str | None = None,
@@ -370,13 +374,16 @@ class InMemoryCatalog:
     def register_output_idempotent(self, idempotency_key: str, **kwargs) -> CatalogTable:
         """Durable-executor write projection keyed by one logical output effect.
 
-        The default provider is observably idempotent by URI: catalog entries upsert, lineage edges are
-        unique, and parent usage increments only when the edge is first created. ``idempotency_key`` is
-        accepted so external providers can persist the same guarantee in their own control plane.
+        Catalog entries/lineage remain URI-idempotent. The Jobs publisher records one separate aggregate
+        usage event after every output is registered, so a multi-sink run does not overcount parents.
         """
         if not idempotency_key:
             raise ValueError("idempotency_key is required")
-        return self.register_output(**kwargs)
+        return self.register_output(_bump_usage=False, **kwargs)
+
+    def record_usage_idempotent(self, idempotency_key: str, parents: list[str]) -> bool:
+        """Count each distinct parent once for one durable run, independently of output cardinality."""
+        return metadb.catalog_bump_usage_once(idempotency_key, parents)
 
     def set_metadata(self, uri: str, *, folder: str | None = None, tags: list[str] | None = None,
                      owner: str | None = None, description: str | None = None) -> CatalogTable:

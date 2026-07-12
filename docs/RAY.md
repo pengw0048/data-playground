@@ -25,6 +25,14 @@ capacity with `DP_RAY_NUM_CPUS`, `DP_RAY_MEM`, `DP_RAY_GPUS`, `DP_RAY_GPU_TYPE`,
 as `DP_RAY_LABELS=pool=a100,zone=use1`. Each non-engine label value must also exist as a Ray custom
 resource on the matching node (for example `--resources='{"a100": 1}'`). An explicit Ray placement that
 does not match this advertised capacity fails before dispatch instead of becoming an unschedulable task.
+`gpuType` is a hard placement pin: it is canonicalized to Ray's exact `accelerator_type` resource, not
+reduced to a generic `num_gpus` request. One execution region cannot combine different GPU types.
+
+GPU clean transforms and broadcast joins use a finite row batch. `DP_RAY_GPU_BATCH_ROWS` defaults to
+`4096`; it must be positive and is capped at `65536`. The parsed value is frozen into a durable Jobs
+attempt, including the default. GPU-pinned aggregate, window, and dedup fail before dispatch because their
+correctness requires one complete hash partition (`batch_size=None`); splitting it to satisfy GPU batching
+would change results. GPU/custom-pinned sort remains unsupported by Ray 2.56's public API.
 
 The backend conservatively falls back to the local DuckDB runner when it cannot prove that a graph is
 safe to distribute.
@@ -32,10 +40,10 @@ safe to distribute.
 | operation | distributed today | important boundary |
 |---|---|---|
 | `map`, `filter`, `flat_map`, `map_batches` | yes | uses the same compiled transform operator as the local engine |
-| grouped `aggregate` | yes, for bare-column group keys | global, expression-key, and order-sensitive aggregates fall back |
-| `window` | yes, for a bare-column partition key | order-sensitive forms without sufficient ordering fall back |
-| full-row `dedup` | yes | keyed dedup and schemas containing floating-point values fall back |
-| `join` | broadcast `inner`, `left`, and `cross` | the materialized right side must fit the configured driver fallback limit |
+| grouped `aggregate` | yes, for bare-column group keys | global, expression-key, order-sensitive, and GPU-pinned aggregates fail/fall back as appropriate |
+| `window` | yes, for a bare-column partition key | order-sensitive forms without a sufficient order fall back; GPU pins fail loud |
+| full-row `dedup` | yes | keyed dedup, floating-point schemas, and GPU pins are rejected |
+| `join` | broadcast `inner`, `left`, and `cross` | the materialized right side must fit the driver fallback limit; GPU maps use finite batches |
 | `sort` | plain-column keys | the final ordered result is coalesced to one worker; Ray 2.56 cannot resource-pin its range shuffle, so GPU/custom-resource sorts fail before dispatch |
 | SQL, sections, metrics/charts, opaque plugin nodes | no | local fallback |
 
@@ -129,7 +137,9 @@ dispatch until distributed schema enforcement is implemented.
 ## What the validation gate proves
 
 The automated Compose gate starts a Ray head, two worker containers, a separate driver node, and MinIO.
-It requires:
+Before that CPU-only topology starts, a logical-resource Ray check (no NVIDIA runtime) proves typed
+accelerator affinity, a wrong-GPU task remaining pending, finite GPU `map_batches`, and Ray 2.56's typed
+read/write remote options. The distributed gate then requires:
 
 1. a real hash-shuffle to span at least two Ray node IDs;
 2. native MinIO Parquet reads feeding distributed GROUP BY and broadcast join results to match DuckDB in
@@ -204,6 +214,8 @@ certification. The backend still needs the following before it should own produc
    resource saturation; keep provider lifecycle rules for versioned objects and incomplete uploads.
 6. Pass staging gates on the intended production topology: active-job failure injection, representative
    large workloads, SLOs/alerts, upgrade/rollback, IAM validation, and recovery runbooks.
+7. Shard durable supervision or add ownership/backoff before large hub fleets: every current hub polls
+   every active Jobs row, so request volume grows with hubs × active jobs.
 
 Object storage holds immutable shards plus `_dp_commits/<attempt>/` manifests. Ownership and lifecycle state
 live in the shared metadata database's indexed attempt, lease, ref, and exact-member inventory tables. The

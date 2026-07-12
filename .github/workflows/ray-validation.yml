@@ -66,6 +66,10 @@ jobs:
           # running head on an earlier image ID; a later `compose run` may then recreate the head and
           # silently replace the GCS cluster identity under the workers.
           docker compose -f docker-compose.ray.yml build ray-head
+          # Ray 2.56 GPU scheduling semantics can be checked with logical resources; no NVIDIA runtime
+          # or fake GPU declaration is added to the CPU-only Compose/KubeRay validation clusters.
+          docker run --rm --shm-size=1g dp-ray:local \
+            python -m hub.ray_gpu_contract_check 2>&1 | tee ray-diagnostics/gpu-contract.log
           docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 ray-head ray-worker minio createbucket
           docker compose -f docker-compose.ray.yml ps -a | tee ray-diagnostics/startup-ps.txt
 
