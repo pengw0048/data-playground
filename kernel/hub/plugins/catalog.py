@@ -16,6 +16,7 @@ with no embedder the catalog still does lexical + faceted search offline, zero e
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import threading
@@ -428,8 +429,9 @@ class InMemoryCatalog:
         self._emb_cache = (self._emb_dirty, time.monotonic(), data)
         return data
 
-    def semantic_search(self, q: str, limit: int = 50) -> list[CatalogTable]:
-        """Rank datasets by cosine similarity of their embedding to the query's. Empty if no embedder."""
+    def semantic_search(self, q: str, limit: int = 50,
+                        query: CatalogQuery | None = None) -> list[CatalogTable]:
+        """Rank datasets by cosine similarity, constrained by the query's structured filters."""
         if self._embedder is None or not q.strip():
             return []
         try:
@@ -441,7 +443,21 @@ class InMemoryCatalog:
                 return []
             uris, mat, norms = data
             scores = (mat @ qv) / (norms * qn)
-            order = np.argsort(-scores)[:limit]
+            allowed = metadb.catalog_filter_uris(
+                folder=query.folder if query else None,
+                tags=query.tags if query else None,
+                owner=query.owner if query else None,
+                has_columns=query.has_columns if query else None,
+                uris=query.uris if query else None,
+            )
+            if allowed is None:
+                order = np.argsort(-scores)[:limit]
+            else:
+                candidates = np.fromiter(
+                    (i for i, uri in enumerate(uris) if uri in allowed), dtype=np.int64,
+                )
+                order = (candidates[np.argsort(-scores[candidates])[:limit]]
+                         if len(candidates) else candidates)
             ranked = [uris[i] for i in order]
         except Exception:  # noqa: BLE001
             log.debug("semantic search failed", exc_info=True)
@@ -450,15 +466,19 @@ class InMemoryCatalog:
         dmap = self._declared_keys(ranked)
         return [self._overlay(self._to_table(docs[u]), dmap) for u in ranked if u in docs]
 
-    def search(self, q: str, mode: str = "hybrid", limit: int = 50) -> list[CatalogTable]:
+    def search(self, q: str, mode: str = "hybrid", limit: int = 50,
+               *, query: CatalogQuery | None = None) -> list[CatalogTable]:
         """Search the catalog. `mode`: 'lexical' (name/folder/tag/column substring + facets),
         'semantic' (embedding similarity — needs an embedder), or 'hybrid' (both, fused by reciprocal
         rank). With no embedder, semantic/hybrid gracefully fall back to lexical, so search always works
         offline."""
-        lexical = self.list_page(CatalogQuery(q=q, limit=limit)).items
+        effective = (query or CatalogQuery()).model_copy(update={
+            "q": q, "limit": limit, "offset": 0,
+        })
+        lexical = self.list_page(effective).items
         if mode == "lexical" or self._embedder is None:
             return lexical
-        semantic = self.semantic_search(q, limit=limit)
+        semantic = self.semantic_search(q, limit=limit, query=effective)
         if mode == "semantic":
             return semantic or lexical
         # hybrid: reciprocal-rank fusion of the two orderings
@@ -597,10 +617,23 @@ class CatalogCompat:
             tables=sorted(direct, key=lambda t: (t.name or "").lower())[:100],
             total_tables=len(direct), truncated=len(direct) > 100)
 
-    def search(self, q: str, mode: str = "hybrid", limit: int = 50) -> list[CatalogTable]:
+    def search(self, q: str, mode: str = "hybrid", limit: int = 50,
+               *, query: CatalogQuery | None = None) -> list[CatalogTable]:
+        effective = (query or CatalogQuery()).model_copy(update={
+            "q": q, "limit": limit, "offset": 0,
+        })
         if hasattr(self._inner, "search"):
-            return self._inner.search(q, mode=mode, limit=limit)
-        return self._all(q)[:limit]
+            search = self._inner.search
+            try:
+                params = inspect.signature(search).parameters.values()
+                accepts_query = any(p.name == "query" or p.kind == inspect.Parameter.VAR_KEYWORD
+                                    for p in params)
+            except (TypeError, ValueError):
+                accepts_query = False
+            hits = list((search(q, mode=mode, limit=limit, query=effective)
+                         if accepts_query else search(q, mode=mode, limit=limit)) or [])
+            return [t for t in hits if self._matches(t, effective)][:limit]
+        return [t for t in self._all(q) if self._matches(t, effective)][:limit]
 
     def search_modes(self) -> list[str]:
         fn = getattr(self._inner, "search_modes", None)
@@ -618,3 +651,21 @@ class CatalogCompat:
             return self._inner.lineage(uri, depth=depth, max_nodes=max_nodes)
         except TypeError:  # old signature: lineage(uri)
             return self._inner.lineage(uri)
+
+
+def search_with_query(provider, query: CatalogQuery, mode: str, limit: int) -> list[CatalogTable]:
+    """Invoke the structured search contract without breaking an older scaled provider.
+
+    New providers receive the complete query and can filter before ranking. A provider that still has
+    the legacy ``search(q, mode, limit)`` signature is filtered over its bounded result as a compatibility
+    fallback; it remains usable, but should adopt ``query=`` to avoid top-k underfill.
+    """
+    search = provider.search
+    try:
+        params = inspect.signature(search).parameters.values()
+        accepts_query = any(p.name == "query" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+    except (TypeError, ValueError):
+        accepts_query = False
+    hits = list((search(query.q or "", mode=mode, limit=limit, query=query)
+                 if accepts_query else search(query.q or "", mode=mode, limit=limit)) or [])
+    return [t for t in hits if CatalogCompat._matches(t, query)][:limit]

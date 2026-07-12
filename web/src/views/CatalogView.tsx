@@ -58,15 +58,26 @@ export function CatalogView() {
 
   const loadFirst = useCallback(async () => {
     const s = ++seq.current
-    setLoading(true); setError(null)
+    setLoading(true); setError(null); setItems([]); setTotal(0); setHasMore(false)
+    setFacets((cur) => ({ folders: [], tags: [], owners: [], semanticAvailable: cur.semanticAvailable }))
     try {
-      // the facet rail stays driven by the lexical facets call in both match modes
-      const [page, fc] = await Promise.all([
-        semantic
-          ? api.searchCatalog(q, 'hybrid', 100).then((hits) => ({ items: hits, total: hits.length, hasMore: false }))
-          : api.tablesPage({ ...params, offset: 0 }),
-        api.facets(params),
-      ])
+      let page: { items: CatalogTable[]; total: number; hasMore: boolean }
+      let fc: Facets
+      if (semantic) {
+        const hits = await api.searchCatalog({
+          q, folder: params.folder, tags: params.tags, owner: params.owner,
+          hasColumns: params.hasColumns, limit: 100,
+        }, 'hybrid')
+        page = { items: hits, total: hits.length, hasMore: false }
+        // Server facets are lexical and therefore describe a different result set. Counts shown in
+        // meaning mode are intentionally computed from the bounded ranked results the user can see.
+        fc = rankedResultFacets(hits)
+      } else {
+        [page, fc] = await Promise.all([
+          api.tablesPage({ ...params, offset: 0 }),
+          api.facets(params),
+        ])
+      }
       if (s !== seq.current) return  // a newer query superseded this one
       setItems(page.items); setTotal(page.total); setHasMore(page.hasMore); setFacets(fc)
     } catch (e) {
@@ -203,6 +214,11 @@ export function CatalogView() {
         </div>
 
         <div className="w-[220px] flex-[0_0_220px] overflow-y-auto border-l border-border p-3">
+          {semantic && (
+            <div className="mb-2 text-[10px] leading-snug text-muted-foreground">
+              Facet counts within these top {items.length.toLocaleString()} meaning results
+            </div>
+          )}
           <FacetGroup title="Tags">
             {facets.tags.map((f) => (
               <FacetRow key={f.value} label={`#${f.value}`} count={f.count}
@@ -230,6 +246,24 @@ export function CatalogView() {
         onPick={async (r) => { setDialog(false); try { await api.registerFile(r.uri); await loadFirst() } catch { /* noop */ } }} />}
     </div>
   )
+}
+
+export function rankedResultFacets(items: CatalogTable[]): Facets {
+  const count = (values: (string | null | undefined)[]) => {
+    const counts = new Map<string, number>()
+    for (const raw of values) {
+      const value = raw?.trim()
+      if (value) counts.set(value, (counts.get(value) ?? 0) + 1)
+    }
+    return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([value, n]) => ({ value, count: n }))
+  }
+  return {
+    folders: count(items.map((t) => t.folder)),
+    tags: count(items.flatMap((t) => [...new Set(t.tags ?? [])])),
+    owners: count(items.map((t) => t.owner)),
+    semanticAvailable: true,
+  }
 }
 
 function Chip({ label, onClear }: { label: string; onClear: () => void }) {
