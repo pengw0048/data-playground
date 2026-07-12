@@ -85,39 +85,56 @@ def _load_canvas_graph(canvas_ref: str):
         return Graph.model_validate(json.loads(c.doc)), c.id
 
 
-def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_json: bool) -> int:
+def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_json: bool,
+                  uid: str | None = None) -> int:
     """Run a saved canvas to completion in-process (no browser) and return a shell exit code:
     0=done, 1=failed, 2=cancelled, 124=timeout. Reuses the exact start_run path the UI + MCP use, so
     placement/gating/ownership are identical; `confirmed=True` because a headless invocation is itself
-    the confirmation for a full pass. `node` targets one node (its upstream cone); default = whole canvas."""
+    the confirmation for a full pass. `node` targets one node (its upstream cone); default = whole canvas.
+    Runs the run + poll with stdout diverted to stderr so a node's own print() can't corrupt the summary
+    / --json; the summary is printed to real stdout after."""
+    import contextlib
     import json
     import time
 
     from fastapi import HTTPException
 
     from hub import metadb
+    from hub.models import RunStatus
     from hub.routers.runs import start_run
     graph, cid = _load_canvas_graph(canvas_ref)
-    uid = metadb.DEFAULT_USER_ID
-    try:
-        status, owner = start_run(deps, graph, node, uid, confirmed=True)
-    except HTTPException as e:
-        raise SystemExit(f"cannot run canvas '{cid}': {e.detail}")
-    run_id = status.run_id
-    deadline = time.monotonic() + timeout_s
-    while status.status in ("queued", "running"):
-        if time.monotonic() > deadline:
-            print(f"timeout: run {run_id} still {status.status} after {timeout_s:g}s", file=sys.stderr)
-            return 124
-        time.sleep(0.25)
+    uid = uid or metadb.DEFAULT_USER_ID
+    with contextlib.redirect_stdout(sys.stderr):  # protect stdout during the run (node print() → stderr)
         try:
-            status = owner.status(run_id)
-        except KeyError:  # evicted from the owner's in-memory ring → read the durable state
-            persisted = metadb.get_run_state(run_id)
-            if persisted is None:
-                break
-            from hub.models import RunStatus
-            status = RunStatus(**persisted)
+            status, owner = start_run(deps, graph, node, uid, confirmed=True)
+        except HTTPException as e:  # invalid/cyclic graph, size-gate, auth 404 (in-process path)
+            raise SystemExit(f"cannot run canvas '{cid}': {e.detail}")
+        except (RuntimeError, OSError) as e:  # kernel failed to start / became unreachable (default backend)
+            raise SystemExit(f"cannot run canvas '{cid}': {e}")
+        run_id = status.run_id
+        deadline = time.monotonic() + timeout_s
+        last_reap = time.monotonic()
+        while status.status in ("queued", "running"):
+            if time.monotonic() > deadline:
+                print(f"timeout: run {run_id} still {status.status} after {timeout_s:g}s", file=sys.stderr)
+                return 124
+            time.sleep(0.25)
+            # No hub process runs the periodic reaper here, so a run whose kernel died would otherwise poll
+            # until --timeout. Reap dead-kernel runs ourselves (only_kernel_runs=True leaves a live kernel's
+            # run — and any in-process/subprocess run — untouched) so a crashed kernel fails fast.
+            if time.monotonic() - last_reap > 5:
+                try:
+                    metadb.reap_orphaned_runs(only_kernel_runs=True)
+                except Exception:  # noqa: BLE001 — reaping is best-effort; never crash the run on it
+                    pass
+                last_reap = time.monotonic()
+            try:
+                status = owner.status(run_id)
+            except KeyError:  # evicted from the owner's in-memory ring → read the durable state
+                persisted = metadb.get_run_state(run_id)
+                if persisted is None:
+                    break
+                status = RunStatus(**persisted)
     if as_json:
         print(json.dumps(status.model_dump(), default=str))
     else:
@@ -152,6 +169,8 @@ def _run_canvas(argv: list[str]) -> None:
     p.add_argument("--workspace", default=None, help="working dir (canvases/outputs/plugins); default CWD")
     p.add_argument("--data-dir", default=None, help="dataset folder (default: <workspace>/data)")
     p.add_argument("--no-seed", dest="seed", action="store_false", default=True)
+    p.add_argument("--user", default=None, help="run as this user id (default: the local user). In auth "
+                                                "mode this must own/share the canvas (mirrors `dataplay mcp`).")
     p.add_argument("--timeout", type=float, default=3600.0, help="max seconds to wait for completion (default 3600)")
     p.add_argument("--json", dest="as_json", action="store_true", help="print the final RunStatus as JSON")
     args = p.parse_args(argv)
@@ -165,7 +184,7 @@ def _run_canvas(argv: list[str]) -> None:
         metadb.init_db()  # schema to head before Deps builds + registers the catalog (fresh-DB first run)
         from hub.deps import set_workspace
         deps = set_workspace(os.environ["DP_WORKSPACE"], os.environ["DP_DATA_DIR"])
-    raise SystemExit(_headless_run(deps, args.canvas, args.node, args.timeout, args.as_json))
+    raise SystemExit(_headless_run(deps, args.canvas, args.node, args.timeout, args.as_json, args.user))
 
 
 def main() -> None:

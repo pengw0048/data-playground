@@ -2744,6 +2744,30 @@ def test_headless_run_resolves_by_name_and_reports_failure(tmp_path):
         _headless_run(get_deps(), "no_such_canvas_xyz", None, 5.0, as_json=False)
 
 
+def test_headless_run_kernel_failure_is_a_clean_exit(tmp_path, monkeypatch):
+    # review MAJOR: the DEFAULT backend is the kernel, whose run() raises RuntimeError/OSError when a
+    # kernel won't start / is unreachable — headless must convert that to a clean SystemExit (exit code),
+    # NOT let a traceback escape. (The suite's in-process backend never hits that path, so force it.)
+    import pytest
+
+    import hub.routers.runs as runs_mod
+    from hub import cli
+    from hub.deps import get_deps
+    p = _seq_parquet(tmp_path)
+    doc = {"id": "kf_canvas", "name": "kf", "version": 1,
+           "nodes": [N("src", "source", {"uri": p}), N("wr", "write", {"name": "kf_out"})],
+           "edges": [E("src", "wr")]}
+    client.put("/api/canvas/kf_canvas", json=doc)
+
+    def _boom(*a, **k):
+        raise RuntimeError("kernel for canvas 'kf_canvas' did not become ready in 1.0s")
+
+    monkeypatch.setattr(runs_mod, "start_run", _boom)  # _headless_run imports start_run at call time
+    with pytest.raises(SystemExit) as ei:
+        cli._headless_run(get_deps(), "kf_canvas", None, 5.0, as_json=False)
+    assert "cannot run canvas 'kf_canvas'" in str(ei.value)
+
+
 def test_coordination_tables_pruned_to_cap(monkeypatch):
     # ARC5 coordination-table-prune: run_records (per-canvas history) and run_states (one full-JSON row
     # per run) must NOT grow without bound in the local DB. record_run caps per-canvas history; a run
