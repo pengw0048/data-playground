@@ -7756,6 +7756,68 @@ def test_ray_region_handoff_uses_an_immutable_attempt_prefix():
     assert attempt_uri("/tmp/out.parquet", "../../unsafe run") == "/tmp/out.attempt-unsafe_run"
 
 
+def test_region_attempt_requires_a_valid_commit_manifest(tmp_path):
+    # Shards alone are not a published handoff. The controller must reject a partial/corrupt attempt and
+    # accept it only after the writer's last operation installs a valid success manifest.
+    import duckdb
+
+    from hub.handoff import MANIFEST_NAME, write_manifest
+
+    attempt = tmp_path / "region.attempt-unit_1"
+    attempt.mkdir()
+    duckdb.connect().execute(
+        f"COPY (SELECT 1 AS x) TO '{attempt / 'part-0.parquet'}' (FORMAT PARQUET)")
+    ctrl = get_deps().controller
+    assert ctrl._region_output_exists(str(attempt)) is False
+    (attempt / MANIFEST_NAME).write_text("{broken")
+    assert ctrl._region_output_exists(str(attempt)) is False
+    write_manifest(str(attempt), run_id="unit_1", rows=1, schema="x: int64")
+    assert ctrl._region_output_exists(str(attempt)) is True
+
+
+def test_region_attempt_cleanup_is_scoped_and_object_gc_is_age_gated(tmp_path, monkeypatch):
+    from hub import handoff
+
+    stable = tmp_path / "stable"
+    failed = tmp_path / "region.attempt-failed"
+    stable.mkdir()
+    failed.mkdir()
+    (stable / "keep").write_text("stable")
+    (failed / "part.parquet").write_text("partial")
+    handoff.discard_attempt(str(stable))
+    handoff.discard_attempt(str(failed))
+    assert stable.exists() and not failed.exists()  # the cleanup API can never delete a stable prefix
+
+    class _Info:
+        def __init__(self, path, mtime):
+            self.path, self.mtime_ns, self.mtime = path, int(mtime * 1_000_000_000), None
+
+    class _FS:
+        def __init__(self):
+            self.deleted = []
+
+        def get_file_info(self, selector):
+            return [
+                _Info("bucket/regions/old.attempt-a/part.parquet", 100),
+                _Info("bucket/regions/old.attempt-a/_DP_SUCCESS.json", 101),
+                _Info("bucket/regions/protected.attempt-b/part.parquet", 100),
+                _Info("bucket/regions/fresh.attempt-c/part.parquet", 950),
+                _Info("bucket/regions/stable.parquet", 100),
+            ]
+
+        def delete_dir(self, path):
+            self.deleted.append(path)
+
+    fs = _FS()
+    monkeypatch.setattr(handoff, "object_fs", lambda uri: (fs, uri.split("://", 1)[1]))
+    monkeypatch.setenv("DP_REGION_HANDOFF_GC_MIN_AGE_SECONDS", "200")
+    monkeypatch.setenv("DP_REGION_HANDOFF_GC_BATCH", "100")
+    removed = handoff.prune_object_attempts(
+        "s3://bucket/regions", protected={"s3://bucket/regions/protected.attempt-b"}, now=1000)
+    assert removed == 1
+    assert fs.deleted == ["bucket/regions/old.attempt-a"]
+
+
 def test_ray_region_worker_direct_write_and_progress(tmp_path):
     # opt-in live Ray: run_unit (region mode) writes WORKER-DIRECT — the output is a DIRECTORY of parquet
     # shards (each written in parallel by a Ray task, no driver collect/OOM), readable + correct; and the

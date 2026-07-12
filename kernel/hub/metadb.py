@@ -756,6 +756,21 @@ def get_result(key: str) -> dict | None:
         return json.loads(r.doc) if r else None
 
 
+def result_uris() -> set[str]:
+    """Artifact URIs referenced by the durable result index (used to protect handoffs from GC)."""
+    with session() as s:
+        docs = s.scalars(select(ResultCache.doc)).all()
+    out: set[str] = set()
+    for raw in docs:
+        try:
+            uri = json.loads(raw).get("uri")
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if isinstance(uri, str) and uri:
+            out.add(uri)
+    return out
+
+
 def put_result(key: str, doc: dict) -> None:
     """Upsert a completed run's result pointer, then prune to the newest N (safe: a miss recomputes)."""
     with session() as s:

@@ -48,6 +48,8 @@ import time
 import uuid
 
 from hub import db, graph as g
+from hub.handoff import (MANIFEST_NAME as _HANDOFF_MANIFEST, discard_attempt,
+                         write_manifest)
 from hub.sinks import SinkSpec, commit_sink, preflight_sink
 from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (DuckDB's own parser), shared
 from hub.ir import (CLEAN_OPS, CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
@@ -90,7 +92,6 @@ from hub.workload_env import build_workload_env, prepare_workload_graph
 # backend, but a sort exceeding one node's memory should not pin engine=ray (a production backend would
 # write ordered shards + stitch on read).
 RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join", "sort"})
-_HANDOFF_MANIFEST = "_DP_SUCCESS.json"
 
 
 def _attempt_handoff_uri(uri: str, run_id: str) -> str:
@@ -107,24 +108,7 @@ def _attempt_handoff_uri(uri: str, run_id: str) -> str:
 
 def _write_handoff_manifest(uri: str, *, run_id: str, rows: int, schema: object) -> None:
     """Write the commit marker last; the controller publishes ``uri`` only after this returns."""
-    import json
-
-    from hub.plugins.adapters import is_object_uri, object_fs
-
-    body = json.dumps({
-        "format": "data-playground-ray-handoff-v1",
-        "runId": run_id,
-        "rows": int(rows),
-        "schema": str(getattr(schema, "base_schema", schema)),
-    }, sort_keys=True).encode()
-    if is_object_uri(uri):
-        fs, path = object_fs(uri)
-        with fs.open_output_stream(path.rstrip("/") + "/" + _HANDOFF_MANIFEST) as stream:
-            stream.write(body)
-        return
-    os.makedirs(uri, exist_ok=True)
-    with open(os.path.join(uri, _HANDOFF_MANIFEST), "wb") as f:
-        f.write(body)
+    write_manifest(uri, run_id=run_id, rows=rows, schema=schema)
 
 
 def _ray_child_env() -> dict[str, str]:
@@ -627,6 +611,11 @@ class RayRunner:
                     status.progress = 1.0
             elif status.status == "running":
                 status.status, status.error = "failed", f"ray driver exited without a terminal status (rc={proc.returncode})"
+        if materialize_uri and status.status != "done":
+            # This URI belongs only to this attempt. A failed/cancelled driver can leave shards but never
+            # a published pointer, so removing the prefix is race-free and prevents routine failures from
+            # waiting for the age-gated object-store sweeper.
+            discard_attempt(materialize_uri)
         for p in status.per_node:  # settle per-node progress to the terminal state
             p.status = "done" if status.status == "done" else status.status
         self._emit(graph, status)
