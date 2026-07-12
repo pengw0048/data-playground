@@ -171,8 +171,10 @@ same seam the built-ins go through, so the core never changes:
 - **backend** (`ExecutionBackend`) — *where* a plan runs. A distributed one also implements
   `PlaceableBackend` (`workers()` / `place()` / `run_unit()`), so a run splits into **regions** that are
   each placed on a fitting backend and handed off through shared **storage**. The bundled **`dp_ray`**
-  backend runs regions on a **Ray cluster** with worker-direct reads/writes; a **`KernelSpawner`**
-  likewise swaps the per-canvas kernel from a local process to a **k8s Pod** for cross-host scale.
+  reference backend runs eligible regions on a **Ray cluster** and writes region outputs directly from
+  workers. Object-store/non-Parquet reads and whole-graph sinks are still driver-funneled today; see the
+  [Ray support and readiness matrix](docs/RAY.md). A **`KernelSpawner`** likewise swaps the per-canvas
+  kernel from a local process to a **k8s Pod** for cross-host scale.
 
 ```mermaid
 flowchart TB
@@ -402,9 +404,11 @@ hint — no fabricated ETA.
 **Adding a distributed backend is a plugin.** Implement the `ExecutionBackend` protocol, plus the
 optional `PlaceableBackend` — `workers()` / `place(requires)` / `run_unit(graph, output_node, output_uri)`
 / `reachable_tiers()`. `run_unit` runs one region reading its input from a tier URI and writing its
-output to a tier URI, so workers read/write shared storage directly. The bundled **`dp_ray`** plugin is
-the working reference (region dispatch on Ray Data with worker-direct parquet reads, verified on real
-Ray) — point your own internal job system at the same `run_unit` contract.
+output to a tier URI; a production backend should keep both paths worker-direct. The bundled **`dp_ray`**
+plugin is the working reference: it proves real Ray Data region dispatch and worker-direct Parquet shard
+outputs, while same-host local Parquet may also be read directly. Object-store/non-Parquet inputs and
+whole-graph sinks currently pass through the driver, so use the [documented support boundary](docs/RAY.md)
+rather than treating the validation harness as a production deployment.
 
 ---
 

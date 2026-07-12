@@ -5,7 +5,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-from hub.workload_env import build_workload_env, prepare_workload_graph
+from hub.workload_env import (build_workload_env, initialize_ephemeral_metadata,
+                              prepare_workload_graph)
 
 
 _CONTROL_SECRETS = {
@@ -92,6 +93,31 @@ def test_ray_driver_uses_one_shot_profile(monkeypatch):
     assert env["AWS_SECRET_ACCESS_KEY"] == "data-secret"
     assert env["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] == "0"
     assert env["PATH"].startswith(str(Path(module.sys.executable).parent))
+
+
+def test_ephemeral_worker_seeds_only_allowlisted_object_store_execution_config(tmp_path, monkeypatch):
+    from hub import metadb
+
+    monkeypatch.setenv("DP_DATABASE_URL", "sqlite:///original-test.db")
+    monkeypatch.setenv("DP_S3_ENDPOINT", "http://minio:9000")
+    monkeypatch.setenv("DP_S3_KEY", "data-key")
+    monkeypatch.setenv("DP_S3_SECRET", "data-secret")
+    monkeypatch.setenv("DP_AUTH_SECRET", "must-not-cross")
+    seeded: list[tuple[str, dict, str]] = []
+    monkeypatch.setattr(metadb, "init_db", lambda: None)
+    monkeypatch.setattr(metadb, "set_setting", lambda key, value, scope: seeded.append((key, value, scope)))
+
+    url = initialize_ephemeral_metadata(str(tmp_path))
+
+    assert url.endswith("/workload-metadata.db")
+    assert seeded == [("objectStore", {
+        "accessKeyId": "data-key",
+        "secretAccessKey": "data-secret",
+        "endpoint": "http://minio:9000",
+        "useSsl": False,
+        "region": "us-east-1",
+    }, "global")]
+    assert "must-not-cross" not in repr(seeded)
 
 
 def test_workload_graph_inlines_named_schema_contract_without_mutating_source():

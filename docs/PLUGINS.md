@@ -159,7 +159,7 @@ test in `kernel/hub/tests/test_kernel.py` you can copy:
 | [`dp_hf_datasets`](../examples/plugins/dp_hf_datasets/) | `add_adapter` | read a Hugging Face Hub dataset as a source: `hf://<id>[@<config>][:<split>]` | `uv pip install -e 'kernel[hf]'` |
 | [`dp_iceberg`](../examples/plugins/dp_iceberg/) | `add_adapter` | read an Apache Iceberg table as a source: `iceberg://<catalog>/<namespace>.<table>` (catalog from your pyiceberg config) | `uv pip install -e 'kernel[iceberg]'` |
 | [`dp_json_pipeline`](../examples/plugins/dp_json_pipeline/) | `set_importer` | parse a tiny JSON pipeline (`source`/`steps`/`write`) into a runnable canvas graph — import → canvas → run | — |
-| [`dp_ray`](../examples/plugins/dp_ray/) | `add_runner` (+ `PlaceableBackend`) | run the clean subset on **Ray Data** (`read → map/filter/flat_map/map_batches → write`), lowered from the engine-neutral IR; falls back to DuckDB for relational/opaque graphs. Opt-in whole-graph via `DP_EXECUTION=ray-data`; also a **region-dispatch** backend — `run_unit` runs one region on Ray with worker-direct parquet reads, claimed when a node is tagged `config.requires.labels.engine=ray`. The reference for a real distributed backend | `uv pip install -e 'kernel[ray]'` |
+| [`dp_ray`](../examples/plugins/dp_ray/) | `add_runner` (+ `PlaceableBackend`) | a **Ray Data reference backend** for clean transforms plus conservatively gated grouped aggregate, partitioned window, full-row dedup, broadcast `inner`/`left`/`cross` join, and plain-key sort; other shapes fall back to DuckDB. Opt-in whole-graph via `DP_EXECUTION=ray-data`, or place a region with `config.requires.labels.engine=ray`. Region outputs are worker-direct Parquet shards; object-store/non-Parquet reads and whole-graph sinks are driver-funneled. See the [support/readiness matrix](RAY.md) | `uv pip install -e 'kernel[ray]'` |
 | [`dp_datasets_place`](../examples/plugins/dp_datasets_place/) | `add_destination` | a save/open "place" (`kind='datasets'`) that browses only dataset files, hiding clutter; path-fenced to its root | — |
 | [`dp_json_view`](../examples/plugins/dp_json_view/) | `add_capability` | tags JSON-doc columns (name-based detector) + declares `viewer={"kind":"json"}` → the SPA shows a JSON tab that pretty-prints those cells, no frontend code | — |
 | [`dp_upper`](../examples/plugins/dp_upper/) | `add_node` (+`ir`) | an `upper` node whose DuckDB build + engine-neutral `ir` hook share one generated operator, so it runs on Ray too (a clean `map`), not just DuckDB | — |
@@ -177,13 +177,14 @@ they prove the wiring; verify the network path against your own Hub/warehouse.
 A distributed backend must not re-read node configs and re-implement lowering. Instead it lowers from
 `hub.ir`: `lower_to_ir(graph, target)` reads the configs ONCE into a `CompiledIR` — a topological list of
 `IRStep`s, each a normalized `op` + resolved portable config + input wiring. A backend pattern-matches on
-`op`. `CompiledIR.is_clean()` / `plan_is_clean(plan)` mark the subset a map-style engine can run
-end-to-end (`read`, `write`, `passthrough`, and per-row/-batch `map`/`filter`/`flat_map`/`map_batches`);
-everything relational (`sql`/`join`/`aggregate`/`sort`/`dedup`), reducing (`metric`/`chart`), or opaque
-(`section`, and a plugin node with no `ir` hook) stays unsupported → gate `can_run` on it so the kernel
-falls back to the DuckDB engine. `dp_ray` above is the worked example — the first non-DuckDB engine to
-run a canvas, reusing the *same* `sandbox.compile_operator` the DuckDB engine runs so results are
-identical.
+`op`. `CompiledIR.is_clean()` / `plan_is_clean(plan)` mark the portable map-style subset
+(`read`, `write`, `passthrough`, and per-row/-batch `map`/`filter`/`flat_map`/`map_batches`). Relational
+ops are not clean by default, but a backend may explicitly claim a smaller, proven-safe set through
+`plan_is_distributable` and conservative config/schema gates. Reducing (`metric`/`chart`) and opaque
+steps (`section`, and a plugin node with no `ir` hook) still fall back to DuckDB. `dp_ray` is the worked
+example: it reuses the same `sandbox.compile_operator` for transforms and the same DuckDB relational SQL
+inside complete Ray partitions; its exact supported shapes and scale limits are documented in
+[RAY.md](RAY.md).
 
 Two properties make this real rather than a side artifact:
 

@@ -6,12 +6,13 @@
 # service runs the byte-identical differential INSIDE the network so the Ray Client version always matches
 # the cluster and it reaches minio/ray-head by DNS.
 #
-#   docker compose -f docker-compose.ray.yml up -d --scale ray-worker=2 --build
-#   docker compose -f docker-compose.ray.yml run --rm driver    # runs the differential; exits 0 on PASS
+#   docker compose -f docker-compose.ray.yml build ray-head
+#   docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 ray-head ray-worker minio createbucket
+#   docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # differential; exits 0 on PASS
 #   docker compose -f docker-compose.ray.yml down -v
 #
-# Kill-a-worker recovery: while a run is in flight, `docker kill <a ray-worker container>` and re-run the
-# differential — Ray Data reconstructs the lost blocks from lineage and the output stays byte-identical.
+# Degraded-cluster rerun: stop one worker BETWEEN runs, then start a new differential. A PASS proves the
+# remaining cluster can accept fresh work; it does not prove recovery of an already in-flight run.
 
 x-ray-env: &ray-env
   RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
@@ -23,15 +24,24 @@ services:
     build: { context: ., dockerfile: docker/ray/Dockerfile }
     # exec form (not a folded scalar) so the resources JSON keeps its quotes; engine_ray = the placement
     # label a node opts into (dp_ray.place), declared here so a pinned region schedules onto the cluster.
-    command: ["ray", "start", "--head", "--port=6379", "--num-cpus=2", "--dashboard-host=0.0.0.0", '--resources={"engine_ray":100}', "--block"]
+    command: ["ray", "start", "--head", "--port=6379", "--num-cpus=2", "--object-store-memory=536870912", "--dashboard-host=0.0.0.0", '--resources={"engine_ray":100}', "--block"]
     environment: *ray-env
+    healthcheck:
+      test: ["CMD-SHELL", "ray status >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+    shm_size: "1gb"
     networks: [dpray]
 
   ray-worker:
     image: dp-ray:local
-    depends_on: [ray-head]
-    command: ["ray", "start", "--address=ray-head:6379", "--num-cpus=2", '--resources={"engine_ray":100}', "--block"]
+    depends_on:
+      ray-head: { condition: service_healthy }
+    command: ["ray", "start", "--address=ray-head:6379", "--num-cpus=2", "--object-store-memory=536870912", '--resources={"engine_ray":100}', "--block"]
     environment: *ray-env
+    shm_size: "1gb"
     networks: [dpray]
 
   minio:
@@ -51,7 +61,7 @@ services:
   driver:
     image: dp-ray:local
     depends_on:
-      ray-head: { condition: service_started }
+      ray-head: { condition: service_healthy }
       createbucket: { condition: service_completed_successfully }
     working_dir: /app/kernel
     environment:
@@ -59,19 +69,23 @@ services:
       RAY_ADDRESS: "auto"                 # connect to the LOCAL raylet after joining the cluster below
       DP_TEST_RAY_LIVE: "1"
       DP_RAY_SHUFFLE_PARTITIONS: "4"
+      DP_MULTINODE_FAULT: "${DP_MULTINODE_FAULT:-}"
       DP_S3_ENDPOINT: "http://minio:9000"
       DP_S3_KEY: "dpminio"
       DP_S3_SECRET: "dpminio123"
       DP_S3_BUCKET: "dpray"
-    # JOIN the cluster as a node (so ray.init(address=auto) connects locally — an external, non-node
-    # process can't attach by GCS address), then run the multi-node byte-identical differential.
+    # JOIN the already-running cluster as a node (so ray.init(address=auto) connects locally — an
+    # external, non-node process can't attach by GCS address), then run the differential. Invoke this
+    # service with `--no-deps`: restarting/recreating a dependency would replace the GCS cluster identity
+    # underneath the persistent workers and invalidate the validation topology.
     entrypoint: ["/bin/sh", "-c"]
     # $$ escapes Compose's own variable interpolation so the SHELL sees $? / $rc (else Compose expands
     # them to empty and `exit` returns 0 even when the differential FAILED — the check's real exit code
     # must propagate so `docker compose run` is a trustworthy CI gate). OPS-12.
-    command: ["ray start --address=ray-head:6379 --num-cpus=2 && python /app/kernel/hub/ray_multinode_check.py; rc=$$?; ray stop >/dev/null 2>&1; exit $$rc"]
+    command: ["ray start --address=ray-head:6379 --num-cpus=2 --object-store-memory=536870912 && python /app/kernel/hub/ray_multinode_check.py; rc=$$?; ray stop >/dev/null 2>&1; exit $$rc"]
     volumes:
       - ./kernel/hub/ray_multinode_check.py:/app/kernel/hub/ray_multinode_check.py:ro
+    shm_size: "1gb"
     networks: [dpray]
 
 networks:

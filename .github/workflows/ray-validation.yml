@@ -1,0 +1,136 @@
+name: Ray validation
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/ray-validation.yml"
+      - "docker-compose.ray.yml"
+      - "docker/ray/**"
+      - "deploy/kuberay/**"
+      - "examples/plugins/dp_ray/**"
+      - "kernel/pyproject.toml"
+      - "kernel/uv.lock"
+      - "kernel/hub/backends.py"
+      - "kernel/hub/db.py"
+      - "kernel/hub/deps.py"
+      - "kernel/hub/graph.py"
+      - "kernel/hub/ir.py"
+      - "kernel/hub/models.py"
+      - "kernel/hub/ray_*.py"
+      - "kernel/hub/sandbox.py"
+      - "kernel/hub/sinks.py"
+      - "kernel/hub/sqlanalyze.py"
+      - "kernel/hub/workload_env.py"
+      - "kernel/hub/executors/**"
+      - "kernel/hub/plugins/adapters.py"
+      - "kernel/hub/plugins/runner.py"
+      - "kernel/hub/tests/test_kernel.py"
+      - "README.md"
+      - "docs/PLUGINS.md"
+      - "docs/RAY.md"
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ray-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  multi-node-differential:
+    name: Ray (multi-node differential and controls)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      COMPOSE_PROJECT_NAME: dp-ray-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate Compose configuration
+        run: docker compose -f docker-compose.ray.yml config -q
+
+      - name: Build and start head, two workers, and MinIO
+        run: |
+          mkdir -p ray-diagnostics
+          # Finish the shared image first. Building while `up` creates multiple services can leave a
+          # running head on an earlier image ID; a later `compose run` may then recreate the head and
+          # silently replace the GCS cluster identity under the workers.
+          docker compose -f docker-compose.ray.yml build ray-head
+          docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 ray-head ray-worker minio createbucket
+          docker compose -f docker-compose.ray.yml ps -a | tee ray-diagnostics/startup-ps.txt
+
+      - name: Require the head and both workers to register
+        run: |
+          registered=0
+          for _ in $(seq 1 60); do
+            registered=$(docker compose -f docker-compose.ray.yml exec -T ray-head python -c \
+              'import ray; ray.init(address="auto", configure_logging=False, log_to_driver=False); print(sum(1 for n in ray.nodes() if n.get("Alive") and n.get("Resources", {}).get("CPU", 0) > 0))' \
+              2>/dev/null | tail -1) || true
+            if [ "$registered" -ge 3 ] 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$registered" -lt 3 ] 2>/dev/null; then
+            echo "Expected a Ray head plus two registered workers; observed $registered CPU-bearing nodes."
+            exit 1
+          fi
+          echo "Ray head and two workers registered."
+
+      - name: Require a clean distributed PASS
+        run: |
+          DP_MULTINODE_FAULT= docker compose -f docker-compose.ray.yml run --rm --no-deps driver 2>&1 | tee ray-diagnostics/clean.log
+
+      - name: Require every fault control to fail
+        run: |
+          for fault in schema rows join; do
+            set +e
+            DP_MULTINODE_FAULT="$fault" docker compose -f docker-compose.ray.yml run --rm --no-deps driver 2>&1 | tee "ray-diagnostics/fault-$fault.log"
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              echo "Fault control '$fault' unexpectedly passed; the differential oracle is not trustworthy."
+              exit 1
+            fi
+            echo "Fault control '$fault' failed as required (exit $rc)."
+          done
+
+      - name: Require a degraded-cluster rerun after one worker stops
+        run: |
+          workers=$(docker compose -f docker-compose.ray.yml ps -q ray-worker)
+          worker_count=$(printf '%s\n' "$workers" | sed '/^$/d' | wc -l)
+          if [ "$worker_count" -ne 2 ]; then
+            echo "Expected exactly two worker containers, found $worker_count."
+            exit 1
+          fi
+          victim=$(printf '%s\n' "$workers" | sed -n '2p')
+          docker kill "$victim"
+          echo "Stopped worker $victim between runs. This checks a fresh degraded-cluster run, not in-flight recovery."
+          DP_MULTINODE_FAULT= docker compose -f docker-compose.ray.yml run --rm --no-deps driver 2>&1 | tee ray-diagnostics/degraded-rerun.log
+
+      - name: Capture Ray diagnostics
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p ray-diagnostics
+          docker compose -f docker-compose.ray.yml ps -a > ray-diagnostics/final-ps.txt 2>&1
+          docker compose -f docker-compose.ray.yml logs --no-color > ray-diagnostics/compose.log 2>&1
+          docker info > ray-diagnostics/docker-info.txt 2>&1
+          df -h > ray-diagnostics/disk.txt 2>&1
+
+      - name: Upload Ray diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ray-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ray-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Tear down Ray validation cluster
+        if: always()
+        run: docker compose -f docker-compose.ray.yml down -v --remove-orphans

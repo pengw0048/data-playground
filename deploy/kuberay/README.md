@@ -1,22 +1,35 @@
-# Multi-node validation of the distributed engine (dp_ray)
+# Multi-node validation of the Ray reference backend (`dp_ray`)
 
-The distributed backend's promise is *byte-identical to single-node DuckDB, on a real multi-node
-cluster*. Two ways to prove it — both run the same check (`hub/ray_multinode_check.py`): a distributed
-GROUP BY over Ray Data's hash shuffle, written worker-direct to object storage, compared to DuckDB.
+This harness checks selected `dp_ray` operations against single-node DuckDB on a real multi-node
+cluster. Both paths below run `hub/ray_multinode_check.py`: a distributed GROUP BY and broadcast join,
+written worker-direct to object storage, compared with DuckDB. It does not certify every supported
+operation or make `dp_ray` production-capable; see the [support/readiness matrix](../../docs/RAY.md).
 
 ## 1. docker-compose (fastest — a head + 2 worker containers + MinIO)
 
 ```bash
-docker compose -f docker-compose.ray.yml up -d --scale ray-worker=2 --build
-docker compose -f docker-compose.ray.yml run --rm driver     # → "[multinode] PASS: … byte-identical …"
+docker compose -f docker-compose.ray.yml build ray-head
+docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 \
+  ray-head ray-worker minio createbucket
+docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # → "[multinode] PASS: … byte-identical …"
 docker compose -f docker-compose.ray.yml down -v
 ```
 
-Kill-a-worker recovery: with the cluster up, `docker kill data-playground-ray-worker-2` and re-run the
-`driver` — the degraded cluster still returns byte-identical output (Ray reschedules / reconstructs from
-lineage). Validated: 4 nodes → PASS; after killing a worker, 3 nodes → PASS.
+**Degraded-cluster rerun:** stop one worker *between* runs and start the driver again. A PASS proves the
+remaining cluster accepts fresh work and still returns the same result. This is deliberately not called
+in-flight recovery: the harness does not kill a worker during an active job and does not prove lineage
+reconstruction for that job.
+
+```bash
+worker="$(docker compose -f docker-compose.ray.yml ps -q ray-worker | tail -1)"
+docker kill "$worker"
+docker compose -f docker-compose.ray.yml run --rm --no-deps driver
+```
 
 ## 2. KubeRay on Kubernetes (e.g. kind — the pods path)
+
+These manifests are a disposable validation environment: local image tags, fixed workers, ephemeral
+MinIO, and test credentials. They are not a secure or highly available production deployment.
 
 ```bash
 kind create cluster
@@ -63,9 +76,9 @@ silently inert. Run the harness once per fault target — each **must exit nonze
 
 ```bash
 for f in schema rows join; do
-  DP_MULTINODE_FAULT=$f docker compose -f docker-compose.ray.yml run --rm driver   # expect NONZERO each
+  DP_MULTINODE_FAULT=$f docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # expect NONZERO each
 done
-docker compose -f docker-compose.ray.yml run --rm driver                            # clean → PASS (exit 0)
+docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # clean → PASS (exit 0)
 ```
 
 (`DP_MULTINODE_FAULT=1` is accepted as an alias for `rows`, back-compat.)
