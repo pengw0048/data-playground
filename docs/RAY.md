@@ -82,6 +82,8 @@ deduplication preserve or derive empty-result schemas. Schema-changing Python tr
 `outputSchema`; without that contract, an empty result fails instead of publishing a misleading schema.
 These transforms materialize once inside Ray so non-empty downstream operators use the actual runtime
 schema rather than a stale declaration; this adds a stage boundary but does not collect data to the driver.
+Transforms with `enforceSchema=true` fall back to the local engine; an explicit Ray pin fails before
+dispatch until distributed schema enforcement is implemented.
 
 ## What the validation gate proves
 

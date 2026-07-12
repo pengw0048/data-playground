@@ -7772,10 +7772,17 @@ def test_ray_ir_carries_transform_output_schema_for_empty_results():
         N("s", "source", {"uri": _uri("events")}),
         N("t", "transform", {
             "mode": "flat_map", "code": "def fn(row): return []", "outputSchema": contract,
+            "enforceSchema": True,
         }),
     ], "edges": [E("s", "t")]})
     step = lower_to_ir(graph, "t", deps.node_specs).by_id()["t"]
     assert step.config["outputSchema"] == contract
+    assert step.config["enforceSchema"] is True
+    assert "distributed schema enforcement is not implemented" in (
+        object.__new__(_load_dp_ray().RayRunner)._ray_unsupported_reason(
+            lower_to_ir(graph, "t", deps.node_specs)
+        ) or ""
+    )
 
 
 def test_ray_whole_run_scopes_each_sink_attempt_by_step_and_unstripped_target(tmp_path):
@@ -8282,6 +8289,17 @@ def test_ray_typed_empty_paths_live_keep_pre_materialization_schema(tmp_path, mo
             )
             assert table.num_rows == 0 and table.schema.names == expected_names
 
+        sorted_then_deduped = runner._build(
+            SimpleNamespace(op="dedup", inputs=[("src", None)], config={"on": ""}),
+            {"src": runner._build(
+                SimpleNamespace(op="sort", inputs=[("src", None)], config={"by": "k"}),
+                {"src": filtered(source_plan)},
+            )},
+        )
+        assert mod._collect_arrow(
+            sorted_then_deduped, purpose="live empty sort then dedup"
+        ).schema == source_schema
+
         left_empty = filtered(source_plan)
         left_empty_join = SimpleNamespace(
             inputs=[("left", None), ("right", None)], config={"on": "k", "how": "left"},
@@ -8356,11 +8374,18 @@ def test_ray_typed_empty_paths_live_keep_pre_materialization_schema(tmp_path, mo
                 "outputSchema": [{"name": "renamed", "type": "int"}],
             },
         )
-        declared_empty = mod._collect_arrow(
-            runner._build(declared_flat_map, {"src": mod._read_native_parquet(ray, source_plan)}),
-            purpose="live declared empty map",
+        declared_dataset = runner._build(
+            declared_flat_map, {"src": mod._read_native_parquet(ray, source_plan)}
         )
+        declared_empty = mod._collect_arrow(declared_dataset, purpose="live declared empty map")
         assert declared_empty.schema == pa.schema([("renamed", pa.int64())])
+        declared_dedup = runner._build(
+            SimpleNamespace(op="dedup", inputs=[("src", None)], config={"on": ""}),
+            {"src": declared_dataset},
+        )
+        assert mod._collect_arrow(
+            declared_dedup, purpose="live declared empty map then dedup"
+        ).schema == pa.schema([("renamed", pa.int64())])
 
         undeclared_flat_map = SimpleNamespace(
             op="flat_map", inputs=[("src", None)],

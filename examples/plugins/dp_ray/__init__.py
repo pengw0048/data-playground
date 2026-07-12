@@ -950,6 +950,13 @@ class RayRunner:
                         if s.op in CLEAN_TRANSFORM_MODES and not s.config.get("code")]
         if missing_code:
             return "worker-portable transform code is missing for node(s): " + ", ".join(missing_code)
+        enforced = [s.id for s in ir.steps
+                    if s.op in CLEAN_TRANSFORM_MODES and s.config.get("enforceSchema") is True]
+        if enforced:
+            return (
+                "distributed schema enforcement is not implemented for transform node(s): "
+                + ", ".join(enforced)
+            )
         for s in ir.steps:
             if s.op == "write":
                 try:
@@ -1419,8 +1426,12 @@ class RayRunner:
             # the result is deterministic + byte-identical (unlike keyed DISTINCT ON — gated out above).
             lineage_schema = _arrow_schema(_known_ray_schema(parent))
             parent = parent.materialize()
+            rows = parent.count()
             runtime_schema = _runtime_ray_schema(parent)
-            schema = runtime_schema or lineage_schema
+            if rows > 0 and runtime_schema is None:
+                raise RuntimeError("a non-empty Ray dedup input did not expose an Arrow schema")
+            schema = runtime_schema if rows > 0 else lineage_schema
+            parent = _remember_ray_schema(parent, schema)
             keys = schema.names if schema is not None else list(parent.columns())
             return self._shuffle_duckdb(parent, keys, "SELECT DISTINCT * FROM _blk", opts)
         if step.op == "join":

@@ -159,6 +159,8 @@ def resolve_config(node: GraphNode) -> dict:
         # empty result without re-running user code. Named refs are resolved before isolated dispatch.
         if isinstance(cfg.get("outputSchema"), (list, dict)):
             c["outputSchema"] = cfg["outputSchema"]
+        if cfg.get("enforceSchema") is True:
+            c["enforceSchema"] = True
         return c
     if t == "source":
         opts = {k: str(cfg[k]).strip().lower() if k == "header" else str(cfg[k]).strip()
