@@ -13,6 +13,7 @@ trap 'rm -rf "${TMP}"' EXIT
 case "${TIMEOUT_SECONDS}" in
   ''|*[!0-9]*|0) echo "DP_RAY_VALIDATION_TIMEOUT_SECONDS must be a positive integer" >&2; exit 2 ;;
 esac
+TIMEOUT_SECONDS=$((10#${TIMEOUT_SECONDS}))
 
 # Bind kubectl to the exact cluster that `kind load` targets. A user's same-named kubeconfig context may
 # have been redirected; using it while deleting fixed validation resource names would be unsafe.
@@ -25,7 +26,10 @@ say() { printf '\n== %s\n' "$*"; }
 wait_for_no_pods() {
   local selector="$1" label="$2" deadline=$((SECONDS + 180)) remaining
   while (( SECONDS < deadline )); do
-    remaining="$("${KUBECTL[@]}" get pods -l "${selector}" -o name 2>/dev/null || true)"
+    if ! remaining="$("${KUBECTL[@]}" get pods -l "${selector}" -o name)"; then
+      echo "could not list old ${label} pods; refusing to recreate validation resources" >&2
+      return 1
+    fi
     [ -z "${remaining}" ] && return 0
     sleep 2
   done

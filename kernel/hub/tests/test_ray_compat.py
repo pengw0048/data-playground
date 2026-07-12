@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -199,3 +201,35 @@ def test_kuberay_validation_profile_fits_a_four_cpu_kind_node_and_recreates_work
     assert 'wait_for_no_pods "batch.kubernetes.io/job-name=dp-ray-multinode-check"' in script
     assert 'if (( ${failed:-0} >= 1 ))' in script
     assert 'sed "s|image: dp-ray:local|image: ${IMAGE}|g"' in script
+
+
+def test_kuberay_validation_fails_closed_when_old_pod_listing_fails(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name, body in {
+        "kind": "#!/bin/sh\necho 'apiVersion: v1'\n",
+        "docker": "#!/bin/sh\nexit 0\n",
+        "kubectl": (
+            "#!/bin/sh\n"
+            "case \" $* \" in\n"
+            "  *\" get pods -l ray.io/cluster=dp-ray \"*) exit 42 ;;\n"
+            "esac\n"
+            "exit 0\n"
+        ),
+    }.items():
+        executable = fake_bin / name
+        executable.write_text(body)
+        executable.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update({
+        "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+        "KIND_CLUSTER": "fail-closed-test",
+        "DP_RAY_VALIDATION_IMAGE": "dp-ray:fail-closed-test",
+        "DP_RAY_VALIDATION_TIMEOUT_SECONDS": "08",
+    })
+    result = subprocess.run(
+        [_ROOT / "deploy/kuberay/validate.sh"], env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "could not list old RayCluster pods; refusing to recreate" in result.stderr
