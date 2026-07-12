@@ -38,15 +38,13 @@ def _free_port() -> int:
 
 
 def _kernel_child_env() -> dict:
-    """The kernel child runs the canvas's ARBITRARY Python. Keep the hub's forgeable session-signing
-    secret out of its env (the kernel authenticates its channel with a per-kernel token and never
-    signs/verifies hub sessions); preserve the auth-mode SIGNAL via DP_AUTH_MODE so the child still
-    turns on its DuckDB FS sandbox + local-path confinement. DB + object-store creds necessarily remain
-    — the kernel IS the data engine and the single writer of run state (P0-SEC-01)."""
-    env = dict(os.environ)
-    if env.pop("DP_AUTH_SECRET", None):
-        env["DP_AUTH_MODE"] = "1"
-    return env
+    """Allowlisted long-lived-kernel environment.
+
+    The kernel still needs the metadata DB until lease/heartbeat/run-state writes move behind a scoped
+    control-plane API. It receives no signing/bootstrap/provider secrets merely because the hub has them.
+    """
+    from hub.workload_env import build_workload_env
+    return build_workload_env(include_metadata_db=True)
 
 
 def _post(endpoint: str, path: str, token: str, body: dict, timeout: float = 60.0, connect_retries: int = 20) -> dict:

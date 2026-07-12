@@ -26,6 +26,11 @@ def main() -> int:
     job = json.load(open(sys.argv[1]))
     status_file = job["statusFile"]
     try:
+        # The worker needs catalog tables for normal Deps composition, not the hub's users/settings/run
+        # state. Build a private disposable DB before importing settings instead of forwarding the hub
+        # metadata credential into caller-controlled code.
+        from hub.workload_env import initialize_ephemeral_metadata
+        initialize_ephemeral_metadata(os.path.dirname(status_file))
         from hub import compiler
         from hub.deps import set_workspace
         from hub.models import Graph

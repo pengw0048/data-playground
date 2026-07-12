@@ -17,13 +17,8 @@ from __future__ import annotations
 import hashlib
 import os
 
-# DP_* env the kernel pod needs to share the hub's DB / storage / dataset roots. Object-store creds ride
-# along too so the pod's DuckDB can read s3://gs:// data. NOT the session-signing secret (DP_AUTH_SECRET)
-# — the pod runs arbitrary canvas Python; it gets the auth-mode SIGNAL via DP_AUTH_MODE instead (P0-SEC-01).
-_FORWARD_ENV = ("DP_DATABASE_URL", "DP_DATASET_ROOTS", "DP_STORAGE_URL",
-                "DP_MEMORY_LIMIT", "DP_SPILL_DIR", "DP_KERNEL_IDLE_TTL", "DP_CANVAS_PIP_DEPS",
-                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION",
-                "GOOGLE_APPLICATION_CREDENTIALS")
+from hub.workload_env import build_workload_env
+
 _PORT = 8500  # fixed inside the pod; the Service exposes it
 
 
@@ -64,9 +59,10 @@ class PodSpawner:
                 raise
 
     def _pod_body(self, name: str, cmd: list[str]) -> dict:
-        env = [{"name": k, "value": os.environ[k]} for k in _FORWARD_ENV if os.environ.get(k)]
-        if os.environ.get("DP_AUTH_SECRET") or os.environ.get("DP_AUTH_MODE") == "1":
-            env.append({"name": "DP_AUTH_MODE", "value": "1"})  # auth-mode signal, not the signing secret
+        # The image supplies PATH/HOME/etc.; only explicit workload config/capabilities cross the pod
+        # boundary. The metadata identity remains until the kernel persistence protocol is separated.
+        child = build_workload_env(include_metadata_db=True, include_host_runtime=False)
+        env = [{"name": key, "value": child[key]} for key in sorted(child)]
         return {
             "metadata": {"name": name, "labels": {"app": "dp-kernel", "dp-canvas": name}},
             "spec": {

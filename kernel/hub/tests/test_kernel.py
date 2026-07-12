@@ -2085,18 +2085,21 @@ def test_users_create_and_list():
     assert created["id"] in ids and "local" in ids and created["id"] not in before
 
 
-def test_kernel_child_env_strips_signing_secret_but_keeps_auth_mode(monkeypatch):
-    # P0-SEC-01: the kernel child runs arbitrary canvas Python; it must NOT inherit the forgeable
-    # session-signing secret, but must still know it's in auth mode (via DP_AUTH_MODE) so its FS/path
-    # confinement stays on. Data-plane creds (DB, object store) necessarily remain — it IS the engine.
+def test_kernel_child_env_is_allowlisted_but_keeps_auth_mode(monkeypatch):
+    # The long-lived kernel still owns DB-backed lease/run-state writes and data access, but it must not
+    # inherit unrelated hub control/provider secrets. DP_AUTH_MODE preserves its FS/path confinement.
     from hub import auth, kernel_backend
     monkeypatch.setenv("DP_AUTH_SECRET", "x" * 40)
+    monkeypatch.setenv("DP_AUTH_PASSWORD", "bootstrap-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    monkeypatch.setenv("UNRELATED_DEPLOY_TOKEN", "control-secret")
     monkeypatch.setenv("DP_DATABASE_URL", "postgresql+psycopg://u:p@h/db")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s3cr3t-key")
     env = kernel_backend._kernel_child_env()
     assert "DP_AUTH_SECRET" not in env          # the forgeable signing secret is stripped
+    assert not {"DP_AUTH_PASSWORD", "OPENAI_API_KEY", "UNRELATED_DEPLOY_TOKEN"} & env.keys()
     assert env["DP_AUTH_MODE"] == "1"           # but the auth-mode signal survives
-    assert env["DP_DATABASE_URL"] and env["AWS_SECRET_ACCESS_KEY"]  # data-plane creds remain (necessary)
+    assert env["DP_DATABASE_URL"] and env["AWS_SECRET_ACCESS_KEY"]  # explicit residual capabilities
     # the signal alone enables auth mode with NO usable signing material in the child
     monkeypatch.delenv("DP_AUTH_SECRET")
     monkeypatch.setenv("DP_AUTH_MODE", "1")
@@ -2153,6 +2156,7 @@ def test_first_admin_bootstrap_from_env_password(monkeypatch):
         # wire the bootstrap and re-run the startup seed (init_db is idempotent)
         monkeypatch.setenv("DP_AUTH_PASSWORD", "bootstrap-pw-123")
         metadb.init_db()
+        assert "DP_AUTH_PASSWORD" not in os.environ  # one-time input, not ambient runtime configuration
         assert metadb.is_admin("local")
         assert client.post("/api/auth/login", json={"userId": "local", "password": "bootstrap-pw-123"}).status_code == 200
         assert client.get("/api/canvas").status_code == 200  # a gated route is now reachable

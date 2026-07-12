@@ -51,6 +51,7 @@ from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (D
 from hub.ir import (CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
                     plan_is_clean, plan_is_distributable)
 from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
+from hub.workload_env import build_workload_env
 
 _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", ".json", ".lance")
 
@@ -88,6 +89,19 @@ _KNOWN_EXT = (".parquet", ".pq", ".csv", ".tsv", ".arrow", ".feather", ".ipc", "
 # backend, but a sort exceeding one node's memory should not pin engine=ray (a production backend would
 # write ordered shards + stitch on read).
 RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join", "sort"})
+
+
+def _ray_child_env() -> dict[str, str]:
+    """Allowlisted Ray-driver environment; the driver never needs the hub metadata identity."""
+    child = build_workload_env(include_metadata_db=False)
+    # A kernel launched through uv must not make Ray workers build a fresh, ray-less environment.
+    for key in list(child):
+        if key in ("VIRTUAL_ENV", "UV", "UV_PROJECT_ENVIRONMENT", "CONDA_PREFIX") or key.startswith("UV_"):
+            child.pop(key, None)
+    child["PATH"] = os.path.dirname(sys.executable) + os.pathsep + child.get("PATH", "")
+    child["RAY_DATA_DISABLE_PROGRESS_BARS"] = "1"
+    child["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+    return child
 
 
 def _ray_opts(requires: dict | None) -> dict:
@@ -377,13 +391,7 @@ class RayRunner:
             # ray-less .venv → workers can't `import ray` → the raylet dies and the run hangs. Strip the
             # uv/venv markers and put the venv's bin on PATH so Ray runs workers with THIS interpreter
             # (which has ray); run from the work dir so uv/Ray don't pick up the repo's pyproject.
-            venv_bin = os.path.dirname(sys.executable)
-            child_env = {k: v for k, v in os.environ.items()
-                         if k not in ("VIRTUAL_ENV", "UV", "UV_PROJECT_ENVIRONMENT", "CONDA_PREFIX")
-                         and not k.startswith("UV_")}
-            child_env["PATH"] = venv_bin + os.pathsep + child_env.get("PATH", "")
-            child_env["RAY_DATA_DISABLE_PROGRESS_BARS"] = "1"
-            child_env["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"  # workers use this interpreter, not a fresh uv venv
+            child_env = _ray_child_env()
             proc = subprocess.Popen([sys.executable, driver, job_file], cwd=work,
                                     stdout=_dlog, stderr=_dlog, start_new_session=True, env=child_env)
             while proc.poll() is None:

@@ -317,8 +317,13 @@ def init_db() -> None:
         # bootstrap: seed the default user's credential from DP_AUTH_PASSWORD (once) so an existing
         # shared-password deployment keeps working after upgrading to per-user auth
         from hub import auth
-        if auth.auth_enabled() and not u.password_hash and auth.bootstrap_password():
-            u.password_hash = auth.hash_password(auth.bootstrap_password())
+        bootstrap = auth.bootstrap_password()
+        if auth.auth_enabled() and not u.password_hash and bootstrap:
+            u.password_hash = auth.hash_password(bootstrap)
+    # The cleartext value is bootstrap input, not runtime configuration. Consume it after the DB commit
+    # whether or not this restart needed to seed a hash, so no subsequently spawned workload inherits it.
+    if bootstrap:
+        os.environ.pop("DP_AUTH_PASSWORD", None)
     reap_kernels()        # drop leases whose kernel is dead (stale heartbeat)
     reap_orphaned_runs()  # fail in-flight runs whose owning kernel is gone; live-kernel runs survive (reattach)
 

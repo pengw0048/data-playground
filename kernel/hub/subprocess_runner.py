@@ -25,6 +25,12 @@ from hub.models import CompilePlan, Graph, PerNodeStatus, Placement, RunEstimate
 from hub.plugins.runner import _CONFIRM_ROWS, _MAX_RUNS
 
 
+def _subrun_child_env() -> dict[str, str]:
+    """A one-shot worker does not own control-plane persistence and receives no metadata identity."""
+    from hub.workload_env import build_workload_env
+    return build_workload_env(include_metadata_db=False)
+
+
 class SubprocessRunner:
     name = "local-subprocess"
 
@@ -102,10 +108,10 @@ class SubprocessRunner:
         with open(job_file, "w") as f:
             json.dump({"workspace": self.workspace, "dataDir": self.data_dir, "graph": graph.model_dump(),
                        "target": target, "statusFile": status_file, **job_extra}, f)
-        # keep the forgeable signing secret out of the subrun child too (defense in depth for the case
-        # where the subprocess runner is selected directly on the hub, not parented by a kernel) — P0-SEC-01
-        from hub.kernel_backend import _kernel_child_env
-        proc = subprocess.Popen([sys.executable, "-m", "hub.subrun", job_file], env=_kernel_child_env())
+        # A one-shot worker gets only runtime/data capabilities, never the hub metadata identity or
+        # ambient signing/bootstrap/provider secrets. It creates a disposable local metadata DB itself.
+        proc = subprocess.Popen([sys.executable, "-m", "hub.subrun", job_file],
+                                env=_subrun_child_env())
         with self._lock:
             self.runs[run_id] = status
             self._procs[run_id] = proc

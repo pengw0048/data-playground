@@ -19,7 +19,9 @@ services:
       # admin's password from this. REQUIRED — else a fresh auth-on deploy has an admin with NO usable
       # credential and no authenticated route to create one (a lockout). Log in as user `local` with
       # this password, create per-user accounts, and each user rotates their own password in-app.
-      # Changing it later does NOT rotate the admin (rotation is via /auth/password); keep it set.
+      # init_db consumes it from the process environment immediately; it is not a runtime login secret
+      # and changing it later does NOT rotate the admin (rotation is via /auth/password). Compose keeps
+      # requiring the input so a brand-new volume can never start in a locked-out state.
       DP_AUTH_PASSWORD: "${DP_AUTH_PASSWORD:?set DP_AUTH_PASSWORD to a first-admin password so login isn't locked out}"
       # multi-user: confine dataset reads to these roots (see kernel/hub/paths.py). The workspace
       # volume is /data; add more host roots you mount if users load datasets from them.
