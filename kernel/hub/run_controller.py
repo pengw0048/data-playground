@@ -378,9 +378,11 @@ class RunController:
         Stable/legacy handoffs keep the runner's ordinary existence contract. This scopes the manifest
         requirement to immutable attempt prefixes, so other placed backends remain compatible.
         """
-        from hub.handoff import is_attempt_uri, read_manifest
-        if is_attempt_uri(uri) and read_manifest(uri) is None:
-            return False
+        from hub.handoff import is_attempt_uri, read_manifest, validate_shards
+        if is_attempt_uri(uri):
+            manifest = read_manifest(uri)
+            if manifest is None or not validate_shards(uri, manifest):
+                return False
         return self.base._output_exists(uri)
 
     def _safe_to_split(self, graph: Graph, target: str, regions) -> bool:

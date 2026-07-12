@@ -49,7 +49,7 @@ import uuid
 
 from hub import db, graph as g
 from hub.handoff import (MANIFEST_NAME as _HANDOFF_MANIFEST, discard_attempt,
-                         read_manifest, write_manifest)
+                         read_manifest, validate_shards, write_manifest)
 from hub.sinks import SinkSpec, commit_sink, preflight_sink
 from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (DuckDB's own parser), shared
 from hub.ir import (CLEAN_OPS, CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
@@ -197,6 +197,7 @@ class RayRunner:
         self.on_complete = getattr(self.base, "on_complete", None)
         self.runs: dict[str, RunStatus] = {}
         self._cancel: dict[str, threading.Event] = {}
+        self._cancel_ack: set[str] = set()
         self._lock = threading.Lock()
 
     # Gate on the declared subset from the CompilePlan alone. An unpinned whole-backend choice can use
@@ -218,6 +219,15 @@ class RayRunner:
                 ev.set()  # cooperative — checked between IR steps (Ray has no cheap mid-Dataset abort)
             st.status = "cancelled"
         return st
+
+    def cancel_acknowledged(self, run_id: str) -> bool:
+        """True only after the isolated driver has exited and can no longer publish."""
+        with self._lock:
+            return run_id in self._cancel_ack
+
+    def _acknowledge_cancel(self, run_id: str) -> None:
+        with self._lock:
+            self._cancel_ack.add(run_id)
 
     # -- PlaceableBackend (region dispatch, Phase C3) ---------------------- #
     # dp_ray advertises ONE synthetic worker labelled engine=ray. place() claims a region ONLY when it
@@ -301,7 +311,8 @@ class RayRunner:
             self.runs[run_id] = status
         try:
             committed = read_manifest(attempt_uri)
-            if committed is not None and self.base._output_exists(attempt_uri):
+            if (committed is not None and validate_shards(attempt_uri, committed)
+                    and self.base._output_exists(attempt_uri)):
                 status.status, status.output_uri = "done", attempt_uri
                 status.rows_processed = status.total_rows = int(committed["rows"])
                 status.progress = 1.0
@@ -637,6 +648,8 @@ class RayRunner:
                 status.status, status.error = "failed", f"ray driver exited without a terminal status (rc={proc.returncode})"
         for p in status.per_node:  # settle per-node progress to the terminal state
             p.status = "done" if status.status == "done" else status.status
+        if status.status == "cancelled":
+            self._acknowledge_cancel(run_id)  # only after Popen.poll/wait proved the driver exited
         self._emit(graph, status)
         with self._lock:
             self._cancel.pop(run_id, None)

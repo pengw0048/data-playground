@@ -117,12 +117,15 @@ The following changes are required before calling the backend production-capable
 6. Pass staging gates on the intended production topology: active-job failure injection, representative
    large workloads, SLOs/alerts, upgrade/rollback, and recovery runbooks.
 
-Object-store attempts live under the dedicated `<DP_STORAGE_URL>/regions/` prefix. Configure a native
-bucket lifecycle on that prefix to expire both committed cache artifacts and unreferenced failed attempts;
-its retention must exceed the longest possible run. Expiration turns a later cache lookup into a safe
-recompute. The hub deliberately does not recursively scan and delete a shared bucket in the foreground:
-it cannot prove ownership across deployments with separate metadata databases, and a full prefix listing
-is not bounded at production fragment counts.
+Object-store data attempts live under `<DP_STORAGE_URL>/regions/`; their authoritative commit records live
+under the sibling `regions/_dp_commits/` subprefix. The manifest contains the exact shard path and size
+inventory, and every cache lookup verifies it. Configure two native lifecycle rules: expire
+`regions/_dp_commits/` first, then expire all `regions/` data after an additional grace period longer than
+the maximum run duration plus the storage provider's lifecycle-evaluation skew. Once the commit disappears,
+new readers recompute; already-resolved readers retain every shard throughout the grace window. Failed
+attempts have no commit and leave with the later data rule. The hub deliberately does not recursively scan
+and delete a shared bucket in the foreground: it cannot prove ownership across deployments with separate
+metadata databases, and a full shared-prefix listing is not bounded at production fragment counts.
 
 Repository changes can make the backend production-capable and provide repeatable validation. A specific
 deployment is production-ready only after its IAM, network, storage, KubeRay, capacity, and operational
