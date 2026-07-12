@@ -2709,6 +2709,47 @@ def test_run_history_persisted_with_canvas(tmp_path):
     assert any(p["node_id"] == "wr" and p["status"] == "done" for p in pn)
 
 
+def test_coordination_tables_pruned_to_cap(monkeypatch):
+    # ARC5 coordination-table-prune: run_records (per-canvas history) and run_states (one full-JSON row
+    # per run) must NOT grow without bound in the local DB. record_run caps per-canvas history; a run
+    # reaching a terminal status prunes finished run_states to the newest N — while NEVER pruning a live
+    # (running/queued) row, so the reaper + in-flight status lookups are untouched.
+    from sqlalchemy import func, select as _select
+
+    from hub import metadb
+    monkeypatch.setattr(metadb, "_RUN_HISTORY_MAX", 3)
+    monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 3)
+
+    # run_records: per-canvas cap (isolated by a unique canvas id)
+    cid = "prune_canvas_x"
+    with metadb.session() as s:
+        s.add(metadb.Canvas(id=cid, owner_id=metadb.DEFAULT_USER_ID, name="t", version=1, doc="{}", visibility="private"))
+    for i in range(7):
+        assert metadb.record_run(cid, None, "done", rows=i) is True
+    with metadb.session() as s:
+        surviving = sorted(r.rows for r in s.scalars(_select(metadb.RunRecord).where(metadb.RunRecord.canvas_id == cid)))
+    # exactly the cap, and the NEWEST 3 (rows 4,5,6) survive — pins keep-newest, not merely the count
+    # (a reversed keep-oldest impl would pass a count-only assertion). Each record_run is its own DB
+    # transaction (ms apart) so created_at is strictly increasing → deterministic, no timestamp ties.
+    assert surviving == [4, 5, 6], f"run_records prune must keep the newest {3}: {surviving}"
+
+    # run_states: global terminal cap, live rows never pruned. Clean slate first (other tests leave rows).
+    with metadb.session() as s:
+        for rs in s.scalars(_select(metadb.RunState)).all():
+            s.delete(rs)
+    metadb.save_run_state("live_run_a", {"run_id": "live_run_a", "status": "running"})
+    metadb.save_run_state("live_run_b", {"run_id": "live_run_b", "status": "queued"})
+    for i in range(6):
+        metadb.save_run_state(f"done_run_{i}", {"run_id": f"done_run_{i}", "status": "done"})
+    with metadb.session() as s:
+        term_ids = {r.run_id for r in s.scalars(_select(metadb.RunState).where(metadb.RunState.status.in_(metadb._TERMINAL_RUN)))}
+        n_live = s.scalar(_select(func.count()).select_from(metadb.RunState).where(~metadb.RunState.status.in_(metadb._TERMINAL_RUN)))
+    # terminal capped to the newest 3 (done_run_3/4/5); live rows (running/queued) never pruned
+    assert term_ids == {"done_run_3", "done_run_4", "done_run_5"}, f"terminal prune must keep newest: {term_ids}"
+    assert n_live == 2, f"live run_states must never be pruned: {n_live}"
+    assert metadb.get_run_state("live_run_a") and metadb.get_run_state("live_run_b")
+
+
 def test_telemetry_sink_seam_fires_once_per_finished_run(tmp_path):
     # reg.add_telemetry_sink registers a consumer that gets a normalized record on each finished run; a
     # sink that raises is swallowed (never fails the run) and the other sinks still fire.
