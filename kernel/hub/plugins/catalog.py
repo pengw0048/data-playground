@@ -25,6 +25,7 @@ from hub import metadb
 from hub.models import (
     CatalogBrowse,
     CatalogPage,
+    CatalogPublicationReceipt,
     CatalogQuery,
     CatalogTable,
     Facets,
@@ -150,7 +151,8 @@ class InMemoryCatalog:
                 owner=owner, description=description,
             )
             self._persist(
-                table, parents=parents, pipeline=pipeline, strict=strict_persist)
+                table, parents=parents, pipeline=pipeline,
+                strict=strict_persist)
         self._embed_one(table)  # best-effort semantic index (no-op without an embedder)
         return table
 
@@ -311,10 +313,12 @@ class InMemoryCatalog:
                         parents: list[str] | None = None, pipeline: str | None = None,
                         folder: str = "", tags: list[str] | None = None, owner: str | None = None,
                         description: str | None = None,
-                        _bump_usage: bool = True) -> CatalogTable:
+                        _bump_usage: bool = True, _require_durable: bool = False) -> CatalogTable:
         table = self._add(name=name, uri=uri, version=version, meta=pipeline, folder=folder,
                           tags=tags, owner=owner, description=description,
-                          parents=parents, pipeline=pipeline)
+                          parents=parents, pipeline=pipeline,
+                          strict_probe=_require_durable,
+                          strict_persist=_require_durable)
         parent_uris = list(dict.fromkeys(parents or []))
         if _bump_usage:
             # Local/legacy calls are one completed run each and retain their per-call popularity bump.
@@ -371,7 +375,9 @@ class InMemoryCatalog:
             raise RuntimeError("core managed publication did not return a durable receipt")
         return {**receipt, "table": table}
 
-    def register_output_idempotent(self, idempotency_key: str, **kwargs) -> CatalogTable:
+    def register_output_idempotent(
+        self, idempotency_key: str, **kwargs
+    ) -> CatalogPublicationReceipt:
         """Durable-executor write projection keyed by one logical output effect.
 
         Catalog entries/lineage remain URI-idempotent. The Jobs publisher records one separate aggregate
@@ -379,7 +385,13 @@ class InMemoryCatalog:
         """
         if not idempotency_key:
             raise ValueError("idempotency_key is required")
-        return self.register_output(_bump_usage=False, **kwargs)
+        table = self.register_output(_bump_usage=False, _require_durable=True, **kwargs)
+        metadb.catalog_record_output_publication(
+            idempotency_key, table.uri, table.version
+        )
+        return CatalogPublicationReceipt(
+            idempotency_key=idempotency_key, uri=table.uri, version=table.version
+        )
 
     def record_usage_idempotent(self, idempotency_key: str, parents: list[str]) -> bool:
         """Count each distinct parent once for one durable run, independently of output cardinality."""

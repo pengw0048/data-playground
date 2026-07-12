@@ -6,7 +6,8 @@
   handoff path. This is zero-configuration and single-host.
 - With `DP_RAY_JOBS_ADDRESS`, whole-graph runs use Ray's official Jobs API plus SQL and shared object
   storage. A replacement hub can reattach to the same submission. Multi-region parent orchestration is
-  still in-memory, so Jobs mode deliberately does not claim placed child regions.
+  still in-memory, so Jobs mode deliberately does not claim placed child regions. Explicit Ray/GPU pins
+  use whole-graph admission instead and therefore cannot silently fall back to local execution.
 
 This is a durable lifecycle implementation, not a claim that the whole Ray backend or the example
 deployment is production-ready. The remaining scale, isolation, health, and resilience gates are in
@@ -95,16 +96,20 @@ API keys are never sent to the driver.
 5. On `SUCCEEDED`, the hub reads and verifies the exact result envelope. Missing results receive a bounded
    consistency grace period; transport/auth failures remain non-terminal and retry.
 6. Supervisors compete for a renewable SQL publication lease. Catalog projection is a required,
-   idempotent effect and is retried on failure. One database transaction then CAS-publishes the backend
-   result, public terminal `RunState`, and run-history row. Telemetry is best-effort after that barrier.
+   idempotent effect and is retried on failure. Every output must return a durable receipt only after its
+   catalog reference is readable; a method return without that receipt cannot publish terminal success.
+   One database transaction then CAS-publishes the backend result, public terminal `RunState`, and
+   run-history row. Telemetry is best-effort after that barrier.
 
 External catalog providers must implement the runtime-checkable `DurableCatalogPublisher` capability:
 `register_output_idempotent(idempotency_key, ...)` and
 `record_usage_idempotent(idempotency_key, parents)` with durable idempotency. Publication is at-least-once
-at that provider boundary; multiple independent sinks are not one cross-dataset transaction. Output keys
-remain per sink, while one separate run-level usage event aggregates every distinct parent across all
-sinks. Thus two real runs increment popularity twice, a two-sink run increments a shared parent once, and
-a crash/retry does not increment it again. Permanent lineage-edge existence is not a run-usage event.
+at that provider boundary. `register_output_idempotent` must not return until the output reference is
+durably readable and must return a matching `CatalogPublicationReceipt`; Jobs validates its key and URI.
+Multiple independent sinks are not one cross-dataset transaction. Output keys remain per sink, while one
+separate run-level usage event aggregates every distinct parent across all sinks. Thus two real runs
+increment popularity twice, a two-sink run increments a shared parent once, and a crash/retry does not
+increment it again. Permanent lineage-edge existence is not a run-usage event.
 
 Terminal `RunState` and backend-detail rows share the normal bounded retention policy. Pruning happens in
 the same terminal publication transaction and leaves `run_records` history intact. A separate compact,

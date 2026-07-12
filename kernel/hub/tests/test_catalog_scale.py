@@ -635,6 +635,10 @@ def test_migration_0020_adds_backend_job_binding_without_rewriting_run_state(
             sa.text("SELECT name FROM sqlite_master WHERE type='table'")
         )}
         assert {"catalog_publication_events", "run_terminal_fences"} <= tables
+        receipt_columns = {row[1] for row in connection.execute(
+            sa.text("PRAGMA table_info('catalog_publication_events')")
+        )}
+        assert {"event_key", "effect_type", "uri", "version"} <= receipt_columns
         assert connection.execute(sa.text(
             "SELECT status FROM run_terminal_fences WHERE run_id='legacy-done'"
         )).scalar_one() == "done"

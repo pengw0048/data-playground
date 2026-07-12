@@ -19,7 +19,7 @@ from sqlalchemy import select
 from hub import metadb
 from hub.compiler import compile_plan
 from hub.deps import Deps
-from hub.models import Graph, ResourceSpec
+from hub.models import CatalogPublicationReceipt, Graph, GraphNode, ResourceSpec
 
 
 def _load_dp_ray():
@@ -133,9 +133,14 @@ class CountingCatalog:
     def register_output_idempotent(self, idempotency_key: str, **kwargs):
         with self.lock:
             if idempotency_key in self.keys:
-                return
+                return CatalogPublicationReceipt(
+                    idempotency_key=idempotency_key, uri=kwargs["uri"], version=kwargs.get("version")
+                )
             self.keys.add(idempotency_key)
             self.calls.append({"idempotency_key": idempotency_key, **kwargs})
+            return CatalogPublicationReceipt(
+                idempotency_key=idempotency_key, uri=kwargs["uri"], version=kwargs.get("version")
+            )
 
     def record_usage_idempotent(self, idempotency_key: str, parents: list[str]):
         with self.lock:
@@ -154,7 +159,7 @@ class RecoveringCatalog(CountingCatalog):
     def register_output_idempotent(self, idempotency_key: str, **kwargs):
         if not self.available:
             raise ConnectionError("catalog temporarily unavailable")
-        super().register_output_idempotent(idempotency_key, **kwargs)
+        return super().register_output_idempotent(idempotency_key, **kwargs)
 
 
 @pytest.fixture
@@ -945,6 +950,42 @@ def test_ray_jobs_rejects_partitioned_remote_sink_and_durable_region_claim(jobs_
     assert client.submit_calls == []
 
 
+def test_ray_jobs_whole_graph_admission_is_separate_from_region_placement(jobs_config):
+    from hub.routers.runs import _route_by_capability
+
+    _module, deps, runner, client, _store = _runner(jobs_config)
+    deps.runners.insert(0, runner)
+    local = deps.runner
+    plain = _graph()
+    pinned = _graph()
+    pinned.nodes[1].data["config"]["requires"] = {"labels": {"engine": "ray"}}
+
+    assert _route_by_capability(deps, runner, plain) is runner  # selected Ray stays selected
+    assert _route_by_capability(deps, local, pinned) is runner  # explicit pin becomes one durable Job
+    assert _route_by_capability(deps, local, plain) is local    # no pin keeps the selected fallback
+    assert runner.place(ResourceSpec(labels={"engine": "ray"})) is None  # regions remain unclaimed
+
+    disconnected = _graph()
+    disconnected.nodes.append(GraphNode.model_validate({
+        "id": "other", "type": "transform", "position": {"x": 0, "y": 0},
+        "data": {"config": {
+            "mode": "map", "code": "def fn(row): return row",
+            "requires": {"labels": {"engine": "ray"}},
+        }},
+    }))
+    assert _route_by_capability(deps, local, disconnected, "write") is local
+
+    unsupported = _graph()
+    unsupported.nodes[1].data["config"]["requires"] = {"labels": {"engine": "ray"}}
+    unsupported.nodes[-1].data["config"]["partitionBy"] = "customer_id"
+    routed = _route_by_capability(deps, local, unsupported)
+    plan = compile_plan(unsupported, "write", deps.registry, deps.node_specs, deps.node_ir)
+    with pytest.raises(RuntimeError, match="partitionBy"):
+        routed.run(plan, unsupported, "write", "distributed",
+                   run_id=f"run_jobs_pinned_unsupported_{uuid.uuid4().hex}")
+    assert client.submit_calls == []
+
+
 def test_canvas_delete_is_blocked_while_external_job_is_active(jobs_config):
     _module, deps, runner, _client, _store = _runner(jobs_config)
     graph = _graph()
@@ -1273,6 +1314,51 @@ def test_catalog_is_required_and_retried_before_terminal_publication(jobs_config
     catalog.available = True
     assert _wait(runner, status.run_id).status == "done"
     assert len(catalog.calls) == 1
+
+
+def test_default_catalog_persist_failure_cannot_publish_terminal_done(
+        jobs_config, monkeypatch):
+    workspace, data = jobs_config
+    catalog = Deps(str(workspace), str(data)).catalog
+
+    def _unresolvable(_uri):
+        raise RuntimeError("test catalog does not inspect the object store")
+
+    catalog.resolve = _unresolvable
+    monkeypatch.setattr(catalog, "_object_stat_sig", lambda _uri: "")
+    _module, deps, runner, client, store = _runner(jobs_config, catalog=catalog)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_catalog_receipt_{uuid.uuid4().hex}")
+    _wait_submitted(client, status.backend_ref.submission_id)
+
+    original = metadb.catalog_upsert_entry
+
+    def _swallowed_before_this_fix(*_args, **_kwargs):
+        raise ConnectionError("forced durable catalog write failure")
+
+    monkeypatch.setattr(metadb, "catalog_upsert_entry", _swallowed_before_this_fix)
+    _complete(store, client, status)
+    deadline = time.monotonic() + 1
+    while "waiting for catalog" not in (runner.status(status.run_id).error or "") \
+            and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    output_uri = store.read(status.backend_ref.job_uri)["sink_targets"]["write"]
+    assert runner.status(status.run_id).status in ("queued", "running")
+    assert metadb.backend_job(status.run_id)["publication_state"] == "pending"
+    assert metadb.catalog_get(output_uri) is None
+
+    monkeypatch.setattr(metadb, "catalog_upsert_entry", original)
+    assert _wait(runner, status.run_id).status == "done"
+    assert metadb.catalog_get(output_uri)["uri"] == output_uri
+    with metadb.session() as session:
+        receipt = session.get(
+            metadb.CatalogPublicationEvent,
+            f"ray-jobs:{status.backend_ref.attempt_id}:write",
+        )
+        assert receipt and receipt.effect_type == "output" and receipt.uri == output_uri
 
 
 def test_driver_rejects_independent_binding_mismatch_before_importing_ray(jobs_config, tmp_path):

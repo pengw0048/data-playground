@@ -1951,9 +1951,10 @@ def test_catalog_usage_counts_runs_and_deduplicates_one_publication_event(tmp_pa
     duckdb.connect().execute(f"COPY (SELECT 3 AS id) TO '{output_two}' (FORMAT PARQUET)")
     d.catalog.register_output(name="source", uri=source, parents=[])
 
-    d.catalog.register_output_idempotent(
+    receipt = d.catalog.register_output_idempotent(
         "attempt-a:write-one", name="output", uri=output, parents=[source], pipeline="canvas"
     )
+    assert receipt.idempotency_key == "attempt-a:write-one" and receipt.uri == output
     d.catalog.register_output_idempotent(
         "attempt-a:write-two", name="output-two", uri=output_two, parents=[source], pipeline="canvas"
     )

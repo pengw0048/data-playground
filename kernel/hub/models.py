@@ -81,6 +81,14 @@ class CatalogTable(Wire):
     usage: int = 0  # how often this dataset has been read (popularity signal; drives "most used" sort)
 
 
+class CatalogPublicationReceipt(Wire):
+    """Durable acknowledgement returned by an idempotent catalog output publication."""
+    idempotency_key: str
+    uri: str
+    version: str | None = None
+    durable: Literal[True] = True
+
+
 Cardinality = Literal["1:1", "1:N", "N:1", "N:M", "unknown"]
 
 

@@ -15,8 +15,8 @@ from typing import Any, Protocol, runtime_checkable
 import duckdb
 
 from hub.models import (
-    CatalogBrowse, CatalogPage, CatalogQuery, CatalogTable, ColumnSchema, CompilePlan, Facets, Graph,
-    GraphNode, LineageResult, Placement, Relationship, RunEstimate, RunStatus,
+    CatalogBrowse, CatalogPage, CatalogPublicationReceipt, CatalogQuery, CatalogTable, ColumnSchema,
+    CompilePlan, Facets, Graph, GraphNode, LineageResult, Placement, Relationship, RunEstimate, RunStatus,
 )
 
 # The `dataset` wire is a lazy DuckDB relation — the currency a node's build produces/consumes.
@@ -121,6 +121,18 @@ class PlaceableBackend(Protocol):
 
 
 @runtime_checkable
+class WholeGraphRequirementBackend(Protocol):
+    """Optional admission seam for a backend that owns a requirement as one whole-graph run.
+
+    This is deliberately separate from ``PlaceableBackend.place``: a durable external backend may be
+    able to recover one submitted graph while region orchestration remains hub-local and non-durable.
+    Returning true routes the whole graph to this backend, which must then reject unsupported pinned
+    work explicitly instead of silently falling back to the default engine.
+    """
+    def accepts_whole_graph(self, requires: Any) -> bool: ...
+
+
+@runtime_checkable
 class DatasetAdapter(Protocol):
     """How a URI becomes readable/writable columnar data — the seam for a new storage/format/warehouse
     (Iceberg, Delta, a REST source, …). Register a plugin adapter via `reg.add_adapter(a)`; it is
@@ -196,5 +208,7 @@ class DurableCatalogPublisher(Protocol):
     Output effects use one key per sink. Usage/popularity is a separate run-level effect over the union
     of source parents, so retries and multi-sink graphs remain both idempotent and correctly counted.
     """
-    def register_output_idempotent(self, idempotency_key: str, **kwargs: Any) -> CatalogTable: ...
+    def register_output_idempotent(
+        self, idempotency_key: str, **kwargs: Any
+    ) -> CatalogPublicationReceipt: ...
     def record_usage_idempotent(self, idempotency_key: str, parents: list[str]) -> bool: ...

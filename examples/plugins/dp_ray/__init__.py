@@ -77,7 +77,8 @@ from hub.ir import (CLEAN_OPS, CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_k
 from hub.job_artifacts import (RAY_JOB_CANONICAL_FIELDS, RAY_JOB_CONTRACT_VERSION,
                                RAY_JOB_ENVELOPE_FIELDS, RAY_JOB_RESULT_FIELDS, ArtifactCorrupt,
                                ArtifactNotFound, JsonArtifactStore, canonical_json, require_exact_object)
-from hub.models import PerNodeStatus, ResourceSpec, RunBackendRef, RunStatus, WorkerInfo
+from hub.models import (CatalogPublicationReceipt, PerNodeStatus, ResourceSpec, RunBackendRef,
+                        RunStatus, WorkerInfo)
 from hub.placement import node_requires, satisfies
 from hub.sqlpolicy import (
     FragmentKind,
@@ -1536,6 +1537,10 @@ class RayRunner:
         labels = getattr(requires, "labels", None) or {}
         return "ray" if labels.get("engine") == "ray" else None
 
+    def accepts_whole_graph(self, requires) -> bool:
+        """Claim hard Ray pins in Jobs mode without claiming non-durable region orchestration."""
+        return bool(self.jobs_address and self._requires_ray(requires))
+
     def reachable_tiers(self):
         # A same-host reference cluster (worker-direct LOCAL reads) reaches local + object. But an
         # OFF-HOST cluster's workers can't read the hub's local disk — declaring local there would let the
@@ -2234,10 +2239,21 @@ class RayRunner:
                     raise RuntimeError(
                         f"core publisher returned an invalid receipt for sink '{step_id}'")
             elif register_once is not None:
-                register_once(
-                    idempotency_key=f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}",
+                idempotency_key = f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}"
+                raw_receipt = register_once(
+                    idempotency_key=idempotency_key,
                     name=name, uri=uri, version=None, parents=parents, pipeline="canvas",
                 )
+                try:
+                    receipt = CatalogPublicationReceipt.model_validate(raw_receipt)
+                except Exception as e:  # noqa: BLE001 — a durable receipt is the publication boundary
+                    raise RuntimeError(
+                        "durable catalog publisher returned no valid output receipt"
+                    ) from e
+                if receipt.idempotency_key != idempotency_key or receipt.uri != uri:
+                    raise RuntimeError(
+                        "durable catalog publisher returned a receipt for a different output effect"
+                    )
             else:
                 publish_unmanaged_output_attested(
                     self.catalog, name=name, uri=uri, version=None,

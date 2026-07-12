@@ -74,6 +74,9 @@ def upgrade() -> None:
     op.create_table(
         "catalog_publication_events",
         sa.Column("event_key", sa.String(), primary_key=True),
+        sa.Column("effect_type", sa.String(), nullable=False, server_default="usage"),
+        sa.Column("uri", sa.Text(), nullable=True),
+        sa.Column("version", sa.String(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
     )
 

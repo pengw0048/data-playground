@@ -273,9 +273,12 @@ class CatalogEdge(Base):
 
 
 class CatalogPublicationEvent(Base):
-    """One durable usage-accounting effect from an idempotent external-run publication."""
+    """One durable catalog effect from an idempotent external-run publication."""
     __tablename__ = "catalog_publication_events"
     event_key: Mapped[str] = mapped_column(String, primary_key=True)
+    effect_type: Mapped[str] = mapped_column(String, default="usage")
+    uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    version: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -4169,15 +4172,52 @@ def catalog_bump_usage(uri: str, n: int = 1) -> None:
             logical.usage += n
 
 
+def catalog_record_output_publication(event_key: str, uri: str, version: str | None) -> None:
+    """Persist a receipt only after the referenced catalog entry is durably readable.
+
+    The entry upsert and this receipt are separate retry-safe commits: a crash between them leaves an
+    unacknowledged entry that the next call re-upserts, while a crash after the receipt replays the same
+    event. Durable backends must not expose terminal success until this function returns.
+    """
+    if not event_key:
+        raise ValueError("catalog publication event_key is required")
+    if not uri:
+        raise ValueError("catalog publication uri is required")
+    try:
+        with session() as s:
+            if s.get(CatalogEntry, uri) is None:
+                raise RuntimeError(f"catalog output is not durably readable: {uri}")
+            event = s.get(CatalogPublicationEvent, event_key)
+            if event is not None:
+                if event.effect_type != "output" or event.uri != uri or event.version != version:
+                    raise RuntimeError(f"catalog publication key collision: {event_key}")
+                return
+            s.add(CatalogPublicationEvent(
+                event_key=event_key, effect_type="output", uri=uri, version=version
+            ))
+            s.flush()
+    except IntegrityError:
+        # A concurrent publisher may win the primary-key insert. Validate its committed receipt rather
+        # than treating an unrelated event-key collision as idempotent success.
+        with session() as s:
+            event = s.get(CatalogPublicationEvent, event_key)
+            if (event is None or event.effect_type != "output" or event.uri != uri
+                    or event.version != version or s.get(CatalogEntry, uri) is None):
+                raise RuntimeError(f"catalog publication key collision: {event_key}") from None
+
+
 def catalog_bump_usage_once(event_key: str, uris: list[str]) -> bool:
     """Apply one durable publication event to every distinct parent URI exactly once."""
     if not event_key:
         raise ValueError("catalog publication event_key is required")
     try:
         with session() as s:
-            if s.get(CatalogPublicationEvent, event_key) is not None:
+            event = s.get(CatalogPublicationEvent, event_key)
+            if event is not None:
+                if event.effect_type != "usage":
+                    raise RuntimeError(f"catalog publication key collision: {event_key}")
                 return False
-            s.add(CatalogPublicationEvent(event_key=event_key))
+            s.add(CatalogPublicationEvent(event_key=event_key, effect_type="usage"))
             s.flush()  # unique PK is the cross-process idempotency fence
             for uri in dict.fromkeys(str(value) for value in uris if value):
                 s.execute(
@@ -4186,7 +4226,11 @@ def catalog_bump_usage_once(event_key: str, uris: list[str]) -> bool:
                 )
             return True
     except IntegrityError:
-        return False
+        with session() as s:
+            event = s.get(CatalogPublicationEvent, event_key)
+            if event is None or event.effect_type != "usage":
+                raise RuntimeError(f"catalog publication key collision: {event_key}") from None
+            return False
 
 
 def catalog_add_edge(parent: str, child: str, pipeline: str | None = None,

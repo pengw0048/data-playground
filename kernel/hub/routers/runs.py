@@ -320,21 +320,30 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
     return (max(rows) if rows else None), (max(byts) if byts else None), sizes
 
 
-def _route_by_capability(deps, chosen, graph):
-    """If the graph declares a compute requirement the chosen backend can't place, prefer a backend
-    whose place() satisfies it (e.g. the GPU pool). A routing HINT, not a hard gate: if nothing can
-    place it (no matching pool configured), fall back to the chosen backend (OSS simulates GPUs, so an
-    unmet requirement still runs locally rather than blocking)."""
-    req = placement.graph_requires(graph, deps.node_specs)
+def _route_by_capability(deps, chosen, graph, target_node_id: str | None = None):
+    """Route a declared requirement to region placement or explicit whole-graph admission.
+
+    ``place`` remains the region seam. ``accepts_whole_graph`` lets a durable backend own a pinned graph
+    without claiming non-durable region orchestration. If neither seam accepts, retain the chosen
+    backend for the existing soft-requirement/local-simulation behavior.
+    """
+    nodes = graph_mod.upstream_chain(graph, target_node_id) if target_node_id else None
+    req = placement.graph_requires(graph, deps.node_specs, nodes=nodes)
     if not (req.cpu or req.gpu or req.gpu_type or req.mem or req.labels):  # no requirement → leave choice
         return chosen
 
     def _can_place(r):
         return hasattr(r, "place") and r.place(req) is not None
 
-    if _can_place(chosen):
+    def _accepts_whole_graph(r):
+        accepts = getattr(r, "accepts_whole_graph", None)
+        return callable(accepts) and bool(accepts(req))
+
+    if _can_place(chosen) or _accepts_whole_graph(chosen):
         return chosen
-    return next((r for r in deps.runners if _can_place(r)), chosen)
+    return next(
+        (r for r in deps.runners if _can_place(r) or _accepts_whole_graph(r)), chosen
+    )
 
 
 @router.post("/run/estimate", response_model=RunEstimate)
@@ -385,7 +394,9 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
-    runner = _route_by_capability(deps, deps.pick_runner(plan, uid), graph)  # honor node requires
+    runner = _route_by_capability(
+        deps, deps.pick_runner(plan, uid), graph, target_node_id
+    )  # honor requirements only in the target's executable cone
     rows, byts, sizes = _cone_size(graph, target_node_id, deps)
     est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and not confirmed:

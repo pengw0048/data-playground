@@ -113,7 +113,9 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 Catalogs used by an at-least-once durable runner additionally implement the runtime-checkable
 `DurableCatalogPublisher` capability from `backends.py`: one idempotency key per output through
 `register_output_idempotent`, plus one run-level `record_usage_idempotent` call over all distinct source
-parents. Providers that do not need popularity can make the latter a durable idempotent no-op.
+parents. The output method must return a matching `CatalogPublicationReceipt` only after the provider can
+durably read the registered reference; returning `None` or an optimistic in-memory object blocks terminal
+publication. Providers that do not need popularity can make the latter a durable idempotent no-op.
 
 Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter; runners are picked
 by `pick_runner` (respects the Settings → Execution choice, else the first that `can_run`). **The
@@ -129,6 +131,11 @@ input from the given tier URI and writing its output to `output_uri`, so workers
 directly), and `reachable_tiers()` (which storage tiers this backend can read/write — e.g. `("object",)` for
 a remote cluster, `("local","object")` for one sharing the hub's disk). The core feature-detects these, so a
 non-distributed backend omits them.
+
+A backend that can durably own a pinned graph but cannot yet recover multi-region orchestration can instead
+implement `WholeGraphRequirementBackend.accepts_whole_graph(requires)`. This admission seam routes the
+entire graph to that backend without making `place()` claim a region. Once claimed, unsupported pinned work
+must fail explicitly; it must not fall back to an engine that does not satisfy the requirement.
 
 **How placement + tiering drive `run_unit`.** A run splits into regions (maximal same-backend subgraphs, cut
 at a backend change / fan-out / `checkpoint`). A region is placed by a cost estimate — a conservative per-node
