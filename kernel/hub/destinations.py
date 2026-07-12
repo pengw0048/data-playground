@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from typing import Protocol, runtime_checkable
+from urllib.parse import unquote
 
 from hub import metadb
 
@@ -68,18 +69,45 @@ class ObjectStoreBackend:
 
     def browse(self, root: str, path: str) -> dict:
         from hub import db
-        prefix = (root.rstrip("/") + "/" + path.strip("/")).rstrip("/") if path else root.rstrip("/")
         try:
+            prefix = self._safe_prefix(root, path)
             db.ensure_object_store()
             with db.lock():
-                rows = db.conn().execute(f"SELECT file FROM glob('{prefix}/*')").fetchall()
+                rows = db.conn().execute("SELECT file FROM glob(?)", [f"{prefix}/*"]).fetchall()
         except Exception as e:  # noqa: BLE001 — no creds / bad bucket → say so honestly
             return {"path": path, "entries": [], "error": str(e)}
         entries = []
         for (f,) in rows:
+            if not isinstance(f, str) or not f.startswith(prefix + "/"):
+                continue
             name = f.rstrip("/").rsplit("/", 1)[-1]
             entries.append({"name": name, "kind": "dir" if f.endswith("/") else "file", "uri": f})
         return {"path": path, "entries": entries}
+
+    def _safe_prefix(self, root: str, path: str) -> str:
+        base = root.rstrip("/")
+        scheme = f"{self.kind}://"
+        if not base.startswith(scheme) or not base[len(scheme):].split("/", 1)[0]:
+            raise ValueError(f"invalid {self.kind} destination root")
+
+        relative = path.strip("/")
+        decoded = relative
+        # Decode enough layers to catch encoded traversal without letting a deliberately deep value
+        # turn validation into an unbounded CPU loop. More layers are not a useful browse prefix.
+        for _ in range(4):
+            unquoted = unquote(decoded)
+            if unquoted == decoded:
+                break
+            decoded = unquoted
+        else:
+            if unquote(decoded) != decoded:
+                raise ValueError("destination path is excessively encoded")
+        parts = decoded.strip("/").split("/") if decoded else []
+        if "://" in decoded or "\\" in decoded or any(part in (".", "..") for part in parts):
+            raise ValueError("destination path must stay within its configured root")
+        if any(char in root or char in decoded for char in "*?[]"):
+            raise ValueError("destination path cannot contain glob characters")
+        return f"{base}/{relative}" if relative else base
 
     def target_uri(self, root: str, path: str, filename: str) -> str:
         base = (root.rstrip("/") + "/" + path.strip("/")).rstrip("/")
