@@ -57,8 +57,9 @@ import uuid
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from hub import db, graph as g
-from hub.handoff import (attempt_has_commit_record, attempt_has_contents, discard_attempt,
-                         read_manifest, validate_shards, write_manifest)
+from hub.handoff import (attempt_has_commit_record, attempt_has_contents, claim_attempt,
+                         discard_attempt, is_attempt_uri, read_manifest,
+                         validate_shards, write_manifest)
 from hub.sinks import SinkSpec, commit_sink, preflight_sink
 from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (DuckDB's own parser), shared
 from hub.ir import (CLEAN_OPS, CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
@@ -453,14 +454,23 @@ def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str
     raw = str(run_id)
     readable = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-") or "attempt"
     readable = readable[:64].rstrip("._-") or "attempt"
+    from hub.plugins.adapters import is_object_uri
+    if is_object_uri(uri):
+        from hub import metadb
+        owner = metadb.object_attempt_owner_id()
+    else:
+        owner = None
     # Hash the complete, unmodified logical URI before stripping its extension. `out.parquet` and
     # `out.pq` otherwise share one physical base. A whole-graph write also scopes by step ID so fan-out
     # sinks in one run can never reattach each other. Canonical JSON prevents delimiter ambiguity.
-    identity = json.dumps({
+    identity_doc = {
         "runId": raw,
         "scope": None if scope is None else str(scope),
         "uri": str(uri),
-    }, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    }
+    if owner:
+        identity_doc["owner"] = owner
+    identity = json.dumps(identity_doc, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
     parsed = urlsplit(base)
     if parsed.scheme.lower() in ("s3", "gs", "gcs", "r2") and parsed.netloc:
@@ -658,7 +668,10 @@ def _write_worker_direct_parquet(dataset, uri: str, *, attempt_id: str,
         owns_prefix = False
         return rows, out_dir
     finally:
-        if owns_prefix:
+        if owns_prefix and not is_object_uri(out_dir):
+            # A local failed write is synchronous with this process. On an object store, Ray worker tasks
+            # can outlive a failed/disconnected driver; only durable backend terminal reconciliation may
+            # authorize deletion, so leave the registered writing attempt for lifecycle handling.
             discard_attempt(out_dir)
 
 
@@ -867,6 +880,14 @@ class RayRunner:
                 )
         if reason and self._requires_ray(requires, graph, output_node):
             return self._unsupported_status(graph, output_node, reason, run_id=run_id)
+        try:
+            claim_attempt(attempt_uri, logical_uri=output_uri, kind="region", run_id=run_id)
+        except Exception as e:  # noqa: BLE001 — an untracked object write must never start
+            status.status = "failed"
+            status.error = f"object attempt claim failed: {type(e).__name__}: {e}"
+            for item in status.per_node:
+                item.status = "failed"
+            return status
         if reason:
             return self._materialize_local(  # non-clean → local engine, same reserved status/attempt
                 graph, output_node, attempt_uri, run_id, status=status)
@@ -1102,6 +1123,31 @@ class RayRunner:
                 targets[step.id] = uri
         return targets
 
+    def _claim_sink_attempts(self, ir, targets: dict[str, str], run_id: str) -> dict[str, str]:
+        """Precompute and register worker-direct sink attempts in the hub control plane.
+
+        The isolated driver intentionally has a private metadata DB, so it must receive the exact physical
+        URI instead of minting/registering one after dispatch. If a later claim fails, unwind the claims
+        already made; no writer has started yet.
+        """
+        attempts: dict[str, str] = {}
+        try:
+            for step in ir.steps:
+                if step.op != "write":
+                    continue
+                target_uri = targets[step.id]
+                spec = SinkSpec.from_config(step.config, step.config.get("title"))
+                if not _worker_direct_parquet_sink(spec, target_uri, self.resolve_adapter(target_uri)):
+                    continue
+                attempt_uri = _attempt_handoff_uri(target_uri, run_id, scope=step.id)
+                claim_attempt(attempt_uri, logical_uri=target_uri, kind="sink", run_id=run_id)
+                attempts[step.id] = attempt_uri
+            return attempts
+        except Exception:
+            for attempt_uri in attempts.values():
+                discard_attempt(attempt_uri)
+            raise
+
     def _sink_targets_runnable(self, ir) -> bool:
         try:
             self._resolve_sink_targets(ir)
@@ -1176,12 +1222,29 @@ class RayRunner:
             self._cancel[run_id] = threading.Event()
             self._cancel_ack.discard(run_id)
         self._emit(graph, status)
+        try:
+            sink_attempts = self._claim_sink_attempts(ir, sink_targets, run_id)
+        except Exception as e:  # noqa: BLE001 — never dispatch an object write the hub cannot track
+            status.status = "failed"
+            status.error = f"object sink attempt claim failed: {type(e).__name__}: {e}"
+            for item in status.per_node:
+                item.status = "failed"
+            self._emit(graph, status)
+            with self._lock:
+                self._cancel.pop(run_id, None)
+            if self.on_complete:
+                try:
+                    self.on_complete(graph, target_node_id, status)
+                except Exception:  # noqa: BLE001
+                    pass
+            return status
         # PROCESS ISOLATION: run Ray in a fresh subprocess (its main thread inits Ray BEFORE any DuckDB),
         # so the app's shared DuckDB connection never coexists with Ray in one process. The parent only
         # spawns + polls a status file (no DuckDB here), so it can't deadlock. (Ray inline in-process
         # deadlocks against the shared DuckDB connection — see the module docstring.)
         threading.Thread(target=self._supervise, args=(run_id, graph, target_node_id, status),
-                         kwargs={"requires": requires.model_dump(), "sink_targets": sink_targets},
+                         kwargs={"requires": requires.model_dump(), "sink_targets": sink_targets,
+                                 "sink_attempts": sink_attempts},
                          daemon=True).start()
         return status
 
@@ -1192,24 +1255,53 @@ class RayRunner:
             except Exception:  # noqa: BLE001 — never let persistence break a run
                 pass
 
-    def _register_outputs(self, graph, result) -> None:
+    def _register_outputs(self, graph, result, *, expected_targets=None, expected_attempts=None) -> None:
         """Publish driver-written outputs through the hub-owned catalog/control plane."""
-        for output in result.get("outputs") or []:
+        from hub import metadb
+        from hub.plugins.adapters import is_object_uri
+        outputs = result.get("outputs") or []
+        if expected_targets is not None:
+            returned = {str(output.get("step_id")) for output in outputs if output.get("step_id")}
+            if returned != set(expected_targets):
+                raise RuntimeError("ray driver returned an incomplete or unexpected sink set")
+        for output in outputs:
             step_id, name, uri = output.get("step_id"), output.get("name"), output.get("uri")
+            logical_uri = output.get("logical_uri")
             if not (step_id and name and uri):
                 raise RuntimeError("ray driver returned an incomplete sink result")
+            if expected_targets is not None and logical_uri != expected_targets.get(step_id):
+                raise RuntimeError(f"ray driver returned an unexpected logical URI for sink '{step_id}'")
+            expected_uri = (expected_attempts or {}).get(step_id)
+            if expected_uri is not None and uri != expected_uri:
+                raise RuntimeError(f"ray driver returned an unexpected attempt URI for sink '{step_id}'")
             parents = [u for edge in g.incoming(graph, step_id)
                        for u in [self.base._source_uri(nm_node=edge.source, graph=graph)] if u]
             self.catalog.register_output(name=name, uri=uri, version=None,
                                          parents=parents, pipeline="canvas")
+            persisted = metadb.catalog_get(uri)
+            if logical_uri and is_object_uri(uri) and is_attempt_uri(uri):
+                with metadb.session() as session:
+                    attempt = session.get(metadb.ObjectAttempt, uri)
+                    state = attempt.state if attempt is not None else None
+                    if state not in ("published", "retiring", "retired"):
+                        self.catalog.unregister(uri)
+                        raise RuntimeError(
+                            f"catalog did not atomically publish the attempt for sink '{step_id}'"
+                        )
+                    if state == "published" and (persisted is None or persisted.get("uri") != uri):
+                        raise RuntimeError(f"catalog lost the published pointer for sink '{step_id}'")
+            elif persisted is None or persisted.get("uri") != uri:
+                self.catalog.unregister(uri)
+                raise RuntimeError(f"catalog did not persist the output pointer for sink '{step_id}'")
 
     def _supervise(self, run_id, graph, target, status, materialize_uri=None, requires=None,
-                   sink_targets=None) -> None:
+                   sink_targets=None, sink_attempts=None) -> None:
         """Parent side: spawn the isolated Ray driver, poll its status file, mirror the result. Touches
         NO DuckDB (only subprocess + files + the DB-backed on_status/on_complete hooks) → never deadlocks.
         `materialize_uri` set = region mode (write target → that uri); else whole-graph mode (write node).
         `requires` = the region's resource need, forwarded to the driver → per-task Ray placement.
-        `sink_targets` is the hub-resolved write-step-id → physical URI map; region mode omits it."""
+        `sink_targets` is the hub-resolved write-step-id → logical URI map; `sink_attempts` carries the
+        exact parent-claimed physical URI for worker-direct sinks. Region mode omits both."""
         import json
         import subprocess
         import tempfile
@@ -1224,6 +1316,7 @@ class RayRunner:
                "materialize_uri": materialize_uri, "attempt_id": run_id, "status_file": status_file}
         if sink_targets is not None:  # whole-graph run only; region materialization has no write sink
             job["sink_targets"] = sink_targets
+            job["sink_attempts"] = sink_attempts or {}
         with open(job_file, "w") as f:
             json.dump(job, f)
         driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_driver.py")
@@ -1241,6 +1334,11 @@ class RayRunner:
             child_env = _ray_child_env()
             proc = subprocess.Popen([sys.executable, driver, job_file], cwd=work,
                                     stdout=_dlog, stderr=_dlog, start_new_session=True, env=child_env)
+            try:
+                deadline_s = max(1.0, float(os.environ.get("DP_RUN_DEADLINE_S", "3600")))
+            except ValueError:
+                deadline_s = 3600.0
+            driver_started = time.monotonic()
             while proc.poll() is None:
                 if cancel.is_set():
                     proc.terminate()
@@ -1250,6 +1348,16 @@ class RayRunner:
                         proc.kill()
                         proc.wait(timeout=5)
                     status.status = "cancelled"
+                    break
+                if deadline_s and time.monotonic() - driver_started > deadline_s:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    status.status = "failed"
+                    status.error = f"Ray run exceeded the wall-clock deadline of {deadline_s:.0f}s — killed"
                     break
                 # surface the driver's INTERIM progress (it rewrites the status file as it computes/writes)
                 # into the parent RunStatus, so a placed region's progress advances mid-run — not just at
@@ -1279,7 +1387,10 @@ class RayRunner:
             if result and result.get("status") in ("done", "failed", "cancelled"):
                 if result.get("outputs"):
                     try:
-                        self._register_outputs(graph, result)
+                        self._register_outputs(
+                            graph, result, expected_targets=sink_targets,
+                            expected_attempts=sink_attempts,
+                        )
                     except Exception as e:  # noqa: BLE001 — local parity: catalog commit failure fails the run
                         prior = f"{result.get('error')}; " if result.get("error") else ""
                         result = dict(
@@ -1297,9 +1408,14 @@ class RayRunner:
         for p in status.per_node:  # settle per-node progress to the terminal state
             p.status = "done" if status.status == "done" else status.status
         if materialize_uri and status.status != "done":
-            # The child process is now gone, so no writer can race this deletion. A failed/cancelled
-            # immutable attempt was never published by the controller and is safe to remove.
-            discard_attempt(materialize_uri)
+            from hub.plugins.adapters import is_object_uri
+            if not is_object_uri(materialize_uri):
+                discard_attempt(materialize_uri)
+        if sink_attempts and status.status != "done":
+            from hub.plugins.adapters import is_object_uri
+            for attempt_uri in sink_attempts.values():
+                if not is_object_uri(attempt_uri):
+                    discard_attempt(attempt_uri)
         if status.status == "cancelled":
             self._acknowledge_cancel(run_id)  # only after Popen.poll/wait proved the driver exited
         self._emit(graph, status)
@@ -1312,7 +1428,7 @@ class RayRunner:
                 pass
 
     def _run_ir_sync(self, ir, graph, target, ray_opts=None, progress=None, sink_targets=None,
-                     attempt_id: str | None = None) -> dict:
+                     attempt_id: str | None = None, sink_attempts=None) -> dict:
         """Child side (in the driver subprocess, Ray already init'd): execute the clean IR synchronously
         and return a result dict for the parent. Reuses _build/_commit; the fresh-process DuckDB is safe
         because Ray was init'd before it was created. Sink targets are physical URIs resolved by the hub;
@@ -1328,9 +1444,11 @@ class RayRunner:
                     if not target_uri:
                         raise RuntimeError(f"missing hub-resolved target URI for write step '{step.id}'")
                     rows, out_uri, out_table = self._commit(
-                        step, datasets, target_uri, attempt_id=attempt_id, ray_opts=ray_opts
+                        step, datasets, target_uri, attempt_id=attempt_id, ray_opts=ray_opts,
+                        attempt_uri=(sink_attempts or {}).get(step.id),
                     )
-                    outputs.append({"step_id": step.id, "name": out_table, "uri": out_uri})
+                    outputs.append({"step_id": step.id, "name": out_table, "uri": out_uri,
+                                    "logical_uri": target_uri})
                 else:
                     datasets[step.id] = self._build(step, datasets, ray_opts)
             if target and target in datasets:  # a non-sink target → force a real row count
@@ -1563,14 +1681,18 @@ class RayRunner:
 
     def _commit(self, step, datasets, target_uri: str, *,
                 attempt_id: str | None = None,
-                ray_opts: dict | None = None) -> tuple[int, str, str]:
+                ray_opts: dict | None = None,
+                attempt_uri: str | None = None) -> tuple[int, str, str]:
         cfg = step.config
         spec = SinkSpec.from_config(cfg, cfg.get("title"))
         ds = datasets[step.inputs[0][0]]
         adapter = self.resolve_adapter(target_uri)
         attempt_id = attempt_id or f"driver_{uuid.uuid4().hex}"
         if _worker_direct_parquet_sink(spec, target_uri, adapter):
-            actual_uri = _attempt_handoff_uri(target_uri, attempt_id, scope=step.id)
+            actual_uri = attempt_uri or _attempt_handoff_uri(target_uri, attempt_id, scope=step.id)
+            from hub.plugins.adapters import is_object_uri
+            if is_object_uri(target_uri) and attempt_uri is None:
+                raise RuntimeError("object sink attempt was not preclaimed by the hub before dispatch")
             rows, actual_uri = _write_worker_direct_parquet(
                 ds, actual_uri, attempt_id=attempt_id, ray_opts=ray_opts
             )

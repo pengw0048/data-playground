@@ -125,6 +125,8 @@ class InMemoryCatalog:
         tags = [str(t).strip() for t in (tags or []) if str(t).strip()]
         with self._lock:
             prior = metadb.catalog_get(uri)  # by uri (PK)
+            if prior is None:
+                prior = metadb.object_attempt_catalog_prior(uri)
             tid = (prior or {}).get("id") or f"tbl_{name}"
             if prior is None:
                 other = metadb.catalog_get(f"tbl_{name}")  # id collision across different files

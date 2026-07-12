@@ -8,6 +8,8 @@ failed attempts remain unreferenced and can be expired without touching a commit
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import shutil
 
@@ -17,6 +19,8 @@ ATTEMPT_MARKER = ".attempt-"
 MANIFEST_NAME = "_DP_SUCCESS.json"
 MANIFEST_FORMAT = "data-playground-ray-handoff-v2"
 _MAX_SHARDS = 200_000
+_DEFAULT_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_DEFAULT_DELETE_GRACE_SECONDS = 24 * 60 * 60
 
 
 def is_attempt_uri(uri: str) -> bool:
@@ -28,6 +32,91 @@ def _object_manifest_path(path: str) -> str:
     """Commit records use a separate prefix so storage lifecycle can expire them before data."""
     parent, name = path.rstrip("/").rsplit("/", 1)
     return f"{parent}/_dp_commits/{name}/{MANIFEST_NAME}"
+
+
+def _object_commit_dir(path: str) -> str:
+    return _object_manifest_path(path).rsplit("/", 1)[0]
+
+
+def claim_attempt(uri: str, *, logical_uri: str, kind: str, run_id: str) -> None:
+    """Register one exact object attempt in the shared control-plane DB before dispatch."""
+    if not is_object_uri(uri):
+        return
+    if not is_attempt_uri(uri) or kind not in ("region", "sink"):
+        raise ValueError("object attempt claims require an immutable attempt URI and region/sink kind")
+    if not is_object_uri(logical_uri):
+        raise ValueError("an object attempt requires an object-store logical target")
+    from hub import metadb
+    metadb.claim_object_attempt(uri.rstrip("/"), logical_uri.rstrip("/"), kind, str(run_id))
+
+
+def mark_attempt_published(uri: str, *, reference_key: str | None = None) -> list[str]:
+    """Publish the DB pointer and return exact prior sink attempts selected for retirement."""
+    if not is_object_uri(uri):
+        return []
+    from hub import metadb
+    return metadb.publish_object_attempt(uri.rstrip("/"), reference_key=reference_key)
+
+
+def _delete_if_present(fs, path: str) -> None:
+    import pyarrow.fs as pafs
+    info = fs.get_file_info(path)
+    try:
+        if info.type == pafs.FileType.Directory:
+            fs.delete_dir(path)
+        elif info.type == pafs.FileType.File:
+            fs.delete_file(path)
+    except Exception:
+        if fs.get_file_info(path).type != pafs.FileType.NotFound:
+            raise
+
+
+def _discard_object_attempt(fs, path: str, *, data: bool = True) -> None:
+    _delete_if_present(fs, _object_commit_dir(path))
+    if data:
+        _delete_if_present(fs, path.rstrip("/"))
+
+
+def _seconds_env(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+        return max(0.0, value) if math.isfinite(value) else default
+    except ValueError:
+        return default
+
+
+def reap_attempts(*, retention_seconds: float | None = None,
+                  delete_grace_seconds: float | None = None, limit: int = 100) -> dict[str, list[str]]:
+    """Run one bounded, DB-indexed GC batch; never list an object-store parent prefix."""
+    from hub import metadb
+    deadline = max(1.0, _seconds_env("DP_RUN_DEADLINE_S", 3600))
+    retention = (max(deadline, _seconds_env(
+        "DP_ATTEMPT_RETENTION_SECONDS", _DEFAULT_RETENTION_SECONDS)) if retention_seconds is None
+                 else max(0.0, float(retention_seconds)))
+    grace = (max(deadline, _seconds_env(
+        "DP_ATTEMPT_DELETE_GRACE_SECONDS", _DEFAULT_DELETE_GRACE_SECONDS))
+             if delete_grace_seconds is None
+             else max(0.0, float(delete_grace_seconds)))
+    batch = metadb.object_attempt_gc_batch(retention, grace, limit=limit)
+    result = {"retired": [], "deleted": []}
+    for item in batch:
+        uri, action = item["uri"], item["action"]
+        try:
+            fs, path = object_fs(uri)
+            if action == "retire":
+                if item.get("kind") == "sink":
+                    metadb.catalog_delete_entry(uri)
+                _discard_object_attempt(fs, path, data=False)
+                metadb.mark_object_attempt_retired(uri)
+                result["retired"].append(uri)
+            elif action in ("discard", "delete"):
+                _discard_object_attempt(fs, path)
+                metadb.delete_object_attempt(uri)
+                result["deleted"].append(uri)
+        except Exception:  # noqa: BLE001 — one provider failure must not block the rest of the batch
+            logging.getLogger("hub").warning("object attempt GC failed for %s (continuing)", uri,
+                                             exc_info=True)
+    return result
 
 
 def _list_shards(uri: str) -> list[dict]:
@@ -171,12 +260,12 @@ def discard_attempt(uri: str) -> None:
         return
     try:
         if is_object_uri(uri):
+            from hub import metadb
+            if not metadb.begin_discard_object_attempt(uri.rstrip("/")):
+                return
             fs, path = object_fs(uri)
-            try:
-                fs.delete_file(_object_manifest_path(path))
-            except Exception:  # noqa: BLE001 — an unpublished attempt normally has no commit object
-                pass
-            fs.delete_dir(path.rstrip("/"))
+            _discard_object_attempt(fs, path)
+            metadb.delete_object_attempt(uri.rstrip("/"))
         else:
             path = path_of(uri)
             shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
