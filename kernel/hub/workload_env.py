@@ -54,6 +54,7 @@ _DATA_CREDENTIAL_ENV = frozenset({
     "AWS_PROFILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE",
     "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
     "DP_S3_ENDPOINT", "DP_S3_KEY", "DP_S3_SECRET", "DP_S3_BUCKET",
+    "DP_GCS_ENDPOINT",
 })
 
 
@@ -126,6 +127,32 @@ def initialize_ephemeral_metadata(directory: str) -> str:
     if object_store:
         metadb.set_setting("objectStore", object_store, "global")
     return url
+
+
+def data_plane_object_store_config(source: Mapping[str, str] | None = None,
+                                   scheme: str | None = None) -> dict[str, Any]:
+    """Translate only allowlisted data-plane environment into the private worker metadata shape."""
+    src = os.environ if source is None else source
+    if (scheme or "").lower() in ("gs", "gcs"):
+        endpoint = src.get("DP_GCS_ENDPOINT")
+        return ({"endpoint": endpoint, "useSsl": not str(endpoint).lower().startswith("http://")}
+                if endpoint else {})
+    key = src.get("DP_S3_KEY") or src.get("AWS_ACCESS_KEY_ID")
+    secret = src.get("DP_S3_SECRET") or src.get("AWS_SECRET_ACCESS_KEY")
+    endpoint = (src.get("DP_S3_ENDPOINT") or src.get("AWS_ENDPOINT_URL_S3")
+                or src.get("AWS_ENDPOINT_URL"))
+    cfg: dict[str, Any] = {}
+    if key and secret:
+        cfg["accessKeyId"], cfg["secretAccessKey"] = key, secret
+    if src.get("AWS_SESSION_TOKEN"):
+        cfg["sessionToken"] = src["AWS_SESSION_TOKEN"]
+    if endpoint:
+        cfg["endpoint"] = endpoint
+        cfg["useSsl"] = not str(endpoint).lower().startswith("http://")
+    region = src.get("AWS_REGION") or src.get("AWS_DEFAULT_REGION")
+    if region:
+        cfg["region"] = region
+    return cfg
 
 
 def prepare_workload_graph(graph: Any) -> dict:

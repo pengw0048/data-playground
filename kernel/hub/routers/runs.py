@@ -482,9 +482,26 @@ def _require_run_mutate_access(run_id: str, uid: str) -> None:
     raise HTTPException(404, f"run '{run_id}' not found")
 
 
-def _runner_for(run_id: str):
+def _runner_for(run_id: str, *, fallback: bool = True):
+    """Resolve an in-process owner, including a durable backend reconstructed after restart."""
     deps = get_deps()
-    return deps.run_index.get(run_id, deps.runner)
+    owner = deps.run_index.get(run_id)
+    if owner is None:
+        binding = metadb.backend_job(run_id)
+        if binding:
+            owner = next(
+                (runner for runner in deps.runners
+                 if getattr(runner, "durable_backend", None) == binding.get("backend")),
+                None,
+            )
+            if owner is not None:
+                try:
+                    owner.status(run_id)  # lazy reattach if startup recovery missed a just-created row
+                except KeyError:
+                    owner = None
+                else:
+                    deps.run_index[run_id] = owner
+    return owner if owner is not None else (deps.runner if fallback else None)
 
 
 def _status_or_lost(run_id: str) -> RunStatus:
@@ -522,7 +539,7 @@ def run_status(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
 def run_cancel(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
     _require_run_mutate_access(run_id, uid)  # only owner/editor may disrupt a shared canvas run
     deps = get_deps()
-    owner = deps.run_index.get(run_id)
+    owner = _runner_for(run_id, fallback=False)
     if owner is not None:
         return owner.cancel(run_id)  # this instance ran it → cancel in-process
     # not owned here (the hub restarted, or another stateless instance accepted the run) — route via the

@@ -92,14 +92,19 @@ def object_fs(uri: str):
     import pyarrow.fs as pafs
 
     from hub import metadb
-    cfg = metadb.get_setting("objectStore", "global", default={}) or {}
     scheme, _, rest = uri.partition("://")
     scheme = scheme.lower()
+    cfg = metadb.get_setting("objectStore", "global", default={}) or {}
+    if not cfg:
+        from hub.workload_env import data_plane_object_store_config
+        cfg = data_plane_object_store_config(scheme=scheme)
     endpoint = str(cfg.get("endpoint") or "").strip()
     if scheme in ("s3", "r2"):
         kw: dict = {}
         if cfg.get("accessKeyId") and cfg.get("secretAccessKey"):
             kw["access_key"], kw["secret_key"] = cfg["accessKeyId"], cfg["secretAccessKey"]
+        if cfg.get("sessionToken"):
+            kw["session_token"] = cfg["sessionToken"]
         if cfg.get("region"):
             kw["region"] = cfg["region"]
         if endpoint:  # MinIO / R2 / custom S3-compatible endpoint

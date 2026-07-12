@@ -378,6 +378,13 @@ class Deps:
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self.run_owner: dict[str, str] = {}  # run_id -> creator uid, to authorize ad-hoc (no-canvas) runs
         self._load_plugins()
+        # init_db deliberately preserves external backend bindings before plugins exist. Once discovery is
+        # complete, surface any missing plugin/config instead of leaving a silent forever-running status.
+        from hub import metadb
+        metadb.note_unhandled_backend_jobs({
+            str(r.durable_backend) for r in self.runners
+            if getattr(r, "durable_backend", None) and getattr(r, "durable_available", False)
+        })
 
     def resolve_adapter(self, uri: str):
         for a in self.adapters:

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
+import sys
 from pathlib import Path
 
 from hub.workload_env import (build_workload_env, initialize_ephemeral_metadata,
-                              prepare_workload_graph)
+                              data_plane_object_store_config, prepare_workload_graph)
 
 
 _CONTROL_SECRETS = {
@@ -30,6 +32,7 @@ def _source() -> dict[str, str]:
         "DP_STORAGE_URL": "s3://data/output",
         "AWS_ACCESS_KEY_ID": "data-key",
         "AWS_SECRET_ACCESS_KEY": "data-secret",
+        "DP_GCS_ENDPOINT": "http://gcs-emulator:4443",
         **_CONTROL_SECRETS,
     }
 
@@ -46,6 +49,7 @@ def test_one_shot_workload_environment_is_allowlisted_without_metadata_identity(
     assert env["DP_STORAGE_URL"] == "s3://data/output"
     assert env["DP_RAY_LABELS"] == "pool=a100"
     assert env["AWS_SECRET_ACCESS_KEY"] == "data-secret"
+    assert env["DP_GCS_ENDPOINT"] == "http://gcs-emulator:4443"
     assert "DP_DATABASE_URL" not in env
     assert env["DP_AUTH_MODE"] == "1"  # derived confinement signal, never signing material
 
@@ -132,6 +136,46 @@ def test_ephemeral_worker_seeds_only_allowlisted_object_store_execution_config(t
         "region": "us-east-1",
     }, "global")]
     assert "must-not-cross" not in repr(seeded)
+
+
+def test_job_artifact_module_does_not_freeze_metadata_settings_before_worker_bootstrap():
+    code = (
+        "import sys; import hub.job_artifacts; "
+        "assert 'hub.settings' not in sys.modules; assert 'hub.metadb' not in sys.modules"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_data_plane_object_store_config_uses_only_allowlisted_worker_identity():
+    cfg = data_plane_object_store_config({
+        "DP_S3_KEY": "job-key",
+        "DP_S3_SECRET": "job-secret",
+        "AWS_SESSION_TOKEN": "job-session",
+        "DP_S3_ENDPOINT": "http://minio:9000",
+        "AWS_REGION": "us-east-1",
+        "DP_DATABASE_URL": "postgresql://control-plane",
+        "DP_AUTH_SECRET": "control-secret",
+    })
+
+    assert cfg == {
+        "accessKeyId": "job-key",
+        "secretAccessKey": "job-secret",
+        "sessionToken": "job-session",
+        "endpoint": "http://minio:9000",
+        "useSsl": False,
+        "region": "us-east-1",
+    }
+    mixed = {
+        "AWS_ACCESS_KEY_ID": "aws-only",
+        "AWS_SECRET_ACCESS_KEY": "aws-secret",
+        "DP_GCS_ENDPOINT": "http://gcs:4443",
+    }
+    assert data_plane_object_store_config(mixed, scheme="s3") == {
+        "accessKeyId": "aws-only", "secretAccessKey": "aws-secret"
+    }
+    assert data_plane_object_store_config(mixed, scheme="gcs") == {
+        "endpoint": "http://gcs:4443", "useSsl": False
+    }
 
 
 def test_workload_graph_inlines_named_schema_contract_without_mutating_source():

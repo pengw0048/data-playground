@@ -388,13 +388,13 @@ class Playground:
         from fastapi import HTTPException as HTTPExc
 
         from hub import metadb
-        from hub.routers.runs import _require_run_mutate_access
+        from hub.routers.runs import _require_run_mutate_access, _runner_for
         run_id = self._req(args, "runId")
         try:
             _require_run_mutate_access(run_id, self.user_id)
         except HTTPExc as e:
             raise ToolError(str(e.detail))
-        owner = self.deps.run_index.get(run_id)
+        owner = _runner_for(run_id, fallback=False)
         if owner is not None:
             return self._run_envelope(owner.cancel(run_id), None)
         kb = self.deps.kernel_backend()

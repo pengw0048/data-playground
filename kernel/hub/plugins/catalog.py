@@ -292,13 +292,14 @@ class InMemoryCatalog:
         return LineageResult(nodes=nodes, edges=kept, truncated=truncated)
 
     # -- CatalogProvider: write-back -------------------------------------- #
-    def _add_edge(self, parent: str, child: str, pipeline: str | None, column: str | None = None) -> None:
+    def _add_edge(self, parent: str, child: str, pipeline: str | None,
+                  column: str | None = None) -> bool:
         if parent == child:
-            return
+            return False
         try:
-            metadb.catalog_add_edge(parent, child, pipeline, column)
+            return metadb.catalog_add_edge(parent, child, pipeline, column)
         except Exception:  # noqa: BLE001
-            pass
+            return False
 
     def register(self, table: CatalogTable, parents: list[str] | None = None,
                  pipeline: str | None = None) -> None:
@@ -365,6 +366,17 @@ class InMemoryCatalog:
         if receipt is None:
             raise RuntimeError("core managed publication did not return a durable receipt")
         return {**receipt, "table": table}
+
+    def register_output_idempotent(self, idempotency_key: str, **kwargs) -> CatalogTable:
+        """Durable-executor write projection keyed by one logical output effect.
+
+        The default provider is observably idempotent by URI: catalog entries upsert, lineage edges are
+        unique, and parent usage increments only when the edge is first created. ``idempotency_key`` is
+        accepted so external providers can persist the same guarantee in their own control plane.
+        """
+        if not idempotency_key:
+            raise ValueError("idempotency_key is required")
+        return self.register_output(**kwargs)
 
     def set_metadata(self, uri: str, *, folder: str | None = None, tags: list[str] | None = None,
                      owner: str | None = None, description: str | None = None) -> CatalogTable:

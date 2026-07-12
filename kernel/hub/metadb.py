@@ -100,6 +100,7 @@ class RunRecord(Base):
     output_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
     per_node: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON: durable per-node breakdown
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (UniqueConstraint("canvas_id", "run_id", name="uq_run_record_canvas_run"),)
 
 
 class CanvasVersion(Base):
@@ -129,6 +130,34 @@ class RunState(Base):
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # the run's creator uid (durable owner, for authz)
     auth_canvas_id: Mapped[str | None] = mapped_column(String, nullable=True)  # the real canvas it was authorized against (None = ad-hoc)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class RunBackendJob(Base):
+    """Durable binding between one logical run and one external backend attempt.
+
+    ``run_id`` and ``(backend, submission_id)`` are unique, so concurrent submitters converge on the same
+    attempt. The publication lease elects one reattaching supervisor to register terminal outputs/history;
+    another supervisor can take over only after the lease expires.
+    """
+    __tablename__ = "run_backend_jobs"
+    run_id: Mapped[str] = mapped_column(String, primary_key=True)
+    backend: Mapped[str] = mapped_column(String, index=True)
+    cluster_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    attempt_id: Mapped[str] = mapped_column(String)
+    submission_id: Mapped[str] = mapped_column(String)
+    job_uri: Mapped[str] = mapped_column(Text)
+    result_uri: Mapped[str] = mapped_column(Text)
+    code_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    publication_state: Mapped[str] = mapped_column(String, default="pending")
+    publication_owner: Mapped[str | None] = mapped_column(String, nullable=True)
+    publication_lease_until: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    result_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    __table_args__ = (UniqueConstraint("backend", "submission_id", name="uq_run_backend_submission"),)
+
+
+class ActiveBackendJobsError(RuntimeError):
+    """A canvas cannot be deleted while external work can still produce side effects."""
 
 
 class SchemaContract(Base):
@@ -1080,16 +1109,25 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
     with session() as s:
         if s.get(Canvas, canvas_id, with_for_update=True) is None:
             return False  # ad-hoc / unsaved-canvas / internal region run → don't dangle a run row
-        rid = _uid()
-        s.add(RunRecord(id=rid, canvas_id=canvas_id, run_id=run_id, target_node_id=target_node_id,
-                        status=status, rows=rows, ms=ms, error=error, output_table=output_table,
-                        output_uri=output_uri,
-                        per_node=json.dumps(per_node, default=str) if per_node else None))
+        # A durable external backend may reclaim an expired publication lease after a supervisor crash.
+        # Replaying its completion must update the logical run's history, not append a duplicate row.
+        rec = (s.scalar(select(RunRecord).where(
+            RunRecord.run_id == run_id, RunRecord.canvas_id == canvas_id
+        ).limit(1).with_for_update())
+               if run_id else None)
+        if rec is None:
+            rec = RunRecord(id=_uid(), canvas_id=canvas_id, run_id=run_id)
+            s.add(rec)
+        rid = rec.id
+        rec.target_node_id, rec.status = target_node_id, status
+        rec.rows, rec.ms, rec.error = rows, ms, error
+        rec.output_table, rec.output_uri = output_table, output_uri
+        rec.per_node = json.dumps(per_node, default=str) if per_node else None
         s.flush()
         stale = list(s.scalars(select(RunRecord).where(
-            RunRecord.canvas_id == canvas_id
+            RunRecord.canvas_id == canvas_id, RunRecord.id != rid
         ).order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
-          .offset(_RUN_HISTORY_MAX).with_for_update()))
+          .offset(max(0, _RUN_HISTORY_MAX - 1)).with_for_update()))
         _replace_attempt_ref(s, "run_record", rid, output_uri)
         for obj in stale:
             _replace_attempt_ref(s, "run_record", obj.id, None)
@@ -1110,6 +1148,20 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         canvas = s.get(Canvas, canvas_id, with_for_update=True)
         if canvas is None:
             return
+        active = s.scalar(
+            select(RunBackendJob.run_id)
+            .join(RunState, RunState.run_id == RunBackendJob.run_id)
+            .where(
+                or_(RunState.canvas_id == canvas_id, RunState.auth_canvas_id == canvas_id),
+                RunState.status.in_(("queued", "running")),
+            )
+            .order_by(RunBackendJob.run_id).limit(1)
+        )
+        if active:
+            raise ActiveBackendJobsError(
+                f"canvas '{canvas_id}' has active external run '{active}'; "
+                "cancel it and wait for terminal status"
+            )
         shares = list(s.scalars(select(CanvasShare).where(
             CanvasShare.canvas_id == canvas_id
         ).order_by(CanvasShare.user_id).with_for_update()))
@@ -1135,6 +1187,9 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         # also drop this canvas's run_states — else auth_canvas_id/canvas_id dangle into a reusable id
         # namespace and a later canvas re-created under the same id could re-grant its old runs (P0-AUTH-02)
         for rs in run_states:
+            job = s.get(RunBackendJob, rs.run_id)
+            if job is not None:
+                s.delete(job)
             _replace_attempt_ref(s, "run_state", rs.run_id, None)
             local_owners.append(("run_state", rs.run_id))
             s.delete(rs)
@@ -1241,6 +1296,10 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
         if r is None:
             s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload, kernel_id=kernel_id))
         else:
+            # Terminal state is monotonic. Two restart-recovered supervisors may observe the same external
+            # job at slightly different times; a delayed RUNNING update must never regress a published result.
+            if r.status in _TERMINAL_RUN and st != r.status:
+                return
             r.status = st
             r.doc = payload
             if canvas_id and not r.canvas_id:
@@ -1268,6 +1327,9 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
             s, "run_state", run_id, output_uri, publish=publish_region)
         if st in _TERMINAL_RUN:
             for obj in stale:
+                job = s.get(RunBackendJob, obj.run_id)
+                if job is not None:
+                    s.delete(job)
                 _replace_attempt_ref(s, "run_state", obj.run_id, None)
                 s.delete(obj)
             _lock_local_result_registry(s)
@@ -1318,13 +1380,189 @@ def local_result_run_state_receipt(
             and artifact.state == "ready"
             and artifact.writer_run_id is None
             and artifact.writer_token is None)
-
-
 def get_run_state(run_id: str) -> dict | None:
     """The last-persisted RunStatus dict for a run, or None if unknown to this instance's DB."""
     with session() as s:
         r = s.get(RunState, run_id)
         return json.loads(r.doc) if r else None
+
+
+def bind_backend_job(run_id: str, ref: dict, status: dict,
+                     canvas_id: str | None = None) -> tuple[dict, bool]:
+    """Atomically bind a logical run to one external attempt and its recoverable queued state.
+
+    Returns ``(stored_ref, created)``. A caller whose deterministic attempt differs from ``stored_ref``
+    must not submit: another request already owns this logical run id. The backend row and ``run_states``
+    handoff commit together, so a process cannot die in between and leave a binding recovery cannot join.
+    """
+    row = RunBackendJob(
+        run_id=run_id,
+        backend=str(ref["backend"]),
+        cluster_ref=str(ref.get("cluster_ref") or "") or None,
+        attempt_id=str(ref["attempt_id"]),
+        submission_id=str(ref["submission_id"]),
+        job_uri=str(ref["job_uri"]),
+        result_uri=str(ref["result_uri"]),
+        code_ref=str(ref.get("code_ref") or "") or None,
+        publication_state="pending",
+    )
+    try:
+        with session() as s:
+            s.add(row)
+            s.flush()
+            state = s.get(RunState, run_id)
+            st = str(status.get("status") or "queued")
+            payload = json.dumps(status, default=str)
+            if state is None:
+                s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload))
+            elif state.status not in _TERMINAL_RUN:
+                state.status, state.doc = st, payload
+                if canvas_id and not state.canvas_id:
+                    state.canvas_id = canvas_id
+        return backend_job(run_id), True
+    except IntegrityError:
+        existing = backend_job(run_id)
+        if existing is None:
+            raise
+        # Rows created by this version are atomic. This repair also makes a pre-upgrade/manual binding
+        # recoverable if it predates that invariant.
+        if get_run_state(run_id) is None:
+            save_run_state(run_id, status, canvas_id=canvas_id)
+        return existing, False
+
+
+def _backend_job_doc(row: RunBackendJob) -> dict:
+    return {
+        "run_id": row.run_id,
+        "backend": row.backend,
+        "cluster_ref": row.cluster_ref,
+        "attempt_id": row.attempt_id,
+        "submission_id": row.submission_id,
+        "job_uri": row.job_uri,
+        "result_uri": row.result_uri,
+        "code_ref": row.code_ref,
+        "durable": True,
+        "publication_state": row.publication_state,
+        "result": json.loads(row.result_doc) if row.result_doc else None,
+    }
+
+
+def backend_job(run_id: str) -> dict | None:
+    with session() as s:
+        row = s.get(RunBackendJob, run_id)
+        return _backend_job_doc(row) if row else None
+
+
+def active_backend_jobs(backend: str) -> list[tuple[dict, dict]]:
+    """Return ``(backend_ref, RunStatus doc)`` for reattachable non-terminal jobs."""
+    out: list[tuple[dict, dict]] = []
+    with session() as s:
+        rows = s.execute(
+            select(RunBackendJob, RunState).join(RunState, RunState.run_id == RunBackendJob.run_id)
+            .where(RunBackendJob.backend == backend, RunState.status.in_(("queued", "running")))
+        ).all()
+        for job, state in rows:
+            try:
+                doc = json.loads(state.doc)
+            except (TypeError, ValueError):
+                doc = {"run_id": state.run_id, "status": state.status, "per_node": []}
+            out.append((_backend_job_doc(job), doc))
+    return out
+
+
+def note_unhandled_backend_jobs(available_backends: set[str]) -> int:
+    """Keep external runs live but make a missing plugin/configuration visible after process restart."""
+    changed = 0
+    with session() as s:
+        rows = s.execute(
+            select(RunBackendJob, RunState).join(RunState, RunState.run_id == RunBackendJob.run_id)
+            .where(RunState.status.in_(("queued", "running")))
+        ).all()
+        for job, state in rows:
+            if job.backend in available_backends:
+                continue
+            try:
+                doc = json.loads(state.doc)
+            except (TypeError, ValueError):
+                doc = {"run_id": state.run_id, "status": state.status, "per_node": []}
+            doc["error"] = (
+                f"durable backend '{job.backend}' is unavailable in this process; "
+                "restore its plugin and control-plane configuration to reattach or cancel"
+            )
+            state.doc = json.dumps(doc, default=str)
+            changed += 1
+    return changed
+
+
+def claim_backend_publication(run_id: str, attempt_id: str, owner: str,
+                              lease_seconds: float = 30.0) -> str:
+    """Try to become the one terminal-result publisher: claimed | busy | published | lost."""
+    with session() as s:
+        # Derive every deadline from the metadata DB server's clock. Hub/pod wall-clock skew must not
+        # let one supervisor steal a live lease early or write a deadline far into the future.
+        now = s.scalar(select(func.current_timestamp()))
+        lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
+        result = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                RunBackendJob.publication_state != "published",
+                or_(RunBackendJob.publication_owner == owner,
+                    RunBackendJob.publication_owner.is_(None),
+                    RunBackendJob.publication_lease_until.is_(None),
+                    RunBackendJob.publication_lease_until < now),
+            ).values(publication_owner=owner, publication_lease_until=lease)
+        )
+        if result.rowcount:
+            return "claimed"
+        row = s.get(RunBackendJob, run_id)
+        if row is None or row.attempt_id != attempt_id:
+            return "lost"
+        return "published" if row.publication_state == "published" else "busy"
+
+
+def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result: dict) -> bool:
+    """Commit the winner's terminal RunStatus for later reattach without replaying side effects."""
+    with session() as s:
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                RunBackendJob.publication_owner == owner,
+                RunBackendJob.publication_state != "published",
+            ).values(publication_state="published", publication_owner=None,
+                     publication_lease_until=None, result_doc=json.dumps(result, default=str))
+        )
+        return bool(updated.rowcount)
+
+
+def renew_backend_publication(run_id: str, attempt_id: str, owner: str,
+                              lease_seconds: float = 30.0) -> bool:
+    """Extend an active publication lease while catalog/history side effects are in flight."""
+    with session() as s:
+        now = s.scalar(select(func.current_timestamp()))
+        lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                RunBackendJob.publication_owner == owner,
+                RunBackendJob.publication_state != "published",
+            ).values(publication_lease_until=lease)
+        )
+        return bool(updated.rowcount)
+
+
+def backend_publication_owned(run_id: str, attempt_id: str, owner: str) -> bool:
+    """Fence an external side effect immediately before it is issued by a lease holder."""
+    with session() as s:
+        return s.scalar(select(RunBackendJob.run_id).where(
+            RunBackendJob.run_id == run_id,
+            RunBackendJob.attempt_id == attempt_id,
+            RunBackendJob.publication_state != "published",
+            RunBackendJob.publication_owner == owner,
+            RunBackendJob.publication_lease_until >= func.current_timestamp(),
+        ).limit(1)) is not None
 
 
 def run_stalled(run_id: str, threshold_s: float) -> bool:
@@ -3627,25 +3865,29 @@ def catalog_bump_usage(uri: str, n: int = 1) -> None:
             logical.usage += n
 
 
-def catalog_add_edge(parent: str, child: str, pipeline: str | None = None, column: str | None = None) -> None:
+def catalog_add_edge(parent: str, child: str, pipeline: str | None = None,
+                     column: str | None = None) -> bool:
     """Write-through a lineage edge; one row per (parent, child). `column` records column-level
-    provenance when known."""
+    provenance when known. Returns whether this call created the edge."""
     if parent == child:
-        return
+        return False
     with session() as s:
         parent_target, child_target = _lock_catalog_mutation_targets(s, [parent, child])
         if not child_target["known"]:
             raise RuntimeError("catalog lineage child is not registered")
         parent_key, child_key = parent_target["catalog_key"], child_target["catalog_key"]
         if parent_key == child_key:
-            return
-        exists = s.scalars(select(CatalogEdge).where(
+            return False
+        edge = s.scalars(select(CatalogEdge).where(
             CatalogEdge.parent == parent_key, CatalogEdge.child == child_key)).first()
-        if exists is None:
+        if edge is None:
             s.add(CatalogEdge(
                 parent=parent_key, child=child_key, pipeline=pipeline, column=column))
-        elif column and not exists.column:
-            exists.column = column
+            s.flush()
+            return True
+        if column and not edge.column:
+            edge.column = column
+        return False
 
 
 def _row_to_doc(r: "CatalogEntry", tags: list[str]) -> dict:
@@ -4336,7 +4578,9 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
         live = {k.kernel_id for k in s.scalars(select(Kernel)) if not _kernel_stale(k)}
         reaped_run_ids: list[str] = []
         candidate = select(RunState).where(
-            RunState.status.in_(("queued", "running")))
+            RunState.status.in_(("queued", "running")),
+            ~exists().where(RunBackendJob.run_id == RunState.run_id),
+        )
         if only_kernel_runs:
             candidate = candidate.where(RunState.kernel_id.is_not(None))
             if live:

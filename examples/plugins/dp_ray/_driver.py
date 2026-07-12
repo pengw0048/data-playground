@@ -12,7 +12,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import sys
+import tempfile
 
 
 def _log(m: str) -> None:
@@ -22,7 +24,11 @@ def _log(m: str) -> None:
 def _progress_writer(status_file: str):
     """Rewrite the status file with an interim {running, progress} so the parent surfaces mid-run
     progress for a placed region. The parent tolerates a partial read; main()'s finally writes the term."""
+    from hub.plugins.adapters import is_object_uri
+
     def emit(frac: float, rows: int | None = None) -> None:
+        if is_object_uri(status_file):
+            return  # Jobs mode uses the official JobStatus stream; the shared artifact is terminal-only
         try:
             with open(status_file, "w") as f:
                 json.dump({"status": "running", "progress": float(frac), "rows": int(rows or 0)}, f)
@@ -32,9 +38,12 @@ def _progress_writer(status_file: str):
 
 
 def main() -> None:
-    job = json.load(open(sys.argv[1]))
-    status_file = job["status_file"]
+    from hub.job_artifacts import read_json_artifact, write_json_artifact
+
+    job = read_json_artifact(sys.argv[1])
+    status_file = job.get("result_uri") or job["status_file"]
     result = {"status": "failed", "error": "ray driver did not run", "rows": 0}
+    metadata_dir = None
     try:
         os.environ.setdefault("RAY_DATA_DISABLE_PROGRESS_BARS", "1")
         # THE macOS/uv fix: if the kernel was launched via `uv run`, Ray (RAY_ENABLE_UV_RUN_RUNTIME_ENV,
@@ -47,7 +56,7 @@ def main() -> None:
         _ncpu = os.environ.get("DP_RAY_NUM_CPUS")
         # RAY_ADDRESS set → ATTACH to a real multi-node cluster head (docker-compose / KubeRay); unset →
         # start a local head (dev / single-host). num_cpus is ignored when attaching to an existing cluster.
-        _addr = os.environ.get("RAY_ADDRESS") or None
+        _addr = "auto" if os.environ.get("DP_RAY_JOB_MODE") == "1" else (os.environ.get("RAY_ADDRESS") or None)
         # Ray 2.56 + numpy 2.5 crashes every hash-shuffle (read-only hash array); patch it on the DRIVER
         # here and on every WORKER. The shuffle runs in worker processes, and Ray Data's internal shuffle
         # actors do NOT inherit the job runtime_env hook — but they DO inherit the raylet's env, so set the
@@ -74,7 +83,10 @@ def main() -> None:
         # Deps expects catalog tables, but a Ray driver does not own hub control state. Use a private
         # disposable metadata DB rather than receiving the hub's unrestricted database identity.
         from hub.workload_env import initialize_ephemeral_metadata
-        initialize_ephemeral_metadata(os.path.dirname(status_file))
+        # A Jobs result lives in object storage, not a local directory. Metadata remains a private temp DB
+        # inside the entrypoint container and is never the hub's control-plane identity.
+        metadata_dir = tempfile.mkdtemp(prefix="dp-ray-job-metadata-")
+        initialize_ephemeral_metadata(metadata_dir)
         from hub.deps import set_workspace
         from hub.ir import lower_to_ir
         from hub.models import Graph
@@ -83,7 +95,8 @@ def main() -> None:
             job["workspace"], job["data_dir"], maintain_storage=False
         )  # fresh DuckDB, created AFTER ray.init; parent hub owns shared-storage maintenance
         _log("deps built; load module")
-        spec = importlib.util.spec_from_file_location("dp_ray_driver_mod", job["module"])
+        module_path = job.get("module") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "__init__.py")
+        spec = importlib.util.spec_from_file_location("dp_ray_driver_mod", module_path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         runner = mod.RayRunner(deps)
@@ -104,8 +117,18 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read
         result = {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
     finally:
-        with open(status_file, "w") as f:
-            json.dump(result, f)
+        if job.get("attempt_id"):
+            result = {
+                **result,
+                "contract_version": int(job.get("contract_version") or 1),
+                "attempt_id": job["attempt_id"],
+                "submission_id": job["submission_id"],
+            }
+        try:
+            write_json_artifact(status_file, result)
+        finally:
+            if metadata_dir:
+                shutil.rmtree(metadata_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -598,6 +598,36 @@ def test_migration_0020_quarantines_unsafe_legacy_and_removes_managed_visibility
     eng.dispose()
 
 
+def test_migration_0020_adds_backend_job_binding_without_rewriting_run_state(
+        tmp_path, monkeypatch):
+    """Legacy RunStatus JSON remains valid while the durable binding/publication table is added."""
+    import json as _json
+
+    import sqlalchemy as sa
+    from alembic import command
+
+    from hub.settings import settings as live_settings
+
+    url = f"sqlite:///{tmp_path}/backend-jobs.db"
+    monkeypatch.setattr(live_settings, "database_url", url)
+    cfg = metadb._alembic_cfg()
+    command.upgrade(cfg, "0019_object_attempts")
+    eng = sa.create_engine(url)
+    legacy = {"run_id": "legacy-live", "status": "running", "per_node": []}
+    with eng.begin() as connection:
+        connection.execute(sa.text(
+            "INSERT INTO run_states (run_id, status, doc) VALUES (:run_id, 'running', :doc)"
+        ), {"run_id": legacy["run_id"], "doc": _json.dumps(legacy)})
+    command.upgrade(cfg, "head")
+    with eng.connect() as connection:
+        assert _json.loads(connection.execute(
+            sa.text("SELECT doc FROM run_states WHERE run_id='legacy-live'")
+        ).scalar_one()) == legacy
+        columns = {row[1] for row in connection.execute(sa.text("PRAGMA table_info('run_backend_jobs')"))}
+        assert {"run_id", "attempt_id", "submission_id", "publication_state", "result_doc"} <= columns
+    eng.dispose()
+
+
 def test_semantic_plugin_registers_embedder():
     """The shipped dp_semantic_catalog plugin wires an embedder through reg.add_embedder when enabled,
     and is a no-op when disabled — without importing the heavy model (the embedder fn is lazy)."""
