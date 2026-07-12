@@ -204,8 +204,8 @@ function FilesContent() {
                 <div style={{ fontSize: 13, fontWeight: 600, color: color.ink, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name || 'untitled'}</div>
                 {meta && <div style={{ fontSize: 11, color: color.text3, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{meta}</div>}
               </div>
-              <button title="Delete" onClick={(e) => { e.stopPropagation(); deleteFile(f.id) }}
-                style={{ border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer', padding: 2 }}><Icon name="trash" size={13} /></button>
+              {f.role === 'owner' && <button title="Delete" onClick={(e) => { e.stopPropagation(); deleteFile(f.id) }}
+                style={{ border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer', padding: 2 }}><Icon name="trash" size={13} /></button>}
             </div>
           </div>
           )

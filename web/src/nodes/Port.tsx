@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Handle, Position } from '@xyflow/react'
 import { wire as wireTokens, type WireType } from '../theme/tokens'
-import { useStore } from '../store/graph'
+import { roleCanEdit, useStore } from '../store/graph'
 import type { PortSpec } from '../types/graph'
 
 // A typed port. Shape + tint encode the wire type (design — wire types). Incompatible
@@ -18,6 +18,7 @@ export function Port({ spec, side, index, count, nodeId }: {
   const isSource = side === 'output'
   const top = count === 1 ? '50%' : `${((index + 1) / (count + 1)) * 100}%`
   const [hover, setHover] = useState(false)
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const connected = useStore((s) => s.doc.edges.some((e) => isSource
     ? e.source === nodeId && (e.sourceHandle == null || e.sourceHandle === spec.id)
     : e.target === nodeId && (e.targetHandle == null || e.targetHandle === spec.id)))
@@ -39,7 +40,7 @@ export function Port({ spec, side, index, count, nodeId }: {
     placeItems: 'center',
     transition: 'width .1s, height .1s, background .1s',
     // the hover "+" is the visible affordance; a plain pointer avoids the redundant OS "+"/crosshair cursor
-    cursor: 'pointer',
+    cursor: canEdit ? 'pointer' : 'default',
   }
 
   return (
@@ -48,10 +49,10 @@ export function Port({ spec, side, index, count, nodeId }: {
       type={isSource ? 'source' : 'target'}
       position={isSource ? Position.Right : Position.Left}
       style={base}
-      isConnectable
-      onMouseEnter={() => setHover(true)}
+      isConnectable={canEdit}
+      onMouseEnter={() => { if (canEdit) setHover(true) }}
       onMouseLeave={() => setHover(false)}
-      onClick={isSource && nodeId ? (e) => {
+      onClick={canEdit && isSource && nodeId ? (e) => {
         e.stopPropagation()
         window.dispatchEvent(new CustomEvent('dp-port-click', {
           detail: { nodeId, handleId: spec.id, x: e.clientX, y: e.clientY },
@@ -59,7 +60,7 @@ export function Port({ spec, side, index, count, nodeId }: {
       } : undefined}
     >
       {/* the "+" add-affordance on an output port, shown on hover (counter-rotated for diamonds) */}
-      {isSource && hover && (
+      {canEdit && isSource && hover && (
         <span style={{ color: '#fff', fontSize: 11, lineHeight: 1, fontWeight: 700, pointerEvents: 'none',
           transform: tok.shape === 'diamond' ? 'rotate(-45deg)' : undefined }}>+</span>
       )}

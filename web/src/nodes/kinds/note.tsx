@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { register, type NodeComponentProps } from '../registry'
-import { useStore } from '../../store/graph'
+import { roleCanEdit, useStore } from '../../store/graph'
 import { color } from '../../theme/tokens'
 import { cn } from '@/lib/utils'
 
@@ -11,14 +11,16 @@ import { cn } from '@/lib/utils'
 // so it never participates in the dataflow — purely for documenting a canvas.
 function Note({ id, data, selected }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const [editing, setEditing] = useState(false)
   const md = String(data.config.markdown ?? '')
+  useEffect(() => { if (!canEdit) setEditing(false) }, [canEdit])
 
   return (
     // the note is a paper-like annotation with a FIXED cream background, so its ink is pinned dark
     // (text-[#2c2a20]) in both themes — text-foreground would flip to near-white in dark, invisible on cream
     <div
-      onDoubleClick={() => setEditing(true)}
+      onDoubleClick={() => { if (canEdit) setEditing(true) }}
       className={cn('min-h-24 w-[268px] overflow-hidden rounded-lg p-3 text-[12.5px] text-[#2c2a20]',
         selected ? 'shadow-md ring-2 ring-primary/20' : 'shadow-sm')}
       style={{ background: '#fffdf3', border: selected ? `1.5px solid ${color.focus}` : '1px solid #ece3c4' }}
@@ -39,7 +41,7 @@ function Note({ id, data, selected }: NodeComponentProps) {
           <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD}>{md}</ReactMarkdown>
         </div>
       ) : (
-        <div className="italic text-[#9a9482]">Double-click to edit…</div>
+        <div className="italic text-[#9a9482]">{canEdit ? 'Double-click to edit…' : 'Empty note'}</div>
       )}
     </div>
   )

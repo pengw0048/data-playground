@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useStore } from '../store/graph'
+import { roleCanEdit, useStore } from '../store/graph'
 import { examples } from '../examples'
 import { color } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
@@ -25,6 +25,8 @@ export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
   const kernelInfo = useStore((s) => s.kernelInfo)
   const saved = useStore((s) => s.saved)
+  const canvasRole = useStore((s) => s.canvasRole)
+  const canEdit = roleCanEdit(canvasRole)
   const rerunAll = useStore((s) => s.rerunAll)
   // in a co-edit session undo/redo go through the CRDT manager (not the snapshot stacks), so enable the
   // buttons whenever collab is active — pressing with empty history is a harmless no-op
@@ -36,6 +38,11 @@ export function TopBar() {
   const [versionsOpen, setVersionsOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
+  const saveLabel = !canEdit
+    ? (canvasRole === 'viewer' ? 'view only' : 'read only')
+    : saved
+      ? (kernelUp ? 'saved' : 'saved locally')
+      : 'saving…'
 
   // let anything (e.g. the agent's "Configure a model" CTA) open Settings
   useEffect(() => {
@@ -50,10 +57,10 @@ export function TopBar() {
         <AppMenu onSettings={() => setSettingsOpen(true)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} />
         <span className="text-[13.5px] text-muted-foreground">/</span>
         <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
-        <span data-testid="autosave" title={!kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined} className="ml-0.5 text-[11px] text-muted-foreground">· {saved ? (kernelUp ? 'saved' : 'saved locally') : 'saving…'}</span>
+        <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : !kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined} className="ml-0.5 text-[11px] text-muted-foreground">· {saveLabel}</span>
         <span className="ml-1.5 inline-flex gap-0.5">
-          <IconBtn name="undo" label="Undo" disabled={!canUndo} onClick={() => useStore.getState().undo()} />
-          <IconBtn name="redo" label="Redo" disabled={!canRedo} onClick={() => useStore.getState().redo()} />
+          <IconBtn name="undo" label="Undo" disabled={!canEdit || !canUndo} onClick={() => useStore.getState().undo()} />
+          <IconBtn name="redo" label="Redo" disabled={!canEdit || !canRedo} onClick={() => useStore.getState().redo()} />
           <ThemeToggle />
         </span>
       </div>
@@ -67,7 +74,7 @@ export function TopBar() {
           <span className="h-2 w-2 rounded-full" style={{ background: kernelUp ? color.latest : color.failed }} />
           kernel · {kernelUp ? 'warm' : 'offline'}
         </div>
-        <Button onClick={rerunAll} title="Re-run the whole graph" size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
+        <Button onClick={rerunAll} disabled={!canEdit} title={canEdit ? 'Re-run the whole graph' : 'View-only canvas'} size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
           <Icon name="refresh" size={13} /> Rerun all
         </Button>
         <Button data-testid="share-btn" onClick={() => setShareOpen(true)} title="Share this canvas" size="sm" className="rounded-full">
@@ -144,6 +151,8 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
   const newFromExample = useStore((s) => s.newFromExample)
   const renameFile = useStore((s) => s.renameFile)
   const deleteFile = useStore((s) => s.deleteFile)
+  const canvasRole = useStore((s) => s.canvasRole)
+  const canEdit = roleCanEdit(canvasRole)
 
   return (
     <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
@@ -160,6 +169,7 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
         <div className="px-2 py-1.5" onKeyDown={(e) => e.stopPropagation()}>
           <input
             value={doc.name ?? ''}
+            disabled={!canEdit}
             onChange={(e) => renameFile(e.target.value)}
             placeholder="untitled"
             className="w-full rounded-md border border-border bg-background px-2 py-1 text-[12.5px] font-semibold text-foreground outline-none"
@@ -191,8 +201,8 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
             <Icon name="grid" size={14} /> {ex.name}
           </DropdownMenuItem>
         ))}
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> Delete this file</DropdownMenuItem>
+        {canvasRole === 'owner' && <DropdownMenuSeparator />}
+        {canvasRole === 'owner' && <DropdownMenuItem onSelect={() => deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> Delete this file</DropdownMenuItem>}
       </DropdownMenuContent>
     </DropdownMenu>
   )

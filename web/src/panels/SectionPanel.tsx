@@ -1,5 +1,5 @@
 import { Suspense, lazy, useState } from 'react'
-import { useStore } from '../store/graph'
+import { roleCanEdit, useStore } from '../store/graph'
 import { allSpecs } from '../nodes/registry'
 import { color } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
@@ -15,6 +15,7 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
   const node = nodes.find((n) => n.id === nodeId)
   const children = nodes.filter((n) => n.parentId === nodeId)
   const updateConfig = useStore((s) => s.updateConfig)
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   if (!node) return null
   const cfg = node.data.config
   const subnodes = (Array.isArray(cfg.subnodes) ? cfg.subnodes : []) as SubNode[]
@@ -37,9 +38,13 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
         for multiple output ports, <code>emit("port", rel)</code>. Loops are bounded by maxRuns. Not sample-previewable — runs on a full pass.
       </div>
 
+      {!canEdit && <div className="rounded-md bg-muted px-2.5 py-1.5 text-[10.5px] text-muted-foreground">View-only access</div>}
+
+      <fieldset disabled={!canEdit} style={{ display: 'contents' }}>
+
       <Field label="driver script (Python)">
         <Suspense fallback={<div style={{ height: 200, border: `1px solid ${color.border}`, borderRadius: 8, display: 'grid', placeItems: 'center', color: color.text3, fontSize: 12 }}>loading editor…</div>}>
-          <CodeEditor language="python" height={200} value={String(cfg.script ?? '')} onChange={(v) => updateConfig(nodeId, { script: v })} />
+          <CodeEditor language="python" height={200} value={String(cfg.script ?? '')} readOnly={!canEdit} onChange={(v) => updateConfig(nodeId, { script: v })} />
         </Suspense>
       </Field>
 
@@ -98,6 +103,7 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
             style={{ width: 90, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', outline: 'none' }} />
         </Field>
       </div>
+      </fieldset>
     </div>
   )
 }

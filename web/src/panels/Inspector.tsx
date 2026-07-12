@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useStore, nodeRunnable } from '../store/graph'
+import { useStore, nodeRunnable, roleCanEdit } from '../store/graph'
 import { getSpec } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
 import { useSchemaWarnings } from '../nodes/fields'
@@ -37,6 +37,8 @@ export const canDeclareSchemaKind = (kind: string) => CONTRACT_KINDS.has(kind) |
 export function Inspector() {
   const selectedIds = useStore((s) => s.selectedIds)
   const nodes = useStore((s) => s.doc.nodes)
+  const canvasRole = useStore((s) => s.canvasRole)
+  const canEdit = roleCanEdit(canvasRole)
   const id = selectedIds.length === 1 ? selectedIds[0] : null
   const node = id ? nodes.find((n) => n.id === id) : null
 
@@ -47,6 +49,11 @@ export function Inspector() {
       <div className="flex h-[52px] flex-none items-center border-b border-border px-3.5 text-[13px] font-semibold text-foreground">
         Inspector
       </div>
+      {!canEdit && (
+        <div className="flex-none border-b border-border bg-muted/60 px-3.5 py-2 text-[10.5px] text-muted-foreground">
+          {canvasRole === 'viewer' ? 'View-only access' : 'Editing disabled until access is known'}
+        </div>
+      )}
       {node ? <NodeInspector key={node.id} nodeId={node.id} />
         : <Empty text={selectedIds.length > 1 ? `${selectedIds.length} nodes selected` : 'Select a node to see its properties'} />}
     </aside>
@@ -61,6 +68,10 @@ function Empty({ text }: { text: string }) {
   )
 }
 
+function EditOnly({ enabled, children }: { enabled: boolean; children: React.ReactNode }) {
+  return <fieldset disabled={!enabled} className="contents">{children}</fieldset>
+}
+
 function NodeInspector({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const runnable = useStore((s) => nodeRunnable(s.doc, nodeId))
@@ -69,6 +80,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const allSchemas = useStore((s) => s.schemas)
   const edges = useStore((s) => s.doc.edges)
   const warnings = useSchemaWarnings(nodeId)   // config references a column not in the (known) input
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
   useEffect(() => setName(node?.data.title ?? ''), [node?.data.title])
@@ -108,6 +120,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           <span className="h-[26px] w-1 flex-none rounded-sm" style={{ background: kindAccent[kind] ?? color.text3 }} />
           <input
             value={name}
+            disabled={!canEdit}
             onChange={(e) => setName(e.target.value)}
             onBlur={() => { if (name.trim() && name !== node.data.title) rename(nodeId, name.trim()) }}
             onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
@@ -126,15 +139,17 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       </div>
 
       {/* properties (reused generic param editor) */}
-      <Section title="Properties">
-        <NodeParamFields nodeId={nodeId} />
-        {codeParams.length === 0 && (bspec?.params ?? []).length === 0 && kind !== 'write' && (
-          <div className="text-[11.5px] text-muted-foreground">No editable parameters.</div>
-        )}
-      </Section>
+      <EditOnly enabled={canEdit}>
+        <Section title="Properties">
+          <NodeParamFields nodeId={nodeId} />
+          {codeParams.length === 0 && (bspec?.params ?? []).length === 0 && kind !== 'write' && (
+            <div className="text-[11.5px] text-muted-foreground">No editable parameters.</div>
+          )}
+        </Section>
+      </EditOnly>
 
       {/* a write node's output destination lives here in the panel, not cluttering the card */}
-      {kind === 'write' && <WriteDestination nodeId={nodeId} />}
+      {kind === 'write' && <EditOnly enabled={canEdit}><WriteDestination nodeId={nodeId} /></EditOnly>}
 
       {/* code snippet + open the full editor (Monaco panel; fullscreen editor is a later step) */}
       {codeParams.map((p) => {
@@ -147,9 +162,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
             </pre>
             <div className="mt-1.5 flex gap-1.5">
               {kind === 'section' ? (
-                <CodeBtn icon="code" label="Open section editor →" onClick={() => togglePanel(nodeId, 'section')} />
+                <CodeBtn icon="code" label="Open section editor →" disabled={!canEdit} onClick={() => togglePanel(nodeId, 'section')} />
               ) : (
-                <CodeBtn icon="external" label="Open fullscreen editor" onClick={() => openCodeFullscreen(nodeId, p.name, p.lang)} />
+                <CodeBtn icon="external" label={canEdit ? 'Open fullscreen editor' : 'View full code'} onClick={() => openCodeFullscreen(nodeId, p.name, p.lang)} />
               )}
             </div>
           </Section>
@@ -157,13 +172,13 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       })}
 
       {/* catalog-driven join hints: suggested keys (measured cardinality) + a fan-out warning */}
-      {kind === 'join' && <JoinHints nodeId={nodeId} />}
+      {kind === 'join' && <EditOnly enabled={canEdit}><JoinHints nodeId={nodeId} /></EditOnly>}
 
       {/* compute placement: what this step needs → the run routes to a matching worker (e.g. a GPU pool) */}
-      {(kind === 'transform' || kind === 'section') && <ResourcesSection nodeId={nodeId} />}
+      {(kind === 'transform' || kind === 'section') && <EditOnly enabled={canEdit}><ResourcesSection nodeId={nodeId} /></EditOnly>}
 
       {/* checkpoint: materialize this node's output → inspectable + reused across runs (splits a region) */}
-      {kind !== 'source' && kind !== 'note' && kind !== 'write' && <CheckpointToggle nodeId={nodeId} />}
+      {kind !== 'source' && kind !== 'note' && kind !== 'write' && <EditOnly enabled={canEdit}><CheckpointToggle nodeId={nodeId} /></EditOnly>}
 
       {/* run plan: appears only when placement actually splits/routes this run (a cluster backend, an
           engine label, or a checkpoint) — makes the cost-aware scheduler + tiering visible before running */}
@@ -183,12 +198,12 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         </div>
         {/* editable output ports: only on the section (its driver script emit()s to named ports) —
             fixed-port ops (filter/sort/join) keep their ports as a type contract the wires rely on */}
-        {kind === 'section' && <><Separator className="my-1" /><OutputPortsEditor nodeId={nodeId} /></>}
+        {kind === 'section' && <><Separator className="my-1" /><EditOnly enabled={canEdit}><OutputPortsEditor nodeId={nodeId} /></EditOnly></>}
       </Section>
 
       {/* schema contract: a code op (transform/plugin/vector-search) is untyped until it runs — let the
           user DECLARE its output columns, or infer them from a sample. Either way types it + downstream. */}
-      {canDeclareSchema && <SchemaContract nodeId={nodeId} runnable={runnable && !invalid} />}
+      {canDeclareSchema && <EditOnly enabled={canEdit}><SchemaContract nodeId={nodeId} runnable={runnable && !invalid} /></EditOnly>}
 
       {/* actions */}
       <Section title="Actions">
@@ -200,13 +215,13 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           {/* a note never runs — only offer duplicate / delete for annotations */}
           {kind !== 'note' && <>
             <Action icon="eye" label="View data" disabled={!runnable || !!invalid} onClick={() => runPreview(nodeId)} />
-            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : 'Run'} disabled={(!runnable || !!invalid) && runState !== 'running'}
+            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid) && runState !== 'running')}
               onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
-            {spec?.canBypass && <Action icon="power" label="Bypass" onClick={() => bypass(nodeId)} />}
-            <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} onClick={() => disable(nodeId)} />
+            {spec?.canBypass && <Action icon="power" label="Bypass" disabled={!canEdit} onClick={() => bypass(nodeId)} />}
+            <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} disabled={!canEdit} onClick={() => disable(nodeId)} />
           </>}
-          <Action icon="duplicate" label="Duplicate" onClick={() => duplicate(nodeId)} />
-          <Action icon="trash" label="Delete" danger onClick={() => removeNode(nodeId)} />
+          <Action icon="duplicate" label="Duplicate" disabled={!canEdit} onClick={() => duplicate(nodeId)} />
+          <Action icon="trash" label="Delete" disabled={!canEdit} danger onClick={() => removeNode(nodeId)} />
         </div>
       </Section>
     </div>
@@ -270,9 +285,9 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
   )
 }
 
-function CodeBtn({ icon, label, onClick }: { icon: IconName; label: string; onClick: () => void }) {
+function CodeBtn({ icon, label, onClick, disabled }: { icon: IconName; label: string; onClick: () => void; disabled?: boolean }) {
   return (
-    <Button variant="outline" size="sm" onClick={onClick}
+    <Button variant="outline" size="sm" onClick={onClick} disabled={disabled}
       className="h-auto gap-1.5 px-2.5 py-1.5 text-[11.5px] font-medium text-primary shadow-none [&_svg]:size-3">
       <Icon name={icon} size={12} /> {label}
     </Button>

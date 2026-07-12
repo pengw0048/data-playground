@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useUpdateNodeInternals } from '@xyflow/react'
 import { register, nodeOutputs, type NodeComponentProps } from '../registry'
 import { Port } from '../Port'
-import { useStore, nodeRunnable } from '../../store/graph'
+import { useStore, nodeRunnable, roleCanEdit } from '../../store/graph'
 import { status as statusTok } from '../../theme/tokens'
 import { Icon } from '../../ui/Icon'
 import { Tooltip } from '../../ui/Tooltip'
@@ -23,9 +23,11 @@ function Section({ id, data, selected }: NodeComponentProps) {
   const rename = useStore((s) => s.rename)
   const openPanel = useStore((s) => s.openPanels[id])
   const runnable = useStore((s) => nodeRunnable(s.doc, id))
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const [editing, setEditing] = useState(false)
   const [val, setVal] = useState(data.title)
   useEffect(() => setVal(data.title), [data.title])
+  useEffect(() => { if (!canEdit) setEditing(false) }, [canEdit])
 
   // output ports can change at runtime (declared emit ports) — re-measure so edges route (see NodeCard)
   const updateNodeInternals = useUpdateNodeInternals()
@@ -56,16 +58,16 @@ function Section({ id, data, selected }: NodeComponentProps) {
               className="w-[140px] rounded border border-primary px-1 py-px text-[13px] font-semibold text-foreground outline-none"
             />
           ) : (
-            <span onDoubleClick={(e) => { e.stopPropagation(); setEditing(true) }}
-              className="flex-1 cursor-text truncate text-[13px] font-semibold text-foreground">
+            <span onDoubleClick={(e) => { if (canEdit) { e.stopPropagation(); setEditing(true) } }}
+              className={cn('flex-1 truncate text-[13px] font-semibold text-foreground', canEdit && 'cursor-text')}>
               {data.title}
             </span>
           )}
           <span className={editing ? 'flex-1' : undefined} />
           <span className="rounded bg-muted px-1.5 py-0.5 text-[8.5px] font-semibold tracking-[0.6px] text-muted-foreground">SECTION</span>
           <Tooltip label={runnable ? 'Run up to here' : 'Connect a source to run'}>
-            <button aria-label="Run section" aria-disabled={!runnable} onClick={(e) => { e.stopPropagation(); if (runnable) requestRun(id) }}
-              className={cn('grid h-[22px] w-6 place-items-center rounded-md', runnable ? 'cursor-pointer text-muted-foreground' : 'cursor-not-allowed text-muted-foreground/40')}>
+            <button aria-label="Run section" aria-disabled={!canEdit || !runnable} onClick={(e) => { e.stopPropagation(); if (canEdit && runnable) requestRun(id) }}
+              className={cn('grid h-[22px] w-6 place-items-center rounded-md', canEdit && runnable ? 'cursor-pointer text-muted-foreground' : 'cursor-not-allowed text-muted-foreground/40')}>
               <Icon name="play" size={13} />
             </button>
           </Tooltip>
@@ -82,7 +84,7 @@ function Section({ id, data, selected }: NodeComponentProps) {
             onClick={(e) => { e.stopPropagation(); togglePanel(id, 'section') }}
             className={cn('inline-flex items-center gap-[5px] rounded-md border border-border bg-card px-3 py-[5px] text-[11.5px]', openPanel === 'section' ? 'text-primary' : 'text-muted-foreground')}
           >
-            <Icon name="code" size={12} /> Edit script →
+            <Icon name="code" size={12} /> {canEdit ? 'Edit script →' : 'View script →'}
           </button>
         </div>
       </div>

@@ -2,16 +2,54 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 
 // the store module runs autosave side-effects at import; stub the network client so nothing escapes.
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
-vi.mock('../api/client', () => ({ api: new Proxy({}, { get: () => async () => ({}) }) }))
+const apiMocks = vi.hoisted(() => ({ listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn() }))
+vi.mock('../api/client', () => ({
+  api: new Proxy({}, {
+    get: (_target, property) => property === 'listCanvases'
+      ? apiMocks.listCanvases
+      : property === 'getCanvas'
+        ? apiMocks.getCanvas
+        : property === 'createCanvas'
+          ? apiMocks.createCanvas
+        : async () => ({}),
+  }),
+  KernelError: class KernelError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status } },
+  setApiUser: vi.fn(),
+}))
 
 import { useStore } from './graph'
+import { KernelError } from '../api/client'
 
-const NODE = (id: string, type = 'source') => ({ id, type, position: { x: 0, y: 0 }, data: {} })
+const storage = new Map<string, string>()
+Object.defineProperty(globalThis, 'localStorage', {
+  configurable: true,
+  value: {
+    get length() { return storage.size },
+    clear: () => storage.clear(),
+    getItem: (key: string) => storage.get(key) ?? null,
+    key: (index: number) => Array.from(storage.keys())[index] ?? null,
+    removeItem: (key: string) => { storage.delete(key) },
+    setItem: (key: string, value: string) => { storage.set(key, String(value)) },
+  } satisfies Storage,
+})
+
+const NODE = (id: string, type = 'source') => ({
+  id, type, position: { x: 0, y: 0 },
+  data: { title: id, config: {}, status: 'draft' as const, history: [] },
+})
 
 describe('graph store — core authority ops', () => {
   beforeEach(() => {
     // start each test from a known empty doc
-    useStore.setState({ doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] }, past: [], future: [] })
+    localStorage.clear()
+    apiMocks.listCanvases.mockReset().mockResolvedValue([])
+    apiMocks.getCanvas.mockReset()
+    apiMocks.createCanvas.mockReset().mockResolvedValue({ ok: true })
+    useStore.setState({ currentUser: { id: 'alice', name: 'Alice' } })
+    useStore.setState({
+      doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] },
+      canvasRole: 'owner', past: [], future: [], toasts: [], agentOpen: false, accessDenied: false, kernelUp: false,
+    })
   })
 
   it('applyAgentGraph REPLACES nodes/edges and marks them stale (undoable)', () => {
@@ -44,4 +82,169 @@ describe('graph store — core authority ops', () => {
     useStore.getState().dismissToast(t!.id)
     expect(useStore.getState().toasts.some((x) => x.msg === 'boom')).toBe(false)
   })
+
+  it('refreshes a stale editor role and installs the server-confirmed viewer role before reopening', async () => {
+    const doc = { id: 'shared', version: 1, name: 'shared', nodes: [NODE('a')], edges: [] }
+    apiMocks.getCanvas.mockResolvedValue(doc)
+    useStore.setState({ files: [{ id: 'shared', name: 'shared', version: 1, role: 'editor' }] })
+    apiMocks.listCanvases.mockResolvedValue([{ id: 'shared', name: 'shared', version: 1, role: 'viewer' }])
+
+    expect(await useStore.getState().openFile('shared')).toBe(true)
+    const before = useStore.getState().doc
+
+    expect(useStore.getState().canvasRole).toBe('viewer')
+    expect(useStore.getState().addNode('source', { x: 10, y: 10 })).toBeNull()
+    useStore.getState().setNodes([])
+    useStore.getState().updateConfig('a', { uri: 'changed' })
+    useStore.getState().renameFile('changed')
+    useStore.getState().applyAgentGraph({ nodes: [NODE('replacement')], edges: [] })
+
+    expect(useStore.getState().doc).toBe(before)
+    expect(useStore.getState().past).toHaveLength(0)
+  })
+
+  it('lets only the latest overlapping file-open navigation install a document', async () => {
+    let finishA!: (doc: ReturnType<typeof emptyTestDoc>) => void
+    const a = new Promise<ReturnType<typeof emptyTestDoc>>((resolve) => { finishA = resolve })
+    apiMocks.getCanvas.mockImplementation((id: string) => id === 'a' ? a : Promise.resolve(emptyTestDoc('b')))
+    apiMocks.listCanvases.mockResolvedValue([{ id: 'b', name: 'b', version: 1, role: 'owner' }])
+
+    const openA = useStore.getState().openFile('a')
+    const openB = useStore.getState().openFile('b')
+    expect(await openB).toBe(true)
+    finishA(emptyTestDoc('a'))
+
+    expect(await openA).toBe(false)
+    expect(useStore.getState().doc.id).toBe('b')
+    expect(useStore.getState().canvasRole).toBe('owner')
+  })
+
+  it('isolates cached roles by user and fails closed across an identity change', async () => {
+    const doc = { id: 'shared', version: 1, name: 'shared', nodes: [], edges: [] }
+    useStore.getState().loadDoc(doc, 'owner')
+    expect(localStorage.getItem('dp-canvas-role-alice-shared')).toBeNull() // local state alone is not authority
+    apiMocks.listCanvases.mockResolvedValue([{ id: 'shared', name: 'shared', version: 1, role: 'owner' }])
+    await useStore.getState().refreshFiles() // only this authoritative response is cached
+    expect(localStorage.getItem('dp-canvas-role-alice-shared')).toBe('owner')
+
+    // Bob must not inherit Alice's owner role during the user-switch/startup window.
+    useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } })
+    expect(useStore.getState().canvasRole).toBeNull()
+    useStore.getState().loadDoc(doc) // unknown Bob role stays fail-closed
+    expect(useStore.getState().canvasRole).toBeNull()
+    expect(useStore.getState().addNode('source', { x: 0, y: 0 })).toBeNull()
+    expect(localStorage.getItem('dp-canvas-role-bob-shared')).toBeNull()
+
+    // Once Bob's own server response says viewer, only Bob's cache receives that role.
+    apiMocks.listCanvases.mockResolvedValue([{ id: 'shared', name: 'shared', version: 1, role: 'viewer' }])
+    await useStore.getState().refreshFiles()
+    expect(useStore.getState().canvasRole).toBe('viewer')
+    expect(localStorage.getItem('dp-canvas-role-bob-shared')).toBe('viewer')
+    expect(localStorage.getItem('dp-canvas-role-alice-shared')).toBe('owner')
+  })
+
+  it('fails closed immediately when an authoritative file refresh no longer includes the open canvas', async () => {
+    const doc = { id: 'shared', version: 1, name: 'shared', nodes: [], edges: [] }
+    useStore.getState().loadDoc(doc, 'owner')
+    apiMocks.listCanvases.mockResolvedValue([{ id: 'shared', name: 'shared', version: 1, role: 'owner' }])
+    await useStore.getState().refreshFiles()
+    useStore.setState({ agentOpen: true })
+    expect(localStorage.getItem('dp-canvas-role-alice-shared')).toBe('owner')
+
+    apiMocks.listCanvases.mockResolvedValue([]) // revoked or deleted on the server
+    await useStore.getState().refreshFiles()
+
+    expect(useStore.getState().canvasRole).toBeNull()
+    expect(useStore.getState().agentOpen).toBe(false)
+    expect(localStorage.getItem('dp-canvas-role-alice-shared')).toBeNull()
+    expect(useStore.getState().addNode('source', { x: 0, y: 0 })).toBeNull()
+  })
+
+  it('does not treat a failed file-list refresh as an authoritative revocation', async () => {
+    const doc = emptyTestDoc('shared')
+    useStore.getState().loadDoc(doc, 'owner')
+    apiMocks.listCanvases.mockResolvedValueOnce([{ id: 'shared', name: 'shared', version: 1, role: 'owner' }])
+    expect(await useStore.getState().refreshFiles()).toBe(true)
+    expect(localStorage.getItem('dp-canvas-role-alice-shared')).toBe('owner')
+
+    apiMocks.listCanvases.mockRejectedValueOnce(new TypeError('offline'))
+    expect(await useStore.getState().refreshFiles()).toBe(false)
+
+    expect(useStore.getState().canvasRole).toBe('owner')
+    expect(localStorage.getItem('dp-canvas-role-alice-shared')).toBe('owner')
+  })
+
+  it('opens fail-closed when the document loads but its fresh role cannot be confirmed', async () => {
+    const doc = emptyTestDoc('shared')
+    useStore.getState().loadDoc(doc, 'owner')
+    apiMocks.listCanvases.mockResolvedValueOnce([{ id: 'shared', name: 'shared', version: 1, role: 'owner' }])
+    await useStore.getState().refreshFiles()
+    expect(localStorage.getItem('dp-canvas-role-alice-shared')).toBe('owner')
+
+    apiMocks.getCanvas.mockResolvedValue(doc)
+    apiMocks.listCanvases.mockRejectedValueOnce(new TypeError('offline'))
+    expect(await useStore.getState().openFile('shared')).toBe(true)
+
+    expect(useStore.getState().canvasRole).toBeNull()
+    // The network failure was not a revocation: keep the last confirmed cache for offline bootstrap.
+    expect(localStorage.getItem('dp-canvas-role-alice-shared')).toBe('owner')
+    expect(useStore.getState().toasts.some((toast) => toast.msg.includes('Opened read-only'))).toBe(true)
+  })
+
+  it('surfaces an explicit read-only message when reopen confirms access was removed', async () => {
+    const doc = emptyTestDoc('shared')
+    apiMocks.getCanvas.mockResolvedValue(doc)
+    useStore.setState({ files: [{ id: 'shared', name: 'shared', version: 1, role: 'owner' }] })
+    apiMocks.listCanvases.mockResolvedValue([])
+
+    expect(await useStore.getState().openFile('shared')).toBe(true)
+
+    expect(useStore.getState().canvasRole).toBeNull()
+    expect(useStore.getState().toasts.some((toast) => toast.msg.includes('no longer in your accessible files'))).toBe(true)
+  })
+
+  it('preserves the current canvas when new-file or example creation is forbidden', async () => {
+    const before = useStore.getState().doc
+    apiMocks.createCanvas.mockRejectedValue(new KernelError(403, 'forbidden'))
+
+    await useStore.getState().newFile()
+    expect(useStore.getState().doc).toBe(before)
+    expect(useStore.getState().canvasRole).toBe('owner')
+
+    await useStore.getState().newFromExample('purchases')
+    expect(useStore.getState().doc).toBe(before)
+    expect(useStore.getState().canvasRole).toBe('owner')
+    expect(useStore.getState().toasts.filter((toast) => toast.msg.includes('permission'))).toHaveLength(2)
+  })
+
+  it('fails the current canvas closed when new-file creation returns 401', async () => {
+    apiMocks.listCanvases.mockResolvedValue([{ id: 'c', name: 'test', version: 1, role: 'owner' }])
+    await useStore.getState().refreshFiles()
+    useStore.getState().setAgentOpen(true)
+    apiMocks.createCanvas.mockRejectedValueOnce(new KernelError(401, 'session expired'))
+    const before = useStore.getState().doc
+
+    await useStore.getState().newFile()
+
+    expect(useStore.getState().doc).toBe(before)
+    expect(useStore.getState().canvasRole).toBeNull()
+    expect(useStore.getState().agentOpen).toBe(false)
+    expect(localStorage.getItem('dp-canvas-role-alice-c')).toBeNull()
+    expect(useStore.getState().toasts.some((toast) => toast.msg.includes('session'))).toBe(true)
+  })
+
+  it('keeps local-first owner drafts for genuine transport failures', async () => {
+    const beforeId = useStore.getState().doc.id
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+
+    await useStore.getState().newFile()
+
+    expect(useStore.getState().doc.id).not.toBe(beforeId)
+    expect(useStore.getState().canvasRole).toBe('owner')
+    expect(useStore.getState().view).toBe('canvas')
+  })
 })
+
+function emptyTestDoc(id: string) {
+  return { id, version: 1, name: id, nodes: [], edges: [] }
+}

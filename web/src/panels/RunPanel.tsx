@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { useStore } from '../store/graph'
+import { roleCanEdit, useStore } from '../store/graph'
 import { color, status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
@@ -10,6 +10,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const estimate = useStore((s) => s.estimate)
   const doRun = useStore((s) => s.run)
   const cancel = useStore((s) => s.cancelRun)
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
 
   useEffect(() => {
     if (!run || run.phase === 'idle') estimate(nodeId)
@@ -37,11 +38,11 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           {est.breakdown && <div className="mt-2 text-[11px] text-muted-foreground">{est.breakdown}</div>}
           {phase === 'confirm' ? (
             <div className="mt-3.5 flex gap-2">
-              <Button size="sm" onClick={() => doRun(nodeId, true)} className="flex-1 bg-[#d99a2b] text-white hover:bg-[#c98d24]">Run</Button>
+              <Button size="sm" onClick={() => doRun(nodeId, true)} disabled={!canEdit} title={canEdit ? 'Run' : 'View-only canvas'} className="flex-1 bg-[#d99a2b] text-white hover:bg-[#c98d24]">Run</Button>
               <Button size="sm" variant="outline" onClick={() => useStore.getState().closePanel(nodeId)} className="flex-1">Cancel</Button>
             </div>
           ) : (
-            <Button size="sm" onClick={() => doRun(nodeId, false)} className="mt-3.5 w-full">Run</Button>
+            <Button size="sm" onClick={() => doRun(nodeId, false)} disabled={!canEdit} title={canEdit ? 'Run' : 'View-only canvas'} className="mt-3.5 w-full">Run</Button>
           )}
         </>
       )}
@@ -64,7 +65,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             </div>
           )}
           <PerNode st={st} />
-          <Button size="sm" variant="outline" onClick={() => cancel(nodeId)} className="mt-3 w-full">
+          <Button size="sm" variant="outline" onClick={() => cancel(nodeId)} disabled={!canEdit} title={canEdit ? 'Stop this run' : 'View-only canvas'} className="mt-3 w-full">
             <Icon name="stop" size={12} /> Stop
           </Button>
         </>

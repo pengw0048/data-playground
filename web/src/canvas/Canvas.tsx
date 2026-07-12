@@ -9,7 +9,7 @@ import { SECTION_W, SECTION_H } from '../nodes/kinds/section'
 import { WireEdge } from '../wires/WireEdge'
 import { canConnect, portWire, portMulti, getSpec } from '../nodes/registry'
 import { schemaWarnings } from '../nodes/schema'
-import { useStore, newId, freePosition } from '../store/graph'
+import { useStore, newId, freePosition, roleCanEdit } from '../store/graph'
 import { api } from '../api/client'
 import { examples } from '../examples'
 import { kindAccent, color } from '../theme/tokens'
@@ -41,7 +41,7 @@ function ArrowDefs() {
   )
 }
 
-function EmptyState() {
+function EmptyState({ canEdit }: { canEdit: boolean }) {
   const { screenToFlowPosition } = useReactFlow()
   const addNode = useStore((s) => s.addNode)
   const setAgentOpen = useStore((s) => s.setAgentOpen)
@@ -49,7 +49,10 @@ function EmptyState() {
   // gate the Agent CTA on a configured model — otherwise the most prominent first-run button leads
   // straight to "Agent unavailable" (the default is no model).
   const [agentOk, setAgentOk] = useState(false)
-  useEffect(() => { api.agentStatus().then((s) => setAgentOk(!!s.available)).catch(() => setAgentOk(false)) }, [])
+  useEffect(() => {
+    if (!canEdit) return
+    api.agentStatus().then((s) => setAgentOk(!!s.available)).catch(() => setAgentOk(false))
+  }, [canEdit])
   const add = () => {
     const c = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
     addNode('source', { x: c.x - 116, y: c.y - 40 })
@@ -59,14 +62,16 @@ function EmptyState() {
       <div className="pointer-events-auto text-center">
         <div className="text-[15px] font-semibold text-foreground">Empty canvas</div>
         <div className="mx-auto mt-1.5 max-w-[340px] text-[12.5px] leading-normal text-muted-foreground">
-          Add a dataset source to begin — or open a runnable example.
+          {canEdit ? 'Add a dataset source to begin — or open a runnable example.' : 'You have view-only access to this canvas.'}
         </div>
-        <div className="mt-3.5 flex justify-center gap-2">
-          <Button onClick={add} className="rounded-lg bg-foreground text-[12.5px] text-background hover:bg-foreground/90">+ Add a source</Button>
-          {agentOk && <Button variant="outline" onClick={() => setAgentOpen(true)} className="rounded-lg text-[12.5px] text-muted-foreground">Ask the Agent</Button>}
-        </div>
+        {canEdit && (
+          <div className="mt-3.5 flex justify-center gap-2">
+            <Button onClick={add} className="rounded-lg bg-foreground text-[12.5px] text-background hover:bg-foreground/90">+ Add a source</Button>
+            {agentOk && <Button variant="outline" onClick={() => setAgentOpen(true)} className="rounded-lg text-[12.5px] text-muted-foreground">Ask the Agent</Button>}
+          </div>
+        )}
         {/* runnable starters on the seeded data — a first-timer never opens the file menu to find them */}
-        <div className="mx-auto mt-6 grid max-w-[460px] gap-2">
+        {canEdit && <div className="mx-auto mt-6 grid max-w-[460px] gap-2">
           <div className="text-[10.5px] font-semibold uppercase tracking-[0.6px] text-muted-foreground/70">Start from an example</div>
           {examples.map((ex) => (
             <button key={ex.key} onClick={() => { void newFromExample(ex.key) }} title={ex.blurb}
@@ -75,7 +80,7 @@ function EmptyState() {
               <div className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-muted-foreground">{ex.blurb}</div>
             </button>
           ))}
-        </div>
+        </div>}
       </div>
     </div>
   )
@@ -85,6 +90,8 @@ export function Canvas() {
   const specsVersion = useStore((s) => s.specsVersion)
   const nodeTypes = useMemo(() => buildNodeTypes(), [specsVersion])
   const doc = useStore((s) => s.doc)
+  const canvasRole = useStore((s) => s.canvasRole)
+  const canEdit = roleCanEdit(canvasRole)
   const schemas = useStore((s) => s.schemas)
   const previews = useStore((s) => s.previews)
   const catalog = useStore((s) => s.catalog)
@@ -112,15 +119,17 @@ export function Canvas() {
   // Drag a data file from the OS onto the canvas → upload it and drop a bound source node where it landed.
   const [dropActive, setDropActive] = useState(false)
   const onDragOverFiles = useCallback((e: React.DragEvent) => {
+    if (!canEdit) return
     if (!Array.from(e.dataTransfer?.types ?? []).includes('Files')) return  // ignore node/text drags
     e.preventDefault()
     e.dataTransfer.dropEffect = 'copy'
     setDropActive(true)
-  }, [])
+  }, [canEdit])
   const onDragLeaveFiles = useCallback((e: React.DragEvent) => {
     if (!e.currentTarget.contains(e.relatedTarget as HTMLElement | null)) setDropActive(false)  // not a child-to-child move
   }, [])
   const onDropFiles = useCallback(async (e: React.DragEvent) => {
+    if (!canEdit) return
     const files = Array.from(e.dataTransfer?.files ?? [])
     if (!files.length) return
     e.preventDefault()
@@ -135,7 +144,7 @@ export function Canvas() {
       const pos = freePosition(g.doc.nodes, { x: base.x - 116, y: base.y - 40 })
       g.addNode('source', pos, { uri: t.uri, tableId: t.id }, t.name)
     }
-  }, [screenToFlowPosition])
+  }, [canEdit, screenToFlowPosition])
 
   // React Flow needs to own node measurements (`measured`/width/height): if we rebuilt node
   // objects from the store every render we'd drop them, and RF keeps unmeasured nodes hidden.
@@ -194,7 +203,7 @@ export function Canvas() {
     // re-runs the reconcile effect (rebuilding ALL RF nodes, O(n)/frame) and floods the collab socket.
     // RF emits the final position with dragging:false at release; non-drag moves have it unset too.
     const moved = changes.filter((c) => c.type === 'position' && (c as any).position && !(c as any).dragging) as any[]
-    if (moved.length) {
+    if (canEdit && moved.length) {
       const byId = new Map(moved.map((c) => [c.id, c.position]))
       // snapshot the pre-move doc so a settled drag is its OWN undo step (setNodes doesn't commit);
       // also marks a CRDT boundary so undo behaves the same solo and while co-editing.
@@ -208,15 +217,17 @@ export function Canvas() {
       for (const c of selChanges) (c.selected ? cur.add(c.id) : cur.delete(c.id))
       useStore.getState().setSelection([...cur])
     }
-  }, [setNodes])
+  }, [canEdit, setNodes])
 
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
+    if (!canEdit) return
     const applied = applyEdgeChanges(changes, rfEdges)
     const keep = new Set(applied.map((e) => e.id))
     setEdges(doc.edges.filter((e) => keep.has(e.id)))
-  }, [rfEdges, doc.edges, setEdges])
+  }, [canEdit, rfEdges, doc.edges, setEdges])
 
   const isValidConnection = useCallback((c: Connection | Edge) => {
+    if (!canEdit) return false
     const sw = portWire(doc.nodes, c.source!, c.sourceHandle, 'source')
     const tgt = doc.nodes.find((n) => n.id === c.target)
     if (!tgt) return false
@@ -226,7 +237,7 @@ export function Canvas() {
     if (portMulti(tgt.type, c.targetHandle)) return true
     const occupied = doc.edges.some((e) => e.target === c.target && (e.targetHandle ?? null) === (c.targetHandle ?? null))
     return !occupied
-  }, [doc.nodes, doc.edges])
+  }, [canEdit, doc.nodes, doc.edges])
 
   const onConnect = useCallback((c: Connection) => {
     if (!isValidConnection(c)) return
@@ -241,6 +252,7 @@ export function Canvas() {
   // ignoring the edge being moved (so re-dropping on its own port isn't a false "occupied"), then
   // swap it. Without this a wire could only be changed by deleting a node.
   const onReconnect = useCallback((oldEdge: Edge, c: Connection) => {
+    if (!canEdit) return
     const sw = portWire(doc.nodes, c.source!, c.sourceHandle, 'source')
     const tgt = doc.nodes.find((n) => n.id === c.target)
     if (!tgt || !canConnect(sw, tgt.type, c.targetHandle)) return
@@ -250,11 +262,12 @@ export function Canvas() {
     removeEdge(oldEdge.id)
     connect({ id: newId('e'), source: c.source!, target: c.target!,
       sourceHandle: c.sourceHandle, targetHandle: c.targetHandle, data: { wire: (sw ?? 'dataset') as WireType } })
-  }, [doc.nodes, doc.edges, removeEdge, connect])
+  }, [canEdit, doc.nodes, doc.edges, removeEdge, connect])
 
   // Dropping a node onto a section makes it a contained child (parentId); dragging it out detaches
   // it. Coordinates convert between absolute (top-level) and relative-to-section on the boundary.
   const onNodeDragStop = useCallback((e: MouseEvent | TouchEvent, dragged: Node) => {
+    if (!canEdit) return
     // visual drag-containment is one level: section frames are a fixed size, so a same-size section
     // can't sit cleanly inside another. Nested logic is expressed in the driver script instead — a
     // section's script can run() another section (the engine carries the nested subtree; see
@@ -279,12 +292,13 @@ export function Canvas() {
     } else if (curParent) {
       setParent(dragged.id, null, abs) // dragged out → back to absolute top-level coords
     }
-  }, [setParent])
+  }, [canEdit, setParent])
 
   // A CLICK on an output port opens the add-node menu (Port dispatches this event). A drag to
   // connect never fires a click on the origin handle, so pulling a wire never pops the picker.
   useEffect(() => {
     const onPortClick = (ev: Event) => {
+      if (!canEdit) return
       const { nodeId, handleId, x, y } = (ev as CustomEvent).detail as { nodeId: string; handleId: string; x: number; y: number }
       const wire = portWire(doc.nodes, nodeId, handleId, 'source')
       if (!wire) return
@@ -292,7 +306,7 @@ export function Canvas() {
     }
     window.addEventListener('dp-port-click', onPortClick)
     return () => window.removeEventListener('dp-port-click', onPortClick)
-  }, [doc.nodes])
+  }, [canEdit, doc.nodes])
 
   // keyboard: Delete / Backspace remove selection; B bypass; M mute
   useEffect(() => {
@@ -303,22 +317,24 @@ export function Canvas() {
       if (document.querySelector('.dp-modal-overlay')) return
       const tag = (e.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
+      const editable = roleCanEdit(useStore.getState().canvasRole)
       // undo / redo work regardless of selection
       if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
         e.preventDefault()
+        if (!editable) return
         if (e.shiftKey) useStore.getState().redo()
         else useStore.getState().undo()
         return
       }
-      if ((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y')) { e.preventDefault(); useStore.getState().redo(); return }
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y')) { e.preventDefault(); if (editable) useStore.getState().redo(); return }
       // clipboard + selection (work on the canvas, not in a field — inputs bailed out above)
       if (e.metaKey || e.ctrlKey) {
         const k = e.key.toLowerCase()
         if (k === 'a') { e.preventDefault(); useStore.getState().selectAll(); return }
         if (k === 'c') { e.preventDefault(); useStore.getState().copySelection(); return }
-        if (k === 'x') { e.preventDefault(); useStore.getState().cutSelection(); return }
-        if (k === 'v') { e.preventDefault(); useStore.getState().paste(); return }
-        if (k === 'd') { e.preventDefault(); useStore.getState().duplicateSelected(); return }
+        if (k === 'x') { e.preventDefault(); if (editable) useStore.getState().cutSelection(); return }
+        if (k === 'v') { e.preventDefault(); if (editable) useStore.getState().paste(); return }
+        if (k === 'd') { e.preventDefault(); if (editable) useStore.getState().duplicateSelected(); return }
       }
       // Escape closes any open floating panel (data viewer / run / …) and clears the selection
       if (e.key === 'Escape') {
@@ -328,6 +344,7 @@ export function Canvas() {
       }
       const ids = useStore.getState().selectedIds
       if (!ids.length) return
+      if (!editable) return
       if (e.key === 'Delete' || e.key === 'Backspace') { removeSelected(); e.preventDefault() }
       if (e.key === 'b' || e.key === 'B') {
         // honor canBypass (matches the ⋯ menu) — bypass only the selected nodes that allow it
@@ -357,9 +374,12 @@ export function Canvas() {
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         onReconnect={onReconnect}
-        onEdgeDoubleClick={(_, edge) => removeEdge(edge.id)}
+        onEdgeDoubleClick={(_, edge) => { if (canEdit) removeEdge(edge.id) }}
         onNodeDragStop={onNodeDragStop}
         isValidConnection={isValidConnection}
+        nodesDraggable={canEdit}
+        nodesConnectable={canEdit}
+        edgesReconnectable={canEdit}
         onPaneClick={() => { select(null); setMenu(null); useStore.setState({ openPanels: {} }) }}
         onNodeClick={(e, n) => { if (!e.shiftKey && !e.metaKey && !e.ctrlKey) select(n.id) }}
         defaultEdgeOptions={{ type: 'wire' }}
@@ -397,10 +417,10 @@ export function Canvas() {
         )}
       </ReactFlow>
 
-      {doc.nodes.length === 0 && <EmptyState />}
+      {doc.nodes.length === 0 && <EmptyState canEdit={canEdit} />}
 
       {/* file-drop affordance — pointer-events:none so it never intercepts the drop itself */}
-      {dropActive && (
+      {canEdit && dropActive && (
         <div className="pointer-events-none absolute inset-3 z-50 grid place-items-center rounded-xl border-2 border-dashed border-primary bg-primary/5">
           <div className="rounded-lg bg-card px-4 py-2.5 text-[13px] font-semibold text-foreground shadow-lg">
             Drop to upload as a source · Parquet / CSV / JSON / Arrow
@@ -410,7 +430,7 @@ export function Canvas() {
 
       <PanelHost />
 
-      {menu && (
+      {canEdit && menu && (
         <ConnectMenu
           x={menu.x}
           y={menu.y}
