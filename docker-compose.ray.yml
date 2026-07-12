@@ -6,12 +6,12 @@
 # service runs the byte-identical differential INSIDE the network so the Ray Client version always matches
 # the cluster and it reaches minio/ray-head by DNS.
 #
-#   docker compose -f docker-compose.ray.yml up -d --scale ray-worker=2 --build
+#   docker compose -f docker-compose.ray.yml up -d --scale ray-worker=2 --build ray-head ray-worker minio createbucket
 #   docker compose -f docker-compose.ray.yml run --rm driver    # runs the differential; exits 0 on PASS
 #   docker compose -f docker-compose.ray.yml down -v
 #
-# Kill-a-worker recovery: while a run is in flight, `docker kill <a ray-worker container>` and re-run the
-# differential — Ray Data reconstructs the lost blocks from lineage and the output stays byte-identical.
+# Degraded-cluster rerun: stop one worker BETWEEN runs, then start a new differential. A PASS proves the
+# remaining cluster can accept fresh work; it does not prove recovery of an already in-flight run.
 
 x-ray-env: &ray-env
   RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
@@ -25,6 +25,7 @@ services:
     # label a node opts into (dp_ray.place), declared here so a pinned region schedules onto the cluster.
     command: ["ray", "start", "--head", "--port=6379", "--num-cpus=2", "--dashboard-host=0.0.0.0", '--resources={"engine_ray":100}', "--block"]
     environment: *ray-env
+    shm_size: "3gb"
     networks: [dpray]
 
   ray-worker:
@@ -32,6 +33,7 @@ services:
     depends_on: [ray-head]
     command: ["ray", "start", "--address=ray-head:6379", "--num-cpus=2", '--resources={"engine_ray":100}', "--block"]
     environment: *ray-env
+    shm_size: "3gb"
     networks: [dpray]
 
   minio:
@@ -59,6 +61,7 @@ services:
       RAY_ADDRESS: "auto"                 # connect to the LOCAL raylet after joining the cluster below
       DP_TEST_RAY_LIVE: "1"
       DP_RAY_SHUFFLE_PARTITIONS: "4"
+      DP_MULTINODE_FAULT: "${DP_MULTINODE_FAULT:-}"
       DP_S3_ENDPOINT: "http://minio:9000"
       DP_S3_KEY: "dpminio"
       DP_S3_SECRET: "dpminio123"
@@ -72,6 +75,7 @@ services:
     command: ["ray start --address=ray-head:6379 --num-cpus=2 && python /app/kernel/hub/ray_multinode_check.py; rc=$$?; ray stop >/dev/null 2>&1; exit $$rc"]
     volumes:
       - ./kernel/hub/ray_multinode_check.py:/app/kernel/hub/ray_multinode_check.py:ro
+    shm_size: "3gb"
     networks: [dpray]
 
 networks:
