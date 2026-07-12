@@ -2609,6 +2609,39 @@ def test_run_deadline_hard_kills_a_runaway_child(tmp_path):
     assert st.run_id not in runner._procs or runner._procs[st.run_id].poll() is not None  # child reaped
 
 
+def test_subprocess_region_cancel_stops_materializer_before_publish(tmp_path):
+    # run_unit uses subrun's materializeUri path (the RunController handoff worker). Cancel after that path
+    # reports running, then require terminal cancelled + a reaped child + no handoff artifact.
+    import time as _t
+
+    from hub.deps import get_deps
+    from hub.models import Graph
+    from hub.settings import settings
+    from hub.subprocess_runner import SubprocessRunner
+
+    source = _seq_parquet(tmp_path, n=5)
+    graph = Graph(**{"id": "region_subprocess_cancel", "version": 1, "nodes": [
+        N("src", "source", {"uri": source}),
+        N("xf", "transform", {"source": "adhoc", "mode": "map",
+                                  "code": "def fn(row):\n    while True:\n        pass"}),
+    ], "edges": [E("src", "xf")]})
+    output = str(tmp_path / "region_cancelled.parquet")
+    runner = SubprocessRunner(settings.workspace, settings.data_dir,
+                              catalog=get_deps().catalog, deadline_s=30)
+    st = runner.run_unit(graph, "xf", output)
+    deadline = _t.monotonic() + 10
+    while runner.status(st.run_id).status == "queued" and _t.monotonic() < deadline:
+        _t.sleep(0.05)
+    assert runner.status(st.run_id).status == "running", "materializeUri child never entered its run path"
+    runner.cancel(st.run_id)
+    while runner.status(st.run_id).status not in ("done", "failed", "cancelled") and _t.monotonic() < deadline:
+        _t.sleep(0.05)
+    assert runner.status(st.run_id).status == "cancelled"
+    while st.run_id in runner._procs and _t.monotonic() < deadline:
+        _t.sleep(0.05)
+    assert st.run_id not in runner._procs and not os.path.exists(output)
+
+
 def test_subprocess_run_is_recorded_in_history(tmp_path):
     # run history must be captured for the isolated-process backend too. The PARENT records it (the
     # child disables its own on_complete to avoid a daemon-thread race that dropped records): a run
@@ -3165,6 +3198,297 @@ def test_headless_run_kernel_failure_is_a_clean_exit(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as ei:
         cli._headless_run(get_deps(), "kf_canvas", None, 5.0, as_json=False)
     assert "cannot run canvas 'kf_canvas'" in str(ei.value)
+
+
+def test_headless_timeout_cancels_waits_and_never_publishes(tmp_path, monkeypatch, capsys):
+    # P0-EXEC-03: a timeout is a stop request, not merely a client-side return. Hold the built-in local
+    # adapter immediately before its write, let the CLI deadline fire, and prove _headless_run waits for
+    # the worker's terminal acknowledgement before returning 124. The fenced write must never appear later.
+    import re
+    import threading
+    import uuid
+
+    from hub import metadb
+    from hub.cli import _headless_run
+    from hub.deps import get_deps
+
+    d = get_deps()
+    src = _seq_parquet(tmp_path, n=20)
+    suffix = uuid.uuid4().hex
+    output_name = f"cli_timeout_{suffix}.parquet"
+    table_name = output_name.removesuffix(".parquet")
+    output_uri = d.storage.output_uri(table_name, ".parquet")
+    cid = f"cli_timeout_{suffix}"
+    client.put(f"/api/canvas/{cid}", json={
+        "id": cid, "name": cid, "version": 1,
+        "nodes": [N("src", "source", {"uri": src}),
+                  N("wr", "write", {"filename": output_name, "writeMode": "overwrite"})],
+        "edges": [E("src", "wr")],
+    })
+
+    resolve = d.runner.resolve_adapter
+    real = resolve(output_uri)
+    entered = threading.Event()
+    finished = threading.Event()
+
+    class _SlowCommitAdapter:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def write(self, uri, rel, mode="overwrite", partition_by=None, cancelled=None):
+            if uri != output_uri:
+                return real.write(uri, rel, mode, partition_by=partition_by, cancelled=cancelled)
+            entered.set()
+            try:
+                assert cancelled is not None, "the runner must pass its cancellation fence to the adapter"
+                deadline = time.monotonic() + 5
+                while not cancelled() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                return real.write(uri, rel, mode, partition_by=partition_by, cancelled=cancelled)
+            finally:
+                finished.set()
+
+    slow = _SlowCommitAdapter()
+    monkeypatch.setattr(d.runner, "resolve_adapter", lambda uri: slow if uri == output_uri else resolve(uri))
+    previous_backend = metadb.get_setting("backend", "global", default="") or ""
+    metadb.set_setting("backend", "local-out-of-core", "global")
+    try:
+        code = _headless_run(d, cid, "wr", 0.01, as_json=False)
+    finally:
+        metadb.set_setting("backend", previous_backend, "global")
+
+    captured = capsys.readouterr()
+    match = re.search(r"run (run_[0-9a-f]+)", captured.err)
+    assert code == 124 and match, captured.err
+    run_id = match.group(1)
+    assert entered.is_set() and finished.is_set(), "CLI returned before the local worker acknowledged stop"
+    assert d.runner.status(run_id).status == "cancelled"
+    assert metadb.get_run_state(run_id)["status"] == "cancelled"
+    assert not os.path.exists(output_uri)
+    time.sleep(0.2)
+    assert not os.path.exists(output_uri), "a cancelled attempt published after the CLI returned"
+    assert not any(t.name == table_name for t in d.catalog.list_tables(None))
+
+
+def test_headless_timeout_stops_isolated_child_without_late_publish(tmp_path, capsys):
+    # The production-local path is the isolated subprocess runner (also used inside the default kernel).
+    # A runaway Python cell ignores DuckDB interrupt, so this exercises cooperative cancel followed by the
+    # bounded hard-kill fallback. Terminal cancelled is emitted only after the child is reaped.
+    import re
+    import uuid
+
+    from hub import metadb
+    from hub.cli import _headless_run
+    from hub.deps import get_deps
+
+    d = get_deps()
+    src = _seq_parquet(tmp_path, n=5)
+    suffix = uuid.uuid4().hex
+    output_name = f"cli_subprocess_timeout_{suffix}.parquet"
+    table_name = output_name.removesuffix(".parquet")
+    output_uri = d.storage.output_uri(table_name, ".parquet")
+    cid = f"cli_subprocess_timeout_{suffix}"
+    client.put(f"/api/canvas/{cid}", json={
+        "id": cid, "name": cid, "version": 1,
+        "nodes": [
+            N("src", "source", {"uri": src}),
+            N("xf", "transform", {"source": "adhoc", "mode": "map",
+                                      "code": "def fn(row):\n    while True:\n        pass"}),
+            N("wr", "write", {"filename": output_name, "writeMode": "overwrite"}),
+        ],
+        "edges": [E("src", "xf"), E("xf", "wr")],
+    })
+
+    previous_backend = metadb.get_setting("backend", "global", default="") or ""
+    metadb.set_setting("backend", "local-subprocess", "global")
+    try:
+        code = _headless_run(d, cid, None, 0.05, as_json=False)
+    finally:
+        metadb.set_setting("backend", previous_backend, "global")
+
+    captured = capsys.readouterr()
+    match = re.search(r"run (run_[0-9a-f]+)", captured.err)
+    assert code == 124 and match, captured.err
+    run_id = match.group(1)
+    owner = d.run_index[run_id]
+    assert owner.name == "local-subprocess" and owner.status(run_id).status == "cancelled"
+    assert run_id not in owner._procs, "terminal cancellation was published before the child was reaped"
+    assert metadb.get_run_state(run_id)["status"] == "cancelled"
+    assert not os.path.exists(output_uri)
+    time.sleep(0.2)
+    assert not os.path.exists(output_uri), "the reaped child published after the CLI returned"
+    assert not any(t.name == table_name for t in d.catalog.list_tables(None))
+
+
+def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, capsys):
+    # A checkpoint makes the RunController publish an intermediate region parquet before the final write.
+    # Hold that handoff, time out the CLI, and prove both the handoff and user output stay unpublished.
+    import glob
+    import re
+    import uuid
+
+    from hub import metadb
+    from hub.cli import _headless_run
+    from hub.deps import get_deps
+
+    d = get_deps()
+    source = _seq_parquet(tmp_path, n=20)
+    suffix = uuid.uuid4().hex
+    output_name = f"cli_region_timeout_{suffix}.parquet"
+    table_name = output_name.removesuffix(".parquet")
+    output_uri = d.storage.output_uri(table_name, ".parquet")
+    cid = f"cli_region_timeout_{suffix}"
+    client.put(f"/api/canvas/{cid}", json={
+        "id": cid, "name": cid, "version": 1,
+        "nodes": [
+            N("src", "source", {"uri": source}),
+            {"id": "checkpoint", "type": "filter", "position": {"x": 0, "y": 0},
+             "data": {"config": {"predicate": "v >= 0", "checkpoint": True}}},
+            N("wr", "write", {"filename": output_name, "writeMode": "overwrite"}),
+        ],
+        "edges": [E("src", "checkpoint"), E("checkpoint", "wr")],
+    })
+
+    region_root = os.path.join(d.workspace, "regions")
+    before = set(glob.glob(os.path.join(region_root, "*")))
+    resolve = d.resolve_adapter
+    real = resolve(os.path.join(region_root, "probe.parquet"))
+    entered = False
+
+    class _SlowRegionAdapter:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def write(self, uri, rel, mode="overwrite", partition_by=None, cancelled=None):
+            nonlocal entered
+            entered = True
+            assert cancelled is not None
+            deadline = time.monotonic() + 5
+            while not cancelled() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            return real.write(uri, rel, mode, partition_by=partition_by, cancelled=cancelled)
+
+    slow = _SlowRegionAdapter()
+    monkeypatch.setattr(d, "resolve_adapter",
+                        lambda uri: slow if os.path.dirname(str(uri)) == region_root else resolve(uri))
+    previous_backend = metadb.get_setting("backend", "global", default="") or ""
+    metadb.set_setting("backend", "local-out-of-core", "global")
+    try:
+        code = _headless_run(d, cid, "wr", 0.01, as_json=False)
+    finally:
+        metadb.set_setting("backend", previous_backend, "global")
+
+    captured = capsys.readouterr()
+    match = re.search(r"run (run_[0-9a-f]+)", captured.err)
+    assert code == 124 and match and entered, captured.err
+    run_id = match.group(1)
+    assert d.run_index[run_id] is d.controller and d.controller.status(run_id).status == "cancelled"
+    assert metadb.get_run_state(run_id)["status"] == "cancelled"
+    assert not os.path.exists(output_uri)
+    assert set(glob.glob(os.path.join(region_root, "*"))) == before, "cancelled handoff published late"
+    assert not any(t.name == table_name for t in d.catalog.list_tables(None))
+
+
+def test_local_overwrite_cancel_fence_preserves_previous_output(tmp_path):
+    # The local adapter writes a temp sibling first. A cancellation that arrives after staging but before
+    # os.replace must discard that temp and leave the previously published dataset byte-for-byte readable.
+    import glob
+
+    import duckdb
+
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter
+    from hub.plugins.runner import _CancelToken
+
+    output = str(tmp_path / "fenced.parquet")
+    cancel_file = tmp_path / "cancel.requested"
+    duckdb.connect().execute(f"COPY (SELECT 1 AS value) TO '{output}' (FORMAT PARQUET)")
+    checks = 0
+    token = _CancelToken(cancel_file.exists)
+
+    def cancelled():
+        nonlocal checks
+        checks += 1
+        if checks == 3:  # after row count + pre-write check: staging is complete, publish has not happened
+            assert glob.glob(output + ".tmp-*"), "test did not reach the staging-to-publish boundary"
+            cancel_file.touch()  # the same external request file the isolated child observes
+        return token.is_set()
+
+    with db.run_scope():
+        replacement = db.conn().sql("SELECT 2 AS value")
+        with pytest.raises(RuntimeError, match="cancelled before output commit"):
+            DuckDBAdapter().write(output, replacement, cancelled=cancelled)
+    assert duckdb.connect().read_parquet(output).fetchall() == [(1,)]
+    assert not glob.glob(output + ".tmp-*"), "cancelled staging file leaked"
+
+
+def test_headless_sigint_cancels_and_returns_run_identity(monkeypatch, capsys):
+    # KeyboardInterrupt is the in-process form of SIGINT. It follows the same cancel/ack path, returns the
+    # conventional shell code 130, and emits a machine-readable run identity under --json.
+    import json
+
+    import hub.routers.runs as runs_mod
+    from hub.cli import _headless_run
+    from hub.deps import get_deps
+    from hub.models import RunStatus
+
+    cid = "cli_sigint_canvas"
+    client.put(f"/api/canvas/{cid}", json={
+        "id": cid, "name": cid, "version": 1, "nodes": [], "edges": [],
+    })
+    state = RunStatus(run_id="run_sigint_test", status="running", placement="local", per_node=[])
+
+    class _InterruptOwner:
+        cancelled = False
+        cancel_acknowledges_stop = True
+
+        def status(self, run_id):
+            assert run_id == state.run_id
+            if not self.cancelled:
+                raise KeyboardInterrupt
+            return state
+
+        def cancel(self, run_id):
+            assert run_id == state.run_id
+            self.cancelled = True
+            state.status = "cancelled"
+            return state
+
+    owner = _InterruptOwner()
+    monkeypatch.setattr(runs_mod, "start_run", lambda *args, **kwargs: (state, owner))
+    code = _headless_run(get_deps(), cid, None, 30.0, as_json=True)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert code == 130 and owner.cancelled
+    assert payload["run_id"] == state.run_id and payload["status"] == "cancelled"
+    assert payload["exit_reason"] == "interrupted by SIGINT" and payload["cancel_acknowledged"] is True
+    assert state.run_id in captured.err and "SIGINT" in captured.err
+
+
+def test_cli_does_not_trust_an_eager_plugin_cancel_status():
+    # Legacy/plugin backends may relabel a run cancelled while their driver still owns live work. Without
+    # the explicit acknowledgement seam, CLI cancellation must time out as unacknowledged, not claim safety.
+    from hub.cli import _cancel_and_wait
+    from hub.models import RunStatus
+
+    state = RunStatus(run_id="run_eager_plugin", status="running", placement="distributed", per_node=[])
+
+    class _EagerPlugin:
+        def cancel(self, _run_id):
+            state.status = "cancelled"
+            return state
+
+        def status(self, _run_id):
+            return state
+
+    class _NoDurableState:
+        @staticmethod
+        def get_run_state(_run_id):
+            return None
+
+    final, acknowledged, error = _cancel_and_wait(_EagerPlugin(), state.run_id, state,
+                                                   _NoDurableState(), timeout_s=0)
+    assert final.status == "cancelled" and acknowledged is False and error is None
 
 
 def test_headless_run_canvas_params(tmp_path):
@@ -5882,6 +6206,7 @@ def test_move_tier_copies_a_region_parquet():
     # reuse a prior run's result on a different tier instead of recomputing). Content must be preserved.
     import os as _os
     import tempfile
+    import threading
     from hub import db
     from hub.tiers import Tier
     d = get_deps()
@@ -5890,10 +6215,68 @@ def test_move_tier_copies_a_region_parquet():
         dst = _os.path.join(tmp, "sub", "dst.parquet")
         with db.run_scope():
             db.conn().sql("SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,name)").write_parquet(src)
-        d.controller._move_tier(src, dst, Tier("local", _os.path.join(tmp, "sub"), 0))
+        d.controller._move_tier(src, dst, Tier("local", _os.path.join(tmp, "sub"), 0), threading.Event())
         assert _os.path.exists(dst)
         with db.run_scope():
             assert db.conn().read_parquet(dst).aggregate("count(*) AS n").fetchone()[0] == 2
+
+
+def test_controller_region_cancel_fences_staged_handoff(tmp_path, monkeypatch):
+    # Region handoffs used to call relation.write_parquet(out_uri) directly. Land cancellation exactly
+    # after the replacement parquet is staged and prove the controller never publishes the handoff.
+    import glob
+    import threading
+
+    from hub.deps import Deps
+    from hub.models import Graph, ResourceSpec
+    from hub.planner import Region
+
+    workspace = tmp_path / "region-ws"
+    data_dir = tmp_path / "region-data"
+    workspace.mkdir()
+    data_dir.mkdir()
+    d = Deps(str(workspace), str(data_dir))
+    source = _seq_parquet(tmp_path, n=10)
+    graph = Graph(**{"id": "region_cancel", "version": 1,
+                     "nodes": [N("s", "source", {"uri": source})], "edges": []})
+    region = Region(id="r", node_ids={"s"}, output_node="s", backend="default", worker=None,
+                    requires=ResourceSpec(), cut_inputs=[])
+    subgraph = d.controller._subgraph(graph, region, {})
+    key = d.runner._plan_hash(subgraph, "s")
+    output = str(workspace / "regions" / f"r_{key}.parquet")
+    cancel = threading.Event()
+    run_id = "run_region_cancel_fence"
+    d.controller._cancel[run_id] = cancel
+    resolve = d.resolve_adapter
+    real = resolve(output)
+    checks = 0
+
+    class _FenceAdapter:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def write(self, uri, rel, mode="overwrite", partition_by=None, cancelled=None):
+            nonlocal checks
+
+            def fence():
+                nonlocal checks
+                checks += 1
+                if checks == 3:
+                    assert glob.glob(output + ".tmp-*"), "region handoff did not reach its publish fence"
+                    cancel.set()
+                return bool(cancelled and cancelled())
+
+            return real.write(uri, rel, mode, partition_by=partition_by, cancelled=fence)
+
+    monkeypatch.setattr(d, "resolve_adapter", lambda uri: _FenceAdapter() if uri == output else resolve(uri))
+    monkeypatch.setattr(d.controller, "_backend_runner", lambda *args, **kwargs: d.runner)
+    try:
+        with pytest.raises(RuntimeError, match="cancelled before output commit"):
+            d.controller._materialize(run_id, graph, region, {}, [region])
+    finally:
+        d.controller._cancel.pop(run_id, None)
+    assert cancel.is_set() and not os.path.exists(output)
+    assert not glob.glob(output + ".tmp-*"), "cancelled region staging file leaked"
 
 
 def test_row_estimate_uses_the_shared_estimator():
@@ -6064,6 +6447,23 @@ def test_dist_cancel_cancels_every_concurrent_subrun_and_await_survives_dropped_
             def cancel(self, _sid): pass
         s = ctrl._await(_Poller(), "sub_x", cancel_run="run_no_such_key")
         assert s.status == "done"  # polled to completion without KeyError
+
+        # A Ray-like legacy backend may report cancelled before its driver stops. Without the explicit
+        # acknowledgement seam, the controller must keep polling rather than finalize the logical run.
+        eager_polls = ["cancelled", "cancelled", "done"]
+
+        class _EagerBackend:
+            calls = 0
+
+            def status(self, sub_id):
+                self.calls += 1
+                return RunStatus(run_id=sub_id, status=eager_polls.pop(0), placement="distributed", per_node=[])
+
+            def cancel(self, _sub_id):
+                pass
+
+        eager = _EagerBackend()
+        assert ctrl._await(eager, "sub_eager").status == "done" and eager.calls == 3
     finally:
         ctrl.runs.pop(rid, None)
         ctrl._cancel.pop(rid, None)

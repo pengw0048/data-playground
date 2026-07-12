@@ -10,6 +10,7 @@ Content-addressed: an unchanged plan (by node config + source fingerprint) is se
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import threading
@@ -65,8 +66,28 @@ def _diagnose(msg: str) -> str | None:
 _MAX_RUNS = 100          # cap retained run history / cache so a long-lived kernel doesn't grow forever
 
 
+class _CancelToken:
+    """Internal cancel Event plus an optional external predicate (the subprocess cancel-request file)."""
+
+    def __init__(self, external=None):
+        self._event = threading.Event()
+        self._external = external
+
+    def set(self) -> None:
+        self._event.set()
+
+    def is_set(self) -> bool:
+        if self._event.is_set():
+            return True
+        try:
+            return bool(self._external and self._external())
+        except Exception:  # noqa: BLE001 — a broken external probe must not fail the run
+            return False
+
+
 class LocalRunner:
     name = "local-out-of-core"
+    cancel_acknowledges_stop = True  # cancelled is set only after the adapter can no longer publish
 
     def __init__(self, resolve_adapter, registry, catalog, workspace: str, node_builders=None,
                  node_specs=None, storage=None):
@@ -88,7 +109,7 @@ class LocalRunner:
         self.node_builders = node_builders if node_builders is not None else {}
         self.node_specs = node_specs if node_specs is not None else {}
         self.runs: dict[str, RunStatus] = {}
-        self._cancel: dict[str, threading.Event] = {}
+        self._cancel: dict[str, _CancelToken] = {}
         self._scopes: dict[str, object] = {}  # run_id -> db._Scope, so cancel interrupts THIS run's cursor
         self._cache: dict[str, dict] = {}
         self._lock = threading.Lock()
@@ -164,14 +185,14 @@ class LocalRunner:
 
     # -- run --------------------------------------------------------------- #
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
-            placement: Placement, run_id: str | None = None) -> RunStatus:
+            placement: Placement, run_id: str | None = None, cancel_check=None) -> RunStatus:
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         status = RunStatus(run_id=run_id, status="queued", placement=placement, per_node=per_node,
                            target_node_id=target_node_id)
         with self._lock:
             self.runs[run_id] = status
-            self._cancel[run_id] = threading.Event()
+            self._cancel[run_id] = _CancelToken(cancel_check)
             self._evict()
         self._emit(graph, status)  # persist 'queued' before the worker starts (pollable on any instance)
         threading.Thread(target=self._execute, args=(run_id, plan, graph, target_node_id), daemon=True).start()
@@ -223,13 +244,16 @@ class LocalRunner:
                 for step in plan.steps:
                     if cancel.is_set():
                         status.status = "cancelled"
+                        for p in status.per_node:
+                            if p.status != "done":
+                                p.status = "cancelled"
                         return
                     pn = next((p for p in status.per_node if p.node_id == step.node_id), None)
                     if pn:
                         pn.status = "running"
                     t0 = time.time()
                     if step.kind == "write":
-                        rows_seen = self._commit_write(nm[step.node_id], graph, engine, status, cached)
+                        rows_seen = self._commit_write(nm[step.node_id], graph, engine, status, cached, cancel)
                     elif step.kind == "assert":
                         rows_seen = self._check_assert(nm[step.node_id], engine)  # violation count; may raise
                     else:
@@ -249,8 +273,15 @@ class LocalRunner:
                 # "rows" is the violation count from _check_assert (already set), and re-counting would
                 # rebuild — and re-raise — a warn-severity assert's un-evaluable predicate (defeating warn).
                 if target and nm.get(target) and nm[target].type not in ("write", "assert"):
-                    rows_seen = self._materialize_result(target, engine, status, cached, phash)
+                    rows_seen = self._materialize_result(target, engine, status, cached, phash, cancel)
                     status.rows_processed = rows_seen
+
+                # Resolve the last-instruction race explicitly. If no output crossed its commit point,
+                # cancellation wins before `done`. Once output_uri is set, publication/reuse already won;
+                # report done truthfully (the CLI still exits 124/130 and includes that terminal state)
+                # rather than claim cancelled while a committed artifact exists.
+                if cancel.is_set() and not status.output_uri:
+                    raise RuntimeError("run cancelled before completion")
 
                 # set the final counts BEFORE flipping to 'done' — a client polls in another thread and
                 # reads a terminal status eagerly; the finally sets these too late, so a poll could
@@ -265,8 +296,8 @@ class LocalRunner:
             except Exception as e:  # noqa: BLE001
                 if cancel.is_set():
                     status.status = "cancelled"  # an interrupted step is a cancel, not a failure
-                    for p in status.per_node:  # settle the interrupted node too (else it animates forever)
-                        if p.status == "running":
+                    for p in status.per_node:  # settle interrupted + not-yet-started nodes too
+                        if p.status != "done":
                             p.status = "cancelled"
                 else:
                     status.status = "failed"
@@ -314,8 +345,27 @@ class LocalRunner:
             return cached["rows"]
         return int(engine.relation(node_id).aggregate("count(*) AS n").fetchone()[0])
 
+    @staticmethod
+    def _adapter_write(adapter, uri: str, rel, mode: str, cancel: _CancelToken, **kwargs) -> dict:
+        """Invoke an adapter with the optional cancellation fence when it supports that seam.
+
+        Older/plugin adapters keep their existing signature. They still receive a pre-call cancellation
+        check, but only adapters accepting ``cancelled`` can fence a long write at its publish point.
+        """
+        if cancel.is_set():
+            raise RuntimeError("run cancelled before output commit")
+        try:
+            params = inspect.signature(adapter.write).parameters.values()
+            supports_fence = any(p.name == "cancelled" or p.kind == inspect.Parameter.VAR_KEYWORD
+                                 for p in params)
+        except (TypeError, ValueError):
+            supports_fence = False
+        if supports_fence:
+            kwargs["cancelled"] = cancel.is_set
+        return adapter.write(uri, rel, mode, **kwargs)
+
     def _materialize_result(self, node_id: str, engine: BuildEngine, status: RunStatus,
-                            cached: dict | None, phash: str) -> int:
+                            cached: dict | None, phash: str, cancel: _CancelToken) -> int:
         """A non-write target's full result → a durable parquet artifact so the UI can page the exact
         rows a full pass produced (an aggregate/sort a sample can't preview) and they survive a restart
         (P0-UX-01). CONTENT-ADDRESSED by the plan hash (`__result_<phash>`): identical content shares one
@@ -330,7 +380,7 @@ class LocalRunner:
             return int(cached.get("rows") or 0)
         rel = engine.relation(node_id)
         uri = self.storage.output_uri(f"__result_{phash}", ".parquet")  # content-addressed run result
-        res = self.resolve_adapter(uri).write(uri, rel, "overwrite")
+        res = self._adapter_write(self.resolve_adapter(uri), uri, rel, "overwrite", cancel)
         status.output_uri = res.get("uri", uri)
         status.output_table = None  # a run result, not a catalog table (don't clutter the Tables view)
         prune = getattr(self.storage, "prune_results", None)  # coarse newest-N GC so results don't pile up
@@ -400,10 +450,12 @@ class LocalRunner:
             raise RuntimeError(f"schema contract on '{title}' violated — {'; '.join(parts)}")
 
     def _commit_write(self, node, graph: Graph, engine: BuildEngine, status: RunStatus,
-                      cached: dict | None) -> int:
+                      cached: dict | None, cancel: _CancelToken) -> int:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         from hub.sinks import SinkSpec, commit_sink
         spec = SinkSpec.from_config(cfg, node.data.get("title") if isinstance(node.data, dict) else None)
+        if cancel.is_set():
+            raise RuntimeError("run cancelled before output commit")
         # content-addressed skip: an identical overwrite plan already wrote this, so re-running is a
         # no-op. append is NOT idempotent (it must add a part every run), so it never uses the cache.
         if spec.mode != "append" and cached and cached.get("table") and cached.get("uri") and self._output_exists(cached["uri"]):
@@ -416,7 +468,12 @@ class LocalRunner:
         # route by the wired output PORT (source_handle) — a write off a multi-output node must
         # persist that port's data, not the default/first one. Mirrors BuildEngine._inputs.
         parent_rel = engine.relation(inc[0].source, inc[0].source_handle)
-        committed = commit_sink(spec, parent_rel, self.workspace, self.storage, self.resolve_adapter)
+        committed = commit_sink(
+            spec, parent_rel, self.workspace, self.storage, self.resolve_adapter,
+            write_adapter=lambda adapter, uri, rel, mode, **kwargs: self._adapter_write(
+                adapter, uri, rel, mode, cancel, **kwargs
+            ),
+        )
 
         parent_uris = [u for e in inc for u in [self._source_uri(nm_node=e.source, graph=graph)] if u]
         self.catalog.register_output(name=committed.name, uri=committed.uri, parents=parent_uris,
@@ -437,12 +494,13 @@ class LocalRunner:
 
     def cancel(self, run_id: str) -> RunStatus:
         st = self.runs[run_id]
-        # only cancel an in-flight run — never relabel a finished/failed one
+        # Request cancellation only. The worker publishes the terminal `cancelled` state after it has
+        # unwound past every possible commit point, so a caller can treat terminal status as acknowledgement
+        # instead of returning while this thread may still publish.
         if st.status in ("queued", "running"):
             if run_id in self._cancel:
                 self._cancel[run_id].set()
             scope = self._scopes.get(run_id)
             if scope is not None:
                 scope.interrupt()  # abort THIS run's cursor (base-conn interrupt wouldn't touch it)
-            st.status = "cancelled"
         return st

@@ -24,6 +24,8 @@ import uuid
 from hub.models import CompilePlan, Graph, PerNodeStatus, Placement, RunEstimate, RunStatus
 from hub.plugins.runner import _CONFIRM_ROWS, _MAX_RUNS
 
+_CANCEL_GRACE_S = 2.0  # cooperative child cancel first; then SIGTERM/SIGKILL for runaway native/Python code
+
 
 def _subrun_child_env() -> dict[str, str]:
     """A one-shot worker does not own control-plane persistence and receives no metadata identity."""
@@ -42,6 +44,7 @@ class SubprocessRunner:
         self.on_status = None    # optional (graph, status) hook — Deps wires it to DB-backed live status
         self.runs: dict[str, RunStatus] = {}
         self._procs: dict[str, subprocess.Popen] = {}
+        self._cancel_files: dict[str, str] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.Lock()
         # wall-clock deadline: a child that runs longer than this is hard-killed and the run fails, so a
@@ -106,11 +109,13 @@ class SubprocessRunner:
         run_id = status.run_id
         job_dir = tempfile.mkdtemp(prefix="dp-run-")
         status_file = os.path.join(job_dir, "status.json")
+        cancel_file = os.path.join(job_dir, "cancel.requested")
         job_file = os.path.join(job_dir, "job.json")
         with open(job_file, "w") as f:
             json.dump({"workspace": self.workspace, "dataDir": self.data_dir,
                        "graph": prepare_workload_graph(graph),
-                       "target": target, "statusFile": status_file, **job_extra}, f)
+                       "target": target, "statusFile": status_file,
+                       "cancelFile": cancel_file, **job_extra}, f)
         # A one-shot worker gets only runtime/data capabilities, never the hub metadata identity or
         # ambient signing/bootstrap/provider secrets. It creates a disposable local metadata DB itself.
         proc = subprocess.Popen([sys.executable, "-m", "hub.subrun", job_file],
@@ -118,6 +123,7 @@ class SubprocessRunner:
         with self._lock:
             self.runs[run_id] = status
             self._procs[run_id] = proc
+            self._cancel_files[run_id] = cancel_file
             self._evict()
         self._emit(graph, status)  # persist 'queued' to the DB (pollable on any instance / after restart)
         threading.Thread(target=self._watch, args=(run_id, proc, status_file, job_dir, graph, target), daemon=True).start()
@@ -141,11 +147,10 @@ class SubprocessRunner:
             self.runs.pop(victim, None)
             self._cancelled.discard(victim)
             self._procs.pop(victim, None)
+            self._cancel_files.pop(victim, None)
 
     def _read(self, run_id: str, status_file: str) -> RunStatus | None:
         """Merge progress, but hold a child terminal status for parent-side finalization."""
-        if run_id in self._cancelled:
-            return self.runs[run_id]  # don't let a stale child 'running' status overwrite cancellation
         try:
             with open(status_file) as f:
                 payload = json.load(f)
@@ -154,13 +159,15 @@ class SubprocessRunner:
         observed = RunStatus(**{**payload, "run_id": run_id})  # the child had its own run id
         if observed.status in ("done", "failed", "cancelled"):
             return observed
-        self.runs[run_id] = observed
+        if run_id not in self._cancelled:
+            self.runs[run_id] = observed
         return None
 
     def _watch(self, run_id: str, proc: subprocess.Popen, status_file: str, job_dir: str,
                graph: Graph, target: str | None) -> None:
         start = time.monotonic()
         deadline_hit = False
+        cancel_seen_at = None
         last = None
         terminal = None
         while True:
@@ -179,6 +186,19 @@ class SubprocessRunner:
                 time.sleep(0.1)
                 terminal = self._read(run_id, status_file)
                 break
+            if run_id in self._cancelled:
+                cancel_seen_at = cancel_seen_at or time.monotonic()
+                if time.monotonic() - cancel_seen_at > _CANCEL_GRACE_S:
+                    # The cooperative request reaches LocalRunner's cursor interrupt + pre-publish fence.
+                    # A runaway Python/native operation may ignore it; terminate only after the grace window.
+                    if proc.poll() is None:
+                        try:
+                            proc.terminate()
+                        except OSError:
+                            pass  # exited between poll and signal
+                    time.sleep(0.1)
+                    self._read(run_id, status_file)
+                    break
             if self.deadline_s and self.deadline_s > 0 and time.monotonic() - start > self.deadline_s:
                 deadline_hit = True           # runaway — hard-kill the child and fail the run
                 if proc.poll() is None:
@@ -188,10 +208,11 @@ class SubprocessRunner:
                 break
             time.sleep(0.15)
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=2 if run_id in self._cancelled else 5)
         except subprocess.TimeoutExpired:
             proc.kill()  # SIGTERM ignored (e.g. a C-level DuckDB loop) → force-reap so _watch can't hang
             proc.wait()
+        terminal = self._read(run_id, status_file) or terminal
         current = self.runs.get(run_id)
         st = terminal or (current.model_copy(deep=True) if current is not None else None)
         forced = bool(st and st.status in ("queued", "running"))  # exited without a terminal status
@@ -214,6 +235,10 @@ class SubprocessRunner:
                 pass
         # Finalize before publishing the terminal status. Otherwise a caller can observe `done` and query
         # the catalog while parent-side output registration is still in flight.
+        # Persist run history here (the child disables its own on_complete to avoid a daemon-thread
+        # race). We read the terminal status from the child's atomically-written status file, or the
+        # status we forced above on a crash/cancel — recording every terminal run, like the in-process
+        # backend, with no double-write.
         if st is not None and st.status in ("done", "failed", "cancelled"):
             if self.on_complete:
                 try:
@@ -226,17 +251,33 @@ class SubprocessRunner:
         shutil.rmtree(job_dir, ignore_errors=True)
         with self._lock:
             self._procs.pop(run_id, None)
+            self._cancel_files.pop(run_id, None)
 
     def status(self, run_id: str) -> RunStatus:
         return self.runs[run_id]
 
-    def cancel(self, run_id: str) -> RunStatus:
-        self._cancelled.add(run_id)  # so _watch reports 'cancelled', not 'failed', for the hard-killed child
+    def cancel_acknowledged(self, run_id: str) -> bool:
+        """True only once a cancelled child's process is observably gone/reaped."""
+        st = self.runs.get(run_id)
+        if st is None or st.status != "cancelled":
+            return False
         with self._lock:
             proc = self._procs.get(run_id)
-        if proc is not None and proc.poll() is None:
-            proc.terminate()  # hard kill — the isolation payoff
-        st = self.runs[run_id]
-        if st.status in ("queued", "running"):
-            st.status = "cancelled"
-        return st
+        return proc is None or proc.poll() is not None
+
+    def cancel(self, run_id: str) -> RunStatus:
+        with self._lock:
+            self._cancelled.add(run_id)  # hard-kill fallback resolves as cancelled, not failed
+            cancel_file = self._cancel_files.get(run_id)
+        if cancel_file:
+            try:
+                with open(cancel_file, "x"):
+                    pass
+            except FileExistsError:
+                pass
+            except OSError:
+                pass  # watcher still hard-kills after the bounded grace period
+        # _watch publishes `cancelled` only after wait()/kill() has reaped the child. Until then the status
+        # remains non-terminal, making terminal status a real stop acknowledgement rather than an optimistic
+        # label while the process could still commit an output.
+        return self.runs[run_id]

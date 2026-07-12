@@ -36,6 +36,8 @@ def _region_concurrency() -> int:
 
 
 class RunController:
+    cancel_acknowledges_stop = True  # cancelled is published only after in-flight region tasks unwind
+
     name = "run-controller"
 
     def __init__(self, deps, base, place_fn):
@@ -306,7 +308,10 @@ class RunController:
                         status.progress = _step_progress(status)
                         self._emit(graph, status)
             finally:
-                ex.shutdown(wait=False, cancel_futures=True)  # drop queued regions; don't block on running ones
+                # A cancellation's terminal state is an acknowledgement: wait for already-running region
+                # tasks to unwind after their sub-runs were cancelled. Failures retain the fast wait=False
+                # path; the CLI has its own bounded acknowledgement deadline if a remote backend ignores stop.
+                ex.shutdown(wait=cancel.is_set(), cancel_futures=True)
             if cancel.is_set():
                 status.status = "cancelled"
                 return
@@ -405,13 +410,15 @@ class RunController:
         # capture the cancel Event ONCE (don't subscript self._cancel each poll): a sibling region's
         # failure can pop self._cancel[cancel_run] while this orphaned poll is still running → KeyError.
         ev = self._cancel.get(cancel_run) if cancel_run else None
+        cancel_sent = False
+        from hub.backends import stop_acknowledged
         while True:
             s = backend.status(sub_id)
-            if s.status in ("done", "failed", "cancelled"):
+            if stop_acknowledged(backend, s):
                 return s
-            if ev is not None and ev.is_set():
+            if ev is not None and ev.is_set() and not cancel_sent:
                 backend.cancel(sub_id)
-                return backend.status(sub_id)
+                cancel_sent = True
             time.sleep(0.1)
 
     def _boundary_tier(self, region, regions):
@@ -426,7 +433,7 @@ class RunController:
                 reach.append(tier_mod.backend_reach(self._backend_runner(rc), rc.backend == "default"))
         return tier_mod.pick_tier(tier_mod.tiers(self.deps.workspace), reach)
 
-    def _move_tier(self, src_uri: str, dst_uri: str, dst_tier) -> None:
+    def _move_tier(self, src_uri: str, dst_uri: str, dst_tier, cancel) -> None:
         """Copy a materialized region parquet across tiers (cheaper than recomputing). DuckDB streams it;
         httpfs handles an object-store endpoint on either side."""
         from hub.plugins.adapters import is_object_uri
@@ -437,7 +444,8 @@ class RunController:
                 os.makedirs(dst_tier.prefix, exist_ok=True)  # DuckDB won't create a local file's parent dir
             # src may be a single file OR a directory of shards (a worker-direct write) — the adapter's
             # scan handles both (local isdir → dir-scan, object prefix → glob); consolidate into dst.
-            self.deps.resolve_adapter(src_uri).scan(src_uri).write_parquet(dst_uri)
+            rel = self.deps.resolve_adapter(src_uri).scan(src_uri)
+            self.base._adapter_write(self.deps.resolve_adapter(dst_uri), dst_uri, rel, "overwrite", cancel)
 
     def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], regions=None, uid: str | None = None) -> str:
         """Materialize an intermediate region's output to a durable, content-addressed parquet — reused
@@ -445,6 +453,9 @@ class RunController:
         in the target worker's PROCESS for a placed region (C3). The output lands on the tier reachable
         by both producer and consumers (local, or a shared object store for a remote handoff — Phase C)."""
         from hub import tiers as tier_mod
+        cancel = self._cancel.get(run_id) or threading.Event()
+        if cancel.is_set():
+            raise RuntimeError("run cancelled before region materialization")
         subg = self._subgraph(graph, region, ref_uri)
         key = self.base._plan_hash(subg, region.output_node)
         picked = self._boundary_tier(region, regions or [])
@@ -469,7 +480,7 @@ class RunController:
             alt = self.base._cache_get(f"{key}@{other.name}")
             if alt and alt.get("uri") and self.base._output_exists(alt["uri"]):
                 dst = tier.uri(f"{region.id}_{key}.parquet")
-                self._move_tier(alt["uri"], dst, tier)
+                self._move_tier(alt["uri"], dst, tier, cancel)
                 self.base._cache_put(ckey, {"uri": dst, "table": region.id, "rows": None})
                 return dst
         if tier.is_object:
@@ -485,7 +496,8 @@ class RunController:
                 eng = BuildEngine(subg, self.deps.resolve_adapter, self.deps.registry, full=True,
                                      node_builders=self.deps.node_builders, node_specs=self.deps.node_specs,
                                      pushdown=True, output_node=region.output_node)
-                eng.relation(region.output_node).write_parquet(out_uri)
+                rel = eng.relation(region.output_node)
+                self.base._adapter_write(self.deps.resolve_adapter(out_uri), out_uri, rel, "overwrite", cancel)
         else:
             # a placed backend may write a DIRECTORY of shards (worker-direct parallel write, e.g. Ray
             # Data) rather than the single file we suggested — honor the uri it actually produced. The
@@ -569,7 +581,7 @@ class RunController:
                 backend.cancel(sub_id)
             except Exception:  # noqa: BLE001
                 pass
-        st = self.runs.get(run_id)
-        if st and st.status in ("queued", "running"):
-            st.status = "cancelled"
-        return st
+        # _orchestrate publishes the terminal state only after all locally-owned sub-runs have acknowledged
+        # cancellation. Until then the logical run remains non-terminal, so clients do not mistake a request
+        # for completion while a region may still publish.
+        return self.runs.get(run_id)

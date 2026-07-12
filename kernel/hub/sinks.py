@@ -108,13 +108,15 @@ def preflight_sink(spec: SinkSpec, workspace: str, storage, resolve_adapter,
 
 
 def commit_sink(spec: SinkSpec, relation, workspace: str, storage, resolve_adapter,
-                target_uri: str | None = None) -> SinkCommit:
+                target_uri: str | None = None, write_adapter=None) -> SinkCommit:
     """Write a relation through the selected adapter using the normalized sink contract."""
 
     uri = preflight_sink(spec, workspace, storage, resolve_adapter, target_uri=target_uri)
     adapter = resolve_adapter(uri)
     kwargs = {"partition_by": spec.partition_by} if spec.partition_by else {}
-    result = adapter.write(uri, relation, spec.mode, **kwargs)
+    writer = write_adapter or (lambda selected, target, rel, mode, **opts:
+                               selected.write(target, rel, mode, **opts))
+    result = writer(adapter, uri, relation, spec.mode, **kwargs)
     return SinkCommit(
         name=spec.name,
         uri=result.get("uri", uri),
