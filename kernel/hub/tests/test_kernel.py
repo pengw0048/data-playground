@@ -7620,12 +7620,25 @@ def test_ray_typed_empty_collect_and_broadcast_join_keep_declared_schema(monkeyp
     collected = mod._collect_arrow(ZeroBlockDataset(collected_schema), purpose="typed-empty test")
     assert collected.num_rows == 0 and collected.schema == collected_schema
 
+    class ResultDataset:
+        def __init__(self, table):
+            self.table = table
+
+        def schema(self, fetch_if_missing=True):
+            return self.table.schema
+
+        def to_pylist(self):
+            return self.table.to_pylist()
+
     class LeftDataset:
         def columns(self):
             return ["k", "left_value"]
 
+        def schema(self, fetch_if_missing=True):
+            return pa.schema([("k", pa.int64()), ("left_value", pa.string())])
+
         def map_batches(self, fn, **_kwargs):
-            return fn(pa.table({"k": [1], "left_value": ["left"]}))
+            return ResultDataset(fn(pa.table({"k": [1], "left_value": ["left"]})))
 
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda _refs: []))
     right_schema = pa.schema([("k", pa.int64()), ("right_value", pa.string())])
@@ -7636,10 +7649,125 @@ def test_ray_typed_empty_collect_and_broadcast_join_keep_declared_schema(monkeyp
     joined = object.__new__(mod.RayRunner)._build_join(
         step, {"left": LeftDataset(), "right": ZeroBlockDataset(right_schema)}
     )
-    assert joined.schema == pa.schema([
+    assert joined.schema() == pa.schema([
         ("k", pa.int64()), ("left_value", pa.string()), ("right_value", pa.string()),
     ])
     assert joined.to_pylist() == [{"k": 1, "left_value": "left", "right_value": None}]
+
+
+def test_ray_empty_schema_lineage_covers_supported_ops_and_declared_udfs(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    import pyarrow as pa
+
+    mod = _load_dp_ray()
+    runner = object.__new__(mod.RayRunner)
+    monkeypatch.setenv("DP_RAY_SHUFFLE_PARTITIONS", "2")
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda refs: refs))
+
+    class SchemaDroppingDataset:
+        def __init__(self, refs=None):
+            self.refs = list(refs or [])
+
+        def schema(self, fetch_if_missing=True):
+            return None
+
+        def materialize(self):
+            return self
+
+        def count(self):
+            return 0
+
+        def size_bytes(self):
+            return 0
+
+        def iter_batches(self, **_kwargs):
+            return iter(())
+
+        def to_arrow_refs(self):
+            return self.refs
+
+        def map_batches(self, _fn, **_kwargs):
+            return SchemaDroppingDataset()
+
+        def repartition(self, *_args, **_kwargs):
+            return SchemaDroppingDataset()
+
+        def sort(self, *_args, **_kwargs):
+            return SchemaDroppingDataset(refs=[pa.table({})])
+
+    source_schema = pa.schema([("k", pa.int64()), ("v", pa.int64())])
+
+    def source():
+        return mod._remember_ray_schema(SchemaDroppingDataset(), source_schema)
+
+    filter_step = SimpleNamespace(
+        op="filter", inputs=[("src", None)],
+        config={"mode": "filter", "code": "def fn(row): return False", "onError": "raise"},
+    )
+
+    def empty_parent():
+        return runner._build(filter_step, {"src": source()})
+
+    assert mod._collect_arrow(empty_parent(), purpose="empty filter").schema == source_schema
+    relational = [
+        (SimpleNamespace(op="aggregate", inputs=[("src", None)],
+                         config={"groupBy": "k", "aggs": "count(*) AS n"}), ["k", "n"]),
+        (SimpleNamespace(op="window", inputs=[("src", None)],
+                         config={"partitionBy": "k", "orderBy": "v",
+                                 "expr": "row_number()", "as": "rn"}), ["k", "v", "rn"]),
+        (SimpleNamespace(op="dedup", inputs=[("src", None)], config={"on": ""}), ["k", "v"]),
+        (SimpleNamespace(op="sort", inputs=[("src", None)], config={"by": "k"}), ["k", "v"]),
+    ]
+    for step, names in relational:
+        table = mod._collect_arrow(runner._build(step, {"src": empty_parent()}), purpose=step.op)
+        assert table.num_rows == 0 and table.schema.names == names
+
+    right_schema = pa.schema([("k", pa.int64()), ("right_value", pa.string())])
+    right = mod._remember_ray_schema(SchemaDroppingDataset(refs=[pa.table({})]), right_schema)
+    join_step = SimpleNamespace(
+        inputs=[("left", None), ("right", None)], config={"on": "k", "how": "left"},
+    )
+    joined = runner._build_join(join_step, {"left": empty_parent(), "right": right})
+    assert mod._collect_arrow(joined, purpose="empty join").schema == pa.schema([
+        ("k", pa.int64()), ("v", pa.int64()), ("right_value", pa.string()),
+    ])
+
+    declared = SimpleNamespace(
+        op="flat_map", inputs=[("src", None)],
+        config={
+            "mode": "flat_map", "code": "def fn(row): return []", "onError": "raise",
+            "outputSchema": [{"name": "renamed", "type": "int"}],
+        },
+    )
+    declared_table = mod._collect_arrow(
+        runner._build(declared, {"src": source()}), purpose="declared empty map"
+    )
+    assert declared_table.schema == pa.schema([("renamed", pa.int64())])
+
+    undeclared = SimpleNamespace(
+        op="flat_map", inputs=[("src", None)],
+        config={"mode": "flat_map", "code": "def fn(row): return []", "onError": "raise"},
+    )
+    with pytest.raises(RuntimeError, match="did not expose an Arrow schema"):
+        mod._collect_arrow(runner._build(undeclared, {"src": source()}), purpose="unknown empty map")
+
+
+def test_ray_ir_carries_transform_output_schema_for_empty_results():
+    from hub.ir import lower_to_ir
+    from hub.models import Graph
+
+    deps = get_deps()
+    contract = [{"name": "renamed", "type": "int", "capabilities": []}]
+    graph = Graph(**{"id": "ray-schema-contract", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("events")}),
+        N("t", "transform", {
+            "mode": "flat_map", "code": "def fn(row): return []", "outputSchema": contract,
+        }),
+    ], "edges": [E("s", "t")]})
+    step = lower_to_ir(graph, "t", deps.node_specs).by_id()["t"]
+    assert step.config["outputSchema"] == contract
 
 
 def test_ray_whole_run_scopes_each_sink_attempt_by_step_and_unstripped_target(tmp_path):
@@ -7749,9 +7877,12 @@ def test_ray_native_object_parquet_read_never_scans_through_the_driver(tmp_path,
         def __init__(self, style, **kwargs):
             self.style, self.kwargs = style, kwargs
 
+    class DatasetPaths(list):
+        pass
+
     def read_parquet(paths, **kwargs):
         read_calls.append((paths, kwargs))
-        return paths
+        return DatasetPaths(paths)
 
     datasource.Partitioning = Partitioning
     ray_data.datasource = datasource
@@ -7810,7 +7941,9 @@ def test_ray_native_object_parquet_read_never_scans_through_the_driver(tmp_path,
     ]
 
 
-def test_ray_native_metadata_oracle_does_not_block_unrelated_run_scopes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("already_scoped", [False, True])
+def test_ray_native_metadata_oracle_does_not_block_unrelated_run_scopes(
+        tmp_path, monkeypatch, already_scoped):
     import threading
 
     import pyarrow as pa
@@ -7843,7 +7976,11 @@ def test_ray_native_metadata_oracle_does_not_block_unrelated_run_scopes(tmp_path
 
     def prove_native():
         try:
-            mod._native_parquet_plan(str(source), DuckDBAdapter())
+            if already_scoped:
+                with db.run_scope():
+                    mod._native_parquet_plan(str(source), DuckDBAdapter())
+            else:
+                mod._native_parquet_plan(str(source), DuckDBAdapter())
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -7957,9 +8094,17 @@ def test_ray_hive_native_plan_matches_adapter_schema_and_fails_closed_on_unprove
     workspace = tmp_path / "ws"
     workspace.mkdir()
     runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+
+    class DatasetTable:
+        def __init__(self, table):
+            self._table = table
+
+        def __getattr__(self, name):
+            return getattr(self._table, name)
+
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(
         put=lambda value: value,
-        data=SimpleNamespace(from_arrow_refs=lambda refs: pa.concat_tables(refs)),
+        data=SimpleNamespace(from_arrow_refs=lambda refs: DatasetTable(pa.concat_tables(refs))),
     ))
     sentinel_table = runner._build(SimpleNamespace(
         op="read", config={"uri": str(sentinel)},
@@ -8027,6 +8172,7 @@ def test_ray_typed_empty_paths_live_keep_pre_materialization_schema(tmp_path, mo
 
     ray = pytest.importorskip("ray")
     mod = _load_dp_ray()
+    runner = object.__new__(mod.RayRunner)
     empty_hive = tmp_path / "empty-hive" / "n=1"
     empty_hive.mkdir(parents=True)
     pq.write_table(
@@ -8037,40 +8183,127 @@ def test_ray_typed_empty_paths_live_keep_pre_materialization_schema(tmp_path, mo
     expected_hive_schema = pa.schema([("v", pa.int64()), ("n", pa.int64())])
     assert hive_plan["schema"] == expected_hive_schema
 
-    empty_right = tmp_path / "empty-right.parquet"
+    source = tmp_path / "source.parquet"
+    pq.write_table(pa.table({"k": [1, 2], "v": [10, 20]}), source)
+    source_plan = mod._native_parquet_plan(str(source), DuckDBAdapter())
+    source_schema = pa.schema([("k", pa.int64()), ("v", pa.int64())])
+
+    right_source = tmp_path / "right.parquet"
     right_schema = pa.schema([("k", pa.int64()), ("right_value", pa.string())])
-    pq.write_table(pa.Table.from_batches([], schema=right_schema), empty_right)
-    right_plan = mod._native_parquet_plan(str(empty_right), DuckDBAdapter())
+    pq.write_table(pa.table({"k": [1], "right_value": ["right"]}, schema=right_schema), right_source)
+    right_plan = mod._native_parquet_plan(str(right_source), DuckDBAdapter())
+
+    filter_step = SimpleNamespace(
+        op="filter", inputs=[("src", None)],
+        config={"mode": "filter", "code": "def fn(row):\n    return False", "onError": "raise"},
+    )
+
+    def filtered(plan):
+        return runner._build(filter_step, {"src": mod._read_native_parquet(ray, plan)})
 
     monkeypatch.setenv("RAY_DATA_DISABLE_PROGRESS_BARS", "1")
+    monkeypatch.setenv("DP_RAY_SHUFFLE_PARTITIONS", "2")
     ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
     try:
+        # A source that is already empty keeps its native logical schema.
+        direct_empty = mod._collect_arrow(
+            mod._read_native_parquet(ray, hive_plan), purpose="live native empty source"
+        )
+        assert direct_empty.schema == expected_hive_schema
+
+        # A supported transform can erase every Ray block and both of Ray's schema() surfaces. Driver-side
+        # lineage must still type worker-direct publication and bounded collection without re-running it.
         output = str(tmp_path / "typed-empty.attempt-live")
         assert mod._write_worker_direct_parquet(
-            mod._read_native_parquet(ray, hive_plan), output, attempt_id="live-empty"
+            filtered(source_plan), output, attempt_id="live-empty"
         ) == (0, output)
         manifest = read_manifest(output)
         assert manifest is not None and validate_shards(output, manifest)
-        assert pq.read_table(os.path.join(output, "part-000000.parquet")).schema == expected_hive_schema
+        assert pq.read_table(os.path.join(output, "part-000000.parquet")).schema == source_schema
 
         collected = mod._collect_arrow(
-            mod._read_native_parquet(ray, hive_plan), purpose="live typed-empty collect"
+            filtered(source_plan), purpose="live typed-empty collect"
         )
-        assert collected.num_rows == 0 and collected.schema == expected_hive_schema
+        assert collected.num_rows == 0 and collected.schema == source_schema
 
         left = ray.data.from_items([{"k": 1, "left_value": "left"}], override_num_blocks=1)
-        step = SimpleNamespace(
+        right_empty_join = SimpleNamespace(
             inputs=[("left", None), ("right", None)],
             config={"on": "k", "how": "left"},
         )
-        joined = object.__new__(mod.RayRunner)._build_join(
-            step, {"left": left, "right": mod._read_native_parquet(ray, right_plan)}
+        joined = runner._build_join(
+            right_empty_join, {"left": left, "right": filtered(right_plan)}
         ).materialize()
         joined_schema = getattr(joined.schema(), "base_schema", joined.schema())
         assert joined_schema == pa.schema([
             ("k", pa.int64()), ("left_value", pa.string()), ("right_value", pa.string()),
         ])
         assert joined.take_all() == [{"k": 1, "left_value": "left", "right_value": None}]
+
+        # A non-empty zero-column ref (Ray's empty sort representation) must use its lineage hint instead
+        # of entering the `if refs` branch as an untyped table.
+        sorted_empty = runner._build(SimpleNamespace(
+            op="sort", inputs=[("src", None)], config={"by": "k"},
+        ), {"src": filtered(right_plan)})
+        sort_joined = runner._build_join(
+            right_empty_join, {"left": left, "right": sorted_empty}
+        ).materialize()
+        assert sort_joined.take_all() == [{"k": 1, "left_value": "left", "right_value": None}]
+
+        # Every claimed relational operator has an explicit empty-schema rule; left-empty join derives
+        # its own projection instead of inheriting either side.
+        relational = [
+            (SimpleNamespace(op="aggregate", inputs=[("src", None)],
+                             config={"groupBy": "k", "aggs": "count(*) AS n"}), ["k", "n"]),
+            (SimpleNamespace(op="window", inputs=[("src", None)],
+                             config={"partitionBy": "k", "orderBy": "v",
+                                     "expr": "row_number()", "as": "rn"}), ["k", "v", "rn"]),
+            (SimpleNamespace(op="dedup", inputs=[("src", None)], config={"on": ""}), ["k", "v"]),
+            (SimpleNamespace(op="sort", inputs=[("src", None)], config={"by": "k"}), ["k", "v"]),
+        ]
+        for step, expected_names in relational:
+            table = mod._collect_arrow(
+                runner._build(step, {"src": filtered(source_plan)}),
+                purpose=f"live empty {step.op}",
+            )
+            assert table.num_rows == 0 and table.schema.names == expected_names
+
+        left_empty = filtered(source_plan)
+        left_empty_join = SimpleNamespace(
+            inputs=[("left", None), ("right", None)], config={"on": "k", "how": "left"},
+        )
+        joined_empty = mod._collect_arrow(
+            runner._build_join(
+                left_empty_join,
+                {"left": left_empty, "right": mod._read_native_parquet(ray, right_plan)},
+            ),
+            purpose="live left-empty join",
+        )
+        assert joined_empty.num_rows == 0
+        assert joined_empty.schema.names == ["k", "v", "right_value"]
+
+        declared_flat_map = SimpleNamespace(
+            op="flat_map", inputs=[("src", None)],
+            config={
+                "mode": "flat_map", "code": "def fn(row):\n    return []", "onError": "raise",
+                "outputSchema": [{"name": "renamed", "type": "int"}],
+            },
+        )
+        declared_empty = mod._collect_arrow(
+            runner._build(declared_flat_map, {"src": mod._read_native_parquet(ray, source_plan)}),
+            purpose="live declared empty map",
+        )
+        assert declared_empty.schema == pa.schema([("renamed", pa.int64())])
+
+        undeclared_flat_map = SimpleNamespace(
+            op="flat_map", inputs=[("src", None)],
+            config={"mode": "flat_map", "code": "def fn(row):\n    return []", "onError": "raise"},
+        )
+        with pytest.raises(RuntimeError, match="did not expose an Arrow schema"):
+            mod._collect_arrow(
+                runner._build(undeclared_flat_map, {"src": mod._read_native_parquet(ray, source_plan)}),
+                purpose="live undeclared empty map",
+            )
     finally:
         ray.shutdown()
 
@@ -8116,7 +8349,7 @@ def test_ray_compatibility_sources_are_size_bounded_before_adapter_scan(tmp_path
     mod = _load_dp_ray()
     runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
     table = pa.table({"x": [1, 2]})
-    sentinel = object()
+    sentinel = SimpleNamespace()
     scans = []
     source = tmp_path / "small.csv"
     source.write_text("x\n1\n2\n")
@@ -8298,7 +8531,7 @@ def test_remote_ray_bounds_local_sources_and_never_dispatches_a_local_region_han
 
     monkeypatch.setenv("DP_RAY_REMOTE", "1")
     monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "1048576")
-    sentinel = object()
+    sentinel = SimpleNamespace()
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(
         put=lambda value: value,
         data=SimpleNamespace(

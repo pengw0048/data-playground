@@ -246,7 +246,7 @@ def _bounded_adapter_source(uri: str, adapter: object, ray):
             refs.append(ray.put(pa.Table.from_batches([batch], schema=schema)))
     if not refs:
         refs.append(ray.put(pa.Table.from_batches([], schema=schema)))
-    return ray.data.from_arrow_refs(refs)
+    return _remember_ray_schema(ray.data.from_arrow_refs(refs), schema)
 
 
 def _native_parquet_plan(uri: str, adapter: object) -> dict | None:
@@ -385,7 +385,7 @@ def _native_parquet_plan(uri: str, adapter: object) -> dict | None:
 def _read_native_parquet(ray, plan: dict, ray_opts: dict | None = None):
     from ray.data.datasource import Partitioning
 
-    return ray.data.read_parquet(
+    dataset = ray.data.read_parquet(
         plan["paths"], filesystem=plan["filesystem"], schema=plan["schema"],
         columns=plan["schema"].names,
         partitioning=Partitioning(
@@ -394,6 +394,7 @@ def _read_native_parquet(ray, plan: dict, ray_opts: dict | None = None):
         ),
         ray_remote_args=ray_opts or None,
     )
+    return _remember_ray_schema(dataset, plan["schema"])
 
 
 _ATTEMPT_COMPONENT_MAX_BYTES = 240
@@ -523,12 +524,80 @@ def _write_empty_parquet(uri: str, schema: object) -> None:
         pq.write_table(table, stream)
 
 
+_RAY_SCHEMA_HINT_ATTR = "_dp_known_arrow_schema"
+_UNKNOWN_RAY_SCHEMA = object()
+_NO_RAY_SCHEMA_HINT = object()
+
+
+def _arrow_schema(schema):
+    import pyarrow as pa
+
+    arrow_schema = getattr(schema, "base_schema", schema)
+    return arrow_schema if isinstance(arrow_schema, pa.Schema) else None
+
+
+def _remember_ray_schema(dataset, schema):
+    """Attach driver-side schema lineage; Ray Dataset transformations do not preserve custom attrs."""
+    arrow_schema = _arrow_schema(schema)
+    setattr(dataset, _RAY_SCHEMA_HINT_ATTR, arrow_schema if arrow_schema is not None else _UNKNOWN_RAY_SCHEMA)
+    return dataset
+
+
 def _known_ray_schema(dataset):
     """Return already-known schema metadata without asking Ray to execute or sample the Dataset."""
+    hint = getattr(dataset, _RAY_SCHEMA_HINT_ATTR, _NO_RAY_SCHEMA_HINT)
+    if hint is _UNKNOWN_RAY_SCHEMA:
+        return None
+    if hint is not _NO_RAY_SCHEMA_HINT:
+        return hint
     try:
-        return dataset.schema(fetch_if_missing=False)
+        schema = dataset.schema(fetch_if_missing=False)
     except TypeError:  # lightweight unit-test stand-ins expose the older no-argument shape
-        return dataset.schema()
+        schema = dataset.schema()
+    return schema
+
+
+def _ray_schema_explicitly_unknown(dataset) -> bool:
+    return getattr(dataset, _RAY_SCHEMA_HINT_ATTR, _NO_RAY_SCHEMA_HINT) is _UNKNOWN_RAY_SCHEMA
+
+
+def _declared_ray_schema(config: dict):
+    """Convert a resolved outputSchema contract to Arrow metadata without executing user code."""
+    columns = config.get("outputSchema")
+    if not isinstance(columns, list) or not columns:
+        return None
+    import duckdb
+
+    from hub.executors.engine import _duck_type
+
+    projections = []
+    for column in columns:
+        if not isinstance(column, dict) or not str(column.get("name") or ""):
+            raise RuntimeError("Ray transform outputSchema contains an unnamed column")
+        name = str(column["name"]).replace('"', '""')
+        projections.append(f'CAST(NULL AS {_duck_type(column.get("type"))}) AS "{name}"')
+    con = duckdb.connect()
+    try:
+        return con.execute(f"SELECT {', '.join(projections)} WHERE FALSE").to_arrow_table().schema
+    finally:
+        con.close()
+
+
+def _duckdb_empty_result_schema(sql: str, **inputs):
+    """Resolve relational output metadata from typed empty inputs on an isolated DuckDB connection."""
+    import pyarrow as pa
+    import duckdb
+
+    schemas = {name: _arrow_schema(schema) for name, schema in inputs.items()}
+    if any(schema is None for schema in schemas.values()):
+        return None
+    con = duckdb.connect()
+    try:
+        for name, schema in schemas.items():
+            con.register(name, pa.Table.from_batches([], schema=schema))
+        return con.execute(sql).to_arrow_table().schema
+    finally:
+        con.close()
 
 
 def _write_worker_direct_parquet(dataset, uri: str, *, attempt_id: str,
@@ -553,7 +622,12 @@ def _write_worker_direct_parquet(dataset, uri: str, *, attempt_id: str,
         materialized = dataset.materialize()
         rows = materialized.count()
         materialized_schema = _known_ray_schema(materialized)
-        schema = materialized_schema if materialized_schema is not None else declared_schema
+        unknown_schema = _ray_schema_explicitly_unknown(dataset)
+        schema = (
+            declared_schema if rows == 0 and declared_schema is not None
+            else None if rows == 0 and unknown_schema
+            else materialized_schema if materialized_schema is not None else declared_schema
+        )
         if rows == 0:
             _write_empty_parquet(out_dir, schema)
         else:
@@ -1312,7 +1386,14 @@ class RayRunner:
         if step.op in CLEAN_TRANSFORM_MODES:
             # `opts` (num_gpus / custom resources from the region's requires) makes Ray schedule each map
             # task onto a worker that has the resource — the planner's placement, honored on the cluster.
-            return parent.map_batches(_make_mapper(step.config), batch_format="pyarrow", **opts)
+            result = parent.map_batches(_make_mapper(step.config), batch_format="pyarrow", **opts)
+            if step.op == "filter":
+                empty_schema = _known_ray_schema(parent)
+            else:
+                # map/flat-map/batch UDFs may change columns. Only an explicit portable contract can
+                # type an all-empty result without re-running user code; otherwise terminal paths fail.
+                empty_schema = _declared_ray_schema(step.config)
+            return _remember_ray_schema(result, empty_schema)
         if step.op == "aggregate":
             return self._build_aggregate(step, parent, opts)
         if step.op == "window":
@@ -1321,7 +1402,9 @@ class RayRunner:
             # full-row DISTINCT: shuffle by ALL columns so identical rows colocate in one partition, then
             # DuckDB DISTINCT per partition. Every surviving row is identical to the dups it replaces, so
             # the result is deterministic + byte-identical (unlike keyed DISTINCT ON — gated out above).
-            return self._shuffle_duckdb(parent, list(parent.columns()), "SELECT DISTINCT * FROM _blk", opts)
+            parent_schema = _arrow_schema(_known_ray_schema(parent))
+            keys = parent_schema.names if parent_schema is not None else list(parent.columns())
+            return self._shuffle_duckdb(parent, keys, "SELECT DISTINCT * FROM _blk", opts)
         if step.op == "join":
             return self._build_join(step, datasets, opts)
         if step.op == "sort":
@@ -1332,7 +1415,9 @@ class RayRunner:
             # range-partitions into ONE block → a single ordered output file (a sharded write's parts read
             # back in arbitrary order would lose the global order). Matches the single-node engine, which
             # also writes one ordered file. `descending` is per-key.
-            return parent.sort(cols, descending=desc).repartition(1)
+            return _remember_ray_schema(
+                parent.sort(cols, descending=desc).repartition(1), _known_ray_schema(parent)
+            )
         raise RuntimeError(f"ray backend reached a non-clean op '{step.op}' (should have fallen back)")
 
     def _build_join(self, step, datasets, ray_opts=None):
@@ -1348,24 +1433,35 @@ class RayRunner:
         left = datasets[step.inputs[0][0]]                     # incoming-edge order = engine's left, right
         right_source = datasets[step.inputs[1][0]]
         declared_right_schema = _known_ray_schema(right_source)
+        right_schema_unknown = _ray_schema_explicitly_unknown(right_source)
         right = right_source.materialize()
         try:
             right_bytes = right.size_bytes()
         except Exception:  # noqa: BLE001 — fail closed instead of risking an unbounded driver collect
             right_bytes = None
         _require_driver_fallback(right_bytes, "broadcast join right side")
+        materialized_schema = _known_ray_schema(right)
+        materialized_arrow_schema = _arrow_schema(materialized_schema)
+        declared_right_arrow_schema = _arrow_schema(declared_right_schema)
         refs = ray.get(right.to_arrow_refs())                  # broadcast side: driver → workers
         if refs:
             right_tbl = pa.concat_tables(refs)
+            if right_tbl.num_rows == 0:
+                if declared_right_arrow_schema is None:
+                    raise RuntimeError("an empty broadcast side did not expose an Arrow schema")
+                right_tbl = pa.Table.from_batches([], schema=declared_right_arrow_schema)
         else:                                                  # right produced ZERO blocks — keep its TYPED
-            materialized_schema = _known_ray_schema(right)
-            sch = materialized_schema if materialized_schema is not None else declared_right_schema
-            arrow_schema = getattr(sch, "base_schema", sch)
-            if not isinstance(arrow_schema, pa.Schema):
+            right_arrow_schema = declared_right_arrow_schema or (
+                None if right_schema_unknown else materialized_arrow_schema
+            )
+            if right_arrow_schema is None:
                 raise RuntimeError("an empty broadcast side did not expose an Arrow schema")
-            right_tbl = pa.Table.from_batches([], schema=arrow_schema)  # typed NULLs, not null-typed crash
+            right_tbl = pa.Table.from_batches([], schema=right_arrow_schema)  # typed NULLs, not null crash
         cfg = step.config
-        sql = join_sql(list(left.columns()), list(right_tbl.column_names), "_l", "_r",
+        left_schema = _known_ray_schema(left)
+        left_arrow_schema = _arrow_schema(left_schema)
+        left_columns = left_arrow_schema.names if left_arrow_schema is not None else list(left.columns())
+        sql = join_sql(left_columns, list(right_tbl.column_names), "_l", "_r",
                        cfg.get("on"), cfg.get("condition"), cfg.get("how"))
 
         def _join_block(tbl):                                  # each LEFT block ⋈ the full broadcast right
@@ -1375,7 +1471,11 @@ class RayRunner:
             con.register("_r", right_tbl)
             return con.execute(sql).fetch_arrow_table()
 
-        return left.map_batches(_join_block, batch_format="pyarrow", batch_size=None, **(ray_opts or {}))
+        result = left.map_batches(
+            _join_block, batch_format="pyarrow", batch_size=None, **(ray_opts or {})
+        )
+        schema = _duckdb_empty_result_schema(sql, _l=left_schema, _r=right_tbl.schema)
+        return _remember_ray_schema(result, schema)
 
     def _shuffle_duckdb(self, parent, keys, sql, ray_opts=None):
         """The shared distributed-relational mechanism: RAY hash-shuffles `parent` by `keys` so every row
@@ -1391,6 +1491,7 @@ class RayRunner:
             con.register("_blk", tbl)
             return con.execute(sql).fetch_arrow_table()
 
+        input_schema = _known_ray_schema(parent)
         try:
             parts = int(os.environ.get("DP_RAY_SHUFFLE_PARTITIONS", "0"))
         except ValueError:
@@ -1403,7 +1504,11 @@ class RayRunner:
             parent = parent.materialize()
             parts = max(1, parent.num_blocks())
         shuffled = parent.repartition(parts, keys=keys)
-        return shuffled.map_batches(_run, batch_format="pyarrow", batch_size=None, **(ray_opts or {}))
+        result = shuffled.map_batches(
+            _run, batch_format="pyarrow", batch_size=None, **(ray_opts or {})
+        )
+        schema = _duckdb_empty_result_schema(sql, _blk=input_schema)
+        return _remember_ray_schema(result, schema)
 
     def _build_aggregate(self, step, parent, ray_opts=None):
         """Distributed GROUP BY: hash-shuffle by the group key, DuckDB `GROUP BY` per complete partition
@@ -1461,6 +1566,7 @@ def _collect_arrow(dataset, *, purpose: str = "Ray result"):
     import pyarrow as pa
 
     declared_schema = _known_ray_schema(dataset)
+    unknown_schema = _ray_schema_explicitly_unknown(dataset)
     materialized = dataset.materialize()
     try:
         size = materialized.size_bytes()
@@ -1480,7 +1586,7 @@ def _collect_arrow(dataset, *, purpose: str = "Ray result"):
     if batches:
         return pa.concat_tables(batches)
     materialized_schema = _known_ray_schema(materialized)
-    schema = materialized_schema if materialized_schema is not None else declared_schema
+    schema = declared_schema if declared_schema is not None else None if unknown_schema else materialized_schema
     arrow_schema = getattr(schema, "base_schema", schema)
     if not isinstance(arrow_schema, pa.Schema):
         raise RuntimeError("an empty Ray result did not expose an Arrow schema")

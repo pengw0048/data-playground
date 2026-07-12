@@ -77,7 +77,9 @@ worker-direct Parquet output; a local destination makes the graph fall back befo
 
 Append, partitioning, destination selection, and non-Parquet formats retain the shared sink contract;
 they are not silently converted into overwrite Parquet. Empty Parquet results publish one typed empty
-shard plus the manifest so their schema remains readable.
+shard plus the manifest so their schema remains readable. Filters, relational operators, and full-row
+deduplication preserve or derive empty-result schemas. Schema-changing Python transforms must declare
+`outputSchema`; without that contract, an empty result fails instead of publishing a misleading schema.
 
 ## What the validation gate proves
 
