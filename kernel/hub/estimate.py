@@ -26,7 +26,7 @@ from hub.models import Graph, GraphNode
 
 # ops whose result needs ~O(input) memory (a hash/sort build) → they set a region's working-set need;
 # streaming ops (scan/filter/select/map/sample/limit/write) need ~O(1) and don't.
-_BLOCKING = {"sort", "dedup", "aggregate", "join", "sql", "vector-search", "window"}
+_BLOCKING = {"sort", "dedup", "aggregate", "join", "sql", "vector-search", "window", "pivot"}
 # code ops: output cardinality can't be known without running them.
 _CODE = {"transform", "notebook", "opaque", "section", "loop"}
 
@@ -275,7 +275,7 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
             out[nid] = _sized(1, "bounded", w)
             continue
 
-        if t in ("aggregate", "join", "sql", "unnest") or t in _CODE or t in ("vector-search",):
+        if t in ("aggregate", "join", "sql", "unnest", "pivot") or t in _CODE or t in ("vector-search",):
             # genuinely unknown output cardinality — never fabricate. blocking per op type (drives placement).
             out[nid] = _sized(None, "unknown", w, is_blocking(t))
             continue

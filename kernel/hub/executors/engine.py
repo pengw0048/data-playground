@@ -623,6 +623,36 @@ class BuildEngine:
             cq = _ident(col)
             return db.conn().sql(f'SELECT * EXCLUDE ("{cq}"), unnest("{cq}") AS "{cq}" FROM {v}')
 
+        if t == "unpivot":
+            cols = [c.strip() for c in (cfg.get("columns") or "").split(",") if c.strip()]
+            if not cols:
+                return parent  # nothing chosen to fold → pass through
+            name_col = (cfg.get("nameColumn") or "name").strip() or "name"
+            value_col = (cfg.get("valueColumn") or "value").strip() or "value"
+            # keep NULL cells by DEFAULT so wide→long loses NO rows — DuckDB's bare UNPIVOT drops them
+            # (a row whose folded columns are all NULL would silently vanish). Opt out with includeNulls=false.
+            kn = cfg.get("includeNulls", True)
+            keep_nulls = kn if isinstance(kn, bool) else str(kn).strip().lower() not in ("false", "0", "no", "off", "")
+            nulls = "INCLUDE NULLS" if keep_nulls else "EXCLUDE NULLS"
+            v = self._view(parent, "up")  # wide → long: each chosen column becomes (name, value) rows
+            on = ", ".join(f'"{_ident(c)}"' for c in cols)  # the SQL-standard FROM-form takes the NULLS mode
+            return db.conn().sql(
+                f'SELECT * FROM {v} UNPIVOT {nulls} ("{_ident(value_col)}" FOR "{_ident(name_col)}" IN ({on}))')
+
+        if t == "pivot":
+            on_col = (cfg.get("pivotOn") or cfg.get("on") or "").strip()
+            using = (cfg.get("using") or "").strip()
+            if not on_col:
+                raise NotPreviewable(node, "pivot needs a column to pivot on")
+            if not self.full:  # PIVOT's output columns are the DISTINCT values of on_col → a sample would
+                raise NotPreviewable(node, "pivot reshapes rows into data-dependent columns — needs a full pass")
+            group = [c.strip() for c in (cfg.get("groupBy") or "").split(",") if c.strip()]
+            v = self._view(parent, "pv")  # long → wide: distinct values of on_col become columns
+            sql = f'PIVOT {v} ON "{_ident(on_col)}" USING {using or "count(*)"}'
+            if group:
+                sql += " GROUP BY " + ", ".join(f'"{_ident(c)}"' for c in group)
+            return db.conn().sql(sql)
+
         if t == "aggregate":
             if not self.full:
                 grouped = (cfg.get("groupBy") or cfg.get("group") or "").strip()

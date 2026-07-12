@@ -4906,6 +4906,65 @@ def test_window_fill_unnest_nodes(tmp_path):
         assert totals == {5050}  # sum(1..100), NOT sum of a 10-row sample — faithful despite sample_k=10
 
 
+def test_pivot_unpivot_nodes(tmp_path):
+    # ARC10 reshape built-ins: pivot (long → wide, out-of-core aggregate) + unpivot (wide → long),
+    # lowering to DuckDB PIVOT / UNPIVOT.
+    import duckdb
+    import pytest
+
+    from hub import db
+    from hub.executors.engine import BuildEngine, NotPreviewable
+    from hub.models import Graph
+    d = get_deps()
+
+    def eng(graph, **kw):
+        return BuildEngine(graph, d.resolve_adapter, d.registry, node_specs=d.node_specs,
+                           node_builders=d.node_builders, **kw)
+
+    # pivot: long (uid, cat, amt) → wide (uid, a, b) with sum(amt); u2 has no 'b' → NULL cell
+    pl = str(tmp_path / "long.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES ('u1','a',10),('u1','b',20),('u2','a',5)) t(uid,cat,amt)) TO '{pl}' (FORMAT PARQUET)")
+    gp = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pl}),
+        N("p", "pivot", {"pivotOn": "cat", "using": "sum(amt)", "groupBy": "uid"})], "edges": [E("s", "p")]})
+    with db.run_scope():
+        t = eng(gp, full=True).relation("p").order("uid").to_arrow_table()
+        assert set(t.column_names) == {"uid", "a", "b"}
+        assert {r["uid"]: (r["a"], r["b"]) for r in t.to_pylist()} == {"u1": (10, 20), "u2": (5, None)}
+
+    # pivot's output columns are the DISTINCT values of `cat` → a sample would produce wrong columns; refuse
+    with db.run_scope(), pytest.raises(NotPreviewable):
+        eng(gp, full=False, sample_k=1).relation("p")
+
+    # unpivot: wide (uid, a, b) → long (uid, name, value); previewable (row-wise, no aggregate). Data has a
+    # NULL cell in EACH row → default (includeNulls) must keep every (row × column) cell — DuckDB's bare
+    # UNPIVOT would silently drop the NULL cells (and a fully-NULL row would vanish entirely).
+    pw = str(tmp_path / "wide.parquet")
+    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES ('u1',10,NULL),('u2',NULL,5)) t(uid,a,b)) TO '{pw}' (FORMAT PARQUET)")
+    gu = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pw}),
+        N("u", "unpivot", {"columns": "a, b", "nameColumn": "name", "valueColumn": "value"})], "edges": [E("s", "u")]})
+    with db.run_scope():
+        t2 = eng(gu, full=True).relation("u").order("uid, name").to_arrow_table()
+        assert set(t2.column_names) == {"uid", "name", "value"}
+        assert sorted((r["uid"], r["name"], r["value"]) for r in t2.to_pylist()) == \
+            [("u1", "a", 10), ("u1", "b", None), ("u2", "a", None), ("u2", "b", 5)]  # NULLs kept, no row loss
+
+    # includeNulls=false → drop the NULL cells (the compact form)
+    gd = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pw}),
+        N("u", "unpivot", {"columns": "a, b", "includeNulls": False})], "edges": [E("s", "u")]})
+    with db.run_scope():
+        t3 = eng(gd, full=True).relation("u").to_arrow_table()
+        assert sorted((r["uid"], r["name"], r["value"]) for r in t3.to_pylist()) == [("u1", "a", 10), ("u2", "b", 5)]
+
+    # pivot's columns are data-dependent → its schema_only port is UNTYPED (not a misleading [uid] subset)
+    from hub.executors.schema import schema_for_graph
+    ports = schema_for_graph(gp, d.resolve_adapter, d.registry, node_builders=d.node_builders, node_specs=d.node_specs)
+    assert ports.get("p") is None, f"pivot port should be untyped (data-dependent columns), got {ports.get('p')}"
+
+    # pivot aggregates the full input → blocking (drives region placement); unpivot is row-wise → not
+    from hub import estimate as _est
+    assert _est.is_blocking("pivot") and not _est.is_blocking("unpivot")
+
+
 def test_failed_run_attributes_error_to_a_node_with_a_hint():
     # a failed run names WHERE it broke (per-node error) + WHY (a fix hint for common error classes),
     # not just a global banner. A bad column reference → the target node carries the error + hint.

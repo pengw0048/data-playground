@@ -16,7 +16,10 @@ from hub.models import Graph
 from hub.plugins.adapters import relation_columns
 
 # kinds whose output columns require EXECUTING code (Python / a real query) → untyped port when undeclared
-_UNTYPED = {"transform", "notebook", "section", "vector-search", "loop", "opaque"}
+# pivot's output columns are the DISTINCT DATA VALUES of the pivot column — unknowable without a full
+# pass, and the lazy limit=0 schema probe would report only the group keys (a misleading subset) — so
+# treat it as untyped (null port) rather than authoritative.
+_UNTYPED = {"transform", "notebook", "section", "vector-search", "loop", "opaque", "pivot"}
 
 
 def _norm_col(c) -> dict:
