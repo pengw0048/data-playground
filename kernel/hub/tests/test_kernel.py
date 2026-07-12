@@ -8026,6 +8026,224 @@ def test_ray_native_metadata_oracle_does_not_block_unrelated_run_scopes(
     assert errors == []
 
 
+def test_ray_native_parquet_fragment_selection_matches_adapter_rows(tmp_path):
+    from types import SimpleNamespace
+
+    import pyarrow as pa
+    import pyarrow.fs as pafs
+    import pyarrow.parquet as pq
+
+    from hub.plugins.adapters import DuckDBAdapter
+
+    mod = _load_dp_ray()
+    adapter = DuckDBAdapter()
+
+    names = tmp_path / "fragment-names"
+    names.mkdir()
+    for relative, value in (
+        ("part.parquet", 1),
+        ("_late.parquet", 2),
+        (".hidden.parquet", 3),
+        ("late.PARQUET", 99),
+    ):
+        pq.write_table(pa.table({"x": [value]}), names / relative)
+    names_plan = mod._native_parquet_plan(str(names), adapter)
+    adapter_rows = sorted(row[0] for row in adapter.scan(str(names)).project("x").fetchall())
+    native_rows = sorted(
+        value
+        for path in names_plan["paths"]
+        for value in pq.read_table(path).column("x").to_pylist()
+    )
+    assert adapter_rows == native_rows == [1, 2, 3]
+
+    nested = tmp_path / "hidden-nested"
+    (nested / ".hidden-dir").mkdir(parents=True)
+    pq.write_table(pa.table({"x": [1]}), nested / "part.parquet")
+    pq.write_table(pa.table({"x": [2]}), nested / ".hidden-dir" / "part.parquet")
+    _fs, root, info, files = mod._file_infos(str(nested))
+    assert sorted(mod._native_parquet_fragments(str(nested), root, info, files)) == sorted(
+        [str(nested / "part.parquet"), str(nested / ".hidden-dir" / "part.parquet")]
+    )
+    with pytest.raises(RuntimeError, match="mixes root files and partition directories"):
+        mod._native_parquet_plan(str(nested), adapter)
+
+    aliases = tmp_path / "mixed-parquet-aliases"
+    aliases.mkdir()
+    pq.write_table(pa.table({"x": [10]}), aliases / "part.parquet")
+    pq.write_table(pa.table({"x": [20]}), aliases / "part.pq")
+    alias_plan = mod._native_parquet_plan(str(aliases), adapter)
+    adapter_rows = sorted(row[0] for row in adapter.scan(str(aliases)).project("x").fetchall())
+    native_rows = sorted(
+        value
+        for path in alias_plan["paths"]
+        for value in pq.read_table(path).column("x").to_pylist()
+    )
+    assert adapter_rows == native_rows == [10]
+
+    exact = tmp_path / "exact.PARQUET"
+    pq.write_table(pa.table({"x": [30]}), exact)
+    exact_plan = mod._native_parquet_plan(str(exact), adapter)
+    assert exact_plan["paths"] == [str(exact)]
+    assert adapter.scan(str(exact)).project("x").fetchall() == [(30,)]
+
+    # Object prefixes have a different, explicit contract: lowercase .parquet only. An explicit object
+    # is still exact regardless of extension because the adapter addresses that one key directly.
+    directory = SimpleNamespace(type=pafs.FileType.Directory)
+    object_files = [SimpleNamespace(path=path) for path in (
+        "bucket/prefix/part.parquet",
+        "bucket/prefix/_late.parquet",
+        "bucket/prefix/.hidden.parquet",
+        "bucket/prefix/part.pq",
+        "bucket/prefix/late.PARQUET",
+    )]
+    assert mod._native_parquet_fragments(
+        "s3://bucket/prefix", "bucket/prefix", directory, object_files
+    ) == [
+        "bucket/prefix/.hidden.parquet",
+        "bucket/prefix/_late.parquet",
+        "bucket/prefix/part.parquet",
+    ]
+    assert mod._native_parquet_fragments(
+        "s3://bucket/exact.PQ", "bucket/exact.PQ",
+        SimpleNamespace(type=pafs.FileType.File), [SimpleNamespace(path="bucket/exact.PQ")],
+    ) == ["bucket/exact.PQ"]
+    assert mod._native_parquet_fragments(
+        "s3://bucket/directory.parquet", "bucket/directory.parquet", directory,
+        [SimpleNamespace(path="bucket/directory.parquet/part.parquet")],
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_status", "cleanup_fails"),
+    [
+        ("success", "done", False),
+        ("failure", "failed", False),
+        ("cancel", "cancelled", False),
+        ("cleanup-failure", "failed", True),
+        ("settle-failure", "failed", False),
+    ],
+)
+def test_ray_popen_supervisor_erases_sensitive_workdir_and_closes_log(
+        tmp_path, monkeypatch, outcome, expected_status, cleanup_fails):
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+    import threading
+    from pathlib import Path
+
+    from hub.deps import Deps
+    from hub.models import Graph, PerNodeStatus, RunStatus
+
+    mod = _load_dp_ray()
+    workspace = tmp_path / "workspace"
+    data = tmp_path / "data"
+    workspace.mkdir()
+    data.mkdir()
+    runner = mod.RayRunner(Deps(str(workspace), str(data)))
+    runner.on_status = None
+    workdirs: list[Path] = []
+    log_handles = []
+    catalog_calls = []
+    completion_observations = []
+    discarded_attempts = []
+    real_mkdtemp = tempfile.mkdtemp
+    real_rmtree = shutil.rmtree
+
+    def _mkdtemp(*, prefix):
+        path = Path(real_mkdtemp(prefix=prefix, dir=tmp_path))
+        workdirs.append(path)
+        return str(path)
+
+    class FakeProcess:
+        def __init__(self, _args, *, stdout, **_kwargs):
+            log_handles.append(stdout)
+            with open(_args[-1]) as stream:
+                job = json.load(stream)
+            if outcome in ("success", "cleanup-failure", "settle-failure"):
+                Path(job["status_file"]).write_text(json.dumps({
+                    "status": "done", "rows": 1,
+                    "outputs": [{"step_id": "write", "name": "out", "uri": "/tmp/out"}],
+                }))
+                self.returncode = 0
+            elif outcome == "failure":
+                Path(job["status_file"]).write_text(json.dumps({
+                    "status": "failed", "error": "driver failed", "rows": 0, "outputs": [],
+                }))
+                self.returncode = 1
+            else:
+                self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                self.returncode = -15
+            return self.returncode
+
+    monkeypatch.setattr(tempfile, "mkdtemp", _mkdtemp)
+    monkeypatch.setattr(subprocess, "Popen", FakeProcess)
+    if cleanup_fails:
+        monkeypatch.setattr(
+            shutil, "rmtree",
+            lambda _path: (_ for _ in ()).throw(OSError("forced cleanup denial")),
+        )
+    if outcome == "settle-failure":
+        monkeypatch.setattr(
+            runner, "_settle_popen_result",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("forced settlement failure")),
+        )
+        monkeypatch.setattr(mod, "discard_attempt", discarded_attempts.append)
+    run_id = f"popen-cleanup-{outcome}"
+    graph = Graph(id=f"canvas-{outcome}", version=1, nodes=[], edges=[])
+    status = RunStatus(
+        run_id=run_id, status="queued", placement="distributed",
+        per_node=[PerNodeStatus(node_id="target", status="queued")],
+    )
+    runner.runs[run_id] = status
+    runner._register_outputs = lambda _graph, result: catalog_calls.append(
+        (result, any(path.exists() for path in workdirs))
+    )
+    runner._cancel[run_id] = threading.Event()
+    if outcome == "cancel":
+        runner._cancel[run_id].set()
+    runner.on_complete = lambda _graph, _target, final: completion_observations.append(
+        (final.status, any(path.exists() for path in workdirs))
+    )
+
+    materialize_uri = "/tmp/unpublished-attempt" if outcome == "settle-failure" else None
+    runner._supervise(run_id, graph, None, status, materialize_uri=materialize_uri)
+
+    assert status.status == expected_status
+    assert log_handles and all(handle.closed for handle in log_handles)
+    if cleanup_fails:
+        assert completion_observations == [("failed", True)]
+        assert "workdir cleanup failed" in (status.error or "")
+        assert catalog_calls == []
+        assert workdirs and all(path.exists() for path in workdirs)
+        for path in workdirs:
+            real_rmtree(path)
+    else:
+        assert completion_observations == [(expected_status, False)]
+        if outcome == "success":
+            assert len(catalog_calls) == 1 and catalog_calls[0][1] is False
+        else:
+            assert catalog_calls == []
+        assert workdirs and all(not path.exists() for path in workdirs)
+        assert list(tmp_path.glob("dp_ray_*")) == []
+    if outcome == "settle-failure":
+        assert "result settlement failed" in (status.error or "")
+        assert discarded_attempts == [materialize_uri]
+        assert run_id not in runner._cancel
+
+
 def test_ray_hive_native_plan_matches_adapter_schema_and_fails_closed_on_unproved_layouts(
         tmp_path, monkeypatch):
     import datetime

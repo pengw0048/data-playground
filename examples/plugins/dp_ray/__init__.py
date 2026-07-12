@@ -45,6 +45,7 @@ small graph won't spin up Ray unless you ask.
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -200,6 +201,39 @@ def _physical_source_bytes(uri: str) -> int | None:
         return None
 
 
+def _native_parquet_fragments(uri: str, root: str, root_info, files: list[object]) -> list[str]:
+    """Select exactly the files ``DuckDBAdapter`` would read for this URI shape.
+
+    An explicit file is exact. An object prefix uses the adapter's current lowercase ``*.parquet``
+    contract. A local directory first probes lowercase ``.parquet``, then ``.pq``; after that probe,
+    DuckDB's glob includes hidden files/directories of the winning extension. Python's case-sensitive
+    patterns match DuckDB on the supported Linux production filesystem and the empirically verified
+    macOS development path.
+    """
+    import pyarrow.fs as pafs
+
+    from hub.plugins.adapters import is_object_uri
+
+    if is_object_uri(uri):
+        # DuckDBAdapter identifies an exact object by the URI suffix before it ever stats the key.
+        if uri.lower().endswith(_PARQUET_EXTENSIONS):
+            return [root] if root_info.type == pafs.FileType.File else []
+        if root_info.type != pafs.FileType.Directory:
+            return []
+        return sorted(info.path for info in files if info.path.endswith(".parquet"))
+    if root_info.type == pafs.FileType.File:
+        return [root]
+    if root_info.type != pafs.FileType.Directory:
+        return []
+    for extension in _PARQUET_EXTENSIONS:
+        pattern = os.path.join(root, "**", f"*{extension}")
+        if not glob.glob(pattern, recursive=True):
+            continue
+        selected = set(glob.glob(pattern, recursive=True, include_hidden=True))
+        return sorted(info.path for info in files if info.path in selected)
+    return []
+
+
 def _bounded_builtin_source_supported(uri: str) -> bool:
     """Formats whose exact built-in adapter scan is lazy enough to stream under a byte ceiling."""
     from hub.plugins.adapters import is_object_uri, path_of
@@ -264,11 +298,7 @@ def _native_parquet_plan(uri: str, adapter: object) -> dict | None:
         import pyarrow.parquet as pq
 
         fs, root, root_info, files = _file_infos(uri)
-        fragments = sorted(
-            info.path for info in files
-            if info.path.lower().endswith(_PARQUET_EXTENSIONS)
-            and not posixpath.basename(info.path).startswith(("_", "."))
-        )
+        fragments = _native_parquet_fragments(uri, root, root_info, files)
         if not fragments:
             return None
         if len(fragments) > _PARQUET_FRAGMENT_LIMIT:
@@ -1212,6 +1242,68 @@ class RayRunner:
 
     def _supervise(self, run_id, graph, target, status, materialize_uri=None, requires=None,
                    sink_targets=None) -> None:
+        """Run one local Ray driver in an isolated temporary directory and always erase it."""
+        import shutil
+        import tempfile
+
+        work = tempfile.mkdtemp(prefix="dp_ray_")
+        result, returncode = None, "not-started"
+        cleanup_succeeded = False
+        try:
+            try:
+                result, returncode = self._supervise_in_work(
+                    run_id, graph, target, status, work,
+                    materialize_uri=materialize_uri, requires=requires, sink_targets=sink_targets,
+                )
+            except Exception as exc:  # noqa: BLE001 — terminal publication still follows cleanup
+                status.status = "failed"
+                detail = str(exc).replace("\n", " ")[:500]
+                status.error = f"Ray supervisor failed: {type(exc).__name__}: {detail}"
+        finally:
+            # job.json contains graph code/source URIs and the ephemeral metadata DB may contain broad
+            # development credentials. Terminal publication is intentionally AFTER this deletion.
+            try:
+                shutil.rmtree(work)
+                cleanup_succeeded = True
+            except Exception as exc:  # noqa: BLE001 — cleanup failure is a visible terminal contract
+                detail = str(exc).replace("\n", " ")[:500]
+                cleanup_error = f"Ray driver workdir cleanup failed: {type(exc).__name__}: {detail}"
+                status.error = f"{status.error}; {cleanup_error}" if status.error else cleanup_error
+                if status.status != "cancelled":
+                    status.status = "failed"
+
+            if cleanup_succeeded and status.status == "running":
+                try:
+                    self._settle_popen_result(graph, status, result, returncode)
+                except Exception as exc:  # noqa: BLE001 — continue through terminal cleanup/bookkeeping
+                    detail = str(exc).replace("\n", " ")[:500]
+                    status.status = "failed"
+                    status.error = f"Ray result settlement failed: {type(exc).__name__}: {detail}"
+            if materialize_uri and status.status != "done":
+                # Centralized here so a helper exception, cleanup failure, ordinary driver failure, and
+                # cancellation all retire the unpublished immutable attempt before terminal visibility.
+                try:
+                    discard_attempt(materialize_uri)
+                except Exception as exc:  # noqa: BLE001
+                    detail = str(exc).replace("\n", " ")[:500]
+                    discard_error = f"Ray attempt cleanup failed: {type(exc).__name__}: {detail}"
+                    status.error = f"{status.error}; {discard_error}" if status.error else discard_error
+
+            for item in status.per_node:
+                item.status = "done" if status.status == "done" else status.status
+            if status.status == "cancelled":
+                self._acknowledge_cancel(run_id)  # child stopped and cleanup was attempted before ack
+            self._emit(graph, status)
+            with self._lock:
+                self._cancel.pop(run_id, None)
+            if self.on_complete:
+                try:
+                    self.on_complete(graph, target, status)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _supervise_in_work(self, run_id, graph, target, status, work, materialize_uri=None,
+                           requires=None, sink_targets=None) -> tuple[dict | None, int | str]:
         """Parent side: spawn the isolated Ray driver, poll its status file, mirror the result. Touches
         NO DuckDB (only subprocess + files + the DB-backed on_status/on_complete hooks) → never deadlocks.
         `materialize_uri` set = region mode (write target → that uri); else whole-graph mode (write node).
@@ -1219,12 +1311,10 @@ class RayRunner:
         `sink_targets` is the hub-resolved write-step-id → physical URI map; region mode omits it."""
         import json
         import subprocess
-        import tempfile
 
         cancel = self._cancel[run_id]
         status.status = "running"
         self._emit(graph, status)
-        work = tempfile.mkdtemp(prefix="dp_ray_")
         job_file, status_file = os.path.join(work, "job.json"), os.path.join(work, "status.json")
         job = {"workspace": self.deps.workspace, "data_dir": self.deps.data_dir, "target": target,
                "graph": prepare_workload_graph(graph), "module": os.path.abspath(__file__), "requires": requires,
@@ -1235,11 +1325,13 @@ class RayRunner:
             json.dump(job, f)
         driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_driver.py")
         result = None
+        proc = None
+        driver_log = None
         try:
             # Redirect the child's stdio to a log file (never an inherited pipe — Ray logs copiously and
             # a full pipe would block the child mid-run; the result comes back via status_file). Own
             # session so Ray's worker signals/pgroup are decoupled from the (daemon-thread) parent.
-            _dlog = open(os.path.join(work, "driver.log"), "w")
+            driver_log = open(os.path.join(work, "driver.log"), "w")
             # CRITICAL for a kernel launched via `uv run`: Ray detects the uv context and re-launches its
             # WORKERS through uv, which (with the repo pyproject + a VIRTUAL_ENV mismatch) builds a fresh
             # ray-less .venv → workers can't `import ray` → the raylet dies and the run hangs. Strip the
@@ -1247,7 +1339,8 @@ class RayRunner:
             # (which has ray); run from the work dir so uv/Ray don't pick up the repo's pyproject.
             child_env = _ray_child_env()
             proc = subprocess.Popen([sys.executable, driver, job_file], cwd=work,
-                                    stdout=_dlog, stderr=_dlog, start_new_session=True, env=child_env)
+                                    stdout=driver_log, stderr=driver_log,
+                                    start_new_session=True, env=child_env)
             while proc.poll() is None:
                 if cancel.is_set():
                     proc.terminate()
@@ -1278,45 +1371,46 @@ class RayRunner:
                     result = json.load(f)
         except Exception as e:  # noqa: BLE001
             status.status, status.error = "failed", f"{type(e).__name__}: {e}"
-        if status.status not in ("cancelled",):
-            # only a TERMINAL status file is authoritative — the driver rewrites this same file with an
-            # interim {"status":"running",...} as it progresses, and a hard kill (OOM/SIGKILL/segfault)
-            # bypasses its finally, leaving that interim behind. Treating "running" as the result would
-            # peg the sub-run at running forever and hang RunController._await. A dead driver → fail.
-            if result and result.get("status") in ("done", "failed", "cancelled"):
-                if result.get("outputs"):
+        finally:
+            # A parent-side error must not leave the credential-bearing child running while its work
+            # directory is erased. Terminate first, then close the inherited log descriptor.
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                except Exception:  # noqa: BLE001 — last-resort cleanup; status below remains failed
                     try:
-                        self._register_outputs(graph, result)
-                    except Exception as e:  # noqa: BLE001 — local parity: catalog commit failure fails the run
-                        prior = f"{result.get('error')}; " if result.get("error") else ""
-                        result = dict(
-                            result, status="failed",
-                            error=f"{prior}catalog registration failed: {type(e).__name__}: {e}",
-                        )
-                status.status = result["status"]
-                status.error = result.get("error")
-                status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
-                status.rows_processed = status.total_rows = int(result.get("rows") or 0)
-                if status.status == "done":
-                    status.progress = 1.0
-            elif status.status == "running":
-                status.status, status.error = "failed", f"ray driver exited without a terminal status (rc={proc.returncode})"
-        for p in status.per_node:  # settle per-node progress to the terminal state
-            p.status = "done" if status.status == "done" else status.status
-        if materialize_uri and status.status != "done":
-            # The child process is now gone, so no writer can race this deletion. A failed/cancelled
-            # immutable attempt was never published by the controller and is safe to remove.
-            discard_attempt(materialize_uri)
-        if status.status == "cancelled":
-            self._acknowledge_cancel(run_id)  # only after Popen.poll/wait proved the driver exited
-        self._emit(graph, status)
-        with self._lock:
-            self._cancel.pop(run_id, None)
-        if self.on_complete:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    except Exception:  # noqa: BLE001
+                        pass
+            if driver_log is not None:
+                driver_log.close()
+        return result, proc.returncode if proc is not None else "not-started"
+
+    def _settle_popen_result(self, graph, status, result, returncode) -> None:
+        """Apply a local driver result only after its sensitive work directory was erased."""
+        # Only a TERMINAL status file is authoritative. A hard kill can leave the last interim
+        # {"status":"running", ...} file behind; a dead driver must fail rather than hang forever.
+        if not (result and result.get("status") in ("done", "failed", "cancelled")):
+            status.status = "failed"
+            status.error = f"ray driver exited without a terminal status (rc={returncode})"
+            return
+        if result.get("outputs"):
             try:
-                self.on_complete(graph, target, status)
-            except Exception:  # noqa: BLE001
-                pass
+                self._register_outputs(graph, result)
+            except Exception as exc:  # noqa: BLE001 — local parity: catalog commit failure fails the run
+                prior = f"{result.get('error')}; " if result.get("error") else ""
+                result = dict(
+                    result, status="failed",
+                    error=f"{prior}catalog registration failed: {type(exc).__name__}: {exc}",
+                )
+        status.status = result["status"]
+        status.error = result.get("error")
+        status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
+        status.rows_processed = status.total_rows = int(result.get("rows") or 0)
+        if status.status == "done":
+            status.progress = 1.0
 
     def _run_ir_sync(self, ir, graph, target, ray_opts=None, progress=None, sink_targets=None,
                      attempt_id: str | None = None) -> dict:
