@@ -97,7 +97,7 @@ def test_hash_shuffle_feature_detection_returns_the_validated_target():
 def test_ray_dependency_image_and_kuberay_manifest_share_one_version_contract():
     pyproject = tomllib.loads((_ROOT / "kernel/pyproject.toml").read_text())
     assert pyproject["project"]["optional-dependencies"]["ray"] == [
-        f"ray[data]=={ray_compat.SUPPORTED_RAY_VERSION}"
+        f"ray[data,default]=={ray_compat.SUPPORTED_RAY_VERSION}"
     ]
     lock = (_ROOT / "kernel/uv.lock").read_text()
     assert f'specifier = "=={ray_compat.SUPPORTED_RAY_VERSION}"' in lock
@@ -136,3 +136,60 @@ def test_ray_image_and_validation_pods_enforce_a_non_root_security_boundary():
 
     job = yaml.safe_load((_ROOT / "deploy/kuberay/differential-job.yaml").read_text())
     _assert_restricted_pod(job["spec"]["template"]["spec"], "driver")
+
+
+def test_kuberay_validation_profile_fits_a_four_cpu_kind_node_and_recreates_workloads():
+    cluster = yaml.safe_load((_ROOT / "deploy/kuberay/raycluster.yaml").read_text())
+    head = cluster["spec"]["headGroupSpec"]
+    workers = cluster["spec"]["workerGroupSpecs"][0]
+    job = yaml.safe_load((_ROOT / "deploy/kuberay/differential-job.yaml").read_text())
+    head_pod = head["template"]["spec"]
+    worker_pod = workers["template"]["spec"]
+    job_pod = job["spec"]["template"]["spec"]
+    head_container = head_pod["containers"][0]
+    worker_container = worker_pod["containers"][0]
+    driver = job["spec"]["template"]["spec"]["containers"][0]
+
+    assert head["rayStartParams"]["num-cpus"] == "2"
+    assert workers["rayStartParams"]["num-cpus"] == "2"
+    assert workers["replicas"] == workers["minReplicas"] == workers["maxReplicas"] == 2
+    assert "--num-cpus=2" in driver["command"][2]
+    assert "--object-store-memory=536870912" in driver["command"][2]
+
+    cpu_requests = [
+        head_container["resources"]["requests"]["cpu"],
+        worker_container["resources"]["requests"]["cpu"],
+        driver["resources"]["requests"]["cpu"],
+    ]
+    assert cpu_requests == ["600m", "600m", "500m"]
+    requested_millicpu = (
+        int(cpu_requests[0][:-1])
+        + (2 * int(cpu_requests[1][:-1]))
+        + int(cpu_requests[2][:-1])
+    )
+    assert requested_millicpu == 2300  # leaves 1700m for kind/KubeRay/MinIO on a 4-CPU node
+    assert [
+        head_container["resources"]["requests"]["memory"],
+        worker_container["resources"]["requests"]["memory"],
+        driver["resources"]["requests"]["memory"],
+    ] == ["1500Mi", "1500Mi", "1Gi"]
+    assert [
+        head_container["resources"]["limits"],
+        worker_container["resources"]["limits"],
+        driver["resources"]["limits"],
+    ] == [
+        {"cpu": "2", "memory": "2Gi"},
+        {"cpu": "2", "memory": "2Gi"},
+        {"cpu": "2", "memory": "2Gi"},
+    ]
+    assert [
+        head_pod["volumes"][0]["emptyDir"]["sizeLimit"],
+        worker_pod["volumes"][0]["emptyDir"]["sizeLimit"],
+        job_pod["volumes"][0]["emptyDir"]["sizeLimit"],
+    ] == ["1Gi", "1Gi", "1Gi"]
+
+    script = (_ROOT / "deploy/kuberay/validate.sh").read_text()
+    assert "dp-ray:kuberay-$(date +%Y%m%d%H%M%S)-$$" in script
+    assert "delete job dp-ray-multinode-check dp-ray-createbucket" in script
+    assert "delete raycluster dp-ray" in script
+    assert 'sed "s|image: dp-ray:local|image: ${IMAGE}|g"' in script

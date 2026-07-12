@@ -24,7 +24,11 @@ spec:
             capabilities: { drop: ["ALL"] }
           workingDir: /app/kernel
           # join the cluster (KubeRay's head Service is <clustername>-head-svc), then run the differential
-          command: ["/bin/sh", "-c", "ray start --address=dp-ray-head-svc:6379 --num-cpus=2 && python /app/kernel/hub/ray_multinode_check.py; rc=$?; ray stop >/dev/null 2>&1; exit $rc"]
+          command: ["/bin/sh", "-c", "ray start --address=dp-ray-head-svc:6379 --num-cpus=2 --object-store-memory=536870912 && python /app/kernel/hub/ray_multinode_check.py; rc=$?; ray stop >/dev/null 2>&1; exit $rc"]
+          # Local validation sizing only; production requests/limits must come from measured workloads.
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "2Gi" }
           env:
             - { name: RAY_ADDRESS, value: "auto" }
             - { name: RAY_ENABLE_UV_RUN_RUNTIME_ENV, value: "0" }
@@ -39,4 +43,4 @@ spec:
             - { name: dshm, mountPath: /dev/shm }
       volumes:
         - name: dshm
-          emptyDir: { medium: Memory, sizeLimit: 2Gi }
+          emptyDir: { medium: Memory, sizeLimit: 1Gi }

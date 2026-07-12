@@ -28,26 +28,26 @@ docker compose -f docker-compose.ray.yml run --rm --no-deps driver
 
 ## 2. KubeRay on Kubernetes (e.g. kind — the pods path)
 
-These manifests are a disposable validation environment: local image tags, fixed workers, ephemeral
-MinIO, and test credentials. They are not a secure or highly available production deployment.
+These manifests are a disposable validation environment: fixed workers, ephemeral MinIO, and test
+credentials. They are not a secure or highly available production deployment. Their CPU/memory values
+are deliberately sized so one head, two workers, MinIO, and the driver fit on a typical 4-CPU/8-GiB
+single-node kind cluster; they are **not** production capacity guidance.
 
 ```bash
 kind create cluster
 helm repo add kuberay https://ray-project.github.io/kuberay-helm/ && helm repo update
 helm install kuberay-operator kuberay/kuberay-operator
 
-docker build -f docker/ray/Dockerfile -t dp-ray:local .
-kind load docker-image dp-ray:local
-
-kubectl apply -f deploy/kuberay/raycluster.yaml
-kubectl apply -f deploy/kuberay/minio.yaml
-kubectl apply -f deploy/kuberay/differential-job.yaml
-kubectl logs -f job/dp-ray-multinode-check           # → "[multinode] PASS: … byte-identical …"
-
-# Make it a real GATE, not just a log tail: wait for the Job to actually SUCCEED (nonzero = FAIL).
-kubectl wait --for=condition=complete --timeout=600s job/dp-ray-multinode-check \
-  || { echo "multinode differential FAILED"; kubectl logs job/dp-ray-multinode-check; exit 1; }
+KIND_CLUSTER=kind ./deploy/kuberay/validate.sh
+# → all three RayCluster pods and the Job must become Ready/Complete
+# → "[multinode] PASS: … byte-identical …"
 ```
+
+The script is intentionally re-runnable. Each invocation builds and loads a unique image tag, deletes
+the prior RayCluster and immutable Jobs, and then creates fresh pod templates. Reusing `dp-ray:local`
+with `imagePullPolicy: IfNotPresent` plus `kubectl apply` can otherwise leave old cluster pods and an old
+Job running even after a new image was loaded. Set `KIND_CLUSTER=<name>` for a non-default kind cluster;
+`DP_RAY_VALIDATION_IMAGE=<unique-tag>` can override the generated tag.
 
 Both paths use the same `docker/ray/Dockerfile` image. The optional dependency, image, and KubeRay
 `rayVersion` are pinned to **Ray 2.56.0**, the only version currently validated against dp_ray's private
