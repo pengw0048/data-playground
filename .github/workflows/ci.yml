@@ -25,7 +25,9 @@ jobs:
       - name: Install kernel (dev extra)
         run: cd kernel && uv sync --extra dev
       - name: Run tests
-        run: cd kernel && uv run pytest -q
+        # Dump every thread if one test stalls for a minute. The job-level cap prevents runaway spend;
+        # this makes an intermittent deadlock actionable instead of ending with only "operation canceled".
+        run: cd kernel && uv run pytest -q -o faulthandler_timeout=60
 
   e2e:
     name: e2e (Playwright — real UI on the real kernel)
