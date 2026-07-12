@@ -64,10 +64,116 @@ def _run_mcp(argv: list[str]) -> None:
     mcp.serve_stdio(server)
 
 
+def _load_canvas_graph(canvas_ref: str):
+    """Resolve a saved canvas by id (exact) or by name (unique match) → (Graph, canvas_id). Exits with a
+    clear message if it's missing or the name is ambiguous."""
+    import json
+
+    from sqlalchemy import select
+
+    from hub import metadb
+    from hub.models import Graph
+    with metadb.session() as s:
+        c = s.get(metadb.Canvas, canvas_ref)
+        if c is None:  # not an id → try a unique name
+            matches = s.scalars(select(metadb.Canvas).where(metadb.Canvas.name == canvas_ref)).all()
+            if len(matches) > 1:
+                raise SystemExit(f"'{canvas_ref}' names {len(matches)} canvases — pass the canvas id instead")
+            c = matches[0] if matches else None
+        if c is None:
+            raise SystemExit(f"no canvas with id or name '{canvas_ref}'")
+        return Graph.model_validate(json.loads(c.doc)), c.id
+
+
+def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_json: bool) -> int:
+    """Run a saved canvas to completion in-process (no browser) and return a shell exit code:
+    0=done, 1=failed, 2=cancelled, 124=timeout. Reuses the exact start_run path the UI + MCP use, so
+    placement/gating/ownership are identical; `confirmed=True` because a headless invocation is itself
+    the confirmation for a full pass. `node` targets one node (its upstream cone); default = whole canvas."""
+    import json
+    import time
+
+    from fastapi import HTTPException
+
+    from hub import metadb
+    from hub.routers.runs import start_run
+    graph, cid = _load_canvas_graph(canvas_ref)
+    uid = metadb.DEFAULT_USER_ID
+    try:
+        status, owner = start_run(deps, graph, node, uid, confirmed=True)
+    except HTTPException as e:
+        raise SystemExit(f"cannot run canvas '{cid}': {e.detail}")
+    run_id = status.run_id
+    deadline = time.monotonic() + timeout_s
+    while status.status in ("queued", "running"):
+        if time.monotonic() > deadline:
+            print(f"timeout: run {run_id} still {status.status} after {timeout_s:g}s", file=sys.stderr)
+            return 124
+        time.sleep(0.25)
+        try:
+            status = owner.status(run_id)
+        except KeyError:  # evicted from the owner's in-memory ring → read the durable state
+            persisted = metadb.get_run_state(run_id)
+            if persisted is None:
+                break
+            from hub.models import RunStatus
+            status = RunStatus(**persisted)
+    if as_json:
+        print(json.dumps(status.model_dump(), default=str))
+    else:
+        head = f"canvas {cid}  run {run_id}  →  {status.status.upper()}"
+        if status.total_rows is not None or status.ms is not None:
+            head += f"  ({status.total_rows if status.total_rows is not None else '?'} rows"
+            head += f", {status.ms} ms)" if status.ms is not None else ")"
+        if status.output_table:
+            head += f"  →  {status.output_table}"
+        print(head)
+        for p in (status.per_node or []):
+            line = f"  {p.node_id}: {p.status}"
+            if p.rows is not None:
+                line += f" ({p.rows} rows)"
+            if p.error:
+                line += f" — {p.error}"
+            print(line)
+        if status.error:
+            print(f"error: {status.error}", file=sys.stderr)
+    return {"done": 0, "failed": 1, "cancelled": 2}.get(status.status, 1)
+
+
+def _run_canvas(argv: list[str]) -> None:
+    """`dataplay run <canvas>` — run a saved canvas to completion headless (cron / CI / scripting), print
+    a summary, and exit non-zero on failure. Shares the workspace/DB with the web app + MCP server."""
+    import contextlib
+    import logging
+
+    p = argparse.ArgumentParser(prog="dataplay run", description="Run a saved canvas to completion (headless).")
+    p.add_argument("canvas", help="canvas id, or a unique canvas name, to run")
+    p.add_argument("--node", default=None, help="run only this node id + its upstream (default: the whole canvas)")
+    p.add_argument("--workspace", default=None, help="working dir (canvases/outputs/plugins); default CWD")
+    p.add_argument("--data-dir", default=None, help="dataset folder (default: <workspace>/data)")
+    p.add_argument("--no-seed", dest="seed", action="store_false", default=True)
+    p.add_argument("--timeout", type=float, default=3600.0, help="max seconds to wait for completion (default 3600)")
+    p.add_argument("--json", dest="as_json", action="store_true", help="print the final RunStatus as JSON")
+    args = p.parse_args(argv)
+
+    logging.basicConfig(level=logging.WARNING, stream=sys.stderr,  # keep stdout clean for the summary / --json
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # divert set_workspace's plugin-discovery prints to stderr so stdout is only the run summary (parseable)
+    with contextlib.redirect_stdout(sys.stderr):
+        _prepare_workspace(args.workspace, args.data_dir, args.seed)
+        from hub import metadb
+        metadb.init_db()  # schema to head before Deps builds + registers the catalog (fresh-DB first run)
+        from hub.deps import set_workspace
+        deps = set_workspace(os.environ["DP_WORKSPACE"], os.environ["DP_DATA_DIR"])
+    raise SystemExit(_headless_run(deps, args.canvas, args.node, args.timeout, args.as_json))
+
+
 def main() -> None:
     argv = sys.argv[1:]
     if argv and argv[0] == "mcp":
         return _run_mcp(argv[1:])
+    if argv and argv[0] == "run":
+        return _run_canvas(argv[1:])
     p = argparse.ArgumentParser(prog="dataplay", description="Data Playground — a node canvas for data.")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8471)
