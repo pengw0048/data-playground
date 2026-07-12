@@ -160,6 +160,36 @@ async def ws_run(ws: WebSocket, run_id: str):
 # version (last-write-wins on the doc); a CRDT (Yjs) is the conflict-free hardening.
 _collab_rooms: dict[str, set[WebSocket]] = {}
 _collab_ids: dict[WebSocket, str] = {}  # socket -> its clientId (for leave notifications)
+_collab_users: dict[WebSocket, str | None] = {}  # None = trusted open-mode socket; otherwise auth uid
+_COLLAB_DOC_MESSAGES = frozenset(("yjs", "ysync"))
+
+
+async def _live_collab_role(ws: WebSocket, canvas_id: str) -> str | None:
+    """Current role for a connected socket, re-read at the document-message boundary.
+
+    Authenticated collaboration permissions are mutable while a socket is open. Keep the uid captured
+    from its signed handshake, but never cache its canvas role. The metadata DB is shared across web
+    instances; running the lookup off-loop makes revocation visible without blocking other sockets.
+    """
+    if ws not in _collab_users:
+        return None
+    uid = _collab_users[ws]
+    if uid is None:  # open mode is the existing trusted/single-user behavior
+        return "editor"
+    try:
+        return await asyncio.to_thread(metadb.canvas_role, canvas_id, uid)
+    except Exception:  # noqa: BLE001 — fail closed if the authorization store is unavailable
+        logging.getLogger("hub").warning("collab role revalidation failed", exc_info=True)
+        return None
+
+
+async def _close_revoked_collab_peer(ws: WebSocket, room: set[WebSocket]) -> None:
+    """Stop future fan-out to a peer whose current read access is gone."""
+    room.discard(ws)
+    try:
+        await ws.close(code=1008)
+    except Exception:  # noqa: BLE001 — already-disconnected peers are simply gone from the room
+        pass
 
 
 @app.websocket("/ws/collab/{canvas_id}")
@@ -169,29 +199,43 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
     if _cross_site_ws(ws):
         await ws.close(code=1008)  # cross-site origin — reject before touching the room
         return
-    can_write = True  # open mode (no auth): a single-user/trusted instance — everyone may edit
+    uid: str | None = None
     if auth.auth_enabled():
         uid = auth.verify(ws.cookies.get("dp_session"))
-        role = metadb.canvas_role(canvas_id, uid) if uid else None
+        try:
+            role = await asyncio.to_thread(metadb.canvas_role, canvas_id, uid) if uid else None
+        except Exception:  # noqa: BLE001 — admission fails closed when the role store is unavailable
+            logging.getLogger("hub").warning("collab admission role lookup failed", exc_info=True)
+            role = None
         if role is None:
             await ws.close(code=1008)  # policy violation
             return
-        can_write = role in ("owner", "editor")  # a viewer may watch, not mutate
     await ws.accept()
     room = _collab_rooms.setdefault(canvas_id, set())
     room.add(ws)
+    _collab_users[ws] = uid
     try:
         while True:
             msg = await ws.receive_json()
             if isinstance(msg, dict) and msg.get("clientId"):
                 _collab_ids[ws] = msg["clientId"]
-            # a viewer may receive edits + presence, but its own doc updates ('yjs' carries CRDT state)
-            # must NOT be relayed — else an editor peer would merge + autosave them, laundering a change
-            # past the read-only boundary that put_canvas enforces.
-            if not can_write and isinstance(msg, dict) and msg.get("type") == "yjs":
-                continue
+            msg_type = msg.get("type") if isinstance(msg, dict) else None
+            if msg_type in _COLLAB_DOC_MESSAGES:
+                role = await _live_collab_role(ws, canvas_id)
+                if role is None:  # access removed after this socket connected
+                    await _close_revoked_collab_peer(ws, room)
+                    break
+                # A viewer may request/read Yjs sync and send presence, but its own updates must never
+                # be relayed — otherwise an editor peer could merge + autosave a laundered write.
+                if msg_type == "yjs" and role not in ("owner", "editor"):
+                    continue
             for peer in list(room):
                 if peer is not ws:
+                    # A share can be removed while this recipient's socket remains open. Revalidate
+                    # before every document-bearing fan-out; presence remains cheap and viewer-safe.
+                    if msg_type in _COLLAB_DOC_MESSAGES and await _live_collab_role(peer, canvas_id) is None:
+                        await _close_revoked_collab_peer(peer, room)
+                        continue
                     try:
                         await peer.send_json(msg)
                     except Exception:  # noqa: BLE001
@@ -200,6 +244,7 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
         pass
     finally:
         room.discard(ws)
+        _collab_users.pop(ws, None)
         cid = _collab_ids.pop(ws, None)
         if cid:  # let peers drop this collaborator's cursor/avatar
             for peer in list(room):
@@ -219,6 +264,9 @@ async def _broadcast_external_edit(canvas_id: str) -> None:
     if not room:
         return
     for peer in list(room):
+        if await _live_collab_role(peer, canvas_id) is None:
+            await _close_revoked_collab_peer(peer, room)
+            continue
         try:
             await peer.send_json({"type": "external-edit", "canvasId": canvas_id})
         except Exception:  # noqa: BLE001 — a dead peer is dropped, exactly like ws_collab's fan-out
