@@ -1,12 +1,13 @@
 # Ray backend: support and production readiness
 
-`dp_ray` is a working **reference execution backend** for Data Playground. It proves that the
-engine-neutral IR can execute on a real multi-node Ray Data cluster, and it is continuously checked by
-the multi-node differential in [`ray-validation.yml`](../.github/workflows/ray-validation.yml).
+`dp_ray` is a working distributed execution backend for Data Playground. Its supported data path is
+fail-closed: large Parquet inputs and simple Parquet overwrite outputs stay off the driver, while every
+remaining compatibility collect has an explicit byte ceiling. The multi-node differential in
+[`ray-validation.yml`](../.github/workflows/ray-validation.yml) verifies that contract on Ray and MinIO.
 
-It is not yet a production-capable backend. The Compose and KubeRay files in this repository are
-validation harnesses, not deployment manifests. This page defines the current boundary so a green
-differential is not mistaken for production readiness.
+The Compose and KubeRay files in this repository are validation harnesses, not deployment manifests. A
+green differential does not certify an operator's IAM, capacity, KubeRay configuration, or incident
+procedures. The final section separates backend guarantees from deployment responsibilities.
 
 ## Current execution contract
 
@@ -28,9 +29,9 @@ safe to distribute.
 |---|---|---|
 | `map`, `filter`, `flat_map`, `map_batches` | yes | uses the same compiled transform operator as the local engine |
 | grouped `aggregate` | yes, for bare-column group keys | global, expression-key, and order-sensitive aggregates fall back |
-| `window` | yes, for a bare-column partition key | order-sensitive forms without a sufficient order fall back |
+| `window` | yes, for a bare-column partition key | order-sensitive forms without sufficient ordering fall back |
 | full-row `dedup` | yes | keyed dedup and schemas containing floating-point values fall back |
-| `join` | broadcast `inner`, `left`, and `cross` | the complete right side is collected by the driver and must be bounded |
+| `join` | broadcast `inner`, `left`, and `cross` | the materialized right side must fit the configured driver fallback limit |
 | `sort` | plain-column keys | the final ordered result is coalesced to one worker; Ray 2.56 cannot resource-pin its range shuffle, so GPU/custom-resource sorts fail before dispatch |
 | SQL, sections, metrics/charts, opaque plugin nodes | no | local fallback |
 
@@ -38,14 +39,43 @@ safe to distribute.
 
 | path | current behavior |
 |---|---|
-| same-host local Parquet file or parts directory | Ray workers read Parquet directly |
-| object-store Parquet | the driver reads through the dataset adapter, materializes Arrow, then creates a Ray Dataset |
-| CSV, Lance, Iceberg, Hugging Face, or another adapter | the driver reads through the adapter, then creates a Ray Dataset |
-| placed-region output | workers write a directory of Parquet shards directly to the selected storage tier |
-| whole-graph write sink | Ray blocks are collected to the driver, then committed through the normal adapter/sink contract |
+| local/shared Parquet file or parts directory | same-host Ray workers read it directly; a remote cluster uses only the bounded driver stream or falls back before dispatch |
+| object-store Parquet file or shard prefix | only the exact built-in `DuckDBAdapter` may use `ray.data.read_parquet`; it receives a credentials-aware filesystem, exact fragment list, full adapter-oracle schema, selected columns, and typed dataset-rooted Hive partitioning |
+| built-in CSV/JSON/local IPC or a Parquet layout whose native proof fails | compatibility scan only when stored and decoded sizes are known below the driver fallback limit |
+| object IPC, Lance, Iceberg, Hugging Face, or a plugin adapter | no implicit driver scan; local fallback (or fail-loud for an explicit Ray pin) until the adapter exposes a dedicated bounded/distributed capability |
+| placed-region output | workers write an immutable directory/prefix of Parquet shards; `_DP_SUCCESS.json` is written last |
+| whole-graph unpartitioned Parquet overwrite | workers write an immutable attempt prefix; the returned/catalog URI is that completed prefix, not the stable logical filename |
+| append, partitioned overwrite, CSV, JSON, Arrow, Lance, or plugin sink | normal adapter/sink semantics through the bounded compatibility path |
 
-Object-store reads and whole-graph sinks are therefore **driver-funneled today**. They are semantically
-supported but are not a scale-out path for data larger than driver memory.
+`DP_RAY_DRIVER_FALLBACK_MAX_BYTES` is an integer byte count with a default of `67108864` (64 MiB).
+Built-in compatibility sources are checked against stored physical bytes before `adapter.scan`, then
+decoded in small record batches whose cumulative Arrow bytes are checked and transferred to Ray one
+batch at a time; the driver never concatenates the source into one Arrow table. Ray Dataset sinks
+and broadcast sides are materialized (and may spill) and checked with `Dataset.size_bytes()` before
+block/reference collection. An unknown size or a value above the limit fails with guidance; it never
+means "collect anyway."
+
+Native Parquet discovery processes at most 10,000 files and reads each physical footer before dispatch.
+`pyarrow.unify_schemas(..., promote_options="permissive")` preserves compatible drift such as `int32` to
+`int64`; incompatible drift takes the bounded built-in path or falls back. The exact `DuckDBAdapter`
+metadata schema is the semantic oracle for physical and partition column order/types. Ray 2.56 native
+Hive is limited to proven `int64` and string partition fields with consistent, unique keys. The Hive
+default-partition sentinel, DATE/other partition types, duplicate keys, and inconsistent layouts take the
+bounded/local path. A flat dataset below an ancestor such as `tenant=acme` remains native without leaking
+that ancestor. A genuinely Hive-partitioned dataset below a Hive-looking root/ancestor falls back because
+DuckDB parses the ancestor while exact-root Ray intentionally does not.
+Compact prefixes before the 10,000-file ceiling. The ceiling bounds retained metadata and footer work,
+but PyArrow's object-store listing API may materialize the provider's prefix response before the count is
+known; data bytes remain worker-direct, while very large metadata listings still require compaction or a
+future catalog-backed fragment manifest.
+
+Increasing this limit trades compatibility for driver-memory risk. Prefer Parquet on shared/object
+storage or the local backend instead. A remote Ray cluster must use an object-store destination for
+worker-direct Parquet output; a local destination makes the graph fall back before Ray starts.
+
+Append, partitioning, destination selection, and non-Parquet formats retain the shared sink contract;
+they are not silently converted into overwrite Parquet. Empty Parquet results publish one typed empty
+shard plus the manifest so their schema remains readable.
 
 ## What the validation gate proves
 
@@ -53,12 +83,17 @@ The automated Compose gate starts a Ray head, two worker containers, a separate 
 It requires:
 
 1. a real hash-shuffle to span at least two Ray node IDs;
-2. distributed GROUP BY and broadcast join results to match DuckDB in Arrow schema and row values;
-3. the schema, aggregate-row, and join-row fault controls to each fail;
-4. a fresh run to pass after one worker is stopped between runs.
+2. native MinIO Parquet reads feeding distributed GROUP BY and broadcast join results to match DuckDB in
+   Arrow schema and row values;
+3. native Parquet reads to unify compatible physical footer drift, exclude a flat-root Hive-looking
+   ancestor, and preserve typed numeric/string Hive columns through a real aggregate and broadcast join;
+4. a whole-graph Parquet overwrite to publish an immutable, manifested, worker-written prefix and
+   register that actual URI;
+5. the schema, aggregate-row, and join-row fault controls to each fail;
+6. a fresh run to pass after one worker is stopped between runs.
 
-The last check proves that the remaining cluster accepts a **new degraded-cluster run**. It does not kill
-a worker during an active job and does not prove in-flight task reconstruction. KubeRay validation is
+The last check proves that the remaining cluster accepts a new degraded-cluster run. It does not kill a
+worker during an active job and does not prove in-flight task reconstruction. KubeRay validation is
 manual and uses the same differential; see [`deploy/kuberay/README.md`](../deploy/kuberay/README.md).
 
 Run the Compose gate locally:
@@ -91,29 +126,32 @@ identity underneath the persistent workers.
 | gate | status | production-capable requirement |
 |---|---|---|
 | selected-operator semantic parity | partial | extend multi-node differentials to every claimed operator and edge type |
-| object-store scale-out reads | missing | worker-direct distributed reads, plus bounded fallback for adapters without that capability |
+| object-store Parquet scale-out reads | implemented | operate with least-privilege credentials and validate representative production datasets |
+| bounded adapter compatibility | implemented | tune or disable the limit from measured workload/driver memory; native connectors are preferable |
+| whole-graph Parquet overwrite data path | implemented | use shared object storage for remote clusters; garbage-collect superseded attempt prefixes |
 | durable job lifecycle | missing | persisted Ray submission/attempt ID, restart reconciliation, acknowledged cancel, timeout, and fencing |
 | atomic region publication | implemented | distributed and local-fallback handoffs use immutable per-attempt prefixes; the controller validates the success manifest before cache publication |
-| workload isolation | missing | explicit environment allowlist, scoped storage identity, per-run namespace, and cluster policy boundary |
+| workload isolation | partial | environment/control-plane separation exists; replace broad data credentials with attempt-scoped identity and enforce cluster policy |
 | cluster health and placement truth | missing | live resource/health discovery, backpressure, and fail-loud behavior for an explicit Ray pin |
 | runtime compatibility | partial | one supported Ray range and a driver/worker/core/plugin version handshake |
 | resilience | partial | active-job worker/head/driver failure tests, retry policy, and orphan cleanup |
-| observability | missing | durable job IDs, queue/retry/spill/storage metrics, structured logs, traces, and alerts |
+| observability | partial | durable job IDs, queue/retry/spill/storage metrics, retained structured logs, traces, and alerts |
 | deployment security and HA | operator-owned | immutable images, secrets/IAM, TLS/network policy, pod security, quotas, autoscaling, and HA storage |
 
-## Remaining P0 work
+## What remains before production ownership
 
-The following changes are required before calling the backend production-capable:
+The data-plane paths above are production-safe within their stated contract. The backend as a whole
+still needs the following before it should own production workloads:
 
-1. Remove the object-store Parquet driver funnel and introduce an explicit distributed-read capability
-   for adapters, with a fail-loud or size-bounded fallback.
-2. Replace local subprocess ownership with a durable Ray job lifecycle that survives kernel/hub restarts
+1. Replace local subprocess ownership with a durable Ray job lifecycle that survives kernel/hub restarts
    and supports idempotent submission, cancellation, timeout, retry, and attempt fencing.
-3. Scope each workload's environment and storage identity. Arbitrary canvas code must not inherit
-   control-plane credentials or another tenant's object prefix.
-4. Discover live cluster capacity and health, enforce admission/backpressure, and reject an explicit Ray
+2. Replace broad data-plane credentials with attempt/dataset-scoped identities and enforce per-run
+   namespace, network, pod-security, and quota boundaries on the target cluster.
+3. Discover live cluster capacity and health, enforce admission/backpressure, and reject an explicit Ray
    placement when its requirements cannot be honored.
-5. Pin and verify the supported Ray/runtime image contract across the submitting process and every worker.
+4. Pin and verify the supported Ray/runtime image contract across the submitting process and every worker.
+5. Add lifecycle management for abandoned/superseded immutable attempt prefixes and alerts for failed
+   manifests, object-store errors, spill pressure, queue delay, retries, and resource saturation.
 6. Pass staging gates on the intended production topology: active-job failure injection, representative
    large workloads, SLOs/alerts, upgrade/rollback, and recovery runbooks.
 
@@ -134,7 +172,11 @@ exact-key cleanup is implemented.
 
 `run_unit` mints a random attempt ID by default and enforces one owner per ID inside a runner. A caller that
 supplies deterministic IDs must fence ownership in its durable control plane. A committed retry reattaches;
-an existing partial/mismatched prefix fails closed and is never overwritten.
+an existing partial/mismatched prefix or a manifest owned by another raw attempt ID fails closed and is
+never overwritten. Attempt paths keep a readable run slug (capped at 64 characters) plus a 128-bit SHA-256
+suffix over the complete raw attempt ID and unmodified logical URI. Whole-graph sinks also include the
+write-step ID in that digest, so fan-out writes and `.parquet`/`.pq` targets cannot collide after extension
+stripping. The manifest keeps the overall raw attempt ID for restart reattachment and auditability.
 
 Repository changes can make the backend production-capable and provide repeatable validation. A specific
 deployment is production-ready only after its IAM, network, storage, KubeRay, capacity, and operational

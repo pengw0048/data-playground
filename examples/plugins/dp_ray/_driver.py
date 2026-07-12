@@ -92,9 +92,12 @@ def main() -> None:
         prog = _progress_writer(status_file)
         _log(f"lowered; {'_run_ir_materialize' if mat else '_run_ir_sync'}; ray_opts={ray_opts}")
         result = (runner._run_ir_materialize(
-            ir, graph, target, mat, ray_opts, prog, job.get("attempt_id") or "driver"
+            ir, graph, target, mat, ray_opts, prog, job.get("attempt_id")
         ) if mat
-                  else runner._run_ir_sync(ir, graph, target, ray_opts, prog, job.get("sink_targets")))
+                  else runner._run_ir_sync(
+                      ir, graph, target, ray_opts, prog, job.get("sink_targets"),
+                      job.get("attempt_id"),
+                  ))
         _log(f"run done: {result.get('status')}")
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read
         result = {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}

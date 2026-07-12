@@ -1,27 +1,32 @@
 """Reference plugin — a **Ray Data execution backend** that runs a canvas on Ray, straight from the
 engine-neutral IR (`hub.ir`).
 
-This is the proof that the IR is a real engine-neutral contract: a SECOND engine (Ray Data, not DuckDB)
-executes the graph WITHOUT re-reading node configs or re-implementing lowering. It runs the **clean
-subset** — `read → per-row/-batch map/filter/flat_map/map_batches → write` — where the transform
-operator is the SAME `sandbox.compile_operator` the default engine runs, so results match byte-for-byte.
-Anything relational (`sql`/`join`/`aggregate`/`sort`/`dedup`), reducing (`metric`/`chart`), or opaque
-(`section`, plugin kinds) makes `can_run` return False → the kernel falls back to the DuckDB engine,
-which runs it correctly. `run()` re-checks and delegates too, so a mis-route degrades safely.
+This proves that the IR is a real engine-neutral contract: a SECOND engine (Ray Data, not DuckDB)
+executes the graph WITHOUT re-reading node configs or re-implementing lowering. The backend distributes
+the clean map-style subset plus explicitly gated grouped aggregate, partitioned window, full-row dedup,
+broadcast join, and plain-key sort shapes. Unsupported or semantically uncertain shapes fall back to the
+DuckDB engine before Ray dispatch.
 
-Honest scope (a reference, not a tuned production backend): the map/filter/flat_map/map_batches stages
-run **distributed on Ray Data** — that's the point being proven. Source reads go through the driver's
-adapter (→ Arrow → `ray.data.from_arrow`) so EVERY source works (Lance/HF/Iceberg/plugin), and the sink
-collects to the driver and writes via the adapter; cancellation is cooperative between IR steps (Ray has
-no cheap mid-Dataset abort).
+Parquet files and shard prefixes claimed by the exact built-in DuckDB adapter are read by Ray workers
+directly only after fragment, physical-footer union, adapter-metadata schema, and typed exact-root Hive
+layout proof.
+Simple overwrite Parquet sinks are written by workers to an immutable attempt prefix and published only
+after a success manifest lands. Exact built-in lazy formats can use a batch-streamed compatibility path
+only when their driver transfer fits `DP_RAY_DRIVER_FALLBACK_MAX_BYTES` (64 MiB by default). Object IPC
+and plugin adapters without an explicit Ray capability fall back before dispatch; append, partitioned,
+non-Parquet, and custom sinks keep shared sink semantics under the same byte bound. Broadcast joins use
+the bound for the right side. This prevents a Ray selection from becoming an unbounded driver OOM path
+while preserving small compatibility workloads.
 
 EXECUTION MODEL — an isolated subprocess driver. Running Ray inline in the kernel process deadlocks: the
 source read / sink write go through a DuckDB base connection, and a materialization on the hub's
 pre-existing connection wedges once `ray.init()` has run in the same process. So `run()` spawns a fresh
 subprocess (`_driver.py`) whose OWN process holds its DuckDB + Ray (`ray.init` before any DuckDB). The hub
 resolves logical destinations before dispatch and owns catalog registration after the driver returns;
-the driver receives physical sink URIs and never reads that control-plane state. This is the
-production-correct isolation shape (the same boundary the built-in SubprocessRunner uses).
+the driver receives physical sink URIs and never reads that control-plane state. This is the same
+process-isolation boundary the built-in SubprocessRunner uses. The local supervisor is still an explicit
+production boundary: it acknowledges cancellation only after the child exits, but does not yet preserve
+job ownership or reconcile that lifecycle across a hub restart; see `docs/RAY.md`.
 
 The `uv` fix. If the kernel is launched via `uv run` (common), Ray's default behavior
 (`RAY_ENABLE_UV_RUN_RUNTIME_ENV`) re-launches its WORKERS through `uv` too — which builds a fresh,
@@ -40,16 +45,20 @@ small graph won't spin up Ray unless you ask.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import posixpath
 import re
 import sys
 import threading
 import time
 import uuid
+from urllib.parse import unquote
 
 from hub import db, graph as g
-from hub.handoff import (MANIFEST_NAME as _HANDOFF_MANIFEST, attempt_has_shards,
-                         discard_attempt, read_manifest, validate_shards, write_manifest)
+from hub.handoff import (attempt_has_commit_record, attempt_has_contents, discard_attempt,
+                         read_manifest, validate_shards, write_manifest)
 from hub.sinks import SinkSpec, commit_sink, preflight_sink
 from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (DuckDB's own parser), shared
 from hub.ir import (CLEAN_OPS, CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
@@ -92,23 +101,408 @@ from hub.workload_env import build_workload_env, prepare_workload_graph
 # backend, but a sort exceeding one node's memory should not pin engine=ray (a production backend would
 # write ordered shards + stitch on read).
 RAY_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join", "sort"})
+_DRIVER_FALLBACK_DEFAULT_BYTES = 64 << 20
+_DRIVER_FALLBACK_BATCH_ROWS = 1024
+_DRIVER_FALLBACK_MAX_BATCHES = 20_000
+_PARQUET_FRAGMENT_LIMIT = 10_000
+_PARQUET_EXTENSIONS = (".parquet", ".pq")
+_HIVE_DEFAULT_PARTITION = "__HIVE_DEFAULT_PARTITION__"
 
 
-def _attempt_handoff_uri(uri: str, run_id: str) -> str:
+def _driver_fallback_limit() -> int:
+    raw = os.environ.get("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", str(_DRIVER_FALLBACK_DEFAULT_BYTES))
+    try:
+        limit = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("DP_RAY_DRIVER_FALLBACK_MAX_BYTES must be an integer byte count") from exc
+    if limit < 0:
+        raise RuntimeError("DP_RAY_DRIVER_FALLBACK_MAX_BYTES must be >= 0")
+    return limit
+
+
+def _require_driver_fallback(size: int | None, purpose: str) -> int:
+    """Authorize one compatibility collect only when its byte size is known and bounded."""
+    limit = _driver_fallback_limit()
+    guidance = (
+        "Use Parquet on shared/object storage for worker-direct I/O, run this shape on the local backend, "
+        "or raise DP_RAY_DRIVER_FALLBACK_MAX_BYTES only after sizing driver memory."
+    )
+    if size is None or size < 0:
+        raise RuntimeError(
+            f"{purpose} requires a driver compatibility collect, but its byte size is unknown. {guidance}"
+        )
+    if size > limit:
+        raise RuntimeError(
+            f"{purpose} requires a {size}-byte driver compatibility collect, above the {limit}-byte limit. "
+            f"{guidance}"
+        )
+    return size
+
+
+def _remote_ray() -> bool:
+    return os.environ.get("DP_RAY_REMOTE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_builtin_adapter(adapter: object) -> bool:
+    """Native filesystem paths must never bypass plugin adapter semantics."""
+    from hub.plugins.adapters import DuckDBAdapter
+
+    return type(adapter) is DuckDBAdapter
+
+
+def _filesystem_path(uri: str):
+    import pyarrow.fs as pafs
+
+    from hub.plugins.adapters import is_object_uri, object_fs, path_of
+
+    return object_fs(uri) if is_object_uri(uri) else (pafs.LocalFileSystem(), path_of(uri))
+
+
+def _file_infos(uri: str) -> tuple[object, str, object, list[object]]:
+    """Return filesystem metadata with a hard file-count contract for driver-side processing.
+
+    PyArrow's filesystem call can still materialize a provider listing before returning. The count cap
+    bounds footer reads and all subsequent metadata retained by this process; deployments should compact
+    prefixes well below it (and use provider inventory/metrics for truly enormous prefixes).
+    """
+    import pyarrow.fs as pafs
+
+    fs, path = _filesystem_path(uri)
+    info = fs.get_file_info(path)
+    if info.type == pafs.FileType.File:
+        return fs, path, info, [info]
+    if info.type != pafs.FileType.Directory:
+        return fs, path, info, []
+    infos = fs.get_file_info(pafs.FileSelector(path.rstrip("/"), recursive=True, allow_not_found=True))
+    files = [item for item in infos if item.type == pafs.FileType.File]
+    if len(files) > _PARQUET_FRAGMENT_LIMIT:
+        raise RuntimeError(
+            f"source '{uri}' contains more than {_PARQUET_FRAGMENT_LIMIT:,} files; compact the dataset "
+            "or run it on the local backend"
+        )
+    return fs, path.rstrip("/"), info, files
+
+
+def _physical_source_bytes(uri: str) -> int | None:
+    """Best-effort stored byte size before opening a source through an adapter."""
+    limit = _driver_fallback_limit()
+    try:
+        _fs, _path, _info, files = _file_infos(uri)
+        if not files:
+            return None
+        total = 0
+        for info in files:
+            total += max(0, int(info.size))
+            if total > limit:
+                return total
+        return total
+    except Exception:  # noqa: BLE001 — unknown size fails closed at the caller
+        return None
+
+
+def _bounded_builtin_source_supported(uri: str) -> bool:
+    """Formats whose exact built-in adapter scan is lazy enough to stream under a byte ceiling."""
+    from hub.plugins.adapters import is_object_uri, path_of
+
+    low = uri.split("?", 1)[0].rstrip("/").lower()
+    if is_object_uri(uri):
+        # DuckDBAdapter eagerly downloads object IPC before it can expose a reader. Never invoke it in a
+        # Ray driver. CSV/JSON and Parquet are lazy in DuckDB; a suffix-less URI is its Parquet-prefix form.
+        if low.endswith((".arrow", ".feather", ".ipc")):
+            return False
+        return not low.endswith((".lance", ".delta", ".iceberg"))
+    path = path_of(uri)
+    return os.path.isdir(path) or low.endswith((
+        ".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson", ".arrow", ".feather", ".ipc",
+    ))
+
+
+def _bounded_adapter_source(uri: str, adapter: object, ray):
+    """Stream a proven-small built-in source into Ray without concatenating batches on the driver."""
+    import pyarrow as pa
+
+    if not _is_builtin_adapter(adapter) or not _bounded_builtin_source_supported(uri):
+        raise RuntimeError(
+            f"source '{uri}' has no bounded Ray driver-streaming contract; run it on the local backend "
+            "or provide a native distributed connector"
+        )
+    _require_driver_fallback(_physical_source_bytes(uri), f"source '{uri}'")
+    refs = []
+    decoded_bytes = 0
+    with db.base_guard():
+        relation = adapter.scan(uri)
+        reader = relation.to_arrow_reader(_DRIVER_FALLBACK_BATCH_ROWS)
+        schema = reader.schema
+        for index, batch in enumerate(reader, start=1):
+            if index > _DRIVER_FALLBACK_MAX_BATCHES:
+                raise RuntimeError(
+                    f"source '{uri}' produced more than {_DRIVER_FALLBACK_MAX_BATCHES:,} driver batches; "
+                    "compact it or use a native distributed connector"
+                )
+            decoded_bytes += int(batch.nbytes)
+            _require_driver_fallback(decoded_bytes, f"source '{uri}' after decoding")
+            # Each object is transferred to Ray immediately. The driver retains only bounded ObjectRef
+            # metadata and never constructs one all-source Arrow table.
+            refs.append(ray.put(pa.Table.from_batches([batch], schema=schema)))
+    if not refs:
+        refs.append(ray.put(pa.Table.from_batches([], schema=schema)))
+    return ray.data.from_arrow_refs(refs)
+
+
+def _native_parquet_plan(uri: str, adapter: object) -> dict | None:
+    """Prove a built-in Parquet dataset's fragments, physical schema, and partition boundary.
+
+    Footer schemas are unified explicitly because Ray 2.56 otherwise infers from one fragment. Hive
+    parsing is rooted at the dataset itself so an ancestor such as ``tenant=acme`` cannot become a data
+    column, while genuine immediate ``key=value`` partitions remain visible.
+    """
+    if not _is_builtin_adapter(adapter):
+        return None
+    try:
+        import pyarrow as pa
+        import pyarrow.fs as pafs
+        import pyarrow.parquet as pq
+
+        fs, root, root_info, files = _file_infos(uri)
+        fragments = sorted(
+            info.path for info in files
+            if info.path.lower().endswith(_PARQUET_EXTENSIONS)
+            and not posixpath.basename(info.path).startswith(("_", "."))
+        )
+        if not fragments:
+            return None
+        if len(fragments) > _PARQUET_FRAGMENT_LIMIT:
+            raise RuntimeError(
+                f"source '{uri}' contains more than {_PARQUET_FRAGMENT_LIMIT:,} Parquet fragments; "
+                "compact the dataset or run it on the local backend"
+            )
+        is_file = root_info.type == pafs.FileType.File
+        base_dir = posixpath.dirname(root) if is_file else root.rstrip("/")
+        parents: list[tuple[str, ...]] = []
+        for fragment in fragments:
+            relative = posixpath.relpath(fragment, base_dir or ".")
+            if relative == ".." or relative.startswith("../"):
+                raise RuntimeError(f"source '{uri}' has a fragment outside its dataset root")
+            parent = posixpath.dirname(relative)
+            parents.append(tuple(p for p in parent.split("/") if p and p != "."))
+        nonempty = [parts for parts in parents if parts]
+        partition_keys: tuple[str, ...] = ()
+        if nonempty:
+            if len(nonempty) != len(parents):
+                raise RuntimeError(f"source '{uri}' mixes root files and partition directories")
+            key_rows = []
+            for parts in parents:
+                keys = []
+                for component in parts:
+                    key, sep, value = component.partition("=")
+                    key, value = unquote(key), unquote(value)
+                    if not sep or not key or not value:
+                        raise RuntimeError(
+                            f"source '{uri}' has a non-Hive fragment layout at '{component}'"
+                        )
+                    if value == _HIVE_DEFAULT_PARTITION:
+                        raise RuntimeError(
+                            f"source '{uri}' uses the Hive default-partition sentinel; "
+                            "Ray cannot prove DuckDB NULL partition parity"
+                        )
+                    keys.append(key)
+                if len(set(keys)) != len(keys):
+                    raise RuntimeError(f"source '{uri}' repeats a Hive partition key in one path")
+                key_rows.append(tuple(keys))
+            partition_keys = key_rows[0]
+            if any(keys != partition_keys for keys in key_rows[1:]):
+                raise RuntimeError(f"source '{uri}' has inconsistent Hive partition keys")
+            # DuckDB receives an absolute/globbed path and parses Hive-looking components above the
+            # requested root too. Ray is deliberately rooted at `base_dir`, so a genuine partitioned
+            # dataset nested below any `key=value` component would have different logical columns. Reject
+            # before asking the adapter for metadata; the oracle itself would already contain the leak.
+            def _hive_like(component: str) -> bool:
+                key, sep, value = component.partition("=")
+                return bool(sep and unquote(key) and unquote(value))
+
+            if any(_hive_like(component) for component in root.rstrip("/").split("/") if component):
+                raise RuntimeError(
+                    f"source '{uri}' is a Hive dataset below a Hive-looking root/ancestor; "
+                    "use bounded/local adapter semantics"
+                )
+        schemas = [pq.read_schema(fragment, filesystem=fs) for fragment in fragments]
+        unified = pa.unify_schemas(schemas, promote_options="permissive")
+        if set(partition_keys) & set(unified.names):
+            raise RuntimeError(f"source '{uri}' stores a Hive partition key in both paths and file data")
+        # The exact built-in adapter is the semantic oracle. DuckDB decides partition-column presence,
+        # ordering, and types; Ray may run native only when its physical union plus typed partitions can
+        # reproduce that metadata exactly without reading rows into the driver.
+        with db.base_guard():
+            oracle = adapter.scan(uri, limit=0).to_arrow_table().schema
+        if oracle.names[:len(unified.names)] != unified.names:
+            raise RuntimeError(f"source '{uri}' adapter physical-column order differs from footer union")
+        for field in unified:
+            if oracle.field(field.name).type != field.type:
+                raise RuntimeError(
+                    f"source '{uri}' adapter type for '{field.name}' differs from footer union"
+                )
+        partition_fields = [oracle.field(name) for name in oracle.names[len(unified.names):]]
+        if set(field.name for field in partition_fields) != set(partition_keys):
+            raise RuntimeError(f"source '{uri}' adapter Hive columns differ from its exact-root layout")
+        partition_types: dict[str, type] = {}
+        supported = {
+            pa.int64(): int,
+            pa.string(): str,
+        }
+        for field in partition_fields:
+            python_type = supported.get(field.type)
+            if python_type is None:
+                raise RuntimeError(
+                    f"source '{uri}' Hive column '{field.name}' has unsupported Ray 2.56 partition "
+                    f"type {field.type}"
+                )
+            partition_types[field.name] = python_type
+        logical = pa.schema([*unified, *partition_fields], metadata=oracle.metadata)
+        if logical.names != oracle.names or any(
+                logical.field(name).type != oracle.field(name).type for name in logical.names):
+            raise RuntimeError(f"source '{uri}' logical schema differs from the adapter metadata oracle")
+        return {
+            "paths": fragments,
+            "filesystem": fs,
+            "schema": logical,
+            "base_dir": base_dir,
+            "partition_keys": partition_keys,
+            "partition_types": partition_types,
+        }
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — any listing/footer uncertainty disables native execution
+        raise RuntimeError(f"could not prove native Parquet layout/schema for '{uri}': {exc}") from exc
+
+
+def _read_native_parquet(ray, plan: dict, ray_opts: dict | None = None):
+    from ray.data.datasource import Partitioning
+
+    return ray.data.read_parquet(
+        plan["paths"], filesystem=plan["filesystem"], schema=plan["schema"],
+        columns=plan["schema"].names,
+        partitioning=Partitioning(
+            "hive", base_dir=plan["base_dir"], field_types=plan["partition_types"],
+            filesystem=plan["filesystem"]
+        ),
+        ray_remote_args=ray_opts or None,
+    )
+
+
+def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str:
     """Return an immutable region-output prefix for one execution attempt.
 
     The controller suggests a stable, content-addressed URI. Writing a multi-object Ray result directly
     to that prefix lets a retry race a still-running/failed attempt and expose a mixture of shards. Keep
     the stable URI as the cache key, but publish a unique physical prefix only after the attempt succeeds.
     """
-    base = uri[:-len(".parquet")] if uri.lower().endswith(".parquet") else uri.rstrip("/")
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", run_id).strip("._-") or uuid.uuid4().hex
-    return f"{base}.attempt-{safe}"
+    low = uri.lower()
+    extension = next((ext for ext in (".parquet", ".pq") if low.endswith(ext)), "")
+    base = uri[:-len(extension)] if extension else uri.rstrip("/")
+    raw = str(run_id)
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-") or "attempt"
+    readable = readable[:64].rstrip("._-") or "attempt"
+    # Hash the complete, unmodified logical URI before stripping its extension. `out.parquet` and
+    # `out.pq` otherwise share one physical base. A whole-graph write also scopes by step ID so fan-out
+    # sinks in one run can never reattach each other. Canonical JSON prevents delimiter ambiguity.
+    identity = json.dumps({
+        "runId": raw,
+        "scope": None if scope is None else str(scope),
+        "uri": str(uri),
+    }, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+    return f"{base}.attempt-{readable}-{digest}"
+
+
+def _worker_direct_parquet_sink(spec: SinkSpec, uri: str, adapter: object) -> bool:
+    """True only for sink shapes Ray can publish without changing adapter semantics."""
+    from urllib.parse import urlparse
+
+    from hub.plugins.adapters import is_object_uri
+
+    scheme = urlparse(uri).scheme.lower()
+    filesystem_uri = is_object_uri(uri) or scheme in ("", "file")
+    return (
+        _is_builtin_adapter(adapter) and filesystem_uri
+        and spec.mode == "overwrite" and not spec.partition_by
+        and spec.extension.lower() in (".parquet", ".pq")
+    )
 
 
 def _write_handoff_manifest(uri: str, *, run_id: str, rows: int, schema: object) -> None:
     """Write the commit marker last; the controller publishes ``uri`` only after this returns."""
     write_manifest(uri, run_id=run_id, rows=rows, schema=schema)
+
+
+def _write_empty_parquet(uri: str, schema: object) -> None:
+    """Publish one typed empty shard when Ray has no blocks to write."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub.plugins.adapters import is_object_uri, object_fs, path_of
+
+    arrow_schema = getattr(schema, "base_schema", schema)
+    if not isinstance(arrow_schema, pa.Schema):
+        raise RuntimeError("an empty Ray result did not expose an Arrow schema")
+    table = pa.Table.from_batches([], schema=arrow_schema)
+    if is_object_uri(uri):
+        fs, path = object_fs(uri)
+        with fs.open_output_stream(path.rstrip("/") + "/part-000000.parquet") as stream:
+            pq.write_table(table, stream)
+        return
+    local_uri = path_of(uri)
+    os.makedirs(local_uri, exist_ok=True)
+    # Exclusive creation is the local create-only fence. Object-store attempts rely on their unique
+    # publisher identity plus the empty-prefix proof immediately above this call.
+    with open(os.path.join(local_uri, "part-000000.parquet"), "xb") as stream:
+        pq.write_table(table, stream)
+
+
+def _write_worker_direct_parquet(dataset, uri: str, *, attempt_id: str,
+                                 ray_opts: dict | None = None) -> tuple[int, str]:
+    """Write one immutable Parquet attempt and publish its success manifest last."""
+    from hub.plugins.adapters import is_object_uri, object_fs, path_of
+    low = uri.lower()
+    extension = next((ext for ext in _PARQUET_EXTENSIONS if low.endswith(ext)), "")
+    out_dir = uri[:-len(extension)] if extension else uri.rstrip("/")
+    committed = read_manifest(out_dir)
+    if (committed is not None and committed.get("runId") == attempt_id
+            and validate_shards(out_dir, committed)):
+        return int(committed["rows"]), out_dir
+    if attempt_has_commit_record(out_dir) or attempt_has_contents(out_dir):
+        raise RuntimeError(
+            "Ray output attempt already exists without an exact committed inventory; refusing to "
+            "overwrite an immutable or possibly live prefix"
+        )
+    owns_prefix = True
+    try:
+        materialized = dataset.materialize()
+        rows = materialized.count()
+        schema = materialized.schema()
+        if rows == 0:
+            _write_empty_parquet(out_dir, schema)
+        else:
+            try:
+                from ray.data import SaveMode
+                create_only = SaveMode.ERROR
+            except (ModuleNotFoundError, ImportError):  # unit fakes run without the optional Ray package
+                create_only = "error"
+            if is_object_uri(out_dir):
+                fs, path = object_fs(out_dir)
+                materialized.write_parquet(
+                    path, filesystem=fs, mode=create_only, ray_remote_args=ray_opts or None
+                )
+            else:
+                local_dir = path_of(out_dir)
+                materialized.write_parquet(
+                    local_dir, mode=create_only, ray_remote_args=ray_opts or None
+                )
+        _write_handoff_manifest(out_dir, run_id=attempt_id, rows=rows, schema=schema)
+        owns_prefix = False
+        return rows, out_dir
+    finally:
+        if owns_prefix:
+            discard_attempt(out_dir)
 
 
 def _ray_child_env() -> dict[str, str]:
@@ -286,7 +680,8 @@ class RayRunner:
             self.runs[run_id] = status
             self._cancel_ack.discard(run_id)
         committed = read_manifest(attempt_uri)
-        if (committed is not None and validate_shards(attempt_uri, committed)
+        if (committed is not None and committed.get("runId") == run_id
+                and validate_shards(attempt_uri, committed)
                 and self.base._output_exists(attempt_uri)):
             status.status, status.output_uri = "done", attempt_uri
             status.rows_processed = status.total_rows = int(committed["rows"])
@@ -294,7 +689,7 @@ class RayRunner:
             for item in status.per_node:
                 item.status = "done"
             return status
-        if committed is not None or attempt_has_shards(attempt_uri):
+        if attempt_has_commit_record(attempt_uri) or attempt_has_contents(attempt_uri):
             status.status = "failed"
             status.error = (
                 "Ray attempt prefix already exists without an exact committed inventory; "
@@ -304,6 +699,15 @@ class RayRunner:
             return status
         reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
         reason = reason or self._resource_unsupported_reason(requires, ir)
+        reason = reason or self._source_unsupported_reason(ir)
+        if _remote_ray():
+            from hub.plugins.adapters import is_object_uri
+
+            if not is_object_uri(attempt_uri):
+                reason = reason or (
+                    "a remote Ray cluster cannot materialize a region on the hub's local filesystem; "
+                    "configure a shared object storage tier"
+                )
         if reason and self._requires_ray(requires, graph, output_node):
             return self._unsupported_status(graph, output_node, reason, run_id=run_id)
         if reason:
@@ -340,7 +744,8 @@ class RayRunner:
         owns_prefix = False
         try:
             committed = read_manifest(attempt_uri)
-            if (committed is not None and validate_shards(attempt_uri, committed)
+            if (committed is not None and committed.get("runId") == run_id
+                    and validate_shards(attempt_uri, committed)
                     and self.base._output_exists(attempt_uri)):
                 status.status, status.output_uri = "done", attempt_uri
                 status.rows_processed = status.total_rows = int(committed["rows"])
@@ -348,7 +753,7 @@ class RayRunner:
                 for p in status.per_node:
                     p.status = "done"
                 return status
-            if committed is not None or attempt_has_shards(attempt_uri):
+            if attempt_has_commit_record(attempt_uri) or attempt_has_contents(attempt_uri):
                 raise RuntimeError(
                     "attempt prefix already exists without an exact committed inventory; use a new run ID")
             owns_prefix = True
@@ -453,6 +858,49 @@ class RayRunner:
             return "sort cannot honor GPU/custom-resource placement with the supported Ray 2.56 API"
         return None
 
+    def _source_unsupported_reason(self, ir) -> str | None:
+        """Preflight every read before a Ray subprocess can touch data.
+
+        Native reads are reserved for the exact built-in adapter and require bounded fragment/footer/layout
+        proof. Everything else must have a known-small built-in streaming path; custom adapter semantics,
+        object IPC's eager download, and unbounded/unknown inputs fall back or fail before dispatch.
+        """
+        from hub.plugins.adapters import is_object_uri
+
+        for step in ir.steps:
+            if step.op != "read":
+                continue
+            uri = step.config.get("uri")
+            if not uri:
+                return f"read node '{step.id}' has no physical URI"
+            try:
+                adapter = self.resolve_adapter(uri)
+            except Exception as exc:  # noqa: BLE001
+                return f"source '{uri}' adapter resolution failed: {type(exc).__name__}: {exc}"
+            if not _is_builtin_adapter(adapter):
+                return (
+                    f"source '{uri}' is claimed by adapter '{type(adapter).__name__}', which has no explicit "
+                    "bounded/distributed Ray capability"
+                )
+            if not (_remote_ray() and not is_object_uri(uri)):
+                try:
+                    if _native_parquet_plan(uri, adapter) is not None:
+                        continue
+                except RuntimeError:
+                    # A schema/layout proof failure may still use the exact built-in adapter, but only under
+                    # the small driver-streaming ceiling checked below.
+                    pass
+            if not _bounded_builtin_source_supported(uri):
+                return (
+                    f"source '{uri}' has no bounded Ray driver-streaming contract; use shared Parquet, "
+                    "a native distributed connector, or the local backend"
+                )
+            try:
+                _require_driver_fallback(_physical_source_bytes(uri), f"source '{uri}'")
+            except RuntimeError as exc:
+                return str(exc)
+        return None
+
     def _unsupported_status(self, graph, target, reason, *, run_id=None, plan=None) -> RunStatus:
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"
         per_node = ([PerNodeStatus(node_id=s.node_id, status="failed", label=s.label) for s in plan.steps]
@@ -478,13 +926,23 @@ class RayRunner:
 
     def _resolve_sink_targets(self, ir) -> dict[str, str]:
         """Resolve and validate logical sinks on the hub, before the isolated driver is dispatched."""
+        from hub.plugins.adapters import is_object_uri
+
         targets: dict[str, str] = {}
         for step in ir.steps:
             if step.op == "write":
                 spec = SinkSpec.from_config(step.config, step.config.get("title"))
-                targets[step.id] = preflight_sink(
+                uri = preflight_sink(
                     spec, self.deps.workspace, self.base.storage, self.resolve_adapter
                 )
+                adapter = self.resolve_adapter(uri)
+                worker_direct = _worker_direct_parquet_sink(spec, uri, adapter)
+                if worker_direct and _remote_ray() and not is_object_uri(uri):
+                    raise RuntimeError(
+                        "a remote Ray cluster requires an object-storage destination for worker-direct "
+                        "Parquet output; configure DP_STORAGE_URL/destId or run this graph locally"
+                    )
+                targets[step.id] = uri
         return targets
 
     def _sink_targets_runnable(self, ir) -> bool:
@@ -538,6 +996,7 @@ class RayRunner:
         cone = g.upstream_chain(graph, target_node_id) if target_node_id else graph.nodes
         requires = graph_requires(graph, self.node_specs, nodes=cone)
         reason = reason or self._resource_unsupported_reason(requires, ir)
+        reason = reason or self._source_unsupported_reason(ir)
         if reason and self._requires_ray(requires, graph, target_node_id):
             return self._unsupported_status(graph, target_node_id, reason, run_id=run_id, plan=plan)
         if reason:
@@ -680,6 +1139,10 @@ class RayRunner:
                 status.status, status.error = "failed", f"ray driver exited without a terminal status (rc={proc.returncode})"
         for p in status.per_node:  # settle per-node progress to the terminal state
             p.status = "done" if status.status == "done" else status.status
+        if materialize_uri and status.status != "done":
+            # The child process is now gone, so no writer can race this deletion. A failed/cancelled
+            # immutable attempt was never published by the controller and is safe to remove.
+            discard_attempt(materialize_uri)
         if status.status == "cancelled":
             self._acknowledge_cancel(run_id)  # only after Popen.poll/wait proved the driver exited
         self._emit(graph, status)
@@ -691,12 +1154,14 @@ class RayRunner:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _run_ir_sync(self, ir, graph, target, ray_opts=None, progress=None, sink_targets=None) -> dict:
+    def _run_ir_sync(self, ir, graph, target, ray_opts=None, progress=None, sink_targets=None,
+                     attempt_id: str | None = None) -> dict:
         """Child side (in the driver subprocess, Ray already init'd): execute the clean IR synchronously
         and return a result dict for the parent. Reuses _build/_commit; the fresh-process DuckDB is safe
         because Ray was init'd before it was created. Sink targets are physical URIs resolved by the hub;
         the isolated driver never reads destination settings."""
         outputs: list[dict[str, str]] = []
+        attempt_id = attempt_id or f"driver_{uuid.uuid4().hex}"
         try:
             datasets: dict[str, object] = {}
             rows, out_uri, out_table = 0, None, None
@@ -705,7 +1170,9 @@ class RayRunner:
                     target_uri = (sink_targets or {}).get(step.id)
                     if not target_uri:
                         raise RuntimeError(f"missing hub-resolved target URI for write step '{step.id}'")
-                    rows, out_uri, out_table = self._commit(step, datasets, target_uri)
+                    rows, out_uri, out_table = self._commit(
+                        step, datasets, target_uri, attempt_id=attempt_id, ray_opts=ray_opts
+                    )
                     outputs.append({"step_id": step.id, "name": out_table, "uri": out_uri})
                 else:
                     datasets[step.id] = self._build(step, datasets, ray_opts)
@@ -718,13 +1185,13 @@ class RayRunner:
                     "rows": 0, "outputs": outputs}
 
     def _run_ir_materialize(self, ir, graph, target, uri, ray_opts=None, progress=None,
-                            attempt_id: str = "driver") -> dict:
+                            attempt_id: str | None = None) -> dict:
         """Child side, region mode: run the clean IR up to `target` on Ray and materialize it to `uri`.
         WORKER-DIRECT WRITE: `uri` becomes a DIRECTORY of parquet shards, each written in parallel by a
         Ray task — nothing funnels through the driver (the old collect→concat→single-file OOM'd on a big
         region). The RunController's ref-read / _output_exists / _move_tier all accept a parts-dir. Reports
         interim `progress` so the parent's placed-region progress advances mid-run."""
-        from hub.plugins.adapters import is_object_uri, object_fs
+        attempt_id = attempt_id or f"driver_{uuid.uuid4().hex}"
         try:
             if progress:
                 progress(0.05)
@@ -733,23 +1200,11 @@ class RayRunner:
                 if step.op == "write":  # a region is cut BEFORE any write; ignore a stray one
                     continue
                 datasets[step.id] = self._build(step, datasets, ray_opts)
-            ds = datasets[target].materialize()  # execute the read→map pipeline ONCE, in the cluster (spillable)
-            rows = ds.count()
+            rows, out_dir = _write_worker_direct_parquet(
+                datasets[target], uri, attempt_id=attempt_id, ray_opts=ray_opts
+            )
             if progress:
-                progress(0.6, rows)
-            out_dir = uri[:-len(".parquet")] if uri.lower().endswith(".parquet") else uri  # a DIR of shards
-            # The parent dispatches only a proven-empty prefix: a committed retry reattaches and a partial
-            # retry fails closed. OVERWRITE is retained defensively, never as permission to mutate a commit.
-            from ray.data import SaveMode
-            if is_object_uri(out_dir):
-                fs, p = object_fs(out_dir)               # creds-aware object filesystem (same as the adapter)
-                ds.write_parquet(p, filesystem=fs, mode=SaveMode.OVERWRITE,
-                                 ray_remote_args=ray_opts or None)  # each block → its own object, by a worker
-            else:
-                os.makedirs(out_dir, exist_ok=True)
-                ds.write_parquet(out_dir, mode=SaveMode.OVERWRITE,
-                                 ray_remote_args=ray_opts or None)  # WORKER-DIRECT: parallel shard write, no funnel
-            _write_handoff_manifest(out_dir, run_id=attempt_id, rows=rows, schema=ds.schema())
+                progress(0.9, rows)
             return {"status": "done", "rows": rows, "output_uri": out_dir, "output_table": None}
         except Exception as e:  # noqa: BLE001
             return {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
@@ -759,22 +1214,23 @@ class RayRunner:
         opts = ray_opts or {}
 
         if step.op == "read":
-            import glob as _glob
-
             uri = step.config["uri"]
             from hub.plugins.adapters import is_object_uri
-            # WORKER-DIRECT read for a local parquet FILE or a parts-DIRECTORY (an upstream region's
-            # worker-direct handoff has the .parquet suffix stripped) — Ray reads both natively, so a
-            # chained region doesn't re-funnel the whole upstream output through this driver.
-            is_parts_dir = os.path.isdir(uri) and _glob.glob(os.path.join(uri, "**", "*.parquet"), recursive=True)
-            if not is_object_uri(uri) and (uri.lower().endswith((".parquet", ".pq")) or is_parts_dir):
+
+            adapter = self.resolve_adapter(uri)
+            if not _is_builtin_adapter(adapter):
+                raise RuntimeError(
+                    f"source '{uri}' is claimed by adapter '{type(adapter).__name__}' without an explicit "
+                    "bounded/distributed Ray capability"
+                )
+            if not (_remote_ray() and not is_object_uri(uri)):
                 try:
-                    return ray.data.read_parquet(uri, ray_remote_args=opts or None)  # workers, no driver funnel
-                except Exception:  # noqa: BLE001 — fall back to the always-works driver-Arrow path below
-                    pass
-            with db.base_guard():                              # any other source (Lance/HF/Iceberg/CSV/object/plugin)
-                tbl = self.resolve_adapter(uri).scan(uri).to_arrow_table()
-            return ray.data.from_arrow(tbl)
+                    native = _native_parquet_plan(uri, adapter)
+                except RuntimeError:
+                    native = None  # bounded exact-adapter compatibility is the only permitted fallback
+                if native is not None:
+                    return _read_native_parquet(ray, native, opts)
+            return _bounded_adapter_source(uri, adapter, ray)
         parent = datasets[step.inputs[0][0]]                   # clean transforms/passthrough are single-input
         if step.op == "passthrough":
             return parent
@@ -815,7 +1271,12 @@ class RayRunner:
 
         from hub.executors.engine import join_sql
         left = datasets[step.inputs[0][0]]                     # incoming-edge order = engine's left, right
-        right = datasets[step.inputs[1][0]]
+        right = datasets[step.inputs[1][0]].materialize()
+        try:
+            right_bytes = right.size_bytes()
+        except Exception:  # noqa: BLE001 — fail closed instead of risking an unbounded driver collect
+            right_bytes = None
+        _require_driver_fallback(right_bytes, "broadcast join right side")
         refs = ray.get(right.to_arrow_refs())                  # broadcast side: driver → workers
         if refs:
             right_tbl = pa.concat_tables(refs)
@@ -889,11 +1350,24 @@ class RayRunner:
         return self._shuffle_duckdb(
             parent, keys, f'SELECT *, {expr} OVER ({over}) AS "{col}" FROM _blk', ray_opts)
 
-    def _commit(self, step, datasets, target_uri: str) -> tuple[int, str, str]:
+    def _commit(self, step, datasets, target_uri: str, *,
+                attempt_id: str | None = None,
+                ray_opts: dict | None = None) -> tuple[int, str, str]:
         cfg = step.config
         spec = SinkSpec.from_config(cfg, cfg.get("title"))
         ds = datasets[step.inputs[0][0]]
-        tbl = _collect_arrow(ds)                                # collect blocks to the driver, typed when empty
+        adapter = self.resolve_adapter(target_uri)
+        attempt_id = attempt_id or f"driver_{uuid.uuid4().hex}"
+        if _worker_direct_parquet_sink(spec, target_uri, adapter):
+            actual_uri = _attempt_handoff_uri(target_uri, attempt_id, scope=step.id)
+            rows, actual_uri = _write_worker_direct_parquet(
+                ds, actual_uri, attempt_id=attempt_id, ray_opts=ray_opts
+            )
+            return rows, actual_uri, spec.name
+        tbl = _collect_arrow(ds, purpose=(
+            f"{spec.mode} {spec.extension} sink"
+            + (f" partitioned by {spec.partition_by}" if spec.partition_by else "")
+        ))
         with db.base_guard():
             rel = db.conn().from_arrow(tbl)
             committed = commit_sink(spec, rel, self.deps.workspace, self.base.storage,
@@ -901,14 +1375,29 @@ class RayRunner:
         return committed.rows, committed.uri, committed.name
 
 
-def _collect_arrow(dataset):
-    """Collect a Ray Dataset without erasing the schema when it contains zero output blocks."""
+def _collect_arrow(dataset, *, purpose: str = "Ray result"):
+    """Collect a Ray Dataset only after its materialized Arrow footprint passes the driver limit."""
     import pyarrow as pa
 
-    batches = list(dataset.iter_batches(batch_format="pyarrow"))
+    materialized = dataset.materialize()
+    try:
+        size = materialized.size_bytes()
+    except Exception:  # noqa: BLE001 — unknown size is never authorization to collect
+        size = None
+    _require_driver_fallback(size, purpose)
+    batches = []
+    decoded_bytes = 0
+    for index, batch in enumerate(materialized.iter_batches(batch_format="pyarrow"), start=1):
+        if index > _DRIVER_FALLBACK_MAX_BATCHES:
+            raise RuntimeError(
+                f"{purpose} produced more than {_DRIVER_FALLBACK_MAX_BATCHES:,} driver batches"
+            )
+        decoded_bytes += int(batch.nbytes)
+        _require_driver_fallback(decoded_bytes, f"{purpose} after decoding")
+        batches.append(batch)
     if batches:
         return pa.concat_tables(batches)
-    schema = dataset.schema()
+    schema = materialized.schema()
     arrow_schema = getattr(schema, "base_schema", schema)
     if not isinstance(arrow_schema, pa.Schema):
         raise RuntimeError("an empty Ray result did not expose an Arrow schema")

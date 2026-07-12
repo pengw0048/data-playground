@@ -5071,6 +5071,7 @@ def test_run_routes_to_a_capability_matching_backend(tmp_path, monkeypatch):
     import json
 
     from hub.deps import Deps
+    from hub.ir import lower_to_ir
     from hub.models import Graph
     from hub.routers.runs import _route_by_capability
     monkeypatch.setenv("DP_POOL_WORKERS", json.dumps([{"name": "gpu", "cpu": 16, "gpu": 2, "gpu_type": "a100"}]))
@@ -7324,6 +7325,7 @@ def test_ray_backend_operator_gating_and_fallback(tmp_path):
 
 def test_ray_sink_contract_matches_local_without_a_live_cluster(tmp_path, monkeypatch):
     """Ray's driver-side commit must use the local sink contract even when no Ray cluster is available."""
+    import json
     import re
 
     import duckdb
@@ -7360,13 +7362,30 @@ def test_ray_sink_contract_matches_local_without_a_live_cluster(tmp_path, monkey
         def __init__(self, table, *, no_blocks=False):
             self.table = table
             self.no_blocks = no_blocks
+            self.iterated = False
+            self.writes = []
+
+        def materialize(self):
+            return self
+
+        def size_bytes(self):
+            return self.table.nbytes
+
+        def count(self):
+            return self.table.num_rows
 
         def iter_batches(self, batch_format):
             assert batch_format == "pyarrow"
+            self.iterated = True
             return iter(()) if self.no_blocks else iter((self.table,))
 
         def schema(self):
             return self.table.schema
+
+        def write_parquet(self, path, **kwargs):
+            os.makedirs(path, exist_ok=True)
+            pq.write_table(self.table, os.path.join(path, "part-000000.parquet"))
+            self.writes.append({"path": path, **kwargs})
 
     def graph(destination_id, filename, *, mode="overwrite", partition_by="", empty=False,
               output_format="parquet"):
@@ -7452,7 +7471,7 @@ def test_ray_sink_contract_matches_local_without_a_live_cluster(tmp_path, monkey
         f"DESCRIBE SELECT * FROM read_parquet('{local_empty_uri}')"
     ).fetchall()]
     ray_schema = [(r[0], str(r[1])) for r in con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{ray_empty_uri}')"
+        f"DESCRIBE SELECT * FROM read_parquet('{ray_empty_uri}/**/*.parquet')"
     ).fetchall()]
     assert ray_schema == local_schema == [("cat", "VARCHAR"), ("value", "INTEGER")]
     version = deps.catalog.get_table(ray_empty_name).version
@@ -7468,16 +7487,528 @@ def test_ray_sink_contract_matches_local_without_a_live_cluster(tmp_path, monkey
         raise AssertionError("driver read destination settings")
 
     monkeypatch.setattr(destinations, "target_uri", no_destination_settings)
-    monkeypatch.setattr(ray_runner, "_build", lambda *_args, **_kwargs: Dataset(source_table))
-    result = ray_runner._run_ir_sync(driver_ir, driver_graph, "w", sink_targets=resolved)
+    direct_dataset = Dataset(source_table)
+    monkeypatch.setattr(ray_runner, "_build", lambda *_args, **_kwargs: direct_dataset)
+    result = ray_runner._run_ir_sync(
+        driver_ir, driver_graph, "w", sink_targets=resolved, attempt_id="whole-test"
+    )
     assert result["status"] == "done", result.get("error")
     ray_runner._register_outputs(driver_graph, result)
     assert result["rows"] == 3
-    assert result["output_uri"] == str(ray_root / "daily/2026/driver_resolved.parquet")
+    assert result["output_uri"] == mod._attempt_handoff_uri(
+        resolved["w"], "whole-test", scope="w"
+    )
+    assert direct_dataset.iterated is False
+    assert direct_dataset.writes[0]["path"] == result["output_uri"]
+    with open(os.path.join(result["output_uri"], "_DP_SUCCESS.json")) as manifest_file:
+        assert json.load(manifest_file)["runId"] == "whole-test"
     assert deps.catalog.get_table(result["output_table"]).uri == result["output_uri"]
 
 
+def test_ray_worker_direct_attempt_is_create_only_and_empty_retry_cannot_publish_stale_shards(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub.handoff import read_manifest, validate_shards, write_manifest
+
+    mod = _load_dp_ray()
+
+    class Dataset:
+        def __init__(self, table):
+            self.table = table
+            self.materialized = False
+
+        def materialize(self):
+            self.materialized = True
+            return self
+
+        def count(self):
+            return self.table.num_rows
+
+        def schema(self):
+            return self.table.schema
+
+        def write_parquet(self, path, **_kwargs):
+            os.makedirs(path, exist_ok=True)
+            pq.write_table(self.table, os.path.join(path, "part-000000.parquet"))
+
+    schema = pa.schema([("x", pa.int64())])
+    committed_uri = str(tmp_path / "whole.attempt-same")
+    first = Dataset(pa.table({"x": pa.array([1, 2], type=pa.int64())}))
+    assert mod._write_worker_direct_parquet(first, committed_uri, attempt_id="same") == (2, committed_uri)
+    manifest = read_manifest(committed_uri)
+    assert manifest is not None and validate_shards(committed_uri, manifest)
+    original = pq.read_table(os.path.join(committed_uri, "part-000000.parquet")).column("x").to_pylist()
+
+    empty_retry = Dataset(pa.Table.from_batches([], schema=schema))
+    assert mod._write_worker_direct_parquet(
+        empty_retry, committed_uri, attempt_id="same"
+    ) == (2, committed_uri)
+    assert empty_retry.materialized is False, "a committed retry must reattach without executing/writing"
+    assert pq.read_table(os.path.join(committed_uri, "part-000000.parquet")).column("x").to_pylist() == original
+
+    wrong_uri = str(tmp_path / "whole.attempt-wrong-run")
+    os.makedirs(wrong_uri)
+    pq.write_table(pa.table({"x": [7]}), os.path.join(wrong_uri, "part.parquet"))
+    write_manifest(wrong_uri, run_id="different-run", rows=1, schema=schema)
+    wrong_retry = Dataset(pa.Table.from_batches([], schema=schema))
+    with pytest.raises(RuntimeError, match="already exists without an exact committed inventory"):
+        mod._write_worker_direct_parquet(wrong_retry, wrong_uri, attempt_id="expected-run")
+    assert wrong_retry.materialized is False
+
+    partial_uri = str(tmp_path / "whole.attempt-partial")
+    os.makedirs(partial_uri)
+    pq.write_table(pa.table({"x": [99]}), os.path.join(partial_uri, "stale.parquet"))
+    partial_retry = Dataset(pa.Table.from_batches([], schema=schema))
+    with pytest.raises(RuntimeError, match="already exists without an exact committed inventory"):
+        mod._write_worker_direct_parquet(partial_retry, partial_uri, attempt_id="partial")
+    assert partial_retry.materialized is False
+    assert pq.read_table(os.path.join(partial_uri, "stale.parquet")).column("x").to_pylist() == [99]
+
+    unknown_uri = str(tmp_path / "whole.attempt-unknown")
+    os.makedirs(unknown_uri)
+    with open(os.path.join(unknown_uri, "writer.tmp"), "wb") as marker:
+        marker.write(b"partial")
+    with pytest.raises(RuntimeError, match="already exists without an exact committed inventory"):
+        mod._write_worker_direct_parquet(
+            Dataset(pa.Table.from_batches([], schema=schema)), unknown_uri, attempt_id="unknown"
+        )
+
+    empty_uri = str(tmp_path / "whole.attempt-empty")
+    fresh_empty = Dataset(pa.Table.from_batches([], schema=schema))
+    assert mod._write_worker_direct_parquet(fresh_empty, empty_uri, attempt_id="empty") == (0, empty_uri)
+    empty_manifest = read_manifest(empty_uri)
+    assert empty_manifest is not None and empty_manifest["rows"] == 0
+    assert validate_shards(empty_uri, empty_manifest)
+    assert pq.read_table(os.path.join(empty_uri, "part-000000.parquet")).schema == schema
+
+
+def test_ray_whole_run_scopes_each_sink_attempt_by_step_and_unstripped_target(tmp_path):
+    from types import SimpleNamespace
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub.deps import Deps
+    from hub.handoff import read_manifest
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    mod = _load_dp_ray()
+    runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+
+    class Dataset:
+        def __init__(self, value):
+            self.table = pa.table({"x": [value]})
+            self.written = False
+
+        def materialize(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def schema(self):
+            return self.table.schema
+
+        def write_parquet(self, path, **_kwargs):
+            self.written = True
+            os.makedirs(path, exist_ok=True)
+            pq.write_table(self.table, os.path.join(path, "part.parquet"))
+
+    target_parquet = str(tmp_path / "out.parquet")
+    target_pq = str(tmp_path / "out.pq")
+    first_ds, second_ds = Dataset(1), Dataset(2)
+    first_step = SimpleNamespace(
+        id="write-a", op="write", inputs=[("src", None)],
+        config={"filename": "out.parquet", "writeMode": "overwrite"},
+    )
+    second_step = SimpleNamespace(
+        id="write-b", op="write", inputs=[("src", None)],
+        config={"filename": "out.pq", "writeMode": "overwrite"},
+    )
+    first = runner._commit(
+        first_step, {"src": first_ds}, target_parquet, attempt_id="whole-shared"
+    )
+    second = runner._commit(
+        second_step, {"src": second_ds}, target_pq, attempt_id="whole-shared"
+    )
+
+    assert first_ds.written and second_ds.written
+    assert first[1] == mod._attempt_handoff_uri(target_parquet, "whole-shared", scope="write-a")
+    assert second[1] == mod._attempt_handoff_uri(target_pq, "whole-shared", scope="write-b")
+    assert first[1] != second[1], "same-base sink attempts must never reattach each other"
+    assert pq.read_table(os.path.join(first[1], "part.parquet")).column("x").to_pylist() == [1]
+    assert pq.read_table(os.path.join(second[1], "part.parquet")).column("x").to_pylist() == [2]
+    assert read_manifest(first[1])["runId"] == read_manifest(second[1])["runId"] == "whole-shared"
+
+    # Even if a caller reuses a step ID, the complete pre-strip logical URI remains in the digest input.
+    assert mod._attempt_handoff_uri(target_parquet, "whole-shared", scope="same") != \
+        mod._attempt_handoff_uri(target_pq, "whole-shared", scope="same")
+
+
+def test_ray_native_object_parquet_read_never_scans_through_the_driver(tmp_path, monkeypatch):
+    """Only the exact built-in adapter may use the proved, credentials-aware native path."""
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    import pyarrow as pa
+    import pyarrow.fs as pafs
+    import pyarrow.parquet as pq
+
+    from hub.deps import Deps
+    from hub.plugins import adapters
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    runner = _load_dp_ray().RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+    filesystem = pafs.LocalFileSystem()
+    read_calls = []
+    source_file = tmp_path / "source.parquet"
+    prefix = tmp_path / "tenant=must-not-surface" / "upstream.attempt-abc"
+    prefix.mkdir(parents=True)
+    hive = tmp_path / "true-hive"
+    (hive / "cat=alpha").mkdir(parents=True)
+    pq.write_table(pa.table({"x": pa.array([1], type=pa.int64())}), source_file)
+    pq.write_table(pa.table({"x": pa.array([2], type=pa.int32())}), prefix / "part-000000.parquet")
+    pq.write_table(pa.table({"x": pa.array([3], type=pa.int64())}), prefix / "part-000001.parquet")
+    pq.write_table(pa.table({"x": pa.array([4], type=pa.int64())}), hive / "cat=alpha" / "part.parquet")
+
+    def object_fs(uri):
+        if uri.endswith(".parquet"):
+            return filesystem, str(source_file)
+        if "true-hive" in uri:
+            return filesystem, str(hive)
+        return filesystem, str(prefix)
+
+    monkeypatch.setattr(adapters, "object_fs", object_fs)
+    ray = ModuleType("ray")
+    ray_data = ModuleType("ray.data")
+    datasource = ModuleType("ray.data.datasource")
+
+    class Partitioning:
+        def __init__(self, style, **kwargs):
+            self.style, self.kwargs = style, kwargs
+
+    def read_parquet(paths, **kwargs):
+        read_calls.append((paths, kwargs))
+        return paths
+
+    datasource.Partitioning = Partitioning
+    ray_data.datasource = datasource
+    ray_data.read_parquet = read_parquet
+    ray.data = ray_data
+    monkeypatch.setitem(sys.modules, "ray", ray)
+    monkeypatch.setitem(sys.modules, "ray.data", ray_data)
+    monkeypatch.setitem(sys.modules, "ray.data.datasource", datasource)
+
+    adapter = runner.resolve_adapter("s3://bucket/source.parquet")
+    metadata_scans = []
+
+    class MetadataRelation:
+        def __init__(self, schema):
+            self.schema = schema
+
+        def to_arrow_table(self):
+            return pa.Table.from_batches([], schema=self.schema)
+
+    def metadata_scan(uri, *, limit=None, **_kwargs):
+        assert limit == 0, "native proof may query adapter metadata but must never scan data rows"
+        metadata_scans.append(uri)
+        if "true-hive" in uri:
+            return MetadataRelation(pa.schema([("x", pa.int64()), ("cat", pa.string())]))
+        return MetadataRelation(pa.schema([("x", pa.int64())]))
+
+    monkeypatch.setattr(adapter, "scan", metadata_scan)
+
+    file_result = runner._build(SimpleNamespace(
+        op="read", config={"uri": "s3://bucket/source.parquet"},
+    ), {})
+    prefix_result = runner._build(SimpleNamespace(
+        op="read", config={"uri": "s3://bucket/upstream.attempt-abc"},
+    ), {})
+    hive_result = runner._build(SimpleNamespace(
+        op="read", config={"uri": "s3://bucket/true-hive"},
+    ), {})
+    assert file_result == [str(source_file)]
+    assert prefix_result == [str(prefix / "part-000000.parquet"), str(prefix / "part-000001.parquet")]
+    assert hive_result == [str(hive / "cat=alpha" / "part.parquet")]
+    assert [call[0] for call in read_calls] == [file_result, prefix_result, hive_result]
+    assert all(call[1]["filesystem"] is filesystem for call in read_calls)
+    assert all(call[1]["partitioning"].style == "hive" for call in read_calls)
+    assert all(call[1]["columns"] == call[1]["schema"].names for call in read_calls)
+    assert read_calls[0][1]["partitioning"].kwargs["base_dir"] == str(tmp_path)
+    assert read_calls[1][1]["partitioning"].kwargs["base_dir"] == str(prefix)
+    assert read_calls[1][1]["schema"] == pa.schema([("x", pa.int64())])
+    assert read_calls[2][1]["partitioning"].kwargs["base_dir"] == str(hive)
+    assert read_calls[2][1]["partitioning"].kwargs["base_dir"] != str(tmp_path)
+    assert read_calls[2][1]["schema"] == pa.schema([("x", pa.int64()), ("cat", pa.string())])
+    assert read_calls[2][1]["partitioning"].kwargs["field_types"] == {"cat": str}
+    assert metadata_scans == [
+        "s3://bucket/source.parquet",
+        "s3://bucket/upstream.attempt-abc",
+        "s3://bucket/true-hive",
+    ]
+
+
+def test_ray_hive_native_plan_matches_adapter_schema_and_fails_closed_on_unproved_layouts(
+        tmp_path, monkeypatch):
+    import datetime
+    import sys
+    from types import SimpleNamespace
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub.deps import Deps
+    from hub.plugins.adapters import DuckDBAdapter
+
+    mod = _load_dp_ray()
+    adapter = DuckDBAdapter()
+
+    native = tmp_path / "native-hive"
+    for path, value in (("n=1/tier=alpha", 10), ("n=2/tier=beta", 20)):
+        directory = native / path
+        directory.mkdir(parents=True)
+        pq.write_table(pa.table({"v": [value]}), directory / "part.parquet")
+    plan = mod._native_parquet_plan(str(native), adapter)
+    assert plan["schema"] == pa.schema([
+        ("v", pa.int64()), ("n", pa.int64()), ("tier", pa.string()),
+    ])
+    assert plan["partition_types"] == {"n": int, "tier": str}
+    assert plan["schema"].names == ["v", "n", "tier"]
+
+    duplicate = tmp_path / "duplicate-hive" / "x=1" / "x=2"
+    duplicate.mkdir(parents=True)
+    pq.write_table(pa.table({"v": [1]}), duplicate / "part.parquet")
+    with pytest.raises(RuntimeError, match="repeats a Hive partition key"):
+        mod._native_parquet_plan(str(tmp_path / "duplicate-hive"), adapter)
+
+    encoded_sentinel = tmp_path / "encoded-sentinel" / "p=%5F%5FHIVE%5FDEFAULT%5FPARTITION%5F%5F"
+    encoded_sentinel.mkdir(parents=True)
+    pq.write_table(pa.table({"v": [1]}), encoded_sentinel / "part.parquet")
+    with pytest.raises(RuntimeError, match="default-partition sentinel"):
+        mod._native_parquet_plan(str(tmp_path / "encoded-sentinel"), adapter)
+
+    sentinel = tmp_path / "sentinel"
+    for partition, value in (("p=__HIVE_DEFAULT_PARTITION__", 1), ("p=present", 2)):
+        directory = sentinel / partition
+        directory.mkdir(parents=True)
+        pq.write_table(pa.table({"v": [value]}), directory / "part.parquet")
+    with pytest.raises(RuntimeError, match="default-partition sentinel"):
+        mod._native_parquet_plan(str(sentinel), adapter)
+
+    dated = tmp_path / "date-hive"
+    for partition in ("d=2026-07-12", "d=2026-07-13"):
+        directory = dated / partition
+        directory.mkdir(parents=True)
+        pq.write_table(pa.table({"v": [1]}), directory / "part.parquet")
+    with pytest.raises(RuntimeError, match="unsupported Ray 2.56 partition type date32"):
+        mod._native_parquet_plan(str(dated), adapter)
+
+    ancestor_root = tmp_path / "tenant=acme" / "genuine-hive"
+    ancestor_partition = ancestor_root / "n=1"
+    ancestor_partition.mkdir(parents=True)
+    pq.write_table(pa.table({"v": [1]}), ancestor_partition / "part.parquet")
+    trapped = DuckDBAdapter()
+    monkeypatch.setattr(
+        trapped, "scan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ancestor-Hive rejection must happen before the adapter metadata probe")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="below a Hive-looking root/ancestor"):
+        mod._native_parquet_plan(str(ancestor_root), trapped)
+
+    # A flat dataset below a Hive-looking ancestor is safe: adapter Hive parsing is disabled and Ray is
+    # rooted at the flat dataset, so the ancestor never becomes a logical column.
+    flat = tmp_path / "tenant=acme" / "flat"
+    flat.mkdir(parents=True)
+    pq.write_table(pa.table({"v": [3]}), flat / "part.parquet")
+    flat_plan = mod._native_parquet_plan(str(flat), adapter)
+    assert flat_plan["schema"] == pa.schema([("v", pa.int64())])
+    assert flat_plan["partition_types"] == {}
+
+    # Sentinel NULL and DATE still preserve exact DuckDB semantics on the bounded compatibility path.
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(
+        put=lambda value: value,
+        data=SimpleNamespace(from_arrow_refs=lambda refs: pa.concat_tables(refs)),
+    ))
+    sentinel_table = runner._build(SimpleNamespace(
+        op="read", config={"uri": str(sentinel)},
+    ), {})
+    assert sorted(sentinel_table.to_pylist(), key=lambda row: row["v"]) == [
+        {"v": 1, "p": None}, {"v": 2, "p": "present"},
+    ]
+    date_table = runner._build(SimpleNamespace(
+        op="read", config={"uri": str(dated)},
+    ), {})
+    assert date_table.schema.field("d").type == pa.date32()
+    assert sorted(row["d"] for row in date_table.to_pylist()) == [
+        datetime.date(2026, 7, 12), datetime.date(2026, 7, 13),
+    ]
+
+
+@pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="real Ray 2.56 Hive schema/rows regression")
+def test_ray_native_hive_live_exposes_logical_schema_columns_and_typed_rows(tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub.plugins.adapters import DuckDBAdapter
+
+    ray = pytest.importorskip("ray")
+    mod = _load_dp_ray()
+    root = tmp_path / "live-hive"
+    for path, value in (("n=1/tier=alpha", 10), ("n=2/tier=beta", 20)):
+        directory = root / path
+        directory.mkdir(parents=True)
+        pq.write_table(pa.table({"v": [value]}), directory / "part.parquet")
+    plan = mod._native_parquet_plan(str(root), DuckDBAdapter())
+    monkeypatch.setenv("RAY_DATA_DISABLE_PROGRESS_BARS", "1")
+    ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
+    try:
+        dataset = mod._read_native_parquet(ray, plan).materialize()
+        schema = getattr(dataset.schema(), "base_schema", dataset.schema())
+        assert schema == pa.schema([
+            ("v", pa.int64()), ("n", pa.int64()), ("tier", pa.string()),
+        ])
+        assert dataset.columns() == ["v", "n", "tier"]
+        assert sorted(dataset.take_all(), key=lambda row: row["n"]) == [
+            {"v": 10, "n": 1, "tier": "alpha"},
+            {"v": 20, "n": 2, "tier": "beta"},
+        ]
+    finally:
+        ray.shutdown()
+
+
+def test_ray_custom_parquet_adapters_never_take_the_native_filesystem_path(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from hub.deps import Deps
+    from hub.plugins.adapters import DuckDBAdapter
+    from hub.sinks import SinkSpec
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    mod = _load_dp_ray()
+    runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+
+    class CustomParquetAdapter(DuckDBAdapter):
+        def scan(self, _uri, **_kwargs):
+            raise AssertionError("custom adapter scan must not run after Ray dispatch")
+
+    custom = CustomParquetAdapter()
+    monkeypatch.setattr(runner, "resolve_adapter", lambda _uri: custom)
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(data=SimpleNamespace()))
+    for uri in (str(tmp_path / "custom.parquet"), "s3://bucket/custom.parquet"):
+        with pytest.raises(RuntimeError, match="CustomParquetAdapter.*explicit bounded/distributed"):
+            runner._build(SimpleNamespace(op="read", config={"uri": uri}), {})
+        assert mod._worker_direct_parquet_sink(
+            SinkSpec.from_config({"filename": "custom.parquet"}), uri, custom
+        ) is False
+
+
+def test_ray_compatibility_sources_are_size_bounded_before_adapter_scan(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    import pyarrow as pa
+
+    from hub.deps import Deps
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    mod = _load_dp_ray()
+    runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+    table = pa.table({"x": [1, 2]})
+    sentinel = object()
+    scans = []
+    source = tmp_path / "small.csv"
+    source.write_text("x\n1\n2\n")
+    adapter = runner.resolve_adapter(str(source))
+    original_scan = adapter.scan
+
+    def tracked_scan(uri):
+        scans.append(uri)
+        return original_scan(uri)
+
+    monkeypatch.setattr(adapter, "scan", tracked_scan)
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(
+        put=lambda value: value,
+        data=SimpleNamespace(from_arrow_refs=lambda refs: sentinel),
+    ))
+    monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "1024")
+    assert runner._build(SimpleNamespace(op="read", config={"uri": str(source)}), {}) is sentinel
+    assert scans == [str(source)]
+
+    too_large = tmp_path / "large.csv"
+    too_large.write_bytes(b"x" * 17)
+    monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "16")
+    with pytest.raises(RuntimeError, match="above the 16-byte limit"):
+        runner._build(SimpleNamespace(op="read", config={"uri": str(too_large)}), {})
+    with pytest.raises(RuntimeError, match="byte size is unknown"):
+        runner._build(SimpleNamespace(op="read", config={"uri": str(tmp_path / "missing.csv")}), {})
+    assert scans == [str(source)], "over-limit and unknown sources must fail before adapter.scan"
+
+    decoded = pa.table({"x": [1, 2, 3]})  # 24 Arrow bytes from a 6-byte CSV source
+
+    class DecodedRelation:
+        def to_arrow_reader(self, _batch_rows):
+            return pa.RecordBatchReader.from_batches(decoded.schema, decoded.to_batches())
+
+    def decoded_scan(uri):
+        scans.append(uri)
+        return DecodedRelation()
+
+    monkeypatch.setattr(adapter, "scan", decoded_scan)
+    with pytest.raises(RuntimeError, match="24-byte driver compatibility collect, above the 16-byte limit"):
+        runner._build(SimpleNamespace(op="read", config={"uri": str(source)}), {})
+
+
+def test_ray_driver_collect_rejects_unknown_or_over_limit_before_iteration(monkeypatch):
+    import pyarrow as pa
+
+    mod = _load_dp_ray()
+    monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "16")
+
+    class Dataset:
+        def __init__(self, size):
+            self.size = size
+            self.iterated = False
+
+        def materialize(self):
+            return self
+
+        def size_bytes(self):
+            if self.size is None:
+                raise RuntimeError("unknown")
+            return self.size
+
+        def iter_batches(self, *, batch_format):
+            assert batch_format == "pyarrow"
+            self.iterated = True
+            return iter((pa.table({"x": [1]}),))
+
+        def schema(self):
+            return pa.schema([("x", pa.int64())])
+
+    small = Dataset(8)
+    assert mod._collect_arrow(small, purpose="CSV sink").column("x").to_pylist() == [1]
+    assert small.iterated
+    for size, message in ((17, "above the 16-byte limit"), (None, "byte size is unknown")):
+        rejected = Dataset(size)
+        with pytest.raises(RuntimeError, match=message):
+            mod._collect_arrow(rejected, purpose="CSV sink")
+        assert rejected.iterated is False
+
+
 def test_ray_rejects_or_falls_back_before_dispatch_for_unsupported_sinks(tmp_path, monkeypatch):
+    import duckdb
+
     from hub.compiler import compile_plan
     from hub.deps import Deps
     from hub.ir import lower_to_ir
@@ -7489,9 +8020,14 @@ def test_ray_rejects_or_falls_back_before_dispatch_for_unsupported_sinks(tmp_pat
     mod = _load_dp_ray()
     ray_runner = mod.RayRunner(deps)
 
+    source_uri = str(tmp_path / "unused.parquet")
+    duckdb.connect().execute(
+        f"COPY (SELECT 1 AS x) TO '{source_uri}' (FORMAT PARQUET)"
+    )
+
     def graph(config):
         return Graph(**{"id": "sink-gate", "version": 1, "nodes": [
-            _ray_node("src", "source", {"uri": "unused.parquet"}),
+            _ray_node("src", "source", {"uri": source_uri}),
             _ray_node("w", "write", config),
         ], "edges": [_ray_edge("src", "w")]})
 
@@ -7508,7 +8044,7 @@ def test_ray_rejects_or_falls_back_before_dispatch_for_unsupported_sinks(tmp_pat
 
     monkeypatch.setattr(mod.threading, "Thread", DeferredThread)
     unit = Graph(**{"id": "unit", "version": 1, "nodes": [
-        _ray_node("src", "source", {"uri": "unused.parquet"}),
+        _ray_node("src", "source", {"uri": source_uri}),
     ], "edges": []})
     ray_runner.run_unit(unit, "src", str(tmp_path / "unit.parquet"))
     assert "sink_targets" not in dispatched[-1]["kwargs"].get("kwargs", {})
@@ -7517,6 +8053,10 @@ def test_ray_rejects_or_falls_back_before_dispatch_for_unsupported_sinks(tmp_pat
     ray_runner.run(compile_plan(valid, "w", deps.registry, deps.node_specs), valid, "w", "local")
     sink_targets = dispatched[-1]["kwargs"]["kwargs"]["sink_targets"]
     assert sink_targets == {"w": str(workspace / "outputs/valid.parquet")}
+
+    monkeypatch.setenv("DP_RAY_REMOTE", "1")
+    assert ray_runner._sink_targets_runnable(lower_to_ir(valid, "w", deps.node_specs)) is False
+    monkeypatch.delenv("DP_RAY_REMOTE")
 
     # This combination is outside the product contract and must never be dispatched with partitionBy
     # silently discarded. The Ray gate rejects it; run() delegates before starting a Ray supervisor.
@@ -7542,6 +8082,69 @@ def test_ray_rejects_or_falls_back_before_dispatch_for_unsupported_sinks(tmp_pat
     assert ray_runner.run(
         compile_plan(partitioned, "w", deps.registry, deps.node_specs), partitioned, "w", "local"
     ) is sentinel
+
+
+def test_remote_ray_bounds_local_sources_and_never_dispatches_a_local_region_handoff(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    import duckdb
+
+    from hub.deps import Deps
+    from hub.ir import lower_to_ir
+    from hub.models import Graph
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    deps = Deps(str(workspace), str(tmp_path / "data"))
+    mod = _load_dp_ray()
+    runner = mod.RayRunner(deps)
+    source = str(tmp_path / "small.parquet")
+    duckdb.connect().execute(f"COPY (SELECT 1 AS x) TO '{source}' (FORMAT PARQUET)")
+    graph = Graph(**{"id": "remote-local", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": source}),
+    ], "edges": []})
+
+    monkeypatch.setenv("DP_RAY_REMOTE", "1")
+    monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "1048576")
+    sentinel = object()
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(
+        put=lambda value: value,
+        data=SimpleNamespace(
+            from_arrow_refs=lambda _refs: sentinel,
+            read_parquet=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("remote workers must not read a hub-local Parquet path")
+            ),
+        ),
+    ))
+    assert runner._build(SimpleNamespace(op="read", config={"uri": source}), {}) is sentinel
+    monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "1")
+    assert "above the 1-byte limit" in (
+        runner._source_unsupported_reason(lower_to_ir(graph, "src", runner.node_specs)) or ""
+    )
+    monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "1048576")
+
+    dispatched = []
+
+    class TrappedThread:
+        def __init__(self, *args, **kwargs):
+            dispatched.append((args, kwargs))
+
+        def start(self):
+            raise AssertionError("a local remote-region handoff must be rejected/fallback before dispatch")
+
+    monkeypatch.setattr(mod.threading, "Thread", TrappedThread)
+    local = runner.run_unit(
+        graph, "src", str(tmp_path / "local-region.parquet"), run_id="remote_local_fallback"
+    )
+    assert local.status == "done" and local.placement == "local"
+    pinned = runner.run_unit(
+        graph, "src", str(tmp_path / "pinned-region.parquet"),
+        requires={"labels": {"engine": "ray"}}, run_id="remote_local_pinned",
+    )
+    assert pinned.status == "failed"
+    assert "remote Ray cluster cannot materialize" in (pinned.error or "")
+    assert dispatched == []
 
 
 @pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="live Ray run — opt-in because it needs the [ray] extra + a real Ray executor (slow). Verified passing on macOS AND Linux via the dp_ray subprocess driver (which disables Ray's uv-run worker hook). Enable: DP_TEST_RAY_LIVE=1.")
@@ -7590,7 +8193,7 @@ def test_ray_backend_live_differential(tmp_path):
     assert st_loc.status == "done", st_loc.error
 
     def rows(uri):
-        return sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{uri}')").fetchall())
+        return sorted(r[0] for r in deps.resolve_adapter(uri).scan(uri).project("x").fetchall())
     assert rows(st_ray.output_uri) == rows(st_loc.output_uri) == [10, 12, 14, 16, 18, 20]
 
 
@@ -7626,6 +8229,8 @@ def test_ray_custom_labels_are_advertised_to_the_pre_dispatch_gate(tmp_path, mon
 
 
 def test_ray_whole_run_enforces_and_forwards_final_region_resources(tmp_path, monkeypatch):
+    import duckdb
+
     from hub.compiler import compile_plan
     from hub.deps import Deps
     from hub.models import Graph
@@ -7633,10 +8238,12 @@ def test_ray_whole_run_enforces_and_forwards_final_region_resources(tmp_path, mo
     (tmp_path / "ws").mkdir()
     mod = _load_dp_ray()
     rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    source_uri = str(tmp_path / "input.parquet")
+    duckdb.connect().execute(f"COPY (SELECT 1 AS x) TO '{source_uri}' (FORMAT PARQUET)")
 
     def graph(pool):
         return Graph(**{"id": "ray-final-placement", "version": 1, "nodes": [
-            _ray_node("src", "source", {"uri": "unused.parquet", "requires": {
+            _ray_node("src", "source", {"uri": source_uri, "requires": {
                 "labels": {"engine": "ray", "pool": pool}}}),
         ], "edges": []})
 
@@ -7728,6 +8335,12 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
         def columns(self):
             return ["k"]
 
+        def materialize(self):
+            return self
+
+        def size_bytes(self):
+            return 8
+
         def repartition(self, *args, **kwargs):
             return self
 
@@ -7808,15 +8421,38 @@ def test_ray_explicit_placement_fails_unadvertised_resources_before_dispatch(tmp
     assert "requested resources" in (status.error or "")
     assert "advertised Ray capacity" in (status.error or "")
 def test_ray_region_handoff_uses_an_immutable_attempt_prefix():
+    import hashlib
+    import json
+
     attempt_uri = _load_dp_ray()._attempt_handoff_uri
+
+    def digest_hex(uri, run_id, scope=None):
+        identity = json.dumps({"runId": run_id, "scope": scope, "uri": uri},
+                              ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return hashlib.sha256(identity.encode()).hexdigest()[:32]
 
     first = attempt_uri("s3://bucket/regions/node_hash.parquet", "unit_first")
     second = attempt_uri("s3://bucket/regions/node_hash.parquet", "unit_second")
 
-    assert first == "s3://bucket/regions/node_hash.attempt-unit_first"
-    assert second == "s3://bucket/regions/node_hash.attempt-unit_second"
+    assert first == (
+        "s3://bucket/regions/node_hash.attempt-unit_first-"
+        + digest_hex("s3://bucket/regions/node_hash.parquet", "unit_first")
+    )
+    assert second == (
+        "s3://bucket/regions/node_hash.attempt-unit_second-"
+        + digest_hex("s3://bucket/regions/node_hash.parquet", "unit_second")
+    )
     assert first != second
-    assert attempt_uri("/tmp/out.parquet", "../../unsafe run") == "/tmp/out.attempt-unsafe_run"
+    unsafe = attempt_uri("/tmp/out.parquet", "../../unsafe run")
+    collision = attempt_uri("/tmp/out.parquet", "unsafe run")
+    assert unsafe.startswith("/tmp/out.attempt-unsafe_run-") and unsafe != collision
+    assert attempt_uri("/tmp/out.parquet", "same", scope="w") != \
+        attempt_uri("/tmp/out.pq", "same", scope="w")
+    assert attempt_uri("/tmp/out.parquet", "same", scope="w1") != \
+        attempt_uri("/tmp/out.parquet", "same", scope="w2")
+    long_uri = attempt_uri("/tmp/out.parquet", "x" * 10_000)
+    readable, suffix = long_uri.split(".attempt-", 1)[1].rsplit("-", 1)
+    assert len(readable) == 64 and len(suffix) == 32
 
 
 def test_ray_region_reattaches_committed_attempt_and_refuses_partial_retry(tmp_path):
@@ -7844,6 +8480,9 @@ def test_ray_region_reattaches_committed_attempt_and_refuses_partial_retry(tmp_p
     done = rr.run_unit(graph, "src", suggested, run_id=run_id)
     assert done.status == "done" and done.output_uri == attempt and done.rows_processed == 1
     assert not rr.cancel_acknowledged(run_id)
+    restarted = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    reattached = restarted.run_unit(graph, "src", suggested, run_id=run_id)
+    assert reattached.status == "done" and reattached.output_uri == attempt
 
     partial_id = "unit_partial"
     partial = mod._attempt_handoff_uri(suggested, partial_id)
@@ -7852,6 +8491,17 @@ def test_ray_region_reattaches_committed_attempt_and_refuses_partial_retry(tmp_p
         f"COPY (SELECT 2 AS x) TO '{partial}/part-0.parquet' (FORMAT PARQUET)")
     failed = rr.run_unit(graph, "src", suggested, run_id=partial_id)
     assert failed.status == "failed" and "refusing to overwrite" in (failed.error or "")
+
+    wrong_id = "unit_wrong_manifest"
+    wrong = mod._attempt_handoff_uri(suggested, wrong_id)
+    os.makedirs(wrong)
+    duckdb.connect().execute(
+        f"COPY (SELECT 3 AS x) TO '{wrong}/part-0.parquet' (FORMAT PARQUET)")
+    write_manifest(wrong, run_id="different-owner", rows=1, schema="x: int64")
+    wrong_status = mod.RayRunner(
+        Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    ).run_unit(graph, "src", suggested, run_id=wrong_id)
+    assert wrong_status.status == "failed" and "refusing to overwrite" in (wrong_status.error or "")
 
 
 def test_region_attempt_requires_a_valid_commit_manifest(tmp_path):
@@ -8381,7 +9031,7 @@ def test_ray_backend_run_unit_falls_back_locally_for_a_nonclean_region(tmp_path)
     st = rr.run_unit(gr, "a", out, run_id="unit_local_fallback")
     assert st.status == "done", st.error
     assert st.placement == "local"  # a non-clean region fell back to the local engine, not Ray
-    assert st.output_uri != out and st.output_uri.endswith(".attempt-unit_local_fallback")
+    assert st.output_uri == _load_dp_ray()._attempt_handoff_uri(out, "unit_local_fallback")
     assert not os.path.exists(out), "the fallback wrote the stable controller suggestion"
     assert os.path.isfile(os.path.join(st.output_uri, "_DP_SUCCESS.json"))
     assert duckdb.connect().execute(
@@ -8396,8 +9046,8 @@ def test_ray_backend_run_unit_falls_back_locally_for_a_nonclean_region(tmp_path)
 
 @pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="live Ray run — opt-in (needs [ray] + a real executor). Enable: DP_TEST_RAY_LIVE=1.")
 def test_ray_backend_run_unit_live(tmp_path):
-    # D end-to-end: run_unit executes a region on Ray (reads a parquet WORKER-DIRECT via ray.data.read_parquet)
-    # and materializes output_node → a single parquet uri, matching the local engine byte-for-byte.
+    # D end-to-end: run_unit executes a region on Ray (reads Parquet via ray.data.read_parquet) and
+    # materializes output_node to an immutable worker-direct parts prefix.
     import time
 
     import duckdb

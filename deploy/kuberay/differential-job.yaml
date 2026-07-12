@@ -39,6 +39,7 @@ spec:
             - { name: DP_S3_KEY, value: "dpminio" }
             - { name: DP_S3_SECRET, value: "dpminio123" }
             - { name: DP_S3_BUCKET, value: "dpray" }
+            - { name: DP_STORAGE_URL, value: "s3://dpray/outputs" }
           volumeMounts:
             - { name: dshm, mountPath: /dev/shm }
       volumes:

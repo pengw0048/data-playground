@@ -117,6 +117,19 @@ def read_manifest(uri: str) -> dict | None:
     return doc
 
 
+def attempt_has_commit_record(uri: str) -> bool:
+    """Whether any commit object exists, valid or corrupt; uncertainty is treated as occupied."""
+    try:
+        if is_object_uri(uri):
+            import pyarrow.fs as pafs
+
+            fs, path = object_fs(uri)
+            return fs.get_file_info(_object_manifest_path(path)).type == pafs.FileType.File
+        return os.path.lexists(os.path.join(path_of(uri), MANIFEST_NAME))
+    except Exception:  # noqa: BLE001 — never overwrite a prefix whose commit state is unknown
+        return True
+
+
 def validate_shards(uri: str, manifest: dict) -> bool:
     """Fail closed unless the current Parquet path/size set exactly matches the committed inventory."""
     try:
@@ -130,6 +143,25 @@ def attempt_has_shards(uri: str) -> bool:
     try:
         return bool(_list_shards(uri))
     except Exception:  # noqa: BLE001 — never overwrite a prefix whose state cannot be proven empty
+        return True
+
+
+def attempt_has_contents(uri: str) -> bool:
+    """Whether an unpublished data prefix contains any object, not only a recognized Parquet shard."""
+    try:
+        if is_object_uri(uri):
+            import pyarrow.fs as pafs
+
+            fs, path = object_fs(uri)
+            infos = fs.get_file_info(
+                pafs.FileSelector(path.rstrip("/"), recursive=True, allow_not_found=True)
+            )
+            return any(info.type == pafs.FileType.File for info in infos)
+        path = path_of(uri)
+        if os.path.isfile(path) or os.path.islink(path):
+            return True
+        return any(files for _root, _dirs, files in os.walk(path))
+    except Exception:  # noqa: BLE001 — never overwrite a prefix whose occupancy is uncertain
         return True
 
 

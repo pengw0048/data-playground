@@ -25,6 +25,7 @@ def _source() -> dict[str, str]:
         "PATH": "/runtime/bin",
         "DP_MEMORY_LIMIT": "2GB",
         "DP_RAY_LABELS": "pool=a100",
+        "DP_RAY_DRIVER_FALLBACK_MAX_BYTES": "33554432",
         "DP_DATABASE_URL": "postgresql+psycopg://worker:secret@db/dataplay",
         "DP_STORAGE_URL": "s3://data/output",
         "AWS_ACCESS_KEY_ID": "data-key",
@@ -94,6 +95,7 @@ def test_ray_driver_uses_one_shot_profile(monkeypatch):
     assert "DP_DATABASE_URL" not in env
     assert env["AWS_SECRET_ACCESS_KEY"] == "data-secret"
     assert env["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] == "0"
+    assert env["DP_RAY_DRIVER_FALLBACK_MAX_BYTES"] == "33554432"
     assert env["PATH"].startswith(str(Path(module.sys.executable).parent))
 
 
