@@ -154,6 +154,13 @@ def resolve_config(node: GraphNode) -> dict:
                 c |= {"processor": cfg.get("processor"), "params": cfg.get("params", {})}
         if cfg.get("code"):  # keep the code too — it's the portable, self-contained operator
             c["code"] = cfg["code"]
+        # A schema-changing Ray UDF can produce zero rows, at which point Ray 2.56 drops every output
+        # block and its schema. Carry the portable contract so a distributed backend can publish a typed
+        # empty result without re-running user code. Named refs are resolved before isolated dispatch.
+        if isinstance(cfg.get("outputSchema"), (list, dict)):
+            c["outputSchema"] = cfg["outputSchema"]
+        if cfg.get("enforceSchema") is True:
+            c["enforceSchema"] = True
         return c
     if t == "source":
         opts = {k: str(cfg[k]).strip().lower() if k == "header" else str(cfg[k]).strip()

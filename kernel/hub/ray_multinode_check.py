@@ -5,10 +5,15 @@ worker containers, each its own filesystem) plus MinIO as the shared object stor
 
   1. the CLUSTER genuinely spreads a HASH-SHUFFLE EXCHANGE (the aggregate's exact mechanism) across
      >=2 distinct Ray node ids — the node probe repartitions-by-key then reports per-partition node ids;
-  2. a distributed GROUP BY and a broadcast join, each confirmed to have run on the Ray path
+  2. native object-store Parquet reads feed a distributed GROUP BY and broadcast join, each confirmed
+     to have run on the Ray path
      (`status.placement == "distributed"` — NOT dp_ray's silent single-node fallback), written
      WORKER-DIRECT to object storage, are byte-identical to single-node DuckDB (schema + rows as a sorted
-     multiset, NULLs included).
+     multiset, NULLs included);
+  3. physical-footer schema drift is unified, a flat-root Hive-looking ancestor stays out of the schema,
+     and typed numeric/string Hive columns survive a real distributed aggregate + broadcast join;
+  4. a whole-graph overwrite sink writes Ray blocks directly to an immutable object prefix, publishes a
+     success manifest, registers that actual URI, and never substitutes the stable logical filename.
 
 Note the honest scope: N nodes is credited to the cluster/shuffle (the probe), not to the specific tested
 query — a query's own node spread isn't observable from this process (the dp_ray run executes in its own
@@ -129,6 +134,7 @@ def main() -> int:
 
     # (2) byte-identical differential — DuckDB oracle vs the dp_ray cluster run (no ray.init here)
     from hub import db, metadb
+    from hub.compiler import compile_plan
     from hub.deps import Deps
     from hub.executors.engine import BuildEngine
     from hub.models import Graph
@@ -200,6 +206,104 @@ def main() -> int:
     _log(f"PASS: distributed GROUP BY (placement=distributed) byte-identical to DuckDB "
          f"({len(ray_rows)} groups incl. NULL); worker-direct object-store output; cluster shuffle spans {n_nodes} nodes")
 
+    # Native Parquet proof on the real Ray/MinIO path. Ray 2.56 otherwise infers one footer and applies
+    # Hive parsing above the requested dataset root. Exercise both failure modes plus a genuine immediate
+    # Hive partition before this backend can claim worker-direct object reads.
+    if not fault:
+        ancestor_src = f"s3://{bucket}/tenant=must-not-surface/schema_drift"
+        db.conn().execute(
+            f"COPY (SELECT CAST(1 AS INTEGER) AS x) TO '{ancestor_src}/part-32.parquet' (FORMAT PARQUET)"
+        )
+        db.conn().execute(
+            f"COPY (SELECT CAST(2 AS BIGINT) AS x) TO '{ancestor_src}/part-64.parquet' (FORMAT PARQUET)"
+        )
+        ancestor_graph = Graph(**{"id": "native-schema", "version": 1, "nodes": [
+            {"id": "src", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": ancestor_src}}},
+        ], "edges": []})
+        ancestor_status = rr.run_unit(
+            ancestor_graph, "src", f"s3://{bucket}/native_schema_out.parquet"
+        )
+        for _ in range(1800):
+            if rr.status(ancestor_status.run_id).status in ("done", "failed", "cancelled"):
+                break
+            time.sleep(0.2)
+        ancestor_status = rr.status(ancestor_status.run_id)
+        if ancestor_status.status != "done" or ancestor_status.placement != "distributed":
+            _log(f"FAIL: native schema/ancestor-Hive run did not distribute: {ancestor_status.error}")
+            return 1
+        ancestor_table = deps.resolve_adapter(ancestor_status.output_uri).scan(
+            ancestor_status.output_uri
+        ).to_arrow_table()
+        if ancestor_table.column_names != ["x"] or str(ancestor_table.schema.field("x").type) != "int64" \
+                or sorted(ancestor_table.column("x").to_pylist()) != [1, 2]:
+            _log(f"FAIL: native schema union/ancestor-Hive boundary drifted: {ancestor_table}")
+            return 1
+
+        hive_src = f"s3://{bucket}/true_hive"
+        db.conn().execute(
+            f"COPY (SELECT CAST(10 AS BIGINT) AS v) TO '{hive_src}/cat=1/tier=alpha/part-a.parquet' "
+            "(FORMAT PARQUET)"
+        )
+        db.conn().execute(
+            f"COPY (SELECT CAST(20 AS BIGINT) AS v) TO '{hive_src}/cat=2/tier=beta/part-b.parquet' "
+            "(FORMAT PARQUET)"
+        )
+        hive_dim = f"s3://{bucket}/true_hive_dim.parquet"
+        db.conn().execute(
+            f"COPY (SELECT * FROM (VALUES (1::BIGINT, 'one'), (2::BIGINT, 'two')) t(cat, name)) "
+            f"TO '{hive_dim}' (FORMAT PARQUET)"
+        )
+        hive_graph = Graph(**{"id": "native-hive", "version": 1, "nodes": [
+            {"id": "src", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": hive_src}}},
+            {"id": "agg", "type": "aggregate", "position": {"x": 0, "y": 0},
+             "data": {"config": {"groupBy": "cat, tier", "aggs": "sum(v) AS total"}}},
+            {"id": "dim", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": hive_dim}}},
+            {"id": "join", "type": "join", "position": {"x": 0, "y": 0},
+             "data": {"config": {"on": "cat", "how": "inner"}}},
+        ], "edges": [
+            {"id": "h1", "source": "src", "target": "agg", "data": {"wire": "dataset"}},
+            {"id": "h2", "source": "agg", "target": "join", "data": {"wire": "dataset"}},
+            {"id": "h3", "source": "dim", "target": "join", "data": {"wire": "dataset"}},
+        ]})
+        hive_status = rr.run_unit(hive_graph, "join", f"s3://{bucket}/native_hive_out.parquet")
+        for _ in range(1800):
+            if rr.status(hive_status.run_id).status in ("done", "failed", "cancelled"):
+                break
+            time.sleep(0.2)
+        hive_status = rr.status(hive_status.run_id)
+        if hive_status.status != "done" or hive_status.placement != "distributed":
+            _log(f"FAIL: true-Hive native read did not distribute: {hive_status.error}")
+            return 1
+        hive_table = deps.resolve_adapter(hive_status.output_uri).scan(hive_status.output_uri).to_arrow_table()
+        with db.run_scope():
+            hive_oracle = BuildEngine(
+                hive_graph, deps.resolve_adapter, deps.registry, full=True,
+                node_specs=deps.node_specs, output_node="join",
+            ).relation("join").to_arrow_table()
+        hive_schema_error = _schema_diff(hive_table, hive_oracle)
+        con.register("hive_ray", hive_table)
+        con.register("hive_oracle", hive_oracle)
+        hive_query = "SELECT cat, tier, total, name FROM {table} ORDER BY cat, tier"
+        hive_rows = con.execute(hive_query.format(table="hive_ray")).fetchall()
+        hive_oracle_rows = con.execute(hive_query.format(table="hive_oracle")).fetchall()
+        if (hive_schema_error or str(hive_table.schema.field("cat").type) != "int64"
+                or str(hive_table.schema.field("tier").type) != "string"
+                or hive_rows != hive_oracle_rows
+                or [(row[0], row[1], int(row[2]), row[3]) for row in hive_rows]
+                != [(1, "alpha", 10, "one"), (2, "beta", 20, "two")]):
+            _log(
+                f"FAIL: typed true-Hive aggregate/join parity drifted: "
+                f"schema={hive_schema_error} ray={hive_rows} duck={hive_oracle_rows}"
+            )
+            return 1
+        _log(
+            "PASS: native Parquet unifies physical footers, excludes a flat-root ancestor Hive key, "
+            "and preserves typed numeric/string Hive columns through a real aggregate + join"
+        )
+
     # (3) a BROADCAST join across nodes: the big fact (cat, v) ⋈ a small dim (cat, name), right side
     # broadcast to every worker, output written worker-direct to the object store — byte-identical to DuckDB.
     dim = f"s3://{bucket}/dim.parquet"
@@ -235,6 +339,41 @@ def main() -> int:
         _log("FAIL: cluster broadcast join != DuckDB")
         return 1
     _log(f"PASS: broadcast join (placement=distributed) byte-identical to DuckDB; cluster shuffle spans {n_nodes} nodes")
+
+    # (4) WHOLE-GRAPH overwrite: unlike run_unit above, this traverses the write-node sink contract. The
+    # stable logical target must never receive shards; workers write an immutable attempt prefix, the
+    # driver adds the manifest last, and only then does the hub register the actual physical URI.
+    whole = Graph(**{"id": "whole", "version": 1, "nodes": [
+        {"id": "src", "type": "source", "position": {"x": 0, "y": 0},
+         "data": {"config": {"uri": src}}},
+        {"id": "w", "type": "write", "position": {"x": 0, "y": 0},
+         "data": {"config": {"name": "whole_out", "writeMode": "overwrite"}}},
+    ], "edges": [{"id": "ew", "source": "src", "target": "w", "data": {"wire": "dataset"}}]})
+    stw = rr.run(compile_plan(whole, "w", deps.registry, deps.node_specs), whole, "w", "local")
+    for _ in range(1800):
+        if rr.status(stw.run_id).status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.2)
+    stw = rr.status(stw.run_id)
+    expected_prefix = f"s3://{bucket}/outputs/whole_out.attempt-"
+    if stw.status != "done" or stw.placement != "distributed":
+        _log(f"FAIL: whole-graph overwrite not distributed — {stw.status}/{stw.placement}: {stw.error}")
+        return 1
+    if not (stw.output_uri or "").startswith(expected_prefix):
+        _log(f"FAIL: whole-graph sink did not return an immutable attempt URI: {stw.output_uri}")
+        return 1
+    from hub.handoff import read_manifest, validate_shards
+    manifest = read_manifest(stw.output_uri)
+    registered = deps.catalog.get_table(stw.output_table)
+    whole_tbl = deps.resolve_adapter(stw.output_uri).scan(stw.output_uri).to_arrow_table()
+    if (manifest is None or manifest.get("runId") != stw.run_id or manifest.get("rows") != 8000
+            or not validate_shards(stw.output_uri, manifest)):
+        _log(f"FAIL: whole-graph success manifest is invalid: {manifest}")
+        return 1
+    if registered.uri != stw.output_uri or whole_tbl.num_rows != 8000:
+        _log(f"FAIL: catalog/output did not publish the completed attempt: {registered.uri}")
+        return 1
+    _log("PASS: whole-graph Parquet overwrite is worker-direct, immutable, manifested, and cataloged")
     return 0
 
 

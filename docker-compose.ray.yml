@@ -74,6 +74,7 @@ services:
       DP_S3_KEY: "dpminio"
       DP_S3_SECRET: "dpminio123"
       DP_S3_BUCKET: "dpray"
+      DP_STORAGE_URL: "s3://dpray/outputs"
     # JOIN the already-running cluster as a node (so ray.init(address=auto) connects locally — an
     # external, non-node process can't attach by GCS address), then run the differential. Invoke this
     # service with `--no-deps`: restarting/recreating a dependency would replace the GCS cluster identity
