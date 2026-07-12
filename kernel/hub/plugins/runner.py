@@ -322,24 +322,24 @@ class LocalRunner:
         artifact and re-running reuses it, while different content (another canvas, an edit) gets its own
         file — so a stable per-node path can't collide across canvases or go stale after an edit. NOT
         registered in the catalog — it's an ephemeral run result, not a user-published dataset.
-        Best-effort: a relation that can't serialize (a section/opaque) falls back to a plain count so the
-        run still reports a truthful total instead of failing."""
+        Materialization is part of the run contract: a write/commit failure propagates and fails the run
+        instead of reporting `done` with an artifact the UI cannot reopen."""
         if cached and cached.get("uri") and self._output_exists(cached["uri"]):
             status.output_uri = cached["uri"]
             status.output_table = cached.get("table")
             return int(cached.get("rows") or 0)
-        try:
-            rel = engine.relation(node_id)
-            uri = self.storage.output_uri(f"__result_{phash}", ".parquet")  # content-addressed run result
-            res = self.resolve_adapter(uri).write(uri, rel, "overwrite")
-            status.output_uri = res.get("uri", uri)
-            status.output_table = None  # a run result, not a catalog table (don't clutter the Tables view)
-            prune = getattr(self.storage, "prune_results", None)  # coarse newest-N GC so results don't pile up
-            if callable(prune):
+        rel = engine.relation(node_id)
+        uri = self.storage.output_uri(f"__result_{phash}", ".parquet")  # content-addressed run result
+        res = self.resolve_adapter(uri).write(uri, rel, "overwrite")
+        status.output_uri = res.get("uri", uri)
+        status.output_table = None  # a run result, not a catalog table (don't clutter the Tables view)
+        prune = getattr(self.storage, "prune_results", None)  # coarse newest-N GC so results don't pile up
+        if callable(prune):
+            try:
                 prune()
-            return int(res.get("rows") or 0)
-        except Exception:  # noqa: BLE001 — can't serialize this relation → still report a truthful count
-            return self._count(engine, node_id, cached)
+            except Exception:  # noqa: BLE001 — post-commit retention must not invalidate a valid artifact
+                pass
+        return int(res.get("rows") or 0)
 
     def _check_assert(self, node, engine: BuildEngine) -> int:
         """A data-quality gate: the node's relation is the VIOLATING rows (predicate not TRUE). Count them;

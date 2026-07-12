@@ -18,6 +18,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
   const pushToast = useStore((s) => s.pushToast)
   const [tab, setTab] = useState('rows')
+  const [resultMode, setResultMode] = useState<'sample' | 'full'>('sample')
   const [detail, setDetail] = useState<number | null>(null)  // index of the row whose detail is open
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
 
@@ -25,19 +26,24 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
     if (!preview) runPreview(nodeId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeId])
+  useEffect(() => setResultMode('sample'), [nodeId])
   const page = (o: number) => { setDetail(null); runPreview(nodeId, o) }
 
   if (!preview || preview.loading) return <Skeleton />
   if (preview.error) return <ErrorState reason={preview.error} onRetry={() => runPreview(nodeId, offset)} />
   const res = preview.result!
   if (res.error) return <ErrorState reason={res.reason ?? 'preview failed'} onRetry={() => runPreview(nodeId, offset)} />
+  const done = run?.status?.status === 'done' ? run.status : undefined
   if (res.notPreviewable) {
     // P0-UX-01: a sample can't preview this node (an aggregate/sort), but a full run MATERIALIZES the
     // result to a durable artifact — so if this node's last run is done and produced one, show the exact
     // Full result (restorable after a restart via the persisted run status) instead of a dead end.
-    const done = run?.status?.status === 'done' ? run.status : undefined
     if (done?.outputUri) return <FullResult uri={done.outputUri} total={done.totalRows ?? null} />
     return <NotPreviewable reason={res.reason ?? 'needs a full pass'} onRun={() => requestRun(nodeId)} />
+  }
+  if (done?.outputUri && resultMode === 'full') {
+    return <FullResult uri={done.outputUri} total={done.totalRows ?? null}
+      modeToggle={<ResultModeToggle mode="full" onChange={setResultMode} />} />
   }
 
   const columns = res.columns
@@ -70,14 +76,17 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
         ))}
         {detail != null && (
           <button onClick={() => setDetail(null)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-semibold text-primary">
-            <Icon name="chevronLeft" size={12} /> Row {offset + detail}
+            <Icon name="chevronLeft" size={12} /> Row {offset + detail + 1}
           </button>
+        )}
+        {done?.outputUri && detail == null && (
+          <ResultModeToggle mode="sample" onChange={setResultMode} />
         )}
         <span className="flex-1" />
         {!special && detail == null && activeTab !== 'stats' && (
           <>
             <span className="text-[10.5px] text-muted-foreground">
-              rows {res.rows.length ? offset : 0}–{offset + res.rows.length}
+              rows {res.rows.length ? offset + 1 : 0}–{offset + res.rows.length}
               {res.truncated && <span className="ml-1.5 rounded bg-muted px-1.5 py-px">sample</span>}
             </span>
             {activeTab === 'rows' && (
@@ -136,6 +145,21 @@ function PageBtn({ dir, disabled, onClick }: { dir: 'prev' | 'next'; disabled: b
       )}>
       <Icon name={dir === 'prev' ? 'chevronLeft' : 'chevronRight'} size={13} />
     </button>
+  )
+}
+
+function ResultModeToggle({ mode, onChange }: {
+  mode: 'sample' | 'full'; onChange: (mode: 'sample' | 'full') => void
+}) {
+  return (
+    <div className="flex items-center gap-0.5 rounded-md border border-border p-0.5 text-[10px]">
+      {(['sample', 'full'] as const).map((value) => (
+        <button key={value} onClick={() => onChange(value)} aria-pressed={mode === value}
+          className={`rounded px-1.5 py-0.5 ${mode === value ? 'bg-muted font-semibold text-foreground' : 'text-muted-foreground'}`}>
+          {value === 'sample' ? 'Sample' : 'Full result'}
+        </button>
+      ))}
+    </div>
   )
 }
 
@@ -427,35 +451,55 @@ function ErrorState({ reason, onRetry }: { reason: string; onRetry: () => void }
 
 // P0-UX-01: page the DURABLE artifact a full run materialized for a not-sample-previewable target
 // (an aggregate/sort). Read back over the normal sample-by-uri API, so it's restorable after a restart.
-function FullResult({ uri, total }: { uri: string; total: number | null }) {
+export function FullResult({ uri, total, modeToggle }: {
+  uri: string; total: number | null; modeToggle?: React.ReactNode
+}) {
   const [data, setData] = useState<import('../types/api').SampleResult | null>(null)
-  const [err, setErr] = useState<string | null>(null)
+  const [err, setErr] = useState<(Error & { status?: number }) | null>(null)
   const [detail, setDetail] = useState<number | null>(null)
+  const [offset, setOffset] = useState(0)
+  const [retry, setRetry] = useState(0)
   const pushToast = useStore((s) => s.pushToast)
+  useEffect(() => setOffset(0), [uri])
   useEffect(() => {
     let live = true
     setData(null); setErr(null); setDetail(null)
-    api.sample(uri, PAGE).then((r) => { if (live) setData(r) }).catch((e) => { if (live) setErr((e as Error).message) })
+    api.sample(uri, PAGE, undefined, offset)
+      .then((r) => { if (live) setData(r) })
+      .catch((e) => { if (live) setErr(e instanceof Error ? e : new Error(String(e))) })
     return () => { live = false }
-  }, [uri])
-  if (err) return <ErrorState reason={err} onRetry={() => { setData(null); api.sample(uri, PAGE).then(setData).catch((e) => setErr((e as Error).message)) }} />
+  }, [uri, offset, retry])
+  if (err) return <ArtifactUnavailable error={err} modeToggle={modeToggle}
+    onRetry={() => setRetry((n) => n + 1)} />
   if (!data) return <Skeleton />
   const cols = (data.columns ?? []) as ColumnSchema[]
   const rows = data.rows ?? []
-  const more = total != null && total > rows.length  // the artifact is bigger than this first page
+  // A write run's total is rows written by that attempt; an append artifact can already contain more.
+  // Prefer the count measured from the artifact being viewed, using run history only as a fallback.
+  const reportedTotal = data.rowCount ?? total ?? null
+  const more = !!data.hasMore || (reportedTotal != null && reportedTotal > offset + rows.length)
+  const page = (next: number) => { setData(null); setDetail(null); setOffset(Math.max(0, next)) }
   return (
     <div className="dp-dark text-foreground">
       <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
         <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">Full result</span>
+        {modeToggle}
         <span className="text-[10.5px] text-muted-foreground">
-          {more ? `first ${rows.length} of ${total} rows` : `${total ?? rows.length} rows`}
+          rows {rows.length ? offset + 1 : 0}–{offset + rows.length}
+          {reportedTotal != null ? ` of ${reportedTotal.toLocaleString()}` : ''}
         </span>
         {detail != null && (
           <button onClick={() => setDetail(null)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-semibold text-primary">
-            <Icon name="chevronLeft" size={12} /> Row {detail}
+            <Icon name="chevronLeft" size={12} /> Row {offset + detail + 1}
           </button>
         )}
         <span className="flex-1" />
+        {detail == null && (
+          <span className="inline-flex gap-0.5">
+            <PageBtn dir="prev" disabled={offset === 0} onClick={() => page(offset - PAGE)} />
+            <PageBtn dir="next" disabled={!more} onClick={() => page(offset + PAGE)} />
+          </span>
+        )}
         {detail == null && rows.length > 0 && (
           <ExportCluster columns={cols} rows={rows} name="result" truncated={more} pushToast={pushToast} />
         )}
@@ -463,6 +507,32 @@ function FullResult({ uri, total }: { uri: string; total: number | null }) {
       {detail != null && rows[detail]
         ? <RowDetail columns={cols} row={rows[detail]} />
         : <RowsTable columns={cols} rows={rows} onRowClick={setDetail} />}
+    </div>
+  )
+}
+
+function ArtifactUnavailable({ error, onRetry, modeToggle }: {
+  error: Error & { status?: number }; onRetry: () => void; modeToggle?: React.ReactNode
+}) {
+  const status = error.status
+  const denied = status === 401 || status === 403
+  const missing = !denied && (status === 404 || status === 410 || /no such file|not found|missing|expired/i.test(error.message))
+  const title = denied ? 'Full result access denied' : missing ? 'Full result expired or removed' : 'Couldn’t load full result'
+  const note = denied
+    ? 'You no longer have access to this artifact. Switch back to the sample or ask the owner for access.'
+    : missing
+      ? 'The stored artifact is no longer available. Run the node again to create a new full result.'
+      : 'The artifact may still exist. Check the connection and retry, or switch back to the sample.'
+  return (
+    <div className="dp-dark px-5 py-6 text-center text-muted-foreground">
+      {modeToggle && <div className="mb-3 flex justify-center">{modeToggle}</div>}
+      <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
+        <Icon name="clock" size={18} />
+      </div>
+      <div className="text-[13px] font-semibold text-foreground">{title}</div>
+      <div className="mx-auto mt-1.5 max-w-[360px] text-[11.5px] leading-normal">{note}</div>
+      <div title={error.message} className="dp-mono mx-auto mt-2 max-w-[380px] overflow-hidden text-ellipsis whitespace-nowrap text-[10px] text-muted-foreground/70">{error.message}</div>
+      <Button variant="outline" size="sm" onClick={onRetry} className="mt-3.5">Retry</Button>
     </div>
   )
 }

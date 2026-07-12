@@ -468,6 +468,7 @@ class SampleRequest(Wire):
     uri: str
     k: int = 50
     columns: list[str] | None = None
+    offset: int = 0
 
 
 class ImportRequest(Wire):

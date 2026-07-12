@@ -431,6 +431,33 @@ def test_migration_0017_backfills_pre_existing_docs(tmp_path, monkeypatch):
     eng.dispose()
 
 
+def test_migration_0018_preserves_legacy_run_history(tmp_path, monkeypatch):
+    """Existing run rows migrate with null links; new code can distinguish legacy history safely."""
+    import sqlalchemy as sa
+    from alembic import command
+
+    from hub.settings import settings as live_settings
+
+    url = f"sqlite:///{tmp_path}/run-links.db"
+    monkeypatch.setattr(live_settings, "database_url", url)
+    cfg = metadb._alembic_cfg()
+    command.upgrade(cfg, "0017_catalog_org")
+    eng = sa.create_engine(url)
+    with eng.begin() as c:
+        c.execute(sa.text("INSERT INTO users (id, name) VALUES ('legacy-user', 'Legacy')"))
+        c.execute(sa.text("INSERT INTO canvases (id, owner_id, name, version, doc) "
+                          "VALUES ('legacy-canvas', 'legacy-user', 'Legacy', 1, '{}')"))
+        c.execute(sa.text("INSERT INTO run_records (id, canvas_id, status, rows) "
+                          "VALUES ('history-row', 'legacy-canvas', 'done', 12)"))
+    command.upgrade(cfg, "head")
+    with eng.connect() as c:
+        row = c.execute(sa.text("SELECT run_id, output_uri FROM run_records WHERE id='history-row'")).one()
+        assert tuple(row) == (None, None)
+        indexes = {r[1] for r in c.execute(sa.text("PRAGMA index_list('run_records')"))}
+        assert "ix_run_records_run_id" in indexes
+    eng.dispose()
+
+
 def test_semantic_plugin_registers_embedder():
     """The shipped dp_semantic_catalog plugin wires an embedder through reg.add_embedder when enabled,
     and is a no-op when disabled — without importing the heavy model (the embedder fn is lazy)."""

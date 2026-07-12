@@ -2365,6 +2365,21 @@ def test_preview_paginates_with_offset(tmp_path):
     assert [r["v"] for r in pg1["rows"]] == list(range(10, 20))  # offset advances the window
 
 
+def test_materialized_artifact_sample_paginates_with_offset(tmp_path):
+    p = _seq_parquet(tmp_path, n=105)  # column v = 0..104
+    pg0 = client.post("/api/data/sample", json={"uri": p, "k": 50, "offset": 0}).json()
+    pg1 = client.post("/api/data/sample", json={"uri": p, "k": 50, "offset": 50}).json()
+    last = client.post("/api/data/sample", json={"uri": p, "k": 50, "offset": 100}).json()
+    assert [r["v"] for r in pg0["rows"]] == list(range(50)) and pg0["hasMore"] is True
+    assert [r["v"] for r in pg1["rows"]] == list(range(50, 100)) and pg1["hasMore"] is True
+    assert [r["v"] for r in last["rows"]] == list(range(100, 105)) and last["hasMore"] is False
+    assert pg0["rowCount"] == pg1["rowCount"] == last["rowCount"] == 105
+    assert client.post("/api/data/sample", json={"uri": p, "k": 50, "offset": -1}).status_code == 400
+    os.remove(p)
+    missing = client.post("/api/data/sample", json={"uri": p, "k": 50, "offset": 0})
+    assert missing.status_code == 410 and "missing or expired" in missing.json()["detail"]
+
+
 def test_preview_has_more_marks_the_last_page(tmp_path):
     p = _seq_parquet(tmp_path, n=100)  # exactly 2 pages of 50
     g = {"id": "c1", "version": 1, "nodes": [N("s", "source", {"uri": p})], "edges": []}
@@ -2838,11 +2853,88 @@ def test_run_history_persisted_with_canvas(tmp_path):
             break
         time.sleep(0.05)
     assert runs and runs[0]["status"] == "done" and runs[0]["outputTable"] == "hist_out"
-    assert any(r["status"] == "done" for r in client.get("/api/canvas/hist_canvas/runs").json())
+    assert runs[0]["runId"] == st["runId"] and runs[0]["outputUri"] == st["outputUri"]
+    # The history row, not the runner's in-memory map, is sufficient to reopen the committed artifact.
+    # This is the restart/reopen path used by Run history after a fresh browser/server process.
+    reopened = client.post("/api/data/sample", json={"uri": runs[0]["outputUri"], "k": 5, "offset": 0}).json()
+    assert len(reopened["rows"]) == 5 and reopened["rowCount"] == st["totalRows"]
+    api_runs = client.get("/api/canvas/hist_canvas/runs").json()
+    api_record = next(r for r in api_runs if r["runId"] == st["runId"])
+    assert api_record["status"] == "done" and api_record["outputUri"] == st["outputUri"]
     # durable per-node breakdown (telemetry) travels with the run record, not just the transient RunState
     pn = runs[0]["perNode"]
     assert pn and all("node_id" in p and "status" in p for p in pn)
     assert any(p["node_id"] == "wr" and p["status"] == "done" for p in pn)
+
+
+def test_non_write_full_result_reopens_from_durable_history(tmp_path):
+    """The ephemeral Full Result link, not only a write-node output, survives in run history."""
+    from hub import metadb
+
+    canvas_id = "nonwrite_history_canvas"
+    client.put(f"/api/canvas/{canvas_id}", json={
+        "id": canvas_id, "name": "non-write history", "version": 1, "nodes": [], "edges": [],
+    })
+    source = _seq_parquet(tmp_path, n=105)
+    graph = {"id": canvas_id, "version": 1, "nodes": [
+        N("src", "source", {"uri": source}),
+        N("agg", "aggregate", {"groupBy": "v", "aggs": "count(*) AS n"}),
+    ], "edges": [E("src", "agg")]}
+    status = _poll(client.post("/api/run", json={
+        "graph": graph, "targetNodeId": "agg", "confirmed": True,
+    }).json()["runId"])
+    assert status["status"] == "done" and status["outputUri"] and status["outputTable"] is None
+
+    records = []
+    for _ in range(40):
+        records = metadb.list_runs(canvas_id)
+        if any(r["runId"] == status["runId"] for r in records):
+            break
+        time.sleep(0.05)
+    record = next(r for r in records if r["runId"] == status["runId"])
+    assert record["outputUri"] == status["outputUri"] and record["outputTable"] is None
+
+    # Reopen and page using only the durable history link, as the UI does after a restart.
+    second = client.post("/api/data/sample", json={
+        "uri": record["outputUri"], "k": 50, "offset": 50,
+    }).json()
+    assert len(second["rows"]) == 50 and second["rowCount"] == 105 and second["hasMore"] is True
+
+
+def test_full_result_commit_failure_fails_the_run(tmp_path):
+    """A local relation is not a successful full run until its reopenable artifact commits."""
+    from hub.compiler import compile_plan
+    from hub.models import Graph
+    from hub.plugins.runner import LocalRunner
+
+    class FailingStorage:
+        def output_uri(self, name, ext):
+            return f"fail://results/{name}{ext}"
+
+    class FailingAdapter:
+        def write(self, uri, rel, mode="overwrite"):
+            raise OSError("artifact commit failed")
+
+    d = get_deps()
+    source = _seq_parquet(tmp_path, n=10)
+    graph = Graph(**{"id": "commit_failure", "version": 1,
+                     "nodes": [N("s", "source", {"uri": source})], "edges": []})
+
+    def resolve(uri):
+        return FailingAdapter() if uri.startswith("fail://") else d.resolve_adapter(uri)
+
+    runner = LocalRunner(resolve, d.registry, d.catalog, d.workspace,
+                         node_builders=d.node_builders, node_specs=d.node_specs,
+                         storage=FailingStorage())
+    status = runner.run(compile_plan(graph, "s", d.registry, d.node_specs), graph, "s", "local")
+    for _ in range(200):
+        status = runner.status(status.run_id)
+        if status.status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.01)
+    assert status.status == "failed"
+    assert "artifact commit failed" in (status.error or "")
+    assert status.output_uri is None
 
 
 def test_headless_run_executes_a_saved_canvas(tmp_path, capsys):

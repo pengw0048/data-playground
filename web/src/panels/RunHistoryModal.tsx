@@ -5,6 +5,8 @@ import { status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { FullResult } from './DataPanel'
 
 // Persisted run history + telemetry for the current canvas (survives restarts) — /canvas/{id}/runs.
 // Charts are native inline SVG (no external lib) so they work fully offline and theme-aware.
@@ -13,6 +15,7 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
   const [runs, setRuns] = useState<RunRecordDto[] | null>(null)
   const [err, setErr] = useState('')
   const [open, setOpen] = useState<string | null>(null)  // expanded run id → per-node breakdown
+  const [resultOpen, setResultOpen] = useState<string | null>(null)
   useEffect(() => {
     api.listRuns(canvasId).then(setRuns).catch((e) => setErr((e as Error).message))
   }, [canvasId])
@@ -35,6 +38,7 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
             {runs?.map((r) => {
               const st = statusTok[r.status as keyof typeof statusTok] ?? statusTok.draft
               const hasNodes = !!r.perNode && r.perNode.length > 0
+              const hasResult = r.status === 'done' && !!r.outputUri
               const isOpen = open === r.id
               return (
                 <div key={r.id} className="border-b border-border">
@@ -50,10 +54,21 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                       {r.error && <span className="text-destructive"> · {r.error}</span>}
                     </span>
                     {r.rows != null && <span className="text-muted-foreground">{r.rows.toLocaleString()} rows</span>}
+                    {hasResult && (
+                      <Button variant="ghost" size="sm" className="h-6 px-2 text-[10.5px]"
+                        onClick={(e) => { e.stopPropagation(); setResultOpen(resultOpen === r.id ? null : r.id) }}>
+                        {resultOpen === r.id ? 'Hide result' : 'Open full result'}
+                      </Button>
+                    )}
                     {r.ms != null && <span className="w-16 text-right text-muted-foreground">{fmtMs(r.ms)}</span>}
                     <span className="w-32 text-right text-[11px] text-muted-foreground">{r.createdAt ? new Date(r.createdAt).toLocaleString() : ''}</span>
                   </div>
                   {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
+                  {resultOpen === r.id && r.outputUri && (
+                    <div className="border-t border-border">
+                      <FullResult uri={r.outputUri} total={r.rows ?? null} />
+                    </div>
+                  )}
                 </div>
               )
             })}
