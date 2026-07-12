@@ -7498,6 +7498,7 @@ def test_ray_sink_contract_matches_local_without_a_live_cluster(tmp_path, monkey
     assert result["output_uri"] == mod._attempt_handoff_uri(
         resolved["w"], "whole-test", scope="w"
     )
+    assert result["outputs"][0]["logical_uri"] == resolved["w"]
     assert direct_dataset.iterated is False
     assert direct_dataset.writes[0]["path"] == result["output_uri"]
     with open(os.path.join(result["output_uri"], "_DP_SUCCESS.json")) as manifest_file:
@@ -7789,6 +7790,94 @@ def test_ray_ir_carries_transform_output_schema_for_empty_results():
             lower_to_ir(graph, "t", deps.node_specs)
         ) or ""
     )
+
+
+def test_ray_sink_attempt_retention_runs_only_after_catalog_publication(tmp_path, monkeypatch):
+    from hub import metadb
+    from hub.deps import Deps
+    from hub.models import Graph
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    mod = _load_dp_ray()
+    runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+    graph = Graph(**{"id": "sink-gc-order", "version": 1, "nodes": [
+        _ray_node("w", "write", {"filename": "out.parquet", "writeMode": "overwrite"}),
+    ], "edges": []})
+    logical = "s3://bucket/outputs/out.parquet"
+    first = "s3://bucket/outputs/out.attempt-catalog-first"
+    second = "s3://bucket/outputs/out.attempt-catalog-second"
+    failed = "s3://bucket/outputs/out.attempt-catalog-failed"
+    for uri, run_id in ((first, "catalog-first"), (second, "catalog-second"),
+                        (failed, "catalog-failed")):
+        metadb.claim_object_attempt(uri, logical, "sink", run_id)
+
+    runner._register_outputs(graph, {"outputs": [
+        {"step_id": "w", "name": "out", "uri": first, "logical_uri": logical},
+    ]})
+    stable_id = metadb.catalog_get(first)["id"]
+    runner._register_outputs(graph, {"outputs": [
+        {"step_id": "w", "name": "out", "uri": second, "logical_uri": logical},
+    ]})
+    assert metadb.catalog_get(first) is None
+    assert metadb.catalog_get(second)["id"] == stable_id
+    with metadb.session() as session:
+        assert session.get(metadb.ObjectAttempt, first).state == "retiring"
+        assert session.get(metadb.ObjectAttempt, second).state == "published"
+
+    def fail_register(**_kwargs):
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr(runner.catalog, "register_output", fail_register)
+    with pytest.raises(RuntimeError, match="catalog unavailable"):
+        runner._register_outputs(graph, {"outputs": [
+            {"step_id": "w", "name": "out", "uri": failed, "logical_uri": logical},
+        ]})
+    with metadb.session() as session:
+        assert session.get(metadb.ObjectAttempt, failed).state == "writing"
+        assert session.get(metadb.ObjectAttempt, second).state == "published"
+
+    metadb.catalog_delete_entry(second)
+    metadb.retire_object_attempts([second])
+    for uri in (first, second):
+        metadb.mark_object_attempt_retired(uri)
+        metadb.delete_object_attempt(uri)
+    assert metadb.begin_discard_object_attempt(failed) is True
+    metadb.delete_object_attempt(failed)
+
+
+def test_ray_sink_swallowed_catalog_persist_failure_does_not_publish(tmp_path, monkeypatch):
+    from hub import metadb
+    from hub.deps import Deps
+    from hub.models import Graph
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    mod = _load_dp_ray()
+    runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+    graph = Graph(**{"id": "sink-persist-failure", "version": 1, "nodes": [
+        _ray_node("w", "write", {"filename": "out.parquet", "writeMode": "overwrite"}),
+    ], "edges": []})
+    attempt = "s3://bucket/outputs/out.attempt-persist-failure"
+    metadb.catalog_delete_entry(attempt)
+    metadb.claim_object_attempt(
+        attempt, "s3://bucket/outputs/out.parquet", "sink", "persist-failure"
+    )
+
+    monkeypatch.setattr(
+        metadb, "catalog_upsert_entry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+    with pytest.raises(RuntimeError, match="atomically publish"):
+        runner._register_outputs(graph, {"outputs": [{
+            "step_id": "w", "name": "out", "uri": attempt,
+            "logical_uri": "s3://bucket/outputs/out.parquet",
+        }]})
+    assert metadb.catalog_get(attempt) is None
+    with metadb.session() as session:
+        assert session.get(metadb.ObjectAttempt, attempt).state == "writing"
+    assert metadb.begin_discard_object_attempt(attempt) is True
+    metadb.delete_object_attempt(attempt)
 
 
 def test_ray_whole_run_scopes_each_sink_attempt_by_step_and_unstripped_target(tmp_path):
@@ -8807,6 +8896,8 @@ def test_ray_rejects_or_falls_back_before_dispatch_for_unsupported_sinks(tmp_pat
     ray_runner.run(compile_plan(valid, "w", deps.registry, deps.node_specs), valid, "w", "local")
     sink_targets = dispatched[-1]["kwargs"]["kwargs"]["sink_targets"]
     assert sink_targets == {"w": str(workspace / "outputs/valid.parquet")}
+    sink_attempts = dispatched[-1]["kwargs"]["kwargs"]["sink_attempts"]
+    assert sink_attempts["w"].startswith(str(workspace / "outputs/valid.attempt-"))
 
     monkeypatch.setenv("DP_RAY_REMOTE", "1")
     assert ray_runner._sink_targets_runnable(lower_to_ir(valid, "w", deps.node_specs)) is False
@@ -9182,14 +9273,23 @@ def test_ray_explicit_placement_fails_unadvertised_resources_before_dispatch(tmp
     assert status.status == "failed"
     assert "requested resources" in (status.error or "")
     assert "advertised Ray capacity" in (status.error or "")
-def test_ray_region_handoff_uses_an_immutable_attempt_prefix():
+
+
+def test_ray_region_handoff_uses_an_immutable_attempt_prefix(monkeypatch):
     import hashlib
     import json
 
+    from hub import metadb
+
+    owner = "0123456789abcdef0123456789abcdef"
+    monkeypatch.setattr(metadb, "object_attempt_owner_id", lambda: owner)
     attempt_uri = _load_dp_ray()._attempt_handoff_uri
 
     def digest_hex(uri, run_id, scope=None):
-        identity = json.dumps({"runId": run_id, "scope": scope, "uri": uri},
+        doc = {"runId": run_id, "scope": scope, "uri": uri}
+        if uri.startswith(("s3://", "gs://", "gcs://", "r2://")):
+            doc["owner"] = owner
+        identity = json.dumps(doc,
                               ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         return hashlib.sha256(identity.encode()).hexdigest()[:32]
 
@@ -9215,6 +9315,9 @@ def test_ray_region_handoff_uses_an_immutable_attempt_prefix():
     long_uri = attempt_uri("/tmp/out.parquet", "x" * 10_000)
     readable, suffix = long_uri.split(".attempt-", 1)[1].rsplit("-", 1)
     assert len(readable) == 64 and len(suffix) == 32
+    owner_a_uri = attempt_uri("s3://bucket/out.parquet", "same", scope="w")
+    monkeypatch.setattr(metadb, "object_attempt_owner_id", lambda: "f" * 32)
+    assert owner_a_uri != attempt_uri("s3://bucket/out.parquet", "same", scope="w")
 
 
 def test_ray_attempt_uri_fits_local_components_and_object_child_paths(tmp_path):
@@ -9362,6 +9465,220 @@ def test_region_attempt_cleanup_is_scoped_to_an_attempt(tmp_path):
     handoff.discard_attempt(str(stable))
     handoff.discard_attempt(str(failed))
     assert stable.exists() and not failed.exists()  # the cleanup API can never delete a stable prefix
+
+
+def test_object_attempt_registry_serializes_publish_and_discard():
+    import threading
+
+    from hub import metadb
+
+    logical = "s3://registry-lock-test/out.parquet"
+    uris = [f"s3://registry-lock-test/out.attempt-{suffix}" for suffix in ("a", "b")]
+    for index, uri in enumerate(uris):
+        metadb.claim_object_attempt(uri, logical, "sink", f"registry-lock-{index}")
+
+    barrier = threading.Barrier(3)
+    errors = []
+
+    def publish(uri):
+        try:
+            barrier.wait()
+            metadb.publish_object_attempt(uri)
+        except Exception as exc:  # noqa: BLE001 — asserted below after both threads join
+            errors.append(exc)
+
+    threads = [threading.Thread(target=publish, args=(uri,)) for uri in uris]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    with metadb.session() as session:
+        assert {session.get(metadb.ObjectAttempt, uri).state for uri in uris} == \
+            {"published", "retiring"}
+
+    fenced = "s3://registry-lock-test/out.attempt-fenced"
+    metadb.claim_object_attempt(fenced, logical, "sink", "registry-lock-fenced")
+    assert metadb.begin_discard_object_attempt(fenced) is True
+    with pytest.raises(RuntimeError, match="discarding"):
+        metadb.publish_object_attempt(fenced)
+    metadb.delete_object_attempt(fenced)
+
+    metadb.retire_object_attempts(uris)
+    for uri in uris:
+        metadb.mark_object_attempt_retired(uri)
+        metadb.delete_object_attempt(uri)
+
+
+def test_object_attempt_registry_reaps_superseded_and_fenced_failures(monkeypatch):
+    pytest.importorskip("moto")
+    pytest.importorskip("flask")
+    boto3 = pytest.importorskip("boto3")
+    import pyarrow as pa
+    import pyarrow.fs as pafs
+    from moto.server import ThreadedMotoServer
+
+    from hub import handoff, metadb
+    from hub.plugins.adapters import object_fs
+
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    cleanup = []
+    try:
+        host, port = server.get_host_and_port()
+        endpoint = f"http://{host}:{port}"
+        client = boto3.client(
+            "s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
+            region_name="us-east-1",
+        )
+        client.create_bucket(Bucket="bkt")
+        metadb.set_setting("objectStore", {
+            "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
+            "secretAccessKey": "s", "useSsl": False,
+        }, "global")
+        def land(uri, run_id):
+            fs, path = object_fs(uri)
+            with fs.open_output_stream(path + "/part-000000.parquet") as stream:
+                stream.write(run_id.encode())
+            handoff.write_manifest(uri, run_id=run_id, rows=1, schema="x: int64")
+
+        sink_logical = "s3://bkt/outputs/out.parquet"
+        sink_old = "s3://bkt/outputs/out.attempt-old"
+        sink_new = "s3://bkt/outputs/out.attempt-new"
+        for uri, run_id in ((sink_old, "old"), (sink_new, "new")):
+            handoff.claim_attempt(uri, logical_uri=sink_logical, kind="sink", run_id=run_id)
+            land(uri, run_id)
+            metadb.catalog_upsert_entry(uri, "out", {"id": f"tbl_{run_id}", "name": "out", "uri": uri})
+        cleanup.append(sink_new)
+        with metadb.session() as session:
+            assert session.get(metadb.ObjectAttempt, sink_old).state == "retiring"
+            assert session.get(metadb.ObjectAttempt, sink_new).state == "published"
+
+        # A generic failure cleanup call cannot delete an already published winner.
+        handoff.discard_attempt(sink_new)
+        new_fs, new_path = object_fs(sink_new)
+        assert handoff.read_manifest(sink_new) is not None
+        assert new_fs.get_file_info(new_path + "/part-000000.parquet").size > 0
+        with metadb.session() as session:
+            assert session.get(metadb.ObjectAttempt, sink_new).state == "published"
+
+        first = handoff.reap_attempts(retention_seconds=3600, delete_grace_seconds=3600)
+        assert first["deleted"] == []
+        assert metadb.catalog_get(sink_old) is None
+        assert handoff.read_manifest(sink_old) is None  # no new cache/catalog reader can admit it
+        fs, old_path = object_fs(sink_old)
+        assert fs.get_file_info(old_path + "/part-000000.parquet").size > 0  # active readers get grace
+        with metadb.session() as session:
+            assert session.get(metadb.ObjectAttempt, sink_old).state == "retired"
+        assert sink_old in first["retired"] or first["retired"] == []  # periodic reaper may win the phase
+
+        second = handoff.reap_attempts(retention_seconds=3600, delete_grace_seconds=0)
+        assert second == {"retired": [], "deleted": [sink_old]}
+
+        # Region retirement follows the exact result-cache pointer swap, not an object-prefix listing or
+        # wall-clock guess. An active cache URI is retained; the replaced URI enters the same two phases.
+        region_logical = "s3://bkt/regions/r_src_hash.parquet"
+        region_old = "s3://bkt/regions/r_src_hash.attempt-old"
+        region_new = "s3://bkt/regions/r_src_hash.attempt-new"
+        for uri, run_id in ((region_old, "region-old"), (region_new, "region-new")):
+            handoff.claim_attempt(uri, logical_uri=region_logical, kind="region", run_id=run_id)
+            land(uri, run_id)
+        assert metadb.put_result("object-gc-region-key", {"uri": region_old}) == []
+        assert metadb.put_result("object-gc-region-key", {"uri": region_new}) == [region_old]
+        cleanup.append(region_new)
+        region_phase1 = handoff.reap_attempts(retention_seconds=3600, delete_grace_seconds=0)
+        with metadb.session() as session:
+            assert session.get(metadb.ObjectAttempt, region_old).state == "retired"
+        assert region_old in region_phase1["retired"] or region_phase1["retired"] == []
+        assert handoff.reap_attempts(retention_seconds=3600, delete_grace_seconds=0) == \
+            {"retired": [], "deleted": [region_old]}
+
+        # RunState and age are not writer-exit proof. Only the supervisor that observed child exit may
+        # fence and discard its exact unpublished attempt.
+        partial = "s3://bkt/outputs/live.attempt-partial"
+        handoff.claim_attempt(partial, logical_uri="s3://bkt/outputs/live.parquet",
+                              kind="sink", run_id="live-object-gc")
+        partial_fs, partial_path = object_fs(partial)
+        with partial_fs.open_output_stream(partial_path + "/part-000000.parquet") as stream:
+            stream.write(b"partial")
+        metadb.save_run_state("live-object-gc", {"run_id": "live-object-gc", "status": "running"})
+        assert handoff.reap_attempts(retention_seconds=3600, delete_grace_seconds=0) == \
+            {"retired": [], "deleted": []}
+        assert partial_fs.get_file_info(partial_path + "/part-000000.parquet").size > 0
+        metadb.save_run_state("live-object-gc", {"run_id": "live-object-gc", "status": "failed"})
+        assert handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0) == \
+            {"retired": [], "deleted": []}
+        assert partial_fs.get_file_info(partial_path + "/part-000000.parquet").size > 0
+        handoff.discard_attempt(partial)
+        assert partial_fs.get_file_info(partial_path + "/part-000000.parquet").type == \
+            pafs.FileType.NotFound
+
+        orphan = "s3://bkt/outputs/orphan.attempt-crashed-hub"
+        handoff.claim_attempt(orphan, logical_uri="s3://bkt/outputs/orphan.parquet",
+                              kind="sink", run_id="missing-run-owner")
+        orphan_fs, orphan_path = object_fs(orphan)
+        with orphan_fs.open_output_stream(orphan_path + "/part-000000.parquet") as stream:
+            stream.write(b"partial")
+        assert handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0) == \
+            {"retired": [], "deleted": []}
+        assert orphan_fs.get_file_info(orphan_path + "/part-000000.parquet").size > 0
+        handoff.discard_attempt(orphan)  # explicit terminal-backend acknowledgement in this test
+
+        # A failed driver cannot delete object data merely because its own process is unwinding: remote
+        # Ray workers may still be writing. The durable backend reconciler/provider lifecycle owns it.
+        worker_failed = "s3://bkt/outputs/worker.attempt-driver-failed"
+        handoff.claim_attempt(worker_failed, logical_uri="s3://bkt/outputs/worker.parquet",
+                              kind="sink", run_id="driver-failed")
+
+        class FailedRemoteWrite:
+            def materialize(self):
+                return self
+
+            def count(self):
+                return 1
+
+            def schema(self):
+                return pa.schema([("x", pa.int64())])
+
+            @staticmethod
+            def write_parquet(path, *, filesystem, **_kwargs):
+                with filesystem.open_output_stream(path.rstrip("/") + "/late.parquet") as stream:
+                    stream.write(b"still-writing")
+                raise RuntimeError("driver lost a remote task")
+
+        with pytest.raises(RuntimeError, match="driver lost"):
+            _load_dp_ray()._write_worker_direct_parquet(
+                FailedRemoteWrite(), worker_failed, attempt_id="driver-failed"
+            )
+        failed_fs, failed_path = object_fs(worker_failed)
+        assert failed_fs.get_file_info(failed_path + "/late.parquet").size > 0
+        with metadb.session() as session:
+            assert session.get(metadb.ObjectAttempt, worker_failed).state == "writing"
+        handoff.discard_attempt(worker_failed)  # simulated durable terminal acknowledgement
+
+        # Missing rows have no tombstone/CAS fence, so generic cleanup must leave legacy data alone.
+        legacy = "s3://bkt/outputs/legacy.attempt-unregistered"
+        legacy_fs, legacy_path = object_fs(legacy)
+        with legacy_fs.open_output_stream(legacy_path + "/part.parquet") as stream:
+            stream.write(b"legacy")
+        handoff.discard_attempt(legacy)
+        assert legacy_fs.get_file_info(legacy_path + "/part.parquet").size > 0
+        legacy_fs.delete_dir(legacy_path)
+
+        keys = [item["Key"] for item in client.list_objects_v2(Bucket="bkt").get("Contents", [])]
+        assert not any("attempt-old" in key or "attempt-partial" in key or "crashed-hub" in key
+                       for key in keys), keys
+        assert any("attempt-new" in key for key in keys)
+    finally:
+        try:
+            metadb.retire_object_attempts(cleanup)
+            handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0)
+            handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0)
+        except Exception:
+            pass
+        server.stop()
+        metadb.set_setting("objectStore", {}, "global")
 
 
 def test_ray_region_worker_direct_write_and_progress(tmp_path):

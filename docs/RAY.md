@@ -136,7 +136,7 @@ identity underneath the persistent workers.
 | selected-operator semantic parity | partial | extend multi-node differentials to every claimed operator and edge type |
 | object-store Parquet scale-out reads | implemented | operate with least-privilege credentials and validate representative production datasets |
 | bounded adapter compatibility | implemented | tune or disable the limit from measured workload/driver memory; native connectors are preferable |
-| whole-graph Parquet overwrite data path | implemented | use shared object storage for remote clusters; garbage-collect superseded attempt prefixes |
+| whole-graph Parquet overwrite data path | implemented | use shared object storage for remote clusters and tune the built-in deletion grace to the workload |
 | durable job lifecycle | missing | persisted Ray submission/attempt ID, restart reconciliation, acknowledged cancel, timeout, and fencing |
 | atomic region publication | implemented | distributed and local-fallback handoffs use immutable per-attempt prefixes; the controller validates the success manifest before cache publication |
 | workload isolation | partial | environment/control-plane separation exists; replace broad data credentials with attempt-scoped identity and enforce cluster policy |
@@ -158,20 +158,35 @@ still needs the following before it should own production workloads:
 3. Discover live cluster capacity and health, enforce admission/backpressure, and reject an explicit Ray
    placement when its requirements cannot be honored.
 4. Pin and verify the supported Ray/runtime image contract across the submitting process and every worker.
-5. Add lifecycle management for abandoned/superseded immutable attempt prefixes and alerts for failed
-   manifests, object-store errors, spill pressure, queue delay, retries, and resource saturation.
+5. Add alerts for failed manifests, object-store GC errors, spill pressure, queue delay, retries, and
+   resource saturation; keep provider lifecycle rules for versioned objects and incomplete uploads.
 6. Pass staging gates on the intended production topology: active-job failure injection, representative
    large workloads, SLOs/alerts, upgrade/rollback, and recovery runbooks.
 
-Object-store data attempts live under `<DP_STORAGE_URL>/regions/`; their authoritative commit records live
-under the sibling `regions/_dp_commits/` subprefix. The manifest contains the exact shard path and size
-inventory, and every cache lookup verifies it. Configure two native lifecycle rules: expire
-`regions/_dp_commits/` first, then expire all `regions/` data after an additional grace period longer than
-the maximum run duration plus the storage provider's lifecycle-evaluation skew. Once the commit disappears,
-new readers recompute; already-resolved readers retain every shard throughout the grace window. Failed
-attempts have no commit and leave with the later data rule. The hub deliberately does not recursively scan
-and delete a shared bucket in the foreground: it cannot prove ownership across deployments with separate
-metadata databases, and a full shared-prefix listing is not bounded at production fragment counts.
+Object storage holds only immutable shards plus `_dp_commits/<attempt>/` inventories. Ownership and
+lifecycle state live in the shared metadata database's indexed `object_attempts` table; the database's
+durable installation identity is included in each object attempt URI, so separate deployments sharing a
+bucket parent cannot collide or reap each other's data. The parent registers exact physical URIs before
+dispatch. Region attempts are published in the same transaction as their result-cache pointer, and only an
+exact pointer replacement/eviction retires the prior URI. Whole-graph overwrites use a transactionally
+ordered `logical_uri -> physical attempt` swap; the returned prior URI is the only version retired. No GC
+path lists the data prefix or infers a winner from object mtimes/client clocks.
+
+Failed/cancelled object attempts are deleted only after durable backend reconciliation proves every writer
+stopped; local driver exit alone is insufficient because remote Ray tasks can outlive it. The periodic
+reaper never infers that a `writing` attempt is dead from `RunState`, age, or a local deadline: an
+independent driver or durable Ray Job can survive a hub crash. Unreconciled attempts therefore require
+backend terminal/stop acknowledgement or a provider lifecycle rule; time alone is not a safe write fence.
+`DP_ATTEMPT_RETENTION_SECONDS` remains reserved for that future reconciled lifecycle and does not authorize
+deleting an unacknowledged writer.
+
+Retirement is two phase: the old catalog entry and commit record disappear first, preventing new readers;
+the immutable shard prefix remains for `DP_ATTEMPT_DELETE_GRACE_SECONDS` (one day by default) so readers
+that already resolved the old URI can finish. The automatic grace also cannot be configured below the run
+deadline; raise it for longer external readers. Provider lifecycle is still required for crash-orphaned
+writers without terminal proof, object versions, incomplete multipart uploads, and legacy attempts created
+before the registry. On S3 with versioning, a normal delete only creates a delete marker, so a
+noncurrent-version expiration rule releases the bytes.
 
 Local region handoffs are retained for the same correctness reason. The hub does not evict files by age or
 directory count: an mtime cannot prove that a cache entry, catalog version, concurrent hub, or active reader

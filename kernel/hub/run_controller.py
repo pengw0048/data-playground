@@ -515,6 +515,13 @@ class RunController:
                 f"region {region.id} on {region.backend} returned an unreadable or uncommitted handoff: "
                 f"{result_uri}")
         self.base._cache_put(ckey, {"uri": result_uri, "table": region.id, "rows": None})
+        if tier.is_object:
+            from hub.handoff import is_attempt_uri
+            if is_attempt_uri(result_uri):
+                published = self.base._cache_get(ckey)
+                if not published or published.get("uri") != result_uri:
+                    raise RuntimeError(
+                        f"region {region.id} committed object data but its cache pointer was not published")
         return result_uri
 
     def _run_final(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], uid: str | None = None) -> RunStatus:

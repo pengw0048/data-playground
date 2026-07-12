@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import json
+import math
 import os
 import uuid
 
@@ -225,6 +226,46 @@ class ResultCache(Base):
     key: Mapped[str] = mapped_column(String, primary_key=True)
     doc: Mapped[str] = mapped_column(Text)  # {uri, table, rows, fmt}
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class InstallationIdentity(Base):
+    """One durable identity for every hub instance sharing this metadata database."""
+    __tablename__ = "installation_identity"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_token: Mapped[str] = mapped_column(String, nullable=False)
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_installation_identity_singleton"),
+        UniqueConstraint("owner_token", name="uq_installation_identity_owner_token"),
+    )
+
+
+class ObjectAttempt(Base):
+    """Authoritative lifecycle registry for immutable object-store write attempts.
+
+    Object storage holds only data and commit markers. Publication ownership, logical replacement, and
+    bounded GC selection live here so every hub instance observes one transactionally ordered state.
+    """
+    __tablename__ = "object_attempts"
+    uri: Mapped[str] = mapped_column(String, primary_key=True)
+    logical_uri: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    run_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String, nullable=False, default="writing", server_default="writing", index=True)
+    reference_key: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    published_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retired_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    gc_attempted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        CheckConstraint("kind IN ('region', 'sink')", name="ck_object_attempt_kind"),
+        CheckConstraint(
+            "state IN ('writing', 'published', 'retiring', 'retired', 'discarding')",
+            name="ck_object_attempt_state",
+        ),
+        Index("ix_object_attempts_gc", "state", "gc_attempted_at", "retired_at", "created_at", "uri"),
+        Index("ix_object_attempts_sink_target", "kind", "logical_uri", "state"),
+    )
 
 
 class Setting(Base):
@@ -747,6 +788,8 @@ def diff_columns(a: list[dict], b: list[dict]) -> dict:
 
 
 _RESULT_CACHE_MAX = 1000  # persistent equivalent of the old in-process _MAX_RUNS cache cap
+_INSTALLATION_ID = 1
+_OBJECT_ATTEMPT_KINDS = ("region", "sink")
 
 
 def get_result(key: str) -> dict | None:
@@ -756,22 +799,335 @@ def get_result(key: str) -> dict | None:
         return json.loads(r.doc) if r else None
 
 
-def put_result(key: str, doc: dict) -> None:
-    """Upsert a completed run's result pointer, then prune to the newest N (safe: a miss recomputes)."""
+def _db_now(s) -> datetime.datetime:
+    """The database server's transaction clock, normalized for SQLite's string result."""
+    value = s.scalar(select(func.now()))
+    if isinstance(value, str):
+        value = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if not isinstance(value, datetime.datetime):
+        raise RuntimeError("metadata database did not return a timestamp")
+    return value
+
+
+def _lock_object_attempt_registry(s) -> InstallationIdentity:
+    """Serialize lifecycle pointer swaps across hub instances, including SQLite's no-op FOR UPDATE."""
+    result = s.execute(
+        update(InstallationIdentity)
+        .where(InstallationIdentity.id == _INSTALLATION_ID)
+        .values(owner_token=InstallationIdentity.owner_token)
+    )
+    if result.rowcount != 1:
+        raise RuntimeError("object-attempt installation identity is missing")
+    row = s.get(InstallationIdentity, _INSTALLATION_ID, with_for_update=True)
+    if row is None:
+        raise RuntimeError("object-attempt installation identity is missing")
+    return row
+
+
+def object_attempt_owner_id() -> str:
+    """The durable non-secret owner token shared by every hub using this metadata database."""
     with session() as s:
-        r = s.get(ResultCache, key)
-        payload = json.dumps(doc, default=str)
-        if r is None:
-            s.add(ResultCache(key=key, doc=payload))
+        row = s.get(InstallationIdentity, _INSTALLATION_ID)
+        if row is None or not row.owner_token:
+            raise RuntimeError("object-attempt installation identity is missing")
+        return row.owner_token
+
+
+def _validate_object_attempt_identity(row: ObjectAttempt, *, logical_uri: str, kind: str,
+                                      run_id: str) -> None:
+    if (row.logical_uri, row.kind, row.run_id) != (logical_uri, kind, run_id):
+        raise RuntimeError("object attempt URI is already claimed by a different logical write")
+
+
+def claim_object_attempt(uri: str, logical_uri: str, kind: str, run_id: str) -> None:
+    """Idempotently register one immutable object attempt before its first shard is written."""
+    uri, logical_uri, run_id = str(uri).rstrip("/"), str(logical_uri).rstrip("/"), str(run_id)
+    if not uri or not logical_uri or not run_id or kind not in _OBJECT_ATTEMPT_KINDS:
+        raise ValueError("object attempt claim requires URI, logical URI, run ID, and region/sink kind")
+    with session() as s:
+        _lock_object_attempt_registry(s)
+        row = s.get(ObjectAttempt, uri, with_for_update=True)
+        if row is not None:
+            _validate_object_attempt_identity(row, logical_uri=logical_uri, kind=kind, run_id=run_id)
+            if row.state in ("retiring", "retired", "discarding"):
+                raise RuntimeError(f"cannot reclaim immutable object attempt in state {row.state!r}")
+            return
+        s.add(ObjectAttempt(uri=uri, logical_uri=logical_uri, kind=kind, run_id=run_id, state="writing"))
+
+
+def _publish_object_attempt_in_session(s, row: ObjectAttempt, now: datetime.datetime,
+                                       reference_key: str | None = None) -> list[str]:
+    if row.state in ("retiring", "retired", "discarding"):
+        raise RuntimeError(f"cannot publish object attempt in state {row.state!r}")
+    if row.state == "writing":
+        row.state, row.published_at = "published", now
+    elif row.published_at is None:
+        row.published_at = now
+    if reference_key is not None:
+        row.reference_key = str(reference_key)
+    s.flush()
+    retired: list[str] = []
+    if row.kind == "sink":
+        prior = list(s.scalars(
+            select(ObjectAttempt).where(
+                ObjectAttempt.kind == "sink",
+                ObjectAttempt.logical_uri == row.logical_uri,
+                ObjectAttempt.state == "published",
+                ObjectAttempt.uri != row.uri,
+            ).order_by(ObjectAttempt.published_at.asc(), ObjectAttempt.uri.asc()).with_for_update()
+        ))
+        for old in prior:
+            old.state, old.gc_attempted_at = "retiring", None
+            retired.append(old.uri)
+    return retired
+
+
+def publish_object_attempt(uri: str, reference_key: str | None = None) -> list[str]:
+    """Publish one attempt and atomically fence superseded siblings of a logical sink."""
+    uri = str(uri).rstrip("/")
+    with session() as s:
+        _lock_object_attempt_registry(s)
+        now = _db_now(s)
+        row = s.get(ObjectAttempt, uri, with_for_update=True)
+        if row is None:
+            raise KeyError(uri)
+        return _publish_object_attempt_in_session(s, row, now, reference_key)
+
+
+def object_attempt_catalog_prior(uri: str) -> dict | None:
+    """Catalog identity/organization of the current published version of this sink target."""
+    uri = str(uri).rstrip("/")
+    with session() as s:
+        row = s.get(ObjectAttempt, uri)
+        if row is None or row.kind != "sink":
+            return None
+        prior = s.scalars(
+            select(ObjectAttempt).where(
+                ObjectAttempt.kind == "sink",
+                ObjectAttempt.logical_uri == row.logical_uri,
+                ObjectAttempt.state == "published",
+                ObjectAttempt.uri != uri,
+            ).order_by(ObjectAttempt.published_at.desc(), ObjectAttempt.uri.desc()).limit(1)
+        ).first()
+        if prior is None:
+            return None
+        entry = s.get(CatalogEntry, prior.uri)
+        return _row_to_doc(entry, _tags_for(s, [prior.uri]).get(prior.uri, [])) if entry else None
+
+
+def retire_object_attempts(uris: list[str]) -> list[str]:
+    """Fence exact published attempts from new readers; physical retirement happens out of transaction."""
+    ordered = list(dict.fromkeys(str(uri).rstrip("/") for uri in uris if str(uri).strip()))
+    if not ordered:
+        return []
+    retired: list[str] = []
+    with session() as s:
+        _lock_object_attempt_registry(s)
+        rows = {row.uri: row for row in s.scalars(
+            select(ObjectAttempt).where(ObjectAttempt.uri.in_(ordered)).with_for_update()
+        )}
+        for uri in ordered:
+            row = rows.get(uri)
+            if row is not None and row.state == "published":
+                row.state = "retiring"
+                row.gc_attempted_at = None
+                retired.append(uri)
+    return retired
+
+
+def mark_object_attempt_retired(uri: str) -> None:
+    """Acknowledge that catalog/cache admission and the commit marker have been retired."""
+    uri = str(uri).rstrip("/")
+    with session() as s:
+        _lock_object_attempt_registry(s)
+        row = s.get(ObjectAttempt, uri, with_for_update=True)
+        if row is None:
+            return
+        if row.state == "retired":
+            return
+        if row.state != "retiring":
+            raise RuntimeError(f"cannot mark object attempt retired from state {row.state!r}")
+        row.state, row.retired_at, row.gc_attempted_at = "retired", _db_now(s), None
+
+
+def begin_discard_object_attempt(uri: str) -> bool:
+    """Fence one unpublished attempt before physical deletion.
+
+    Registered attempts must atomically move from ``writing`` to ``discarding``; publication refuses
+    that state. Missing object attempts are not safe to delete because there is no durable tombstone to
+    stop a concurrent claimant; legacy prefixes remain provider-lifecycle work.
+    """
+    uri = str(uri).rstrip("/")
+    with session() as s:
+        _lock_object_attempt_registry(s)
+        row = s.get(ObjectAttempt, uri, with_for_update=True)
+        if row is None:
+            return False
+        if row.state == "discarding":
+            return True
+        if row.state != "writing":
+            return False
+        row.state, row.gc_attempted_at = "discarding", None
+        return True
+
+
+def delete_object_attempt(uri: str) -> None:
+    """Forget an exact attempt after its fenced-discard or grace-expired objects were removed."""
+    uri = str(uri).rstrip("/")
+    with session() as s:
+        _lock_object_attempt_registry(s)
+        row = s.get(ObjectAttempt, uri, with_for_update=True)
+        if row is None:
+            return
+        if row.state not in ("discarding", "retired"):
+            raise RuntimeError(f"cannot delete object attempt in state {row.state!r}")
+        s.delete(row)
+
+
+def _gc_seconds(value: float, name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite non-negative number") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return parsed
+
+
+def _object_attempt_action(row: ObjectAttempt, action: str) -> dict:
+    return {
+        "action": action,
+        "uri": row.uri,
+        "logical_uri": row.logical_uri,
+        "kind": row.kind,
+        "run_id": row.run_id,
+        "reference_key": row.reference_key,
+    }
+
+
+def object_attempt_gc_batch(retention_seconds: float, grace_seconds: float,
+                            limit: int = 100) -> list[dict]:
+    """Select one bounded, transactionally ordered batch of safe object-lifecycle actions.
+
+    The caller performs storage/catalog I/O after this short transaction, then acknowledges ``retire``
+    with ``mark_object_attempt_retired`` and ``discard``/``delete`` with ``delete_object_attempt``.
+    Actions are idempotent, so another hub selecting the same pending row is harmless.
+    """
+    # Retained as a validated compatibility knob. Age is not proof that an independent driver or a
+    # durable Ray Job stopped writing, so unpublished attempts are never selected from it.
+    _gc_seconds(retention_seconds, "retention_seconds")
+    grace = _gc_seconds(grace_seconds, "grace_seconds")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("object attempt GC limit must be a positive integer")
+    actions: list[dict] = []
+    with session() as s:
+        _lock_object_attempt_registry(s)
+        now = _db_now(s)
+
+        def remaining() -> int:
+            return limit - len(actions)
+
+        retry_cutoff = now - datetime.timedelta(seconds=60)
+        claimable = or_(ObjectAttempt.gc_attempted_at.is_(None),
+                        ObjectAttempt.gc_attempted_at <= retry_cutoff)
+
+        retiring = list(s.scalars(
+            select(ObjectAttempt).where(ObjectAttempt.state == "retiring", claimable)
+            .order_by(ObjectAttempt.created_at.asc(), ObjectAttempt.uri.asc())
+            .limit(remaining()).with_for_update()
+        ))
+        for row in retiring:
+            row.gc_attempted_at = now
+        actions.extend(_object_attempt_action(row, "retire") for row in retiring)
+        if remaining() <= 0:
+            return actions
+
+        retired_cutoff = now - datetime.timedelta(seconds=grace)
+        expired = list(s.scalars(
+            select(ObjectAttempt).where(
+                ObjectAttempt.state == "retired",
+                ObjectAttempt.retired_at.is_not(None),
+                ObjectAttempt.retired_at <= retired_cutoff,
+                claimable,
+            ).order_by(ObjectAttempt.retired_at.asc(), ObjectAttempt.uri.asc())
+            .limit(remaining()).with_for_update()
+        ))
+        for row in expired:
+            row.gc_attempted_at = now
+        actions.extend(_object_attempt_action(row, "delete") for row in expired)
+        if remaining() <= 0:
+            return actions
+
+        discarding = list(s.scalars(
+            select(ObjectAttempt).where(ObjectAttempt.state == "discarding", claimable)
+            .order_by(ObjectAttempt.created_at.asc(), ObjectAttempt.uri.asc())
+            .limit(remaining()).with_for_update()
+        ))
+        for row in discarding:
+            row.gc_attempted_at = now
+        actions.extend(_object_attempt_action(row, "discard") for row in discarding)
+    return actions
+
+
+def _result_doc_uri(raw: str | dict | None) -> str | None:
+    try:
+        doc = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return None
+    uri = doc.get("uri") if isinstance(doc, dict) else None
+    return str(uri).rstrip("/") if uri else None
+
+
+def put_result(key: str, doc: dict) -> list[str]:
+    """Atomically publish a region result pointer and return exact attempt URIs it superseded/evicted."""
+    payload = json.dumps(doc, default=str)
+    new_uri = _result_doc_uri(doc)
+    old_refs: list[tuple[str, str]] = []
+    retired: list[str] = []
+    with session() as s:
+        _lock_object_attempt_registry(s)
+        now = _db_now(s)
+        row = s.get(ResultCache, key, with_for_update=True)
+        if row is None:
+            s.add(ResultCache(key=key, doc=payload, created_at=now))
         else:
-            r.doc = payload
+            old_uri = _result_doc_uri(row.doc)
+            if old_uri and old_uri != new_uri:
+                old_refs.append((old_uri, key))
+            row.doc, row.created_at = payload, now
+
+        if new_uri:
+            attempt = s.get(ObjectAttempt, new_uri, with_for_update=True)
+            if attempt is not None and attempt.kind == "region":
+                if attempt.state in ("retiring", "retired", "discarding"):
+                    raise RuntimeError(f"cannot publish region attempt in state {attempt.state!r}")
+                if attempt.state == "writing":
+                    attempt.state, attempt.published_at = "published", now
+                elif attempt.published_at is None:
+                    attempt.published_at = now
+                attempt.reference_key = key
+
         s.flush()
-        stale = s.scalars(select(ResultCache.key).order_by(ResultCache.created_at.desc())
-                          .offset(_RESULT_CACHE_MAX)).all()
-        for k in stale:
-            obj = s.get(ResultCache, k)
-            if obj:
-                s.delete(obj)
+        stale = list(s.scalars(
+            select(ResultCache).order_by(ResultCache.created_at.desc(), ResultCache.key.desc())
+            .offset(_RESULT_CACHE_MAX).with_for_update()
+        ))
+        for stale_row in stale:
+            old_uri = _result_doc_uri(stale_row.doc)
+            if old_uri and old_uri != new_uri:
+                old_refs.append((old_uri, stale_row.key))
+            s.delete(stale_row)
+
+        for old_uri, reference_key in old_refs:
+            if old_uri == new_uri or old_uri in retired:
+                continue
+            attempt = s.get(ObjectAttempt, old_uri, with_for_update=True)
+            if (attempt is not None and attempt.kind == "region" and attempt.state == "published"
+                    and attempt.reference_key == reference_key):
+                attempt.state = "retiring"
+                attempt.gc_attempted_at = None
+                retired.append(old_uri)
+    return retired
 
 
 def _doc_org(doc: dict) -> tuple[str, str, str | None, str | None, int | None, list[str], list[str]]:
@@ -808,8 +1164,14 @@ def catalog_upsert_entry(uri: str, name: str, doc: dict) -> None:
     owner / description / row_count / tags / column-names are mirrored to indexed columns + join tables
     so browse/search/facet push down to the DB. `usage` (popularity) is owned by the column and NOT
     overwritten from the doc — it's bumped independently on reads."""
-    tbl_id, folder, owner, description, rows, tags, cols = _doc_org(doc)
     with session() as s:
+        attempt = s.get(ObjectAttempt, uri)
+        if attempt is not None and attempt.kind == "sink":
+            _lock_object_attempt_registry(s)
+            attempt = s.get(ObjectAttempt, uri, with_for_update=True)
+            if attempt is None or attempt.kind != "sink":
+                raise RuntimeError("object sink attempt disappeared during catalog publication")
+        tbl_id, folder, owner, description, rows, tags, cols = _doc_org(doc)
         r = s.get(CatalogEntry, uri)
         payload = json.dumps(doc, default=str)
         if r is None:
@@ -819,6 +1181,14 @@ def catalog_upsert_entry(uri: str, name: str, doc: dict) -> None:
             r.name, r.doc, r.tbl_id = name, payload, tbl_id
             r.folder, r.owner, r.description, r.row_count = folder, owner, description, rows
         _sync_children(s, uri, tags, cols)
+        if attempt is not None:
+            retired = _publish_object_attempt_in_session(s, attempt, _db_now(s))
+            if retired:
+                _delete_catalog_children(s, retired)
+                for old_uri in retired:
+                    old = s.get(CatalogEntry, old_uri)
+                    if old is not None:
+                        s.delete(old)
 
 
 def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: str | None,
