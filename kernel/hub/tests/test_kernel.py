@@ -2709,6 +2709,65 @@ def test_run_history_persisted_with_canvas(tmp_path):
     assert any(p["node_id"] == "wr" and p["status"] == "done" for p in pn)
 
 
+def test_headless_run_executes_a_saved_canvas(tmp_path, capsys):
+    # ARC7 headless-run: `dataplay run <canvas>` runs a SAVED canvas to completion in-process (cron/CI),
+    # exits 0 on done, materializes the write, and reuses the exact start_run path the UI/MCP use.
+    from hub.cli import _headless_run
+    from hub.deps import get_deps
+    p = _seq_parquet(tmp_path)
+    doc = {"id": "hr_canvas", "name": "hr", "version": 1,
+           "nodes": [N("src", "source", {"uri": p}), N("wr", "write", {"name": "hr_out"})],
+           "edges": [E("src", "wr")]}
+    client.put("/api/canvas/hr_canvas", json=doc)
+    code = _headless_run(get_deps(), "hr_canvas", None, 30.0, as_json=False)
+    out = capsys.readouterr().out
+    assert code == 0, f"headless run exited {code}; stdout:\n{out}"
+    assert "DONE" in out and "hr_out" in out
+    # the write actually materialized a queryable output table
+    assert any(t["name"] == "hr_out" for t in client.get("/api/catalog/tables").json())
+
+
+def test_headless_run_resolves_by_name_and_reports_failure(tmp_path):
+    # name lookup (not just id) works; an unknown canvas errors out (SystemExit), not a silent 0.
+    import pytest
+
+    from hub.cli import _headless_run, _load_canvas_graph
+    from hub.deps import get_deps
+    p = _seq_parquet(tmp_path)
+    doc = {"id": "hr_named_id", "name": "my-nightly-job", "version": 1,
+           "nodes": [N("src", "source", {"uri": p}), N("wr", "write", {"name": "hr_named_out"})],
+           "edges": [E("src", "wr")]}
+    client.put("/api/canvas/hr_named_id", json=doc)
+    graph, cid = _load_canvas_graph("my-nightly-job")  # resolves a unique NAME → its id
+    assert cid == "hr_named_id" and len(graph.nodes) == 2
+    with pytest.raises(SystemExit):  # unknown ref must fail loudly
+        _headless_run(get_deps(), "no_such_canvas_xyz", None, 5.0, as_json=False)
+
+
+def test_headless_run_kernel_failure_is_a_clean_exit(tmp_path, monkeypatch):
+    # review MAJOR: the DEFAULT backend is the kernel, whose run() raises RuntimeError/OSError when a
+    # kernel won't start / is unreachable — headless must convert that to a clean SystemExit (exit code),
+    # NOT let a traceback escape. (The suite's in-process backend never hits that path, so force it.)
+    import pytest
+
+    import hub.routers.runs as runs_mod
+    from hub import cli
+    from hub.deps import get_deps
+    p = _seq_parquet(tmp_path)
+    doc = {"id": "kf_canvas", "name": "kf", "version": 1,
+           "nodes": [N("src", "source", {"uri": p}), N("wr", "write", {"name": "kf_out"})],
+           "edges": [E("src", "wr")]}
+    client.put("/api/canvas/kf_canvas", json=doc)
+
+    def _boom(*a, **k):
+        raise RuntimeError("kernel for canvas 'kf_canvas' did not become ready in 1.0s")
+
+    monkeypatch.setattr(runs_mod, "start_run", _boom)  # _headless_run imports start_run at call time
+    with pytest.raises(SystemExit) as ei:
+        cli._headless_run(get_deps(), "kf_canvas", None, 5.0, as_json=False)
+    assert "cannot run canvas 'kf_canvas'" in str(ei.value)
+
+
 def test_coordination_tables_pruned_to_cap(monkeypatch):
     # ARC5 coordination-table-prune: run_records (per-canvas history) and run_states (one full-JSON row
     # per run) must NOT grow without bound in the local DB. record_run caps per-canvas history; a run
