@@ -96,8 +96,12 @@ def test_nodes_endpoint():
 
 
 def test_catalog_and_capabilities():
-    tabs = {t["name"]: t for t in client.get("/api/catalog/tables").json()}
-    assert {"images", "movies", "events"} <= set(tabs)
+    # The catalog is persistent and paginated. Query each fixture by name so unrelated local or
+    # earlier-suite entries cannot push a fixture off the first page.
+    tabs = {}
+    for name in ("images", "movies", "events"):
+        matches = client.get("/api/catalog/tables", params={"q": name}).json()
+        tabs[name] = next(t for t in matches if t["name"] == name)
     caps = {c["name"]: c["capabilities"] for c in tabs["images"]["columns"]}
     assert "media" in caps["image_url"] and "vector" in caps["embedding"]
     assert tabs["images"]["rowCount"] == 500
