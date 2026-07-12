@@ -3,8 +3,10 @@
 # (docker-compose.ray.yml). It carries the `hub` package + the [ray] extra so every worker can run the
 # shuffle compat shim (hub.ray_compat) and the map operators (hub.sandbox / hub.executors.engine).
 #
-# The [ray] extra is exactly pinned to the version whose private hash-shuffle ABI is validated. The
-# driver runs inside this image too, and dp_ray handshakes every live node before data execution.
+# The [ray] extra is exactly pinned to the version whose private hash-shuffle ABI is validated and uses
+# Ray's supported `data,default` dependency set. `default` is required by KubeRay's dashboard-agent
+# /api/healthz probe on port 52365; a data-only install starts raylets but never serves that endpoint.
+# The driver runs inside this image too, and dp_ray handshakes every live node before data execution.
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*

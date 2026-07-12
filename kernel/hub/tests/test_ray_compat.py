@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -97,7 +99,7 @@ def test_hash_shuffle_feature_detection_returns_the_validated_target():
 def test_ray_dependency_image_and_kuberay_manifest_share_one_version_contract():
     pyproject = tomllib.loads((_ROOT / "kernel/pyproject.toml").read_text())
     assert pyproject["project"]["optional-dependencies"]["ray"] == [
-        f"ray[data]=={ray_compat.SUPPORTED_RAY_VERSION}"
+        f"ray[data,default]=={ray_compat.SUPPORTED_RAY_VERSION}"
     ]
     lock = (_ROOT / "kernel/uv.lock").read_text()
     assert f'specifier = "=={ray_compat.SUPPORTED_RAY_VERSION}"' in lock
@@ -136,3 +138,98 @@ def test_ray_image_and_validation_pods_enforce_a_non_root_security_boundary():
 
     job = yaml.safe_load((_ROOT / "deploy/kuberay/differential-job.yaml").read_text())
     _assert_restricted_pod(job["spec"]["template"]["spec"], "driver")
+
+
+def test_kuberay_validation_profile_fits_a_four_cpu_kind_node_and_recreates_workloads():
+    cluster = yaml.safe_load((_ROOT / "deploy/kuberay/raycluster.yaml").read_text())
+    head = cluster["spec"]["headGroupSpec"]
+    workers = cluster["spec"]["workerGroupSpecs"][0]
+    job = yaml.safe_load((_ROOT / "deploy/kuberay/differential-job.yaml").read_text())
+    head_pod = head["template"]["spec"]
+    worker_pod = workers["template"]["spec"]
+    job_pod = job["spec"]["template"]["spec"]
+    head_container = head_pod["containers"][0]
+    worker_container = worker_pod["containers"][0]
+    driver = job["spec"]["template"]["spec"]["containers"][0]
+
+    assert head["rayStartParams"]["num-cpus"] == "2"
+    assert workers["rayStartParams"]["num-cpus"] == "2"
+    assert workers["replicas"] == workers["minReplicas"] == workers["maxReplicas"] == 2
+    assert "--num-cpus=2" in driver["command"][2]
+    assert "--object-store-memory=536870912" in driver["command"][2]
+
+    cpu_requests = [
+        head_container["resources"]["requests"]["cpu"],
+        worker_container["resources"]["requests"]["cpu"],
+        driver["resources"]["requests"]["cpu"],
+    ]
+    assert cpu_requests == ["600m", "600m", "500m"]
+    requested_millicpu = (
+        int(cpu_requests[0][:-1])
+        + (2 * int(cpu_requests[1][:-1]))
+        + int(cpu_requests[2][:-1])
+    )
+    assert requested_millicpu == 2300  # leaves 1700m for kind/KubeRay/MinIO on a 4-CPU node
+    assert [
+        head_container["resources"]["requests"]["memory"],
+        worker_container["resources"]["requests"]["memory"],
+        driver["resources"]["requests"]["memory"],
+    ] == ["1500Mi", "1500Mi", "1Gi"]
+    assert [
+        head_container["resources"]["limits"],
+        worker_container["resources"]["limits"],
+        driver["resources"]["limits"],
+    ] == [
+        {"cpu": "2", "memory": "2Gi"},
+        {"cpu": "2", "memory": "2Gi"},
+        {"cpu": "2", "memory": "2Gi"},
+    ]
+    assert [
+        head_pod["volumes"][0]["emptyDir"]["sizeLimit"],
+        worker_pod["volumes"][0]["emptyDir"]["sizeLimit"],
+        job_pod["volumes"][0]["emptyDir"]["sizeLimit"],
+    ] == ["1Gi", "1Gi", "1Gi"]
+
+    script = (_ROOT / "deploy/kuberay/validate.sh").read_text()
+    assert "dp-ray:kuberay-$(date +%Y%m%d%H%M%S)-$$" in script
+    assert 'kind get kubeconfig --name "${KIND_CLUSTER}"' in script
+    assert 'kubectl --kubeconfig "${KIND_KUBECONFIG}"' in script
+    assert "delete job dp-ray-multinode-check dp-ray-createbucket" in script
+    assert "delete raycluster dp-ray" in script
+    assert script.count("--cascade=foreground") == 2
+    assert 'wait_for_no_pods "ray.io/cluster=dp-ray"' in script
+    assert 'wait_for_no_pods "batch.kubernetes.io/job-name=dp-ray-multinode-check"' in script
+    assert 'if (( ${failed:-0} >= 1 ))' in script
+    assert 'sed "s|image: dp-ray:local|image: ${IMAGE}|g"' in script
+
+
+def test_kuberay_validation_fails_closed_when_old_pod_listing_fails(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name, body in {
+        "kind": "#!/bin/sh\necho 'apiVersion: v1'\n",
+        "docker": "#!/bin/sh\nexit 0\n",
+        "kubectl": (
+            "#!/bin/sh\n"
+            "case \" $* \" in\n"
+            "  *\" get pods -l ray.io/cluster=dp-ray \"*) exit 42 ;;\n"
+            "esac\n"
+            "exit 0\n"
+        ),
+    }.items():
+        executable = fake_bin / name
+        executable.write_text(body)
+        executable.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update({
+        "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+        "KIND_CLUSTER": "fail-closed-test",
+        "DP_RAY_VALIDATION_IMAGE": "dp-ray:fail-closed-test",
+        "DP_RAY_VALIDATION_TIMEOUT_SECONDS": "08",
+    })
+    result = subprocess.run(
+        [_ROOT / "deploy/kuberay/validate.sh"], env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "could not list old RayCluster pods; refusing to recreate" in result.stderr

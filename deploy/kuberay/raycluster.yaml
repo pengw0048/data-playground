@@ -5,13 +5,8 @@
 # Prereqs: a cluster (kind create cluster) + the KubeRay operator:
 #   helm repo add kuberay https://ray-project.github.io/kuberay-helm/ && helm repo update
 #   helm install kuberay-operator kuberay/kuberay-operator
-# Load the image into kind (built by docker/ray/Dockerfile), apply this, then run the check as a Job:
-#   docker build -f docker/ray/Dockerfile -t dp-ray:local .
-#   kind load docker-image dp-ray:local
-#   kubectl apply -f deploy/kuberay/raycluster.yaml
-#   kubectl apply -f deploy/kuberay/minio.yaml        # object store (below)
-#   kubectl apply -f deploy/kuberay/differential-job.yaml
-#   kubectl logs -f job/dp-ray-multinode-check        # expect "[multinode] PASS: … byte-identical …"
+# Run deploy/kuberay/validate.sh so a reused kind cluster receives a fresh image tag and fresh Job/pods.
+# The checked-in dp-ray:local image below is only a render placeholder for that script.
 #
 # The image, this rayVersion field, and kernel[ray] are all pinned to 2.56.0. The driver rejects an
 # unsupported/mixed cluster before data execution, and every worker validates the private shuffle ABI.
@@ -24,6 +19,8 @@ spec:
   headGroupSpec:
     rayStartParams:
       dashboard-host: "0.0.0.0"
+      # Keep two logical CPUs per Ray node: Ray Data reserves a small coordinator fraction, so a
+      # one-CPU node cannot admit its normal 1-CPU block tasks even while the host has free CPU.
       num-cpus: "2"
       resources: '"{\"engine_ray\": 100}"'
     template:
@@ -43,13 +40,15 @@ spec:
               allowPrivilegeEscalation: false
               capabilities: { drop: ["ALL"] }
             resources:
-              requests: { cpu: "1", memory: "2Gi" }
-              limits: { cpu: "2", memory: "3Gi" }
+              # Disposable kind sizing: leave room for Kubernetes, KubeRay, MinIO, and the driver on a
+              # 4-CPU/8-GiB node. This is a validation profile, not production capacity guidance.
+              requests: { cpu: "600m", memory: "1500Mi" }
+              limits: { cpu: "2", memory: "2Gi" }
             volumeMounts:
               - { name: dshm, mountPath: /dev/shm }
         volumes:
           - name: dshm
-            emptyDir: { medium: Memory, sizeLimit: 2Gi }
+            emptyDir: { medium: Memory, sizeLimit: 1Gi }
   workerGroupSpecs:
     - groupName: workers
       replicas: 2
@@ -75,10 +74,10 @@ spec:
                 allowPrivilegeEscalation: false
                 capabilities: { drop: ["ALL"] }
               resources:
-                requests: { cpu: "1", memory: "2Gi" }
-                limits: { cpu: "2", memory: "3Gi" }
+                requests: { cpu: "600m", memory: "1500Mi" }
+                limits: { cpu: "2", memory: "2Gi" }
               volumeMounts:
                 - { name: dshm, mountPath: /dev/shm }
           volumes:
             - name: dshm
-              emptyDir: { medium: Memory, sizeLimit: 2Gi }
+              emptyDir: { medium: Memory, sizeLimit: 1Gi }
