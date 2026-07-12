@@ -80,9 +80,11 @@ API keys are never sent to the driver.
 
 ## Durable state machine
 
-1. The hub writes or verifies the write-once job envelope.
+1. The hub first commits `run_id`, authorized `created_by`, and `auth_canvas_id`. Only then may it allocate
+   a write-once job envelope. A future workload-identity provider observes that principal in the hub-side
+   launch context; raw principal/canvas identity is not copied into Ray artifacts or submission metadata.
 2. One SQL transaction binds `run_id` to backend, cluster, submission, attempt, object URIs, code ref,
-   and the non-secret Jobs control address while creating the queued `run_states` row.
+   and the non-secret Jobs control address while updating the prebound queued `run_states` row.
 3. Status plus a successful Jobs listing distinguish an absent job from an ambiguous API failure. Only
    authoritative absence opens submission/replay. SQL then linearizes exactly one request with a
    DB-clock lease and a CAS that requires `cancel_requested=false`; an expired-owner reclaim moves

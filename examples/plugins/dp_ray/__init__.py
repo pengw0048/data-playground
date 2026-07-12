@@ -1248,7 +1248,14 @@ class RayRunner:
 
     def _make_jobs_artifacts(self, run_id: str, graph, target, *, sink_targets=None,
                              materialize_uri=None, requires=None) -> tuple[dict, dict]:
+        from hub import metadb
+
         cfg = self._jobs_contract()
+        created_by, _auth_canvas_id = metadb.run_auth(run_id)
+        if not created_by:
+            raise RuntimeError(
+                "Ray Jobs requires a durable run owner before artifact allocation"
+            )
         graph_doc = prepare_workload_graph(graph)
         semantic_env = build_workload_semantic_env()
         semantic_env.update({
@@ -1540,6 +1547,11 @@ class RayRunner:
     def accepts_whole_graph(self, requires) -> bool:
         """Claim hard Ray pins in Jobs mode without claiming non-durable region orchestration."""
         return bool(self.jobs_address and self._requires_ray(requires))
+
+    @staticmethod
+    def preallocate_run_id() -> str:
+        """Mint a logical ID without allocating artifacts or contacting Ray."""
+        return f"run_{uuid.uuid4().hex[:10]}"
 
     def reachable_tiers(self):
         # A same-host reference cluster (worker-direct LOCAL reads) reaches local + object. But an

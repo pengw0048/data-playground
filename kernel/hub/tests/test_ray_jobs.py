@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import datetime
+import json
 import os
 import shlex
 import sys
@@ -126,6 +127,10 @@ class CountingCatalog:
         self.usage_keys: set[str] = set()
         self.lock = threading.Lock()
 
+    @staticmethod
+    def resolve_ref(ref: str) -> str:
+        return ref
+
     def register_output(self, **kwargs):
         with self.lock:
             self.calls.append(kwargs)
@@ -210,7 +215,17 @@ def _runner(jobs_config, client=None, store=None, recover=False, catalog=None):
     module = _load_dp_ray()
     client = client or FakeJobsClient()
     store = store or MemoryArtifacts()
-    runner = module.RayRunner(deps, jobs_client_factory=client, artifact_store=store, recover=recover)
+
+    class TestRayRunner(module.RayRunner):
+        """Direct unit calls stand in for the API, which normally prebinds the authorized principal."""
+        def _make_jobs_artifacts(self, run_id, *args, **kwargs):
+            if metadb.run_auth(run_id) == (None, None):
+                metadb.bind_run_owner(run_id, metadb.DEFAULT_USER_ID, None)
+            return super()._make_jobs_artifacts(run_id, *args, **kwargs)
+
+    runner = TestRayRunner(
+        deps, jobs_client_factory=client, artifact_store=store, recover=recover
+    )
     return module, deps, runner, client, store
 
 
@@ -267,7 +282,7 @@ def _complete(store: MemoryArtifacts, client: FakeJobsClient, status, rows=3):
     client.set_status(ref.submission_id, "SUCCEEDED")
 
 
-def test_ray_jobs_submit_is_deterministic_idempotent_and_excludes_metadata_identity(jobs_config):
+def test_ray_jobs_submit_is_deterministic_and_excludes_metadata_secrets(jobs_config):
     module, deps, runner, client, store = _runner(jobs_config)
     graph = _graph()
     plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
@@ -290,6 +305,10 @@ def test_ray_jobs_submit_is_deterministic_idempotent_and_excludes_metadata_ident
     assert "PATH" not in env and "PYTHONPATH" not in env  # remote image owns its interpreter/code paths
     assert env["DP_CANVAS_PIP_DEPS"] == "0"
     assert env["DP_RAY_JOB_MODE"] == "1"
+    job = store.read(ref.job_uri)
+    assert "created_by" not in job and "auth_canvas_id" not in job
+    assert "dataplay_created_by" not in submit["metadata"]
+    assert "dataplay_auth_canvas_id" not in submit["metadata"]
     persisted = metadb.get_run_state(run_id)
     assert persisted and persisted["backend_ref"]["submission_id"] == ref.submission_id
 
@@ -986,6 +1005,71 @@ def test_ray_jobs_whole_graph_admission_is_separate_from_region_placement(jobs_c
     assert client.submit_calls == []
 
 
+def test_start_run_prebinds_authorized_identity_before_ray_side_effects(
+        jobs_config, monkeypatch):
+    from hub.routers import runs as runs_router
+
+    _module, deps, runner, client, store = _runner(jobs_config)
+    deps.runners.insert(0, runner)
+    uid = f"ray-owner-{uuid.uuid4().hex}"
+    graph = _graph()
+    graph.nodes[1].data["config"]["requires"] = {"labels": {"engine": "ray"}}
+    with metadb.session() as session:
+        session.add(metadb.User(id=uid, name="Ray Owner"))
+        session.add(metadb.Canvas(
+            id=graph.id, owner_id=uid, name="authorized", version=1, doc="{}"
+        ))
+    monkeypatch.setattr(runs_router.auth, "auth_enabled", lambda: True)
+    monkeypatch.setattr(runs_router, "_cone_size", lambda *_args, **_kwargs: (None, None, {}))
+
+    observed: list[tuple[str, tuple[str | None, str | None], dict]] = []
+    write = store.write
+
+    def _write(uri, value):
+        if uri.endswith("/job.dpjob"):
+            observed.append(("artifact", metadb.run_auth(value["run_id"]), dict(value)))
+        return write(uri, value)
+
+    submit = client.submit_job
+
+    def _submit(**kwargs):
+        run_id = kwargs["metadata"]["dataplay_run_id"]
+        observed.append(("submit", metadb.run_auth(run_id), dict(kwargs["metadata"])))
+        return submit(**kwargs)
+
+    monkeypatch.setattr(store, "write", _write)
+    monkeypatch.setattr(client, "submit_job", _submit)
+
+    status, owner = runs_router.start_run(deps, graph, "write", uid)
+    assert owner is runner
+    _wait_submitted(client, status.backend_ref.submission_id)
+    assert [kind for kind, _auth, _doc in observed] == ["artifact", "submit"]
+    assert all(auth == (uid, graph.id) for _kind, auth, _doc in observed)
+    artifact, metadata = observed[0][2], observed[1][2]
+    assert "created_by" not in artifact and "auth_canvas_id" not in artifact
+    assert "dataplay_created_by" not in metadata and "dataplay_auth_canvas_id" not in metadata
+    assert uid not in json.dumps(artifact) and uid not in json.dumps(metadata)
+
+    _complete(store, client, status)
+    assert _wait(runner, status.run_id).status == "done"
+
+
+def test_ray_jobs_refuses_artifact_allocation_without_prebound_identity(jobs_config):
+    module, deps, _runner_with_test_identity, client, store = _runner(jobs_config)
+    runner = module.RayRunner(
+        deps, jobs_client_factory=client, artifact_store=store, recover=False
+    )
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    run_id = f"unbound-ray-run-{uuid.uuid4().hex}"
+
+    with pytest.raises(RuntimeError, match="durable run owner"):
+        runner.run(plan, graph, "write", "distributed", run_id=run_id)
+
+    assert store.values == {} and client.submit_calls == []
+    assert metadb.backend_job(run_id) is None
+
+
 def test_canvas_delete_is_blocked_while_external_job_is_active(jobs_config):
     _module, deps, runner, _client, _store = _runner(jobs_config)
     graph = _graph()
@@ -1296,6 +1380,56 @@ def test_fast_terminal_run_can_bind_owner_while_detail_still_exists(jobs_config)
         assert session.get(metadb.RunTerminalFence, run_id).status == "failed"
 
 
+def test_prebound_fast_terminal_does_not_rebind_after_identity_fence(
+        jobs_config, monkeypatch):
+    from hub.models import RunEstimate, RunStatus
+    from hub.routers import runs as runs_router
+
+    _module, deps, _runner_obj, _client, _store = _runner(jobs_config)
+    seen_auth = None
+
+    class ImmediateBackend:
+        name = "immediate-prebound"
+
+        @staticmethod
+        def can_run(_plan):
+            return True
+
+        @staticmethod
+        def estimate(_plan, _rows, _byts=None):
+            return RunEstimate(placement="local", needs_confirm=False)
+
+        @staticmethod
+        def preallocate_run_id():
+            return f"run_fast_prebound_{uuid.uuid4().hex}"
+
+        @staticmethod
+        def run(_plan, _graph, _target, _placement, run_id=None):
+            nonlocal seen_auth
+            seen_auth = metadb.run_auth(run_id)
+            status = RunStatus(run_id=run_id, status="done", placement="local", per_node=[])
+            metadb.save_run_state(run_id, status.model_dump())
+            return status
+
+    backend = ImmediateBackend()
+    deps.runners.insert(0, backend)
+    previous = metadb.get_setting("backend", default="")
+    metadb.set_setting("backend", backend.name)
+    monkeypatch.setattr(runs_router.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(runs_router, "_cone_size", lambda *_args, **_kwargs: (None, None, {}))
+    monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 0)
+    try:
+        status, owner = runs_router.start_run(deps, _graph(), "write", "fast-owner")
+    finally:
+        metadb.set_setting("backend", previous)
+
+    assert owner is backend and status.status == "done"
+    assert seen_auth == ("fast-owner", None)
+    assert metadb.get_run_state(status.run_id) is None
+    with metadb.session() as session:
+        assert session.get(metadb.RunTerminalFence, status.run_id).status == "done"
+
+
 def test_catalog_is_required_and_retried_before_terminal_publication(jobs_config):
     catalog = RecoveringCatalog()
     _module, deps, runner, client, store = _runner(jobs_config, catalog=catalog)
@@ -1406,8 +1540,9 @@ def test_ray_jobs_live_submission_round_trip(tmp_path):
     graph = _graph(name=f"jobs_live_{uuid.uuid4().hex}", source=source)
     plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
 
-    status = runner.run(plan, graph, "write", "distributed",
-                        run_id=f"run_jobs_live_{uuid.uuid4().hex}")
+    run_id = f"run_jobs_live_{uuid.uuid4().hex}"
+    metadb.bind_run_owner(run_id, metadb.DEFAULT_USER_ID, None)
+    status = runner.run(plan, graph, "write", "distributed", run_id=run_id)
     final = _wait(runner, status.run_id, timeout=120)
 
     assert final.status == "done", final.error

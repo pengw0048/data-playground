@@ -406,13 +406,32 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     # schema+actual-aware `sizes` we just computed so cost-based placement routes on the SAME measured
     # widths the gate saw — not a second, coarse re-estimate.
     overall = deps.controller.run(graph, target_node_id, uid, sizes=sizes)
+    identity_prebound = False
     if overall is not None:
         status, owner = overall, deps.controller
     else:
-        status, owner = runner.run(plan, graph, target_node_id, est.placement), runner
+        preallocate = getattr(runner, "preallocate_run_id", None)
+        if callable(preallocate):
+            run_id = str(preallocate())
+            if not run_id:
+                raise RuntimeError("execution backend returned an empty preallocated run id")
+            # This commit is the authorization boundary: external artifacts, workload identity, and
+            # submission are forbidden until the logical run has an authoritative principal.
+            metadb.bind_run_owner(run_id, uid, auth_canvas)
+            identity_prebound = True
+            status = runner.run(
+                plan, graph, target_node_id, est.placement, run_id=run_id
+            )
+            if status.run_id != run_id:
+                raise RuntimeError("execution backend did not preserve its prebound run id")
+        else:
+            status = runner.run(plan, graph, target_node_id, est.placement)
+        owner = runner
     deps.run_index[status.run_id] = owner  # so status/cancel/ws reach the right owner
     deps.run_owner[status.run_id] = uid  # fast in-process creator lookup; auth-mode runs are canvas-bound
-    if auth.auth_enabled():  # persist the owner so authz survives restart / other stateless instances
+    if auth.auth_enabled() and not identity_prebound:
+        # Prebound external runs already committed this before allocation; avoid a second bind after a
+        # fast terminal publication may have pruned detail and installed the permanent identity fence.
         metadb.bind_run_owner(status.run_id, uid, auth_canvas)
     # bound both (insertion-ordered) so they can't grow for the process lifetime — the runners
     # themselves only retain the last _MAX_RUNS, and _status_or_lost already tolerates a missing id.

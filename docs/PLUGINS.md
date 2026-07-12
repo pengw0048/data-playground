@@ -137,6 +137,12 @@ implement `WholeGraphRequirementBackend.accepts_whole_graph(requires)`. This adm
 entire graph to that backend without making `place()` claim a region. Once claimed, unsupported pinned work
 must fail explicitly; it must not fall back to an engine that does not satisfy the requirement.
 
+An external backend that allocates workload identity or artifacts can implement
+`PreboundRunIdentityBackend.preallocate_run_id()`. The method only mints an ID and must have no external
+side effects. The hub durably binds that ID to the authorized creator/canvas before calling
+`run(..., run_id=...)`; the backend must preserve the supplied ID. This ordering gives identity providers a
+reliable principal without exposing hub database credentials to workers.
+
 **How placement + tiering drive `run_unit`.** A run splits into regions (maximal same-backend subgraphs, cut
 at a backend change / fan-out / `checkpoint`). A region is placed by a cost estimate — a conservative per-node
 size estimate (`hub/estimate.py`) raises a memory requirement when a blocking region's working set exceeds the

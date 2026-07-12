@@ -133,6 +133,16 @@ class WholeGraphRequirementBackend(Protocol):
 
 
 @runtime_checkable
+class PreboundRunIdentityBackend(Protocol):
+    """Optional seam for external allocation that requires a durable principal first.
+
+    ``preallocate_run_id`` must be side-effect free. The hub binds that ID to the authorized creator and
+    canvas before calling ``run(..., run_id=...)``; the backend must use the supplied ID unchanged.
+    """
+    def preallocate_run_id(self) -> str: ...
+
+
+@runtime_checkable
 class DatasetAdapter(Protocol):
     """How a URI becomes readable/writable columnar data — the seam for a new storage/format/warehouse
     (Iceberg, Delta, a REST source, …). Register a plugin adapter via `reg.add_adapter(a)`; it is
