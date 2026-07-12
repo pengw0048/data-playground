@@ -2346,6 +2346,59 @@ def test_subprocess_runner_enforces_named_schema_contract_without_hub_db_access(
         metadb.set_setting("backend", "", "global")
 
 
+def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_path):
+    import json
+    import threading
+
+    from hub.models import Graph, RunStatus
+    from hub.subprocess_runner import SubprocessRunner
+
+    registration_started = threading.Event()
+    allow_registration = threading.Event()
+
+    class BlockingCatalog:
+        def register_output(self, **_kwargs):
+            registration_started.set()
+            assert allow_registration.wait(timeout=5)
+
+    class FinishedProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    runner = SubprocessRunner("test", str(tmp_path), catalog=BlockingCatalog())
+    run_id = "run_catalog_gate"
+    runner.runs[run_id] = RunStatus(run_id=run_id, status="running", per_node=[])
+    status_file = tmp_path / "status.json"
+    status_file.write_text(json.dumps(RunStatus(
+        run_id="child",
+        status="done",
+        per_node=[],
+        output_uri=str(tmp_path / "result.parquet"),
+        output_table="result",
+    ).model_dump()))
+    graph = Graph.model_validate({"id": "c", "version": 1, "nodes": [], "edges": []})
+
+    watcher = threading.Thread(target=runner._watch, args=(
+        run_id, FinishedProcess(), str(status_file), str(tmp_path), graph, None
+    ))
+    watcher.start()
+    assert registration_started.wait(timeout=5)
+
+    assert runner.status(run_id).status == "running"
+
+    allow_registration.set()
+    watcher.join(timeout=5)
+    assert not watcher.is_alive()
+    assert runner.status(run_id).status == "done"
+
+
 def test_run_deadline_hard_kills_a_runaway_child(tmp_path):
     # cell-crash-isolation: a runaway cell (`while True`) in an isolated run must be HARD-KILLED at the
     # wall-clock deadline and resolve to 'failed' with a deadline message — never pin the worker forever.
