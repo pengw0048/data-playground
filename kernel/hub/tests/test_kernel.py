@@ -7758,8 +7758,14 @@ def test_ray_empty_schema_lineage_covers_supported_ops_and_declared_udfs(monkeyp
         op="flat_map", inputs=[("src", None)],
         config={"mode": "flat_map", "code": "def fn(row): return []", "onError": "raise"},
     )
+    undeclared_dataset = runner._build(undeclared, {"src": source()})
     with pytest.raises(RuntimeError, match="did not expose an Arrow schema"):
-        mod._collect_arrow(runner._build(undeclared, {"src": source()}), purpose="unknown empty map")
+        mod._collect_arrow(undeclared_dataset, purpose="unknown empty map")
+    with pytest.raises(RuntimeError, match="empty Ray dedup input did not expose"):
+        runner._build(
+            SimpleNamespace(op="dedup", inputs=[("src", None)], config={"on": ""}),
+            {"src": undeclared_dataset},
+        )
 
 
 def test_ray_ir_carries_transform_output_schema_for_empty_results():
@@ -8366,6 +8372,15 @@ def test_ray_typed_empty_paths_live_keep_pre_materialization_schema(tmp_path, mo
             )
             assert actual.schema.names == names
             assert actual.num_rows == 2
+        runtime_dedup = mod._collect_arrow(
+            runner._build(
+                SimpleNamespace(op="dedup", inputs=[("src", None)], config={"on": ""}),
+                {"src": mapped},
+            ),
+            purpose="live runtime-schema dedup",
+        )
+        assert runtime_dedup.schema.names == ["k", "extra"]
+        assert runtime_dedup.num_rows == 2
 
         declared_flat_map = SimpleNamespace(
             op="flat_map", inputs=[("src", None)],
@@ -8391,10 +8406,15 @@ def test_ray_typed_empty_paths_live_keep_pre_materialization_schema(tmp_path, mo
             op="flat_map", inputs=[("src", None)],
             config={"mode": "flat_map", "code": "def fn(row):\n    return []", "onError": "raise"},
         )
+        undeclared_dataset = runner._build(
+            undeclared_flat_map, {"src": mod._read_native_parquet(ray, source_plan)}
+        )
         with pytest.raises(RuntimeError, match="did not expose an Arrow schema"):
-            mod._collect_arrow(
-                runner._build(undeclared_flat_map, {"src": mod._read_native_parquet(ray, source_plan)}),
-                purpose="live undeclared empty map",
+            mod._collect_arrow(undeclared_dataset, purpose="live undeclared empty map")
+        with pytest.raises(RuntimeError, match="empty Ray dedup input did not expose"):
+            runner._build(
+                SimpleNamespace(op="dedup", inputs=[("src", None)], config={"on": ""}),
+                {"src": undeclared_dataset},
             )
     finally:
         ray.shutdown()

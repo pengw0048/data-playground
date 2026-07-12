@@ -1431,9 +1431,10 @@ class RayRunner:
             if rows > 0 and runtime_schema is None:
                 raise RuntimeError("a non-empty Ray dedup input did not expose an Arrow schema")
             schema = runtime_schema if rows > 0 else lineage_schema
+            if schema is None:
+                raise RuntimeError("an empty Ray dedup input did not expose an Arrow schema")
             parent = _remember_ray_schema(parent, schema)
-            keys = schema.names if schema is not None else list(parent.columns())
-            return self._shuffle_duckdb(parent, keys, "SELECT DISTINCT * FROM _blk", opts)
+            return self._shuffle_duckdb(parent, schema.names, "SELECT DISTINCT * FROM _blk", opts)
         if step.op == "join":
             return self._build_join(step, datasets, opts)
         if step.op == "sort":
