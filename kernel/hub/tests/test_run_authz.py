@@ -1,8 +1,8 @@
-"""Run action authorization.
+"""Graph-read and run-action authorization.
 
-With auth enabled, status/output are readable by every collaborator, while submit/cancel require an
-owner/editor role. Unrelated authenticated accounts cannot enumerate the run. These checks are no-ops
-in open mode (single trusted user), so the rest of the suite (which runs open) is unaffected.
+With auth enabled, caller-supplied graph analysis requires a real readable saved canvas; status/output
+are readable by every collaborator, while submit/cancel require an owner/editor role. Unrelated users
+cannot enumerate either canvas or run objects. Open mode remains a single trusted user.
 """
 from __future__ import annotations
 
@@ -58,6 +58,45 @@ def _graph(canvas_id: str) -> dict:
             "edges": []}
 
 
+def _analysis_graph(canvas_id: str) -> dict:
+    """A real two-source graph exercises rows, schema, estimates, plans, and join hints."""
+    uri = _uri("events")
+    return {"id": canvas_id, "name": "authz analysis", "version": 1, "nodes": [
+        {"id": "left", "type": "source", "position": {"x": 0, "y": 0},
+         "data": {"title": "left", "config": {"uri": uri}}},
+        {"id": "right", "type": "source", "position": {"x": 0, "y": 100},
+         "data": {"title": "right", "config": {"uri": uri}}},
+        {"id": "join", "type": "join", "position": {"x": 200, "y": 0},
+         "data": {"title": "join", "config": {"on": "id", "how": "inner"}}},
+    ], "edges": [
+        {"id": "left-join", "source": "left", "target": "join", "targetHandle": "a",
+         "data": {"wire": "dataset"}},
+        {"id": "right-join", "source": "right", "target": "join", "targetHandle": "b",
+         "data": {"wire": "dataset"}},
+    ]}
+
+
+_GRAPH_READ_ENDPOINTS = [
+    ("compile", "/api/graph/compile"),
+    ("preview", "/api/run/preview"),
+    ("profile", "/api/run/profile"),
+    ("schema", "/api/graph/schema"),
+    ("graph-estimate", "/api/graph/estimate"),
+    ("plan", "/api/graph/plan"),
+    ("join-analysis", "/api/graph/join-analysis"),
+    ("run-estimate", "/api/run/estimate"),
+]
+
+
+def _graph_read_body(case: str, canvas_id: str) -> dict:
+    graph = _analysis_graph(canvas_id)
+    if case == "preview":
+        return {"graph": graph, "nodeId": "join", "k": 2}
+    if case == "profile":
+        return {"graph": graph, "nodeId": "join", "full": False}
+    return {"graph": graph, "targetNodeId": "join"}
+
+
 def _start_run(hdr: dict, canvas_id: str):
     return client.post("/api/run", json={"graph": _graph(canvas_id), "targetNodeId": "s", "confirmed": True},
                        headers=hdr)
@@ -103,25 +142,83 @@ def test_run_creation_is_bound_to_an_authorized_canvas(authed):
     assert r.status_code == 404, r.text
 
 
-def test_adhoc_run_is_private_to_its_creator(authed):
-    # a graph id that names no saved canvas is the caller's own ad-hoc workspace — allowed, and owned
-    r = _start_run(_hdr("authz_a"), "authz_adhoc_never_saved")
-    assert r.status_code == 200, r.text
-    rid = r.json()["runId"]
-    assert client.get(f"/api/run/{rid}", headers=_hdr("authz_a")).status_code == 200
-    assert client.get(f"/api/run/{rid}", headers=_hdr("authz_b")).status_code == 404
+def test_auth_mode_rejects_invented_graph_for_estimate_and_submit(authed, monkeypatch):
+    """POST /run cannot bypass the read-route guard with the same invented graph id."""
+    invented = "authz_adhoc_never_saved"
+    graph = _graph(invented)
+    touched: list[str] = []
+    monkeypatch.setattr(get_deps().catalog, "resolve_ref",
+                        lambda ref: touched.append(str(ref)) or ref)
+    estimate = client.post("/api/run/estimate", json={
+        "graph": graph, "targetNodeId": "s",
+    }, headers=_hdr("authz_a"))
+    submit = client.post("/api/run", json={
+        "graph": graph, "targetNodeId": "s", "confirmed": True,
+    }, headers=_hdr("authz_a"))
+    assert estimate.status_code == submit.status_code == 404
+    assert touched == []
 
 
-def test_adhoc_run_cannot_be_hijacked_by_claiming_its_canvas_id(authed):
-    # the run's canvas_id is client-supplied and shares the canvas-id namespace; a stranger must NOT be
-    # able to POST a canvas with the ad-hoc run's id to retroactively "own" (and read) the run.
-    rid = _start_run(_hdr("authz_a"), "authz_adhoc_claimable").json()["runId"]
-    claim = client.post("/api/canvas", json={"id": "authz_adhoc_claimable", "name": "claim"},
-                        headers=_hdr("authz_b"))
-    assert claim.status_code == 200  # B does own a NEW canvas by that id now...
-    # ...but the run was authorized against no real canvas, so B still cannot reach it
-    assert client.get(f"/api/run/{rid}", headers=_hdr("authz_b")).status_code == 404
-    assert client.post(f"/api/run/{rid}/cancel", headers=_hdr("authz_b")).status_code == 404
+@pytest.mark.parametrize("canvas_id", ["authz_canvas", "authz_invented"], ids=["private", "invented"])
+@pytest.mark.parametrize(("case", "path"), _GRAPH_READ_ENDPOINTS, ids=[c[0] for c in _GRAPH_READ_ENDPOINTS])
+def test_graph_reads_reject_before_source_resolution(authed, monkeypatch, canvas_id, case, path):
+    """A stranger/private id and an invented id fail before catalog or adapter data access."""
+    body = _graph_read_body(case, canvas_id)  # build while the real catalog methods are still installed
+    touched: list[str] = []
+
+    def touched_resolver(ref):
+        touched.append(f"resolve:{ref}")
+        raise AssertionError("source ref resolved before graph authorization")
+
+    def touched_adapter(uri):
+        touched.append(f"adapter:{uri}")
+        raise AssertionError("data adapter resolved before graph authorization")
+
+    deps = get_deps()
+    monkeypatch.setattr(deps.catalog, "resolve_ref", touched_resolver)
+    monkeypatch.setattr(deps, "resolve_adapter", touched_adapter)
+    response = client.post(path, json=body, headers=_hdr("authz_b"))
+    assert response.status_code == 404, response.text
+    assert touched == []
+
+
+@pytest.mark.parametrize("uid", ["authz_a", "authz_editor", "authz_viewer"],
+                         ids=["owner", "editor", "viewer"])
+@pytest.mark.parametrize(("case", "path"), _GRAPH_READ_ENDPOINTS, ids=[c[0] for c in _GRAPH_READ_ENDPOINTS])
+def test_graph_reads_allow_every_canvas_read_role(authed, monkeypatch, uid, case, path):
+    _share_editor_and_viewer()
+    monkeypatch.setattr(get_deps(), "chosen_backend", lambda _uid=None: "local-out-of-core")
+    response = client.post(path, json=_graph_read_body(case, "authz_canvas"), headers=_hdr(uid))
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    if case == "compile":
+        assert {s["nodeId"] for s in payload["steps"]} == {"left", "right", "join"}
+    elif case == "preview":
+        assert payload["rows"]
+    elif case == "profile":
+        assert payload["columns"]
+    elif case == "schema":
+        assert payload["left"] and payload["join"]
+    elif case == "graph-estimate":
+        assert "left" in payload and "join" in payload
+    elif case == "plan":
+        assert payload["regions"]
+    elif case == "join-analysis":
+        assert "suggestions" in payload
+    elif case == "run-estimate":
+        assert payload["placement"] == "local"
+
+
+def test_agent_graph_is_authorized_before_provider_or_data_access(authed, monkeypatch):
+    """The optional graph-aware agent is another caller-supplied graph execution surface."""
+    import hub.routers.runs as runs
+
+    monkeypatch.setattr(runs, "agent_status", lambda: (_ for _ in ()).throw(
+        AssertionError("agent provider checked before graph authorization")))
+    response = client.post("/api/agent", json={
+        "outcome": "preview this", "graph": _analysis_graph("authz_invented"),
+    }, headers=_hdr("authz_b"))
+    assert response.status_code == 404
 
 
 def test_deleting_a_canvas_severs_its_runs(authed):
@@ -228,3 +325,24 @@ def test_mcp_reuses_submit_and_cancel_mutation_policy(authed):
     assert viewer_cancel["isError"] is True and "owner or editor" in viewer_cancel["content"][0]["text"]
     editor_cancel = _mcp_tool("authz_editor", "cancel_run", {"runId": run_id})
     assert editor_cancel.get("isError") is not True
+
+
+def test_mcp_graph_reads_use_the_authorized_saved_document(authed, monkeypatch):
+    """MCP accepts a canvas id, not a caller-supplied graph; `_get_doc` enforces the same read roles."""
+    _share_editor_and_viewer()
+    monkeypatch.setattr(get_deps(), "chosen_backend", lambda _uid=None: "local-out-of-core")
+    saved = client.put("/api/canvas/authz_canvas", json=_analysis_graph("authz_canvas"),
+                       headers=_hdr("authz_a"))
+    assert saved.status_code == 200, saved.text
+
+    viewer_preview = _mcp_tool("authz_viewer", "preview_node",
+                               {"canvasId": "authz_canvas", "nodeId": "join", "limit": 2})
+    viewer_validate = _mcp_tool("authz_viewer", "validate_canvas", {"canvasId": "authz_canvas"})
+    assert viewer_preview.get("isError") is not True
+    assert viewer_preview["structuredContent"]["rows"]
+    assert viewer_validate.get("isError") is not True
+
+    for canvas_id in ("authz_canvas", "authz_invented"):
+        denied = _mcp_tool("authz_b", "preview_node",
+                           {"canvasId": canvas_id, "nodeId": "join", "limit": 1})
+        assert denied["isError"] is True and "not found" in denied["content"][0]["text"]
