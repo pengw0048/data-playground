@@ -124,6 +124,10 @@ def test_workload_graph_inlines_named_schema_contract_without_mutating_source():
     from hub import metadb
     from hub.models import Graph
 
+    # This module does not import the ASGI app, whose startup normally initializes metadata.
+    # Initialize explicitly so the workload-boundary tests are valid in isolation as well as in the
+    # full suite.
+    metadb.init_db()
     metadb.save_schema_contract("isolated_worker_contract", [{"name": "v", "type": "int"}])
     graph = Graph.model_validate({
         "id": "contract-worker",
@@ -147,8 +151,10 @@ def test_workload_graph_inlines_named_schema_contract_without_mutating_source():
 
 
 def test_workload_graph_keeps_missing_contract_for_fail_closed_enforcement():
+    from hub import metadb
     from hub.models import Graph
 
+    metadb.init_db()
     graph = Graph.model_validate({
         "id": "missing-contract-worker",
         "version": 1,
