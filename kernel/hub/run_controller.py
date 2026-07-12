@@ -359,19 +359,6 @@ class RunController:
                 except Exception:  # noqa: BLE001
                     pass
 
-    @staticmethod
-    def _prune_regions(d: str, keep: int = 500) -> None:
-        import shutil
-        try:
-            files = sorted((os.path.join(d, f) for f in os.listdir(d)), key=os.path.getmtime)
-            for f in files[:-keep]:
-                try:  # a worker-direct handoff is a DIRECTORY of shards — os.remove can't delete a dir
-                    shutil.rmtree(f) if os.path.isdir(f) else os.remove(f)
-                except OSError:
-                    pass
-        except OSError:
-            pass
-
     def _region_output_exists(self, uri: str) -> bool:
         """A Ray attempt is reusable only when its last-written commit manifest is valid.
 
@@ -500,7 +487,6 @@ class RunController:
             db.ensure_object_store()
         else:
             os.makedirs(tier.prefix, exist_ok=True)
-            self._prune_regions(tier.prefix)  # bound the LOCAL handoff dir (coarse GC; TTL/refcount later)
         out_uri = tier.uri(f"{region.id}_{key}.parquet")
         backend = self._backend_runner(region, uid)
         result_uri = out_uri

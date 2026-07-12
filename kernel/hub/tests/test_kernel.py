@@ -6279,6 +6279,42 @@ def test_controller_region_cancel_fences_staged_handoff(tmp_path, monkeypatch):
     assert not glob.glob(output + ".tmp-*"), "cancelled region staging file leaked"
 
 
+def test_controller_does_not_evict_unowned_region_artifacts(tmp_path):
+    # Region files can remain referenced by the result cache, catalog, another hub instance, or a running
+    # reader. A previous newest-500 cleanup guessed ownership from mtime and deleted valid data. Until an
+    # ownership/reference ledger exists, retaining an artifact is safer than corrupting a published result.
+    import os as _os
+
+    from hub.deps import Deps
+    from hub.models import Graph, ResourceSpec
+    from hub.planner import Region
+
+    workspace = tmp_path / "region-retention-ws"
+    data_dir = tmp_path / "region-retention-data"
+    workspace.mkdir()
+    data_dir.mkdir()
+    regions = workspace / "regions"
+    regions.mkdir()
+    artifacts = []
+    for i in range(501):
+        artifact = regions / f"existing_{i:03d}.parquet"
+        artifact.write_bytes(b"published")
+        artifacts.append(artifact)
+    _os.utime(artifacts[0], (1, 1))  # the former mtime-based pruning always selected this valid artifact
+
+    d = Deps(str(workspace), str(data_dir))
+    source = _seq_parquet(tmp_path, n=10)
+    graph = Graph(**{"id": "region_retention", "version": 1,
+                     "nodes": [N("s", "source", {"uri": source})], "edges": []})
+    region = Region(id="r", node_ids={"s"}, output_node="s", backend="default", worker=None,
+                    requires=ResourceSpec(), cut_inputs=[])
+
+    output = d.controller._materialize("run_region_retention", graph, region, {}, [region])
+
+    assert all(artifact.exists() for artifact in artifacts)
+    assert _os.path.exists(output)
+
+
 def test_row_estimate_uses_the_shared_estimator():
     # the confirm-gate now shares hub.estimate: the "volume" of a source→sample(100) run is the source
     # count (max across the cone) + estimated bytes, and an all-unknown run is (None, None) (→ err toward

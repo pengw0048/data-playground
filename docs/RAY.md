@@ -127,6 +127,11 @@ attempts have no commit and leave with the later data rule. The hub deliberately
 and delete a shared bucket in the foreground: it cannot prove ownership across deployments with separate
 metadata databases, and a full shared-prefix listing is not bounded at production fragment counts.
 
+Local region handoffs are retained for the same correctness reason. The hub does not evict files by age or
+directory count: an mtime cannot prove that a cache entry, catalog version, concurrent hub, or active reader
+no longer references an artifact. Monitor local region capacity until the ownership-aware artifact ledger and
+exact-key cleanup described in the production roadmap are available.
+
 `run_unit` mints a random attempt ID by default and enforces one owner per ID inside a runner. A caller that
 supplies deterministic IDs must fence ownership in its durable control plane. A committed retry reattaches;
 an existing partial/mismatched prefix fails closed and is never overwritten.
