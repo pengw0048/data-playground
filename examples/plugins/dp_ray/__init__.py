@@ -48,8 +48,8 @@ import time
 import uuid
 
 from hub import db, graph as g
-from hub.handoff import (MANIFEST_NAME as _HANDOFF_MANIFEST, discard_attempt,
-                         read_manifest, validate_shards, write_manifest)
+from hub.handoff import (MANIFEST_NAME as _HANDOFF_MANIFEST, attempt_has_shards,
+                         discard_attempt, read_manifest, validate_shards, write_manifest)
 from hub.sinks import SinkSpec, commit_sink, preflight_sink
 from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (DuckDB's own parser), shared
 from hub.ir import (CLEAN_OPS, CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
@@ -272,20 +272,44 @@ class RayRunner:
         handoff contract). A clean region runs distributed on Ray: reads AND writes worker-direct (each
         block written as its own parquet shard, no driver funnel — output_uri becomes a DIRECTORY of
         shards). `requires` (the planner's resolved region need) is passed to Ray so its map tasks are
-        scheduled onto a matching worker. Anything non-clean falls back to the base subprocess-materialize."""
+        scheduled onto a matching worker. Unsupported unpinned work falls back locally; an explicit Ray
+        requirement fails before dispatch."""
         run_id = run_id or f"unit_{uuid.uuid4().hex[:10]}"
         attempt_uri = _attempt_handoff_uri(output_uri, run_id)
         ir = lower_to_ir(graph, output_node, self.node_specs, self.deps.node_ir)
+        status = RunStatus(run_id=run_id, status="queued", placement="distributed", target_node_id=output_node,
+                           per_node=[PerNodeStatus(node_id=output_node, status="queued", label=output_node)])
+        with self._lock:
+            prior = self.runs.get(run_id)
+            if prior is not None:
+                return prior  # one in-process owner for an explicit attempt ID
+            self.runs[run_id] = status
+            self._cancel_ack.discard(run_id)
+        committed = read_manifest(attempt_uri)
+        if (committed is not None and validate_shards(attempt_uri, committed)
+                and self.base._output_exists(attempt_uri)):
+            status.status, status.output_uri = "done", attempt_uri
+            status.rows_processed = status.total_rows = int(committed["rows"])
+            status.progress = 1.0
+            for item in status.per_node:
+                item.status = "done"
+            return status
+        if committed is not None or attempt_has_shards(attempt_uri):
+            status.status = "failed"
+            status.error = (
+                "Ray attempt prefix already exists without an exact committed inventory; "
+                "refusing to overwrite an immutable or possibly live attempt")
+            for item in status.per_node:
+                item.status = "failed"
+            return status
         reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
         reason = reason or self._resource_unsupported_reason(requires, ir)
         if reason and self._requires_ray(requires, graph, output_node):
             return self._unsupported_status(graph, output_node, reason, run_id=run_id)
         if reason:
-            return self._materialize_local(graph, output_node, attempt_uri, run_id)  # non-clean → local engine
-        status = RunStatus(run_id=run_id, status="queued", placement="distributed", target_node_id=output_node,
-                           per_node=[PerNodeStatus(node_id=output_node, status="queued", label=output_node)])
+            return self._materialize_local(  # non-clean → local engine, same reserved status/attempt
+                graph, output_node, attempt_uri, run_id, status=status)
         with self._lock:
-            self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()
         req = requires.model_dump() if hasattr(requires, "model_dump") else requires
         # Never let retries/concurrent attempts overwrite the same multi-object prefix. The controller
@@ -295,7 +319,7 @@ class RayRunner:
                          kwargs={"materialize_uri": attempt_uri, "requires": req}, daemon=True).start()
         return status
 
-    def _materialize_local(self, graph, output_node, attempt_uri, run_id=None) -> RunStatus:
+    def _materialize_local(self, graph, output_node, attempt_uri, run_id=None, status=None) -> RunStatus:
         """Non-clean region fallback under the same immutable handoff contract as distributed Ray.
 
         The fallback is synchronous and uses DuckDB only, but it still writes one unique attempt prefix,
@@ -305,10 +329,15 @@ class RayRunner:
         from hub.executors.engine import BuildEngine
         from hub.plugins.adapters import is_object_uri
         run_id = run_id or f"unit_{uuid.uuid4().hex[:10]}"
-        status = RunStatus(run_id=run_id, status="running", placement="local", target_node_id=output_node,
-                           per_node=[PerNodeStatus(node_id=output_node, status="running", label=output_node)])
+        status = status or RunStatus(
+            run_id=run_id, status="running", placement="local", target_node_id=output_node,
+            per_node=[PerNodeStatus(node_id=output_node, status="running", label=output_node)])
+        status.status, status.placement = "running", "local"
+        for item in status.per_node:
+            item.status = "running"
         with self._lock:
-            self.runs[run_id] = status
+            self.runs.setdefault(run_id, status)
+        owns_prefix = False
         try:
             committed = read_manifest(attempt_uri)
             if (committed is not None and validate_shards(attempt_uri, committed)
@@ -319,9 +348,10 @@ class RayRunner:
                 for p in status.per_node:
                     p.status = "done"
                 return status
-            # A prior crash with the same explicit attempt ID may have left unpublished shards. No live
-            # owner can share that deterministic ID in this synchronous fallback, so reset only this prefix.
-            discard_attempt(attempt_uri)
+            if committed is not None or attempt_has_shards(attempt_uri):
+                raise RuntimeError(
+                    "attempt prefix already exists without an exact committed inventory; use a new run ID")
+            owns_prefix = True
             with db.run_scope():
                 if is_object_uri(attempt_uri):
                     db.ensure_object_store()
@@ -338,7 +368,8 @@ class RayRunner:
             status.rows_processed = status.total_rows = int(result.get("rows") or 0)
             status.progress = 1.0
         except Exception as e:  # noqa: BLE001
-            discard_attempt(attempt_uri)  # synchronous writer has stopped; this cannot race a live task
+            if owns_prefix:
+                discard_attempt(attempt_uri)  # synchronous writer stopped; safe to remove only our prefix
             status.status, status.error = "failed", f"{type(e).__name__}: {e}"
         for p in status.per_node:
             p.status = status.status
@@ -527,6 +558,7 @@ class RayRunner:
         with self._lock:
             self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()
+            self._cancel_ack.discard(run_id)
         self._emit(graph, status)
         # PROCESS ISOLATION: run Ray in a fresh subprocess (its main thread inits Ray BEFORE any DuckDB),
         # so the app's shared DuckDB connection never coexists with Ray in one process. The parent only
@@ -706,8 +738,8 @@ class RayRunner:
             if progress:
                 progress(0.6, rows)
             out_dir = uri[:-len(".parquet")] if uri.lower().endswith(".parquet") else uri  # a DIR of shards
-            # OVERWRITE (not Ray's default append) makes a retry of this SAME attempt idempotent. Distinct
-            # attempts already have distinct immutable prefixes, so they can never mix their shards.
+            # The parent dispatches only a proven-empty prefix: a committed retry reattaches and a partial
+            # retry fails closed. OVERWRITE is retained defensively, never as permission to mutate a commit.
             from ray.data import SaveMode
             if is_object_uri(out_dir):
                 fs, p = object_fs(out_dir)               # creds-aware object filesystem (same as the adapter)

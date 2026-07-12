@@ -7756,6 +7756,41 @@ def test_ray_region_handoff_uses_an_immutable_attempt_prefix():
     assert attempt_uri("/tmp/out.parquet", "../../unsafe run") == "/tmp/out.attempt-unsafe_run"
 
 
+def test_ray_region_reattaches_committed_attempt_and_refuses_partial_retry(tmp_path):
+    import duckdb
+
+    from hub.deps import Deps
+    from hub.handoff import write_manifest
+    from hub.models import Graph
+
+    (tmp_path / "ws").mkdir()
+    mod = _load_dp_ray()
+    rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    graph = Graph(**{"id": "reattach", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": "unused.parquet"}),
+    ], "edges": []})
+
+    suggested = str(tmp_path / "region.parquet")
+    run_id = "unit_committed"
+    attempt = mod._attempt_handoff_uri(suggested, run_id)
+    os.makedirs(attempt)
+    duckdb.connect().execute(
+        f"COPY (SELECT 1 AS x) TO '{attempt}/part-0.parquet' (FORMAT PARQUET)")
+    write_manifest(attempt, run_id=run_id, rows=1, schema="x: int64")
+    rr._acknowledge_cancel(run_id)  # a prior owner reused this explicit ID; registration must clear it
+    done = rr.run_unit(graph, "src", suggested, run_id=run_id)
+    assert done.status == "done" and done.output_uri == attempt and done.rows_processed == 1
+    assert not rr.cancel_acknowledged(run_id)
+
+    partial_id = "unit_partial"
+    partial = mod._attempt_handoff_uri(suggested, partial_id)
+    os.makedirs(partial)
+    duckdb.connect().execute(
+        f"COPY (SELECT 2 AS x) TO '{partial}/part-0.parquet' (FORMAT PARQUET)")
+    failed = rr.run_unit(graph, "src", suggested, run_id=partial_id)
+    assert failed.status == "failed" and "refusing to overwrite" in (failed.error or "")
+
+
 def test_region_attempt_requires_a_valid_commit_manifest(tmp_path):
     # Shards alone are not a published handoff. The controller must reject a partial/corrupt attempt and
     # accept it only after the writer's last operation installs a valid success manifest.
@@ -7772,6 +7807,11 @@ def test_region_attempt_requires_a_valid_commit_manifest(tmp_path):
     (attempt / MANIFEST_NAME).write_text("{broken")
     assert ctrl._region_output_exists(str(attempt)) is False
     write_manifest(str(attempt), run_id="unit_1", rows=1, schema="x: int64")
+    assert ctrl._region_output_exists(str(attempt)) is True
+    duckdb.connect().execute(
+        f"COPY (SELECT 2 AS x) TO '{attempt / 'unexpected.parquet'}' (FORMAT PARQUET)")
+    assert ctrl._region_output_exists(str(attempt)) is False  # extra shard is also a partial/mixed attempt
+    os.remove(attempt / "unexpected.parquet")
     assert ctrl._region_output_exists(str(attempt)) is True
     os.remove(attempt / "part-0.parquet")
     assert ctrl._region_output_exists(str(attempt)) is False  # lifecycle/manual shard loss => recompute

@@ -127,6 +127,10 @@ attempts have no commit and leave with the later data rule. The hub deliberately
 and delete a shared bucket in the foreground: it cannot prove ownership across deployments with separate
 metadata databases, and a full shared-prefix listing is not bounded at production fragment counts.
 
+`run_unit` mints a random attempt ID by default and enforces one owner per ID inside a runner. A caller that
+supplies deterministic IDs must fence ownership in its durable control plane. A committed retry reattaches;
+an existing partial/mismatched prefix fails closed and is never overwritten.
+
 Repository changes can make the backend production-capable and provide repeatable validation. A specific
 deployment is production-ready only after its IAM, network, storage, KubeRay, capacity, and operational
 gates also pass.

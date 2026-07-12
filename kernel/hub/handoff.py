@@ -2,7 +2,7 @@
 
 A distributed writer owns one unique ``.attempt-*`` prefix. Data shards are written first and the
 manifest is written last. The controller publishes an attempt URI only after validating that manifest;
-failed attempts can therefore be removed without touching a committed sibling.
+failed attempts remain unreferenced and can be expired without touching a committed sibling.
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ def _object_manifest_path(path: str) -> str:
     return f"{parent}/_dp_commits/{name}/{MANIFEST_NAME}"
 
 
-def _shard_inventory(uri: str) -> list[dict]:
-    """Exact Parquet objects that make up an attempt, captured before the commit record is written."""
+def _list_shards(uri: str) -> list[dict]:
+    """Current Parquet objects under one attempt prefix."""
     shards: list[dict] = []
     if is_object_uri(uri):
         import pyarrow.fs as pafs
@@ -51,6 +51,12 @@ def _shard_inventory(uri: str) -> list[dict]:
                     relative = os.path.relpath(path, base).replace(os.sep, "/")
                     shards.append({"path": relative, "size": os.path.getsize(path)})
     shards.sort(key=lambda item: item["path"])
+    return shards
+
+
+def _shard_inventory(uri: str) -> list[dict]:
+    """Exact Parquet objects that make up an attempt, captured before the commit record is written."""
+    shards = _list_shards(uri)
     if not shards:
         raise RuntimeError("region handoff produced no Parquet shard")
     if len(shards) > _MAX_SHARDS:
@@ -112,23 +118,19 @@ def read_manifest(uri: str) -> dict | None:
 
 
 def validate_shards(uri: str, manifest: dict) -> bool:
-    """Fail closed when any committed shard is absent or has changed size."""
+    """Fail closed unless the current Parquet path/size set exactly matches the committed inventory."""
     try:
-        shards = manifest["shards"]
-        if is_object_uri(uri):
-            import pyarrow.fs as pafs
-            fs, base = object_fs(uri)
-            paths = [base.rstrip("/") + "/" + item["path"] for item in shards]
-            infos = fs.get_file_info(paths)
-            return len(infos) == len(shards) and all(
-                info.type == pafs.FileType.File and int(info.size) == int(item["size"])
-                for info, item in zip(infos, shards))
-        base = path_of(uri)
-        paths = [os.path.join(base, *item["path"].split("/")) for item in shards]
-        return all(os.path.isfile(path) and os.path.getsize(path) == item["size"]
-                   for path, item in zip(paths, shards))
+        return _shard_inventory(uri) == manifest["shards"]
     except Exception:  # noqa: BLE001 — missing/auth/metadata uncertainty is never a cache hit
         return False
+
+
+def attempt_has_shards(uri: str) -> bool:
+    """Whether an unpublished prefix already contains data; uncertainty fails closed as occupied."""
+    try:
+        return bool(_list_shards(uri))
+    except Exception:  # noqa: BLE001 — never overwrite a prefix whose state cannot be proven empty
+        return True
 
 
 def discard_attempt(uri: str) -> None:
