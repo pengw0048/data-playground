@@ -101,12 +101,15 @@ class SubprocessRunner:
         return self._spawn(status, {"materializeUri": output_uri}, graph, output_node)
 
     def _spawn(self, status: RunStatus, job_extra: dict, graph: Graph, target: str | None) -> RunStatus:
+        from hub.workload_env import prepare_workload_graph
+
         run_id = status.run_id
         job_dir = tempfile.mkdtemp(prefix="dp-run-")
         status_file = os.path.join(job_dir, "status.json")
         job_file = os.path.join(job_dir, "job.json")
         with open(job_file, "w") as f:
-            json.dump({"workspace": self.workspace, "dataDir": self.data_dir, "graph": graph.model_dump(),
+            json.dump({"workspace": self.workspace, "dataDir": self.data_dir,
+                       "graph": prepare_workload_graph(graph),
                        "target": target, "statusFile": status_file, **job_extra}, f)
         # A one-shot worker gets only runtime/data capabilities, never the hub metadata identity or
         # ambient signing/bootstrap/provider secrets. It creates a disposable local metadata DB itself.

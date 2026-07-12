@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-from hub.workload_env import build_workload_env
+from hub.workload_env import build_workload_env, prepare_workload_graph
 
 
 _CONTROL_SECRETS = {
@@ -92,3 +92,54 @@ def test_ray_driver_uses_one_shot_profile(monkeypatch):
     assert env["AWS_SECRET_ACCESS_KEY"] == "data-secret"
     assert env["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] == "0"
     assert env["PATH"].startswith(str(Path(module.sys.executable).parent))
+
+
+def test_workload_graph_inlines_named_schema_contract_without_mutating_source():
+    from hub import metadb
+    from hub.models import Graph
+
+    metadb.save_schema_contract("isolated_worker_contract", [{"name": "v", "type": "int"}])
+    graph = Graph.model_validate({
+        "id": "contract-worker",
+        "version": 1,
+        "nodes": [{
+            "id": "transform",
+            "type": "transform",
+            "position": {"x": 0, "y": 0},
+            "data": {"config": {
+                "outputSchema": {"ref": "isolated_worker_contract"},
+                "enforceSchema": True,
+            }},
+        }],
+        "edges": [],
+    })
+
+    payload = prepare_workload_graph(graph)
+
+    assert payload["nodes"][0]["data"]["config"]["outputSchema"] == [{"name": "v", "type": "int"}]
+    assert graph.nodes[0].data["config"]["outputSchema"] == {"ref": "isolated_worker_contract"}
+
+
+def test_workload_graph_keeps_missing_contract_for_fail_closed_enforcement():
+    from hub.models import Graph
+
+    graph = Graph.model_validate({
+        "id": "missing-contract-worker",
+        "version": 1,
+        "nodes": [{
+            "id": "transform",
+            "type": "transform",
+            "position": {"x": 0, "y": 0},
+            "data": {"config": {
+                "outputSchema": {"ref": "missing_isolated_worker_contract"},
+                "enforceSchema": True,
+            }},
+        }],
+        "edges": [],
+    })
+
+    payload = prepare_workload_graph(graph)
+
+    assert payload["nodes"][0]["data"]["config"]["outputSchema"] == {
+        "ref": "missing_isolated_worker_contract"
+    }

@@ -2318,6 +2318,34 @@ def test_subprocess_runner_executes_in_isolation(tmp_path):
         metadb.set_setting("backend", "", "global")  # restore the default in-process runner
 
 
+def test_subprocess_runner_enforces_named_schema_contract_without_hub_db_access(tmp_path):
+    from hub import metadb
+
+    metadb.save_schema_contract("subprocess_value_contract", [{"name": "v", "type": "int"}])
+    metadb.set_setting("backend", "local-subprocess", "global")
+    try:
+        p = _seq_parquet(tmp_path, n=10)
+        g = {"id": "c", "version": 1, "nodes": [
+            N("src", "source", {"uri": p}),
+            N("xf", "transform", {
+                "mode": "map",
+                "code": "def fn(row): return row",
+                "outputSchema": {"ref": "subprocess_value_contract"},
+                "enforceSchema": True,
+            }),
+        ], "edges": [E("src", "xf")]}
+        run = client.post(
+            "/api/run", json={"graph": g, "targetNodeId": "xf", "confirmed": True}
+        ).json()
+
+        status = _poll(run["runId"], tries=400)
+
+        assert status["status"] == "done", status.get("error")
+        assert (status["totalRows"] or status["rowsProcessed"]) == 10
+    finally:
+        metadb.set_setting("backend", "", "global")
+
+
 def test_run_deadline_hard_kills_a_runaway_child(tmp_path):
     # cell-crash-isolation: a runaway cell (`while True`) in an isolated run must be HARD-KILLED at the
     # wall-clock deadline and resolve to 'failed' with a deadline message — never pin the worker forever.

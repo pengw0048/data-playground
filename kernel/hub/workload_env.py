@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from typing import Any
 
 # Process/runtime plumbing required to execute the same interpreter and native data libraries. These
 # are paths and behavior flags, not application/provider credentials.
@@ -93,3 +94,26 @@ def initialize_ephemeral_metadata(directory: str) -> str:
     from hub import metadb
     metadb.init_db()
     return url
+
+
+def prepare_workload_graph(graph: Any) -> dict:
+    """Serialize a graph for a worker that cannot read hub metadata.
+
+    Named schema contracts are control-plane references. Resolve them in the hub before dispatch and
+    carry only their column value into the job, so schema enforcement keeps working without granting the
+    worker the metadata identity. Missing references stay unresolved and therefore still fail closed in
+    the worker instead of silently disabling enforcement.
+    """
+    payload = graph.model_dump()
+    from hub import metadb
+
+    for node in payload.get("nodes", []):
+        data = node.get("data") if isinstance(node, dict) else None
+        config = data.get("config") if isinstance(data, dict) else None
+        schema = config.get("outputSchema") if isinstance(config, dict) else None
+        if not (isinstance(schema, dict) and schema.get("ref")):
+            continue
+        contract = metadb.get_schema_contract(str(schema["ref"]), schema.get("version"))
+        if contract and contract.get("columns"):
+            config["outputSchema"] = contract["columns"]
+    return payload
