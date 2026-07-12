@@ -93,7 +93,7 @@ identity underneath the persistent workers.
 | selected-operator semantic parity | partial | extend multi-node differentials to every claimed operator and edge type |
 | object-store scale-out reads | missing | worker-direct distributed reads, plus bounded fallback for adapters without that capability |
 | durable job lifecycle | missing | persisted Ray submission/attempt ID, restart reconciliation, acknowledged cancel, timeout, and fencing |
-| atomic region publication | implemented | immutable per-attempt prefixes; the controller validates the success manifest before cache publication; failed and stale object-store attempts are collected |
+| atomic region publication | implemented | distributed and local-fallback handoffs use immutable per-attempt prefixes; the controller validates the success manifest before cache publication |
 | workload isolation | missing | explicit environment allowlist, scoped storage identity, per-run namespace, and cluster policy boundary |
 | cluster health and placement truth | missing | live resource/health discovery, backpressure, and fail-loud behavior for an explicit Ray pin |
 | runtime compatibility | partial | one supported Ray range and a driver/worker/core/plugin version handshake |
@@ -117,9 +117,12 @@ The following changes are required before calling the backend production-capable
 6. Pass staging gates on the intended production topology: active-job failure injection, representative
    large workloads, SLOs/alerts, upgrade/rollback, and recovery runbooks.
 
-By default, immutable handoffs are retained for at least seven days before object-store collection. Set
-`DP_REGION_HANDOFF_GC_MIN_AGE_SECONDS` above the longest possible run in the deployment; the age floor
-protects a reader that resolved an older cache pointer immediately before another run replaced it.
+Object-store attempts live under the dedicated `<DP_STORAGE_URL>/regions/` prefix. Configure a native
+bucket lifecycle on that prefix to expire both committed cache artifacts and unreferenced failed attempts;
+its retention must exceed the longest possible run. Expiration turns a later cache lookup into a safe
+recompute. The hub deliberately does not recursively scan and delete a shared bucket in the foreground:
+it cannot prove ownership across deployments with separate metadata databases, and a full prefix listing
+is not bounded at production fragment counts.
 
 Repository changes can make the backend production-capable and provide repeatable validation. A specific
 deployment is production-ready only after its IAM, network, storage, KubeRay, capacity, and operational

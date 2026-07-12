@@ -7775,7 +7775,7 @@ def test_region_attempt_requires_a_valid_commit_manifest(tmp_path):
     assert ctrl._region_output_exists(str(attempt)) is True
 
 
-def test_region_attempt_cleanup_is_scoped_and_object_gc_is_age_gated(tmp_path, monkeypatch):
+def test_region_attempt_cleanup_is_scoped_to_an_attempt(tmp_path):
     from hub import handoff
 
     stable = tmp_path / "stable"
@@ -7787,35 +7787,6 @@ def test_region_attempt_cleanup_is_scoped_and_object_gc_is_age_gated(tmp_path, m
     handoff.discard_attempt(str(stable))
     handoff.discard_attempt(str(failed))
     assert stable.exists() and not failed.exists()  # the cleanup API can never delete a stable prefix
-
-    class _Info:
-        def __init__(self, path, mtime):
-            self.path, self.mtime_ns, self.mtime = path, int(mtime * 1_000_000_000), None
-
-    class _FS:
-        def __init__(self):
-            self.deleted = []
-
-        def get_file_info(self, selector):
-            return [
-                _Info("bucket/regions/old.attempt-a/part.parquet", 100),
-                _Info("bucket/regions/old.attempt-a/_DP_SUCCESS.json", 101),
-                _Info("bucket/regions/protected.attempt-b/part.parquet", 100),
-                _Info("bucket/regions/fresh.attempt-c/part.parquet", 950),
-                _Info("bucket/regions/stable.parquet", 100),
-            ]
-
-        def delete_dir(self, path):
-            self.deleted.append(path)
-
-    fs = _FS()
-    monkeypatch.setattr(handoff, "object_fs", lambda uri: (fs, uri.split("://", 1)[1]))
-    monkeypatch.setenv("DP_REGION_HANDOFF_GC_MIN_AGE_SECONDS", "200")
-    monkeypatch.setenv("DP_REGION_HANDOFF_GC_BATCH", "100")
-    removed = handoff.prune_object_attempts(
-        "s3://bucket/regions", protected={"s3://bucket/regions/protected.attempt-b"}, now=1000)
-    assert removed == 1
-    assert fs.deleted == ["bucket/regions/old.attempt-a"]
 
 
 def test_ray_region_worker_direct_write_and_progress(tmp_path):
@@ -8274,11 +8245,21 @@ def test_ray_backend_run_unit_falls_back_locally_for_a_nonclean_region(tmp_path)
         _ray_node("s", "source", {"uri": p}),
         _ray_node("a", "aggregate", {"groupBy": "x*2", "aggs": "count(*) AS n"}),
     ], "edges": [_ray_edge("s", "a")]})
-    out = str(tmp_path / "sub" / "unit.parquet")  # parent dir missing → guards the local materialize makedirs
-    st = rr.run_unit(gr, "a", out)
+    out = str(tmp_path / "sub" / "unit.parquet")
+    st = rr.run_unit(gr, "a", out, run_id="unit_local_fallback")
     assert st.status == "done", st.error
     assert st.placement == "local"  # a non-clean region fell back to the local engine, not Ray
-    assert duckdb.connect().execute(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0] == 2
+    assert st.output_uri != out and st.output_uri.endswith(".attempt-unit_local_fallback")
+    assert not os.path.exists(out), "the fallback wrote the stable controller suggestion"
+    assert os.path.isfile(os.path.join(st.output_uri, "_DP_SUCCESS.json"))
+    assert duckdb.connect().execute(
+        f"SELECT count(*) FROM read_parquet('{st.output_uri}/**/*.parquet')").fetchone()[0] == 2
+
+    # Reattaching the same explicit attempt is read-only and returns the committed physical prefix.
+    manifest_mtime = os.path.getmtime(os.path.join(st.output_uri, "_DP_SUCCESS.json"))
+    again = rr.run_unit(gr, "a", out, run_id="unit_local_fallback")
+    assert again.status == "done" and again.output_uri == st.output_uri
+    assert os.path.getmtime(os.path.join(st.output_uri, "_DP_SUCCESS.json")) == manifest_mtime
 
 
 @pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="live Ray run — opt-in (needs [ray] + a real executor). Enable: DP_TEST_RAY_LIVE=1.")

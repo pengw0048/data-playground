@@ -383,15 +383,6 @@ class RunController:
             return False
         return self.base._output_exists(uri)
 
-    @staticmethod
-    def _durable_result_uris() -> set[str]:
-        """Best-effort roots protected by the shared result index during object-store sweeping."""
-        try:
-            from hub import metadb
-            return metadb.result_uris()
-        except Exception:  # noqa: BLE001 — GC protection falls back to the age floor + current run refs
-            return set()
-
     def _safe_to_split(self, graph: Graph, target: str, regions) -> bool:
         """Refuse to split (→ run the whole graph in-process, correct but unplaced) for shapes the
         single-port parquet handoff can't represent yet, rather than silently corrupt data:
@@ -536,13 +527,6 @@ class RunController:
                 f"region {region.id} on {region.backend} returned an unreadable or uncommitted handoff: "
                 f"{result_uri}")
         self.base._cache_put(ckey, {"uri": result_uri, "table": region.id, "rows": None})
-        if tier.is_object:
-            # Failed attempts are removed by their writer. This age-gated sweep catches hard-crash and
-            # superseded-success orphans while protecting every durable cache pointer plus this run's
-            # already-resolved inputs. It is intentionally after publication: current output is protected.
-            from hub.handoff import prune_object_attempts
-            protected = self._durable_result_uris() | set(ref_uri.values()) | {result_uri}
-            prune_object_attempts(tier.prefix, protected=protected)
         return result_uri
 
     def _run_final(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], uid: str | None = None) -> RunStatus:
