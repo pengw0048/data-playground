@@ -6,8 +6,9 @@
 # service runs the byte-identical differential INSIDE the network so the Ray Client version always matches
 # the cluster and it reaches minio/ray-head by DNS.
 #
-#   docker compose -f docker-compose.ray.yml up -d --scale ray-worker=2 --build ray-head ray-worker minio createbucket
-#   docker compose -f docker-compose.ray.yml run --rm driver    # runs the differential; exits 0 on PASS
+#   docker compose -f docker-compose.ray.yml build ray-head
+#   docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 ray-head ray-worker minio createbucket
+#   docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # differential; exits 0 on PASS
 #   docker compose -f docker-compose.ray.yml down -v
 #
 # Degraded-cluster rerun: stop one worker BETWEEN runs, then start a new differential. A PASS proves the
@@ -73,8 +74,10 @@ services:
       DP_S3_KEY: "dpminio"
       DP_S3_SECRET: "dpminio123"
       DP_S3_BUCKET: "dpray"
-    # JOIN the cluster as a node (so ray.init(address=auto) connects locally — an external, non-node
-    # process can't attach by GCS address), then run the multi-node byte-identical differential.
+    # JOIN the already-running cluster as a node (so ray.init(address=auto) connects locally — an
+    # external, non-node process can't attach by GCS address), then run the differential. Invoke this
+    # service with `--no-deps`: restarting/recreating a dependency would replace the GCS cluster identity
+    # underneath the persistent workers and invalidate the validation topology.
     entrypoint: ["/bin/sh", "-c"]
     # $$ escapes Compose's own variable interpolation so the SHELL sees $? / $rc (else Compose expands
     # them to empty and `exit` returns 0 even when the differential FAILED — the check's real exit code

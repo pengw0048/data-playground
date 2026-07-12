@@ -56,7 +56,11 @@ jobs:
       - name: Build and start head, two workers, and MinIO
         run: |
           mkdir -p ray-diagnostics
-          docker compose -f docker-compose.ray.yml up -d --build --scale ray-worker=2 ray-head ray-worker minio createbucket
+          # Finish the shared image first. Building while `up` creates multiple services can leave a
+          # running head on an earlier image ID; a later `compose run` may then recreate the head and
+          # silently replace the GCS cluster identity under the workers.
+          docker compose -f docker-compose.ray.yml build ray-head
+          docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 ray-head ray-worker minio createbucket
           docker compose -f docker-compose.ray.yml ps -a | tee ray-diagnostics/startup-ps.txt
 
       - name: Require the head and both workers to register
@@ -79,13 +83,13 @@ jobs:
 
       - name: Require a clean distributed PASS
         run: |
-          DP_MULTINODE_FAULT= docker compose -f docker-compose.ray.yml run --rm driver 2>&1 | tee ray-diagnostics/clean.log
+          DP_MULTINODE_FAULT= docker compose -f docker-compose.ray.yml run --rm --no-deps driver 2>&1 | tee ray-diagnostics/clean.log
 
       - name: Require every fault control to fail
         run: |
           for fault in schema rows join; do
             set +e
-            DP_MULTINODE_FAULT="$fault" docker compose -f docker-compose.ray.yml run --rm driver 2>&1 | tee "ray-diagnostics/fault-$fault.log"
+            DP_MULTINODE_FAULT="$fault" docker compose -f docker-compose.ray.yml run --rm --no-deps driver 2>&1 | tee "ray-diagnostics/fault-$fault.log"
             rc=${PIPESTATUS[0]}
             set -e
             if [ "$rc" -eq 0 ]; then
@@ -106,7 +110,7 @@ jobs:
           victim=$(printf '%s\n' "$workers" | sed -n '2p')
           docker kill "$victim"
           echo "Stopped worker $victim between runs. This checks a fresh degraded-cluster run, not in-flight recovery."
-          DP_MULTINODE_FAULT= docker compose -f docker-compose.ray.yml run --rm driver 2>&1 | tee ray-diagnostics/degraded-rerun.log
+          DP_MULTINODE_FAULT= docker compose -f docker-compose.ray.yml run --rm --no-deps driver 2>&1 | tee ray-diagnostics/degraded-rerun.log
 
       - name: Capture Ray diagnostics
         if: always()
