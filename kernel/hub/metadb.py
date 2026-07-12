@@ -422,24 +422,31 @@ def get_setting(key: str, scope: str = "global", scope_id: str = "", default=Non
 SHARE_ROLES = ("editor", "viewer")  # the ONLY roles a share may grant; ownership is by owner_id alone
 
 
+def _effective_canvas_role(c: Canvas, uid: str, explicit_role: str | None = None) -> str | None:
+    """Resolve one role consistently: owner > explicit share > workspace visibility baseline."""
+    if c.owner_id == uid:
+        return "owner"
+    if explicit_role is not None:
+        # A share can NEVER confer ownership. Clamp a legacy/out-of-band value rather than letting it
+        # override Canvas.owner_id; this also keeps list_canvases_for aligned with canvas_role.
+        return explicit_role if explicit_role in SHARE_ROLES else "viewer"
+    if c.visibility == "workspace":
+        return "editor"
+    if c.visibility == "workspace_view":
+        return "viewer"
+    return None
+
+
 def canvas_role(canvas_id: str, uid: str) -> str | None:
     """The user's access to a canvas: 'owner' | 'editor' | 'viewer' | None."""
     with session() as s:
         c = s.get(Canvas, canvas_id)
         if c is None:
             return None
-        if c.owner_id == uid:
-            return "owner"
-        if c.visibility == "workspace":
-            return "editor"  # any user of this instance can edit a workspace-visible canvas
-        sh = s.scalar(select(CanvasShare).where(CanvasShare.canvas_id == canvas_id, CanvasShare.user_id == uid))
-        if sh:
-            # a share can NEVER confer ownership — owner is decided by owner_id above. Clamp any legacy
-            # /out-of-band role (e.g. a pre-fix 'owner' row) down to 'viewer' so it can't escalate.
-            return sh.role if sh.role in SHARE_ROLES else "viewer"
-        if c.visibility == "workspace_view":
-            return "viewer"  # workspace-visible but read-only, unless explicitly shared as editor above
-        return None
+        explicit_role = s.scalar(
+            select(CanvasShare.role).where(CanvasShare.canvas_id == canvas_id, CanvasShare.user_id == uid)
+        )
+        return _effective_canvas_role(c, uid, explicit_role)
 
 
 def canvas_exists(canvas_id: str) -> bool:
@@ -522,15 +529,15 @@ def list_canvases_for(uid: str) -> list[dict]:
     with session() as s:
         out: dict[str, dict] = {}
         for c in s.scalars(select(Canvas).where(Canvas.owner_id == uid)):
-            out[c.id] = _canvas_row(c, "owner", False)
-        for c, role in s.execute(select(Canvas, CanvasShare.role)
-                                 .join(CanvasShare, CanvasShare.canvas_id == Canvas.id)
-                                 .where(CanvasShare.user_id == uid)).all():
-            out.setdefault(c.id, _canvas_row(c, role, True))
+            out[c.id] = _canvas_row(c, _effective_canvas_role(c, uid), False)
+        for c, explicit_role in s.execute(select(Canvas, CanvasShare.role)
+                                          .join(CanvasShare, CanvasShare.canvas_id == Canvas.id)
+                                          .where(CanvasShare.user_id == uid)).all():
+            out.setdefault(c.id, _canvas_row(c, _effective_canvas_role(c, uid, explicit_role), True))
         for c in s.scalars(select(Canvas).where(Canvas.visibility == "workspace", Canvas.owner_id != uid)):
-            out.setdefault(c.id, _canvas_row(c, "editor", True))
+            out.setdefault(c.id, _canvas_row(c, _effective_canvas_role(c, uid), True))
         for c in s.scalars(select(Canvas).where(Canvas.visibility == "workspace_view", Canvas.owner_id != uid)):
-            out.setdefault(c.id, _canvas_row(c, "viewer", True))
+            out.setdefault(c.id, _canvas_row(c, _effective_canvas_role(c, uid), True))
         return sorted(out.values(), key=lambda r: r["updatedAt"] or "", reverse=True)
 
 
