@@ -6670,6 +6670,10 @@ def test_resolve_config_is_the_shared_builtin_resolver():
         {"uri": "t", "options": {"delimiter": ";", "header": "no"}}                        # uri|table → uri; opts nested + normalized
     assert resolve_config(N("source", {"uri": "/p.parquet"})) == {"uri": "/p.parquet"}     # no options key when unset
     assert resolve_config(N("sample", {})) == {"n": None, "seed": 42}                       # n unset → engine supplies sample_k
+    assert resolve_config(N("write", {"filename": "x.csv", "format": "csv", "writeMode": "append",
+                                      "destId": "archive", "destPath": "daily/2026", "partitionBy": ""})) == \
+        {"name": None, "filename": "x.csv", "title": None, "format": "csv", "writeMode": "append",
+         "destId": "archive", "destPath": "daily/2026", "partitionBy": ""}
     assert resolve_config(N("metric", {"agg": "mean", "column": "x"})) == {"agg": "mean", "column": "x"}  # verbatim
 
 
@@ -6867,6 +6871,228 @@ def test_ray_backend_operator_gating_and_fallback(tmp_path):
               _ray_node("m", "transform", {"mode": "map", "source": "library", "processor": "p1"}),
               _ray_node("w", "write", {"name": "o"})], [_ray_edge("src", "m"), _ray_edge("m", "w")])
     assert rr._ray_runnable(lower_to_ir(libg, "w", deps.node_specs)) is False
+
+
+def test_ray_sink_contract_matches_local_without_a_live_cluster(tmp_path, monkeypatch):
+    """Ray's driver-side commit must use the local sink contract even when no Ray cluster is available."""
+    import re
+
+    import duckdb
+    import pyarrow.parquet as pq
+
+    from hub import destinations
+    from hub.compiler import compile_plan
+    from hub.deps import Deps
+    from hub.ir import lower_to_ir
+    from hub.models import Graph
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    local_root, ray_root = tmp_path / "local-dest", tmp_path / "ray-dest"
+    (local_root / "daily/2026").mkdir(parents=True)
+    (ray_root / "daily/2026").mkdir(parents=True)
+    roots = {"local-test": local_root, "ray-test": ray_root}
+
+    def target_uri(_workspace, destination_id, path, filename):
+        return str(roots[destination_id] / path / os.path.basename(filename))
+
+    monkeypatch.setattr(destinations, "target_uri", target_uri)
+    deps = Deps(str(workspace), str(tmp_path / "data"))
+    mod = _load_dp_ray()
+    ray_runner = mod.RayRunner(deps)
+    source_uri = str(tmp_path / "input.parquet")
+    duckdb.connect().execute(
+        f"COPY (SELECT * FROM (VALUES ('a', 1), ('b', 2), ('a', 3)) t(cat, value)) "
+        f"TO '{source_uri}' (FORMAT PARQUET)"
+    )
+    source_table = pq.read_table(source_uri)
+
+    class Dataset:
+        def __init__(self, table, *, no_blocks=False):
+            self.table = table
+            self.no_blocks = no_blocks
+
+        def iter_batches(self, batch_format):
+            assert batch_format == "pyarrow"
+            return iter(()) if self.no_blocks else iter((self.table,))
+
+        def schema(self):
+            return self.table.schema
+
+    def graph(destination_id, filename, *, mode="overwrite", partition_by="", empty=False,
+              output_format="parquet"):
+        nodes = [_ray_node("src", "source", {"uri": source_uri})]
+        edges = []
+        parent = "src"
+        if empty:
+            nodes.append(_ray_node("f", "transform", {
+                "mode": "filter", "code": "def fn(row):\n    return False",
+            }))
+            edges.append(_ray_edge("src", "f"))
+            parent = "f"
+        nodes.append(_ray_node("w", "write", {
+            "filename": filename, "format": output_format, "writeMode": mode,
+            "destId": destination_id, "destPath": "daily/2026", "partitionBy": partition_by,
+        }))
+        edges.append(_ray_edge(parent, "w"))
+        return Graph(**{"id": f"{destination_id}-{filename}", "version": 1,
+                        "nodes": nodes, "edges": edges})
+
+    def wait_local(gr):
+        status = deps.runner.run(
+            compile_plan(gr, "w", deps.registry, deps.node_specs), gr, "w", "local"
+        )
+        for _ in range(300):
+            status = deps.runner.status(status.run_id)
+            if status.status in ("done", "failed", "cancelled"):
+                break
+            time.sleep(0.02)
+        assert status.status == "done", status.error
+        return status
+
+    def ray_commit(gr, table, *, no_blocks=False):
+        ir = lower_to_ir(gr, "w", deps.node_specs)
+        write = ir.by_id()["w"]
+        parent = write.inputs[0][0]
+        target = ray_runner._resolve_sink_targets(ir)["w"]
+        committed = ray_runner._commit(write, {parent: Dataset(table, no_blocks=no_blocks)}, target)
+        ray_runner._register_outputs(gr, {"outputs": [
+            {"step_id": write.id, "name": committed[2], "uri": committed[1]},
+        ]})
+        return committed
+
+    # Destination, nested path, format, partitionBy, and overwrite are identical to the local contract.
+    local_partitioned = graph("local-test", "local_partitioned.parquet", partition_by="cat")
+    local_status = wait_local(local_partitioned)
+    ray_partitioned = graph("ray-test", "ray_partitioned.parquet", partition_by="cat")
+    ray_rows, ray_uri, _ = ray_commit(ray_partitioned, source_table)
+    assert ray_rows == 3
+    assert local_status.output_uri == str(local_root / "daily/2026/local_partitioned")
+    assert ray_uri == str(ray_root / "daily/2026/ray_partitioned")
+    scan = lambda uri: sorted(deps.resolve_adapter(uri).scan(uri).fetchall())  # noqa: E731
+    assert scan(local_status.output_uri) == scan(ray_uri)
+
+    # With no filename extension, format chooses the same physical extension on both backends.
+    local_csv = wait_local(graph("local-test", "local_csv", output_format="csv"))
+    _, ray_csv_uri, _ = ray_commit(graph("ray-test", "ray_csv", output_format="csv"), source_table)
+    assert local_csv.output_uri.endswith("/local_csv.csv") and ray_csv_uri.endswith("/ray_csv.csv")
+    assert scan(local_csv.output_uri) == scan(ray_csv_uri)
+
+    # Append remains append (not an implicit overwrite) and returns the adapter's parts-directory URI.
+    local_append = graph("local-test", "local_append.parquet", mode="append")
+    local_append_uri = wait_local(local_append).output_uri
+    wait_local(local_append)
+    ray_append = graph("ray-test", "ray_append.parquet", mode="append")
+    _, ray_append_uri, _ = ray_commit(ray_append, source_table)
+    _, ray_append_uri, _ = ray_commit(ray_append, source_table)
+    assert len(scan(local_append_uri)) == len(scan(ray_append_uri)) == 6
+    assert scan(local_append_uri) == scan(ray_append_uri)
+
+    # An empty Ray Dataset can expose zero blocks; commit reconstructs a zero-row table from its schema.
+    local_empty = graph("local-test", "local_empty.parquet", empty=True)
+    local_empty_uri = wait_local(local_empty).output_uri
+    empty_table = mod._make_mapper({
+        "mode": "filter", "code": "def fn(row):\n    return False", "onError": "raise",
+    })(source_table)
+    assert empty_table.num_rows == 0 and empty_table.schema == source_table.schema
+    ray_empty = graph("ray-test", "ray_empty.parquet", empty=True)
+    empty_rows, ray_empty_uri, ray_empty_name = ray_commit(ray_empty, empty_table, no_blocks=True)
+    assert empty_rows == 0
+    con = duckdb.connect()
+    local_schema = [(r[0], str(r[1])) for r in con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet('{local_empty_uri}')"
+    ).fetchall()]
+    ray_schema = [(r[0], str(r[1])) for r in con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet('{ray_empty_uri}')"
+    ).fetchall()]
+    assert ray_schema == local_schema == [("cat", "VARCHAR"), ("value", "INTEGER")]
+    version = deps.catalog.get_table(ray_empty_name).version
+    assert version != "v1" and re.fullmatch(r"v[0-9a-f]{10}", version)
+
+    # The hub resolves destId exactly once. An isolated driver with no control-plane settings can commit
+    # from the physical URI in its job without calling destinations.target_uri again.
+    driver_graph = graph("ray-test", "driver_resolved.parquet")
+    driver_ir = lower_to_ir(driver_graph, "w", deps.node_specs)
+    resolved = ray_runner._resolve_sink_targets(driver_ir)
+
+    def no_destination_settings(*_args, **_kwargs):
+        raise AssertionError("driver read destination settings")
+
+    monkeypatch.setattr(destinations, "target_uri", no_destination_settings)
+    monkeypatch.setattr(ray_runner, "_build", lambda *_args, **_kwargs: Dataset(source_table))
+    result = ray_runner._run_ir_sync(driver_ir, driver_graph, "w", sink_targets=resolved)
+    assert result["status"] == "done", result.get("error")
+    ray_runner._register_outputs(driver_graph, result)
+    assert result["rows"] == 3
+    assert result["output_uri"] == str(ray_root / "daily/2026/driver_resolved.parquet")
+    assert deps.catalog.get_table(result["output_table"]).uri == result["output_uri"]
+
+
+def test_ray_rejects_or_falls_back_before_dispatch_for_unsupported_sinks(tmp_path, monkeypatch):
+    from hub.compiler import compile_plan
+    from hub.deps import Deps
+    from hub.ir import lower_to_ir
+    from hub.models import Graph
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    deps = Deps(str(workspace), str(tmp_path / "data"))
+    mod = _load_dp_ray()
+    ray_runner = mod.RayRunner(deps)
+
+    def graph(config):
+        return Graph(**{"id": "sink-gate", "version": 1, "nodes": [
+            _ray_node("src", "source", {"uri": "unused.parquet"}),
+            _ray_node("w", "write", config),
+        ], "edges": [_ray_edge("src", "w")]})
+
+    # Whole-graph dispatch carries the hub-resolved map into the supervisor; region materialization does
+    # not, because it stops before a write sink. Defer the thread so this stays cluster-free.
+    dispatched = []
+
+    class DeferredThread:
+        def __init__(self, *args, **kwargs):
+            dispatched.append({"args": args, "kwargs": kwargs})
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(mod.threading, "Thread", DeferredThread)
+    unit = Graph(**{"id": "unit", "version": 1, "nodes": [
+        _ray_node("src", "source", {"uri": "unused.parquet"}),
+    ], "edges": []})
+    ray_runner.run_unit(unit, "src", str(tmp_path / "unit.parquet"))
+    assert "sink_targets" not in dispatched[-1]["kwargs"].get("kwargs", {})
+
+    valid = graph({"filename": "valid.parquet"})
+    ray_runner.run(compile_plan(valid, "w", deps.registry, deps.node_specs), valid, "w", "local")
+    sink_targets = dispatched[-1]["kwargs"]["kwargs"]["sink_targets"]
+    assert sink_targets == {"w": str(workspace / "outputs/valid.parquet")}
+
+    # This combination is outside the product contract and must never be dispatched with partitionBy
+    # silently discarded. The Ray gate rejects it; run() delegates before starting a Ray supervisor.
+    invalid = graph({"filename": "x.parquet", "writeMode": "append", "partitionBy": "cat"})
+    invalid_ir = lower_to_ir(invalid, "w", deps.node_specs)
+    assert ray_runner._ray_runnable(invalid_ir) is False
+    sentinel = object()
+    monkeypatch.setattr(ray_runner.base, "run", lambda *args, **kwargs: sentinel)
+    assert ray_runner.run(
+        compile_plan(invalid, "w", deps.registry, deps.node_specs), invalid, "w", "local"
+    ) is sentinel
+
+    # A plugin adapter without a partition_by keyword is also detected by the metadata-only preflight.
+    class NoPartitionAdapter:
+        def write(self, uri, relation, mode="overwrite"):
+            raise AssertionError("must not be invoked")
+
+    partitioned = graph({"filename": "x.parquet", "writeMode": "overwrite", "partitionBy": "cat"})
+    partitioned_ir = lower_to_ir(partitioned, "w", deps.node_specs)
+    assert ray_runner._ray_runnable(partitioned_ir) is True
+    monkeypatch.setattr(ray_runner, "resolve_adapter", lambda _uri: NoPartitionAdapter())
+    assert ray_runner._sink_targets_runnable(partitioned_ir) is False
+    assert ray_runner.run(
+        compile_plan(partitioned, "w", deps.registry, deps.node_specs), partitioned, "w", "local"
+    ) is sentinel
 
 
 @pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="live Ray run — opt-in because it needs the [ray] extra + a real Ray executor (slow). Verified passing on macOS AND Linux via the dp_ray subprocess driver (which disables Ray's uv-run worker hook). Enable: DP_TEST_RAY_LIVE=1.")

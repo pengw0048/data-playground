@@ -3,8 +3,8 @@
 Spawned by RayRunner._supervise as `python _driver.py <job.json>`. Runs the clean IR on Ray in a FRESH
 process whose MAIN thread initializes Ray BEFORE any DuckDB is created — which is what avoids the
 in-process DuckDB↔Ray deadlock that makes inline execution hang. Reads a job file (workspace, data_dir,
-graph, target, the dp_ray module path), executes, and writes a result JSON to the status file the parent
-polls. Any failure is captured into that status file so the parent never waits forever.
+graph, target, hub-resolved sink URIs, the dp_ray module path), executes, and writes a result JSON to the
+status file the parent polls. Any failure is captured there so the parent never waits forever.
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ def main() -> None:
         prog = _progress_writer(status_file)
         _log(f"lowered; {'_run_ir_materialize' if mat else '_run_ir_sync'}; ray_opts={ray_opts}")
         result = (runner._run_ir_materialize(ir, graph, target, mat, ray_opts, prog) if mat
-                  else runner._run_ir_sync(ir, graph, target, ray_opts, prog))
+                  else runner._run_ir_sync(ir, graph, target, ray_opts, prog, job.get("sink_targets")))
         _log(f"run done: {result.get('status')}")
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read
         result = {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
