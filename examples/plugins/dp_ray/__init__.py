@@ -850,10 +850,17 @@ class RayRunner:
             return con.execute(sql).fetch_arrow_table()
 
         try:
-            parts = int(os.environ.get("DP_RAY_SHUFFLE_PARTITIONS", "0")) or None
+            parts = int(os.environ.get("DP_RAY_SHUFFLE_PARTITIONS", "0"))
         except ValueError:
-            parts = None
-        shuffled = parent.repartition(parts, keys=keys) if parts else parent.repartition(keys=keys)
+            parts = 0
+        if parts <= 0:
+            # Ray 2.56 requires num_blocks even for a keyed repartition. Materializing first gives us the
+            # actual upstream block count through the public API; using the lazy Dataset's private plan
+            # would couple the plugin to an unstable Ray implementation detail. This deliberately adds an
+            # upstream barrier in auto mode; a correct keyed shuffle must materialize the full input anyway.
+            parent = parent.materialize()
+            parts = max(1, parent.num_blocks())
+        shuffled = parent.repartition(parts, keys=keys)
         return shuffled.map_batches(_run, batch_format="pyarrow", batch_size=None, **(ray_opts or {}))
 
     def _build_aggregate(self, step, parent, ray_opts=None):

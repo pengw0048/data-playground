@@ -7678,6 +7678,32 @@ def test_ray_whole_run_enforces_and_forwards_final_region_resources(tmp_path, mo
     assert pinned.status == "failed" and "explicitly required" in (pinned.error or "")
 
 
+def test_ray_shuffle_without_partition_override_uses_materialized_block_count(monkeypatch):
+    mod = _load_dp_ray()
+    rr = object.__new__(mod.RayRunner)
+    calls = []
+    monkeypatch.delenv("DP_RAY_SHUFFLE_PARTITIONS", raising=False)
+
+    class _Data:
+        def materialize(self):
+            calls.append("materialize")
+            return self
+
+        def num_blocks(self):
+            return 3
+
+        def repartition(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return self
+
+        def map_batches(self, _fn, **_kwargs):
+            return self
+
+    data = _Data()
+    assert rr._shuffle_duckdb(data, ["k"], "SELECT DISTINCT * FROM _blk") is data
+    assert calls == ["materialize", ((3,), {"keys": ["k"]})]
+
+
 def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(tmp_path, monkeypatch):
     import sys
     from types import SimpleNamespace
@@ -7693,6 +7719,7 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
     rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
     opts = {"num_gpus": 1.0, "resources": {"a100": 0.001}}
     calls = []
+    monkeypatch.setenv("DP_RAY_SHUFFLE_PARTITIONS", "4")
 
     class _Data:
         def __init__(self, refs=None):
