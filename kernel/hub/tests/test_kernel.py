@@ -3647,41 +3647,181 @@ def test_json_pipeline_importer_round_trips_to_a_run():
         deps.importer = prev
 
 
-def test_collab_relay_gates_viewer_doc_updates(monkeypatch):
-    # a viewer may watch (presence + peers' edits) but its OWN doc updates ('yjs' carries CRDT state)
-    # must NOT be relayed — else an editor peer would merge + autosave them, laundering a change past
-    # the read-only boundary that put_canvas enforces.
+def _provision_private_collab_canvas(cid: str, owner: str, *users: str) -> None:
+    from hub.metadb import Canvas, User, session
+    with session() as s:
+        canvas = s.get(Canvas, cid)
+        if canvas is None:
+            s.add(Canvas(id=cid, owner_id=owner, name="t", version=1, doc="{}", visibility="private"))
+        else:
+            canvas.owner_id, canvas.visibility = owner, "private"
+        for uid in (owner, *users):
+            if s.get(User, uid) is None:
+                s.add(User(id=uid, name=uid))
+
+
+@pytest.fixture(scope="module")
+def live_collab_url():
+    """Real single-loop ASGI server for cross-socket tests.
+
+    Starlette's nested TestClient websocket sessions each own a different portal/loop; yielding to a
+    DB worker before sending through another session is therefore not a faithful relay test. Uvicorn
+    exercises the production topology: every socket on this worker shares one event loop.
+    """
+    import socket
+    import threading
+    import uvicorn
+
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(128)
+    port = sock.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, log_level="critical", lifespan="off", ws="websockets-sansio"))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+    thread.start()
+    deadline = time.time() + 5
+    while not server.started and thread.is_alive() and time.time() < deadline:
+        time.sleep(0.01)
+    if not server.started:
+        server.should_exit = True
+        thread.join(timeout=2)
+        raise RuntimeError("test collaboration server did not start")
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+        if thread.is_alive():
+            server.force_exit = True
+            thread.join(timeout=2)
+
+
+async def _collab_send(ws, msg: dict) -> None:  # noqa: ANN001 — websockets client protocol varies by version
+    import json
+    await ws.send(json.dumps(msg))
+
+
+async def _collab_recv(ws) -> dict:  # noqa: ANN001 — websockets client protocol varies by version
+    import asyncio
+    import json
+    return json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
+
+
+def test_collab_relay_gates_viewer_doc_updates(monkeypatch, live_collab_url):
+    # A viewer may watch (presence + peers' edits) but its OWN doc updates must not be relayed.
+    import asyncio
+    import websockets
     from hub import auth, metadb
-    from hub.metadb import Canvas, session
+
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
     cid = "cvs_viewer_gate"
-    from hub.metadb import User
-    with session() as s:
-        if s.get(Canvas, cid) is None:
-            s.add(Canvas(id=cid, owner_id="owner_u", name="t", version=1, doc="{}", visibility="private"))
-        for u in ("owner_u", "editor_u", "viewer_u"):  # sessions require the user to exist (revocation check)
-            if s.get(User, u) is None:
-                s.add(User(id=u, name=u))
+    _provision_private_collab_canvas(cid, "owner_u", "editor_u", "viewer_u")
     metadb.share_canvas(cid, "editor_u", "editor")
     metadb.share_canvas(cid, "viewer_u", "viewer")
-    ed_cookie = {"cookie": f"dp_session={auth.sign('editor_u')}"}
-    vw_cookie = {"cookie": f"dp_session={auth.sign('viewer_u')}"}
-    client.cookies.clear()
-    try:
-        with client.websocket_connect(f"/ws/collab/{cid}", headers=ed_cookie) as ed:
-            with client.websocket_connect(f"/ws/collab/{cid}", headers=vw_cookie) as vw:
-                # the viewer sends a doc update then a presence; the editor must receive ONLY the presence
-                # (if the yjs had been relayed it would arrive first)
-                vw.send_json({"clientId": "V", "type": "yjs", "update": "AAAA"})
-                vw.send_json({"clientId": "V", "type": "presence", "name": "Val"})
-                got = ed.receive_json()
-                assert got["type"] == "presence" and got["clientId"] == "V"  # yjs dropped, presence relayed
-                # an editor's doc update DOES reach the viewer (a writer's edits flow to watchers)
-                ed.send_json({"clientId": "E", "type": "yjs", "update": "BBBB"})
-                got2 = vw.receive_json()
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(ws_url, additional_headers={"Cookie": f"dp_session={auth.sign('editor_u')}"}, proxy=None) as ed:
+            async with websockets.connect(ws_url, additional_headers={"Cookie": f"dp_session={auth.sign('viewer_u')}"}, proxy=None) as vw:
+                await _collab_send(vw, {"clientId": "V", "type": "yjs", "update": "AAAA"})
+                await _collab_send(vw, {"clientId": "V", "type": "presence", "name": "Val"})
+                got = await _collab_recv(ed)
+                assert got["type"] == "presence" and got["clientId"] == "V"
+                await _collab_send(ed, {"clientId": "E", "type": "yjs", "update": "BBBB"})
+                got2 = await _collab_recv(vw)
                 assert got2["type"] == "yjs" and got2["clientId"] == "E"
+
+    try:
+        asyncio.run(scenario())
     finally:
-        client.cookies.clear()
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_rechecks_editor_downgrade_on_the_same_socket(monkeypatch, live_collab_url):
+    # Downgrading a connected editor must take effect without reconnecting: its next Yjs update is
+    # dropped, while viewer-safe presence and incoming document updates keep working on that socket.
+    import asyncio
+    import httpx
+    import websockets
+    from hub import auth, metadb
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    cid, owner_uid, editor_uid = "cvs_live_downgrade", "live_owner_d", "live_editor_d"
+    _provision_private_collab_canvas(cid, owner_uid, editor_uid)
+    metadb.share_canvas(cid, editor_uid, "editor")
+    owner_cookie = f"dp_session={auth.sign(owner_uid)}"
+    editor_cookie = f"dp_session={auth.sign(editor_uid)}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner:
+            async with websockets.connect(ws_url, additional_headers={"Cookie": editor_cookie}, proxy=None) as editor:
+                async with httpx.AsyncClient(base_url=live_collab_url, headers={"Cookie": owner_cookie}) as http:
+                    response = await http.post(f"/api/canvas/{cid}/share", json={"userId": editor_uid, "role": "viewer"})
+                assert response.status_code == 200
+
+                await _collab_send(editor, {"clientId": "E", "type": "yjs", "update": "BLOCKED_AFTER_DOWNGRADE"})
+                await _collab_send(editor, {"clientId": "E", "type": "presence", "name": "still watching"})
+                got = await _collab_recv(owner)  # same-socket ordering proves the preceding Yjs was dropped
+                assert got["type"] == "presence" and got["name"] == "still watching"
+
+                await _collab_send(owner, {"clientId": "O", "type": "yjs", "update": "READABLE_AS_VIEWER"})
+                got2 = await _collab_recv(editor)
+                assert got2["type"] == "yjs" and got2["update"] == "READABLE_AS_VIEWER"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_collab_url):
+    # Both sockets were admitted while the user was an editor. After unshare, one cannot relay a Yjs
+    # write and the other is closed instead of receiving the next document update.
+    import asyncio
+    import httpx
+    import websockets
+    from hub import auth, metadb
+    from websockets.exceptions import ConnectionClosed
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    cid, owner_uid, editor_uid = "cvs_live_remove", "live_owner_r", "live_editor_r"
+    _provision_private_collab_canvas(cid, owner_uid, editor_uid)
+    metadb.share_canvas(cid, editor_uid, "editor")
+    owner_cookie = f"dp_session={auth.sign(owner_uid)}"
+    editor_cookie = f"dp_session={auth.sign(editor_uid)}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner_a:
+            async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner_b:
+                async with websockets.connect(ws_url, additional_headers={"Cookie": editor_cookie}, proxy=None) as removed_writer:
+                    async with websockets.connect(ws_url, additional_headers={"Cookie": editor_cookie}, proxy=None) as removed_reader:
+                        async with httpx.AsyncClient(base_url=live_collab_url, headers={"Cookie": owner_cookie}) as http:
+                            response = await http.delete(f"/api/canvas/{cid}/share/{editor_uid}")
+                        assert response.status_code == 200
+
+                        await _collab_send(removed_writer, {"clientId": "RW", "type": "yjs", "update": "MUST_NOT_RELAY"})
+                        with pytest.raises(ConnectionClosed) as writer_closed:
+                            await _collab_recv(removed_writer)
+                        assert writer_closed.value.rcvd and writer_closed.value.rcvd.code == 1008
+                        # The revoked writer had announced a clientId in its rejected frame, so its
+                        # close legitimately emits presence-only leave messages. Drain those before
+                        # asserting the next document frame; no canvas data is present in a leave.
+                        for watcher in (owner_a, owner_b, removed_reader):
+                            leave = await _collab_recv(watcher)
+                            assert leave == {"type": "leave", "clientId": "RW"}
+
+                        await _collab_send(owner_b, {"clientId": "OB", "type": "yjs", "update": "AFTER_REMOVAL"})
+                        got = await _collab_recv(owner_a)
+                        assert got["type"] == "yjs" and got["update"] == "AFTER_REMOVAL"
+                        with pytest.raises(ConnectionClosed) as reader_closed:
+                            await _collab_recv(removed_reader)
+                        assert reader_closed.value.rcvd and reader_closed.value.rcvd.code == 1008
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
 
 
 def test_execution_backend_plugin_contract(tmp_path):
