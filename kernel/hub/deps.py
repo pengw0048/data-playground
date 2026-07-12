@@ -378,13 +378,6 @@ class Deps:
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self.run_owner: dict[str, str] = {}  # run_id -> creator uid, to authorize ad-hoc (no-canvas) runs
         self._load_plugins()
-        # init_db deliberately preserves external backend bindings before plugins exist. Once discovery is
-        # complete, surface any missing plugin/config instead of leaving a silent forever-running status.
-        from hub import metadb
-        metadb.note_unhandled_backend_jobs({
-            str(r.durable_backend) for r in self.runners
-            if getattr(r, "durable_backend", None) and getattr(r, "durable_available", False)
-        })
 
     def resolve_adapter(self, uri: str):
         for a in self.adapters:
@@ -579,12 +572,25 @@ _deps: Deps | None = None
 _deps_lock = __import__("threading").Lock()
 
 
+def _note_unhandled_backend_jobs(deps: Deps) -> None:
+    """Run the shared-run diagnostic only in the global control-plane composition root.
+
+    Kernel and one-shot driver ``Deps`` instances can point at private metadata or represent a single
+    canvas. They must never diagnose or mutate ownership of unrelated shared backend runs.
+    """
+    from hub import metadb
+    metadb.note_unhandled_backend_jobs({
+        str(r.durable_backend) for r in deps.runners if getattr(r, "durable_backend", None)
+    })
+
+
 def get_deps() -> Deps:
     global _deps
     if _deps is None:
         with _deps_lock:  # double-checked: concurrent first requests must not build Deps twice
             if _deps is None:
                 _deps = Deps(settings.workspace, settings.data_dir)
+                _note_unhandled_backend_jobs(_deps)
     return _deps
 
 

@@ -41,6 +41,11 @@ def upgrade() -> None:
         sa.Column("job_uri", sa.Text(), nullable=False),
         sa.Column("result_uri", sa.Text(), nullable=False),
         sa.Column("code_ref", sa.String(), nullable=True),
+        # The endpoint is a non-secret durable routing handle. Recovery and cancellation must not
+        # depend on the replacement process still carrying the original environment configuration.
+        sa.Column("control_address", sa.Text(), nullable=True),
+        sa.Column("cancel_requested", sa.Boolean(), nullable=False, server_default=sa.false()),
+        sa.Column("quarantine_reason", sa.Text(), nullable=True),
         sa.Column("publication_state", sa.String(), nullable=False, server_default="pending"),
         sa.Column("publication_owner", sa.String(), nullable=True),
         sa.Column("publication_lease_until", sa.DateTime(timezone=True), nullable=True),

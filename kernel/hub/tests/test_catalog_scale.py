@@ -624,7 +624,8 @@ def test_migration_0020_adds_backend_job_binding_without_rewriting_run_state(
             sa.text("SELECT doc FROM run_states WHERE run_id='legacy-live'")
         ).scalar_one()) == legacy
         columns = {row[1] for row in connection.execute(sa.text("PRAGMA table_info('run_backend_jobs')"))}
-        assert {"run_id", "attempt_id", "submission_id", "publication_state", "result_doc"} <= columns
+        assert {"run_id", "attempt_id", "submission_id", "control_address", "cancel_requested",
+                "quarantine_reason", "publication_state", "result_doc"} <= columns
     eng.dispose()
 
 

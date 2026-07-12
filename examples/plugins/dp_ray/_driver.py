@@ -10,6 +10,7 @@ status file the parent polls. Any failure is captured there so the parent never 
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import shutil
@@ -38,9 +39,40 @@ def _progress_writer(status_file: str):
 
 
 def main() -> None:
-    from hub.job_artifacts import read_json_artifact, write_json_artifact
+    from hub.job_artifacts import (RAY_JOB_CANONICAL_FIELDS, RAY_JOB_CONTRACT_VERSION,
+                                   RAY_JOB_ENVELOPE_FIELDS, canonical_json, read_json_artifact,
+                                   require_exact_object, write_json_artifact,
+                                   write_json_artifact_once)
 
-    job = read_json_artifact(sys.argv[1])
+    jobs_mode = len(sys.argv) == 5
+    if len(sys.argv) not in (2, 5):
+        raise RuntimeError(
+            "usage: _driver.py JOB_URI EXPECTED_ATTEMPT_ID EXPECTED_SUBMISSION_ID EXPECTED_ENVELOPE_SHA256"
+        )
+    job_uri = sys.argv[1]
+    job = read_json_artifact(job_uri)
+    if jobs_mode:
+        expected_attempt, expected_submission, expected_envelope = sys.argv[2:]
+        job = require_exact_object(job, RAY_JOB_ENVELOPE_FIELDS, label="Ray job artifact")
+        canonical = {key: job[key] for key in RAY_JOB_CANONICAL_FIELDS}
+        attempt = hashlib.sha256(canonical_json(canonical)).hexdigest()[:24]
+        envelope = {key: job[key] for key in RAY_JOB_ENVELOPE_FIELDS if key != "envelope_sha256"}
+        envelope_sha256 = hashlib.sha256(canonical_json(envelope)).hexdigest()
+        semantic_env = job["semantic_env"]
+        if (int(job["contract_version"]) != RAY_JOB_CONTRACT_VERSION
+                or job["job_uri"] != job_uri
+                or job["attempt_id"] != expected_attempt
+                or job["submission_id"] != expected_submission
+                or job["envelope_sha256"] != expected_envelope
+                or attempt != expected_attempt
+                or envelope_sha256 != expected_envelope
+                or not isinstance(semantic_env, dict)
+                or any(not isinstance(k, str) or not isinstance(v, str) for k, v in semantic_env.items())
+                or hashlib.sha256(canonical_json(semantic_env)).hexdigest() != job["semantic_env_sha256"]):
+            raise RuntimeError("Ray job artifact does not match the independently submitted execution binding")
+        # The artifact is now fully verified. Apply its frozen non-secret semantics before importing Ray
+        # or workload/plugin code; rotatable credentials arrived separately through runtime_env.
+        os.environ.update(semantic_env)
     status_file = job.get("result_uri") or job["status_file"]
     result = {"status": "failed", "error": "ray driver did not run", "rows": 0}
     metadata_dir = None
@@ -117,15 +149,21 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read
         result = {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
     finally:
-        if job.get("attempt_id"):
+        if jobs_mode:
             result = {
-                **result,
-                "contract_version": int(job.get("contract_version") or 1),
+                "contract_version": RAY_JOB_CONTRACT_VERSION,
                 "attempt_id": job["attempt_id"],
                 "submission_id": job["submission_id"],
+                "envelope_sha256": job["envelope_sha256"],
+                "status": result.get("status", "failed"),
+                "rows": int(result.get("rows") or 0),
+                "error": result.get("error"),
+                "output_uri": result.get("output_uri"),
+                "output_table": result.get("output_table"),
+                "outputs": result.get("outputs") or [],
             }
         try:
-            write_json_artifact(status_file, result)
+            (write_json_artifact_once if jobs_mode else write_json_artifact)(status_file, result)
         finally:
             if metadata_dir:
                 shutil.rmtree(metadata_dir, ignore_errors=True)

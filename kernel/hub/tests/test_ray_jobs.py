@@ -17,7 +17,7 @@ import pytest
 from hub import metadb
 from hub.compiler import compile_plan
 from hub.deps import Deps
-from hub.models import Graph
+from hub.models import Graph, ResourceSpec
 
 
 def _load_dp_ray():
@@ -130,6 +130,17 @@ class CountingCatalog:
             self.calls.append({"idempotency_key": idempotency_key, **kwargs})
 
 
+class RecoveringCatalog(CountingCatalog):
+    def __init__(self):
+        super().__init__()
+        self.available = False
+
+    def register_output_idempotent(self, idempotency_key: str, **kwargs):
+        if not self.available:
+            raise ConnectionError("catalog temporarily unavailable")
+        super().register_output_idempotent(idempotency_key, **kwargs)
+
+
 @pytest.fixture
 def jobs_config(monkeypatch, tmp_path):
     metadb.init_db()  # standalone module execution does not import test_kernel's app bootstrap
@@ -207,11 +218,13 @@ def _write_success(store: MemoryArtifacts, status, rows=3):
     job = store.read(ref.job_uri)
     output_uri = job["sink_targets"]["write"]
     store.write(ref.result_uri, {
-        "contract_version": 1,
+        "contract_version": job["contract_version"],
         "attempt_id": ref.attempt_id,
         "submission_id": ref.submission_id,
+        "envelope_sha256": job["envelope_sha256"],
         "status": "done",
         "rows": rows,
+        "error": None,
         "output_uri": output_uri,
         "output_table": "jobs_out",
         "outputs": [{"step_id": "write", "name": "jobs_out", "uri": output_uri}],
@@ -226,7 +239,7 @@ def _complete(store: MemoryArtifacts, client: FakeJobsClient, status, rows=3):
 
 
 def test_ray_jobs_submit_is_deterministic_idempotent_and_excludes_metadata_identity(jobs_config):
-    _module, deps, runner, client, store = _runner(jobs_config)
+    module, deps, runner, client, store = _runner(jobs_config)
     graph = _graph()
     plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
     run_id = f"run_jobs_submit_{uuid.uuid4().hex}"
@@ -235,13 +248,14 @@ def test_ray_jobs_submit_is_deterministic_idempotent_and_excludes_metadata_ident
     second = runner.run(plan, graph, "write", "distributed", run_id=run_id)
     assert first.backend_ref == second.backend_ref
     ref = first.backend_ref
-    assert ref is not None and ref.attempt_id == runner._make_jobs_artifacts(
-        run_id, graph, "write", sink_targets={"write": "s3://shared/outputs/jobs_out.parquet"}
-    )[0]["attempt_id"]
+    assert ref is not None
+    assert ref.attempt_id == module._job_attempt_id(store.read(ref.job_uri))
     _wait_submitted(client, ref.submission_id)
     assert len(client.submit_calls) == 1
     submit = client.submit_calls[0]
-    assert shlex.split(submit["entrypoint"])[-1] == ref.job_uri
+    entrypoint_args = shlex.split(submit["entrypoint"])[-4:]
+    assert entrypoint_args == [ref.job_uri, ref.attempt_id, ref.submission_id,
+                               store.read(ref.job_uri)["envelope_sha256"]]
     env = submit["runtime_env"]["env_vars"]
     assert "DP_DATABASE_URL" not in env and "DP_AUTH_SECRET" not in env
     assert "PATH" not in env and "PYTHONPATH" not in env  # remote image owns its interpreter/code paths
@@ -289,7 +303,8 @@ def test_ray_jobs_recognizes_preexisting_duplicate_without_second_submit(jobs_co
     plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
     run_id = f"run_jobs_duplicate_{uuid.uuid4().hex}"
     ref, _job = runner._make_jobs_artifacts(
-        run_id, graph, "write", sink_targets={"write": "s3://shared/outputs/jobs_out.parquet"}
+        run_id, graph, "write", sink_targets={"write": "s3://shared/outputs/jobs_out.parquet"},
+        requires=ResourceSpec().model_dump(),
     )
     client.put(ref["submission_id"], "RUNNING")
 
@@ -372,7 +387,9 @@ def test_ray_jobs_restart_reattaches_and_catalog_publication_has_one_winner(jobs
     assert _wait(recovered_a, run_id).status == "done"
     assert _wait(recovered_b, run_id).status == "done"
     assert len(catalog.calls) == 1
-    assert completions == [run_id]
+    # Jobs publication records required SQL state/history inside the winner transaction; it must not
+    # call the generic on_complete hook (which would duplicate history and can swallow failures).
+    assert completions == []
     binding = metadb.backend_job(run_id)
     assert binding and binding["publication_state"] == "published"
     assert metadb.get_run_state(run_id)["status"] == "done"
@@ -587,6 +604,230 @@ def test_canvas_delete_is_blocked_while_external_job_is_active(jobs_config):
     metadb.save_run_state(status.run_id, status.model_copy(update={"status": "failed"}).model_dump(),
                           canvas_id=graph.id)
     metadb.delete_canvas_cascade(graph.id)
+
+
+def test_early_result_never_beats_running_and_corruption_waits_for_stopped(jobs_config):
+    _module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_early_result_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    assert ref is not None
+    _wait_submitted(client, ref.submission_id)
+    _write_success(store, status)
+    corrupt = store.read(ref.result_uri)
+    corrupt["unexpected"] = "field"
+    store.write(ref.result_uri, corrupt)
+
+    def _accepted_but_live(submission_id: str):
+        client.stop_calls.append(submission_id)
+        return True
+
+    client.stop_job = _accepted_but_live
+    deadline = time.monotonic() + 1
+    while not client.stop_calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert runner.status(status.run_id).status in ("queued", "running")
+    assert metadb.backend_job(status.run_id)["publication_state"] == "pending"
+
+    client.set_status(ref.submission_id, "STOPPED")
+    final = _wait(runner, status.run_id)
+    assert final.status == "failed" and "unknown=unexpected" in (final.error or "")
+
+
+def test_recovery_without_local_jobs_config_stays_live_but_durable_cancel_works(jobs_config, monkeypatch):
+    module, deps, original, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    original._ensure_jobs_supervisor = lambda _run_id: None
+    status = original.run(plan, graph, "write", "distributed",
+                          run_id=f"run_jobs_no_config_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    assert ref is not None
+    client.put(ref.submission_id, "RUNNING")
+    for key in (
+        "DP_RAY_JOBS_ADDRESS", "DP_RAY_JOBS_ENTRYPOINT", "DP_RAY_JOBS_CODE_REF",
+        "DP_RAY_JOBS_CLUSTER_REF", "DP_RAY_JOBS_WORKSPACE", "DP_RAY_JOBS_DATA_DIR",
+        "DP_STORAGE_URL", "DP_RAY_JOBS_ARTIFACT_PREFIX",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    recovered = module.RayRunner(deps, jobs_client_factory=client, artifact_store=store, recover=True)
+    deadline = time.monotonic() + 1
+    while "configuration unavailable" not in (recovered.status(status.run_id).error or "") \
+            and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert recovered.status(status.run_id).status == "queued"
+    assert client.stop_calls == [] and client.submit_calls == []
+
+    final = recovered.cancel(status.run_id)
+    assert final.status == "cancelled"
+    assert client.stop_calls == [ref.submission_id]
+    assert metadb.backend_job(status.run_id)["cancel_requested"] is True
+
+
+def test_cancel_stops_from_sql_while_job_artifact_is_missing_and_never_submits(jobs_config):
+    module, deps, original, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    original._ensure_jobs_supervisor = lambda _run_id: None
+    status = original.run(plan, graph, "write", "distributed",
+                          run_id=f"run_jobs_missing_cancel_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    assert ref is not None
+    with store.lock:
+        store.values.pop(ref.job_uri)
+    client.put(ref.submission_id, "RUNNING")
+    recovered = module.RayRunner(deps, jobs_client_factory=client, artifact_store=store, recover=True)
+
+    deadline = time.monotonic() + 1
+    while "artifact missing" not in (recovered.status(status.run_id).error or "") \
+            and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert recovered.cancel(status.run_id).status == "cancelled"
+    assert client.stop_calls == [ref.submission_id]
+    assert client.submit_calls == []
+
+
+def test_jobs_semantic_environment_is_frozen_while_credentials_rotate(jobs_config, monkeypatch):
+    module, _deps, runner, _client, _store = _runner(jobs_config)
+    graph = _graph()
+    monkeypatch.setenv("DP_MEMORY_LIMIT", "4GB")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "old-secret")
+    ref_a, job_a = runner._make_jobs_artifacts("semantic-run", graph, "write", sink_targets={
+        "write": "s3://shared/outputs/jobs_out.parquet",
+    })
+    assert job_a["semantic_env"]["DP_MEMORY_LIMIT"] == "4GB"
+    assert "AWS_SECRET_ACCESS_KEY" not in job_a["semantic_env"]
+
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "rotated-secret")
+    ref_b, job_b = runner._make_jobs_artifacts("semantic-run", graph, "write", sink_targets={
+        "write": "s3://shared/outputs/jobs_out.parquet",
+    })
+    assert ref_a["attempt_id"] == ref_b["attempt_id"]
+    assert job_a["envelope_sha256"] == job_b["envelope_sha256"]
+    launch_env = module._ray_jobs_env(job_a)
+    assert launch_env["DP_MEMORY_LIMIT"] == "4GB"
+    assert launch_env["AWS_SECRET_ACCESS_KEY"] == "rotated-secret"
+
+
+def test_jobs_whole_graph_uses_target_cone_resources_and_forwards_ray_options(jobs_config, monkeypatch):
+    monkeypatch.setenv("DP_RAY_GPUS", "2")
+    monkeypatch.setenv("DP_RAY_GPU_TYPE", "a100")
+    monkeypatch.setenv("DP_RAY_LABELS", "pool=a100")
+    module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    graph.nodes[1].data["config"]["requires"] = {
+        "gpuType": "a100", "labels": {"engine": "ray", "pool": "a100"},
+    }
+    graph.nodes.append(Graph.model_validate({
+        "id": "unused", "version": 1,
+        "nodes": [{"id": "unused", "type": "transform", "position": {"x": 0, "y": 0},
+                   "data": {"config": {"mode": "map", "code": "def fn(row): return row",
+                                       "requires": {"gpu": 99, "gpuType": "h100"}}}}],
+        "edges": [],
+    }).nodes[0])
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_resources_{uuid.uuid4().hex}")
+    job = store.read(status.backend_ref.job_uri)
+    assert job["requires"]["gpu_type"] == "a100"
+    assert job["requires"]["labels"] == {"engine": "ray", "pool": "a100"}
+    assert module._ray_opts(job["requires"]) == {
+        "num_gpus": 1.0, "resources": {"a100": 0.001},
+    }
+    assert client.submit_calls == []
+
+    sort_graph = _graph()
+    sort_graph.nodes[1].type = "sort"
+    sort_graph.nodes[1].data["config"] = {
+        "by": "id", "requires": {"gpuType": "a100", "labels": {"engine": "ray", "pool": "a100"}},
+    }
+    sort_plan = compile_plan(sort_graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    rejected = runner.run(sort_plan, sort_graph, "write", "distributed",
+                          run_id=f"run_jobs_sort_{uuid.uuid4().hex}")
+    assert rejected.status == "failed" and "sort cannot honor" in (rejected.error or "")
+
+
+def test_backend_publication_atomically_updates_state_and_history(jobs_config, monkeypatch):
+    graph = _graph()
+    with metadb.session() as session:
+        session.add(metadb.Canvas(id=graph.id, owner_id=metadb.DEFAULT_USER_ID,
+                                  name="history", version=1, doc="{}"))
+    run_id = f"atomic_publish_{uuid.uuid4().hex}"
+    status_doc = {"run_id": run_id, "status": "running", "target_node_id": "write", "per_node": []}
+    ref = {
+        "backend": "ray-jobs", "cluster_ref": "cluster", "attempt_id": "attempt",
+        "submission_id": f"submission-{uuid.uuid4().hex}", "job_uri": "s3://b/job",
+        "result_uri": "s3://b/result", "code_ref": "sha256:test",
+        "control_address": "http://ray:8265",
+    }
+    metadb.bind_backend_job(run_id, ref, status_doc, canvas_id=graph.id)
+    assert metadb.claim_backend_publication(run_id, "attempt", "owner", 10) == "claimed"
+    result = {**status_doc, "status": "done", "total_rows": 7, "output_uri": "s3://b/out"}
+    assert metadb.finish_backend_publication(run_id, "attempt", "owner", result) is True
+    assert metadb.backend_job(run_id)["publication_state"] == "published"
+    assert metadb.get_run_state(run_id)["status"] == "done"
+    history = metadb.list_runs(graph.id)
+    assert len(history) == 1 and history[0]["runId"] == run_id and history[0]["rows"] == 7
+
+    rollback_id = f"atomic_rollback_{uuid.uuid4().hex}"
+    rollback_ref = {**ref, "submission_id": f"submission-{uuid.uuid4().hex}"}
+    metadb.bind_backend_job(rollback_id, rollback_ref, {**status_doc, "run_id": rollback_id}, canvas_id=graph.id)
+    assert metadb.claim_backend_publication(rollback_id, "attempt", "owner", 10) == "claimed"
+    monkeypatch.setattr(metadb, "_upsert_run_record", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("history write failed")
+    ))
+    with pytest.raises(RuntimeError, match="history write failed"):
+        metadb.finish_backend_publication(
+            rollback_id, "attempt", "owner", {**result, "run_id": rollback_id}
+        )
+    assert metadb.backend_job(rollback_id)["publication_state"] == "pending"
+    assert metadb.get_run_state(rollback_id)["status"] == "running"
+
+
+def test_catalog_is_required_and_retried_before_terminal_publication(jobs_config):
+    catalog = RecoveringCatalog()
+    _module, deps, runner, client, store = _runner(jobs_config, catalog=catalog)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_catalog_retry_{uuid.uuid4().hex}")
+    _wait_submitted(client, status.backend_ref.submission_id)
+    _complete(store, client, status)
+    deadline = time.monotonic() + 1
+    while "waiting for catalog" not in (runner.status(status.run_id).error or "") \
+            and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert runner.status(status.run_id).status in ("queued", "running")
+    assert metadb.backend_job(status.run_id)["publication_state"] == "pending"
+    catalog.available = True
+    assert _wait(runner, status.run_id).status == "done"
+    assert len(catalog.calls) == 1
+
+
+def test_driver_rejects_independent_binding_mismatch_before_importing_ray(jobs_config, tmp_path):
+    import json
+    import subprocess
+
+    module, _deps, runner, _client, _store = _runner(jobs_config)
+    _ref, job = runner._make_jobs_artifacts("driver-binding", _graph(), "write", sink_targets={
+        "write": "s3://shared/outputs/jobs_out.parquet",
+    })
+    job_path = tmp_path / "job.dpjob"
+    job["job_uri"] = str(job_path)
+    job["envelope_sha256"] = module._job_envelope_sha256(job)
+    job_path.write_text(json.dumps(job))
+    driver = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_ray" / "_driver.py"
+    proc = subprocess.run(
+        [sys.executable, str(driver), str(job_path), job["attempt_id"], job["submission_id"], "wrong"],
+        text=True, capture_output=True, timeout=10,
+    )
+    assert proc.returncode != 0
+    assert "independently submitted execution binding" in proc.stderr
 
 
 @pytest.mark.skipif(os.environ.get("DP_TEST_RAY_JOBS_LIVE") != "1",

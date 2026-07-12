@@ -1,112 +1,141 @@
 # Durable Ray Jobs execution
 
-`dp_ray` has two driver modes with the same IR and result semantics:
+`dp_ray` supports two driver modes over the same IR:
 
-- **Development default:** when `DP_RAY_JOBS_ADDRESS` is unset, the hub starts `_driver.py` with local
-  `Popen`. This preserves the existing zero-configuration, single-host workflow.
-- **Durable remote mode:** when `DP_RAY_JOBS_ADDRESS` is set, the hub uses Ray's official
-  `JobSubmissionClient` for submit, status, logs, and stop. The Ray cluster, SQL metadata DB, and object
-  store become the durable control/data planes; the submitting Python process is disposable.
+- With no `DP_RAY_JOBS_ADDRESS`, it keeps the development `Popen` driver and the manifest-v2 region
+  handoff path. This is zero-configuration and single-host.
+- With `DP_RAY_JOBS_ADDRESS`, whole-graph runs use Ray's official Jobs API plus SQL and shared object
+  storage. A replacement hub can reattach to the same submission. Multi-region parent orchestration is
+  still in-memory, so Jobs mode deliberately does not claim placed child regions.
 
-The lifecycle follows Ray's [Python SDK for job submission](https://docs.ray.io/en/latest/cluster/running-applications/job-submission/sdk.html)
-and its documented [job status API](https://docs.ray.io/en/latest/cluster/running-applications/job-submission/doc/ray.job_submission.JobSubmissionClient.get_job_status.html).
+This is a durable lifecycle implementation, not a claim that the whole Ray backend or the example
+deployment is production-ready. The remaining scale, isolation, health, and resilience gates are in
+[`RAY.md`](RAY.md).
 
-## Required production contract
-
-Configure the submitting hub/kernel with:
+## Required contract
 
 ```bash
 DP_RAY_JOBS_ADDRESS=https://ray-dashboard.example:8265
-# Stable, non-secret identity for this cluster. Keep it unchanged if the endpoint/DNS name moves.
 DP_RAY_JOBS_CLUSTER_REF=production-ray-east
 
-# This command must already exist in the Ray head image. No source tree is uploaded at run time.
+# Both paths are baked into the Ray image; source is not uploaded per run.
 DP_RAY_JOBS_ENTRYPOINT='/app/kernel/.venv/bin/python /app/examples/plugins/dp_ray/_driver.py'
-# Use an immutable image digest or release identifier. It participates in the attempt hash.
+DP_RAY_JOBS_MODULE=/app/examples/plugins/dp_ray/__init__.py
 DP_RAY_JOBS_CODE_REF='sha256:0123456789abcdef...'
 DP_RAY_JOBS_WORKSPACE=/app/kernel
 DP_RAY_JOBS_DATA_DIR=/app/kernel/data
 
-# Hub, Ray driver, and every worker must reach the same object store.
 DP_STORAGE_URL=s3://data-playground/outputs
 # Optional; defaults to $DP_STORAGE_URL/__ray_jobs__.
 DP_RAY_JOBS_ARTIFACT_PREFIX=s3://data-playground/control/ray-jobs
 ```
 
-The Ray image must contain the `hub` package, `dp_ray`, and the same dependency versions used by its
-workers. `docker/ray/Dockerfile` is the reference image shape; production should publish it by immutable
-digest and use that digest as `DP_RAY_JOBS_CODE_REF`.
+`DP_RAY_JOBS_MODULE` has the reference-image default shown above, but setting it explicitly makes a
+custom image contract easier to audit. The Jobs address must be HTTP(S) and must not contain userinfo,
+query parameters, or fragments; credentials belong in the Jobs client's supported configuration, not in
+SQL, artifacts, logs, or URLs.
 
-Ray Jobs mode fails before submission when any code-path or cluster identity setting is absent, when control artifacts are
-not on `s3://`, `r2://`, `gs://`, or `gcs://`, or when a graph contains host-local inputs/outputs. Remote
-file-adapter append is also rejected: Ray remembers submission IDs, but a total cluster-state loss could
-require replaying a durable attempt, and replaying append would duplicate rows. Use overwrite or a
-transactional/table-format sink for retriable production writes.
+Jobs mode rejects incomplete image/cluster identity, host-local input or output paths, partitioned file
+sinks, and append file sinks before submission. Replay after authoritative Ray job-metadata loss is safe
+only for overwrite/idempotent sinks. A transactional external sink may provide a stronger contract.
 
-Object-store credentials are passed through the workload allowlist (`AWS_*`, `DP_S3_*`, or Google ADC).
-`DP_DATABASE_URL`, auth signing material, provider API keys, and other hub control-plane secrets are not
-sent to Ray. Configure Ray Jobs API authentication with Ray's supported client environment/configuration;
-do not put API tokens in the shared job artifact.
+## Execution envelope and TOCTOU boundary
 
-## Durable lifecycle
+The hub resolves sinks and schema references, then creates an exact-field JSON envelope containing the
+graph, target, target-cone resources, code/module/entrypoint identity, remote paths, and a frozen non-secret
+semantic environment. Unknown or missing fields are corruption. The canonical contract produces an
+attempt ID; the complete envelope produces a second SHA-256 binding.
 
-1. The hub resolves physical sink URIs and inlines control-plane schema references.
-2. It canonicalizes the graph, target, resources, resolved sinks, remote paths, and immutable code ref.
-   The SHA-256 digest is the attempt ID; the Ray submission ID is derived deterministically from the
-   logical run ID plus that digest.
-3. An immutable `job.dpjob` is written to shared object storage. A `run_backend_jobs` row atomically binds
-   the logical run to that one attempt, while `RunStatus.backendRef` makes the handle visible and durable.
-4. The official Jobs client checks status/list before submit. If another submitter already created the
-   deterministic ID—or accepted the request while its response was lost—the existing Job is polled.
-5. The image-baked driver reads `job.dpjob`, executes the IR, and writes one terminal `result.dpresult`
-   envelope containing the contract version, attempt ID, and submission ID.
-6. On success/failure/STOPPED, supervisors compete for a renewable SQL publication lease. One winner
-   commits the canonical terminal RunStatus; other supervisors load it. Catalog projection carries a
-   deterministic idempotency key per attempt/write step. The built-in catalog honors it; external catalog
-   providers used with Ray Jobs must implement `register_output_idempotent(idempotency_key, ...)` durably.
+The Ray entrypoint receives four independent arguments: job URI, expected attempt ID, expected submission
+ID, and expected envelope hash. `_driver.py` rereads the object and verifies the exact field set, both
+hashes, the semantic-environment hash, and all four arguments **before** importing Ray or workload/plugin
+code. A hub validation followed by an object replacement therefore cannot redirect execution.
 
-On hub/kernel restart, boot-time orphan reaping preserves runs with a valid backend binding. When the
-plugin loads, it reconstructs queued/running runs from SQL, reads the shared job artifact, and reattaches
-to the deterministic Ray submission. No old PID, local temp directory, or in-memory Python dictionary is
-part of the recovery contract.
+These hashes are integrity bindings, not signatures. An ordinary S3/GCS object is mutable unless IAM or
+retention policy says otherwise. The implementation applies write-once semantics at the application
+boundary (an existing different envelope/result is rejected), but production must also enforce the
+storage boundary:
 
-## Cancellation and failure behavior
+- only the control plane may create/read `*.dpjob`; Ray workloads must not update or delete them;
+- only the bound workload identity may create its `*.dpresult`, and unrelated attempts must not access
+  that prefix;
+- the control plane may read results, while overwrite/delete is denied after creation;
+- bucket administrators remain trusted, and retention/lifecycle rules must outlive maximum recovery time.
 
-`cancel()` asks the supervisor to call `stop_job`, then waits up to
-`DP_RAY_JOBS_CANCEL_TIMEOUT_S` (default 30 seconds) for `STOPPED`, `SUCCEEDED`, or `FAILED`. It never labels
-a still-running remote job cancelled. If the timeout expires, the run remains non-terminal with an
-actionable error and polling continues. A successful race is published as success; `STOPPED` becomes
-cancelled. Cancellation cannot roll back a sink the driver committed before it received the stop signal;
-`cancelled` therefore means execution stopped, not that no physical side effect occurred. This is why the
-mode accepts only overwrite/replay-safe sinks. Failed-job messages come from the Jobs API; driver logs are
-fetched separately and known credential values are redacted rather than copied into shared RunStatus.
+Prefer distinct hub and Ray service identities. The current workload allowlist can pass `AWS_*`,
+`DP_S3_*`, or Google credential references for compatibility; those remain broad capabilities, so a
+deployment that forwards one shared credential has not achieved tenant isolation.
 
-Relevant tuning knobs:
+## Frozen semantics and credential rotation
+
+Settings that change execution meaning—plugin selection, memory/shuffle/runtime flags, storage endpoints,
+workspace/data paths, and Ray labels—are frozen in the envelope and participate in the attempt hash.
+Reattachment and replay use that snapshot even if the replacement hub's environment changed.
+
+Credential values and credential-file/profile selectors are excluded from the semantic snapshot. Each
+launch uses the operator's current allowlisted data credentials, so key rotation does not create a new
+logical attempt. Hub metadata identity (`DP_DATABASE_URL`), auth signing material, and provider/control
+API keys are never sent to the driver.
+
+## Durable state machine
+
+1. The hub writes or verifies the write-once job envelope.
+2. One SQL transaction binds `run_id` to backend, cluster, submission, attempt, object URIs, code ref,
+   and the non-secret Jobs control address while creating the queued `run_states` row.
+3. Status plus a successful Jobs listing distinguish an absent job from an ambiguous API failure. Only
+   authoritative absence permits deterministic submission or replay.
+4. A result cannot beat an explicit `PENDING`/`RUNNING` Jobs status. Readable result corruption while the
+   job is live triggers stop/quarantine, and terminal failure is published only after Ray reports terminal
+   or successful listing proves the job absent. A valid hash-bound result is terminal evidence when Ray's
+   job metadata is authoritatively gone.
+5. On `SUCCEEDED`, the hub reads and verifies the exact result envelope. Missing results receive a bounded
+   consistency grace period; transport/auth failures remain non-terminal and retry.
+6. Supervisors compete for a renewable SQL publication lease. Catalog projection is a required,
+   idempotent effect and is retried on failure. One database transaction then CAS-publishes the backend
+   result, public terminal `RunState`, and run-history row. Telemetry is best-effort after that barrier.
+
+External catalog providers must implement
+`register_output_idempotent(idempotency_key, ...)` with durable idempotency. Publication is at-least-once
+at that provider boundary; multiple independent sinks are not one cross-dataset transaction.
+
+## Recovery and cancellation
+
+The SQL binding stores the original control address and `cancel_requested`. Restart recovery does not
+depend on a PID, local temp directory, or process-local event. Missing local Jobs configuration is reported
+as a non-terminal configuration-unavailable state; it is never reclassified as artifact tampering and does
+not stop or replay a real job.
+
+Cancellation is the exception: it uses the durable SQL address/submission ID even while local config or
+the job artifact is missing/unavailable. Intent is committed before the process-local event. Once intent
+exists, supervisors never submit or replay that attempt. `stop_job` is followed until Ray is terminal; an
+ambiguous control failure remains non-terminal. `STOPPED`, or an authoritative proof that no job exists,
+publishes `cancelled`. A concurrent `SUCCEEDED`/`FAILED` is reconciled normally.
+
+Cancellation cannot undo a sink committed before stop. `cancelled` means execution was authoritatively
+stopped, not that no physical side effect occurred.
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
-| `DP_RAY_JOBS_POLL_S` | `1` | Job status poll interval |
-| `DP_RAY_JOBS_CANCEL_TIMEOUT_S` | `30` | Wait for remote stop acknowledgement |
-| `DP_RAY_JOBS_RESULT_TIMEOUT_S` | `30` | Wait for the terminal result object after `SUCCEEDED` |
+| `DP_RAY_JOBS_POLL_S` | `1` | Jobs/control/artifact retry interval |
+| `DP_RAY_JOBS_CANCEL_TIMEOUT_S` | `30` | Synchronous wait for durable stop acknowledgement |
+| `DP_RAY_JOBS_RESULT_TIMEOUT_S` | `30` | Missing-result grace period after `SUCCEEDED` |
 | `DP_RAY_JOBS_PUBLICATION_LEASE_S` | `60` | Renewable single-publisher lease |
 
-## Tradeoffs and non-goals
+## Logs and operator access
 
-- The SQL binding and publication fence require the same shared metadata DB used by `run_states`.
-  PostgreSQL is the production choice; SQLite remains appropriate for one local hub.
-- Job/result control artifacts are small but durable. Configure a bucket lifecycle policy consistent with
-  run-state/history retention; this change does not delete Ray's own job history or object-store artifacts.
-- The publication fence makes catalog/history side effects single-winner and retryable. It does not turn
-  several independent write nodes into one cross-dataset transaction. Crash recovery is at-least-once at
-  the provider call boundary, so an external provider must enforce the supplied idempotency key.
-- Durable Jobs currently covers whole-graph `RayRunner.run`. It deliberately does not advertise the
-  in-memory multi-region `RunController` placement path: making only a child region durable would lose the
-  parent orchestration on restart and would be misleading.
-- A cancel request is not acknowledged until Ray reports a terminal status. The request intent itself is
-  currently process-local; if that hub dies before acknowledgement, the run remains non-terminal and the
-  caller/operator must retry cancel after reattachment. Persisting `cancel_requested` is follow-up work.
-- Ray Jobs mode intentionally uses image-baked code. Dynamic per-run `working_dir` or pip uploads are not
-  implemented because they weaken reproducibility, startup latency, and supply-chain control.
-- Live cluster validation remains opt-in. Cluster-free tests use a deterministic fake
-  `JobSubmissionClient` to cover submit ambiguity, duplicate recognition, stop acknowledgement/timeouts,
-  failed logs, restart reattachment, and one-time publication.
+Failed shared status contains the bounded Jobs API message; it does not copy driver logs. `RayRunner.logs`
+is an internal/operator helper with best-effort credential redaction, not an authenticated application
+route. Use a Ray Dashboard/log backend protected by TLS, network policy, and the cluster's authentication
+boundary. Do not expose port 8265 directly to end users.
+
+## Current limits
+
+- Durable Jobs covers whole-graph execution only. Region data publication uses manifest v2, but the
+  multi-region parent is not restart-durable.
+- Object-store reads and whole-graph file sinks remain driver-funneled in several paths.
+- Live capacity/health discovery, admission backpressure, scoped per-attempt identity, active-job fault
+  injection, HA/upgrade runbooks, and production observability remain open readiness gates.
+- Job/result artifacts are retained until operator lifecycle rules remove them. No foreground recursive
+  cleanup scans a shared bucket.
+- Dynamic `working_dir` and per-run pip upload are intentionally unsupported; code is image-baked and
+  identified by `DP_RAY_JOBS_CODE_REF`.

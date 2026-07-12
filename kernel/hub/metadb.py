@@ -148,6 +148,9 @@ class RunBackendJob(Base):
     job_uri: Mapped[str] = mapped_column(Text)
     result_uri: Mapped[str] = mapped_column(Text)
     code_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    control_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    quarantine_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     publication_state: Mapped[str] = mapped_column(String, default="pending")
     publication_owner: Mapped[str | None] = mapped_column(String, nullable=True)
     publication_lease_until: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1093,6 +1096,47 @@ def list_canvases_for(uid: str) -> list[dict]:
 _RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (older history is pruned)
 
 
+def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None, status: str,
+                       rows: int | None = None, ms: int | None = None, error: str | None = None,
+                       output_table: str | None = None, per_node: list[dict] | None = None,
+                       run_id: str | None = None, output_uri: str | None = None) -> bool:
+    """Session-scoped history upsert shared by normal completion and backend publication."""
+    if not canvas_id:
+        return False
+    if status != "done" and _local_result_candidate(output_uri) is not None:
+        output_uri = None
+        output_table = None
+    if s.get(Canvas, canvas_id, with_for_update=True) is None:
+        return False
+    rec = (s.scalar(select(RunRecord).where(
+        RunRecord.run_id == run_id, RunRecord.canvas_id == canvas_id
+    ).limit(1).with_for_update())
+           if run_id else None)
+    if rec is None:
+        rec = RunRecord(id=_uid(), canvas_id=canvas_id, run_id=run_id)
+        s.add(rec)
+    rid = rec.id
+    rec.target_node_id, rec.status = target_node_id, status
+    rec.rows, rec.ms, rec.error = rows, ms, error
+    rec.output_table, rec.output_uri = output_table, output_uri
+    rec.per_node = json.dumps(per_node, default=str) if per_node else None
+    s.flush()
+    stale = list(s.scalars(select(RunRecord).where(
+        RunRecord.canvas_id == canvas_id, RunRecord.id != rid
+    ).order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
+      .offset(max(0, _RUN_HISTORY_MAX - 1)).with_for_update()))
+    _replace_attempt_ref(s, "run_record", rid, output_uri)
+    for obj in stale:
+        _replace_attempt_ref(s, "run_record", obj.id, None)
+        s.delete(obj)
+    if stale:
+        _lock_local_result_registry(s)
+    sync_local_result_owner(s, "run_record", rid, output_uri)
+    for obj in stale:
+        _drop_local_result_owner_locked(s, "run_record", obj.id)
+    return True
+
+
 def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
                rows: int | None = None, ms: int | None = None, error: str | None = None,
                output_table: str | None = None, per_node: list[dict] | None = None,
@@ -1107,38 +1151,11 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
         output_uri = None
         output_table = None
     with session() as s:
-        if s.get(Canvas, canvas_id, with_for_update=True) is None:
-            return False  # ad-hoc / unsaved-canvas / internal region run → don't dangle a run row
-        # A durable external backend may reclaim an expired publication lease after a supervisor crash.
-        # Replaying its completion must update the logical run's history, not append a duplicate row.
-        rec = (s.scalar(select(RunRecord).where(
-            RunRecord.run_id == run_id, RunRecord.canvas_id == canvas_id
-        ).limit(1).with_for_update())
-               if run_id else None)
-        if rec is None:
-            rec = RunRecord(id=_uid(), canvas_id=canvas_id, run_id=run_id)
-            s.add(rec)
-        rid = rec.id
-        rec.target_node_id, rec.status = target_node_id, status
-        rec.rows, rec.ms, rec.error = rows, ms, error
-        rec.output_table, rec.output_uri = output_table, output_uri
-        rec.per_node = json.dumps(per_node, default=str) if per_node else None
-        s.flush()
-        stale = list(s.scalars(select(RunRecord).where(
-            RunRecord.canvas_id == canvas_id, RunRecord.id != rid
-        ).order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
-          .offset(max(0, _RUN_HISTORY_MAX - 1)).with_for_update()))
-        _replace_attempt_ref(s, "run_record", rid, output_uri)
-        for obj in stale:
-            _replace_attempt_ref(s, "run_record", obj.id, None)
-            s.delete(obj)
-        if stale:
-            _lock_local_result_registry(s)
-        # Global lifecycle lock order: object-attempt rows above, then the local registry.
-        sync_local_result_owner(s, "run_record", rid, output_uri)
-        for obj in stale:
-            _drop_local_result_owner_locked(s, "run_record", obj.id)
-        return True
+        return _upsert_run_record(
+            s, canvas_id=canvas_id, target_node_id=target_node_id, status=status,
+            rows=rows, ms=ms, error=error, output_table=output_table, per_node=per_node,
+            run_id=run_id, output_uri=output_uri,
+        )
 
 
 def delete_canvas_cascade(canvas_id: str) -> None:
@@ -1404,6 +1421,8 @@ def bind_backend_job(run_id: str, ref: dict, status: dict,
         job_uri=str(ref["job_uri"]),
         result_uri=str(ref["result_uri"]),
         code_ref=str(ref.get("code_ref") or "") or None,
+        control_address=str(ref.get("control_address") or "") or None,
+        cancel_requested=bool(ref.get("cancel_requested", False)),
         publication_state="pending",
     )
     try:
@@ -1441,6 +1460,9 @@ def _backend_job_doc(row: RunBackendJob) -> dict:
         "job_uri": row.job_uri,
         "result_uri": row.result_uri,
         "code_ref": row.code_ref,
+        "control_address": row.control_address,
+        "cancel_requested": bool(row.cancel_requested),
+        "quarantine_reason": row.quarantine_reason,
         "durable": True,
         "publication_state": row.publication_state,
         "result": json.loads(row.result_doc) if row.result_doc else None,
@@ -1468,6 +1490,26 @@ def active_backend_jobs(backend: str) -> list[tuple[dict, dict]]:
                 doc = {"run_id": state.run_id, "status": state.status, "per_node": []}
             out.append((_backend_job_doc(job), doc))
     return out
+
+
+def request_backend_cancel(run_id: str) -> bool:
+    """Persist cancel intent before any process-local event or remote stop request is issued."""
+    with session() as s:
+        updated = s.execute(
+            update(RunBackendJob).where(RunBackendJob.run_id == run_id)
+            .values(cancel_requested=True)
+        )
+        return bool(updated.rowcount)
+
+
+def request_backend_quarantine(run_id: str, reason: str) -> bool:
+    """Persist a contract-corruption fence so restart cannot resume or publish the attempt."""
+    with session() as s:
+        updated = s.execute(
+            update(RunBackendJob).where(RunBackendJob.run_id == run_id)
+            .values(quarantine_reason=str(reason)[:4000])
+        )
+        return bool(updated.rowcount)
 
 
 def note_unhandled_backend_jobs(available_backends: set[str]) -> int:
@@ -1522,8 +1564,26 @@ def claim_backend_publication(run_id: str, attempt_id: str, owner: str,
 
 
 def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result: dict) -> bool:
-    """Commit the winner's terminal RunStatus for later reattach without replaying side effects."""
+    """Atomically publish backend evidence, public RunState, and durable run history.
+
+    Catalog projection is performed before this transaction by an idempotent provider. This transaction
+    is the terminal visibility barrier: readers can never observe a published backend row paired with a
+    stale live RunState or missing SQL run history.
+    """
+    published = dict(result)
+    terminal = str(published.get("status") or "")
+    if terminal not in _TERMINAL_RUN:
+        raise ValueError("backend publication requires a terminal RunStatus")
+    if terminal != "done" and _local_result_candidate(_result_doc_uri(published)) is not None:
+        for key in ("uri", "outputUri", "output_uri", "outputTable", "output_table"):
+            published.pop(key, None)
     with session() as s:
+        canvas_id = s.scalar(select(RunState.canvas_id).where(RunState.run_id == run_id))
+        if canvas_id and s.get(Canvas, canvas_id, with_for_update=True) is None:
+            return False
+        state = s.get(RunState, run_id, with_for_update=True)
+        if state is None:
+            return False
         updated = s.execute(
             update(RunBackendJob).where(
                 RunBackendJob.run_id == run_id,
@@ -1531,9 +1591,26 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
                 RunBackendJob.publication_owner == owner,
                 RunBackendJob.publication_state != "published",
             ).values(publication_state="published", publication_owner=None,
-                     publication_lease_until=None, result_doc=json.dumps(result, default=str))
+                     publication_lease_until=None, result_doc=json.dumps(published, default=str))
         )
-        return bool(updated.rowcount)
+        if not updated.rowcount:
+            return False
+        payload = json.dumps(published, default=str)
+        state.status, state.doc = terminal, payload
+        output_uri = _result_doc_uri(published)
+        _replace_attempt_ref(s, "run_state", run_id, output_uri)
+        per_node = published.get("per_node") or None
+        _upsert_run_record(
+            s, canvas_id=state.canvas_id, target_node_id=published.get("target_node_id"),
+            status=terminal, rows=published.get("total_rows"), ms=published.get("ms"),
+            error=published.get("error"), output_table=published.get("output_table"),
+            per_node=per_node, run_id=run_id, output_uri=output_uri,
+        )
+        sync_local_result_owner(s, "run_state", run_id, published)
+        if terminal == "done":
+            _release_terminal_local_result_writers(
+                s, run_id, allow_unreferenced=False)
+        return True
 
 
 def renew_backend_publication(run_id: str, attempt_id: str, owner: str,

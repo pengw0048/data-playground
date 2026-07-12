@@ -7,8 +7,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from hub.workload_env import (build_workload_env, initialize_ephemeral_metadata,
-                              data_plane_object_store_config, prepare_workload_graph)
+import pytest
+
+from hub.workload_env import (build_workload_credential_env, build_workload_env,
+                              build_workload_semantic_env, data_plane_object_store_config,
+                              initialize_ephemeral_metadata, prepare_workload_graph)
 
 
 _CONTROL_SECRETS = {
@@ -77,9 +80,34 @@ def test_blank_auth_secret_does_not_put_open_local_workloads_in_auth_mode():
     source["DP_AUTH_SECRET"] = "   "
 
     env = build_workload_env(include_metadata_db=False, source=source)
+    semantic = build_workload_semantic_env(source=source)
 
     assert "DP_AUTH_SECRET" not in env
     assert "DP_AUTH_MODE" not in env
+    assert "DP_AUTH_MODE" not in semantic
+
+
+def test_durable_workload_environment_separates_semantics_from_rotatable_credentials():
+    semantic = build_workload_semantic_env(source=_source())
+    credentials = build_workload_credential_env(source=_source())
+    assert semantic["DP_MEMORY_LIMIT"] == "2GB"
+    assert semantic["DP_STORAGE_URL"] == "s3://data/output"
+    assert semantic["DP_GCS_ENDPOINT"] == "http://gcs-emulator:4443"
+    assert "AWS_SECRET_ACCESS_KEY" not in semantic
+    assert credentials == {
+        "AWS_ACCESS_KEY_ID": "data-key", "AWS_SECRET_ACCESS_KEY": "data-secret",
+    }
+
+
+def test_readable_malformed_job_artifact_is_corruption_not_missing(tmp_path):
+    from hub.job_artifacts import ArtifactCorrupt, ArtifactNotFound, read_json_artifact
+
+    malformed = tmp_path / "bad.dpjob"
+    malformed.write_text('{"run_id":')
+    with pytest.raises(ArtifactCorrupt):
+        read_json_artifact(str(malformed))
+    with pytest.raises(ArtifactNotFound):
+        read_json_artifact(str(tmp_path / "missing.dpjob"))
 
 
 def test_pod_manifest_uses_the_same_explicit_profile(monkeypatch):
@@ -111,6 +139,27 @@ def test_ray_driver_uses_one_shot_profile(monkeypatch):
     assert env["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] == "0"
     assert env["DP_RAY_DRIVER_FALLBACK_MAX_BYTES"] == "33554432"
     assert env["PATH"].startswith(str(Path(module.sys.executable).parent))
+
+
+def test_only_global_control_plane_marks_unhandled_backend_jobs(tmp_path, monkeypatch):
+    from hub import deps as deps_module
+    from hub import metadb
+
+    workspace, data = tmp_path / "workspace", tmp_path / "data"
+    workspace.mkdir()
+    data.mkdir()
+    calls: list[set[str]] = []
+    monkeypatch.setattr(metadb, "note_unhandled_backend_jobs", lambda backends: calls.append(backends) or 0)
+    monkeypatch.setattr(deps_module.settings, "workspace", str(workspace))
+    monkeypatch.setattr(deps_module.settings, "data_dir", str(data))
+
+    deps_module.Deps(str(workspace), str(data))
+    deps_module.set_workspace(str(workspace), str(data))
+    assert calls == []
+
+    monkeypatch.setattr(deps_module, "_deps", None)
+    deps_module.get_deps()
+    assert len(calls) == 1
 
 
 def test_ephemeral_worker_seeds_only_allowlisted_object_store_execution_config(tmp_path, monkeypatch):

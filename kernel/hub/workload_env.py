@@ -48,14 +48,43 @@ _WORKLOAD_RUNTIME_ENV = frozenset({
 # Current compatibility bridge for the data plane. These identities remain broad; replacing them with
 # attempt/dataset-scoped SecretRefs is separate architecture work. Listing them explicitly prevents an
 # unrelated provider/control credential from hitchhiking merely because it also lives in os.environ.
-_DATA_CREDENTIAL_ENV = frozenset({
-    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+_DATA_CONNECTION_ENV = frozenset({
     "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3",
-    "AWS_PROFILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE",
-    "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
-    "DP_S3_ENDPOINT", "DP_S3_KEY", "DP_S3_SECRET", "DP_S3_BUCKET",
+    "GOOGLE_CLOUD_PROJECT",
+    "DP_S3_ENDPOINT", "DP_S3_BUCKET",
     "DP_GCS_ENDPOINT",
 })
+
+# Rotatable identities and credential-file selectors are deliberately separate from execution
+# semantics. Durable jobs snapshot the semantic environment into their hash-bound envelope, while a
+# replay receives the operator's current credential values so normal key rotation does not change the
+# logical attempt.
+_DATA_CREDENTIAL_ENV = frozenset({
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "AWS_PROFILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "DP_S3_KEY", "DP_S3_SECRET",
+})
+
+
+def _derived_auth_mode(src: Mapping[str, str], env: dict[str, str]) -> None:
+    if str(src.get("DP_AUTH_SECRET") or "").strip() or src.get("DP_AUTH_MODE") == "1":
+        env["DP_AUTH_MODE"] = "1"
+
+
+def build_workload_semantic_env(*, source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return non-secret execution settings suitable for a durable, hash-bound snapshot."""
+    src = os.environ if source is None else source
+    keys = set(_WORKLOAD_RUNTIME_ENV) | set(_DATA_CONNECTION_ENV)
+    env = {key: str(src[key]) for key in keys if src.get(key) not in (None, "")}
+    _derived_auth_mode(src, env)
+    return env
+
+
+def build_workload_credential_env(*, source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return only rotatable data-plane credentials/references for the next workload launch."""
+    src = os.environ if source is None else source
+    return {key: str(src[key]) for key in _DATA_CREDENTIAL_ENV if src.get(key) not in (None, "")}
 
 
 def build_workload_env(*, include_metadata_db: bool = False, include_host_runtime: bool = True,
@@ -67,7 +96,7 @@ def build_workload_env(*, include_metadata_db: bool = False, include_host_runtim
     ``source`` is injectable so pod-manifest and regression tests do not mutate global state.
     """
     src = os.environ if source is None else source
-    keys = set(_WORKLOAD_RUNTIME_ENV) | set(_DATA_CREDENTIAL_ENV)
+    keys = set(_WORKLOAD_RUNTIME_ENV) | set(_DATA_CONNECTION_ENV) | set(_DATA_CREDENTIAL_ENV)
     if include_host_runtime:
         keys.update(_HOST_RUNTIME_ENV)
     if include_metadata_db:
@@ -76,8 +105,7 @@ def build_workload_env(*, include_metadata_db: bool = False, include_host_runtim
 
     # Auth mode controls filesystem/path confinement, but children never receive material that can sign
     # sessions or bootstrap an administrator. This derived boolean is the only auth value they need.
-    if str(src.get("DP_AUTH_SECRET") or "").strip() or src.get("DP_AUTH_MODE") == "1":
-        env["DP_AUTH_MODE"] = "1"
+    _derived_auth_mode(src, env)
     return env
 
 

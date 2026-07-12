@@ -6,7 +6,8 @@ written worker-direct to object storage, compared with DuckDB. It does not certi
 operation or make `dp_ray` production-capable; see the [support/readiness matrix](../../docs/RAY.md).
 The optional whole-graph Ray Jobs control-plane lifecycle is documented separately in
 [Durable Ray Jobs execution](../../docs/RAY_JOBS.md). Expose and protect the head Dashboard/Jobs endpoint
-according to cluster policy; these validation manifests deliberately do not publish it.
+according to cluster policy; the application does not proxy an authenticated logs route, and these
+validation manifests deliberately do not publish the Dashboard.
 
 ## 1. docker-compose (fastest — a head + 2 worker containers + MinIO)
 

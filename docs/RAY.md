@@ -9,6 +9,10 @@ The Compose and KubeRay files in this repository are validation harnesses, not d
 green differential does not certify an operator's IAM, capacity, KubeRay configuration, or incident
 procedures. The final section separates backend guarantees from deployment responsibilities.
 
+For whole-graph execution, the optional [Ray Jobs lifecycle](RAY_JOBS.md) now persists an attempt and
+submission binding, reattaches after hub restart, persists cancel intent, and atomically publishes
+terminal SQL state/history. It does not make the in-memory multi-region parent orchestration durable.
+
 ## Current execution contract
 
 Install the Ray extra, load [`examples/plugins/dp_ray`](../examples/plugins/dp_ray/), and select
@@ -174,13 +178,13 @@ identity underneath the persistent workers.
 | object-store Parquet scale-out reads | implemented | operate with least-privilege credentials and validate representative production datasets |
 | bounded adapter compatibility | implemented | tune or disable the limit from measured workload/driver memory; native connectors are preferable |
 | whole-graph Parquet overwrite data path | implemented | use shared object storage for remote clusters and tune the built-in deletion grace to the workload |
-| durable job lifecycle | missing | persisted Ray submission/attempt ID, restart reconciliation, acknowledged cancel, timeout, and fencing |
+| durable job lifecycle | partial | whole-graph Jobs has persisted attempt/submission/control routing, restart reconciliation, durable acknowledged cancel, exact artifact fencing, and atomic terminal SQL publication; the multi-region parent and active-failure staging remain open |
 | atomic region publication | implemented | distributed and local-fallback handoffs use immutable per-attempt prefixes; the controller validates the success manifest before cache publication |
-| workload isolation | partial | environment/control-plane separation exists; replace broad data credentials with attempt-scoped identity and enforce cluster policy |
-| cluster health and placement truth | missing | live resource/health discovery, backpressure, and fail-loud behavior for an explicit Ray pin |
+| workload isolation | partial | one-shot drivers use an explicit allowlist and private metadata DB; scoped per-attempt storage identity and enforced cluster/IAM policy remain open |
+| cluster health and placement truth | partial | target-cone requirements, static advertised-capacity admission, GPU/custom task options, and fail-loud unsupported shapes are implemented; live discovery/backpressure remain open |
 | runtime compatibility | partial | one supported Ray range and a driver/worker/core/plugin version handshake |
 | resilience | partial | active-job worker/head/driver failure tests, retry policy, and orphan cleanup |
-| observability | partial | durable job IDs, queue/retry/spill/storage metrics, retained structured logs, traces, and alerts |
+| observability | partial | durable job IDs and shared status exist; queue/retry/spill/storage metrics, authenticated log integration, traces, and alerts remain open |
 | deployment security and HA | operator-owned | immutable images, secrets/IAM, TLS/network policy, pod security, quotas, autoscaling, and HA storage |
 
 ## What remains before production ownership
@@ -188,17 +192,18 @@ identity underneath the persistent workers.
 The correctness fences above are implemented and tested, but they are not by themselves a production
 certification. The backend still needs the following before it should own production workloads:
 
-1. Replace local subprocess ownership with a durable Ray job lifecycle that survives kernel/hub restarts
-   and supports idempotent submission, cancellation, timeout, retry, and attempt fencing.
+1. Make the multi-region parent orchestration durable, then exercise head/worker/driver loss during an
+   active Jobs run with bounded retry and recovery assertions.
 2. Replace broad data-plane credentials with attempt/dataset-scoped identities and enforce per-run
    namespace, network, pod-security, and quota boundaries on the target cluster.
 3. Discover live cluster capacity and health, enforce admission/backpressure, and reject an explicit Ray
    placement when its requirements cannot be honored.
-4. Pin and verify the supported Ray/runtime image contract across the submitting process and every worker.
+4. Pin and verify the supported Ray/runtime image contract across the submitting process and every worker,
+   including upgrade and rollback behavior.
 5. Add alerts for failed manifests, object-store GC errors, spill pressure, queue delay, retries, and
    resource saturation; keep provider lifecycle rules for versioned objects and incomplete uploads.
 6. Pass staging gates on the intended production topology: active-job failure injection, representative
-   large workloads, SLOs/alerts, upgrade/rollback, and recovery runbooks.
+   large workloads, SLOs/alerts, upgrade/rollback, IAM validation, and recovery runbooks.
 
 Object storage holds immutable shards plus `_dp_commits/<attempt>/` manifests. Ownership and lifecycle state
 live in the shared metadata database's indexed attempt, lease, ref, and exact-member inventory tables. The
