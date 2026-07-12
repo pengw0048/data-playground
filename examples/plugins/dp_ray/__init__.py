@@ -54,7 +54,7 @@ import sys
 import threading
 import time
 import uuid
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from hub import db, graph as g
 from hub.handoff import (attempt_has_commit_record, attempt_has_contents, discard_attempt,
@@ -332,8 +332,13 @@ def _native_parquet_plan(uri: str, adapter: object) -> dict | None:
         # The exact built-in adapter is the semantic oracle. DuckDB decides partition-column presence,
         # ordering, and types; Ray may run native only when its physical union plus typed partitions can
         # reproduce that metadata exactly without reading rows into the driver.
-        with db.base_guard():
+        if db.is_run_scoped():
             oracle = adapter.scan(uri, limit=0).to_arrow_table().schema
+        else:
+            # Remote listing/footer work can block for seconds. Execute it on a thread-confined cursor so
+            # only cursor creation briefly takes the base lock; unrelated previews/runs remain available.
+            with db.run_scope():
+                oracle = adapter.scan(uri, limit=0).to_arrow_table().schema
         if oracle.names[:len(unified.names)] != unified.names:
             raise RuntimeError(f"source '{uri}' adapter physical-column order differs from footer union")
         for field in unified:
@@ -342,8 +347,10 @@ def _native_parquet_plan(uri: str, adapter: object) -> dict | None:
                     f"source '{uri}' adapter type for '{field.name}' differs from footer union"
                 )
         partition_fields = [oracle.field(name) for name in oracle.names[len(unified.names):]]
-        if set(field.name for field in partition_fields) != set(partition_keys):
-            raise RuntimeError(f"source '{uri}' adapter Hive columns differ from its exact-root layout")
+        if tuple(field.name for field in partition_fields) != partition_keys:
+            raise RuntimeError(
+                f"source '{uri}' adapter Hive column order differs from its exact-root layout"
+            )
         partition_types: dict[str, type] = {}
         supported = {
             pa.int64(): int,
@@ -389,6 +396,49 @@ def _read_native_parquet(ray, plan: dict, ray_opts: dict | None = None):
     )
 
 
+_ATTEMPT_COMPONENT_MAX_BYTES = 240
+_OBJECT_ATTEMPT_KEY_MAX_BYTES = 896  # reserve 128 bytes for a shard or commit-record child path
+_ATTEMPT_MIN_SLUG_BYTES = 8
+
+
+def _utf8_prefix(value: str, max_bytes: int) -> str:
+    """Return the longest valid UTF-8 prefix within ``max_bytes``."""
+    if max_bytes <= 0:
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _attempt_component(base_name: str, readable: str, digest: str, limit: int, uri: str) -> str:
+    marker = ".attempt-"
+    digest_suffix = f"-{digest}"
+    floor = _utf8_prefix(readable, min(_ATTEMPT_MIN_SLUG_BYTES, len(readable.encode("utf-8"))))
+    floor = floor.rstrip("._-") or "a"
+    fixed_bytes = len((marker + digest_suffix).encode("utf-8"))
+    if limit < fixed_bytes + len(floor.encode("utf-8")):
+        raise RuntimeError(
+            f"Ray output URI '{uri}' leaves only {max(0, limit)} bytes for an immutable attempt name; "
+            "shorten its parent path"
+        )
+    base, slug = base_name, readable
+    if len((base + marker + slug + digest_suffix).encode("utf-8")) > limit:
+        slug_budget = limit - fixed_bytes - len(base.encode("utf-8"))
+        slug = (
+            _utf8_prefix(readable, slug_budget).rstrip("._-")
+            if slug_budget >= len(floor.encode("utf-8")) else floor
+        )
+        slug = slug or floor
+    if len((base + marker + slug + digest_suffix).encode("utf-8")) > limit:
+        base_budget = limit - fixed_bytes - len(slug.encode("utf-8"))
+        base = _utf8_prefix(base_name, base_budget)
+    component = base + marker + slug + digest_suffix
+    if len(component.encode("utf-8")) > limit:  # defensive: never return a prefix the writer cannot create
+        raise RuntimeError(f"Ray output URI '{uri}' cannot fit a bounded immutable attempt name")
+    return component
+
+
 def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str:
     """Return an immutable region-output prefix for one execution attempt.
 
@@ -411,7 +461,22 @@ def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str
         "uri": str(uri),
     }, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
-    return f"{base}.attempt-{readable}-{digest}"
+    parsed = urlsplit(base)
+    if parsed.scheme.lower() in ("s3", "gs", "gcs", "r2") and parsed.netloc:
+        parent_path, separator, base_name = parsed.path.rpartition("/")
+        if not separator or not base_name:
+            raise RuntimeError(f"Ray object output URI '{uri}' must include an object key")
+        parent_key = parent_path.lstrip("/")
+        parent_bytes = len(parent_key.encode("utf-8")) + (1 if parent_key else 0)
+        component_limit = min(_ATTEMPT_COMPONENT_MAX_BYTES, _OBJECT_ATTEMPT_KEY_MAX_BYTES - parent_bytes)
+        component = _attempt_component(base_name, readable, digest, component_limit, uri)
+        path = f"{parent_path}/{component}" if parent_path else f"/{component}"
+        return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+    parent, separator, base_name = base.rpartition("/")
+    component = _attempt_component(
+        base_name if separator else base, readable, digest, _ATTEMPT_COMPONENT_MAX_BYTES, uri
+    )
+    return f"{parent}/{component}" if separator else component
 
 
 def _worker_direct_parquet_sink(spec: SinkSpec, uri: str, adapter: object) -> bool:
@@ -458,6 +523,14 @@ def _write_empty_parquet(uri: str, schema: object) -> None:
         pq.write_table(table, stream)
 
 
+def _known_ray_schema(dataset):
+    """Return already-known schema metadata without asking Ray to execute or sample the Dataset."""
+    try:
+        return dataset.schema(fetch_if_missing=False)
+    except TypeError:  # lightweight unit-test stand-ins expose the older no-argument shape
+        return dataset.schema()
+
+
 def _write_worker_direct_parquet(dataset, uri: str, *, attempt_id: str,
                                  ray_opts: dict | None = None) -> tuple[int, str]:
     """Write one immutable Parquet attempt and publish its success manifest last."""
@@ -476,9 +549,11 @@ def _write_worker_direct_parquet(dataset, uri: str, *, attempt_id: str,
         )
     owns_prefix = True
     try:
+        declared_schema = _known_ray_schema(dataset)
         materialized = dataset.materialize()
         rows = materialized.count()
-        schema = materialized.schema()
+        materialized_schema = _known_ray_schema(materialized)
+        schema = materialized_schema if materialized_schema is not None else declared_schema
         if rows == 0:
             _write_empty_parquet(out_dir, schema)
         else:
@@ -1271,7 +1346,9 @@ class RayRunner:
 
         from hub.executors.engine import join_sql
         left = datasets[step.inputs[0][0]]                     # incoming-edge order = engine's left, right
-        right = datasets[step.inputs[1][0]].materialize()
+        right_source = datasets[step.inputs[1][0]]
+        declared_right_schema = _known_ray_schema(right_source)
+        right = right_source.materialize()
         try:
             right_bytes = right.size_bytes()
         except Exception:  # noqa: BLE001 — fail closed instead of risking an unbounded driver collect
@@ -1281,8 +1358,12 @@ class RayRunner:
         if refs:
             right_tbl = pa.concat_tables(refs)
         else:                                                  # right produced ZERO blocks — keep its TYPED
-            sch = right.schema()                               # empty schema so a LEFT join emits correctly-
-            right_tbl = getattr(sch, "base_schema", sch).empty_table()  # typed NULLs (not a null-typed crash)
+            materialized_schema = _known_ray_schema(right)
+            sch = materialized_schema if materialized_schema is not None else declared_right_schema
+            arrow_schema = getattr(sch, "base_schema", sch)
+            if not isinstance(arrow_schema, pa.Schema):
+                raise RuntimeError("an empty broadcast side did not expose an Arrow schema")
+            right_tbl = pa.Table.from_batches([], schema=arrow_schema)  # typed NULLs, not null-typed crash
         cfg = step.config
         sql = join_sql(list(left.columns()), list(right_tbl.column_names), "_l", "_r",
                        cfg.get("on"), cfg.get("condition"), cfg.get("how"))
@@ -1379,6 +1460,7 @@ def _collect_arrow(dataset, *, purpose: str = "Ray result"):
     """Collect a Ray Dataset only after its materialized Arrow footprint passes the driver limit."""
     import pyarrow as pa
 
+    declared_schema = _known_ray_schema(dataset)
     materialized = dataset.materialize()
     try:
         size = materialized.size_bytes()
@@ -1397,7 +1479,8 @@ def _collect_arrow(dataset, *, purpose: str = "Ray result"):
         batches.append(batch)
     if batches:
         return pa.concat_tables(batches)
-    schema = materialized.schema()
+    materialized_schema = _known_ray_schema(materialized)
+    schema = materialized_schema if materialized_schema is not None else declared_schema
     arrow_schema = getattr(schema, "base_schema", schema)
     if not isinstance(arrow_schema, pa.Schema):
         raise RuntimeError("an empty Ray result did not expose an Arrow schema")

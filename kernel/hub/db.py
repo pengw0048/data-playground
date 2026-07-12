@@ -183,6 +183,11 @@ def conn() -> duckdb.DuckDBPyConnection:
     return c if c is not None else _base_conn()
 
 
+def is_run_scoped() -> bool:
+    """Whether this thread already owns an isolated run cursor."""
+    return getattr(_local, "con", None) is not None
+
+
 class _Scope:
     """One run/preview's isolated DuckDB cursor + the temp views it minted."""
 

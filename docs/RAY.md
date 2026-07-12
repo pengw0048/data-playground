@@ -60,10 +60,12 @@ Native Parquet discovery processes at most 10,000 files and reads each physical 
 `int64`; incompatible drift takes the bounded built-in path or falls back. The exact `DuckDBAdapter`
 metadata schema is the semantic oracle for physical and partition column order/types. Ray 2.56 native
 Hive is limited to proven `int64` and string partition fields with consistent, unique keys. The Hive
-default-partition sentinel, DATE/other partition types, duplicate keys, and inconsistent layouts take the
-bounded/local path. A flat dataset below an ancestor such as `tenant=acme` remains native without leaking
-that ancestor. A genuinely Hive-partitioned dataset below a Hive-looking root/ancestor falls back because
-DuckDB parses the ancestor while exact-root Ray intentionally does not.
+directory-key order must also match the exact adapter metadata order; otherwise Ray 2.56 reorders the
+materialized columns and the source takes the bounded/local path. The Hive default-partition sentinel,
+DATE/other partition types, duplicate keys, and inconsistent layouts also take the bounded/local path. A
+flat dataset below an ancestor such as `tenant=acme` remains native without leaking that ancestor. A
+genuinely Hive-partitioned dataset below a Hive-looking root/ancestor falls back because DuckDB parses the
+ancestor while exact-root Ray intentionally does not.
 Compact prefixes before the 10,000-file ceiling. The ceiling bounds retained metadata and footer work,
 but PyArrow's object-store listing API may materialize the provider's prefix response before the count is
 known; data bytes remain worker-direct, while very large metadata listings still require compaction or a

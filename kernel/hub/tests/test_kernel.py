@@ -7574,13 +7574,72 @@ def test_ray_worker_direct_attempt_is_create_only_and_empty_retry_cannot_publish
             Dataset(pa.Table.from_batches([], schema=schema)), unknown_uri, attempt_id="unknown"
         )
 
+    class Ray56EmptyDataset(Dataset):
+        def schema(self, fetch_if_missing=True):
+            return None if self.materialized else self.table.schema
+
     empty_uri = str(tmp_path / "whole.attempt-empty")
-    fresh_empty = Dataset(pa.Table.from_batches([], schema=schema))
+    fresh_empty = Ray56EmptyDataset(pa.Table.from_batches([], schema=schema))
     assert mod._write_worker_direct_parquet(fresh_empty, empty_uri, attempt_id="empty") == (0, empty_uri)
     empty_manifest = read_manifest(empty_uri)
     assert empty_manifest is not None and empty_manifest["rows"] == 0
     assert validate_shards(empty_uri, empty_manifest)
     assert pq.read_table(os.path.join(empty_uri, "part-000000.parquet")).schema == schema
+
+
+def test_ray_typed_empty_collect_and_broadcast_join_keep_declared_schema(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    import pyarrow as pa
+
+    mod = _load_dp_ray()
+
+    class ZeroBlockDataset:
+        def __init__(self, schema):
+            self.declared = schema
+            self.materialized = False
+
+        def schema(self, fetch_if_missing=True):
+            return None if self.materialized else self.declared
+
+        def materialize(self):
+            self.materialized = True
+            return self
+
+        def size_bytes(self):
+            return 0
+
+        def iter_batches(self, **_kwargs):
+            return iter(())
+
+        def to_arrow_refs(self):
+            return []
+
+    collected_schema = pa.schema([("k", pa.int64()), ("value", pa.string())])
+    collected = mod._collect_arrow(ZeroBlockDataset(collected_schema), purpose="typed-empty test")
+    assert collected.num_rows == 0 and collected.schema == collected_schema
+
+    class LeftDataset:
+        def columns(self):
+            return ["k", "left_value"]
+
+        def map_batches(self, fn, **_kwargs):
+            return fn(pa.table({"k": [1], "left_value": ["left"]}))
+
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda _refs: []))
+    right_schema = pa.schema([("k", pa.int64()), ("right_value", pa.string())])
+    step = SimpleNamespace(
+        inputs=[("left", None), ("right", None)],
+        config={"on": "k", "how": "left"},
+    )
+    joined = object.__new__(mod.RayRunner)._build_join(
+        step, {"left": LeftDataset(), "right": ZeroBlockDataset(right_schema)}
+    )
+    assert joined.schema == pa.schema([
+        ("k", pa.int64()), ("left_value", pa.string()), ("right_value", pa.string()),
+    ])
+    assert joined.to_pylist() == [{"k": 1, "left_value": "left", "right_value": None}]
 
 
 def test_ray_whole_run_scopes_each_sink_attempt_by_step_and_unstripped_target(tmp_path):
@@ -7751,6 +7810,64 @@ def test_ray_native_object_parquet_read_never_scans_through_the_driver(tmp_path,
     ]
 
 
+def test_ray_native_metadata_oracle_does_not_block_unrelated_run_scopes(tmp_path, monkeypatch):
+    import threading
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter
+
+    mod = _load_dp_ray()
+    source = tmp_path / "metadata-oracle.parquet"
+    pq.write_table(pa.table({"value": [1]}), source)
+    real_scan = DuckDBAdapter.scan
+    oracle_started = threading.Event()
+    release_oracle = threading.Event()
+    errors = []
+
+    def slow_scan(adapter, *args, **kwargs):
+        relation = real_scan(adapter, *args, **kwargs)
+
+        class SlowRelation:
+            def to_arrow_table(self):
+                oracle_started.set()
+                if not release_oracle.wait(5):
+                    raise TimeoutError("test did not release the metadata oracle")
+                return relation.to_arrow_table()
+
+        return SlowRelation()
+
+    monkeypatch.setattr(DuckDBAdapter, "scan", slow_scan)
+
+    def prove_native():
+        try:
+            mod._native_parquet_plan(str(source), DuckDBAdapter())
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    proof = threading.Thread(target=prove_native)
+    proof.start()
+    assert oracle_started.wait(5)
+    unrelated_entered = threading.Event()
+
+    def unrelated_run():
+        with db.run_scope():
+            unrelated_entered.set()
+
+    unrelated = threading.Thread(target=unrelated_run)
+    unrelated.start()
+    entered_before_release = unrelated_entered.wait(2)
+    release_oracle.set()
+    proof.join(5)
+    unrelated.join(5)
+
+    assert entered_before_release, "slow metadata I/O held the global DuckDB base lock"
+    assert not proof.is_alive() and not unrelated.is_alive()
+    assert errors == []
+
+
 def test_ray_hive_native_plan_matches_adapter_schema_and_fails_closed_on_unproved_layouts(
         tmp_path, monkeypatch):
     import datetime
@@ -7806,6 +7923,13 @@ def test_ray_hive_native_plan_matches_adapter_schema_and_fails_closed_on_unprove
     with pytest.raises(RuntimeError, match="unsupported Ray 2.56 partition type date32"):
         mod._native_parquet_plan(str(dated), adapter)
 
+    reversed_keys = tmp_path / "reversed-hive" / "z=1" / "a=alpha"
+    reversed_keys.mkdir(parents=True)
+    pq.write_table(pa.table({"v": [7]}), reversed_keys / "part.parquet")
+    reversed_root = tmp_path / "reversed-hive"
+    with pytest.raises(RuntimeError, match="Hive column order differs"):
+        mod._native_parquet_plan(str(reversed_root), adapter)
+
     ancestor_root = tmp_path / "tenant=acme" / "genuine-hive"
     ancestor_partition = ancestor_root / "n=1"
     ancestor_partition.mkdir(parents=True)
@@ -7850,6 +7974,13 @@ def test_ray_hive_native_plan_matches_adapter_schema_and_fails_closed_on_unprove
     assert sorted(row["d"] for row in date_table.to_pylist()) == [
         datetime.date(2026, 7, 12), datetime.date(2026, 7, 13),
     ]
+    reversed_table = runner._build(SimpleNamespace(
+        op="read", config={"uri": str(reversed_root)},
+    ), {})
+    assert reversed_table.schema == pa.schema([
+        ("v", pa.int64()), ("a", pa.string()), ("z", pa.int64()),
+    ])
+    assert reversed_table.to_pylist() == [{"v": 7, "a": "alpha", "z": 1}]
 
 
 @pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="real Ray 2.56 Hive schema/rows regression")
@@ -7880,6 +8011,66 @@ def test_ray_native_hive_live_exposes_logical_schema_columns_and_typed_rows(tmp_
             {"v": 10, "n": 1, "tier": "alpha"},
             {"v": 20, "n": 2, "tier": "beta"},
         ]
+    finally:
+        ray.shutdown()
+
+
+@pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="real Ray 2.56 typed-empty regression")
+def test_ray_typed_empty_paths_live_keep_pre_materialization_schema(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub.handoff import read_manifest, validate_shards
+    from hub.plugins.adapters import DuckDBAdapter
+
+    ray = pytest.importorskip("ray")
+    mod = _load_dp_ray()
+    empty_hive = tmp_path / "empty-hive" / "n=1"
+    empty_hive.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_batches([], schema=pa.schema([("v", pa.int64())])),
+        empty_hive / "part.parquet",
+    )
+    hive_plan = mod._native_parquet_plan(str(tmp_path / "empty-hive"), DuckDBAdapter())
+    expected_hive_schema = pa.schema([("v", pa.int64()), ("n", pa.int64())])
+    assert hive_plan["schema"] == expected_hive_schema
+
+    empty_right = tmp_path / "empty-right.parquet"
+    right_schema = pa.schema([("k", pa.int64()), ("right_value", pa.string())])
+    pq.write_table(pa.Table.from_batches([], schema=right_schema), empty_right)
+    right_plan = mod._native_parquet_plan(str(empty_right), DuckDBAdapter())
+
+    monkeypatch.setenv("RAY_DATA_DISABLE_PROGRESS_BARS", "1")
+    ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
+    try:
+        output = str(tmp_path / "typed-empty.attempt-live")
+        assert mod._write_worker_direct_parquet(
+            mod._read_native_parquet(ray, hive_plan), output, attempt_id="live-empty"
+        ) == (0, output)
+        manifest = read_manifest(output)
+        assert manifest is not None and validate_shards(output, manifest)
+        assert pq.read_table(os.path.join(output, "part-000000.parquet")).schema == expected_hive_schema
+
+        collected = mod._collect_arrow(
+            mod._read_native_parquet(ray, hive_plan), purpose="live typed-empty collect"
+        )
+        assert collected.num_rows == 0 and collected.schema == expected_hive_schema
+
+        left = ray.data.from_items([{"k": 1, "left_value": "left"}], override_num_blocks=1)
+        step = SimpleNamespace(
+            inputs=[("left", None), ("right", None)],
+            config={"on": "k", "how": "left"},
+        )
+        joined = object.__new__(mod.RayRunner)._build_join(
+            step, {"left": left, "right": mod._read_native_parquet(ray, right_plan)}
+        ).materialize()
+        joined_schema = getattr(joined.schema(), "base_schema", joined.schema())
+        assert joined_schema == pa.schema([
+            ("k", pa.int64()), ("left_value", pa.string()), ("right_value", pa.string()),
+        ])
+        assert joined.take_all() == [{"k": 1, "left_value": "left", "right_value": None}]
     finally:
         ray.shutdown()
 
@@ -8335,6 +8526,9 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
         def columns(self):
             return ["k"]
 
+        def schema(self, fetch_if_missing=True):
+            return pa.schema([("k", pa.int64())])
+
         def materialize(self):
             return self
 
@@ -8453,6 +8647,61 @@ def test_ray_region_handoff_uses_an_immutable_attempt_prefix():
     long_uri = attempt_uri("/tmp/out.parquet", "x" * 10_000)
     readable, suffix = long_uri.split(".attempt-", 1)[1].rsplit("-", 1)
     assert len(readable) == 64 and len(suffix) == 32
+
+
+def test_ray_attempt_uri_fits_local_components_and_object_child_paths(tmp_path):
+    from urllib.parse import urlsplit
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub.handoff import _object_manifest_path, read_manifest
+
+    mod = _load_dp_ray()
+    schema = pa.schema([("value", pa.int64())])
+
+    class EmptyDataset:
+        def materialize(self):
+            return self
+
+        def count(self):
+            return 0
+
+        def schema(self, fetch_if_missing=True):
+            return schema
+
+    logical_names = ["x" * 180 + ".parquet", "数据" * 40 + ".parquet"]
+    for index, logical_name in enumerate(logical_names):
+        logical_uri = str(tmp_path / logical_name)
+        run_id = f"local-{index}-" + "r" * 10_000
+        attempt = mod._attempt_handoff_uri(logical_uri, run_id)
+        assert len(attempt.rsplit("/", 1)[-1].encode("utf-8")) <= 240
+        assert mod._write_worker_direct_parquet(
+            EmptyDataset(), attempt, attempt_id=run_id
+        ) == (0, attempt)
+        assert read_manifest(attempt)["runId"] == run_id
+        assert pq.read_table(os.path.join(attempt, "part-000000.parquet")).schema == schema
+
+    # Object attempts leave 128 bytes below the provider's 1024-byte key ceiling for Ray's shard name
+    # and the sibling commit record. The digest still distinguishes long IDs after readable truncation.
+    parent = "p" * 830
+    logical = f"s3://bucket/{parent}/out.parquet"
+    first = mod._attempt_handoff_uri(logical, "a" * 10_000)
+    second = mod._attempt_handoff_uri(logical, "b" * 10_000)
+    assert first != second
+    for attempt in (first, second):
+        parsed = urlsplit(attempt)
+        key = parsed.path.lstrip("/")
+        assert len(key.encode("utf-8")) <= 896
+        assert len(key.encode("utf-8")) + 128 <= 1024
+        assert len((key + "/part-000000.parquet").encode("utf-8")) <= 1024
+        manifest_path = _object_manifest_path(f"{parsed.netloc}/{key}")
+        manifest_key = manifest_path.split("/", 1)[1]
+        assert len(manifest_key.encode("utf-8")) <= 1024
+
+    too_deep = f"s3://bucket/{'p' * 860}/out.parquet"
+    with pytest.raises(RuntimeError, match="shorten its parent path"):
+        mod._attempt_handoff_uri(too_deep, "run")
 
 
 def test_ray_region_reattaches_committed_attempt_and_refuses_partial_retry(tmp_path):
