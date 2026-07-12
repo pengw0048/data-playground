@@ -8333,6 +8333,151 @@ def test_ray_popen_supervisor_erases_sensitive_workdir_and_closes_log(
         assert run_id not in runner._cancel
 
 
+def test_ray_popen_multi_sink_failure_keeps_partial_output_private_and_untouched(tmp_path, monkeypatch):
+    from hub.deps import Deps
+    from hub.ir import lower_to_ir
+    from hub.models import Graph, RunStatus
+
+    mod = _load_dp_ray()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+    graph = Graph(**{
+        "id": "multi-sink-failure", "version": 1,
+        "nodes": [
+            _ray_node("src", "source", {"uri": "/tmp/input.parquet"}),
+            _ray_node("first", "write", {"name": "first"}),
+            _ray_node("second", "write", {"name": "second"}),
+        ],
+        "edges": [_ray_edge("src", "first"), _ray_edge("src", "second")],
+    })
+    ir = lower_to_ir(graph, None, runner.node_specs)
+    # URI naming is not ownership: a custom/stable file may legitimately contain `.attempt-`.
+    first_output = tmp_path / "custom.attempt-output.csv"
+    first_output.write_text("x\n1\n")
+    sink_targets = {"first": str(first_output), "second": "/tmp/second"}
+    commits = []
+
+    monkeypatch.setattr(runner, "_build", lambda *_args, **_kwargs: object())
+
+    def commit(step, *_args, **_kwargs):
+        commits.append(step.id)
+        if step.id == "second":
+            raise RuntimeError("second sink failed")
+        return 3, str(first_output), "first"
+
+    monkeypatch.setattr(runner, "_commit", commit)
+    result = runner._run_ir_sync(
+        ir, graph, None,
+        sink_targets=sink_targets,
+        attempt_id="run",
+    )
+    assert result["status"] == "failed"
+    assert commits == ["first", "second"]
+    partial_outputs = [{
+        "step_id": "first", "name": "first", "uri": str(first_output),
+        "logical_uri": str(first_output),
+    }]
+    assert result["outputs"] == partial_outputs
+
+    catalog_calls = []
+    monkeypatch.setattr(runner, "_register_outputs", lambda *_args: catalog_calls.append(True))
+    monkeypatch.setattr(
+        mod, "discard_attempt",
+        lambda _uri: pytest.fail("terminal settlement guessed ownership from a returned URI"),
+    )
+    status = RunStatus(
+        run_id="run", status="running", output_uri="stale-uri", output_table="stale-table"
+    )
+    runner._settle_popen_result(
+        graph, status, result, 1,
+        expected_targets=sink_targets, expected_attempts={},
+    )
+
+    assert status.status == "failed"
+    assert status.output_uri is None and status.output_table is None
+    assert catalog_calls == []
+    assert first_output.read_text() == "x\n1\n"
+    assert result["outputs"] == partial_outputs
+
+    cancelled = dict(
+        result, status="cancelled", error=None,
+        output_uri=str(first_output), output_table="first",
+    )
+    cancelled_status = RunStatus(run_id="cancelled-run", status="running")
+    runner._settle_popen_result(
+        graph, cancelled_status, cancelled, -15,
+        expected_targets=sink_targets, expected_attempts={},
+    )
+    assert cancelled_status.status == "cancelled"
+    assert cancelled_status.output_uri is None and cancelled_status.output_table is None
+    assert catalog_calls == []
+    assert first_output.read_text() == "x\n1\n"
+    assert cancelled["outputs"] == result["outputs"]
+
+
+def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tmp_path, monkeypatch):
+    from hub.deps import Deps
+    from hub.models import Graph, RunStatus
+
+    mod = _load_dp_ray()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+    graph = Graph(id="multi-sink-success", version=1, nodes=[], edges=[])
+    expected_targets = {
+        "first": "/tmp/first.parquet", "second": "/tmp/second.parquet",
+    }
+    expected_attempts = {
+        "first": "/tmp/first.attempt-run", "second": "/tmp/second.attempt-run",
+    }
+    monkeypatch.setattr(
+        runner.catalog, "register_output",
+        lambda **_kwargs: pytest.fail("an incomplete expected sink set reached the catalog"),
+    )
+    missing_status = RunStatus(
+        run_id="missing", status="running",
+        output_uri="/tmp/stale.attempt-run", output_table="stale",
+    )
+    runner._settle_popen_result(
+        graph, missing_status,
+        {"status": "done", "rows": 0, "outputs": []}, 0,
+        expected_targets=expected_targets, expected_attempts=expected_attempts,
+    )
+    assert missing_status.status == "failed"
+    assert "incomplete or unexpected sink set" in (missing_status.error or "")
+    assert missing_status.output_uri is None and missing_status.output_table is None
+
+    result = {
+        "status": "done", "rows": 5,
+        "output_uri": "/tmp/second.attempt-run", "output_table": "second",
+        "outputs": [
+            {"step_id": "first", "name": "first", "uri": "/tmp/first.attempt-run",
+             "logical_uri": "/tmp/first.parquet"},
+            {"step_id": "second", "name": "second", "uri": "/tmp/second.attempt-run",
+             "logical_uri": "/tmp/second.parquet"},
+        ],
+    }
+    registered = []
+    monkeypatch.setattr(
+        runner, "_register_outputs",
+        lambda got_graph, got_result, **kwargs: registered.append((got_graph, got_result, kwargs)),
+    )
+    status = RunStatus(run_id="run", status="running")
+
+    runner._settle_popen_result(
+        graph, status, result, 0,
+        expected_targets=expected_targets, expected_attempts=expected_attempts,
+    )
+
+    assert registered == [(graph, result, {
+        "expected_targets": expected_targets, "expected_attempts": expected_attempts,
+    })]
+    assert status.status == "done" and status.progress == 1.0
+    assert status.output_uri == result["output_uri"] and status.output_table == "second"
+    assert status.rows_processed == status.total_rows == 5
+
+
 def test_ray_hive_native_plan_matches_adapter_schema_and_fails_closed_on_unproved_layouts(
         tmp_path, monkeypatch):
     import datetime
