@@ -630,7 +630,8 @@ def test_migration_0020_adds_backend_job_binding_without_rewriting_run_state(
         columns = {row[1] for row in connection.execute(sa.text("PRAGMA table_info('run_backend_jobs')"))}
         assert {"run_id", "attempt_id", "submission_id", "control_address", "cancel_requested",
                 "quarantine_reason", "submission_state", "submission_owner",
-                "submission_lease_until", "publication_state", "result_doc"} <= columns
+                "submission_lease_until", "publication_state", "last_control_observed_at",
+                "recovery_blocked_reason", "result_doc"} <= columns
         tables = {row[0] for row in connection.execute(
             sa.text("SELECT name FROM sqlite_master WHERE type='table'")
         )}

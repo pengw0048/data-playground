@@ -711,6 +711,140 @@ def test_ray_jobs_restart_reattaches_and_catalog_publication_has_one_winner(jobs
     metadb.drop_kernel(graph.id, "new-kernel")
 
 
+def test_same_state_control_recovery_clears_durable_error_without_write_churn(jobs_config):
+    _module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    status = runner.run(
+        plan, graph, "write", "distributed",
+        run_id=f"run_jobs_error_clear_{uuid.uuid4().hex}",
+    )
+    ref = status.backend_ref
+    assert ref is not None
+    _wait_submitted(client, ref.submission_id)
+    deadline = time.monotonic() + 2
+    while runner.status(status.run_id).status != "running" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert runner.status(status.run_id).status == "running"
+
+    # Freeze the next Jobs poll so the test observes the persisted error before the same RUNNING state
+    # succeeds again. Recovery must clear that stale DB/UI error even though the visible label is unchanged.
+    with client.lock:
+        runner._persist_jobs_live_error(status, "Ray control temporarily unavailable")
+        assert metadb.get_run_state(status.run_id)["error"] == "Ray control temporarily unavailable"
+
+    deadline = time.monotonic() + 2
+    while metadb.get_run_state(status.run_id)["error"] is not None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert metadb.get_run_state(status.run_id)["error"] is None
+    with metadb.session() as session:
+        cleared_at = session.get(metadb.RunState, status.run_id).updated_at
+    time.sleep(0.08)  # several 10ms same-state polls must not rewrite the full RunState document
+    with metadb.session() as session:
+        assert session.get(metadb.RunState, status.run_id).updated_at == cleared_at
+
+    _complete(store, client, status)
+    assert _wait(runner, status.run_id).status == "done"
+
+
+def test_jobs_stall_clock_uses_successful_control_observations_not_error_writes(jobs_config):
+    _module, deps, runner, _client, _store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(
+        plan, graph, "write", "distributed",
+        run_id=f"run_jobs_control_clock_{uuid.uuid4().hex}",
+    )
+    ref = status.backend_ref
+    assert ref is not None
+    old = metadb._now() - datetime.timedelta(minutes=5)
+
+    with metadb.session() as session:
+        state = session.get(metadb.RunState, status.run_id)
+        job = session.get(metadb.RunBackendJob, status.run_id)
+        state.updated_at = old
+        job.updated_at = old
+        job.last_control_observed_at = metadb._now()
+    assert metadb.run_stalled(status.run_id, 60) is False
+
+    with metadb.session() as session:
+        session.get(metadb.RunBackendJob, status.run_id).last_control_observed_at = old
+    runner._persist_jobs_live_error(status, "repeated control failure")
+    assert metadb.run_stalled(status.run_id, 60) is True, (
+        "fresh error text must not make a dead control plane look healthy"
+    )
+
+    assert metadb.note_backend_control_observed(status.run_id, ref.attempt_id, 0) is True
+    assert metadb.run_stalled(status.run_id, 60) is False
+    observed = metadb.backend_job(status.run_id)["last_control_observed_at"]
+    assert metadb.note_backend_control_observed(status.run_id, ref.attempt_id) is False
+    assert metadb.backend_job(status.run_id)["last_control_observed_at"] == observed
+    _retire_inert_test_run(status)
+
+
+@pytest.mark.parametrize("malformed_kind", ["invalid-json", "invalid-shape"])
+def test_malformed_recovery_row_is_durably_visible_without_replay(
+        jobs_config, monkeypatch, caplog, malformed_kind):
+    module, deps, original, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    original._ensure_jobs_supervisor = lambda _run_id: None
+    status = original.run(
+        plan, graph, "write", "distributed",
+        run_id=f"run_jobs_malformed_{malformed_kind}_{uuid.uuid4().hex}",
+    )
+    with metadb.session() as session:
+        state = session.get(metadb.RunState, status.run_id)
+        state.status = "running"
+        state.doc = (
+            "{not-json" if malformed_kind == "invalid-json" else json.dumps({
+                "run_id": status.run_id,
+                "status": "running",
+                "per_node": "not-a-list",
+            })
+        )
+
+    supervised: list[str] = []
+    monkeypatch.setattr(
+        module.RayRunner, "_ensure_jobs_supervisor",
+        lambda _self, run_id: supervised.append(run_id),
+    )
+    caplog.set_level("WARNING", logger="hub")
+    recovered = module.RayRunner(
+        deps, jobs_client_factory=client, artifact_store=store, recover=True
+    )
+
+    blocked = recovered.status(status.run_id)
+    binding = metadb.backend_job(status.run_id)
+    persisted = metadb.get_run_state(status.run_id)
+    assert status.run_id not in supervised
+    assert blocked.status == "running" and "recovery blocked" in (blocked.error or "")
+    assert persisted["status"] == "running" and persisted["error"] == blocked.error
+    assert binding["recovery_blocked_reason"] in blocked.error
+    assert len(binding["recovery_blocked_reason"]) <= 2000
+    assert client.submit_calls == [] and client.stop_calls == []
+    warning = next(
+        record for record in caplog.records
+        if record.getMessage().startswith("ray_jobs_recovery_blocked run_id=")
+        and getattr(record, "dataplay_run_id", None) == status.run_id
+    )
+    assert warning.dataplay_backend == "ray-jobs" and warning.dataplay_error_type
+
+    cancelled = recovered.cancel(status.run_id)
+    assert cancelled.status == "running" and "cancellation recorded" in (cancelled.error or "")
+    assert metadb.backend_job(status.run_id)["cancel_requested"] is True
+    assert client.submit_calls == [] and client.stop_calls == []
+
+    # Repeated restarts retain one bounded diagnosis instead of recursively wrapping it.
+    restarted = module.RayRunner(
+        deps, jobs_client_factory=client, artifact_store=store, recover=True
+    )
+    assert (restarted.status(status.run_id).error or "").count("Ray Jobs recovery blocked:") == 1
+    assert status.run_id not in supervised
+    _retire_inert_test_run(restarted.status(status.run_id))
+
+
 def test_ray_jobs_multi_sink_usage_is_one_event_per_run(jobs_config):
     catalog = CountingCatalog()
     _module, _deps, runner, _client, _store = _runner(jobs_config, catalog=catalog)

@@ -91,6 +91,8 @@ from hub.sqlpolicy import (
 from hub.workload_env import (build_workload_credential_env, build_workload_env,
                               build_workload_semantic_env, prepare_workload_graph)
 
+log = logging.getLogger("hub")
+
 # the relational ops THIS backend claims beyond the map-style clean subset (ARC3). The engine does NOT
 # reimplement these on Ray operators — it lets RAY do only the SHUFFLE (hash-partition rows by the op's
 # key) and lets DUCKDB do the compute on each COMPLETE partition, running the SAME SQL the single-node
@@ -134,6 +136,7 @@ _HIVE_DEFAULT_PARTITION = "__HIVE_DEFAULT_PARTITION__"
 _JOBS_BACKEND = "ray-jobs"
 _JOB_TERMINAL = frozenset({"SUCCEEDED", "FAILED", "STOPPED"})
 _CANCEL_FENCE_ENTRYPOINT = "sleep 86400"
+_CONTROL_OBSERVATION_WRITE_S = 10.0
 _JOBS_CLIENT_ENV_LOCK = threading.Lock()
 _GPU_BATCH_ROWS_DEFAULT = 4096
 _GPU_BATCH_ROWS_MAX = 65536
@@ -978,6 +981,8 @@ class RayRunner:
         self._supervising: set[str] = set()
         self._cancel_stop_sent: set[str] = set()
         self._backend_refs: dict[str, dict] = {}
+        self._control_observed_monotonic: dict[str, float] = {}
+        self._recovery_blocked: set[str] = set()
         self._lock = threading.Lock()
         self.jobs_address = os.environ.get("DP_RAY_JOBS_ADDRESS", "").strip()
         # Presence of the plugin is enough to own/recover an existing binding: its durable SQL row carries
@@ -1060,6 +1065,17 @@ class RayRunner:
     def cancel(self, run_id: str) -> RunStatus:
         st = self.runs.get(run_id)
         ref = getattr(st, "backend_ref", None) if st else None
+        if st and run_id in self._recovery_blocked and st.status in ("queued", "running"):
+            from hub import metadb
+
+            metadb.request_backend_cancel(run_id)
+            if run_id in self._cancel:
+                self._cancel[run_id].set()
+            suffix = "cancellation recorded; repair the malformed durable binding before remote stop can resume"
+            if suffix not in (st.error or ""):
+                st.error = f"{st.error}; {suffix}" if st.error else suffix
+                metadb.save_run_state(run_id, st.model_dump())
+            return st
         if st and ref and ref.backend == _JOBS_BACKEND and st.status in ("queued", "running"):
             from hub import metadb
             metadb.request_backend_cancel(run_id)
@@ -1470,6 +1486,8 @@ class RayRunner:
                 self._cancel.pop(victim, None)
                 self._settled.pop(victim, None)
                 self._backend_refs.pop(victim, None)
+                self._control_observed_monotonic.pop(victim, None)
+                self._recovery_blocked.discard(victim)
                 self._cancel_stop_sent.discard(victim)
                 if getattr(self.deps, "run_index", {}).get(victim) is self:
                     self.deps.run_index.pop(victim, None)
@@ -1487,12 +1505,73 @@ class RayRunner:
 
         for ref, doc in metadb.active_backend_jobs(_JOBS_BACKEND):
             try:
+                if ref.get("recovery_blocked_reason"):
+                    raise RuntimeError(str(ref["recovery_blocked_reason"]))
+                if doc.get("_recovery_error"):
+                    raise ValueError(str(doc["_recovery_error"]))
                 status = RunStatus.model_validate(doc)
                 status.backend_ref = self._ref_model(ref)
                 self._install_jobs_status(status, ref)
                 self._ensure_jobs_supervisor(status.run_id)
-            except Exception:  # noqa: BLE001 — one damaged legacy row must not prevent plugin registration
-                continue
+            except Exception as exc:  # noqa: BLE001 — isolate and surface each damaged active row
+                run_id = str(ref.get("run_id") or doc.get("run_id") or "")
+                if not run_id:
+                    log.warning(
+                        "ray_jobs_recovery_blocked missing_run_id backend=%s error_type=%s",
+                        _JOBS_BACKEND, type(exc).__name__,
+                    )
+                    continue
+                persisted_reason = str(ref.get("recovery_blocked_reason") or "")
+                detail = self._safe_job_error(exc, limit=1000)
+                reason = persisted_reason or (
+                    f"Ray Jobs recovery blocked: {type(exc).__name__}: {detail}"
+                )
+                live_status = str(doc.get("status") or "queued")
+                if live_status not in ("queued", "running"):
+                    live_status = "queued"
+                blocked = RunStatus(
+                    run_id=run_id, status=live_status, placement="distributed", per_node=[], error=reason,
+                    target_node_id=(doc.get("target_node_id")
+                                    if isinstance(doc.get("target_node_id"), str) else None),
+                )
+                try:
+                    blocked.backend_ref = self._ref_model(ref)
+                except Exception:  # the durable row itself may be the malformed recovery input
+                    pass
+                if ref.get("cancel_requested"):
+                    blocked.error = (
+                        f"{reason}; cancellation recorded; repair the malformed durable binding "
+                        "before remote stop can resume"
+                    )[:2000]
+                marked = metadb.mark_backend_recovery_blocked(
+                    run_id, _JOBS_BACKEND, blocked.model_dump(), reason
+                )
+                if not marked:  # a terminal publisher or repair won the race; do not install stale state
+                    log.warning(
+                        "ray_jobs_recovery_blocked_race run_id=%s backend=%s",
+                        run_id, _JOBS_BACKEND,
+                        extra={"dataplay_run_id": run_id, "dataplay_backend": _JOBS_BACKEND},
+                    )
+                    continue
+                with self._lock:
+                    self.runs[run_id] = blocked
+                    self._backend_refs[run_id] = dict(ref)
+                    self._cancel.setdefault(run_id, threading.Event())
+                    if ref.get("cancel_requested"):
+                        self._cancel[run_id].set()
+                    self._settled.setdefault(run_id, threading.Event())
+                    self._recovery_blocked.add(run_id)
+                if hasattr(self.deps, "run_index"):
+                    self.deps.run_index[run_id] = self
+                log.warning(
+                    "ray_jobs_recovery_blocked run_id=%s backend=%s error_type=%s reason=%s",
+                    run_id, _JOBS_BACKEND, type(exc).__name__, detail,
+                    extra={
+                        "dataplay_run_id": run_id,
+                        "dataplay_backend": _JOBS_BACKEND,
+                        "dataplay_error_type": type(exc).__name__,
+                    },
+                )
 
     def _reattach_job(self, run_id: str) -> RunStatus | None:
         from hub import metadb
@@ -2555,6 +2634,7 @@ class RayRunner:
         try:
             client = self._jobs_client(binding.get("control_address"))
             state = self._find_job(client, ref.submission_id)
+            self._note_jobs_control_observed(status, ref)
             if state is None:
                 state, _accepted_fence = self._fence_missing_stop(
                     client, status, ref, reason="quarantine"
@@ -2589,6 +2669,26 @@ class RayRunner:
 
         status.error = message
         metadb.save_run_state(status.run_id, status.model_dump())
+
+    def _note_jobs_control_observed(self, status: RunStatus, ref: RunBackendRef) -> None:
+        """Advance durable liveness after a successful Jobs status/list observation, at bounded rate."""
+        from hub import metadb
+
+        now = time.monotonic()
+        with self._lock:
+            previous = self._control_observed_monotonic.get(status.run_id)
+            if previous is not None and now - previous < _CONTROL_OBSERVATION_WRITE_S:
+                return
+            self._control_observed_monotonic[status.run_id] = now
+        try:
+            metadb.note_backend_control_observed(
+                status.run_id, ref.attempt_id, _CONTROL_OBSERVATION_WRITE_S
+            )
+        except Exception:
+            # A failed durable write must remain retryable; process-local throttling is not authoritative.
+            with self._lock:
+                self._control_observed_monotonic.pop(status.run_id, None)
+            raise
 
     def _refresh_jobs_binding(self, run_id: str) -> dict:
         from hub import metadb
@@ -2676,6 +2776,8 @@ class RayRunner:
         try:
             client = self._jobs_client(binding.get("control_address"))
             state = self._find_job(client, ref.submission_id)
+            self._note_jobs_control_observed(status, ref)
+            status.error = None
             cancel_fenced = binding.get("submission_state") == "stop_fenced"
             if state is None:
                 state, accepted_fence = self._fence_missing_stop(
@@ -2814,6 +2916,7 @@ class RayRunner:
                 try:
                     client = self._jobs_client(binding.get("control_address"))
                     state = self._find_job(client, ref.submission_id)
+                    self._note_jobs_control_observed(status, ref)
                     if state is None:
                         completed = self._terminal_result_if_present(job)
                         if completed is not None:
@@ -2840,7 +2943,9 @@ class RayRunner:
                         return
                     time.sleep(self._jobs_poll_s)
                     continue
+                previous_live_error = status.error
                 cancelling, cancel_client, cancel_state = self._cancel_control_state(status, ref, binding)
+                cleared_live_error = previous_live_error is not None and status.error is None
                 if cancelling:
                     client = cancel_client or client
                     if cancel_state in ("STOPPED", "MISSING"):
@@ -2855,6 +2960,7 @@ class RayRunner:
                     try:
                         assert client is not None
                         observed = self._find_job(client, ref.submission_id)
+                        self._note_jobs_control_observed(status, ref)
                         if observed is not None:
                             state = observed
                             if observed not in _JOB_TERMINAL:
@@ -2873,6 +2979,7 @@ class RayRunner:
                                 if state == "CANCEL_REQUESTED":
                                     self._cancel[run_id].set()
                                     state = "METADATA_MISSING"
+                        cleared_live_error = status.error is not None
                         status.error = None
                     except Exception as e:  # noqa: BLE001 — no terminal claim on ambiguous control/storage
                         self._persist_jobs_live_error(
@@ -2881,7 +2988,7 @@ class RayRunner:
                         )
                         state = "METADATA_MISSING"
                 visible = "running" if state == "RUNNING" else "queued"
-                if visible != last_visible:
+                if visible != last_visible or cleared_live_error:
                     status.status = visible
                     from hub import metadb
                     metadb.save_run_state(status.run_id, status.model_dump())

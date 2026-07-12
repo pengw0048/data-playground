@@ -123,7 +123,16 @@ resurrecting a completed run even when no history row exists or bounded history 
 The SQL binding stores the original control address and `cancel_requested`. Restart recovery does not
 depend on a PID, local temp directory, or process-local event. Missing local Jobs configuration is reported
 as a non-terminal configuration-unavailable state; it is never reclassified as artifact tampering and does
-not stop or replay a real job.
+not stop or replay a real job. A malformed active binding or `RunStatus` document is also fail-closed: the
+hub persists a bounded `recovery blocked` diagnosis, emits a structured warning, exposes the run as
+non-terminal, and starts no supervisor that could replay it. Cancellation records durable intent but cannot
+claim a remote stop until an operator repairs the binding enough to recover its control route.
+
+Backend stall detection is anchored to the last successful Jobs status/list observation, not to generic
+`RunState.updated_at`. Healthy same-state polls advance that durable clock at a bounded write rate, while
+repeated error-message writes do not hide a control-plane outage. When a successful poll clears a stale
+live error without changing `queued`/`running`, the hub persists that clear exactly once rather than
+rewriting the full status document on every poll.
 
 Cancellation is the exception: it uses the durable SQL address/submission ID even while local config or
 the job artifact is missing/unavailable. Intent is committed before the process-local event. Once intent

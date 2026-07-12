@@ -159,6 +159,10 @@ class RunBackendJob(Base):
     publication_state: Mapped[str] = mapped_column(String, default="pending")
     publication_owner: Mapped[str | None] = mapped_column(String, nullable=True)
     publication_lease_until: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_control_observed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recovery_blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
     __table_args__ = (UniqueConstraint("backend", "submission_id", name="uq_run_backend_submission"),)
@@ -1479,6 +1483,9 @@ def bind_backend_job(run_id: str, ref: dict, status: dict,
         cancel_requested=bool(ref.get("cancel_requested", False)),
         submission_state="queued",
         publication_state="pending",
+        # Allocation starts the liveness grace period. Only successful control observations advance it;
+        # RunState error writes deliberately do not.
+        last_control_observed_at=_now(),
     )
     try:
         with session() as s:
@@ -1538,6 +1545,10 @@ def _backend_job_doc(row: RunBackendJob) -> dict:
         ),
         "durable": True,
         "publication_state": row.publication_state,
+        "last_control_observed_at": (
+            row.last_control_observed_at.isoformat() if row.last_control_observed_at else None
+        ),
+        "recovery_blocked_reason": row.recovery_blocked_reason,
         "result": json.loads(row.result_doc) if row.result_doc else None,
     }
 
@@ -1546,6 +1557,37 @@ def backend_job(run_id: str) -> dict | None:
     with session() as s:
         row = s.get(RunBackendJob, run_id)
         return _backend_job_doc(row) if row else None
+
+
+def note_backend_control_observed(
+        run_id: str, attempt_id: str, min_interval_s: float = 10.0) -> bool:
+    """Throttle the durable liveness clock advanced only by successful backend observations."""
+    now = _now()
+    cutoff = now - datetime.timedelta(seconds=max(0.0, float(min_interval_s)))
+    with session() as s:
+        updated = s.execute(update(RunBackendJob).where(
+            RunBackendJob.run_id == run_id,
+            RunBackendJob.attempt_id == attempt_id,
+            or_(RunBackendJob.last_control_observed_at.is_(None),
+                RunBackendJob.last_control_observed_at <= cutoff),
+        ).values(last_control_observed_at=now))
+        return bool(updated.rowcount)
+
+
+def mark_backend_recovery_blocked(
+        run_id: str, backend: str, status: dict, reason: str) -> bool:
+    """Persist a non-terminal, operator-visible fence for a malformed active backend row."""
+    bounded = str(reason)[:2000]
+    payload = json.dumps(status, default=str)
+    with session() as s:
+        job = s.get(RunBackendJob, run_id)
+        state = s.get(RunState, run_id)
+        if job is None or state is None or job.backend != backend or state.status not in ("queued", "running"):
+            return False
+        job.recovery_blocked_reason = bounded
+        state.status = str(status.get("status") or state.status)
+        state.doc = payload
+        return True
 
 
 def active_backend_jobs(backend: str) -> list[tuple[dict, dict]]:
@@ -1559,8 +1601,15 @@ def active_backend_jobs(backend: str) -> list[tuple[dict, dict]]:
         for job, state in rows:
             try:
                 doc = json.loads(state.doc)
+                if not isinstance(doc, dict):
+                    raise TypeError("stored RunStatus is not a JSON object")
             except (TypeError, ValueError):
-                doc = {"run_id": state.run_id, "status": state.status, "per_node": []}
+                doc = {
+                    "run_id": state.run_id,
+                    "status": state.status,
+                    "per_node": [],
+                    "_recovery_error": "stored RunStatus is not a valid JSON object",
+                }
             out.append((_backend_job_doc(job), doc))
     return out
 
@@ -1873,15 +1922,23 @@ def backend_publication_owned(run_id: str, attempt_id: str, owner: str) -> bool:
 
 
 def run_stalled(run_id: str, threshold_s: float) -> bool:
-    """True if a run's last status update (run_states.updated_at, bumped on every step transition) is
-    older than threshold_s — a soft 'stuck?' hint for a still-running run. A long single step can trip
-    it (no step completed recently ≠ dead), so it's advisory; a genuinely dead kernel is caught by the
-    heartbeat reaper, not this."""
+    """True when neither local status progress nor external control liveness was observed recently.
+
+    Durable backend error text updates must not hide a dead control plane, while successful same-state
+    polls must keep a healthy long-running job from looking stalled. Local runs retain RunState time.
+    """
     with session() as s:
         r = s.get(RunState, run_id)
         if r is None or r.updated_at is None:
             return False
-        return _stale_secs(r.updated_at) > threshold_s  # _stale_secs normalizes SQLite's naive datetimes
+        job = s.get(RunBackendJob, run_id)
+        observed_at = (
+            job.last_control_observed_at or job.updated_at or r.updated_at
+            if job is not None else r.updated_at
+        )
+        if observed_at is None:
+            return False
+        return _stale_secs(observed_at) > threshold_s  # normalizes SQLite's naive datetimes
 
 
 def save_schema_contract(name: str, columns: list[dict]) -> int:

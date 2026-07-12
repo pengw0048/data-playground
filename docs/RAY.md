@@ -194,7 +194,7 @@ identity underneath the persistent workers.
 | cluster health and placement truth | partial | target-cone requirements, static advertised-capacity admission, GPU/custom task options, and fail-loud unsupported shapes are implemented; live discovery/backpressure remain open |
 | runtime compatibility | partial | one supported Ray range and a driver/worker/core/plugin version handshake |
 | resilience | partial | active-job worker/head/driver failure tests, retry policy, and orphan cleanup |
-| observability | partial | durable job IDs and shared status exist; queue/retry/spill/storage metrics, authenticated log integration, traces, and alerts remain open |
+| observability | partial | durable job IDs, control-observation liveness, shared status, and visible recovery-blocked diagnoses exist; queue/retry/spill/storage metrics, authenticated log integration, traces, and alerts remain open |
 | deployment security and HA | operator-owned | immutable images, secrets/IAM, TLS/network policy, pod security, quotas, autoscaling, and HA storage |
 
 ## What remains before production ownership
