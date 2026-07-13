@@ -1,4 +1,4 @@
-"""Alembic environment — invoked programmatically from metadb.init_db (command.upgrade/stamp).
+"""Alembic environment — invoked programmatically from metadb.migrate_db (command.upgrade).
 
 The DB url always comes from hub settings (DP_DATABASE_URL), so migrations target the same DB
 the app uses. SQLite gets batch mode so ALTER TABLE (add column, etc.) works.
@@ -23,11 +23,21 @@ if context.is_offline_mode():
         context.run_migrations()
 else:
     url = _url()
-    kw = {"connect_args": {"check_same_thread": False}} if url.startswith("sqlite") else {}
-    connectable = create_engine(url, **kw)
-    with connectable.connect() as connection:
+    supplied_connection = context.config.attributes.get("connection")
+
+    def run(connection):
         context.configure(connection=connection, target_metadata=target_metadata,
-                          render_as_batch=url.startswith("sqlite"))
+                           render_as_batch=url.startswith("sqlite"))
         with context.begin_transaction():
             context.run_migrations()
-    connectable.dispose()
+
+    if supplied_connection is not None:
+        # Programmatic migrations pass the application's connection so in-memory SQLite migrates the
+        # database the process will actually use (and file migrations remain inside its lock scope).
+        run(supplied_connection)
+    else:
+        kw = {"connect_args": {"check_same_thread": False}} if url.startswith("sqlite") else {}
+        connectable = create_engine(url, **kw)
+        with connectable.connect() as connection:
+            run(connection)
+        connectable.dispose()

@@ -22,3 +22,9 @@ from hub.seed import seed_if_empty  # noqa: E402
 from hub.settings import settings  # noqa: E402
 
 seed_if_empty(settings.data_dir)
+
+# A deliberately supplied Postgres test database follows the production contract too: the test
+# harness is the one-shot migrator, while importing hub.main later only performs the strict head check.
+if os.environ.get("DP_TEST_DATABASE_URL") and not settings.database_url.startswith("sqlite"):
+    from hub import metadb  # noqa: E402
+    metadb.migrate_db()

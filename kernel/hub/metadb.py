@@ -16,14 +16,17 @@ import hashlib
 import json
 import math
 import os
+import threading
 import uuid
-from urllib.parse import urlsplit
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String,
     Text, UniqueConstraint, create_engine, exists, func, or_, select, update,
 )
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from hub.settings import settings
@@ -496,15 +499,51 @@ class CatalogDeclaredKey(Base):
 
 _engine = None
 _Session = None
+_sqlite_memory_migration_lock = threading.RLock()
+
+
+def _database_url():
+    return make_url(settings.database_url)
+
+
+def _is_sqlite_database() -> bool:
+    return _database_url().get_backend_name() == "sqlite"
+
+
+def _sqlite_is_memory_or_temporary() -> bool:
+    """Whether this process owns the complete lifetime of the SQLite database.
+
+    ``sqlite://`` and ``:memory:`` have no cross-process identity. SQLite URI databases using
+    ``mode=memory`` are likewise process-local even when they have a name, so an in-process lock is
+    the strongest meaningful serialization for them.
+    """
+    url = _database_url()
+    database = url.database
+    query = {str(key).lower(): str(value).lower() for key, value in url.query.items()}
+    uri = query.get("uri") in ("1", "true", "yes", "on") and bool(
+        database and database.startswith("file:"))
+    return (
+        database in (None, "", ":memory:")
+        or bool(uri and (
+            query.get("mode") == "memory"
+            or database.startswith("file::memory:")
+        ))
+    )
 
 
 def engine():
     global _engine, _Session
     if _engine is None:
         url = settings.database_url
-        kw = {"connect_args": {"check_same_thread": False}} if url.startswith("sqlite") else {}
+        sqlite = _is_sqlite_database()
+        kw = {"connect_args": {"check_same_thread": False}} if sqlite else {}
+        if sqlite and _sqlite_is_memory_or_temporary():
+            # A process-local SQLite DB must use one shared DBAPI connection; otherwise each worker
+            # thread gets a different empty database even though migration succeeded on startup.
+            from sqlalchemy.pool import StaticPool
+            kw["poolclass"] = StaticPool
         _engine = create_engine(url, **kw)
-        if url.startswith("sqlite"):
+        if sqlite:
             # The bundled default is a local SQLite file, but run status is upserted from daemon runner
             # threads on every per-node step, concurrent with autosave PUTs, catalog writes, and fast
             # GET-run polling. With the default rollback journal + busy_timeout=0 that intermittently
@@ -529,44 +568,234 @@ def engine():
 _MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "migrations")
 
 
-def _alembic_cfg():
+class SchemaNotReadyError(RuntimeError):
+    """The metadata database cannot safely serve this application revision."""
+
+
+def _alembic_cfg(connection=None):
     from alembic.config import Config
     cfg = Config()
     cfg.set_main_option("script_location", _MIGRATIONS_DIR)
+    if connection is not None:
+        cfg.attributes["connection"] = connection
     return cfg
 
 
-def init_db() -> None:
-    """Bring the metadata schema to head via Alembic, then seed the default local user.
+def expected_schema_head() -> str:
+    """Return the repository's one valid Alembic head, rejecting a branched migration graph."""
+    from alembic.script import ScriptDirectory
 
-    Alembic is the source of truth for schema. A pre-Alembic DB (tables created by the old
-    create_all) is adopted by stamping the baseline before upgrading, so existing installs migrate
-    cleanly instead of erroring on already-present tables."""
-    from alembic import command
-    from sqlalchemy import inspect
+    heads = tuple(ScriptDirectory.from_config(_alembic_cfg()).get_heads())
+    if len(heads) != 1:
+        found = ", ".join(heads) if heads else "none"
+        raise SchemaNotReadyError(
+            f"metadata migration graph must have exactly one Alembic head; found {found}")
+    return heads[0]
 
-    names = set(inspect(engine()).get_table_names())
-    cfg = _alembic_cfg()
-    if "users" in names and "alembic_version" not in names:
-        command.stamp(cfg, "0001_baseline")  # legacy DB → adopt the baseline without recreating tables
-    command.upgrade(cfg, "head")
+
+def _current_schema_heads(connection=None) -> tuple[str, ...]:
+    from alembic.runtime.migration import MigrationContext
+
+    if connection is not None:
+        return tuple(MigrationContext.configure(connection).get_current_heads())
+    with engine().connect() as current_connection:
+        return tuple(MigrationContext.configure(current_connection).get_current_heads())
+
+
+def schema_at_head() -> bool:
+    """Whether the connected database is at this build's exact, unique schema head."""
+    try:
+        return _current_schema_heads() == (expected_schema_head(),)
+    except Exception:  # noqa: BLE001 - readiness is false for an unreachable or malformed DB
+        return False
+
+
+def require_schema_at_head() -> str:
+    """Fail closed unless the database is at this build's exact Alembic head; never run DDL."""
+    expected = expected_schema_head()
+    try:
+        current = _current_schema_heads()
+    except Exception as exc:
+        raise SchemaNotReadyError(f"cannot inspect metadata schema: {exc}") from exc
+    if current != (expected,):
+        found = ", ".join(current) if current else "unversioned"
+        raise SchemaNotReadyError(
+            f"metadata schema is not at required Alembic head {expected!r} (current: {found}); "
+            "run 'dataplay migrate' as a one-shot release step before starting services")
+    return expected
+
+
+def _sqlite_file_lock_path() -> str | None:
+    """Canonical cross-process migration lock for a file-backed SQLite URL.
+
+    The key follows the real resolved database path, not the spelling of ``DP_DATABASE_URL``. That
+    makes relative paths, symlinked workspace paths, and SQLite ``file:`` URI forms converge on the
+    same lock. Process-local temporary and memory databases deliberately return ``None``.
+    """
+    if not _is_sqlite_database() or _sqlite_is_memory_or_temporary():
+        return None
+    database = _database_url().database
+    if database is None:
+        return None
+    query = {str(key).lower(): str(value).lower() for key, value in _database_url().query.items()}
+    uri = query.get("uri") in ("1", "true", "yes", "on") and database.startswith("file:")
+    if uri:
+        uri = urlsplit(database)
+        if uri.netloc not in ("", "localhost"):
+            raise SchemaNotReadyError(
+                f"unsupported SQLite file URI authority {uri.netloc!r}; use a local file path")
+        database = unquote(uri.path)
+    path = Path(database).expanduser().resolve(strict=False)
+    return f"{path}.migrate.lock"
+
+
+@contextlib.contextmanager
+def _sqlite_migration_guard():
+    lock_path = _sqlite_file_lock_path()
+    if lock_path is None:
+        with _sqlite_memory_migration_lock:
+            yield
+        return
+
+    from filelock import FileLock, Timeout
+
+    lock = FileLock(lock_path, timeout=120)
+    try:
+        with lock:
+            yield
+    except Timeout as exc:
+        raise SchemaNotReadyError(
+            f"timed out waiting for SQLite metadata migration lock {lock_path!r}") from exc
+
+
+def _bootstrap_metadata() -> None:
+    """Seed first-run control-plane data. Call only from the serialized migration path."""
+    from hub import auth
+
+    bootstrap = auth.bootstrap_password()
     with session() as s:
         u = s.get(User, DEFAULT_USER_ID)
         if u is None:
-            u = User(id=DEFAULT_USER_ID, name="Local", is_admin=True)  # the seeded/bootstrap user is the admin
+            u = User(id=DEFAULT_USER_ID, name="Local", is_admin=True)
             s.add(u)
         elif not u.is_admin and s.query(User).filter(User.is_admin).count() == 0:
-            u.is_admin = True  # no admin exists yet (upgraded DB) → the default user becomes admin
-        # bootstrap: seed the default user's credential from DP_AUTH_PASSWORD (once) so an existing
-        # shared-password deployment keeps working after upgrading to per-user auth
-        from hub import auth
-        bootstrap = auth.bootstrap_password()
-        if auth.auth_enabled() and not u.password_hash and bootstrap:
+            u.is_admin = True
+        if os.environ.get("DP_AUTH_SECRET", "").strip() and not u.password_hash and bootstrap:
             u.password_hash = auth.hash_password(bootstrap)
-    # The cleartext value is bootstrap input, not runtime configuration. Consume it after the DB commit
-    # whether or not this restart needed to seed a hash, so no subsequently spawned workload inherits it.
+        if os.environ.get("DP_AUTH_SECRET", "").strip():
+            login_capable_admin = s.query(User).filter(
+                User.is_admin.is_(True),
+                User.password_hash.is_not(None),
+                User.password_hash != "",
+            ).first()
+            if login_capable_admin is None:
+                raise SchemaNotReadyError(
+                    "session auth is enabled but no administrator has a login credential; provide "
+                    "DP_AUTH_PASSWORD to the one-shot 'dataplay migrate' command for first bootstrap")
+    # The cleartext value is one-shot migration input. Never let a subsequently spawned workload
+    # inherit it after the bootstrap transaction commits.
     if bootstrap:
         os.environ.pop("DP_AUTH_PASSWORD", None)
+
+
+def _validate_migration_auth_inputs() -> None:
+    """Reject bootstrap input that cannot produce a usable, securely signed login."""
+    from hub import auth
+
+    raw_secret = os.environ.get("DP_AUTH_SECRET")
+    if raw_secret is not None and not raw_secret.strip():
+        raise SchemaNotReadyError("DP_AUTH_SECRET is configured but blank")
+    if raw_secret is not None:
+        try:
+            auth.reject_weak_secret()
+        except RuntimeError as exc:
+            raise SchemaNotReadyError(str(exc)) from exc
+    if auth.bootstrap_password() and raw_secret is None:
+        raise SchemaNotReadyError(
+            "DP_AUTH_PASSWORD requires a non-empty DP_AUTH_SECRET; refusing to discard a bootstrap "
+            "password while session auth is disabled")
+
+
+def _require_login_capable_admin() -> None:
+    """Fail closed when real session auth has no administrator who can log in."""
+    raw_secret = os.environ.get("DP_AUTH_SECRET")
+    if raw_secret is None:
+        return
+    if not raw_secret.strip():
+        raise SchemaNotReadyError("DP_AUTH_SECRET is configured but blank")
+    with session() as s:
+        login_capable_admin = s.query(User).filter(
+            User.is_admin.is_(True),
+            User.password_hash.is_not(None),
+            User.password_hash != "",
+        ).first()
+    if login_capable_admin is None:
+        raise SchemaNotReadyError(
+            "session auth is enabled but no administrator has a login credential; run 'dataplay "
+            "migrate' with DP_AUTH_PASSWORD to bootstrap the first administrator")
+
+
+def _upgrade_schema_and_bootstrap() -> str:
+    """Run the explicit migration contract on the current database connection."""
+    from alembic import command
+    from sqlalchemy import inspect
+
+    expected = expected_schema_head()
+    with engine().connect() as connection:
+        current = _current_schema_heads(connection)
+        names = set(inspect(connection).get_table_names())
+        if not current and names:
+            raise SchemaNotReadyError(
+                "refusing to migrate a non-empty metadata database without a valid Alembic "
+                "revision; restore a versioned backup or migrate it with an audited conversion")
+        if current != (expected,):
+            # The inspection queries opened an implicit transaction. End it before Alembic owns the
+            # connection's migration transaction.
+            connection.rollback()
+            try:
+                command.upgrade(_alembic_cfg(connection), expected)
+            except Exception as exc:
+                raise SchemaNotReadyError(f"metadata migration failed: {exc}") from exc
+            current = _current_schema_heads(connection)
+            if current != (expected,):
+                found = ", ".join(current) if current else "unversioned"
+                raise SchemaNotReadyError(
+                    f"metadata migration did not reach required head {expected!r} (current: {found})")
+    _bootstrap_metadata()
+    return expected
+
+
+def migrate_db() -> str:
+    """Upgrade metadata explicitly and run bootstrap data writes.
+
+    File-backed SQLite is serialized across processes by a canonical file lock. Production databases
+    intentionally have no application-level process lock: operators run this as one stopped-service,
+    one-shot release step.
+    """
+    _validate_migration_auth_inputs()
+    if _is_sqlite_database():
+        with _sqlite_migration_guard():
+            return _upgrade_schema_and_bootstrap()
+    return _upgrade_schema_and_bootstrap()
+
+
+def init_db() -> None:
+    """Prepare metadata for a service process without unsafe production DDL.
+
+    Local SQLite keeps the zero-config behavior, but migrations and bootstrap are serialized. Any
+    non-SQLite deployment is immutable at service startup: it must already be at the exact unique
+    Alembic head produced by ``dataplay migrate``.
+    """
+    if _is_sqlite_database():
+        migrate_db()
+    else:
+        require_schema_at_head()
+        from hub import auth
+        if auth.bootstrap_password():
+            raise SchemaNotReadyError(
+                "DP_AUTH_PASSWORD is accepted only by the one-shot 'dataplay migrate' command; "
+                "remove it from the service environment")
+        _require_login_capable_admin()
     reap_kernels()        # drop leases whose kernel is dead (stale heartbeat)
     reap_orphaned_runs()  # fail in-flight runs whose owning kernel is gone; live-kernel runs survive (reattach)
 

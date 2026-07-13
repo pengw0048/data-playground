@@ -67,7 +67,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata: { name: dp-hub, namespace: dp }
 spec:
-  replicas: 1
+  # Release contract: keep metadata writers stopped until the one-shot migration Job succeeds.
+  # deploy/verify-pod-substrate.sh scales this to one after that gate.
+  replicas: 0
   selector: { matchLabels: { app: dp-hub } }
   template:
     metadata: { labels: { app: dp-hub } }
@@ -90,9 +92,10 @@ spec:
             - { name: DP_WORKSPACE, value: "/data" }
           ports: [{ containerPort: 8471 }]
           readinessProbe:
-            httpGet: { path: /api/health, port: 8471 }
+            httpGet: { path: /api/readyz, port: 8471 }
             initialDelaySeconds: 5
             periodSeconds: 3
+            timeoutSeconds: 10
 ---
 apiVersion: v1
 kind: Service

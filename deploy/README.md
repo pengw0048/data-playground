@@ -18,6 +18,30 @@ a per-canvas kernel Pod, the run completed on it, and "restart kernel" tore the 
 a local, disposable cluster (its own kube-context) and never touches your other contexts. `KEEP=1` leaves
 the cluster up for poking; otherwise it self-tears-down.
 
+## Metadata migration release step
+
+Postgres-backed services never run schema DDL at startup. Before deploying a new hub/kernel image:
+
+1. Stop **every** process that can write metadata: hub replicas, per-canvas kernel Pods, MCP servers,
+   headless runs, and any external worker using the same database. Wait until they have actually exited;
+   scaling a Deployment is asynchronous.
+2. Run exactly one `dataplay migrate` process using the new release image and the normal
+   `DP_DATABASE_URL`. Supply `DP_AUTH_SECRET` and the one-time `DP_AUTH_PASSWORD` here when bootstrapping
+   the first admin; do not put `DP_AUTH_PASSWORD` in the application Deployment.
+3. Start the new application replicas. Server, MCP, headless, and kernel processes fail closed unless
+   the database is already at the build's exact Alembic head; `/api/readyz` reports the same check.
+
+`k8s/migrate-job.yaml` is a reference pre-deploy Job. Give each real release Job a unique name (or
+delete the completed reference Job before reapplying it), wait for it to complete, and only then roll
+out the application. `k8s/pod-substrate.yaml` intentionally keeps the hub at zero replicas; the
+verification script runs the Job and scales the hub to one only after it succeeds. Keep migration a
+release-level Job, not a per-Pod initContainer: replicas must not race to migrate the same database.
+The reference script can prove this ordering inside its disposable kind cluster, but an operator must
+still stop MCP/headless/external writers that are outside that cluster. Local file-backed SQLite remains
+zero-config and serializes automatic first-run migration with a lock derived from the resolved database
+file path. A non-empty database without a recognized Alembic revision is rejected rather than guessed or
+auto-stamped; recover it from a versioned backup or perform an explicit, audited conversion.
+
 ## What the pieces are
 
 - `k8s/pod-substrate.yaml` — Namespace, Postgres (the shared metadata DB), RBAC (the hub's ServiceAccount
