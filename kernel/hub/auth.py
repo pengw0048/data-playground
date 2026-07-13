@@ -27,11 +27,22 @@ def _secret() -> str:
     return os.environ.get("DP_AUTH_SECRET", "")
 
 
+def _signing_secret() -> str | None:
+    """The configured session-signing secret, or None when it is absent/blank.
+
+    ``DP_AUTH_MODE`` is deliberately not considered here. It is a confinement marker inherited by
+    workload children after the hub strips its signing secret; treating that marker as key material
+    would turn an empty, publicly-known HMAC key into a valid authenticator.
+    """
+    secret = _secret()
+    return secret if secret.strip() else None
+
+
 def auth_enabled() -> bool:
     # DP_AUTH_MODE is an internal marker the kernel spawner sets so a kernel CHILD knows it is in
     # auth/production mode (→ turns on the DuckDB FS sandbox + local-path confinement) WITHOUT carrying
     # the forgeable signing secret's value. It is NEVER used as crypto material (see _secret/sign/verify).
-    return bool(_secret()) or os.environ.get("DP_AUTH_MODE") == "1"
+    return _signing_secret() is not None or os.environ.get("DP_AUTH_MODE") == "1"
 
 
 # Known-weak defaults that must never guard real sessions — the secret is public (repo/docs), so a
@@ -40,14 +51,23 @@ _WEAK_SECRETS = {"change-me-in-production", "changeme", "secret", "dev", "test"}
 
 
 def reject_weak_secret() -> None:
-    if _secret().strip() in _WEAK_SECRETS:
+    secret = _signing_secret()
+    if secret is None and os.environ.get("DP_AUTH_MODE") == "1":
+        raise RuntimeError(
+            "authentication was explicitly configured but cannot authenticate hub sessions without "
+            "a non-empty DP_AUTH_SECRET. Set a real random secret on the hub; workload children keep "
+            "DP_AUTH_MODE but intentionally do not receive the signing secret.")
+    if secret is not None and secret.strip() in _WEAK_SECRETS:
         raise RuntimeError(
             "DP_AUTH_SECRET is a known-weak/default value — sessions signed with it are forgeable. "
             "Set a real random secret, e.g. `openssl rand -hex 32`.")
 
 
 def _mac(payload: str) -> str:
-    return hmac.new(_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+    secret = _signing_secret()
+    if secret is None:
+        raise RuntimeError("cannot sign a session without a non-empty DP_AUTH_SECRET")
+    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
 def sign(user_id: str, now: int | None = None) -> str:
@@ -55,6 +75,8 @@ def sign(user_id: str, now: int | None = None) -> str:
     DP_AUTH_SECRET. `epoch` is the user's session epoch at sign time; verify rejects the token once the
     stored epoch moves past it (password change / disable / delete), so revocation is immediate rather
     than waiting out the TTL."""
+    if _signing_secret() is None:
+        raise RuntimeError("cannot sign a session without a non-empty DP_AUTH_SECRET")
     from hub import metadb  # function-local: metadb imports auth (avoid an import cycle)
     epoch = metadb.user_token_epoch(user_id) or 0
     exp = (now if now is not None else int(time.time())) + _TTL_SECONDS
@@ -66,7 +88,9 @@ def verify(token: str | None) -> str | None:
     """Return the user id iff the token's signature is valid, not expired, AND its epoch still matches
     the user's current epoch (not revoked), else None. (Legacy 3-part tokens no longer verify → a
     one-time re-login after this ships.)"""
-    if not token:
+    # Fail closed before computing a MAC. HMAC with b"" is well-defined and therefore forgeable by
+    # anyone; DP_AUTH_MODE is only a child-workload confinement signal, never a substitute key.
+    if _signing_secret() is None or not token:
         return None
     parts = token.split(".")
     if len(parts) != 4:
