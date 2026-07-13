@@ -30,6 +30,8 @@ import time
 from dataclasses import dataclass
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -189,6 +191,19 @@ async def _lifespan(_app):
 
 
 app = FastAPI(title="Data Playground kernel", version="0.1.0", lifespan=_lifespan)
+_SENSITIVE_AUTH_BODY_PATHS = frozenset(("/api/auth/login", "/api/auth/password", "/api/users"))
+
+
+@app.exception_handler(RequestValidationError)
+async def _safe_auth_validation_error(request: Request, exc: RequestValidationError):
+    # FastAPI's default validation response includes rejected input. Never echo a password, and never
+    # ask the JSON encoder to serialize an unpaired surrogate from an attacker-controlled auth body.
+    # Other routes retain FastAPI's useful field-level diagnostics.
+    if request.url.path in _SENSITIVE_AUTH_BODY_PATHS:
+        return JSONResponse({"detail": "invalid authentication request body"}, status_code=422)
+    return await request_validation_exception_handler(request, exc)
+
+
 # Restrict CORS to localhost origins only. The kernel binds to 127.0.0.1 and serves the SPA
 # same-origin (and the Vite dev server proxies /api), so a wildcard is unnecessary — and a
 # wildcard would let any site the user visits read this local API cross-origin (data exfiltration).
