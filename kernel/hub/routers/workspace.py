@@ -17,7 +17,7 @@ from sqlalchemy import select as _sa_select
 
 from hub import auth, metadb
 from hub.models import RunStatus
-from hub.security import current_user
+from hub.security import RequestIdentity, current_identity, current_user
 
 router = APIRouter()
 public_router = APIRouter()
@@ -36,26 +36,44 @@ def auth_login(body: dict, response: Response) -> dict:
     uid = body.get("userId") or ""
     # PER-USER: the password must match THIS user's own credential — knowing the instance/bootstrap
     # password no longer lets you sign in as someone else
-    if not uid or not auth.verify_password(body.get("password", ""), metadb.user_password_hash(uid)):
+    snapshot = metadb.user_auth_snapshot(uid) if uid else None
+    if snapshot is None:
+        raise HTTPException(401, "invalid user or password")
+    password_hash, epoch = snapshot
+    if not auth.verify_password(body.get("password", ""), password_hash):
+        raise HTTPException(401, "invalid user or password")
+    # Scrypt runs without a DB lock. Reconfirm the exact hash+epoch snapshot afterwards, then sign
+    # that original epoch: a concurrent rotation either fails this check or invalidates the old token.
+    if not metadb.user_auth_snapshot_matches(uid, password_hash, epoch):
         raise HTTPException(401, "invalid user or password")
     # Secure flag opt-in for HTTPS deployments (default off so internal http installs still work)
-    response.set_cookie("dp_session", auth.sign(uid), httponly=True, samesite="lax",
+    response.set_cookie("dp_session", auth.sign_at_epoch(uid, epoch), httponly=True, samesite="lax",
                         secure=bool(os.environ.get("DP_AUTH_SECURE_COOKIE")))
     return {"ok": True, "userId": uid}
 
 
 @router.post("/auth/password")
-def change_password(body: dict, response: Response, uid: str = Depends(current_user)) -> dict:
+def change_password(body: dict, response: Response,
+                    identity: RequestIdentity = Depends(current_identity)) -> dict:
     """Set/rotate the CURRENT user's password. If one is already set, the old password must match."""
-    current = metadb.user_password_hash(uid)
-    if current and not auth.verify_password(body.get("oldPassword", ""), current):
+    uid = identity.user_id
+    snapshot = metadb.user_auth_snapshot(uid)
+    if snapshot is None:
+        raise HTTPException(409, "password was changed concurrently; sign in again")
+    current, snapshot_epoch = snapshot
+    if current is not None and not auth.verify_password(body.get("oldPassword", ""), current):
         raise HTTPException(403, "current password is incorrect")
     new = body.get("newPassword") or ""
     if len(new) < 6:
         raise HTTPException(400, "password must be at least 6 characters")
-    metadb.set_user_password(uid, auth.hash_password(new))  # bumps the token epoch → revokes OTHER sessions
+    # Both scrypt operations stay outside the DB transaction. The conditional update then proves that
+    # the exact hash and admitted token epoch are still current, replaces the hash, and bumps the epoch.
+    admission_epoch = identity.session_epoch if identity.session_epoch is not None else snapshot_epoch
+    epoch = metadb.compare_and_set_user_password(uid, current, admission_epoch, auth.hash_password(new))
+    if epoch is None:
+        raise HTTPException(409, "password was changed concurrently; sign in again")
     if auth.auth_enabled():  # re-issue THIS session's cookie at the new epoch so the caller isn't logged out
-        response.set_cookie("dp_session", auth.sign(uid), httponly=True, samesite="lax",
+        response.set_cookie("dp_session", auth.sign_at_epoch(uid, epoch), httponly=True, samesite="lax",
                             secure=bool(os.environ.get("DP_AUTH_SECURE_COOKIE")))
     return {"ok": True}
 
@@ -354,4 +372,3 @@ def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
             value = {**value, **{k: stored.get(k) for k in _SECRET_SUBKEYS if value.get(k) == _REDACTED}}
     metadb.set_setting(body.key, value, scope=body.scope, scope_id=scope_id)
     return {"ok": True}
-

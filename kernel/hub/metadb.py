@@ -427,20 +427,65 @@ def resolve_user(user_id: str | None) -> str:
         return DEFAULT_USER_ID
 
 
-def user_password_hash(user_id: str) -> str | None:
+def user_auth_snapshot(user_id: str) -> tuple[str | None, int] | None:
+    """Read the credential hash and session epoch from one database snapshot."""
     with session() as s:
-        u = s.get(User, user_id)
-        return u.password_hash if u else None
+        row = s.execute(
+            select(User.password_hash, User.token_epoch).where(User.id == user_id)
+        ).one_or_none()
+        return (row.password_hash, row.token_epoch or 0) if row is not None else None
+
+
+def user_password_hash(user_id: str) -> str | None:
+    snapshot = user_auth_snapshot(user_id)
+    return snapshot[0] if snapshot is not None else None
+
+
+def user_auth_snapshot_matches(user_id: str, expected_hash: str | None, expected_epoch: int) -> bool:
+    """Confirm that an earlier credential snapshot is still current without holding a scrypt lock."""
+    expected_password = (
+        User.password_hash.is_(None) if expected_hash is None else User.password_hash == expected_hash
+    )
+    with session() as s:
+        return s.scalar(
+            select(User.id).where(
+                User.id == user_id,
+                expected_password,
+                User.token_epoch == expected_epoch,
+            )
+        ) is not None
 
 
 def set_user_password(user_id: str, pw_hash: str | None) -> bool:
+    """Unconditionally set a credential for explicit provisioning/admin use."""
+    stmt = (
+        update(User)
+        .where(User.id == user_id)
+        .values(password_hash=pw_hash, token_epoch=func.coalesce(User.token_epoch, 0) + 1)
+        .returning(User.id)
+    )
     with session() as s:
-        u = s.get(User, user_id)
-        if u is None:
-            return False
-        u.password_hash = pw_hash
-        u.token_epoch = (u.token_epoch or 0) + 1  # revoke every outstanding session on a password change
-        return True
+        return s.scalar(stmt) is not None
+
+
+def compare_and_set_user_password(user_id: str, expected_hash: str | None, expected_epoch: int,
+                                  pw_hash: str) -> int | None:
+    """Rotate a credential only if its exact previously verified value is still current.
+
+    The hash and admission epoch conditions, replacement, and epoch increment are one database
+    statement. This keeps request-level scrypt work outside the transaction while making concurrent
+    rotation semantics identical on SQLite and PostgreSQL. Return the winning epoch, or ``None`` for a
+    stale/revoked/missing user.
+    """
+    expected = User.password_hash.is_(None) if expected_hash is None else User.password_hash == expected_hash
+    stmt = (
+        update(User)
+        .where(User.id == user_id, expected, User.token_epoch == expected_epoch)
+        .values(password_hash=pw_hash, token_epoch=func.coalesce(User.token_epoch, 0) + 1)
+        .returning(User.token_epoch)
+    )
+    with session() as s:
+        return s.scalar(stmt)
 
 
 def user_token_epoch(user_id: str) -> int | None:
@@ -454,9 +499,11 @@ def user_token_epoch(user_id: str) -> int | None:
 def bump_token_epoch(user_id: str) -> None:
     """Invalidate all outstanding sessions for a user (call on disable / delete / forced logout)."""
     with session() as s:
-        u = s.get(User, user_id)
-        if u is not None:
-            u.token_epoch = (u.token_epoch or 0) + 1
+        s.execute(
+            update(User)
+            .where(User.id == user_id)
+            .values(token_epoch=func.coalesce(User.token_epoch, 0) + 1)
+        )
 
 
 def get_setting(key: str, scope: str = "global", scope_id: str = "", default=None):

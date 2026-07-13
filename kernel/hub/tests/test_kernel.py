@@ -2376,7 +2376,7 @@ def test_authenticated_principal_deletion_never_falls_back_to_local_admin(monkey
     from fastapi import HTTPException
 
     from hub import auth, metadb
-    from hub.security import current_user
+    from hub.security import current_identity
 
     monkeypatch.setenv("DP_AUTH_SECRET", "strict-principal-secret")
     monkeypatch.delenv("DP_AUTH_MODE", raising=False)
@@ -2388,19 +2388,20 @@ def test_authenticated_principal_deletion_never_falls_back_to_local_admin(monkey
     with metadb.session() as s:
         s.add(metadb.User(id=uid, name="Deleted during auth"))
     token = auth.sign(uid)
-    original_verify = auth.verify
+    original_verify = auth.verify_claims
 
     def verify_then_delete(candidate):
-        verified = original_verify(candidate)
+        claims = original_verify(candidate)
+        assert claims is not None
         with metadb.session() as s:
-            user = s.get(metadb.User, verified)
+            user = s.get(metadb.User, claims.user_id)
             if user is not None:
                 s.delete(user)
-        return verified
+        return claims
 
-    monkeypatch.setattr(auth, "verify", verify_then_delete)
+    monkeypatch.setattr(auth, "verify_claims", verify_then_delete)
     with pytest.raises(HTTPException) as exc:
-        current_user(x_dp_user=None, dp_session=token)
+        current_identity(x_dp_user=None, dp_session=token)
     assert exc.value.status_code == 401
     assert metadb.user_token_epoch("local") is not None  # the fallback admin still exists but was not selected
 
@@ -4898,6 +4899,319 @@ def test_change_password_keeps_the_acting_session(monkeypatch):
         assert client.get("/api/canvas").status_code == 200                       # NOT logged out (cookie re-issued)
     finally:
         client.cookies.clear()
+
+
+def test_password_compare_and_set_handles_unset_and_stale_credentials():
+    from hub import auth, metadb
+    from hub.metadb import User, session
+
+    uid = "password_cas_unset"
+    with session() as s:
+        s.add(User(id=uid, name="Unset CAS", password_hash=None, token_epoch=7))
+
+    first_hash = auth.hash_password("first-password")
+    assert metadb.compare_and_set_user_password(uid, None, 7, first_hash) == 8
+    assert metadb.compare_and_set_user_password(uid, None, 8, auth.hash_password("stale-password")) is None
+    with session() as s:
+        user = s.get(User, uid)
+        assert user.password_hash == first_hash
+        assert user.token_epoch == 8
+
+
+def test_verify_password_rejects_noncanonical_or_wrong_length_encodings():
+    import base64
+
+    from hub import auth
+
+    password = "strict-password"
+    valid = auth.hash_password(password)
+    prefix, salt_b64, hash_b64 = valid.split("$")
+    salt = base64.b64decode(salt_b64)
+    derived = base64.b64decode(hash_b64)
+    malformed = [
+        f"{prefix}${salt_b64}!${hash_b64}",
+        f"{prefix}${salt_b64}${hash_b64}!",
+        f"{prefix}${salt_b64}=${hash_b64}",
+        f"{prefix}${base64.b64encode(salt[:-1]).decode()}${hash_b64}",
+        f"{prefix}${base64.b64encode(salt + b'x').decode()}${hash_b64}",
+        f"{prefix}${salt_b64}${base64.b64encode(derived[:-1]).decode()}",
+        f"{prefix}${salt_b64}${base64.b64encode(derived + b'x').decode()}",
+        f"{valid}$trailing-field",
+    ]
+    assert auth.verify_password(password, valid)
+    assert all(not auth.verify_password(password, candidate) for candidate in malformed)
+
+
+def test_concurrent_session_epoch_bumps_are_not_lost():
+    import concurrent.futures
+    import threading
+
+    from hub import metadb
+    from hub.metadb import User, session
+
+    uid = "password_epoch_bump_race"
+    with session() as s:
+        s.add(User(id=uid, name="Epoch Bump", token_epoch=20))
+    start = threading.Barrier(2)
+
+    def bump(_index):
+        start.wait(timeout=10)
+        metadb.bump_token_epoch(uid)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(bump, range(2)))
+    assert metadb.user_token_epoch(uid) == 22
+
+
+def test_concurrent_password_changes_exactly_one_wins(monkeypatch):
+    import concurrent.futures
+    import threading
+
+    from hub import auth
+    from hub.metadb import User, session
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "password-cas-secret")
+    uid = "password_cas_race"
+    old_hash = auth.hash_password("old-password")
+    with session() as s:
+        s.add(User(id=uid, name="Password CAS", password_hash=old_hash, token_epoch=11))
+    session_token = auth.sign(uid)
+
+    # Both requests must finish verifying the exact same old hash before either reaches the CAS.
+    # The database conditional update, not request timing or a Python lock, decides the winner.
+    verified = threading.Barrier(2)
+    real_verify_password = auth.verify_password
+
+    def verify_together(password, stored):
+        valid = real_verify_password(password, stored)
+        if stored == old_hash:
+            verified.wait(timeout=10)
+        return valid
+
+    monkeypatch.setattr(auth, "verify_password", verify_together)
+    passwords = ("winner-candidate-a", "winner-candidate-b")
+    clients = (TestClient(app), TestClient(app))
+
+    def rotate(index):
+        response = clients[index].post(
+            "/api/auth/password",
+            json={"oldPassword": "old-password", "newPassword": passwords[index]},
+            headers={"Cookie": f"dp_session={session_token}"},
+        )
+        return passwords[index], response
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = dict(pool.map(rotate, range(2)))
+    finally:
+        for request_client in clients:
+            request_client.close()
+
+    winners = [(password, response) for password, response in results.items() if response.status_code == 200]
+    losers = [(password, response) for password, response in results.items() if response.status_code == 409]
+    assert len(winners) == len(losers) == 1
+    winner_password, winner_response = winners[0]
+    loser_password, loser_response = losers[0]
+    assert loser_response.json()["detail"] == "password was changed concurrently; sign in again"
+    assert "set-cookie" not in loser_response.headers
+    assert winner_response.cookies.get("dp_session")
+
+    with session() as s:
+        user = s.get(User, uid)
+        assert user.token_epoch == 12
+        assert auth.verify_password(winner_password, user.password_hash)
+        assert not auth.verify_password(loser_password, user.password_hash)
+    assert auth.verify(winner_response.cookies.get("dp_session")) == uid
+
+
+def test_revoked_inflight_password_change_cannot_resurrect_session(monkeypatch):
+    import concurrent.futures
+    import threading
+
+    from fastapi import Depends
+
+    from hub import auth, metadb
+    from hub.metadb import User, session
+    from hub.security import RequestIdentity, current_identity, current_user
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "password-admission-secret")
+    uid = "password_admission_epoch"
+    old_hash = auth.hash_password("old-password")
+    with session() as s:
+        s.add(User(id=uid, name="Admission Epoch", password_hash=old_hash, token_epoch=30))
+    session_token = auth.sign(uid)
+    claims = auth.verify_claims(session_token)
+    assert claims is not None and claims.user_id == uid and claims.epoch == 30
+
+    request_admitted = threading.Event()
+    resume_request = threading.Event()
+
+    def pause_after_admission(identity: RequestIdentity = Depends(current_identity)):
+        request_admitted.set()
+        assert resume_request.wait(timeout=10)
+        return identity.user_id
+
+    # Override the global gate itself. Its current_identity subdependency has already verified and
+    # cached the signed epoch when this pauses; the password route must consume that exact identity.
+    app.dependency_overrides[current_user] = pause_after_admission
+    request_client = TestClient(app)
+
+    def rotate():
+        return request_client.post(
+            "/api/auth/password",
+            json={"oldPassword": "old-password", "newPassword": "resurrected-password"},
+            headers={"Cookie": f"dp_session={session_token}"},
+        )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(rotate)
+            try:
+                assert request_admitted.wait(timeout=10)
+                metadb.bump_token_epoch(uid)
+            finally:
+                resume_request.set()
+            response = pending.result(timeout=10)
+    finally:
+        app.dependency_overrides.pop(current_user, None)
+        request_client.close()
+
+    assert response.status_code == 409
+    assert "set-cookie" not in response.headers
+    with session() as s:
+        user = s.get(User, uid)
+        assert user.token_epoch == 31
+        assert user.password_hash == old_hash
+
+
+def test_old_password_login_fails_if_credential_rotates_after_verification(monkeypatch):
+    import concurrent.futures
+    import threading
+
+    from hub import auth, metadb
+    from hub.metadb import User, session
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "login-snapshot-secret")
+    uid = "login_snapshot_race"
+    old_hash = auth.hash_password("old-password")
+    new_hash = auth.hash_password("new-password")
+    with session() as s:
+        s.add(User(id=uid, name="Login Snapshot", password_hash=old_hash, token_epoch=40))
+
+    password_verified = threading.Event()
+    resume_login = threading.Event()
+    real_verify_password = auth.verify_password
+
+    def pause_after_verification(password, stored):
+        valid = real_verify_password(password, stored)
+        if password == "old-password" and stored == old_hash:
+            password_verified.set()
+            assert resume_login.wait(timeout=10)
+        return valid
+
+    monkeypatch.setattr(auth, "verify_password", pause_after_verification)
+    request_client = TestClient(app)
+
+    def login():
+        return request_client.post(
+            "/api/auth/login",
+            json={"userId": uid, "password": "old-password"},
+        )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(login)
+            try:
+                assert password_verified.wait(timeout=10)
+                assert metadb.compare_and_set_user_password(uid, old_hash, 40, new_hash) == 41
+            finally:
+                resume_login.set()
+            response = pending.result(timeout=10)
+    finally:
+        request_client.close()
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid user or password"
+    assert "set-cookie" not in response.headers
+    with session() as s:
+        user = s.get(User, uid)
+        assert user.token_epoch == 41
+        assert user.password_hash == new_hash
+
+
+def test_login_cookie_cannot_catch_up_to_rotation_after_snapshot_confirmation(monkeypatch):
+    from hub import auth, metadb
+    from hub.metadb import User, session
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "login-signing-epoch-secret")
+    uid = "login_signing_epoch"
+    old_hash = auth.hash_password("old-password")
+    new_hash = auth.hash_password("new-password")
+    with session() as s:
+        s.add(User(id=uid, name="Login Signing Epoch", password_hash=old_hash, token_epoch=45))
+
+    signed_epochs = []
+    real_sign_at_epoch = auth.sign_at_epoch
+
+    def rotate_before_sign(user_id, epoch, now=None):
+        signed_epochs.append(epoch)
+        assert metadb.compare_and_set_user_password(user_id, old_hash, 45, new_hash) == 46
+        return real_sign_at_epoch(user_id, epoch, now)
+
+    monkeypatch.setattr(auth, "sign_at_epoch", rotate_before_sign)
+    request_client = TestClient(app)
+    try:
+        response = request_client.post(
+            "/api/auth/login",
+            json={"userId": uid, "password": "old-password"},
+        )
+    finally:
+        request_client.close()
+
+    issued = response.cookies.get("dp_session")
+    assert response.status_code == 200
+    assert signed_epochs == [45]
+    assert issued and issued.split(".")[1] == "45"
+    assert metadb.user_token_epoch(uid) == 46
+    assert auth.verify(issued) is None
+
+
+def test_password_change_cookie_cannot_catch_up_to_a_later_revocation(monkeypatch):
+    from hub import auth, metadb
+    from hub.metadb import User, session
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "password-epoch-secret")
+    uid = "password_cas_epoch"
+    with session() as s:
+        s.add(User(id=uid, name="Password Epoch", password_hash=auth.hash_password("old-password"),
+                   token_epoch=4))
+    session_token = auth.sign(uid)
+
+    signed_epochs = []
+    real_sign_at_epoch = auth.sign_at_epoch
+
+    def revoke_before_sign(user_id, epoch, now=None):
+        signed_epochs.append(epoch)
+        metadb.bump_token_epoch(user_id)
+        return real_sign_at_epoch(user_id, epoch, now)
+
+    monkeypatch.setattr(auth, "sign_at_epoch", revoke_before_sign)
+    request_client = TestClient(app)
+    try:
+        response = request_client.post(
+            "/api/auth/password",
+            json={"oldPassword": "old-password", "newPassword": "new-password"},
+            headers={"Cookie": f"dp_session={session_token}"},
+        )
+    finally:
+        request_client.close()
+
+    assert response.status_code == 200
+    issued = response.cookies.get("dp_session")
+    assert signed_epochs == [5]
+    assert issued and issued.split(".")[1] == "5"
+    assert metadb.user_token_epoch(uid) == 6
+    assert auth.verify(issued) is None
 
 
 def test_signed_session_auth(monkeypatch):
