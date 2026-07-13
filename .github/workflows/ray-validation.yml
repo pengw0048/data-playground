@@ -41,11 +41,19 @@ concurrency:
 
 jobs:
   multi-node-differential:
-    name: Ray (multi-node differential and controls)
+    name: Ray (${{ matrix.scenario }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        scenario:
+          - clean-and-degraded
+          - default-shuffle
+          - fault-controls
     env:
-      COMPOSE_PROJECT_NAME: dp-ray-${{ github.run_id }}-${{ github.run_attempt }}
+      COMPOSE_PROJECT_NAME: dp-ray-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.scenario }}
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -83,11 +91,13 @@ jobs:
           echo "Ray head and two workers registered."
 
       - name: Require a clean distributed PASS
+        if: matrix.scenario == 'clean-and-degraded'
         run: |
           set -o pipefail
           DP_MULTINODE_FAULT= docker compose -f docker-compose.ray.yml run --rm --no-deps driver 2>&1 | tee ray-diagnostics/clean.log
 
       - name: Require the default shuffle-partition path
+        if: matrix.scenario == 'default-shuffle'
         run: |
           set -o pipefail
           docker compose -f docker-compose.ray.yml run --rm --no-deps \
@@ -95,8 +105,14 @@ jobs:
             | tee ray-diagnostics/default-shuffle.log
 
       - name: Require every fault control to fail
+        if: matrix.scenario == 'fault-controls'
         run: |
           for fault in schema rows join; do
+            case "$fault" in
+              schema) expected="FAIL: cluster aggregate SCHEMA != DuckDB" ;;
+              rows) expected="FAIL: cluster aggregate != DuckDB" ;;
+              join) expected="FAIL: cluster broadcast join != DuckDB" ;;
+            esac
             set +e
             DP_MULTINODE_FAULT="$fault" docker compose -f docker-compose.ray.yml run --rm --no-deps driver 2>&1 | tee "ray-diagnostics/fault-$fault.log"
             rc=${PIPESTATUS[0]}
@@ -105,10 +121,15 @@ jobs:
               echo "Fault control '$fault' unexpectedly passed; the differential oracle is not trustworthy."
               exit 1
             fi
+            if ! grep -Fq "$expected" "ray-diagnostics/fault-$fault.log"; then
+              echo "Fault control '$fault' failed for the wrong reason; expected marker: $expected"
+              exit 1
+            fi
             echo "Fault control '$fault' failed as required (exit $rc)."
           done
 
       - name: Require a degraded-cluster rerun after one worker stops
+        if: matrix.scenario == 'clean-and-degraded'
         run: |
           set -o pipefail
           workers=$(docker compose -f docker-compose.ray.yml ps -q ray-worker)
@@ -136,7 +157,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ray-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ray-validation-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.scenario }}
           path: ray-diagnostics/
           if-no-files-found: warn
           retention-days: 14
