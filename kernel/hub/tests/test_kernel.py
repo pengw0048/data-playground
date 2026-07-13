@@ -647,7 +647,7 @@ def test_request_body_and_graph_complexity_limits(monkeypatch):
     # (2) oversized code on a node → 422 (body itself well under the byte cap)
     big = {"id": "c", "version": 1, "nodes": [N("t", "transform", {"code": "x" * (MAX_CODE_LEN + 1)})], "edges": []}
     assert client.post("/api/graph/compile", json={"graph": big}).status_code == 422
-    # (3) a body over the byte cap → 413 from the middleware (header-only check)
+    # (3) a body over the byte cap → 413 from the middleware
     monkeypatch.setattr(settings, "max_body_bytes", 200)
     payload = {"graph": {"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": "x" * 500})], "edges": []}}
     assert client.post("/api/graph/compile", json=payload).status_code == 413
