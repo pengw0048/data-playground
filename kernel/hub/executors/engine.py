@@ -26,6 +26,20 @@ from hub.plugins.capabilities import tag_columns
 # nested subqueries a regex cannot. Re-exported so callers + tests keep the `engine.sql_*` names.
 from hub.sqlanalyze import needs_full_input as sql_needs_full_input
 from hub.sqlanalyze import reduces_rows as sql_reduces_rows
+from hub.sqlpolicy import (
+    FragmentKind,
+    SQLPolicyError,
+    bind_input_ctes,
+    identifier,
+    identifier_key,
+    identifier_list,
+    quote_identifier,
+    unique_identifier_names,
+    validate_fragment,
+    validate_identifier_alias,
+    validate_identifier_schema,
+    validate_query,
+)
 
 Relation = duckdb.DuckDBPyRelation
 
@@ -283,31 +297,48 @@ def normalize_how(how: str) -> str:
 
 
 def join_projection(lcols: list, rcols: list, using_keys=()) -> str:
-    """SELECT list for a join: all left columns as-is, right columns renamed with a `_2` suffix where they
-    clash with a left column (no duplicate names). For a USING join the key columns are coalesced (kept
-    once, unqualified) — pass them as `using_keys` so the key comes from the coalesced value (not a."key",
-    which is NULL for a right-only row) and the right's key columns are skipped."""
-    keys = {str(k).strip().strip('"') for k in using_keys}
-    lset = set(lcols)
-    parts = [f'"{c}"' if c in keys else f'a."{c}"' for c in lcols]
-    parts += [f'b."{c}" AS "{c}_2"' if (c in lset and c not in keys) else f'b."{c}"'
-              for c in rcols if c not in keys]
+    """Build a deterministic, unambiguous SELECT list for a join."""
+    lcols = validate_identifier_schema(lcols, label="left join input schema")
+    rcols = validate_identifier_schema(rcols, label="right join input schema")
+    keys = [str(k) for k in using_keys]
+    key_names = [identifier(key, lcols, label="join key") for key in keys]
+    for key in keys:
+        identifier(key, rcols, label="join key")
+    key_folds = {identifier_key(key) for key in key_names}
+
+    parts = [
+        quote_identifier(column)
+        if identifier_key(column) in key_folds else f"a.{quote_identifier(column)}"
+        for column in lcols
+    ]
+    right_columns = [column for column in rcols if identifier_key(column) not in key_folds]
+    right_aliases = unique_identifier_names(right_columns, used=lcols)
+    for column, alias in zip(right_columns, right_aliases, strict=True):
+        expression = f"b.{quote_identifier(column)}"
+        if alias != column:
+            expression += f" AS {quote_identifier(alias)}"
+        parts.append(expression)
     return ", ".join(parts)
 
 
-def join_sql(lcols: list, rcols: list, a: str, b: str, on: str, condition: str, how: str) -> str:
+def join_sql(lcols: list, rcols: list, a: str, b: str, on: str, condition: str, how: str,
+             *, con=None) -> str:
     """The DuckDB join SQL over two views `a`,`b` — the SINGLE source of truth for join semantics + output
     naming, so the single-node engine and the distributed backend (dp_ray) never diverge. `on` = a
     comma-separated USING key list; `condition` = a raw ON expression (a.x = b.y); else a CROSS join."""
     on, cond, how = (on or "").strip(), (condition or "").strip(), normalize_how(how)
+    qa, qb = quote_identifier(a), quote_identifier(b)
     if how == "cross" or (not on and not cond):
-        return f"SELECT {join_projection(lcols, rcols)} FROM {a} AS a CROSS JOIN {b} AS b"
+        return f"SELECT {join_projection(lcols, rcols)} FROM {qa} AS a CROSS JOIN {qb} AS b"
     if cond:
-        return f"SELECT {join_projection(lcols, rcols)} FROM {a} AS a {how.upper()} JOIN {b} AS b ON ({cond})"
-    keylist = [c.strip() for c in on.split(",") if c.strip()]
-    cols = ", ".join(f'"{c}"' for c in keylist)
+        validate_fragment(FragmentKind.JOIN_ON, cond, con=con)
+        return f"SELECT {join_projection(lcols, rcols)} FROM {qa} AS a {how.upper()} JOIN {qb} AS b ON ({cond})"
+    keylist = identifier_list(on, lcols, label="join key")
+    for key in keylist:
+        identifier(key, rcols, label="join key")
+    cols = ", ".join(quote_identifier(c) for c in keylist)
     return (f"SELECT {join_projection(lcols, rcols, using_keys=keylist)} "
-            f"FROM {a} AS a {how.upper()} JOIN {b} AS b USING ({cols})")
+            f"FROM {qa} AS a {how.upper()} JOIN {qb} AS b USING ({cols})")
 
 
 class BuildEngine:
@@ -461,9 +492,15 @@ class BuildEngine:
             return None, None
         ccfg = _cfg(consumer)
         if consumer.type == "filter":
-            return None, ((ccfg.get("predicate") or "").strip() or None)
+            predicate = (ccfg.get("predicate") or "").strip()
+            if predicate:
+                validate_fragment(FragmentKind.PREDICATE, predicate, con=db.conn())
+            return None, (predicate or None)
         if consumer.type == "select":
-            return _plain_columns((ccfg.get("select") or ccfg.get("expr") or "").strip()), None
+            projection = (ccfg.get("select") or ccfg.get("expr") or "").strip()
+            if projection:
+                validate_fragment(FragmentKind.PROJECTION, projection, con=db.conn())
+            return _plain_columns(projection), None
         return None, None
 
     # -- building ---------------------------------------------------------- #
@@ -540,6 +577,8 @@ class BuildEngine:
 
         if t == "filter":
             pred = (cfg.get("predicate") or "").strip()
+            if pred:
+                validate_fragment(FragmentKind.PREDICATE, pred, con=db.conn())
             return parent.filter(pred) if pred else parent
 
         if t == "assert":
@@ -552,17 +591,22 @@ class BuildEngine:
             v = self._view(parent, "as")
             # no predicate → ZERO violations (`WHERE false`, not `return parent`: this port is the VIOLATING
             # rows, so passing the input through would count every row as a violation). WHERE keeps the schema.
+            if pred:
+                validate_fragment(FragmentKind.PREDICATE, pred, con=db.conn())
             violations = db.conn().sql(f"SELECT * FROM {v} WHERE {f'({pred}) IS NOT TRUE' if pred else 'false'}")
             return {"out": violations, "pass": parent}
 
         if t == "select":
             expr = (cfg.get("expr") or "").strip()  # resolver canonicalizes select/expr → 'expr'
+            if expr:
+                validate_fragment(FragmentKind.PROJECTION, expr, con=db.conn())
             return parent.project(expr) if expr else parent
 
         if t == "sort":
             by = (cfg.get("by") or "").strip()
             if not by:
                 return parent
+            validate_fragment(FragmentKind.ORDER_BY, by, con=db.conn())
             # the true top-N is over ALL rows, not a 2000-row prefix — sort the full input in preview
             # too (the preview limit turns it into an efficient top-N)
             src = parent if self.full else self._faithful_inputs(node)[0]
@@ -572,8 +616,10 @@ class BuildEngine:
             on = (cfg.get("on") or "").strip()
             if on:
                 v = self._view(parent, "d")
-                cols = ", ".join(f'"{c.strip()}"' for c in on.split(","))
-                return db.conn().sql(f"SELECT DISTINCT ON ({cols}) * FROM {v}")
+                cols = ", ".join(
+                    quote_identifier(c) for c in identifier_list(on, parent.columns, label="dedup column")
+                )
+                return db.conn().sql(f"SELECT DISTINCT ON ({cols}) * FROM {quote_identifier(v)}")
             return parent.distinct()
 
         if t == "window":
@@ -582,25 +628,36 @@ class BuildEngine:
                 return parent
             part = (cfg.get("partitionBy") or "").strip()
             order = (cfg.get("orderBy") or "").strip()
+            validate_fragment(FragmentKind.WINDOW_EXPR, expr, con=db.conn())
+            if part:
+                validate_fragment(FragmentKind.GROUP_BY, part, con=db.conn())
+            if order:
+                validate_fragment(FragmentKind.ORDER_BY, order, con=db.conn())
             over = " ".join(x for x in [f"PARTITION BY {part}" if part else "",
                                         f"ORDER BY {order}" if order else ""] if x)
-            col = (cfg.get("as") or "").strip() or "window"  # strip THEN default (all-spaces → "window", not "")
+            col = validate_identifier_alias(
+                (cfg.get("as") or "").strip() or "window", label="window output column"
+            )
             # a window fn ranks/aggregates ACROSS rows, so a sample would lie (rank within the sample, a
             # partial SUM) — compute over the full input in preview too, like sort (the preview LIMIT then
             # just truncates the display).
             src = parent if self.full else self._faithful_inputs(node)[0]
             v = self._view(src, "w")
-            return db.conn().sql(f'SELECT *, {expr} OVER ({over}) AS "{_ident(col)}" FROM {v}')
+            return db.conn().sql(
+                f"SELECT *, {expr} OVER ({over}) AS {quote_identifier(col)} FROM {quote_identifier(v)}"
+            )
 
         if t == "fill":
-            cols = [c.strip() for c in (cfg.get("columns") or "").split(",") if c.strip()]
+            cols = identifier_list(cfg.get("columns") or "", parent.columns, label="fill column")
             if not cols:
                 return parent
             method = (cfg.get("method") or "constant").strip()
             value = (cfg.get("value") or "").strip()
+            if method == "constant" and value:
+                validate_fragment(FragmentKind.LITERAL, value, con=db.conn())
 
             def _fill(c: str) -> str:
-                q = f'"{_ident(c)}"'
+                q = quote_identifier(c)
                 if method == "constant":
                     return f"COALESCE({q}, {value})" if value else q  # blank value → no-op replace
                 if method == "zero":
@@ -612,32 +669,44 @@ class BuildEngine:
             # value; run over the full input in preview (constant/zero are per-row, so stay on `parent`).
             faithful = method in ("mean", "min", "max") and not self.full
             v = self._view(self._faithful_inputs(node)[0] if faithful else parent, "fl")
-            repl = ", ".join(f'{_fill(c)} AS "{c}"' for c in cols)
-            return db.conn().sql(f"SELECT * REPLACE ({repl}) FROM {v}")
+            repl = ", ".join(f"{_fill(c)} AS {quote_identifier(c)}" for c in cols)
+            return db.conn().sql(f"SELECT * REPLACE ({repl}) FROM {quote_identifier(v)}")
 
         if t == "unnest":
             col = (cfg.get("column") or "").strip()
             if not col:
                 return parent
+            parsed = identifier_list(col, parent.columns, label="unnest column")
+            if len(parsed) != 1:
+                raise SQLPolicyError("unnest column must name exactly one input column")
+            col = parsed[0]
             v = self._view(parent, "un")  # explode a list column → one row per element, others repeated
-            cq = _ident(col)
-            return db.conn().sql(f'SELECT * EXCLUDE ("{cq}"), unnest("{cq}") AS "{cq}" FROM {v}')
+            cq = quote_identifier(col)
+            return db.conn().sql(
+                f"SELECT * EXCLUDE ({cq}), system.main.unnest({cq}) AS {cq} FROM {quote_identifier(v)}"
+            )
 
         if t == "unpivot":
-            cols = [c.strip() for c in (cfg.get("columns") or "").split(",") if c.strip()]
+            cols = identifier_list(cfg.get("columns") or "", parent.columns, label="unpivot column")
             if not cols:
                 return parent  # nothing chosen to fold → pass through
-            name_col = (cfg.get("nameColumn") or "name").strip() or "name"
-            value_col = (cfg.get("valueColumn") or "value").strip() or "value"
+            name_col = validate_identifier_alias(
+                (cfg.get("nameColumn") or "name").strip() or "name", label="unpivot name column"
+            )
+            value_col = validate_identifier_alias(
+                (cfg.get("valueColumn") or "value").strip() or "value", label="unpivot value column"
+            )
             # keep NULL cells by DEFAULT so wide→long loses NO rows — DuckDB's bare UNPIVOT drops them
             # (a row whose folded columns are all NULL would silently vanish). Opt out with includeNulls=false.
             kn = cfg.get("includeNulls", True)
             keep_nulls = kn if isinstance(kn, bool) else str(kn).strip().lower() not in ("false", "0", "no", "off", "")
             nulls = "INCLUDE NULLS" if keep_nulls else "EXCLUDE NULLS"
             v = self._view(parent, "up")  # wide → long: each chosen column becomes (name, value) rows
-            on = ", ".join(f'"{_ident(c)}"' for c in cols)  # the SQL-standard FROM-form takes the NULLS mode
+            on = ", ".join(quote_identifier(c) for c in cols)  # the SQL-standard FROM-form takes the NULLS mode
             return db.conn().sql(
-                f'SELECT * FROM {v} UNPIVOT {nulls} ("{_ident(value_col)}" FOR "{_ident(name_col)}" IN ({on}))')
+                f"SELECT * FROM {quote_identifier(v)} UNPIVOT {nulls} "
+                f"({quote_identifier(value_col)} FOR {quote_identifier(name_col)} IN ({on}))"
+            )
 
         if t == "pivot":
             on_col = (cfg.get("pivotOn") or cfg.get("on") or "").strip()
@@ -646,11 +715,14 @@ class BuildEngine:
                 raise NotPreviewable(node, "pivot needs a column to pivot on")
             if not self.full:  # PIVOT's output columns are the DISTINCT values of on_col → a sample would
                 raise NotPreviewable(node, "pivot reshapes rows into data-dependent columns — needs a full pass")
-            group = [c.strip() for c in (cfg.get("groupBy") or "").split(",") if c.strip()]
+            on_col = identifier(on_col, parent.columns, label="pivot column")
+            group = identifier_list(cfg.get("groupBy") or "", parent.columns, label="pivot group column")
+            using = using or "count(*)"
+            validate_fragment(FragmentKind.AGGREGATES, using, con=db.conn())
             v = self._view(parent, "pv")  # long → wide: distinct values of on_col become columns
-            sql = f'PIVOT {v} ON "{_ident(on_col)}" USING {using or "count(*)"}'
+            sql = f"PIVOT {quote_identifier(v)} ON {quote_identifier(on_col)} USING {using}"
             if group:
-                sql += " GROUP BY " + ", ".join(f'"{_ident(c)}"' for c in group)
+                sql += " GROUP BY " + ", ".join(quote_identifier(c) for c in group)
             return db.conn().sql(sql)
 
         if t == "aggregate":
@@ -659,6 +731,9 @@ class BuildEngine:
                 raise NotPreviewable(node, f"{'grouped' if grouped else 'global'} aggregate — needs a full pass (a sample would lie)")
             aggs = (cfg.get("aggs") or "count(*) AS n").strip()
             group = (cfg.get("groupBy") or "").strip()  # resolver canonicalizes groupBy/group → 'groupBy'
+            validate_fragment(FragmentKind.AGGREGATES, aggs, con=db.conn())
+            if group:
+                validate_fragment(FragmentKind.GROUP_BY, group, con=db.conn())
             # include the group key(s) in the projection, else the aggregated rows are unlabeled
             return parent.aggregate(f"{group}, {aggs}", group) if group else parent.aggregate(aggs)
 
@@ -666,9 +741,10 @@ class BuildEngine:
             q = (cfg.get("sql") or "").strip()
             if not q:
                 return parent
-            # accept the documented `{input}` / `{inputN}` placeholder as well as the bare CTE name, so a
-            # user following the SDK/docs convention doesn't hit a raw ParserException.
-            q = re.sub(r"\{input(\d*)\}", r"input\1", q)
+            # `input` / `inputN` are real query-scope CTE names.  Do not text-rewrite placeholder-looking
+            # strings: a global replacement can alter literals/comments and create a second SQL grammar.
+            validated = validate_query(q, len(inputs), con=db.conn())
+            q = validated.sql
             # a GROUP BY / global aggregate over the 2000-row sample would present a PARTIAL result as
             # complete (the aggregate node already refuses a sample for exactly this reason) — refuse it.
             if not self.full and sql_reduces_rows(q):
@@ -682,10 +758,7 @@ class BuildEngine:
                 sql_inputs = self._faithful_inputs(node)
             # Expose inputs as query-scoped CTEs named input/input2/... backed by UNIQUE views,
             # so two sql nodes in one graph never clobber a shared literal 'input' view.
-            aliases = ["input"] + [f"input{i + 1}" for i in range(1, len(sql_inputs))]
-            ctes = [f"{a} AS (SELECT * FROM {self._view(rel)})" for a, rel in zip(aliases, sql_inputs)]
-            cte = "WITH " + ", ".join(ctes)
-            wrapped = f"{cte}, {q[4:].lstrip()}" if q[:4].upper() == "WITH" else f"{cte} {q}"
+            wrapped = bind_input_ctes(validated, [self._view(rel) for rel in sql_inputs])
             return db.conn().sql(wrapped)
 
         if t == "join":
@@ -697,7 +770,8 @@ class BuildEngine:
             ins = inputs if self.full else self._faithful_inputs(node)
             a, b = self._view(ins[0], "ja"), self._view(ins[1], "jb")
             return db.conn().sql(join_sql(list(ins[0].columns), list(ins[1].columns), a, b,
-                                          cfg.get("on"), cfg.get("condition"), cfg.get("how")))
+                                          cfg.get("on"), cfg.get("condition"), cfg.get("how"),
+                                          con=db.conn()))
 
         if t == "union":
             # stack every incoming input row-wise. BY NAME aligns columns by name (filling missing ones
@@ -737,10 +811,15 @@ class BuildEngine:
                                           sample_k=None, full=True, node_builders=self.node_builders,
                                           node_specs=self.node_specs)
                     base = full.relation(inc[0].source, inc[0].source_handle)
-            expr = "count(*)" if agg == "count" or not col else f'{_agg_name(agg)}("{_ident(col)}")'
+            if col:
+                col = identifier(col, base.columns, label="metric column")
+            expr = "count(*)" if agg == "count" or not col else f"{_agg_name(agg)}({quote_identifier(col)})"
             v = self._view(base, "m")
             title = (node.data.get("title") if isinstance(node.data, dict) else None) or "metric"
-            return db.conn().sql(f"SELECT '{_sql_str(title)}' AS metric, ({expr})::DOUBLE AS value FROM {v}")
+            return db.conn().sql(
+                f"SELECT '{_sql_str(title)}' AS metric, ({expr})::DOUBLE AS value "
+                f"FROM {quote_identifier(v)}"
+            )
 
         if t == "chart":
             x, y, agg = cfg.get("x"), cfg.get("y"), cfg.get("agg", "count")  # default matches nodespec/UI
@@ -762,14 +841,22 @@ class BuildEngine:
                     full = BuildEngine(self.graph, self.resolve_adapter, self.registry, sample_k=None,
                                           full=True, node_builders=self.node_builders, node_specs=self.node_specs)
                     base = full.relation(inc[0].source, inc[0].source_handle)
-            v, xq = self._view(base, "ch"), f'"{_ident(x)}"'
+            x = identifier(x, base.columns, label="chart X column")
+            if y:
+                y = identifier(y, base.columns, label="chart Y column")
+            v, xq = self._view(base, "ch"), quote_identifier(x)
             if agg == "none":  # raw points (scatter/line) — the chart series is x,y as-is
-                return db.conn().sql(f'SELECT {xq} AS x, "{_ident(y)}" AS y FROM {v}')
-            yexpr = "count(*)" if agg == "count" or not y else f'{_agg_name(agg)}("{_ident(y)}")'
+                return db.conn().sql(
+                    f"SELECT {xq} AS x, {quote_identifier(y)} AS y FROM {quote_identifier(v)}"
+                )
+            yexpr = "count(*)" if agg == "count" or not y else f"{_agg_name(agg)}({quote_identifier(y)})"
             # grouped series (bar/line): one point per distinct x, capped so a huge-cardinality x can't
             # blow up the chart. TRY_CAST (not ::DOUBLE) so a non-numeric/temporal min/max degrades to
             # NULL (dropped by the renderer) instead of a raw ConversionException.
-            return db.conn().sql(f"SELECT {xq} AS x, TRY_CAST(({yexpr}) AS DOUBLE) AS y FROM {v} GROUP BY {xq} ORDER BY {xq} LIMIT 2000")
+            return db.conn().sql(
+                f"SELECT {xq} AS x, TRY_CAST(({yexpr}) AS DOUBLE) AS y "
+                f"FROM {quote_identifier(v)} GROUP BY {xq} ORDER BY {xq} LIMIT 2000"
+            )
 
         if t == "vector-search":
             return self._vector_search(node, inputs)
@@ -923,6 +1010,7 @@ class BuildEngine:
         # the true nearest-K are over ALL rows (and the query row itself must come from the full set),
         # not a 2000-row prefix — score the full input in preview too
         src = inputs[0] if self.full else self._faithful_inputs(node)[0]
+        col = identifier(col, src.columns, label="vector column")
         base = self._view(src, "vs")
         con = db.conn()
         # query = an explicit external vector (e.g. a text embedding), else a chosen row's vector.
@@ -938,7 +1026,10 @@ class BuildEngine:
         else:
             qrow = max(0, int(cfg.get("queryRow", 0)))
             try:
-                q = con.sql(f'SELECT "{_ident(col)}" AS q FROM {base} OFFSET {qrow} LIMIT 1').fetchone()
+                q = con.sql(
+                    f"SELECT {quote_identifier(col)} AS q FROM {quote_identifier(base)} "
+                    f"OFFSET {qrow} LIMIT 1"
+                ).fetchone()
             except Exception as e:  # noqa: BLE001
                 raise NotPreviewable(node, f"no vector column '{col}': {e}") from e
             if not q or q[0] is None:
@@ -954,8 +1045,8 @@ class BuildEngine:
                 pass
         qlit = "[" + ", ".join(str(x) for x in query) + "]::DOUBLE[]"
         return con.sql(
-            f'SELECT *, list_cosine_similarity("{_ident(col)}", {qlit}) AS _score '
-            f'FROM {base} ORDER BY _score DESC LIMIT {k}'
+            f"SELECT *, system.main.list_cosine_similarity({quote_identifier(col)}, {qlit}) AS _score "
+            f"FROM {quote_identifier(base)} ORDER BY _score DESC LIMIT {k}"
         )
 
     def _bare_lance_source(self, node: GraphNode) -> str | None:
@@ -1128,16 +1219,7 @@ def _table_to_rows(tbl: "pa.Table") -> list[dict]:
 
 
 def _dedupe_names(names: list[str]) -> list[str]:
-    seen: dict[str, int] = {}
-    out: list[str] = []
-    for n in names:
-        if n in seen:
-            seen[n] += 1
-            out.append(f"{n}_{seen[n]}")
-        else:
-            seen[n] = 1
-            out.append(n)
-    return out
+    return unique_identifier_names(names)
 
 
 _AGG_ALLOWED = {"count", "sum", "mean", "avg", "min", "max", "median", "stddev"}

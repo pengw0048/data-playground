@@ -12,7 +12,7 @@ passing a `Registry` you use to add things:
 
 ```python
 # examples/plugins/dp_example/__init__.py
-from hub.sdk import NodeSpec, ParamSpec, PortSpec, ctx
+from hub.sdk import NodeSpec, ParamSpec, PortSpec, ctx, identifier, quote_identifier
 
 SPEC = NodeSpec(
     kind="redact", title="redact", category="compute", tag="redact",
@@ -29,9 +29,10 @@ def build(engine, node, inputs):
     if not col:
         return inputs[0]                      # not configured yet → passthrough
     keep = int(cfg.get("keep") or 0)
-    s = f'CAST("{col}" AS VARCHAR)'
-    masked = f"left({s}, {keep}) || repeat('*', greatest(length({s}) - {keep}, 0))"
-    return ctx.sql(inputs[0], f'SELECT * REPLACE ({masked} AS "{col}") FROM {{input}}')
+    column = quote_identifier(identifier(col, inputs[0].columns, label="redact column"))
+    s = f"CAST({column} AS VARCHAR)"
+    masked = f"left({s}, {keep}) || rpad('', CAST(greatest(length({s}) - {keep}, 0) AS INTEGER), '*')"
+    return ctx.sql(inputs[0], f"SELECT * REPLACE ({masked} AS {column}) FROM input")
 
 def register(reg):
     reg.add_node(SPEC, build)
@@ -51,8 +52,8 @@ That's the whole plugin. Two pieces:
 
 `ctx` turns relations into relations without materializing:
 
-- `ctx.sql(rel, "… {input} …")` — run SQL over `rel`, referenced as the placeholder token `{input}`.
-  (Use `{input}`, not a bare name — it can't occur in valid SQL, so it never rewrites a real token.)
+- `ctx.sql(rel, "… FROM input …")` — run one validated `SELECT` over `rel`, referenced by the
+  query-scope CTE `input` (no textual placeholder substitution).
 - `ctx.arrow_map(rel, fn)` — apply a Python `fn(pa.RecordBatch) -> RecordBatch | list[dict]` over
   Arrow batches (the escape hatch when SQL isn't enough).
 - `ctx.polars(rel, fn)` — apply `fn(polars.DataFrame) -> polars.DataFrame`.

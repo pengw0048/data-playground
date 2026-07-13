@@ -97,12 +97,23 @@ def _parse_bytes(s: str) -> int | None:
 
 def _apply_session(c: duckdb.DuckDBPyConnection) -> None:
     c.execute("SET enable_progress_bar = false")
-    # Do NOT auto-install/auto-load extensions: that let ANY uri (e.g. https://evil/x.parquet)
-    # silently pull in httpfs and fetch it (SSRF). Object-store access loads httpfs EXPLICITLY in
-    # ensure_object_store(), so s3://gs:// still work; other schemes now fail closed instead of
-    # reaching out. Re-asserted on every per-run cursor (below) since it's a security setting.
+    # A SQL identifier must resolve only against DuckDB's catalog.  Python replacement scans can turn
+    # an otherwise missing table name into an in-process Python object, bypassing the SQL input policy.
+    c.execute("SET python_enable_replacements = false")
+    # Keep unqualified relation/function resolution deterministic.  `main` still exposes the run's
+    # generated views; arbitrary attached/custom schemas cannot silently enter the search path.
+    c.execute("SET search_path = 'main'")
+    # Do NOT auto-install/auto-load extensions: unknown schemes must not silently add network access.
+    # Object-store access loads httpfs explicitly in ensure_object_store(), so authenticated sessions
+    # also disable its direct HTTP(S) and Hugging Face filesystems. S3FileSystem remains available,
+    # while user-authored SQL and dataset URLs cannot turn trusted extension loading into arbitrary
+    # network egress after httpfs is loaded.
+    # Re-asserted on every per-run cursor (below) because these are security settings.
     c.execute("SET autoinstall_known_extensions = false")
     c.execute("SET autoload_known_extensions = false")
+    from hub import auth
+    if auth.auth_enabled():
+        c.execute("SET disabled_filesystems = 'HTTPFileSystem,HuggingFaceFileSystem'")
     # Out-of-core: point DuckDB's temp files at an explicit, operator-controllable dir so large
     # sorts/joins/aggregates spill to disk instead of failing (robust across versions + lets a deploy
     # put spill on fast/roomy disk). DP_MEMORY_LIMIT optionally caps per-kernel RAM (multi-tenant).
@@ -209,12 +220,18 @@ def run_scope() -> Iterator[_Scope]:
     """Give this thread its own DuckDB cursor for the duration of a run/preview, so it doesn't
     serialize on (or get wedged by) any other run. Yields a `_Scope` whose `.interrupt()` a canceller
     can call from another thread. On exit, rolls back and drops only the views this scope created."""
+    _prime_object_store_before_scope()
     with _lock:
         cur = _base_conn().cursor()  # cursor creation touches the base connection — serialize it too
     try:
         _apply_session(cur)  # re-assert the SSRF-safe extension policy on the cursor (defensive)
     except Exception:  # noqa: BLE001
         pass
+    # Keep one catalog snapshot from policy validation through lazy relation execution.  DuckDBPyRelation
+    # binds at fetch/write time, not at con.sql(), so without this fence a concurrent catalog mutation
+    # could insert a macro/UDF after validation and change which function the relation executes.  Runs do
+    # not publish DuckDB catalog state; rollback is already their cleanup contract.
+    cur.execute("BEGIN TRANSACTION")
     scope = _Scope(cur)
     _local.con = cur
     _local.scope = scope
@@ -239,45 +256,118 @@ def run_scope() -> Iterator[_Scope]:
 
 
 _obj_store_loaded = False
+_obj_store_aws_loaded = False
+_obj_store_secret_config: tuple | None = None
+
+_CREDENTIAL_ENV_KEYS = (
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN",
+    "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_EC2_METADATA_DISABLED",
+)
 
 
 def _sql_str(s: str) -> str:
     return str(s).replace("'", "''")
 
 
-def ensure_object_store() -> None:
-    """Prepare the connection for object storage (s3://, gs://): load httpfs and (re)register
-    credentials. Called before an object-store read/write. Credentials come from the `objectStore`
-    setting (explicit keys — for AWS, MinIO, R2, or any S3-compatible endpoint) or, when none are
-    set, the standard AWS credential chain (env vars / ~/.aws / instance role)."""
-    global _obj_store_loaded
+def _object_store_fingerprint(cfg: dict) -> tuple:
+    config = tuple(cfg.get(key) for key in (
+        "accessKeyId", "secretAccessKey", "region", "endpoint", "useSsl",
+    ))
+    explicit_keys = bool(cfg.get("accessKeyId") and cfg.get("secretAccessKey"))
+    environment = () if explicit_keys else tuple(os.environ.get(key) for key in _CREDENTIAL_ENV_KEYS)
+    return (("config" if explicit_keys else "credential_chain"), *config, *environment)
+
+
+def _publish_object_store(cfg: dict) -> None:
+    """Publish one fingerprinted object-store configuration under the base lock."""
+    global _obj_store_loaded, _obj_store_aws_loaded, _obj_store_secret_config
+    fingerprint = _object_store_fingerprint(cfg)
     with _lock:
-        c = conn()
+        c = _base_conn()
         if not _obj_store_loaded:
             c.execute("INSTALL httpfs")  # bundled on some platforms, downloaded on others (needs net once)
             c.execute("LOAD httpfs")
             _obj_store_loaded = True
+            _obj_store_secret_config = None
+        if fingerprint == _obj_store_secret_config:
+            return
+        explicit_keys = fingerprint[0] == "config"
+        if not explicit_keys and not _obj_store_aws_loaded:
+            # credential_chain is registered by aws (not httpfs) on DuckDB 1.5.x. Explicit credentials
+            # remain httpfs-only; chain users pay this installation/load cost once.
+            c.execute("INSTALL aws")
+            c.execute("LOAD aws")
+            _obj_store_aws_loaded = True
+        for kind, secret in (("s3", "dp_s3"), ("gcs", "dp_gcs")):
+            if explicit_keys:
+                parts = [f"TYPE {kind}", f"KEY_ID '{_sql_str(cfg['accessKeyId'])}'",
+                         f"SECRET '{_sql_str(cfg['secretAccessKey'])}'"]
+                if cfg.get("region"):
+                    parts.append(f"REGION '{_sql_str(cfg['region'])}'")
+                endpoint = str(cfg.get("endpoint") or "").strip()
+                if kind == "s3" and endpoint:
+                    # DuckDB wants host[:port] with no scheme; the scheme decides USE_SSL
+                    use_ssl = not endpoint.startswith("http://") if cfg.get("useSsl") is None else bool(cfg.get("useSsl"))
+                    host = endpoint.split("://", 1)[-1].rstrip("/")
+                    parts += [f"ENDPOINT '{_sql_str(host)}'", "URL_STYLE 'path'",
+                              f"USE_SSL {'true' if use_ssl else 'false'}"]
+                c.execute(f"CREATE OR REPLACE TEMPORARY SECRET {secret} ({', '.join(parts)})")
+            else:
+                try:
+                    c.execute(
+                        f"CREATE OR REPLACE TEMPORARY SECRET {secret} "
+                        f"(TYPE {kind}, PROVIDER credential_chain, REFRESH auto)"
+                    )
+                except duckdb.Error as exc:
+                    # An empty chain preserves anonymous/default access. Never hide catalog conflicts,
+                    # extension errors, or an invalid secret implementation.
+                    if "Secret Validation Failure" not in str(exc):
+                        raise
+                    c.execute(f"DROP SECRET IF EXISTS {secret}")
+        # A successfully created chain refreshes expiring role/container credentials itself. Static env
+        # key/session/profile changes are in the fingerprint and force replacement before the next cursor.
+        # If no chain credentials exist, cache the attempted fingerprint as an anonymous/no-secret
+        # state. A later static env/session/profile change invalidates it; an established role/container
+        # chain uses REFRESH auto for expiry-driven rotation.
+        _obj_store_secret_config = fingerprint
+
+
+def ensure_object_store() -> None:
+    """Publish httpfs + credentials on the base connection for object-store consumers.
+
+    A run scope owns a long rollback-only transaction.  Creating its secret there would make two
+    concurrent runs conflict on the shared catalog even though both use the same credentials.  The
+    base connection instead performs one short, serialized autocommit publication per config; scoped
+    cursors consume that committed secret without writing the catalog themselves.
+    """
+    from hub import metadb
+    _publish_object_store(metadb.get_setting("objectStore", "global", default={}) or {})
+
+
+def _prime_object_store_before_scope() -> None:
+    """Best-effort publish before a cursor takes its credential snapshot.
+
+    A cursor that began while an older fixed secret existed keeps that old version even after the base
+    connection replaces it.  Prime configured/previously-used object storage before creating the cursor;
+    a later real object operation still calls ``ensure_object_store`` and surfaces any setup error.
+    """
+    try:
+        scheme = (os.environ.get("DP_STORAGE_URL") or "").split(":", 1)[0].lower()
+        # A process that has never published a secret cannot have a stale cursor snapshot. This fast
+        # path keeps purely local previews free of metadata/provider work.
+        if (not _obj_store_loaded and _obj_store_secret_config is None
+                and scheme not in ("s3", "s3a", "s3n", "gs", "gcs")):
+            return
         from hub import metadb
         cfg = metadb.get_setting("objectStore", "global", default={}) or {}
-        for kind, secret in (("s3", "dp_s3"), ("gcs", "dp_gcs")):
-            try:
-                if cfg.get("accessKeyId") and cfg.get("secretAccessKey"):
-                    parts = [f"TYPE {kind}", f"KEY_ID '{_sql_str(cfg['accessKeyId'])}'",
-                             f"SECRET '{_sql_str(cfg['secretAccessKey'])}'"]
-                    if cfg.get("region"):
-                        parts.append(f"REGION '{_sql_str(cfg['region'])}'")
-                    endpoint = str(cfg.get("endpoint") or "").strip()
-                    if kind == "s3" and endpoint:
-                        # DuckDB wants host[:port] with no scheme; the scheme decides USE_SSL
-                        use_ssl = not endpoint.startswith("http://") if cfg.get("useSsl") is None else bool(cfg.get("useSsl"))
-                        host = endpoint.split("://", 1)[-1].rstrip("/")
-                        parts += [f"ENDPOINT '{_sql_str(host)}'", "URL_STYLE 'path'",
-                                  f"USE_SSL {'true' if use_ssl else 'false'}"]
-                    c.execute(f"CREATE OR REPLACE SECRET {secret} ({', '.join(parts)})")
-                else:
-                    c.execute(f"CREATE OR REPLACE SECRET {secret} (TYPE {kind}, PROVIDER credential_chain)")
-            except Exception:  # noqa: BLE001 — a secret type may be unavailable; the other still helps
-                pass
+        if not _obj_store_loaded or _object_store_fingerprint(cfg) != _obj_store_secret_config:
+            _publish_object_store(cfg)
+    except Exception:  # noqa: BLE001 — defer setup failure until an object-store operation actually runs
+        pass
 
 
 def responsive(timeout_s: float = 5.0) -> bool:

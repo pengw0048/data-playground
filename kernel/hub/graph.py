@@ -170,6 +170,34 @@ def all_upstream_source_uris(graph: Graph, node_id: str) -> list[str]:
     return uris
 
 
+def all_upstream_publication_uris(graph: Graph, node_id: str) -> list[str]:
+    """Original source URIs to record when publishing a derived catalog output.
+
+    Region execution replaces a cut with a physical ref-source. The ref is the URI the runner must
+    read and lease, but catalog lineage must retain the original sources the unsplit graph would have
+    recorded. Only the controller-owned private sidecar can override a synthetic source; client graph
+    data is never trusted as provenance.
+    """
+    overrides = getattr(graph, "_publication_source_uris", {})
+    uris: list[str] = []
+    seen: set[str] = set()
+    for node in upstream_chain(graph, node_id):
+        if node.type != "source" or not isinstance(node.data, dict):
+            continue
+        configured = overrides.get(node.id)
+        if configured is None:
+            config = node.data.get("config")
+            if not isinstance(config, dict):
+                continue
+            uri = config.get("uri") or config.get("table")
+            configured = (uri,) if uri else ()
+        for uri in configured:
+            if uri and uri not in seen:
+                seen.add(uri)
+                uris.append(uri)
+    return uris
+
+
 def execution_source_uris(graph: Graph, target_node_id: str | None) -> list[str]:
     """Exact, stable source URI set for the execution cone selected by ``target_node_id``."""
     if target_node_id is not None:
