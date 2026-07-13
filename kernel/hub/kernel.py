@@ -77,7 +77,7 @@ def main() -> None:
     from hub.relation_cache import RelationCache
 
     canvas, kid, token = args.canvas, args.kernel_id, args.token
-    deps = set_workspace(args.workspace, args.data_dir)
+    deps = set_workspace(args.workspace, args.data_dir, maintain_storage=False)
     warm = RelationCache()  # per-kernel warm cache of preview intermediate relations (dropped on restart)
     # cell-crash-isolation: full RUNS execute in a killable, deadline-bounded child PROCESS by default, so
     # a runaway/segfaulting/OOM cell kills only that run — the warm kernel (and its live previews) survive.
@@ -152,6 +152,9 @@ def main() -> None:
             try:
                 if not metadb.heartbeat_kernel(canvas, kid):
                     os._exit(0)  # fenced out — a newer kernel took over this canvas
+                retry_result_fences = getattr(deps.storage, "retry_result_fences", None)
+                if callable(retry_result_fences):
+                    retry_result_fences(50)  # only this process can close its inherited writer/read FDs
                 busy = _liveness_busy(_inflight[0], run_runner.runs)
                 if busy:
                     last_activity[0] = time.monotonic()
@@ -196,7 +199,8 @@ def main() -> None:
         _ensure_deps(graph)
         with _inflight_work():
             return preview_node(graph, body.node_id, body.k, deps.resolve_adapter,
-                                deps.registry, deps.node_builders, deps.node_specs, offset=body.offset, cache=warm).model_dump()
+                                deps.registry, deps.node_builders, deps.node_specs, offset=body.offset,
+                                cache=warm, storage=deps.storage).model_dump()
 
     @app.post("/profile")
     def profile(body: PreviewBody, x_dp_kernel_token: str = Header(None)):
@@ -206,7 +210,8 @@ def main() -> None:
         _ensure_deps(graph)
         with _inflight_work():
             return profile_node(graph, body.node_id, deps.resolve_adapter, deps.registry,
-                                deps.node_builders, deps.node_specs, cache=warm, full=body.full).model_dump()
+                                deps.node_builders, deps.node_specs, cache=warm, full=body.full,
+                                storage=deps.storage).model_dump()
 
     @app.post("/cancel")
     def cancel(body: dict, x_dp_kernel_token: str = Header(None)):

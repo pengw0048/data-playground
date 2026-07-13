@@ -82,10 +82,13 @@ class RunController:
             try:
                 from hub.executors.schema import schema_for_graph
                 schemas = schema_for_graph(graph, self.deps.resolve_adapter, self.deps.registry,
-                                           self.deps.node_builders, self.deps.node_specs)
+                                           self.deps.node_builders, self.deps.node_specs,
+                                           storage=self.deps.storage)
             except Exception:  # noqa: BLE001
                 schemas = None
-            sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target, schemas=schemas)  # once — reused by plan()
+            sizes = est_mod.estimate_sizes(
+                graph, self.deps.resolve_adapter, target=target, schemas=schemas,
+                storage=self.deps.storage)  # once — reused by plan()
         except Exception:  # noqa: BLE001
             sizes = {}
 
@@ -199,7 +202,8 @@ class RunController:
         from hub.models import ResourceSpec
         if sizes is None:  # reuse a caller-computed estimate (plan_summary) to avoid a second source-count pass
             try:
-                sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target)
+                sizes = est_mod.estimate_sizes(
+                    graph, self.deps.resolve_adapter, target=target, storage=self.deps.storage)
             except Exception:  # noqa: BLE001 — placement is best-effort; a bad estimate must not block the run
                 return {}
         from hub import placement
@@ -561,12 +565,28 @@ class RunController:
                                    run_id: str, region_id: str):
         """Pin every exact source generation while this parent-owned region actually reads it."""
         from hub.handoff import managed_read_lease
+        from hub.storage import (
+            local_result_read_scope,
+            preflight_managed_execution_sources,
+        )
 
         stack = contextlib.ExitStack()
         guards = []
         try:
             try:
-                for uri in g.all_upstream_source_uris(graph, target):
+                uris = preflight_managed_execution_sources(
+                    self.deps.storage,
+                    g.all_upstream_source_uris(graph, target),
+                )
+                local_guards = stack.enter_context(local_result_read_scope(
+                    self.deps.storage, uris,
+                    owner=f"region-source:{run_id}:{region_id}"))
+                guards.extend(local_guards)
+                classify_local = getattr(
+                    self.deps.storage, "requires_result_read", None)
+                for uri in uris:
+                    if callable(classify_local) and classify_local(uri):
+                        continue
                     guards.append(stack.enter_context(managed_read_lease(
                         uri, owner=f"region-source:{run_id}:{region_id}",
                         ttl_seconds=self._region_pin_ttl())))
@@ -787,6 +807,18 @@ class RunController:
         if cancel.is_set():
             raise RuntimeError("run cancelled before region materialization")
         subg = self._subgraph(graph, region, ref_uri)
+        with self._region_source_lease_scope(
+                subg, region.output_node, run_id=run_id,
+                region_id=region.id) as source_guards:
+            return self._materialize_with_sources(
+                run_id, region, regions, uid, subg, cancel, source_guards)
+
+    def _materialize_with_sources(
+            self, run_id: str, region, regions, uid: str | None,
+            subg: Graph, cancel, source_guards) -> str:
+        """Materialize while the wrapper retains every source fence from hash through publication."""
+        from hub import tiers as tier_mod
+
         key = self.base._plan_hash(subg, region.output_node)
         picked = self._boundary_tier(region, regions or [])
         if picked is None:
@@ -860,9 +892,7 @@ class RunController:
                     result_uri = self._allocate_region_attempt(
                         logical_uri=logical_uri, run_id=run_id,
                         region_id=region.id, cache_key=ckey)
-                with self._region_source_lease_scope(
-                        subg, region.output_node, run_id=run_id,
-                        region_id=region.id) as source_guards:
+                with contextlib.nullcontext(source_guards):
                     with db.run_scope():
                         eng = BuildEngine(
                             subg, self.deps.resolve_adapter, self.deps.registry, full=True,
@@ -909,14 +939,9 @@ class RunController:
 
         # A placed backend owns its writer lifecycle. It receives only the stable logical target and must
         # return one exact, parent-registered region attempt after its worker can no longer mutate it.
-        # Backends that own and renew exact parent-side source leases fence them through worker reaping
-        # themselves. Other backends remain protected by the controller's generic outer lease scope.
-        source_scope = (contextlib.nullcontext([])
-                        if getattr(backend, "manages_source_leases", False)
-                        else self._region_source_lease_scope(
-                            subg, region.output_node, run_id=run_id,
-                            region_id=region.id))
-        with source_scope as source_guards:
+        # The wrapper's parent-owned scope covers plan fingerprinting, cache/tier decisions, dispatch,
+        # worker reaping, and publication. A backend may hold an additional inherited/process fence.
+        with contextlib.nullcontext(source_guards):
             sub = backend.run_unit(
                 subg, region.output_node, logical_uri, requires=region.requires)
             self._track_sub(run_id, backend, sub.run_id)

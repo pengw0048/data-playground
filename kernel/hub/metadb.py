@@ -231,6 +231,76 @@ class ResultCache(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class LocalResultArtifact(Base):
+    """One exact built-in local full-result file with a fenced writer lifecycle."""
+    __tablename__ = "local_result_artifacts"
+    uri: Mapped[str] = mapped_column(Text, primary_key=True)
+    namespace_id: Mapped[str] = mapped_column(String, nullable=False)
+    storage_root: Mapped[str] = mapped_column(Text, nullable=False)
+    lock_name: Mapped[str] = mapped_column(String, nullable=False)
+    lock_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    lock_protected: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true")
+    state: Mapped[str] = mapped_column(String, nullable=False, default="writing", server_default="writing")
+    writer_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    writer_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    delete_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    committed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delete_attempted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        UniqueConstraint(
+            "namespace_id", "lock_name",
+            name="uq_local_result_artifact_namespace_lock"),
+        CheckConstraint(
+            "state IN ('writing', 'ready', 'deleting')",
+            name="ck_local_result_artifact_state"),
+        CheckConstraint(
+            "((writer_run_id IS NULL AND writer_token IS NULL) OR "
+            "(writer_run_id IS NOT NULL AND writer_token IS NOT NULL))",
+            name="ck_local_result_artifact_writer_pair"),
+        CheckConstraint(
+            "((lock_protected AND lock_token IS NOT NULL) OR "
+            "(NOT lock_protected AND lock_token IS NULL))",
+            name="ck_local_result_artifact_lock_pair"),
+        CheckConstraint(
+            "((state = 'deleting' AND delete_token IS NOT NULL "
+            "AND delete_attempted_at IS NOT NULL) OR "
+            "(state <> 'deleting' AND delete_token IS NULL "
+            "AND delete_attempted_at IS NULL))",
+            name="ck_local_result_artifact_delete_state"),
+        CheckConstraint(
+            "state <> 'ready' OR committed_at IS NOT NULL",
+            name="ck_local_result_artifact_ready_commit"),
+        Index(
+            "ix_local_result_artifacts_reclaim", "namespace_id", "state",
+            "delete_attempted_at", "created_at"),
+        Index("ix_local_result_artifacts_writer", "writer_run_id", "writer_token"),
+    )
+
+
+class LocalResultReference(Base):
+    """One exact durable owner or temporary reader of a managed local full result."""
+    __tablename__ = "local_result_references"
+    uri: Mapped[str] = mapped_column(
+        Text, ForeignKey("local_result_artifacts.uri"), primary_key=True)
+    owner_kind: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_key: Mapped[str] = mapped_column(String, primary_key=True)
+    __table_args__ = (
+        Index("ix_local_result_references_owner", "owner_kind", "owner_key"),)
+
+
+class LocalResultRegistry(Base):
+    """Singleton transaction lock for local artifact and reference mutations."""
+    __tablename__ = "local_result_registry"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_token: Mapped[str] = mapped_column(String, nullable=False)
+    lock_cursor_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reclaim_cursor_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_local_result_registry_singleton"),)
+
+
 class InstallationIdentity(Base):
     """One durable identity for every hub instance sharing this metadata database."""
     __tablename__ = "installation_identity"
@@ -728,8 +798,11 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
     bound (one row per run, forever) — mirrors the ResultCache / CanvasVersion caps."""
     if not canvas_id:
         return False
+    if status != "done" and _local_result_candidate(output_uri) is not None:
+        output_uri = None
+        output_table = None
     with session() as s:
-        if s.get(Canvas, canvas_id) is None:
+        if s.get(Canvas, canvas_id, with_for_update=True) is None:
             return False  # ad-hoc / unsaved-canvas / internal region run → don't dangle a run row
         rid = _uid()
         s.add(RunRecord(id=rid, canvas_id=canvas_id, run_id=run_id, target_node_id=target_node_id,
@@ -737,14 +810,20 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
                         output_uri=output_uri,
                         per_node=json.dumps(per_node, default=str) if per_node else None))
         s.flush()
+        stale = list(s.scalars(select(RunRecord).where(
+            RunRecord.canvas_id == canvas_id
+        ).order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
+          .offset(_RUN_HISTORY_MAX).with_for_update()))
         _replace_attempt_ref(s, "run_record", rid, output_uri)
-        stale = s.scalars(select(RunRecord.id).where(RunRecord.canvas_id == canvas_id)
-                          .order_by(RunRecord.created_at.desc()).offset(_RUN_HISTORY_MAX)).all()
-        for rid in stale:
-            obj = s.get(RunRecord, rid)
-            if obj:
-                _replace_attempt_ref(s, "run_record", rid, None)
-                s.delete(obj)
+        for obj in stale:
+            _replace_attempt_ref(s, "run_record", obj.id, None)
+            s.delete(obj)
+        if stale:
+            _lock_local_result_registry(s)
+        # Global lifecycle lock order: object-attempt rows above, then the local registry.
+        sync_local_result_owner(s, "run_record", rid, output_uri)
+        for obj in stale:
+            _drop_local_result_owner_locked(s, "run_record", obj.id)
         return True
 
 
@@ -752,22 +831,41 @@ def delete_canvas_cascade(canvas_id: str) -> None:
     """Delete a canvas and its children (shares, run history) — FKs don't cascade (SQLite FK off,
     Postgres would error), so clean them explicitly."""
     with session() as s:
-        for sh in s.scalars(select(CanvasShare).where(CanvasShare.canvas_id == canvas_id)):
+        canvas = s.get(Canvas, canvas_id, with_for_update=True)
+        if canvas is None:
+            return
+        shares = list(s.scalars(select(CanvasShare).where(
+            CanvasShare.canvas_id == canvas_id
+        ).order_by(CanvasShare.user_id).with_for_update()))
+        runs = list(s.scalars(select(RunRecord).where(
+            RunRecord.canvas_id == canvas_id
+        ).order_by(RunRecord.id).with_for_update()))
+        versions = list(s.scalars(select(CanvasVersion).where(
+            CanvasVersion.canvas_id == canvas_id
+        ).order_by(CanvasVersion.id).with_for_update()))
+        run_states = list(s.scalars(select(RunState).where(
+            (RunState.canvas_id == canvas_id) | (RunState.auth_canvas_id == canvas_id)
+        ).order_by(RunState.run_id).with_for_update()))
+        local_owners: list[tuple[str, str]] = [("canvas", canvas_id)]
+        for sh in shares:
             s.delete(sh)
-        for r in s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id)):
+        for r in runs:
             _replace_attempt_ref(s, "run_record", r.id, None)
+            local_owners.append(("run_record", r.id))
             s.delete(r)
-        for v in s.scalars(select(CanvasVersion).where(CanvasVersion.canvas_id == canvas_id)):
+        for v in versions:
+            local_owners.append(("canvas_version", v.id))
             s.delete(v)
         # also drop this canvas's run_states — else auth_canvas_id/canvas_id dangle into a reusable id
         # namespace and a later canvas re-created under the same id could re-grant its old runs (P0-AUTH-02)
-        for rs in s.scalars(select(RunState).where(
-                (RunState.canvas_id == canvas_id) | (RunState.auth_canvas_id == canvas_id))):
+        for rs in run_states:
             _replace_attempt_ref(s, "run_state", rs.run_id, None)
+            local_owners.append(("run_state", rs.run_id))
             s.delete(rs)
-        c = s.get(Canvas, canvas_id)
-        if c:
-            s.delete(c)
+        _lock_local_result_registry(s)
+        for owner_kind, owner_key in sorted(local_owners):
+            _drop_local_result_owner_locked(s, owner_kind, owner_key)
+        s.delete(canvas)
 
 
 def latest_actuals(canvas_id: str | None) -> dict[str, int]:
@@ -814,6 +912,10 @@ _RUN_STATE_MAX = 2000  # cap on TERMINAL run_states — live (queued/running) ro
 _TERMINAL_RUN = ("done", "failed", "cancelled")
 
 
+class RunStatePublicationRejected(RuntimeError):
+    """A definitive owner-row race loss, never an unknown database commit outcome."""
+
+
 def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                    kernel_id: str | None = None, *, publish_region: bool = False) -> None:
     """Upsert a run's live status (the runner calls this on each transition). `status` is a RunStatus
@@ -823,9 +925,42 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
     full RunStatus JSON, so unbounded growth is a real local-DB leak) — live rows are never touched, so
     the reaper and in-flight status lookups are unaffected; an evicted OLD run just 404s on GET /run/{id}
     (its durable per-canvas history lives in run_records)."""
+    status = dict(status)
+    st = str(status.get("status", "running"))
+    if st != "done" and _local_result_candidate(_result_doc_uri(status)) is not None:
+        for key in ("uri", "outputUri", "output_uri", "outputTable", "output_table"):
+            status.pop(key, None)
     with session() as s:
-        r = s.get(RunState, run_id, with_for_update=True)
-        st = str(status.get("status", "running"))
+        stale_candidate_ids: list[str] = []
+        locked: dict[str, RunState] = {}
+        if st not in _TERMINAL_RUN:
+            # No retention rows participate in a progress update, so the current row can keep the
+            # original direct lock. This also serializes a canvas cascade with every live update.
+            r = s.get(RunState, run_id, with_for_update=True)
+        else:
+            existing_was_present = s.get(RunState, run_id) is not None
+            if (st == "done" and _local_result_candidate(_result_doc_uri(status)) is not None
+                    and not existing_was_present):
+                # Local publication must attach to the run identity minted before execution. Upserting
+                # a missing row here could resurrect a canvas-deleted run and fabricate its first owner.
+                raise RunStatePublicationRejected(
+                    "managed local result has no pre-existing run state")
+            stale_candidate_ids = list(s.scalars(select(RunState.run_id).where(
+                RunState.status.in_(_TERMINAL_RUN), RunState.run_id != str(run_id)
+            ).order_by(RunState.updated_at.desc(), RunState.run_id.desc())
+              .offset(max(0, _RUN_STATE_MAX - 1))))
+            lock_ids = set(stale_candidate_ids)
+            if existing_was_present:
+                lock_ids.add(str(run_id))
+            locked = {row.run_id: row for row in s.scalars(select(RunState).where(
+                RunState.run_id.in_(sorted(lock_ids))
+            ).order_by(RunState.run_id).with_for_update())} if lock_ids else {}
+            r = locked.get(str(run_id))
+            if existing_was_present and r is None:
+                # A canvas cascade deleted the initially-observed row before this union lock. Never
+                # resurrect a dangling RunState or its local-result reference after that deletion.
+                raise RunStatePublicationRejected(
+                    "run state was deleted before terminal publication")
         payload = json.dumps(status, default=str)
         if r is None:
             s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload, kernel_id=kernel_id))
@@ -837,6 +972,17 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
             if kernel_id and not r.kernel_id:
                 r.kernel_id = kernel_id
         s.flush()
+        stale = []
+        if st in _TERMINAL_RUN:
+            # Re-evaluate age after every candidate lock; delete only rows included in the one
+            # deterministic PK-ordered acquisition above. A row refreshed while we waited is retained.
+            stale_now = set(s.scalars(select(RunState.run_id).where(
+                RunState.status.in_(_TERMINAL_RUN)
+            ).order_by(RunState.updated_at.desc(), RunState.run_id.desc())
+              .offset(_RUN_STATE_MAX)))
+            stale = [locked[key] for key in sorted(stale_now & set(stale_candidate_ids))
+                     if key != str(run_id) and key in locked
+                     and locked[key].status in _TERMINAL_RUN]
         output_uri = _result_doc_uri(status)
         output_attempt = s.get(ObjectAttempt, output_uri) if output_uri else None
         publish_region = bool(
@@ -844,14 +990,58 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
             and output_attempt is not None and output_attempt.kind == "region")
         _replace_attempt_ref(
             s, "run_state", run_id, output_uri, publish=publish_region)
-        if st in _TERMINAL_RUN:  # once per run at completion (not every transition) → prune finished rows
-            stale = s.scalars(select(RunState.run_id).where(RunState.status.in_(_TERMINAL_RUN))
-                              .order_by(RunState.updated_at.desc()).offset(_RUN_STATE_MAX)).all()
-            for rid in stale:
-                obj = s.get(RunState, rid)
-                if obj:
-                    _replace_attempt_ref(s, "run_state", rid, None)
-                    s.delete(obj)
+        if st in _TERMINAL_RUN:
+            for obj in stale:
+                _replace_attempt_ref(s, "run_state", obj.run_id, None)
+                s.delete(obj)
+            _lock_local_result_registry(s)
+        # The RunState transaction is the primary local-result publication boundary. Object attempt
+        # locks above always precede the local registry lock.
+        sync_local_result_owner(s, "run_state", run_id, status)
+        if st == "done":
+            _release_terminal_local_result_writers(
+                s, run_id, allow_unreferenced=False)
+        if st in _TERMINAL_RUN:
+            for obj in stale:
+                _drop_local_result_owner_locked(s, "run_state", obj.run_id)
+
+
+def local_result_run_state_receipt(
+        run_id: str, namespace_id: str, expected_doc: dict) -> bool:
+    """Prove an exact local full-result terminal transaction committed.
+
+    A database driver may raise after PostgreSQL committed.  Callers must not turn that unknown result
+    into ``failed`` and delete a now-published artifact.  This read-back receipt validates every part of
+    the same publication boundary: byte-for-byte RunState JSON, the exact durable reference, the ready
+    artifact in this filesystem namespace, and release of the writer identity.  Connectivity errors are
+    intentionally allowed to raise so they can never be mistaken for an authoritative negative answer.
+    """
+    if not namespace_id or not isinstance(expected_doc, dict):
+        raise ValueError("local result receipt requires a namespace and status document")
+    expected = dict(expected_doc)
+    if str(expected.get("status")) != "done":
+        return False
+    expected_payload = json.dumps(expected, default=str)
+    uri = _local_result_candidate(_result_doc_uri(expected))
+    if uri is None:
+        return False
+    with session() as s:
+        state = s.get(RunState, str(run_id), with_for_update=True)
+        if (state is None or state.status != "done"
+                or state.doc != expected_payload):
+            return False
+        # Owner rows precede the registry in the global lifecycle lock order.
+        _lock_local_result_registry(s)
+        ref = s.get(LocalResultReference, {
+            "uri": uri, "owner_kind": "run_state", "owner_key": str(run_id),
+        })
+        artifact = s.get(LocalResultArtifact, uri, with_for_update=True)
+        return bool(
+            ref is not None and artifact is not None
+            and artifact.namespace_id == namespace_id
+            and artifact.state == "ready"
+            and artifact.writer_run_id is None
+            and artifact.writer_token is None)
 
 
 def get_run_state(run_id: str) -> dict | None:
@@ -932,6 +1122,15 @@ def diff_columns(a: list[dict], b: list[dict]) -> dict:
 _RESULT_CACHE_MAX = 1000  # persistent equivalent of the old in-process _MAX_RUNS cache cap
 _INSTALLATION_ID = 1
 _OBJECT_ATTEMPT_KINDS = ("region", "sink")
+_LOCAL_RESULT_REGISTRY_ID = 1
+_LOCAL_RESULT_OWNER_KINDS = {
+    "canvas", "canvas_version", "catalog_entry", "result_cache", "run_record", "run_state",
+}
+_LOCAL_RESULT_EPHEMERAL_OWNER_KIND = "read_lease"
+_LOCAL_RESULT_DIR = ".dp-results"
+_LOCAL_RESULT_PREFIX = "__result_"
+_LOCAL_RESULT_MAX_URI = 4096
+_LOCAL_RESULT_QUERY_CHUNK = 200
 _WRITABLE_ATTEMPT_STATES = ("allocated", "writing")
 _TERMINAL_ATTEMPT_STATES = (
     "superseded", "abandoned", "delete_pending", "deleting", "delete_verifying", "deleted",
@@ -939,6 +1138,546 @@ _TERMINAL_ATTEMPT_STATES = (
 )
 _OBJECT_SCHEMES = ("s3", "r2", "gs", "gcs")
 _ATTEMPT_MARKER = ".attempt-"
+
+
+def _local_result_candidate(value) -> str | None:
+    """Cheap shape filter before a value is ever admitted to a lifecycle database query."""
+    if not isinstance(value, str) or not value or len(value) > _LOCAL_RESULT_MAX_URI:
+        return None
+    if "://" in value:
+        try:
+            scheme = urlsplit(value).scheme.lower()
+        except ValueError:
+            return None
+        if scheme != "file":
+            return None
+    if _LOCAL_RESULT_PREFIX not in value or _LOCAL_RESULT_DIR not in value:
+        return None
+    path = value[len("file://"):] if value.startswith("file://") else value
+    if "\x00" in path:
+        return None
+    name = os.path.basename(path)
+    if (not name.startswith(_LOCAL_RESULT_PREFIX) or not name.endswith(".parquet")
+            or os.path.basename(os.path.dirname(path)) != _LOCAL_RESULT_DIR):
+        return None
+    return path
+
+
+def _canvas_local_result_candidates(value) -> set[str]:
+    """Extract bounded executable source bindings, including legacy nested section bodies."""
+    if not isinstance(value, dict):
+        raise ValueError("canvas document must be an object")
+    nodes = value.get("nodes", [])
+    if not isinstance(nodes, list) or len(nodes) > 5000:
+        raise ValueError("canvas document has an invalid or oversized node list")
+    children: dict[str, list[dict]] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        parent = node.get("parentId") or node.get("parent_id")
+        if parent:
+            children.setdefault(str(parent), []).append(node)
+    candidates: set[str] = set()
+    queue: list[tuple[dict, int, bool]] = [
+        (node, 0, True) for node in nodes if isinstance(node, dict)]
+    seen: set[int] = set()
+    cursor = 0
+    while cursor < len(queue):
+        if cursor >= 10_000:
+            raise ValueError("canvas section source traversal exceeds the supported node limit")
+        node, depth, visual = queue[cursor]
+        cursor += 1
+        if depth > 64:
+            raise ValueError("canvas legacy section nesting exceeds the supported depth")
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        data = node.get("data") if visual else None
+        config = ((data.get("config") if isinstance(data, dict) else None)
+                  if visual else node.get("config"))
+        if not isinstance(config, dict):
+            config = {}
+        if node.get("type") == "source":
+            candidate = _local_result_candidate(config.get("uri") or config.get("table"))
+            if candidate is not None:
+                candidates.add(candidate)
+        if node.get("type") != "section":
+            continue
+        direct = children.get(str(node.get("id")), []) if visual else []
+        if direct:  # identical precedence to section._collect_subnodes
+            queue.extend((child, depth, True) for child in direct)
+            continue
+        subnodes = config.get("subnodes") or []
+        if not isinstance(subnodes, list):
+            raise ValueError("canvas legacy section subnodes must be a list")
+        queue.extend((child, depth + 1, False)
+                     for child in subnodes if isinstance(child, dict))
+    return candidates
+
+
+def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
+    """Owner-aware exact extraction avoids scanning arbitrary caller-controlled JSON strings."""
+    candidates: set[str] = set()
+    if owner_kind in ("run_state", "result_cache"):
+        for value in values:
+            candidate = _local_result_candidate(_result_doc_uri(value))
+            if candidate is not None:
+                candidates.add(candidate)
+    elif owner_kind in ("run_record", "catalog_entry"):
+        for value in values:
+            candidate = _local_result_candidate(value)
+            if candidate is not None:
+                candidates.add(candidate)
+    elif owner_kind in ("canvas", "canvas_version"):
+        for value in values:
+            candidates.update(_canvas_local_result_candidates(value))
+    else:
+        raise ValueError(f"unknown local-result owner kind {owner_kind!r}")
+    return sorted(candidates)
+
+
+def _lock_local_result_registry(s) -> LocalResultRegistry:
+    """Serialize local lifecycle changes across PostgreSQL and SQLite processes.
+
+    Callers that also mutate object attempts must acquire all object-attempt locks first. The local
+    registry is deliberately the final lifecycle lock in the global order.
+    """
+    # ORM mutation is not lock order until SQL reaches the database. Flush every pending durable-owner
+    # and object-attempt/ref/lease mutation before taking the final local registry lock; no_autoflush
+    # below then prevents the registry statement itself from inverting that physical order.
+    s.flush()
+    with s.no_autoflush:
+        result = s.execute(
+            update(LocalResultRegistry)
+            .where(LocalResultRegistry.id == _LOCAL_RESULT_REGISTRY_ID)
+            .values(owner_token=LocalResultRegistry.owner_token),
+            execution_options={"autoflush": False},
+        )
+        row = s.get(LocalResultRegistry, _LOCAL_RESULT_REGISTRY_ID, with_for_update=True)
+    if result.rowcount != 1 or row is None:
+        raise RuntimeError("local result registry identity is missing")
+    return row
+
+
+def _drop_local_result_owner_locked(s, owner_kind: str, owner_key: str) -> None:
+    refs = list(s.scalars(select(LocalResultReference).where(
+        LocalResultReference.owner_kind == owner_kind,
+        LocalResultReference.owner_key == owner_key,
+    ).order_by(LocalResultReference.uri)))
+    for ref in refs:
+        s.get(LocalResultArtifact, ref.uri, with_for_update=True)
+        s.delete(ref)
+
+
+def _drop_local_result_owner(s, owner_kind: str, owner_key: str) -> None:
+    _lock_local_result_registry(s)
+    _drop_local_result_owner_locked(s, owner_kind, owner_key)
+
+
+def sync_local_result_owner(s, owner_kind: str, owner_key: str, *values) -> None:
+    """Replace one durable owner's exact local-result references in the owner's transaction."""
+    if owner_kind not in _LOCAL_RESULT_OWNER_KINDS:
+        raise ValueError(f"unknown local-result owner kind {owner_kind!r}")
+    candidates = _local_result_owner_candidates(owner_kind, values)
+    if not candidates and s.scalar(select(LocalResultReference.uri).where(
+            LocalResultReference.owner_kind == owner_kind,
+            LocalResultReference.owner_key == str(owner_key)).limit(1)) is None:
+        # The durable owner row/key is already serialized by its caller. Avoid turning every ordinary
+        # progress/autosave/catalog write into a global local-registry UPDATE on object-only workloads.
+        return
+    _lock_local_result_registry(s)
+    _drop_local_result_owner_locked(s, owner_kind, str(owner_key))
+    artifacts: list[LocalResultArtifact] = []
+    for start in range(0, len(candidates), _LOCAL_RESULT_QUERY_CHUNK):
+        chunk = candidates[start:start + _LOCAL_RESULT_QUERY_CHUNK]
+        artifacts.extend(s.scalars(
+            select(LocalResultArtifact).where(LocalResultArtifact.uri.in_(chunk))
+            .order_by(LocalResultArtifact.uri).with_for_update()))
+    if {artifact.uri for artifact in artifacts} != set(candidates):
+        raise RuntimeError("managed local-result owner references an unknown artifact")
+    for artifact in artifacts:
+        if artifact.state == "deleting":
+            raise RuntimeError("managed local result is already being reclaimed")
+        if artifact.state != "ready":
+            raise RuntimeError("managed local result is not ready for durable publication")
+        if artifact.writer_run_id is not None or artifact.writer_token is not None:
+            if (owner_kind != "run_state"
+                    or str(owner_key) != artifact.writer_run_id):
+                # Only the exact writer's RunState transaction may establish the primary ref and clear
+                # its writer pair. Secondary owners cannot pin a guessed/provisional URI before that.
+                raise RuntimeError(
+                    "managed local result must be published by its exact writer run first")
+        s.add(LocalResultReference(
+            uri=artifact.uri, owner_kind=owner_kind, owner_key=str(owner_key)))
+
+
+def begin_local_result(uri: str, namespace_id: str, storage_root: str, lock_name: str,
+                       lock_protected: bool,
+                       run_id: str, writer_token: str, lock_token: str | None) -> None:
+    """Reserve a never-reused exact local result before the first file side effect."""
+    if not uri or not namespace_id or not storage_root or not lock_name or not run_id or not writer_token:
+        raise ValueError(
+            "local result uri, namespace, root, lock, run id, and writer token are required")
+    if _local_result_candidate(uri) != uri:
+        raise ValueError("local result uri is outside the reserved namespace")
+    if bool(lock_protected) != bool(lock_token):
+        raise ValueError("protected local results require an exact lock token")
+    with session() as s:
+        _lock_local_result_registry(s)
+        existing = s.get(LocalResultArtifact, uri, with_for_update=True)
+        if existing is not None:
+            if (
+                existing.namespace_id == namespace_id
+                and existing.storage_root == storage_root
+                and existing.lock_name == lock_name
+                and existing.lock_token == lock_token
+                and bool(existing.lock_protected) == bool(lock_protected)
+                and existing.state == "writing"
+                and existing.writer_run_id == str(run_id)
+                and existing.writer_token == str(writer_token)
+                and existing.committed_at is None
+                and existing.delete_token is None
+                and existing.delete_attempted_at is None
+            ):
+                # Exact replay after an unknown commit outcome. The registry lock serializes this
+                # transaction behind the original one, so returning proves that one reservation won.
+                return
+            raise RuntimeError("managed local result uri already exists")
+        s.add(LocalResultArtifact(
+            uri=uri, namespace_id=namespace_id, storage_root=storage_root, lock_name=lock_name,
+            lock_token=lock_token,
+            lock_protected=bool(lock_protected), state="writing", writer_run_id=str(run_id),
+            writer_token=str(writer_token), created_at=_db_now(s)))
+
+
+def commit_local_result(uri: str, namespace_id: str, run_id: str, writer_token: str,
+                        lock_token: str | None) -> None:
+    """Fence the ready transition to the writer that reserved this exact file."""
+    with session() as s:
+        _lock_local_result_registry(s)
+        row = s.get(LocalResultArtifact, uri, with_for_update=True)
+        if (row is None or row.namespace_id != namespace_id or row.state != "writing"
+                or row.writer_run_id != str(run_id)
+                or row.writer_token != str(writer_token)
+                or bool(row.lock_protected) != bool(lock_token)
+                or (lock_token is not None and row.lock_token != lock_token)):
+            raise RuntimeError("local result writer lost ownership before commit")
+        row.state = "ready"
+        row.committed_at = _db_now(s)
+
+
+def release_local_result_writer(
+        uri: str, namespace_id: str, run_id: str, writer_token: str) -> bool:
+    """Release a successful process fence only after a durable reference exists."""
+    with session() as s:
+        _lock_local_result_registry(s)
+        row = s.get(LocalResultArtifact, uri, with_for_update=True)
+        if row is None:
+            return True
+        if row.namespace_id != namespace_id:
+            raise RuntimeError("local result belongs to a different filesystem namespace")
+        if (row.state in ("ready", "deleting")
+                and row.writer_run_id is None and row.writer_token is None):
+            # Retention may claim an unreferenced artifact after the terminal transaction cleared its
+            # writer identity but before this process closes its SH descriptor. Closing that exact
+            # process fence is both safe and necessary for the already-claimed delete to obtain EX.
+            return True
+        if row.writer_run_id != str(run_id) or row.writer_token != str(writer_token):
+            raise RuntimeError("local result writer lost ownership before release")
+        if row.state != "ready":
+            raise RuntimeError("cannot release an uncommitted local result writer")
+        if s.scalar(select(LocalResultReference.uri).where(
+                LocalResultReference.uri == uri).limit(1)) is None:
+            return False
+        row.writer_run_id = row.writer_token = None
+        return True
+
+
+def _release_terminal_local_result_writers(
+        s, run_id: str, *, allow_unreferenced: bool = False) -> None:
+    rows = list(s.scalars(select(LocalResultArtifact).where(
+        LocalResultArtifact.writer_run_id == str(run_id)).with_for_update()))
+    for row in rows:
+        if not allow_unreferenced and s.scalar(select(LocalResultReference.uri).where(
+                LocalResultReference.uri == row.uri).limit(1)) is None:
+            continue
+        row.writer_run_id = row.writer_token = None
+
+
+def acquire_local_result_read(
+        uri: str, namespace_id: str, lock_name: str, reader_id: str,
+        lock_token: str | None) -> bool:
+    """Add an ephemeral exact reader ref after its process acquired the shared OS lock."""
+    with session() as s:
+        _lock_local_result_registry(s)
+        row = s.get(LocalResultArtifact, uri, with_for_update=True)
+        if (row is None or row.namespace_id != namespace_id
+                or row.state != "ready" or row.lock_name != lock_name
+                or bool(row.lock_protected) != bool(lock_token)
+                or (lock_token is not None and row.lock_token != lock_token)):
+            return False
+        key = {
+            "uri": uri,
+            "owner_kind": _LOCAL_RESULT_EPHEMERAL_OWNER_KIND,
+            "owner_key": str(reader_id),
+        }
+        if s.get(LocalResultReference, key) is None:
+            s.add(LocalResultReference(**key))
+        return True
+
+
+def local_result_read_active(uri: str, namespace_id: str, reader_id: str) -> bool:
+    """Check that the exact ephemeral reader identity is still registered."""
+    with session() as s:
+        row = s.get(LocalResultArtifact, uri)
+        return row is not None and row.namespace_id == namespace_id and s.get(LocalResultReference, {
+            "uri": uri,
+            "owner_kind": _LOCAL_RESULT_EPHEMERAL_OWNER_KIND,
+            "owner_key": str(reader_id),
+        }) is not None
+
+
+def release_local_result_read(uri: str, namespace_id: str, reader_id: str) -> None:
+    """Unconditionally release a stopped reader; no replacement durable owner is required."""
+    with session() as s:
+        _lock_local_result_registry(s)
+        key = {
+            "uri": uri,
+            "owner_kind": _LOCAL_RESULT_EPHEMERAL_OWNER_KIND,
+            "owner_key": str(reader_id),
+        }
+        ref = s.get(LocalResultReference, key)
+        if ref is not None:
+            row = s.get(LocalResultArtifact, uri, with_for_update=True)
+            if row is None or row.namespace_id != namespace_id:
+                raise RuntimeError("local result belongs to a different filesystem namespace")
+            s.delete(ref)
+
+
+def local_result_lock_candidates(
+        namespace_id: str, *, limit: int = 50) -> list[tuple[str, str, str]]:
+    """Bounded, rotating set of process-owned artifacts needing death reconciliation."""
+    if limit <= 0:
+        return []
+    lease_exists = select(LocalResultReference.uri).where(
+        LocalResultReference.uri == LocalResultArtifact.uri,
+        LocalResultReference.owner_kind == _LOCAL_RESULT_EPHEMERAL_OWNER_KIND,
+    ).exists()
+    with session() as s:
+        registry = _lock_local_result_registry(s)
+        predicates = (
+            LocalResultArtifact.namespace_id == namespace_id,
+            LocalResultArtifact.lock_protected.is_(True),
+            LocalResultArtifact.state.in_(("writing", "ready")),
+            or_(LocalResultArtifact.writer_run_id.is_not(None), lease_exists),
+        )
+        cursor = registry.lock_cursor_uri
+        rows = list(s.scalars(select(LocalResultArtifact).where(
+            *predicates,
+            LocalResultArtifact.uri > cursor if cursor else True,
+        ).order_by(LocalResultArtifact.uri).limit(limit)))
+        if cursor and len(rows) < limit:
+            rows.extend(s.scalars(select(LocalResultArtifact).where(
+                *predicates, LocalResultArtifact.uri <= cursor,
+            ).order_by(LocalResultArtifact.uri).limit(limit - len(rows))))
+        registry.lock_cursor_uri = rows[-1].uri if rows else None
+        return [(row.uri, row.lock_name, row.lock_token) for row in rows if row.lock_token]
+
+
+def reconcile_dead_local_result(uri: str, namespace_id: str, lock_name: str) -> None:
+    """Clear process fences only while the caller holds the exact exclusive OS lock."""
+    with session() as s:
+        _lock_local_result_registry(s)
+        row = s.get(LocalResultArtifact, uri, with_for_update=True)
+        if (row is None or row.namespace_id != namespace_id
+                or row.lock_name != lock_name or row.state == "deleting"):
+            return
+        row.writer_run_id = row.writer_token = None
+        for ref in s.scalars(select(LocalResultReference).where(
+                LocalResultReference.uri == uri,
+                LocalResultReference.owner_kind == _LOCAL_RESULT_EPHEMERAL_OWNER_KIND)):
+            s.delete(ref)
+
+
+def abandon_local_result(
+        uri: str, namespace_id: str, run_id: str, writer_token: str) -> str | None:
+    """Fence an aborted writer and authorize deletion of only its exact reserved file."""
+    with session() as s:
+        _lock_local_result_registry(s)
+        row = s.get(LocalResultArtifact, uri, with_for_update=True)
+        if row is None:
+            return None
+        if row.namespace_id != namespace_id:
+            raise RuntimeError("local result belongs to a different filesystem namespace")
+        if row.state == "deleting":
+            if (row.writer_run_id == str(run_id)
+                    and row.writer_token == str(writer_token)
+                    and row.delete_token):
+                return row.delete_token
+            raise RuntimeError("local result writer lost ownership before abort")
+        if row.writer_run_id != str(run_id) or row.writer_token != str(writer_token):
+            raise RuntimeError("local result writer lost ownership before abort")
+        if s.scalar(select(LocalResultReference.uri).where(
+                LocalResultReference.uri == uri).limit(1)) is not None:
+            raise RuntimeError("cannot abort a referenced local result")
+        row.state = "deleting"
+        row.delete_token = uuid.uuid4().hex
+        row.delete_attempted_at = _db_now(s)
+        return row.delete_token
+
+
+def claim_local_result_reclaims(
+        namespace_id: str, *, limit: int = 50,
+        prefer_fresh: bool = False) -> list[tuple[str, str, str | None]]:
+    """Claim exact unreferenced files whose process locks prove every user stopped."""
+    if not namespace_id or limit <= 0:
+        return []
+    claimed: list[tuple[str, str, str | None]] = []
+    with session() as s:
+        registry = _lock_local_result_registry(s)
+        deleting_budget = (0 if limit == 1 and prefer_fresh
+                           else (1 if limit == 1 else max(1, (limit + 1) // 2)))
+        deleting = _rotating_deleting_local_results(
+            s, registry, namespace_id, deleting_budget, lock_protected=True)
+        now = _db_now(s)
+        for row in deleting:
+            row.delete_token = row.delete_token or uuid.uuid4().hex
+            row.delete_attempted_at = now
+            claimed.append((row.uri, row.delete_token, row.lock_token))
+        remaining = limit - len(claimed)
+        no_reference = ~select(LocalResultReference.uri).where(
+            LocalResultReference.uri == LocalResultArtifact.uri).exists()
+        rows = list(s.scalars(select(LocalResultArtifact).where(
+            LocalResultArtifact.namespace_id == namespace_id,
+            LocalResultArtifact.lock_protected.is_(True),
+            LocalResultArtifact.state.in_(("writing", "ready")),
+            LocalResultArtifact.writer_run_id.is_(None), no_reference,
+        ).order_by(LocalResultArtifact.created_at, LocalResultArtifact.uri)
+          .limit(remaining).with_for_update()))
+        for row in rows:
+            if s.scalar(select(LocalResultReference.uri).where(
+                    LocalResultReference.uri == row.uri).limit(1)) is not None:
+                continue
+            row.state = "deleting"
+            row.writer_run_id = row.writer_token = None
+            row.delete_token = uuid.uuid4().hex
+            row.delete_attempted_at = now
+            claimed.append((row.uri, row.delete_token, row.lock_token))
+        if not claimed and deleting_budget == 0:
+            # A limit=1 fresh turn should not stall deletion retries when there is no fresh work.
+            fallback = _rotating_deleting_local_results(
+                s, registry, namespace_id, 1, lock_protected=True)
+            if fallback:
+                row = fallback[0]
+                row.delete_token = row.delete_token or uuid.uuid4().hex
+                row.delete_attempted_at = now
+                claimed.append((row.uri, row.delete_token, row.lock_token))
+    return claimed
+
+
+def _rotating_deleting_local_results(
+        s, registry: LocalResultRegistry, namespace_id: str, limit: int,
+        *, lock_protected: bool | None) -> list[LocalResultArtifact]:
+    """Select a strict persistent URI rotation independent of database timestamp precision."""
+    if limit <= 0:
+        return []
+    predicates = [
+        LocalResultArtifact.namespace_id == namespace_id,
+        LocalResultArtifact.state == "deleting",
+    ]
+    if lock_protected is not None:
+        predicates.append(LocalResultArtifact.lock_protected.is_(lock_protected))
+    cursor = registry.reclaim_cursor_uri
+    rows = list(s.scalars(select(LocalResultArtifact).where(
+        *predicates, LocalResultArtifact.uri > cursor if cursor else True,
+    ).order_by(LocalResultArtifact.uri).limit(limit).with_for_update()))
+    if cursor and len(rows) < limit:
+        rows.extend(s.scalars(select(LocalResultArtifact).where(
+            *predicates, LocalResultArtifact.uri <= cursor,
+        ).order_by(LocalResultArtifact.uri).limit(limit - len(rows)).with_for_update()))
+    if rows:
+        registry.reclaim_cursor_uri = rows[-1].uri
+    return rows
+
+
+def claim_deleting_local_results(
+        namespace_id: str, *, limit: int = 50) -> list[tuple[str, str, str | None]]:
+    """Retry only durable explicit-abort deletions, including no-flock platforms.
+
+    A deleting row is terminal proof that its exact writer stopped and no reference existed. Windows
+    cannot safely discover or claim fresh abandoned writers, but it can safely finish this already-
+    authorized queue after a transient synchronous delete failure.
+    """
+    if not namespace_id or limit <= 0:
+        return []
+    with session() as s:
+        registry = _lock_local_result_registry(s)
+        rows = _rotating_deleting_local_results(
+            s, registry, namespace_id, limit, lock_protected=False)
+        now = _db_now(s)
+        out = []
+        for row in rows:
+            row.delete_token = row.delete_token or uuid.uuid4().hex
+            row.delete_attempted_at = now
+            out.append((row.uri, row.delete_token, row.lock_token))
+        return out
+
+
+def delete_local_result(uri: str, namespace_id: str, delete_token: str, delete_file) -> bool:
+    """Revalidate a claim, durably unlink data, then commit retirement of its ownership row.
+
+    The caller keeps the exact lock FD open and removes the lock pathname only after this transaction
+    commits. Thus a failed commit leaves a retryable deleting row plus its deletion fence.
+    """
+    with session() as s:
+        _lock_local_result_registry(s)
+        row = s.get(LocalResultArtifact, uri, with_for_update=True)
+        if row is None:
+            return False
+        if (row.namespace_id != namespace_id or row.state != "deleting"
+                or row.delete_token != delete_token):
+            raise RuntimeError("local result delete claim is stale")
+        if s.scalar(select(LocalResultReference.uri).where(
+                LocalResultReference.uri == uri).limit(1)) is not None:
+            raise RuntimeError("cannot delete a referenced local result")
+        delete_file()
+        s.delete(row)
+        return True
+
+
+def local_result_artifact_absent(
+        uri: str, namespace_id: str, lock_name: str, lock_token: str) -> bool:
+    """Confirm an exact lock is orphaned after a committed artifact-row deletion."""
+    with session() as s:
+        _lock_local_result_registry(s)
+        row = s.get(LocalResultArtifact, uri, with_for_update=True)
+        if row is None:
+            return True
+        if (row.namespace_id != namespace_id or row.lock_name != lock_name
+                or row.lock_token != lock_token):
+            return False
+        return False
+
+
+def local_result_lock_row_absent(
+        uri: str, namespace_id: str, lock_name: str) -> bool:
+    """Prove a malformed pre-DB lock has no exact lifecycle row before unlinking it."""
+    with session() as s:
+        _lock_local_result_registry(s)
+        row = s.scalars(select(LocalResultArtifact).where(or_(
+            LocalResultArtifact.uri == uri,
+            (LocalResultArtifact.namespace_id == namespace_id)
+            & (LocalResultArtifact.lock_name == lock_name),
+        )).order_by(LocalResultArtifact.uri).limit(1).with_for_update()).first()
+        return row is None
+
+
+def local_result_uri_absent(uri: str, namespace_id: str) -> bool:
+    """Confirm an exact unique result URI has no lifecycle row before temp cleanup."""
+    with session() as s:
+        _lock_local_result_registry(s)
+        row = s.get(LocalResultArtifact, uri, with_for_update=True)
+        return row is None
 
 
 def object_attempt_uri_shape(uri: str | None) -> bool:
@@ -2131,12 +2870,14 @@ def _result_doc_uri(raw: str | dict | None) -> str | None:
 
 
 def put_result(key: str, doc: dict) -> list[str]:
-    """Atomically replace a cache row and its durable attempt reference."""
+    """Atomically replace a cache row and its durable object/local artifact reference."""
     payload = json.dumps(doc, default=str)
     new_uri = _result_doc_uri(doc)
     retired: list[str] = []
     with session() as s:
         now = _db_now(s)
+        stale_candidate_keys: list[str] = []
+        locked_cache: dict[str, ResultCache] = {}
         if s.get_bind().dialect.name == "sqlite":
             # One atomic same-key upsert is the SQLite lock/CAS point, including concurrent first
             # publication. It obtains SQLite's writer transaction before any attempt/ref mutation; a
@@ -2149,25 +2890,50 @@ def put_result(key: str, doc: dict) -> list[str]:
                 set_={"doc": payload, "created_at": now},
             ))
         else:
-            row = s.get(ResultCache, key, with_for_update=True)
+            existing = s.get(ResultCache, key)
+            stale_candidate_keys = list(s.scalars(select(ResultCache.key).where(
+                ResultCache.key != str(key)
+            ).order_by(ResultCache.created_at.desc(), ResultCache.key.desc())
+              .offset(max(0, _RESULT_CACHE_MAX - 1))))
+            lock_keys = set(stale_candidate_keys)
+            if existing is not None:
+                lock_keys.add(str(key))
+            locked_cache = {row.key: row for row in s.scalars(select(ResultCache).where(
+                ResultCache.key.in_(sorted(lock_keys))
+            ).order_by(ResultCache.key).with_for_update())} if lock_keys else {}
+            row = locked_cache.get(str(key))
             if row is None:
                 s.add(ResultCache(key=key, doc=payload, created_at=now))
             else:
                 row.doc, row.created_at = payload, now
         s.flush()
+        if s.get_bind().dialect.name == "sqlite":
+            stale = [row for row in s.scalars(
+                select(ResultCache).where(ResultCache.key != str(key))
+                .order_by(ResultCache.created_at.desc(), ResultCache.key.desc())
+                .offset(max(0, _RESULT_CACHE_MAX - 1)).with_for_update())]
+        else:
+            stale_now = set(s.scalars(select(ResultCache.key).order_by(
+                ResultCache.created_at.desc(), ResultCache.key.desc()
+            ).offset(_RESULT_CACHE_MAX)))
+            stale = [locked_cache[stale_key]
+                     for stale_key in sorted(stale_now & set(stale_candidate_keys))
+                     if stale_key != str(key) and stale_key in locked_cache]
         attempt = s.get(ObjectAttempt, new_uri, with_for_update=True) if new_uri else None
         if attempt is not None:
             if attempt.kind != "region":
                 raise RuntimeError("result cache cannot own a sink attempt")
         retired.extend(_replace_attempt_ref(
             s, "result_cache", key, new_uri, publish=attempt is not None))
-        stale = list(s.scalars(
-            select(ResultCache).order_by(ResultCache.created_at.desc(), ResultCache.key.desc())
-            .offset(_RESULT_CACHE_MAX).with_for_update()
-        ))
         for stale_row in stale:
             retired.extend(_replace_attempt_ref(s, "result_cache", stale_row.key, None))
             s.delete(stale_row)
+        if stale:
+            _lock_local_result_registry(s)
+        # Every object-attempt row/ref is settled before the local registry lock is acquired.
+        sync_local_result_owner(s, "result_cache", key, doc)
+        for stale_row in stale:
+            _drop_local_result_owner_locked(s, "result_cache", stale_row.key)
     return list(dict.fromkeys(retired))
 
 
@@ -2502,17 +3268,27 @@ def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
     so browse/search/facet push down to the DB. `usage` (popularity) is owned by the column and NOT
     overwritten from the doc — it's bumped independently on reads."""
     with session() as s:
+        normalized = str(uri).rstrip("/")
+        payload = dict(doc)
         _catalog_upsert_in_session(
-            s, str(uri).rstrip("/"), name, dict(doc), parents=parents, pipeline=pipeline)
+            s, normalized, name, payload, parents=parents, pipeline=pipeline)
+        sync_local_result_owner(s, "catalog_entry", normalized, normalized, payload)
 
 
 def catalog_publish_entries(entries: list[tuple[str, str, dict, list[str] | None, str | None]]) -> None:
     """Reusable atomic publication primitive for a future successful multi-sink batch."""
     with session() as s:
+        local_owners: list[tuple[str, dict]] = []
         for uri, name, doc, parents, pipeline in entries:
+            normalized = str(uri).rstrip("/")
+            payload = dict(doc)
             _catalog_upsert_in_session(
-                s, str(uri).rstrip("/"), name, dict(doc),
+                s, normalized, name, payload,
                 parents=parents, pipeline=pipeline)
+            local_owners.append((normalized, payload))
+        for normalized, payload in local_owners:
+            sync_local_result_owner(
+                s, "catalog_entry", normalized, normalized, payload)
 
 
 def catalog_managed_publication_receipt(uri: str) -> dict | None:
@@ -2902,6 +3678,8 @@ def catalog_delete_entry(uri: str) -> None:
             _delete_catalog_children(s, [current_uri])
         if entry is not None:
             s.delete(entry)
+        # Object governance/ref mutations above always precede the local registry lock.
+        _drop_local_result_owner(s, "catalog_entry", current_uri)
 
 
 def catalog_delete_prefix(uri_prefix: str) -> int:
@@ -2953,6 +3731,9 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
                 logical.governance_doc = "{}"
                 _delete_catalog_governance(s, logical.catalog_key)
             s.delete(entries[uri])
+        _lock_local_result_registry(s)
+        for uri in current_uris:
+            _drop_local_result_owner_locked(s, "catalog_entry", uri)
     return len(current_uris)
 
 
@@ -3026,6 +3807,7 @@ def catalog_bulk_seed(entries: list[dict]) -> int:
     with session() as s:
         existing = {u for (u,) in s.execute(select(CatalogEntry.uri).where(
             CatalogEntry.uri.in_([e["uri"] for e in entries]))).all()}
+        local_owners: list[tuple[str, dict]] = []
         for e in entries:
             uri = e["uri"]
             if uri in existing:
@@ -3038,7 +3820,11 @@ def catalog_bulk_seed(entries: list[dict]) -> int:
                 s.add(CatalogTag(uri=uri, tag=t))
             for c in dict.fromkeys(cols):
                 s.add(CatalogColumn(uri=uri, column=c))
+            local_owners.append((uri, doc))
             n += 1
+        s.flush()
+        for uri, doc in local_owners:
+            sync_local_result_owner(s, "catalog_entry", uri, uri, doc)
     return n
 
 
@@ -3272,49 +4058,95 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
     n = 0
     with session() as s:
         live = {k.kernel_id for k in s.scalars(select(Kernel)) if not _kernel_stale(k)}
-        for r in s.scalars(select(RunState).where(RunState.status.in_(("queued", "running")))):
-            if r.kernel_id and r.kernel_id in live:
-                continue  # owning kernel is alive → leave it running (reattach)
-            if only_kernel_runs and not r.kernel_id:
-                continue  # periodic path: a kernel-less run belongs to a live hub process, not us to reap
+        reaped_run_ids: list[str] = []
+        candidate = select(RunState).where(
+            RunState.status.in_(("queued", "running")))
+        if only_kernel_runs:
+            candidate = candidate.where(RunState.kernel_id.is_not(None))
+            if live:
+                candidate = candidate.where(RunState.kernel_id.not_in(live))
+        elif live:
+            candidate = candidate.where(or_(
+                RunState.kernel_id.is_(None), RunState.kernel_id.not_in(live)))
+        # Filter before FOR UPDATE: a periodic pass must never block progress writes for a run whose
+        # kernel is observably live.  Empty ``live`` intentionally means every kernel-owned row is a
+        # candidate (and, on boot, every kernel-less row from the previous hub is too).
+        rows = s.scalars(candidate.order_by(
+            RunState.run_id).with_for_update()).all()
+        for r in rows:
             try:
                 d = json.loads(r.doc)
             except Exception:  # noqa: BLE001
                 d = {"run_id": r.run_id}
+            # A child may have reported a provisional binding before its durable parent reaped and
+            # committed it. Interrupted runs never publish that binding as a failed RunState owner.
+            for key in ("uri", "outputUri", "output_uri", "outputTable", "output_table"):
+                d.pop(key, None)
             d["status"] = "failed"
             d["error"] = "interrupted — the run's kernel is gone (hub restarted with no live kernel)"
             r.status = "failed"
             r.doc = json.dumps(d, default=str)
+            _replace_attempt_ref(s, "run_state", r.run_id, None)
+            reaped_run_ids.append(r.run_id)
             n += 1
+        if reaped_run_ids:
+            # Global order: every object-attempt ref above, then the local registry exactly once.
+            _lock_local_result_registry(s)
+            for run_id in reaped_run_ids:
+                _drop_local_result_owner_locked(s, "run_state", run_id)
     return n
+
+
+def _snapshot_canvas_in_session(
+        s, canvas: Canvas, doc_json: str, version: int,
+        author_id: str | None = None, label: str | None = None,
+        throttle_seconds: int = 90, keep: int = 30) -> bool:
+    """Snapshot in the transaction that already holds the canvas row lock."""
+    canvas_id = canvas.id
+    if label is None:
+        last = s.scalars(select(CanvasVersion).where(
+            CanvasVersion.canvas_id == canvas_id, CanvasVersion.label.is_(None)
+        ).order_by(CanvasVersion.created_at.desc()).limit(1)).first()
+        if last:
+            if last.doc == doc_json:
+                return False
+            lc = last.created_at
+            if lc is not None and lc.tzinfo is None:
+                lc = lc.replace(tzinfo=datetime.timezone.utc)
+            if lc is not None and (_now() - lc).total_seconds() < throttle_seconds:
+                return False
+    snapshot_id = _uid()
+    s.add(CanvasVersion(
+        id=snapshot_id, canvas_id=canvas_id, version=version, doc=doc_json,
+        label=label, author_id=author_id))
+    s.flush()  # owner row/FK first; local registry remains the final lifecycle lock
+    autos = list(s.scalars(select(CanvasVersion).where(
+        CanvasVersion.canvas_id == canvas_id, CanvasVersion.label.is_(None)
+    ).order_by(CanvasVersion.created_at.desc(), CanvasVersion.id).with_for_update()))
+    try:
+        snapshot_doc = json.loads(doc_json)
+    except (TypeError, ValueError):
+        snapshot_doc = {}
+    old_autos = autos[keep:]
+    if old_autos:
+        _lock_local_result_registry(s)
+    sync_local_result_owner(s, "canvas_version", snapshot_id, snapshot_doc)
+    for old in old_autos:
+        _drop_local_result_owner_locked(s, "canvas_version", old.id)
+        s.delete(old)
+    return True
 
 
 def snapshot_canvas(canvas_id: str, doc_json: str, version: int, author_id: str | None = None,
                     label: str | None = None, throttle_seconds: int = 90, keep: int = 30) -> bool:
-    """Save a snapshot of a canvas doc for later restore. Auto-snapshots (label=None) are throttled —
-    skipped if a recent one exists or the doc is unchanged — and pruned to the newest `keep`; named
-    snapshots are always kept. Returns True if a row was written."""
+    """Save a bounded snapshot while serializing with canvas update/restore/delete."""
     with session() as s:
-        if s.get(Canvas, canvas_id) is None:
+        canvas = s.get(Canvas, canvas_id, with_for_update=True)
+        if canvas is None:
             return False
-        if label is None:
-            last = s.scalars(select(CanvasVersion).where(CanvasVersion.canvas_id == canvas_id, CanvasVersion.label.is_(None))
-                             .order_by(CanvasVersion.created_at.desc()).limit(1)).first()
-            if last:
-                if last.doc == doc_json:
-                    return False  # nothing changed since the last auto-snapshot
-                lc = last.created_at
-                if lc is not None and lc.tzinfo is None:
-                    lc = lc.replace(tzinfo=datetime.timezone.utc)  # SQLite may hand back naive
-                if lc is not None and (_now() - lc).total_seconds() < throttle_seconds:
-                    return False  # too soon — don't snapshot every 400ms autosave
-        s.add(CanvasVersion(canvas_id=canvas_id, version=version, doc=doc_json, label=label, author_id=author_id))
-        s.flush()
-        autos = s.scalars(select(CanvasVersion).where(CanvasVersion.canvas_id == canvas_id, CanvasVersion.label.is_(None))
-                          .order_by(CanvasVersion.created_at.desc())).all()
-        for old in autos[keep:]:  # prune the oldest auto-snapshots; named ones are retained
-            s.delete(old)
-    return True
+        return _snapshot_canvas_in_session(
+            s, canvas, doc_json, version, author_id=author_id, label=label,
+            throttle_seconds=throttle_seconds, keep=keep)
 
 
 def list_versions(canvas_id: str, limit: int = 50) -> list[dict]:

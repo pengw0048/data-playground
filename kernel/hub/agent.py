@@ -202,7 +202,7 @@ try:
         else:
             try:
                 res = preview_node(Graph(**ctx.deps.wg), node_id, 8, d.resolve_adapter, d.registry,
-                                   d.node_builders, d.node_specs)
+                                   d.node_builders, d.node_specs, storage=d.storage)
                 if res.not_previewable:
                     out = {"not_previewable": True, "reason": res.reason}
                 elif res.error:

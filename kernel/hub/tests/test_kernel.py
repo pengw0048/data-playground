@@ -2700,7 +2700,8 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
         def wait(timeout=None):
             return 0
 
-    runner = SubprocessRunner("test", str(tmp_path), catalog=BlockingCatalog())
+    runner = SubprocessRunner(
+        str(tmp_path / "workspace"), str(tmp_path), catalog=BlockingCatalog())
     run_id = "run_catalog_gate"
     runner.runs[run_id] = RunStatus(run_id=run_id, status="running", per_node=[])
     runner._sink_contracts[run_id] = {"write": {
@@ -8430,7 +8431,8 @@ def test_ray_control_plane_setup_and_preflight_errors_are_generic(
     monkeypatch.setattr(runner, "_ray_unsupported_reason", lambda _ir: None)
     monkeypatch.setattr(runner, "_dedup_unsupported_reason", lambda _graph, _ir: None)
     monkeypatch.setattr(runner, "_resource_unsupported_reason", lambda _requires, _ir: None)
-    monkeypatch.setattr(runner, "_source_unsupported_reason", lambda _ir: None)
+    monkeypatch.setattr(
+        runner, "_source_unsupported_reason", lambda _graph, _target, _ir: None)
     monkeypatch.setattr(runner, "_resolve_sink_targets", lambda _ir: {"write": "/tmp/out.csv"})
     monkeypatch.setattr(
         runner, "_claim_sink_attempts",
@@ -9924,7 +9926,8 @@ def test_remote_ray_bounds_local_sources_and_never_dispatches_a_local_region_han
     assert runner._build(SimpleNamespace(op="read", config={"uri": source}), {}) is sentinel
     monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "1")
     assert "above the 1-byte limit" in (
-        runner._source_unsupported_reason(lower_to_ir(graph, "src", runner.node_specs)) or ""
+        runner._source_unsupported_reason(
+            graph, "src", lower_to_ir(graph, "src", runner.node_specs)) or ""
     )
     monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "1048576")
 
@@ -10133,6 +10136,7 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
     (tmp_path / "ws").mkdir()
     mod = _load_dp_ray()
     rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     opts = {"num_gpus": 1.0, "resources": {"a100": 0.001}}
     calls = []
     monkeypatch.setenv("DP_RAY_SHUFFLE_PARTITIONS", "4")
@@ -10188,6 +10192,7 @@ def test_ray_explicit_placement_fails_unsupported_shape_while_unpinned_falls_bac
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     graph = Graph(**{"id": "ray-placement", "version": 1, "nodes": [
         _ray_node("src", "source", {"uri": "unused.parquet"}),
         _ray_node("sql", "sql", {"sql": "SELECT * FROM input"}),
@@ -10229,6 +10234,7 @@ def test_ray_explicit_placement_fails_unadvertised_resources_before_dispatch(tmp
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     graph = Graph(**{"id": "ray-resource-placement", "version": 1, "nodes": [
         _ray_node("src", "source", {"uri": "unused.parquet"}),
     ], "edges": []})
@@ -11102,7 +11108,7 @@ def test_ray_sort_live_differential(tmp_path):
            sorted((r["k"] is None, r["k"] or 0, r["v"]) for r in duck_rows)  # same multiset of rows
 
 
-def test_ray_region_requires_fail_before_dispatch(tmp_path):
+def test_ray_region_requires_fail_before_dispatch(tmp_path, monkeypatch):
     # An explicit Ray region whose declared resources are not advertised fails before driver dispatch;
     # it never becomes a permanently pending Ray task that looks like a hung run.
     from hub.deps import Deps
@@ -11110,6 +11116,7 @@ def test_ray_region_requires_fail_before_dispatch(tmp_path):
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     g = Graph(**{"id": "c", "version": 1, "nodes": [
         _ray_node("src", "source", {"uri": "unused.parquet"}),
         _ray_node("m", "transform", {"mode": "map", "code": "def fn(row):\n    row['x'] = row['x'] + 1\n    return row"}),
