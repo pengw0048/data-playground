@@ -36,9 +36,14 @@ deployment (`DP_AUTH_SECRET` set) needs a real token a CLI can't present yet, so
 install. Best for scripts, CI, or a no-browser box:
 
 ```bash
-claude mcp add dataplay -- uv run dataplay mcp                       # workspace = CWD
-claude mcp add dataplay -- uv run dataplay mcp --workspace /path/to/proj
+claude mcp add dataplay -- \
+  uv --directory /absolute/path/to/data-playground/kernel run dataplay mcp \
+  --workspace /absolute/path/to/workspace
 ```
+
+Use absolute paths because the MCP client may launch the command from a directory other than the
+repository. Choose the workspace that should own the metadata database, catalog, canvases, and
+outputs.
 
 A canvas it builds is persisted to the shared workspace DB, so it appears in the browser's **Files**
 list; if that canvas is already open, **reload** to pick up the changes (an out-of-process client

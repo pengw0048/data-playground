@@ -70,9 +70,12 @@ Prefer `ctx.sql` when it suffices — it stays in the engine and spills to disk.
 Three discovery paths (see `kernel/hub/deps.py`):
 
 1. **Drop-in** — copy the folder into `<workspace>/plugins/<pack>/`. Restart; it's picked up.
+
    ```bash
-   cp -r examples/plugins/dp_example "$DP_WORKSPACE/plugins/"
+   mkdir -p kernel/plugins
+   cp -R examples/plugins/dp_example kernel/plugins/
    ```
+
 2. **`DP_PLUGINS`** — a comma-separated list of importable module names: `DP_PLUGINS=dp_example`.
 3. **pip entry point** — publish a package exposing the `dataplay.plugins` entry-point group.
 
@@ -160,10 +163,10 @@ test in `kernel/hub/tests/test_kernel.py` you can copy:
 |---|---|---|---|
 | [`dp_example`](../examples/plugins/dp_example/) | `add_node` | a `redact` compute node (mask a PII column) | — |
 | [`dp_sql_catalog`](../examples/plugins/dp_sql_catalog/) | `set_catalog` | a `CatalogProvider` backed by a SQL `datasets(name, uri)` table — subclasses `InMemoryCatalog`, overrides only the reads; `DP_SQL_CATALOG_URL` / `DP_SQL_CATALOG_TABLE` | uses `sqlalchemy` (core dep) |
-| [`dp_hf_datasets`](../examples/plugins/dp_hf_datasets/) | `add_adapter` | read a Hugging Face Hub dataset as a source: `hf://<id>[@<config>][:<split>]` | `uv pip install -e 'kernel[hf]'` |
-| [`dp_iceberg`](../examples/plugins/dp_iceberg/) | `add_adapter` | read an Apache Iceberg table as a source: `iceberg://<catalog>/<namespace>.<table>` (catalog from your pyiceberg config) | `uv pip install -e 'kernel[iceberg]'` |
+| [`dp_hf_datasets`](../examples/plugins/dp_hf_datasets/) | `add_adapter` | read a Hugging Face Hub dataset as a source: `hf://<id>[@<config>][:<split>]` | `uv sync --project kernel --extra dev --extra hf` |
+| [`dp_iceberg`](../examples/plugins/dp_iceberg/) | `add_adapter` | read an Apache Iceberg table as a source: `iceberg://<catalog>/<namespace>.<table>` (catalog from your pyiceberg config) | `uv sync --project kernel --extra dev --extra iceberg` |
 | [`dp_json_pipeline`](../examples/plugins/dp_json_pipeline/) | `set_importer` | parse a tiny JSON pipeline (`source`/`steps`/`write`) into a runnable canvas graph — import → canvas → run | — |
-| [`dp_ray`](../examples/plugins/dp_ray/) | `add_runner` (+ `PlaceableBackend`) | a **Ray Data reference backend** for clean transforms plus conservatively gated grouped aggregate, partitioned window, full-row dedup, broadcast `inner`/`left`/`cross` join, and plain-key sort. Unpinned choices may fall back to DuckDB; an explicit `config.requires.labels.engine=ray` instead fails loudly when the shape or resources are unsupported. Region outputs are worker-direct Parquet shards; object-store/non-Parquet reads and whole-graph sinks are driver-funneled. Driver and workers must use the pinned Ray 2.56.0 runtime, verified by a startup handshake. See the [support/readiness matrix](RAY.md) | `uv pip install -e 'kernel[ray]'` |
+| [`dp_ray`](../examples/plugins/dp_ray/) | `add_runner` (+ `PlaceableBackend`) | a **Ray Data reference backend** for clean transforms plus conservatively gated grouped aggregate, partitioned window, full-row dedup, broadcast `inner`/`left`/`cross` join, and plain-key sort. Unpinned choices may fall back to DuckDB; an explicit `config.requires.labels.engine=ray` instead fails loudly when the shape or resources are unsupported. Region outputs are worker-direct Parquet shards; object-store/non-Parquet reads and whole-graph sinks are driver-funneled. Driver and workers must use the pinned Ray 2.56.0 runtime, verified by a startup handshake. See the [support/readiness matrix](RAY.md) | `uv sync --project kernel --extra dev --extra ray` |
 | [`dp_datasets_place`](../examples/plugins/dp_datasets_place/) | `add_destination` | a save/open "place" (`kind='datasets'`) that browses only dataset files, hiding clutter; path-fenced to its root | — |
 | [`dp_json_view`](../examples/plugins/dp_json_view/) | `add_capability` | tags JSON-doc columns (name-based detector) + declares `viewer={"kind":"json"}` → the SPA shows a JSON tab that pretty-prints those cells, no frontend code | — |
 | [`dp_upper`](../examples/plugins/dp_upper/) | `add_node` (+`ir`) | an `upper` node whose DuckDB build + engine-neutral `ir` hook share one generated operator, so it runs on Ray too (a clean `map`), not just DuckDB | — |
