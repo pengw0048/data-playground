@@ -91,7 +91,8 @@ def main() -> None:
     # spares this run while we're alive). Wire it onto the runner that OWNS runs (the isolated child
     # manager when isolating), since that's what emits queued/progress/terminal for /run.
     run_runner.on_status = lambda g, st: metadb.save_run_state(
-        st.run_id, st.model_dump(), canvas_id=getattr(g, "id", None), kernel_id=kid)
+        st.run_id, st.model_dump(), canvas_id=getattr(g, "id", None), kernel_id=kid,
+        publish_region=st.status == "done")
 
     last_activity = [time.monotonic()]
     # in-process preview/profile run IN this kernel (not offloaded to a child), so — unlike /run — they

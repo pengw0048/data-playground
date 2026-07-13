@@ -22,6 +22,7 @@ in hub.security so the routers can depend on it without importing this module.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import os
 import threading
@@ -120,7 +121,27 @@ class RequestBodyLimitMiddleware:
             await self._response(limit)(scope, receive, send)
 
 
-app = FastAPI(title="Data Playground kernel", version="0.1.0")
+_object_attempt_reaper_stop = threading.Event()
+_object_attempt_reaper_thread: threading.Thread | None = None
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    global _object_attempt_reaper_stop, _object_attempt_reaper_thread
+    _object_attempt_reaper_stop = threading.Event()
+    _object_attempt_reaper_thread = threading.Thread(
+        target=_object_attempt_reaper_loop, args=(_object_attempt_reaper_stop,),
+        daemon=True, name="dp-object-attempt-reaper")
+    _object_attempt_reaper_thread.start()
+    try:
+        yield
+    finally:
+        _object_attempt_reaper_stop.set()
+        _object_attempt_reaper_thread.join(timeout=5)
+        _object_attempt_reaper_thread = None
+
+
+app = FastAPI(title="Data Playground kernel", version="0.1.0", lifespan=_lifespan)
 # Restrict CORS to localhost origins only. The kernel binds to 127.0.0.1 and serves the SPA
 # same-origin (and the Vite dev server proxies /api), so a wildcard is unnecessary — and a
 # wildcard would let any site the user visits read this local API cross-origin (data exfiltration).
@@ -179,21 +200,14 @@ def _reaper_loop() -> None:
 threading.Thread(target=_reaper_loop, daemon=True, name="dp-reaper").start()
 
 
-def _object_attempt_reaper_loop() -> None:
+def _object_attempt_reaper_loop(stop: threading.Event) -> None:
     """Keep provider I/O off startup and the kernel/substrate reaper's progress path."""
     from hub.handoff import reap_attempts
-    while True:
-        time.sleep(metadb.KERNEL_STALE_S)
+    while not stop.wait(metadb.KERNEL_STALE_S):
         try:
             reap_attempts()
         except Exception:  # noqa: BLE001 — provider failure must not stop future GC cycles
             logging.getLogger("hub").warning("object attempt GC cycle failed (continuing)", exc_info=True)
-
-
-threading.Thread(
-    target=_object_attempt_reaper_loop, daemon=True, name="dp-object-attempt-reaper"
-).start()
-
 
 def _cross_site_ws(ws: WebSocket) -> bool:
     """A browser page from ANOTHER origin opening this socket (cross-site WebSocket hijacking): the

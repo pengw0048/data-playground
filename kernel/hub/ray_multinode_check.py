@@ -139,8 +139,8 @@ def main() -> int:
     from hub.executors.engine import BuildEngine
     from hub.models import Graph
     ws, data = tempfile.mkdtemp(prefix="mn_ws_"), tempfile.mkdtemp(prefix="mn_data_")
-    deps = Deps(ws, data)
     metadb.init_db()  # create the metadata schema in this fresh workspace DB (settings/catalog/run_states)
+    deps = Deps(ws, data)
     metadb.set_setting("objectStore", {"accessKeyId": key, "secretAccessKey": secret,
                                        "endpoint": endpoint, "region": "us-east-1", "useSsl": False}, "global")
     src, out_uri = f"s3://{bucket}/src.parquet", f"s3://{bucket}/agg_out.parquet"

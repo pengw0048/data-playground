@@ -478,20 +478,24 @@ def data_sample(req: SampleRequest) -> SampleResult:
         if not os.path.exists(local) and not glob.glob(local, recursive=True):
             raise HTTPException(410, "dataset artifact is missing or expired")
     try:
-        adapter = deps.resolve_adapter(req.uri)
-        with db.run_scope():  # own cursor — a big sample doesn't block other users' runs/previews
-            # Keep the adapter contract unchanged: request a bounded prefix, then page that lazy
-            # relation. Fetch one extra row so `has_more` is exact even when count() is unavailable.
-            rel = adapter.scan(req.uri, req.columns, limit=req.offset + req.k + 1)
-            cols = relation_columns(rel)          # schema is metadata — no second scan needed
-            page = _table_to_rows(rel.limit(req.k + 1, req.offset).to_arrow_table())
-            rows = page[:req.k]
-            total = adapter.count(req.uri)
+        from hub.handoff import managed_read_lease
+        with managed_read_lease(req.uri, owner=f"sample:{uuid.uuid4().hex}"):
+            adapter = deps.resolve_adapter(req.uri)
+            with db.run_scope():  # own cursor — a big sample doesn't block other users' runs/previews
+                # Keep the adapter contract unchanged: request a bounded prefix, then page that lazy
+                # relation. Fetch one extra row so `has_more` is exact even when count() is unavailable.
+                rel = adapter.scan(req.uri, req.columns, limit=req.offset + req.k + 1)
+                cols = relation_columns(rel)          # schema is metadata — no second scan needed
+                page = _table_to_rows(rel.limit(req.k + 1, req.offset).to_arrow_table())
+                rows = page[:req.k]
+                total = adapter.count(req.uri)
         with contextlib.suppress(Exception):
             metadb.catalog_bump_usage(req.uri)  # someone looked at this data → popularity signal (best-effort)
         has_more = len(page) > req.k or (total is not None and total > req.offset + len(rows))
         return SampleResult(columns=cols, rows=rows, row_count=total, has_more=has_more,
                             truncated=(total is None or total > req.offset + len(rows)))
+    except FileNotFoundError as e:
+        raise HTTPException(410, str(e))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"{type(e).__name__}: {e}")
 
