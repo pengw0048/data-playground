@@ -75,7 +75,7 @@ def build_workload_env(*, include_metadata_db: bool = False, include_host_runtim
 
     # Auth mode controls filesystem/path confinement, but children never receive material that can sign
     # sessions or bootstrap an administrator. This derived boolean is the only auth value they need.
-    if src.get("DP_AUTH_SECRET") or src.get("DP_AUTH_MODE") == "1":
+    if str(src.get("DP_AUTH_SECRET") or "").strip() or src.get("DP_AUTH_MODE") == "1":
         env["DP_AUTH_MODE"] = "1"
     return env
 

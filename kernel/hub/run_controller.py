@@ -644,6 +644,7 @@ class RunController:
     def _allocate_region_attempt(self, *, logical_uri: str, run_id: str,
                                  region_id: str, cache_key: str) -> str:
         """Allocate one parent-owned generation before a local producer/copy can write."""
+        handle = None
         try:
             from hub.handoff import allocate_attempt, physical_attempt_uri
             invocation = uuid.uuid4().hex
@@ -660,6 +661,8 @@ class RunController:
                 handle["uri"], logical_uri, expected_run_id=run_id)
             return handle["uri"]
         except Exception:  # noqa: BLE001 — provider/DB details stay in server logs
+            if handle is not None:
+                self._abandon_region_attempt(handle["uri"])
             logging.getLogger("hub").exception(
                 "region object-attempt allocation failed")
             raise RuntimeError("region object lifecycle allocation failed") from None
