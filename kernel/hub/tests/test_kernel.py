@@ -4558,9 +4558,11 @@ def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_
         metadb.delete_canvas_cascade(cid)
 
 
-def test_collab_rechecks_token_for_sender_and_recipient(monkeypatch, live_collab_url):
-    # A session epoch bump fences every already-open socket before either document direction can leak.
+def test_collab_logout_revokes_sender_and_recipient(monkeypatch, live_collab_url):
+    # Real logout bumps the session epoch and fences every already-open socket before either document
+    # direction can leak. This intentionally revokes all of the user's sessions, not just this cookie.
     import asyncio
+    import httpx
     import websockets
     from hub import auth, metadb
     monkeypatch.setenv("DP_AUTH_SECRET", "ws-revocation-test-secret-not-weak-0123456789")
@@ -4576,7 +4578,11 @@ def test_collab_rechecks_token_for_sender_and_recipient(monkeypatch, live_collab
         async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner:
             async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as writer:
                 async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as reader:
-                    await asyncio.to_thread(metadb.bump_token_epoch, revoked_uid)
+                    async with httpx.AsyncClient(
+                        base_url=live_collab_url, headers={"Cookie": revoked_cookie},
+                    ) as http:
+                        response = await http.post("/api/auth/logout")
+                    assert response.status_code == 200
                     assert auth.verify(revoked_token) is None
 
                     await _collab_send(writer, {
