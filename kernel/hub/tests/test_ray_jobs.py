@@ -984,7 +984,8 @@ def test_quarantine_fences_an_expired_submit_before_terminal_failure(jobs_config
     binding = metadb.backend_job(status.run_id)
     assert binding["submission_state"] == "stop_fenced"
     assert runner._resume_quarantined_job(status, ref, binding) is True
-    assert status.status == "failed" and "tampered envelope" in (status.error or "")
+    assert status.status == "failed"
+    assert status.error == "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
 
 
 def test_ray_jobs_restart_reattaches_and_catalog_publication_has_one_winner(jobs_config):
@@ -1153,7 +1154,7 @@ def test_malformed_recovery_row_is_durably_visible_without_replay(
     restarted = module.RayRunner(
         deps, jobs_client_factory=client, artifact_store=store, recover=True
     )
-    assert (restarted.status(status.run_id).error or "").count("Ray Jobs recovery blocked:") == 1
+    assert (restarted.status(status.run_id).error or "").count("Ray Jobs recovery blocked (") == 1
     assert status.run_id not in supervised
     _retire_inert_test_run(restarted.status(status.run_id))
 
@@ -1184,7 +1185,9 @@ def test_malformed_backend_result_blocks_only_its_own_recovery_row(jobs_config, 
     )
 
     assert good.run_id in supervised and bad.run_id not in supervised
-    assert "result_doc" in (recovered.status(bad.run_id).error or "")
+    assert recovered.status(bad.run_id).error == (
+        "Ray Jobs recovery blocked (code=recovery_blocked,type=ValueError)"
+    )
     assert recovered.status(good.run_id).status == "queued"
     _retire_inert_test_run(recovered.status(bad.run_id))
     _retire_inert_test_run(recovered.status(good.run_id))
@@ -1263,6 +1266,77 @@ def test_ray_jobs_failure_never_shares_rotated_credentials_or_remote_text(
     )
     assert client.log_calls == []
     assert runner.catalog.calls == []
+
+
+@pytest.mark.parametrize("failure_site", ["status", "list"])
+def test_ray_jobs_discovery_exceptions_never_share_rotated_credentials(
+        jobs_config, monkeypatch, caplog, failure_site):
+    old_secret = f"retired-{failure_site}-control-secret"
+    raw_phrase = f"raw {failure_site} response body"
+    _module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    status = runner.run(
+        plan, graph, "write", "distributed",
+        run_id=f"run_jobs_{failure_site}_exception_{uuid.uuid4().hex}",
+    )
+    ref = status.backend_ref
+    assert ref is not None
+    _wait_submitted(client, ref.submission_id)
+    deadline = time.monotonic() + 2
+    while runner.status(status.run_id).status != "running" and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert runner.status(status.run_id).status == "running"
+
+    original_status = client.get_job_status
+    original_list = client.list_jobs
+
+    def _secret_status_error(_submission_id):
+        raise RuntimeError(f"{raw_phrase}: token={old_secret}")
+
+    def _safe_status_error(_submission_id):
+        raise ConnectionError("status request unavailable")
+
+    def _secret_list_error():
+        raise LookupError(f"{raw_phrase}: token={old_secret}")
+
+    def _safe_list_error():
+        raise ConnectionError("list request unavailable")
+
+    monkeypatch.setattr(
+        client, "get_job_status",
+        _secret_status_error if failure_site == "status" else _safe_status_error,
+    )
+    monkeypatch.setattr(
+        client, "list_jobs",
+        _safe_list_error if failure_site == "status" else _secret_list_error,
+    )
+    caplog.set_level("WARNING", logger="hub")
+
+    live_error = persisted_error = None
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        live_error = runner.status(status.run_id).error
+        persisted = metadb.get_run_state(status.run_id)
+        persisted_error = persisted.get("error") if persisted else None
+        if live_error and persisted_error and "code=status_control_unavailable" in live_error:
+            break
+        time.sleep(0.002)
+
+    monkeypatch.setattr(client, "get_job_status", original_status)
+    monkeypatch.setattr(client, "list_jobs", original_list)
+    _complete(store, client, status)
+    assert _wait(runner, status.run_id).status == "done"
+
+    expected = (
+        "Ray status/control plane unavailable; retrying "
+        "(code=status_control_unavailable,type=RuntimeError)"
+    )
+    assert live_error == expected
+    assert persisted_error == expected
+    shared = json.dumps({"live": live_error, "persisted": persisted_error}) + caplog.text
+    assert old_secret not in shared
+    assert raw_phrase not in shared
 
 
 def test_ray_jobs_fails_before_submit_without_baked_code_or_shared_io(jobs_config, monkeypatch):
@@ -1534,7 +1608,8 @@ def test_ray_jobs_tampered_job_is_stopped_before_failed_publication(jobs_config)
     recovered = module.RayRunner(deps, jobs_client_factory=client, artifact_store=store, recover=True)
     final = _wait(recovered, status.run_id)
 
-    assert final.status == "failed" and "invalid Ray Jobs artifact" in (final.error or "")
+    assert final.status == "failed"
+    assert final.error == "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
     assert client.stop_calls == [ref.submission_id]
     assert metadb.backend_job(status.run_id)["publication_state"] == "published"
 
@@ -1722,7 +1797,8 @@ def test_early_result_never_beats_running_and_corruption_waits_for_stopped(jobs_
 
     client.set_status(ref.submission_id, "STOPPED")
     final = _wait(runner, status.run_id)
-    assert final.status == "failed" and "unknown=unexpected" in (final.error or "")
+    assert final.status == "failed"
+    assert final.error == "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
 
 
 def test_trusted_result_wins_cancel_without_local_jobs_config_or_ray_metadata(jobs_config, monkeypatch):
@@ -1832,7 +1908,7 @@ def test_unsupported_job_contract_is_quarantined_without_workload_replay(jobs_co
     final = _wait(recovered, status.run_id)
 
     assert final.status == "failed"
-    assert "unsupported Ray job artifact contract_version 2" in (final.error or "")
+    assert final.error == "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
     assert client.submit_calls == [] and client.stop_calls == [ref.submission_id]
 
 

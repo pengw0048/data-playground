@@ -544,7 +544,9 @@ def _native_parquet_plan(uri: str, adapter: object) -> dict | None:
     except RuntimeError:
         raise
     except Exception as exc:  # noqa: BLE001 — any listing/footer uncertainty disables native execution
-        raise RuntimeError(f"could not prove native Parquet layout/schema for '{uri}': {exc}") from exc
+        raise RuntimeError(
+            f"native Parquet proof unavailable (code=parquet_proof_unavailable,type={type(exc).__name__})"
+        ) from exc
 
 
 def _read_native_parquet(ray, plan: dict, ray_opts: dict | None = None):
@@ -1163,26 +1165,9 @@ class RayRunner:
         return "Ray diagnostics are available only through protected operator tooling"
 
     @staticmethod
-    def _redact_job_text(value: str) -> str:
-        # Workload code can print its environment. Never mirror known data credentials into shared run
-        # status/log consumers; access to a run is broader than possession of its object-store identity.
-        for key in (
-            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-            "DP_S3_KEY", "DP_S3_SECRET",
-        ):
-            secret = os.environ.get(key)
-            if secret and len(secret) >= 4:
-                value = value.replace(secret, "[REDACTED]")
-        value = re.sub(
-            r"(?i)([?&](?:x-amz-)?(?:signature|credential|token|api[_-]?key|secret|password)=)[^&\s]+",
-            r"\1[REDACTED]",
-            value,
-        )
-        value = re.sub(r"(https?://)[^/@\s:]+:[^/@\s]+@", r"\1[REDACTED]@", value)
-        return value
-
-    def _safe_job_error(self, error: object, limit: int = 2000) -> str:
-        return self._redact_job_text(str(error))[:limit]
+    def _stable_exception(context: str, error: BaseException, code: str) -> str:
+        """Safe projection for shared state/logs: never include remote exception text or identifiers."""
+        return f"{context} (code={code},type={type(error).__name__})"
 
     @staticmethod
     def _public_remote_error(error: object) -> str:
@@ -1720,10 +1705,8 @@ class RayRunner:
                         _JOBS_BACKEND, type(exc).__name__,
                     )
                     continue
-                persisted_reason = str(ref.get("recovery_blocked_reason") or "")
-                detail = self._safe_job_error(exc, limit=1000)
-                reason = persisted_reason or (
-                    f"Ray Jobs recovery blocked: {type(exc).__name__}: {detail}"
+                reason = self._stable_exception(
+                    "Ray Jobs recovery blocked", exc, "recovery_blocked"
                 )
                 live_status = str(doc.get("status") or "queued")
                 if live_status not in ("queued", "running"):
@@ -1763,8 +1746,8 @@ class RayRunner:
                 if hasattr(self.deps, "run_index"):
                     self.deps.run_index[run_id] = self
                 log.warning(
-                    "ray_jobs_recovery_blocked run_id=%s backend=%s error_type=%s reason=%s",
-                    run_id, _JOBS_BACKEND, type(exc).__name__, detail,
+                    "ray_jobs_recovery_blocked run_id=%s backend=%s error_type=%s code=%s",
+                    run_id, _JOBS_BACKEND, type(exc).__name__, "recovery_blocked",
                     extra={
                         "dataplay_run_id": run_id,
                         "dataplay_backend": _JOBS_BACKEND,
@@ -1885,7 +1868,9 @@ class RayRunner:
             attempt_uri = _allocate_handoff_uri(output_uri, run_id, "region")
         except Exception as e:  # noqa: BLE001 — a control-plane allocation must precede object writes
             status.status = "failed"
-            status.error = f"object attempt allocation failed: {type(e).__name__}: {e}"
+            status.error = self._stable_exception(
+                "Object attempt allocation failed", e, "object_attempt_allocation_failed"
+            )
             for item in status.per_node:
                 item.status = "failed"
             return status
@@ -1976,7 +1961,10 @@ class RayRunner:
         except Exception as e:  # noqa: BLE001
             if owns_prefix:
                 discard_attempt(attempt_uri)  # synchronous writer stopped; safe to remove only our prefix
-            status.status, status.error = "failed", f"{type(e).__name__}: {e}"
+            status.status = "failed"
+            status.error = self._stable_exception(
+                "Ray local materialization failed", e, "local_materialization_failed"
+            )
         for p in status.per_node:
             p.status = status.status
         return status
@@ -2013,7 +2001,10 @@ class RayRunner:
                 try:
                     SinkSpec.from_config(s.config, s.config.get("title"))
                 except (TypeError, ValueError) as exc:
-                    return f"write node '{s.id}' has unsupported sink semantics: {exc}"
+                    return (
+                        "write node has unsupported sink semantics "
+                        f"(code=sink_semantics_unsupported,type={type(exc).__name__})"
+                    )
             if s.op == "aggregate":
                 if not parse_group_keys(s.config.get("groupBy", "")):
                     return f"aggregate node '{s.id}' needs a non-empty bare-column GROUP BY"
@@ -2088,7 +2079,10 @@ class RayRunner:
         try:
             req = requires if isinstance(requires, ResourceSpec) else ResourceSpec(**requires)
         except Exception as exc:  # noqa: BLE001
-            return f"invalid Ray resource requirement: {exc}"
+            return (
+                "invalid Ray resource requirement "
+                f"(code=resource_requirement_invalid,type={type(exc).__name__})"
+            )
         if req.gpu_type:
             req = req.model_copy(update={"gpu_type": _canonical_accelerator_type(req.gpu_type)})
         workers = self.workers()
@@ -2152,7 +2146,10 @@ class RayRunner:
             try:
                 adapter = self.resolve_adapter(uri)
             except Exception as exc:  # noqa: BLE001
-                return f"source '{uri}' adapter resolution failed: {type(exc).__name__}: {exc}"
+                return (
+                    "Ray source adapter resolution failed "
+                    f"(code=source_adapter_unavailable,type={type(exc).__name__})"
+                )
             if not _is_builtin_adapter(adapter):
                 return (
                     f"source '{uri}' is claimed by adapter '{type(adapter).__name__}', which has no explicit "
@@ -2389,7 +2386,10 @@ class RayRunner:
             logging.getLogger(__name__).exception("Ray sink preflight failed")
             if self._requires_ray(requires, graph, target_node_id):
                 return self._unsupported_status(
-                    graph, target_node_id, "sink preflight failed",
+                    graph, target_node_id,
+                    self._stable_exception(
+                        "Ray sink preflight failed", exc, "sink_preflight_failed"
+                    ),
                     run_id=run_id, plan=plan,
                 )
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)
@@ -2410,10 +2410,12 @@ class RayRunner:
         self._emit(graph, status)
         try:
             sink_attempts = self._claim_sink_attempts(ir, sink_targets, run_id)
-        except Exception:  # noqa: BLE001 — never dispatch an object write the hub cannot track
+        except Exception as exc:  # noqa: BLE001 — never dispatch an object write the hub cannot track
             logging.getLogger(__name__).exception("Ray sink control-plane setup failed")
             status.status = "failed"
-            status.error = "Ray sink control-plane setup failed"
+            status.error = self._stable_exception(
+                "Object sink attempt allocation failed", exc, "sink_attempt_allocation_failed"
+            )
             for item in status.per_node:
                 item.status = "failed"
             self._emit(graph, status)
@@ -2604,9 +2606,9 @@ class RayRunner:
                 return self._listed_job_status(client.list_jobs(), submission_id)
             except Exception as list_error:  # noqa: BLE001
                 raise RuntimeError(
-                    f"cannot determine whether Ray job '{submission_id}' already exists: "
-                    f"status={self._safe_job_error(status_error)}; "
-                    f"list={self._safe_job_error(list_error)}"
+                    "Ray Jobs discovery unavailable "
+                    f"(code=job_discovery_unavailable,status_type={type(status_error).__name__},"
+                    f"list_type={type(list_error).__name__})"
                 ) from list_error
 
     @staticmethod
@@ -2750,12 +2752,16 @@ class RayRunner:
             return None
         except ArtifactCorrupt as e:
             return {"status": "failed", "rows": 0, "outputs": [], "artifact_invalid": True,
-                    "error": f"invalid Ray result artifact: {type(e).__name__}: {self._safe_job_error(e)}"}
+                    "error": self._stable_exception(
+                        "Ray result artifact rejected", e, "result_artifact_invalid"
+                    )}
         try:
             result = self._validate_job_result(job, raw)
         except Exception as e:
             return {"status": "failed", "rows": 0, "outputs": [], "artifact_invalid": True,
-                    "error": f"invalid Ray result artifact: {type(e).__name__}: {self._safe_job_error(e)}"}
+                    "error": self._stable_exception(
+                        "Ray result artifact rejected", e, "result_artifact_invalid"
+                    )}
         return result
 
     def _result_contract_error_if_present(self, job: dict) -> Exception | None:
@@ -2808,7 +2814,7 @@ class RayRunner:
         status.status = result["status"]
         status.error = (
             (self._public_remote_error(result["error"]) if remote
-             else self._safe_job_error(result["error"]))
+             else "Ray Jobs artifact rejected (code=artifact_contract_invalid)")
             if result.get("error") else None
         )
         status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
@@ -2873,9 +2879,9 @@ class RayRunner:
                     except Exception as e:  # noqa: BLE001 — match local: catalog publication is run contract
                         # Catalog projection is a required, idempotent effect. Never turn its temporary
                         # outage into a terminal failed run; retain the publication lease and retry.
-                        status.error = (
-                            f"Ray result publication waiting for catalog: {type(e).__name__}: "
-                            f"{self._safe_job_error(e)}"
+                        status.error = self._stable_exception(
+                            "Ray result publication waiting for catalog", e,
+                            "catalog_publication_unavailable",
                         )
                         metadb.save_run_state(status.run_id, status.model_dump())
                         time.sleep(self._jobs_poll_s)
@@ -2898,7 +2904,9 @@ class RayRunner:
         """Persist the corruption fence, stop the SQL-bound attempt, then publish failure."""
         from hub import metadb
 
-        reason = f"invalid Ray Jobs artifact: {type(error).__name__}: {self._safe_job_error(error)}"
+        reason = self._stable_exception(
+            "Ray Jobs artifact rejected", error, "artifact_contract_invalid"
+        )
         metadb.request_backend_quarantine(status.run_id, reason)
         binding = metadb.backend_job(status.run_id) or {}
         self._backend_refs[status.run_id] = binding
@@ -2908,7 +2916,7 @@ class RayRunner:
         """Return true only after the durable quarantine reaches terminal publication."""
         from hub import metadb
 
-        reason = str(binding.get("quarantine_reason") or "invalid Ray Jobs artifact")
+        reason = "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
         try:
             client = self._jobs_client(binding.get("control_address"))
             state = self._find_job(client, ref.submission_id)
@@ -2933,9 +2941,9 @@ class RayRunner:
                 metadb.save_run_state(status.run_id, status.model_dump())
                 return False
         except Exception as control_error:  # cannot prove the untrusted remote execution stopped
-            status.error = (
-                reason + "; control plane unavailable, run remains non-terminal: "
-                f"{type(control_error).__name__}: {self._safe_job_error(control_error)}"
+            status.error = self._stable_exception(
+                "Ray quarantine control unavailable; run remains non-terminal",
+                control_error, "quarantine_control_unavailable",
             )
             metadb.save_run_state(status.run_id, status.model_dump())
             return False
@@ -3041,16 +3049,18 @@ class RayRunner:
                     )
                 except Exception as metadata_error:
                     self._persist_jobs_live_error(
-                        status,
-                        f"Ray {reason} winner metadata is invalid; control remains non-terminal: "
-                        f"{type(metadata_error).__name__}",
+                        status, self._stable_exception(
+                            f"Ray {reason} winner metadata is invalid; control remains non-terminal",
+                            metadata_error, "stop_fence_metadata_invalid",
+                        ),
                     )
                     return "FENCING", False
                 return existing, accepted_fence
             self._persist_jobs_live_error(
-                status,
-                f"Ray {reason} fence submission is uncertain; retrying after its DB lease: "
-                f"{type(submit_error).__name__}: {self._safe_job_error(submit_error)}",
+                status, self._stable_exception(
+                    f"Ray {reason} fence submission is uncertain; retrying after its DB lease",
+                    submit_error, "stop_fence_submit_uncertain",
+                ),
             )
             return "FENCING", False
 
@@ -3099,9 +3109,10 @@ class RayRunner:
             return True, client, state
         except Exception as e:  # noqa: BLE001 — ambiguity can hide a still-running remote attempt
             self._persist_jobs_live_error(
-                status,
-                f"Ray cancellation control unavailable; retrying: {type(e).__name__}: "
-                f"{self._safe_job_error(e)}",
+                status, self._stable_exception(
+                    "Ray cancellation control unavailable; retrying", e,
+                    "cancellation_control_unavailable",
+                ),
             )
             return True, None, None
 
@@ -3147,8 +3158,9 @@ class RayRunner:
                         if cancel_state in ("MISSING", "STOPPED", "SUCCEEDED", "FAILED"):
                             state = cancel_state
                     self._persist_jobs_live_error(
-                        status, f"Ray Jobs artifact missing; retrying: {type(e).__name__}: "
-                        f"{self._safe_job_error(e)}"
+                        status, self._stable_exception(
+                            "Ray Jobs artifact missing; retrying", e, "job_artifact_missing"
+                        )
                     )
                     time.sleep(self._jobs_poll_s)
                     continue
@@ -3166,8 +3178,10 @@ class RayRunner:
                         if cancel_state in ("MISSING", "STOPPED", "SUCCEEDED", "FAILED"):
                             state = cancel_state
                     self._persist_jobs_live_error(
-                        status, f"Ray Jobs artifact unavailable; retrying: {type(e).__name__}: "
-                        f"{self._safe_job_error(e)}"
+                        status, self._stable_exception(
+                            "Ray Jobs artifact unavailable; retrying", e,
+                            "job_artifact_unavailable",
+                        )
                     )
                     time.sleep(self._jobs_poll_s)
                     continue
@@ -3262,8 +3276,10 @@ class RayRunner:
                     status.error = None
                 except Exception as e:  # noqa: BLE001 — accepted submit/control outage is ambiguous
                     self._persist_jobs_live_error(
-                        status, f"Ray Jobs control plane unavailable; retrying: {type(e).__name__}: "
-                        f"{self._safe_job_error(e)}"
+                        status, self._stable_exception(
+                            "Ray Jobs control plane unavailable; retrying", e,
+                            "control_plane_unavailable",
+                        )
                     )
                     state = None
                     time.sleep(self._jobs_poll_s)
@@ -3332,8 +3348,10 @@ class RayRunner:
                         status.error = None
                     except Exception as e:  # noqa: BLE001 — no terminal claim on ambiguous control/storage
                         self._persist_jobs_live_error(
-                            status, f"Ray status/control plane unavailable; retrying: {type(e).__name__}: "
-                            f"{self._safe_job_error(e)}"
+                            status, self._stable_exception(
+                                "Ray status/control plane unavailable; retrying", e,
+                                "status_control_unavailable",
+                            )
                         )
                         state = "METADATA_MISSING"
                 visible = "running" if state == "RUNNING" else "queued"
@@ -3359,15 +3377,17 @@ class RayRunner:
                     # Ray is authoritatively terminal here. Readable corruption/missing terminal evidence
                     # becomes a failed run; transport/auth errors propagate and remain reattachable.
                     result = {"status": "failed",
-                              "error": f"{type(e).__name__}: {self._safe_job_error(e)}",
+                              "error": f"{type(e).__name__}: result artifact rejected",
                               "rows": 0, "outputs": []}
             self._publish_job_result(job, graph, target, status, result)
         except DurableTerminalObserved:
             pass  # permanent fence already converged the local object; finally stops supervision
         except Exception as e:  # noqa: BLE001 — retain ownership; a fresh supervisor retries reattachment
             self._persist_jobs_live_error(
-                status, f"Ray Jobs supervision interrupted; retrying: {type(e).__name__}: "
-                f"{self._safe_job_error(e)}"
+                status, self._stable_exception(
+                    "Ray Jobs supervision interrupted; retrying", e,
+                    "supervision_interrupted",
+                )
             )
         finally:
             if status.status in ("done", "failed", "cancelled"):
@@ -3411,9 +3431,11 @@ class RayRunner:
                 materialize_uri=materialize_uri, requires=requires,
                 sink_targets=sink_targets, sink_attempts=sink_attempts,
             )
-        except Exception:  # noqa: BLE001 — provider/process detail belongs only in server logs
+        except Exception as exc:  # noqa: BLE001 — provider/process detail belongs only in server logs
             logging.getLogger(__name__).exception("Ray supervisor setup failed")
-            supervisor_error = "Ray execution supervisor failed"
+            supervisor_error = self._stable_exception(
+                "Ray supervisor setup failed", exc, "supervisor_setup_failed"
+            )
 
         state = {
             "run_id": run_id, "graph": graph, "target": target, "status": status,
@@ -3511,9 +3533,11 @@ class RayRunner:
                 except (ValueError, OSError):
                     pass
                 time.sleep(0.2)
-        except Exception:  # noqa: BLE001 — keep user-visible status non-terminal until reap proof
+        except Exception as exc:  # noqa: BLE001 — keep user-visible status non-terminal until reap proof
             logging.getLogger(__name__).exception("Ray driver supervision failed")
-            supervisor_error = "Ray execution supervisor failed"
+            supervisor_error = self._stable_exception(
+                "Ray driver control failed", exc, "driver_control_failed"
+            )
         finally:
             # A parent-side error must not leave the credential-bearing child running while its work
             # directory is erased. Terminate first, then close the inherited log descriptor.
@@ -3685,12 +3709,13 @@ class RayRunner:
             return
         if not (result and result.get("status") in ("done", "failed", "cancelled")):
             status.status = "failed"
-            status.error = f"ray driver exited without a terminal status (rc={returncode})"
+            status.error = "Ray driver exited without a terminal status (code=driver_result_missing)"
             return
         should_publish = (
             result["status"] == "done"
             and (expected_targets is not None or bool(result.get("outputs")))
         )
+        shared_error = None
         if should_publish:
             try:
                 if expected_targets is None and expected_attempts is None:
@@ -3700,13 +3725,19 @@ class RayRunner:
                         graph, result, expected_targets=expected_targets,
                         expected_attempts=expected_attempts,
                     )
-            except Exception:  # noqa: BLE001 — local parity: catalog commit failure fails the run
+            except Exception as exc:  # noqa: BLE001 — local parity: catalog commit failure fails the run
                 logging.getLogger(__name__).exception("Ray output publication failed")
-                result = dict(result, status="failed", error="Ray output publication failed")
+                shared_error = self._stable_exception(
+                    "Catalog registration failed", exc, "catalog_registration_failed"
+                )
+                result = dict(result, status="failed", error=None)
         # Failed/cancelled outputs stay private. Remote attempts remain fenced as writing until the
         # backend can prove every worker is terminal; the ownership reaper deliberately never guesses.
         status.status = result["status"]
-        status.error = result.get("error")
+        status.error = (
+            shared_error
+            or (self._public_remote_error(result["error"]) if result.get("error") else None)
+        )
         if status.status == "done":
             status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
         else:
