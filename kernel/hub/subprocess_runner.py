@@ -11,6 +11,7 @@ Ray backends would be plugins over this same ExecutionBackend protocol.)
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import logging
 import os
@@ -58,6 +59,7 @@ def _safe_abandon_attempt(uri: str, *, context: str) -> None:
 
 class SubprocessRunner:
     name = "local-subprocess"
+    manages_source_leases = True
 
     def __init__(self, workspace: str, data_dir: str, catalog=None, deadline_s: float | None = None,
                  storage=None, resolve_adapter=None, node_builders=None):
@@ -80,6 +82,7 @@ class SubprocessRunner:
         self._object_results: dict[str, dict] = {}
         self._object_sinks: dict[str, dict[str, dict]] = {}
         self._sink_contracts: dict[str, dict[str, dict]] = {}
+        self._source_leases: dict[str, dict] = {}
         self._lock = threading.Lock()
         # wall-clock deadline: a child that runs longer than this is hard-killed and the run fails, so a
         # runaway cell (`while True`, a livelocked native op) can't pin a worker forever. <=0 disables.
@@ -118,6 +121,7 @@ class SubprocessRunner:
                     owned["uri"], context="parent object-result shutdown")
             self._discard_object_sinks(self._object_sinks.get(run_id, {}))
             self._sink_contracts.pop(run_id, None)
+            self._release_source_leases(run_id)
 
     def reachable_tiers(self) -> tuple:
         # every subprocess backend is a SAME-HOST child sharing the workspace filesystem, so it reaches the
@@ -128,6 +132,73 @@ class SubprocessRunner:
 
     def can_run(self, plan: CompilePlan) -> bool:
         return plan.acyclic
+
+    def _claim_source_leases(self, graph: Graph, target: str | None, run_id: str) -> dict:
+        """Attest and pin every managed source in the durable parent before child dispatch."""
+        try:
+            deadline = float(os.environ.get("DP_RUN_DEADLINE_S", "3600"))
+        except ValueError:
+            deadline = 3600.0
+        ttl = max(300.0, deadline + 300.0)
+        stack = contextlib.ExitStack()
+        guards = []
+        attempts: dict[str, dict] = {}
+        seen: set[str] = set()
+        try:
+            from hub import graph as graph_mod
+            from hub.handoff import (
+                has_attempt_path_component, is_attempt_uri, managed_read_lease)
+            for uri in graph_mod.execution_source_uris(graph, target):
+                normalized = str(uri).rstrip("/")
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                if (has_attempt_path_component(normalized)
+                        and not is_attempt_uri(normalized)):
+                    raise FileNotFoundError(
+                        "managed source must reference the exact attempt root")
+                guard = stack.enter_context(managed_read_lease(
+                    normalized, owner=f"subprocess:{run_id}", ttl_seconds=ttl))
+                guards.append(guard)
+                if guard.lease_id:
+                    attestation = guard.attestation
+                    if not isinstance(attestation, dict) or attestation.get("uri") != normalized:
+                        raise RuntimeError("managed source lease returned an invalid attestation")
+                    attempts[normalized] = {
+                        "attemptId": attestation["attempt_id"],
+                        "generation": attestation["generation"],
+                        "storageNamespace": attestation["storage_namespace"],
+                        "logicalUri": attestation["logical_uri"],
+                        "kind": attestation["kind"],
+                    }
+                elif has_attempt_path_component(normalized):
+                    raise FileNotFoundError(
+                        "managed source attempt has no durable parent attestation")
+            return {"stack": stack, "guards": guards, "attempts": attempts}
+        except Exception:
+            try:
+                stack.close()
+            except Exception:  # noqa: BLE001 — cleanup must not replace the acquisition failure
+                logging.getLogger("hub").exception(
+                    "partial managed-source lease cleanup failed")
+            raise
+
+    def _check_source_leases(self, run_id: str) -> None:
+        with self._lock:
+            guards = list((self._source_leases.get(run_id) or {}).get("guards", ()))
+        for guard in guards:
+            guard.check()
+
+    def _release_source_leases(self, run_id: str) -> None:
+        with self._lock:
+            owned = self._source_leases.pop(run_id, None)
+        if owned is None:
+            return
+        try:
+            owned["stack"].close()
+        except Exception:  # noqa: BLE001 — an expired lease is safe and cleanup must remain terminal
+            logging.getLogger("hub").exception(
+                "parent managed-source lease cleanup failed")
 
     def estimate(self, plan: CompilePlan, rows: int | None, byts: int | None = None) -> RunEstimate:
         from hub.plugins.runner import _CONFIRM_BYTES, _fmt_bytes
@@ -255,6 +326,10 @@ class SubprocessRunner:
         status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=per)
         job_extra: dict = {"runId": run_id}
         try:
+            source_leases = self._claim_source_leases(graph, target_node_id, run_id)
+            with self._lock:
+                self._source_leases[run_id] = source_leases
+            job_extra["managedSourceAttempts"] = source_leases["attempts"]
             sink_targets, object_sinks, sink_contracts = self._claim_sink_contracts(
                 plan, graph, run_id)
             if object_sinks:
@@ -303,6 +378,7 @@ class SubprocessRunner:
                     owned["uri"], context="parent object-result pre-dispatch")
             self._discard_object_sinks(self._object_sinks.pop(run_id, {}))
             self._sink_contracts.pop(run_id, None)
+            self._release_source_leases(run_id)
             raise
 
     def run_unit(self, graph: Graph, output_node: str, output_uri: str, requires=None) -> RunStatus:
@@ -315,28 +391,32 @@ class SubprocessRunner:
         status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=[])
         materialize_uri = output_uri
         from hub.plugins.adapters import is_object_uri
-        if is_object_uri(output_uri):
-            if self.resolve_adapter is None:
-                raise RuntimeError(
-                    "object-backed subprocess regions require a parent adapter resolver")
-            self.resolve_adapter(output_uri)
-            from hub.handoff import allocate_attempt, is_attempt_uri, physical_attempt_uri
-            if is_attempt_uri(output_uri):
-                raise RuntimeError(
-                    "subprocess region output must be a stable logical object URI")
-            handle = allocate_attempt(
-                logical_uri=output_uri, kind="region", run_id=run_id,
-                allocation_key=f"subprocess-region:{run_id}:{output_node}:{output_uri}",
-                uri_factory=lambda namespace, generation, attempt_id: physical_attempt_uri(
-                    output_uri, namespace, generation, attempt_id),
-            )
-            materialize_uri = handle["uri"]
-            self._object_results[run_id] = {
-                "uri": materialize_uri, "cache_key": None, "run_state_owner": False,
-            }
         try:
+            source_leases = self._claim_source_leases(graph, output_node, run_id)
+            with self._lock:
+                self._source_leases[run_id] = source_leases
+            if is_object_uri(output_uri):
+                if self.resolve_adapter is None:
+                    raise RuntimeError(
+                        "object-backed subprocess regions require a parent adapter resolver")
+                self.resolve_adapter(output_uri)
+                from hub.handoff import allocate_attempt, is_attempt_uri, physical_attempt_uri
+                if is_attempt_uri(output_uri):
+                    raise RuntimeError(
+                        "subprocess region output must be a stable logical object URI")
+                handle = allocate_attempt(
+                    logical_uri=output_uri, kind="region", run_id=run_id,
+                    allocation_key=f"subprocess-region:{run_id}:{output_node}:{output_uri}",
+                    uri_factory=lambda namespace, generation, attempt_id: physical_attempt_uri(
+                        output_uri, namespace, generation, attempt_id),
+                )
+                materialize_uri = handle["uri"]
+                self._object_results[run_id] = {
+                    "uri": materialize_uri, "cache_key": None, "run_state_owner": False,
+                }
             return self._spawn(
-                status, {"runId": run_id, "materializeUri": materialize_uri},
+                status, {"runId": run_id, "materializeUri": materialize_uri,
+                         "managedSourceAttempts": source_leases["attempts"]},
                 graph, output_node)
         except Exception as exc:
             if isinstance(exc, _SpawnSetupError) and not exc.reaped:
@@ -345,6 +425,7 @@ class SubprocessRunner:
             if owned is not None:
                 _safe_abandon_attempt(
                     owned["uri"], context="parent region-result pre-dispatch")
+            self._release_source_leases(run_id)
             raise
 
     def _spawn(self, status: RunStatus, job_extra: dict, graph: Graph, target: str | None) -> RunStatus:
@@ -355,14 +436,15 @@ class SubprocessRunner:
         status_file = os.path.join(job_dir, "status.json")
         cancel_file = os.path.join(job_dir, "cancel.requested")
         job_file = os.path.join(job_dir, "job.json")
-        with open(job_file, "w") as f:
-            json.dump({"workspace": self.workspace, "dataDir": self.data_dir,
-                       "graph": prepare_workload_graph(graph),
-                       "target": target, "statusFile": status_file,
-                       "cancelFile": cancel_file, **job_extra}, f)
-        # A one-shot worker gets only runtime/data capabilities, never the hub metadata identity or
-        # ambient signing/bootstrap/provider secrets. It creates a disposable local metadata DB itself.
         try:
+            prepared_graph = prepare_workload_graph(graph)
+            with open(job_file, "w") as f:
+                json.dump({"workspace": self.workspace, "dataDir": self.data_dir,
+                           "graph": prepared_graph,
+                           "target": target, "statusFile": status_file,
+                           "cancelFile": cancel_file, **job_extra}, f)
+            # A one-shot worker gets only runtime/data capabilities, never the hub metadata identity or
+            # ambient signing/bootstrap/provider secrets. It creates a disposable local metadata DB itself.
             proc = subprocess.Popen([sys.executable, "-m", "hub.subrun", job_file],
                                     env=_subrun_child_env())
         except Exception:
@@ -517,6 +599,7 @@ class SubprocessRunner:
                         _safe_abandon_attempt(
                             owned_result["uri"], context="parent object-result supervisor")
                     self._discard_object_sinks(self._object_sinks.get(run_id, {}))
+                    self._release_source_leases(run_id)
                 else:
                     logging.getLogger("hub").error(
                         "subprocess writer could not be proven stopped; ownership retained")
@@ -555,7 +638,20 @@ class SubprocessRunner:
         cancel_seen_at = None
         last = None
         terminal = None
+        source_lease_lost = False
         while True:
+            try:
+                self._check_source_leases(run_id)
+            except Exception:  # noqa: BLE001 — no publication may follow a lost source fence
+                source_lease_lost = True
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                time.sleep(0.1)
+                terminal = self._read(run_id, status_file)
+                break
             terminal = self._read(run_id, status_file)
             if terminal is not None:
                 break
@@ -598,8 +694,14 @@ class SubprocessRunner:
             proc.kill()  # SIGTERM ignored (e.g. a C-level DuckDB loop) → force-reap so _watch can't hang
             proc.wait()
         terminal = self._read(run_id, status_file) or terminal
+        try:
+            self._check_source_leases(run_id)
+        except Exception:  # noqa: BLE001 — fence again after reaping and before any publication
+            source_lease_lost = True
         current = self.runs.get(run_id)
         st = terminal or (current.model_copy(deep=True) if current is not None else None)
+        if st is None:
+            st = RunStatus(run_id=run_id, status="failed", placement="local", per_node=[])
         forced = bool(st and st.status in ("queued", "running"))  # exited without a terminal status
         if forced:
             if run_id in self._cancelled:
@@ -616,6 +718,10 @@ class SubprocessRunner:
             else:
                 st.status = "failed"
                 st.error = st.error or f"execution process exited (code {proc.returncode})"
+            st.output_uri = st.output_table = None
+        if source_lease_lost:
+            st.status = "failed"
+            st.error = "managed source lease was lost during execution"
             st.output_uri = st.output_table = None
         owned_sinks = self._object_sinks.get(run_id, {})
         sink_contracts = self._sink_contracts.get(run_id, {})
@@ -748,6 +854,7 @@ class SubprocessRunner:
             self._object_results.pop(run_id, None)
             self._object_sinks.pop(run_id, None)
             self._sink_contracts.pop(run_id, None)
+        self._release_source_leases(run_id)
 
     def status(self, run_id: str) -> RunStatus:
         return self.runs[run_id]

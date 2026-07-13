@@ -42,6 +42,44 @@ def _materialize_region(deps, rel, mat_uri: str, cancel, external_cancel, run_id
     return rows
 
 
+def _parent_attested_source_uris(job: dict, graph) -> frozenset[str]:
+    """Validate the exact managed-source contract before graph compilation or adapter scanning."""
+    from hub import graph as graph_mod
+    from hub.handoff import (
+        has_attempt_path_component, is_attempt_uri, physical_attempt_uri)
+    from hub.plugins.adapters import is_object_uri
+
+    source_attempts: set[str] = set()
+    for uri in graph_mod.execution_source_uris(graph, job.get("target")):
+        normalized = str(uri).rstrip("/")
+        if not is_object_uri(normalized) or not has_attempt_path_component(normalized):
+            continue
+        if not is_attempt_uri(normalized):
+            raise RuntimeError("managed source must reference the exact attempt root")
+        source_attempts.add(normalized)
+    raw = job.get("managedSourceAttempts")
+    if not isinstance(raw, dict):
+        raise RuntimeError("managed source attestation contract is missing")
+    attested: set[str] = set()
+    for uri, identity in raw.items():
+        normalized = str(uri).rstrip("/")
+        if not isinstance(identity, dict):
+            raise RuntimeError("managed source attestation contract is malformed")
+        try:
+            expected = physical_attempt_uri(
+                str(identity["logicalUri"]), str(identity["storageNamespace"]),
+                int(identity["generation"]), str(identity["attemptId"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("managed source attestation contract is malformed") from exc
+        if (expected.rstrip("/") != normalized
+                or identity.get("kind") not in ("region", "sink")):
+            raise RuntimeError("managed source attestation identity does not match its URI")
+        attested.add(normalized)
+    if source_attempts != set(attested):
+        raise RuntimeError("managed source attestation contract does not match the graph")
+    return frozenset(attested)
+
+
 def main() -> int:
     job = json.load(open(sys.argv[1]))
     status_file = job["statusFile"]
@@ -72,6 +110,9 @@ def main() -> int:
             dict(job.get("sinkTargets") or {}) if "sinkTargets" in job else None)
         deps.runner.forced_sink_attempts = dict(job.get("sinkAttempts") or {})
         graph = Graph(**job["graph"])
+        # The disposable child DB cannot prove lifecycle ownership. Accept managed source attempts only
+        # when the durable parent attested the exact physical URI and is holding its renewable read lease.
+        deps.runner.parent_attested_source_uris = _parent_attested_source_uris(job, graph)
         external_cancel = (lambda: os.path.exists(cancel_file)) if cancel_file else None
         # deps parity with the warm kernel's _ensure_deps: install the canvas's declared pip deps and let
         # the sandbox import EXACTLY them (and put the deps dir on THIS process's sys.path). A fresh child

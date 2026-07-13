@@ -139,6 +139,11 @@ class LocalRunner:
         # None means a normal in-process runner. An empty dict is an authoritative "no write sinks" contract.
         self.forced_sink_targets: dict[str, str] | None = None
         self.forced_sink_attempts: dict[str, str] = {}
+        # A metadata-isolated child cannot validate a parent-owned managed source against its disposable
+        # database. Its parent holds the renewable read leases and passes only the exact physical URIs it
+        # attested before dispatch. None means this is a normal in-process runner; an empty set is an
+        # authoritative child contract with no managed sources.
+        self.parent_attested_source_uris: frozenset[str] | None = None
         # keep the SAME dict object deps passes (plugins fill it AFTER construction) — an
         # empty {} is falsy, so `or {}` would rebind a new dict and drop plugin lowerings.
         self.node_builders = node_builders if node_builders is not None else {}
@@ -323,14 +328,19 @@ class LocalRunner:
             with self._lock:
                 self._scopes[run_id] = scope  # cancel() interrupts this scope's cursor
             try:
-                from hub.handoff import managed_read_lease
-                for source in graph.nodes:
-                    if source.type != "source" or not isinstance(source.data, dict):
+                from hub.handoff import (
+                    has_attempt_path_component, is_attempt_uri, managed_read_lease)
+                for uri in g.execution_source_uris(graph, target):
+                    normalized = str(uri).rstrip("/")
+                    if (self.parent_attested_source_uris is not None
+                            and normalized in self.parent_attested_source_uris):
                         continue
-                    uri = (source.data.get("config") or {}).get("uri")
-                    if uri:
-                        read_guards.append(read_leases.enter_context(managed_read_lease(
-                            uri, owner=f"run:{run_id}", ttl_seconds=ttl)))
+                    if (has_attempt_path_component(normalized)
+                            and not is_attempt_uri(normalized)):
+                        raise FileNotFoundError(
+                            "managed source must reference the exact attempt root")
+                    read_guards.append(read_leases.enter_context(managed_read_lease(
+                        normalized, owner=f"run:{run_id}", ttl_seconds=ttl)))
                 last_step_published = False
                 for step in plan.steps:
                     last_step_published = False

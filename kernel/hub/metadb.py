@@ -953,6 +953,18 @@ def object_attempt_uri_shape(uri: str | None) -> bool:
             and _ATTEMPT_MARKER in parsed.path.rstrip("/").rsplit("/", 1)[-1])
 
 
+def object_attempt_namespace_path(uri: str | None) -> bool:
+    """Recognize any object URI inside the reserved attempt namespace, including member paths."""
+    if not uri:
+        return False
+    try:
+        parsed = urlsplit(str(uri))
+    except ValueError:
+        return False
+    return (parsed.scheme.lower() in _OBJECT_SCHEMES and bool(parsed.netloc)
+            and any(_ATTEMPT_MARKER in part for part in parsed.path.split("/") if part))
+
+
 def _validated_object_uri(uri: str, *, attempt: bool) -> str:
     """Normalize one managed URI and reject authority/query forms that could leak or alias."""
     raw = str(uri).strip().rstrip("/")
@@ -1508,6 +1520,10 @@ def acquire_object_attempt_lease(uri: str, lease_type: str, owner: str,
     uri = str(uri).rstrip("/")
     if lease_type not in ("read", "write"):
         raise ValueError("callers may acquire only read or write leases")
+    if lease_type == "read":
+        lease_id, _attestation = acquire_attested_object_read(
+            uri, owner, ttl_seconds=ttl_seconds, allow_committed=allow_committed)
+        return lease_id
     with session() as s:
         row = s.get(ObjectAttempt, uri, with_for_update=True)
         if row is None:
@@ -1515,14 +1531,57 @@ def acquire_object_attempt_lease(uri: str, lease_type: str, owner: str,
                 _validated_object_uri(uri, attempt=True)
                 raise FileNotFoundError("attempt-shaped object URI has no lifecycle ownership row")
             return None
-        allowed = (("published", "committed") if lease_type == "read" and allow_committed
-                   else ("published",) if lease_type == "read" else ("allocated", "writing"))
+        allowed = ("allocated", "writing")
         if row.state not in allowed:
             raise FileNotFoundError(
                 f"managed artifact generation is unavailable (state={row.state})")
         if lease_type == "write":
             row.state = "writing"
         return _put_lease(s, row, lease_type, owner, ttl_seconds)
+
+
+def acquire_attested_object_read(uri: str, owner: str, ttl_seconds: float = 300, *,
+                                 allow_committed: bool = False
+                                 ) -> tuple[str | None, dict | None]:
+    """Atomically attest one exact managed generation and acquire its renewable read lease.
+
+    Ordinary unmanaged URIs return ``(None, None)``. Attempt-shaped URIs always fail closed unless the
+    current installation owns the exact published (or explicitly allowed committed) generation.
+    """
+    normalized = str(uri).rstrip("/")
+    reserved_path = object_attempt_namespace_path(normalized)
+    if reserved_path and not object_attempt_uri_shape(normalized):
+        raise FileNotFoundError("managed source must reference the exact attempt root")
+    if reserved_path:
+        normalized = _validated_object_uri(normalized, attempt=True)
+    with session() as s:
+        candidate = s.get(ObjectAttempt, normalized)
+        if candidate is None:
+            if reserved_path:
+                raise FileNotFoundError(
+                    "attempt-shaped object URI has no lifecycle ownership row")
+            return None, None
+        # Installation identity is immutable during normal operation. Clone isolation fences every
+        # inherited attempt before changing it, so a snapshot avoids a global registry write lock on each
+        # read while the locked attempt reload below remains the sole attestation/publication authority.
+        identity = s.get(InstallationIdentity, _INSTALLATION_ID)
+        if identity is None:
+            raise RuntimeError("object-attempt installation identity is missing")
+        configured = os.environ.get("DP_STORAGE_NAMESPACE", "").strip()
+        if configured and configured != identity.storage_namespace:
+            raise RuntimeError(
+                "DP_STORAGE_NAMESPACE does not match this metadata database")
+        row = s.get(ObjectAttempt, normalized, with_for_update=True, populate_existing=True)
+        if row is None:
+            raise FileNotFoundError("managed artifact generation is unavailable")
+        if row.storage_namespace != identity.storage_namespace:
+            raise FileNotFoundError("managed artifact belongs to another storage namespace")
+        allowed = ("published", "committed") if allow_committed else ("published",)
+        if row.state not in allowed:
+            raise FileNotFoundError(
+                f"managed artifact generation is unavailable (state={row.state})")
+        lease_id = _put_lease(s, row, "read", owner, ttl_seconds)
+        return lease_id, _attempt_handle(row)
 
 
 def renew_object_attempt_lease(lease_id: str, ttl_seconds: float = 300) -> bool:
