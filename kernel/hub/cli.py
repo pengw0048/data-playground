@@ -383,6 +383,10 @@ def main() -> None:
     # bind on the LAN is arbitrary code/file access. Set DP_AUTH_SECRET (multi-user auth) or
     # DP_ALLOW_INSECURE_BIND=1 (trusted private network).
     from hub import auth
+    # Validate the hub's signing configuration before seed, metadata migration, plugin discovery, or
+    # dependency construction can mutate the workspace. DP_AUTH_MODE is also inherited by workload
+    # children as a confinement-only marker, but those children do not enter this server path.
+    auth.reject_weak_secret()
     loopback = args.host in ("127.0.0.1", "::1", "localhost", "")
     if not loopback and not auth.auth_enabled() and os.environ.get("DP_ALLOW_INSECURE_BIND") != "1":
         raise SystemExit(

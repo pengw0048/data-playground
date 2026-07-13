@@ -54,14 +54,19 @@ def _parent_attested_source_uris(job: dict, graph) -> frozenset[str]:
     from hub.handoff import (
         has_attempt_path_component, is_attempt_uri, physical_attempt_uri)
     from hub.plugins.adapters import is_object_uri
+    from hub.paths import local_path
     from hub.storage import MAX_MANAGED_EXECUTION_SOURCES
 
     source_attempts: set[str] = set()
     local_sources: set[str] = set()
     for uri in graph_mod.execution_source_uris(graph, job.get("target")):
         normalized = str(uri).rstrip("/")
-        path = normalized[len("file://"):] if normalized.startswith("file://") else normalized
-        if (os.path.basename(os.path.dirname(path)) == ".dp-results"
+        try:
+            path = local_path(normalized)
+        except ValueError as exc:
+            raise RuntimeError("managed local-source URI is not canonical") from exc
+        if (path is not None
+                and os.path.basename(os.path.dirname(path)) == ".dp-results"
                 and os.path.basename(path).startswith("__result_")
                 and path.endswith(".parquet")):
             local_sources.add(path)
@@ -103,9 +108,15 @@ def _parent_attested_source_uris(job: dict, graph) -> frozenset[str]:
         raise RuntimeError("managed local-source attestation contract is missing or malformed")
     if len(raw) + len(raw_local) > MAX_MANAGED_EXECUTION_SOURCES:
         raise RuntimeError("managed source attestation contract exceeds the source limit")
-    attested_local = {
-        uri[len("file://"):] if uri.startswith("file://") else uri for uri in raw_local
-    }
+    attested_local: set[str] = set()
+    for uri in raw_local:
+        try:
+            path = local_path(uri)
+        except ValueError as exc:
+            raise RuntimeError("managed local-source attestation contract is malformed") from exc
+        if path is None:
+            raise RuntimeError("managed local-source attestation contract is malformed")
+        attested_local.add(path)
     if local_sources != attested_local:
         raise RuntimeError("managed local-source attestation contract does not match the graph")
     return frozenset(attested | attested_local)

@@ -8,19 +8,36 @@ default: a new route is protected unless it's explicitly added to the pre-login 
 
 from __future__ import annotations
 
-from fastapi import Cookie, Header, HTTPException
+from dataclasses import dataclass
+
+from fastapi import Cookie, Depends, Header, HTTPException
 
 from hub import auth, metadb
 
 
-def current_user(x_dp_user: str | None = Header(default=None),
-                 dp_session: str | None = Cookie(default=None)) -> str:
-    """Resolve the request's user. With auth enabled (DP_AUTH_SECRET), identity comes ONLY from a
-    valid signed session cookie (a raw header is not trusted); otherwise it's the X-DP-User header
-    (open internal-tool mode), defaulting to the local user."""
+@dataclass(frozen=True)
+class RequestIdentity:
+    """A request identity established by the auth gate, including its admitted session epoch."""
+
+    user_id: str
+    session_epoch: int | None
+
+
+def current_identity(x_dp_user: str | None = Header(default=None),
+                     dp_session: str | None = Cookie(default=None)) -> RequestIdentity:
+    """Resolve one trusted identity for reuse by every dependency in this request."""
     if auth.auth_enabled():
-        uid = auth.verify(dp_session)
-        if not uid:
+        claims = auth.verify_claims(dp_session)
+        # Retain the exact signed principal instead of passing it through the open-mode resolver, whose
+        # unknown-user fallback is intentionally the local account. The second epoch read narrows the
+        # deletion/revocation window without ever changing the admitted identity.
+        if (claims is None
+                or metadb.user_token_epoch(claims.user_id) != claims.epoch):
             raise HTTPException(401, "authentication required")
-        return metadb.resolve_user(uid)
-    return metadb.resolve_user(x_dp_user)
+        return RequestIdentity(user_id=claims.user_id, session_epoch=claims.epoch)
+    return RequestIdentity(user_id=metadb.resolve_user(x_dp_user), session_epoch=None)
+
+
+def current_user(identity: RequestIdentity = Depends(current_identity)) -> str:
+    """Return the already-resolved user id expected by ordinary route dependencies."""
+    return identity.user_id

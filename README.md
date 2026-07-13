@@ -234,7 +234,7 @@ entry point). It can register nodes, dataset adapters, runners, capabilities, or
 
 ```python
 # plugins/upcase/__init__.py
-from hub.sdk import NodeSpec, PortSpec, ParamSpec, ctx
+from hub.sdk import NodeSpec, PortSpec, ParamSpec, ctx, identifier, quote_identifier
 
 SPEC = NodeSpec(kind="upcase", title="uppercase", category="compute",
                 inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
@@ -242,7 +242,8 @@ SPEC = NodeSpec(kind="upcase", title="uppercase", category="compute",
 
 def build(engine, node, inputs):                      # contribute one step to the plan
     col = node.data.get("config", {}).get("column", "name")
-    return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM {{input}}')
+    column = quote_identifier(identifier(col, inputs[0].columns, label="uppercase column"))
+    return ctx.sql(inputs[0], f"SELECT * REPLACE (upper({column}) AS {column}) FROM input")
 
 def register(reg):
     reg.add_node(SPEC, build)

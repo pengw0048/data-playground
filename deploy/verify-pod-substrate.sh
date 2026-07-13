@@ -16,8 +16,13 @@ PF_PID=""
 
 say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 wait_for_no_pods() {
-  local selector="$1" deadline=$((SECONDS + 120))
-  while [ -n "$($K get pods -l "$selector" -o name)" ]; do
+  local selector="$1" deadline=$((SECONDS + 120)) resources
+  while true; do
+    if ! resources="$($K get pods -l "$selector" -o name)"; then
+      echo "failed to list pods matching ${selector}; refusing to continue migration" >&2
+      return 1
+    fi
+    [ -z "$resources" ] && return 0
     if (( SECONDS >= deadline )); then
       echo "timed out waiting for pods matching ${selector} to stop" >&2
       $K get pods -l "$selector" -o wide >&2
@@ -27,8 +32,13 @@ wait_for_no_pods() {
   done
 }
 wait_for_no_services() {
-  local selector="$1" deadline=$((SECONDS + 120))
-  while [ -n "$($K get services -l "$selector" -o name)" ]; do
+  local selector="$1" deadline=$((SECONDS + 120)) resources
+  while true; do
+    if ! resources="$($K get services -l "$selector" -o name)"; then
+      echo "failed to list services matching ${selector}; refusing to continue migration" >&2
+      return 1
+    fi
+    [ -z "$resources" ] && return 0
     if (( SECONDS >= deadline )); then
       echo "timed out waiting for services matching ${selector} to stop" >&2
       $K get services -l "$selector" -o wide >&2

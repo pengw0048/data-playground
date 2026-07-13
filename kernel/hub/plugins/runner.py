@@ -79,7 +79,8 @@ def _diagnose(msg: str) -> str | None:
     """Map a common engine error to ONE actionable hint (the run failure's 'how to fix'). Honest: only
     recognized patterns get a hint; anything else shows the raw error alone (never fabricate a cause)."""
     m = msg.lower()
-    if "referenced column" in m or "not found in from" in m:  # specifically an unknown COLUMN
+    if ("referenced column" in m or "not found in from" in m
+            or "not present in the input schema" in m):  # specifically an unknown COLUMN
         return "a column name doesn't match this step's input — check its column references (see the amber ⚠ hints)"
     if "conversion error" in m or "could not convert" in m or "cannot cast" in m or "type mismatch" in m:
         return "a value doesn't fit the column type — check the types or add an explicit cast"
@@ -991,7 +992,7 @@ class LocalRunner:
             if managed_parquet and not parent_owned:
                 _safe_abandon_attempt(attempt_uri)
             raise
-        parent_uris = g.all_upstream_source_uris(graph, node.id)
+        parent_uris = g.all_upstream_publication_uris(graph, node.id)
         if not (managed_parquet and parent_contract):
             if managed_parquet:
                 publish = managed_publisher

@@ -7,20 +7,165 @@ secure-default boundary.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+from typing import Callable, Hashable, TypeVar
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel, ConfigDict, field_validator
 from pydantic.alias_generators import to_camel
 from sqlalchemy import select as _sa_select
 
-from hub import auth, metadb
+from hub import auth, auth_admission, metadb
 from hub.models import RunStatus
-from hub.security import current_user
+from hub.security import RequestIdentity, current_identity, current_user
 
 router = APIRouter()
 public_router = APIRouter()
+_T = TypeVar("_T")
+MAX_AUTH_USER_ID_BYTES = 128
+MAX_AUTH_USER_PROFILE_FIELD_BYTES = 1024
+
+
+class _StrictAuthBody(BaseModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+        strict=True,
+        hide_input_in_errors=True,
+    )
+
+
+def _bounded_password(value: str) -> str:
+    auth.password_bytes_for_kdf(value)
+    return value
+
+
+def _bounded_database_text(value: str, *, label: str, max_bytes: int) -> str:
+    """Reject text that cannot cross both SQLite and PostgreSQL boundaries safely."""
+    # Reject obviously oversized values before allocating a second encoded copy. The request-body cap
+    # remains the outer allocation bound; this narrower limit keeps auth metadata and DB work small.
+    if len(value) > max_bytes:
+        raise ValueError(f"{label} must be at most {max_bytes} UTF-8 bytes")
+    if "\x00" in value:
+        raise ValueError(f"{label} must not contain NUL")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{label} must be valid UTF-8") from exc
+    if len(encoded) > max_bytes:
+        raise ValueError(f"{label} must be at most {max_bytes} UTF-8 bytes")
+    return value
+
+
+def _bounded_user_id(value: str) -> str:
+    # UUIDs and generated project IDs are far below this bound; the exact UTF-8 check keeps multibyte
+    # identifiers deterministic and rejects PostgreSQL-incompatible NUL before hashing or DB access.
+    return _bounded_database_text(value, label="user id", max_bytes=MAX_AUTH_USER_ID_BYTES)
+
+
+class LoginBody(_StrictAuthBody):
+    user_id: str
+    password: str
+
+    _user_id_is_bounded = field_validator("user_id")(_bounded_user_id)
+    _password_is_bounded = field_validator("password")(_bounded_password)
+
+
+class PasswordChangeBody(_StrictAuthBody):
+    old_password: str = ""
+    new_password: str
+
+    _passwords_are_bounded = field_validator("old_password", "new_password")(_bounded_password)
+
+
+def _client_host(request: Request) -> str:
+    # Consume only the peer identity supplied by the ASGI server; this route never parses raw forwarded
+    # headers. Uvicorn may already have normalized request.client from those headers when the immediate
+    # peer is in its configured trusted-proxy set, which is the correct deployment-layer boundary.
+    return request.client.host if request.client is not None else ""
+
+
+def _password_attempt_key(client_host: str, user_id: str) -> bytes:
+    return auth_admission.password_attempt_key(client_host, user_id)
+
+
+def _admit_attempt(limiter: auth_admission.AttemptLimiter, key: Hashable) -> None:
+    decision = limiter.consume(key)
+    if not decision.allowed:
+        raise HTTPException(
+            429,
+            "too many password attempts",
+            headers={"Retry-After": str(decision.retry_after)},
+        )
+
+
+async def _run_password_work(function: Callable[..., _T], *args: object) -> _T:
+    # Admission happens before submission to a dedicated, fixed-size executor, so password work can
+    # neither wait inside AnyIO's shared worker pool nor starve unrelated sync endpoints.
+    gate = auth_admission.password_work_gate
+    if not gate.try_acquire():
+        raise HTTPException(429, "password service is busy", headers={"Retry-After": "1"})
+    try:
+        future = auth_admission.password_work_executor.submit(function, *args)
+    except BaseException:
+        gate.release()
+        raise
+
+    # The request task may be cancelled while a Python worker continues. Tie the lease to the actual
+    # concurrent Future, not the request lifetime; a queued cancellation also completes the Future and
+    # releases exactly once. Capture this request's gate so test swaps/config changes cannot mis-release.
+    future.add_done_callback(lambda _done: gate.release())
+    try:
+        return await asyncio.wrap_future(future)
+    except asyncio.CancelledError:
+        future.cancel()  # succeeds only while queued; running work retains its lease until completion
+        raise
+
+
+def _login_password_work(user_id: str, password: str) -> int | None:
+    # PER-USER: the password must match THIS user's own credential — knowing the instance/bootstrap
+    # password no longer lets you sign in as someone else.
+    snapshot = metadb.user_auth_snapshot(user_id) if user_id else None
+    if snapshot is None:
+        return None
+    password_hash, epoch = snapshot
+    if not auth.verify_password(password, password_hash):
+        return None
+    # Scrypt runs without a DB lock. Reconfirm the exact hash+epoch snapshot afterwards, then sign
+    # that original epoch: a concurrent rotation either fails this check or invalidates the old token.
+    if not metadb.user_auth_snapshot_matches(user_id, password_hash, epoch):
+        return None
+    return epoch
+
+
+def _change_password_work(identity: RequestIdentity, old_password: str, new_password: str) -> int:
+    """Verify, hash, and CAS while one password-work lease remains held."""
+    uid = identity.user_id
+    snapshot = metadb.user_auth_snapshot(uid)
+    if snapshot is None:
+        raise HTTPException(409, "password was changed concurrently; sign in again")
+    current, snapshot_epoch = snapshot
+    if current is not None and not auth.verify_password(old_password, current):
+        raise HTTPException(403, "current password is incorrect")
+    if len(new_password) < 6:
+        raise HTTPException(400, "password must be at least 6 characters")
+    # Both scrypt operations stay outside the DB transaction. The conditional update then proves that
+    # the exact hash and admitted token epoch are still current, replaces the hash, and bumps the epoch.
+    admission_epoch = identity.session_epoch if identity.session_epoch is not None else snapshot_epoch
+    epoch = metadb.compare_and_set_user_password(
+        uid,
+        current,
+        admission_epoch,
+        auth.hash_password(new_password),
+    )
+    if epoch is None:
+        raise HTTPException(409, "password was changed concurrently; sign in again")
+    return epoch
+
 
 @public_router.get("/auth/status")
 def auth_status(dp_session: str | None = Cookie(default=None)) -> dict:
@@ -30,47 +175,80 @@ def auth_status(dp_session: str | None = Cookie(default=None)) -> dict:
 
 
 @public_router.post("/auth/login")
-def auth_login(body: dict, response: Response) -> dict:
+async def auth_login(body: LoginBody, response: Response, request: Request) -> dict:
     if not auth.auth_enabled():
-        return {"ok": True, "userId": metadb.resolve_user(body.get("userId"))}
-    uid = body.get("userId") or ""
-    # PER-USER: the password must match THIS user's own credential — knowing the instance/bootstrap
-    # password no longer lets you sign in as someone else
-    if not uid or not auth.verify_password(body.get("password", ""), metadb.user_password_hash(uid)):
+        # This endpoint is async so authenticated password work can use explicit admission. Preserve the
+        # old sync endpoint's off-event-loop DB behavior for the open-mode identity lookup.
+        user_id = await run_in_threadpool(metadb.resolve_user, body.user_id)
+        return {"ok": True, "userId": user_id}
+    uid = body.user_id
+    client_host = _client_host(request)
+    peer_key = auth_admission.login_peer_attempt_key(client_host)
+    # NAT/proxy tradeoff: callers behind one trusted peer share this aggregate quota and may throttle
+    # each other. A larger peer burst (100/minute) limits false positives while still keeping one peer
+    # below the 4096 pair-table cap throughout the ten-minute entry lifetime, so random-ID sprays remain
+    # bounded. Successful login resets only the pair bucket, never this peer bucket.
+    _admit_attempt(auth_admission.login_peer_attempts, peer_key)
+    attempt_key = _password_attempt_key(client_host, uid)
+    _admit_attempt(auth_admission.login_attempts, attempt_key)
+    epoch = await _run_password_work(_login_password_work, uid, body.password)
+    if epoch is None:
         raise HTTPException(401, "invalid user or password")
     # Secure flag opt-in for HTTPS deployments (default off so internal http installs still work)
-    response.set_cookie("dp_session", auth.sign(uid), httponly=True, samesite="lax",
+    response.set_cookie("dp_session", auth.sign_at_epoch(uid, epoch), httponly=True, samesite="lax",
                         secure=bool(os.environ.get("DP_AUTH_SECURE_COOKIE")))
+    auth_admission.login_attempts.reset(attempt_key)
     return {"ok": True, "userId": uid}
 
 
 @router.post("/auth/password")
-def change_password(body: dict, response: Response, uid: str = Depends(current_user)) -> dict:
+async def change_password(body: PasswordChangeBody, response: Response, request: Request,
+                          identity: RequestIdentity = Depends(current_identity)) -> dict:
     """Set/rotate the CURRENT user's password. If one is already set, the old password must match."""
-    current = metadb.user_password_hash(uid)
-    if current and not auth.verify_password(body.get("oldPassword", ""), current):
-        raise HTTPException(403, "current password is incorrect")
-    new = body.get("newPassword") or ""
-    if len(new) < 6:
-        raise HTTPException(400, "password must be at least 6 characters")
-    metadb.set_user_password(uid, auth.hash_password(new))  # bumps the token epoch → revokes OTHER sessions
+    uid = identity.user_id
+    attempt_key = _password_attempt_key(_client_host(request), uid)
+    _admit_attempt(auth_admission.password_change_attempts, attempt_key)
+    epoch = await _run_password_work(_change_password_work, identity, body.old_password, body.new_password)
+    auth_admission.password_change_attempts.reset(attempt_key)
     if auth.auth_enabled():  # re-issue THIS session's cookie at the new epoch so the caller isn't logged out
-        response.set_cookie("dp_session", auth.sign(uid), httponly=True, samesite="lax",
+        response.set_cookie("dp_session", auth.sign_at_epoch(uid, epoch), httponly=True, samesite="lax",
                             secure=bool(os.environ.get("DP_AUTH_SECURE_COOKIE")))
     return {"ok": True}
 
 
 @public_router.post("/auth/logout")
-def auth_logout(response: Response) -> dict:
+def auth_logout(response: Response, dp_session: str | None = Cookie(default=None)) -> dict:
+    # Sessions are stateless apart from the per-user epoch, so logout revokes every session issued
+    # at the current epoch. Keep this route public so an expired/invalid cookie can still be cleared.
+    uid = auth.verify(dp_session) if auth.auth_enabled() else None
+    if uid is not None:
+        metadb.bump_token_epoch(uid)
     response.delete_cookie("dp_session")
     return {"ok": True}
 
 
-class UserBody(BaseModel):
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+class UserBody(_StrictAuthBody):
     name: str
     email: str | None = None
     password: str | None = None  # set the new user's credential (required for login when auth is on)
+
+    @field_validator("name", "email")
+    @classmethod
+    def _profile_text_is_database_safe(cls, value: str | None) -> str | None:
+        if value is not None:
+            _bounded_database_text(
+                value,
+                label="user profile field",
+                max_bytes=MAX_AUTH_USER_PROFILE_FIELD_BYTES,
+            )
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def _optional_password_is_bounded(cls, value: str | None) -> str | None:
+        if value is not None:
+            _bounded_password(value)
+        return value
 
 
 class SettingBody(BaseModel):
@@ -101,15 +279,23 @@ def _require_admin(uid: str) -> None:
         raise HTTPException(403, "admin only")
 
 
-@router.post("/users")
-def create_user(body: UserBody, uid: str = Depends(current_user)) -> dict:  # admin-only (auth mode)
+def _create_user_work(body: UserBody, uid: str) -> dict:
     _require_admin(uid)
+    if body.password is not None and len(body.password) < 6:
+        raise HTTPException(400, "password must be at least 6 characters")
+    password_hash = auth.hash_password(body.password) if body.password is not None else None
     with metadb.session() as s:
-        u = metadb.User(name=body.name, email=body.email,
-                        password_hash=auth.hash_password(body.password) if body.password else None)
+        u = metadb.User(name=body.name, email=body.email, password_hash=password_hash)
         s.add(u)
         s.flush()
         return {"id": u.id, "name": u.name, "email": u.email}
+
+
+@router.post("/users")
+async def create_user(body: UserBody, uid: str = Depends(current_user)) -> dict:  # admin-only (auth mode)
+    if body.password is None:
+        return await run_in_threadpool(_create_user_work, body, uid)
+    return await _run_password_work(_create_user_work, body, uid)
 
 
 @router.get("/me")

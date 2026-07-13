@@ -68,6 +68,16 @@ def test_long_lived_kernel_profile_only_adds_the_current_metadata_bridge():
     assert env["DP_AUTH_MODE"] == "1"
 
 
+def test_blank_auth_secret_does_not_put_open_local_workloads_in_auth_mode():
+    source = _source()
+    source["DP_AUTH_SECRET"] = "   "
+
+    env = build_workload_env(include_metadata_db=False, source=source)
+
+    assert "DP_AUTH_SECRET" not in env
+    assert "DP_AUTH_MODE" not in env
+
+
 def test_pod_manifest_uses_the_same_explicit_profile(monkeypatch):
     from hub.pod_spawner import PodSpawner
 

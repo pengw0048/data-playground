@@ -22,6 +22,7 @@ from hub import graph as g
 from hub.grain import grain_of
 from hub.models import ColumnSchema, Graph, JoinAnalysis, JoinSuggestion, KeyInfo
 from hub.plugins.capabilities import display_base_type, is_key_column
+from hub.sqlpolicy import identifier, quote_identifier
 
 # a join key column set is at most this wide — a wider composite is almost never a real join key and
 # the combinatorics (C(n,k)) would explode.
@@ -61,15 +62,6 @@ def measure_unique(uri: str, cols: list[str], resolve_adapter) -> tuple[bool | N
     every key non-unique. Runs on its own cursor (run_scope), so a big scan doesn't hold the base lock
     and stall other previews. Returns (None, n) when the data/columns can't be read (→ 'unknown'
     cardinality, never a false 'not unique') and (None, 0) for empty data (cardinality is moot)."""
-    quoted = ", ".join(f'"{c}"' for c in cols)
-    if len(cols) > 1:
-        # a composite (a,b) struct is non-null even when a field is NULL, so count(DISTINCT (a,b))
-        # would count a null-bearing tuple as a distinct value — reporting a NULL-containing key as
-        # unique. Exclude any-null tuples (FILTER) to match the single-column NULL semantics.
-        notnull = " AND ".join(f'"{c}" IS NOT NULL' for c in cols)
-        dexpr = f"count(DISTINCT ({quoted})) FILTER (WHERE {notnull})"
-    else:
-        dexpr = f"count(DISTINCT {quoted})"  # excludes NULLs already
     try:
         adapter = resolve_adapter(uri)
         # cache by (uri, cols, fingerprint) so the Inspector's debounced re-fires (typing on the
@@ -83,7 +75,17 @@ def measure_unique(uri: str, cols: list[str], resolve_adapter) -> tuple[bool | N
         except Exception:  # noqa: BLE001 — adapter without fingerprint → just skip the cache
             key = None
         with db.run_scope():
-            n, d = adapter.scan(uri, columns=cols).aggregate(f"count(*) AS n, {dexpr} AS d").fetchone()
+            selected = adapter.scan(uri, columns=cols)
+            canonical = [identifier(c, selected.columns, label="relationship key") for c in cols]
+            quoted = ", ".join(quote_identifier(c) for c in canonical)
+            if len(canonical) > 1:
+                # a composite (a,b) struct is non-null even when a field is NULL, so
+                # count(DISTINCT (a,b)) would count a null-bearing tuple as a distinct value.
+                notnull = " AND ".join(f"{quote_identifier(c)} IS NOT NULL" for c in canonical)
+                dexpr = f"count(DISTINCT ({quoted})) FILTER (WHERE {notnull})"
+            else:
+                dexpr = f"count(DISTINCT {quoted})"  # excludes NULLs already
+            n, d = selected.aggregate(f"count(*) AS n, {dexpr} AS d").fetchone()
         n = int(n)
         result = ((d == n) if n else None, n)
         if key is not None:
@@ -287,10 +289,10 @@ def _configured_join_key(node) -> tuple[list[str], list[str]] | None:
 
 def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | None],
                  catalog, resolve_adapter, storage=None) -> JoinAnalysis:
-    """Fence every managed local input through all uniqueness scans."""
-    from hub.storage import local_result_read_scope
+    """Fence every managed input through all uniqueness scans."""
+    from hub.storage import source_read_scope
 
-    with local_result_read_scope(
+    with source_read_scope(
             storage, g.all_upstream_source_uris(graph, node_id),
             owner=f"join-analysis:{uuid.uuid4().hex}"):
         return _analyze_join_unfenced(

@@ -1789,20 +1789,57 @@ def test_isolated_clone_cannot_take_original_namespace_or_inherited_visibility(t
         handoff.set_managed_object_provider(None)
 
 
-def test_app_lifespan_starts_and_stops_object_reaper():
+def test_app_lifespan_starts_and_stops_background_reapers():
     from fastapi.testclient import TestClient
     from hub import main
 
-    def live_reapers():
+    def live_reapers(name: str):
         return [thread for thread in threading.enumerate()
-                if thread.name == "dp-object-attempt-reaper" and thread.is_alive()]
+                if thread.name == name and thread.is_alive()]
 
-    before = len(live_reapers())
+    object_before = len(live_reapers("dp-object-attempt-reaper"))
+    local_before = len(live_reapers("dp-local-result-reaper"))
     with TestClient(main.app):
-        assert len(live_reapers()) == before + 1
+        assert len(live_reapers("dp-object-attempt-reaper")) == object_before + 1
+        assert len(live_reapers("dp-local-result-reaper")) == local_before + 1
         assert main._object_attempt_reaper_thread is not None
-    assert len(live_reapers()) == before
+        assert main._local_result_reaper_thread is not None
+    assert len(live_reapers("dp-object-attempt-reaper")) == object_before
+    assert len(live_reapers("dp-local-result-reaper")) == local_before
     assert main._object_attempt_reaper_thread is None
+    assert main._local_result_reaper_thread is None
+
+
+def test_overlapping_app_lifespans_share_background_reapers_until_last_exit():
+    from fastapi.testclient import TestClient
+    from hub import main
+
+    def live_reapers(name: str):
+        return [thread for thread in threading.enumerate()
+                if thread.name == name and thread.is_alive()]
+
+    object_before = len(live_reapers("dp-object-attempt-reaper"))
+    local_before = len(live_reapers("dp-local-result-reaper"))
+    with TestClient(main.app):
+        object_thread = main._object_attempt_reaper_thread
+        local_thread = main._local_result_reaper_thread
+        assert object_thread is not None
+        assert local_thread is not None
+        assert len(live_reapers("dp-object-attempt-reaper")) == object_before + 1
+        assert len(live_reapers("dp-local-result-reaper")) == local_before + 1
+        with TestClient(main.app):
+            assert main._object_attempt_reaper_thread is object_thread
+            assert main._local_result_reaper_thread is local_thread
+            assert len(live_reapers("dp-object-attempt-reaper")) == object_before + 1
+            assert len(live_reapers("dp-local-result-reaper")) == local_before + 1
+        assert main._object_attempt_reaper_thread is object_thread
+        assert main._local_result_reaper_thread is local_thread
+        assert object_thread.is_alive()
+        assert local_thread.is_alive()
+    assert len(live_reapers("dp-object-attempt-reaper")) == object_before
+    assert len(live_reapers("dp-local-result-reaper")) == local_before
+    assert main._object_attempt_reaper_thread is None
+    assert main._local_result_reaper_thread is None
 
 
 @pytest.mark.parametrize("versioning_enabled", [False, True], ids=["unversioned", "versioned"])
@@ -2963,9 +3000,11 @@ def test_subprocess_unmanaged_uri_mismatch_never_calls_catalog(tmp_path):
     assert calls == []
 
 
-def test_subprocess_parent_registers_unmanaged_sink_with_source_lineage(tmp_path):
+def test_subprocess_parent_registers_unmanaged_sink_with_source_lineage_across_region_cut(tmp_path):
     from hub import graph as graph_mod
-    from hub.models import CompilePlan, Graph, PlanStep, RunStatus
+    from hub.models import CompilePlan, Graph, PlanStep, ResourceSpec, RunStatus
+    from hub.planner import Region
+    from hub.run_controller import RunController
     from hub.subprocess_runner import SubprocessRunner
 
     source_a = str(tmp_path / "source-a.parquet")
@@ -3008,18 +3047,28 @@ def test_subprocess_parent_registers_unmanaged_sink_with_source_lineage(tmp_path
             {"id": "transform-write", "source": "transform", "target": "write"},
         ],
     })
+    expected_parents = graph_mod.all_upstream_source_uris(graph, "write")
+    region = Region(
+        id="final", node_ids={"write"}, output_node="write", backend="default",
+        worker=None, requires=ResourceSpec(),
+        cut_inputs=[("transform", None, "write", None)],
+    )
+    region_ref = str(tmp_path / "region-ref.parquet")
+    graph = RunController._subgraph(
+        None, graph, region, {"transform": region_ref})
+    ref_node_id = next(
+        node.id for node in graph.nodes
+        if (node.data.get("config") or {}).get("uri") == region_ref
+    )
     plan = CompilePlan(target_node_id="write", steps=[
-        PlanStep(node_id="source-a", kind="read", label="source-a"),
-        PlanStep(node_id="source-b", kind="read", label="source-b"),
-        PlanStep(node_id="join", kind="op", label="join"),
-        PlanStep(node_id="transform", kind="op", label="transform"),
+        PlanStep(node_id=ref_node_id, kind="read", label="source"),
         PlanStep(node_id="write", kind="write", label="write"),
     ])
     runner = SubprocessRunner(
         str(tmp_path), str(tmp_path), catalog=Catalog(), storage=LocalStorage())
     _targets, _attempts, contracts = runner._claim_sink_contracts(plan, graph, "run")
-    expected_parents = graph_mod.all_upstream_source_uris(graph, "write")
     assert set(expected_parents) == {source_a, source_b}
+    assert graph_mod.execution_source_uris(graph, "write") == [region_ref]
     assert contracts["write"]["parents"] == expected_parents
     runner._sink_contracts["run"] = contracts
     runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
@@ -3767,10 +3816,12 @@ def test_local_runner_rejects_multiple_writes_before_starting_worker(tmp_path):
     assert runner.runs == {}
 
 
-def test_local_unmanaged_sink_registers_all_join_sources(tmp_path, monkeypatch):
+def test_local_unmanaged_sink_registers_all_join_sources_across_region_cut(tmp_path, monkeypatch):
     from hub import graph as graph_mod, sinks
-    from hub.models import Graph, RunStatus
+    from hub.models import Graph, ResourceSpec, RunStatus
+    from hub.planner import Region
     from hub.plugins.runner import LocalRunner, _CancelToken
+    from hub.run_controller import RunController
 
     source_a = str(tmp_path / "a.parquet")
     source_b = str(tmp_path / "b.parquet")
@@ -3823,6 +3874,14 @@ def test_local_unmanaged_sink_registers_all_join_sources(tmp_path, monkeypatch):
             {"id": "transform-write", "source": "transform", "target": "write"},
         ],
     })
+    expected = graph_mod.all_upstream_source_uris(graph, "write")
+    region = Region(
+        id="final", node_ids={"write"}, output_node="write", backend="default",
+        worker=None, requires=ResourceSpec(),
+        cut_inputs=[("transform", None, "write", None)],
+    )
+    graph = RunController._subgraph(
+        None, graph, region, {"transform": str(tmp_path / "region-ref.parquet")})
     monkeypatch.setattr(
         sinks, "commit_sink",
         lambda *_args, **_kwargs: sinks.SinkCommit(name="joined", uri=output, rows=2))
@@ -3832,8 +3891,8 @@ def test_local_unmanaged_sink_registers_all_join_sources(tmp_path, monkeypatch):
         next(node for node in graph.nodes if node.id == "write"), graph, Engine(),
         RunStatus(run_id="run", status="running", per_node=[]), None,
         _CancelToken(), pre_publish=lambda **_kwargs: None)
-    expected = graph_mod.all_upstream_source_uris(graph, "write")
     assert set(expected) == {source_a, source_b}
+    assert graph_mod.execution_source_uris(graph, "write") == [str(tmp_path / "region-ref.parquet")]
     assert registered["parents"] == expected
 
 

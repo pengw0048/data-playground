@@ -639,7 +639,7 @@ requires-dist = [
     { name = "data-playground", extras = ["agent"], marker = "extra == 'dev'" },
     { name = "data-playground", extras = ["lance"], marker = "extra == 'dev'" },
     { name = "datasets", marker = "extra == 'hf'", specifier = ">=2.0" },
-    { name = "duckdb", specifier = ">=1.1" },
+    { name = "duckdb", specifier = "==1.5.4" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "filelock", specifier = ">=3.16" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },

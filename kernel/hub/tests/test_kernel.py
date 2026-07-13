@@ -17,6 +17,10 @@ client = TestClient(app)
 def test_observability_livez_readyz_version(monkeypatch):
     # ARC8 observability: livez (pure liveness), readyz (REAL dep checks → 200/503), version (redacted
     # deployment identity). All are pre-auth probes (app-level, outside the /api auth gate).
+    from hub import db, metadb
+    object_store_primes = []
+    monkeypatch.setattr(
+        db, "_prime_object_store_before_scope", lambda: object_store_primes.append(True))
     assert client.get("/api/livez").json()["ok"] is True
     assert client.get("/api/health").status_code == 200  # back-compat alias for livez
     r = client.get("/api/readyz")
@@ -31,7 +35,6 @@ def test_observability_livez_readyz_version(monkeypatch):
     assert client.get("/api/version").json()["storage"] == "local", "bare storage path leaked"
     monkeypatch.setenv("DP_STORAGE_URL", "s3://bucket/prefix")
     assert client.get("/api/version").json()["storage"] == "s3"  # a scheme'd url → its scheme
-    from hub import metadb
     monkeypatch.setattr(metadb, "schema_at_head", lambda: False)
     r = client.get("/api/readyz")
     assert r.status_code == 503
@@ -41,6 +44,7 @@ def test_observability_livez_readyz_version(monkeypatch):
     r = client.get("/api/readyz")
     assert r.status_code == 503
     assert r.json()["checks"] == {"db": False, "schema": False, "engine": True}
+    assert object_store_primes == []
 
 
 def _uri(name: str) -> str:
@@ -192,6 +196,39 @@ def test_warm_relation_cache_reuses_and_invalidates():
     r3 = prev("user_id, amount, amount * 2 AS dbl")  # edited select → new plan_hash → must NOT be stale
     assert [c.name for c in r3.columns] == ["user_id", "amount", "dbl"]
     assert all(row["dbl"] == row["amount"] * 2 for row in r3.rows)
+
+
+def test_warm_relation_cache_hit_crosses_run_scopes_without_rerunning_scan():
+    import pyarrow as pa
+
+    from hub import db
+    from hub.executors.preview import preview_node
+    from hub.models import Graph
+    from hub.relation_cache import RelationCache
+
+    calls = {"scan": 0}
+
+    class Adapter:
+        def fingerprint(self, _uri):
+            return "stable"
+
+        def scan(self, _uri, **_kwargs):
+            calls["scan"] += 1
+            return db.conn().from_arrow(pa.table({"value": [1, 2, 3]}))
+
+    adapter = Adapter()
+    graph = Graph(**{"id": "warm-cross-scope", "version": 1, "nodes": [
+        N("src", "source", {"uri": "mock://warm-cache"}),
+        N("sel", "select", {"select": "value, value * 2 AS doubled"}),
+    ], "edges": [E("src", "sel")]})
+    cache = RelationCache()
+
+    first = preview_node(graph, "sel", 10, lambda _uri: adapter, object(), cache=cache)
+    second = preview_node(graph, "sel", 10, lambda _uri: adapter, object(), cache=cache)
+
+    assert not first.error and not second.error
+    assert first.rows == second.rows
+    assert calls["scan"] == 1, "the second run_scope must hit Arrow cache, not rebuild the source"
 
 
 def test_relation_cache_no_deadlock_and_eviction_safe():
@@ -424,14 +461,14 @@ def test_sql_join_and_window_preview_faithfully(tmp_path):
     assert res["rowCount"] > 0, "sql join previewed two prefixes → 0 matches (the lie); must run full inputs"
 
 
-def test_sql_accepts_input_placeholder_and_aggregate_message_reflects_groupby():
-    # the sql node accepts the documented {input}/{inputN} placeholder (not just the bare CTE name)
+def test_sql_query_scope_cte_and_aggregate_message_reflects_groupby():
+    # the SQL node exposes its source as the real query-scope CTE name `input`
     g = {"id": "c", "version": 1, "nodes": [
         N("s", "source", {"uri": _uri("events")}),
-        N("q", "sql", {"sql": "SELECT event, amount FROM {input} WHERE amount > 0"}),
+        N("q", "sql", {"sql": "SELECT event, amount FROM input WHERE amount > 0"}),
     ], "edges": [E("s", "q")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 5}).json()
-    assert not r["notPreviewable"] and not r.get("error"), r.get("reason")   # {input} resolved, no ParserException
+    assert not r["notPreviewable"] and not r.get("error"), r.get("reason")
     # the aggregate not-previewable reason is conditional on groupBy (was hardcoded 'global aggregate')
     gg = {"id": "c", "version": 1, "nodes": [
         N("s", "source", {"uri": _uri("events")}),
@@ -657,7 +694,7 @@ def test_request_body_and_graph_complexity_limits(monkeypatch):
     # (2) oversized code on a node → 422 (body itself well under the byte cap)
     big = {"id": "c", "version": 1, "nodes": [N("t", "transform", {"code": "x" * (MAX_CODE_LEN + 1)})], "edges": []}
     assert client.post("/api/graph/compile", json={"graph": big}).status_code == 422
-    # (3) a body over the byte cap → 413 from the middleware (header-only check)
+    # (3) a body over the byte cap → 413 from the middleware
     monkeypatch.setattr(settings, "max_body_bytes", 200)
     payload = {"graph": {"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": "x" * 500})], "edges": []}}
     assert client.post("/api/graph/compile", json=payload).status_code == 413
@@ -907,9 +944,10 @@ def test_code_cell_preview_profile_disabled_in_auth_mode(monkeypatch):
     assert pf.not_previewable and "multi-user" in (pf.reason or "")
 
 
-def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch):
+def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch, tmp_path):
     # P0-EXEC-02: a full profile must be deadline-bounded + interruptible, so a huge pure-SQL aggregate
-    # can't pin the warm kernel forever. A ~5e10-row cross join can't finish in 0.5s → it's interrupted.
+    # can't pin the warm kernel forever. A 62.5B-row hashed cross join over the wired input cannot finish in
+    # 0.5s → it is interrupted, without weakening the user-SQL policy to allow range() table functions.
     import time as _t
 
     from hub.deps import get_deps
@@ -918,9 +956,17 @@ def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch):
     from hub.models import Graph
     monkeypatch.setattr(profile_mod, "PROFILE_FULL_BUDGET_S", 0.5)
     d = get_deps()
+    source = str(tmp_path / "profile-deadline.parquet")
+    import duckdb
+    duckdb.connect().execute(
+        f"COPY (SELECT i AS id FROM range(500) t(i)) TO '{source}' (FORMAT PARQUET)"
+    )
     g = Graph(**{"id": "cD", "version": 1, "nodes": [
-        N("s", "source", {"uri": _uri("images")}),
-        N("q", "sql", {"sql": "SELECT r.x FROM input, range(50000000) r(x)"}),
+        N("s", "source", {"uri": source}),
+        N("q", "sql", {"sql": (
+            "SELECT hash(a.id, b.id, c.id, d.id) AS id "
+            "FROM input a, input b, input c, input d"
+        )}),
     ], "edges": [E("s", "q")]})
     t0 = _t.time()
     r = profile_node(g, "q", d.resolve_adapter, d.registry, d.node_builders, d.node_specs, full=True)
@@ -1102,7 +1148,7 @@ def test_plugin_run_applies_lowering(tmp_path):
                     inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
                     params=[])
     deps.node_specs[spec.kind] = spec
-    deps.node_builders[spec.kind] = lambda engine, node, inputs: ctx.sql(inputs[0], "SELECT *, 42 AS c FROM {input}")
+    deps.node_builders[spec.kind] = lambda engine, node, inputs: ctx.sql(inputs[0], "SELECT *, 42 AS c FROM input")
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
         N("p", "const42", {}),
@@ -2227,7 +2273,7 @@ def test_plugin_node_lowering():
                     params=[ParamSpec(name="column", type="string", default="format")])
     def build(engine, node, inputs):
         col = node.data.get("config", {}).get("column", "format")
-        return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM _')
+        return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM input')
     deps.node_specs[spec.kind] = spec
     deps.node_builders[spec.kind] = build
 
@@ -2274,10 +2320,147 @@ def test_kernel_child_env_is_allowlisted_but_keeps_auth_mode(monkeypatch):
     assert not {"DP_AUTH_PASSWORD", "OPENAI_API_KEY", "UNRELATED_DEPLOY_TOKEN"} & env.keys()
     assert env["DP_AUTH_MODE"] == "1"           # but the auth-mode signal survives
     assert env["DP_DATABASE_URL"] and env["AWS_SECRET_ACCESS_KEY"]  # explicit residual capabilities
-    # the signal alone enables auth mode with NO usable signing material in the child
+    # The signal alone keeps workload confinement enabled, but is never usable signing material. The
+    # kernel child does not import hub.main, so the hub-only startup guard does not block this process.
     monkeypatch.delenv("DP_AUTH_SECRET")
     monkeypatch.setenv("DP_AUTH_MODE", "1")
     assert auth.auth_enabled() is True and auth._secret() == ""
+    assert auth.verify("local.0.9999999999.forged") is None
+    with pytest.raises(RuntimeError, match="cannot sign a session"):
+        auth.sign("local")
+
+
+@pytest.mark.parametrize("raw_secret", [None, "", "   "])
+def test_auth_mode_without_a_signing_secret_fails_closed(monkeypatch, raw_secret):
+    """DP_AUTH_MODE is a workload marker, not an implicit public HMAC key."""
+    import hashlib
+    import hmac
+
+    from hub import auth
+
+    monkeypatch.setenv("DP_AUTH_MODE", "1")
+    if raw_secret is None:
+        monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
+    else:
+        monkeypatch.setenv("DP_AUTH_SECRET", raw_secret)
+    payload = "local.0.9999999999"
+    forged = f"{payload}.{hmac.new((raw_secret or '').encode(), payload.encode(), hashlib.sha256).hexdigest()}"
+
+    assert auth.auth_enabled() is True  # confinement remains enabled for a workload child
+    assert auth.verify(forged) is None   # an empty/blank key can never authenticate a request
+    with pytest.raises(RuntimeError, match="cannot sign a session"):
+        auth.sign("local")
+    with pytest.raises(RuntimeError, match="cannot authenticate hub sessions"):
+        auth.reject_weak_secret()
+
+
+@pytest.mark.parametrize("raw_secret", ["", "   "])
+def test_blank_secret_without_auth_mode_remains_open_local_mode(monkeypatch, raw_secret):
+    """An empty optional env value is still unconfigured; only DP_AUTH_MODE opts into auth."""
+    from hub import auth
+
+    monkeypatch.delenv("DP_AUTH_MODE", raising=False)
+    monkeypatch.setenv("DP_AUTH_SECRET", raw_secret)
+
+    assert auth.auth_enabled() is False
+    auth.reject_weak_secret()
+    assert auth.verify("local.0.9999999999.forged") is None
+    with pytest.raises(RuntimeError, match="cannot sign a session"):
+        auth.sign("local")
+
+
+@pytest.mark.parametrize("raw_secret", [None, ""])
+def test_hub_startup_rejects_auth_mode_without_a_signing_secret(tmp_path, raw_secret):
+    """Importing the web app is hub startup; fail before opening its metadata database."""
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    if raw_secret is None:
+        env.pop("DP_AUTH_SECRET", None)
+    else:
+        env["DP_AUTH_SECRET"] = raw_secret
+    env["DP_AUTH_MODE"] = "1"
+    env["DP_WORKSPACE"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-c", "import hub.main"],
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "cannot authenticate hub sessions without" in result.stderr
+    assert "non-empty DP_AUTH_SECRET" in result.stderr
+
+
+def test_cli_rejects_marker_only_auth_before_creating_metadata(tmp_path):
+    """The normal `dataplay` path must fail before seed, DB migration, or dependency setup."""
+    import subprocess
+    import sys
+
+    workspace = tmp_path / "workspace"
+    env = dict(os.environ)
+    env.pop("DP_AUTH_SECRET", None)
+    env.pop("DP_DATABASE_URL", None)
+    env["DP_AUTH_MODE"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hub.cli",
+            "--workspace",
+            str(workspace),
+            "--no-open",
+            "--no-seed",
+        ],
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "cannot authenticate hub sessions without" in result.stderr
+    assert not (workspace / "dataplay.db").exists()
+
+
+def test_authenticated_principal_deletion_never_falls_back_to_local_admin(monkeypatch):
+    """Deleting a user between signature verification and principal resolution must return 401."""
+    from fastapi import HTTPException
+
+    from hub import auth, metadb
+    from hub.security import current_identity
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "strict-principal-secret")
+    monkeypatch.delenv("DP_AUTH_MODE", raising=False)
+    uid = "principal_deleted_during_auth"
+    with metadb.session() as s:
+        existing = s.get(metadb.User, uid)
+        if existing is not None:
+            s.delete(existing)
+    with metadb.session() as s:
+        s.add(metadb.User(id=uid, name="Deleted during auth"))
+    token = auth.sign(uid)
+    original_verify = auth.verify_claims
+
+    def verify_then_delete(candidate):
+        claims = original_verify(candidate)
+        assert claims is not None
+        with metadb.session() as s:
+            user = s.get(metadb.User, claims.user_id)
+            if user is not None:
+                s.delete(user)
+        return claims
+
+    monkeypatch.setattr(auth, "verify_claims", verify_then_delete)
+    with pytest.raises(HTTPException) as exc:
+        current_identity(x_dp_user=None, dp_session=token)
+    assert exc.value.status_code == 401
+    assert metadb.user_token_epoch("local") is not None  # the fallback admin still exists but was not selected
 
 
 def test_canvas_pip_deps_default_off_under_auth(monkeypatch):
@@ -2368,6 +2551,7 @@ def test_local_dataset_path_confined_in_auth_mode(monkeypatch):
     # local paths are confined to the workspace / data dir / DP_DATASET_ROOTS. Open mode = trusted, no confinement.
     import os as _os
     from hub import paths
+    from hub.plugins.adapters import path_of
     from hub.settings import settings
     inside = _os.path.join(settings.data_dir, "some_dataset.parquet")
     monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
@@ -2375,8 +2559,21 @@ def test_local_dataset_path_confined_in_auth_mode(monkeypatch):
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
     paths.ensure_local_uri_allowed(inside)                  # inside a root → allowed
     paths.ensure_local_uri_allowed("s3://bucket/x.parquet")  # object-store → not a local path → allowed
-    with pytest.raises(PermissionError):
-        paths.ensure_local_uri_allowed("/etc/passwd")       # outside every root → rejected
+    for escaped in ("/etc/passwd", "file:///etc/passwd", "FILE:///etc/passwd", "FiLe:///etc/passwd"):
+        with pytest.raises(PermissionError):
+            paths.ensure_local_uri_allowed(escaped)         # scheme case cannot bypass the same root check
+    # urlsplit calls the drive letter a URI scheme; DuckDB calls it a local filename. The shared parser
+    # must follow the executable adapter boundary so Windows cannot skip confinement.
+    monkeypatch.setattr(paths, "allowed_roots", lambda: [_os.path.realpath("/definitely-allowed")])
+    for drive_path in (r"C:\data\secret.csv", "C:/data/secret.csv"):
+        expected_drive = drive_path.replace("/", "\\") if _os.name == "nt" else drive_path
+        assert paths.local_path(drive_path) == expected_drive
+        assert path_of(drive_path) == expected_drive
+        with pytest.raises(PermissionError):
+            paths.ensure_local_uri_allowed(drive_path)
+    win_file_uri = "file:///C:/data/secret.csv"
+    expected = r"C:\data\secret.csv" if _os.name == "nt" else "/C:/data/secret.csv"
+    assert paths.local_path(win_file_uri) == expected
 
 
 def test_canvas_crud_is_per_user():
@@ -2809,6 +3006,107 @@ def test_object_store_s3_roundtrip_and_browse(tmp_path):
     finally:
         server.stop()
         metadb.set_setting("objectStore", {}, "global")  # restore the default credential chain for other tests
+
+
+def test_object_store_concurrent_run_scopes_consume_base_published_credentials():
+    import threading
+
+    from hub import db, metadb
+
+    previous = metadb.get_setting("objectStore", "global", default={}) or {}
+    configured = {
+        "endpoint": "http://example.invalid:9443", "region": "us-east-1",
+        "accessKeyId": "scope-key", "secretAccessKey": "scope-secret", "useSsl": False,
+    }
+    try:
+        # Publish an OLD committed secret first. A cursor keeps that version if replacement happens only
+        # after BEGIN, so both run_scope entries must prime the NEW config before taking their snapshots.
+        try:
+            with db.lock():
+                base = db._base_conn()
+                base.execute("INSTALL httpfs")
+                base.execute("LOAD httpfs")
+                base.execute("DROP SECRET IF EXISTS dp_s3")
+                base.execute("DROP SECRET IF EXISTS dp_gcs")
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"httpfs unavailable: {exc}")
+        metadb.set_setting("objectStore", {
+            "endpoint": "https://old.invalid", "region": "us-west-2",
+            "accessKeyId": "old-key", "secretAccessKey": "old-secret", "useSsl": True,
+        }, "global")
+        db._obj_store_loaded = False
+        db._obj_store_secret_config = None
+        db.ensure_object_store()
+        metadb.set_setting("objectStore", configured, "global")
+
+        scopes_ready = threading.Barrier(2)
+        first_published = threading.Event()
+        second_consumed = threading.Event()
+        results = [None, None]
+        errors = [None, None]
+
+        def consume(index: int) -> None:
+            try:
+                with db.run_scope():
+                    local_view = db.unique_view("object_store_scope")
+                    db.conn().execute(f'CREATE TEMP VIEW "{local_view}" AS SELECT {index} AS value')
+                    scopes_ready.wait(timeout=5)
+                    if index == 0:
+                        db.ensure_object_store()
+                        first_published.set()
+                        assert second_consumed.wait(timeout=5)
+                    else:
+                        assert first_published.wait(timeout=5)
+                        db.ensure_object_store()
+                        second_consumed.set()
+                    resolved = db.conn().execute(
+                        "SELECT name FROM which_secret('s3://bucket/key.parquet', 's3')"
+                    ).fetchone()
+                    detail = db.conn().execute(
+                        "SELECT secret_string FROM duckdb_secrets() WHERE name = 'dp_s3'"
+                    ).fetchone()
+                    results[index] = (resolved, detail)
+            except BaseException as exc:  # noqa: BLE001 — preserve thread assertion details
+                errors[index] = exc
+            finally:
+                first_published.set()
+                second_consumed.set()
+
+        threads = [threading.Thread(target=consume, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert not any(thread.is_alive() for thread in threads)
+        assert errors == [None, None]
+        for resolved, detail in results:
+            assert resolved == ("dp_s3",)
+            assert detail and "key_id=scope-key" in detail[0]
+            assert "endpoint=example.invalid:9443" in detail[0]
+    finally:
+        metadb.set_setting("objectStore", previous, "global")
+        db._obj_store_secret_config = None
+        db.ensure_object_store()
+
+
+def test_object_store_credential_fingerprint_tracks_static_aws_env(monkeypatch):
+    from hub import db
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "key-one")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-one")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-one")
+    monkeypatch.setenv("AWS_PROFILE", "profile-one")
+    first = db._object_store_fingerprint({})
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "key-two")
+    assert db._object_store_fingerprint({}) != first
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "key-one")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-two")
+    assert db._object_store_fingerprint({}) != first
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-one")
+    monkeypatch.setenv("AWS_PROFILE", "profile-two")
+    assert db._object_store_fingerprint({}) != first
 
 
 def test_object_store_destination_browse_binds_untrusted_prefix(monkeypatch):
@@ -4461,6 +4759,15 @@ async def _collab_recv(ws) -> dict:  # noqa: ANN001 — websockets client protoc
     return json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
 
 
+async def _expect_ws_policy_close(ws) -> None:  # noqa: ANN001 — protocol varies by websockets version
+    import asyncio
+    from websockets.exceptions import ConnectionClosed
+    with pytest.raises(ConnectionClosed) as closed:
+        await asyncio.wait_for(ws.recv(), timeout=3)
+    assert closed.value.rcvd is not None
+    assert closed.value.rcvd.code == 1008
+
+
 def test_collab_relay_gates_viewer_doc_updates(monkeypatch, live_collab_url):
     # A viewer may watch (presence + peers' edits) but its OWN doc updates must not be relayed.
     import asyncio
@@ -4574,6 +4881,98 @@ def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_
     try:
         asyncio.run(scenario())
     finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_logout_revokes_sender_and_recipient(monkeypatch, live_collab_url):
+    # Real logout bumps the session epoch and fences every already-open socket before either document
+    # direction can leak. This intentionally revokes all of the user's sessions, not just this cookie.
+    import asyncio
+    import httpx
+    import websockets
+    from hub import auth, metadb
+    monkeypatch.setenv("DP_AUTH_SECRET", "ws-revocation-test-secret-not-weak-0123456789")
+    cid, owner_uid, revoked_uid = "cvs_token_revoke", "live_owner_t", "live_editor_t"
+    _provision_private_collab_canvas(cid, owner_uid, revoked_uid)
+    metadb.share_canvas(cid, revoked_uid, "editor")
+    owner_cookie = f"dp_session={auth.sign(owner_uid)}"
+    revoked_token = auth.sign(revoked_uid)
+    revoked_cookie = f"dp_session={revoked_token}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner:
+            async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as writer:
+                async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as reader:
+                    async with httpx.AsyncClient(
+                        base_url=live_collab_url, headers={"Cookie": revoked_cookie},
+                    ) as http:
+                        response = await http.post("/api/auth/logout")
+                    assert response.status_code == 200
+                    assert auth.verify(revoked_token) is None
+
+                    await _collab_send(writer, {
+                        "clientId": "revoked-writer", "type": "yjs", "update": "MUST_NOT_RELAY",
+                    })
+                    await _expect_ws_policy_close(writer)
+                    # The presence-only leave is the next ordered room event, proving the rejected
+                    # document was not delivered before the sender was fenced.
+                    expected_leave = {"type": "leave", "clientId": "revoked-writer"}
+                    assert await _collab_recv(owner) == expected_leave
+                    assert await _collab_recv(reader) == expected_leave
+
+                    await _collab_send(owner, {
+                        "clientId": "owner", "type": "yjs", "update": "MUST_NOT_RECEIVE",
+                    })
+                    await _expect_ws_policy_close(reader)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+@pytest.mark.parametrize("revocation", ["token", "share"])
+def test_run_ws_rechecks_session_and_read_access(monkeypatch, live_collab_url, revocation):
+    # A first status frame is the synchronization barrier: after revocation commits, the next stream
+    # boundary must be a 1008 close, never another row-count/error/output-bearing status payload.
+    import asyncio
+    import websockets
+    from hub import auth, metadb
+    from hub.models import RunStatus
+    monkeypatch.setenv("DP_AUTH_SECRET", "ws-revocation-test-secret-not-weak-0123456789")
+    run_id, cid = f"run_ws_revoke_{revocation}", f"cvs_run_ws_revoke_{revocation}"
+    owner_uid, reader_uid = f"run_owner_{revocation}", f"run_reader_{revocation}"
+    _provision_private_collab_canvas(cid, owner_uid, reader_uid)
+    metadb.share_canvas(cid, reader_uid, "viewer")
+    metadb.save_run_state(
+        run_id, RunStatus(run_id=run_id, status="running", rows_processed=7).model_dump(),
+        canvas_id=cid,
+    )
+    metadb.bind_run_owner(run_id, owner_uid, cid)
+    get_deps().run_index.pop(run_id, None)
+    get_deps().run_owner.pop(run_id, None)
+    reader_token = auth.sign(reader_uid)
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/run/{run_id}"
+        async with websockets.connect(
+                ws_url, additional_headers={"Cookie": f"dp_session={reader_token}"}, proxy=None) as ws:
+            first = await _collab_recv(ws)
+            assert first["runId"] == run_id and first["status"] == "running"
+            if revocation == "token":
+                await asyncio.to_thread(metadb.bump_token_epoch, reader_uid)
+                assert auth.verify(reader_token) is None
+            else:
+                await asyncio.to_thread(metadb.unshare_canvas, cid, reader_uid)
+                assert metadb.canvas_role(cid, reader_uid) is None
+            await _expect_ws_policy_close(ws)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        get_deps().run_index.pop(run_id, None)
+        get_deps().run_owner.pop(run_id, None)
         metadb.delete_canvas_cascade(cid)
 
 
@@ -4790,6 +5189,319 @@ def test_change_password_keeps_the_acting_session(monkeypatch):
         assert client.get("/api/canvas").status_code == 200                       # NOT logged out (cookie re-issued)
     finally:
         client.cookies.clear()
+
+
+def test_password_compare_and_set_handles_unset_and_stale_credentials():
+    from hub import auth, metadb
+    from hub.metadb import User, session
+
+    uid = "password_cas_unset"
+    with session() as s:
+        s.add(User(id=uid, name="Unset CAS", password_hash=None, token_epoch=7))
+
+    first_hash = auth.hash_password("first-password")
+    assert metadb.compare_and_set_user_password(uid, None, 7, first_hash) == 8
+    assert metadb.compare_and_set_user_password(uid, None, 8, auth.hash_password("stale-password")) is None
+    with session() as s:
+        user = s.get(User, uid)
+        assert user.password_hash == first_hash
+        assert user.token_epoch == 8
+
+
+def test_verify_password_rejects_noncanonical_or_wrong_length_encodings():
+    import base64
+
+    from hub import auth
+
+    password = "strict-password"
+    valid = auth.hash_password(password)
+    prefix, salt_b64, hash_b64 = valid.split("$")
+    salt = base64.b64decode(salt_b64)
+    derived = base64.b64decode(hash_b64)
+    malformed = [
+        f"{prefix}${salt_b64}!${hash_b64}",
+        f"{prefix}${salt_b64}${hash_b64}!",
+        f"{prefix}${salt_b64}=${hash_b64}",
+        f"{prefix}${base64.b64encode(salt[:-1]).decode()}${hash_b64}",
+        f"{prefix}${base64.b64encode(salt + b'x').decode()}${hash_b64}",
+        f"{prefix}${salt_b64}${base64.b64encode(derived[:-1]).decode()}",
+        f"{prefix}${salt_b64}${base64.b64encode(derived + b'x').decode()}",
+        f"{valid}$trailing-field",
+    ]
+    assert auth.verify_password(password, valid)
+    assert all(not auth.verify_password(password, candidate) for candidate in malformed)
+
+
+def test_concurrent_session_epoch_bumps_are_not_lost():
+    import concurrent.futures
+    import threading
+
+    from hub import metadb
+    from hub.metadb import User, session
+
+    uid = "password_epoch_bump_race"
+    with session() as s:
+        s.add(User(id=uid, name="Epoch Bump", token_epoch=20))
+    start = threading.Barrier(2)
+
+    def bump(_index):
+        start.wait(timeout=10)
+        metadb.bump_token_epoch(uid)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(bump, range(2)))
+    assert metadb.user_token_epoch(uid) == 22
+
+
+def test_concurrent_password_changes_exactly_one_wins(monkeypatch):
+    import concurrent.futures
+    import threading
+
+    from hub import auth
+    from hub.metadb import User, session
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "password-cas-secret")
+    uid = "password_cas_race"
+    old_hash = auth.hash_password("old-password")
+    with session() as s:
+        s.add(User(id=uid, name="Password CAS", password_hash=old_hash, token_epoch=11))
+    session_token = auth.sign(uid)
+
+    # Both requests must finish verifying the exact same old hash before either reaches the CAS.
+    # The database conditional update, not request timing or a Python lock, decides the winner.
+    verified = threading.Barrier(2)
+    real_verify_password = auth.verify_password
+
+    def verify_together(password, stored):
+        valid = real_verify_password(password, stored)
+        if stored == old_hash:
+            verified.wait(timeout=10)
+        return valid
+
+    monkeypatch.setattr(auth, "verify_password", verify_together)
+    passwords = ("winner-candidate-a", "winner-candidate-b")
+    clients = (TestClient(app), TestClient(app))
+
+    def rotate(index):
+        response = clients[index].post(
+            "/api/auth/password",
+            json={"oldPassword": "old-password", "newPassword": passwords[index]},
+            headers={"Cookie": f"dp_session={session_token}"},
+        )
+        return passwords[index], response
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = dict(pool.map(rotate, range(2)))
+    finally:
+        for request_client in clients:
+            request_client.close()
+
+    winners = [(password, response) for password, response in results.items() if response.status_code == 200]
+    losers = [(password, response) for password, response in results.items() if response.status_code == 409]
+    assert len(winners) == len(losers) == 1
+    winner_password, winner_response = winners[0]
+    loser_password, loser_response = losers[0]
+    assert loser_response.json()["detail"] == "password was changed concurrently; sign in again"
+    assert "set-cookie" not in loser_response.headers
+    assert winner_response.cookies.get("dp_session")
+
+    with session() as s:
+        user = s.get(User, uid)
+        assert user.token_epoch == 12
+        assert auth.verify_password(winner_password, user.password_hash)
+        assert not auth.verify_password(loser_password, user.password_hash)
+    assert auth.verify(winner_response.cookies.get("dp_session")) == uid
+
+
+def test_revoked_inflight_password_change_cannot_resurrect_session(monkeypatch):
+    import concurrent.futures
+    import threading
+
+    from fastapi import Depends
+
+    from hub import auth, metadb
+    from hub.metadb import User, session
+    from hub.security import RequestIdentity, current_identity, current_user
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "password-admission-secret")
+    uid = "password_admission_epoch"
+    old_hash = auth.hash_password("old-password")
+    with session() as s:
+        s.add(User(id=uid, name="Admission Epoch", password_hash=old_hash, token_epoch=30))
+    session_token = auth.sign(uid)
+    claims = auth.verify_claims(session_token)
+    assert claims is not None and claims.user_id == uid and claims.epoch == 30
+
+    request_admitted = threading.Event()
+    resume_request = threading.Event()
+
+    def pause_after_admission(identity: RequestIdentity = Depends(current_identity)):
+        request_admitted.set()
+        assert resume_request.wait(timeout=10)
+        return identity.user_id
+
+    # Override the global gate itself. Its current_identity subdependency has already verified and
+    # cached the signed epoch when this pauses; the password route must consume that exact identity.
+    app.dependency_overrides[current_user] = pause_after_admission
+    request_client = TestClient(app)
+
+    def rotate():
+        return request_client.post(
+            "/api/auth/password",
+            json={"oldPassword": "old-password", "newPassword": "resurrected-password"},
+            headers={"Cookie": f"dp_session={session_token}"},
+        )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(rotate)
+            try:
+                assert request_admitted.wait(timeout=10)
+                metadb.bump_token_epoch(uid)
+            finally:
+                resume_request.set()
+            response = pending.result(timeout=10)
+    finally:
+        app.dependency_overrides.pop(current_user, None)
+        request_client.close()
+
+    assert response.status_code == 409
+    assert "set-cookie" not in response.headers
+    with session() as s:
+        user = s.get(User, uid)
+        assert user.token_epoch == 31
+        assert user.password_hash == old_hash
+
+
+def test_old_password_login_fails_if_credential_rotates_after_verification(monkeypatch):
+    import concurrent.futures
+    import threading
+
+    from hub import auth, metadb
+    from hub.metadb import User, session
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "login-snapshot-secret")
+    uid = "login_snapshot_race"
+    old_hash = auth.hash_password("old-password")
+    new_hash = auth.hash_password("new-password")
+    with session() as s:
+        s.add(User(id=uid, name="Login Snapshot", password_hash=old_hash, token_epoch=40))
+
+    password_verified = threading.Event()
+    resume_login = threading.Event()
+    real_verify_password = auth.verify_password
+
+    def pause_after_verification(password, stored):
+        valid = real_verify_password(password, stored)
+        if password == "old-password" and stored == old_hash:
+            password_verified.set()
+            assert resume_login.wait(timeout=10)
+        return valid
+
+    monkeypatch.setattr(auth, "verify_password", pause_after_verification)
+    request_client = TestClient(app)
+
+    def login():
+        return request_client.post(
+            "/api/auth/login",
+            json={"userId": uid, "password": "old-password"},
+        )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(login)
+            try:
+                assert password_verified.wait(timeout=10)
+                assert metadb.compare_and_set_user_password(uid, old_hash, 40, new_hash) == 41
+            finally:
+                resume_login.set()
+            response = pending.result(timeout=10)
+    finally:
+        request_client.close()
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid user or password"
+    assert "set-cookie" not in response.headers
+    with session() as s:
+        user = s.get(User, uid)
+        assert user.token_epoch == 41
+        assert user.password_hash == new_hash
+
+
+def test_login_cookie_cannot_catch_up_to_rotation_after_snapshot_confirmation(monkeypatch):
+    from hub import auth, metadb
+    from hub.metadb import User, session
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "login-signing-epoch-secret")
+    uid = "login_signing_epoch"
+    old_hash = auth.hash_password("old-password")
+    new_hash = auth.hash_password("new-password")
+    with session() as s:
+        s.add(User(id=uid, name="Login Signing Epoch", password_hash=old_hash, token_epoch=45))
+
+    signed_epochs = []
+    real_sign_at_epoch = auth.sign_at_epoch
+
+    def rotate_before_sign(user_id, epoch, now=None):
+        signed_epochs.append(epoch)
+        assert metadb.compare_and_set_user_password(user_id, old_hash, 45, new_hash) == 46
+        return real_sign_at_epoch(user_id, epoch, now)
+
+    monkeypatch.setattr(auth, "sign_at_epoch", rotate_before_sign)
+    request_client = TestClient(app)
+    try:
+        response = request_client.post(
+            "/api/auth/login",
+            json={"userId": uid, "password": "old-password"},
+        )
+    finally:
+        request_client.close()
+
+    issued = response.cookies.get("dp_session")
+    assert response.status_code == 200
+    assert signed_epochs == [45]
+    assert issued and issued.split(".")[1] == "45"
+    assert metadb.user_token_epoch(uid) == 46
+    assert auth.verify(issued) is None
+
+
+def test_password_change_cookie_cannot_catch_up_to_a_later_revocation(monkeypatch):
+    from hub import auth, metadb
+    from hub.metadb import User, session
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "password-epoch-secret")
+    uid = "password_cas_epoch"
+    with session() as s:
+        s.add(User(id=uid, name="Password Epoch", password_hash=auth.hash_password("old-password"),
+                   token_epoch=4))
+    session_token = auth.sign(uid)
+
+    signed_epochs = []
+    real_sign_at_epoch = auth.sign_at_epoch
+
+    def revoke_before_sign(user_id, epoch, now=None):
+        signed_epochs.append(epoch)
+        metadb.bump_token_epoch(user_id)
+        return real_sign_at_epoch(user_id, epoch, now)
+
+    monkeypatch.setattr(auth, "sign_at_epoch", revoke_before_sign)
+    request_client = TestClient(app)
+    try:
+        response = request_client.post(
+            "/api/auth/password",
+            json={"oldPassword": "old-password", "newPassword": "new-password"},
+            headers={"Cookie": f"dp_session={session_token}"},
+        )
+    finally:
+        request_client.close()
+
+    assert response.status_code == 200
+    issued = response.cookies.get("dp_session")
+    assert signed_epochs == [5]
+    assert issued and issued.split(".")[1] == "5"
+    assert metadb.user_token_epoch(uid) == 6
+    assert auth.verify(issued) is None
 
 
 def test_signed_session_auth(monkeypatch):
@@ -5163,17 +5875,24 @@ def test_planner_partitions_by_placement():
 def test_run_controller_executes_checkpointed_regions(tmp_path):
     # C2: a `checkpoint` splits the run into two regions; the controller materializes the upstream
     # region, then runs the final region reading its ref — the result matches an unsplit run.
+    import uuid
+
     p = _seq_parquet(tmp_path)  # v = 0..999
+    output_name = f"ckpt_out_{uuid.uuid4().hex}"
     gd = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": p}),
         {"id": "f1", "type": "filter", "position": {"x": 0, "y": 0}, "data": {"config": {"predicate": "v < 500", "checkpoint": True}}},
         N("f2", "filter", {"predicate": "v >= 100"}),
-        N("wr", "write", {"name": "ckpt_out"}),
+        N("wr", "write", {"name": output_name}),
     ], "edges": [E("src", "f1"), E("f1", "f2"), E("f2", "wr")]}
     st = _poll(client.post("/api/run", json={"graph": gd, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
     assert st["status"] == "done", st
-    out = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_ckpt_out").uri, "k": 5}).json()
+    table = get_deps().catalog.get_table(f"tbl_{output_name}")
+    out = client.post("/api/data/sample", json={"uri": table.uri, "k": 5}).json()
     assert out["rowCount"] == 400  # v in [100, 500) → 400 rows, split across two regions
+    edges = get_deps().catalog.lineage(table.uri).edges
+    assert any(edge.parent == p and edge.child == table.uri for edge in edges)
+    assert not any(edge.child == table.uri and "/regions/" in edge.parent for edge in edges)
 
 
 def test_default_region_runs_isolated_when_kernel_is_selected():
@@ -5263,6 +5982,119 @@ def test_subgraph_preserves_join_operand_order():
                     requires=ResourceSpec(), cut_inputs=[("upA", None, "j", "a")])
     sub = ctrl._subgraph(graph, region, {"upA": "/tmp/ref.parquet"})
     assert [e.target_handle for e in gg.incoming(sub, "j")] == ["a", "b"]  # ref 'a' first, intra 'b' second
+
+
+def test_region_ref_ids_are_deterministic_collision_safe_and_reused():
+    from hub import graph as gg
+    from hub.models import Graph, ResourceSpec
+    from hub.planner import Region
+    from hub.run_controller import _region_internal_id_base
+
+    real_source = "s3://raw/real"
+    real_ref = "s3://managed/regions/real"
+    ref_base = _region_internal_id_base("ref", "x")
+    first_edge_base = _region_internal_id_base(
+        "edge", "cut-right", "x", None, "z-right", None)
+    graph = Graph(**{"id": "lineage", "version": 1, "nodes": [
+        N("raw", "source", {"uri": real_source}),
+        N("x", "filter", {"predicate": "id > 0"}),
+        # Client-controlled nodes occupy the old predictable ID, the new SHA-derived ref base, and
+        # the first cut-edge base. None may be mistaken for a controller-owned source or edge.
+        N("__ref_x", "source", {"uri": "s3://attacker/old-id"}),
+        N(ref_base, "source", {"uri": "s3://attacker/ref-base"}),
+        N(first_edge_base, "source", {"uri": "s3://attacker/edge-base"}),
+        # Deliberately non-lexical region-node order: reconstruction must follow graph.nodes, not its set.
+        N("z-right", "filter", {"predicate": "id > 0"}),
+        N("a-left", "filter", {"predicate": "id > 0"}),
+        N("join", "join", {}), N("write", "write", {"name": "out"}),
+    ], "edges": [
+        {"id": "raw-x", "source": "raw", "target": "x"},
+        {"id": "cut-right", "source": "x", "target": "z-right"},
+        {"id": "cut-left", "source": "x", "target": "a-left"},
+        # Incoming join order is intentionally different from region-node order and must be preserved.
+        {"id": "left-join", "source": "a-left", "target": "join", "targetHandle": "a"},
+        {"id": "right-join", "source": "z-right", "target": "join", "targetHandle": "b"},
+        {"id": "join-write", "source": "join", "target": "write"},
+    ]})
+    region = Region(
+        id="final", node_ids={"a-left", "z-right", "join", "write"}, output_node="write",
+        backend="default", worker=None, requires=ResourceSpec(),
+        cut_inputs=[("x", None, "z-right", None), ("x", None, "a-left", None)],
+    )
+    sub = get_deps().controller._subgraph(graph, region, {"x": real_ref})
+    repeated = get_deps().controller._subgraph(graph, region, {"x": real_ref})
+
+    assert sub.model_dump(by_alias=True) == repeated.model_dump(by_alias=True)
+    assert [node.id for node in sub.nodes[:4]] == ["z-right", "a-left", "join", "write"]
+    generated_source = next(
+        node for node in sub.nodes
+        if (node.data.get("config") or {}).get("uri") == real_ref)
+    assert generated_source.id.startswith(ref_base + "_")
+    assert generated_source.id not in {node.id for node in graph.nodes}
+    cut_edges = [edge for edge in sub.edges if edge.target in {"z-right", "a-left"}]
+    assert len(cut_edges) == 2
+    assert {edge.source for edge in cut_edges} == {generated_source.id}
+    assert next(edge for edge in cut_edges if edge.target == "z-right").id.startswith(
+        first_edge_base + "_")
+    assert [edge.target_handle for edge in gg.incoming(sub, "join")] == ["a", "b"]
+    assert gg.execution_source_uris(sub, "write") == [real_ref]
+    assert gg.all_upstream_publication_uris(sub, "write") == [real_source]
+
+    node_ids = [node.id for node in sub.nodes]
+    edge_ids = [edge.id for edge in sub.edges]
+    assert len(node_ids) == len(set(node_ids))
+    assert len(edge_ids) == len(set(edge_ids))
+    assert len(node_ids + edge_ids) == len(set(node_ids + edge_ids))
+    dumped = sub.model_dump(by_alias=True)
+    assert "publicationSourceUris" not in dumped and "_publication_source_uris" not in dumped
+
+    # Neither a top-level private-looking key nor user-controlled node data can forge provenance.
+    forged = Graph.model_validate({
+        "id": "forged", "version": 1,
+        "_publication_source_uris": {"source": ["s3://forged/top-level"]},
+        "nodes": [{"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                   "data": {"publicationSourceUris": ["s3://forged/node"],
+                            "config": {"uri": "s3://real/source"}}}],
+        "edges": [],
+    })
+    assert gg.all_upstream_publication_uris(forged, "source") == ["s3://real/source"]
+
+
+def test_region_publication_lineage_survives_multiple_nested_cuts():
+    from hub import graph as gg
+    from hub.models import Graph, ResourceSpec
+    from hub.planner import Region
+
+    source = "s3://raw/original"
+    graph = Graph(**{"id": "nested-lineage", "version": 1, "nodes": [
+        N("source", "source", {"uri": source}),
+        N("stage-one", "filter", {"predicate": "id > 0"}),
+        N("stage-two", "filter", {"predicate": "id > 1"}),
+        N("write", "write", {"name": "out"}),
+    ], "edges": [
+        E("source", "stage-one"), E("stage-one", "stage-two"), E("stage-two", "write"),
+    ]})
+    middle_region = Region(
+        id="middle", node_ids={"stage-two", "write"}, output_node="write",
+        backend="default", worker=None, requires=ResourceSpec(),
+        cut_inputs=[("stage-one", None, "stage-two", None)],
+    )
+    middle_ref = "s3://managed/regions/middle"
+    middle = get_deps().controller._subgraph(
+        graph, middle_region, {"stage-one": middle_ref})
+    assert gg.execution_source_uris(middle, "write") == [middle_ref]
+    assert gg.all_upstream_publication_uris(middle, "write") == [source]
+
+    final_region = Region(
+        id="final", node_ids={"write"}, output_node="write",
+        backend="default", worker=None, requires=ResourceSpec(),
+        cut_inputs=[("stage-two", None, "write", None)],
+    )
+    final_ref = "s3://managed/regions/final"
+    final = get_deps().controller._subgraph(
+        middle, final_region, {"stage-two": final_ref})
+    assert gg.execution_source_uris(final, "write") == [final_ref]
+    assert gg.all_upstream_publication_uris(final, "write") == [source]
 
 
 def test_controller_refuses_unsafe_splits():
@@ -8119,11 +8951,12 @@ def test_ray_rejects_any_multiple_write_sinks_before_allocation(tmp_path, monkey
     assert allocations == []
 
 
-def test_ray_unmanaged_publication_attests_external_catalog_and_all_join_lineage(
+def test_ray_unmanaged_publication_attests_external_catalog_and_all_join_lineage_across_region_cut(
         tmp_path):
     from hub import graph as graph_mod
     from hub.deps import Deps
-    from hub.models import Graph
+    from hub.models import Graph, ResourceSpec
+    from hub.planner import Region
 
     runner = _load_dp_ray().RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
     source_a = str(tmp_path / "a.parquet")
@@ -8158,13 +8991,21 @@ def test_ray_unmanaged_publication_attests_external_catalog_and_all_join_lineage
         _ray_edge("join", "transform"),
         _ray_edge("transform", "write"),
     ]})
+    expected = graph_mod.all_upstream_source_uris(graph, "write")
+    region = Region(
+        id="final", node_ids={"write"}, output_node="write", backend="default",
+        worker=None, requires=ResourceSpec(),
+        cut_inputs=[("transform", None, "write", None)],
+    )
+    graph = runner.deps.controller._subgraph(
+        graph, region, {"transform": str(tmp_path / "region-ref.parquet")})
     runner._register_outputs(graph, {"outputs": [{
         "step_id": "write", "name": "joined", "uri": output,
         "logical_uri": output,
     }]}, expected_targets={"write": output}, expected_attempts={})
 
-    expected = graph_mod.all_upstream_source_uris(graph, "write")
     assert set(expected) == {source_a, source_b}
+    assert graph_mod.execution_source_uris(graph, "write") == [str(tmp_path / "region-ref.parquet")]
     assert registered["parents"] == expected
     assert readbacks == [output]
 

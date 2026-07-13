@@ -283,7 +283,7 @@ class SubprocessRunner:
                     spec, self.workspace, self.storage, self.resolve_adapter)
                 adapter = self.resolve_adapter(target_uri)
             targets[step.node_id] = target_uri
-            parents = graph_mod.all_upstream_source_uris(graph, step.node_id)
+            parents = graph_mod.all_upstream_publication_uris(graph, step.node_id)
             contracts[step.node_id] = {
                 "logical_uri": target_uri,
                 "published_uri": expected_sink_uri(spec, target_uri, adapter),
