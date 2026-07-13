@@ -25,9 +25,44 @@ async function addNode(page: Page, category: string, kindTitle: string) {
 // without this a prior test's nodes would leak in and break count assertions.
 async function fresh(page: Page) {
   await page.goto('/')
+  await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
+  const previous = await page.evaluate(() => location.hash)
   await page.getByTestId('file-menu').click()
   await page.getByText('New file').click()
+  // The previous canvas is often empty too. Waiting only for zero rendered nodes can therefore return
+  // before async create + file refresh + navigation finish, and the test would mutate the old canvas.
+  await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
+}
+
+// Prove the app's collab socket has joined THIS canvas before driving an out-of-band edit. The
+// autosave label only proves the HTTP canvas exists; it says nothing about websocket readiness. A
+// short-lived peer waits for the app's presence frame, which the server can relay only after the app
+// is registered in the room. This is an event handshake, not a timing delay.
+async function waitForCollabRoom(page: Page, canvasId: string) {
+  await page.evaluate((id) => new Promise<void>((resolve, reject) => {
+    const protocol = location.protocol === 'https:' ? 'wss' : 'ws'
+    const socket = new WebSocket(`${protocol}://${location.host}/ws/collab/${encodeURIComponent(id)}`)
+    const deadline = window.setTimeout(() => {
+      socket.close()
+      reject(new Error(`app did not join collab room ${id}`))
+    }, 8_000)
+    socket.onopen = () => socket.send(JSON.stringify({
+      type: 'presence', clientId: `e2e-probe-${crypto.randomUUID()}`, name: 'e2e probe', color: '#888',
+    }))
+    socket.onmessage = (event) => {
+      let message: { type?: string } | null = null
+      try { message = JSON.parse(String(event.data)) } catch { /* wait for a valid presence frame */ }
+      if (message?.type !== 'presence') return
+      window.clearTimeout(deadline)
+      socket.close()
+      resolve()
+    }
+    socket.onerror = () => {
+      window.clearTimeout(deadline)
+      reject(new Error(`could not join collab room ${id}`))
+    }
+  }), canvasId)
 }
 
 test.describe('Data Playground canvas', () => {
@@ -447,6 +482,7 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('autosave')).toHaveText(/saved/, { timeout: 8_000 }) // persisted → MCP can load it
     const cid = (await page.evaluate(() => location.hash)).replace('#/canvas/', '')
     expect(cid).toBeTruthy()
+    await waitForCollabRoom(page, cid)
     // add a node purely via MCP (no browser interaction) — the request is the agent's tool call
     const res = await page.request.post('/mcp', {
       headers: { 'X-DP-User': 'local' },
