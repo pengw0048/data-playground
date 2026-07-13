@@ -740,7 +740,7 @@ def build_server(base_url: str | None = None, user_id: str | None = None) -> MCP
     from hub import metadb
     from hub.deps import get_deps
     from hub.settings import settings
-    metadb.init_db()  # create metadata tables (idempotent) — the web app does this in hub.main; we're standalone
+    metadb.init_db()  # locked local init, or a strict production schema-head check (never production DDL)
     uid = metadb.resolve_user(user_id or metadb.DEFAULT_USER_ID)
     if user_id and uid != user_id:
         # resolve_user silently falls back to the default 'local' user for an unknown id — a typo'd

@@ -53,9 +53,8 @@ def _run_mcp(argv: list[str]) -> None:
 
     from hub.deps import set_workspace
     from hub import mcp, metadb
-    # Migrate the metadata DB BEFORE set_workspace builds deps + seeds the catalog, so the seed's
-    # catalog_entries write-throughs land instead of failing against a not-yet-created schema (which
-    # would drop the seeded datasets on first read). build_server's init_db then no-ops.
+    # Validate metadata BEFORE set_workspace builds deps + seeds the catalog. Local SQLite may perform
+    # its locked first-run migration here; production databases must already be migrated explicitly.
     with contextlib.redirect_stdout(sys.stderr):
         metadb.init_db()
         set_workspace(os.environ["DP_WORKSPACE"], os.environ["DP_DATA_DIR"])
@@ -285,7 +284,7 @@ def _run_canvas(argv: list[str]) -> None:
     with contextlib.redirect_stdout(sys.stderr):
         _prepare_workspace(args.workspace, args.data_dir, args.seed)
         from hub import metadb
-        metadb.init_db()  # schema to head before Deps builds + registers the catalog (fresh-DB first run)
+        metadb.init_db()  # locked local init, or a production schema-head check (never production DDL)
         from hub.deps import set_workspace
         deps = set_workspace(os.environ["DP_WORKSPACE"], os.environ["DP_DATA_DIR"])
     raise SystemExit(_headless_run(deps, args.canvas, args.node, args.timeout, args.as_json, args.user, params))
@@ -331,8 +330,30 @@ def _run_seed_catalog(argv: list[str]) -> None:
           f"dataplay seed-catalog --remove --prefix {args.prefix}", file=sys.stderr)
 
 
+def _run_migrate(argv: list[str]) -> None:
+    """`dataplay migrate` — the one-shot metadata schema and bootstrap release step."""
+    p = argparse.ArgumentParser(
+        prog="dataplay migrate",
+        description="Upgrade the metadata database to this build's Alembic head.")
+    p.add_argument("--workspace", default=None,
+                   help="working dir used by the default SQLite database (default: CWD)")
+    p.add_argument("--data-dir", default=None,
+                   help="data directory (only used to establish the normal workspace environment)")
+    args = p.parse_args(argv)
+
+    _prepare_workspace(args.workspace, args.data_dir, seed=False)
+    from hub import metadb
+    try:
+        head = metadb.migrate_db()
+    except metadb.SchemaNotReadyError as exc:
+        raise SystemExit(f"migration refused: {exc}") from None
+    print(f"metadata schema is at Alembic head {head}")
+
+
 def main() -> None:
     argv = sys.argv[1:]
+    if argv and argv[0] == "migrate":
+        return _run_migrate(argv[1:])
     if argv and argv[0] == "mcp":
         return _run_mcp(argv[1:])
     if argv and argv[0] == "run":
@@ -381,10 +402,9 @@ def main() -> None:
         if seed_if_empty(data_dir):
             print(f"seeded sample datasets → {data_dir}")
 
-    # Migrate the metadata DB BEFORE building deps. set_workspace eagerly constructs Deps, which seeds
-    # the catalog and write-throughs each seeded dataset to catalog_entries; if the schema isn't there
-    # yet those writes fail and the seed is silently dropped on the first catalog read (hub.main's own
-    # init_db at import runs too late — after the seed). Idempotent: hub.main re-runs it harmlessly.
+    # Validate metadata BEFORE building deps. set_workspace eagerly constructs Deps and writes seeded
+    # catalog entries. Local SQLite may perform its locked first-run migration; production databases
+    # must already be at this build's head from a one-shot `dataplay migrate` release step.
     from hub import metadb
     metadb.init_db()
     # configure the workspace BEFORE the app imports/builds deps (get_deps is lazy)

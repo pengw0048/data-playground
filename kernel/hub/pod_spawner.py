@@ -79,7 +79,7 @@ class PodSpawner:
         }
 
     def _svc_body(self, name: str) -> dict:
-        return {"metadata": {"name": name},
+        return {"metadata": {"name": name, "labels": {"app": "dp-kernel", "dp-canvas": name}},
                 "spec": {"selector": {"dp-canvas": name},
                          "ports": [{"port": _PORT, "targetPort": _PORT}]}}
 

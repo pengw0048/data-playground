@@ -77,6 +77,9 @@ def main() -> None:
     from hub.relation_cache import RelationCache
 
     canvas, kid, token = args.canvas, args.kernel_id, args.token
+    # A kernel is a service process too: production metadata must already be migrated by the one-shot
+    # release command. Local/disposable SQLite keeps its serialized auto-initialization behavior.
+    metadb.init_db()
     deps = set_workspace(args.workspace, args.data_dir, maintain_storage=False)
     warm = RelationCache()  # per-kernel warm cache of preview intermediate relations (dropped on restart)
     # cell-crash-isolation: full RUNS execute in a killable, deadline-bounded child PROCESS by default, so

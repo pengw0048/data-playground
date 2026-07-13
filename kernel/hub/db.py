@@ -380,8 +380,12 @@ def responsive(timeout_s: float = 5.0) -> bool:
 
     def _probe() -> None:
         try:
-            with run_scope() as sc:
-                sc.con.execute("SELECT 1").fetchone()
+            # A readiness probe must not call run_scope(): that path primes object-store extensions
+            # and credentials before opening its cursor, which can perform provider/network I/O and
+            # make a healthy engine look wedged. Probe the shared engine and its serialization lock
+            # directly; a lock that cannot be acquired within the deadline is itself not ready.
+            with base_guard():
+                conn().execute("SELECT 1").fetchone()
         except Exception:  # noqa: BLE001 — an error is still a live, responsive engine
             pass
         ok.append(True)

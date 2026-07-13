@@ -10,8 +10,8 @@ make setup && make run             # from a clone → serves on http://localhost
 # after setup the command is:  cd kernel && uv run dataplay
 ```
 
-(Or `docker compose up` — see the README.) On first run it seeds three generic datasets you'll see in
-the **Tables** view: `images` (with an embedding column), `movies`, and `events`
+For Docker Compose, follow the README's explicit migrate-then-start sequence. On first run it seeds
+three generic datasets you'll see in the **Tables** view: `images` (with an embedding column), `movies`, and `events`
 (`id, user_id, event, amount` — 2,000 rows). We'll use `events`.
 
 > **In a hurry?** The file menu → **New from example → Purchases per user** drops this whole pipeline,

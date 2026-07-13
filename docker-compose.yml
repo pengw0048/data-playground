@@ -1,11 +1,33 @@
 # Data Playground — Postgres-backed, restart-durable single-instance setup.
 #
-# `docker compose up` → the app on http://localhost:8471 with its metadata (users, canvases, run
-# state, catalog) in Postgres, so it survives restarts and is ready to scale out. To run SEVERAL
-# stateless web instances, set `deploy.replicas` (or run more `kernel` services) behind a load
-# balancer that sticky-routes /ws/collab/{canvas_id} by canvas id — see the README "Scaling out".
+# Follow the README's explicit migrate-then-start release sequence. A plain `docker compose up` never
+# runs DDL. The app is served on http://localhost:8471 with metadata (users, canvases, run state,
+# catalog) in Postgres. To run several stateless web instances, set `deploy.replicas` (or run more
+# `kernel` services) behind a load balancer that sticky-routes /ws/collab/{canvas_id} by canvas id.
 services:
+  migrate:
+    # Release tool only: `docker compose up` must never race this with an existing writer. Run it
+    # explicitly, after stopping every metadata writer: `docker compose run --rm migrate`.
+    profiles: ["tools"]
+    image: "${DP_IMAGE:-dataplay:local}"
+    build: .
+    command: ["dataplay", "migrate", "--workspace", "/data"]
+    environment:
+      DP_DATABASE_URL: "postgresql+psycopg://dp:dp@postgres:5432/dataplay"
+      # Bootstrap is owned by this one-shot release step, never by an application replica. It is
+      # required only until a login-capable admin exists; `run --rm` removes the transient container.
+      DP_AUTH_SECRET: "${DP_AUTH_SECRET:?set DP_AUTH_SECRET to a random secret, e.g. openssl rand -hex 32}"
+      DP_AUTH_PASSWORD: "${DP_AUTH_PASSWORD:-}"
+    volumes:
+      - dp-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   kernel:
+    # Use the same immutable DP_IMAGE tag or digest for the application and one-shot migrator.
+    image: "${DP_IMAGE:-dataplay:local}"
     build: .
     ports:
       - "8471:8471"
@@ -15,14 +37,6 @@ services:
       # per-user auth (signed session cookies). REQUIRED — compose refuses to start without it, so
       # sessions can't be forged with a shipped default. Generate one: `openssl rand -hex 32`.
       DP_AUTH_SECRET: "${DP_AUTH_SECRET:?set DP_AUTH_SECRET to a random secret, e.g. openssl rand -hex 32}"
-      # first-admin bootstrap: on first boot init_db (kernel/hub/metadb.py) seeds the built-in "local"
-      # admin's password from this. REQUIRED — else a fresh auth-on deploy has an admin with NO usable
-      # credential and no authenticated route to create one (a lockout). Log in as user `local` with
-      # this password, create per-user accounts, and each user rotates their own password in-app.
-      # init_db consumes it from the process environment immediately; it is not a runtime login secret
-      # and changing it later does NOT rotate the admin (rotation is via /auth/password). Compose keeps
-      # requiring the input so a brand-new volume can never start in a locked-out state.
-      DP_AUTH_PASSWORD: "${DP_AUTH_PASSWORD:?set DP_AUTH_PASSWORD to a first-admin password so login isn't locked out}"
       # multi-user: confine dataset reads to these roots (see kernel/hub/paths.py). The workspace
       # volume is /data; add more host roots you mount if users load datasets from them.
       DP_DATASET_ROOTS: "/data"

@@ -15,6 +15,38 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PF_PID=""
 
 say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
+wait_for_no_pods() {
+  local selector="$1" deadline=$((SECONDS + 120)) resources
+  while true; do
+    if ! resources="$($K get pods -l "$selector" -o name)"; then
+      echo "failed to list pods matching ${selector}; refusing to continue migration" >&2
+      return 1
+    fi
+    [ -z "$resources" ] && return 0
+    if (( SECONDS >= deadline )); then
+      echo "timed out waiting for pods matching ${selector} to stop" >&2
+      $K get pods -l "$selector" -o wide >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+wait_for_no_services() {
+  local selector="$1" deadline=$((SECONDS + 120)) resources
+  while true; do
+    if ! resources="$($K get services -l "$selector" -o name)"; then
+      echo "failed to list services matching ${selector}; refusing to continue migration" >&2
+      return 1
+    fi
+    [ -z "$resources" ] && return 0
+    if (( SECONDS >= deadline )); then
+      echo "timed out waiting for services matching ${selector} to stop" >&2
+      $K get services -l "$selector" -o wide >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
 cleanup() {
   [ -n "$PF_PID" ] && kill "$PF_PID" 2>/dev/null || true
   if [ "${KEEP:-0}" = "1" ]; then echo "KEEP=1 → leaving cluster '${CLUSTER}' up (kind delete cluster --name ${CLUSTER} to remove)"; else
@@ -36,16 +68,28 @@ say "2/6 Create kind cluster '${CLUSTER}' + load the app image"
 kind get clusters 2>/dev/null | grep -qx "${CLUSTER}" || kind create cluster --name "${CLUSTER}" >/dev/null
 kind load docker-image dataplay:podverify --name "${CLUSTER}" >/dev/null
 
-say "3/6 Apply manifests + wait for Postgres and the hub"
+say "3/6 Apply manifests, run the one-shot migration, then start the hub"
+# The manifest sets the Hub Deployment to zero replicas atomically, so applying a new image cannot
+# launch it before migration. Wait for old hub Pods to exit, then stop detached per-canvas kernels;
+# those remain independent metadata writers after the Hub itself is gone.
 kubectl --context "${CTX}" apply -f "${ROOT}/deploy/k8s/pod-substrate.yaml" >/dev/null
 $K rollout status deploy/postgres --timeout=120s
+wait_for_no_pods app=dp-hub
+$K delete pod -l app=dp-kernel --ignore-not-found --wait=false >/dev/null
+wait_for_no_pods app=dp-kernel
+$K delete service -l app=dp-kernel --ignore-not-found >/dev/null
+wait_for_no_services app=dp-kernel
+$K delete job dp-migrate --ignore-not-found >/dev/null
+$K apply -f "${ROOT}/deploy/k8s/migrate-job.yaml" >/dev/null
+$K wait --for=condition=complete job/dp-migrate --timeout=120s
+$K scale deploy/dp-hub --replicas=1 >/dev/null
 $K rollout status deploy/dp-hub --timeout=120s
 
-say "4/6 Port-forward the hub + wait for /api/health"
+say "4/6 Port-forward the hub + wait for /api/readyz"
 kubectl --context "${CTX}" -n dp port-forward svc/dp-hub 18471:8471 >/dev/null 2>&1 &
 PF_PID=$!
-for i in $(seq 1 30); do curl -fsS localhost:18471/api/health >/dev/null 2>&1 && break; sleep 1; done
-curl -fsS localhost:18471/api/health && echo " ← hub healthy"
+for i in $(seq 1 30); do curl -fsS localhost:18471/api/readyz >/dev/null 2>&1 && break; sleep 1; done
+curl -fsS localhost:18471/api/readyz && echo " ← hub ready"
 
 H=(-H 'Content-Type: application/json' -H 'X-DP-User: local')
 CANVAS='{"id":"cv-podverify","name":"podverify","version":1,
@@ -73,9 +117,16 @@ echo "run status: $ST"; [ "$ST" = done ] && echo "✓ run completed on the kerne
 
 say "6/6 Restart the kernel → the Pod + Service should be deleted"
 curl -fsS "${H[@]}" -X POST localhost:18471/api/canvas/cv-podverify/kernel/restart >/dev/null
-for i in $(seq 1 30); do [ "$($K get pods -l app=dp-kernel --no-headers 2>/dev/null | wc -l | tr -d ' ')" = 0 ] && break; sleep 1; done
+for i in $(seq 1 30); do
+  PODS="$($K get pods -l app=dp-kernel --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  SERVICES="$($K get services -l app=dp-kernel --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$PODS" = 0 ] && [ "$SERVICES" = 0 ] && break
+  sleep 1
+done
 $K get pods,svc -l app=dp-kernel --no-headers 2>/dev/null
 test "$($K get pods -l app=dp-kernel --no-headers 2>/dev/null | wc -l | tr -d ' ')" = 0 \
   && echo "✓ kernel Pod torn down on restart" || { echo "✗ kernel pod still present after restart"; exit 1; }
+test "$($K get services -l app=dp-kernel --no-headers 2>/dev/null | wc -l | tr -d ' ')" = 0 \
+  && echo "✓ kernel Service torn down on restart" || { echo "✗ kernel service still present after restart"; exit 1; }
 
 say "ALL CHECKS PASSED — the pod substrate spawns, runs, and tears down on a real cluster"

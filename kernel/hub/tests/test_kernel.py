@@ -17,12 +17,16 @@ client = TestClient(app)
 def test_observability_livez_readyz_version(monkeypatch):
     # ARC8 observability: livez (pure liveness), readyz (REAL dep checks → 200/503), version (redacted
     # deployment identity). All are pre-auth probes (app-level, outside the /api auth gate).
+    from hub import db, metadb
+    object_store_primes = []
+    monkeypatch.setattr(
+        db, "_prime_object_store_before_scope", lambda: object_store_primes.append(True))
     assert client.get("/api/livez").json()["ok"] is True
     assert client.get("/api/health").status_code == 200  # back-compat alias for livez
     r = client.get("/api/readyz")
     body = r.json()
     assert r.status_code == 200 and body["ready"] is True
-    assert body["checks"]["db"] is True and body["checks"]["engine"] is True  # real checks, not static ok
+    assert body["checks"] == {"db": True, "schema": True, "engine": True}  # real checks, not static ok
     v = client.get("/api/version").json()
     assert v["auth"] in ("enabled", "open") and v["spawner"] and v["duckdb"] and v["python"]
     assert v["db"] and "://" not in v["db"], "DB reported as dialect only — no creds leaked"
@@ -31,6 +35,16 @@ def test_observability_livez_readyz_version(monkeypatch):
     assert client.get("/api/version").json()["storage"] == "local", "bare storage path leaked"
     monkeypatch.setenv("DP_STORAGE_URL", "s3://bucket/prefix")
     assert client.get("/api/version").json()["storage"] == "s3"  # a scheme'd url → its scheme
+    monkeypatch.setattr(metadb, "schema_at_head", lambda: False)
+    r = client.get("/api/readyz")
+    assert r.status_code == 503
+    assert r.json()["checks"]["schema"] is False
+    monkeypatch.setattr(metadb, "ping", lambda: False)
+    monkeypatch.setattr(metadb, "schema_at_head", lambda: pytest.fail("schema check followed a DB timeout"))
+    r = client.get("/api/readyz")
+    assert r.status_code == 503
+    assert r.json()["checks"] == {"db": False, "schema": False, "engine": True}
+    assert object_store_primes == []
 
 
 def _uri(name: str) -> str:
@@ -2487,8 +2501,8 @@ def test_per_user_password_is_not_a_skeleton_key(monkeypatch):
 
 
 def test_first_admin_bootstrap_from_env_password(monkeypatch):
-    # P0-DEPLOY-01: a fresh auth-on deploy (as Compose forces) seeds an admin with NO password →
-    # every login 401s and there's no authed route to set one (a lockout). DP_AUTH_PASSWORD closes it.
+    # P0-DEPLOY-01: a fresh auth-on deploy needs a first-admin credential before application replicas
+    # start. The one-shot migration consumes DP_AUTH_PASSWORD and closes that bootstrap lockout.
     from hub import auth, metadb
     client.cookies.clear()
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")     # auth on
@@ -2496,9 +2510,9 @@ def test_first_admin_bootstrap_from_env_password(monkeypatch):
     try:
         # no DP_AUTH_PASSWORD → the deadlock: the seeded admin can't authenticate at all
         assert client.post("/api/auth/login", json={"userId": "local", "password": "anything"}).status_code == 401
-        # wire the bootstrap and re-run the startup seed (init_db is idempotent)
+        # Run the migration-owned bootstrap again (idempotent at the current schema head).
         monkeypatch.setenv("DP_AUTH_PASSWORD", "bootstrap-pw-123")
-        metadb.init_db()
+        metadb.migrate_db()
         assert "DP_AUTH_PASSWORD" not in os.environ  # one-time input, not ambient runtime configuration
         assert metadb.is_admin("local")
         assert client.post("/api/auth/login", json={"userId": "local", "password": "bootstrap-pw-123"}).status_code == 200
@@ -4213,6 +4227,7 @@ def test_pod_spawner_builds_manifests_and_conforms_to_the_spi():
     assert cmd[:3] == ["python", "-m", "hub.kernel"]
     assert {"cv-abc", "k1", "tok123", "0.0.0.0"} <= set(cmd)  # our canvas/kernel/token + bind-all
     assert f"{name}.default.svc.cluster.local" in cmd        # advertise-host = the Service DNS
+    assert svc["metadata"]["labels"] == {"app": "dp-kernel", "dp-canvas": name}
     assert svc["spec"]["selector"]["dp-canvas"] == pod["metadata"]["labels"]["dp-canvas"]  # Service → Pod
     sp.kill("cv-abc", "k1")
     assert ("del-pod", name, "default") in api.calls and ("del-svc", name, "default") in api.calls
