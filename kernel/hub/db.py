@@ -103,12 +103,17 @@ def _apply_session(c: duckdb.DuckDBPyConnection) -> None:
     # Keep unqualified relation/function resolution deterministic.  `main` still exposes the run's
     # generated views; arbitrary attached/custom schemas cannot silently enter the search path.
     c.execute("SET search_path = 'main'")
-    # Do NOT auto-install/auto-load extensions: that let ANY uri (e.g. https://evil/x.parquet)
-    # silently pull in httpfs and fetch it (SSRF). Object-store access loads httpfs EXPLICITLY in
-    # ensure_object_store(), so s3://gs:// still work; other schemes now fail closed instead of
-    # reaching out. Re-asserted on every per-run cursor (below) since it's a security setting.
+    # Do NOT auto-install/auto-load extensions: unknown schemes must not silently add network access.
+    # Object-store access loads httpfs explicitly in ensure_object_store(), so authenticated sessions
+    # also disable its direct HTTP(S) and Hugging Face filesystems. S3FileSystem remains available,
+    # while user-authored SQL and dataset URLs cannot turn trusted extension loading into arbitrary
+    # network egress after httpfs is loaded.
+    # Re-asserted on every per-run cursor (below) because these are security settings.
     c.execute("SET autoinstall_known_extensions = false")
     c.execute("SET autoload_known_extensions = false")
+    from hub import auth
+    if auth.auth_enabled():
+        c.execute("SET disabled_filesystems = 'HTTPFileSystem,HuggingFaceFileSystem'")
     # Out-of-core: point DuckDB's temp files at an explicit, operator-controllable dir so large
     # sorts/joins/aggregates spill to disk instead of failing (robust across versions + lets a deploy
     # put spill on fast/roomy disk). DP_MEMORY_LIMIT optionally caps per-kernel RAM (multi-tenant).
