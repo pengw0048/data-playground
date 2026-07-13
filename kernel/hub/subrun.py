@@ -23,6 +23,25 @@ def _atomic_write(path: str, obj: dict) -> None:
     os.replace(tmp, path)  # atomic — the parent never reads a half-written file
 
 
+def _materialize_region(deps, rel, mat_uri: str, cancel, external_cancel, run_id: str) -> int:
+    """Write a controller handoff, committing managed object attempts with a manifest last."""
+    from hub.plugins.adapters import is_object_uri
+    from hub.handoff import is_attempt_uri, write_manifest
+
+    managed_attempt = is_object_uri(mat_uri) and is_attempt_uri(mat_uri)
+    physical_uri = (
+        mat_uri.rstrip("/") + "/part-00000.parquet" if managed_attempt else mat_uri)
+    adapter = deps.resolve_adapter(physical_uri)
+    result = deps.runner._adapter_write(adapter, physical_uri, rel, "overwrite", cancel)
+    rows = int(result.get("rows") or 0)
+    if external_cancel and external_cancel():
+        raise RuntimeError("region materialization cancelled before commit")
+    if managed_attempt:
+        schema = list(zip(rel.columns, (str(t) for t in rel.types)))
+        write_manifest(mat_uri, run_id=run_id, rows=rows, schema=schema)
+    return rows
+
+
 def main() -> int:
     job = json.load(open(sys.argv[1]))
     status_file = job["statusFile"]
@@ -46,6 +65,12 @@ def main() -> int:
         deps.runner.result_acquire = None
         deps.runner.result_put = None
         deps.runner.forced_result_uri = job.get("forcedResultUri")
+        # Every write target was resolved by the real parent control plane. For managed object sinks the
+        # child also receives one exact physical attempt and is write-only: allocation, inventory commit,
+        # and catalog publication remain in the parent's durable metadata database.
+        deps.runner.forced_sink_targets = (
+            dict(job.get("sinkTargets") or {}) if "sinkTargets" in job else None)
+        deps.runner.forced_sink_attempts = dict(job.get("sinkAttempts") or {})
         graph = Graph(**job["graph"])
         external_cancel = (lambda: os.path.exists(cancel_file)) if cancel_file else None
         # deps parity with the warm kernel's _ensure_deps: install the canvas's declared pip deps and let
@@ -89,9 +114,9 @@ def main() -> int:
                                              node_builders=deps.node_builders, node_specs=deps.node_specs,
                                              pushdown=True, output_node=job.get("target"))
                         rel = eng.relation(job.get("target"))
-                        adapter = deps.resolve_adapter(mat_uri)
-                        deps.runner._adapter_write(adapter, mat_uri, rel, "overwrite",
-                                                   _CancelToken(external_cancel))
+                        rows = _materialize_region(
+                            deps, rel, mat_uri, _CancelToken(external_cancel), external_cancel,
+                            job.get("runId") or "child")
                     finally:
                         monitor_done.set()
             except Exception:
@@ -100,7 +125,8 @@ def main() -> int:
                                                 "rows_processed": 0, "ms": 0, "placement": "local"})
                     return 1
                 raise
-            _atomic_write(status_file, {"run_id": "child", "status": "done", "per_node": [], "rows_processed": 0,
+            _atomic_write(status_file, {"run_id": "child", "status": "done", "per_node": [],
+                                        "rows_processed": rows, "total_rows": rows,
                                         "ms": 0, "placement": "local", "output_uri": mat_uri})
             return 0
         plan = compiler.compile_plan(graph, job.get("target"), deps.registry, deps.node_specs, deps.node_ir)

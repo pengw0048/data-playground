@@ -10,7 +10,7 @@ import uuid
 from urllib.parse import urlsplit
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from hub import handoff, metadb
 
@@ -284,6 +284,180 @@ def test_postgres_result_pin_release_and_expiry_cleanup_share_lock_order():
     assert errors == []
     for handle in handles:
         metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_postgres_sink_publish_and_expired_lease_cleanup_share_lock_order():
+    if metadb.engine().dialect.name != "postgresql":
+        pytest.skip("requires a real PostgreSQL metadata database")
+    errors: list[tuple[str, BaseException]] = []
+    handles: list[dict] = []
+    for index in range(5):
+        token = uuid.uuid4().hex
+        handle = _handle(
+            "sink",
+            logical=f"s3://lifecycle-tests/{token}/publish-expiry.parquet",
+            allocation_key=f"pg-publish-expiry-{token}",
+        )
+        handles.append(handle)
+        _commit(handle)
+        with metadb.session() as session:
+            session.get(
+                metadb.ObjectAttemptLease, handle["publish_lease_id"],
+            ).expires_at = metadb._db_now(session) - datetime.timedelta(seconds=1)
+        barrier = threading.Barrier(2)
+
+        def publish() -> None:
+            try:
+                barrier.wait(timeout=3)
+                metadb.catalog_upsert_entry(
+                    handle["uri"], f"publish-expiry-{index}", {
+                        "id": "ignored", "name": f"publish-expiry-{index}",
+                        "uri": handle["uri"],
+                    })
+            except BaseException as exc:  # noqa: BLE001 - losing the GC race is valid
+                errors.append(("publish", exc))
+
+        def expire() -> None:
+            try:
+                barrier.wait(timeout=3)
+                metadb.object_attempt_gc_batch(0, 0)
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(("expire", exc))
+
+        threads = [threading.Thread(target=publish), threading.Thread(target=expire)]
+        with _postgres_lock_timeout():
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=8)
+        assert all(not thread.is_alive() for thread in threads)
+        current = metadb.catalog_get(handle["uri"])
+        if current is not None:
+            assert current["uri"] == handle["uri"]
+            metadb.catalog_delete_entry(handle["uri"])
+        else:
+            assert _state(handle["uri"]) != "published"
+    assert not any(
+        "lock timeout" in str(exc).lower() or "deadlock" in str(exc).lower()
+        for _name, exc in errors
+    )
+    assert not any(name == "expire" for name, _exc in errors)
+    assert all(
+        name == "publish" and "terminal proof" in str(exc)
+        for name, exc in errors
+    )
+    for handle in handles:
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_postgres_expiry_releases_each_attempt_before_waiting_for_the_next():
+    if metadb.engine().dialect.name != "postgresql":
+        pytest.skip("requires a real PostgreSQL metadata database")
+    metadb.object_attempt_gc_batch(0, 0)
+    handles = [
+        _handle(
+            "sink",
+            logical=f"s3://lifecycle-tests/{uuid.uuid4().hex}/expiry-order.parquet",
+            allocation_key=f"pg-expiry-order-{uuid.uuid4().hex}",
+        )
+        for _index in range(2)
+    ]
+    first, second = sorted(handles, key=lambda item: item["uri"])
+    with metadb.session() as session:
+        past = metadb._db_now(session) - datetime.timedelta(seconds=1)
+        for handle in handles:
+            session.get(
+                metadb.ObjectAttemptLease, handle["write_lease_id"],
+            ).expires_at = past
+            session.get(
+                metadb.ObjectAttemptLease, handle["publish_lease_id"],
+            ).expires_at = past
+
+    errors: list[BaseException] = []
+
+    def expire() -> None:
+        try:
+            metadb.object_attempt_gc_batch(0, 0)
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    with _postgres_lock_timeout(5):
+        with metadb.session() as blocker:
+            blocker.get(metadb.ObjectAttempt, second["uri"], with_for_update=True)
+            thread = threading.Thread(target=expire)
+            thread.start()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with metadb.session() as observer:
+                    if observer.get(
+                            metadb.ObjectAttemptLease, first["publish_lease_id"]) is None:
+                        break
+                time.sleep(0.01)
+            else:
+                raise AssertionError(
+                    "expiry retained the first attempt while waiting for the second")
+            assert thread.is_alive(), "expiry did not wait for the blocked second attempt"
+            # NOWAIT is the structural assertion: expiry committed the first attempt's short transaction
+            # before it tried to acquire the blocked second row.
+            assert blocker.get(
+                metadb.ObjectAttempt, first["uri"],
+                with_for_update={"nowait": True},
+            ) is not None
+        thread.join(timeout=8)
+    assert not thread.is_alive()
+    assert errors == []
+    for handle in handles:
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_postgres_expiry_waits_for_attempt_before_locking_publish_lease():
+    if metadb.engine().dialect.name != "postgresql":
+        pytest.skip("requires a real PostgreSQL metadata database")
+    handle = _handle(
+        "sink",
+        logical=f"s3://lifecycle-tests/{uuid.uuid4().hex}/attempt-first-expiry.parquet",
+        allocation_key=f"pg-attempt-first-{uuid.uuid4().hex}",
+    )
+    _commit(handle)
+    with metadb.session() as session:
+        session.get(
+            metadb.ObjectAttemptLease, handle["publish_lease_id"],
+        ).expires_at = metadb._db_now(session) - datetime.timedelta(seconds=1)
+    errors: list[BaseException] = []
+
+    def expire() -> None:
+        try:
+            metadb.object_attempt_gc_batch(0, 0)
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    thread = None
+    with _postgres_lock_timeout(5):
+        with metadb.session() as blocker:
+            blocker.get(metadb.ObjectAttempt, handle["uri"], with_for_update=True)
+            thread = threading.Thread(target=expire)
+            thread.start()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with metadb.session() as observer:
+                    waiting = observer.scalar(text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                        "WHERE NOT granted AND pid <> pg_backend_pid())"
+                    ))
+                if waiting:
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("expiry did not wait for the locked attempt")
+            # A lease-first expiry implementation holds this row while waiting above and NOWAIT fails.
+            assert blocker.get(
+                metadb.ObjectAttemptLease, handle["publish_lease_id"],
+                with_for_update={"nowait": True},
+            ) is not None
+        thread.join(timeout=8)
+    assert thread is not None and not thread.is_alive()
+    assert errors == []
+    metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
 def test_postgres_unregister_serializes_governance_mutations():
@@ -749,7 +923,7 @@ def test_done_run_state_is_primary_owner_for_noncacheable_committed_region():
     metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
-def test_local_runner_terminal_persistence_failure_never_exposes_done(tmp_path):
+def test_local_runner_terminal_persistence_failure_never_exposes_done(tmp_path, caplog):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     from hub import compiler
@@ -784,6 +958,7 @@ def test_local_runner_terminal_persistence_failure_never_exposes_done(tmp_path):
     runner.on_status = lambda _graph, status: (
         (_ for _ in ()).throw(RuntimeError("terminal persistence unavailable"))
         if status.status == "done" else None)
+    caplog.set_level("ERROR", logger="hub")
     plan = compiler.compile_plan(
         graph, "source", deps.registry, deps.node_specs, deps.node_ir)
     started = runner.run(plan, graph, "source", "local")
@@ -793,7 +968,9 @@ def test_local_runner_terminal_persistence_failure_never_exposes_done(tmp_path):
         time.sleep(0.01)
     final = runner.status(started.run_id)
     assert final.status == "failed" and final.output_uri is None
-    assert "terminal persistence unavailable" in (final.error or "")
+    assert "full result publication failed" in (final.error or "")
+    assert "terminal persistence unavailable" not in (final.error or "")
+    assert "terminal persistence unavailable" in caplog.text
     with metadb.session() as session:
         assert not list(session.scalars(select(metadb.ObjectAttemptRef).where(
             metadb.ObjectAttemptRef.ref_type == "result_reader",
@@ -879,6 +1056,49 @@ def test_unrelated_attempt_writes_do_not_take_installation_lock(monkeypatch):
         thread.join()
     assert errors == []
     assert _state(left["uri"]) == _state(right["uri"]) == "published"
+
+
+def test_sqlite_cache_replacement_and_reader_pin_are_serialized():
+    if metadb.engine().dialect.name != "sqlite":
+        pytest.skip("requires a SQLite metadata database")
+    old, new = _handle(), _handle()
+    _commit(old)
+    _commit(new)
+    cache_key = f"sqlite-cache-race-{uuid.uuid4().hex}"
+    metadb.put_result(cache_key, {"uri": old["uri"], "rows": 1})
+    barrier = threading.Barrier(2)
+    acquired: list[tuple[dict | None, str | None]] = []
+    errors: list[BaseException] = []
+
+    def acquire() -> None:
+        try:
+            barrier.wait(timeout=3)
+            acquired.append(metadb.acquire_result_cache_pin(
+                cache_key, f"sqlite-reader-{uuid.uuid4().hex}", 30))
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    def replace() -> None:
+        try:
+            barrier.wait(timeout=3)
+            metadb.put_result(cache_key, {"uri": new["uri"], "rows": 1})
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=acquire), threading.Thread(target=replace)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=8)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == [] and len(acquired) == 1
+    doc, pin_id = acquired[0]
+    assert doc["uri"] in (old["uri"], new["uri"]) and pin_id
+    assert _state(doc["uri"]) == "published"
+    metadb.release_result_cache_pin(pin_id)
+    metadb.put_result(cache_key, {"uri": None})
+    metadb.quarantine_object_attempt(old["uri"], "test cleanup")
+    metadb.quarantine_object_attempt(new["uri"], "test cleanup")
 
 
 class _ExactProvider:
@@ -1574,6 +1794,104 @@ def test_app_lifespan_starts_and_stops_object_reaper():
     assert main._object_attempt_reaper_thread is None
 
 
+@pytest.mark.parametrize("versioning_enabled", [False, True], ids=["unversioned", "versioned"])
+def test_moto_exact_root_marker_is_inventoried_and_exactly_reaped(versioning_enabled):
+    pytest.importorskip("moto")
+    pytest.importorskip("flask")
+    boto3 = pytest.importorskip("boto3")
+    pytest.importorskip("pyarrow")
+    from moto.server import ThreadedMotoServer
+
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    previous_store = metadb.get_setting("objectStore", "global", default={}) or {}
+    handle = None
+    try:
+        host, port = server.get_host_and_port()
+        endpoint = f"http://{host}:{port}"
+        client = boto3.client(
+            "s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
+            region_name="us-east-1")
+        mode = "versioned" if versioning_enabled else "unversioned"
+        bucket = f"lifecycle-root-marker-{mode}"
+        client.create_bucket(Bucket=bucket)
+        if versioning_enabled:
+            client.put_bucket_versioning(
+                Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+        metadb.set_setting("objectStore", {
+            "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
+            "secretAccessKey": "s", "useSsl": False,
+        }, "global")
+
+        token = uuid.uuid4().hex
+        logical = f"s3://{bucket}/results/{token}.parquet"
+        handle = _handle(
+            "sink", logical=logical, allocation_key=f"root-marker-{mode}-{token}")
+        attempt_key = urlsplit(handle["uri"]).path.lstrip("/").rstrip("/")
+        root_marker_key = attempt_key + "/"
+        shard_key = attempt_key + "/part-00000.parquet"
+        sibling_key = f"results/manual-sibling-{token}.parquet"
+        client.put_object(Bucket=bucket, Key=root_marker_key, Body=b"")
+        client.put_object(Bucket=bucket, Key=shard_key, Body=b"parquet-test-data")
+        client.put_object(Bucket=bucket, Key=sibling_key, Body=b"keep")
+        handoff.write_manifest(
+            handle["uri"], run_id=handle["run_id"], rows=1, schema="value: int64")
+
+        handoff.prepare_attempt_commit(handle["uri"])
+        inventory = metadb.object_attempt_inventory(handle["uri"])
+        root_marker = [
+            item for item in inventory
+            if item["key"] == f"{bucket}/{root_marker_key}"
+        ]
+        assert len(root_marker) == 1
+        assert root_marker[0]["size"] == 0
+        assert root_marker[0]["member_type"] == (
+            "object_version" if versioning_enabled else "unversioned_object")
+
+        name = f"root-marker-{mode}-{token}"
+        metadb.catalog_upsert_entry(handle["uri"], name, {
+            "id": "ignored", "name": name, "uri": handle["uri"],
+        })
+        assert _state(handle["uri"]) == "published"
+        with metadb.session() as session:
+            assert session.scalar(select(metadb.ObjectAttemptRef).where(
+                metadb.ObjectAttemptRef.attempt_uri == handle["uri"],
+                metadb.ObjectAttemptRef.ref_type == "catalog",
+            )) is not None
+
+        metadb.catalog_delete_entry(handle["uri"])
+        assert _state(handle["uri"]) == "superseded"
+        with metadb.session() as session:
+            assert session.scalar(select(metadb.ObjectAttemptRef).where(
+                metadb.ObjectAttemptRef.attempt_uri == handle["uri"],
+            )) is None
+
+        first = handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0)
+        assert handle["uri"] in first["observed"]
+        assert _state(handle["uri"]) == "delete_verifying"
+        assert metadb.object_attempt_inventory(handle["uri"], pending_only=True) == []
+        _force_delete_verification_due(handle["uri"])
+        assert handle["uri"] in handoff.reap_attempts(
+            retention_seconds=0, delete_grace_seconds=0)["deleted"]
+
+        assert client.list_objects_v2(Bucket=bucket, Prefix=attempt_key).get("Contents", []) == []
+        if versioning_enabled:
+            history = client.list_object_versions(Bucket=bucket, Prefix=attempt_key)
+            assert history.get("Versions", []) == []
+            assert history.get("DeleteMarkers", []) == []
+        assert client.get_object(Bucket=bucket, Key=sibling_key)["Body"].read() == b"keep"
+        assert _state(handle["uri"]) == "deleted"
+        assert any(item["key"] == f"{bucket}/{root_marker_key}"
+                   for item in metadb.object_attempt_inventory(handle["uri"]))
+    finally:
+        if handle is not None and _state(handle["uri"]) != "deleted":
+            with contextlib.suppress(Exception):
+                metadb.catalog_delete_entry(handle["uri"])
+            metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+        metadb.set_setting("objectStore", previous_store, "global")
+        server.stop()
+
+
 def test_moto_versioned_s3_history_read_and_exact_sibling_safe_gc(monkeypatch):
     pytest.importorskip("moto")
     pytest.importorskip("flask")
@@ -1884,6 +2202,7 @@ def test_moto_subprocess_backends_publish_parent_owned_object_full_result(
         source = tmp_path / "source.parquet"
         pq.write_table(pa.table({"value": [1, 2, 3]}), source)
         deps = Deps(str(workspace), str(data_dir))
+
         runner = next(candidate for candidate in deps.runners if candidate.name == backend)
         graph = Graph.model_validate({
             "id": f"{backend}-object-result", "version": 1,
@@ -1928,6 +2247,413 @@ def test_moto_subprocess_backends_publish_parent_owned_object_full_result(
         settings.database_url = original_url
         metadb._engine, metadb._Session = original_engine, original_session
         server.stop()
+
+
+@pytest.mark.parametrize("backend", ["local-subprocess", "local-pool"])
+def test_moto_subprocess_backends_publish_parent_owned_managed_sink(
+        tmp_path, monkeypatch, backend):
+    pytest.importorskip("moto")
+    pytest.importorskip("flask")
+    boto3 = pytest.importorskip("boto3")
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    from moto.server import ThreadedMotoServer
+
+    from hub import compiler
+    from hub.deps import Deps
+    from hub.models import Graph
+    from hub.settings import settings
+
+    original_engine, original_session = metadb._engine, metadb._Session
+    original_url = settings.database_url
+    isolated_url = f"sqlite:///{tmp_path / 'parent-sink-metadata.db'}"
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    runner = None
+    published_uri = None
+    try:
+        host, port = server.get_host_and_port()
+        endpoint = f"http://{host}:{port}"
+        client = boto3.client(
+            "s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
+            region_name="us-east-1")
+        client.create_bucket(Bucket="subprocess-managed-sink")
+        client.put_bucket_versioning(
+            Bucket="subprocess-managed-sink", VersioningConfiguration={"Status": "Enabled"})
+
+        if metadb._engine is not None:
+            metadb._engine.dispose()
+        settings.database_url = isolated_url
+        metadb._engine = metadb._Session = None
+        metadb.init_db()
+        metadb.set_setting("objectStore", {
+            "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
+            "secretAccessKey": "s", "useSsl": False,
+        }, "global")
+        monkeypatch.setenv("DP_STORAGE_URL", "s3://subprocess-managed-sink/results")
+        monkeypatch.setenv("DP_S3_ENDPOINT", endpoint)
+        monkeypatch.setenv("DP_S3_KEY", "k")
+        monkeypatch.setenv("DP_S3_SECRET", "s")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        if backend == "local-pool":
+            monkeypatch.setenv("DP_POOL_WORKERS", '[{"name":"worker","cpu":2}]')
+
+        workspace = tmp_path / "workspace"
+        data_dir = tmp_path / "data"
+        workspace.mkdir()
+        data_dir.mkdir()
+        source = tmp_path / "source.parquet"
+        pq.write_table(pa.table({"value": [1, 2, 3]}), source)
+        deps = Deps(str(workspace), str(data_dir))
+
+        class ParquetProbe:
+            @staticmethod
+            def _metadata(uri):
+                parsed = urlsplit(uri)
+                key = parsed.path.lstrip("/").rstrip("/") + "/part-00000.parquet"
+                body = client.get_object(Bucket=parsed.netloc, Key=key)["Body"].read()
+                return pq.ParquetFile(pa.BufferReader(body)).metadata
+
+            def schema(self, uri):
+                from hub.models import ColumnSchema
+
+                metadata = self._metadata(uri)
+                return [ColumnSchema(name=metadata.schema.column(i).name,
+                                     type=str(metadata.schema.column(i).physical_type))
+                        for i in range(metadata.num_columns)]
+
+            def count(self, uri):
+                return self._metadata(uri).num_rows
+
+            @staticmethod
+            def fingerprint(_uri):
+                return "subprocess-managed-sink-test"
+
+        # Filesystem clients can stall on Moto's S3 glob transport. The ownership contract under test still
+        # performs the real child S3 write, parent inventory proof, and metadata/catalog transaction;
+        # use Moto's boto3 client only for the catalog's schema/count read-back.
+        monkeypatch.setattr(deps.catalog, "resolve", lambda _uri: ParquetProbe())
+        monkeypatch.setattr(deps.catalog, "_object_stat_sig", lambda _uri: "")
+        runner = next(candidate for candidate in deps.runners if candidate.name == backend)
+        graph = Graph.model_validate({
+            "id": f"{backend}-managed-sink", "version": 1,
+            "nodes": [
+                {"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                 "data": {"config": {"uri": str(source)}}},
+                {"id": "write", "type": "write", "position": {"x": 200, "y": 0},
+                 "data": {"config": {"filename": "daily.parquet",
+                                       "writeMode": "overwrite"}}},
+            ],
+            "edges": [{"id": "source-write", "source": "source", "target": "write",
+                       "data": {"wire": "dataset"}}],
+        })
+        plan = compiler.compile_plan(
+            graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+        status = runner.run(plan, graph, "write", "local")
+        deadline = time.monotonic() + 30
+        while runner.status(status.run_id).status not in ("done", "failed", "cancelled"):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        final = runner.status(status.run_id)
+        assert final.status == "done", final.error
+        assert final.output_uri and final.output_table == "daily"
+        published_uri = final.output_uri
+        logical_uri = "s3://subprocess-managed-sink/results/daily.parquet"
+        assert metadb.catalog_get(logical_uri)["uri"] == published_uri
+        with metadb.session() as session:
+            attempt = session.get(metadb.ObjectAttempt, published_uri)
+            assert attempt is not None and attempt.kind == "sink" and attempt.state == "published"
+            assert session.scalar(select(metadb.ObjectAttemptRef).where(
+                metadb.ObjectAttemptRef.ref_type == "catalog",
+                metadb.ObjectAttemptRef.attempt_uri == published_uri,
+            )) is not None
+        assert any(edge["parent"] == str(source) and edge["child"] == published_uri
+                   for edge in metadb.catalog_edges())
+        result_key = urlsplit(published_uri).path.lstrip("/").rstrip("/") \
+            + "/part-00000.parquet"
+        result_bytes = client.get_object(
+            Bucket="subprocess-managed-sink", Key=result_key)["Body"].read()
+        assert pq.read_table(pa.BufferReader(result_bytes)).num_rows == 3
+    finally:
+        if runner is not None:
+            runner._terminate_all()
+        if published_uri is not None:
+            with contextlib.suppress(Exception):
+                metadb.catalog_delete_entry(published_uri)
+            with contextlib.suppress(Exception):
+                metadb.quarantine_object_attempt(published_uri, "test cleanup")
+        if metadb._engine is not None:
+            metadb._engine.dispose()
+        settings.database_url = original_url
+        metadb._engine, metadb._Session = original_engine, original_session
+        server.stop()
+
+
+def test_subprocess_parent_attests_and_prepares_managed_sink_before_publish(
+        tmp_path, monkeypatch):
+    from hub.models import RunStatus
+    from hub.plugins import catalog as catalog_mod
+    from hub.subprocess_runner import SubprocessRunner
+
+    attempt_uri = "s3://managed/results/daily.attempt-parent"
+    events = []
+    monkeypatch.setattr(
+        handoff, "prepare_attempt_commit",
+        lambda uri: events.append(("prepare", uri)))
+
+    def publish(**kwargs):
+        events.append(("publish", kwargs))
+        return {"uri": kwargs["uri"]}
+
+    monkeypatch.setattr(catalog_mod, "core_managed_publisher", lambda _catalog: publish)
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path), catalog=object())
+    sinks = {"write": {
+        "uri": attempt_uri, "logical_uri": "s3://managed/results/daily.parquet",
+        "name": "daily", "parents": ["s3://managed/source.parquet"],
+    }}
+    runner._publish_object_sinks(sinks, RunStatus(
+        run_id="run", status="done", per_node=[],
+        output_uri=attempt_uri, output_table="daily"))
+    assert events == [
+        ("prepare", attempt_uri),
+        ("publish", {
+            "name": "daily", "uri": attempt_uri, "version": None,
+            "parents": ["s3://managed/source.parquet"], "pipeline": "canvas",
+        }),
+    ]
+
+    with pytest.raises(RuntimeError, match="unexpected output binding"):
+        runner._publish_object_sinks(sinks, RunStatus(
+            run_id="run", status="done", per_node=[],
+            output_uri=attempt_uri, output_table="wrong"))
+    assert len(events) == 2
+
+
+@pytest.mark.parametrize("object_backed", [False, True], ids=["unmanaged", "managed"])
+def test_subprocess_multi_sink_fails_before_allocation_or_dispatch(
+        tmp_path, monkeypatch, object_backed):
+    from hub.models import CompilePlan, Graph, PlanStep
+    from hub.plugins import catalog as catalog_mod
+    from hub.plugins.adapters import DuckDBAdapter
+    from hub.subprocess_runner import SubprocessRunner
+    import hub.subprocess_runner as subprocess_runner
+
+    calls = []
+
+    class ObjectStorage:
+        @staticmethod
+        def output_uri(name, ext):
+            if object_backed:
+                return f"s3://managed/results/{name}{ext}"
+            return str(tmp_path / f"{name}{ext}")
+
+    class Catalog:
+        @staticmethod
+        def register_output(**_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        catalog_mod, "core_managed_publisher", lambda _catalog: lambda **_kwargs: None)
+    monkeypatch.setattr(
+        handoff, "allocate_attempt", lambda **_kwargs: calls.append("allocate"))
+    monkeypatch.setattr(
+        subprocess_runner.subprocess, "Popen", lambda *_args, **_kwargs: calls.append("popen"))
+    runner = SubprocessRunner(
+        str(tmp_path), str(tmp_path), catalog=Catalog(), storage=ObjectStorage(),
+        resolve_adapter=lambda _uri: DuckDBAdapter())
+    graph = Graph.model_validate({
+        "id": "multi-sink", "version": 1,
+        "nodes": [
+            {"id": "first", "type": "write", "position": {"x": 0, "y": 0},
+             "data": {"config": {"filename": "first.parquet"}}},
+            {"id": "second", "type": "write", "position": {"x": 0, "y": 100},
+             "data": {"config": {"filename": "second.parquet"}}},
+        ],
+        "edges": [],
+    })
+    plan = CompilePlan(target_node_id="first", steps=[
+        PlanStep(node_id="first", kind="write", label="first"),
+        PlanStep(node_id="second", kind="write", label="second"),
+    ])
+    with pytest.raises(RuntimeError, match="until atomic multi-sink publication"):
+        runner.run(plan, graph, "first", "local")
+    assert calls == []
+
+
+@pytest.mark.parametrize("catalog", [None, object()], ids=["missing", "not-callable"])
+def test_subprocess_unmanaged_sink_requires_parent_catalog_before_dispatch(
+        tmp_path, monkeypatch, catalog):
+    from hub.models import CompilePlan, Graph, PlanStep
+    from hub.subprocess_runner import SubprocessRunner
+    import hub.subprocess_runner as subprocess_runner
+
+    calls = []
+
+    class LocalStorage:
+        @staticmethod
+        def output_uri(name, ext):
+            return str(tmp_path / f"{name}{ext}")
+
+    monkeypatch.setattr(
+        subprocess_runner.subprocess, "Popen", lambda *_args, **_kwargs: calls.append("popen"))
+    runner = SubprocessRunner(
+        str(tmp_path), str(tmp_path), catalog=catalog, storage=LocalStorage())
+    graph = Graph.model_validate({
+        "id": "unmanaged-sink", "version": 1,
+        "nodes": [
+            {"id": "write", "type": "write", "position": {"x": 0, "y": 0},
+             "data": {"config": {"filename": "out.csv"}}},
+        ],
+        "edges": [],
+    })
+    plan = CompilePlan(target_node_id="write", steps=[
+        PlanStep(node_id="write", kind="write", label="write"),
+    ])
+    with pytest.raises(RuntimeError, match="require parent catalog registration"):
+        runner.run(plan, graph, "write", "local")
+    assert calls == []
+
+
+@pytest.mark.parametrize("case", [
+    "local-append", "local-partitioned", "object-append", "local-overwrite",
+])
+def test_subprocess_parent_contract_uses_shared_published_sink_uri(tmp_path, case):
+    from hub.models import CompilePlan, Graph, PlanStep
+    from hub.plugins.adapters import DuckDBAdapter
+    from hub.subprocess_runner import SubprocessRunner
+
+    if case == "local-append":
+        target = str(tmp_path / "out.csv")
+        config = {"filename": "out.csv", "writeMode": "append"}
+        expected = str(tmp_path / "out")
+    elif case == "local-partitioned":
+        target = str(tmp_path / "out.parquet")
+        config = {"filename": "out.parquet", "partitionBy": "category"}
+        expected = str(tmp_path / "out")
+    elif case == "object-append":
+        target = "s3://contract-tests/results/out.parquet"
+        config = {"filename": "out.parquet", "writeMode": "append"}
+        expected = "s3://contract-tests/results/out"
+    else:
+        target = str(tmp_path / "out.csv")
+        config = {"filename": "out.csv", "writeMode": "overwrite"}
+        expected = target
+
+    class Storage:
+        @staticmethod
+        def output_uri(_name, _ext):
+            return target
+
+    class Catalog:
+        register_output = get_table = staticmethod(lambda **_kwargs: None)
+
+    graph = Graph.model_validate({
+        "id": f"contract-{case}", "version": 1,
+        "nodes": [{"id": "write", "type": "write", "position": {"x": 0, "y": 0},
+                   "data": {"config": config}}],
+        "edges": [],
+    })
+    plan = CompilePlan(target_node_id="write", steps=[
+        PlanStep(node_id="write", kind="write", label="write"),
+    ])
+    runner = SubprocessRunner(
+        str(tmp_path), str(tmp_path), catalog=Catalog(), storage=Storage(),
+        resolve_adapter=lambda _uri: DuckDBAdapter())
+    targets, attempts, contracts = runner._claim_sink_contracts(plan, graph, "run")
+    assert targets == {"write": target} and attempts == {}
+    assert contracts["write"]["logical_uri"] == target
+    assert contracts["write"]["published_uri"] == expected
+
+
+def test_core_strict_publication_ignores_post_commit_usage_failure(
+        tmp_path, monkeypatch):
+    from hub.models import ColumnSchema
+    from hub.plugins.catalog import InMemoryCatalog
+
+    output_uri = str(tmp_path / "strict-usage.parquet")
+    parent_uri = str(tmp_path / "parent.parquet")
+
+    class Probe:
+        schema = staticmethod(lambda _uri: [ColumnSchema(name="value", type="BIGINT")])
+        count = staticmethod(lambda _uri: 1)
+        fingerprint = staticmethod(lambda _uri: "strict-usage")
+
+    catalog = InMemoryCatalog(str(tmp_path / "catalog-data"), lambda _uri: Probe())
+    monkeypatch.setattr(
+        metadb, "catalog_bump_usage",
+        lambda _uri: (_ for _ in ()).throw(RuntimeError("usage unavailable")))
+    table = catalog.publish_output_strict(
+        name="strict-usage", uri=output_uri, parents=[parent_uri], pipeline="canvas")
+    assert table.uri == output_uri
+    assert metadb.catalog_get(output_uri)["uri"] == output_uri
+    assert any(edge["parent"] == parent_uri and edge["child"] == output_uri
+               for edge in metadb.catalog_edges())
+    metadb.catalog_delete_entry(output_uri)
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["unmanaged", "managed"])
+@pytest.mark.parametrize("cancelled", [False, True], ids=["failed", "cancelled"])
+def test_subprocess_done_status_with_nonzero_exit_never_publishes(
+        tmp_path, monkeypatch, managed, cancelled):
+    from hub.models import Graph, RunStatus
+    from hub.subprocess_runner import SubprocessRunner
+
+    calls = []
+    expected_uri = ("s3://managed/results/out.attempt-parent" if managed
+                    else str(tmp_path / "out.csv"))
+    job_dir = tmp_path / f"nonzero-{managed}-{cancelled}"
+    job_dir.mkdir()
+    status_file = job_dir / "status.json"
+    status_file.write_text(json.dumps(RunStatus(
+        run_id="child", status="done", per_node=[],
+        output_uri=expected_uri, output_table="out",
+    ).model_dump()))
+
+    class Catalog:
+        @staticmethod
+        def register_output(**_kwargs):
+            calls.append("register")
+
+        @staticmethod
+        def get_table(_uri):
+            calls.append("readback")
+
+    class FinishedProcess:
+        returncode = 7
+
+        @staticmethod
+        def poll():
+            return 7
+
+        @staticmethod
+        def wait(timeout=None):
+            return 7
+
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path), catalog=Catalog())
+    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner._sink_contracts["run"] = {"write": {
+        "logical_uri": ("s3://managed/results/out.parquet" if managed else expected_uri),
+        "published_uri": expected_uri, "name": "out", "parents": [],
+    }}
+    if managed:
+        runner._object_sinks["run"] = {"write": {
+            "uri": expected_uri, "logical_uri": "s3://managed/results/out.parquet",
+            "name": "out", "parents": [],
+        }}
+        monkeypatch.setattr(
+            runner, "_publish_object_sinks", lambda *_args: calls.append("publish"))
+        monkeypatch.setattr(
+            runner, "_discard_object_sinks", lambda _sinks: calls.append("discard"))
+    if cancelled:
+        runner._cancelled.add("run")
+    runner._watch(
+        "run", FinishedProcess(), str(status_file), str(job_dir),
+        Graph.model_validate({"id": "nonzero", "version": 1,
+                              "nodes": [], "edges": []}), None)
+    final = runner.status("run")
+    assert final.status == ("cancelled" if cancelled else "failed")
+    assert final.output_uri is None and final.output_table is None
+    assert calls == (["discard"] if managed else [])
 
 
 @pytest.mark.parametrize("child_status,cancelled,expected", [
@@ -1987,6 +2713,428 @@ def test_subprocess_parent_discards_object_result_only_after_child_reaped(
         handoff.discard_attempt = original_discard
         handoff.set_managed_object_provider(None)
         metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+@pytest.mark.parametrize("child_status,cancelled,expected", [
+    ("failed", False, "failed"),
+    ("done", True, "cancelled"),
+])
+def test_subprocess_parent_discards_managed_sink_only_after_child_reaped(
+        tmp_path, child_status, cancelled, expected):
+    from hub.models import Graph, RunStatus
+    from hub.subprocess_runner import SubprocessRunner
+
+    handle = _handle(
+        "sink", logical=f"s3://lifecycle-tests/{uuid.uuid4().hex}/subprocess-sink.parquet")
+    provider = _ExactProvider([])
+    handoff.set_managed_object_provider(provider)
+    job_dir = tmp_path / f"sink-job-{child_status}-{cancelled}"
+    job_dir.mkdir()
+    status_file = job_dir / "status.json"
+    status_file.write_text(json.dumps(RunStatus(
+        run_id="child", status=child_status, per_node=[],
+        output_uri=handle["uri"], output_table="daily",
+    ).model_dump()))
+    events: list[str] = []
+
+    class FinishedProcess:
+        returncode = 0 if child_status == "done" else 1
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            events.append("reaped")
+            return 0
+
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path))
+    runner.runs[handle["run_id"]] = RunStatus(
+        run_id=handle["run_id"], status="running", per_node=[])
+    runner._object_sinks[handle["run_id"]] = {"write": {
+        "uri": handle["uri"], "logical_uri": handle["logical_uri"],
+        "name": "daily", "parents": [],
+    }}
+    if cancelled:
+        runner._cancelled.add(handle["run_id"])
+    original_discard = handoff.discard_attempt
+
+    def discard_after_reap(uri):
+        assert events == ["reaped"]
+        original_discard(uri)
+
+    handoff.discard_attempt = discard_after_reap
+    try:
+        runner._watch(
+            handle["run_id"], FinishedProcess(), str(status_file), str(job_dir),
+            Graph.model_validate({"id": "subprocess-sink", "version": 1,
+                                  "nodes": [], "edges": []}), None)
+        final = runner.status(handle["run_id"])
+        assert final.status == expected
+        assert final.output_uri is None and final.output_table is None
+        assert _state(handle["uri"]) == "abandoned"
+    finally:
+        handoff.discard_attempt = original_discard
+        handoff.set_managed_object_provider(None)
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_subprocess_parent_catalog_failure_is_generic_and_clears_output(
+        tmp_path, caplog):
+    from hub.models import Graph, RunStatus
+    from hub.subprocess_runner import SubprocessRunner
+
+    job_dir = tmp_path / "unmanaged-catalog-failure"
+    job_dir.mkdir()
+    status_file = job_dir / "status.json"
+    status_file.write_text(json.dumps(RunStatus(
+        run_id="child", status="done", per_node=[],
+        output_uri=str(tmp_path / "out.parquet"), output_table="out",
+    ).model_dump()))
+
+    class FinishedProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    class FailingCatalog:
+        @staticmethod
+        def register_output(**_kwargs):
+            raise RuntimeError("secret-provider-detail")
+
+        @staticmethod
+        def get_table(_uri):
+            raise AssertionError("read-back must not run after registration fails")
+
+    caplog.set_level("ERROR", logger="hub")
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path), catalog=FailingCatalog())
+    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner._sink_contracts["run"] = {"write": {
+        "logical_uri": str(tmp_path / "out.parquet"),
+        "published_uri": str(tmp_path / "out.parquet"), "name": "out", "parents": [],
+    }}
+    runner._watch(
+        "run", FinishedProcess(), str(status_file), str(job_dir),
+        Graph.model_validate({"id": "catalog-failure", "version": 1,
+                              "nodes": [], "edges": []}), None)
+    final = runner.status("run")
+    assert final.status == "failed"
+    assert final.error == "parent catalog registration failed"
+    assert final.output_uri is None and final.output_table is None
+    assert "secret-provider-detail" not in final.error
+    assert "secret-provider-detail" in caplog.text
+
+
+def test_subprocess_builtin_catalog_strict_publish_rejects_same_uri_persist_failure(
+        tmp_path, monkeypatch, caplog):
+    from hub.models import ColumnSchema, Graph, RunStatus
+    from hub.plugins.catalog import InMemoryCatalog
+    from hub.subprocess_runner import SubprocessRunner
+
+    output_uri = str(tmp_path / "durable-readback.parquet")
+    job_dir = tmp_path / "durable-readback-job"
+    job_dir.mkdir()
+    status_file = job_dir / "status.json"
+    status_file.write_text(json.dumps(RunStatus(
+        run_id="child", status="done", per_node=[],
+        output_uri=output_uri, output_table="durable-readback",
+    ).model_dump()))
+
+    class Probe:
+        @staticmethod
+        def schema(_uri):
+            return [ColumnSchema(name="value", type="BIGINT")]
+
+        @staticmethod
+        def count(_uri):
+            return 1
+
+        @staticmethod
+        def fingerprint(_uri):
+            return "durable-readback"
+
+    class FinishedProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    catalog = InMemoryCatalog(str(tmp_path / "catalog-data"), lambda _uri: Probe())
+    prior = catalog.register_output(name="durable-readback", uri=output_uri, parents=[])
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path), catalog=catalog)
+    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner._sink_contracts["run"] = {"write": {
+        "logical_uri": output_uri, "published_uri": output_uri,
+        "name": "durable-readback", "parents": [],
+    }}
+    monkeypatch.setattr(
+        metadb, "catalog_upsert_entry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("secret-metadb-persist-detail")))
+    caplog.set_level("WARNING", logger="hub")
+
+    runner._watch(
+        "run", FinishedProcess(), str(status_file), str(job_dir),
+        Graph.model_validate({"id": "durable-readback", "version": 1,
+                              "nodes": [], "edges": []}), None)
+    final = runner.status("run")
+    assert final.status == "failed"
+    assert final.error == "parent catalog registration failed"
+    assert final.output_uri is None and final.output_table is None
+    assert "secret-metadb-persist-detail" not in final.error
+    assert "secret-metadb-persist-detail" in caplog.text
+    assert catalog.get_table(output_uri).version == prior.version
+
+
+def test_subprocess_unmanaged_uri_mismatch_never_calls_catalog(tmp_path):
+    from hub.models import Graph, RunStatus
+    from hub.subprocess_runner import SubprocessRunner
+
+    calls = []
+    expected_uri = str(tmp_path / "expected.csv")
+    returned_uri = str(tmp_path / "unexpected.csv")
+    job_dir = tmp_path / "unmanaged-uri-mismatch"
+    job_dir.mkdir()
+    status_file = job_dir / "status.json"
+    status_file.write_text(json.dumps(RunStatus(
+        run_id="child", status="done", per_node=[],
+        output_uri=returned_uri, output_table="expected",
+    ).model_dump()))
+
+    class Catalog:
+        @staticmethod
+        def register_output(**_kwargs):
+            calls.append("register")
+            raise AssertionError("mismatched output must not reach catalog")
+
+        @staticmethod
+        def get_table(_uri):
+            calls.append("readback")
+            raise AssertionError("mismatched output must not reach catalog")
+
+    class FinishedProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path), catalog=Catalog())
+    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner._sink_contracts["run"] = {"write": {
+        "logical_uri": expected_uri, "published_uri": expected_uri,
+        "name": "expected", "parents": [],
+    }}
+    runner._watch(
+        "run", FinishedProcess(), str(status_file), str(job_dir),
+        Graph.model_validate({"id": "uri-mismatch", "version": 1,
+                              "nodes": [], "edges": []}), None)
+    final = runner.status("run")
+    assert final.status == "failed"
+    assert final.error == "parent catalog registration failed"
+    assert final.output_uri is None and final.output_table is None
+    assert calls == []
+
+
+def test_subprocess_parent_registers_unmanaged_sink_with_source_lineage(tmp_path):
+    from hub import graph as graph_mod
+    from hub.models import CompilePlan, Graph, PlanStep, RunStatus
+    from hub.subprocess_runner import SubprocessRunner
+
+    source_a = str(tmp_path / "source-a.parquet")
+    source_b = str(tmp_path / "source-b.parquet")
+    registered = {}
+
+    class LocalStorage:
+        @staticmethod
+        def output_uri(name, ext):
+            return str(tmp_path / f"{name}{ext}")
+
+    class Catalog:
+        @staticmethod
+        def register_output(**kwargs):
+            registered.update(kwargs)
+            return {"uri": kwargs["uri"], "name": kwargs["name"], "version": "v1"}
+
+        @staticmethod
+        def get_table(uri):
+            return {"uri": uri, "name": registered["name"], "version": "v1"}
+
+    graph = Graph.model_validate({
+        "id": "unmanaged-lineage", "version": 1,
+        "nodes": [
+            {"id": "source-a", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": source_a}}},
+            {"id": "source-b", "type": "source", "position": {"x": 0, "y": 100},
+             "data": {"config": {"uri": source_b}}},
+            {"id": "join", "type": "join", "position": {"x": 100, "y": 50},
+             "data": {"config": {"leftOn": "id", "rightOn": "id"}}},
+            {"id": "transform", "type": "transform", "position": {"x": 100, "y": 0},
+             "data": {"config": {"mode": "map", "code": "def fn(row): return row"}}},
+            {"id": "write", "type": "write", "position": {"x": 200, "y": 0},
+             "data": {"config": {"filename": "derived.csv"}}},
+        ],
+        "edges": [
+            {"id": "a-join", "source": "source-a", "target": "join", "targetHandle": "a"},
+            {"id": "b-join", "source": "source-b", "target": "join", "targetHandle": "b"},
+            {"id": "join-transform", "source": "join", "target": "transform"},
+            {"id": "transform-write", "source": "transform", "target": "write"},
+        ],
+    })
+    plan = CompilePlan(target_node_id="write", steps=[
+        PlanStep(node_id="source-a", kind="read", label="source-a"),
+        PlanStep(node_id="source-b", kind="read", label="source-b"),
+        PlanStep(node_id="join", kind="op", label="join"),
+        PlanStep(node_id="transform", kind="op", label="transform"),
+        PlanStep(node_id="write", kind="write", label="write"),
+    ])
+    runner = SubprocessRunner(
+        str(tmp_path), str(tmp_path), catalog=Catalog(), storage=LocalStorage())
+    _targets, _attempts, contracts = runner._claim_sink_contracts(plan, graph, "run")
+    expected_parents = graph_mod.all_upstream_source_uris(graph, "write")
+    assert set(expected_parents) == {source_a, source_b}
+    assert contracts["write"]["parents"] == expected_parents
+    runner._sink_contracts["run"] = contracts
+    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    job_dir = tmp_path / "lineage-job"
+    job_dir.mkdir()
+    status_file = job_dir / "status.json"
+    status_file.write_text(json.dumps(RunStatus(
+        run_id="child", status="done", per_node=[],
+        output_uri=str(tmp_path / "derived.csv"), output_table="derived",
+    ).model_dump()))
+
+    class FinishedProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    runner._watch(
+        "run", FinishedProcess(), str(status_file), str(job_dir), graph, "write")
+    assert runner.status("run").status == "done"
+    assert registered["parents"] == expected_parents
+
+
+def test_isolated_child_adapter_disagreement_never_writes_assigned_sink(tmp_path):
+    from hub.models import Graph, RunStatus
+    from hub.plugins.runner import LocalRunner, _CancelToken
+
+    writes = []
+
+    class ChildPluginAdapter:
+        @staticmethod
+        def write(*_args, **_kwargs):
+            writes.append(True)
+            return {"rows": 1}
+
+    class Engine:
+        @staticmethod
+        def relation(_node_id, _source_handle=None):
+            return type("Relation", (), {"columns": ["value"], "types": ["BIGINT"]})()
+
+    class Storage:
+        @staticmethod
+        def output_uri(name, ext):
+            return f"s3://managed/results/{name}{ext}"
+
+    graph = Graph.model_validate({
+        "id": "adapter-disagreement", "version": 1,
+        "nodes": [
+            {"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": str(tmp_path / "source.parquet")}}},
+            {"id": "write", "type": "write", "position": {"x": 100, "y": 0},
+             "data": {"config": {"filename": "out.parquet"}}},
+        ],
+        "edges": [{"id": "source-write", "source": "source", "target": "write"}],
+    })
+    runner = LocalRunner(
+        lambda _uri: ChildPluginAdapter(), None, object(), str(tmp_path), storage=Storage())
+    runner.forced_sink_targets = {"write": "s3://managed/results/out.parquet"}
+    runner.forced_sink_attempts = {
+        "write": "s3://managed/results/out.attempt-parent",
+    }
+    with pytest.raises(RuntimeError, match="parent and child disagree"):
+        runner._commit_write(
+            next(node for node in graph.nodes if node.id == "write"), graph, Engine(),
+            RunStatus(run_id="run", status="running", per_node=[]), None, _CancelToken())
+    assert writes == []
+
+
+def test_subprocess_managed_sink_cleanup_outage_does_not_block_terminalization(
+        tmp_path, monkeypatch, caplog):
+    from hub.models import Graph, RunStatus
+    from hub.subprocess_runner import SubprocessRunner
+
+    attempt_uri = "s3://managed/results/daily.attempt-parent"
+    job_dir = tmp_path / "managed-cleanup-outage"
+    job_dir.mkdir()
+    status_file = job_dir / "status.json"
+    status_file.write_text(json.dumps(RunStatus(
+        run_id="child", status="done", per_node=[],
+        output_uri=attempt_uri, output_table="daily",
+    ).model_dump()))
+
+    class FinishedProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    caplog.set_level("ERROR", logger="hub")
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path))
+    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner._procs["run"] = FinishedProcess()
+    runner._object_sinks["run"] = {"write": {
+        "uri": attempt_uri, "logical_uri": "s3://managed/results/daily.parquet",
+        "name": "daily", "parents": [],
+    }}
+    monkeypatch.setattr(
+        runner, "_publish_object_sinks",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("secret-publish-detail")))
+    monkeypatch.setattr(
+        metadb, "abandon_committed_object_attempt",
+        lambda _uri: (_ for _ in ()).throw(RuntimeError("metadata unavailable")))
+
+    runner._watch(
+        "run", FinishedProcess(), str(status_file), str(job_dir),
+        Graph.model_validate({"id": "cleanup-outage", "version": 1,
+                              "nodes": [], "edges": []}), None)
+    final = runner.status("run")
+    assert final.status == "failed"
+    assert final.error == "parent managed-sink publication failed"
+    assert final.output_uri is None and final.output_table is None
+    assert "secret-publish-detail" not in final.error
+    assert "secret-publish-detail" in caplog.text
+    assert "metadata unavailable" in caplog.text
+    assert "run" not in runner._procs and "run" not in runner._object_sinks
+    assert not job_dir.exists()
 
 
 def test_subprocess_parent_persistence_failure_never_publishes_done(tmp_path, monkeypatch):
@@ -2133,3 +3281,908 @@ def test_subprocess_orderly_shutdown_fences_watcher_before_reap_and_discard(tmp_
     runner._terminate_all()
     assert events == ["terminate", "wait", "discard"]
     assert run_id in runner._cancelled
+
+
+@pytest.mark.parametrize("object_backed", [False, True], ids=["local", "object"])
+def test_subprocess_run_unit_allocates_exact_object_attempt_before_spawn(
+        tmp_path, monkeypatch, object_backed):
+    from hub.models import Graph
+    from hub.subprocess_runner import SubprocessRunner
+
+    logical = (
+        "s3://region-contract/results/out.parquet" if object_backed
+        else str(tmp_path / "out.parquet"))
+    attempt = "s3://region-contract/results/out.attempt-parent"
+    allocations = []
+    monkeypatch.setattr(
+        handoff, "allocate_attempt",
+        lambda **kwargs: allocations.append(kwargs) or {"uri": attempt})
+    runner = SubprocessRunner(
+        str(tmp_path), str(tmp_path), resolve_adapter=lambda _uri: object())
+    spawned = {}
+
+    def spawn(status, job_extra, graph, target):
+        spawned.update(status=status, job_extra=job_extra, graph=graph, target=target)
+        if object_backed:
+            assert runner._object_results[status.run_id]["uri"] == attempt
+        return status
+
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    graph = Graph.model_validate({"id": "region", "version": 1, "nodes": [], "edges": []})
+    status = runner.run_unit(graph, "result", logical)
+
+    assert spawned["job_extra"]["runId"] == status.run_id
+    assert spawned["job_extra"]["materializeUri"] == (attempt if object_backed else logical)
+    if object_backed:
+        assert len(allocations) == 1
+        assert allocations[0]["kind"] == "region"
+        assert allocations[0]["logical_uri"] == logical
+        assert runner._object_results[status.run_id]["run_state_owner"] is False
+    else:
+        assert allocations == [] and status.run_id not in runner._object_results
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["local", "managed-object"])
+def test_subrun_region_materializer_writes_managed_shard_and_manifest_last(
+        tmp_path, monkeypatch, managed):
+    from types import SimpleNamespace
+
+    from hub.subrun import _materialize_region
+
+    target = (
+        "s3://region-contract/results/out.attempt-parent" if managed
+        else str(tmp_path / "out.parquet"))
+    writes = []
+    manifests = []
+    relation = SimpleNamespace(columns=["value"], types=["BIGINT"])
+
+    class Runner:
+        @staticmethod
+        def _adapter_write(adapter, uri, rel, mode, cancel):
+            writes.append((adapter, uri, rel, mode, cancel))
+            return {"rows": 3}
+
+    deps = SimpleNamespace(
+        runner=Runner(), resolve_adapter=lambda uri: f"adapter:{uri}")
+    monkeypatch.setattr(
+        handoff, "write_manifest",
+        lambda uri, **kwargs: manifests.append((uri, kwargs)))
+    cancel = object()
+    rows = _materialize_region(
+        deps, relation, target, cancel, lambda: False, "unit-parent")
+
+    physical = target.rstrip("/") + "/part-00000.parquet" if managed else target
+    assert rows == 3
+    assert writes == [(f"adapter:{physical}", physical, relation, "overwrite", cancel)]
+    assert manifests == ([(target, {
+        "run_id": "unit-parent", "rows": 3, "schema": [("value", "BIGINT")],
+    })] if managed else [])
+
+
+def test_subprocess_region_attempt_is_returned_without_run_state_ownership(
+        tmp_path, monkeypatch):
+    from hub.models import Graph, RunStatus
+    from hub.subprocess_runner import SubprocessRunner
+
+    attempt = "s3://region-contract/results/out.attempt-parent"
+    job_dir = tmp_path / "region-job"
+    job_dir.mkdir()
+    status_file = job_dir / "status.json"
+    status_file.write_text(json.dumps(RunStatus(
+        run_id="child", status="done", per_node=[], output_uri=attempt,
+    ).model_dump()))
+
+    class FinishedProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    prepared = []
+    persisted = []
+    monkeypatch.setattr(handoff, "prepare_attempt_commit", prepared.append)
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path))
+    runner.runs["unit"] = RunStatus(run_id="unit", status="running", per_node=[])
+    runner._object_results["unit"] = {
+        "uri": attempt, "cache_key": None, "run_state_owner": False,
+    }
+    runner.on_status = lambda _graph, status: persisted.append(status.model_copy(deep=True))
+    runner._watch(
+        "unit", FinishedProcess(), str(status_file), str(job_dir),
+        Graph.model_validate({"id": "region", "version": 1, "nodes": [], "edges": []}),
+        "result")
+
+    final = runner.status("unit")
+    assert final.status == "done" and final.output_uri == attempt
+    assert prepared == [attempt]
+    assert persisted[-1].status == "done" and persisted[-1].output_uri is None
+    assert "unit" not in runner._object_results and not job_dir.exists()
+
+
+def test_subprocess_malformed_child_status_fails_generically_after_reap_and_cleans(
+        tmp_path, monkeypatch, caplog):
+    from hub.models import Graph, RunStatus
+    from hub.subprocess_runner import SubprocessRunner
+    import hub.subprocess_runner as subprocess_runner
+
+    job_dir = tmp_path / "malformed-child"
+    job_dir.mkdir()
+    status_file = job_dir / "status.json"
+    status_file.write_text('{"status":"done","per_node":"SECRET_BAD_SHAPE"}')
+    events = []
+
+    class Process:
+        returncode = 0
+        polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls == 1 else 0
+
+        @staticmethod
+        def wait(timeout=None):
+            events.append("reaped")
+            return 0
+
+        @staticmethod
+        def terminate():
+            raise AssertionError("malformed interim status must not terminate a live child")
+
+    caplog.set_level("ERROR", logger="hub")
+    monkeypatch.setattr(
+        subprocess_runner, "_safe_abandon_attempt",
+        lambda _uri, **_kwargs: events.append("cleanup"))
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path))
+    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner._procs["run"] = Process()
+    runner._object_results["run"] = {
+        "uri": "s3://region-contract/out.attempt-parent", "cache_key": None,
+    }
+    runner._watch(
+        "run", runner._procs["run"], str(status_file), str(job_dir),
+        Graph.model_validate({"id": "malformed", "version": 1,
+                              "nodes": [], "edges": []}), None)
+
+    final = runner.status("run")
+    assert final.status == "failed"
+    assert final.error == "execution process exited without a valid terminal status"
+    assert "SECRET_BAD_SHAPE" not in final.error
+    assert events == ["reaped", "cleanup"]
+    assert not job_dir.exists() and runner._procs == {} and runner._object_results == {}
+
+
+def test_local_cleanup_outages_do_not_replace_primary_failure_or_skip_finally(
+        tmp_path, monkeypatch, caplog):
+    from hub.models import CompilePlan, Graph, RunStatus
+    from hub.plugins.runner import LocalRunner, _CancelToken
+
+    attempt = "s3://local-cleanup/results/out.attempt-parent"
+
+    class Adapter:
+        @staticmethod
+        def fingerprint(_uri):
+            return "source"
+
+    class Guard:
+        @staticmethod
+        def check():
+            return None
+
+    class Lease:
+        def __enter__(self):
+            return Guard()
+
+        def __exit__(self, *_args):
+            raise RuntimeError("lease cleanup unavailable")
+
+    runner = LocalRunner(lambda _uri: Adapter(), {}, object(), str(tmp_path))
+    graph = Graph.model_validate({
+        "id": "cleanup", "version": 1,
+        "nodes": [{"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                   "data": {"config": {"uri": "s3://local-cleanup/source.parquet"}}}],
+        "edges": [],
+    })
+    runner.runs["run"] = RunStatus(run_id="run", status="queued", per_node=[])
+    runner._cancel["run"] = _CancelToken()
+
+    def fail_result(_node_id, _engine, status, *_args):
+        status.output_uri = attempt
+        raise RuntimeError("primary data failure")
+
+    runner._materialize_result = fail_result
+    monkeypatch.setattr(handoff, "managed_read_lease", lambda *_args, **_kwargs: Lease())
+    monkeypatch.setattr(
+        metadb, "abandon_committed_object_attempt",
+        lambda _uri: (_ for _ in ()).throw(RuntimeError("metadata cleanup unavailable")))
+    discarded = []
+    monkeypatch.setattr(handoff, "discard_attempt", discarded.append)
+    caplog.set_level("ERROR", logger="hub")
+
+    runner._execute(
+        "run", CompilePlan(target_node_id="source", steps=[]), graph, "source")
+    final = runner.status("run")
+    assert final.status == "failed" and "primary data failure" in (final.error or "")
+    assert "metadata cleanup unavailable" not in (final.error or "")
+    assert discarded == []
+    assert "metadata cleanup unavailable" in caplog.text
+    assert "lease cleanup unavailable" in caplog.text
+    assert "run" not in runner._cancel and "run" not in runner._scopes
+
+
+def test_local_sink_prepublication_fence_blocks_catalog_and_abandons_attempt(
+        tmp_path, monkeypatch):
+    from hub.models import Graph, RunStatus
+    from hub.plugins import catalog as catalog_mod
+    from hub.plugins.runner import LocalRunner, _CancelToken
+
+    logical = "s3://lease-fence/results/out.parquet"
+    attempt = "s3://lease-fence/results/out.attempt-parent"
+    lease_alive = True
+    published = []
+    discarded = []
+
+    class CoreAdapter:
+        @staticmethod
+        def write(_uri, _rel, _mode, cancelled=None):
+            nonlocal lease_alive
+            lease_alive = False
+            return {"rows": 1}
+
+    CoreAdapter.__module__ = "hub.plugins.adapters"
+    adapter = CoreAdapter()
+
+    class Storage:
+        @staticmethod
+        def output_uri(_name, _ext):
+            return logical
+
+    class Engine:
+        @staticmethod
+        def relation(_node_id, _source_handle=None):
+            return type("Relation", (), {"columns": ["value"], "types": ["BIGINT"]})()
+
+    graph = Graph.model_validate({
+        "id": "lease-fence", "version": 1,
+        "nodes": [
+            {"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": str(tmp_path / "source.parquet")}}},
+            {"id": "write", "type": "write", "position": {"x": 100, "y": 0},
+             "data": {"config": {"filename": "out.parquet"}}},
+        ],
+        "edges": [{"id": "source-write", "source": "source", "target": "write"}],
+    })
+    runner = LocalRunner(
+        lambda _uri: adapter, {}, object(), str(tmp_path), storage=Storage())
+    monkeypatch.setattr(handoff, "allocate_attempt", lambda **_kwargs: {"uri": attempt})
+    monkeypatch.setattr(handoff, "write_manifest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(handoff, "discard_attempt", discarded.append)
+    monkeypatch.setattr(metadb, "abandon_committed_object_attempt", lambda _uri: False)
+    monkeypatch.setattr(
+        catalog_mod, "core_managed_publisher",
+        lambda _catalog: lambda **kwargs: published.append(kwargs))
+
+    def fence(**_kwargs):
+        if not lease_alive:
+            raise RuntimeError("managed source lease lost during write")
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        runner._commit_write(
+            next(node for node in graph.nodes if node.id == "write"), graph, Engine(),
+            RunStatus(run_id="run", status="running", per_node=[]), None,
+            _CancelToken(), pre_publish=fence)
+    assert published == []
+    assert discarded == [attempt]
+
+
+def test_local_successful_sink_publication_is_not_reversed_by_later_lease_renewal(
+        tmp_path, monkeypatch):
+    from hub.models import CompilePlan, Graph, PerNodeStatus, PlanStep, RunStatus
+    from hub.plugins.runner import LocalRunner, _CancelToken
+
+    checks = []
+
+    class Adapter:
+        @staticmethod
+        def fingerprint(_uri):
+            return "source"
+
+    class Guard:
+        @staticmethod
+        def check():
+            checks.append("check")
+            if len(checks) > 2:
+                raise RuntimeError("lease renewal failed after publication")
+
+    class Lease:
+        def __enter__(self):
+            return Guard()
+
+        @staticmethod
+        def __exit__(*_args):
+            return None
+
+    class Catalog:
+        @staticmethod
+        def register_output(**kwargs):
+            return {"uri": kwargs["uri"], "name": kwargs["name"], "version": "v1"}
+
+        @staticmethod
+        def get_table(uri):
+            return {"uri": uri, "name": "out", "version": "v1"}
+
+    graph = Graph.model_validate({
+        "id": "post-publish-lease", "version": 1,
+        "nodes": [
+            {"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": str(tmp_path / "source.parquet")}}},
+            {"id": "write", "type": "write", "position": {"x": 100, "y": 0},
+             "data": {"config": {"filename": "out.csv"}}},
+        ],
+        "edges": [{"id": "source-write", "source": "source", "target": "write"}],
+    })
+    step = PlanStep(node_id="write", kind="write", label="write")
+    plan = CompilePlan(target_node_id="write", steps=[step])
+    runner = LocalRunner(lambda _uri: Adapter(), {}, Catalog(), str(tmp_path))
+    runner.runs["run"] = RunStatus(
+        run_id="run", status="queued",
+        per_node=[PerNodeStatus(node_id="write", status="queued", label="write")])
+    runner._cancel["run"] = _CancelToken()
+    monkeypatch.setattr(handoff, "managed_read_lease", lambda *_args, **_kwargs: Lease())
+
+    def commit(_node, _graph, _engine, status, _cached, _cancel, pre_publish=None):
+        pre_publish(check_cancel=False)
+        status.output_uri = str(tmp_path / "out.csv")
+        status.output_table = "out"
+        return 1
+
+    runner._commit_write = commit
+    runner._execute("run", plan, graph, "write")
+    assert runner.status("run").status == "done"
+    assert checks == ["check", "check"]
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["unmanaged", "managed"])
+def test_local_cancel_race_respects_sink_commit_point(
+        tmp_path, monkeypatch, managed):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    from hub import compiler
+    from hub.deps import Deps
+    from hub.models import Graph
+    from hub.plugins import catalog as catalog_mod
+    from hub.plugins.adapters import DuckDBAdapter
+    from hub.plugins.runner import LocalRunner
+
+    source = tmp_path / "source.parquet"
+    pq.write_table(pa.table({"value": [1]}), source)
+    workspace = tmp_path / "workspace"
+    data_dir = tmp_path / "data"
+    workspace.mkdir()
+    data_dir.mkdir()
+    deps = Deps(str(workspace), str(data_dir))
+    logical = (
+        "s3://cancel-race/results/out.parquet" if managed
+        else "custom://cancel-race/out.csv")
+    attempt = "s3://cancel-race/results/out.attempt-parent"
+    registered = []
+    managed_published = []
+    discarded = []
+
+    class Catalog:
+        @staticmethod
+        def register_output(**kwargs):
+            registered.append(kwargs)
+            return {"uri": kwargs["uri"], "name": kwargs["name"], "version": "v1"}
+
+        @staticmethod
+        def get_table(uri):
+            return {"uri": uri, "name": registered[-1]["name"], "version": "v1"}
+
+    class SinkAdapter:
+        @staticmethod
+        def write(uri, _rel, _mode, cancelled=None):
+            next(iter(runner._cancel.values())).set()
+            return {"uri": uri, "rows": 1}
+
+    if managed:
+        SinkAdapter.__module__ = "hub.plugins.adapters"
+    sink_adapter = SinkAdapter()
+    source_adapter = DuckDBAdapter()
+
+    class Storage:
+        @staticmethod
+        def output_uri(_name, _ext):
+            return logical
+
+    def resolve(uri):
+        return sink_adapter if uri == logical or uri.startswith(attempt) else source_adapter
+
+    runner = LocalRunner(
+        resolve, deps.registry, Catalog(), str(workspace),
+        node_builders=deps.node_builders, node_specs=deps.node_specs, storage=Storage())
+    monkeypatch.setattr(handoff, "allocate_attempt", lambda **_kwargs: {"uri": attempt})
+    monkeypatch.setattr(handoff, "write_manifest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(handoff, "discard_attempt", discarded.append)
+    monkeypatch.setattr(metadb, "abandon_committed_object_attempt", lambda _uri: False)
+    monkeypatch.setattr(
+        catalog_mod, "core_managed_publisher",
+        lambda _catalog: lambda **kwargs: managed_published.append(kwargs) or {"uri": kwargs["uri"]})
+    graph = Graph.model_validate({
+        "id": "cancel-race", "version": 1,
+        "nodes": [
+            {"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": str(source)}}},
+            {"id": "write", "type": "write", "position": {"x": 100, "y": 0},
+             "data": {"config": {"filename": "out.parquet" if managed else "out.csv"}}},
+        ],
+        "edges": [{"id": "source-write", "source": "source", "target": "write"}],
+    })
+    plan = compiler.compile_plan(
+        graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    started = runner.run(plan, graph, "write", "local")
+    deadline = time.monotonic() + 5
+    while runner.status(started.run_id).status not in ("done", "failed", "cancelled"):
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    final = runner.status(started.run_id)
+    if managed:
+        assert final.status == "cancelled"
+        assert managed_published == [] and registered == []
+        assert discarded == [attempt]
+    else:
+        assert final.status == "done"
+        assert final.output_uri == logical and final.output_table == "out"
+        assert len(registered) == 1 and managed_published == [] and discarded == []
+
+
+def test_local_runner_rejects_multiple_writes_before_starting_worker(tmp_path):
+    from hub.models import CompilePlan, Graph, PlanStep
+    from hub.plugins.runner import LocalRunner
+
+    runner = LocalRunner(lambda _uri: object(), {}, object(), str(tmp_path))
+    plan = CompilePlan(target_node_id="second", steps=[
+        PlanStep(node_id="first", kind="write", label="first"),
+        PlanStep(node_id="second", kind="write", label="second"),
+    ])
+    with pytest.raises(RuntimeError, match="until atomic multi-sink publication"):
+        runner.run(
+            plan, Graph.model_validate({"id": "multi", "version": 1,
+                                        "nodes": [], "edges": []}), "second", "local")
+    assert runner.runs == {}
+
+
+def test_local_unmanaged_sink_registers_all_join_sources(tmp_path, monkeypatch):
+    from hub import graph as graph_mod, sinks
+    from hub.models import Graph, RunStatus
+    from hub.plugins.runner import LocalRunner, _CancelToken
+
+    source_a = str(tmp_path / "a.parquet")
+    source_b = str(tmp_path / "b.parquet")
+    output = str(tmp_path / "joined.csv")
+    registered = {}
+
+    class Catalog:
+        @staticmethod
+        def register_output(**kwargs):
+            registered.update(kwargs)
+            return {"uri": kwargs["uri"], "name": kwargs["name"], "version": "v1"}
+
+        @staticmethod
+        def get_table(uri):
+            return {"uri": uri, "name": registered["name"], "version": "v1"}
+
+    class Storage:
+        @staticmethod
+        def output_uri(_name, _ext):
+            return output
+
+    class Adapter:
+        @staticmethod
+        def write(*_args, **_kwargs):
+            raise AssertionError("commit_sink is isolated in this lineage test")
+
+    class Engine:
+        @staticmethod
+        def relation(_node_id, _source_handle=None):
+            return object()
+
+    graph = Graph.model_validate({
+        "id": "local-lineage", "version": 1,
+        "nodes": [
+            {"id": "a", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": source_a}}},
+            {"id": "b", "type": "source", "position": {"x": 0, "y": 100},
+             "data": {"config": {"uri": source_b}}},
+            {"id": "join", "type": "join", "position": {"x": 100, "y": 50},
+             "data": {"config": {}}},
+            {"id": "transform", "type": "transform", "position": {"x": 200, "y": 50},
+             "data": {"config": {}}},
+            {"id": "write", "type": "write", "position": {"x": 300, "y": 50},
+             "data": {"config": {"filename": "joined.csv"}}},
+        ],
+        "edges": [
+            {"id": "a-join", "source": "a", "target": "join", "targetHandle": "a"},
+            {"id": "b-join", "source": "b", "target": "join", "targetHandle": "b"},
+            {"id": "join-transform", "source": "join", "target": "transform"},
+            {"id": "transform-write", "source": "transform", "target": "write"},
+        ],
+    })
+    monkeypatch.setattr(
+        sinks, "commit_sink",
+        lambda *_args, **_kwargs: sinks.SinkCommit(name="joined", uri=output, rows=2))
+    runner = LocalRunner(
+        lambda _uri: Adapter(), {}, Catalog(), str(tmp_path), storage=Storage())
+    runner._commit_write(
+        next(node for node in graph.nodes if node.id == "write"), graph, Engine(),
+        RunStatus(run_id="run", status="running", per_node=[]), None,
+        _CancelToken(), pre_publish=lambda **_kwargs: None)
+    expected = graph_mod.all_upstream_source_uris(graph, "write")
+    assert set(expected) == {source_a, source_b}
+    assert registered["parents"] == expected
+
+
+def test_local_sink_catalog_detail_is_logged_but_status_is_generic(
+        tmp_path, caplog):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    from hub import compiler
+    from hub.deps import Deps
+    from hub.models import Graph
+    from hub.plugins.runner import LocalRunner
+
+    workspace = tmp_path / "workspace"
+    data_dir = tmp_path / "data"
+    workspace.mkdir()
+    data_dir.mkdir()
+    source = tmp_path / "source.parquet"
+    pq.write_table(pa.table({"value": [1]}), source)
+    deps = Deps(str(workspace), str(data_dir))
+
+    class FailingCatalog:
+        @staticmethod
+        def register_output(**_kwargs):
+            raise RuntimeError("SECRET_LOCAL_CATALOG_DETAIL")
+
+        @staticmethod
+        def get_table(_uri):
+            raise AssertionError("read-back must not run after registration fails")
+
+    graph = Graph.model_validate({
+        "id": "local-secret", "version": 1,
+        "nodes": [
+            {"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": str(source)}}},
+            {"id": "write", "type": "write", "position": {"x": 100, "y": 0},
+             "data": {"config": {"filename": "out.csv"}}},
+        ],
+        "edges": [{"id": "source-write", "source": "source", "target": "write"}],
+    })
+    runner = LocalRunner(
+        deps.resolve_adapter, deps.registry, FailingCatalog(), str(workspace),
+        node_builders=deps.node_builders, node_specs=deps.node_specs,
+        storage=deps.storage)
+    plan = compiler.compile_plan(
+        graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    caplog.set_level("ERROR", logger="hub")
+    started = runner.run(plan, graph, "write", "local")
+    deadline = time.monotonic() + 5
+    while runner.status(started.run_id).status not in ("done", "failed", "cancelled"):
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    final = runner.status(started.run_id)
+    assert final.status == "failed"
+    assert "sink publication failed" in (final.error or "")
+    assert "SECRET_LOCAL_CATALOG_DETAIL" not in (final.error or "")
+    assert "SECRET_LOCAL_CATALOG_DETAIL" in caplog.text
+
+
+def test_strict_unmanaged_publication_requires_readable_output_and_subclass_persistence(
+        tmp_path, monkeypatch):
+    from hub.models import ColumnSchema
+    from hub.plugins.catalog import (
+        InMemoryCatalog,
+        publish_unmanaged_output_attested,
+    )
+
+    missing_uri = str(tmp_path / "missing.parquet")
+
+    class MissingAdapter:
+        @staticmethod
+        def schema(_uri):
+            raise FileNotFoundError("missing output")
+
+        @staticmethod
+        def count(_uri):
+            raise FileNotFoundError("missing output")
+
+    catalog = InMemoryCatalog(str(tmp_path / "empty"), lambda _uri: MissingAdapter())
+    with pytest.raises(RuntimeError, match="schema/count probe failed"):
+        catalog.publish_output_strict("missing", missing_uri)
+    assert metadb.catalog_get(missing_uri) is None
+
+    class Probe:
+        @staticmethod
+        def schema(_uri):
+            return [ColumnSchema(name="value", type="BIGINT")]
+
+        @staticmethod
+        def count(_uri):
+            return 1
+
+        @staticmethod
+        def fingerprint(_uri):
+            return "strict-subclass"
+
+    class ReadOnlyCatalog(InMemoryCatalog):
+        def register_output(self, **_kwargs):
+            raise AssertionError("subclass must retain the inherited strict authority")
+
+        def publish_output_strict(self, **_kwargs):
+            return {"uri": strict_uri, "name": "strict", "version": "forged"}
+
+    strict_uri = str(tmp_path / "strict.parquet")
+    subclass = ReadOnlyCatalog(str(tmp_path / "empty-subclass"), lambda _uri: Probe())
+    monkeypatch.setattr(
+        metadb, "catalog_upsert_entry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("persist unavailable")))
+    with pytest.raises(RuntimeError, match="persist unavailable"):
+        publish_unmanaged_output_attested(
+            subclass, name="strict", uri=strict_uri, parents=[], pipeline="canvas")
+    assert metadb.catalog_get(strict_uri) is None
+
+
+def test_post_popen_setup_failure_retains_writer_when_reap_is_unproved(
+        tmp_path, monkeypatch):
+    from hub.models import CompilePlan, Graph
+    from hub.subprocess_runner import SubprocessRunner
+    import hub.subprocess_runner as subprocess_runner
+
+    attempt = "s3://setup-retained/results/out.attempt-parent"
+    discarded = []
+
+    class Storage:
+        @staticmethod
+        def output_uri(_name, _ext):
+            return "s3://setup-retained/results/out.parquet"
+
+    class Adapter:
+        @staticmethod
+        def fingerprint(_uri):
+            return "source"
+
+    class Process:
+        returncode = None
+
+        @staticmethod
+        def poll():
+            return None
+
+        @staticmethod
+        def terminate():
+            return None
+
+        @staticmethod
+        def wait(timeout=None):
+            raise OSError("wait proof unavailable")
+
+    class BrokenThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        @staticmethod
+        def start():
+            raise RuntimeError("thread setup failed")
+
+    monkeypatch.setattr(subprocess_runner.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(subprocess_runner.threading, "Thread", BrokenThread)
+    monkeypatch.setattr(handoff, "allocate_attempt", lambda **_kwargs: {"uri": attempt})
+    monkeypatch.setattr(handoff, "discard_attempt", discarded.append)
+    runner = SubprocessRunner(
+        str(tmp_path), str(tmp_path), storage=Storage(),
+        resolve_adapter=lambda _uri: Adapter())
+    runner.on_status = lambda _graph, _status: None
+    graph = Graph.model_validate({
+        "id": "setup-retained", "version": 1,
+        "nodes": [{"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                   "data": {"config": {"uri": str(tmp_path / "source.parquet")}}}],
+        "edges": [],
+    })
+    with pytest.raises(RuntimeError, match="thread setup failed"):
+        runner.run(
+            CompilePlan(target_node_id="source", steps=[]), graph, "source", "local",
+            run_id="setup-retained")
+
+    assert discarded == []
+    assert "setup-retained" in runner._procs
+    assert "setup-retained" in runner._object_results
+    assert runner.status("setup-retained").status == "running"
+    assert runner.status("setup-retained").stalled is True
+    cancel_file = runner._cancel_files["setup-retained"]
+    assert (job_dir := __import__("pathlib").Path(cancel_file).parent).is_dir()
+    runner._procs.clear()
+    runner._cancel_files.clear()
+    runner._object_results.clear()
+    runner.runs.clear()
+    __import__("shutil").rmtree(job_dir, ignore_errors=True)
+
+
+def test_metadata_cleanup_outage_never_discards_uncertain_object(
+        monkeypatch, caplog):
+    from hub.plugins import runner as runner_mod
+    import hub.subprocess_runner as subprocess_runner
+
+    attempt = "s3://cleanup-outage/results/out.attempt-owned"
+    discarded = []
+    monkeypatch.setattr(
+        metadb, "abandon_committed_object_attempt",
+        lambda _uri: (_ for _ in ()).throw(RuntimeError("metadata unavailable")))
+    monkeypatch.setattr(handoff, "discard_attempt", discarded.append)
+    caplog.set_level("ERROR", logger="hub")
+
+    runner_mod._safe_abandon_attempt(attempt)
+    subprocess_runner._safe_abandon_attempt(attempt, context="test cleanup")
+    assert discarded == []
+    assert caplog.text.count("metadata unavailable") >= 2
+
+
+def test_supervisor_reap_failure_retains_attempt_jobdir_and_process_tracking(
+        tmp_path, monkeypatch):
+    from hub.models import Graph, RunStatus
+    from hub.subprocess_runner import SubprocessRunner
+    import hub.subprocess_runner as subprocess_runner
+
+    job_dir = tmp_path / "unreaped-supervisor"
+    job_dir.mkdir()
+    status_file = job_dir / "status.json"
+    attempt = "s3://supervisor-retained/results/out.attempt-parent"
+    cleanup = []
+
+    class Process:
+        returncode = None
+
+        @staticmethod
+        def poll():
+            return None
+
+        @staticmethod
+        def terminate():
+            return None
+
+        @staticmethod
+        def wait(timeout=None):
+            raise OSError("reap unavailable")
+
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path))
+    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner._procs["run"] = Process()
+    runner._cancel_files["run"] = str(job_dir / "cancel.requested")
+    runner._object_results["run"] = {"uri": attempt, "cache_key": None}
+    runner._sink_contracts["run"] = {"write": {"name": "out"}}
+    completed = []
+    retries = []
+    runner.on_complete = lambda *_args: completed.append(True)
+    monkeypatch.setattr(
+        runner, "_watch_inner",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("watcher bug")))
+    monkeypatch.setattr(
+        runner, "_schedule_watch_retry",
+        lambda *_args, **_kwargs: retries.append("retry"))
+    monkeypatch.setattr(
+        subprocess_runner, "_safe_abandon_attempt",
+        lambda *_args, **_kwargs: cleanup.append("cleanup"))
+    runner._watch(
+        "run", runner._procs["run"], str(status_file), str(job_dir),
+        Graph.model_validate({"id": "supervisor", "version": 1,
+                              "nodes": [], "edges": []}), None)
+
+    assert runner.status("run").status == "running"
+    assert runner.status("run").stalled is True
+    assert "retrying writer reconciliation" in (runner.status("run").error or "")
+    assert completed == [] and retries == ["retry"]
+    assert cleanup == []
+    assert runner._procs.get("run") is not None
+    assert runner._object_results["run"]["uri"] == attempt
+    assert "run" in runner._sink_contracts
+    assert job_dir.is_dir()
+    runner._procs.clear()
+    runner._cancel_files.clear()
+    runner._object_results.clear()
+    runner._sink_contracts.clear()
+    runner.runs.clear()
+    __import__("shutil").rmtree(job_dir, ignore_errors=True)
+
+
+def test_managed_catalog_probe_holds_read_lease_against_gc(
+        tmp_path, monkeypatch):
+    from hub.models import ColumnSchema
+    from hub.plugins.catalog import InMemoryCatalog
+
+    handle = _handle(
+        "sink", logical=f"s3://catalog-probe/{uuid.uuid4().hex}/out.parquet")
+    _commit(handle)
+    entered = threading.Event()
+    release = threading.Event()
+    result = []
+    errors = []
+
+    class BlockingProbe:
+        @staticmethod
+        def schema(_uri):
+            entered.set()
+            assert release.wait(timeout=5)
+            return [ColumnSchema(name="value", type="BIGINT")]
+
+        @staticmethod
+        def count(_uri):
+            return 1
+
+        @staticmethod
+        def fingerprint(_uri):
+            return "blocked-probe"
+
+    catalog = InMemoryCatalog(str(tmp_path / "catalog"), lambda _uri: BlockingProbe())
+    monkeypatch.setattr(handoff, "prepare_attempt_commit", lambda _uri: None)
+
+    def publish():
+        try:
+            result.append(catalog.publish_managed_output("out", handle["uri"]))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=publish)
+    thread.start()
+    assert entered.wait(timeout=5)
+    with metadb.session() as session:
+        publish_lease = session.get(
+            metadb.ObjectAttemptLease, handle["publish_lease_id"])
+        publish_lease.expires_at = metadb._db_now(session) - datetime.timedelta(seconds=1)
+        read_leases = list(session.scalars(select(metadb.ObjectAttemptLease).where(
+            metadb.ObjectAttemptLease.attempt_uri == handle["uri"],
+            metadb.ObjectAttemptLease.lease_type == "read")))
+        assert len(read_leases) == 1
+
+    assert handoff.reap_attempts(
+        retention_seconds=0, delete_grace_seconds=0) == {
+            "observed": [], "deleted": [], "quarantined": [],
+        }
+    assert _state(handle["uri"]) == "committed"
+    release.set()
+    thread.join(timeout=15)
+    assert not thread.is_alive() and errors == []
+    assert result[0]["uri"] == handle["uri"]
+    assert _state(handle["uri"]) == "published"
+    metadb.catalog_delete_entry(handle["uri"])
+    metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_pool_worker_slot_stays_fenced_until_child_stop_is_proven(
+        tmp_path, monkeypatch):
+    from hub.pool_runner import PoolRunner
+    from hub.subprocess_runner import SubprocessRunner
+
+    class Process:
+        stopped = False
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+    runner = PoolRunner(
+        str(tmp_path), str(tmp_path), [{"name": "worker", "cpu": 1}])
+    proc = Process()
+    runner._assigned["run"] = "worker"
+    runner._procs["run"] = proc
+    monkeypatch.setattr(SubprocessRunner, "_watch", lambda *_args, **_kwargs: None)
+
+    runner._watch("run")
+    assert runner._assigned == {"run": "worker"}
+    assert runner.workers()[0].state == "busy"
+
+    proc.stopped = True
+    runner._watch("run")
+    assert runner._assigned == {}
+    assert runner.workers()[0].state == "idle"

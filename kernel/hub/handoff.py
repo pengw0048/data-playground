@@ -441,6 +441,13 @@ def _exact_manifest_inventory(uri: str, manifest: dict,
     visible = [item for item in actual if item["member_type"] in (
         "object_version", "unversioned_object") and item.get("is_latest")]
     by_key = {str(item["key"]): item for item in visible}
+    # Ray's S3 filesystem creates an empty object for the exact output directory before its workers
+    # write shards. It is owned by this immutable attempt and remains part of the persisted exact
+    # inventory (and therefore exact GC); allow only that precise zero-byte root marker. Any nested,
+    # non-empty, or otherwise unexpected object still fails the set-equality barrier below.
+    root_marker = base.rstrip("/") + "/"
+    if (marker := by_key.get(root_marker)) is not None and marker.get("size") == 0:
+        expected[root_marker] = 0
     if set(by_key) != set(expected):
         raise RuntimeError("manifest inventory does not match the latest visible object versions")
     for key, size in expected.items():

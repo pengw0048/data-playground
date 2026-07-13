@@ -102,7 +102,8 @@ class InMemoryCatalog:
     def _add(self, name: str, uri: str, version: str | None = None, meta: str | None = None,
              folder: str = "", tags: list[str] | None = None, owner: str | None = None,
              description: str | None = None, parents: list[str] | None = None,
-             pipeline: str | None = None, *, strict_probe: bool = False) -> CatalogTable:
+             pipeline: str | None = None, *, strict_probe: bool = False,
+             strict_persist: bool = False) -> CatalogTable:
         import hashlib as _h
         # schema/count probe (may touch disk/network) OUTSIDE the lock so a slow adapter doesn't block
         # concurrent catalog reads; only the version/collision compute + upsert below is serialized.
@@ -112,7 +113,7 @@ class InMemoryCatalog:
             count = adapter.count(uri)
         except Exception as exc:  # noqa: BLE001 — unmanaged registrations may describe offline data
             if strict_probe:
-                raise RuntimeError("managed output schema/count probe failed") from exc
+                raise RuntimeError("output schema/count probe failed") from exc
             adapter, columns, count = None, [], None
         fp = "unknown"
         try:
@@ -148,7 +149,8 @@ class InMemoryCatalog:
                 columns=columns, keys=keys, meta=meta, folder=folder, tags=tags,
                 owner=owner, description=description,
             )
-            self._persist(table, parents=parents, pipeline=pipeline)
+            self._persist(
+                table, parents=parents, pipeline=pipeline, strict=strict_persist)
         self._embed_one(table)  # best-effort semantic index (no-op without an embedder)
         return table
 
@@ -169,7 +171,7 @@ class InMemoryCatalog:
                     name, prior.get("version"), version, detail)
 
     def _persist(self, table: CatalogTable, *, parents: list[str] | None = None,
-                 pipeline: str | None = None) -> None:
+                 pipeline: str | None = None, strict: bool = False) -> None:
         try:
             from hub.handoff import prepare_attempt_commit
             prepare_attempt_commit(table.uri)
@@ -178,7 +180,7 @@ class InMemoryCatalog:
                 parents=parents, pipeline=pipeline)
         except Exception as e:  # noqa: BLE001
             from hub.handoff import is_attempt_uri
-            if metadb.object_attempt_is_managed(table.uri) or is_attempt_uri(table.uri):
+            if strict or metadb.object_attempt_is_managed(table.uri) or is_attempt_uri(table.uri):
                 raise
             log.warning("catalog persist failed for %s (%s: %s)", table.name, type(e).__name__, e)
 
@@ -315,6 +317,21 @@ class InMemoryCatalog:
             metadb.catalog_bump_usage(parent)  # a derived output READ its parent → popularity signal
         return table
 
+    def publish_output_strict(self, name: str, uri: str, version: str | None = None,
+                              parents: list[str] | None = None,
+                              pipeline: str | None = None) -> CatalogTable:
+        """Durably publish a just-written unmanaged output or propagate the metadata transaction failure."""
+        table = self._add(
+            name=name, uri=uri, version=version, meta=pipeline,
+            parents=parents, pipeline=pipeline, strict_probe=True,
+            strict_persist=True)
+        for parent in parents or []:
+            try:
+                metadb.catalog_bump_usage(parent)
+            except Exception:  # noqa: BLE001 — popularity is optional after durable publication
+                log.warning("catalog usage bump failed after strict publication", exc_info=True)
+        return table
+
     def publish_managed_output(self, name: str, uri: str, version: str | None = None,
                                parents: list[str] | None = None,
                                pipeline: str | None = None) -> dict:
@@ -325,9 +342,19 @@ class InMemoryCatalog:
         from hub.handoff import prepare_attempt_commit
         prepare_attempt_commit(uri)
         try:
-            table = self._add(
-                name=name, uri=uri, version=version, parents=parents, pipeline=pipeline,
-                strict_probe=True)
+            from hub.handoff import managed_read_lease
+            try:
+                deadline = float(os.environ.get("DP_RUN_DEADLINE_S", "3600"))
+            except ValueError:
+                deadline = 3600.0
+            ttl = max(300.0, deadline + 300.0)
+            with managed_read_lease(
+                    uri, owner=f"catalog-publish:{name}", ttl_seconds=ttl,
+                    allow_committed=True) as guard:
+                guard.check()
+                table = self._add(
+                    name=name, uri=uri, version=version, parents=parents, pipeline=pipeline,
+                    strict_probe=True)
         except Exception:
             receipt = metadb.catalog_managed_publication_receipt(uri)
             if receipt is not None:
@@ -571,6 +598,56 @@ class InMemoryCatalog:
 def core_managed_publisher(catalog):
     """Return the core lifecycle publisher only; a lookalike custom method cannot claim this authority."""
     return catalog.publish_managed_output if type(catalog) is InMemoryCatalog else None
+
+
+def core_unmanaged_publisher(catalog):
+    """Return the inherited core strict writer; external catalogs use register + read-back."""
+    if not isinstance(catalog, InMemoryCatalog):
+        return None
+    from functools import partial
+    return partial(InMemoryCatalog.publish_output_strict, catalog)
+
+
+def unmanaged_publication_supported(catalog) -> bool:
+    """Whether a catalog can durably publish and attest a just-written unmanaged output."""
+    return bool(
+        core_unmanaged_publisher(catalog) is not None
+        or (callable(getattr(catalog, "register_output", None))
+            and callable(getattr(catalog, "get_table", None)))
+    )
+
+
+def publish_unmanaged_output_attested(catalog, *, name: str, uri: str,
+                                      version: str | None = None,
+                                      parents: list[str] | None = None,
+                                      pipeline: str | None = None):
+    """Publish an unmanaged output and require an exact uri/name/version receipt."""
+    publish = core_unmanaged_publisher(catalog)
+    kwargs = {
+        "name": name, "uri": uri, "version": version,
+        "parents": parents, "pipeline": pipeline,
+    }
+    if publish is not None:
+        receipt = observed = publish(**kwargs)
+    else:
+        if not unmanaged_publication_supported(catalog):
+            raise RuntimeError(
+                "unmanaged output publication requires catalog registration with read-back")
+        receipt = catalog.register_output(**kwargs)
+        observed = catalog.get_table(uri)
+
+    missing = object()
+
+    def field(doc, key):
+        if isinstance(doc, dict):
+            return doc[key] if key in doc else missing
+        return getattr(doc, key, missing)
+
+    expected = (field(receipt, "uri"), field(receipt, "name"), field(receipt, "version"))
+    actual = (field(observed, "uri"), field(observed, "name"), field(observed, "version"))
+    if expected[0] != uri or expected[1] != name or missing in expected or actual != expected:
+        raise RuntimeError("catalog publication read-back did not match its receipt")
+    return observed
 
 
 class CatalogCompat:

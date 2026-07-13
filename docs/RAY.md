@@ -77,10 +77,11 @@ worker-direct Parquet output; a local destination makes the graph fall back befo
 
 ### Managed object publication and deletion
 
-Worker-direct managed writes currently support one managed Parquet sink per Ray run. A graph with two or
-more such sinks fails before any attempt is allocated or writer is dispatched; atomic batch publication is
-required before that limit can be lifted. An external catalog also fails before allocation because only the
-core catalog publisher can atomically swap the logical pointer, ownership reference, and attempt state.
+Each Ray run currently supports at most one write sink, regardless of sink type. A graph with two or more
+write sinks fails before any attempt is allocated or writer is dispatched; atomic batch publication is
+required before that limit can be lifted. Managed object writes require the core catalog authority that can
+atomically swap the logical pointer, ownership reference, and attempt state. Unmanaged writes require a
+catalog with durable registration and exact read-back attestation.
 
 Core provides a built-in lifecycle provider for S3 and compatible endpoints that implement its complete API
 contract. [R2's S3 compatibility API](https://developers.cloudflare.com/r2/api/s3/api/) currently omits the

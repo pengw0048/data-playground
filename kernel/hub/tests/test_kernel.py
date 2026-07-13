@@ -751,6 +751,7 @@ def test_kernel_liveness_counts_in_process_preview_profile():
 def test_dp_execution_is_the_third_precedence_tier(tmp_path, monkeypatch):
     # precedence: per-user > workspace > DP_EXECUTION > kernel default. With no user/global setting,
     # DP_EXECUTION (settings.execution) is honored — the tier only incidentally covered before.
+    from hub import handoff
     from hub.deps import Deps
     from hub.settings import settings
     monkeypatch.setattr(settings, "execution", "local-out-of-core")
@@ -2538,9 +2539,19 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
     allow_registration = threading.Event()
 
     class BlockingCatalog:
+        entry = None
+
         def register_output(self, **_kwargs):
             registration_started.set()
             assert allow_registration.wait(timeout=5)
+            self.entry = {
+                "uri": _kwargs["uri"], "name": _kwargs["name"], "version": "v1",
+            }
+            return self.entry
+
+        def get_table(self, uri):
+            assert self.entry is not None and self.entry["uri"] == uri
+            return self.entry
 
     class FinishedProcess:
         returncode = 0
@@ -2556,6 +2567,11 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
     runner = SubprocessRunner("test", str(tmp_path), catalog=BlockingCatalog())
     run_id = "run_catalog_gate"
     runner.runs[run_id] = RunStatus(run_id=run_id, status="running", per_node=[])
+    runner._sink_contracts[run_id] = {"write": {
+        "logical_uri": str(tmp_path / "result.parquet"),
+        "published_uri": str(tmp_path / "result.parquet"),
+        "name": "result", "parents": [],
+    }}
     status_file = tmp_path / "status.json"
     status_file.write_text(json.dumps(RunStatus(
         run_id="child",
@@ -7818,7 +7834,7 @@ def ray_catalog_object_store():
             "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
             "secretAccessKey": "s", "useSsl": False,
         }, "global")
-        yield
+        yield client
     finally:
         metadb.set_setting("objectStore", previous, "global")
         server.stop()
@@ -7950,13 +7966,15 @@ def test_ray_sink_swallowed_catalog_persist_failure_does_not_publish(
 
     monkeypatch.setattr(
         metadb, "catalog_upsert_entry",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("database unavailable SECRET_SENTINEL")),
     )
-    with pytest.raises(RuntimeError, match="atomically publish"):
+    with pytest.raises(RuntimeError, match="atomically publish") as raised:
         runner._register_outputs(graph, {"outputs": [{
             "step_id": "w", "name": "out", "uri": attempt,
             "logical_uri": "s3://ray-catalog-lifecycle/outputs/out.parquet",
         }]})
+    assert "SECRET_SENTINEL" not in str(raised.value)
     assert metadb.catalog_get(attempt) is None
     with metadb.session() as session:
         assert session.get(metadb.ObjectAttempt, attempt).state == "abandoned"
@@ -7997,6 +8015,50 @@ def test_core_managed_publisher_fails_closed_on_unreadable_output(
     metadb.quarantine_object_attempt(attempt, "test cleanup")
 
 
+@pytest.mark.parametrize(("suffix", "marker_key", "marker_body", "should_commit"), [
+    ("empty", "/", b"", True),
+    ("nonempty", "/", b"not-a-directory-marker", False),
+    ("nested", "/nested/", b"", False),
+])
+def test_managed_attempt_inventory_allows_only_empty_exact_root_marker(
+        tmp_path, ray_catalog_object_store, suffix, marker_key, marker_body, should_commit):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub import handoff, metadb
+    from hub.plugins.adapters import object_fs
+
+    logical = f"s3://ray-catalog-lifecycle/outputs/root-marker-{suffix}.parquet"
+    attempt = f"s3://ray-catalog-lifecycle/outputs/root-marker-{suffix}.attempt-test"
+    metadb.allocate_object_attempt(
+        logical_uri=logical, kind="sink", run_id=f"root-marker-{suffix}",
+        allocation_key=f"root-marker-{suffix}", catalog_key_base=f"tbl_root_marker_{suffix}",
+        uri_factory=lambda _namespace, _generation, _attempt_id: attempt)
+    fs, path = object_fs(attempt)
+    bucket, key = path.split("/", 1)
+    ray_catalog_object_store.put_object(
+        Bucket=bucket, Key=key.rstrip("/") + marker_key, Body=marker_body)
+    table = pa.table({"x": [1]})
+    with fs.open_output_stream(path.rstrip("/") + "/part-00000.parquet") as stream:
+        pq.write_table(table, stream)
+    handoff.write_manifest(
+        attempt, run_id=f"root-marker-{suffix}", rows=1, schema=table.schema)
+
+    if should_commit:
+        handoff.prepare_attempt_commit(attempt)
+        inventory = metadb.object_attempt_inventory(attempt)
+        assert any(item["key"] == path.rstrip("/") + "/" and item["size"] == 0
+                   for item in inventory)
+        with metadb.session() as session:
+            assert session.get(metadb.ObjectAttempt, attempt).state == "committed"
+    else:
+        with pytest.raises(RuntimeError, match="inventory could not be proven"):
+            handoff.prepare_attempt_commit(attempt)
+        with metadb.session() as session:
+            assert session.get(metadb.ObjectAttempt, attempt).state == "quarantined"
+    metadb.quarantine_object_attempt(attempt, "test cleanup")
+
+
 def test_ray_managed_publisher_preflight_rejects_lookalike_custom_catalog(tmp_path, monkeypatch):
     import inspect
 
@@ -8023,6 +8085,138 @@ def test_ray_managed_publisher_preflight_rejects_lookalike_custom_catalog(tmp_pa
             ir, {"w": "s3://external-managed/outputs/out.parquet"}, "external-preflight")
     assert allocated == []
     assert "metadb" not in inspect.getsource(runner._register_outputs)
+
+
+def test_ray_rejects_any_multiple_write_sinks_before_allocation(tmp_path, monkeypatch):
+    from hub.deps import Deps
+    from hub.ir import lower_to_ir
+    from hub.models import Graph
+
+    mod = _load_dp_ray()
+    runner = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    graph = Graph(**{"id": "ray-multi-write", "version": 1, "nodes": [
+        _ray_node("first", "write", {"filename": "first.csv"}),
+        _ray_node("second", "write", {"filename": "second.csv"}),
+    ], "edges": []})
+    ir = lower_to_ir(graph, "second", runner.node_specs, runner.deps.node_ir)
+    allocations = []
+    monkeypatch.setattr(mod, "allocate_attempt", lambda **kwargs: allocations.append(kwargs))
+    with pytest.raises(RuntimeError, match="multiple Ray write sinks"):
+        runner._claim_sink_attempts(
+            ir, {"first": "/tmp/first.csv", "second": "/tmp/second.csv"}, "run")
+    assert allocations == []
+
+
+def test_ray_unmanaged_publication_attests_external_catalog_and_all_join_lineage(
+        tmp_path):
+    from hub import graph as graph_mod
+    from hub.deps import Deps
+    from hub.models import Graph
+
+    runner = _load_dp_ray().RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    source_a = str(tmp_path / "a.parquet")
+    source_b = str(tmp_path / "b.parquet")
+    output = str(tmp_path / "joined.csv")
+    registered = {}
+    readbacks = []
+
+    class Catalog:
+        @staticmethod
+        def register_output(**kwargs):
+            registered.update(kwargs)
+            return {"uri": kwargs["uri"], "name": kwargs["name"], "version": "v1"}
+
+        @staticmethod
+        def get_table(uri):
+            readbacks.append(uri)
+            return {"uri": uri, "name": registered["name"], "version": "v1"}
+
+    runner.catalog = Catalog()
+    graph = Graph(**{"id": "ray-lineage", "version": 1, "nodes": [
+        _ray_node("a", "source", {"uri": source_a}),
+        _ray_node("b", "source", {"uri": source_b}),
+        _ray_node("join", "join", {}),
+        _ray_node("transform", "transform", {}),
+        _ray_node("write", "write", {"filename": "joined.csv"}),
+    ], "edges": [
+        {"id": "a-join", "source": "a", "target": "join",
+         "targetHandle": "a", "data": {"wire": "dataset"}},
+        {"id": "b-join", "source": "b", "target": "join",
+         "targetHandle": "b", "data": {"wire": "dataset"}},
+        _ray_edge("join", "transform"),
+        _ray_edge("transform", "write"),
+    ]})
+    runner._register_outputs(graph, {"outputs": [{
+        "step_id": "write", "name": "joined", "uri": output,
+        "logical_uri": output,
+    }]}, expected_targets={"write": output}, expected_attempts={})
+
+    expected = graph_mod.all_upstream_source_uris(graph, "write")
+    assert set(expected) == {source_a, source_b}
+    assert registered["parents"] == expected
+    assert readbacks == [output]
+
+
+def test_ray_settlement_logs_provider_detail_but_returns_generic_error(
+        tmp_path, monkeypatch, caplog):
+    from hub.deps import Deps
+    from hub.models import Graph, RunStatus
+
+    runner = _load_dp_ray().RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    monkeypatch.setattr(
+        runner, "_register_outputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("SECRET_RAY_CATALOG_DETAIL")))
+    caplog.set_level("ERROR")
+    status = RunStatus(run_id="run", status="running", per_node=[])
+    runner._settle_popen_result(
+        Graph(id="ray-generic", version=1, nodes=[], edges=[]), status,
+        {"status": "done", "rows": 0, "outputs": [{"step_id": "write"}]}, 0)
+    assert status.status == "failed"
+    assert status.error == "Ray output publication failed"
+    assert "SECRET_RAY_CATALOG_DETAIL" not in status.error
+    assert "SECRET_RAY_CATALOG_DETAIL" in caplog.text
+
+
+def test_ray_control_plane_setup_and_preflight_errors_are_generic(
+        tmp_path, monkeypatch, caplog):
+    from hub.deps import Deps
+    from hub.models import CompilePlan, Graph, PlanStep
+
+    runner = _load_dp_ray().RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    graph = Graph(**{"id": "ray-control-error", "version": 1, "nodes": [
+        _ray_node("write", "write", {"filename": "out.csv"}),
+    ], "edges": []})
+    plan = CompilePlan(target_node_id="write", steps=[
+        PlanStep(node_id="write", kind="write", label="write"),
+    ])
+    monkeypatch.setattr(runner, "_ray_unsupported_reason", lambda _ir: None)
+    monkeypatch.setattr(runner, "_dedup_unsupported_reason", lambda _graph, _ir: None)
+    monkeypatch.setattr(runner, "_resource_unsupported_reason", lambda _requires, _ir: None)
+    monkeypatch.setattr(runner, "_source_unsupported_reason", lambda _ir: None)
+    monkeypatch.setattr(runner, "_resolve_sink_targets", lambda _ir: {"write": "/tmp/out.csv"})
+    monkeypatch.setattr(
+        runner, "_claim_sink_attempts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("SECRET_RAY_ALLOCATION_TOKEN")))
+    caplog.set_level("ERROR")
+    failed = runner.run(plan, graph, "write", "distributed")
+    assert failed.status == "failed"
+    assert failed.error == "Ray sink control-plane setup failed"
+    assert "SECRET_RAY_ALLOCATION_TOKEN" not in failed.error
+    assert "SECRET_RAY_ALLOCATION_TOKEN" in caplog.text
+
+    monkeypatch.setattr(
+        runner, "_resolve_sink_targets",
+        lambda _ir: (_ for _ in ()).throw(
+            RuntimeError("s3://user:SECRET_URI_PASSWORD@example/out")))
+    monkeypatch.setattr(runner, "_requires_ray", lambda *_args, **_kwargs: True)
+    unsupported = runner.run(
+        plan, graph, "write", "distributed", run_id="ray-preflight-secret")
+    assert unsupported.status == "failed"
+    assert "sink preflight failed" in (unsupported.error or "")
+    assert "SECRET_URI_PASSWORD" not in (unsupported.error or "")
+    assert "SECRET_URI_PASSWORD" in caplog.text
 
 
 def test_ray_whole_run_scopes_each_sink_attempt_by_step_and_unstripped_target(tmp_path):
@@ -8478,6 +8672,244 @@ def test_ray_popen_supervisor_erases_sensitive_workdir_and_closes_log(
         assert run_id not in runner._cancel
 
 
+def test_ray_unreaped_driver_stays_nonterminal_and_retains_every_fence(
+        tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    import tempfile
+    import threading
+    from pathlib import Path
+
+    from hub import handoff
+    from hub.deps import Deps
+    from hub.models import Graph, RunStatus
+
+    mod = _load_dp_ray()
+    workspace, data = tmp_path / "workspace", tmp_path / "data"
+    workspace.mkdir()
+    data.mkdir()
+    runner = mod.RayRunner(Deps(str(workspace), str(data)))
+    work = tmp_path / "retained-ray-driver"
+    work.mkdir()
+    emitted, completed, started, lease_events = [], [], [], []
+
+    class Lease:
+        def __enter__(self):
+            lease_events.append("opened")
+            return self
+
+        def check(self):
+            return None
+
+        def __exit__(self, *_args):
+            lease_events.append("closed")
+
+    processes = []
+
+    class UnreapableProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.returncode = None
+            self.reapable = False
+            processes.append(self)
+
+        def poll(self):
+            return self.returncode if self.reapable else None
+
+        def terminate(self):
+            if not self.reapable:
+                raise OSError("terminate unavailable")
+
+        def kill(self):
+            if not self.reapable:
+                raise OSError("kill unavailable")
+
+        def wait(self, timeout=None):
+            if not self.reapable:
+                raise OSError("wait unavailable")
+            return self.returncode
+
+    class DeferredThread:
+        def __init__(self, *args, **kwargs):
+            self.target = kwargs.get("target")
+
+        def start(self):
+            started.append(self.target)
+            raise RuntimeError("thread start unavailable")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda **_kwargs: str(work))
+    monkeypatch.setattr(subprocess, "Popen", UnreapableProcess)
+    monkeypatch.setattr(threading, "Thread", DeferredThread)
+    monkeypatch.setattr(handoff, "managed_read_lease", lambda *_args, **_kwargs: Lease())
+    real_rmtree = shutil.rmtree
+    removed = []
+    monkeypatch.setattr(shutil, "rmtree", lambda path: removed.append(path))
+
+    run_id = "ray-unreaped"
+    graph = Graph(**{
+        "id": "ray-unreaped", "version": 1,
+        "nodes": [_ray_node("source", "source", {"uri": "s3://bucket/source.attempt-x"})],
+        "edges": [],
+    })
+    status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=[])
+    runner.runs[run_id] = status
+    runner._cancel[run_id] = threading.Event()
+    runner._cancel[run_id].set()  # drive the supervisor into its terminate/reap path
+    runner.on_status = lambda _graph, observed: emitted.append(observed.status)
+    runner.on_complete = lambda *_args: completed.append(True)
+
+    runner._supervise(run_id, graph, None, status)
+
+    assert status.status == "running" and status.stalled is True
+    assert status.error == "Ray driver termination is still being reconciled"
+    assert emitted and emitted[-1] == "running"
+    assert completed == [] and removed == []
+    assert work.is_dir() and run_id in runner._cancel
+    assert run_id in runner._unreaped_drivers and started
+    assert lease_events == ["opened"]
+    assert not runner.cancel_acknowledged(run_id)
+
+    assert processes
+    processes[0].reapable = True
+    processes[0].returncode = 0
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    runner._terminate_all()  # the atexit fallback owns reconciliation if Thread.start failed
+
+    assert status.status == "cancelled" and runner.cancel_acknowledged(run_id)
+    assert completed == [True] and not work.exists()
+    assert run_id not in runner._unreaped_drivers
+    assert run_id not in runner._driver_procs and run_id not in runner._driver_workdirs
+    assert lease_events == ["opened", "closed"]
+
+
+def test_ray_clean_done_receipt_wins_late_cancel_and_nonzero_done_stays_private(
+        tmp_path, monkeypatch):
+    import json
+    import subprocess
+    import tempfile
+    import threading
+    from pathlib import Path
+
+    from hub.deps import Deps
+    from hub.models import Graph, RunStatus
+
+    mod = _load_dp_ray()
+    workspace, data = tmp_path / "workspace", tmp_path / "data"
+    workspace.mkdir()
+    data.mkdir()
+    runner = mod.RayRunner(Deps(str(workspace), str(data)))
+    registered = []
+    driver_work = tmp_path / "late-cancel-driver"
+    driver_work.mkdir()
+
+    class DoneProcess:
+        returncode = 0
+
+        def __init__(self, args, **_kwargs):
+            with open(args[-1]) as stream:
+                job = json.load(stream)
+            Path(job["status_file"]).write_text(json.dumps({
+                "status": "done", "rows": 1,
+                "outputs": [{
+                    "step_id": "write", "name": "out", "uri": "/tmp/out.csv",
+                    "logical_uri": "/tmp/out.csv",
+                }],
+                "output_uri": "/tmp/out.csv", "output_table": "out",
+            }))
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(
+        tempfile, "mkdtemp",
+        lambda **_kwargs: str(driver_work),
+    )
+    monkeypatch.setattr(subprocess, "Popen", DoneProcess)
+    monkeypatch.setattr(
+        runner, "_register_outputs",
+        lambda _graph, result: registered.append(result),
+    )
+    run_id = "ray-late-cancel"
+    graph = Graph(id="ray-late-cancel", version=1, nodes=[], edges=[])
+    status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=[])
+    runner.runs[run_id] = status
+    runner._cancel[run_id] = threading.Event()
+    runner._cancel[run_id].set()
+
+    runner._supervise(run_id, graph, None, status)
+
+    assert status.status == "done" and status.output_uri == "/tmp/out.csv"
+    assert len(registered) == 1
+    assert not runner.cancel_acknowledged(run_id)
+
+    failed = RunStatus(run_id="ray-done-nonzero", status="running")
+    runner._settle_popen_result(
+        graph, failed, {
+            "status": "done", "rows": 1,
+            "outputs": [{"step_id": "write"}],
+        }, -9,
+    )
+    assert failed.status == "failed"
+    assert failed.error == "Ray driver exited unsuccessfully after writing a terminal receipt"
+    assert failed.output_uri is None and failed.output_table is None
+    assert len(registered) == 1
+
+
+def test_ray_reconcile_and_shutdown_have_one_terminal_finalizer(tmp_path, monkeypatch):
+    import threading
+
+    from hub.deps import Deps
+
+    runner = _load_dp_ray().RayRunner(
+        Deps(str(tmp_path / "workspace"), str(tmp_path / "data")))
+    barrier = threading.Barrier(2)
+    finalized = []
+
+    class ReapedProcess:
+        returncode = 0
+
+    proc = ReapedProcess()
+    run_id = "ray-one-finalizer"
+    state = {"run_id": run_id, "proc": proc, "work": str(tmp_path / "work")}
+    runner._unreaped_drivers[run_id] = state
+    runner._driver_procs[run_id] = proc
+    runner._driver_workdirs[run_id] = state["work"]
+    runner._cancel[run_id] = threading.Event()
+    monkeypatch.setattr(
+        runner, "_try_reap_driver",
+        lambda _proc: (barrier.wait(timeout=5), True)[1],
+    )
+    monkeypatch.setattr(
+        runner, "_finish_supervision",
+        lambda claimed: finalized.append(claimed),
+    )
+
+    workers = [
+        threading.Thread(target=runner._reconcile_unreaped_driver, args=(run_id,)),
+        threading.Thread(target=runner._terminate_all),
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert finalized == [state]
+    assert run_id not in runner._unreaped_drivers
+    runner._finalizing_drivers.discard(run_id)
+    runner._driver_procs.pop(run_id, None)
+    runner._driver_workdirs.pop(run_id, None)
+    runner._cancel.pop(run_id, None)
+
+
 def test_ray_popen_multi_sink_failure_keeps_partial_output_private_and_untouched(tmp_path, monkeypatch):
     from hub.deps import Deps
     from hub.ir import lower_to_ir
@@ -8590,7 +9022,7 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
         expected_targets=expected_targets, expected_attempts=expected_attempts,
     )
     assert missing_status.status == "failed"
-    assert "incomplete or unexpected sink set" in (missing_status.error or "")
+    assert missing_status.error == "Ray output publication failed"
     assert missing_status.output_uri is None and missing_status.output_table is None
 
     result = {

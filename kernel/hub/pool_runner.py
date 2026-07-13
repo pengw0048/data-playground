@@ -79,7 +79,8 @@ class PoolRunner(SubprocessRunner):
             raise RuntimeError(f"no worker in the pool satisfies {req.model_dump(exclude_none=True)}")
         status = super().run(plan, graph, target_node_id, placement_)
         with self._lock:
-            self._assigned[status.run_id] = worker
+            if status.run_id in self._procs:
+                self._assigned[status.run_id] = worker
         return status
 
     def _watch(self, run_id: str, *args) -> None:
@@ -87,4 +88,10 @@ class PoolRunner(SubprocessRunner):
             super()._watch(run_id, *args)
         finally:
             with self._lock:
-                self._assigned.pop(run_id, None)  # free the slot when the run ends
+                proc = self._procs.get(run_id)
+                try:
+                    stopped = proc is None or proc.poll() is not None
+                except Exception:  # noqa: BLE001 — uncertainty keeps the worker slot fenced
+                    stopped = False
+                if stopped:
+                    self._assigned.pop(run_id, None)

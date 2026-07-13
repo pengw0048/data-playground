@@ -991,6 +991,15 @@ def acquire_result_cache_pin(key: str, owner: str, ttl_seconds: float = 300) -> 
     reader is reaped after its lease expires.
     """
     with session() as s:
+        # SQLite ignores FOR UPDATE. A no-op write to THIS cache key upgrades the transaction before the
+        # pointer read, so replacement cannot slip between that read and result_reader publication. Do
+        # not use the installation singleton here: unrelated cache keys are independent ownership paths.
+        if s.get_bind().dialect.name == "sqlite":
+            s.execute(
+                update(ResultCache)
+                .where(ResultCache.key == str(key))
+                .values(doc=ResultCache.doc)
+            )
         cache = s.get(ResultCache, str(key), with_for_update=True)
         if cache is None:
             return None, None
@@ -1067,6 +1076,29 @@ def object_attempt_namespace(uri: str) -> str:
         if row is None:
             raise RuntimeError("attempt-shaped object URI has no lifecycle ownership row")
         return row.storage_namespace
+
+
+def attest_object_attempt(uri: str, *, logical_uri: str, kind: str,
+                          expected_run_id: str | None = None,
+                          allowed_states: tuple[str, ...] | None = None) -> dict:
+    """Return immutable attempt identity only when the current installation owns the exact write."""
+    normalized = _validated_object_uri(uri, attempt=True)
+    logical = _validated_object_uri(logical_uri, attempt=False)
+    if kind not in _OBJECT_ATTEMPT_KINDS:
+        raise ValueError("object attempt attestation requires a supported kind")
+    with session() as s:
+        identity = _installation_identity(s)
+        row = s.get(ObjectAttempt, normalized)
+        if row is None:
+            raise RuntimeError("attempt-shaped object URI has no lifecycle ownership row")
+        _validate_object_attempt_identity(
+            row, logical_uri=logical, kind=kind,
+            run_id=str(expected_run_id) if expected_run_id is not None else None)
+        if row.storage_namespace != identity.storage_namespace:
+            raise RuntimeError("object attempt belongs to another storage namespace")
+        if allowed_states is not None and row.state not in allowed_states:
+            raise RuntimeError(f"object attempt is not attestable in state {row.state!r}")
+        return _attempt_handle(row)
 
 
 def object_storage_namespace() -> str:
@@ -1495,11 +1527,19 @@ def acquire_object_attempt_lease(uri: str, lease_type: str, owner: str,
 
 def renew_object_attempt_lease(lease_id: str, ttl_seconds: float = 300) -> bool:
     with session() as s:
-        lease = s.get(ObjectAttemptLease, str(lease_id), with_for_update=True)
-        if lease is None:
+        key = str(lease_id)
+        identity = s.execute(select(
+            ObjectAttemptLease.attempt_uri,
+            ObjectAttemptLease.generation,
+        ).where(ObjectAttemptLease.lease_id == key)).one_or_none()
+        if identity is None:
             return False
-        row = s.get(ObjectAttempt, lease.attempt_uri, with_for_update=True)
-        if row is None or row.generation != lease.generation:
+        row = s.get(ObjectAttempt, identity.attempt_uri, with_for_update=True)
+        if row is None or row.generation != identity.generation:
+            return False
+        lease = s.get(ObjectAttemptLease, key, with_for_update=True)
+        if (lease is None or lease.attempt_uri != row.uri
+                or lease.generation != row.generation):
             return False
         _put_lease(s, row, lease.lease_type, lease.owner, ttl_seconds, lease_id=lease.lease_id)
         return True
@@ -1516,21 +1556,33 @@ def release_result_cache_pin(pin_id: str) -> None:
     """Release one cache-reader ref/lease pair after terminal ownership publication."""
     with session() as s:
         key = str(pin_id)
-        # Expiry cleanup uses the same lease -> ref -> attempt order.
-        lease = s.get(ObjectAttemptLease, key, with_for_update=True)
+        lease_uri = s.scalar(select(ObjectAttemptLease.attempt_uri).where(
+            ObjectAttemptLease.lease_id == key))
+        ref_uri = s.scalar(select(ObjectAttemptRef.attempt_uri).where(
+            ObjectAttemptRef.ref_type == "result_reader",
+            ObjectAttemptRef.ref_key == key,
+        ))
+        uris = sorted({uri for uri in (lease_uri, ref_uri) if uri})
+        attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
+            ObjectAttempt.uri.in_(uris)).order_by(ObjectAttempt.uri).with_for_update())} \
+            if uris else {}
         ref = s.get(ObjectAttemptRef, {
             "ref_type": "result_reader", "ref_key": key}, with_for_update=True)
-        uri = ref.attempt_uri if ref is not None else None
+        lease = s.get(ObjectAttemptLease, key, with_for_update=True)
+        current_uris = {uri for uri in (
+            ref.attempt_uri if ref is not None else None,
+            lease.attempt_uri if lease is not None else None,
+        ) if uri}
+        if not current_uris.issubset(attempts):
+            raise RuntimeError("result cache pin ownership changed concurrently")
         if ref is not None:
             s.delete(ref)
         if lease is not None:
-            uri = uri or lease.attempt_uri
             s.delete(lease)
         s.flush()
-        if uri:
-            attempt = s.get(ObjectAttempt, uri, with_for_update=True)
-            if attempt is not None:
-                _maybe_supersede(s, attempt, _db_now(s))
+        now = _db_now(s)
+        for uri in sorted(current_uris):
+            _maybe_supersede(s, attempts[uri], now)
 
 
 def _inventory_hash(inventory: list[dict]) -> str:
@@ -1724,6 +1776,47 @@ def _object_attempt_action(row: ObjectAttempt, action: str) -> dict:
     }
 
 
+def _expire_object_attempt_leases(limit: int) -> None:
+    """Remove a bounded set of expired leases in attempt -> ref -> lease order."""
+    with session() as s:
+        cutoff = _db_now(s)
+        attempt_uris = list(s.scalars(select(
+            ObjectAttemptLease.attempt_uri,
+        ).where(
+            ObjectAttemptLease.expires_at <= cutoff,
+        ).distinct().order_by(ObjectAttemptLease.attempt_uri).limit(min(limit, 100))))
+    # Do not carry one attempt lock into acquisition of another. GC candidates and pointer replacement
+    # can touch multiple attempts in other deterministic orders; a short transaction per attempt cannot
+    # participate in a cross-attempt ABBA cycle.
+    for uri in attempt_uris:
+        with session() as s:
+            attempt = s.get(ObjectAttempt, uri, with_for_update=True)
+            if attempt is None:
+                continue
+            now = _db_now(s)
+            has_expired_pin = exists().where(
+                ObjectAttemptLease.lease_id == ObjectAttemptRef.ref_key,
+                ObjectAttemptLease.attempt_uri == uri,
+                ObjectAttemptLease.expires_at <= now,
+            )
+            expired_refs = list(s.scalars(select(ObjectAttemptRef).where(
+                ObjectAttemptRef.ref_type == "result_reader",
+                ObjectAttemptRef.attempt_uri == uri,
+                has_expired_pin,
+            ).order_by(ObjectAttemptRef.ref_key).with_for_update()))
+            expired = list(s.scalars(select(ObjectAttemptLease).where(
+                ObjectAttemptLease.attempt_uri == uri,
+                ObjectAttemptLease.expires_at <= now,
+            ).order_by(ObjectAttemptLease.lease_id).with_for_update()))
+            for ref in expired_refs:
+                s.delete(ref)
+            for lease in expired:
+                s.delete(lease)
+            s.flush()
+            if expired_refs:
+                _maybe_supersede(s, attempt, now)
+
+
 def object_attempt_gc_batch(retention_seconds: float, grace_seconds: float,
                             limit: int = 100) -> list[dict]:
     """Claim bounded observe/delete work using refs, DB-time leases, generation, and delete epoch."""
@@ -1732,30 +1825,14 @@ def object_attempt_gc_batch(retention_seconds: float, grace_seconds: float,
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise ValueError("object attempt GC limit must be a positive integer")
     actions: list[dict] = []
+    # Each expiry transaction commits before the candidate scan, so it never carries attempt/lease
+    # locks into a differently ordered set of GC candidates. Publication and renewal use the same order.
+    _expire_object_attempt_leases(limit)
     with session() as s:
         now = _db_now(s)
 
         def remaining() -> int:
             return limit - len(actions)
-
-        expired_leases = list(s.scalars(select(ObjectAttemptLease).where(
-            ObjectAttemptLease.expires_at <= now).with_for_update()))
-        expired_pin_ids = [lease.lease_id for lease in expired_leases]
-        expired_pin_refs = list(s.scalars(select(ObjectAttemptRef).where(
-            ObjectAttemptRef.ref_type == "result_reader",
-            ObjectAttemptRef.ref_key.in_(expired_pin_ids),
-        ).with_for_update())) if expired_pin_ids else []
-        expired_pin_uris = {ref.attempt_uri for ref in expired_pin_refs}
-        for ref in expired_pin_refs:
-            s.delete(ref)
-        for lease in expired_leases:
-            s.delete(lease)
-        s.flush()
-        for uri in sorted(expired_pin_uris):
-            attempt = s.get(ObjectAttempt, uri, with_for_update=True)
-            if attempt is not None:
-                _maybe_supersede(s, attempt, now)
-        s.flush()
 
         no_refs = ~exists().where(ObjectAttemptRef.attempt_uri == ObjectAttempt.uri)
         no_leases = ~exists().where(
@@ -2001,11 +2078,23 @@ def put_result(key: str, doc: dict) -> list[str]:
     retired: list[str] = []
     with session() as s:
         now = _db_now(s)
-        row = s.get(ResultCache, key, with_for_update=True)
-        if row is None:
-            s.add(ResultCache(key=key, doc=payload, created_at=now))
+        if s.get_bind().dialect.name == "sqlite":
+            # One atomic same-key upsert is the SQLite lock/CAS point, including concurrent first
+            # publication. It obtains SQLite's writer transaction before any attempt/ref mutation; a
+            # reader uses the matching key-scoped no-op update above. PostgreSQL keeps row locks below.
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+            statement = sqlite_insert(ResultCache).values(
+                key=key, doc=payload, created_at=now)
+            s.execute(statement.on_conflict_do_update(
+                index_elements=[ResultCache.key],
+                set_={"doc": payload, "created_at": now},
+            ))
         else:
-            row.doc, row.created_at = payload, now
+            row = s.get(ResultCache, key, with_for_update=True)
+            if row is None:
+                s.add(ResultCache(key=key, doc=payload, created_at=now))
+            else:
+                row.doc, row.created_at = payload, now
         s.flush()
         attempt = s.get(ObjectAttempt, new_uri, with_for_update=True) if new_uri else None
         if attempt is not None:
