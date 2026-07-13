@@ -26,6 +26,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 
 from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -146,8 +147,10 @@ def _cross_site_ws(ws: WebSocket) -> bool:
 async def ws_run(ws: WebSocket, run_id: str):
     # gate the status stream like the HTTP GET /run/{id} (which is behind the auth router) and ws_collab:
     # a run's status carries row counts, per-node state, error text (may embed paths) and output names.
-    uid = auth.verify(ws.cookies.get("dp_session")) if auth.auth_enabled() else None
-    if _cross_site_ws(ws) or (auth.auth_enabled() and not uid):
+    auth_mode = auth.auth_enabled()
+    token = ws.cookies.get("dp_session") if auth_mode else None
+    uid = await asyncio.to_thread(auth.verify, token) if auth_mode else None
+    if _cross_site_ws(ws) or (auth_mode and not uid):
         await ws.close(code=1008)  # policy violation — cross-site origin or no valid session
         return
     # P0-AUTH-02: and, in auth mode, only for a run the caller may reach (its creator or a role on its
@@ -162,6 +165,20 @@ async def ws_run(ws: WebSocket, run_id: str):
             # _status_or_lost reads the shared run_states DB — run it off the event loop so a slow
             # query can't stall every other connection on this worker.
             st = await asyncio.to_thread(_status_or_lost, run_id)
+            # The cookie was authenticated at admission, but its epoch and this run's canvas share are
+            # both mutable. Recheck both at the payload boundary so an already-open socket cannot keep
+            # receiving row counts, errors, or output locations after either permission is revoked.
+            if token is not None:
+                try:
+                    still_allowed = await asyncio.to_thread(
+                        lambda: auth.verify(token) == uid and _run_read_access(run_id, uid)
+                    )
+                except Exception:  # noqa: BLE001 — authorization-store failure must fail closed
+                    logging.getLogger("hub").warning("run websocket access revalidation failed", exc_info=True)
+                    still_allowed = False
+                if not still_allowed:
+                    await ws.close(code=1008)
+                    break
             await ws.send_json(st.model_dump(by_alias=True))
             if st.status in ("done", "failed", "cancelled"):
                 break
@@ -176,26 +193,39 @@ async def ws_run(ws: WebSocket, run_id: str):
 # version (last-write-wins on the doc); a CRDT (Yjs) is the conflict-free hardening.
 _collab_rooms: dict[str, set[WebSocket]] = {}
 _collab_ids: dict[WebSocket, str] = {}  # socket -> its clientId (for leave notifications)
-_collab_users: dict[WebSocket, str | None] = {}  # None = trusted open-mode socket; otherwise auth uid
+
+
+@dataclass(frozen=True)
+class _CollabSession:
+    user_id: str | None
+    token: str | None  # the exact admission token; None only for a trusted open-mode socket
+
+
+_collab_sessions: dict[WebSocket, _CollabSession] = {}
 _COLLAB_DOC_MESSAGES = frozenset(("yjs", "ysync"))
 
 
 async def _live_collab_role(ws: WebSocket, canvas_id: str) -> str | None:
     """Current role for a connected socket, re-read at the document-message boundary.
 
-    Authenticated collaboration permissions are mutable while a socket is open. Keep the uid captured
-    from its signed handshake, but never cache its canvas role. The metadata DB is shared across web
-    instances; running the lookup off-loop makes revocation visible without blocking other sockets.
+    Authenticated sessions and collaboration permissions are mutable while a socket is open. Reverify
+    the exact token captured at admission, then read the current canvas role. The metadata DB is shared
+    across web instances; running both lookups off-loop makes revocation visible without blocking peers.
     """
-    if ws not in _collab_users:
+    session = _collab_sessions.get(ws)
+    if session is None:
         return None
-    uid = _collab_users[ws]
-    if uid is None:  # open mode is the existing trusted/single-user behavior
+    if session.token is None:  # open mode is the existing trusted/single-user behavior
         return "editor"
     try:
-        return await asyncio.to_thread(metadb.canvas_role, canvas_id, uid)
+        def _current_role() -> str | None:
+            if auth.verify(session.token) != session.user_id:
+                return None
+            return metadb.canvas_role(canvas_id, session.user_id)
+
+        return await asyncio.to_thread(_current_role)
     except Exception:  # noqa: BLE001 — fail closed if the authorization store is unavailable
-        logging.getLogger("hub").warning("collab role revalidation failed", exc_info=True)
+        logging.getLogger("hub").warning("collab session/access revalidation failed", exc_info=True)
         return None
 
 
@@ -216,8 +246,10 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
         await ws.close(code=1008)  # cross-site origin — reject before touching the room
         return
     uid: str | None = None
+    token: str | None = None
     if auth.auth_enabled():
-        uid = auth.verify(ws.cookies.get("dp_session"))
+        token = ws.cookies.get("dp_session")
+        uid = await asyncio.to_thread(auth.verify, token)
         try:
             role = await asyncio.to_thread(metadb.canvas_role, canvas_id, uid) if uid else None
         except Exception:  # noqa: BLE001 — admission fails closed when the role store is unavailable
@@ -229,7 +261,7 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
     await ws.accept()
     room = _collab_rooms.setdefault(canvas_id, set())
     room.add(ws)
-    _collab_users[ws] = uid
+    _collab_sessions[ws] = _CollabSession(uid, token)
     try:
         while True:
             msg = await ws.receive_json()
@@ -260,7 +292,7 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
         pass
     finally:
         room.discard(ws)
-        _collab_users.pop(ws, None)
+        _collab_sessions.pop(ws, None)
         cid = _collab_ids.pop(ws, None)
         if cid:  # let peers drop this collaborator's cursor/avatar
             for peer in list(room):
