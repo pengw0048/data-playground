@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import os
 import time
+from dataclasses import dataclass
 
 _TTL_SECONDS = 7 * 24 * 3600  # sessions expire after a week
 
@@ -79,15 +80,33 @@ def sign(user_id: str, now: int | None = None) -> str:
         raise RuntimeError("cannot sign a session without a non-empty DP_AUTH_SECRET")
     from hub import metadb  # function-local: metadb imports auth (avoid an import cycle)
     epoch = metadb.user_token_epoch(user_id) or 0
+    return sign_at_epoch(user_id, epoch, now)
+
+
+def sign_at_epoch(user_id: str, epoch: int, now: int | None = None) -> str:
+    """Sign a session at an epoch already established by an atomic database operation.
+
+    Unlike :func:`sign`, this deliberately does not re-read the user's current epoch. Password
+    rotation uses it with the epoch returned by its compare-and-set: a concurrent later revocation
+    must invalidate that rotation instead of letting the response "catch up" to the newer epoch.
+    """
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        raise ValueError("session epoch must be a non-negative integer")
     exp = (now if now is not None else int(time.time())) + _TTL_SECONDS
     payload = f"{user_id}.{epoch}.{exp}"
     return f"{payload}.{_mac(payload)}"
 
 
-def verify(token: str | None) -> str | None:
-    """Return the user id iff the token's signature is valid, not expired, AND its epoch still matches
-    the user's current epoch (not revoked), else None. (Legacy 3-part tokens no longer verify → a
-    one-time re-login after this ships.)"""
+@dataclass(frozen=True)
+class SessionClaims:
+    """Identity and epoch extracted only after a session token passes every verification step."""
+
+    user_id: str
+    epoch: int
+
+
+def verify_claims(token: str | None) -> SessionClaims | None:
+    """Return trusted claims iff signature, expiry, user existence, and current epoch all verify."""
     # Fail closed before computing a MAC. HMAC with b"" is well-defined and therefore forgeable by
     # anyone; DP_AUTH_MODE is only a child-workload confinement signal, never a substitute key.
     if _signing_secret() is None or not token:
@@ -99,7 +118,8 @@ def verify(token: str | None) -> str | None:
     if not user_id or not hmac.compare_digest(mac, _mac(f"{user_id}.{epoch}.{exp}")):
         return None
     try:
-        if int(exp) < int(time.time()):
+        epoch_value = int(epoch)
+        if epoch_value < 0 or int(exp) < int(time.time()):
             return None  # expired
     except ValueError:
         return None
@@ -107,12 +127,15 @@ def verify(token: str | None) -> str | None:
     current = metadb.user_token_epoch(user_id)
     if current is None:  # user deleted / unknown → revoked
         return None
-    try:
-        if int(epoch) != current:
-            return None  # a newer epoch was issued (password change / disable) → this token is revoked
-    except ValueError:
-        return None
-    return user_id
+    if epoch_value != current:
+        return None  # a newer epoch was issued (password change / disable) → this token is revoked
+    return SessionClaims(user_id=user_id, epoch=epoch_value)
+
+
+def verify(token: str | None) -> str | None:
+    """Return the user id iff the complete signed session claims verify, else ``None``."""
+    claims = verify_claims(token)
+    return claims.user_id if claims is not None else None
 
 
 _SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32}  # ~16MB work factor — fine for interactive login
@@ -131,8 +154,13 @@ def verify_password(pw: str, stored: str | None) -> bool:
         return False
     try:
         _, salt_b64, hash_b64 = stored.split("$")
-        salt, expected = base64.b64decode(salt_b64), base64.b64decode(hash_b64)
-        dk = hashlib.scrypt(pw.encode(), salt=salt, n=_SCRYPT["n"], r=_SCRYPT["r"], p=_SCRYPT["p"], dklen=len(expected))
+        salt = base64.b64decode(salt_b64, validate=True)
+        expected = base64.b64decode(hash_b64, validate=True)
+        if len(salt) != 16 or len(expected) != _SCRYPT["dklen"]:
+            return False
+        if base64.b64encode(salt).decode() != salt_b64 or base64.b64encode(expected).decode() != hash_b64:
+            return False
+        dk = hashlib.scrypt(pw.encode(), salt=salt, **_SCRYPT)
         return hmac.compare_digest(dk, expected)
     except Exception:  # noqa: BLE001 — any parse/format error → not a valid credential
         return False
