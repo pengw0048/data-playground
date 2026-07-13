@@ -16,7 +16,6 @@ import os
 import threading
 import uuid
 from collections.abc import Callable
-from urllib.parse import urlparse
 
 import duckdb
 
@@ -67,8 +66,17 @@ def is_object_uri(uri: str) -> bool:
 
 
 def path_of(uri: str) -> str:
-    p = urlparse(uri)
-    return p.path if p.scheme in ("file", "") else uri
+    from hub.paths import local_path
+
+    path = local_path(uri)
+    return uri if path is None else path
+
+
+def _read_uri(uri: str) -> str:
+    """Normalize a remote scheme only at adapter read boundaries, never at write/control ingress."""
+    from hub.paths import canonical_data_uri
+
+    return canonical_data_uri(uri)
 
 
 def object_fs(uri: str):
@@ -206,10 +214,11 @@ class DuckDBAdapter:
             return lk
 
     def matches(self, uri: str) -> bool:
+        uri = _read_uri(uri)
         if uri.startswith("mem://") or is_object_uri(uri):
             return True
-        p = path_of(uri).lower()
-        if os.path.isdir(path_of(uri)):
+        p = uri.lower()
+        if os.path.isdir(uri):
             return True
         return p.endswith(self._EXTS)
 
@@ -228,6 +237,7 @@ class DuckDBAdapter:
         return rel
 
     def _read(self, con: duckdb.DuckDBPyConnection, uri: str, options: dict | None = None) -> Relation:
+        uri = _read_uri(uri)
         csv = _csv_kwargs(options)  # explicit CSV parse overrides (delimiter / header); else auto-detect
         if uri.startswith("mem://"):
             return con.table(uri[len("mem://"):])
@@ -260,7 +270,7 @@ class DuckDBAdapter:
             # injected. (union_by_name alone disables hive detection, so it must be explicit when wanted.)
             return con.read_parquet(uri.rstrip("/") + "/**/*.parquet", union_by_name=True,
                                     hive_partitioning=self._is_hive_dir(uri, obj=True))
-        p = path_of(uri)
+        p = uri
         low = p.lower()
         if os.path.isdir(p):
             return self._read_dir(con, p)
@@ -364,11 +374,12 @@ class DuckDBAdapter:
             return None
 
     def fingerprint(self, uri: str) -> str:
+        uri = _read_uri(uri)
         if uri.startswith("mem://"):
             return "mem"
         if is_object_uri(uri):
             return "obj:" + hashlib.sha256(uri.encode()).hexdigest()[:12]  # can't stat; key by uri
-        return _fingerprint_path(path_of(uri))
+        return _fingerprint_path(uri)
 
     def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None,
               cancelled: CancelCheck | None = None) -> dict:
@@ -633,14 +644,14 @@ class LanceAdapter:
     name = "lance"
 
     def matches(self, uri: str) -> bool:
-        return path_of(uri).lower().rstrip("/").endswith(".lance")
+        return _read_uri(uri).lower().rstrip("/").endswith(".lance")
 
     def _dataset(self, uri: str):
         try:
             import lance  # lazy — only if the optional `lance` extra is installed
         except ModuleNotFoundError as e:  # a clear remediation, not a raw "No module named 'lance'"
             raise ModuleNotFoundError("Lance support is not installed — run: uv pip install -e 'kernel[lance]'") from e
-        return lance.dataset(path_of(uri))
+        return lance.dataset(_read_uri(uri))
 
     def scan(self, uri: str, columns: list[str] | None = None,
              predicate: str | None = None, limit: int | None = None,
@@ -699,7 +710,7 @@ class LanceAdapter:
         try:
             return f"lance-v{self._dataset(uri).version}"
         except Exception:  # noqa: BLE001
-            return _fingerprint_path(path_of(uri))
+            return _fingerprint_path(_read_uri(uri))
 
     def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None,
               cancelled: CancelCheck | None = None) -> dict:

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 from pydantic.alias_generators import to_camel
 
 # dataset/selection/sample/sql-view are the data wires; metric/value are leaf/value wires
@@ -459,6 +459,9 @@ class Graph(Wire):
     nodes: Annotated[list[GraphNode], Field(max_length=MAX_GRAPH_NODES)] = []
     edges: Annotated[list[GraphEdge], Field(max_length=MAX_GRAPH_EDGES)] = []
     requirements: list[str] = []  # pip specs the canvas needs; the kernel installs them + allows importing them
+    # Parent-owned provenance for synthetic region ref-sources. PrivateAttr keeps this control-plane
+    # metadata out of the client wire model, workload serialization, and user-controlled node data.
+    _publication_source_uris: dict[str, tuple[str, ...]] = PrivateAttr(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #

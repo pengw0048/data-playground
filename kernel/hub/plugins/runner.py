@@ -992,7 +992,7 @@ class LocalRunner:
             if managed_parquet and not parent_owned:
                 _safe_abandon_attempt(attempt_uri)
             raise
-        parent_uris = g.all_upstream_source_uris(graph, node.id)
+        parent_uris = g.all_upstream_publication_uris(graph, node.id)
         if not (managed_parquet and parent_contract):
             if managed_parquet:
                 publish = managed_publisher

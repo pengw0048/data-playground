@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import shutil
+import threading
+import types
 import uuid
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
@@ -11,6 +16,14 @@ from sqlalchemy import select
 
 from hub import handoff, metadb
 from hub.models import Graph, RunStatus
+from hub.storage import (
+    MAX_MANAGED_EXECUTION_SOURCES,
+    ManagedSourceAccessDenied,
+    ManagedSourceLimitExceeded,
+    ManagedSourceReadError,
+    ManagedSourceUnavailable,
+    source_read_scope,
+)
 from hub.subrun import _parent_attested_source_uris
 
 
@@ -125,6 +138,474 @@ def _attempt_state(uri: str) -> str:
         return session.get(metadb.ObjectAttempt, uri).state
 
 
+def _published_region(logical_uri: str) -> dict:
+    handle = _committed_region(logical_uri)
+    metadb.put_result(f"interactive-source-{uuid.uuid4().hex}", {"uri": handle["uri"]})
+    assert _attempt_state(handle["uri"]) == "published"
+    return handle
+
+
+def _read_leases(uri: str) -> list:
+    with metadb.session() as session:
+        return list(session.scalars(select(metadb.ObjectAttemptLease).where(
+            metadb.ObjectAttemptLease.attempt_uri == uri,
+            metadb.ObjectAttemptLease.lease_type == "read",
+        )))
+
+
+def test_interactive_scope_holds_one_deduped_lease_while_reader_blocks():
+    published = _published_region(
+        f"s3://interactive-read-block/{uuid.uuid4().hex}/input.parquet")
+    entered = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocked_adapter_read() -> None:
+        try:
+            with source_read_scope(
+                    None, [published["uri"] + "/", published["uri"]],
+                    owner="blocked-adapter") as guards:
+                assert len(guards) == 1
+                entered.set()
+                assert release.wait(timeout=5)
+        except BaseException as exc:  # noqa: BLE001 - asserted on the parent thread
+            errors.append(exc)
+
+    thread = threading.Thread(target=blocked_adapter_read)
+    thread.start()
+    assert entered.wait(timeout=5)
+    assert len(_read_leases(published["uri"])) == 1
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive() and errors == []
+    assert _read_leases(published["uri"]) == []
+
+
+def test_data_sample_holds_lease_through_blocked_adapter_and_response(monkeypatch):
+    from hub import db
+    from hub.models import SampleRequest
+    from hub.routers import catalog as catalog_routes
+
+    published = _published_region(
+        f"s3://interactive-sample-block/{uuid.uuid4().hex}/input.parquet")
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+    errors: list[BaseException] = []
+
+    class Adapter:
+        def scan(self, uri, *_args, **_kwargs):
+            assert uri == published["uri"] and _read_leases(uri)
+            entered.set()
+            assert release.wait(timeout=5)
+            return db.conn().sql("SELECT 1 AS value")
+
+        @staticmethod
+        def count(_uri):
+            return 1
+
+    monkeypatch.setattr(catalog_routes, "get_deps", lambda: types.SimpleNamespace(
+        storage=None, resolve_adapter=lambda _uri: Adapter()))
+
+    def sample() -> None:
+        try:
+            results.append(catalog_routes.data_sample(SampleRequest(
+                uri=published["uri"], k=1)))
+        except BaseException as exc:  # noqa: BLE001 - asserted on the parent thread
+            errors.append(exc)
+
+    thread = threading.Thread(target=sample)
+    thread.start()
+    assert entered.wait(timeout=5)
+    assert len(_read_leases(published["uri"])) == 1
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive() and errors == []
+    assert results[0].rows == [{"value": 1}]
+    assert _read_leases(published["uri"]) == []
+
+
+@pytest.mark.parametrize("error", [
+    RuntimeError("adapter failed"),
+    TimeoutError("adapter timed out"),
+    asyncio.CancelledError("adapter cancelled"),
+])
+def test_interactive_scope_releases_after_error_timeout_or_cancel(error):
+    published = _published_region(
+        f"s3://interactive-read-error/{uuid.uuid4().hex}/input.parquet")
+    with pytest.raises(type(error), match=str(error)):
+        with source_read_scope(None, [published["uri"]], owner="failing-reader"):
+            assert len(_read_leases(published["uri"])) == 1
+            raise error
+    assert _read_leases(published["uri"]) == []
+
+
+def test_interactive_scope_acquisition_cancel_rolls_back_prior_guard():
+    closed: list[str] = []
+
+    class Guard:
+        def __init__(self, uri):
+            self.uri = uri
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            closed.append(self.uri)
+            return False
+
+    class Storage:
+        @staticmethod
+        def requires_result_read(_uri):
+            return True
+
+        @staticmethod
+        def acquire_result_read(uri, _owner):
+            if uri == "/tmp/second-managed-source.parquet":
+                raise asyncio.CancelledError("cancel during acquisition")
+            return Guard(uri)
+
+    with pytest.raises(asyncio.CancelledError, match="cancel during acquisition"):
+        with source_read_scope(
+                Storage(),
+                ["/tmp/first-managed-source.parquet", "/tmp/second-managed-source.parquet"],
+                owner="cancelled-acquisition"):
+            pytest.fail("the scope must not yield after a cancelled acquisition")
+
+    assert closed == ["/tmp/first-managed-source.parquet"]
+
+
+def test_interactive_scope_timeout_unwinds_before_returning():
+    from hub.sandbox import SandboxError, run_with_timeout
+
+    published = _published_region(
+        f"s3://interactive-read-timeout/{uuid.uuid4().hex}/input.parquet")
+    stop = threading.Event()
+
+    def work() -> None:
+        with source_read_scope(None, [published["uri"]], owner="timed-reader"):
+            stop.wait(timeout=5)
+
+    with pytest.raises(SandboxError, match="time budget"):
+        run_with_timeout(work, 0.01, on_timeout=stop.set)
+    assert _read_leases(published["uri"]) == []
+
+
+def test_interactive_scope_lost_lease_rejects_success_and_releases():
+    published = _published_region(
+        f"s3://interactive-read-lost/{uuid.uuid4().hex}/input.parquet")
+    with pytest.raises(ManagedSourceUnavailable, match="unavailable or expired"):
+        with source_read_scope(None, [published["uri"]], owner="lost-reader") as guards:
+            assert len(guards) == 1
+            guards[0]._lost.set()
+    assert _read_leases(published["uri"]) == []
+
+
+def test_interactive_scope_rejects_every_invalid_generation_before_body():
+    namespace = metadb.object_storage_namespace()
+    unknown = handoff.physical_attempt_uri(
+        f"s3://interactive-invalid/{uuid.uuid4().hex}/unknown.parquet",
+        namespace, 1, uuid.uuid4().hex)
+    committed = _committed_region(
+        f"s3://interactive-invalid/{uuid.uuid4().hex}/committed.parquet")
+
+    logical = f"s3://interactive-invalid/{uuid.uuid4().hex}/superseded.parquet"
+    old = _committed_region(logical)
+    replacement = _committed_region(logical)
+    pointer = f"interactive-replacement-{uuid.uuid4().hex}"
+    metadb.put_result(pointer, {"uri": old["uri"]})
+    metadb.put_result(pointer, {"uri": replacement["uri"]})
+    assert _attempt_state(old["uri"]) == "superseded"
+
+    foreign = _published_region(
+        f"s3://interactive-invalid/{uuid.uuid4().hex}/foreign.parquet")
+    with metadb.session() as session:
+        session.get(metadb.ObjectAttempt, foreign["uri"]).storage_namespace = "foreign-installation"
+
+    descendant_root = _published_region(
+        f"s3://interactive-invalid/{uuid.uuid4().hex}/descendant.parquet")
+    invalid = [
+        unknown,
+        unknown.replace("s3://", "S3://"),
+        committed["uri"],
+        old["uri"],
+        foreign["uri"],
+        f"{descendant_root['uri']}/part-00000.parquet",
+    ]
+    reads: list[str] = []
+    for uri in invalid:
+        with pytest.raises(ManagedSourceUnavailable, match="unavailable or expired"):
+            with source_read_scope(None, [uri], owner="invalid-reader"):
+                reads.append(uri)
+    assert reads == []
+
+
+def test_interactive_scope_rolls_back_partial_acquire_and_caps_before_acquire(monkeypatch):
+    published = _published_region(
+        f"s3://interactive-partial/{uuid.uuid4().hex}/published.parquet")
+    unknown = handoff.physical_attempt_uri(
+        f"s3://interactive-partial/{uuid.uuid4().hex}/unknown.parquet",
+        metadb.object_storage_namespace(), 1, uuid.uuid4().hex)
+    with pytest.raises(ManagedSourceUnavailable):
+        with source_read_scope(
+                None, [published["uri"], unknown], owner="partial-reader"):
+            pytest.fail("an unknown second generation must fail acquisition")
+    assert _read_leases(published["uri"]) == []
+
+    acquisitions: list[str] = []
+
+    @contextlib.contextmanager
+    def acquire(uri, **_kwargs):
+        acquisitions.append(uri)
+        yield object()
+
+    monkeypatch.setattr(handoff, "managed_read_lease", acquire)
+    uris = [
+        handoff.physical_attempt_uri(
+            f"s3://interactive-cap/{index}/input.parquet",
+            metadb.object_storage_namespace(), 1, f"{index:032x}")
+        for index in range(MAX_MANAGED_EXECUTION_SOURCES + 1)
+    ]
+    with pytest.raises(ManagedSourceLimitExceeded, match="at most"):
+        with source_read_scope(None, uris, owner="capped-reader"):
+            pass
+    assert acquisitions == []
+
+
+def test_mixed_case_file_uri_is_confined_before_any_adapter_read(monkeypatch):
+    from fastapi import HTTPException
+    from hub import paths
+    from hub.plugins.adapters import path_of
+    from hub.routers import catalog as catalog_routes
+
+    monkeypatch.setenv(
+        "DP_AUTH_SECRET", "interactive-path-policy-test-secret-0123456789")
+    escaped = "FiLe:///etc/passwd"
+    assert path_of(escaped) == "/etc/passwd"
+    with pytest.raises(PermissionError):
+        paths.ensure_local_uri_allowed(escaped)
+    with pytest.raises(ManagedSourceAccessDenied):
+        with source_read_scope(None, [escaped], owner="confined-reader"):
+            pytest.fail("path policy must run before the read body")
+
+    adapter_calls: list[str] = []
+
+    class Catalog:
+        @staticmethod
+        def get_table(ref):
+            raise KeyError(ref)
+
+    def resolve(_uri):
+        adapter_calls.append("resolve")
+        raise AssertionError("adapter resolution must follow path confinement")
+
+    deps = types.SimpleNamespace(storage=None, catalog=Catalog(), resolve_adapter=resolve)
+    monkeypatch.setattr(catalog_routes, "get_deps", lambda: deps)
+    with pytest.raises(HTTPException) as error:
+        catalog_routes.join_suggestions(catalog_routes.JoinSuggestRequest(
+            left_uri=escaped, right_uri="/tmp/ordinary.parquet"))
+    assert error.value.status_code == 403
+    assert adapter_calls == []
+
+
+def test_colon_local_path_is_confined_and_remote_schemes_are_normalized(monkeypatch):
+    import sys
+
+    from hub import paths
+    from hub.plugins import adapters
+    from hub.plugins.adapters import path_of
+
+    monkeypatch.setenv(
+        "DP_AUTH_SECRET", "interactive-colon-policy-test-secret-0123456789")
+    monkeypatch.setattr(paths, "allowed_roots", lambda: ["/definitely-allowed"])
+    colon_path = "relative:../../outside.csv"
+    assert paths.local_path(colon_path) == colon_path
+    assert path_of(colon_path) == colon_path
+    with pytest.raises(PermissionError):
+        paths.ensure_local_uri_allowed(colon_path)
+
+    class Storage:
+        @staticmethod
+        def requires_result_read(_uri):
+            raise AssertionError("classification must follow local-path confinement")
+
+    with pytest.raises(ManagedSourceAccessDenied):
+        with source_read_scope(Storage(), [colon_path], owner="colon-confined-reader"):
+            pytest.fail("the source scope must not yield for an escaped local path")
+
+    assert path_of("S3://bucket/data.csv") == "S3://bucket/data.csv"
+    assert path_of("HTTPS://example.test/data.csv") == "HTTPS://example.test/data.csv"
+    assert not adapters.is_object_uri("S3://bucket/data.csv")
+    reads: list[str] = []
+
+    class Connection:
+        @staticmethod
+        def read_parquet(uri):
+            reads.append(uri)
+            return object()
+
+    monkeypatch.setattr(adapters.db, "ensure_object_store", lambda: None)
+    adapters.DuckDBAdapter()._read(Connection(), "S3://bucket/data.parquet")
+    assert reads == ["s3://bucket/data.parquet"]
+
+    lance_reads: list[str] = []
+    monkeypatch.setitem(sys.modules, "lance", types.SimpleNamespace(
+        dataset=lambda uri: lance_reads.append(uri) or object()))
+    adapters.LanceAdapter()._dataset("S3://bucket/data.lance")
+    assert lance_reads == ["s3://bucket/data.lance"]
+
+
+def test_source_limit_is_typed_and_not_downgraded_by_estimate_or_plan(monkeypatch):
+    from fastapi import HTTPException
+    from hub import graph as graph_mod
+    from hub.models import CompileRequest
+    from hub.routers import runs as run_routes
+    from hub.run_controller import RunController
+
+    uris = [
+        handoff.physical_attempt_uri(
+            f"s3://interactive-policy-cap/{index}/input.parquet",
+            metadb.object_storage_namespace(), 1, f"{index:032x}")
+        for index in range(MAX_MANAGED_EXECUTION_SOURCES + 1)
+    ]
+    graph = _source_graph("/tmp/ordinary.parquet")
+    monkeypatch.setattr(graph_mod, "execution_source_uris", lambda *_args, **_kwargs: uris)
+
+    def no_adapter(_uri):
+        raise AssertionError("the complete source cap must run before adapter resolution")
+
+    deps = types.SimpleNamespace(
+        storage=None, resolve_adapter=no_adapter, registry={}, node_builders={}, node_specs={},
+        catalog=types.SimpleNamespace(resolve_ref=lambda ref: ref),
+    )
+    controller = RunController(deps, base=None, place_fn=None)
+    deps.controller = controller
+    with pytest.raises(ManagedSourceLimitExceeded):
+        controller.plan_summary(graph, "source")
+    with pytest.raises(HTTPException) as cone_error:
+        run_routes._cone_size(graph, "source", deps)
+    assert cone_error.value.status_code == 400
+    assert "at most" in cone_error.value.detail
+
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    monkeypatch.setattr(run_routes, "_require_graph_read_access", lambda *_args: None)
+    monkeypatch.setattr(run_routes, "_reject_invalid", lambda *_args: None)
+    monkeypatch.setattr(run_routes, "_actuals_for", lambda *_args: {})
+    monkeypatch.setattr(run_routes.graph_mod, "resolve_source_refs", lambda *_args: None)
+    request = CompileRequest(graph=graph, target_node_id="source")
+    for boundary in (run_routes.graph_schema, run_routes.graph_estimate):
+        with pytest.raises(HTTPException) as route_error:
+            boundary(request, uid="user")
+        assert route_error.value.status_code == 400
+        assert "at most" in route_error.value.detail
+    plan = run_routes.graph_plan(request, uid="user")
+    assert plan["regions"] == [] and "at most" in plan["error"]
+    assert isinstance(ManagedSourceLimitExceeded("limit"), ManagedSourceReadError)
+
+
+def test_interactive_scope_is_a_noop_for_ordinary_sources(monkeypatch):
+    class UnmanagedStorage:
+        @staticmethod
+        def requires_result_read(_uri):
+            return False
+
+        @staticmethod
+        def acquire_result_read(*_args, **_kwargs):
+            raise AssertionError("ordinary sources must not acquire a local guard")
+
+    monkeypatch.setattr(
+        handoff, "managed_read_lease",
+        lambda *_args, **_kwargs: pytest.fail("ordinary sources must not acquire an object lease"))
+    with source_read_scope(
+            UnmanagedStorage(),
+            ["/tmp/ordinary.parquet", "/tmp/ordinary.parquet/", "s3://bucket/ordinary.parquet"],
+            owner="ordinary-reader") as guards:
+        assert guards == []
+
+
+def test_interactive_graph_readers_reject_unknown_generation_before_adapter():
+    from hub import relationships
+    from hub.estimate import estimate_sizes
+    from hub.executors.preview import preview_node
+    from hub.executors.profile import profile_node
+    from hub.executors.schema import schema_for_graph
+    from hub.models import ColumnSchema
+
+    unknown = handoff.physical_attempt_uri(
+        f"s3://interactive-callsite/{uuid.uuid4().hex}/unknown.parquet",
+        metadb.object_storage_namespace(), 1, uuid.uuid4().hex)
+    graph = _source_graph(unknown)
+    adapter_calls: list[str] = []
+
+    def resolve(_uri):
+        adapter_calls.append("resolve")
+        raise AssertionError("adapter resolution must follow lifecycle acquisition")
+
+    preview = preview_node(graph, "source", 1, resolve, {}, storage=None)
+    assert preview.error and preview.reason == "managed source is unavailable or expired"
+    sampled = profile_node(graph, "source", resolve, {}, storage=None)
+    full = profile_node(graph, "source", resolve, {}, full=True, storage=None)
+    assert sampled.error and full.error
+    assert sampled.reason == full.reason == "managed source is unavailable or expired"
+    with pytest.raises(ManagedSourceUnavailable):
+        schema_for_graph(graph, resolve, {}, storage=None)
+    with pytest.raises(ManagedSourceUnavailable):
+        estimate_sizes(graph, resolve, storage=None)
+
+    joined = _joined_source_graph(unknown, "/tmp/ordinary.parquet")
+    columns = {
+        "left": [ColumnSchema(name="value", type="BIGINT")],
+        "right": [ColumnSchema(name="value", type="BIGINT")],
+    }
+    with pytest.raises(ManagedSourceUnavailable):
+        relationships.analyze_join(
+            joined, "join", columns, object(), resolve, storage=None)
+    assert adapter_calls == []
+
+
+def test_interactive_catalog_and_graph_ops_use_sanitized_scope(monkeypatch):
+    from fastapi import HTTPException
+    from hub import graph_ops
+    from hub.models import SampleRequest
+    from hub.routers import catalog as catalog_routes
+
+    unknown = handoff.physical_attempt_uri(
+        f"s3://interactive-route/{uuid.uuid4().hex}/unknown.parquet",
+        metadb.object_storage_namespace(), 1, uuid.uuid4().hex)
+    adapter_calls: list[str] = []
+
+    class Catalog:
+        @staticmethod
+        def get_table(_ref):
+            raise KeyError(_ref)
+
+    def resolve(_uri):
+        adapter_calls.append("resolve")
+        raise AssertionError("adapter resolution must follow lifecycle acquisition")
+
+    deps = types.SimpleNamespace(storage=None, catalog=Catalog(), resolve_adapter=resolve)
+    with pytest.raises(ManagedSourceUnavailable, match="unavailable or expired"):
+        graph_ops.join_hints(deps, unknown, "/tmp/ordinary.parquet")
+
+    monkeypatch.setattr(catalog_routes, "get_deps", lambda: deps)
+    with pytest.raises(HTTPException) as sample_error:
+        catalog_routes.data_sample(SampleRequest(uri=unknown, k=1))
+    assert sample_error.value.status_code == 410
+    assert sample_error.value.detail == "managed source is unavailable or expired"
+
+    with pytest.raises(HTTPException) as register_error:
+        catalog_routes.catalog_register(catalog_routes.RegisterRequest(uri=unknown))
+    assert register_error.value.status_code == 400
+    assert register_error.value.detail == "managed source is unavailable or expired"
+
+    with pytest.raises(HTTPException) as join_error:
+        catalog_routes.join_suggestions(catalog_routes.JoinSuggestRequest(
+            left_uri=unknown, right_uri="/tmp/ordinary.parquet"))
+    assert join_error.value.status_code == 400
+    assert join_error.value.detail == "managed source is unavailable or expired"
+    assert adapter_calls == []
+
+
 def test_child_accepts_only_the_exact_parent_attestation():
     logical = "s3://managed-source-contract/data/input.parquet"
     uri, identity = _identity(logical, "installation", 7, "a" * 32)
@@ -135,6 +616,60 @@ def test_child_accepts_only_the_exact_parent_attestation():
     }
 
     assert _parent_attested_source_uris(job, _source_graph(uri)) == frozenset({uri})
+
+
+@pytest.mark.parametrize("scheme", ["file://", "FILE://", "FiLe://"])
+def test_parent_child_local_attestation_uses_one_case_insensitive_canonical_path(tmp_path, scheme):
+    from hub.subprocess_runner import SubprocessRunner
+
+    path = str(tmp_path / ".dp-results" / f"__result_case_{uuid.uuid4().hex}.parquet")
+    file_uri = Path(path).as_uri()
+    graph_uri = scheme + file_uri[len("file://"):]
+
+    class Guard:
+        uri = path
+
+        @staticmethod
+        def fileno():
+            return None
+
+        def __enter__(self):
+            return self
+
+        @staticmethod
+        def __exit__(*args):
+            return False
+
+    class Storage:
+        namespace_id = "local-attestation"
+
+        @staticmethod
+        def requires_result_read(uri):
+            assert uri == path
+            return True
+
+        @staticmethod
+        def acquire_result_read(uri, _owner):
+            assert uri == path
+            return Guard()
+
+        @staticmethod
+        def result_namespace_identity():
+            return (101, 202)
+
+    graph = _source_graph(graph_uri)
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path), storage=Storage())
+    bundle = runner._claim_source_leases(graph, "source", "case-reader")
+    try:
+        job = {
+            "target": "source",
+            "managedSourceAttempts": bundle["attempts"],
+            "managedLocalSources": bundle["local_sources"],
+        }
+        assert list(bundle["local_sources"]) == [path]
+        assert _parent_attested_source_uris(job, graph) == frozenset({path})
+    finally:
+        bundle["stack"].close()
 
 
 @pytest.mark.parametrize("case,match", [
