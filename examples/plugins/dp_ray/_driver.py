@@ -143,21 +143,12 @@ def main() -> None:
         ray_opts = mod._ray_opts(job.get("requires"))  # region resource need → per-Ray-task placement
         prog = _progress_writer(status_file)
         _log(f"lowered; {'_run_ir_materialize' if mat else '_run_ir_sync'}; ray_opts={ray_opts}")
-        sink_attempts = job.get("sink_attempts")
-        if jobs_mode and int(job.get("contract_version") or 0) == 2:
-            sink_attempts = {
-                step_id: mod._legacy_v2_attempt_handoff_uri(
-                    logical_uri, job["attempt_id"], scope=step_id
-                )
-                for step_id, logical_uri in (job.get("sink_targets") or {}).items()
-            }
         result = (runner._run_ir_materialize(
             ir, graph, target, mat, ray_opts, prog, job.get("attempt_id")
         ) if mat
                   else runner._run_ir_sync(
                       ir, graph, target, ray_opts, prog, job.get("sink_targets"),
-                      job.get("attempt_id"), sink_attempts,
-                      job.get("sink_contracts") if int(job.get("contract_version") or 0) >= 3 else None,
+                      job.get("attempt_id"), None, job.get("sink_contracts"),
                   ))
         _log(f"run done: {result.get('status')}")
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read

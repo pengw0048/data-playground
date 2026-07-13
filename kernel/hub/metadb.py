@@ -1783,19 +1783,23 @@ def claim_backend_stop_fence(run_id: str, attempt_id: str, owner: str,
         return "busy"
 
 
-def note_backend_stop_fence_accepted(run_id: str, attempt_id: str) -> bool:
+def note_backend_stop_fence_accepted(
+        run_id: str, attempt_id: str, submission_owner: str | None = None) -> bool:
     """Record that the fixed stop fence, rather than the original workload, reserved the Ray ID."""
     with session() as s:
-        updated = s.execute(
-            update(RunBackendJob).where(
-                RunBackendJob.run_id == run_id,
-                RunBackendJob.attempt_id == attempt_id,
-                or_(RunBackendJob.cancel_requested.is_(True),
-                    RunBackendJob.quarantine_reason.is_not(None)),
-                RunBackendJob.submission_state == "fencing",
-            ).values(submission_state="stop_fenced", submission_owner=None,
-                     submission_lease_until=None)
-        )
+        predicates = [
+            RunBackendJob.run_id == run_id,
+            RunBackendJob.attempt_id == attempt_id,
+            or_(RunBackendJob.cancel_requested.is_(True),
+                RunBackendJob.quarantine_reason.is_not(None)),
+            RunBackendJob.submission_state == "fencing",
+        ]
+        if submission_owner is not None:
+            predicates.append(RunBackendJob.submission_owner == submission_owner)
+        updated = s.execute(update(RunBackendJob).where(*predicates).values(
+            submission_state="stop_fenced", submission_owner=None,
+            submission_lease_until=None,
+        ))
         return bool(updated.rowcount)
 
 

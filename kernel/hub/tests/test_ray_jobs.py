@@ -20,8 +20,7 @@ from sqlalchemy import select
 from hub import metadb
 from hub.compiler import compile_plan
 from hub.deps import Deps
-from hub.models import (CatalogPublicationReceipt, Graph, GraphNode, ResourceSpec, RunBackendRef,
-                        RunStatus)
+from hub.models import CatalogPublicationReceipt, Graph, GraphNode, ResourceSpec
 
 
 def _load_dp_ray():
@@ -111,7 +110,10 @@ class FakeJobsClient:
             self.submit_calls.append(kwargs)
             if submission_id in self.jobs:
                 raise RuntimeError("submission id already exists")
-            self.jobs[submission_id] = {"status": "RUNNING", "message": None, "logs": ""}
+            self.jobs[submission_id] = {
+                "status": "RUNNING", "message": None, "logs": "",
+                "metadata": dict(kwargs.get("metadata") or {}),
+            }
         return submission_id
 
     def stop_job(self, submission_id: str):
@@ -129,9 +131,13 @@ class FakeJobsClient:
             self.log_calls.append(submission_id)
             return self.jobs[submission_id].get("logs", "")
 
-    def put(self, submission_id: str, status: str, message: str | None = None, logs: str = "") -> None:
+    def put(self, submission_id: str, status: str, message: str | None = None, logs: str = "",
+            metadata: dict[str, str] | None = None) -> None:
         with self.lock:
-            self.jobs[submission_id] = {"status": status, "message": message, "logs": logs}
+            self.jobs[submission_id] = {
+                "status": status, "message": message, "logs": logs,
+                "metadata": dict(metadata or {}),
+            }
 
     def set_status(self, submission_id: str, status: str) -> None:
         with self.lock:
@@ -296,25 +302,6 @@ def _materialize_bound_job(runner, status) -> dict:
     """Stand in for the disabled supervisor in tests that exercise lower-level submission fences."""
     assert status.backend_ref is not None
     return runner._read_or_materialize_job_artifact(status.backend_ref, status)
-
-
-def _as_v2_job(module, current_ref: dict, current: dict, run_id: str) -> tuple[dict, dict]:
-    legacy = {key: value for key, value in current.items() if key != "sink_contracts"}
-    legacy["contract_version"] = 2
-    legacy["attempt_id"] = module._job_attempt_id(legacy)
-    legacy["submission_id"] = module._jobs_submission_id(run_id, legacy["attempt_id"])
-    base = f"{legacy['artifact_prefix']}/{legacy['submission_id']}"
-    legacy["job_uri"] = f"{base}/job.dpjob"
-    legacy["result_uri"] = f"{base}/result.dpresult"
-    legacy["envelope_sha256"] = module._job_envelope_sha256(legacy)
-    legacy_ref = {
-        **current_ref,
-        "attempt_id": legacy["attempt_id"],
-        "submission_id": legacy["submission_id"],
-        "job_uri": legacy["job_uri"],
-        "result_uri": legacy["result_uri"],
-    }
-    return legacy_ref, legacy
 
 
 def _write_success(store: MemoryArtifacts, status, rows=3, output_uri: str | None = None,
@@ -533,6 +520,7 @@ def test_failed_jobs_result_keeps_private_partial_output_evidence(jobs_config):
     client.set_status(ref.submission_id, "SUCCEEDED")
     final = _wait(runner, status.run_id)
     assert final.status == "failed" and final.output_uri is None and final.output_table is None
+    assert final.error == "Ray execution failed (RemoteExecutionError; code=ray_execution_failed)"
     assert runner.catalog.calls == []
     assert store.read(ref.result_uri)["outputs"] == [{
         "step_id": "write", "name": "jobs_out", "uri": physical_uri,
@@ -887,6 +875,86 @@ def test_cancel_fence_timeout_still_stops_its_late_remote_job(jobs_config):
     runner._publish_cancelled_binding(status, metadb.backend_job(status.run_id))
 
 
+def test_lost_fence_response_with_instant_success_persists_fence_winner(jobs_config):
+    _module, deps, runner, client, _store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(
+        plan, graph, "write", "distributed",
+        run_id=f"run_jobs_instant_fence_{uuid.uuid4().hex}",
+    )
+    ref = status.backend_ref
+    assert ref is not None
+    assert metadb.claim_backend_submission_after_missing(
+        status.run_id, ref.attempt_id, "crashed-owner", 5
+    ) == "claimed"
+    with metadb.session() as session:
+        session.get(metadb.RunBackendJob, status.run_id).submission_lease_until = (
+            metadb._now() - datetime.timedelta(seconds=1)
+        )
+    assert metadb.request_backend_cancel(status.run_id) is True
+    original_submit = client.submit_job
+
+    def _accepted_then_response_lost(**kwargs):
+        original_submit(**kwargs)
+        client.set_status(kwargs["submission_id"], "SUCCEEDED")
+        raise TimeoutError("fence response lost after remote completion")
+
+    client.submit_job = _accepted_then_response_lost
+    requested, _control, state = runner._cancel_control_state(
+        status, ref, metadb.backend_job(status.run_id)
+    )
+
+    assert requested is True and state == "STOPPED"
+    binding = metadb.backend_job(status.run_id)
+    assert binding["submission_state"] == "stop_fenced"
+    runner._publish_cancelled_binding(status, binding)
+    assert status.status == "cancelled" and "result" not in (status.error or "")
+
+
+def test_fence_submit_race_persists_delayed_workload_winner_from_metadata(jobs_config):
+    _module, deps, runner, client, _store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(
+        plan, graph, "write", "distributed",
+        run_id=f"run_jobs_workload_winner_{uuid.uuid4().hex}",
+    )
+    ref = status.backend_ref
+    assert ref is not None
+    assert metadb.claim_backend_submission_after_missing(
+        status.run_id, ref.attempt_id, "crashed-owner", 5
+    ) == "claimed"
+    with metadb.session() as session:
+        session.get(metadb.RunBackendJob, status.run_id).submission_lease_until = (
+            metadb._now() - datetime.timedelta(seconds=1)
+        )
+    assert metadb.request_backend_cancel(status.run_id) is True
+
+    def _delayed_workload_wins(**kwargs):
+        client.put(
+            kwargs["submission_id"], "RUNNING",
+            metadata={
+                "dataplay_run_id": status.run_id,
+                "dataplay_attempt_id": ref.attempt_id,
+                "dataplay_code_ref": ref.code_ref,
+            },
+        )
+        raise RuntimeError("submission id already exists")
+
+    client.submit_job = _delayed_workload_wins
+    requested, _control, state = runner._cancel_control_state(
+        status, ref, metadb.backend_job(status.run_id)
+    )
+
+    assert requested is True and state == "STOPPED"
+    assert metadb.backend_job(status.run_id)["submission_state"] == "submitted"
+    assert client.stop_calls == [ref.submission_id]
+    runner._publish_cancelled_binding(status, metadb.backend_job(status.run_id))
+
+
 def test_quarantine_fences_an_expired_submit_before_terminal_failure(jobs_config):
     _module, deps, runner, client, _store = _runner(jobs_config)
     graph = _graph()
@@ -1090,6 +1158,38 @@ def test_malformed_recovery_row_is_durably_visible_without_replay(
     _retire_inert_test_run(restarted.status(status.run_id))
 
 
+def test_malformed_backend_result_blocks_only_its_own_recovery_row(jobs_config, monkeypatch):
+    module, deps, original, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    original._ensure_jobs_supervisor = lambda _run_id: None
+    bad = original.run(
+        plan, graph, "write", "distributed",
+        run_id=f"bad-result-row-{uuid.uuid4().hex}",
+    )
+    good = original.run(
+        plan, graph, "write", "distributed",
+        run_id=f"good-result-row-{uuid.uuid4().hex}",
+    )
+    with metadb.session() as session:
+        session.get(metadb.RunBackendJob, bad.run_id).result_doc = "{not-json"
+
+    supervised: list[str] = []
+    monkeypatch.setattr(
+        module.RayRunner, "_ensure_jobs_supervisor",
+        lambda _self, run_id: supervised.append(run_id),
+    )
+    recovered = module.RayRunner(
+        deps, jobs_client_factory=client, artifact_store=store, recover=True
+    )
+
+    assert good.run_id in supervised and bad.run_id not in supervised
+    assert "result_doc" in (recovered.status(bad.run_id).error or "")
+    assert recovered.status(good.run_id).status == "queued"
+    _retire_inert_test_run(recovered.status(bad.run_id))
+    _retire_inert_test_run(recovered.status(good.run_id))
+
+
 def test_ray_jobs_multi_sink_usage_is_one_event_per_run(jobs_config):
     catalog = CountingCatalog()
     _module, _deps, runner, _client, _store = _runner(jobs_config, catalog=catalog)
@@ -1133,8 +1233,10 @@ def test_ray_jobs_multi_sink_usage_is_one_event_per_run(jobs_config):
     assert all(set(call["parents"]) == {left_source, right_source} for call in catalog.calls)
 
 
-def test_ray_jobs_failure_uses_official_info_and_keeps_logs_out_of_shared_status(jobs_config, monkeypatch):
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "job-secret-value")
+def test_ray_jobs_failure_never_shares_rotated_credentials_or_remote_text(
+        jobs_config, monkeypatch, caplog):
+    old_secret = "old-job-secret-value"
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "rotated-secret-value")
     _module, deps, runner, client, _store = _runner(jobs_config)
     graph = _graph()
     plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
@@ -1143,17 +1245,23 @@ def test_ray_jobs_failure_uses_official_info_and_keeps_logs_out_of_shared_status
     ref = status.backend_ref
     assert ref is not None
     _wait_submitted(client, ref.submission_id)
-    client.put(ref.submission_id, "FAILED", message="entrypoint exited 17",
-               logs="traceback: job-secret-value")
+    client.put(
+        ref.submission_id, "FAILED",
+        message=f"entrypoint exited: AWS_SECRET_ACCESS_KEY={old_secret}",
+        logs=f"traceback: {old_secret}",
+    )
 
     final = _wait(runner, status.run_id)
 
     assert final.status == "failed"
-    assert "entrypoint exited 17" in (final.error or "")
-    assert "traceback" not in (final.error or "") and "job-secret-value" not in (final.error or "")
+    assert final.error == "Ray execution failed (RemoteJobFailed; code=ray_execution_failed)"
+    persisted = metadb.get_run_state(status.run_id)
+    assert old_secret not in json.dumps(persisted) and old_secret not in caplog.text
     assert client.log_calls == []
-    assert runner.logs(status.run_id) == "traceback: [REDACTED]"
-    assert client.log_calls == [ref.submission_id]
+    assert runner.logs(status.run_id) == (
+        "Ray diagnostics are available only through protected operator tooling"
+    )
+    assert client.log_calls == []
     assert runner.catalog.calls == []
 
 
@@ -1227,6 +1335,37 @@ def test_sql_bound_envelope_recovers_crash_before_artifact_materialization(jobs_
     assert module.canonical_json(restored) == payload
     _complete(store, client, original.status(run_id))
     assert _wait(original, run_id).status == "done"
+
+
+def test_status_retries_supervisor_after_thread_start_failure(jobs_config, monkeypatch):
+    _module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    original_start = threading.Thread.start
+    failed = False
+
+    def _fail_first_jobs_supervisor(thread):
+        nonlocal failed
+        if not failed and thread.name.startswith("dp-ray-job-"):
+            failed = True
+            raise RuntimeError("forced thread start failure")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", _fail_first_jobs_supervisor)
+    status = runner.run(
+        plan, graph, "write", "distributed",
+        run_id=f"run_jobs_thread_retry_{uuid.uuid4().hex}",
+    )
+    ref = status.backend_ref
+    assert ref is not None and failed is True
+    assert "code=supervisor_start_failed" in (status.error or "")
+    assert status.run_id not in runner._supervising
+    assert metadb.backend_job(status.run_id) is not None
+
+    runner.status(status.run_id)
+    _wait_submitted(client, ref.submission_id)
+    _complete(store, client, status)
+    assert _wait(runner, status.run_id).status == "done"
 
 
 def test_bound_sql_artifact_recovers_before_first_submit(jobs_config):
@@ -1667,95 +1806,34 @@ def test_jobs_semantic_environment_is_frozen_while_credentials_rotate(jobs_confi
     assert job_c["semantic_env"]["DP_RAY_GPU_BATCH_ROWS"] == "8192"
 
 
-def test_v2_job_and_result_artifacts_remain_readable(jobs_config):
-    module, deps, runner, client, store = _runner(jobs_config)
-    assert module._legacy_v2_attempt_handoff_uri(
-        "s3://shared/outputs/jobs_out.parquet", "legacy-attempt-0123456789", scope="write"
-    ) == (
-        "s3://shared/outputs/jobs_out.attempt-legacy-attempt-0123456789-"
-        "b6d8061796617499c93052a67be732d8"
-    )
-    run_id = f"legacy-v2-{uuid.uuid4().hex}"
+def test_unsupported_job_contract_is_quarantined_without_workload_replay(jobs_config):
+    module, deps, original, client, store = _runner(jobs_config)
     graph = _graph()
-    current_ref, current = runner._make_jobs_artifacts(
-        run_id, graph, "write",
-        sink_targets={"write": "s3://shared/outputs/jobs_out.parquet"},
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    original._ensure_jobs_supervisor = lambda _run_id: None
+    status = original.run(
+        plan, graph, "write", "distributed",
+        run_id=f"unsupported-contract-{uuid.uuid4().hex}",
     )
-    legacy_ref, legacy = _as_v2_job(module, current_ref, current, run_id)
-    ref = RunBackendRef.model_validate(legacy_ref)
-    status = RunStatus(run_id=run_id, status="queued", backend_ref=ref)
+    ref = status.backend_ref
+    assert ref is not None
+    job = _materialize_bound_job(original, status)
+    job["contract_version"] = 2
+    store.write(ref.job_uri, job)
+    with metadb.session() as session:
+        session.get(metadb.RunBackendJob, status.run_id).job_doc = (
+            module.canonical_json(job).decode("utf-8")
+        )
+    client.put(ref.submission_id, "RUNNING")
 
-    runner._validate_job_artifact_integrity(ref, status, legacy)
-    logical_uri = legacy["sink_targets"]["write"]
-    physical_uri = module._legacy_v2_attempt_handoff_uri(
-        logical_uri, legacy["attempt_id"], scope="write"
-    )
-    assert physical_uri != module._attempt_handoff_uri(
-        logical_uri, legacy["attempt_id"], scope="write"
-    )
-    result = {
-        "contract_version": 2,
-        "attempt_id": legacy["attempt_id"],
-        "submission_id": legacy["submission_id"],
-        "envelope_sha256": legacy["envelope_sha256"],
-        "status": "done",
-        "rows": 3,
-        "error": None,
-        "output_uri": physical_uri,
-        "output_table": "jobs_out",
-        "outputs": [{"step_id": "write", "name": "jobs_out", "uri": physical_uri}],
-    }
-    store.write(legacy["job_uri"], legacy)
-    store.write(legacy["result_uri"], result)
-    metadb.bind_backend_job(
-        run_id, legacy_ref, status.model_dump(), canvas_id=graph.id,
-        job_payload=module.canonical_json(legacy),
-    )
-    deps.resolve_adapter = lambda _uri: (_ for _ in ()).throw(
-        RuntimeError("legacy result validation must not consult the current adapter registry")
-    )
     recovered = module.RayRunner(
         deps, jobs_client_factory=client, artifact_store=store, recover=True
     )
+    final = _wait(recovered, status.run_id)
 
-    assert _wait(recovered, run_id).status == "done"
-    assert client.submit_calls == [] and client.stop_calls == []
-    with metadb.session() as session:
-        attempt = session.get(metadb.ObjectAttempt, physical_uri)
-        assert attempt is not None and attempt.state == "published"
-    assert metadb.catalog_get(physical_uri)["uri"] == physical_uri
-
-
-def test_v2_replay_preclaims_legacy_direct_candidate_despite_adapter_drift(jobs_config):
-    module, deps, runner, client, _store = _runner(jobs_config)
-    run_id = f"legacy-v2-replay-{uuid.uuid4().hex}"
-    graph = _graph()
-    current_ref, current = runner._make_jobs_artifacts(
-        run_id, graph, "write",
-        sink_targets={"write": "s3://shared/outputs/jobs_out.parquet"},
-    )
-    legacy_ref, legacy = _as_v2_job(module, current_ref, current, run_id)
-    ref = RunBackendRef.model_validate(legacy_ref)
-    status = RunStatus(run_id=run_id, status="queued", backend_ref=ref)
-    metadb.bind_backend_job(
-        run_id, legacy_ref, status.model_dump(), canvas_id=graph.id,
-        job_payload=module.canonical_json(legacy),
-    )
-    runner.resolve_adapter = lambda _uri: (_ for _ in ()).throw(
-        RuntimeError("current adapter drift must not suppress the legacy write claim")
-    )
-
-    runner._prepare_jobs_submission(legacy)
-    logical_uri = legacy["sink_targets"]["write"]
-    physical_uri = module._legacy_v2_attempt_handoff_uri(
-        logical_uri, legacy["attempt_id"], scope="write"
-    )
-    with metadb.session() as session:
-        attempt = session.get(metadb.ObjectAttempt, physical_uri)
-        assert attempt is not None and attempt.state == "writing"
-    assert runner._ensure_job_submitted(client, legacy) == "PENDING"
-    assert client.submit_calls[0]["submission_id"] == legacy["submission_id"]
-    _retire_inert_test_run(status)
+    assert final.status == "failed"
+    assert "unsupported Ray job artifact contract_version 2" in (final.error or "")
+    assert client.submit_calls == [] and client.stop_calls == [ref.submission_id]
 
 
 def test_jobs_whole_graph_uses_target_cone_resources_and_forwards_ray_options(jobs_config, monkeypatch):
@@ -1919,6 +1997,42 @@ def test_terminal_fence_survives_ad_hoc_pruning_without_run_history(jobs_config,
         metadb.bind_run_owner(run_id, "local", None)
     with pytest.raises(metadb.TerminalRunIdError, match="already terminal"):
         metadb.bind_backend_job(run_id, ref, {**status, "status": "queued"})
+
+
+def test_stale_supervisor_converges_after_terminal_detail_is_pruned(jobs_config, monkeypatch):
+    module, deps, runner, _client, _store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(
+        plan, graph, "write", "distributed",
+        run_id=f"stale_terminal_{uuid.uuid4().hex}",
+    )
+    ref = status.backend_ref
+    assert ref is not None
+    job = _materialize_bound_job(runner, status)
+    monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 0)
+    assert metadb.claim_backend_publication(
+        status.run_id, ref.attempt_id, "winner", 10
+    ) == "claimed"
+    winner = status.model_copy(deep=True)
+    winner.status, winner.progress = "done", 1.0
+    assert metadb.finish_backend_publication(
+        status.run_id, ref.attempt_id, "winner", winner.model_dump()
+    ) is True
+    assert metadb.backend_job(status.run_id) is None
+
+    runner._publish_job_result(
+        job, graph, "write", status,
+        {"status": "done", "rows": 1, "outputs": []},
+    )
+    assert status.status == "done"
+
+    status.status = "queued"  # emulate another stale loop that had not observed publication
+    runner._supervising.add(status.run_id)
+    runner._supervise_jobs(status.run_id)
+    assert status.status == "done"
+    assert status.run_id not in runner._supervising
 
 
 def test_fast_terminal_run_can_bind_owner_while_detail_still_exists(jobs_config):

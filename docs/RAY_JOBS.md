@@ -47,6 +47,11 @@ graph, target, target-cone resources, code/module/entrypoint identity, remote pa
 semantic environment. Unknown or missing fields are corruption. The canonical contract produces an
 attempt ID; the complete envelope produces a second SHA-256 binding.
 
+Durable Jobs currently supports contract version 3 only. That version freezes each sink's writer mode,
+logical URI, and physical attempt URI before submission. Earlier experimental versions were never
+released and are intentionally not replayed: an unsupported version is quarantined and stopped rather
+than submitted under semantics that cannot satisfy the current ownership contract.
+
 The Ray entrypoint receives four independent arguments: job URI, expected attempt ID, expected submission
 ID, and expected envelope hash. `_driver.py` rereads the object and verifies the exact field set, both
 hashes, the semantic-environment hash, and all four arguments **before** importing Ray or workload/plugin
@@ -122,7 +127,9 @@ increment it again. Permanent lineage-edge existence is not a run-usage event.
 Terminal `RunState` and backend-detail rows share the normal bounded retention policy. Pruning happens in
 the same terminal publication transaction and leaves `run_records` history intact. A separate compact,
 permanent terminal run-ID fence is not pruned; it prevents stale supervisors or duplicate binds from
-resurrecting a completed run even when no history row exists or bounded history has aged out.
+resurrecting a completed run even when no history row exists or bounded history has aged out. A stale
+supervisor that loses its publication claim or finds the backend row already pruned consults this fence,
+converges its local status, and stops supervising instead of restarting forever.
 
 ## Recovery and cancellation
 
@@ -151,7 +158,9 @@ exists, publishes `cancelled`. Lease expiry permits idempotent takeover of the d
 it does not prove an earlier HTTP request can no longer arrive. For a crashed owner plus concurrent cancel,
 the hub therefore submits a fixed, inert, stoppable fence job under that exact same ID after lease expiry.
 Ray accepts either the delayed workload or the fence, never both; the winner is then stopped and observed.
-A concurrent real `SUCCEEDED`/`FAILED` is reconciled normally. If metadata disappears for a previously
+The hub validates the winner's Ray Job metadata before atomically recording whether the inert fence or
+the bound workload owns that ID; a lost submit response cannot turn an instantly successful fence into a
+missing-result workload failure. A concurrent real `SUCCEEDED`/`FAILED` is reconciled normally. If metadata disappears for a previously
 accepted ID, cancellation still verifies the hash-bound terminal result; trusted completion wins over a
 later cancel request, while a never-linearized queued attempt can cancel directly from authoritative absence.
 
@@ -168,10 +177,11 @@ stopped, not that no physical side effect occurred.
 
 ## Logs and operator access
 
-Failed shared status contains the bounded Jobs API message; it does not copy driver logs. `RayRunner.logs`
-is an internal/operator helper with best-effort credential redaction, not an authenticated application
-route. Use a Ray Dashboard/log backend protected by TLS, network policy, and the cluster's authentication
-boundary. Do not expose port 8265 directly to end users.
+Shared status exposes only a stable failure code/type. It does not copy Ray Job messages or driver logs,
+because remote text can contain credentials that have since rotated and can no longer be reliably
+redacted. `RayRunner.logs` likewise returns no remote payload until a protected operator diagnostics
+surface exists. Use a Ray Dashboard/log backend protected by TLS, network policy, and the cluster's
+authentication boundary. Do not expose port 8265 directly to end users.
 
 ## Current limits
 
