@@ -27,14 +27,97 @@ import os
 import threading
 import time
 
-from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from hub import auth, metadb
 from hub.routers import catalog, runs, workspace
 from hub.routers.runs import _status_or_lost
 from hub.security import current_user
+
+
+class _RequestBodyTooLarge(HTTPException):
+    def __init__(self, limit: int):
+        super().__init__(
+            status_code=413,
+            detail=f"request body exceeds the {limit}-byte limit (raise DP_MAX_BODY_BYTES)",
+        )
+
+
+class RequestBodyLimitMiddleware:
+    """Limit non-upload request body bytes as downstream consumers receive them from ASGI."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    @staticmethod
+    def _response(limit: int) -> JSONResponse:
+        return JSONResponse(
+            {"detail": f"request body exceeds the {limit}-byte limit (raise DP_MAX_BODY_BYTES)"},
+            status_code=413,
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") == "/api/catalog/upload":
+            await self.app(scope, receive, send)
+            return
+
+        from hub.settings import settings
+
+        limit = settings.max_body_bytes
+        content_length = next(
+            (value for name, value in scope.get("headers", ()) if name.lower() == b"content-length"),
+            None,
+        )
+        if content_length is not None:
+            try:
+                declared_over_limit = int(content_length) > limit
+            except ValueError:
+                declared_over_limit = False
+            if declared_over_limit:
+                await self._response(limit)(scope, receive, send)
+                return
+
+        received = 0
+        too_large = False
+        response_started = False
+
+        async def limited_receive() -> Message:
+            nonlocal received, too_large
+            if too_large:
+                raise _RequestBodyTooLarge(limit)
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    too_large = True
+                    raise _RequestBodyTooLarge(limit)
+            return message
+
+        async def limited_send(message: Message) -> None:
+            nonlocal response_started
+            if not too_large:
+                if message["type"] == "http.response.start":
+                    response_started = True
+                await send(message)
+
+        try:
+            await self.app(scope, limited_receive, limited_send)
+        except _RequestBodyTooLarge:
+            pass
+        if too_large:
+            if response_started:
+                # ASGI forbids a second response start. No current route reads request bytes after
+                # starting its response; if a plugin does, abort that response instead of emitting an
+                # invalid 200-then-413 sequence.
+                raise _RequestBodyTooLarge(limit)
+            # A route may translate body-read exceptions (for example JSON-RPC parse errors). Discard
+            # that response and keep the transport-level size contract authoritative.
+            await self._response(limit)(scope, receive, send)
+
 
 app = FastAPI(title="Data Playground kernel", version="0.1.0")
 # Restrict CORS to localhost origins only. The kernel binds to 127.0.0.1 and serves the SPA
@@ -45,31 +128,10 @@ app.add_middleware(
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_methods=["*"], allow_headers=["*"],
 )
-
-
-@app.middleware("http")
-async def _limit_request_body(request: Request, call_next):
-    # SEC-10: cap every request body so a single JSON/graph/canvas/MCP payload can't exhaust memory.
-    # /catalog/upload STREAMS + self-caps at DP_MAX_UPLOAD_BYTES, so it's exempt. Reads only the
-    # Content-Length header — never consumes the body — so upload streaming is untouched. NOTE: header-
-    # based; a Transfer-Encoding: chunked request with NO Content-Length isn't capped here (normal
-    # fetch/JSON clients always set Content-Length). Graph routes still bound node/edge count + code/SQL
-    # length at Pydantic parse. A hard byte budget for chunked bodies needs a pure-ASGI receive wrapper —
-    # deferred (all routes are authed; local-first tool).
-    from fastapi.responses import JSONResponse
-    from hub.settings import settings
-    if request.url.path != "/api/catalog/upload":
-        cl = request.headers.get("content-length")
-        if cl is not None:
-            try:
-                over = int(cl) > settings.max_body_bytes
-            except ValueError:
-                over = False
-            if over:
-                return JSONResponse(
-                    {"detail": f"request body exceeds the {settings.max_body_bytes}-byte limit (raise DP_MAX_BODY_BYTES)"},
-                    status_code=413)
-    return await call_next(request)
+# SEC-10: count actual ASGI request bytes as endpoints consume them instead of trusting Content-Length.
+# An endpoint that ignores its body does not drain it into application memory. Dataset uploads remain
+# exempt because /catalog/upload streams and independently enforces DP_MAX_UPLOAD_BYTES as bytes arrive.
+app.add_middleware(RequestBodyLimitMiddleware)
 # EVERY /api route requires a resolved user (open mode → local; auth mode → a valid session). Only the
 # workspace PUBLIC router (auth status/login/logout + the login roster) is reachable pre-login. This
 # keeps auth the SECURE DEFAULT — a route is gated unless it is explicitly put on the public router —
