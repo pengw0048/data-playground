@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import contextlib
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -35,6 +37,24 @@ def _region_concurrency() -> int:
         return max(1, int(os.environ.get("DP_REGION_CONCURRENCY", "4")))
     except ValueError:
         return 4
+
+
+def _region_internal_id_base(kind: str, *identity) -> str:
+    """A deterministic opaque ID base for one controller-generated graph element."""
+    payload = json.dumps([kind, *identity], ensure_ascii=False, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    return f"__dp_region_{kind}_{digest}"
+
+
+def _reserve_region_internal_id(base: str, occupied: set[str]) -> str:
+    """Reserve ``base`` or its first deterministic suffix outside every client/generated ID."""
+    candidate = base
+    suffix = 1
+    while candidate in occupied:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    occupied.add(candidate)
+    return candidate
 
 
 class _RegionMaterialization(str):
@@ -964,27 +984,45 @@ class RunController:
         # feeds multi-input nodes like join positionally, so a swapped operand order silently corrupts
         # results). A cut input (source outside the region = an upstream materialized region) is replaced
         # IN PLACE by a ref-source reading that region's parquet.
-        nm = g.node_map(graph)
-        nodes = [nm[nid] for nid in region.node_ids if nid in nm]
-        have = {n.id for n in nodes}
+        region_node_ids = set(region.node_ids)
+        # Preserve the original graph order rather than iterating Region.node_ids (a set). Besides making
+        # the serialized subgraph deterministic, this keeps plan/cache hashes stable across processes.
+        region_nodes = [node for node in graph.nodes if node.id in region_node_ids]
+        nodes = list(region_nodes)
         edges: list[GraphEdge] = []
-        for nid in region.node_ids:
-            for e in g.incoming(graph, nid):  # original order, per node
-                if e.source in region.node_ids:
+        publication_sources: dict[str, tuple[str, ...]] = {}
+        ref_nodes: dict[str, str] = {}
+        # Generated node and edge IDs share one namespace that excludes every original ID, including
+        # elements outside this region. A client can occupy any predictable base without taking over a
+        # ref or creating a duplicate; deterministic suffix selection preserves cache identity.
+        occupied_ids = {node.id for node in graph.nodes} | {edge.id for edge in graph.edges}
+        for node in region_nodes:
+            for e in g.incoming(graph, node.id):  # original graph.edges order, per target
+                if e.source in region_node_ids:
                     edges.append(e)  # intra-region edge, unchanged
                 else:  # a cut → read the upstream region's ref at THIS operand position
-                    rid = f"__ref_{e.source}"
-                    if rid not in have:
+                    rid = ref_nodes.get(e.source)
+                    if rid is None:
+                        rid = _reserve_region_internal_id(
+                            _region_internal_id_base("ref", e.source), occupied_ids)
+                        ref_nodes[e.source] = rid
                         nodes.append(GraphNode(id=rid, type="source", position=Position(x=0, y=0),
                                                data={"config": {"uri": ref_uri[e.source]}}))
-                        have.add(rid)
-                    edges.append(GraphEdge(id=f"__e_{rid}_{nid}_{e.target_handle or 'in'}", source=rid,
-                                           target=nid, source_handle=None, target_handle=e.target_handle,
+                        publication_sources[rid] = tuple(
+                            g.all_upstream_publication_uris(graph, e.source))
+                    edge_id = _reserve_region_internal_id(
+                        _region_internal_id_base(
+                            "edge", e.id, e.source, e.source_handle, e.target, e.target_handle),
+                        occupied_ids)
+                    edges.append(GraphEdge(id=edge_id, source=rid,
+                                           target=node.id, source_handle=None, target_handle=e.target_handle,
                                            data=GraphEdgeData()))
         # carry the canvas's requirements so a region's cache key reflects a package-version edit
         # (a transform in a locally-run region can import them) — plan_hash folds them (P0-CACHE-01).
-        return Graph(id="_region", version=1, nodes=nodes, edges=edges,
-                     requirements=getattr(graph, "requirements", None) or [])
+        subgraph = Graph(id="_region", version=1, nodes=nodes, edges=edges,
+                         requirements=getattr(graph, "requirements", None) or [])
+        subgraph._publication_source_uris = publication_sources
+        return subgraph
 
     # -- status / cancel (a logical run, keyed by the overall run_id) ------- #
     def _mark(self, status: RunStatus, region, state: str) -> None:
