@@ -138,21 +138,41 @@ def verify(token: str | None) -> str | None:
     return claims.user_id if claims is not None else None
 
 
-_SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32}  # ~16MB work factor — fine for interactive login
+_SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32}  # ~16MB work factor — admitted before use
+MAX_PASSWORD_BYTES = 1024
+
+
+def password_bytes_for_kdf(password: str) -> bytes:
+    """Return a bounded UTF-8 password representation before allocating scrypt work."""
+    if not isinstance(password, str):
+        raise TypeError("password must be a string")
+    # Every valid UTF-8 code point uses at least one byte. Reject an obviously oversized string before
+    # allocating a second, encoded copy; short multibyte strings still get the exact byte check below.
+    if len(password) > MAX_PASSWORD_BYTES:
+        raise ValueError(f"password must be at most {MAX_PASSWORD_BYTES} UTF-8 bytes")
+    try:
+        encoded = password.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("password must be valid UTF-8") from exc
+    if len(encoded) > MAX_PASSWORD_BYTES:
+        raise ValueError(f"password must be at most {MAX_PASSWORD_BYTES} UTF-8 bytes")
+    return encoded
 
 
 def hash_password(pw: str) -> str:
     """A salted scrypt hash, stored as 'scrypt$<salt_b64>$<hash_b64>' (stdlib only, no new dep)."""
+    password = password_bytes_for_kdf(pw)
     salt = os.urandom(16)
-    dk = hashlib.scrypt(pw.encode(), salt=salt, **_SCRYPT)
+    dk = hashlib.scrypt(password, salt=salt, **_SCRYPT)
     return f"scrypt${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
 
 
 def verify_password(pw: str, stored: str | None) -> bool:
     """Constant-time check of a password against a stored scrypt hash. False if unset/malformed."""
-    if not stored or not stored.startswith("scrypt$"):
-        return False
     try:
+        password = password_bytes_for_kdf(pw)
+        if not stored or not stored.startswith("scrypt$"):
+            return False
         _, salt_b64, hash_b64 = stored.split("$")
         salt = base64.b64decode(salt_b64, validate=True)
         expected = base64.b64decode(hash_b64, validate=True)
@@ -160,7 +180,7 @@ def verify_password(pw: str, stored: str | None) -> bool:
             return False
         if base64.b64encode(salt).decode() != salt_b64 or base64.b64encode(expected).decode() != hash_b64:
             return False
-        dk = hashlib.scrypt(pw.encode(), salt=salt, **_SCRYPT)
+        dk = hashlib.scrypt(password, salt=salt, **_SCRYPT)
         return hmac.compare_digest(dk, expected)
     except Exception:  # noqa: BLE001 — any parse/format error → not a valid credential
         return False
