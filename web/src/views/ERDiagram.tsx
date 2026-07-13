@@ -232,6 +232,10 @@ export function ERDiagram() {
 
   const onNodesChange = useCallback((changes: NodeChange[]) => {
     setPositions((p) => {
+      // React Flow reports dimension measurements through this same callback. Re-rendering controlled
+      // nodes for a measurement drops its internal measured size, so it becomes hidden and is measured
+      // again forever. Positions are the only user state this view owns; leave all other changes alone.
+      if (!changes.some((ch) => ch.type === 'position' && ch.position)) return p
       const next = { ...p }
       for (const ch of changes) if (ch.type === 'position' && ch.position) next[ch.id] = ch.position
       savePositions(next)
