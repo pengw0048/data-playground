@@ -97,6 +97,23 @@ def upstream_chain(graph: Graph, node_id: str) -> list[GraphNode]:
     return [nm[nid] for nid in order]
 
 
+def all_upstream_source_uris(graph: Graph, node_id: str) -> list[str]:
+    """Every source URI feeding a node, de-duplicated in stable upstream traversal order."""
+    uris: list[str] = []
+    seen: set[str] = set()
+    for node in upstream_chain(graph, node_id):
+        if node.type != "source" or not isinstance(node.data, dict):
+            continue
+        config = node.data.get("config")
+        if not isinstance(config, dict):
+            continue
+        uri = config.get("uri") or config.get("table")
+        if uri and uri not in seen:
+            seen.add(uri)
+            uris.append(uri)
+    return uris
+
+
 def topo_order(graph: Graph) -> list[GraphNode]:
     nm = node_map(graph)
     order: list[str] = []

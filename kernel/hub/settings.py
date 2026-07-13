@@ -34,8 +34,9 @@ class Settings:
     # cap on a single dataset upload (POST /catalog/upload). Streamed + enforced as bytes arrive, so a
     # too-large upload is rejected without buffering it. Default 2 GiB; raise for bigger local files.
     max_upload_bytes: int = int(os.environ.get("DP_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
-    # caps every NON-upload request body (JSON API, /mcp, canvas save) + the WebSocket frame size.
-    # 64 MiB is generous vs. any real canvas/graph; uploads stream + self-cap at max_upload_bytes (SEC-10).
+    # caps bytes consumed from every NON-upload request body (JSON API, /mcp, canvas save) + the
+    # WebSocket frame size. 64 MiB is generous vs. any real canvas/graph; uploads stream + self-cap at
+    # max_upload_bytes (SEC-10). Endpoints that ignore a body do not drain it into application memory.
     max_body_bytes: int = int(os.environ.get("DP_MAX_BODY_BYTES", str(64 * 1024**2)))
     plugin_modules: list[str] = [m.strip() for m in os.environ.get("DP_PLUGINS", "").split(",") if m.strip()]
     # LLM agent (optional, provider-agnostic via LiteLLM): pick any model with DP_AGENT_MODEL, e.g.

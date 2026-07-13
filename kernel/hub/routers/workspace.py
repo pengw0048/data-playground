@@ -79,7 +79,12 @@ def change_password(body: dict, response: Response,
 
 
 @public_router.post("/auth/logout")
-def auth_logout(response: Response) -> dict:
+def auth_logout(response: Response, dp_session: str | None = Cookie(default=None)) -> dict:
+    # Sessions are stateless apart from the per-user epoch, so logout revokes every session issued
+    # at the current epoch. Keep this route public so an expired/invalid cookie can still be cleared.
+    uid = auth.verify(dp_session) if auth.auth_enabled() else None
+    if uid is not None:
+        metadb.bump_token_epoch(uid)
     response.delete_cookie("dp_session")
     return {"ok": True}
 

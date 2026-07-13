@@ -9,9 +9,11 @@ Content-addressed: an unchanged plan (by node config + source fingerprint) is se
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import inspect
 import json
+import logging
 import os
 import threading
 import time
@@ -30,6 +32,31 @@ from hub.models import (
 
 _CONFIRM_ROWS = 5_000_000   # fallback gate when byte size is unknown but the row count is known
 _CONFIRM_BYTES = 2 << 30    # 2 GiB — the primary confirm signal: a full pass moving this much data
+
+
+def _safe_abandon_attempt(uri: str) -> None:
+    """Best-effort lifecycle cleanup after this process has proved the writer is stopped."""
+    from hub import metadb
+    from hub.handoff import discard_attempt
+
+    try:
+        abandoned = metadb.abandon_committed_object_attempt(uri)
+    except Exception:  # noqa: BLE001 — cleanup must not replace the terminal run result
+        logging.getLogger("hub").exception("managed attempt abandon failed during run cleanup")
+        return  # metadata uncertainty: retaining data is safer than deleting an owned object
+    if not abandoned:
+        discard_attempt(uri)
+
+
+def _is_core_managed_sink(spec, uri: str, adapter) -> bool:
+    """The one sink shape whose immutable attempt lifecycle is owned by the core control plane."""
+    from hub.plugins.adapters import is_object_uri
+
+    return (
+        is_object_uri(uri) and spec.mode == "overwrite"
+        and spec.extension.lower() in (".parquet", ".pq")
+        and adapter.__class__.__module__ == "hub.plugins.adapters"
+    )
 
 
 def _fmt_bytes(n: int) -> str:
@@ -103,7 +130,15 @@ class LocalRunner:
         # optional result-cache hooks (Deps wires them to the DB-backed content-addressed store, so
         # reuse survives restart + is shared across instances). Absent → fall back to the in-process dict.
         self.result_get = None   # (key) -> {uri, table, rows} | None
+        self.result_acquire = None  # (key, owner, ttl) -> (doc, temporary ownership pin)
         self.result_put = None   # (key, doc) -> None
+        self.forced_result_uri = None  # parent-owned exact attempt URI for metadata-isolated workers
+        # A metadata-isolated worker receives every logical sink target from its parent. Managed object
+        # sinks additionally receive the exact parent-allocated physical attempt; the child may write that
+        # attempt, but must never allocate or publish lifecycle state in its disposable metadata DB.
+        # None means a normal in-process runner. An empty dict is an authoritative "no write sinks" contract.
+        self.forced_sink_targets: dict[str, str] | None = None
+        self.forced_sink_attempts: dict[str, str] = {}
         # keep the SAME dict object deps passes (plugins fill it AFTER construction) — an
         # empty {} is falsy, so `or {}` would rebind a new dict and drop plugin lowerings.
         self.node_builders = node_builders if node_builders is not None else {}
@@ -155,11 +190,32 @@ class LocalRunner:
         with self._lock:
             return self._cache.get(key)
 
+    def _cache_acquire(self, key: str, owner: str, ttl_seconds: float):
+        """Read a cache hit with a temporary durable owner when it points at a managed attempt."""
+        if self.result_acquire:
+            try:
+                doc, pin_id = self.result_acquire(key, owner, ttl_seconds)
+                if pin_id:
+                    from hub.handoff import ManagedResultCachePinGuard
+                    return doc, ManagedResultCachePinGuard(pin_id, ttl_seconds)
+                return doc, None
+            except Exception:  # noqa: BLE001 — an unavailable/stale cache safely recomputes
+                return None, None
+        doc = self._cache_get(key)
+        if doc and doc.get("uri"):
+            from hub import metadb
+            if metadb.object_attempt_uri_shape(doc["uri"]):
+                return None, None  # managed reuse requires an atomic DB-backed ownership pin
+        return doc, None
+
     def _cache_put(self, key: str, doc: dict) -> None:
         if self.result_put:
             try:
                 self.result_put(key, doc)
             except Exception:  # noqa: BLE001 — never let caching break a successful run
+                from hub import metadb
+                if doc.get("uri") and metadb.object_attempt_is_managed(doc["uri"]):
+                    raise
                 pass
             return
         with self._lock:
@@ -186,6 +242,14 @@ class LocalRunner:
     # -- run --------------------------------------------------------------- #
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
             placement: Placement, run_id: str | None = None, cancel_check=None) -> RunStatus:
+        if sum(step.kind == "write" for step in plan.steps) > 1:
+            raise RuntimeError(
+                "local runs support one write sink until atomic multi-sink publication is enabled")
+        if any(step.kind == "write" for step in plan.steps):
+            from hub.plugins.catalog import unmanaged_publication_supported
+            if not unmanaged_publication_supported(self.catalog):
+                raise RuntimeError(
+                    "local write sinks require catalog registration with read-back support")
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         status = RunStatus(run_id=run_id, status="queued", placement=placement, per_node=per_node,
@@ -198,13 +262,22 @@ class LocalRunner:
         threading.Thread(target=self._execute, args=(run_id, plan, graph, target_node_id), daemon=True).start()
         return status
 
-    def _emit(self, graph: Graph, status: RunStatus) -> None:
+    def _emit(self, graph: Graph, status: RunStatus, *, strict: bool = False) -> None:
         """Fire the on_status hook (DB-backed live status); never let persistence break a run."""
         if self.on_status:
             try:
                 self.on_status(graph, status)
             except Exception:  # noqa: BLE001
-                pass
+                if strict:
+                    raise
+
+    def _complete(self, graph: Graph, target: str | None, status: RunStatus, *, strict: bool = False) -> None:
+        if self.on_complete:
+            try:
+                self.on_complete(graph, target, status)
+            except Exception:  # noqa: BLE001
+                if strict:
+                    raise
 
     def _evict(self) -> None:
         """Bound retained run/cancel/cache state (called under self._lock). Dicts keep insertion order.
@@ -229,7 +302,14 @@ class LocalRunner:
         self._emit(graph, status)
         phash = self._plan_hash(graph, target)
         cacheable = self._plan_cacheable(graph, target)
-        cached = self._cache_get(phash) if cacheable else None
+        try:
+            deadline = float(os.environ.get("DP_RUN_DEADLINE_S", "3600"))
+        except ValueError:
+            deadline = 3600.0
+        ttl = max(300.0, deadline + 300.0)
+        cached, cache_pin = self._cache_acquire(
+            phash, f"run:{run_id}", ttl) if cacheable else (None, None)
+        terminal_persisted = False
         engine = BuildEngine(graph, self.resolve_adapter, self.registry, full=True,
                                 node_builders=self.node_builders, node_specs=self.node_specs,
                                 pushdown=True, output_node=target)
@@ -238,10 +318,26 @@ class LocalRunner:
         # Run on our OWN DuckDB cursor (db.run_scope), NOT the process-global lock: a long run no
         # longer serializes every other user's preview/sample/run, and a failure here can't wedge them.
         with db.run_scope() as scope:
+            read_leases = contextlib.ExitStack()
+            read_guards = []
             with self._lock:
                 self._scopes[run_id] = scope  # cancel() interrupts this scope's cursor
             try:
+                from hub.handoff import managed_read_lease
+                for source in graph.nodes:
+                    if source.type != "source" or not isinstance(source.data, dict):
+                        continue
+                    uri = (source.data.get("config") or {}).get("uri")
+                    if uri:
+                        read_guards.append(read_leases.enter_context(managed_read_lease(
+                            uri, owner=f"run:{run_id}", ttl_seconds=ttl)))
+                last_step_published = False
                 for step in plan.steps:
+                    last_step_published = False
+                    if cache_pin is not None:
+                        cache_pin.check()
+                    for guard in read_guards:
+                        guard.check()
                     if cancel.is_set():
                         status.status = "cancelled"
                         for p in status.per_node:
@@ -253,7 +349,22 @@ class LocalRunner:
                         pn.status = "running"
                     t0 = time.time()
                     if step.kind == "write":
-                        rows_seen = self._commit_write(nm[step.node_id], graph, engine, status, cached, cancel)
+                        write_fence_passed = False
+
+                        def pre_publish(*, check_cancel: bool) -> None:
+                            nonlocal write_fence_passed
+                            if cache_pin is not None:
+                                cache_pin.check()
+                            for guard in read_guards:
+                                guard.check()
+                            if check_cancel and cancel.is_set():
+                                raise RuntimeError("run cancelled before output publication")
+                            write_fence_passed = True
+
+                        rows_seen = self._commit_write(
+                            nm[step.node_id], graph, engine, status, cached, cancel,
+                            pre_publish=pre_publish)
+                        last_step_published = write_fence_passed
                     elif step.kind == "assert":
                         rows_seen = self._check_assert(nm[step.node_id], engine)  # violation count; may raise
                     else:
@@ -275,13 +386,28 @@ class LocalRunner:
                 if target and nm.get(target) and nm[target].type not in ("write", "assert"):
                     rows_seen = self._materialize_result(target, engine, status, cached, phash, cancel)
                     status.rows_processed = rows_seen
+                    last_step_published = False
 
                 # Resolve the last-instruction race explicitly. If no output crossed its commit point,
                 # cancellation wins before `done`. Once output_uri is set, publication/reuse already won;
                 # report done truthfully (the CLI still exits 124/130 and includes that terminal state)
                 # rather than claim cancelled while a committed artifact exists.
-                if cancel.is_set() and not status.output_uri:
-                    raise RuntimeError("run cancelled before completion")
+                if cancel.is_set():
+                    from hub import metadb
+                    managed_full_result = bool(
+                        target and nm.get(target) and nm[target].type not in ("write", "assert")
+                        and status.output_uri
+                        and metadb.object_attempt_uri_shape(status.output_uri))
+                    if managed_full_result:
+                        _safe_abandon_attempt(status.output_uri)
+                        status.output_uri = status.output_table = None
+                    if managed_full_result or not status.output_uri:
+                        raise RuntimeError("run cancelled before completion")
+                if not last_step_published:
+                    if cache_pin is not None:
+                        cache_pin.check()
+                    for guard in read_guards:
+                        guard.check()
 
                 # set the final counts BEFORE flipping to 'done' — a client polls in another thread and
                 # reads a terminal status eagerly; the finally sets these too late, so a poll could
@@ -290,10 +416,42 @@ class LocalRunner:
                 status.progress = 1.0
                 status.stalled = False
                 status.ms = int((time.time() - started) * 1000)
-                status.status = "done"
+                from hub import metadb
+                managed_result = bool(
+                    target and nm.get(target) and nm[target].type not in ("write", "assert")
+                    and status.output_uri and metadb.object_attempt_uri_shape(status.output_uri))
+                if managed_result:
+                    if self.on_status is None and not self.forced_result_uri:
+                        raise RuntimeError(
+                            "managed full results require authoritative RunState persistence")
+                    # RunState is the primary owner for a full result. Publish it before the optional
+                    # cache pointer, keep any cache-hit pin through best-effort history persistence, and
+                    # never expose terminal done when the primary durable terminal write fails.
+                    try:
+                        persisted = status.model_copy(deep=True)
+                        persisted.status = "done"
+                        self._emit(graph, persisted, strict=True)
+                    except Exception as exc:
+                        logging.getLogger("hub").exception(
+                            "managed full result publication failed")
+                        raise RuntimeError("full result publication failed") from exc
+                    terminal_persisted = True
+                    status.status = "done"
+                    self._complete(graph, target, status)
+                else:
+                    status.status = "done"
                 if cacheable:
-                    self._cache_put(phash, {"rows": rows_seen, "uri": status.output_uri, "table": status.output_table})
+                    try:
+                        self._cache_put(phash, {
+                            "rows": rows_seen, "uri": status.output_uri,
+                            "table": status.output_table})
+                    except Exception:  # the durable RunState/history owners already committed
+                        pass
             except Exception as e:  # noqa: BLE001
+                from hub import metadb
+                if status.output_uri and metadb.object_attempt_uri_shape(status.output_uri):
+                    _safe_abandon_attempt(status.output_uri)
+                    status.output_uri = status.output_table = None
                 if cancel.is_set():
                     status.status = "cancelled"  # an interrupted step is a cancel, not a failure
                     for p in status.per_node:  # settle interrupted + not-yet-started nodes too
@@ -322,6 +480,11 @@ class LocalRunner:
                         if p.status == "running":
                             p.status = "failed"
             finally:
+                try:
+                    read_leases.close()
+                except Exception:  # noqa: BLE001 — lease expiry is the safe fallback
+                    logging.getLogger("hub").exception(
+                        "managed read lease cleanup failed after local run")
                 # scope exit (below) rolls back + drops this run's views on its own cursor
                 for pth in engine.spill_files:  # GC temp parquet spilled this run (outputs already committed)
                     try:
@@ -330,15 +493,15 @@ class LocalRunner:
                         pass
                 status.ms = int((time.time() - started) * 1000)
                 status.total_rows = rows_seen
-                self._emit(graph, status)  # persist the terminal status (done/failed/cancelled) to the DB
+                if not terminal_persisted:
+                    self._emit(graph, status)  # persist terminal state after all commit-point work
                 with self._lock:
                     self._cancel.pop(run_id, None)  # done/failed/cancelled → drop the cancel Event
                     self._scopes.pop(run_id, None)
-                if self.on_complete:  # persist the finished run (run history); never let it break the run
-                    try:
-                        self.on_complete(graph, target, status)
-                    except Exception:  # noqa: BLE001
-                        pass
+                if not terminal_persisted:
+                    self._complete(graph, target, status)
+                if cache_pin is not None:
+                    cache_pin.close()
 
     def _count(self, engine: BuildEngine, node_id: str, cached: dict | None) -> int:
         if cached and cached.get("rows") is not None:
@@ -374,13 +537,49 @@ class LocalRunner:
         registered in the catalog — it's an ephemeral run result, not a user-published dataset.
         Materialization is part of the run contract: a write/commit failure propagates and fails the run
         instead of reporting `done` with an artifact the UI cannot reopen."""
-        if cached and cached.get("uri") and self._output_exists(cached["uri"]):
+        forced_uri = self.forced_result_uri
+        if not forced_uri and cached and cached.get("uri") and self._output_exists(cached["uri"]):
             status.output_uri = cached["uri"]
             status.output_table = cached.get("table")
             return int(cached.get("rows") or 0)
         rel = engine.relation(node_id)
-        uri = self.storage.output_uri(f"__result_{phash}", ".parquet")  # content-addressed run result
-        res = self._adapter_write(self.resolve_adapter(uri), uri, rel, "overwrite", cancel)
+        logical_uri = forced_uri or self.storage.output_uri(
+            f"__result_{phash}", ".parquet")  # stable cache identity, not the mutable physical object
+        uri = logical_uri
+        from hub.plugins.adapters import is_object_uri
+        if is_object_uri(logical_uri):
+            from hub.handoff import (allocate_attempt, is_attempt_uri, physical_attempt_uri,
+                                     write_manifest)
+            parent_owned = bool(forced_uri)
+            if parent_owned:
+                if not is_attempt_uri(logical_uri):
+                    raise RuntimeError("parent-provided object result URI is not an exact attempt")
+            else:
+                handle = allocate_attempt(
+                    logical_uri=logical_uri, kind="region", run_id=status.run_id,
+                    allocation_key=f"full-result:{status.run_id}:{phash}",
+                    uri_factory=lambda namespace, generation, attempt_id: physical_attempt_uri(
+                        logical_uri, namespace, generation, attempt_id),
+                )
+                uri = handle["uri"]
+            data_uri = uri.rstrip("/") + "/part-00000.parquet"
+            try:
+                res = self._adapter_write(
+                    self.resolve_adapter(data_uri), data_uri, rel, "overwrite", cancel)
+                schema = list(zip(rel.columns, (str(t) for t in rel.types)))
+                write_manifest(
+                    uri, run_id=status.run_id, rows=int(res.get("rows") or 0), schema=schema)
+                if not parent_owned:
+                    from hub.handoff import prepare_attempt_commit
+                    prepare_attempt_commit(uri)
+                res = {**res, "uri": uri}
+            except Exception:
+                if not parent_owned:
+                    from hub.handoff import discard_attempt
+                    discard_attempt(uri)  # this synchronous writer has stopped; terminal proof is valid
+                raise
+        else:
+            res = self._adapter_write(self.resolve_adapter(uri), uri, rel, "overwrite", cancel)
         status.output_uri = res.get("uri", uri)
         status.output_table = None  # a run result, not a catalog table (don't clutter the Tables view)
         prune = getattr(self.storage, "prune_results", None)  # coarse newest-N GC so results don't pile up
@@ -450,9 +649,9 @@ class LocalRunner:
             raise RuntimeError(f"schema contract on '{title}' violated — {'; '.join(parts)}")
 
     def _commit_write(self, node, graph: Graph, engine: BuildEngine, status: RunStatus,
-                      cached: dict | None, cancel: _CancelToken) -> int:
+                      cached: dict | None, cancel: _CancelToken, pre_publish=None) -> int:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-        from hub.sinks import SinkSpec, commit_sink
+        from hub.sinks import SinkCommit, SinkSpec, commit_sink, preflight_sink
         spec = SinkSpec.from_config(cfg, node.data.get("title") if isinstance(node.data, dict) else None)
         if cancel.is_set():
             raise RuntimeError("run cancelled before output commit")
@@ -468,16 +667,94 @@ class LocalRunner:
         # route by the wired output PORT (source_handle) — a write off a multi-output node must
         # persist that port's data, not the default/first one. Mirrors BuildEngine._inputs.
         parent_rel = engine.relation(inc[0].source, inc[0].source_handle)
-        committed = commit_sink(
-            spec, parent_rel, self.workspace, self.storage, self.resolve_adapter,
-            write_adapter=lambda adapter, uri, rel, mode, **kwargs: self._adapter_write(
-                adapter, uri, rel, mode, cancel, **kwargs
-            ),
-        )
+        parent_contract = self.forced_sink_targets is not None
+        if parent_contract and node.id not in self.forced_sink_targets:
+            raise RuntimeError(f"parent did not authorize sink '{node.id}'")
+        forced_target = self.forced_sink_targets.get(node.id) if parent_contract else None
+        if parent_contract and (not isinstance(forced_target, str) or not forced_target):
+            raise RuntimeError(f"parent supplied an invalid target for sink '{node.id}'")
+        logical_uri = preflight_sink(
+            spec, self.workspace, self.storage, self.resolve_adapter,
+            target_uri=forced_target)
+        logical_adapter = self.resolve_adapter(logical_uri)
+        managed_parquet = _is_core_managed_sink(spec, logical_uri, logical_adapter)
+        parent_assigned_attempt = self.forced_sink_attempts.get(node.id)
+        if parent_assigned_attempt and not managed_parquet:
+            raise RuntimeError(
+                f"parent and child disagree on managed sink '{node.id}'")
+        if managed_parquet:
+            from hub.handoff import (allocate_attempt, discard_attempt, is_attempt_uri,
+                                     physical_attempt_uri, write_manifest)
+            parent_owned = parent_contract
+            if parent_owned:
+                attempt_uri = parent_assigned_attempt
+                if not attempt_uri or not is_attempt_uri(attempt_uri):
+                    raise RuntimeError(
+                        f"parent did not assign an exact managed attempt for sink '{node.id}'")
+            else:
+                from hub.plugins.catalog import core_managed_publisher
+                managed_publisher = core_managed_publisher(self.catalog)
+                if managed_publisher is None:
+                    raise RuntimeError(
+                        "managed object writes require the core transactional catalog publisher")
+                handle = allocate_attempt(
+                    logical_uri=logical_uri, kind="sink", run_id=status.run_id,
+                    allocation_key=f"local-sink:{status.run_id}:{node.id}:{logical_uri}",
+                    catalog_key_base=f"tbl_{spec.name}",
+                    uri_factory=lambda namespace, generation, attempt_id: physical_attempt_uri(
+                        logical_uri, namespace, generation, attempt_id),
+                )
+                attempt_uri = handle["uri"]
+            physical_uri = (attempt_uri if spec.partition_by else
+                            attempt_uri.rstrip("/") + "/part-00000.parquet")
+            kwargs = {"partition_by": spec.partition_by} if spec.partition_by else {}
+            try:
+                result = self._adapter_write(
+                    logical_adapter, physical_uri, parent_rel, spec.mode, cancel, **kwargs)
+                rows = int(result.get("rows") or 0)
+                schema = list(zip(parent_rel.columns, (str(t) for t in parent_rel.types)))
+                write_manifest(
+                    attempt_uri, run_id=status.run_id, rows=rows, schema=schema)
+                committed = SinkCommit(name=spec.name, uri=attempt_uri, rows=rows)
+            except Exception:
+                if not parent_owned:
+                    discard_attempt(attempt_uri)
+                raise
+        else:
+            committed = commit_sink(
+                spec, parent_rel, self.workspace, self.storage, self.resolve_adapter,
+                target_uri=forced_target,
+                write_adapter=lambda adapter, uri, rel, mode, **kwargs: self._adapter_write(
+                    adapter, uri, rel, mode, cancel, **kwargs
+                ),
+            )
 
-        parent_uris = [u for e in inc for u in [self._source_uri(nm_node=e.source, graph=graph)] if u]
-        self.catalog.register_output(name=committed.name, uri=committed.uri, parents=parent_uris,
-                                     pipeline="canvas")  # content-addressed version
+        try:
+            if pre_publish is not None:
+                # An unmanaged adapter's successful return is already an externally visible mutation;
+                # publication wins from that point. Immutable managed attempts can still let cancel win
+                # before their pointer is published.
+                pre_publish(check_cancel=managed_parquet)
+        except Exception:
+            if managed_parquet and not parent_owned:
+                _safe_abandon_attempt(attempt_uri)
+            raise
+        parent_uris = g.all_upstream_source_uris(graph, node.id)
+        if not (managed_parquet and parent_contract):
+            if managed_parquet:
+                publish = managed_publisher
+            else:
+                from hub.plugins.catalog import publish_unmanaged_output_attested
+                publish = lambda **kwargs: publish_unmanaged_output_attested(  # noqa: E731
+                    self.catalog, **kwargs)
+            try:
+                publish(name=committed.name, uri=committed.uri, parents=parent_uris,
+                        pipeline="canvas")  # content-addressed version
+            except Exception as exc:
+                logging.getLogger("hub").exception("sink publication failed")
+                if managed_parquet and not parent_owned:
+                    _safe_abandon_attempt(attempt_uri)
+                raise RuntimeError("sink publication failed") from exc
         status.output_uri = committed.uri
         status.output_table = committed.name
         return committed.rows

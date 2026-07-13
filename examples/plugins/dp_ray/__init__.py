@@ -45,9 +45,12 @@ small graph won't spin up Ray unless you ask.
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import glob
 import hashlib
 import json
+import logging
 import os
 import posixpath
 import re
@@ -58,10 +61,10 @@ import uuid
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from hub import db, graph as g
-from hub.handoff import (attempt_has_commit_record, attempt_has_contents, claim_attempt,
-                         discard_attempt, is_attempt_uri, read_manifest,
+from hub.handoff import (allocate_attempt, attempt_has_commit_record, attempt_has_contents,
+                         discard_attempt, is_attempt_uri, lookup_attempt, read_manifest,
                          validate_shards, write_manifest)
-from hub.sinks import SinkSpec, commit_sink, preflight_sink
+from hub.sinks import SinkSpec, commit_sink, expected_sink_uri, preflight_sink
 from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (DuckDB's own parser), shared
 from hub.ir import (CLEAN_OPS, CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
                     plan_is_clean, plan_is_distributable)
@@ -471,7 +474,9 @@ def _attempt_component(base_name: str, readable: str, digest: str, limit: int, u
     return component
 
 
-def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str:
+def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None, *,
+                         namespace: str | None = None, generation: int | None = None,
+                         attempt_id: str | None = None) -> str:
     """Return an immutable region-output prefix for one execution attempt.
 
     The controller suggests a stable, content-addressed URI. Writing a multi-object Ray result directly
@@ -481,11 +486,12 @@ def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str
     low = uri.lower()
     extension = next((ext for ext in (".parquet", ".pq") if low.endswith(ext)), "")
     base = uri[:-len(extension)] if extension else uri.rstrip("/")
-    raw = str(run_id)
+    raw = (f"{namespace}-g{generation}-{attempt_id}" if namespace and generation and attempt_id
+           else str(run_id))
     readable = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-") or "attempt"
     readable = readable[:64].rstrip("._-") or "attempt"
     from hub.plugins.adapters import is_object_uri
-    if is_object_uri(uri):
+    if is_object_uri(uri) and namespace is None:
         from hub import metadb
         owner = metadb.object_attempt_owner_id()
     else:
@@ -498,6 +504,10 @@ def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str
         "scope": None if scope is None else str(scope),
         "uri": str(uri),
     }
+    if namespace is not None:
+        identity_doc.update({
+            "namespace": namespace, "generation": generation, "attemptId": attempt_id,
+        })
     if owner:
         identity_doc["owner"] = owner
     identity = json.dumps(identity_doc, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -518,6 +528,33 @@ def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str
         base_name if separator else base, readable, digest, _ATTEMPT_COMPONENT_MAX_BYTES, uri
     )
     return f"{parent}/{component}" if separator else component
+
+
+def _allocate_handoff_uri(uri: str, run_id: str, kind: str,
+                          scope: str | None = None,
+                          catalog_key_base: str | None = None) -> str:
+    """Use durable allocation for object writes and a process-private path for local writes."""
+    from hub.plugins.adapters import is_object_uri
+    if not is_object_uri(uri):
+        return _attempt_handoff_uri(uri, run_id, scope=scope)
+    logical_hash = hashlib.sha256(str(uri).encode()).hexdigest()
+    allocation_key = json.dumps({
+        "kind": kind, "runId": str(run_id), "scope": scope, "logical": logical_hash,
+    }, sort_keys=True, separators=(",", ":"))
+    if kind == "region":
+        prior = lookup_attempt(
+            logical_uri=uri, kind=kind, run_id=run_id, allocation_key=allocation_key)
+        if prior is not None and prior["state"] in ("committed", "published"):
+            return prior["uri"]
+    handle = allocate_attempt(
+        logical_uri=uri, kind=kind, run_id=run_id, allocation_key=allocation_key,
+        catalog_key_base=catalog_key_base,
+        uri_factory=lambda storage_namespace, allocated_generation, allocated_id:
+        _attempt_handoff_uri(
+            uri, run_id, scope=scope, namespace=storage_namespace,
+            generation=allocated_generation, attempt_id=allocated_id),
+    )
+    return handle["uri"]
 
 
 def _worker_direct_parquet_sink(spec: SinkSpec, uri: str, adapter: object) -> bool:
@@ -792,7 +829,63 @@ class RayRunner:
         self.runs: dict[str, RunStatus] = {}
         self._cancel: dict[str, threading.Event] = {}
         self._cancel_ack: set[str] = set()
+        # A driver whose OS process cannot yet be reaped must remain non-terminal.  Keep every
+        # publication fence and the credential-bearing work directory owned until a background
+        # reconciler can prove the process stopped.
+        self._unreaped_drivers: dict[str, dict] = {}
+        self._finalizing_drivers: set[str] = set()
+        self._driver_procs: dict[str, object] = {}
+        self._driver_workdirs: dict[str, str] = {}
+        self._retained_workdirs: dict[str, str] = {}
         self._lock = threading.Lock()
+        atexit.register(self._terminate_all)
+
+    def _terminate_all(self) -> None:
+        """Fence local drivers at shutdown; clean only writers whose exit is proven."""
+        import shutil
+
+        with self._lock:
+            drivers = list(self._driver_procs.items())
+            for run_id, _proc in drivers:
+                event = self._cancel.get(run_id)
+                if event is not None:
+                    event.set()
+        for run_id, proc in drivers:
+            if not self._try_reap_driver(proc):
+                continue  # retain workdir and managed ownership; never guess writer termination
+            with self._lock:
+                state = self._unreaped_drivers.pop(run_id, None)
+                if state is not None:
+                    if run_id in self._finalizing_drivers:
+                        state = None
+                    else:
+                        self._finalizing_drivers.add(run_id)
+            if state is not None:
+                status_file = os.path.join(state["work"], "status.json")
+                if os.path.exists(status_file):
+                    try:
+                        with open(status_file) as stream:
+                            state["result"] = json.load(stream)
+                    except Exception:  # noqa: BLE001 — malformed receipt stays private
+                        state["result"] = None
+                state["returncode"] = proc.returncode
+                try:
+                    self._finish_supervision(state)
+                except Exception:  # noqa: BLE001 — interpreter shutdown remains best-effort
+                    logging.getLogger(__name__).exception(
+                        "Ray shutdown finalization failed after driver reap")
+                continue
+            # A normal supervisor may still be reading its terminal receipt.  Reaping is enough for
+            # shutdown safety; never race that owner by deleting its workdir here.
+        with self._lock:
+            retained = list(self._retained_workdirs.items())
+        for run_id, work in retained:
+            try:
+                shutil.rmtree(work)
+            except Exception:  # noqa: BLE001 — leave it for operator cleanup
+                continue
+            with self._lock:
+                self._retained_workdirs.pop(run_id, None)
 
     # Gate on the declared subset from the CompilePlan alone. An unpinned whole-backend choice can use
     # DuckDB for unsupported work; run()/run_unit() separately enforce explicit engine=ray placement.
@@ -811,7 +904,9 @@ class RayRunner:
             ev = self._cancel.get(run_id)
             if ev:
                 ev.set()  # cooperative — checked between IR steps (Ray has no cheap mid-Dataset abort)
-            st.status = "cancelled"
+            # Cancellation is only a request here.  A clean terminal `done` receipt may already have
+            # crossed the data commit point, and an unreaped driver may still publish.  The supervisor
+            # arbitrates that race after wait() proves the driver stopped.
         return st
 
     def cancel_acknowledged(self, run_id: str) -> bool:
@@ -869,7 +964,6 @@ class RayRunner:
         scheduled onto a matching worker. Unsupported unpinned work falls back locally; an explicit Ray
         requirement fails before dispatch."""
         run_id = run_id or f"unit_{uuid.uuid4().hex[:10]}"
-        attempt_uri = _attempt_handoff_uri(output_uri, run_id)
         ir = lower_to_ir(graph, output_node, self.node_specs, self.deps.node_ir)
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", target_node_id=output_node,
                            per_node=[PerNodeStatus(node_id=output_node, status="queued", label=output_node)])
@@ -879,6 +973,28 @@ class RayRunner:
                 return prior  # one in-process owner for an explicit attempt ID
             self.runs[run_id] = status
             self._cancel_ack.discard(run_id)
+        reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
+        reason = reason or self._resource_unsupported_reason(requires, ir)
+        reason = reason or self._source_unsupported_reason(ir)
+        if _remote_ray():
+            from hub.plugins.adapters import is_object_uri
+            if not is_object_uri(output_uri):
+                reason = reason or (
+                    "a remote Ray cluster cannot materialize a region on the hub's local filesystem; "
+                    "configure a shared object storage tier"
+                )
+        # Reject an explicitly pinned unsupported graph before allocation. No writer can start on this
+        # path, so minting a durable writing generation/write lease would create a permanent false owner.
+        if reason and self._requires_ray(requires, graph, output_node):
+            return self._unsupported_status(graph, output_node, reason, run_id=run_id)
+        try:
+            attempt_uri = _allocate_handoff_uri(output_uri, run_id, "region")
+        except Exception as e:  # noqa: BLE001 — a control-plane allocation must precede object writes
+            status.status = "failed"
+            status.error = f"object attempt allocation failed: {type(e).__name__}: {e}"
+            for item in status.per_node:
+                item.status = "failed"
+            return status
         committed = read_manifest(attempt_uri)
         if (committed is not None and committed.get("runId") == run_id
                 and validate_shards(attempt_uri, committed)
@@ -894,27 +1010,6 @@ class RayRunner:
             status.error = (
                 "Ray attempt prefix already exists without an exact committed inventory; "
                 "refusing to overwrite an immutable or possibly live attempt")
-            for item in status.per_node:
-                item.status = "failed"
-            return status
-        reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
-        reason = reason or self._resource_unsupported_reason(requires, ir)
-        reason = reason or self._source_unsupported_reason(ir)
-        if _remote_ray():
-            from hub.plugins.adapters import is_object_uri
-
-            if not is_object_uri(attempt_uri):
-                reason = reason or (
-                    "a remote Ray cluster cannot materialize a region on the hub's local filesystem; "
-                    "configure a shared object storage tier"
-                )
-        if reason and self._requires_ray(requires, graph, output_node):
-            return self._unsupported_status(graph, output_node, reason, run_id=run_id)
-        try:
-            claim_attempt(attempt_uri, logical_uri=output_uri, kind="region", run_id=run_id)
-        except Exception as e:  # noqa: BLE001 — an untracked object write must never start
-            status.status = "failed"
-            status.error = f"object attempt claim failed: {type(e).__name__}: {e}"
             for item in status.per_node:
                 item.status = "failed"
             return status
@@ -1167,17 +1262,35 @@ class RayRunner:
         URI instead of minting/registering one after dispatch. If a later claim fails, unwind the claims
         already made; no writer has started yet.
         """
+        if len(targets) > 1:
+            raise RuntimeError(
+                "multiple Ray write sinks require atomic batch publication, which is not enabled")
+
+        managed_steps = []
+        unmanaged_steps = []
+        for step in ir.steps:
+            if step.op != "write":
+                continue
+            target_uri = targets[step.id]
+            spec = SinkSpec.from_config(step.config, step.config.get("title"))
+            if _worker_direct_parquet_sink(spec, target_uri, self.resolve_adapter(target_uri)):
+                managed_steps.append((step, target_uri, spec))
+            else:
+                unmanaged_steps.append(step)
+        from hub.plugins.catalog import core_managed_publisher, unmanaged_publication_supported
+        if managed_steps and core_managed_publisher(self.catalog) is None:
+            raise RuntimeError(
+                "managed object writes require the core transactional catalog publisher")
+        if unmanaged_steps and not unmanaged_publication_supported(self.catalog):
+            raise RuntimeError(
+                "unmanaged Ray writes require catalog registration with read-back support")
+
         attempts: dict[str, str] = {}
         try:
-            for step in ir.steps:
-                if step.op != "write":
-                    continue
-                target_uri = targets[step.id]
-                spec = SinkSpec.from_config(step.config, step.config.get("title"))
-                if not _worker_direct_parquet_sink(spec, target_uri, self.resolve_adapter(target_uri)):
-                    continue
-                attempt_uri = _attempt_handoff_uri(target_uri, run_id, scope=step.id)
-                claim_attempt(attempt_uri, logical_uri=target_uri, kind="sink", run_id=run_id)
+            for step, target_uri, spec in managed_steps:
+                attempt_uri = _allocate_handoff_uri(
+                    target_uri, run_id, "sink", scope=step.id,
+                    catalog_key_base=f"tbl_{spec.name}")
                 attempts[step.id] = attempt_uri
             return attempts
         except Exception:
@@ -1243,10 +1356,11 @@ class RayRunner:
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)  # safe fallback
         try:
             sink_targets = self._resolve_sink_targets(ir)
-        except Exception as exc:  # noqa: BLE001 — resolve/adapter uncertainty ⇒ local or explicit failure
+        except Exception:  # noqa: BLE001 — resolve/adapter uncertainty ⇒ local or explicit failure
+            logging.getLogger(__name__).exception("Ray sink preflight failed")
             if self._requires_ray(requires, graph, target_node_id):
                 return self._unsupported_status(
-                    graph, target_node_id, f"sink preflight failed: {type(exc).__name__}: {exc}",
+                    graph, target_node_id, "sink preflight failed",
                     run_id=run_id, plan=plan,
                 )
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)
@@ -1261,9 +1375,10 @@ class RayRunner:
         self._emit(graph, status)
         try:
             sink_attempts = self._claim_sink_attempts(ir, sink_targets, run_id)
-        except Exception as e:  # noqa: BLE001 — never dispatch an object write the hub cannot track
+        except Exception:  # noqa: BLE001 — never dispatch an object write the hub cannot track
+            logging.getLogger(__name__).exception("Ray sink control-plane setup failed")
             status.status = "failed"
-            status.error = f"object sink attempt claim failed: {type(e).__name__}: {e}"
+            status.error = "Ray sink control-plane setup failed"
             for item in status.per_node:
                 item.status = "failed"
             self._emit(graph, status)
@@ -1294,8 +1409,12 @@ class RayRunner:
 
     def _register_outputs(self, graph, result, *, expected_targets=None, expected_attempts=None) -> None:
         """Publish driver-written outputs through the hub-owned catalog/control plane."""
-        from hub import metadb
         from hub.plugins.adapters import is_object_uri
+        from hub.plugins.catalog import (
+            core_managed_publisher,
+            publish_unmanaged_output_attested,
+        )
+        nodes = {node.id: node for node in graph.nodes}
         outputs = result.get("outputs") or []
         if expected_targets is not None:
             returned = {str(output.get("step_id")) for output in outputs if output.get("step_id")}
@@ -1311,31 +1430,45 @@ class RayRunner:
             expected_uri = (expected_attempts or {}).get(step_id)
             if expected_uri is not None and uri != expected_uri:
                 raise RuntimeError(f"ray driver returned an unexpected attempt URI for sink '{step_id}'")
-            if expected_targets is not None and expected_uri is None and uri != expected_targets.get(step_id):
-                raise RuntimeError(f"ray driver returned an unexpected physical URI for sink '{step_id}'")
+            node = nodes.get(step_id)
+            if node is None or node.type != "write":
+                raise RuntimeError(f"ray driver returned an unknown sink '{step_id}'")
+            spec = SinkSpec.from_config(node.data.get("config") or {}, node.data.get("title"))
+            if name != spec.name:
+                raise RuntimeError(f"ray driver returned an unexpected name for sink '{step_id}'")
+            if expected_targets is not None and expected_uri is None:
+                target_uri = expected_targets.get(step_id)
+                published_uri = expected_sink_uri(
+                    spec, target_uri, self.resolve_adapter(target_uri))
+                if uri != published_uri:
+                    raise RuntimeError(
+                        f"ray driver returned an unexpected physical URI for sink '{step_id}'")
 
         for output in outputs:
             step_id, name, uri = output["step_id"], output["name"], output["uri"]
             logical_uri = output.get("logical_uri")
-            parents = [u for edge in g.incoming(graph, step_id)
-                       for u in [self.base._source_uri(nm_node=edge.source, graph=graph)] if u]
-            self.catalog.register_output(name=name, uri=uri, version=None,
-                                         parents=parents, pipeline="canvas")
-            persisted = metadb.catalog_get(uri)
-            if logical_uri and is_object_uri(uri) and is_attempt_uri(uri):
-                with metadb.session() as session:
-                    attempt = session.get(metadb.ObjectAttempt, uri)
-                    state = attempt.state if attempt is not None else None
-                    if state not in ("published", "retiring", "retired"):
-                        self.catalog.unregister(uri)
-                        raise RuntimeError(
-                            f"catalog did not atomically publish the attempt for sink '{step_id}'"
-                        )
-                    if state == "published" and (persisted is None or persisted.get("uri") != uri):
-                        raise RuntimeError(f"catalog lost the published pointer for sink '{step_id}'")
-            elif persisted is None or persisted.get("uri") != uri:
-                self.catalog.unregister(uri)
-                raise RuntimeError(f"catalog did not persist the output pointer for sink '{step_id}'")
+            parents = g.all_upstream_source_uris(graph, step_id)
+            managed_attempt = bool(logical_uri and is_object_uri(uri) and is_attempt_uri(uri))
+            if managed_attempt:
+                publish = core_managed_publisher(self.catalog)
+                if publish is None:
+                    raise RuntimeError("managed object output has no core publisher")
+                try:
+                    receipt = publish(
+                        name=name, uri=uri, version=None, parents=parents, pipeline="canvas")
+                except Exception as exc:
+                    logging.getLogger(__name__).exception(
+                        "Ray managed sink publication failed for step %s", step_id)
+                    raise RuntimeError(
+                        f"Ray could not atomically publish managed sink '{step_id}'"
+                    ) from exc
+                if not isinstance(receipt, dict) or receipt.get("uri") != uri:
+                    raise RuntimeError(
+                        f"core publisher returned an invalid receipt for sink '{step_id}'")
+            else:
+                publish_unmanaged_output_attested(
+                    self.catalog, name=name, uri=uri, version=None,
+                    parents=parents, pipeline="canvas")
 
     def _supervise(self, run_id, graph, target, status, materialize_uri=None, requires=None,
                    sink_targets=None, sink_attempts=None) -> None:
@@ -1344,75 +1477,63 @@ class RayRunner:
         import tempfile
 
         work = tempfile.mkdtemp(prefix="dp_ray_")
-        result, returncode = None, "not-started"
-        cleanup_succeeded = False
+        with self._lock:
+            self._driver_workdirs[run_id] = work
+        result, returncode, proc = None, "not-started", None
+        driver_reaped = True  # no Popen means there is no writer to fence
+        supervisor_error = None
+        read_leases = contextlib.ExitStack()
+        read_guards = []
         try:
+            from hub.handoff import managed_read_lease
             try:
-                result, returncode = self._supervise_in_work(
-                    run_id, graph, target, status, work,
-                    materialize_uri=materialize_uri, requires=requires,
-                    sink_targets=sink_targets, sink_attempts=sink_attempts,
-                )
-            except Exception as exc:  # noqa: BLE001 — terminal publication still follows cleanup
-                status.status = "failed"
-                detail = str(exc).replace("\n", " ")[:500]
-                status.error = f"Ray supervisor failed: {type(exc).__name__}: {detail}"
-        finally:
-            # job.json contains graph code/source URIs and the ephemeral metadata DB may contain broad
-            # development credentials. Terminal publication is intentionally AFTER this deletion.
-            try:
-                shutil.rmtree(work)
-                cleanup_succeeded = True
-            except Exception as exc:  # noqa: BLE001 — cleanup failure is a visible terminal contract
-                detail = str(exc).replace("\n", " ")[:500]
-                cleanup_error = f"Ray driver workdir cleanup failed: {type(exc).__name__}: {detail}"
-                status.error = f"{status.error}; {cleanup_error}" if status.error else cleanup_error
-                if status.status != "cancelled":
-                    status.status = "failed"
+                deadline = float(os.environ.get("DP_RUN_DEADLINE_S", "3600"))
+            except ValueError:
+                deadline = 3600.0
+            ttl = max(300.0, deadline + 300.0)
+            for source in graph.nodes:
+                if source.type == "source" and isinstance(source.data, dict):
+                    uri = (source.data.get("config") or {}).get("uri")
+                    if uri:
+                        read_guards.append(read_leases.enter_context(managed_read_lease(
+                            uri, owner=f"ray:{run_id}", ttl_seconds=ttl)))
+            result, returncode, proc, driver_reaped, supervisor_error = self._supervise_in_work(
+                run_id, graph, target, status, work,
+                materialize_uri=materialize_uri, requires=requires,
+                sink_targets=sink_targets, sink_attempts=sink_attempts,
+            )
+        except Exception:  # noqa: BLE001 — provider/process detail belongs only in server logs
+            logging.getLogger(__name__).exception("Ray supervisor setup failed")
+            supervisor_error = "Ray execution supervisor failed"
 
-            if cleanup_succeeded and status.status == "running":
-                try:
-                    if sink_targets is None and sink_attempts is None:
-                        self._settle_popen_result(graph, status, result, returncode)
-                    else:
-                        self._settle_popen_result(
-                            graph, status, result, returncode,
-                            expected_targets=sink_targets, expected_attempts=sink_attempts,
-                        )
-                except Exception as exc:  # noqa: BLE001 — continue through terminal cleanup/bookkeeping
-                    detail = str(exc).replace("\n", " ")[:500]
-                    status.status = "failed"
-                    status.error = f"Ray result settlement failed: {type(exc).__name__}: {detail}"
-            if status.status != "done":
-                from hub.plugins.adapters import is_object_uri
-                local_attempts = ([materialize_uri] if materialize_uri else [])
-                local_attempts.extend((sink_attempts or {}).values())
-                for attempt_uri in local_attempts:
-                    if is_object_uri(attempt_uri):
-                        continue  # local driver exit does not prove remote Ray workers stopped writing
-                    try:
-                        discard_attempt(attempt_uri)
-                    except Exception as exc:  # noqa: BLE001
-                        detail = str(exc).replace("\n", " ")[:500]
-                        discard_error = f"Ray attempt cleanup failed: {type(exc).__name__}: {detail}"
-                        status.error = f"{status.error}; {discard_error}" if status.error else discard_error
-
-            for item in status.per_node:
-                item.status = "done" if status.status == "done" else status.status
-            if status.status == "cancelled":
-                self._acknowledge_cancel(run_id)  # child stopped and cleanup was attempted before ack
-            self._emit(graph, status)
+        state = {
+            "run_id": run_id, "graph": graph, "target": target, "status": status,
+            "work": work, "proc": proc, "result": result, "returncode": returncode,
+            "supervisor_error": supervisor_error, "read_leases": read_leases,
+            "read_guards": read_guards, "materialize_uri": materialize_uri,
+            "sink_targets": sink_targets, "sink_attempts": sink_attempts,
+        }
+        if not driver_reaped:
+            status.status = "running"
+            status.stalled = True
+            status.error = "Ray driver termination is still being reconciled"
             with self._lock:
-                self._cancel.pop(run_id, None)
-            if self.on_complete:
-                try:
-                    self.on_complete(graph, target, status)
-                except Exception:  # noqa: BLE001
-                    pass
+                self._unreaped_drivers[run_id] = state
+            self._emit(graph, status)  # non-terminal: the driver may still write
+            try:
+                threading.Thread(
+                    target=self._reconcile_unreaped_driver,
+                    args=(run_id,), daemon=True, name=f"dp-ray-reap-{run_id}",
+                ).start()
+            except Exception:  # ownership remains retained for operator/atexit recovery
+                logging.getLogger(__name__).exception(
+                    "could not start Ray driver reconciliation thread")
+            return
+        self._finish_supervision(state)
 
     def _supervise_in_work(self, run_id, graph, target, status, work, materialize_uri=None,
                            requires=None, sink_targets=None,
-                           sink_attempts=None) -> tuple[dict | None, int | str]:
+                           sink_attempts=None) -> tuple[dict | None, int | str, object | None, bool, str | None]:
         """Parent side: spawn the isolated Ray driver, poll its status file, mirror the result. Touches
         NO DuckDB (only subprocess + files + the DB-backed on_status/on_complete hooks) → never deadlocks.
         `materialize_uri` set = region mode (write target → that uri); else whole-graph mode (write node).
@@ -1438,6 +1559,8 @@ class RayRunner:
         result = None
         proc = None
         driver_log = None
+        supervisor_error = None
+        reaped = True
         try:
             # Redirect the child's stdio to a log file (never an inherited pipe — Ray logs copiously and
             # a full pipe would block the child mid-run; the result comes back via status_file). Own
@@ -1452,6 +1575,9 @@ class RayRunner:
             proc = subprocess.Popen([sys.executable, driver, job_file], cwd=work,
                                     stdout=driver_log, stderr=driver_log,
                                     start_new_session=True, env=child_env)
+            with self._lock:
+                self._driver_procs[run_id] = proc
+            reaped = False
             while proc.poll() is None:
                 if cancel.is_set():
                     proc.terminate()
@@ -1460,7 +1586,6 @@ class RayRunner:
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait(timeout=5)
-                    status.status = "cancelled"
                     break
                 # surface the driver's INTERIM progress (it rewrites the status file as it computes/writes)
                 # into the parent RunStatus, so a placed region's progress advances mid-run — not just at
@@ -1477,33 +1602,178 @@ class RayRunner:
                 except (ValueError, OSError):
                     pass
                 time.sleep(0.2)
-            if os.path.exists(status_file):
-                with open(status_file) as f:
-                    result = json.load(f)
-        except Exception as e:  # noqa: BLE001
-            status.status, status.error = "failed", f"{type(e).__name__}: {e}"
+        except Exception:  # noqa: BLE001 — keep user-visible status non-terminal until reap proof
+            logging.getLogger(__name__).exception("Ray driver supervision failed")
+            supervisor_error = "Ray execution supervisor failed"
         finally:
             # A parent-side error must not leave the credential-bearing child running while its work
             # directory is erased. Terminate first, then close the inherited log descriptor.
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=10)
-                except Exception:  # noqa: BLE001 — last-resort cleanup; status below remains failed
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=5)
-                    except Exception:  # noqa: BLE001
-                        pass
+            if proc is not None:
+                reaped = self._try_reap_driver(proc)
             if driver_log is not None:
                 driver_log.close()
-        return result, proc.returncode if proc is not None else "not-started"
+        if reaped and os.path.exists(status_file):
+            try:
+                with open(status_file) as f:
+                    result = json.load(f)
+            except Exception:  # noqa: BLE001 — an invalid receipt can never authorize publication
+                logging.getLogger(__name__).exception("Ray driver returned an invalid status document")
+                supervisor_error = "Ray execution supervisor failed"
+                result = None
+        return (result, proc.returncode if proc is not None else "not-started",
+                proc, reaped, supervisor_error)
+
+    @staticmethod
+    def _try_reap_driver(proc) -> bool:
+        """Best-effort fence for one local driver; true only after wait/poll proves exit."""
+        try:
+            if proc.poll() is not None:
+                proc.wait(timeout=0)
+                return True
+        except Exception:  # noqa: BLE001 — continue to terminate/kill proof
+            logging.getLogger(__name__).exception("Ray driver poll/wait failed")
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
+            return True
+        except Exception:  # noqa: BLE001 — force-reap below
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+                return True
+            except Exception:  # noqa: BLE001 — alive/unknown remains non-terminal
+                logging.getLogger(__name__).exception("Ray driver could not be force-reaped")
+                return False
+
+    def _reconcile_unreaped_driver(self, run_id: str) -> None:
+        """Retain ownership and retry until the local driver is observably stopped."""
+        while True:
+            with self._lock:
+                state = self._unreaped_drivers.get(run_id)
+            if state is None:
+                return
+            if self._try_reap_driver(state["proc"]):
+                break
+            time.sleep(1.0)
+        with self._lock:
+            state = self._unreaped_drivers.pop(run_id, None)
+            if state is None or run_id in self._finalizing_drivers:
+                return
+            self._finalizing_drivers.add(run_id)
+        status_file = os.path.join(state["work"], "status.json")
+        if os.path.exists(status_file):
+            try:
+                with open(status_file) as f:
+                    state["result"] = json.load(f)
+            except Exception:  # noqa: BLE001 — malformed terminal data remains private
+                logging.getLogger(__name__).exception(
+                    "Ray driver returned an invalid status document after reconciliation")
+                state["result"] = None
+                state["supervisor_error"] = "Ray execution supervisor failed"
+        state["returncode"] = state["proc"].returncode
+        self._finish_supervision(state)
+
+    def _finish_supervision(self, state: dict) -> None:
+        """Publish a terminal result only after the local driver has been proven stopped."""
+        import shutil
+
+        run_id, graph, target, status = (
+            state["run_id"], state["graph"], state["target"], state["status"])
+        cleanup_succeeded = False
+        publication_blocked = False
+        try:
+            for guard in state["read_guards"]:
+                guard.check()
+        except Exception:  # noqa: BLE001 — a lost source fence forbids output publication
+            logging.getLogger(__name__).exception("Ray managed source lease was lost")
+            publication_blocked = True
+            status.status, status.error = "failed", "Ray managed source lease was lost"
+
+        # job.json contains graph code/source URIs and may contain credentials.  Only a reaped driver
+        # reaches this method, so deleting the directory cannot race a live writer.
+        try:
+            shutil.rmtree(state["work"])
+            cleanup_succeeded = True
+        except Exception:  # noqa: BLE001 — cleanup failure is a visible terminal contract
+            logging.getLogger(__name__).exception("Ray driver workdir cleanup failed")
+            status.status, status.error = "failed", "Ray driver workdir cleanup failed"
+
+        if cleanup_succeeded and not publication_blocked:
+            try:
+                kwargs = {
+                    "cancel_requested": bool(
+                        self._cancel.get(run_id) and self._cancel[run_id].is_set()),
+                }
+                if state["sink_targets"] is not None or state["sink_attempts"] is not None:
+                    kwargs.update(
+                        expected_targets=state["sink_targets"],
+                        expected_attempts=state["sink_attempts"],
+                    )
+                self._settle_popen_result(
+                    graph, status, state["result"], state["returncode"], **kwargs)
+            except Exception:  # noqa: BLE001 — continue through terminal bookkeeping
+                logging.getLogger(__name__).exception("Ray result settlement failed")
+                status.status, status.error = "failed", "Ray result settlement failed"
+
+        if status.status != "done":
+            from hub.plugins.adapters import is_object_uri
+            local_attempts = ([state["materialize_uri"]]
+                              if state["materialize_uri"] else [])
+            local_attempts.extend((state["sink_attempts"] or {}).values())
+            for attempt_uri in local_attempts:
+                if is_object_uri(attempt_uri):
+                    continue  # remote worker terminal proof is owned by the durable Ray control plane
+                try:
+                    discard_attempt(attempt_uri)
+                except Exception:  # noqa: BLE001 — cleanup detail stays in server logs
+                    logging.getLogger(__name__).exception("Ray attempt cleanup failed")
+
+        status.stalled = False
+        for item in status.per_node:
+            item.status = "done" if status.status == "done" else status.status
+        if status.status == "cancelled":
+            self._acknowledge_cancel(run_id)
+        self._emit(graph, status)
+        with self._lock:
+            self._cancel.pop(run_id, None)
+            self._unreaped_drivers.pop(run_id, None)
+            self._finalizing_drivers.discard(run_id)
+            self._driver_procs.pop(run_id, None)
+            work = self._driver_workdirs.pop(run_id, None)
+            if cleanup_succeeded:
+                self._retained_workdirs.pop(run_id, None)
+            elif work:
+                self._retained_workdirs[run_id] = work
+        if self.on_complete:
+            try:
+                self.on_complete(graph, target, status)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            state["read_leases"].close()
+        except Exception:  # noqa: BLE001 — lease expiry is the safe fallback after driver stop
+            logging.getLogger(__name__).exception("Ray managed source lease cleanup failed")
 
     def _settle_popen_result(self, graph, status, result, returncode, *,
-                             expected_targets=None, expected_attempts=None) -> None:
+                             expected_targets=None, expected_attempts=None,
+                             cancel_requested: bool = False) -> None:
         """Apply a local driver result only after its sensitive work directory was erased."""
         # Only a TERMINAL status file is authoritative. A hard kill can leave the last interim
         # {"status":"running", ...} file behind; a dead driver must fail rather than hang forever.
+        if result and result.get("status") == "done" and returncode != 0:
+            status.status = "failed"
+            status.error = "Ray driver exited unsuccessfully after writing a terminal receipt"
+            status.output_uri = status.output_table = None
+            return
+        # A clean done receipt wins a late cancellation because its data commit point has already
+        # crossed.  Without that receipt, a reaped driver's cancellation request wins over a crash or
+        # incomplete interim document.
+        if cancel_requested and not (
+                result and result.get("status") == "done" and returncode == 0):
+            status.status = "cancelled"
+            status.error = None
+            status.output_uri = status.output_table = None
+            return
         if not (result and result.get("status") in ("done", "failed", "cancelled")):
             status.status = "failed"
             status.error = f"ray driver exited without a terminal status (rc={returncode})"
@@ -1521,14 +1791,11 @@ class RayRunner:
                         graph, result, expected_targets=expected_targets,
                         expected_attempts=expected_attempts,
                     )
-            except Exception as exc:  # noqa: BLE001 — local parity: catalog commit failure fails the run
-                prior = f"{result.get('error')}; " if result.get("error") else ""
-                result = dict(
-                    result, status="failed",
-                    error=f"{prior}catalog registration failed: {type(exc).__name__}: {exc}",
-                )
-        # Failed/cancelled outputs stay private as cleanup evidence. A URI shape is not ownership proof,
-        # so retiring those artifacts requires the future ownership-aware artifact lifecycle.
+            except Exception:  # noqa: BLE001 — local parity: catalog commit failure fails the run
+                logging.getLogger(__name__).exception("Ray output publication failed")
+                result = dict(result, status="failed", error="Ray output publication failed")
+        # Failed/cancelled outputs stay private. Remote attempts remain fenced as writing until the
+        # backend can prove every worker is terminal; the ownership reaper deliberately never guesses.
         status.status = result["status"]
         status.error = result.get("error")
         if status.status == "done":
