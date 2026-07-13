@@ -23,6 +23,7 @@ import duckdb
 from hub import db
 from hub.models import ColumnSchema
 from hub.plugins.capabilities import tag_columns
+from hub.sqlpolicy import identifier, identifier_list, quote_identifier
 
 Relation = duckdb.DuckDBPyRelation
 CancelCheck = Callable[[], bool]
@@ -218,7 +219,8 @@ class DuckDBAdapter:
         con = db.conn()
         rel = self._read(con, uri, options)
         if columns:
-            rel = rel.project(", ".join(f'"{c}"' for c in columns))
+            selected = [identifier(c, rel.columns, label="projection column") for c in columns]
+            rel = rel.project(", ".join(quote_identifier(c) for c in selected))
         if predicate:
             rel = rel.filter(predicate)
         if limit is not None:
@@ -377,7 +379,7 @@ class DuckDBAdapter:
         low = target.lower()
         rows = int(rel.aggregate("count(*)").fetchone()[0])
         _raise_if_cancelled(cancelled)
-        pcols = [c.strip() for c in (partition_by or "").split(",") if c.strip()]
+        pcols = identifier_list(partition_by, rel.columns, label="partitionBy column")
         if pcols:
             return self._write_partitioned(target, rel, pcols, mode, low, obj, rows, cancelled)
         if mode == "append":
@@ -509,11 +511,8 @@ class DuckDBAdapter:
             raise NotImplementedError("partitioned write does not support append — use overwrite")
         if not low.endswith((".parquet", ".pq")):
             raise NotImplementedError("partitionBy is parquet-only (a Hive-partitioned directory)")
-        missing = [c for c in pcols if c not in rel.columns]
-        if missing:
-            raise ValueError(f"partitionBy columns not in the data: {missing}")
         base = os.path.splitext(target)[0]  # a DIRECTORY (Hive layout), not a single file
-        cols_sql = ", ".join(f'"{c}"' for c in pcols)
+        cols_sql = ", ".join(quote_identifier(c) for c in pcols)
 
         def _copy(dst: str) -> None:
             rel.query("_w", f"COPY _w TO '{dst.replace(chr(39), chr(39) * 2)}' "
@@ -649,6 +648,8 @@ class LanceAdapter:
         # stream batches into DuckDB instead of ds.to_table() (which loads the ENTIRE dataset into RAM
         # before handing it over — a real-scale Lance run/write would OOM and defeat out-of-core).
         ds = self._dataset(uri)
+        selected = ([identifier(c, ds.schema.names, label="projection column") for c in columns]
+                    if columns else None)
         if predicate:
             # PUSH the filter into Lance's scanner → fragment/scalar-index pruning + correct filter-THEN-
             # limit order — BUT only for a predicate with NO double-quote: Lance's datafusion dialect reads
@@ -659,7 +660,7 @@ class LanceAdapter:
             # filter — correct, just no pushdown.
             if '"' not in predicate:
                 try:
-                    reader = ds.scanner(columns=columns, filter=predicate, limit=limit).to_reader()
+                    reader = ds.scanner(columns=selected, filter=predicate, limit=limit).to_reader()
                     return db.conn().from_arrow(reader)
                 except Exception:  # noqa: BLE001 — a datafusion dialect gap → DuckDB fallback below
                     pass
@@ -667,18 +668,20 @@ class LanceAdapter:
             # which a projected scan would fail to bind on), filter, THEN project + limit (filter before
             # limit is what makes a limited filtered scan correct).
             rel = db.conn().from_arrow(ds.scanner().to_reader()).filter(predicate)
-            if columns:
-                rel = rel.project(", ".join(f'"{c}"' for c in columns))
+            if selected:
+                rel = rel.project(", ".join(quote_identifier(c) for c in selected))
             return rel.limit(int(limit)) if limit is not None else rel
-        reader = ds.scanner(columns=columns, limit=limit).to_reader()
+        reader = ds.scanner(columns=selected, limit=limit).to_reader()
         return db.conn().from_arrow(reader)
 
     def nearest(self, uri: str, column: str, query, k: int = 10) -> Relation:
         """Top-k nearest rows to a query vector via Lance's native search (a vector index if one exists,
         else a flat scan) — pushed into Lance rather than a brute-force cosine over every row. Streams
         the result and exposes `_score` = cosine similarity (1 − distance), matching the generic path."""
-        reader = self._dataset(uri).scanner(
-            nearest={"column": column, "q": list(query), "k": int(k), "metric": "cosine"}).to_reader()
+        ds = self._dataset(uri)
+        selected = identifier(column, ds.schema.names, label="vector column")
+        reader = ds.scanner(
+            nearest={"column": selected, "q": list(query), "k": int(k), "metric": "cosine"}).to_reader()
         rel = db.conn().from_arrow(reader)
         return rel.project("* EXCLUDE (_distance), (1 - _distance) AS _score")  # Lance ranks by distance asc
 

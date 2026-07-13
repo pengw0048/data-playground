@@ -17,6 +17,7 @@ into an MCP tool error).
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 
@@ -161,8 +162,11 @@ def _resolve_uri_and_cols(deps, arg: str):
         return t.uri, t.columns  # a registered table's uri was confined at register time — trusted
     except KeyError:
         from hub import paths
+        from hub.storage import local_result_read_scope
         paths.ensure_local_uri_allowed(arg)  # auth mode: don't probe an arbitrary local file's schema
-        return arg, deps.resolve_adapter(arg).schema(arg)
+        with local_result_read_scope(
+                deps.storage, [arg], owner=f"join-schema:{uuid.uuid4().hex}"):
+            return arg, deps.resolve_adapter(arg).schema(arg)
 
 
 def join_hints(deps, left: str, right: str) -> dict:
@@ -170,10 +174,13 @@ def join_hints(deps, left: str, right: str) -> dict:
     data (1:1 / 1:N / N:1 / N:M), plus any owner-declared relationship. `left`/`right` may be catalog
     names/ids or raw uris. Raises on an unreadable dataset — the caller wraps it."""
     from hub import relationships as rel
+    from hub.storage import local_result_read_scope
     (luri, lcols), (ruri, rcols) = _resolve_uri_and_cols(deps, left), _resolve_uri_and_cols(deps, right)
-    sugg = rel.suggest_joins(lcols, rcols,
-                             rel.measured_unique(luri, deps.resolve_adapter),
-                             rel.measured_unique(ruri, deps.resolve_adapter))
+    with local_result_read_scope(
+            deps.storage, [luri, ruri], owner=f"join-hints:{uuid.uuid4().hex}"):
+        sugg = rel.suggest_joins(lcols, rcols,
+                                 rel.measured_unique(luri, deps.resolve_adapter),
+                                 rel.measured_unique(ruri, deps.resolve_adapter))
     return {"suggestions": [s.model_dump(by_alias=True) for s in sugg],
             "declared": [r.model_dump(by_alias=True) for r in deps.catalog.relationships(luri)
                          if ruri in (r.left_uri, r.right_uri)]}
@@ -190,11 +197,14 @@ def validate_graph(deps, graph: dict) -> dict:
 
     g = Graph.model_validate(graph)
     out: dict[str, Any] = {"type_errors": gmod.type_errors(g, deps.node_specs)}
-    cols = schema_for_graph(g, deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs)
+    cols = schema_for_graph(
+        g, deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
+        storage=deps.storage)
     joins: dict[str, dict] = {}
     for n in g.nodes:
         if n.type == "join":
-            ja = rel.analyze_join(g, n.id, cols, deps.catalog, deps.resolve_adapter)
+            ja = rel.analyze_join(
+                g, n.id, cols, deps.catalog, deps.resolve_adapter, storage=deps.storage)
             joins[n.id] = {"cardinality": (ja.suggestions[0].cardinality if ja.suggestions else "unknown"),
                            "warning": ja.warning, "note": ja.note}
     out["joins"] = joins

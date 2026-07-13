@@ -184,6 +184,39 @@ def test_warm_relation_cache_reuses_and_invalidates():
     assert all(row["dbl"] == row["amount"] * 2 for row in r3.rows)
 
 
+def test_warm_relation_cache_hit_crosses_run_scopes_without_rerunning_scan():
+    import pyarrow as pa
+
+    from hub import db
+    from hub.executors.preview import preview_node
+    from hub.models import Graph
+    from hub.relation_cache import RelationCache
+
+    calls = {"scan": 0}
+
+    class Adapter:
+        def fingerprint(self, _uri):
+            return "stable"
+
+        def scan(self, _uri, **_kwargs):
+            calls["scan"] += 1
+            return db.conn().from_arrow(pa.table({"value": [1, 2, 3]}))
+
+    adapter = Adapter()
+    graph = Graph(**{"id": "warm-cross-scope", "version": 1, "nodes": [
+        N("src", "source", {"uri": "mock://warm-cache"}),
+        N("sel", "select", {"select": "value, value * 2 AS doubled"}),
+    ], "edges": [E("src", "sel")]})
+    cache = RelationCache()
+
+    first = preview_node(graph, "sel", 10, lambda _uri: adapter, object(), cache=cache)
+    second = preview_node(graph, "sel", 10, lambda _uri: adapter, object(), cache=cache)
+
+    assert not first.error and not second.error
+    assert first.rows == second.rows
+    assert calls["scan"] == 1, "the second run_scope must hit Arrow cache, not rebuild the source"
+
+
 def test_relation_cache_no_deadlock_and_eviction_safe():
     # regressions: (a) put() of an already-cached key must NOT self-deadlock (it re-entered a non-reentrant
     # lock via get()); (b) a relation handed out by get()/put() must survive a concurrent LRU eviction of
@@ -414,14 +447,14 @@ def test_sql_join_and_window_preview_faithfully(tmp_path):
     assert res["rowCount"] > 0, "sql join previewed two prefixes → 0 matches (the lie); must run full inputs"
 
 
-def test_sql_accepts_input_placeholder_and_aggregate_message_reflects_groupby():
-    # the sql node accepts the documented {input}/{inputN} placeholder (not just the bare CTE name)
+def test_sql_query_scope_cte_and_aggregate_message_reflects_groupby():
+    # the SQL node exposes its source as the real query-scope CTE name `input`
     g = {"id": "c", "version": 1, "nodes": [
         N("s", "source", {"uri": _uri("events")}),
-        N("q", "sql", {"sql": "SELECT event, amount FROM {input} WHERE amount > 0"}),
+        N("q", "sql", {"sql": "SELECT event, amount FROM input WHERE amount > 0"}),
     ], "edges": [E("s", "q")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 5}).json()
-    assert not r["notPreviewable"] and not r.get("error"), r.get("reason")   # {input} resolved, no ParserException
+    assert not r["notPreviewable"] and not r.get("error"), r.get("reason")
     # the aggregate not-previewable reason is conditional on groupBy (was hardcoded 'global aggregate')
     gg = {"id": "c", "version": 1, "nodes": [
         N("s", "source", {"uri": _uri("events")}),
@@ -897,9 +930,10 @@ def test_code_cell_preview_profile_disabled_in_auth_mode(monkeypatch):
     assert pf.not_previewable and "multi-user" in (pf.reason or "")
 
 
-def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch):
+def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch, tmp_path):
     # P0-EXEC-02: a full profile must be deadline-bounded + interruptible, so a huge pure-SQL aggregate
-    # can't pin the warm kernel forever. A ~5e10-row cross join can't finish in 0.5s → it's interrupted.
+    # can't pin the warm kernel forever. A 62.5B-row hashed cross join over the wired input cannot finish in
+    # 0.5s → it is interrupted, without weakening the user-SQL policy to allow range() table functions.
     import time as _t
 
     from hub.deps import get_deps
@@ -908,9 +942,17 @@ def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch):
     from hub.models import Graph
     monkeypatch.setattr(profile_mod, "PROFILE_FULL_BUDGET_S", 0.5)
     d = get_deps()
+    source = str(tmp_path / "profile-deadline.parquet")
+    import duckdb
+    duckdb.connect().execute(
+        f"COPY (SELECT i AS id FROM range(500) t(i)) TO '{source}' (FORMAT PARQUET)"
+    )
     g = Graph(**{"id": "cD", "version": 1, "nodes": [
-        N("s", "source", {"uri": _uri("images")}),
-        N("q", "sql", {"sql": "SELECT r.x FROM input, range(50000000) r(x)"}),
+        N("s", "source", {"uri": source}),
+        N("q", "sql", {"sql": (
+            "SELECT hash(a.id, b.id, c.id, d.id) AS id "
+            "FROM input a, input b, input c, input d"
+        )}),
     ], "edges": [E("s", "q")]})
     t0 = _t.time()
     r = profile_node(g, "q", d.resolve_adapter, d.registry, d.node_builders, d.node_specs, full=True)
@@ -1092,7 +1134,7 @@ def test_plugin_run_applies_lowering(tmp_path):
                     inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
                     params=[])
     deps.node_specs[spec.kind] = spec
-    deps.node_builders[spec.kind] = lambda engine, node, inputs: ctx.sql(inputs[0], "SELECT *, 42 AS c FROM {input}")
+    deps.node_builders[spec.kind] = lambda engine, node, inputs: ctx.sql(inputs[0], "SELECT *, 42 AS c FROM input")
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
         N("p", "const42", {}),
@@ -2217,7 +2259,7 @@ def test_plugin_node_lowering():
                     params=[ParamSpec(name="column", type="string", default="format")])
     def build(engine, node, inputs):
         col = node.data.get("config", {}).get("column", "format")
-        return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM _')
+        return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM input')
     deps.node_specs[spec.kind] = spec
     deps.node_builders[spec.kind] = build
 
@@ -2700,7 +2742,8 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
         def wait(timeout=None):
             return 0
 
-    runner = SubprocessRunner("test", str(tmp_path), catalog=BlockingCatalog())
+    runner = SubprocessRunner(
+        str(tmp_path / "workspace"), str(tmp_path), catalog=BlockingCatalog())
     run_id = "run_catalog_gate"
     runner.runs[run_id] = RunStatus(run_id=run_id, status="running", per_node=[])
     runner._sink_contracts[run_id] = {"write": {
@@ -2934,6 +2977,107 @@ def test_object_store_s3_roundtrip_and_browse(tmp_path):
     finally:
         server.stop()
         metadb.set_setting("objectStore", {}, "global")  # restore the default credential chain for other tests
+
+
+def test_object_store_concurrent_run_scopes_consume_base_published_credentials():
+    import threading
+
+    from hub import db, metadb
+
+    previous = metadb.get_setting("objectStore", "global", default={}) or {}
+    configured = {
+        "endpoint": "http://example.invalid:9443", "region": "us-east-1",
+        "accessKeyId": "scope-key", "secretAccessKey": "scope-secret", "useSsl": False,
+    }
+    try:
+        # Publish an OLD committed secret first. A cursor keeps that version if replacement happens only
+        # after BEGIN, so both run_scope entries must prime the NEW config before taking their snapshots.
+        try:
+            with db.lock():
+                base = db._base_conn()
+                base.execute("INSTALL httpfs")
+                base.execute("LOAD httpfs")
+                base.execute("DROP SECRET IF EXISTS dp_s3")
+                base.execute("DROP SECRET IF EXISTS dp_gcs")
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"httpfs unavailable: {exc}")
+        metadb.set_setting("objectStore", {
+            "endpoint": "https://old.invalid", "region": "us-west-2",
+            "accessKeyId": "old-key", "secretAccessKey": "old-secret", "useSsl": True,
+        }, "global")
+        db._obj_store_loaded = False
+        db._obj_store_secret_config = None
+        db.ensure_object_store()
+        metadb.set_setting("objectStore", configured, "global")
+
+        scopes_ready = threading.Barrier(2)
+        first_published = threading.Event()
+        second_consumed = threading.Event()
+        results = [None, None]
+        errors = [None, None]
+
+        def consume(index: int) -> None:
+            try:
+                with db.run_scope():
+                    local_view = db.unique_view("object_store_scope")
+                    db.conn().execute(f'CREATE TEMP VIEW "{local_view}" AS SELECT {index} AS value')
+                    scopes_ready.wait(timeout=5)
+                    if index == 0:
+                        db.ensure_object_store()
+                        first_published.set()
+                        assert second_consumed.wait(timeout=5)
+                    else:
+                        assert first_published.wait(timeout=5)
+                        db.ensure_object_store()
+                        second_consumed.set()
+                    resolved = db.conn().execute(
+                        "SELECT name FROM which_secret('s3://bucket/key.parquet', 's3')"
+                    ).fetchone()
+                    detail = db.conn().execute(
+                        "SELECT secret_string FROM duckdb_secrets() WHERE name = 'dp_s3'"
+                    ).fetchone()
+                    results[index] = (resolved, detail)
+            except BaseException as exc:  # noqa: BLE001 — preserve thread assertion details
+                errors[index] = exc
+            finally:
+                first_published.set()
+                second_consumed.set()
+
+        threads = [threading.Thread(target=consume, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert not any(thread.is_alive() for thread in threads)
+        assert errors == [None, None]
+        for resolved, detail in results:
+            assert resolved == ("dp_s3",)
+            assert detail and "key_id=scope-key" in detail[0]
+            assert "endpoint=example.invalid:9443" in detail[0]
+    finally:
+        metadb.set_setting("objectStore", previous, "global")
+        db._obj_store_secret_config = None
+        db.ensure_object_store()
+
+
+def test_object_store_credential_fingerprint_tracks_static_aws_env(monkeypatch):
+    from hub import db
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "key-one")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-one")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-one")
+    monkeypatch.setenv("AWS_PROFILE", "profile-one")
+    first = db._object_store_fingerprint({})
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "key-two")
+    assert db._object_store_fingerprint({}) != first
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "key-one")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-two")
+    assert db._object_store_fingerprint({}) != first
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-one")
+    monkeypatch.setenv("AWS_PROFILE", "profile-two")
+    assert db._object_store_fingerprint({}) != first
 
 
 def test_object_store_destination_browse_binds_untrusted_prefix(monkeypatch):
@@ -8559,7 +8703,8 @@ def test_ray_control_plane_setup_and_preflight_errors_are_generic(
     monkeypatch.setattr(runner, "_ray_unsupported_reason", lambda _ir: None)
     monkeypatch.setattr(runner, "_dedup_unsupported_reason", lambda _graph, _ir: None)
     monkeypatch.setattr(runner, "_resource_unsupported_reason", lambda _requires, _ir: None)
-    monkeypatch.setattr(runner, "_source_unsupported_reason", lambda _ir: None)
+    monkeypatch.setattr(
+        runner, "_source_unsupported_reason", lambda _graph, _target, _ir: None)
     monkeypatch.setattr(runner, "_resolve_sink_targets", lambda _ir: {"write": "/tmp/out.csv"})
     monkeypatch.setattr(
         runner, "_claim_sink_attempts",
@@ -10053,7 +10198,8 @@ def test_remote_ray_bounds_local_sources_and_never_dispatches_a_local_region_han
     assert runner._build(SimpleNamespace(op="read", config={"uri": source}), {}) is sentinel
     monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "1")
     assert "above the 1-byte limit" in (
-        runner._source_unsupported_reason(lower_to_ir(graph, "src", runner.node_specs)) or ""
+        runner._source_unsupported_reason(
+            graph, "src", lower_to_ir(graph, "src", runner.node_specs)) or ""
     )
     monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "1048576")
 
@@ -10262,6 +10408,7 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
     (tmp_path / "ws").mkdir()
     mod = _load_dp_ray()
     rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     opts = {"num_gpus": 1.0, "resources": {"a100": 0.001}}
     calls = []
     monkeypatch.setenv("DP_RAY_SHUFFLE_PARTITIONS", "4")
@@ -10317,6 +10464,7 @@ def test_ray_explicit_placement_fails_unsupported_shape_while_unpinned_falls_bac
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     graph = Graph(**{"id": "ray-placement", "version": 1, "nodes": [
         _ray_node("src", "source", {"uri": "unused.parquet"}),
         _ray_node("sql", "sql", {"sql": "SELECT * FROM input"}),
@@ -10358,6 +10506,7 @@ def test_ray_explicit_placement_fails_unadvertised_resources_before_dispatch(tmp
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     graph = Graph(**{"id": "ray-resource-placement", "version": 1, "nodes": [
         _ray_node("src", "source", {"uri": "unused.parquet"}),
     ], "edges": []})
@@ -11231,7 +11380,7 @@ def test_ray_sort_live_differential(tmp_path):
            sorted((r["k"] is None, r["k"] or 0, r["v"]) for r in duck_rows)  # same multiset of rows
 
 
-def test_ray_region_requires_fail_before_dispatch(tmp_path):
+def test_ray_region_requires_fail_before_dispatch(tmp_path, monkeypatch):
     # An explicit Ray region whose declared resources are not advertised fails before driver dispatch;
     # it never becomes a permanently pending Ray task that looks like a hung run.
     from hub.deps import Deps
@@ -11239,6 +11388,7 @@ def test_ray_region_requires_fail_before_dispatch(tmp_path):
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     g = Graph(**{"id": "c", "version": 1, "nodes": [
         _ray_node("src", "source", {"uri": "unused.parquet"}),
         _ray_node("m", "transform", {"mode": "map", "code": "def fn(row):\n    row['x'] = row['x'] + 1\n    return row"}),

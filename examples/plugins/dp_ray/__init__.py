@@ -70,6 +70,14 @@ from hub.ir import (CLEAN_OPS, CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_k
                     plan_is_clean, plan_is_distributable)
 from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
 from hub.placement import satisfies
+from hub.sqlpolicy import (
+    FragmentKind,
+    SQLPolicyError,
+    identifier,
+    quote_identifier,
+    validate_fragment,
+    validate_identifier_alias,
+)
 from hub.workload_env import build_workload_env, prepare_workload_graph
 
 # the relational ops THIS backend claims beyond the map-style clean subset (ARC3). The engine does NOT
@@ -112,6 +120,24 @@ _DRIVER_FALLBACK_MAX_BATCHES = 20_000
 _PARQUET_FRAGMENT_LIMIT = 10_000
 _PARQUET_EXTENSIONS = (".parquet", ".pq")
 _HIVE_DEFAULT_PARTITION = "__HIVE_DEFAULT_PARTITION__"
+
+
+def _secure_duckdb_connection():
+    """A worker/metadata connection with the same fail-closed session and lazy-bind snapshot fence."""
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute("SET autoinstall_known_extensions = false")
+    con.execute("SET autoload_known_extensions = false")
+    con.execute("SET python_enable_replacements = false")
+    con.execute("SET search_path = 'main'")
+    con.execute("BEGIN TRANSACTION")
+    return con
+
+
+def _validate_policy_fragments(con, fragments) -> None:
+    for kind, text in fragments or ():
+        validate_fragment(FragmentKind(kind), text, con=con)
 
 
 def _driver_fallback_limit() -> int:
@@ -659,27 +685,28 @@ def _declared_ray_schema(config: dict):
     for column in columns:
         if not isinstance(column, dict) or not str(column.get("name") or ""):
             raise RuntimeError("Ray transform outputSchema contains an unnamed column")
-        name = str(column["name"]).replace('"', '""')
-        projections.append(f'CAST(NULL AS {_duck_type(column.get("type"))}) AS "{name}"')
-    con = duckdb.connect()
+        name = validate_identifier_alias(column["name"], label="Ray outputSchema column")
+        projections.append(
+            f"CAST(NULL AS {_duck_type(column.get('type'))}) AS {quote_identifier(name)}"
+        )
+    con = _secure_duckdb_connection()
     try:
         return con.execute(f"SELECT {', '.join(projections)} WHERE FALSE").to_arrow_table().schema
     finally:
         con.close()
 
 
-def _duckdb_empty_result_schema(sql: str, **inputs):
+def _duckdb_empty_result_schema(sql: str, *, policy_fragments=(), **inputs):
     """Resolve relational output metadata from typed empty inputs on an isolated DuckDB connection."""
     import pyarrow as pa
-    import duckdb
-
     schemas = {name: _arrow_schema(schema) for name, schema in inputs.items()}
     if any(schema is None for schema in schemas.values()):
         return None
-    con = duckdb.connect()
+    con = _secure_duckdb_connection()
     try:
         for name, schema in schemas.items():
             con.register(name, pa.Table.from_batches([], schema=schema))
+        _validate_policy_fragments(con, policy_fragments)
         return con.execute(sql).to_arrow_table().schema
     finally:
         con.close()
@@ -973,9 +1000,10 @@ class RayRunner:
                 return prior  # one in-process owner for an explicit attempt ID
             self.runs[run_id] = status
             self._cancel_ack.discard(run_id)
-        reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
+        reason = self._source_unsupported_reason(graph, output_node, ir)
+        reason = reason or self._ray_unsupported_reason(ir)
+        reason = reason or self._dedup_unsupported_reason(graph, ir)
         reason = reason or self._resource_unsupported_reason(requires, ir)
-        reason = reason or self._source_unsupported_reason(ir)
         if _remote_ray():
             from hub.plugins.adapters import is_object_uri
             if not is_object_uri(output_uri):
@@ -1060,18 +1088,23 @@ class RayRunner:
                 raise RuntimeError(
                     "attempt prefix already exists without an exact committed inventory; use a new run ID")
             owns_prefix = True
-            with db.run_scope():
-                if is_object_uri(attempt_uri):
-                    db.ensure_object_store()
-                eng = BuildEngine(graph, self.resolve_adapter, self.deps.registry, full=True,
-                                  node_builders=self.deps.node_builders, node_specs=self.node_specs,
-                                  output_node=output_node)
-                rel = eng.relation(output_node)
-                data_uri = attempt_uri.rstrip("/") + "/part-00000.parquet"
-                result = self.base._adapter_write(
-                    self.resolve_adapter(data_uri), data_uri, rel, "overwrite", threading.Event())
-                schema = list(zip(rel.columns, (str(t) for t in rel.types)))
-                write_manifest(attempt_uri, run_id=run_id, rows=int(result.get("rows") or 0), schema=schema)
+            from hub.storage import local_result_read_scope
+            with local_result_read_scope(
+                    self.deps.storage, g.all_upstream_source_uris(graph, output_node),
+                    owner=f"ray-local-fallback:{run_id}"):
+                with db.run_scope():
+                    if is_object_uri(attempt_uri):
+                        db.ensure_object_store()
+                    eng = BuildEngine(graph, self.resolve_adapter, self.deps.registry, full=True,
+                                      node_builders=self.deps.node_builders, node_specs=self.node_specs,
+                                      output_node=output_node)
+                    rel = eng.relation(output_node)
+                    data_uri = attempt_uri.rstrip("/") + "/part-00000.parquet"
+                    result = self.base._adapter_write(
+                        self.resolve_adapter(data_uri), data_uri, rel, "overwrite", threading.Event())
+                    schema = list(zip(rel.columns, (str(t) for t in rel.types)))
+                    write_manifest(
+                        attempt_uri, run_id=run_id, rows=int(result.get("rows") or 0), schema=schema)
             status.status, status.output_uri = "done", attempt_uri
             status.rows_processed = status.total_rows = int(result.get("rows") or 0)
             status.progress = 1.0
@@ -1084,6 +1117,13 @@ class RayRunner:
         return status
 
     def _ray_unsupported_reason(self, ir) -> str | None:
+        policy_con = _secure_duckdb_connection()
+        try:
+            return self._ray_unsupported_reason_with_connection(ir, policy_con)
+        finally:
+            policy_con.close()
+
+    def _ray_unsupported_reason_with_connection(self, ir, policy_con) -> str | None:
         # (1) every step is clean OR a claimed relational op; (2) every clean transform carries inlined
         # code (a Ray worker has no access to the driver's processor registry); (3) every aggregate has a
         # GROUPED, bare-column key we can hash-shuffle on (a global aggregate — empty keys — or an
@@ -1112,6 +1152,17 @@ class RayRunner:
             if s.op == "aggregate":
                 if not parse_group_keys(s.config.get("groupBy", "")):
                     return f"aggregate node '{s.id}' needs a non-empty bare-column GROUP BY"
+                try:
+                    validate_fragment(
+                        FragmentKind.GROUP_BY, s.config.get("groupBy", ""), con=policy_con
+                    )
+                    validate_fragment(
+                        FragmentKind.AGGREGATES,
+                        s.config.get("aggs") or "count(*) AS n",
+                        con=policy_con,
+                    )
+                except SQLPolicyError as exc:
+                    return f"aggregate node '{s.id}' violates SQL policy: {exc}"
                 # pass the EFFECTIVE aggs (default matches _build_aggregate) so a node with no aggs isn't
                 # spuriously rejected by the empty-fragment conservative default.
                 if agg_has_order_sensitive(s.config.get("aggs") or "count(*) AS n"):
@@ -1120,6 +1171,17 @@ class RayRunner:
                 if not parse_group_keys(s.config.get("partitionBy", "")):
                     return f"window node '{s.id}' needs a bare-column PARTITION BY"
                 expr = s.config.get("expr", "")
+                try:
+                    validate_fragment(
+                        FragmentKind.GROUP_BY, s.config.get("partitionBy", ""), con=policy_con
+                    )
+                    validate_fragment(FragmentKind.WINDOW_EXPR, expr, con=policy_con)
+                    if (s.config.get("orderBy") or "").strip():
+                        validate_fragment(
+                            FragmentKind.ORDER_BY, s.config.get("orderBy"), con=policy_con
+                        )
+                except SQLPolicyError as exc:
+                    return f"window node '{s.id}' violates SQL policy: {exc}"
                 if agg_has_order_sensitive(expr):
                     return f"window node '{s.id}' contains an order-sensitive aggregate"
                 if window_needs_order(expr) and not (s.config.get("orderBy") or "").strip():
@@ -1130,6 +1192,12 @@ class RayRunner:
                 from hub.executors.engine import normalize_how
                 if normalize_how(s.config.get("how", "")) not in ("inner", "left", "cross"):
                     return f"join node '{s.id}' uses an unsupported right/full broadcast join"
+                condition = (s.config.get("condition") or "").strip()
+                if condition:
+                    try:
+                        validate_fragment(FragmentKind.JOIN_ON, condition, con=policy_con)
+                    except SQLPolicyError as exc:
+                        return f"join node '{s.id}' violates SQL policy: {exc}"
             if s.op == "sort" and parse_sort_keys(s.config.get("by", "")) is None:
                 return f"sort node '{s.id}' needs a non-empty bare-column sort key"
         return None
@@ -1168,7 +1236,7 @@ class RayRunner:
             return "sort cannot honor GPU/custom-resource placement with the supported Ray 2.56 API"
         return None
 
-    def _source_unsupported_reason(self, ir) -> str | None:
+    def _source_unsupported_reason(self, graph, target, ir) -> str | None:
         """Preflight every read before a Ray subprocess can touch data.
 
         Native reads are reserved for the exact built-in adapter and require bounded fragment/footer/layout
@@ -1177,6 +1245,18 @@ class RayRunner:
         """
         from hub.plugins.adapters import is_object_uri
 
+        classify_local = getattr(self.deps.storage, "requires_result_read", None)
+        if callable(classify_local):
+            for uri in g.execution_source_uris(graph, target):
+                try:
+                    if not classify_local(uri):
+                        continue
+                except Exception as exc:  # an alias must fail before any schema/dedup probe
+                    return f"source '{uri}' is an invalid managed local-result alias: {exc}"
+                return (
+                    f"source '{uri}' is a managed local full result; Ray dispatch cannot inherit its "
+                    "exact POSIX read fence, so use the local backend or shared object storage"
+                )
         for step in ir.steps:
             if step.op != "read":
                 continue
@@ -1342,14 +1422,15 @@ class RayRunner:
         from hub.placement import graph_requires
 
         ir = lower_to_ir(graph, target_node_id, self.node_specs, self.deps.node_ir)
-        reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
+        reason = self._source_unsupported_reason(graph, target_node_id, ir)
+        reason = reason or self._ray_unsupported_reason(ir)
+        reason = reason or self._dedup_unsupported_reason(graph, ir)
         # A final placed region reaches this whole-backend seam (not run_unit). Aggregate the target cone's
         # requirements here so it gets the same fail-loud admission and Ray task options as an intermediate
         # region; otherwise final GPU/custom-resource pins silently bypass placement enforcement.
         cone = g.upstream_chain(graph, target_node_id) if target_node_id else graph.nodes
         requires = graph_requires(graph, self.node_specs, nodes=cone)
         reason = reason or self._resource_unsupported_reason(requires, ir)
-        reason = reason or self._source_unsupported_reason(ir)
         if reason and self._requires_ray(requires, graph, target_node_id):
             return self._unsupported_status(graph, target_node_id, reason, run_id=run_id, plan=plan)
         if reason:
@@ -1486,17 +1567,17 @@ class RayRunner:
         read_guards = []
         try:
             from hub.handoff import managed_read_lease
+            from hub.storage import preflight_managed_execution_sources
             try:
                 deadline = float(os.environ.get("DP_RUN_DEADLINE_S", "3600"))
             except ValueError:
                 deadline = 3600.0
             ttl = max(300.0, deadline + 300.0)
-            for source in graph.nodes:
-                if source.type == "source" and isinstance(source.data, dict):
-                    uri = (source.data.get("config") or {}).get("uri")
-                    if uri:
-                        read_guards.append(read_leases.enter_context(managed_read_lease(
-                            uri, owner=f"ray:{run_id}", ttl_seconds=ttl)))
+            source_uris = preflight_managed_execution_sources(
+                self.deps.storage, g.execution_source_uris(graph, target))
+            for uri in source_uris:
+                read_guards.append(read_leases.enter_context(managed_read_lease(
+                    uri, owner=f"ray:{run_id}", ttl_seconds=ttl)))
             result, returncode, proc, driver_reaped, supervisor_error = self._supervise_in_work(
                 run_id, graph, target, status, work,
                 materialize_uri=materialize_uri, requires=requires,
@@ -1983,16 +2064,18 @@ class RayRunner:
         right_columns = list(right_tbl.column_names)
 
         def _join_block(tbl):                                  # each LEFT block ⋈ the full broadcast right
-            import duckdb
             # A declared outputSchema is empty-result lineage, not an instruction to project a non-empty
             # runtime batch. Build the worker SQL from the actual Arrow block so a stale/narrow contract
             # cannot silently drop columns that the UDF really produced.
-            sql = join_sql(list(tbl.column_names), right_columns, "_l", "_r",
-                           cfg.get("on"), cfg.get("condition"), cfg.get("how"))
-            con = duckdb.connect()
-            con.register("_l", tbl)
-            con.register("_r", right_tbl)
-            return con.execute(sql).fetch_arrow_table()
+            con = _secure_duckdb_connection()
+            try:
+                con.register("_l", tbl)
+                con.register("_r", right_tbl)
+                sql = join_sql(list(tbl.column_names), right_columns, "_l", "_r",
+                               cfg.get("on"), cfg.get("condition"), cfg.get("how"), con=con)
+                return con.execute(sql).fetch_arrow_table()
+            finally:
+                con.close()
 
         result = left.map_batches(
             _join_block, batch_format="pyarrow", batch_size=None, **(ray_opts or {})
@@ -2001,10 +2084,16 @@ class RayRunner:
             left_arrow_schema.names if left_arrow_schema is not None else [], right_columns, "_l", "_r",
             cfg.get("on"), cfg.get("condition"), cfg.get("how"),
         )
-        schema = _duckdb_empty_result_schema(empty_sql, _l=left_schema, _r=right_tbl.schema)
+        join_fragments = (
+            ((FragmentKind.JOIN_ON.value, str(cfg.get("condition") or "")),)
+            if str(cfg.get("condition") or "").strip() else ()
+        )
+        schema = _duckdb_empty_result_schema(
+            empty_sql, policy_fragments=join_fragments, _l=left_schema, _r=right_tbl.schema
+        )
         return _remember_ray_schema(result, schema)
 
-    def _shuffle_duckdb(self, parent, keys, sql, ray_opts=None):
+    def _shuffle_duckdb(self, parent, keys, sql, ray_opts=None, *, policy_fragments=()):
         """The shared distributed-relational mechanism: RAY hash-shuffles `parent` by `keys` so every row
         of a key-group lands in ONE partition (its default HASH_SHUFFLE), then DUCKDB runs `sql` (reading
         the partition as `_blk`) on each WHOLE partition (batch_size=None → the batch IS the partition, so
@@ -2013,10 +2102,13 @@ class RayRunner:
         the same SQL the single-node engine runs, with DuckDB's exact schema. This one mechanism backs
         aggregate/window (and extends to join/dedup) — no operator is reimplemented on Ray."""
         def _run(tbl):                                          # runs on a WORKER, one complete-groups partition
-            import duckdb
-            con = duckdb.connect()
-            con.register("_blk", tbl)
-            return con.execute(sql).fetch_arrow_table()
+            con = _secure_duckdb_connection()
+            try:
+                con.register("_blk", tbl)
+                _validate_policy_fragments(con, policy_fragments)
+                return con.execute(sql).fetch_arrow_table()
+            finally:
+                con.close()
 
         input_schema = _known_ray_schema(parent)
         try:
@@ -2034,7 +2126,9 @@ class RayRunner:
         result = shuffled.map_batches(
             _run, batch_format="pyarrow", batch_size=None, **(ray_opts or {})
         )
-        schema = _duckdb_empty_result_schema(sql, _blk=input_schema)
+        schema = _duckdb_empty_result_schema(
+            sql, policy_fragments=policy_fragments, _blk=input_schema
+        )
         return _remember_ray_schema(result, schema)
 
     def _build_aggregate(self, step, parent, ray_opts=None):
@@ -2042,10 +2136,20 @@ class RayRunner:
         (see _shuffle_duckdb). Any DuckDB aggregate works; only the shuffle key is parsed."""
         cfg = step.config
         keys = parse_group_keys(cfg.get("groupBy", "")) or []   # gating guarantees a non-empty bare-col key
-        group = (cfg.get("groupBy") or "").strip()
+        schema = _arrow_schema(_known_ray_schema(parent))
+        if schema is None:
+            raise RuntimeError("Ray aggregate input did not expose a schema for GROUP BY validation")
+        keys = [identifier(key, schema.names, label="Ray aggregate group column") for key in keys]
+        group = ", ".join(quote_identifier(key) for key in keys)
         aggs = (cfg.get("aggs") or "count(*) AS n").strip()     # DuckDB default (mirrors engine.py:649)
+        fragments = (
+            (FragmentKind.GROUP_BY.value, group),
+            (FragmentKind.AGGREGATES.value, aggs),
+        )
         return self._shuffle_duckdb(
-            parent, keys, f"SELECT {group}, {aggs} FROM _blk GROUP BY {group}", ray_opts)
+            parent, keys, f"SELECT {group}, {aggs} FROM {quote_identifier('_blk')} GROUP BY {group}",
+            ray_opts, policy_fragments=fragments,
+        )
 
     def _build_window(self, step, parent, ray_opts=None):
         """Distributed window: hash-shuffle by PARTITION BY so each window-partition is complete in one Ray
@@ -2054,14 +2158,30 @@ class RayRunner:
         Mirrors engine.py's window SQL. Gating guarantees a bare-column PARTITION BY as the shuffle key."""
         cfg = step.config
         keys = parse_group_keys(cfg.get("partitionBy", "")) or []
-        part = (cfg.get("partitionBy") or "").strip()
+        schema = _arrow_schema(_known_ray_schema(parent))
+        if schema is None:
+            raise RuntimeError("Ray window input did not expose a schema for PARTITION BY validation")
+        keys = [identifier(key, schema.names, label="Ray window partition column") for key in keys]
+        part = ", ".join(quote_identifier(key) for key in keys)
         order = (cfg.get("orderBy") or "").strip()
         expr = (cfg.get("expr") or "").strip()
-        col = ((cfg.get("as") or "").strip() or "window").replace('"', '""')
+        col = validate_identifier_alias(
+            (cfg.get("as") or "").strip() or "window", label="Ray window output column"
+        )
         over = " ".join(x for x in [f"PARTITION BY {part}" if part else "",
                                     f"ORDER BY {order}" if order else ""] if x)
+        fragments = [
+            (FragmentKind.GROUP_BY.value, part),
+            (FragmentKind.WINDOW_EXPR.value, expr),
+        ]
+        if order:
+            fragments.append((FragmentKind.ORDER_BY.value, order))
         return self._shuffle_duckdb(
-            parent, keys, f'SELECT *, {expr} OVER ({over}) AS "{col}" FROM _blk', ray_opts)
+            parent, keys,
+            f"SELECT *, {expr} OVER ({over}) AS {quote_identifier(col)} "
+            f"FROM {quote_identifier('_blk')}",
+            ray_opts, policy_fragments=tuple(fragments),
+        )
 
     def _commit(self, step, datasets, target_uri: str, *,
                 attempt_id: str | None = None,

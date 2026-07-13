@@ -131,6 +131,7 @@ def test_child_accepts_only_the_exact_parent_attestation():
     job = {
         "target": "source",
         "managedSourceAttempts": {uri: identity},
+        "managedLocalSources": {},
     }
 
     assert _parent_attested_source_uris(job, _source_graph(uri)) == frozenset({uri})
