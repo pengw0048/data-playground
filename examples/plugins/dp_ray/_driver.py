@@ -79,7 +79,9 @@ def main() -> None:
         from hub.ir import lower_to_ir
         from hub.models import Graph
 
-        deps = set_workspace(job["workspace"], job["data_dir"])  # fresh DuckDB, created AFTER ray.init
+        deps = set_workspace(
+            job["workspace"], job["data_dir"], maintain_storage=False
+        )  # fresh DuckDB, created AFTER ray.init; parent hub owns shared-storage maintenance
         _log("deps built; load module")
         spec = importlib.util.spec_from_file_location("dp_ray_driver_mod", job["module"])
         mod = importlib.util.module_from_spec(spec)

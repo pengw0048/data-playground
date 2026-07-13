@@ -14,6 +14,7 @@ measured over the tuple. Matching pairs single- and multi-column key sets betwee
 from __future__ import annotations
 
 import re
+import uuid
 from itertools import combinations
 
 from hub import db
@@ -285,7 +286,19 @@ def _configured_join_key(node) -> tuple[list[str], list[str]] | None:
 
 
 def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | None],
-                 catalog, resolve_adapter) -> JoinAnalysis:
+                 catalog, resolve_adapter, storage=None) -> JoinAnalysis:
+    """Fence every managed local input through all uniqueness scans."""
+    from hub.storage import local_result_read_scope
+
+    with local_result_read_scope(
+            storage, g.all_upstream_source_uris(graph, node_id),
+            owner=f"join-analysis:{uuid.uuid4().hex}"):
+        return _analyze_join_unfenced(
+            graph, node_id, columns_by_node, catalog, resolve_adapter)
+
+
+def _analyze_join_unfenced(graph: Graph, node_id: str, columns_by_node: dict[str, list | None],
+                           catalog, resolve_adapter) -> JoinAnalysis:
     """Rank join keys for a join node's two inputs and warn if the join fans out (not 1:1).
     columns_by_node = per-node output columns (from executors.schema.schema_for_graph)."""
     ins = g.incoming(graph, node_id)

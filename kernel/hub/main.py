@@ -40,22 +40,29 @@ from hub.security import current_user
 
 _object_attempt_reaper_stop = threading.Event()
 _object_attempt_reaper_thread: threading.Thread | None = None
+_local_result_reaper_thread: threading.Thread | None = None
 
 
 @asynccontextmanager
 async def _lifespan(_app):
-    global _object_attempt_reaper_stop, _object_attempt_reaper_thread
+    global _object_attempt_reaper_stop, _object_attempt_reaper_thread, _local_result_reaper_thread
     _object_attempt_reaper_stop = threading.Event()
     _object_attempt_reaper_thread = threading.Thread(
         target=_object_attempt_reaper_loop, args=(_object_attempt_reaper_stop,),
         daemon=True, name="dp-object-attempt-reaper")
     _object_attempt_reaper_thread.start()
+    _local_result_reaper_thread = threading.Thread(
+        target=_local_result_reaper_loop, args=(_object_attempt_reaper_stop,),
+        daemon=True, name="dp-local-result-reaper")
+    _local_result_reaper_thread.start()
     try:
         yield
     finally:
         _object_attempt_reaper_stop.set()
         _object_attempt_reaper_thread.join(timeout=5)
+        _local_result_reaper_thread.join(timeout=5)
         _object_attempt_reaper_thread = None
+        _local_result_reaper_thread = None
 
 app = FastAPI(title="Data Playground kernel", version="0.1.0", lifespan=_lifespan)
 # Restrict CORS to localhost origins only. The kernel binds to 127.0.0.1 and serves the SPA
@@ -143,6 +150,20 @@ def _object_attempt_reaper_loop(stop: threading.Event) -> None:
             reap_attempts()
         except Exception:  # noqa: BLE001 — provider failure must not stop future GC cycles
             logging.getLogger("hub").warning("object attempt GC cycle failed (continuing)", exc_info=True)
+
+
+def _local_result_reaper_loop(stop: threading.Event) -> None:
+    """Run bounded exact local-result retention away from run completion latency."""
+    from hub.deps import get_deps
+
+    while not stop.wait(metadb.KERNEL_STALE_S):
+        try:
+            prune = getattr(get_deps().storage, "prune_results", None)
+            if callable(prune):
+                prune()
+        except Exception:  # one transient DB/filesystem failure must not stop future passes
+            logging.getLogger("hub").warning(
+                "local result GC cycle failed (continuing)", exc_info=True)
 
 def _cross_site_ws(ws: WebSocket) -> bool:
     """A browser page from ANOTHER origin opening this socket (cross-site WebSocket hijacking): the

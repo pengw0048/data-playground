@@ -324,9 +324,13 @@ def join_suggestions(req: JoinSuggestRequest) -> list[JoinSuggestion]:
         except KeyError:
             return deps.resolve_adapter(uri).schema(uri)  # not registered → probe directly
     try:
-        return rel.suggest_joins(cols(req.left_uri), cols(req.right_uri),
-                                 rel.measured_unique(req.left_uri, deps.resolve_adapter),
-                                 rel.measured_unique(req.right_uri, deps.resolve_adapter))
+        from hub.storage import local_result_read_scope
+        with local_result_read_scope(
+                deps.storage, [req.left_uri, req.right_uri],
+                owner=f"catalog-join:{uuid.uuid4().hex}"):
+            return rel.suggest_joins(cols(req.left_uri), cols(req.right_uri),
+                                     rel.measured_unique(req.left_uri, deps.resolve_adapter),
+                                     rel.measured_unique(req.right_uri, deps.resolve_adapter))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"{type(e).__name__}: {e}")
 
@@ -353,14 +357,19 @@ def catalog_register(req: RegisterRequest) -> CatalogTable:
     except PermissionError as e:
         raise HTTPException(403, str(e))
     try:
-        deps.resolve_adapter(uri).schema(uri)  # validate readable
+        from hub.storage import local_result_read_scope
+        with local_result_read_scope(
+                deps.storage, [uri], owner=f"catalog-register:{uuid.uuid4().hex}"):
+            deps.resolve_adapter(uri).schema(uri)  # validate readable
+            # Retain the read guard through the catalog-entry transaction: its durable reference must
+            # commit before the temporary reader disappears and makes the artifact reclaimable.
+            return deps.catalog.register_output(
+                name=name, uri=uri, parents=[], folder=(req.folder or "").strip("/"),
+                tags=req.tags, owner=req.owner, description=req.description)
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"cannot read '{uri}': {e}")
-    # register_output write-throughs per-row to catalog_entries (metadb) — authoritative + cross-instance;
-    # organization (folder/tags/owner/description) is optional and set here or later via PUT .../metadata.
-    return deps.catalog.register_output(
-        name=name, uri=uri, parents=[], folder=(req.folder or "").strip("/"),
-        tags=req.tags, owner=req.owner, description=req.description)
 
 
 # --------------------------------------------------------------------------- #
@@ -470,16 +479,21 @@ def data_sample(req: SampleRequest) -> SampleResult:
         paths.ensure_local_uri_allowed(req.uri)  # multi-user: don't sample an arbitrary local file
     except PermissionError as e:
         raise HTTPException(403, str(e))
-    # A persisted run-history link can outlive its coarse file retention. Give the UI a stable signal
-    # for that lifecycle state instead of folding it into the same 400 as a malformed query or a
-    # temporary object-store failure. Remote existence remains adapter-owned and retryable.
-    if "://" not in req.uri or req.uri.startswith("file://"):
-        local = path_of(req.uri)
-        if not os.path.exists(local) and not glob.glob(local, recursive=True):
-            raise HTTPException(410, "dataset artifact is missing or expired")
     try:
         from hub.handoff import managed_read_lease
-        with managed_read_lease(req.uri, owner=f"sample:{uuid.uuid4().hex}"):
+        from hub.storage import local_result_read_scope
+        with contextlib.ExitStack() as read_scope:
+            owner = f"sample:{uuid.uuid4().hex}"
+            local_guards = read_scope.enter_context(local_result_read_scope(
+                deps.storage, [req.uri], owner=owner))
+            if not local_guards:
+                read_scope.enter_context(managed_read_lease(req.uri, owner=owner))
+            # Exact reference-aware retention keeps a managed file stable for this whole scope. For an
+            # unmanaged local path, report a stable expired signal before constructing a lazy relation.
+            if "://" not in req.uri or req.uri.startswith("file://"):
+                local = path_of(req.uri)
+                if not os.path.exists(local) and not glob.glob(local, recursive=True):
+                    raise HTTPException(410, "dataset artifact is missing or expired")
             adapter = deps.resolve_adapter(req.uri)
             with db.run_scope():  # own cursor — a big sample doesn't block other users' runs/previews
                 # Keep the adapter contract unchanged: request a bounded prefix, then page that lazy
@@ -494,6 +508,8 @@ def data_sample(req: SampleRequest) -> SampleResult:
         has_more = len(page) > req.k or (total is not None and total > req.offset + len(rows))
         return SampleResult(columns=cols, rows=rows, row_count=total, has_more=has_more,
                             truncated=(total is None or total > req.offset + len(rows)))
+    except HTTPException:
+        raise
     except FileNotFoundError as e:
         raise HTTPException(410, str(e))
     except Exception as e:  # noqa: BLE001

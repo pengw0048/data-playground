@@ -120,7 +120,7 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
             return SampleResult(error=True, reason=f"kernel unavailable: {type(e).__name__}: {e}")
     return preview_node(req.graph, req.node_id, k,
                         deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
-                        offset=max(0, req.offset))
+                        offset=max(0, req.offset), storage=deps.storage)
 
 
 @router.post("/run/profile", response_model=ProfileResult)
@@ -137,7 +137,7 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
         except Exception as e:  # noqa: BLE001 — kernel unreachable → a clean error, not a raw 500
             return ProfileResult(error=True, reason=f"kernel unavailable: {type(e).__name__}: {e}")
     return profile_node(req.graph, req.node_id, deps.resolve_adapter, deps.registry,
-                        deps.node_builders, deps.node_specs, full=req.full)
+                        deps.node_builders, deps.node_specs, full=req.full, storage=deps.storage)
 
 
 @router.post("/graph/schema")
@@ -148,7 +148,7 @@ def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.target_node_id)
     return schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
-                            deps.node_builders, deps.node_specs)
+                            deps.node_builders, deps.node_specs, storage=deps.storage)
 
 
 @router.post("/graph/estimate")
@@ -161,7 +161,9 @@ def graph_estimate(req: CompileRequest, uid: str = Depends(current_user)) -> dic
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     _reject_invalid(req.graph, deps, req.target_node_id)
     try:
-        sizes = estimate_sizes(req.graph, deps.resolve_adapter, actuals=_actuals_for(req.graph, deps))
+        sizes = estimate_sizes(
+            req.graph, deps.resolve_adapter, actuals=_actuals_for(req.graph, deps),
+            storage=deps.storage)
     except Exception:  # noqa: BLE001 — a hint must never 500
         return {}
     return {nid: {"rows": s.rows, "confidence": s.confidence} for nid, s in sizes.items()}
@@ -196,8 +198,10 @@ def join_analysis(req: CompileRequest, uid: str = Depends(current_user)) -> Join
     if not req.target_node_id:
         return JoinAnalysis(note="no join node selected")
     cols = schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
-                            deps.node_builders, deps.node_specs)
-    return rel.analyze_join(req.graph, req.target_node_id, cols, deps.catalog, deps.resolve_adapter)
+                            deps.node_builders, deps.node_specs, storage=deps.storage)
+    return rel.analyze_join(
+        req.graph, req.target_node_id, cols, deps.catalog, deps.resolve_adapter,
+        storage=deps.storage)
 
 
 # --------------------------------------------------------------------------- #
@@ -288,12 +292,12 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
     from hub.estimate import estimate_sizes
     try:  # per-node schemas sharpen the byte width (else a flat default/row makes the byte gate meaningless)
         schemas = schema_for_graph(req_graph, deps.resolve_adapter, deps.registry,
-                                   deps.node_builders, deps.node_specs)
+                                   deps.node_builders, deps.node_specs, storage=deps.storage)
     except Exception:  # noqa: BLE001 — schema inference is best-effort; fall back to default widths
         schemas = None
     try:
         sizes = estimate_sizes(req_graph, deps.resolve_adapter, target=target_node_id, schemas=schemas,
-                               actuals=_actuals_for(req_graph, deps))
+                               actuals=_actuals_for(req_graph, deps), storage=deps.storage)
     except Exception:  # noqa: BLE001 — a bad estimate must not block the gate
         return None, None, {}
     rows = [s.rows for s in sizes.values() if s.rows is not None]
@@ -318,23 +322,6 @@ def _route_by_capability(deps, chosen, graph):
     return next((r for r in deps.runners if _can_place(r)), chosen)
 
 
-def _cached_noop(runner, graph, target) -> bool:
-    """True if this exact plan already has a reusable result — re-running just re-points at an existing
-    output, so it needs no size confirmation (fixes the 'full cache hit still prompts' false gate)."""
-    if not all(hasattr(runner, m) for m in ("_plan_hash", "_plan_cacheable", "_cache_get", "_output_exists")):
-        return False
-    try:
-        if not runner._plan_cacheable(graph, target):
-            return False
-        c = runner._cache_get(runner._plan_hash(graph, target))
-        if c is None:
-            return False
-        uri = c.get("uri")
-        return (not uri) or runner._output_exists(uri)  # non-sink hit (rows cached) OR the artifact still exists
-    except Exception:  # noqa: BLE001
-        return False
-
-
 @router.post("/run/estimate", response_model=RunEstimate)
 def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunEstimate:
     _require_graph_read_access(req.graph, uid)
@@ -347,8 +334,6 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     rows, byts, _ = _cone_size(req.graph, req.target_node_id, deps)
     runner = deps.pick_runner(plan, uid)
     est = runner.estimate(plan, rows, byts)
-    if est.needs_confirm and _cached_noop(runner, req.graph, req.target_node_id):
-        est.needs_confirm = False  # reusing a cached result is a no-op, not a big pass
     return est
 
 
@@ -388,7 +373,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     runner = _route_by_capability(deps, deps.pick_runner(plan, uid), graph)  # honor node requires
     rows, byts, sizes = _cone_size(graph, target_node_id, deps)
     est = runner.estimate(plan, rows, byts)
-    if est.needs_confirm and not confirmed and not _cached_noop(runner, graph, target_node_id):
+    if est.needs_confirm and not confirmed:
         raise RunNeedsConfirm(est)
     # a run that splits across placement regions (a placed node / checkpoint / fan-out) is owned by the
     # RunController; a single default region returns None → the base runner, exactly as before. Hand it the

@@ -133,9 +133,13 @@ def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
         # honor the client's id so the canvas exists under it immediately (no orphan row, and
         # sharing/opening works without waiting for the first autosave to PUT it).
         cid = doc.get("id") or metadb._uid()
-        if s.get(metadb.Canvas, cid) is None:
+        if s.get(metadb.Canvas, cid, with_for_update=True) is None:
             s.add(metadb.Canvas(id=cid, owner_id=uid, name=doc.get("name") or "untitled",
                                 version=doc.get("version", 1), doc=json.dumps(doc)))
+            # Materialize the durable owner row before the local-result registry lock.  Autoflush is
+            # deliberately disabled inside that lock so every ownership path has one global order.
+            s.flush()
+            metadb.sync_local_result_owner(s, "canvas", cid, doc)
         return {"ok": True, "id": cid}
 
 
@@ -153,7 +157,7 @@ def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> d
     doc_json = json.dumps(doc)
     version = doc.get("version", 1)
     with metadb.session() as s:
-        c = s.get(metadb.Canvas, canvas_id)
+        c = s.get(metadb.Canvas, canvas_id, with_for_update=True)
         if c and role not in ("owner", "editor"):
             raise HTTPException(403, "you don't have edit access to this canvas")
         if not c:
@@ -162,6 +166,8 @@ def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> d
         c.name = doc.get("name") or c.name or "untitled"
         c.version = version
         c.doc = doc_json
+        s.flush()  # settle a newly-created owner row before the local-result registry lock
+        metadb.sync_local_result_owner(s, "canvas", canvas_id, doc)
     # keep a throttled snapshot history so a bad edit is recoverable (autosave fires ~every 400ms; the
     # snapshotter dedups + rate-limits so it doesn't store every keystroke)
     metadb.snapshot_canvas(canvas_id, doc_json, version, author_id=uid)
@@ -188,13 +194,15 @@ def restore_canvas(canvas_id: str, req: RestoreRequest, uid: str = Depends(curre
     if doc is None:
         raise HTTPException(404, "version not found")
     with metadb.session() as s:
-        c = s.get(metadb.Canvas, canvas_id)
+        c = s.get(metadb.Canvas, canvas_id, with_for_update=True)
         if c is None:
             raise HTTPException(404, "not found")
         # snapshot the CURRENT state first so a restore is itself undoable, then swap in the old doc
-        metadb.snapshot_canvas(canvas_id, c.doc, c.version, author_id=uid, label="before restore")
+        metadb._snapshot_canvas_in_session(
+            s, c, c.doc, c.version, author_id=uid, label="before restore")
         c.doc = doc
         c.version = (c.version or 1) + 1
+        metadb.sync_local_result_owner(s, "canvas", canvas_id, json.loads(doc))
     return {"ok": True, "id": canvas_id, "doc": json.loads(doc)}
 
 
@@ -354,4 +362,3 @@ def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
             value = {**value, **{k: stored.get(k) for k in _SECRET_SUBKEYS if value.get(k) == _REDACTED}}
     metadb.set_setting(body.key, value, scope=body.scope, scope_id=scope_id)
     return {"ok": True}
-

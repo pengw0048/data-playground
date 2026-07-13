@@ -973,9 +973,10 @@ class RayRunner:
                 return prior  # one in-process owner for an explicit attempt ID
             self.runs[run_id] = status
             self._cancel_ack.discard(run_id)
-        reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
+        reason = self._source_unsupported_reason(graph, output_node, ir)
+        reason = reason or self._ray_unsupported_reason(ir)
+        reason = reason or self._dedup_unsupported_reason(graph, ir)
         reason = reason or self._resource_unsupported_reason(requires, ir)
-        reason = reason or self._source_unsupported_reason(ir)
         if _remote_ray():
             from hub.plugins.adapters import is_object_uri
             if not is_object_uri(output_uri):
@@ -1060,18 +1061,23 @@ class RayRunner:
                 raise RuntimeError(
                     "attempt prefix already exists without an exact committed inventory; use a new run ID")
             owns_prefix = True
-            with db.run_scope():
-                if is_object_uri(attempt_uri):
-                    db.ensure_object_store()
-                eng = BuildEngine(graph, self.resolve_adapter, self.deps.registry, full=True,
-                                  node_builders=self.deps.node_builders, node_specs=self.node_specs,
-                                  output_node=output_node)
-                rel = eng.relation(output_node)
-                data_uri = attempt_uri.rstrip("/") + "/part-00000.parquet"
-                result = self.base._adapter_write(
-                    self.resolve_adapter(data_uri), data_uri, rel, "overwrite", threading.Event())
-                schema = list(zip(rel.columns, (str(t) for t in rel.types)))
-                write_manifest(attempt_uri, run_id=run_id, rows=int(result.get("rows") or 0), schema=schema)
+            from hub.storage import local_result_read_scope
+            with local_result_read_scope(
+                    self.deps.storage, g.all_upstream_source_uris(graph, output_node),
+                    owner=f"ray-local-fallback:{run_id}"):
+                with db.run_scope():
+                    if is_object_uri(attempt_uri):
+                        db.ensure_object_store()
+                    eng = BuildEngine(graph, self.resolve_adapter, self.deps.registry, full=True,
+                                      node_builders=self.deps.node_builders, node_specs=self.node_specs,
+                                      output_node=output_node)
+                    rel = eng.relation(output_node)
+                    data_uri = attempt_uri.rstrip("/") + "/part-00000.parquet"
+                    result = self.base._adapter_write(
+                        self.resolve_adapter(data_uri), data_uri, rel, "overwrite", threading.Event())
+                    schema = list(zip(rel.columns, (str(t) for t in rel.types)))
+                    write_manifest(
+                        attempt_uri, run_id=run_id, rows=int(result.get("rows") or 0), schema=schema)
             status.status, status.output_uri = "done", attempt_uri
             status.rows_processed = status.total_rows = int(result.get("rows") or 0)
             status.progress = 1.0
@@ -1168,7 +1174,7 @@ class RayRunner:
             return "sort cannot honor GPU/custom-resource placement with the supported Ray 2.56 API"
         return None
 
-    def _source_unsupported_reason(self, ir) -> str | None:
+    def _source_unsupported_reason(self, graph, target, ir) -> str | None:
         """Preflight every read before a Ray subprocess can touch data.
 
         Native reads are reserved for the exact built-in adapter and require bounded fragment/footer/layout
@@ -1177,6 +1183,18 @@ class RayRunner:
         """
         from hub.plugins.adapters import is_object_uri
 
+        classify_local = getattr(self.deps.storage, "requires_result_read", None)
+        if callable(classify_local):
+            for uri in g.execution_source_uris(graph, target):
+                try:
+                    if not classify_local(uri):
+                        continue
+                except Exception as exc:  # an alias must fail before any schema/dedup probe
+                    return f"source '{uri}' is an invalid managed local-result alias: {exc}"
+                return (
+                    f"source '{uri}' is a managed local full result; Ray dispatch cannot inherit its "
+                    "exact POSIX read fence, so use the local backend or shared object storage"
+                )
         for step in ir.steps:
             if step.op != "read":
                 continue
@@ -1342,14 +1360,15 @@ class RayRunner:
         from hub.placement import graph_requires
 
         ir = lower_to_ir(graph, target_node_id, self.node_specs, self.deps.node_ir)
-        reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
+        reason = self._source_unsupported_reason(graph, target_node_id, ir)
+        reason = reason or self._ray_unsupported_reason(ir)
+        reason = reason or self._dedup_unsupported_reason(graph, ir)
         # A final placed region reaches this whole-backend seam (not run_unit). Aggregate the target cone's
         # requirements here so it gets the same fail-loud admission and Ray task options as an intermediate
         # region; otherwise final GPU/custom-resource pins silently bypass placement enforcement.
         cone = g.upstream_chain(graph, target_node_id) if target_node_id else graph.nodes
         requires = graph_requires(graph, self.node_specs, nodes=cone)
         reason = reason or self._resource_unsupported_reason(requires, ir)
-        reason = reason or self._source_unsupported_reason(ir)
         if reason and self._requires_ray(requires, graph, target_node_id):
             return self._unsupported_status(graph, target_node_id, reason, run_id=run_id, plan=plan)
         if reason:
@@ -1486,17 +1505,17 @@ class RayRunner:
         read_guards = []
         try:
             from hub.handoff import managed_read_lease
+            from hub.storage import preflight_managed_execution_sources
             try:
                 deadline = float(os.environ.get("DP_RUN_DEADLINE_S", "3600"))
             except ValueError:
                 deadline = 3600.0
             ttl = max(300.0, deadline + 300.0)
-            for source in graph.nodes:
-                if source.type == "source" and isinstance(source.data, dict):
-                    uri = (source.data.get("config") or {}).get("uri")
-                    if uri:
-                        read_guards.append(read_leases.enter_context(managed_read_lease(
-                            uri, owner=f"ray:{run_id}", ttl_seconds=ttl)))
+            source_uris = preflight_managed_execution_sources(
+                self.deps.storage, g.execution_source_uris(graph, target))
+            for uri in source_uris:
+                read_guards.append(read_leases.enter_context(managed_read_lease(
+                    uri, owner=f"ray:{run_id}", ttl_seconds=ttl)))
             result, returncode, proc, driver_reaped, supervisor_error = self._supervise_in_work(
                 run_id, graph, target, status, work,
                 materialize_uri=materialize_uri, requires=requires,
