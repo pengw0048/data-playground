@@ -101,7 +101,8 @@ class InMemoryCatalog:
 
     def _add(self, name: str, uri: str, version: str | None = None, meta: str | None = None,
              folder: str = "", tags: list[str] | None = None, owner: str | None = None,
-             description: str | None = None) -> CatalogTable:
+             description: str | None = None, parents: list[str] | None = None,
+             pipeline: str | None = None, *, strict_probe: bool = False) -> CatalogTable:
         import hashlib as _h
         # schema/count probe (may touch disk/network) OUTSIDE the lock so a slow adapter doesn't block
         # concurrent catalog reads; only the version/collision compute + upsert below is serialized.
@@ -109,7 +110,9 @@ class InMemoryCatalog:
             adapter = self.resolve(uri)
             columns = adapter.schema(uri)
             count = adapter.count(uri)
-        except Exception:  # noqa: BLE001 — an unresolvable/unreadable uri → empty schema (still registered)
+        except Exception as exc:  # noqa: BLE001 — unmanaged registrations may describe offline data
+            if strict_probe:
+                raise RuntimeError("managed output schema/count probe failed") from exc
             adapter, columns, count = None, [], None
         fp = "unknown"
         try:
@@ -145,7 +148,7 @@ class InMemoryCatalog:
                 columns=columns, keys=keys, meta=meta, folder=folder, tags=tags,
                 owner=owner, description=description,
             )
-            self._persist(table)
+            self._persist(table, parents=parents, pipeline=pipeline)
         self._embed_one(table)  # best-effort semantic index (no-op without an embedder)
         return table
 
@@ -165,10 +168,18 @@ class InMemoryCatalog:
         log.warning("catalog output %r schema changed on overwrite (version %s→%s): %s",
                     name, prior.get("version"), version, detail)
 
-    def _persist(self, table: CatalogTable) -> None:
+    def _persist(self, table: CatalogTable, *, parents: list[str] | None = None,
+                 pipeline: str | None = None) -> None:
         try:
-            metadb.catalog_upsert_entry(table.uri, table.name, table.model_dump(by_alias=True))
+            from hub.handoff import prepare_attempt_commit
+            prepare_attempt_commit(table.uri)
+            metadb.catalog_upsert_entry(
+                table.uri, table.name, table.model_dump(by_alias=True),
+                parents=parents, pipeline=pipeline)
         except Exception as e:  # noqa: BLE001
+            from hub.handoff import is_attempt_uri
+            if metadb.object_attempt_is_managed(table.uri) or is_attempt_uri(table.uri):
+                raise
             log.warning("catalog persist failed for %s (%s: %s)", table.name, type(e).__name__, e)
 
     # -- read-side overlay ------------------------------------------------- #
@@ -290,21 +301,43 @@ class InMemoryCatalog:
     def register(self, table: CatalogTable, parents: list[str] | None = None,
                  pipeline: str | None = None) -> None:
         with self._lock:
-            self._persist(table)
+            self._persist(table, parents=parents, pipeline=pipeline)
         self._embed_one(table)
-        for parent in parents or []:
-            self._add_edge(parent, table.uri, pipeline)
 
     def register_output(self, name: str, uri: str, version: str | None = None,
                         parents: list[str] | None = None, pipeline: str | None = None,
                         folder: str = "", tags: list[str] | None = None, owner: str | None = None,
                         description: str | None = None) -> CatalogTable:
         table = self._add(name=name, uri=uri, version=version, meta=pipeline, folder=folder,
-                          tags=tags, owner=owner, description=description)
+                          tags=tags, owner=owner, description=description,
+                          parents=parents, pipeline=pipeline)
         for parent in parents or []:
-            self._add_edge(parent, uri, pipeline)
             metadb.catalog_bump_usage(parent)  # a derived output READ its parent → popularity signal
         return table
+
+    def publish_managed_output(self, name: str, uri: str, version: str | None = None,
+                               parents: list[str] | None = None,
+                               pipeline: str | None = None) -> dict:
+        """Core single-sink publication: inventory proof, catalog pointer, ref, and state commit."""
+        existing = metadb.catalog_managed_publication_receipt(uri)
+        if existing is not None:
+            return {**existing, "table": self.get_table(uri)}
+        from hub.handoff import prepare_attempt_commit
+        prepare_attempt_commit(uri)
+        try:
+            table = self._add(
+                name=name, uri=uri, version=version, parents=parents, pipeline=pipeline,
+                strict_probe=True)
+        except Exception:
+            receipt = metadb.catalog_managed_publication_receipt(uri)
+            if receipt is not None:
+                return {**receipt, "table": self.get_table(uri)}
+            metadb.abandon_committed_object_attempt(uri)
+            raise
+        receipt = metadb.catalog_managed_publication_receipt(uri)
+        if receipt is None:
+            raise RuntimeError("core managed publication did not return a durable receipt")
+        return {**receipt, "table": table}
 
     def set_metadata(self, uri: str, *, folder: str | None = None, tags: list[str] | None = None,
                      owner: str | None = None, description: str | None = None) -> CatalogTable:
@@ -340,7 +373,9 @@ class InMemoryCatalog:
             doc = metadb.catalog_get(id_or_name)
             if doc is None:
                 return False
-            metadb.catalog_delete_entry(doc["uri"])
+            token = (id_or_name if metadb.object_attempt_is_managed(id_or_name)
+                     else doc["uri"])
+            metadb.catalog_delete_entry(token)
             self._emb_dirty += 1  # its embedding row went with it
         return True
 
@@ -531,6 +566,11 @@ class InMemoryCatalog:
 
     def remove_relationship(self, rel: Relationship) -> None:
         metadb.catalog_delete_relationship(self._rel_key(rel))
+
+
+def core_managed_publisher(catalog):
+    """Return the core lifecycle publisher only; a lookalike custom method cannot claim this authority."""
+    return catalog.publish_managed_output if type(catalog) is InMemoryCatalog else None
 
 
 class CatalogCompat:

@@ -129,6 +129,8 @@ class ObjectStorage:
 
     def __init__(self, root: str):
         self.root = root.rstrip("/")
+        from hub import metadb
+        metadb.bind_object_storage_root(self.root)
 
     def output_uri(self, name: str, ext: str) -> str:
         return f"{self.root}/{name}{ext}"

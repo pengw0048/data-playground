@@ -1,8 +1,8 @@
 # Ray backend: support and production readiness
 
 `dp_ray` is a working distributed execution backend for Data Playground. Its supported data path is
-fail-closed: large Parquet inputs and simple Parquet overwrite outputs stay off the driver, while every
-remaining compatibility collect has an explicit byte ceiling. The multi-node differential in
+designed to fail closed: large Parquet inputs and simple Parquet overwrite outputs stay off the driver,
+while every remaining compatibility collect has an explicit byte ceiling. The multi-node differential in
 [`ray-validation.yml`](../.github/workflows/ray-validation.yml) verifies that contract on Ray and MinIO.
 
 The Compose and KubeRay files in this repository are validation harnesses, not deployment manifests. A
@@ -74,6 +74,42 @@ future catalog-backed fragment manifest.
 Increasing this limit trades compatibility for driver-memory risk. Prefer Parquet on shared/object
 storage or the local backend instead. A remote Ray cluster must use an object-store destination for
 worker-direct Parquet output; a local destination makes the graph fall back before Ray starts.
+
+### Managed object publication and deletion
+
+Worker-direct managed writes currently support one managed Parquet sink per Ray run. A graph with two or
+more such sinks fails before any attempt is allocated or writer is dispatched; atomic batch publication is
+required before that limit can be lifted. An external catalog also fails before allocation because only the
+core catalog publisher can atomically swap the logical pointer, ownership reference, and attempt state.
+
+Core provides a built-in lifecycle provider for S3 and compatible endpoints that implement its complete API
+contract. [R2's S3 compatibility API](https://developers.cloudflare.com/r2/api/s3/api/) currently omits the
+bucket-versioning/version-list operations this provider uses, so `r2://`, GCS, or another scheme must register a
+`ManagedObjectProvider` as documented in [PLUGINS.md](PLUGINS.md); a plain PyArrow filesystem is read-capable
+but intentionally fails managed writes because it cannot prove hidden versions, delete markers, incomplete
+multipart uploads, or conditional namespace ownership. The S3 identity needs, in addition to ordinary
+read/write permissions, permission to read bucket versioning, list object versions and multipart uploads,
+get/conditionally put the `_dp_control/namespaces/<namespace>.json` marker, delete exact object versions and
+delete markers, and abort multipart uploads. In AWS IAM terms this includes `s3:GetBucketVersioning`,
+`s3:ListBucketVersions`, `s3:ListBucketMultipartUploads`, `s3:GetObject`, `s3:PutObject`,
+`s3:DeleteObject`, `s3:DeleteObjectVersion`, and `s3:AbortMultipartUpload`; the endpoint must preserve
+`If-Match` and `If-None-Match` semantics on the marker write.
+
+The metadata database owns a stable storage namespace. Before managed allocation/commit validation or GC,
+core verifies that namespace against the provider-side conditional marker. An offline metadata clone must
+call `isolate_cloned_object_storage(expected, replacement)` before provider access. This destructive clone
+isolation rotates both owner and namespace, quarantines inherited attempts, removes inherited refs/cache/
+catalog visibility, and clears copied marker claims; it does not touch the original installation's marker.
+The isolated clone cannot read or delete the original namespace. An audited disaster-recovery takeover of an
+old namespace is a separate capability and is not implemented; changing `DP_STORAGE_NAMESPACE` alone is
+rejected.
+
+Superseded/abandoned attempts become eligible only after ownership refs and leases are gone and
+the configured retention/grace has elapsed. The reaper inventories only that exact generation, persists
+stable member identities, deletes versions/delete markers/uploads exactly, and then requires two
+database-clock-separated empty observations. A late shard, version, marker, or upload during deletion
+quarantines the attempt instead of declaring it deleted. `writing` attempts are never reaped from age or
+`RunState`; they still require an authoritative writer-stop transition.
 
 Append, partitioning, destination selection, and non-Parquet formats retain the shared sink contract;
 they are not silently converted into overwrite Parquet. Empty Parquet results publish one typed empty
@@ -148,8 +184,8 @@ identity underneath the persistent workers.
 
 ## What remains before production ownership
 
-The data-plane paths above are production-safe within their stated contract. The backend as a whole
-still needs the following before it should own production workloads:
+The correctness fences above are implemented and tested, but they are not by themselves a production
+certification. The backend still needs the following before it should own production workloads:
 
 1. Replace local subprocess ownership with a durable Ray job lifecycle that survives kernel/hub restarts
    and supports idempotent submission, cancellation, timeout, retry, and attempt fencing.
@@ -163,30 +199,28 @@ still needs the following before it should own production workloads:
 6. Pass staging gates on the intended production topology: active-job failure injection, representative
    large workloads, SLOs/alerts, upgrade/rollback, and recovery runbooks.
 
-Object storage holds only immutable shards plus `_dp_commits/<attempt>/` inventories. Ownership and
-lifecycle state live in the shared metadata database's indexed `object_attempts` table; the database's
-durable installation identity is included in each object attempt URI, so separate deployments sharing a
-bucket parent cannot collide or reap each other's data. The parent registers exact physical URIs before
-dispatch. Region attempts are published in the same transaction as their result-cache pointer, and only an
-exact pointer replacement/eviction retires the prior URI. Whole-graph overwrites use a transactionally
-ordered `logical_uri -> physical attempt` swap; the returned prior URI is the only version retired. No GC
-path lists the data prefix or infers a winner from object mtimes/client clocks.
+Object storage holds immutable shards plus `_dp_commits/<attempt>/` manifests. Ownership and lifecycle state
+live in the shared metadata database's indexed attempt, lease, ref, and exact-member inventory tables. The
+parent registers physical attempt URIs before dispatch. Region attempts publish in the same transaction as
+their result-cache pointer; whole-graph overwrites atomically advance a monotonic logical catalog pointer,
+release the provisional publication lease, and supersede only the prior published generation. A committed
+attempt whose publisher crashes remains fenced by its durable publication lease and becomes abandoned only
+after that lease expires and retention eligibility is re-evaluated. GC never lists a shared parent prefix or
+chooses a winner from object mtimes/client clocks.
 
 Failed/cancelled object attempts are deleted only after durable backend reconciliation proves every writer
 stopped; local driver exit alone is insufficient because remote Ray tasks can outlive it. The periodic
 reaper never infers that a `writing` attempt is dead from `RunState`, age, or a local deadline: an
 independent driver or durable Ray Job can survive a hub crash. Unreconciled attempts therefore require
 backend terminal/stop acknowledgement or a provider lifecycle rule; time alone is not a safe write fence.
-`DP_ATTEMPT_RETENTION_SECONDS` remains reserved for that future reconciled lifecycle and does not authorize
-deleting an unacknowledged writer.
+`DP_ATTEMPT_RETENTION_SECONDS` does not authorize deleting an unacknowledged writer.
 
-Retirement is two phase: the old catalog entry and commit record disappear first, preventing new readers;
-the immutable shard prefix remains for `DP_ATTEMPT_DELETE_GRACE_SECONDS` (one day by default) so readers
-that already resolved the old URI can finish. The automatic grace also cannot be configured below the run
-deadline; raise it for longer external readers. Provider lifecycle is still required for crash-orphaned
-writers without terminal proof, object versions, incomplete multipart uploads, and legacy attempts created
-before the registry. On S3 with versioning, a normal delete only creates a delete marker, so a
-noncurrent-version expiration rule releases the bytes.
+The immutable generation remains for `DP_ATTEMPT_DELETE_GRACE_SECONDS` (one day by default) after it loses
+visibility so readers that already resolved and leased the old URI can finish. The automatic grace cannot be
+configured below the run deadline; raise it for longer external readers. The built-in S3 provider deletes
+versioned history and incomplete uploads by exact identity rather than issuing an unversioned delete. A
+provider lifecycle rule remains useful as a last-resort bound for crash-orphaned writers that never receive
+terminal proof, but it is not treated as lifecycle acknowledgement by core.
 
 Local region handoffs are retained for the same correctness reason. The hub does not evict files by age or
 directory count: an mtime cannot prove that a cache entry, catalog version, concurrent hub, or active reader

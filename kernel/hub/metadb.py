@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import hashlib
 import json
 import math
 import os
 import uuid
+from urllib.parse import urlsplit
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String,
-    Text, UniqueConstraint, create_engine, func, or_, select, update,
+    Text, UniqueConstraint, create_engine, exists, func, or_, select, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -172,6 +174,7 @@ class CatalogEntry(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     row_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)  # promoted for sort/display
     usage: Mapped[int] = mapped_column(Integer, default=0, server_default="0", index=True)  # read-count popularity signal
+    logical_id: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, index=True)
 
 
@@ -198,7 +201,7 @@ class CatalogEmbedding(Base):
     Written only when an embedder is registered (reg.add_embedder) — the vector is opaque float32
     bytes + its dim, so the store stays engine-neutral and the search does cosine in the catalog."""
     __tablename__ = "catalog_embeddings"
-    uri: Mapped[str] = mapped_column(String, primary_key=True)
+    catalog_key: Mapped[str] = mapped_column(String, primary_key=True)
     model: Mapped[str] = mapped_column(String)
     dim: Mapped[int] = mapped_column(Integer)
     vec: Mapped[bytes] = mapped_column(LargeBinary)
@@ -233,9 +236,12 @@ class InstallationIdentity(Base):
     __tablename__ = "installation_identity"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_token: Mapped[str] = mapped_column(String, nullable=False)
+    storage_namespace: Mapped[str] = mapped_column(String, nullable=False)
+    storage_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
     __table_args__ = (
         CheckConstraint("id = 1", name="ck_installation_identity_singleton"),
         UniqueConstraint("owner_token", name="uq_installation_identity_owner_token"),
+        UniqueConstraint("storage_namespace", name="uq_installation_identity_storage_namespace"),
     )
 
 
@@ -247,24 +253,146 @@ class ObjectAttempt(Base):
     """
     __tablename__ = "object_attempts"
     uri: Mapped[str] = mapped_column(String, primary_key=True)
+    attempt_id: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    allocation_key: Mapped[str] = mapped_column(String, nullable=False)
+    storage_namespace: Mapped[str] = mapped_column(String, nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
     logical_uri: Mapped[str] = mapped_column(String, nullable=False, index=True)
     kind: Mapped[str] = mapped_column(String, nullable=False, index=True)
     run_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    logical_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    catalog_epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    publish_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     state: Mapped[str] = mapped_column(String, nullable=False, default="writing", server_default="writing", index=True)
-    reference_key: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now())
     published_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     retired_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     gc_attempted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    terminal_proof_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    quiet_until: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    inventory_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    inventory_observations: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    inventory_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    delete_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    delete_owner: Mapped[str | None] = mapped_column(String, nullable=True)
+    delete_lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delete_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    next_delete_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delete_empty_observations: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0")
+    delete_empty_observed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    quarantine_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     __table_args__ = (
         CheckConstraint("kind IN ('region', 'sink')", name="ck_object_attempt_kind"),
         CheckConstraint(
-            "state IN ('writing', 'published', 'retiring', 'retired', 'discarding')",
+            "state IN ('allocated', 'writing', 'committed', 'published', 'superseded', "
+            "'abandoned', 'delete_pending', 'deleting', 'delete_verifying', 'deleted', 'quarantined')",
             name="ck_object_attempt_state",
         ),
+        UniqueConstraint("allocation_key", "generation", name="uq_object_attempt_allocation_generation"),
+        UniqueConstraint(
+            "logical_id", "catalog_epoch", "publish_seq",
+            name="uq_object_attempt_logical_publication"),
         Index("ix_object_attempts_gc", "state", "gc_attempted_at", "retired_at", "created_at", "uri"),
         Index("ix_object_attempts_sink_target", "kind", "logical_uri", "state"),
+        Index("ix_object_attempts_eligibility", "state", "quiet_until", "next_delete_at", "created_at"),
+    )
+
+
+class ObjectAttemptAllocation(Base):
+    """Current generation for one durable allocation key; terminal retry advances this pointer."""
+    __tablename__ = "object_attempt_allocations"
+    allocation_key: Mapped[str] = mapped_column(String, primary_key=True)
+    attempt_uri: Mapped[str] = mapped_column(String, ForeignKey("object_attempts.uri"), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+
+class ObjectAttemptRef(Base):
+    """One durable owning pointer to an immutable attempt generation."""
+    __tablename__ = "object_attempt_refs"
+    ref_type: Mapped[str] = mapped_column(String, primary_key=True)
+    ref_key: Mapped[str] = mapped_column(String, primary_key=True)
+    attempt_uri: Mapped[str] = mapped_column(String, ForeignKey("object_attempts.uri"), nullable=False, index=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+
+
+class ObjectAttemptLease(Base):
+    """DB-clock lease that fences readers, writers, and exact-key deleters."""
+    __tablename__ = "object_attempt_leases"
+    lease_id: Mapped[str] = mapped_column(String, primary_key=True)
+    attempt_uri: Mapped[str] = mapped_column(String, ForeignKey("object_attempts.uri"), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    lease_type: Mapped[str] = mapped_column(String, nullable=False)
+    owner: Mapped[str] = mapped_column(String, nullable=False)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    __table_args__ = (
+        CheckConstraint(
+            "lease_type IN ('read', 'write', 'publish', 'delete')",
+            name="ck_object_attempt_lease_type"),
+        Index("ix_object_attempt_leases_active", "attempt_uri", "lease_type", "expires_at"),
+    )
+
+
+class ObjectAttemptInventory(Base):
+    """Exact provider member identity; one object key may own many versions and uploads."""
+    __tablename__ = "object_attempt_inventory"
+    attempt_uri: Mapped[str] = mapped_column(
+        String, ForeignKey("object_attempts.uri"), primary_key=True)
+    member_id: Mapped[str] = mapped_column(String, primary_key=True)
+    object_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    member_type: Mapped[str] = mapped_column(String, nullable=False)
+    etag: Mapped[str | None] = mapped_column(String, nullable=True)
+    version_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    upload_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    is_latest: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    is_commit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        CheckConstraint(
+            "member_type IN ('object_version', 'delete_marker', 'multipart_upload', "
+            "'unversioned_object')", name="ck_object_attempt_inventory_member_type"),
+    )
+
+
+class ObjectStorageClaim(Base):
+    """Provider-side conditional ownership marker mirrored for one storage namespace."""
+    __tablename__ = "object_storage_claims"
+    storage_namespace: Mapped[str] = mapped_column(String, primary_key=True)
+    storage_scope: Mapped[str] = mapped_column(String, primary_key=True)
+    claim_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    marker_etag: Mapped[str | None] = mapped_column(String, nullable=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+
+class CatalogLogicalDataset(Base):
+    """Stable catalog identity and governance, independent from a physical attempt URI."""
+    __tablename__ = "catalog_logical_datasets"
+    logical_id: Mapped[str] = mapped_column(String, primary_key=True)
+    catalog_key: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    logical_uri: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    current_uri: Mapped[str | None] = mapped_column(String, nullable=True)
+    current_publish_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0")
+    next_publish_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0")
+    catalog_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    state: Mapped[str] = mapped_column(String, nullable=False, default="active", server_default="active")
+    governance_doc: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default="{}")
+    metadata_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    usage: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    __table_args__ = (
+        CheckConstraint("state IN ('active', 'unregistered')", name="ck_catalog_logical_state"),
     )
 
 
@@ -289,10 +417,10 @@ class CatalogRelationship(Base):
 
 
 class CatalogDeclaredKey(Base):
-    """An owner-declared primary key, ONE ROW per dataset uri (columns as a JSON list) — same
+    """An owner-declared primary key, ONE ROW per stable catalog key (columns as JSON) — same
     per-row isolation as CatalogRelationship (no shared-blob lost update)."""
     __tablename__ = "catalog_declared_keys"
-    uri: Mapped[str] = mapped_column(String, primary_key=True)
+    catalog_key: Mapped[str] = mapped_column(String, primary_key=True)
     columns: Mapped[str] = mapped_column(Text)  # JSON list of column names
 
 
@@ -603,16 +731,19 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
     with session() as s:
         if s.get(Canvas, canvas_id) is None:
             return False  # ad-hoc / unsaved-canvas / internal region run → don't dangle a run row
-        s.add(RunRecord(canvas_id=canvas_id, run_id=run_id, target_node_id=target_node_id, status=status,
-                        rows=rows, ms=ms, error=error, output_table=output_table,
+        rid = _uid()
+        s.add(RunRecord(id=rid, canvas_id=canvas_id, run_id=run_id, target_node_id=target_node_id,
+                        status=status, rows=rows, ms=ms, error=error, output_table=output_table,
                         output_uri=output_uri,
                         per_node=json.dumps(per_node, default=str) if per_node else None))
         s.flush()
+        _replace_attempt_ref(s, "run_record", rid, output_uri)
         stale = s.scalars(select(RunRecord.id).where(RunRecord.canvas_id == canvas_id)
                           .order_by(RunRecord.created_at.desc()).offset(_RUN_HISTORY_MAX)).all()
         for rid in stale:
             obj = s.get(RunRecord, rid)
             if obj:
+                _replace_attempt_ref(s, "run_record", rid, None)
                 s.delete(obj)
         return True
 
@@ -624,6 +755,7 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         for sh in s.scalars(select(CanvasShare).where(CanvasShare.canvas_id == canvas_id)):
             s.delete(sh)
         for r in s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id)):
+            _replace_attempt_ref(s, "run_record", r.id, None)
             s.delete(r)
         for v in s.scalars(select(CanvasVersion).where(CanvasVersion.canvas_id == canvas_id)):
             s.delete(v)
@@ -631,6 +763,7 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         # namespace and a later canvas re-created under the same id could re-grant its old runs (P0-AUTH-02)
         for rs in s.scalars(select(RunState).where(
                 (RunState.canvas_id == canvas_id) | (RunState.auth_canvas_id == canvas_id))):
+            _replace_attempt_ref(s, "run_state", rs.run_id, None)
             s.delete(rs)
         c = s.get(Canvas, canvas_id)
         if c:
@@ -681,7 +814,8 @@ _RUN_STATE_MAX = 2000  # cap on TERMINAL run_states — live (queued/running) ro
 _TERMINAL_RUN = ("done", "failed", "cancelled")
 
 
-def save_run_state(run_id: str, status: dict, canvas_id: str | None = None, kernel_id: str | None = None) -> None:
+def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
+                   kernel_id: str | None = None, *, publish_region: bool = False) -> None:
     """Upsert a run's live status (the runner calls this on each transition). `status` is a RunStatus
     model_dump; stored whole as JSON so GET /run/{id} can rebuild it on any instance. `kernel_id`
     stamps the owning kernel so the boot-time reaper fails a run only when its kernel is gone. When a run
@@ -690,7 +824,7 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None, kern
     the reaper and in-flight status lookups are unaffected; an evicted OLD run just 404s on GET /run/{id}
     (its durable per-canvas history lives in run_records)."""
     with session() as s:
-        r = s.get(RunState, run_id)
+        r = s.get(RunState, run_id, with_for_update=True)
         st = str(status.get("status", "running"))
         payload = json.dumps(status, default=str)
         if r is None:
@@ -702,13 +836,21 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None, kern
                 r.canvas_id = canvas_id
             if kernel_id and not r.kernel_id:
                 r.kernel_id = kernel_id
+        s.flush()
+        output_uri = _result_doc_uri(status)
+        output_attempt = s.get(ObjectAttempt, output_uri) if output_uri else None
+        publish_region = bool(
+            publish_region and st == "done"
+            and output_attempt is not None and output_attempt.kind == "region")
+        _replace_attempt_ref(
+            s, "run_state", run_id, output_uri, publish=publish_region)
         if st in _TERMINAL_RUN:  # once per run at completion (not every transition) → prune finished rows
-            s.flush()
             stale = s.scalars(select(RunState.run_id).where(RunState.status.in_(_TERMINAL_RUN))
                               .order_by(RunState.updated_at.desc()).offset(_RUN_STATE_MAX)).all()
             for rid in stale:
                 obj = s.get(RunState, rid)
                 if obj:
+                    _replace_attempt_ref(s, "run_state", rid, None)
                     s.delete(obj)
 
 
@@ -790,6 +932,48 @@ def diff_columns(a: list[dict], b: list[dict]) -> dict:
 _RESULT_CACHE_MAX = 1000  # persistent equivalent of the old in-process _MAX_RUNS cache cap
 _INSTALLATION_ID = 1
 _OBJECT_ATTEMPT_KINDS = ("region", "sink")
+_WRITABLE_ATTEMPT_STATES = ("allocated", "writing")
+_TERMINAL_ATTEMPT_STATES = (
+    "superseded", "abandoned", "delete_pending", "deleting", "delete_verifying", "deleted",
+    "quarantined",
+)
+_OBJECT_SCHEMES = ("s3", "r2", "gs", "gcs")
+_ATTEMPT_MARKER = ".attempt-"
+
+
+def object_attempt_uri_shape(uri: str | None) -> bool:
+    """Recognize an attempt-shaped object URI without treating its shape as ownership proof."""
+    if not uri:
+        return False
+    try:
+        parsed = urlsplit(str(uri))
+    except ValueError:
+        return False
+    return (parsed.scheme.lower() in _OBJECT_SCHEMES and bool(parsed.netloc)
+            and _ATTEMPT_MARKER in parsed.path.rstrip("/").rsplit("/", 1)[-1])
+
+
+def _validated_object_uri(uri: str, *, attempt: bool) -> str:
+    """Normalize one managed URI and reject authority/query forms that could leak or alias."""
+    raw = str(uri).strip().rstrip("/")
+    try:
+        parsed = urlsplit(raw)
+        invalid_authority = parsed.username is not None or parsed.password is not None
+    except ValueError as exc:
+        raise ValueError("managed object URI is invalid") from exc
+    if (parsed.scheme.lower() not in _OBJECT_SCHEMES or not parsed.netloc or invalid_authority
+            or parsed.query or parsed.fragment or not parsed.path.strip("/")):
+        raise ValueError("managed object URI must use a plain object-store authority and key")
+    shaped = _ATTEMPT_MARKER in parsed.path.rstrip("/").rsplit("/", 1)[-1]
+    if shaped != attempt:
+        required = "attempt" if attempt else "logical target"
+        raise ValueError(f"managed object URI is not a valid {required}")
+    return raw
+
+
+def validate_managed_object_uri(uri: str, *, attempt: bool = False) -> str:
+    """Pure validation for control-plane callers before any provider or database side effect."""
+    return _validated_object_uri(uri, attempt=attempt)
 
 
 def get_result(key: str) -> dict | None:
@@ -797,6 +981,38 @@ def get_result(key: str) -> dict | None:
     with session() as s:
         r = s.get(ResultCache, key)
         return json.loads(r.doc) if r else None
+
+
+def acquire_result_cache_pin(key: str, owner: str, ttl_seconds: float = 300) -> tuple[dict | None, str | None]:
+    """Atomically read the current cache pointer and pin its managed region generation.
+
+    The temporary ref is paired with a DB-time lease: it prevents a concurrent cache replacement from
+    superseding the generation before terminal run-state/history refs are durable, while an abandoned
+    reader is reaped after its lease expires.
+    """
+    with session() as s:
+        cache = s.get(ResultCache, str(key), with_for_update=True)
+        if cache is None:
+            return None, None
+        try:
+            doc = json.loads(cache.doc)
+        except (TypeError, ValueError):
+            return None, None
+        uri = _result_doc_uri(doc)
+        attempt = s.get(ObjectAttempt, uri, with_for_update=True) if uri else None
+        if attempt is None:
+            if uri and object_attempt_uri_shape(uri):
+                raise FileNotFoundError("cached object attempt has no lifecycle ownership row")
+            return doc, None
+        if attempt.kind != "region" or attempt.state != "published":
+            raise FileNotFoundError("cached managed result is not currently published")
+        pin_id = uuid.uuid4().hex
+        _put_lease(s, attempt, "read", str(owner), ttl_seconds, lease_id=pin_id)
+        s.add(ObjectAttemptRef(
+            ref_type="result_reader", ref_key=pin_id, attempt_uri=attempt.uri,
+            generation=attempt.generation,
+        ))
+        return doc, pin_id
 
 
 def _db_now(s) -> datetime.datetime:
@@ -824,6 +1040,17 @@ def _lock_object_attempt_registry(s) -> InstallationIdentity:
     return row
 
 
+def _installation_identity(s) -> InstallationIdentity:
+    row = _lock_object_attempt_registry(s)
+    configured = os.environ.get("DP_STORAGE_NAMESPACE", "").strip()
+    if configured and configured != row.storage_namespace:
+        raise RuntimeError(
+            "DP_STORAGE_NAMESPACE does not match this metadata database; isolate an offline metadata "
+            "clone explicitly before allocating object attempts"
+        )
+    return row
+
+
 def object_attempt_owner_id() -> str:
     """The durable non-secret owner token shared by every hub using this metadata database."""
     with session() as s:
@@ -833,65 +1060,622 @@ def object_attempt_owner_id() -> str:
         return row.owner_token
 
 
+def object_attempt_namespace(uri: str) -> str:
+    normalized = _validated_object_uri(uri, attempt=True)
+    with session() as s:
+        row = s.get(ObjectAttempt, normalized)
+        if row is None:
+            raise RuntimeError("attempt-shaped object URI has no lifecycle ownership row")
+        return row.storage_namespace
+
+
+def object_storage_namespace() -> str:
+    """Stable installation namespace embedded into every new physical object-attempt URI."""
+    with session() as s:
+        return _installation_identity(s).storage_namespace
+
+
+def object_attempt_is_managed(uri: str) -> bool:
+    normalized = str(uri).rstrip("/")
+    if object_attempt_uri_shape(normalized):
+        normalized = _validated_object_uri(normalized, attempt=True)
+    with session() as s:
+        return s.get(ObjectAttempt, normalized) is not None
+
+
+def bind_object_storage_root(storage_root: str) -> None:
+    """Bind the metadata DB to one canonical managed root and fail closed on a different root.
+
+    This catches accidental reuse of a metadata database against another bucket/prefix. An offline DB
+    clone that also copies the configured namespace cannot be distinguished without a provider-side
+    conditional ownership marker; providers may implement that additional claim independently.
+    """
+    root = str(storage_root).strip().rstrip("/")
+    if not root:
+        raise ValueError("managed object storage root is required")
+    fingerprint = hashlib.sha256(root.encode()).hexdigest()
+    with session() as s:
+        row = _installation_identity(s)
+        if row.storage_fingerprint and row.storage_fingerprint != fingerprint:
+            raise RuntimeError("metadata database is already bound to a different managed storage root")
+        row.storage_fingerprint = fingerprint
+
+
+def activate_object_storage_claim(namespace: str, storage_scope: str,
+                                  activation_id: str, writer) -> dict:
+    """CAS one provider marker while holding the shared DB installation lock."""
+    namespace, activation_id = str(namespace), str(activation_id)
+    with session() as s:
+        ident = _lock_object_attempt_registry(s)
+        if ident.storage_namespace != namespace:
+            raise RuntimeError("storage namespace is not owned by this metadata database")
+        claim_key = {"storage_namespace": namespace, "storage_scope": str(storage_scope)}
+        row = s.get(ObjectStorageClaim, claim_key, with_for_update=True)
+        prior_token = row.claim_token if row is not None else None
+        prior_etag = row.marker_etag if row is not None else None
+        marker_etag = str(writer(
+            ident.owner_token, namespace, activation_id, prior_token, prior_etag) or "")
+        if not marker_etag:
+            raise RuntimeError("provider did not return a namespace claim identity")
+        if row is None:
+            row = ObjectStorageClaim(
+                storage_namespace=namespace, storage_scope=str(storage_scope),
+                claim_token=activation_id,
+                marker_etag=marker_etag)
+            s.add(row)
+        else:
+            row.claim_token, row.marker_etag = activation_id, marker_etag
+        return {
+            "owner_token": ident.owner_token, "namespace": namespace,
+            "claim_token": activation_id, "marker_etag": marker_etag,
+        }
+
+
+def object_storage_claim(namespace: str, storage_scope: str) -> dict | None:
+    with session() as s:
+        ident = s.get(InstallationIdentity, _INSTALLATION_ID)
+        row = s.get(ObjectStorageClaim, {
+            "storage_namespace": str(namespace), "storage_scope": str(storage_scope)})
+        if (ident is None or ident.storage_namespace != str(namespace)
+                or row is None or not row.claim_token or not row.marker_etag):
+            return None
+        return {
+            "owner_token": ident.owner_token, "namespace": row.storage_namespace,
+            "claim_token": row.claim_token, "marker_etag": row.marker_etag,
+        }
+
+
+def isolate_cloned_object_storage(expected: str, replacement: str) -> str:
+    """Isolate an offline metadata clone under a new owner and storage namespace.
+
+    This deliberately revokes the clone's authority and public visibility for every inherited managed
+    attempt. It is not a disaster-recovery takeover of the original namespace.
+    """
+    replacement = str(replacement).strip()
+    if not replacement or len(replacement.encode()) > 80:
+        raise ValueError("storage namespace must be 1..80 UTF-8 bytes")
+    if replacement == str(expected):
+        raise ValueError("clone isolation requires a new storage namespace")
+    with session() as s:
+        row = _lock_object_attempt_registry(s)
+        if row.storage_namespace != expected:
+            raise RuntimeError("storage namespace changed concurrently")
+        # Every lifecycle row in the copied metadata DB is inherited, including attempts from a
+        # namespace used before the current identity. Leaving any one published would preserve a
+        # public read path into storage the clone no longer owns.
+        inherited = list(s.scalars(select(ObjectAttempt).with_for_update()))
+        inherited_uris = {attempt.uri for attempt in inherited}
+
+        if inherited_uris:
+            for cache in list(s.scalars(select(ResultCache).with_for_update())):
+                if _result_doc_uri(cache.doc) in inherited_uris:
+                    s.delete(cache)
+            for ref in list(s.scalars(select(ObjectAttemptRef).where(
+                    ObjectAttemptRef.attempt_uri.in_(inherited_uris)).with_for_update())):
+                s.delete(ref)
+
+            logical_rows = list(s.scalars(select(CatalogLogicalDataset).where(
+                CatalogLogicalDataset.current_uri.in_(inherited_uris))
+                .order_by(CatalogLogicalDataset.logical_id).with_for_update()))
+            for logical in logical_rows:
+                current_uri = logical.current_uri
+                if current_uri:
+                    _delete_catalog_children(s, [current_uri])
+                    entry = s.get(CatalogEntry, current_uri, with_for_update=True)
+                    if entry is not None:
+                        s.delete(entry)
+                _delete_catalog_governance(s, logical.catalog_key)
+                logical.current_uri = None
+                logical.catalog_epoch += 1
+                logical.state = "unregistered"
+                logical.metadata_version += 1
+                logical.governance_doc = "{}"
+
+            remaining_entries = list(s.scalars(select(CatalogEntry).where(
+                CatalogEntry.uri.in_(inherited_uris)).order_by(CatalogEntry.uri).with_for_update()))
+            for entry in remaining_entries:
+                _delete_catalog_children(s, [entry.uri])
+                s.delete(entry)
+
+            for lease in list(s.scalars(select(ObjectAttemptLease).where(
+                    ObjectAttemptLease.attempt_uri.in_(inherited_uris)).with_for_update())):
+                s.delete(lease)
+            for attempt in inherited:
+                if attempt.state != "deleted":
+                    attempt.state = "quarantined"
+                    attempt.quarantine_reason = "inherited attempt revoked by clone isolation"
+                attempt.delete_owner = attempt.delete_lease_expires_at = None
+
+        for claim in list(s.scalars(select(ObjectStorageClaim).with_for_update())):
+            s.delete(claim)
+        row.owner_token = uuid.uuid4().hex
+        row.storage_namespace = replacement
+        return replacement
+
+
 def _validate_object_attempt_identity(row: ObjectAttempt, *, logical_uri: str, kind: str,
-                                      run_id: str) -> None:
-    if (row.logical_uri, row.kind, row.run_id) != (logical_uri, kind, run_id):
+                                      run_id: str | None = None) -> None:
+    if (row.logical_uri, row.kind) != (logical_uri, kind) or (
+            run_id is not None and row.run_id != run_id):
         raise RuntimeError("object attempt URI is already claimed by a different logical write")
 
 
-def claim_object_attempt(uri: str, logical_uri: str, kind: str, run_id: str) -> None:
-    """Idempotently register one immutable object attempt before its first shard is written."""
-    uri, logical_uri, run_id = str(uri).rstrip("/"), str(logical_uri).rstrip("/"), str(run_id)
-    if not uri or not logical_uri or not run_id or kind not in _OBJECT_ATTEMPT_KINDS:
-        raise ValueError("object attempt claim requires URI, logical URI, run ID, and region/sink kind")
-    with session() as s:
-        _lock_object_attempt_registry(s)
-        row = s.get(ObjectAttempt, uri, with_for_update=True)
-        if row is not None:
-            _validate_object_attempt_identity(row, logical_uri=logical_uri, kind=kind, run_id=run_id)
-            if row.state in ("retiring", "retired", "discarding"):
-                raise RuntimeError(f"cannot reclaim immutable object attempt in state {row.state!r}")
-            return
-        s.add(ObjectAttempt(uri=uri, logical_uri=logical_uri, kind=kind, run_id=run_id, state="writing"))
+def _attempt_handle(row: ObjectAttempt, write_lease_id: str | None = None,
+                    publish_lease_id: str | None = None) -> dict:
+    return {
+        "attempt_id": row.attempt_id,
+        "allocation_key": row.allocation_key,
+        "namespace": row.storage_namespace,
+        "generation": row.generation,
+        "uri": row.uri,
+        "logical_uri": row.logical_uri,
+        "kind": row.kind,
+        "run_id": row.run_id,
+        "storage_namespace": row.storage_namespace,
+        "state": row.state,
+        "write_lease_id": write_lease_id,
+        "publish_lease_id": publish_lease_id,
+    }
 
 
-def _publish_object_attempt_in_session(s, row: ObjectAttempt, now: datetime.datetime,
-                                       reference_key: str | None = None) -> list[str]:
-    if row.state in ("retiring", "retired", "discarding"):
-        raise RuntimeError(f"cannot publish object attempt in state {row.state!r}")
-    if row.state == "writing":
-        row.state, row.published_at = "published", now
-    elif row.published_at is None:
-        row.published_at = now
-    if reference_key is not None:
-        row.reference_key = str(reference_key)
-    s.flush()
-    retired: list[str] = []
-    if row.kind == "sink":
-        prior = list(s.scalars(
-            select(ObjectAttempt).where(
-                ObjectAttempt.kind == "sink",
-                ObjectAttempt.logical_uri == row.logical_uri,
-                ObjectAttempt.state == "published",
-                ObjectAttempt.uri != row.uri,
-            ).order_by(ObjectAttempt.published_at.asc(), ObjectAttempt.uri.asc()).with_for_update()
+def _put_lease(s, row: ObjectAttempt, lease_type: str, owner: str, ttl_seconds: float,
+               lease_id: str | None = None) -> str:
+    ttl = max(1.0, _gc_seconds(ttl_seconds, "lease ttl"))
+    now = _db_now(s)
+    lid = lease_id or uuid.uuid4().hex
+    current = s.get(ObjectAttemptLease, lid, with_for_update=True)
+    # SQLite CURRENT_TIMESTAMP has one-second precision. Without one clock tick of headroom, a renewal
+    # inside the same second can write the same expiry and race a reaper at the boundary. The lease still
+    # uses DB time; this only accounts for that backend's observable clock resolution.
+    precision_margin = 1.0 if s.get_bind().dialect.name == "sqlite" else 0.0
+    expires = now + datetime.timedelta(seconds=ttl + precision_margin)
+    if current is None:
+        s.add(ObjectAttemptLease(
+            lease_id=lid, attempt_uri=row.uri, generation=row.generation,
+            lease_type=lease_type, owner=str(owner), expires_at=expires, created_at=now,
         ))
-        for old in prior:
-            old.state, old.gc_attempted_at = "retiring", None
-            retired.append(old.uri)
-    return retired
+    else:
+        if (current.attempt_uri, current.generation, current.lease_type, current.owner) != (
+                row.uri, row.generation, lease_type, str(owner)):
+            raise RuntimeError("lease ID is already bound to another object attempt")
+        current.expires_at = expires
+    return lid
 
 
-def publish_object_attempt(uri: str, reference_key: str | None = None) -> list[str]:
-    """Publish one attempt and atomically fence superseded siblings of a logical sink."""
-    uri = str(uri).rstrip("/")
+def _reserve_catalog_publication(s, logical_uri: str, catalog_key_base: str) -> tuple[str, int, int]:
+    logical_id = _catalog_logical_id(logical_uri)
+    logical = s.get(CatalogLogicalDataset, logical_id, with_for_update=True)
+    if logical is None:
+        base = str(catalog_key_base).strip() or logical_id
+        catalog_key = f"{base}_{hashlib.sha256(logical_uri.encode()).hexdigest()[:16]}"
+        values = {
+            "logical_id": logical_id, "catalog_key": catalog_key, "logical_uri": logical_uri,
+            "current_uri": None, "current_publish_seq": 0, "next_publish_seq": 0,
+            "catalog_epoch": 0, "state": "active", "governance_doc": "{}",
+            "metadata_version": 0, "usage": 0,
+        }
+        dialect = s.get_bind().dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+            s.execute(dialect_insert(CatalogLogicalDataset).values(**values).on_conflict_do_nothing(
+                index_elements=[CatalogLogicalDataset.logical_id]))
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+            s.execute(dialect_insert(CatalogLogicalDataset).values(**values).on_conflict_do_nothing(
+                index_elements=[CatalogLogicalDataset.logical_id]))
+        else:
+            s.add(CatalogLogicalDataset(**values))
+        s.flush()
+        logical = s.get(CatalogLogicalDataset, logical_id, with_for_update=True)
+        if logical is None:
+            raise RuntimeError("catalog logical identity reservation failed")
+    elif logical.logical_uri != logical_uri:
+        raise RuntimeError("catalog logical identity collision")
+    logical.next_publish_seq += 1
+    return logical.logical_id, logical.catalog_epoch, logical.next_publish_seq
+
+
+def allocate_object_attempt(*, logical_uri: str, kind: str, run_id: str, allocation_key: str,
+                            uri_factory, write_lease_seconds: float = 3600,
+                            publish_lease_seconds: float | None = None,
+                            expected_namespace: str | None = None,
+                            catalog_key_base: str | None = None) -> dict:
+    """Allocate or recover one durable attempt handle before any object write starts.
+
+    An active allocation key reuses the exact handle. Once its generation is terminal, the same key
+    advances to a fresh random attempt ID and physical URI; old rows remain as fenced tombstones.
+    """
+    logical_uri = _validated_object_uri(logical_uri, attempt=False)
+    allocation_key, run_id = str(allocation_key), str(run_id)
+    if not logical_uri or not allocation_key or not run_id or kind not in _OBJECT_ATTEMPT_KINDS:
+        raise ValueError("object attempt allocation requires logical URI, kind, run ID, and allocation key")
+    if kind == "sink" and not str(catalog_key_base or "").strip():
+        raise ValueError("managed sink allocation requires a stable catalog key base")
     with session() as s:
-        _lock_object_attempt_registry(s)
-        now = _db_now(s)
+        ident = _installation_identity(s)
+        if expected_namespace is not None and ident.storage_namespace != expected_namespace:
+            raise RuntimeError("storage namespace changed during provider ownership claim")
+        pointer = s.get(ObjectAttemptAllocation, allocation_key, with_for_update=True)
+        generation = 1
+        locked_logical = None
+        if pointer is not None:
+            # Catalog publication takes logical -> attempt. Read only immutable identity first, then
+            # take the same logical -> attempt order so a committed allocation retry cannot deadlock
+            # with publication. Installation and allocation-pointer locks are never taken by publish.
+            current_identity = s.get(ObjectAttempt, pointer.attempt_uri)
+            if current_identity is None:
+                raise RuntimeError("object attempt allocation points to a missing ownership row")
+            _validate_object_attempt_identity(
+                current_identity, logical_uri=logical_uri, kind=kind)
+            if kind == "sink":
+                if not current_identity.logical_id:
+                    raise RuntimeError("object sink attempt logical publication identity is missing")
+                locked_logical = s.get(
+                    CatalogLogicalDataset, current_identity.logical_id, with_for_update=True)
+                if locked_logical is None or locked_logical.logical_uri != logical_uri:
+                    raise RuntimeError("object sink attempt logical publication identity is missing")
+            current = s.get(ObjectAttempt, pointer.attempt_uri, with_for_update=True)
+            if current is None:
+                raise RuntimeError("object attempt allocation points to a missing ownership row")
+            if current.state in _WRITABLE_ATTEMPT_STATES:
+                _validate_object_attempt_identity(
+                    current, logical_uri=logical_uri, kind=kind, run_id=run_id)
+                current.state = "writing"
+                write_lease_id = _put_lease(
+                    s, current, "write", run_id, write_lease_seconds,
+                    lease_id=f"write:{current.attempt_id}",
+                )
+                publish_lease_id = _put_lease(
+                    s, current, "publish", run_id,
+                    publish_lease_seconds or write_lease_seconds,
+                    lease_id=f"publish:{current.attempt_id}",
+                )
+                return _attempt_handle(current, write_lease_id, publish_lease_id)
+            _validate_object_attempt_identity(current, logical_uri=logical_uri, kind=kind)
+            generation = pointer.generation + 1
+        logical_id = catalog_epoch = publish_seq = None
+        if kind == "sink":
+            if locked_logical is None:
+                logical_id, catalog_epoch, publish_seq = _reserve_catalog_publication(
+                    s, logical_uri, str(catalog_key_base))
+            else:
+                locked_logical.next_publish_seq += 1
+                logical_id = locked_logical.logical_id
+                catalog_epoch = locked_logical.catalog_epoch
+                publish_seq = locked_logical.next_publish_seq
+        attempt_id = uuid.uuid4().hex
+        uri = _validated_object_uri(
+            uri_factory(ident.storage_namespace, generation, attempt_id), attempt=True)
+        if s.get(ObjectAttempt, uri) is not None:
+            raise RuntimeError("physical object-attempt URI is already owned")
+        row = ObjectAttempt(
+            uri=uri, attempt_id=attempt_id, allocation_key=allocation_key,
+            storage_namespace=ident.storage_namespace, generation=generation,
+            logical_uri=logical_uri, kind=kind, run_id=run_id,
+            logical_id=logical_id, catalog_epoch=catalog_epoch, publish_seq=publish_seq,
+            state="writing",
+        )
+        s.add(row)
+        s.flush()
+        if pointer is None:
+            s.add(ObjectAttemptAllocation(
+                allocation_key=allocation_key, attempt_uri=uri, generation=generation,
+            ))
+        else:
+            pointer.attempt_uri, pointer.generation = uri, generation
+        write_lease_id = _put_lease(
+            s, row, "write", run_id, write_lease_seconds, lease_id=f"write:{attempt_id}")
+        publish_lease_id = _put_lease(
+            s, row, "publish", run_id, publish_lease_seconds or write_lease_seconds,
+            lease_id=f"publish:{attempt_id}")
+        return _attempt_handle(row, write_lease_id, publish_lease_id)
+
+
+def lookup_object_attempt(*, allocation_key: str, logical_uri: str, kind: str,
+                          run_id: str | None = None) -> dict | None:
+    """Read the current generation without acquiring writer authority or changing its state."""
+    logical_uri = _validated_object_uri(logical_uri, attempt=False)
+    with session() as s:
+        pointer = s.get(ObjectAttemptAllocation, str(allocation_key))
+        if pointer is None:
+            return None
+        row = s.get(ObjectAttempt, pointer.attempt_uri)
+        if row is None:
+            raise RuntimeError("object attempt allocation points to a missing ownership row")
+        _validate_object_attempt_identity(
+            row, logical_uri=logical_uri, kind=kind, run_id=str(run_id) if run_id else None)
+        return _attempt_handle(row)
+
+
+def _has_attempt_refs(s, uri: str) -> bool:
+    return bool(s.scalar(select(func.count()).select_from(ObjectAttemptRef).where(
+        ObjectAttemptRef.attempt_uri == uri)))
+
+
+def _maybe_supersede(s, row: ObjectAttempt, now: datetime.datetime) -> bool:
+    if row.state == "published" and not _has_attempt_refs(s, row.uri):
+        row.state, row.retired_at = "superseded", now
+        row.delete_owner = row.delete_lease_expires_at = None
+        return True
+    return False
+
+
+def _replace_attempt_ref(s, ref_type: str, ref_key: str, uri: str | None,
+                         *, publish: bool = False) -> list[str]:
+    key = {"ref_type": str(ref_type), "ref_key": str(ref_key)}
+    current = s.get(ObjectAttemptRef, key, with_for_update=True)
+    old_uri = current.attempt_uri if current is not None else None
+    normalized = str(uri).rstrip("/") if uri else None
+    if old_uri == normalized:
+        return []
+    new_attempt = None
+    if normalized:
+        new_attempt = s.get(ObjectAttempt, normalized, with_for_update=True)
+        if new_attempt is None and object_attempt_uri_shape(normalized):
+            _validated_object_uri(normalized, attempt=True)
+            raise RuntimeError("attempt-shaped object URI has no lifecycle ownership row")
+        if new_attempt is not None:
+            if new_attempt.state in _TERMINAL_ATTEMPT_STATES:
+                raise RuntimeError(f"cannot reference object attempt in state {new_attempt.state!r}")
+            if publish:
+                if new_attempt.state not in ("committed", "published"):
+                    raise RuntimeError("object attempt must be committed before pointer publication")
+                new_attempt.state = "published"
+                new_attempt.published_at = new_attempt.published_at or _db_now(s)
+            elif new_attempt.state != "published":
+                raise RuntimeError("run history and state may reference only a published object attempt")
+    if current is not None:
+        s.delete(current)
+        s.flush()
+    if new_attempt is not None:
+        s.add(ObjectAttemptRef(
+            ref_type=str(ref_type), ref_key=str(ref_key), attempt_uri=normalized,
+            generation=new_attempt.generation,
+        ))
+        s.flush()
+        if publish:
+            for lease in s.scalars(select(ObjectAttemptLease).where(
+                    ObjectAttemptLease.attempt_uri == normalized,
+                    ObjectAttemptLease.lease_type == "publish")):
+                s.delete(lease)
+    superseded: list[str] = []
+    if old_uri and old_uri != normalized:
+        old = s.get(ObjectAttempt, old_uri, with_for_update=True)
+        if old is not None and _maybe_supersede(s, old, _db_now(s)):
+            superseded.append(old_uri)
+    return superseded
+
+
+def acquire_object_attempt_lease(uri: str, lease_type: str, owner: str,
+                                 ttl_seconds: float = 300, *,
+                                 allow_committed: bool = False) -> str | None:
+    """Resolve one managed URI and create its lease in the same transaction.
+
+    ``None`` means the URI is not managed. A managed row already won by GC raises an explicit miss.
+    """
+    uri = str(uri).rstrip("/")
+    if lease_type not in ("read", "write"):
+        raise ValueError("callers may acquire only read or write leases")
+    with session() as s:
         row = s.get(ObjectAttempt, uri, with_for_update=True)
         if row is None:
-            raise KeyError(uri)
-        return _publish_object_attempt_in_session(s, row, now, reference_key)
+            if object_attempt_uri_shape(uri):
+                _validated_object_uri(uri, attempt=True)
+                raise FileNotFoundError("attempt-shaped object URI has no lifecycle ownership row")
+            return None
+        allowed = (("published", "committed") if lease_type == "read" and allow_committed
+                   else ("published",) if lease_type == "read" else ("allocated", "writing"))
+        if row.state not in allowed:
+            raise FileNotFoundError(
+                f"managed artifact generation is unavailable (state={row.state})")
+        if lease_type == "write":
+            row.state = "writing"
+        return _put_lease(s, row, lease_type, owner, ttl_seconds)
+
+
+def renew_object_attempt_lease(lease_id: str, ttl_seconds: float = 300) -> bool:
+    with session() as s:
+        lease = s.get(ObjectAttemptLease, str(lease_id), with_for_update=True)
+        if lease is None:
+            return False
+        row = s.get(ObjectAttempt, lease.attempt_uri, with_for_update=True)
+        if row is None or row.generation != lease.generation:
+            return False
+        _put_lease(s, row, lease.lease_type, lease.owner, ttl_seconds, lease_id=lease.lease_id)
+        return True
+
+
+def release_object_attempt_lease(lease_id: str) -> None:
+    with session() as s:
+        lease = s.get(ObjectAttemptLease, str(lease_id), with_for_update=True)
+        if lease is not None:
+            s.delete(lease)
+
+
+def release_result_cache_pin(pin_id: str) -> None:
+    """Release one cache-reader ref/lease pair after terminal ownership publication."""
+    with session() as s:
+        key = str(pin_id)
+        # Expiry cleanup uses the same lease -> ref -> attempt order.
+        lease = s.get(ObjectAttemptLease, key, with_for_update=True)
+        ref = s.get(ObjectAttemptRef, {
+            "ref_type": "result_reader", "ref_key": key}, with_for_update=True)
+        uri = ref.attempt_uri if ref is not None else None
+        if ref is not None:
+            s.delete(ref)
+        if lease is not None:
+            uri = uri or lease.attempt_uri
+            s.delete(lease)
+        s.flush()
+        if uri:
+            attempt = s.get(ObjectAttempt, uri, with_for_update=True)
+            if attempt is not None:
+                _maybe_supersede(s, attempt, _db_now(s))
+
+
+def _inventory_hash(inventory: list[dict]) -> str:
+    normalized = [{
+        "member_id": str(item["member_id"]),
+        "key": str(item["key"]),
+        "member_type": str(item["member_type"]),
+        "etag": item.get("etag"),
+        "version_id": item.get("version_id"),
+        "upload_id": item.get("upload_id"),
+        "size": int(item.get("size") or 0),
+        "is_latest": bool(item.get("is_latest")),
+        "is_commit": bool(item.get("is_commit")),
+    } for item in inventory]
+    normalized.sort(key=lambda item: item["member_id"])
+    return hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _store_inventory(s, row: ObjectAttempt, inventory: list[dict]) -> None:
+    member_ids = [str(item.get("member_id") or "") for item in inventory]
+    keys = [str(item.get("key") or "") for item in inventory]
+    if (any(not value for value in (*member_ids, *keys))
+            or len(member_ids) != len(set(member_ids))):
+        raise RuntimeError("exact object inventory must contain unique non-empty member identities")
+    for old in s.scalars(select(ObjectAttemptInventory).where(
+            ObjectAttemptInventory.attempt_uri == row.uri)):
+        s.delete(old)
+    s.flush()
+    for item in inventory:
+        s.add(ObjectAttemptInventory(
+            attempt_uri=row.uri, member_id=str(item["member_id"]),
+            object_key=str(item["key"]), member_type=str(item["member_type"]),
+            etag=item.get("etag"), version_id=item.get("version_id"),
+            upload_id=item.get("upload_id"), size=int(item.get("size") or 0),
+            is_latest=bool(item.get("is_latest")),
+            is_commit=bool(item.get("is_commit")),
+        ))
+
+
+def record_object_attempt_commit(uri: str, inventory: list[dict], quiet_seconds: float = 0) -> None:
+    """Persist writer terminal proof and exact published members before any pointer can reference them."""
+    with session() as s:
+        row = s.get(ObjectAttempt, str(uri).rstrip("/"), with_for_update=True)
+        if row is None:
+            raise RuntimeError("attempt-shaped object URI has no lifecycle ownership row")
+        if row.state in _TERMINAL_ATTEMPT_STATES:
+            raise RuntimeError(f"cannot commit object attempt in state {row.state!r}")
+        digest = _inventory_hash(inventory)
+        if row.state in ("committed", "published"):
+            if not row.inventory_complete or row.inventory_hash != digest:
+                raise RuntimeError("committed object inventory changed")
+            return
+        now = _db_now(s)
+        _store_inventory(s, row, inventory)
+        row.inventory_hash = digest
+        row.inventory_observations = 2
+        row.inventory_complete = True
+        row.terminal_proof_at = now
+        row.quiet_until = now + datetime.timedelta(seconds=_gc_seconds(quiet_seconds, "quiet_seconds"))
+        row.state = "committed"
+        for lease in s.scalars(select(ObjectAttemptLease).where(
+                ObjectAttemptLease.attempt_uri == row.uri,
+                ObjectAttemptLease.lease_type == "write")):
+            s.delete(lease)
+
+
+def abandon_committed_object_attempt(uri: str) -> bool:
+    """Make an unreferenced, fully inventoried write reclaimable after publication fails."""
+    with session() as s:
+        row = s.get(ObjectAttempt, str(uri).rstrip("/"), with_for_update=True)
+        if row is None:
+            return False
+        if row.state == "abandoned":
+            return True
+        if row.state != "committed":
+            return False
+        owned = s.scalar(select(exists().where(ObjectAttemptRef.attempt_uri == row.uri)))
+        if owned:
+            return False
+        row.state = "abandoned"
+        for lease in s.scalars(select(ObjectAttemptLease).where(
+                ObjectAttemptLease.attempt_uri == row.uri,
+                ObjectAttemptLease.lease_type == "publish")):
+            s.delete(lease)
+        return True
+
+
+def mark_object_attempt_terminal(uri: str, *, quiet_seconds: float = 60) -> bool:
+    """Backend/supervisor proof that a failed writer can no longer mutate this generation."""
+    with session() as s:
+        row = s.get(ObjectAttempt, str(uri).rstrip("/"), with_for_update=True)
+        if row is None:
+            return False
+        if row.state in ("abandoned", "delete_pending", "deleting", "deleted", "quarantined"):
+            return True
+        if row.state not in ("allocated", "writing"):
+            return False
+        now = _db_now(s)
+        row.state, row.terminal_proof_at = "abandoned", now
+        row.quiet_until = now + datetime.timedelta(seconds=_gc_seconds(quiet_seconds, "quiet_seconds"))
+        for lease in s.scalars(select(ObjectAttemptLease).where(
+                ObjectAttemptLease.attempt_uri == row.uri,
+                ObjectAttemptLease.lease_type.in_(("write", "publish")))):
+            s.delete(lease)
+        return True
+
+
+def observe_object_attempt_inventory(uri: str, inventory: list[dict],
+                                     quiet_seconds: float = 60) -> str:
+    """Require two DB-clock-separated identical observations for a failed partial attempt."""
+    with session() as s:
+        row = s.get(ObjectAttempt, str(uri).rstrip("/"), with_for_update=True)
+        if row is None:
+            return "missing"
+        if row.state != "abandoned" or row.terminal_proof_at is None:
+            return row.state
+        now = _db_now(s)
+        digest = _inventory_hash(inventory) if inventory else hashlib.sha256(b"[]").hexdigest()
+        if row.inventory_hash is None:
+            row.inventory_hash, row.inventory_observations = digest, 1
+            margin = 1.0 if s.get_bind().dialect.name == "sqlite" else 0.0
+            row.quiet_until = now + datetime.timedelta(
+                seconds=max(margin, _gc_seconds(quiet_seconds, "quiet_seconds")))
+            return "observed"
+        if digest != row.inventory_hash:
+            row.state = "quarantined"
+            row.quarantine_reason = "object inventory changed after writer terminal proof"
+            return "quarantined"
+        if row.quiet_until is not None and now < row.quiet_until:
+            return "waiting"
+        _store_inventory(s, row, inventory)
+        row.inventory_observations = 2
+        row.inventory_complete = True
+        return "complete"
+
+
+def quarantine_object_attempt(uri: str, reason: str) -> None:
+    with session() as s:
+        row = s.get(ObjectAttempt, str(uri).rstrip("/"), with_for_update=True)
+        if row is not None and row.state != "deleted":
+            row.state, row.quarantine_reason = "quarantined", str(reason)[:4000]
+            row.delete_owner = row.delete_lease_expires_at = None
+            for lease in s.scalars(select(ObjectAttemptLease).where(
+                    ObjectAttemptLease.attempt_uri == row.uri)):
+                s.delete(lease)
 
 
 def object_attempt_catalog_prior(uri: str) -> dict | None:
@@ -915,75 +1699,6 @@ def object_attempt_catalog_prior(uri: str) -> dict | None:
         return _row_to_doc(entry, _tags_for(s, [prior.uri]).get(prior.uri, [])) if entry else None
 
 
-def retire_object_attempts(uris: list[str]) -> list[str]:
-    """Fence exact published attempts from new readers; physical retirement happens out of transaction."""
-    ordered = list(dict.fromkeys(str(uri).rstrip("/") for uri in uris if str(uri).strip()))
-    if not ordered:
-        return []
-    retired: list[str] = []
-    with session() as s:
-        _lock_object_attempt_registry(s)
-        rows = {row.uri: row for row in s.scalars(
-            select(ObjectAttempt).where(ObjectAttempt.uri.in_(ordered)).with_for_update()
-        )}
-        for uri in ordered:
-            row = rows.get(uri)
-            if row is not None and row.state == "published":
-                row.state = "retiring"
-                row.gc_attempted_at = None
-                retired.append(uri)
-    return retired
-
-
-def mark_object_attempt_retired(uri: str) -> None:
-    """Acknowledge that catalog/cache admission and the commit marker have been retired."""
-    uri = str(uri).rstrip("/")
-    with session() as s:
-        _lock_object_attempt_registry(s)
-        row = s.get(ObjectAttempt, uri, with_for_update=True)
-        if row is None:
-            return
-        if row.state == "retired":
-            return
-        if row.state != "retiring":
-            raise RuntimeError(f"cannot mark object attempt retired from state {row.state!r}")
-        row.state, row.retired_at, row.gc_attempted_at = "retired", _db_now(s), None
-
-
-def begin_discard_object_attempt(uri: str) -> bool:
-    """Fence one unpublished attempt before physical deletion.
-
-    Registered attempts must atomically move from ``writing`` to ``discarding``; publication refuses
-    that state. Missing object attempts are not safe to delete because there is no durable tombstone to
-    stop a concurrent claimant; legacy prefixes remain provider-lifecycle work.
-    """
-    uri = str(uri).rstrip("/")
-    with session() as s:
-        _lock_object_attempt_registry(s)
-        row = s.get(ObjectAttempt, uri, with_for_update=True)
-        if row is None:
-            return False
-        if row.state == "discarding":
-            return True
-        if row.state != "writing":
-            return False
-        row.state, row.gc_attempted_at = "discarding", None
-        return True
-
-
-def delete_object_attempt(uri: str) -> None:
-    """Forget an exact attempt after its fenced-discard or grace-expired objects were removed."""
-    uri = str(uri).rstrip("/")
-    with session() as s:
-        _lock_object_attempt_registry(s)
-        row = s.get(ObjectAttempt, uri, with_for_update=True)
-        if row is None:
-            return
-        if row.state not in ("discarding", "retired"):
-            raise RuntimeError(f"cannot delete object attempt in state {row.state!r}")
-        s.delete(row)
-
-
 def _gc_seconds(value: float, name: str) -> float:
     try:
         parsed = float(value)
@@ -1001,72 +1716,272 @@ def _object_attempt_action(row: ObjectAttempt, action: str) -> dict:
         "logical_uri": row.logical_uri,
         "kind": row.kind,
         "run_id": row.run_id,
-        "reference_key": row.reference_key,
+        "storage_namespace": row.storage_namespace,
+        "attempt_id": row.attempt_id,
+        "generation": row.generation,
+        "delete_epoch": row.delete_epoch,
+        "delete_owner": row.delete_owner,
     }
 
 
 def object_attempt_gc_batch(retention_seconds: float, grace_seconds: float,
                             limit: int = 100) -> list[dict]:
-    """Select one bounded, transactionally ordered batch of safe object-lifecycle actions.
-
-    The caller performs storage/catalog I/O after this short transaction, then acknowledges ``retire``
-    with ``mark_object_attempt_retired`` and ``discard``/``delete`` with ``delete_object_attempt``.
-    Actions are idempotent, so another hub selecting the same pending row is harmless.
-    """
-    # Retained as a validated compatibility knob. Age is not proof that an independent driver or a
-    # durable Ray Job stopped writing, so unpublished attempts are never selected from it.
-    _gc_seconds(retention_seconds, "retention_seconds")
+    """Claim bounded observe/delete work using refs, DB-time leases, generation, and delete epoch."""
+    retention = _gc_seconds(retention_seconds, "retention_seconds")
     grace = _gc_seconds(grace_seconds, "grace_seconds")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise ValueError("object attempt GC limit must be a positive integer")
     actions: list[dict] = []
     with session() as s:
-        _lock_object_attempt_registry(s)
         now = _db_now(s)
 
         def remaining() -> int:
             return limit - len(actions)
 
-        retry_cutoff = now - datetime.timedelta(seconds=60)
-        claimable = or_(ObjectAttempt.gc_attempted_at.is_(None),
-                        ObjectAttempt.gc_attempted_at <= retry_cutoff)
+        expired_leases = list(s.scalars(select(ObjectAttemptLease).where(
+            ObjectAttemptLease.expires_at <= now).with_for_update()))
+        expired_pin_ids = [lease.lease_id for lease in expired_leases]
+        expired_pin_refs = list(s.scalars(select(ObjectAttemptRef).where(
+            ObjectAttemptRef.ref_type == "result_reader",
+            ObjectAttemptRef.ref_key.in_(expired_pin_ids),
+        ).with_for_update())) if expired_pin_ids else []
+        expired_pin_uris = {ref.attempt_uri for ref in expired_pin_refs}
+        for ref in expired_pin_refs:
+            s.delete(ref)
+        for lease in expired_leases:
+            s.delete(lease)
+        s.flush()
+        for uri in sorted(expired_pin_uris):
+            attempt = s.get(ObjectAttempt, uri, with_for_update=True)
+            if attempt is not None:
+                _maybe_supersede(s, attempt, now)
+        s.flush()
 
-        retiring = list(s.scalars(
-            select(ObjectAttempt).where(ObjectAttempt.state == "retiring", claimable)
-            .order_by(ObjectAttempt.created_at.asc(), ObjectAttempt.uri.asc())
-            .limit(remaining()).with_for_update()
-        ))
-        for row in retiring:
-            row.gc_attempted_at = now
-        actions.extend(_object_attempt_action(row, "retire") for row in retiring)
-        if remaining() <= 0:
-            return actions
+        no_refs = ~exists().where(ObjectAttemptRef.attempt_uri == ObjectAttempt.uri)
+        no_leases = ~exists().where(
+            (ObjectAttemptLease.attempt_uri == ObjectAttempt.uri)
+            & (ObjectAttemptLease.expires_at > now)
+        )
 
-        retired_cutoff = now - datetime.timedelta(seconds=grace)
-        expired = list(s.scalars(
+        retention_cutoff = now - datetime.timedelta(seconds=retention)
+        committed_orphans = list(s.scalars(
             select(ObjectAttempt).where(
-                ObjectAttempt.state == "retired",
-                ObjectAttempt.retired_at.is_not(None),
-                ObjectAttempt.retired_at <= retired_cutoff,
-                claimable,
-            ).order_by(ObjectAttempt.retired_at.asc(), ObjectAttempt.uri.asc())
+                ObjectAttempt.state == "committed",
+                ObjectAttempt.terminal_proof_at.is_not(None),
+                ObjectAttempt.terminal_proof_at <= retention_cutoff,
+                no_refs, no_leases,
+            ).order_by(ObjectAttempt.created_at, ObjectAttempt.uri)
             .limit(remaining()).with_for_update()
         ))
-        for row in expired:
-            row.gc_attempted_at = now
-        actions.extend(_object_attempt_action(row, "delete") for row in expired)
+        for row in committed_orphans:
+            row.state = "abandoned"
+        s.flush()
+
+        observations = list(s.scalars(
+            select(ObjectAttempt).where(
+                ObjectAttempt.state == "abandoned",
+                ObjectAttempt.terminal_proof_at.is_not(None),
+                ObjectAttempt.inventory_complete.is_(False),
+                or_(ObjectAttempt.quiet_until.is_(None), ObjectAttempt.quiet_until <= now),
+                no_refs, no_leases,
+            ).order_by(ObjectAttempt.created_at, ObjectAttempt.uri)
+            .limit(remaining()).with_for_update()
+        ))
+        actions.extend(_object_attempt_action(row, "observe") for row in observations)
         if remaining() <= 0:
             return actions
 
-        discarding = list(s.scalars(
-            select(ObjectAttempt).where(ObjectAttempt.state == "discarding", claimable)
-            .order_by(ObjectAttempt.created_at.asc(), ObjectAttempt.uri.asc())
+        grace_cutoff = now - datetime.timedelta(seconds=grace)
+        candidates = list(s.scalars(
+            select(ObjectAttempt).where(
+                ObjectAttempt.state.in_(("superseded", "abandoned")),
+                ObjectAttempt.terminal_proof_at.is_not(None),
+                ObjectAttempt.inventory_complete.is_(True),
+                or_(ObjectAttempt.quiet_until.is_(None), ObjectAttempt.quiet_until <= now),
+                ObjectAttempt.terminal_proof_at <= grace_cutoff,
+                or_(
+                    (ObjectAttempt.state == "superseded")
+                    & (ObjectAttempt.retired_at.is_not(None))
+                    & (ObjectAttempt.retired_at <= retention_cutoff),
+                    (ObjectAttempt.state == "abandoned")
+                    & (ObjectAttempt.terminal_proof_at <= retention_cutoff),
+                ),
+                no_refs, no_leases,
+            ).order_by(ObjectAttempt.created_at, ObjectAttempt.uri)
             .limit(remaining()).with_for_update()
         ))
-        for row in discarding:
-            row.gc_attempted_at = now
-        actions.extend(_object_attempt_action(row, "discard") for row in discarding)
+        for row in candidates:
+            row.state, row.next_delete_at = "delete_pending", now
+        s.flush()
+
+        claimable = list(s.scalars(
+            select(ObjectAttempt).where(
+                or_(
+                    (ObjectAttempt.state == "delete_pending")
+                    & or_(ObjectAttempt.next_delete_at.is_(None), ObjectAttempt.next_delete_at <= now),
+                    (ObjectAttempt.state == "deleting")
+                    & (ObjectAttempt.delete_lease_expires_at <= now),
+                    (ObjectAttempt.state == "delete_verifying")
+                    & or_(ObjectAttempt.next_delete_at.is_(None), ObjectAttempt.next_delete_at <= now),
+                ),
+                no_refs, no_leases,
+            ).order_by(ObjectAttempt.created_at, ObjectAttempt.uri)
+            .limit(remaining()).with_for_update()
+        ))
+        for row in claimable:
+            owner = uuid.uuid4().hex
+            action = "verify_empty" if row.state == "delete_verifying" else "delete"
+            if action == "delete":
+                row.state = "deleting"
+            row.delete_epoch += 1
+            row.delete_owner = owner
+            row.delete_lease_expires_at = now + datetime.timedelta(seconds=60)
+            _put_lease(
+                s, row, "delete", owner, 60,
+                lease_id=f"delete:{row.attempt_id}:{row.delete_epoch}",
+            )
+            actions.append(_object_attempt_action(row, action))
     return actions
+
+
+def object_attempt_inventory(uri: str, *, pending_only: bool = False) -> list[dict]:
+    with session() as s:
+        stmt = select(ObjectAttemptInventory).where(
+            ObjectAttemptInventory.attempt_uri == str(uri).rstrip("/"))
+        if pending_only:
+            stmt = stmt.where(ObjectAttemptInventory.deleted_at.is_(None))
+        return [{
+            "member_id": row.member_id, "key": row.object_key,
+            "member_type": row.member_type, "etag": row.etag,
+            "version_id": row.version_id, "upload_id": row.upload_id,
+            "size": row.size, "is_latest": row.is_latest, "is_commit": row.is_commit,
+        } for row in s.scalars(stmt.order_by(ObjectAttemptInventory.member_id))]
+
+
+def validate_object_attempt_delete(action: dict) -> bool:
+    with session() as s:
+        row = s.get(ObjectAttempt, str(action["uri"]).rstrip("/"), with_for_update=True)
+        now = _db_now(s)
+        return bool(row and row.state in ("deleting", "delete_verifying")
+                    and row.attempt_id == action.get("attempt_id")
+                    and row.generation == action.get("generation")
+                    and row.delete_epoch == action.get("delete_epoch")
+                    and row.delete_owner == action.get("delete_owner")
+                    and row.delete_lease_expires_at and row.delete_lease_expires_at > now)
+
+
+def renew_object_attempt_delete(action: dict, ttl_seconds: float = 300) -> bool:
+    """Renew the same epoch/owner before each provider I/O; stale workers cannot advance it."""
+    with session() as s:
+        row = s.get(ObjectAttempt, str(action["uri"]).rstrip("/"), with_for_update=True)
+        now = _db_now(s)
+        if not (row and row.state in ("deleting", "delete_verifying")
+                and row.attempt_id == action.get("attempt_id")
+                and row.generation == action.get("generation")
+                and row.delete_epoch == action.get("delete_epoch")
+                and row.delete_owner == action.get("delete_owner")
+                and row.delete_lease_expires_at and row.delete_lease_expires_at > now):
+            return False
+        ttl = max(1.0, _gc_seconds(ttl_seconds, "delete lease ttl"))
+        row.delete_lease_expires_at = now + datetime.timedelta(seconds=ttl)
+        lease = s.get(ObjectAttemptLease, f"delete:{row.attempt_id}:{row.delete_epoch}",
+                      with_for_update=True)
+        if lease is None:
+            return False
+        lease.expires_at = row.delete_lease_expires_at
+        return True
+
+
+def acknowledge_object_attempt_member(action: dict, member_id: str) -> None:
+    with session() as s:
+        row = s.get(ObjectAttempt, str(action["uri"]).rstrip("/"), with_for_update=True)
+        if not row or not (row.state == "deleting" and row.attempt_id == action.get("attempt_id")
+                           and row.generation == action.get("generation")
+                           and row.delete_epoch == action.get("delete_epoch")
+                           and row.delete_owner == action.get("delete_owner")):
+            raise RuntimeError("stale object-attempt delete acknowledgement")
+        member = s.get(ObjectAttemptInventory, {
+            "attempt_uri": row.uri, "member_id": str(member_id),
+        }, with_for_update=True)
+        if member is None:
+            raise RuntimeError("delete acknowledgement is outside the exact inventory")
+        member.deleted_at = member.deleted_at or _db_now(s)
+
+
+def begin_object_attempt_delete_verification(action: dict, quiet_seconds: float) -> None:
+    with session() as s:
+        row = s.get(ObjectAttempt, str(action["uri"]).rstrip("/"), with_for_update=True)
+        if not row or not (row.state == "deleting" and row.attempt_id == action.get("attempt_id")
+                           and row.generation == action.get("generation")
+                           and row.delete_epoch == action.get("delete_epoch")
+                           and row.delete_owner == action.get("delete_owner")):
+            raise RuntimeError("stale object-attempt delete verification")
+        remaining = s.scalar(select(func.count()).select_from(ObjectAttemptInventory).where(
+            ObjectAttemptInventory.attempt_uri == row.uri,
+            ObjectAttemptInventory.deleted_at.is_(None))) or 0
+        if remaining:
+            raise RuntimeError("cannot verify object-attempt deletion with inventory members remaining")
+        now = _db_now(s)
+        margin = 1.0 if s.get_bind().dialect.name == "sqlite" else 0.0
+        row.state = "delete_verifying"
+        row.delete_empty_observations = 1
+        row.delete_empty_observed_at = now
+        row.next_delete_at = now + datetime.timedelta(
+            seconds=max(margin, _gc_seconds(quiet_seconds, "delete verification quiet seconds")))
+        row.delete_owner = row.delete_lease_expires_at = None
+        for lease in s.scalars(select(ObjectAttemptLease).where(
+                ObjectAttemptLease.attempt_uri == row.uri,
+                ObjectAttemptLease.lease_type == "delete")):
+            s.delete(lease)
+
+
+def complete_object_attempt_delete_verification(action: dict) -> bool:
+    with session() as s:
+        row = s.get(ObjectAttempt, str(action["uri"]).rstrip("/"), with_for_update=True)
+        if not row or not (row.state == "delete_verifying"
+                           and row.attempt_id == action.get("attempt_id")
+                           and row.generation == action.get("generation")
+                           and row.delete_epoch == action.get("delete_epoch")
+                           and row.delete_owner == action.get("delete_owner")):
+            raise RuntimeError("stale object-attempt empty verification")
+        now = _db_now(s)
+        if (row.delete_empty_observed_at is None or now <= row.delete_empty_observed_at
+                or (row.next_delete_at is not None and now < row.next_delete_at)):
+            return False
+        row.delete_empty_observations += 1
+        if row.delete_empty_observations < 2:
+            return False
+        row.state, row.deleted_at = "deleted", now
+        row.delete_owner = row.delete_lease_expires_at = None
+        row.next_delete_at = None
+        for lease in s.scalars(select(ObjectAttemptLease).where(
+                ObjectAttemptLease.attempt_uri == row.uri,
+                ObjectAttemptLease.lease_type == "delete")):
+            s.delete(lease)
+        return True
+
+
+def fail_object_attempt_delete(action: dict, error: str) -> None:
+    with session() as s:
+        row = s.get(ObjectAttempt, str(action["uri"]).rstrip("/"), with_for_update=True)
+        if not row or not (row.state in ("deleting", "delete_verifying")
+                           and row.attempt_id == action.get("attempt_id")
+                           and row.generation == action.get("generation")
+                           and row.delete_epoch == action.get("delete_epoch")
+                           and row.delete_owner == action.get("delete_owner")):
+            return
+        now = _db_now(s)
+        row.delete_attempts += 1
+        row.state = "quarantined" if row.delete_attempts >= 20 else "delete_pending"
+        row.next_delete_at = (None if row.state == "quarantined" else
+                              now + datetime.timedelta(seconds=min(
+                                  3600, 2 ** min(row.delete_attempts, 10))))
+        row.delete_owner = row.delete_lease_expires_at = None
+        row.quarantine_reason = str(error)[:4000] if row.state == "quarantined" else None
+        for lease in s.scalars(select(ObjectAttemptLease).where(
+                ObjectAttemptLease.attempt_uri == row.uri,
+                ObjectAttemptLease.lease_type == "delete")):
+            s.delete(lease)
 
 
 def _result_doc_uri(raw: str | dict | None) -> str | None:
@@ -1074,60 +1989,38 @@ def _result_doc_uri(raw: str | dict | None) -> str | None:
         doc = raw if isinstance(raw, dict) else json.loads(raw or "{}")
     except (TypeError, ValueError):
         return None
-    uri = doc.get("uri") if isinstance(doc, dict) else None
+    uri = (doc.get("uri") or doc.get("outputUri") or doc.get("output_uri")) \
+        if isinstance(doc, dict) else None
     return str(uri).rstrip("/") if uri else None
 
 
 def put_result(key: str, doc: dict) -> list[str]:
-    """Atomically publish a region result pointer and return exact attempt URIs it superseded/evicted."""
+    """Atomically replace a cache row and its durable attempt reference."""
     payload = json.dumps(doc, default=str)
     new_uri = _result_doc_uri(doc)
-    old_refs: list[tuple[str, str]] = []
     retired: list[str] = []
     with session() as s:
-        _lock_object_attempt_registry(s)
         now = _db_now(s)
         row = s.get(ResultCache, key, with_for_update=True)
         if row is None:
             s.add(ResultCache(key=key, doc=payload, created_at=now))
         else:
-            old_uri = _result_doc_uri(row.doc)
-            if old_uri and old_uri != new_uri:
-                old_refs.append((old_uri, key))
             row.doc, row.created_at = payload, now
-
-        if new_uri:
-            attempt = s.get(ObjectAttempt, new_uri, with_for_update=True)
-            if attempt is not None and attempt.kind == "region":
-                if attempt.state in ("retiring", "retired", "discarding"):
-                    raise RuntimeError(f"cannot publish region attempt in state {attempt.state!r}")
-                if attempt.state == "writing":
-                    attempt.state, attempt.published_at = "published", now
-                elif attempt.published_at is None:
-                    attempt.published_at = now
-                attempt.reference_key = key
-
         s.flush()
+        attempt = s.get(ObjectAttempt, new_uri, with_for_update=True) if new_uri else None
+        if attempt is not None:
+            if attempt.kind != "region":
+                raise RuntimeError("result cache cannot own a sink attempt")
+        retired.extend(_replace_attempt_ref(
+            s, "result_cache", key, new_uri, publish=attempt is not None))
         stale = list(s.scalars(
             select(ResultCache).order_by(ResultCache.created_at.desc(), ResultCache.key.desc())
             .offset(_RESULT_CACHE_MAX).with_for_update()
         ))
         for stale_row in stale:
-            old_uri = _result_doc_uri(stale_row.doc)
-            if old_uri and old_uri != new_uri:
-                old_refs.append((old_uri, stale_row.key))
+            retired.extend(_replace_attempt_ref(s, "result_cache", stale_row.key, None))
             s.delete(stale_row)
-
-        for old_uri, reference_key in old_refs:
-            if old_uri == new_uri or old_uri in retired:
-                continue
-            attempt = s.get(ObjectAttempt, old_uri, with_for_update=True)
-            if (attempt is not None and attempt.kind == "region" and attempt.state == "published"
-                    and attempt.reference_key == reference_key):
-                attempt.state = "retiring"
-                attempt.gc_attempted_at = None
-                retired.append(old_uri)
-    return retired
+    return list(dict.fromkeys(retired))
 
 
 def _doc_org(doc: dict) -> tuple[str, str, str | None, str | None, int | None, list[str], list[str]]:
@@ -1158,56 +2051,365 @@ def _sync_children(s, uri: str, tags: list[str], cols: list[str]) -> None:
         s.add(CatalogColumn(uri=uri, column=c))
 
 
-def catalog_upsert_entry(uri: str, name: str, doc: dict) -> None:
+def _catalog_logical_id(logical_uri: str) -> str:
+    return "logical_" + hashlib.sha256(str(logical_uri).rstrip("/").encode()).hexdigest()[:24]
+
+
+def _relationship_key(doc: dict) -> str:
+    left_uri = doc.get("leftUri") or doc.get("left_uri")
+    right_uri = doc.get("rightUri") or doc.get("right_uri")
+    left_cols = doc.get("leftColumns") or doc.get("left_columns") or []
+    right_cols = doc.get("rightColumns") or doc.get("right_columns") or []
+    return json.dumps(sorted([[left_uri, list(left_cols)], [right_uri, list(right_cols)]]))
+
+
+def _catalog_token_to_key(s, token: str) -> str:
+    token = str(token).rstrip("/")
+    logical = s.get(CatalogLogicalDataset, token)
+    if logical is None:
+        logical = s.scalars(select(CatalogLogicalDataset).where(or_(
+            CatalogLogicalDataset.catalog_key == token,
+            CatalogLogicalDataset.logical_uri == token,
+            CatalogLogicalDataset.current_uri == token,
+        )).limit(1)).first()
+    if logical is None:
+        attempt = s.get(ObjectAttempt, token)
+        if attempt is not None and attempt.logical_id:
+            logical = s.get(CatalogLogicalDataset, attempt.logical_id)
+    if logical is None:
+        entry = s.get(CatalogEntry, token)
+        if entry is not None and entry.logical_id:
+            logical = s.get(CatalogLogicalDataset, entry.logical_id)
+    return logical.catalog_key if logical is not None else token
+
+
+def _catalog_token_logical_id(s, token: str) -> str | None:
+    """Resolve a catalog token to its managed logical identity without taking a row lock."""
+    token = str(token).rstrip("/")
+    logical = s.get(CatalogLogicalDataset, token)
+    if logical is None:
+        logical = s.scalars(select(CatalogLogicalDataset).where(or_(
+            CatalogLogicalDataset.catalog_key == token,
+            CatalogLogicalDataset.logical_uri == token,
+            CatalogLogicalDataset.current_uri == token,
+        )).limit(1)).first()
+    if logical is not None:
+        return logical.logical_id
+    attempt = s.get(ObjectAttempt, token)
+    if attempt is not None and attempt.logical_id:
+        return attempt.logical_id
+    entry = s.get(CatalogEntry, token)
+    return entry.logical_id if entry is not None and entry.logical_id else None
+
+
+def _catalog_key_to_uri(s, token: str) -> str:
+    logical = s.scalars(select(CatalogLogicalDataset).where(
+        CatalogLogicalDataset.catalog_key == str(token)).limit(1)).first()
+    return str(logical.current_uri) if logical is not None and logical.current_uri else str(token)
+
+
+def _lock_catalog_mutation_targets(s, tokens: list[str], *,
+                                   exact_current_attempts: set[str] | None = None) -> list[dict]:
+    """Resolve curation targets, lock managed logical rows in deterministic order, and fence stale
+    physical generations. Attempt identity is read before logical locks because its publication epoch
+    and sequence are immutable; governance paths do not need to lock the attempt row itself."""
+    normalized = [str(token).rstrip("/") for token in tokens]
+    exact = {str(token).rstrip("/") for token in (exact_current_attempts or set())}
+    resolved: list[dict] = []
+    logical_ids: set[str] = set()
+    unmanaged_uris: set[str] = set()
+    for token in normalized:
+        attempt = s.get(ObjectAttempt, token)
+        logical = None
+        entry = None
+        if attempt is not None and attempt.logical_id:
+            logical_ids.add(attempt.logical_id)
+        else:
+            logical = s.get(CatalogLogicalDataset, token)
+            if logical is None:
+                logical = s.scalars(select(CatalogLogicalDataset).where(or_(
+                    CatalogLogicalDataset.catalog_key == token,
+                    CatalogLogicalDataset.logical_uri == token,
+                    CatalogLogicalDataset.current_uri == token,
+                )).limit(1)).first()
+            if logical is not None:
+                logical_ids.add(logical.logical_id)
+            else:
+                entry = s.get(CatalogEntry, token)
+                if entry is None:
+                    entry = s.scalars(select(CatalogEntry).where(or_(
+                        CatalogEntry.tbl_id == token, CatalogEntry.name == token,
+                    )).order_by(CatalogEntry.uri).limit(1)).first()
+                if entry is not None and entry.logical_id:
+                    logical_ids.add(entry.logical_id)
+                elif entry is not None:
+                    unmanaged_uris.add(entry.uri)
+        resolved.append({
+            "token": token,
+            "attempt_logical_id": attempt.logical_id if attempt is not None else None,
+            "attempt_epoch": attempt.catalog_epoch if attempt is not None else None,
+            "attempt_publish_seq": attempt.publish_seq if attempt is not None else None,
+            "logical_id": (attempt.logical_id if attempt is not None and attempt.logical_id
+                           else logical.logical_id if logical is not None
+                           else entry.logical_id if entry is not None else None),
+            "entry_uri": entry.uri if entry is not None and not entry.logical_id else None,
+        })
+
+    logical_rows = {row.logical_id: row for row in s.scalars(
+        select(CatalogLogicalDataset).where(
+            CatalogLogicalDataset.logical_id.in_(sorted(logical_ids)))
+        .order_by(CatalogLogicalDataset.logical_id).with_for_update())} if logical_ids else {}
+    managed_entry_uris = sorted({
+        str(row.current_uri) for row in logical_rows.values() if row.current_uri
+    })
+    entry_uris = sorted(set(managed_entry_uris) | unmanaged_uris)
+    entries = {row.uri: row for row in s.scalars(
+        select(CatalogEntry).where(CatalogEntry.uri.in_(entry_uris))
+        .order_by(CatalogEntry.uri).with_for_update())} if entry_uris else {}
+
+    for target in resolved:
+        logical_id = target["logical_id"]
+        if logical_id:
+            logical = logical_rows.get(logical_id)
+            if (logical is None or logical.state != "active" or not logical.current_uri
+                    or logical.current_uri not in entries):
+                raise RuntimeError("catalog governance target is inactive")
+            if target["attempt_logical_id"]:
+                if target["attempt_epoch"] != logical.catalog_epoch:
+                    raise RuntimeError("catalog governance request was fenced by unregister")
+                if (target["token"] in exact
+                        and target["attempt_publish_seq"] != logical.current_publish_seq):
+                    raise RuntimeError("derived catalog state is stale for the current publication")
+            target.update({
+                "known": True, "catalog_key": logical.catalog_key,
+                "current_uri": logical.current_uri, "logical": logical,
+                "entry": entries[logical.current_uri],
+            })
+        elif target["entry_uri"]:
+            entry = entries.get(target["entry_uri"])
+            if entry is None or entry.logical_id:
+                raise RuntimeError("catalog governance target changed concurrently")
+            target.update({
+                "known": True, "catalog_key": entry.uri, "current_uri": entry.uri,
+                "logical": None, "entry": entry,
+            })
+        else:
+            target.update({
+                "known": False, "catalog_key": target["token"],
+                "current_uri": None, "logical": None, "entry": None,
+            })
+    return resolved
+
+
+def _catalog_governance(doc: dict) -> dict:
+    return {key: doc.get(key) for key in (
+        "id", "name", "folder", "owner", "description", "tags") if key in doc}
+
+
+def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
+                               parents: list[str] | None = None,
+                               pipeline: str | None = None) -> None:
+    attempt_identity = s.get(ObjectAttempt, uri)
+    if attempt_identity is None and object_attempt_uri_shape(uri):
+        _validated_object_uri(uri, attempt=True)
+        raise RuntimeError("attempt-shaped object URI has no lifecycle ownership row")
+    logical = None
+    old_uri = None
+    logical_id = None
+    locked_entries: dict[str, CatalogEntry] = {}
+    attempt = attempt_identity
+    parent_snapshots: list[tuple[str, str | None, int | None]] = []
+    for token in dict.fromkeys(str(parent).rstrip("/") for parent in (parents or [])):
+        parent_attempt = s.get(ObjectAttempt, token)
+        parent_snapshots.append((
+            token,
+            (parent_attempt.logical_id if parent_attempt is not None and parent_attempt.logical_id
+             else _catalog_token_logical_id(s, token)),
+            parent_attempt.catalog_epoch if parent_attempt is not None else None,
+        ))
+    if attempt_identity is not None:
+        if attempt_identity.kind != "sink":
+            raise RuntimeError("catalog cannot publish a region attempt")
+        if (not attempt_identity.logical_id or attempt_identity.catalog_epoch is None
+                or attempt_identity.publish_seq is None):
+            raise RuntimeError("object sink attempt has no reserved logical publication identity")
+        logical_id = attempt_identity.logical_id
+    logical_ids = sorted(({logical_id} if logical_id is not None else set()) | {
+        parent_logical_id for _token, parent_logical_id, _epoch in parent_snapshots
+        if parent_logical_id is not None
+    })
+    locked_logicals = {row.logical_id: row for row in s.scalars(
+        select(CatalogLogicalDataset).where(
+            CatalogLogicalDataset.logical_id.in_(logical_ids))
+        .order_by(CatalogLogicalDataset.logical_id).with_for_update())} if logical_ids else {}
+    if attempt_identity is not None:
+        logical = locked_logicals.get(logical_id)
+        if logical is None:
+            raise RuntimeError("object sink attempt logical publication identity is missing")
+        old_uri = logical.current_uri
+        attempt_uris = sorted({candidate for candidate in (uri, old_uri) if candidate})
+        locked_attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
+            ObjectAttempt.uri.in_(attempt_uris)).order_by(ObjectAttempt.uri).with_for_update())}
+        attempt = locked_attempts.get(uri)
+        if attempt is None or (old_uri and old_uri not in locked_attempts):
+            raise RuntimeError("catalog publication ownership changed concurrently")
+        s.get(ObjectAttemptRef, {
+            "ref_type": "catalog", "ref_key": logical_id}, with_for_update=True)
+        locked_entries = {row.uri: row for row in s.scalars(select(CatalogEntry).where(
+            CatalogEntry.uri.in_(attempt_uris)).order_by(CatalogEntry.uri).with_for_update())}
+        if attempt.state not in ("committed", "published"):
+            raise RuntimeError("object sink attempt lacks terminal proof or exact inventory")
+        if (attempt.logical_id, attempt.catalog_epoch, attempt.publish_seq) != (
+                attempt_identity.logical_id, attempt_identity.catalog_epoch,
+                attempt_identity.publish_seq):
+            raise RuntimeError("catalog publication identity changed concurrently")
+        if attempt.catalog_epoch != logical.catalog_epoch:
+            raise RuntimeError("object sink attempt was fenced by catalog unregister")
+        if attempt.publish_seq <= logical.current_publish_seq:
+            raise RuntimeError("object sink attempt publication is older than the current version")
+        try:
+            governance = json.loads(logical.governance_doc or "{}")
+        except (TypeError, ValueError):
+            governance = {}
+        doc["id"] = logical.catalog_key
+        for key in ("name", "folder", "owner", "description", "tags"):
+            if key in governance:
+                doc[key] = governance[key]
+
+        if old_uri and old_uri != uri:
+            for model in (CatalogTag, CatalogColumn):
+                for child in s.scalars(select(model).where(model.uri == old_uri)):
+                    s.delete(child)
+            prior = locked_entries.get(old_uri)
+            if prior is not None:
+                s.delete(prior)
+            s.flush()
+
+    tbl_id, folder, owner, description, rows, tags, cols = _doc_org(doc)
+    payload = json.dumps(doc, default=str)
+    entry = locked_entries.get(uri) if logical is not None else \
+        s.get(CatalogEntry, uri, with_for_update=True)
+    if entry is None:
+        entry = CatalogEntry(
+            uri=uri, name=name, doc=payload, tbl_id=tbl_id, folder=folder,
+            owner=owner, description=description, row_count=rows, logical_id=logical_id,
+            usage=(logical.usage if logical is not None else 0),
+        )
+        s.add(entry)
+    else:
+        entry.name, entry.doc, entry.tbl_id = name, payload, tbl_id
+        entry.folder, entry.owner, entry.description, entry.row_count = folder, owner, description, rows
+        entry.logical_id = logical_id
+        if logical is not None:
+            entry.usage = logical.usage
+    _sync_children(s, uri, tags, cols)
+    s.flush()
+
+    if logical is not None and logical_id is not None:
+        logical.current_uri = uri
+        logical.current_publish_seq = int(attempt.publish_seq)
+        logical.state = "active"
+        logical.governance_doc = json.dumps(_catalog_governance(doc), default=str, sort_keys=True)
+        _replace_attempt_ref(s, "catalog", logical_id, uri, publish=True)
+    child_key = logical.catalog_key if logical is not None else uri
+    for parent, parent_logical_id, parent_attempt_epoch in parent_snapshots:
+        parent_logical = locked_logicals.get(parent_logical_id) \
+            if parent_logical_id is not None else None
+        current_parent_attempt = s.execute(select(
+            ObjectAttempt.logical_id, ObjectAttempt.catalog_epoch,
+        ).where(ObjectAttempt.uri == parent)).one_or_none() \
+            if parent_attempt_epoch is not None else None
+        parent_attempt_is_current_epoch = (
+            parent_attempt_epoch is None or (
+                current_parent_attempt is not None
+                and current_parent_attempt.logical_id == parent_logical_id
+                and current_parent_attempt.catalog_epoch == parent_attempt_epoch
+                and parent_logical is not None
+                and parent_attempt_epoch == parent_logical.catalog_epoch
+            )
+        )
+        if (parent_logical is not None and parent_logical.state == "active"
+                and parent_logical.current_uri and parent_attempt_is_current_epoch):
+            parent_key = parent_logical.catalog_key
+        elif parent_logical is not None and parent == parent_logical.catalog_key:
+            # A stable key cannot remain on an edge after unregister: it would silently attach the
+            # historical edge to a future registration. Preserve only the raw logical URI instead.
+            parent_key = parent_logical.logical_uri
+        else:
+            parent_key = parent
+        if parent_key == child_key:
+            continue
+        edge = s.scalars(select(CatalogEdge).where(
+            CatalogEdge.parent == parent_key, CatalogEdge.child == child_key).limit(1)).first()
+        if edge is None:
+            s.add(CatalogEdge(parent=parent_key, child=child_key, pipeline=pipeline))
+
+
+def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
+                         parents: list[str] | None = None,
+                         pipeline: str | None = None) -> None:
     """Write-through a catalog entry (registered dataset / written output) to the shared DB, keyed by
     uri, so other instances + a restart see it. `doc` is the full CatalogTable model_dump; its folder /
     owner / description / row_count / tags / column-names are mirrored to indexed columns + join tables
     so browse/search/facet push down to the DB. `usage` (popularity) is owned by the column and NOT
     overwritten from the doc — it's bumped independently on reads."""
     with session() as s:
-        attempt = s.get(ObjectAttempt, uri)
-        if attempt is not None and attempt.kind == "sink":
-            _lock_object_attempt_registry(s)
-            attempt = s.get(ObjectAttempt, uri, with_for_update=True)
-            if attempt is None or attempt.kind != "sink":
-                raise RuntimeError("object sink attempt disappeared during catalog publication")
-        tbl_id, folder, owner, description, rows, tags, cols = _doc_org(doc)
-        r = s.get(CatalogEntry, uri)
-        payload = json.dumps(doc, default=str)
-        if r is None:
-            s.add(CatalogEntry(uri=uri, name=name, doc=payload, tbl_id=tbl_id, folder=folder,
-                               owner=owner, description=description, row_count=rows))
-        else:
-            r.name, r.doc, r.tbl_id = name, payload, tbl_id
-            r.folder, r.owner, r.description, r.row_count = folder, owner, description, rows
-        _sync_children(s, uri, tags, cols)
-        if attempt is not None:
-            retired = _publish_object_attempt_in_session(s, attempt, _db_now(s))
-            if retired:
-                _delete_catalog_children(s, retired)
-                for old_uri in retired:
-                    old = s.get(CatalogEntry, old_uri)
-                    if old is not None:
-                        s.delete(old)
+        _catalog_upsert_in_session(
+            s, str(uri).rstrip("/"), name, dict(doc), parents=parents, pipeline=pipeline)
+
+
+def catalog_publish_entries(entries: list[tuple[str, str, dict, list[str] | None, str | None]]) -> None:
+    """Reusable atomic publication primitive for a future successful multi-sink batch."""
+    with session() as s:
+        for uri, name, doc, parents, pipeline in entries:
+            _catalog_upsert_in_session(
+                s, str(uri).rstrip("/"), name, dict(doc),
+                parents=parents, pipeline=pipeline)
+
+
+def catalog_managed_publication_receipt(uri: str) -> dict | None:
+    """Core-only durable receipt; execution backends never inspect lifecycle tables themselves."""
+    with session() as s:
+        attempt = s.get(ObjectAttempt, str(uri).rstrip("/"))
+        if attempt is None or attempt.kind != "sink" or attempt.state != "published" \
+                or not attempt.logical_id:
+            return None
+        logical = s.get(CatalogLogicalDataset, attempt.logical_id)
+        ref = s.get(ObjectAttemptRef, {"ref_type": "catalog", "ref_key": attempt.logical_id})
+        entry = s.get(CatalogEntry, attempt.uri)
+        if (logical is None or logical.current_uri != attempt.uri or ref is None
+                or ref.attempt_uri != attempt.uri or entry is None):
+            return None
+        return {
+            "uri": attempt.uri, "logical_id": attempt.logical_id,
+            "catalog_key": logical.catalog_key, "catalog_epoch": attempt.catalog_epoch,
+            "publish_seq": attempt.publish_seq, "attempt_id": attempt.attempt_id,
+            "generation": attempt.generation,
+        }
 
 
 def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: str | None,
                          tags: list[str]) -> None:
     """Update ONLY the organization fields of an entry (folder/owner/description/tags) — both the
     indexed columns AND the mirrored fields inside the stored doc, so a re-read is consistent without
-    re-probing the dataset. No-op if the uri isn't registered."""
+    re-probing the dataset. Unknown or inactive managed targets fail closed."""
     with session() as s:
-        r = s.get(CatalogEntry, uri)
-        if r is None:
-            return
+        target = _lock_catalog_mutation_targets(s, [uri])[0]
+        if not target["known"]:
+            raise RuntimeError("catalog governance target is not registered")
+        logical, r = target["logical"], target["entry"]
         try:
             doc = json.loads(r.doc)
         except (ValueError, TypeError):
             doc = {}
         doc["folder"], doc["owner"], doc["description"], doc["tags"] = folder, owner, description, list(tags)
         r.folder, r.owner, r.description, r.doc = folder, owner, description, json.dumps(doc, default=str)
+        if logical is not None:
+            logical.governance_doc = json.dumps(
+                _catalog_governance(doc), default=str, sort_keys=True)
+            logical.metadata_version += 1
         cols = [c.get("name") for c in doc.get("columns", []) if isinstance(c, dict) and c.get("name")]
-        _sync_children(s, uri, tags, cols)
+        _sync_children(s, r.uri, tags, cols)
 
 
 def catalog_bump_usage(uri: str, n: int = 1) -> None:
@@ -1215,8 +2417,14 @@ def catalog_bump_usage(uri: str, n: int = 1) -> None:
     run). An atomic `usage = usage + n` (concurrent bumps can't lose increments) that explicitly
     carries updated_at, so a READ never masquerades as an update in the 'Recently updated' sort."""
     with session() as s:
-        s.execute(update(CatalogEntry).where(CatalogEntry.uri == uri)
+        target = _lock_catalog_mutation_targets(s, [uri])[0]
+        if not target["known"]:
+            return
+        logical, current_uri = target["logical"], target["current_uri"]
+        s.execute(update(CatalogEntry).where(CatalogEntry.uri == current_uri)
                   .values(usage=CatalogEntry.usage + n, updated_at=CatalogEntry.updated_at))
+        if logical is not None:
+            logical.usage += n
 
 
 def catalog_add_edge(parent: str, child: str, pipeline: str | None = None, column: str | None = None) -> None:
@@ -1225,9 +2433,17 @@ def catalog_add_edge(parent: str, child: str, pipeline: str | None = None, colum
     if parent == child:
         return
     with session() as s:
-        exists = s.scalars(select(CatalogEdge).where(CatalogEdge.parent == parent, CatalogEdge.child == child)).first()
+        parent_target, child_target = _lock_catalog_mutation_targets(s, [parent, child])
+        if not child_target["known"]:
+            raise RuntimeError("catalog lineage child is not registered")
+        parent_key, child_key = parent_target["catalog_key"], child_target["catalog_key"]
+        if parent_key == child_key:
+            return
+        exists = s.scalars(select(CatalogEdge).where(
+            CatalogEdge.parent == parent_key, CatalogEdge.child == child_key)).first()
         if exists is None:
-            s.add(CatalogEdge(parent=parent, child=child, pipeline=pipeline, column=column))
+            s.add(CatalogEdge(
+                parent=parent_key, child=child_key, pipeline=pipeline, column=column))
         elif column and not exists.column:
             exists.column = column
 
@@ -1403,7 +2619,13 @@ def catalog_get(token: str) -> dict | None:
     """A single entry by uri (PK), then by tbl_id, then by name — all indexed. None if unknown.
     Replaces the old 'load the whole catalog then look it up' path, so get_table is O(1), not O(n)."""
     with session() as s:
-        r = s.get(CatalogEntry, token)
+        catalog_key = _catalog_token_to_key(s, token)
+        logical = s.scalars(select(CatalogLogicalDataset).where(
+            CatalogLogicalDataset.catalog_key == catalog_key).limit(1)).first()
+        r = s.get(CatalogEntry, logical.current_uri) \
+            if logical is not None and logical.current_uri else None
+        if r is None and logical is None:
+            r = s.get(CatalogEntry, token)
         if r is None:
             r = s.scalars(select(CatalogEntry).where(CatalogEntry.tbl_id == token).limit(1)).first()
         if r is None:
@@ -1437,13 +2659,12 @@ def _delete_catalog_children(s, uris: list[str]) -> None:
     lineage edges (either endpoint), declared keys, and relationships. Otherwise a deleted table
     haunts lineage/ER as a ghost node, and a NEW dataset re-registered at the same uri silently
     inherits the old declared key + parents."""
-    for model in (CatalogTag, CatalogColumn, CatalogEmbedding, CatalogDeclaredKey):
+    for model in (CatalogTag, CatalogColumn):
         for r in s.scalars(select(model).where(model.uri.in_(uris))):
             s.delete(r)
     for r in s.scalars(select(CatalogEdge).where(
             or_(CatalogEdge.parent.in_(uris), CatalogEdge.child.in_(uris)))):
         s.delete(r)
-    # relationship endpoints live inside the JSON doc — relationships are curated (small), so scan them
     gone = set(uris)
     for r in s.scalars(select(CatalogRelationship)):
         try:
@@ -1455,14 +2676,84 @@ def _delete_catalog_children(s, uris: list[str]) -> None:
             s.delete(r)
 
 
+def _delete_catalog_governance(s, catalog_key: str) -> None:
+    for model in (CatalogEmbedding, CatalogDeclaredKey):
+        row = s.get(model, catalog_key)
+        if row is not None:
+            s.delete(row)
+    for edge in s.scalars(select(CatalogEdge).where(or_(
+            CatalogEdge.parent == catalog_key, CatalogEdge.child == catalog_key))):
+        s.delete(edge)
+    for relationship in s.scalars(select(CatalogRelationship)):
+        try:
+            doc = json.loads(relationship.doc)
+        except (TypeError, ValueError):
+            continue
+        if catalog_key in (
+                doc.get("leftUri"), doc.get("left_uri"),
+                doc.get("rightUri"), doc.get("right_uri")):
+            s.delete(relationship)
+
+
 def catalog_delete_entry(uri: str) -> None:
     """Remove a catalog entry (unregister) + everything keyed to it (tags/columns/embedding/edges/
     declared key/relationships)."""
     with session() as s:
-        _delete_catalog_children(s, [uri])
-        r = s.get(CatalogEntry, uri)
-        if r is not None:
-            s.delete(r)
+        token = str(uri).rstrip("/")
+        attempt_identity = s.get(ObjectAttempt, token)
+        logical_id = attempt_identity.logical_id if attempt_identity is not None else None
+        logical_snapshot = None
+        if logical_id is None:
+            logical_snapshot = s.get(CatalogLogicalDataset, token)
+            if logical_snapshot is None:
+                logical_snapshot = s.scalars(select(CatalogLogicalDataset).where(or_(
+                    CatalogLogicalDataset.catalog_key == token,
+                    CatalogLogicalDataset.logical_uri == token,
+                    CatalogLogicalDataset.current_uri == token,
+                )).limit(1)).first()
+            logical_id = logical_snapshot.logical_id if logical_snapshot is not None else None
+        logical = s.get(CatalogLogicalDataset, logical_id, with_for_update=True) \
+            if logical_id else None
+        if logical is not None:
+            if logical.state != "active" or not logical.current_uri:
+                raise RuntimeError("catalog governance target is inactive")
+            if (attempt_identity is not None
+                    and attempt_identity.catalog_epoch != logical.catalog_epoch):
+                raise RuntimeError("catalog governance request was fenced by unregister")
+            current_uri = logical.current_uri
+            current_attempt = s.get(ObjectAttempt, current_uri, with_for_update=True)
+            if current_attempt is None or current_attempt.logical_id != logical.logical_id:
+                raise RuntimeError("catalog unregister ownership changed concurrently")
+            s.get(ObjectAttemptRef, {
+                "ref_type": "catalog", "ref_key": logical.logical_id}, with_for_update=True)
+            entry = s.get(CatalogEntry, current_uri, with_for_update=True)
+            if entry is None or entry.logical_id != logical.logical_id:
+                raise RuntimeError("catalog unregister entry changed concurrently")
+            catalog_key = logical.catalog_key
+        else:
+            entry_snapshot = s.get(CatalogEntry, token)
+            if entry_snapshot is None:
+                entry_snapshot = s.scalars(select(CatalogEntry).where(or_(
+                    CatalogEntry.tbl_id == token, CatalogEntry.name == token,
+                )).order_by(CatalogEntry.uri).limit(1)).first()
+            if entry_snapshot is None:
+                return
+            entry = s.get(CatalogEntry, entry_snapshot.uri, with_for_update=True)
+            if entry is None or entry.logical_id:
+                raise RuntimeError("catalog unregister entry changed concurrently")
+            current_uri, catalog_key = entry.uri, entry.uri
+        if logical is not None:
+            _replace_attempt_ref(s, "catalog", logical.logical_id, None)
+            logical.current_uri = None
+            logical.catalog_epoch += 1
+            logical.state = "unregistered"
+            logical.metadata_version += 1
+            logical.governance_doc = "{}"
+        _delete_catalog_governance(s, catalog_key)
+        if current_uri:
+            _delete_catalog_children(s, [current_uri])
+        if entry is not None:
+            s.delete(entry)
 
 
 def catalog_delete_prefix(uri_prefix: str) -> int:
@@ -1470,19 +2761,58 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
     count removed. For bulk teardown of demo/scale entries; a no-op for a prefix that matches none."""
     like = _like_escape(uri_prefix) + "%"
     with session() as s:
-        uris = [u for (u,) in s.execute(select(CatalogEntry.uri).where(
-            CatalogEntry.uri.like(like, escape="\\"))).all()]
-        if not uris:
+        snapshot = list(s.execute(select(CatalogEntry.uri, CatalogEntry.logical_id).where(
+            CatalogEntry.uri.like(like, escape="\\")).order_by(CatalogEntry.uri)).all())
+        if not snapshot:
             return 0
-        _delete_catalog_children(s, uris)
-        for r in s.scalars(select(CatalogEntry).where(CatalogEntry.uri.in_(uris))):
-            s.delete(r)
-    return len(uris)
+        uris = [uri for uri, _logical_id in snapshot]
+        logical_ids = sorted({logical_id for _uri, logical_id in snapshot if logical_id})
+        logical_rows = {row.logical_id: row for row in s.scalars(
+            select(CatalogLogicalDataset).where(
+                CatalogLogicalDataset.logical_id.in_(logical_ids))
+            .order_by(CatalogLogicalDataset.logical_id).with_for_update())} if logical_ids else {}
+        managed_uris = sorted(uri for uri, logical_id in snapshot if logical_id)
+        attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
+            ObjectAttempt.uri.in_(managed_uris)).order_by(ObjectAttempt.uri).with_for_update())} \
+            if managed_uris else {}
+        refs = {row.ref_key: row for row in s.scalars(select(ObjectAttemptRef).where(
+            ObjectAttemptRef.ref_type == "catalog",
+            ObjectAttemptRef.ref_key.in_(logical_ids),
+        ).order_by(ObjectAttemptRef.ref_key).with_for_update())} if logical_ids else {}
+        entries = {row.uri: row for row in s.scalars(select(CatalogEntry).where(
+            CatalogEntry.uri.in_(uris)).order_by(CatalogEntry.uri).with_for_update())}
+        if len(entries) != len(snapshot):
+            raise RuntimeError("catalog prefix changed concurrently")
+        for uri, logical_id in snapshot:
+            if logical_id:
+                logical = logical_rows.get(logical_id)
+                if (logical is None or logical.state != "active"
+                        or logical.current_uri != uri or uri not in attempts
+                        or logical_id not in refs or refs[logical_id].attempt_uri != uri):
+                    raise RuntimeError("catalog prefix changed concurrently")
+            elif entries[uri].logical_id:
+                raise RuntimeError("catalog prefix changed concurrently")
+        current_uris = list(uris)
+        _delete_catalog_children(s, current_uris)
+        for uri, logical_id in snapshot:
+            logical = logical_rows.get(logical_id) if logical_id else None
+            if logical is not None:
+                _replace_attempt_ref(s, "catalog", logical.logical_id, None)
+                logical.current_uri = None
+                logical.catalog_epoch += 1
+                logical.state = "unregistered"
+                logical.metadata_version += 1
+                logical.governance_doc = "{}"
+                _delete_catalog_governance(s, logical.catalog_key)
+            s.delete(entries[uri])
+    return len(current_uris)
 
 
 def catalog_edges() -> list[dict]:
     with session() as s:
-        return [{"parent": r.parent, "child": r.child, "column": r.column, "pipeline": r.pipeline}
+        return [{"parent": _catalog_key_to_uri(s, r.parent),
+                 "child": _catalog_key_to_uri(s, r.child),
+                 "column": r.column, "pipeline": r.pipeline}
                 for r in s.scalars(select(CatalogEdge))]
 
 
@@ -1494,12 +2824,15 @@ def catalog_edges_touching(uris: list[str], limit: int | None = None) -> list[di
     if not uris:
         return []
     with session() as s:
+        keys = list(dict.fromkeys(_catalog_token_to_key(s, uri) for uri in uris))
         stmt = select(CatalogEdge).where(
-            or_(CatalogEdge.parent.in_(uris), CatalogEdge.child.in_(uris)))
+            or_(CatalogEdge.parent.in_(keys), CatalogEdge.child.in_(keys)))
         if limit is not None:
             stmt = stmt.limit(limit)
         rows = s.scalars(stmt)
-        return [{"parent": r.parent, "child": r.child, "column": r.column, "pipeline": r.pipeline} for r in rows]
+        return [{"parent": _catalog_key_to_uri(s, r.parent),
+                 "child": _catalog_key_to_uri(s, r.child),
+                 "column": r.column, "pipeline": r.pipeline} for r in rows]
 
 
 def catalog_edges_page(limit: int = 500, offset: int = 0) -> tuple[list[dict], int]:
@@ -1509,16 +2842,23 @@ def catalog_edges_page(limit: int = 500, offset: int = 0) -> tuple[list[dict], i
         total = s.scalar(select(func.count()).select_from(CatalogEdge)) or 0
         rows = s.scalars(select(CatalogEdge).order_by(CatalogEdge.id.asc())
                          .limit(max(0, limit)).offset(max(0, offset)))
-        return ([{"parent": r.parent, "child": r.child, "column": r.column, "pipeline": r.pipeline}
+        return ([{"parent": _catalog_key_to_uri(s, r.parent),
+                  "child": _catalog_key_to_uri(s, r.child),
+                  "column": r.column, "pipeline": r.pipeline}
                  for r in rows], int(total))
 
 
 # -- semantic search (opt-in: only populated when an embedder is registered) ----------------------- #
 def catalog_set_embedding(uri: str, model: str, dim: int, vec: bytes) -> None:
     with session() as s:
-        r = s.get(CatalogEmbedding, uri)
+        target = _lock_catalog_mutation_targets(
+            s, [uri], exact_current_attempts={str(uri).rstrip("/")})[0]
+        if not target["known"]:
+            raise RuntimeError("catalog embedding target is not registered")
+        catalog_key = target["catalog_key"]
+        r = s.get(CatalogEmbedding, catalog_key)
         if r is None:
-            s.add(CatalogEmbedding(uri=uri, model=model, dim=dim, vec=vec))
+            s.add(CatalogEmbedding(catalog_key=catalog_key, model=model, dim=dim, vec=vec))
         else:
             r.model, r.dim, r.vec = model, dim, vec
 
@@ -1526,7 +2866,8 @@ def catalog_set_embedding(uri: str, model: str, dim: int, vec: bytes) -> None:
 def catalog_embeddings_for(model: str) -> list[tuple[str, bytes]]:
     """(uri, vec-bytes) for every embedding under `model` — the candidate set semantic search scores."""
     with session() as s:
-        return [(r.uri, r.vec) for r in s.scalars(select(CatalogEmbedding).where(CatalogEmbedding.model == model))]
+        return [(_catalog_key_to_uri(s, r.catalog_key), r.vec) for r in s.scalars(
+            select(CatalogEmbedding).where(CatalogEmbedding.model == model))]
 
 
 def catalog_bulk_seed(entries: list[dict]) -> int:
@@ -1556,13 +2897,29 @@ def catalog_bulk_seed(entries: list[dict]) -> int:
 def catalog_relationships() -> list[dict]:
     """Every declared relationship as a Relationship-shaped dict."""
     with session() as s:
-        return [json.loads(r.doc) for r in s.scalars(select(CatalogRelationship))]
+        out = []
+        for row in s.scalars(select(CatalogRelationship)):
+            doc = json.loads(row.doc)
+            for key in ("leftUri", "left_uri", "rightUri", "right_uri"):
+                if doc.get(key):
+                    doc[key] = _catalog_key_to_uri(s, doc[key])
+            out.append(doc)
+        return out
 
 
 def catalog_upsert_relationship(rel_key: str, doc: dict) -> None:
     """Insert or replace ONE relationship row (keyed by rel_key) — no read-modify-write of a shared
     blob, so a concurrent declare of a DIFFERENT relationship on another instance can't be lost."""
     with session() as s:
+        doc = dict(doc)
+        endpoint_keys = [key for key in ("leftUri", "left_uri", "rightUri", "right_uri")
+                         if doc.get(key)]
+        targets = _lock_catalog_mutation_targets(s, [doc[key] for key in endpoint_keys])
+        if endpoint_keys and not any(target["known"] for target in targets):
+            raise RuntimeError("catalog relationship has no registered endpoint")
+        for key, target in zip(endpoint_keys, targets):
+            doc[key] = target["catalog_key"]
+        rel_key = _relationship_key(doc) if endpoint_keys else str(rel_key)
         r = s.get(CatalogRelationship, rel_key)
         payload = json.dumps(doc, default=str)
         if r is None:
@@ -1573,6 +2930,16 @@ def catalog_upsert_relationship(rel_key: str, doc: dict) -> None:
 
 def catalog_delete_relationship(rel_key: str) -> None:
     with session() as s:
+        try:
+            ends = json.loads(rel_key)
+            flat = [uri for uri, _columns in ends]
+            targets = _lock_catalog_mutation_targets(s, flat)
+            rel_key = json.dumps(sorted([
+                [target["catalog_key"], list(columns)]
+                for target, (_uri, columns) in zip(targets, ends)
+            ]))
+        except (TypeError, ValueError):
+            pass
         r = s.get(CatalogRelationship, rel_key)
         if r is not None:
             s.delete(r)
@@ -1583,22 +2950,31 @@ def catalog_declared_keys(uris: list[str] | None = None) -> dict[str, list]:
     read path passes the page's uris so this stays O(page), never O(catalog)). None → all keys."""
     with session() as s:
         stmt = select(CatalogDeclaredKey)
+        requested: dict[str, str] | None = None
         if uris is not None:
             if not uris:
                 return {}
-            stmt = stmt.where(CatalogDeclaredKey.uri.in_(uris))
-        return {r.uri: json.loads(r.columns) for r in s.scalars(stmt)}
+            requested = {str(uri): _catalog_token_to_key(s, uri) for uri in uris}
+            stmt = stmt.where(CatalogDeclaredKey.catalog_key.in_(requested.values()))
+        rows = {r.catalog_key: json.loads(r.columns) for r in s.scalars(stmt)}
+        if requested is not None:
+            return {token: rows[key] for token, key in requested.items() if key in rows}
+        return {_catalog_key_to_uri(s, key): value for key, value in rows.items()}
 
 
 def catalog_set_declared_key(uri: str, columns: list) -> None:
     """Set (columns non-empty) or clear (empty) ONE dataset's declared key — a single row, so it
     can't clobber another dataset's key set concurrently on another instance."""
     with session() as s:
-        r = s.get(CatalogDeclaredKey, uri)
+        target = _lock_catalog_mutation_targets(s, [uri])[0]
+        if not target["known"]:
+            raise RuntimeError("catalog declared-key target is not registered")
+        catalog_key = target["catalog_key"]
+        r = s.get(CatalogDeclaredKey, catalog_key)
         if columns:
             payload = json.dumps(list(columns))
             if r is None:
-                s.add(CatalogDeclaredKey(uri=uri, columns=payload))
+                s.add(CatalogDeclaredKey(catalog_key=catalog_key, columns=payload))
             else:
                 r.columns = payload
         elif r is not None:

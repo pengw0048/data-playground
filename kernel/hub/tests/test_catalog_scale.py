@@ -490,6 +490,114 @@ def test_migration_0019_adds_stable_object_attempt_identity(tmp_path, monkeypatc
     eng.dispose()
 
 
+def test_migration_0020_quarantines_unsafe_legacy_and_removes_managed_visibility(
+        tmp_path, monkeypatch):
+    import json
+
+    import sqlalchemy as sa
+    from alembic import command
+
+    from hub.settings import settings as live_settings
+
+    url = f"sqlite:///{tmp_path}/object-lifecycle.db"
+    monkeypatch.setattr(live_settings, "database_url", url)
+    cfg = metadb._alembic_cfg()
+    command.upgrade(cfg, "0019_object_attempts")
+    eng = sa.create_engine(url)
+    published = "s3://bucket/root/result.attempt-published"
+    with eng.begin() as c:
+        c.execute(sa.text("INSERT INTO users (id, name) VALUES ('u20', 'U20')"))
+        c.execute(sa.text(
+            "INSERT INTO canvases (id, owner_id, name, version, doc) "
+            "VALUES ('c20', 'u20', 'C20', 1, '{}')"))
+        for state in ("published", "writing", "retiring", "retired", "discarding"):
+            uri = published if state == "published" else f"s3://bucket/root/result.attempt-{state}"
+            c.execute(sa.text("""
+                INSERT INTO object_attempts(uri, logical_uri, kind, run_id, state, created_at)
+                VALUES (:uri, 's3://bucket/root/result.parquet', 'region', :run, :state,
+                        CURRENT_TIMESTAMP)
+            """), {"uri": uri, "run": f"run-{state}", "state": state})
+        doc = json.dumps({"uri": published})
+        c.execute(sa.text(
+            "INSERT INTO result_cache(key, doc, created_at) VALUES ('cache20', :doc, CURRENT_TIMESTAMP)"),
+            {"doc": doc})
+        c.execute(sa.text("""
+            INSERT INTO run_records(id, canvas_id, run_id, status, output_uri, created_at)
+            VALUES ('record20', 'c20', 'run-published', 'done', :uri, CURRENT_TIMESTAMP)
+        """), {"uri": published})
+        c.execute(sa.text("""
+            INSERT INTO run_states(run_id, canvas_id, status, doc, updated_at)
+            VALUES ('run-published', 'c20', 'done', :doc, CURRENT_TIMESTAMP)
+        """), {"doc": json.dumps({"status": "done", "output_uri": published})})
+        c.execute(sa.text("""
+            INSERT INTO catalog_entries(uri, name, doc, tbl_id, folder, usage, updated_at)
+            VALUES (:uri, 'result', :doc, 'tbl_result20', 'gold', 0, CURRENT_TIMESTAMP)
+        """), {"uri": published, "doc": json.dumps({
+            "id": "tbl_result20", "name": "result", "uri": published,
+            "folder": "gold", "tags": ["curated"],
+        })})
+        c.execute(sa.text(
+            "INSERT INTO catalog_embeddings(uri, model, dim, vec, updated_at) "
+            "VALUES (:uri, 'legacy-model', 1, :vec, CURRENT_TIMESTAMP)"
+        ), {"uri": published, "vec": b"\x00\x00\x80?"})
+        c.execute(sa.text(
+            "INSERT INTO catalog_declared_keys(uri, columns) VALUES (:uri, '[\"id\"]')"
+        ), {"uri": published})
+        c.execute(sa.text(
+            "INSERT INTO catalog_tags(uri, tag) VALUES (:uri, 'curated')"
+        ), {"uri": published})
+        c.execute(sa.text(
+            'INSERT INTO catalog_columns(uri, "column") VALUES (:uri, \'id\')'
+        ), {"uri": published})
+        c.execute(sa.text(
+            "INSERT INTO catalog_edges(parent, child, pipeline) "
+            "VALUES (:uri, 's3://bucket/source', 'legacy-pipeline')"
+        ), {"uri": published})
+        c.execute(sa.text(
+            "INSERT INTO catalog_relationships(rel_key, doc) VALUES ('legacy-rel', :doc)"
+        ), {"doc": json.dumps({
+            "leftUri": published,
+            "rightUri": "s3://bucket/source",
+            "leftColumns": ["id"],
+            "rightColumns": ["id"],
+        })})
+    command.upgrade(cfg, "head")
+    with eng.connect() as c:
+        states = dict(c.execute(sa.text("SELECT uri, state FROM object_attempts")).all())
+        assert set(states.values()) == {"quarantined"}
+        assert c.execute(sa.text(
+            "SELECT count(*) FROM object_attempts WHERE quarantine_reason IS NOT NULL"
+        )).scalar_one() == 5
+        assert c.execute(sa.text("""
+            SELECT count(*)
+              FROM object_attempt_refs AS ref
+              JOIN object_attempts AS attempt ON attempt.uri=ref.attempt_uri
+             WHERE attempt.state != 'published'
+        """)).scalar_one() == 0
+        assert c.execute(sa.text("SELECT count(*) FROM object_attempt_refs")).scalar_one() == 0
+        assert c.execute(sa.text(
+            "SELECT count(*) FROM result_cache WHERE key='cache20'"
+        )).scalar_one() == 0
+        assert c.execute(sa.text(
+            "SELECT count(*) FROM catalog_entries WHERE uri=:uri"
+        ), {"uri": published}).scalar_one() == 0
+        assert c.execute(sa.text(
+            "SELECT count(*) FROM catalog_logical_datasets WHERE current_uri=:uri"
+        ), {"uri": published}).scalar_one() == 0
+        for table in (
+            "catalog_embeddings", "catalog_declared_keys", "catalog_tags", "catalog_columns",
+            "catalog_edges", "catalog_relationships",
+        ):
+            assert c.execute(sa.text(f"SELECT count(*) FROM {table}")).scalar_one() == 0
+        # Run history remains diagnostic-only and deliberately has no ownership reference.
+        assert c.execute(sa.text(
+            "SELECT output_uri FROM run_records WHERE id='record20'"
+        )).scalar_one() == published
+    with pytest.raises(RuntimeError, match="cannot downgrade.*managed object attempts"):
+        command.downgrade(cfg, "0019_object_attempts")
+    eng.dispose()
+
+
 def test_semantic_plugin_registers_embedder():
     """The shipped dp_semantic_catalog plugin wires an embedder through reg.add_embedder when enabled,
     and is a no-op when disabled — without importing the heavy model (the embedder fn is lazy)."""

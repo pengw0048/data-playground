@@ -42,6 +42,10 @@ def main() -> int:
         # rows keyed by the child's own id (and race a hard-kill on cancel). Silence both hooks here.
         deps.runner.on_complete = None
         deps.runner.on_status = None
+        deps.runner.result_get = None
+        deps.runner.result_acquire = None
+        deps.runner.result_put = None
+        deps.runner.forced_result_uri = job.get("forcedResultUri")
         graph = Graph(**job["graph"])
         external_cancel = (lambda: os.path.exists(cancel_file)) if cancel_file else None
         # deps parity with the warm kernel's _ensure_deps: install the canvas's declared pip deps and let
@@ -106,7 +110,9 @@ def main() -> int:
             return 1
         # Read the parent's request directly at every LocalRunner/adapter fence; the polling loop below
         # additionally calls cancel() to interrupt an in-flight DuckDB cursor.
-        st = deps.runner.run(plan, graph, job.get("target"), "local", cancel_check=external_cancel)
+        st = deps.runner.run(
+            plan, graph, job.get("target"), "local",
+            run_id=job.get("runId"), cancel_check=external_cancel)
         rid = st.run_id
         cancel_requested = False
         while True:

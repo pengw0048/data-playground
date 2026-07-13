@@ -45,6 +45,7 @@ small graph won't spin up Ray unless you ask.
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import hashlib
 import json
@@ -58,8 +59,8 @@ import uuid
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from hub import db, graph as g
-from hub.handoff import (attempt_has_commit_record, attempt_has_contents, claim_attempt,
-                         discard_attempt, is_attempt_uri, read_manifest,
+from hub.handoff import (allocate_attempt, attempt_has_commit_record, attempt_has_contents,
+                         discard_attempt, is_attempt_uri, lookup_attempt, read_manifest,
                          validate_shards, write_manifest)
 from hub.sinks import SinkSpec, commit_sink, preflight_sink
 from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (DuckDB's own parser), shared
@@ -471,7 +472,9 @@ def _attempt_component(base_name: str, readable: str, digest: str, limit: int, u
     return component
 
 
-def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str:
+def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None, *,
+                         namespace: str | None = None, generation: int | None = None,
+                         attempt_id: str | None = None) -> str:
     """Return an immutable region-output prefix for one execution attempt.
 
     The controller suggests a stable, content-addressed URI. Writing a multi-object Ray result directly
@@ -481,11 +484,12 @@ def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str
     low = uri.lower()
     extension = next((ext for ext in (".parquet", ".pq") if low.endswith(ext)), "")
     base = uri[:-len(extension)] if extension else uri.rstrip("/")
-    raw = str(run_id)
+    raw = (f"{namespace}-g{generation}-{attempt_id}" if namespace and generation and attempt_id
+           else str(run_id))
     readable = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-") or "attempt"
     readable = readable[:64].rstrip("._-") or "attempt"
     from hub.plugins.adapters import is_object_uri
-    if is_object_uri(uri):
+    if is_object_uri(uri) and namespace is None:
         from hub import metadb
         owner = metadb.object_attempt_owner_id()
     else:
@@ -498,6 +502,10 @@ def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str
         "scope": None if scope is None else str(scope),
         "uri": str(uri),
     }
+    if namespace is not None:
+        identity_doc.update({
+            "namespace": namespace, "generation": generation, "attemptId": attempt_id,
+        })
     if owner:
         identity_doc["owner"] = owner
     identity = json.dumps(identity_doc, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -518,6 +526,33 @@ def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None) -> str
         base_name if separator else base, readable, digest, _ATTEMPT_COMPONENT_MAX_BYTES, uri
     )
     return f"{parent}/{component}" if separator else component
+
+
+def _allocate_handoff_uri(uri: str, run_id: str, kind: str,
+                          scope: str | None = None,
+                          catalog_key_base: str | None = None) -> str:
+    """Use durable allocation for object writes and a process-private path for local writes."""
+    from hub.plugins.adapters import is_object_uri
+    if not is_object_uri(uri):
+        return _attempt_handoff_uri(uri, run_id, scope=scope)
+    logical_hash = hashlib.sha256(str(uri).encode()).hexdigest()
+    allocation_key = json.dumps({
+        "kind": kind, "runId": str(run_id), "scope": scope, "logical": logical_hash,
+    }, sort_keys=True, separators=(",", ":"))
+    if kind == "region":
+        prior = lookup_attempt(
+            logical_uri=uri, kind=kind, run_id=run_id, allocation_key=allocation_key)
+        if prior is not None and prior["state"] in ("committed", "published"):
+            return prior["uri"]
+    handle = allocate_attempt(
+        logical_uri=uri, kind=kind, run_id=run_id, allocation_key=allocation_key,
+        catalog_key_base=catalog_key_base,
+        uri_factory=lambda storage_namespace, allocated_generation, allocated_id:
+        _attempt_handoff_uri(
+            uri, run_id, scope=scope, namespace=storage_namespace,
+            generation=allocated_generation, attempt_id=allocated_id),
+    )
+    return handle["uri"]
 
 
 def _worker_direct_parquet_sink(spec: SinkSpec, uri: str, adapter: object) -> bool:
@@ -869,7 +904,6 @@ class RayRunner:
         scheduled onto a matching worker. Unsupported unpinned work falls back locally; an explicit Ray
         requirement fails before dispatch."""
         run_id = run_id or f"unit_{uuid.uuid4().hex[:10]}"
-        attempt_uri = _attempt_handoff_uri(output_uri, run_id)
         ir = lower_to_ir(graph, output_node, self.node_specs, self.deps.node_ir)
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", target_node_id=output_node,
                            per_node=[PerNodeStatus(node_id=output_node, status="queued", label=output_node)])
@@ -879,6 +913,28 @@ class RayRunner:
                 return prior  # one in-process owner for an explicit attempt ID
             self.runs[run_id] = status
             self._cancel_ack.discard(run_id)
+        reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
+        reason = reason or self._resource_unsupported_reason(requires, ir)
+        reason = reason or self._source_unsupported_reason(ir)
+        if _remote_ray():
+            from hub.plugins.adapters import is_object_uri
+            if not is_object_uri(output_uri):
+                reason = reason or (
+                    "a remote Ray cluster cannot materialize a region on the hub's local filesystem; "
+                    "configure a shared object storage tier"
+                )
+        # Reject an explicitly pinned unsupported graph before allocation. No writer can start on this
+        # path, so minting a durable writing generation/write lease would create a permanent false owner.
+        if reason and self._requires_ray(requires, graph, output_node):
+            return self._unsupported_status(graph, output_node, reason, run_id=run_id)
+        try:
+            attempt_uri = _allocate_handoff_uri(output_uri, run_id, "region")
+        except Exception as e:  # noqa: BLE001 — a control-plane allocation must precede object writes
+            status.status = "failed"
+            status.error = f"object attempt allocation failed: {type(e).__name__}: {e}"
+            for item in status.per_node:
+                item.status = "failed"
+            return status
         committed = read_manifest(attempt_uri)
         if (committed is not None and committed.get("runId") == run_id
                 and validate_shards(attempt_uri, committed)
@@ -894,27 +950,6 @@ class RayRunner:
             status.error = (
                 "Ray attempt prefix already exists without an exact committed inventory; "
                 "refusing to overwrite an immutable or possibly live attempt")
-            for item in status.per_node:
-                item.status = "failed"
-            return status
-        reason = self._ray_unsupported_reason(ir) or self._dedup_unsupported_reason(graph, ir)
-        reason = reason or self._resource_unsupported_reason(requires, ir)
-        reason = reason or self._source_unsupported_reason(ir)
-        if _remote_ray():
-            from hub.plugins.adapters import is_object_uri
-
-            if not is_object_uri(attempt_uri):
-                reason = reason or (
-                    "a remote Ray cluster cannot materialize a region on the hub's local filesystem; "
-                    "configure a shared object storage tier"
-                )
-        if reason and self._requires_ray(requires, graph, output_node):
-            return self._unsupported_status(graph, output_node, reason, run_id=run_id)
-        try:
-            claim_attempt(attempt_uri, logical_uri=output_uri, kind="region", run_id=run_id)
-        except Exception as e:  # noqa: BLE001 — an untracked object write must never start
-            status.status = "failed"
-            status.error = f"object attempt claim failed: {type(e).__name__}: {e}"
             for item in status.per_node:
                 item.status = "failed"
             return status
@@ -1167,17 +1202,28 @@ class RayRunner:
         URI instead of minting/registering one after dispatch. If a later claim fails, unwind the claims
         already made; no writer has started yet.
         """
+        managed_steps = []
+        for step in ir.steps:
+            if step.op != "write":
+                continue
+            target_uri = targets[step.id]
+            spec = SinkSpec.from_config(step.config, step.config.get("title"))
+            if _worker_direct_parquet_sink(spec, target_uri, self.resolve_adapter(target_uri)):
+                managed_steps.append((step, target_uri, spec))
+        from hub.plugins.catalog import core_managed_publisher
+        if managed_steps and core_managed_publisher(self.catalog) is None:
+            raise RuntimeError(
+                "managed object writes require the core transactional catalog publisher")
+        if len(managed_steps) > 1:
+            raise RuntimeError(
+                "multiple managed sinks require atomic batch publication, which is not enabled")
+
         attempts: dict[str, str] = {}
         try:
-            for step in ir.steps:
-                if step.op != "write":
-                    continue
-                target_uri = targets[step.id]
-                spec = SinkSpec.from_config(step.config, step.config.get("title"))
-                if not _worker_direct_parquet_sink(spec, target_uri, self.resolve_adapter(target_uri)):
-                    continue
-                attempt_uri = _attempt_handoff_uri(target_uri, run_id, scope=step.id)
-                claim_attempt(attempt_uri, logical_uri=target_uri, kind="sink", run_id=run_id)
+            for step, target_uri, spec in managed_steps:
+                attempt_uri = _allocate_handoff_uri(
+                    target_uri, run_id, "sink", scope=step.id,
+                    catalog_key_base=f"tbl_{spec.name}")
                 attempts[step.id] = attempt_uri
             return attempts
         except Exception:
@@ -1294,8 +1340,8 @@ class RayRunner:
 
     def _register_outputs(self, graph, result, *, expected_targets=None, expected_attempts=None) -> None:
         """Publish driver-written outputs through the hub-owned catalog/control plane."""
-        from hub import metadb
         from hub.plugins.adapters import is_object_uri
+        from hub.plugins.catalog import core_managed_publisher
         outputs = result.get("outputs") or []
         if expected_targets is not None:
             returned = {str(output.get("step_id")) for output in outputs if output.get("step_id")}
@@ -1319,23 +1365,24 @@ class RayRunner:
             logical_uri = output.get("logical_uri")
             parents = [u for edge in g.incoming(graph, step_id)
                        for u in [self.base._source_uri(nm_node=edge.source, graph=graph)] if u]
-            self.catalog.register_output(name=name, uri=uri, version=None,
-                                         parents=parents, pipeline="canvas")
-            persisted = metadb.catalog_get(uri)
-            if logical_uri and is_object_uri(uri) and is_attempt_uri(uri):
-                with metadb.session() as session:
-                    attempt = session.get(metadb.ObjectAttempt, uri)
-                    state = attempt.state if attempt is not None else None
-                    if state not in ("published", "retiring", "retired"):
-                        self.catalog.unregister(uri)
-                        raise RuntimeError(
-                            f"catalog did not atomically publish the attempt for sink '{step_id}'"
-                        )
-                    if state == "published" and (persisted is None or persisted.get("uri") != uri):
-                        raise RuntimeError(f"catalog lost the published pointer for sink '{step_id}'")
-            elif persisted is None or persisted.get("uri") != uri:
-                self.catalog.unregister(uri)
-                raise RuntimeError(f"catalog did not persist the output pointer for sink '{step_id}'")
+            managed_attempt = bool(logical_uri and is_object_uri(uri) and is_attempt_uri(uri))
+            if managed_attempt:
+                publish = core_managed_publisher(self.catalog)
+                if publish is None:
+                    raise RuntimeError("managed object output has no core publisher")
+                try:
+                    receipt = publish(
+                        name=name, uri=uri, version=None, parents=parents, pipeline="canvas")
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Ray could not atomically publish managed sink '{step_id}'"
+                    ) from exc
+                if not isinstance(receipt, dict) or receipt.get("uri") != uri:
+                    raise RuntimeError(
+                        f"core publisher returned an invalid receipt for sink '{step_id}'")
+            else:
+                self.catalog.register_output(
+                    name=name, uri=uri, version=None, parents=parents, pipeline="canvas")
 
     def _supervise(self, run_id, graph, target, status, materialize_uri=None, requires=None,
                    sink_targets=None, sink_attempts=None) -> None:
@@ -1346,13 +1393,29 @@ class RayRunner:
         work = tempfile.mkdtemp(prefix="dp_ray_")
         result, returncode = None, "not-started"
         cleanup_succeeded = False
+        read_leases = contextlib.ExitStack()
+        read_guards = []
         try:
             try:
+                from hub.handoff import managed_read_lease
+                try:
+                    deadline = float(os.environ.get("DP_RUN_DEADLINE_S", "3600"))
+                except ValueError:
+                    deadline = 3600.0
+                ttl = max(300.0, deadline + 300.0)
+                for source in graph.nodes:
+                    if source.type == "source" and isinstance(source.data, dict):
+                        uri = (source.data.get("config") or {}).get("uri")
+                        if uri:
+                            read_guards.append(read_leases.enter_context(managed_read_lease(
+                                uri, owner=f"ray:{run_id}", ttl_seconds=ttl)))
                 result, returncode = self._supervise_in_work(
                     run_id, graph, target, status, work,
                     materialize_uri=materialize_uri, requires=requires,
                     sink_targets=sink_targets, sink_attempts=sink_attempts,
                 )
+                for guard in read_guards:
+                    guard.check()
             except Exception as exc:  # noqa: BLE001 — terminal publication still follows cleanup
                 status.status = "failed"
                 detail = str(exc).replace("\n", " ")[:500]
@@ -1409,6 +1472,7 @@ class RayRunner:
                     self.on_complete(graph, target, status)
                 except Exception:  # noqa: BLE001
                     pass
+            read_leases.close()
 
     def _supervise_in_work(self, run_id, graph, target, status, work, materialize_uri=None,
                            requires=None, sink_targets=None,
@@ -1527,8 +1591,8 @@ class RayRunner:
                     result, status="failed",
                     error=f"{prior}catalog registration failed: {type(exc).__name__}: {exc}",
                 )
-        # Failed/cancelled outputs stay private as cleanup evidence. A URI shape is not ownership proof,
-        # so retiring those artifacts requires the future ownership-aware artifact lifecycle.
+        # Failed/cancelled outputs stay private. Remote attempts remain fenced as writing until the
+        # backend can prove every worker is terminal; the ownership reaper deliberately never guesses.
         status.status = result["status"]
         status.error = result.get("error")
         if status.status == "done":
