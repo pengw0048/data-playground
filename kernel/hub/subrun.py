@@ -11,9 +11,15 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import threading
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows receives no inherited resultLockFd and disables automatic crash GC.
+    fcntl = None
 
 
 def _atomic_write(path: str, obj: dict) -> None:
@@ -23,10 +29,148 @@ def _atomic_write(path: str, obj: dict) -> None:
     os.replace(tmp, path)  # atomic — the parent never reads a half-written file
 
 
+def _materialize_region(deps, rel, mat_uri: str, cancel, external_cancel, run_id: str) -> int:
+    """Write a controller handoff, committing managed object attempts with a manifest last."""
+    from hub.plugins.adapters import is_object_uri
+    from hub.handoff import is_attempt_uri, write_manifest
+
+    managed_attempt = is_object_uri(mat_uri) and is_attempt_uri(mat_uri)
+    physical_uri = (
+        mat_uri.rstrip("/") + "/part-00000.parquet" if managed_attempt else mat_uri)
+    adapter = deps.resolve_adapter(physical_uri)
+    result = deps.runner._adapter_write(adapter, physical_uri, rel, "overwrite", cancel)
+    rows = int(result.get("rows") or 0)
+    if external_cancel and external_cancel():
+        raise RuntimeError("region materialization cancelled before commit")
+    if managed_attempt:
+        schema = list(zip(rel.columns, (str(t) for t in rel.types)))
+        write_manifest(mat_uri, run_id=run_id, rows=rows, schema=schema)
+    return rows
+
+
+def _parent_attested_source_uris(job: dict, graph) -> frozenset[str]:
+    """Validate the exact managed-source contract before graph compilation or adapter scanning."""
+    from hub import graph as graph_mod
+    from hub.handoff import (
+        has_attempt_path_component, is_attempt_uri, physical_attempt_uri)
+    from hub.plugins.adapters import is_object_uri
+    from hub.paths import local_path
+    from hub.storage import MAX_MANAGED_EXECUTION_SOURCES
+
+    source_attempts: set[str] = set()
+    local_sources: set[str] = set()
+    for uri in graph_mod.execution_source_uris(graph, job.get("target")):
+        normalized = str(uri).rstrip("/")
+        try:
+            path = local_path(normalized)
+        except ValueError as exc:
+            raise RuntimeError("managed local-source URI is not canonical") from exc
+        if (path is not None
+                and os.path.basename(os.path.dirname(path)) == ".dp-results"
+                and os.path.basename(path).startswith("__result_")
+                and path.endswith(".parquet")):
+            local_sources.add(path)
+            continue
+        if not is_object_uri(normalized) or not has_attempt_path_component(normalized):
+            continue
+        if not is_attempt_uri(normalized):
+            raise RuntimeError("managed source must reference the exact attempt root")
+        source_attempts.add(normalized)
+    if len(source_attempts | local_sources) > MAX_MANAGED_EXECUTION_SOURCES:
+        raise RuntimeError(
+            f"an execution may use at most {MAX_MANAGED_EXECUTION_SOURCES} managed sources")
+    raw = job.get("managedSourceAttempts")
+    if not isinstance(raw, dict):
+        raise RuntimeError("managed source attestation contract is missing")
+    if len(raw) > MAX_MANAGED_EXECUTION_SOURCES:
+        raise RuntimeError("managed source attestation contract exceeds the source limit")
+    attested: set[str] = set()
+    for uri, identity in raw.items():
+        normalized = str(uri).rstrip("/")
+        if not isinstance(identity, dict):
+            raise RuntimeError("managed source attestation contract is malformed")
+        try:
+            expected = physical_attempt_uri(
+                str(identity["logicalUri"]), str(identity["storageNamespace"]),
+                int(identity["generation"]), str(identity["attemptId"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("managed source attestation contract is malformed") from exc
+        if (expected.rstrip("/") != normalized
+                or identity.get("kind") not in ("region", "sink")):
+            raise RuntimeError("managed source attestation identity does not match its URI")
+        attested.add(normalized)
+    if source_attempts != set(attested):
+        raise RuntimeError("managed source attestation contract does not match the graph")
+    raw_local = job.get("managedLocalSources")
+    if not isinstance(raw_local, dict) or not all(
+            isinstance(uri, str) and isinstance(contract, dict)
+            for uri, contract in raw_local.items()):
+        raise RuntimeError("managed local-source attestation contract is missing or malformed")
+    if len(raw) + len(raw_local) > MAX_MANAGED_EXECUTION_SOURCES:
+        raise RuntimeError("managed source attestation contract exceeds the source limit")
+    attested_local: set[str] = set()
+    for uri in raw_local:
+        try:
+            path = local_path(uri)
+        except ValueError as exc:
+            raise RuntimeError("managed local-source attestation contract is malformed") from exc
+        if path is None:
+            raise RuntimeError("managed local-source attestation contract is malformed")
+        attested_local.add(path)
+    if local_sources != attested_local:
+        raise RuntimeError("managed local-source attestation contract does not match the graph")
+    return frozenset(attested | attested_local)
+
+
+def _validate_local_source_locks(job: dict, storage) -> None:
+    """Bind every parent-attested source URI to this namespace and its inherited lock inode."""
+    raw = job.get("managedLocalSources")
+    if not isinstance(raw, dict):
+        raise RuntimeError("managed local-source attestation contract is missing")
+    if not raw:
+        return
+    expected_identity = tuple(storage.result_namespace_identity())
+    for uri, contract in raw.items():
+        identity = contract.get("namespaceIdentity") if isinstance(contract, dict) else None
+        if (not isinstance(identity, list) or len(identity) != 2
+                or not all(isinstance(part, int) for part in identity)
+                or tuple(identity) != expected_identity
+                or contract.get("namespaceId") != storage.namespace_id
+                or not storage.is_managed_result_uri(uri)):
+            raise RuntimeError("managed local-source namespace identity is invalid")
+        fd = contract.get("lockFd")
+        if getattr(storage, "lock_supported", False) and fd is None:
+            raise RuntimeError("managed local-source lock was not inherited")
+        if fd is None:
+            continue
+        if fcntl is None:
+            raise RuntimeError("inherited local-source locks are unavailable on this platform")
+        fd = int(fd)
+        actual = os.fstat(fd)
+        if not stat.S_ISREG(actual.st_mode):
+            raise RuntimeError("inherited local-source lock is not a regular file")
+        _artifact_name, lock_name = storage._result_names(uri)
+        expected = os.stat(
+            lock_name, dir_fd=storage._result_lock_dir_fd, follow_symlinks=False)
+        if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+            raise RuntimeError("inherited local-source lock does not match its exact URI")
+        if storage._read_lock_token(fd) != contract.get("lockToken"):
+            raise RuntimeError("inherited local-source lock token is invalid")
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+
+
 def main() -> int:
     job = json.load(open(sys.argv[1]))
     status_file = job["statusFile"]
     cancel_file = job.get("cancelFile")
+    result_lock_fd = job.get("resultLockFd")
+    if result_lock_fd is not None:
+        if fcntl is None:
+            raise RuntimeError("inherited local-result locks are unavailable on this platform")
+        result_lock_fd = int(result_lock_fd)
+        if not stat.S_ISREG(os.fstat(result_lock_fd).st_mode):
+            raise RuntimeError("inherited local-result lock is not a regular file")
+        fcntl.flock(result_lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     try:
         # The worker needs catalog tables for normal Deps composition, not the hub's users/settings/run
         # state. Build a private disposable DB before importing settings instead of forwarding the hub
@@ -36,13 +180,58 @@ def main() -> int:
         from hub import compiler
         from hub.deps import set_workspace
         from hub.models import Graph
-        deps = set_workspace(job["workspace"], job["dataDir"])
+        deps = set_workspace(
+            job["workspace"], job["dataDir"], maintain_storage=False)
+        _validate_local_source_locks(job, deps.storage)
         # the PARENT (SubprocessRunner) owns ALL run_states writes and run-history recording: it reads our
         # status file and persists under the authoritative (hub) run_id. If we also wrote, we'd emit orphan
         # rows keyed by the child's own id (and race a hard-kill on cancel). Silence both hooks here.
         deps.runner.on_complete = None
         deps.runner.on_status = None
+        deps.runner.result_get = None
+        deps.runner.result_acquire = None
+        deps.runner.result_put = None
+        deps.runner.forced_result_uri = job.get("forcedResultUri")
+        identity = job.get("resultNamespaceIdentity")
+        if identity is not None:
+            if (not isinstance(identity, list) or len(identity) != 2
+                    or not all(isinstance(part, int) for part in identity)):
+                raise RuntimeError("local result namespace identity is malformed")
+            deps.runner.forced_result_namespace_identity = tuple(identity)
+        managed_local = getattr(deps.storage, "is_managed_result_uri", None)
+        forced_local = bool(
+            deps.runner.forced_result_uri and callable(managed_local)
+            and managed_local(deps.runner.forced_result_uri))
+        if forced_local and identity is None:
+            raise RuntimeError("local result namespace identity is missing")
+        if forced_local and job.get("resultNamespaceId") != deps.storage.namespace_id:
+            raise RuntimeError("local result filesystem namespace is invalid")
+        if forced_local and getattr(deps.storage, "lock_supported", False) \
+                and result_lock_fd is None:
+            raise RuntimeError("local result writer lock was not inherited")
+        if result_lock_fd is not None and not forced_local:
+            raise RuntimeError("local result writer lock has no matching result contract")
+        if result_lock_fd is not None:
+            _artifact_name, lock_name = deps.storage._result_names(
+                deps.runner.forced_result_uri)
+            expected_lock = os.stat(
+                lock_name, dir_fd=deps.storage._result_lock_dir_fd, follow_symlinks=False)
+            actual_lock = os.fstat(result_lock_fd)
+            if ((actual_lock.st_dev, actual_lock.st_ino)
+                    != (expected_lock.st_dev, expected_lock.st_ino)
+                    or deps.storage._read_lock_token(result_lock_fd)
+                    != job.get("resultLockToken")):
+                raise RuntimeError("inherited local-result lock does not match its exact URI")
+        # Every write target was resolved by the real parent control plane. For managed object sinks the
+        # child also receives one exact physical attempt and is write-only: allocation, inventory commit,
+        # and catalog publication remain in the parent's durable metadata database.
+        deps.runner.forced_sink_targets = (
+            dict(job.get("sinkTargets") or {}) if "sinkTargets" in job else None)
+        deps.runner.forced_sink_attempts = dict(job.get("sinkAttempts") or {})
         graph = Graph(**job["graph"])
+        # The disposable child DB cannot prove lifecycle ownership. Accept managed source attempts only
+        # when the durable parent attested the exact physical URI and is holding its renewable read lease.
+        deps.runner.parent_attested_source_uris = _parent_attested_source_uris(job, graph)
         external_cancel = (lambda: os.path.exists(cancel_file)) if cancel_file else None
         # deps parity with the warm kernel's _ensure_deps: install the canvas's declared pip deps and let
         # the sandbox import EXACTLY them (and put the deps dir on THIS process's sys.path). A fresh child
@@ -85,9 +274,9 @@ def main() -> int:
                                              node_builders=deps.node_builders, node_specs=deps.node_specs,
                                              pushdown=True, output_node=job.get("target"))
                         rel = eng.relation(job.get("target"))
-                        adapter = deps.resolve_adapter(mat_uri)
-                        deps.runner._adapter_write(adapter, mat_uri, rel, "overwrite",
-                                                   _CancelToken(external_cancel))
+                        rows = _materialize_region(
+                            deps, rel, mat_uri, _CancelToken(external_cancel), external_cancel,
+                            job.get("runId") or "child")
                     finally:
                         monitor_done.set()
             except Exception:
@@ -96,7 +285,8 @@ def main() -> int:
                                                 "rows_processed": 0, "ms": 0, "placement": "local"})
                     return 1
                 raise
-            _atomic_write(status_file, {"run_id": "child", "status": "done", "per_node": [], "rows_processed": 0,
+            _atomic_write(status_file, {"run_id": "child", "status": "done", "per_node": [],
+                                        "rows_processed": rows, "total_rows": rows,
                                         "ms": 0, "placement": "local", "output_uri": mat_uri})
             return 0
         plan = compiler.compile_plan(graph, job.get("target"), deps.registry, deps.node_specs, deps.node_ir)
@@ -106,7 +296,9 @@ def main() -> int:
             return 1
         # Read the parent's request directly at every LocalRunner/adapter fence; the polling loop below
         # additionally calls cancel() to interrupt an in-flight DuckDB cursor.
-        st = deps.runner.run(plan, graph, job.get("target"), "local", cancel_check=external_cancel)
+        st = deps.runner.run(
+            plan, graph, job.get("target"), "local",
+            run_id=job.get("runId"), cancel_check=external_cancel)
         rid = st.run_id
         cancel_requested = False
         while True:

@@ -176,7 +176,22 @@ def _sized(rows: int | None, conf: str, width: int, blocking: bool = False) -> S
 
 
 def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
-                   schemas: dict | None = None, actuals: dict[str, int | None] | None = None) -> dict[str, SizeEst]:
+                   schemas: dict | None = None, actuals: dict[str, int | None] | None = None,
+                   storage=None) -> dict[str, SizeEst]:
+    """Fence managed sources for the entire fingerprint/count estimation pass."""
+    import uuid
+    from hub.storage import source_read_scope
+
+    with source_read_scope(
+            storage, g.execution_source_uris(graph, target),
+            owner=f"estimate:{uuid.uuid4().hex}"):
+        return _estimate_sizes_unfenced(
+            graph, resolve_adapter, target=target, schemas=schemas, actuals=actuals)
+
+
+def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | None = None,
+                             schemas: dict | None = None,
+                             actuals: dict[str, int | None] | None = None) -> dict[str, SizeEst]:
     """Estimate node output sizes in topological order. `target` restricts the pass to that node's
     upstream cone (bounds how many sources we count); None estimates the whole graph (for the UI hint).
     `schemas` (node_id -> column list, e.g. from executors.schema.schema_for_graph) sharpens the byte

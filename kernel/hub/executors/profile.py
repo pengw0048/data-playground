@@ -12,6 +12,7 @@ can say so. This also profiles nodes a sampled profile refuses (aggregate/sql th
 from __future__ import annotations
 
 import os
+import uuid
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -20,6 +21,7 @@ from hub import db, graph as g
 from hub.executors.engine import BuildEngine, NotPreviewable, _dedupe_names
 from hub.executors.preview import _CODE_CELL_KINDS, PREVIEW_BUDGET_S, PREVIEW_SCAN
 from hub.models import ColumnProfile, Graph, ProfileResult
+from hub.storage import ManagedSourceReadError
 from hub.plugins.adapters import display_type
 from hub.sandbox import run_with_timeout
 
@@ -104,7 +106,8 @@ def _full_stats(engine: BuildEngine, node_id: str) -> ProfileResult:
 
 
 def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
-                 node_builders=None, node_specs=None, cache=None, full: bool = False) -> ProfileResult:
+                 node_builders=None, node_specs=None, cache=None, full: bool = False,
+                 storage=None) -> ProfileResult:
     if not g.is_acyclic(graph):
         return ProfileResult(error=True, reason="graph has a cycle — control flow must be encapsulated")
     if node_specs:
@@ -124,13 +127,18 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
         # forever (P0-EXEC-02). Mirrors the sampled path: scope opened on the WORKER thread (thread-local
         # cursor), on_timeout interrupts it. It profiles reducing nodes (aggregate/sql) a sample refuses.
         eng = BuildEngine(graph, resolve_adapter, registry, sample_k=None, full=True,
-                          node_builders=node_builders, node_specs=node_specs, warm=cache, warm_scope="full")
+                          node_builders=node_builders, node_specs=node_specs, warm=cache,
+                          warm_scope="full")
         holder: dict = {}
 
         def work() -> ProfileResult:
-            with db.run_scope() as scope:
-                holder["scope"] = scope
-                return _full_stats(eng, node_id)
+            from hub.storage import source_read_scope
+            with source_read_scope(
+                    storage, g.all_upstream_source_uris(graph, node_id),
+                    owner=f"profile:{uuid.uuid4().hex}"):
+                with db.run_scope() as scope:
+                    holder["scope"] = scope
+                    return _full_stats(eng, node_id)
 
         def on_timeout() -> None:
             sc = holder.get("scope")
@@ -138,6 +146,8 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
 
         try:
             return run_with_timeout(work, PROFILE_FULL_BUDGET_S, on_timeout=on_timeout)
+        except ManagedSourceReadError as e:
+            return ProfileResult(error=True, reason=str(e))
         except NotPreviewable as e:
             return ProfileResult(not_previewable=True, reason=e.reason)
         except Exception as e:  # noqa: BLE001
@@ -149,17 +159,21 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
     holder: dict = {}
 
     def work() -> ProfileResult:
-        with db.run_scope() as scope:
-            holder["scope"] = scope
-            tbl = engine.relation(node_id).limit(PROFILE_ROWS).to_arrow_table()
-            names = _dedupe_names(tbl.column_names)
-            if names != tbl.column_names:
-                tbl = tbl.rename_columns(names)
-            n = tbl.num_rows
-            cols = [ColumnProfile(name=f.name, type=display_type(str(f.type)),
-                                  **_stat(tbl.column(f.name), n, f.type))
-                    for f in tbl.schema]
-            return ProfileResult(columns=cols, row_count=n, sampled=True)
+        from hub.storage import source_read_scope
+        with source_read_scope(
+                storage, g.all_upstream_source_uris(graph, node_id),
+                owner=f"profile:{uuid.uuid4().hex}"):
+            with db.run_scope() as scope:
+                holder["scope"] = scope
+                tbl = engine.relation(node_id).limit(PROFILE_ROWS).to_arrow_table()
+                names = _dedupe_names(tbl.column_names)
+                if names != tbl.column_names:
+                    tbl = tbl.rename_columns(names)
+                n = tbl.num_rows
+                cols = [ColumnProfile(name=f.name, type=display_type(str(f.type)),
+                                      **_stat(tbl.column(f.name), n, f.type))
+                        for f in tbl.schema]
+                return ProfileResult(columns=cols, row_count=n, sampled=True)
 
     def on_timeout() -> None:
         sc = holder.get("scope")
@@ -167,6 +181,8 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
 
     try:
         return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
+    except ManagedSourceReadError as e:
+        return ProfileResult(error=True, reason=str(e))
     except NotPreviewable as e:
         return ProfileResult(not_previewable=True, reason=e.reason)
     except Exception as e:  # noqa: BLE001

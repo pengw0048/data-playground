@@ -15,6 +15,10 @@ process (real cross-worker placement, GPU isolation) is Phase C3 — the region 
 from __future__ import annotations
 
 import concurrent.futures as cf
+import contextlib
+import hashlib
+import json
+import logging
 import os
 import threading
 import time
@@ -25,6 +29,7 @@ from hub import graph as g
 from hub import planner
 from hub.executors.engine import BuildEngine
 from hub.models import (Graph, GraphEdge, GraphEdgeData, GraphNode, PerNodeStatus, Position, RunStatus)
+from hub.storage import ManagedSourceReadError
 
 
 def _region_concurrency() -> int:
@@ -33,6 +38,33 @@ def _region_concurrency() -> int:
         return max(1, int(os.environ.get("DP_REGION_CONCURRENCY", "4")))
     except ValueError:
         return 4
+
+
+def _region_internal_id_base(kind: str, *identity) -> str:
+    """A deterministic opaque ID base for one controller-generated graph element."""
+    payload = json.dumps([kind, *identity], ensure_ascii=False, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    return f"__dp_region_{kind}_{digest}"
+
+
+def _reserve_region_internal_id(base: str, occupied: set[str]) -> str:
+    """Reserve ``base`` or its first deterministic suffix outside every client/generated ID."""
+    candidate = base
+    suffix = 1
+    while candidate in occupied:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    occupied.add(candidate)
+    return candidate
+
+
+class _RegionMaterialization(str):
+    """A region URI plus the temporary cache owner protecting it for the consuming run."""
+
+    def __new__(cls, uri: str, cache_pin=None):
+        value = super().__new__(cls, uri)
+        value.cache_pin = cache_pin
+        return value
 
 
 class RunController:
@@ -47,7 +79,8 @@ class RunController:
         self.on_status = None
         self.on_complete = None
         self.runs: dict[str, RunStatus] = {}
-        self._cancel: dict[str, threading.Event] = {}
+        self._cancel: dict[str, threading.Event] = {}  # user intent only
+        self._stop: dict[str, threading.Event] = {}    # user cancel OR sibling-failure execution stop
         self._sub: dict[str, dict] = {}  # overall run_id -> {sub_run_id: backend} for ALL concurrent sub-runs
         self._lock = threading.Lock()
 
@@ -70,10 +103,17 @@ class RunController:
             try:
                 from hub.executors.schema import schema_for_graph
                 schemas = schema_for_graph(graph, self.deps.resolve_adapter, self.deps.registry,
-                                           self.deps.node_builders, self.deps.node_specs)
+                                           self.deps.node_builders, self.deps.node_specs,
+                                           storage=self.deps.storage)
+            except ManagedSourceReadError:
+                raise
             except Exception:  # noqa: BLE001
                 schemas = None
-            sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target, schemas=schemas)  # once — reused by plan()
+            sizes = est_mod.estimate_sizes(
+                graph, self.deps.resolve_adapter, target=target, schemas=schemas,
+                storage=self.deps.storage)  # once — reused by plan()
+        except ManagedSourceReadError:
+            raise
         except Exception:  # noqa: BLE001
             sizes = {}
 
@@ -187,7 +227,10 @@ class RunController:
         from hub.models import ResourceSpec
         if sizes is None:  # reuse a caller-computed estimate (plan_summary) to avoid a second source-count pass
             try:
-                sizes = est_mod.estimate_sizes(graph, self.deps.resolve_adapter, target=target)
+                sizes = est_mod.estimate_sizes(
+                    graph, self.deps.resolve_adapter, target=target, storage=self.deps.storage)
+            except ManagedSourceReadError:
+                raise
             except Exception:  # noqa: BLE001 — placement is best-effort; a bad estimate must not block the run
                 return {}
         from hub import placement
@@ -239,6 +282,7 @@ class RunController:
         with self._lock:
             self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()
+            self._stop[run_id] = threading.Event()
             self._evict()
         self._emit(graph, status)
         threading.Thread(target=self._orchestrate, args=(run_id, graph, target, regions, uid), daemon=True).start()
@@ -257,16 +301,22 @@ class RunController:
                 break  # everything retained is still in-flight — exceed the cap rather than drop a live run
             self.runs.pop(victim, None)
             self._cancel.pop(victim, None)
+            self._stop.pop(victim, None)
             self._sub.pop(victim, None)
 
     def _orchestrate(self, run_id: str, graph: Graph, target: str, regions, uid: str | None = None) -> None:
         status = self.runs[run_id]
         cancel = self._cancel[run_id]
+        stop = self._stop.setdefault(run_id, threading.Event())
+        if cancel.is_set():
+            stop.set()
         status.status = "running"
         self._emit(graph, status)
         started = time.time()
         ref_uri: dict[str, str] = {}
         ref_lock = threading.Lock()
+        region_cache_pins: list = []
+        failure: Exception | None = None
         from hub.plugins.runner import _step_progress
         try:
             # Materialize the INTERMEDIATE regions concurrently, respecting the region DAG: a region is
@@ -283,40 +333,80 @@ class RunController:
             pending = list(intermediates)
             cap = max(1, min(len(pending) or 1, _region_concurrency()))
             inflight: dict = {}
-            # explicit executor lifecycle (not `with`): on a region failure we shutdown(wait=False,
-            # cancel_futures=True) so a fast failure isn't delayed by the slowest still-running sibling
-            # (the `with`'s __exit__ would join them). A failure sets the local flag, not the cancel event
-            # (the outer except uses cancel.is_set() to distinguish cancel from failure).
+            # Explicit lifecycle (not `with`) lets us publish a nonterminal stalled reconciliation state
+            # before waiting for every sibling writer to acknowledge stop.
             ex = cf.ThreadPoolExecutor(max_workers=cap, thread_name_prefix="dp-region")
             try:
-                while (pending or inflight) and not cancel.is_set():
-                    for r in [r for r in pending if _region_deps(r) <= done_nodes]:
-                        pending.remove(r)
-                        self._mark(status, r, "running")  # status mutated only on THIS thread
-                        with ref_lock:
-                            snap = dict(ref_uri)  # a per-region snapshot → _materialize reads never race a write
-                        inflight[ex.submit(self._materialize, run_id, graph, r, snap, regions, uid)] = r
-                    if not inflight:
-                        break  # nothing ready and nothing running → an unsatisfiable dep (defensive; topo rules it out)
-                    for fut in cf.wait(list(inflight), return_when=cf.FIRST_COMPLETED).done:
-                        r = inflight.pop(fut)
-                        uri = fut.result()  # a region failure raises → finally aborts the pool, outer except fails the run
-                        with ref_lock:
-                            ref_uri[r.output_node] = uri
-                        done_nodes.add(r.output_node)
-                        self._mark(status, r, "done")
-                        status.progress = _step_progress(status)
+                try:
+                    while (pending or inflight) and not stop.is_set():
+                        for r in [r for r in pending if _region_deps(r) <= done_nodes]:
+                            pending.remove(r)
+                            self._mark(status, r, "running")  # status mutated only on THIS thread
+                            with ref_lock:
+                                snap = dict(ref_uri)  # per-region snapshot; no concurrent dict read/write
+                            future = ex.submit(
+                                self._materialize, run_id, graph, r, snap, regions, uid)
+                            inflight[future] = r
+                        if not inflight:
+                            break  # unsatisfiable dependency (defensive; topo planning rules it out)
+                        for fut in cf.wait(
+                                list(inflight), return_when=cf.FIRST_COMPLETED).done:
+                            r = inflight.pop(fut)
+                            materialized = fut.result()
+                            uri = str(materialized)
+                            pin = getattr(materialized, "cache_pin", None)
+                            if pin is not None:
+                                try:
+                                    pin.check()
+                                except Exception:
+                                    self._close_region_pin(pin)
+                                    raise
+                                region_cache_pins.append(pin)
+                            with ref_lock:
+                                ref_uri[r.output_node] = uri
+                            done_nodes.add(r.output_node)
+                            self._mark(status, r, "done")
+                            status.progress = _step_progress(status)
+                            self._emit(graph, status)
+                except Exception as exc:  # a failed region must stop every still-live sibling first
+                    self._signal_execution_stop(run_id)
+                    if not cancel.is_set():
+                        failure = exc
+                        status.status = "running"
+                        status.stalled = True
+                        status.error = "region failure is waiting for sibling stop acknowledgement"
                         self._emit(graph, status)
             finally:
-                # A cancellation's terminal state is an acknowledgement: wait for already-running region
-                # tasks to unwind after their sub-runs were cancelled. Failures retain the fast wait=False
-                # path; the CLI has its own bounded acknowledgement deadline if a remote backend ignores stop.
-                ex.shutdown(wait=cancel.is_set(), cancel_futures=True)
+                # Futures left in this map were never consumed by the scheduler (a sibling failed or the
+                # overall run was cancelled). If one finishes after this thread moves on, release the
+                # result-reader owner it acquired rather than waiting for lease expiry.
+                def _release_unconsumed(future) -> None:
+                    try:
+                        result = future.result()
+                        pin = getattr(result, "cache_pin", None)
+                        if pin is not None:
+                            self._close_region_pin(pin)
+                    except Exception:  # noqa: BLE001 — a failed future owns no returned cache pin
+                        pass
+
+                for future in inflight:
+                    future.add_done_callback(_release_unconsumed)
+                # User cancellation and sibling failure share the execution-stop signal, but not outcome
+                # semantics. In both cases terminal publication waits until local futures unwind and every
+                # backend _await observes a truthful stop acknowledgement. If one never does, this thread
+                # remains here and the durable status stays running+stalled with tracking intact.
+                ex.shutdown(wait=stop.is_set(), cancel_futures=True)
+            if failure is not None:
+                status.stalled = False
+                raise failure
             if cancel.is_set():
+                status.stalled = False
                 status.status = "cancelled"
                 return
             # the FINAL (target) region, now that every upstream region it reads is materialized
             region = final_region
+            for pin in region_cache_pins:
+                pin.check()
             self._mark(status, region, "running")
             sub = self._run_final(run_id, graph, region, ref_uri, uid)
             status.output_uri, status.output_table = sub.output_uri, sub.output_table
@@ -339,10 +429,20 @@ class RunController:
             status.ms = int((time.time() - started) * 1000)
             status.status = "done"
         except Exception as e:  # noqa: BLE001
-            status.status = "cancelled" if cancel.is_set() else "failed"
+            # Once a region has failed, a later user cancel may re-send stop requests but must not erase
+            # the primary outcome. Before a failure is observed, user intent still settles as cancelled.
+            status.status = "failed" if failure is not None else (
+                "cancelled" if cancel.is_set() else "failed")
+            status.stalled = False
             if status.status == "failed":
                 status.error = f"{type(e).__name__}: {e}"
+            else:
+                status.error = None
         finally:
+            # Cache refs protect intermediate managed attempts from a concurrent same-hash replacement
+            # until the consuming final region has stopped. Release only after _run_final returns/fails.
+            for pin in reversed(region_cache_pins):
+                self._close_region_pin(pin)
             if status.status in ("failed", "cancelled"):  # don't leave earlier/other regions stuck
                 for p in status.per_node:
                     if p.status != "done":
@@ -352,6 +452,7 @@ class RunController:
             self._emit(graph, status)
             with self._lock:
                 self._cancel.pop(run_id, None)
+                self._stop.pop(run_id, None)
                 self._sub.pop(run_id, None)
             if self.on_complete:
                 try:
@@ -365,10 +466,18 @@ class RunController:
         Stable/legacy handoffs keep the runner's ordinary existence contract. This scopes the manifest
         requirement to immutable attempt prefixes, so other placed backends remain compatible.
         """
-        from hub.handoff import is_attempt_uri, read_manifest, validate_shards
+        from hub.handoff import (is_attempt_uri, managed_read_lease, prepare_attempt_commit,
+                                 read_manifest, validate_shards)
         if is_attempt_uri(uri):
-            manifest = read_manifest(uri)
-            if manifest is None or not validate_shards(uri, manifest):
+            try:
+                prepare_attempt_commit(uri)
+                with managed_read_lease(
+                        uri, owner="region-validation", allow_committed=True):
+                    manifest = read_manifest(uri)
+                    if manifest is None or not validate_shards(uri, manifest):
+                        return False
+                    return self.base._output_exists(uri)
+            except (FileNotFoundError, RuntimeError):
                 return False
         return self.base._output_exists(uri)
 
@@ -406,10 +515,32 @@ class RunController:
         with self._lock:
             self._sub.get(run_id, {}).pop(sub_id, None)
 
+    def _signal_execution_stop(self, run_id: str) -> None:
+        """Stop every execution owned by a logical run without deciding its terminal outcome.
+
+        User cancellation and sibling failure both use this signal. The former sets ``_cancel`` first;
+        the latter deliberately does not, so a primary region failure remains ``failed`` after every
+        sibling has acknowledged stop. Snapshot under the controller lock, but never call a backend
+        while holding it: a backend may synchronously complete and untrack its sub-run from another
+        thread.
+        """
+        with self._lock:
+            stop = self._stop.setdefault(run_id, threading.Event())
+            stop.set()
+            subs = list(self._sub.get(run_id, {}).items())
+        for sub_id, backend in subs:
+            try:
+                backend.cancel(sub_id)
+            except Exception:  # noqa: BLE001 — _await keeps polling/retrying until stop is proven
+                logging.getLogger("hub").exception(
+                    "region backend stop request failed; awaiting terminal acknowledgement")
+
     def _await(self, backend, sub_id: str, cancel_run: str | None = None) -> RunStatus:
-        # capture the cancel Event ONCE (don't subscript self._cancel each poll): a sibling region's
-        # failure can pop self._cancel[cancel_run] while this orphaned poll is still running → KeyError.
-        ev = self._cancel.get(cancel_run) if cancel_run else None
+        # Capture the execution-stop Event ONCE (don't subscript a tracking dict each poll). It covers
+        # both user cancellation and sibling-failure reconciliation, while _cancel remains user intent
+        # only and therefore cannot accidentally turn a genuine region failure into "cancelled".
+        ev = ((self._stop.get(cancel_run) or self._cancel.get(cancel_run))
+              if cancel_run else None)
         cancel_sent = False
         from hub.backends import stop_acknowledged
         while True:
@@ -417,8 +548,13 @@ class RunController:
             if stop_acknowledged(backend, s):
                 return s
             if ev is not None and ev.is_set() and not cancel_sent:
-                backend.cancel(sub_id)
-                cancel_sent = True
+                try:
+                    backend.cancel(sub_id)
+                except Exception:  # noqa: BLE001 — a request error is not proof the worker stopped
+                    logging.getLogger("hub").exception(
+                        "region backend stop request failed; awaiting terminal acknowledgement")
+                else:
+                    cancel_sent = True
             time.sleep(0.1)
 
     def _boundary_tier(self, region, regions):
@@ -433,30 +569,283 @@ class RunController:
                 reach.append(tier_mod.backend_reach(self._backend_runner(rc), rc.backend == "default"))
         return tier_mod.pick_tier(tier_mod.tiers(self.deps.workspace), reach)
 
-    def _move_tier(self, src_uri: str, dst_uri: str, dst_tier, cancel) -> None:
+    @staticmethod
+    def _region_pin_ttl() -> float:
+        """Keep a cache-reader owner beyond the longest configured run deadline."""
+        try:
+            deadline = float(os.environ.get("DP_RUN_DEADLINE_S", "3600"))
+        except ValueError:
+            deadline = 3600.0
+        return max(300.0, deadline + 300.0)
+
+    @staticmethod
+    def _close_region_pin(pin) -> None:
+        if pin is not None:
+            try:
+                pin.close()
+            except Exception:  # noqa: BLE001 — a stale cache hit is safe to ignore
+                logging.getLogger("hub").exception(
+                    "region result-cache pin cleanup failed")
+
+    @contextlib.contextmanager
+    def _region_source_lease_scope(self, graph: Graph, target: str, *,
+                                   run_id: str, region_id: str):
+        """Pin every exact source generation while this parent-owned region actually reads it."""
+        from hub.handoff import managed_read_lease
+        from hub.storage import (
+            local_result_read_scope,
+            preflight_managed_execution_sources,
+        )
+
+        stack = contextlib.ExitStack()
+        guards = []
+        try:
+            try:
+                uris = preflight_managed_execution_sources(
+                    self.deps.storage,
+                    g.all_upstream_source_uris(graph, target),
+                )
+                local_guards = stack.enter_context(local_result_read_scope(
+                    self.deps.storage, uris,
+                    owner=f"region-source:{run_id}:{region_id}"))
+                guards.extend(local_guards)
+                classify_local = getattr(
+                    self.deps.storage, "requires_result_read", None)
+                for uri in uris:
+                    if callable(classify_local) and classify_local(uri):
+                        continue
+                    guards.append(stack.enter_context(managed_read_lease(
+                        uri, owner=f"region-source:{run_id}:{region_id}",
+                        ttl_seconds=self._region_pin_ttl())))
+            except Exception:  # noqa: BLE001 — ownership details remain in server logs
+                logging.getLogger("hub").exception(
+                    "region source ownership lease acquisition failed")
+                raise RuntimeError("region source ownership lease unavailable") from None
+            yield guards
+        finally:
+            # A failed release retains a conservative lease until DB expiry. It must not replace a
+            # primary execution error or retroactively invalidate output after the explicit fence below.
+            try:
+                stack.close()
+            except Exception:  # noqa: BLE001
+                logging.getLogger("hub").exception(
+                    "region source ownership lease cleanup failed")
+
+    @staticmethod
+    def _check_region_source_leases(guards) -> None:
+        try:
+            for guard in guards:
+                guard.check()
+        except Exception:  # noqa: BLE001 — fail closed before any cache/pointer publication
+            logging.getLogger("hub").exception(
+                "region source ownership lease was lost during execution")
+            raise RuntimeError("region source ownership lease was lost") from None
+
+    @staticmethod
+    def _assert_region_attempt(uri: str, logical_uri: str, *,
+                               expected_run_id: str | None = None,
+                               allowed_states: tuple[str, ...] = (
+                                   "allocated", "writing", "committed", "published")) -> dict:
+        """Attest a placed backend's returned object against the parent ownership registry."""
+        from hub import metadb
+        from hub.handoff import is_attempt_uri
+        from hub.plugins.adapters import is_object_uri
+
+        normalized = str(uri or "").rstrip("/")
+        logical = str(logical_uri).rstrip("/")
+        if not is_object_uri(normalized) or not is_attempt_uri(normalized):
+            raise RuntimeError("placed backend did not return an exact managed region attempt")
+        return metadb.attest_object_attempt(
+            normalized, logical_uri=logical, kind="region",
+            expected_run_id=expected_run_id,
+            allowed_states=allowed_states,
+        )
+
+    def _allocate_region_attempt(self, *, logical_uri: str, run_id: str,
+                                 region_id: str, cache_key: str) -> str:
+        """Allocate one parent-owned generation before a local producer/copy can write."""
+        handle = None
+        try:
+            from hub.handoff import allocate_attempt, physical_attempt_uri
+            invocation = uuid.uuid4().hex
+            handle = allocate_attempt(
+                logical_uri=logical_uri, kind="region", run_id=run_id,
+                # One writer invocation owns one generation. A concurrent retry of the same logical
+                # run/region must not recover and overwrite a still-live writer's physical prefix.
+                allocation_key=(
+                    f"region-handoff:{run_id}:{region_id}:{cache_key}:{invocation}"),
+                uri_factory=lambda namespace, generation, attempt_id: physical_attempt_uri(
+                    logical_uri, namespace, generation, attempt_id),
+            )
+            self._assert_region_attempt(
+                handle["uri"], logical_uri, expected_run_id=run_id)
+            return handle["uri"]
+        except Exception:  # noqa: BLE001 — provider/DB details stay in server logs
+            if handle is not None:
+                self._abandon_region_attempt(handle["uri"])
+            logging.getLogger("hub").exception(
+                "region object-attempt allocation failed")
+            raise RuntimeError("region object lifecycle allocation failed") from None
+
+    @staticmethod
+    def _abandon_region_attempt(uri: str) -> None:
+        """Terminalize a stopped, unpublished writer without deleting provider objects inline."""
+        from hub import metadb
+        from hub.handoff import discard_attempt
+
+        try:
+            abandoned = metadb.abandon_committed_object_attempt(uri)
+            if abandoned:
+                return
+        except Exception:  # noqa: BLE001 — uncertain ownership must retain provider data
+            logging.getLogger("hub").exception(
+                "committed region object-attempt abandon failed")
+            return
+        discard_attempt(uri)
+
+    def _acquire_region_cache(self, cache_key: str, *, owner: str,
+                              logical_uri: str | None = None) -> _RegionMaterialization | None:
+        """Atomically read and temporarily own one reusable region-cache generation."""
+        # SQLite cannot enforce the cache-row FOR UPDATE lock used by PostgreSQL. A concurrent pointer
+        # replacement can therefore retire the generation observed by one acquire before its follow-up
+        # identity check. Release that stale pin and retry the atomic read; never consume it unowned.
+        for _attempt in range(3):
+            doc, pin = self.base._cache_acquire(
+                cache_key, owner, self._region_pin_ttl())
+            uri = doc.get("uri") if isinstance(doc, dict) else None
+            keep_pin = False
+            if not uri:
+                self._close_region_pin(pin)
+                return None
+            try:
+                if logical_uri is not None:
+                    if pin is None:
+                        return None  # object attempts require the DB-backed result_reader ref
+                    self._assert_region_attempt(
+                        uri, logical_uri, allowed_states=("published",))
+                if not self._region_output_exists(uri):
+                    continue
+                if pin is not None:
+                    pin.check()
+                result = _RegionMaterialization(str(uri), pin)
+                keep_pin = True
+                return result
+            except Exception:  # noqa: BLE001 — retry a concurrently replaced/unattested pointer
+                logging.getLogger("hub").warning(
+                    "region result-cache attestation raced a pointer replacement",
+                    exc_info=True)
+            finally:
+                # Ownership transfers only with the returned wrapper. Every miss releases immediately.
+                if not keep_pin:
+                    self._close_region_pin(pin)
+        return None
+
+    def _publish_region_attempt(self, *, cache_key: str, uri: str, logical_uri: str,
+                                table: str, run_id: str, cancel,
+                                expected_attempt_run_id: str) -> _RegionMaterialization:
+        """Commit inventory, publish the cache owner, then pin the exact current generation."""
+        try:
+            self._assert_region_attempt(
+                uri, logical_uri, expected_run_id=expected_attempt_run_id)
+            from hub.handoff import prepare_attempt_commit
+            prepare_attempt_commit(uri)
+        except Exception:  # noqa: BLE001 — provider/DB details stay in server logs
+            self._abandon_region_attempt(uri)
+            logging.getLogger("hub").exception(
+                "region object-attempt commit preparation failed")
+            raise RuntimeError("region object lifecycle publication failed") from None
+        if cancel.is_set():
+            self._abandon_region_attempt(uri)
+            raise RuntimeError("run cancelled before region publication")
+        try:
+            self.base._cache_put(
+                cache_key, {"uri": uri, "table": table, "rows": None})
+        except Exception:  # noqa: BLE001 — commit outcome may be uncertain after a transport error
+            logging.getLogger("hub").exception(
+                "region result-cache publication reported failure")
+            # A transaction may have committed before its caller observed an error. Read-back plus a
+            # result_reader ref is the durable receipt; never report failure while that owner exists.
+            current = self._acquire_region_cache(
+                cache_key, owner=f"region:{run_id}:{table}", logical_uri=logical_uri)
+            if current is not None:
+                if str(current) != uri:
+                    self._abandon_region_attempt(uri)
+                return current
+            self._abandon_region_attempt(uri)
+            raise RuntimeError("region object lifecycle publication failed") from None
+        current = self._acquire_region_cache(
+            cache_key, owner=f"region:{run_id}:{table}", logical_uri=logical_uri)
+        if current is None:
+            self._abandon_region_attempt(uri)
+            raise RuntimeError("region object lifecycle publication failed") from None
+        # A concurrent same-hash publisher may replace our generation between put and acquire. The
+        # atomically pinned winner is equivalent content and is the only safe URI to consume.
+        if str(current) != uri:
+            self._abandon_region_attempt(uri)
+        return current
+
+    def _move_tier(self, src_uri: str, dst_uri: str, dst_tier, cancel,
+                   run_id: str | None = None) -> None:
         """Copy a materialized region parquet across tiers (cheaper than recomputing). DuckDB streams it;
         httpfs handles an object-store endpoint on either side."""
+        from hub.handoff import is_attempt_uri
         from hub.plugins.adapters import is_object_uri
         with db.run_scope():
             if dst_tier.is_object or is_object_uri(src_uri):
-                db.ensure_object_store()      # register object-store creds for whichever side is s3/gs
+                try:
+                    db.ensure_object_store()  # register credentials for whichever side is s3/gs
+                except Exception:  # noqa: BLE001 — provider details stay in server logs
+                    logging.getLogger("hub").exception(
+                        "region tier-copy object-store setup failed")
+                    raise RuntimeError("region object lifecycle setup failed") from None
             if not dst_tier.is_object:
                 os.makedirs(dst_tier.prefix, exist_ok=True)  # DuckDB won't create a local file's parent dir
             # src may be a single file OR a directory of shards (a worker-direct write) — the adapter's
             # scan handles both (local isdir → dir-scan, object prefix → glob); consolidate into dst.
             rel = self.deps.resolve_adapter(src_uri).scan(src_uri)
-            self.base._adapter_write(self.deps.resolve_adapter(dst_uri), dst_uri, rel, "overwrite", cancel)
+            exact_attempt = is_attempt_uri(dst_uri)
+            write_uri = (dst_uri.rstrip("/") + "/part-00000.parquet"
+                         if exact_attempt else dst_uri)
+            result = self.base._adapter_write(
+                self.deps.resolve_adapter(write_uri), write_uri, rel, "overwrite", cancel)
+            if exact_attempt:
+                if cancel.is_set():
+                    raise RuntimeError("run cancelled before region manifest publication")
+                try:
+                    from hub.handoff import write_manifest
+                    schema = list(zip(rel.columns, (str(t) for t in rel.types)))
+                    write_manifest(
+                        dst_uri, run_id=run_id or f"region-copy-{uuid.uuid4().hex}",
+                        rows=int(result.get("rows") or 0), schema=schema)
+                except Exception:  # noqa: BLE001 — provider details stay in server logs
+                    logging.getLogger("hub").exception(
+                        "region object-attempt manifest write failed")
+                    raise RuntimeError("region object lifecycle manifest failed") from None
 
-    def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], regions=None, uid: str | None = None) -> str:
+    def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str],
+                     regions=None, uid: str | None = None) -> str:
         """Materialize an intermediate region's output to a durable, content-addressed parquet — reused
         across runs when the region's plan hash is unchanged. Runs in-process for a default region, or
         in the target worker's PROCESS for a placed region (C3). The output lands on the tier reachable
         by both producer and consumers (local, or a shared object store for a remote handoff — Phase C)."""
         from hub import tiers as tier_mod
-        cancel = self._cancel.get(run_id) or threading.Event()
+        cancel = (self._stop.get(run_id) or self._cancel.get(run_id)
+                  or threading.Event())
         if cancel.is_set():
             raise RuntimeError("run cancelled before region materialization")
         subg = self._subgraph(graph, region, ref_uri)
+        with self._region_source_lease_scope(
+                subg, region.output_node, run_id=run_id,
+                region_id=region.id) as source_guards:
+            return self._materialize_with_sources(
+                run_id, region, regions, uid, subg, cancel, source_guards)
+
+    def _materialize_with_sources(
+            self, run_id: str, region, regions, uid: str | None,
+            subg: Graph, cancel, source_guards) -> str:
+        """Materialize while the wrapper retains every source fence from hash through publication."""
+        from hub import tiers as tier_mod
+
         key = self.base._plan_hash(subg, region.output_node)
         picked = self._boundary_tier(region, regions or [])
         if picked is None:
@@ -469,59 +858,147 @@ class RunController:
                 "(DP_STORAGE_URL=s3://…) or keep the producing and consuming nodes on one backend.")
         tier = picked
         ckey = f"{key}@{tier.name}"  # tier in the cache key: a local vs object copy are distinct entries
-        cached = self.base._cache_get(ckey)
-        if cached and cached.get("uri") and self._region_output_exists(cached["uri"]):
-            return cached["uri"]  # reuse — the upstream region didn't change (on this tier)
+        logical_uri = tier.uri(f"{region.id}_{key}.parquet")
+        cached = self._acquire_region_cache(
+            ckey, owner=f"region:{run_id}:{region.id}",
+            logical_uri=logical_uri if tier.is_object else None)
+        if cached is not None:
+            return cached  # reuse — pin survives until this run's final region has stopped
         # C3 auto data-movement: a prior run materialized this exact region on ANOTHER tier → COPY it to
         # the tier this run needs (cheaper than recomputing), e.g. a local result now feeding a remote step.
         for other in tier_mod.tiers(self.deps.workspace).values():
             if other.name == tier.name:
                 continue
-            alt = self.base._cache_get(f"{key}@{other.name}")
-            if alt and alt.get("uri") and self._region_output_exists(alt["uri"]):
-                dst = tier.uri(f"{region.id}_{key}.parquet")
-                self._move_tier(alt["uri"], dst, tier, cancel)
-                self.base._cache_put(ckey, {"uri": dst, "table": region.id, "rows": None})
-                return dst
+            other_logical = other.uri(f"{region.id}_{key}.parquet")
+            alt = self._acquire_region_cache(
+                f"{key}@{other.name}", owner=f"region-copy:{run_id}:{region.id}",
+                logical_uri=other_logical if other.is_object else None)
+            if alt is None:
+                continue
+            alt_pin = getattr(alt, "cache_pin", None)
+            try:
+                if cancel.is_set():
+                    raise RuntimeError("run cancelled before region tier copy")
+                if tier.is_object:
+                    dst = self._allocate_region_attempt(
+                        logical_uri=logical_uri, run_id=run_id,
+                        region_id=region.id, cache_key=ckey)
+                    try:
+                        self._move_tier(str(alt), dst, tier, cancel, run_id=run_id)
+                        if alt_pin is not None:
+                            alt_pin.check()
+                        return self._publish_region_attempt(
+                            cache_key=ckey, uri=dst, logical_uri=logical_uri,
+                            table=region.id, run_id=run_id, cancel=cancel,
+                            expected_attempt_run_id=run_id)
+                    except Exception:
+                        self._abandon_region_attempt(dst)  # copy is synchronous; writer has stopped
+                        raise
+                self._move_tier(str(alt), logical_uri, tier, cancel, run_id=run_id)
+                if alt_pin is not None:
+                    alt_pin.check()
+                self.base._cache_put(
+                    ckey, {"uri": logical_uri, "table": region.id, "rows": None})
+                return logical_uri
+            finally:
+                self._close_region_pin(alt_pin)
         if tier.is_object:
-            db.ensure_object_store()
+            try:
+                db.ensure_object_store()
+            except Exception:  # noqa: BLE001 — provider details stay in server logs
+                logging.getLogger("hub").exception(
+                    "region object-store setup failed")
+                raise RuntimeError("region object lifecycle setup failed") from None
         else:
             os.makedirs(tier.prefix, exist_ok=True)
-        out_uri = tier.uri(f"{region.id}_{key}.parquet")
         backend = self._backend_runner(region, uid)
-        result_uri = out_uri
         if backend is self.base:
-            with db.run_scope():
-                eng = BuildEngine(subg, self.deps.resolve_adapter, self.deps.registry, full=True,
-                                     node_builders=self.deps.node_builders, node_specs=self.deps.node_specs,
-                                     pushdown=True, output_node=region.output_node)
-                rel = eng.relation(region.output_node)
-                self.base._adapter_write(self.deps.resolve_adapter(out_uri), out_uri, rel, "overwrite", cancel)
-        else:
-            # a placed backend may write a DIRECTORY of shards (worker-direct parallel write, e.g. Ray
-            # Data) rather than the single file we suggested — honor the uri it actually produced. The
-            # ref-read / _output_exists / _move_tier paths all accept a parts-dir as well as a file.
-            sub = backend.run_unit(subg, region.output_node, out_uri, requires=region.requires)
+            try:
+                result_uri = logical_uri
+                if tier.is_object:
+                    result_uri = self._allocate_region_attempt(
+                        logical_uri=logical_uri, run_id=run_id,
+                        region_id=region.id, cache_key=ckey)
+                with contextlib.nullcontext(source_guards):
+                    with db.run_scope():
+                        eng = BuildEngine(
+                            subg, self.deps.resolve_adapter, self.deps.registry, full=True,
+                            node_builders=self.deps.node_builders, node_specs=self.deps.node_specs,
+                            pushdown=True, output_node=region.output_node)
+                        rel = eng.relation(region.output_node)
+                        write_uri = (result_uri.rstrip("/") + "/part-00000.parquet"
+                                     if tier.is_object else result_uri)
+                        result = self.base._adapter_write(
+                            self.deps.resolve_adapter(write_uri), write_uri,
+                            rel, "overwrite", cancel)
+                        rows = int(result.get("rows") or 0)
+                        schema = list(zip(rel.columns, (str(t) for t in rel.types)))
+                        # The shard write is the point at which lazy source scans have completed. Fence
+                        # every exact source generation before writing a commit manifest or cache pointer.
+                        self._check_region_source_leases(source_guards)
+                if tier.is_object:
+                    if cancel.is_set():
+                        raise RuntimeError("run cancelled before region manifest publication")
+                    try:
+                        from hub.handoff import write_manifest
+                        write_manifest(
+                            result_uri, run_id=run_id, rows=rows, schema=schema)
+                    except Exception:  # noqa: BLE001 — provider details stay in server logs
+                        logging.getLogger("hub").exception(
+                            "region object-attempt manifest write failed")
+                        raise RuntimeError(
+                            "region object lifecycle manifest failed") from None
+                if tier.is_object:
+                    return self._publish_region_attempt(
+                        cache_key=ckey, uri=result_uri, logical_uri=logical_uri,
+                        table=region.id, run_id=run_id, cancel=cancel,
+                        expected_attempt_run_id=run_id)
+                if not self._region_output_exists(result_uri):
+                    raise RuntimeError(
+                        f"region {region.id} on {region.backend} returned an unreadable handoff")
+                self.base._cache_put(
+                    ckey, {"uri": result_uri, "table": region.id, "rows": None})
+                return result_uri
+            except Exception:
+                if tier.is_object and "result_uri" in locals():
+                    self._abandon_region_attempt(result_uri)  # in-process writer has stopped
+                raise
+
+        # A placed backend owns its writer lifecycle. It receives only the stable logical target and must
+        # return one exact, parent-registered region attempt after its worker can no longer mutate it.
+        # The wrapper's parent-owned scope covers plan fingerprinting, cache/tier decisions, dispatch,
+        # worker reaping, and publication. A backend may hold an additional inherited/process fence.
+        with contextlib.nullcontext(source_guards):
+            sub = backend.run_unit(
+                subg, region.output_node, logical_uri, requires=region.requires)
             self._track_sub(run_id, backend, sub.run_id)
             try:
                 s = self._await(backend, sub.run_id, cancel_run=run_id)
             finally:
                 self._untrack_sub(run_id, sub.run_id)
             if s.status != "done":
-                raise RuntimeError(f"region {region.id} on {region.backend} {s.status}: {s.error}")
-            result_uri = s.output_uri or out_uri
+                raise RuntimeError(
+                    f"region {region.id} on {region.backend} {s.status}: {s.error}")
+            if source_guards:
+                self._check_region_source_leases(source_guards)
+        result_uri = s.output_uri or logical_uri
+        if tier.is_object:
+            try:
+                self._assert_region_attempt(
+                    result_uri, logical_uri, expected_run_id=sub.run_id)
+            except Exception:  # noqa: BLE001 — backend/metadata details stay in server logs
+                logging.getLogger("hub").exception(
+                    "placed backend returned an unattested region object attempt")
+                raise RuntimeError("region object lifecycle attestation failed") from None
+            return self._publish_region_attempt(
+                cache_key=ckey, uri=result_uri, logical_uri=logical_uri,
+                table=region.id, run_id=run_id, cancel=cancel,
+                expected_attempt_run_id=sub.run_id)
         if not self._region_output_exists(result_uri):
             raise RuntimeError(
-                f"region {region.id} on {region.backend} returned an unreadable or uncommitted handoff: "
-                f"{result_uri}")
-        self.base._cache_put(ckey, {"uri": result_uri, "table": region.id, "rows": None})
-        if tier.is_object:
-            from hub.handoff import is_attempt_uri
-            if is_attempt_uri(result_uri):
-                published = self.base._cache_get(ckey)
-                if not published or published.get("uri") != result_uri:
-                    raise RuntimeError(
-                        f"region {region.id} committed object data but its cache pointer was not published")
+                f"region {region.id} on {region.backend} returned an unreadable handoff")
+        self.base._cache_put(
+            ckey, {"uri": result_uri, "table": region.id, "rows": None})
         return result_uri
 
     def _run_final(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], uid: str | None = None) -> RunStatus:
@@ -542,27 +1019,45 @@ class RunController:
         # feeds multi-input nodes like join positionally, so a swapped operand order silently corrupts
         # results). A cut input (source outside the region = an upstream materialized region) is replaced
         # IN PLACE by a ref-source reading that region's parquet.
-        nm = g.node_map(graph)
-        nodes = [nm[nid] for nid in region.node_ids if nid in nm]
-        have = {n.id for n in nodes}
+        region_node_ids = set(region.node_ids)
+        # Preserve the original graph order rather than iterating Region.node_ids (a set). Besides making
+        # the serialized subgraph deterministic, this keeps plan/cache hashes stable across processes.
+        region_nodes = [node for node in graph.nodes if node.id in region_node_ids]
+        nodes = list(region_nodes)
         edges: list[GraphEdge] = []
-        for nid in region.node_ids:
-            for e in g.incoming(graph, nid):  # original order, per node
-                if e.source in region.node_ids:
+        publication_sources: dict[str, tuple[str, ...]] = {}
+        ref_nodes: dict[str, str] = {}
+        # Generated node and edge IDs share one namespace that excludes every original ID, including
+        # elements outside this region. A client can occupy any predictable base without taking over a
+        # ref or creating a duplicate; deterministic suffix selection preserves cache identity.
+        occupied_ids = {node.id for node in graph.nodes} | {edge.id for edge in graph.edges}
+        for node in region_nodes:
+            for e in g.incoming(graph, node.id):  # original graph.edges order, per target
+                if e.source in region_node_ids:
                     edges.append(e)  # intra-region edge, unchanged
                 else:  # a cut → read the upstream region's ref at THIS operand position
-                    rid = f"__ref_{e.source}"
-                    if rid not in have:
+                    rid = ref_nodes.get(e.source)
+                    if rid is None:
+                        rid = _reserve_region_internal_id(
+                            _region_internal_id_base("ref", e.source), occupied_ids)
+                        ref_nodes[e.source] = rid
                         nodes.append(GraphNode(id=rid, type="source", position=Position(x=0, y=0),
                                                data={"config": {"uri": ref_uri[e.source]}}))
-                        have.add(rid)
-                    edges.append(GraphEdge(id=f"__e_{rid}_{nid}_{e.target_handle or 'in'}", source=rid,
-                                           target=nid, source_handle=None, target_handle=e.target_handle,
+                        publication_sources[rid] = tuple(
+                            g.all_upstream_publication_uris(graph, e.source))
+                    edge_id = _reserve_region_internal_id(
+                        _region_internal_id_base(
+                            "edge", e.id, e.source, e.source_handle, e.target, e.target_handle),
+                        occupied_ids)
+                    edges.append(GraphEdge(id=edge_id, source=rid,
+                                           target=node.id, source_handle=None, target_handle=e.target_handle,
                                            data=GraphEdgeData()))
         # carry the canvas's requirements so a region's cache key reflects a package-version edit
         # (a transform in a locally-run region can import them) — plan_hash folds them (P0-CACHE-01).
-        return Graph(id="_region", version=1, nodes=nodes, edges=edges,
-                     requirements=getattr(graph, "requirements", None) or [])
+        subgraph = Graph(id="_region", version=1, nodes=nodes, edges=edges,
+                         requirements=getattr(graph, "requirements", None) or [])
+        subgraph._publication_source_uris = publication_sources
+        return subgraph
 
     # -- status / cancel (a logical run, keyed by the overall run_id) ------- #
     def _mark(self, status: RunStatus, region, state: str) -> None:
@@ -583,14 +1078,8 @@ class RunController:
     def cancel(self, run_id: str) -> RunStatus:
         ev = self._cancel.get(run_id)
         if ev:
-            ev.set()  # every in-flight region's _await sees this (captured once) and cancels its own sub too
-        with self._lock:
-            subs = list(self._sub.get(run_id, {}).items())  # snapshot: ALL concurrent sub-runs, not just one
-        for sub_id, backend in subs:  # cancel on the backend that OWNS each in-flight region (pool/Ray, not base)
-            try:
-                backend.cancel(sub_id)
-            except Exception:  # noqa: BLE001
-                pass
+            ev.set()
+            self._signal_execution_stop(run_id)
         # _orchestrate publishes the terminal state only after all locally-owned sub-runs have acknowledged
         # cancellation. Until then the logical run remains non-terminal, so clients do not mistake a request
         # for completion while a region may still publish.

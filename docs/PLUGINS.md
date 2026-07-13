@@ -12,7 +12,7 @@ passing a `Registry` you use to add things:
 
 ```python
 # examples/plugins/dp_example/__init__.py
-from hub.sdk import NodeSpec, ParamSpec, PortSpec, ctx
+from hub.sdk import NodeSpec, ParamSpec, PortSpec, ctx, identifier, quote_identifier
 
 SPEC = NodeSpec(
     kind="redact", title="redact", category="compute", tag="redact",
@@ -29,9 +29,10 @@ def build(engine, node, inputs):
     if not col:
         return inputs[0]                      # not configured yet → passthrough
     keep = int(cfg.get("keep") or 0)
-    s = f'CAST("{col}" AS VARCHAR)'
-    masked = f"left({s}, {keep}) || repeat('*', greatest(length({s}) - {keep}, 0))"
-    return ctx.sql(inputs[0], f'SELECT * REPLACE ({masked} AS "{col}") FROM {{input}}')
+    column = quote_identifier(identifier(col, inputs[0].columns, label="redact column"))
+    s = f"CAST({column} AS VARCHAR)"
+    masked = f"left({s}, {keep}) || rpad('', CAST(greatest(length({s}) - {keep}, 0) AS INTEGER), '*')"
+    return ctx.sql(inputs[0], f"SELECT * REPLACE ({masked} AS {column}) FROM input")
 
 def register(reg):
     reg.add_node(SPEC, build)
@@ -51,8 +52,8 @@ That's the whole plugin. Two pieces:
 
 `ctx` turns relations into relations without materializing:
 
-- `ctx.sql(rel, "… {input} …")` — run SQL over `rel`, referenced as the placeholder token `{input}`.
-  (Use `{input}`, not a bare name — it can't occur in valid SQL, so it never rewrites a real token.)
+- `ctx.sql(rel, "… FROM input …")` — run one validated `SELECT` over `rel`, referenced by the
+  query-scope CTE `input` (no textual placeholder substitution).
 - `ctx.arrow_map(rel, fn)` — apply a Python `fn(pa.RecordBatch) -> RecordBatch | list[dict]` over
   Arrow batches (the escape hatch when SQL isn't enough).
 - `ctx.polars(rel, fn)` — apply `fn(polars.DataFrame) -> polars.DataFrame`.
@@ -103,6 +104,7 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 | `reg.add_capability(cap)` | a declared column capability (+ optional viewer tab) | `id`+`label`; an OPTIONAL `detect(col)->bool` (present → `tag_columns` tags matching columns with the id, no core edit); and an OPTIONAL `viewer = {"kind": …}` — a declarative viewer TAB the SPA renders with a generic renderer (`grid` = media/image grid, `json` = pretty-printed cell), surfaced via `KernelInfo.capability_views`. So a plugin adds a viewer tab with **no frontend code**. See `kernel/hub/plugins/capabilities.py` + `web/src/nodes/capabilities.tsx`. |
 | `reg.add_processor(proc)` | a reusable transform in the library picker | a `Processor` (`id/title/mode/build(params)`); see `kernel/hub/plugins/processors.py` |
 | `reg.set_catalog(catalog)` | the whole dataset catalog provider | `CatalogProvider` Protocol (`backends.py`, the source of truth): the bounded discovery surface `list_page(CatalogQuery)/facets/browse(prefix)/search(q, mode)/search_modes` + `list_tables/get_table/lineage(uri, depth, max_nodes)/relationships/resolve_ref` + write-back/curation `register/register_output/set_metadata/unregister/set_declared_key/add_relationship/remove_relationship`. **`get_table` MUST raise `KeyError` on a miss.** A provider written against the pre-scale protocol (no `list_page`/`facets`/`browse`/`search`) still works — `reg.set_catalog` wraps it in `CatalogCompat`, which synthesizes those from bounded `list_tables()` calls. A read-only external catalog can subclass `InMemoryCatalog` and override only the reads (as `dp_sql_catalog` does — note it overrides `list_page/facets/browse/search` too, so SQL rows appear while browsing). A catalog that *fully* replaces the built-in — not subclassing `InMemoryCatalog` — won't automatically receive run-completion `register_output` write-backs (runners hold the catalog they were built with), so either subclass `InMemoryCatalog` or forward `register_output` to your store. |
+| `reg.set_managed_object_provider(factory)` | exact lifecycle operations for managed object attempts | `factory(uri) -> ManagedObjectProvider`. The provider must set `complete_inventory=True` and `conditional_namespace_claims=True`, enumerate every visible object and incomplete multipart upload plus every version/delete marker the service exposes under the exact attempt data/commit roots, assign stable member IDs, delete or abort each member by exact identity, and read/conditionally write the namespace ownership marker. Core has a `boto3` implementation for `s3://` (including compatible endpoints that pass this API contract); `r2://`, `gs://`, and other schemes fail closed unless a provider is registered. The same factory may be selected headlessly with `DP_MANAGED_OBJECT_PROVIDER=pkg.module:Provider`. |
 | `reg.add_embedder(fn, model)` | semantic + hybrid catalog search | `fn(list[str]) -> list[list[float]]`. The built-in catalog embeds each dataset's name/folder/description/tags/columns, stores a vector per dataset (`catalog_embeddings`), background-reindexes existing entries, and ranks by cosine (+ RRF fusion for `hybrid`). Core ships **no** model; see `dp_semantic_catalog`. With no embedder, `search` falls back to lexical and `facets.semanticAvailable` stays false (the UI hides its "meaning" toggle). |
 | `reg.set_importer(importer)` | `/pipelines/import` (import a foreign pipeline format) | `Importer` Protocol (`plugins/importer.py`): `name` + `import_pipeline(config, params) -> PipelineImport`. Populate `PipelineImport.graph` with a runnable canvas `Graph` (nodes/edges of built-in or plugin kinds) and the SPA drops it onto a fresh canvas and runs it — this is what makes *import a pipeline → runnable canvas* real. Default is a `NullImporter` (501, honest). The core auto-lays-out an imported graph left unpositioned. |
 | `reg.add_destination(backend)` | a save/open-dialog **"place"** (a browsable/writable location) | `DestinationBackend` Protocol (`destinations.py`): `kind` + `browse(root, path)` (→ `{path, entries:[{name, kind, uri}], error?}`) + `target_uri(root, path, filename)`. Claims a place `kind`; a user adds a preset (backend + root) in Settings → Destinations. Built-in `local`/`s3`/`gs` go through the same registry. |
@@ -111,7 +113,9 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter; runners are picked
 by `pick_runner` (respects the Settings → Execution choice, else the first that `can_run`). **The
 built-ins go through these same seams — the DuckDB/Lance adapters, the InMemoryCatalog, and the local
-runners are just the first implementations registered, not a privileged core path.**
+runners are just the first implementations registered. Managed immutable-attempt publication is the
+exception: lifecycle ownership, catalog pointer/ref swaps, and deletion fences remain core authority;
+an external catalog cannot acquire that authority by exposing a similarly named method.**
 
 A distributed runner that places work on typed workers (GPU / region routing) can additionally implement
 the optional `PlaceableBackend` Protocol (`backends.py`): `workers()` (advertise capacities), `place(requires)`

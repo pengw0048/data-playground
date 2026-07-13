@@ -95,6 +95,9 @@ def preflight_sink(spec: SinkSpec, workspace: str, storage, resolve_adapter,
     # A hub may pass a URI it already resolved from the control-plane destination settings. In that
     # case an isolated driver validates only the adapter contract and never re-reads those settings.
     uri = target_uri if target_uri is not None else spec.target_uri(workspace, storage)
+    guard = getattr(storage, "ensure_output_allowed", None)
+    if callable(guard):
+        guard(uri)
     if not spec.partition_by:
         return uri
     write = resolve_adapter(uri).write
@@ -105,6 +108,14 @@ def preflight_sink(spec: SinkSpec, workspace: str, storage, resolve_adapter,
     if not any(p.name == "partition_by" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
         raise NotImplementedError("the selected adapter does not support partitionBy")
     return uri
+
+
+def expected_sink_uri(spec: SinkSpec, target_uri: str, adapter) -> str:
+    """Published URI implied by the built-in file adapter's shared sink semantics."""
+    core_file_adapter = adapter is None or adapter.__class__.__module__ == "hub.plugins.adapters"
+    if core_file_adapter and (spec.mode == "append" or spec.partition_by):
+        return os.path.splitext(target_uri)[0]
+    return target_uri
 
 
 def commit_sink(spec: SinkSpec, relation, workspace: str, storage, resolve_adapter,

@@ -25,6 +25,7 @@ from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import is_object_uri, path_of, relation_columns
 from hub.plugins.importer import ImporterNotConfigured
 from hub.settings import settings
+from hub.storage import ManagedSourceReadError, source_read_scope
 from hub.models import (
     CatalogBrowse,
     CatalogMetadata,
@@ -318,15 +319,32 @@ def join_suggestions(req: JoinSuggestRequest) -> list[JoinSuggestion]:
     from hub import relationships as rel
     deps = get_deps()
 
-    def cols(uri: str):
+    def resolve(uri: str):
         try:
-            return deps.catalog.get_table(uri).columns
+            table = deps.catalog.get_table(uri)
+            return table.uri, table.columns
         except KeyError:
-            return deps.resolve_adapter(uri).schema(uri)  # not registered → probe directly
+            return uri, None
     try:
-        return rel.suggest_joins(cols(req.left_uri), cols(req.right_uri),
-                                 rel.measured_unique(req.left_uri, deps.resolve_adapter),
-                                 rel.measured_unique(req.right_uri, deps.resolve_adapter))
+        left_uri, left_cols = resolve(req.left_uri)
+        right_uri, right_cols = resolve(req.right_uri)
+        from hub import paths
+        paths.ensure_local_uri_allowed(left_uri)
+        paths.ensure_local_uri_allowed(right_uri)
+        with source_read_scope(
+                deps.storage, [left_uri, right_uri],
+                owner=f"catalog-join:{uuid.uuid4().hex}"):
+            left_cols = (left_cols if left_cols is not None
+                         else deps.resolve_adapter(left_uri).schema(left_uri))
+            right_cols = (right_cols if right_cols is not None
+                          else deps.resolve_adapter(right_uri).schema(right_uri))
+            return rel.suggest_joins(left_cols, right_cols,
+                                     rel.measured_unique(left_uri, deps.resolve_adapter),
+                                     rel.measured_unique(right_uri, deps.resolve_adapter))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except ManagedSourceReadError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"{type(e).__name__}: {e}")
 
@@ -344,7 +362,7 @@ class RegisterRequest(BaseModel):
 @router.post("/catalog/register", response_model=CatalogTable)
 def catalog_register(req: RegisterRequest) -> CatalogTable:
     deps = get_deps()
-    has_scheme = bool(re.match(r"^[a-z][a-z0-9+.-]*://", req.uri))
+    has_scheme = bool(re.match(r"^[a-z][a-z0-9+.-]*://", req.uri, re.I))
     uri = req.uri if has_scheme else os.path.abspath(os.path.expanduser(req.uri))
     name = req.name or os.path.splitext(os.path.basename(uri.rstrip("/")))[0]
     from hub import paths
@@ -353,14 +371,20 @@ def catalog_register(req: RegisterRequest) -> CatalogTable:
     except PermissionError as e:
         raise HTTPException(403, str(e))
     try:
-        deps.resolve_adapter(uri).schema(uri)  # validate readable
+        with source_read_scope(
+                deps.storage, [uri], owner=f"catalog-register:{uuid.uuid4().hex}"):
+            deps.resolve_adapter(uri).schema(uri)  # validate readable
+            # Retain the read guard through the catalog-entry transaction: its durable reference must
+            # commit before the temporary reader disappears and makes the artifact reclaimable.
+            return deps.catalog.register_output(
+                name=name, uri=uri, parents=[], folder=(req.folder or "").strip("/"),
+                tags=req.tags, owner=req.owner, description=req.description)
+    except HTTPException:
+        raise
+    except ManagedSourceReadError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"cannot read '{uri}': {e}")
-    # register_output write-throughs per-row to catalog_entries (metadb) — authoritative + cross-instance;
-    # organization (folder/tags/owner/description) is optional and set here or later via PUT .../metadata.
-    return deps.catalog.register_output(
-        name=name, uri=uri, parents=[], folder=(req.folder or "").strip("/"),
-        tags=req.tags, owner=req.owner, description=req.description)
 
 
 # --------------------------------------------------------------------------- #
@@ -470,28 +494,34 @@ def data_sample(req: SampleRequest) -> SampleResult:
         paths.ensure_local_uri_allowed(req.uri)  # multi-user: don't sample an arbitrary local file
     except PermissionError as e:
         raise HTTPException(403, str(e))
-    # A persisted run-history link can outlive its coarse file retention. Give the UI a stable signal
-    # for that lifecycle state instead of folding it into the same 400 as a malformed query or a
-    # temporary object-store failure. Remote existence remains adapter-owned and retryable.
-    if "://" not in req.uri or req.uri.startswith("file://"):
-        local = path_of(req.uri)
-        if not os.path.exists(local) and not glob.glob(local, recursive=True):
-            raise HTTPException(410, "dataset artifact is missing or expired")
     try:
-        adapter = deps.resolve_adapter(req.uri)
-        with db.run_scope():  # own cursor — a big sample doesn't block other users' runs/previews
-            # Keep the adapter contract unchanged: request a bounded prefix, then page that lazy
-            # relation. Fetch one extra row so `has_more` is exact even when count() is unavailable.
-            rel = adapter.scan(req.uri, req.columns, limit=req.offset + req.k + 1)
-            cols = relation_columns(rel)          # schema is metadata — no second scan needed
-            page = _table_to_rows(rel.limit(req.k + 1, req.offset).to_arrow_table())
-            rows = page[:req.k]
-            total = adapter.count(req.uri)
+        with source_read_scope(
+                deps.storage, [req.uri], owner=f"sample:{uuid.uuid4().hex}"):
+            # Exact reference-aware retention keeps a managed file stable for this whole scope. For an
+            # unmanaged local path, report a stable expired signal before constructing a lazy relation.
+            local = paths.local_path(req.uri)
+            if local is not None:
+                if not os.path.exists(local) and not glob.glob(local, recursive=True):
+                    raise HTTPException(410, "dataset artifact is missing or expired")
+            adapter = deps.resolve_adapter(req.uri)
+            with db.run_scope():  # own cursor — a big sample doesn't block other users' runs/previews
+                # Keep the adapter contract unchanged: request a bounded prefix, then page that lazy
+                # relation. Fetch one extra row so `has_more` is exact even when count() is unavailable.
+                rel = adapter.scan(req.uri, req.columns, limit=req.offset + req.k + 1)
+                cols = relation_columns(rel)          # schema is metadata — no second scan needed
+                page = _table_to_rows(rel.limit(req.k + 1, req.offset).to_arrow_table())
+                rows = page[:req.k]
+                total = adapter.count(req.uri)
+            has_more = len(page) > req.k or (total is not None and total > req.offset + len(rows))
+            result = SampleResult(columns=cols, rows=rows, row_count=total, has_more=has_more,
+                                  truncated=(total is None or total > req.offset + len(rows)))
         with contextlib.suppress(Exception):
             metadb.catalog_bump_usage(req.uri)  # someone looked at this data → popularity signal (best-effort)
-        has_more = len(page) > req.k or (total is not None and total > req.offset + len(rows))
-        return SampleResult(columns=cols, rows=rows, row_count=total, has_more=has_more,
-                            truncated=(total is None or total > req.offset + len(rows)))
+        return result
+    except HTTPException:
+        raise
+    except FileNotFoundError as e:
+        raise HTTPException(410, str(e))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"{type(e).__name__}: {e}")
 

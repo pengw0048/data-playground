@@ -184,6 +184,39 @@ def test_warm_relation_cache_reuses_and_invalidates():
     assert all(row["dbl"] == row["amount"] * 2 for row in r3.rows)
 
 
+def test_warm_relation_cache_hit_crosses_run_scopes_without_rerunning_scan():
+    import pyarrow as pa
+
+    from hub import db
+    from hub.executors.preview import preview_node
+    from hub.models import Graph
+    from hub.relation_cache import RelationCache
+
+    calls = {"scan": 0}
+
+    class Adapter:
+        def fingerprint(self, _uri):
+            return "stable"
+
+        def scan(self, _uri, **_kwargs):
+            calls["scan"] += 1
+            return db.conn().from_arrow(pa.table({"value": [1, 2, 3]}))
+
+    adapter = Adapter()
+    graph = Graph(**{"id": "warm-cross-scope", "version": 1, "nodes": [
+        N("src", "source", {"uri": "mock://warm-cache"}),
+        N("sel", "select", {"select": "value, value * 2 AS doubled"}),
+    ], "edges": [E("src", "sel")]})
+    cache = RelationCache()
+
+    first = preview_node(graph, "sel", 10, lambda _uri: adapter, object(), cache=cache)
+    second = preview_node(graph, "sel", 10, lambda _uri: adapter, object(), cache=cache)
+
+    assert not first.error and not second.error
+    assert first.rows == second.rows
+    assert calls["scan"] == 1, "the second run_scope must hit Arrow cache, not rebuild the source"
+
+
 def test_relation_cache_no_deadlock_and_eviction_safe():
     # regressions: (a) put() of an already-cached key must NOT self-deadlock (it re-entered a non-reentrant
     # lock via get()); (b) a relation handed out by get()/put() must survive a concurrent LRU eviction of
@@ -414,14 +447,14 @@ def test_sql_join_and_window_preview_faithfully(tmp_path):
     assert res["rowCount"] > 0, "sql join previewed two prefixes → 0 matches (the lie); must run full inputs"
 
 
-def test_sql_accepts_input_placeholder_and_aggregate_message_reflects_groupby():
-    # the sql node accepts the documented {input}/{inputN} placeholder (not just the bare CTE name)
+def test_sql_query_scope_cte_and_aggregate_message_reflects_groupby():
+    # the SQL node exposes its source as the real query-scope CTE name `input`
     g = {"id": "c", "version": 1, "nodes": [
         N("s", "source", {"uri": _uri("events")}),
-        N("q", "sql", {"sql": "SELECT event, amount FROM {input} WHERE amount > 0"}),
+        N("q", "sql", {"sql": "SELECT event, amount FROM input WHERE amount > 0"}),
     ], "edges": [E("s", "q")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 5}).json()
-    assert not r["notPreviewable"] and not r.get("error"), r.get("reason")   # {input} resolved, no ParserException
+    assert not r["notPreviewable"] and not r.get("error"), r.get("reason")
     # the aggregate not-previewable reason is conditional on groupBy (was hardcoded 'global aggregate')
     gg = {"id": "c", "version": 1, "nodes": [
         N("s", "source", {"uri": _uri("events")}),
@@ -647,7 +680,7 @@ def test_request_body_and_graph_complexity_limits(monkeypatch):
     # (2) oversized code on a node → 422 (body itself well under the byte cap)
     big = {"id": "c", "version": 1, "nodes": [N("t", "transform", {"code": "x" * (MAX_CODE_LEN + 1)})], "edges": []}
     assert client.post("/api/graph/compile", json={"graph": big}).status_code == 422
-    # (3) a body over the byte cap → 413 from the middleware (header-only check)
+    # (3) a body over the byte cap → 413 from the middleware
     monkeypatch.setattr(settings, "max_body_bytes", 200)
     payload = {"graph": {"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": "x" * 500})], "edges": []}}
     assert client.post("/api/graph/compile", json=payload).status_code == 413
@@ -751,6 +784,7 @@ def test_kernel_liveness_counts_in_process_preview_profile():
 def test_dp_execution_is_the_third_precedence_tier(tmp_path, monkeypatch):
     # precedence: per-user > workspace > DP_EXECUTION > kernel default. With no user/global setting,
     # DP_EXECUTION (settings.execution) is honored — the tier only incidentally covered before.
+    from hub import handoff
     from hub.deps import Deps
     from hub.settings import settings
     monkeypatch.setattr(settings, "execution", "local-out-of-core")
@@ -896,9 +930,10 @@ def test_code_cell_preview_profile_disabled_in_auth_mode(monkeypatch):
     assert pf.not_previewable and "multi-user" in (pf.reason or "")
 
 
-def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch):
+def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch, tmp_path):
     # P0-EXEC-02: a full profile must be deadline-bounded + interruptible, so a huge pure-SQL aggregate
-    # can't pin the warm kernel forever. A ~5e10-row cross join can't finish in 0.5s → it's interrupted.
+    # can't pin the warm kernel forever. A 62.5B-row hashed cross join over the wired input cannot finish in
+    # 0.5s → it is interrupted, without weakening the user-SQL policy to allow range() table functions.
     import time as _t
 
     from hub.deps import get_deps
@@ -907,9 +942,17 @@ def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch):
     from hub.models import Graph
     monkeypatch.setattr(profile_mod, "PROFILE_FULL_BUDGET_S", 0.5)
     d = get_deps()
+    source = str(tmp_path / "profile-deadline.parquet")
+    import duckdb
+    duckdb.connect().execute(
+        f"COPY (SELECT i AS id FROM range(500) t(i)) TO '{source}' (FORMAT PARQUET)"
+    )
     g = Graph(**{"id": "cD", "version": 1, "nodes": [
-        N("s", "source", {"uri": _uri("images")}),
-        N("q", "sql", {"sql": "SELECT r.x FROM input, range(50000000) r(x)"}),
+        N("s", "source", {"uri": source}),
+        N("q", "sql", {"sql": (
+            "SELECT hash(a.id, b.id, c.id, d.id) AS id "
+            "FROM input a, input b, input c, input d"
+        )}),
     ], "edges": [E("s", "q")]})
     t0 = _t.time()
     r = profile_node(g, "q", d.resolve_adapter, d.registry, d.node_builders, d.node_specs, full=True)
@@ -1091,7 +1134,7 @@ def test_plugin_run_applies_lowering(tmp_path):
                     inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
                     params=[])
     deps.node_specs[spec.kind] = spec
-    deps.node_builders[spec.kind] = lambda engine, node, inputs: ctx.sql(inputs[0], "SELECT *, 42 AS c FROM {input}")
+    deps.node_builders[spec.kind] = lambda engine, node, inputs: ctx.sql(inputs[0], "SELECT *, 42 AS c FROM input")
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
         N("p", "const42", {}),
@@ -2216,7 +2259,7 @@ def test_plugin_node_lowering():
                     params=[ParamSpec(name="column", type="string", default="format")])
     def build(engine, node, inputs):
         col = node.data.get("config", {}).get("column", "format")
-        return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM _')
+        return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM input')
     deps.node_specs[spec.kind] = spec
     deps.node_builders[spec.kind] = build
 
@@ -2494,6 +2537,7 @@ def test_local_dataset_path_confined_in_auth_mode(monkeypatch):
     # local paths are confined to the workspace / data dir / DP_DATASET_ROOTS. Open mode = trusted, no confinement.
     import os as _os
     from hub import paths
+    from hub.plugins.adapters import path_of
     from hub.settings import settings
     inside = _os.path.join(settings.data_dir, "some_dataset.parquet")
     monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
@@ -2501,8 +2545,21 @@ def test_local_dataset_path_confined_in_auth_mode(monkeypatch):
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
     paths.ensure_local_uri_allowed(inside)                  # inside a root → allowed
     paths.ensure_local_uri_allowed("s3://bucket/x.parquet")  # object-store → not a local path → allowed
-    with pytest.raises(PermissionError):
-        paths.ensure_local_uri_allowed("/etc/passwd")       # outside every root → rejected
+    for escaped in ("/etc/passwd", "file:///etc/passwd", "FILE:///etc/passwd", "FiLe:///etc/passwd"):
+        with pytest.raises(PermissionError):
+            paths.ensure_local_uri_allowed(escaped)         # scheme case cannot bypass the same root check
+    # urlsplit calls the drive letter a URI scheme; DuckDB calls it a local filename. The shared parser
+    # must follow the executable adapter boundary so Windows cannot skip confinement.
+    monkeypatch.setattr(paths, "allowed_roots", lambda: [_os.path.realpath("/definitely-allowed")])
+    for drive_path in (r"C:\data\secret.csv", "C:/data/secret.csv"):
+        expected_drive = drive_path.replace("/", "\\") if _os.name == "nt" else drive_path
+        assert paths.local_path(drive_path) == expected_drive
+        assert path_of(drive_path) == expected_drive
+        with pytest.raises(PermissionError):
+            paths.ensure_local_uri_allowed(drive_path)
+    win_file_uri = "file:///C:/data/secret.csv"
+    expected = r"C:\data\secret.csv" if _os.name == "nt" else "/C:/data/secret.csv"
+    assert paths.local_path(win_file_uri) == expected
 
 
 def test_canvas_crud_is_per_user():
@@ -2675,9 +2732,19 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
     allow_registration = threading.Event()
 
     class BlockingCatalog:
+        entry = None
+
         def register_output(self, **_kwargs):
             registration_started.set()
             assert allow_registration.wait(timeout=5)
+            self.entry = {
+                "uri": _kwargs["uri"], "name": _kwargs["name"], "version": "v1",
+            }
+            return self.entry
+
+        def get_table(self, uri):
+            assert self.entry is not None and self.entry["uri"] == uri
+            return self.entry
 
     class FinishedProcess:
         returncode = 0
@@ -2690,9 +2757,15 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
         def wait(timeout=None):
             return 0
 
-    runner = SubprocessRunner("test", str(tmp_path), catalog=BlockingCatalog())
+    runner = SubprocessRunner(
+        str(tmp_path / "workspace"), str(tmp_path), catalog=BlockingCatalog())
     run_id = "run_catalog_gate"
     runner.runs[run_id] = RunStatus(run_id=run_id, status="running", per_node=[])
+    runner._sink_contracts[run_id] = {"write": {
+        "logical_uri": str(tmp_path / "result.parquet"),
+        "published_uri": str(tmp_path / "result.parquet"),
+        "name": "result", "parents": [],
+    }}
     status_file = tmp_path / "status.json"
     status_file.write_text(json.dumps(RunStatus(
         run_id="child",
@@ -2919,6 +2992,107 @@ def test_object_store_s3_roundtrip_and_browse(tmp_path):
     finally:
         server.stop()
         metadb.set_setting("objectStore", {}, "global")  # restore the default credential chain for other tests
+
+
+def test_object_store_concurrent_run_scopes_consume_base_published_credentials():
+    import threading
+
+    from hub import db, metadb
+
+    previous = metadb.get_setting("objectStore", "global", default={}) or {}
+    configured = {
+        "endpoint": "http://example.invalid:9443", "region": "us-east-1",
+        "accessKeyId": "scope-key", "secretAccessKey": "scope-secret", "useSsl": False,
+    }
+    try:
+        # Publish an OLD committed secret first. A cursor keeps that version if replacement happens only
+        # after BEGIN, so both run_scope entries must prime the NEW config before taking their snapshots.
+        try:
+            with db.lock():
+                base = db._base_conn()
+                base.execute("INSTALL httpfs")
+                base.execute("LOAD httpfs")
+                base.execute("DROP SECRET IF EXISTS dp_s3")
+                base.execute("DROP SECRET IF EXISTS dp_gcs")
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"httpfs unavailable: {exc}")
+        metadb.set_setting("objectStore", {
+            "endpoint": "https://old.invalid", "region": "us-west-2",
+            "accessKeyId": "old-key", "secretAccessKey": "old-secret", "useSsl": True,
+        }, "global")
+        db._obj_store_loaded = False
+        db._obj_store_secret_config = None
+        db.ensure_object_store()
+        metadb.set_setting("objectStore", configured, "global")
+
+        scopes_ready = threading.Barrier(2)
+        first_published = threading.Event()
+        second_consumed = threading.Event()
+        results = [None, None]
+        errors = [None, None]
+
+        def consume(index: int) -> None:
+            try:
+                with db.run_scope():
+                    local_view = db.unique_view("object_store_scope")
+                    db.conn().execute(f'CREATE TEMP VIEW "{local_view}" AS SELECT {index} AS value')
+                    scopes_ready.wait(timeout=5)
+                    if index == 0:
+                        db.ensure_object_store()
+                        first_published.set()
+                        assert second_consumed.wait(timeout=5)
+                    else:
+                        assert first_published.wait(timeout=5)
+                        db.ensure_object_store()
+                        second_consumed.set()
+                    resolved = db.conn().execute(
+                        "SELECT name FROM which_secret('s3://bucket/key.parquet', 's3')"
+                    ).fetchone()
+                    detail = db.conn().execute(
+                        "SELECT secret_string FROM duckdb_secrets() WHERE name = 'dp_s3'"
+                    ).fetchone()
+                    results[index] = (resolved, detail)
+            except BaseException as exc:  # noqa: BLE001 — preserve thread assertion details
+                errors[index] = exc
+            finally:
+                first_published.set()
+                second_consumed.set()
+
+        threads = [threading.Thread(target=consume, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert not any(thread.is_alive() for thread in threads)
+        assert errors == [None, None]
+        for resolved, detail in results:
+            assert resolved == ("dp_s3",)
+            assert detail and "key_id=scope-key" in detail[0]
+            assert "endpoint=example.invalid:9443" in detail[0]
+    finally:
+        metadb.set_setting("objectStore", previous, "global")
+        db._obj_store_secret_config = None
+        db.ensure_object_store()
+
+
+def test_object_store_credential_fingerprint_tracks_static_aws_env(monkeypatch):
+    from hub import db
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "key-one")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-one")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-one")
+    monkeypatch.setenv("AWS_PROFILE", "profile-one")
+    first = db._object_store_fingerprint({})
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "key-two")
+    assert db._object_store_fingerprint({}) != first
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "key-one")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-two")
+    assert db._object_store_fingerprint({}) != first
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-one")
+    monkeypatch.setenv("AWS_PROFILE", "profile-two")
+    assert db._object_store_fingerprint({}) != first
 
 
 def test_object_store_destination_browse_binds_untrusted_prefix(monkeypatch):
@@ -4570,6 +4744,15 @@ async def _collab_recv(ws) -> dict:  # noqa: ANN001 — websockets client protoc
     return json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
 
 
+async def _expect_ws_policy_close(ws) -> None:  # noqa: ANN001 — protocol varies by websockets version
+    import asyncio
+    from websockets.exceptions import ConnectionClosed
+    with pytest.raises(ConnectionClosed) as closed:
+        await asyncio.wait_for(ws.recv(), timeout=3)
+    assert closed.value.rcvd is not None
+    assert closed.value.rcvd.code == 1008
+
+
 def test_collab_relay_gates_viewer_doc_updates(monkeypatch, live_collab_url):
     # A viewer may watch (presence + peers' edits) but its OWN doc updates must not be relayed.
     import asyncio
@@ -4683,6 +4866,98 @@ def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_
     try:
         asyncio.run(scenario())
     finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_logout_revokes_sender_and_recipient(monkeypatch, live_collab_url):
+    # Real logout bumps the session epoch and fences every already-open socket before either document
+    # direction can leak. This intentionally revokes all of the user's sessions, not just this cookie.
+    import asyncio
+    import httpx
+    import websockets
+    from hub import auth, metadb
+    monkeypatch.setenv("DP_AUTH_SECRET", "ws-revocation-test-secret-not-weak-0123456789")
+    cid, owner_uid, revoked_uid = "cvs_token_revoke", "live_owner_t", "live_editor_t"
+    _provision_private_collab_canvas(cid, owner_uid, revoked_uid)
+    metadb.share_canvas(cid, revoked_uid, "editor")
+    owner_cookie = f"dp_session={auth.sign(owner_uid)}"
+    revoked_token = auth.sign(revoked_uid)
+    revoked_cookie = f"dp_session={revoked_token}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner:
+            async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as writer:
+                async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as reader:
+                    async with httpx.AsyncClient(
+                        base_url=live_collab_url, headers={"Cookie": revoked_cookie},
+                    ) as http:
+                        response = await http.post("/api/auth/logout")
+                    assert response.status_code == 200
+                    assert auth.verify(revoked_token) is None
+
+                    await _collab_send(writer, {
+                        "clientId": "revoked-writer", "type": "yjs", "update": "MUST_NOT_RELAY",
+                    })
+                    await _expect_ws_policy_close(writer)
+                    # The presence-only leave is the next ordered room event, proving the rejected
+                    # document was not delivered before the sender was fenced.
+                    expected_leave = {"type": "leave", "clientId": "revoked-writer"}
+                    assert await _collab_recv(owner) == expected_leave
+                    assert await _collab_recv(reader) == expected_leave
+
+                    await _collab_send(owner, {
+                        "clientId": "owner", "type": "yjs", "update": "MUST_NOT_RECEIVE",
+                    })
+                    await _expect_ws_policy_close(reader)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+@pytest.mark.parametrize("revocation", ["token", "share"])
+def test_run_ws_rechecks_session_and_read_access(monkeypatch, live_collab_url, revocation):
+    # A first status frame is the synchronization barrier: after revocation commits, the next stream
+    # boundary must be a 1008 close, never another row-count/error/output-bearing status payload.
+    import asyncio
+    import websockets
+    from hub import auth, metadb
+    from hub.models import RunStatus
+    monkeypatch.setenv("DP_AUTH_SECRET", "ws-revocation-test-secret-not-weak-0123456789")
+    run_id, cid = f"run_ws_revoke_{revocation}", f"cvs_run_ws_revoke_{revocation}"
+    owner_uid, reader_uid = f"run_owner_{revocation}", f"run_reader_{revocation}"
+    _provision_private_collab_canvas(cid, owner_uid, reader_uid)
+    metadb.share_canvas(cid, reader_uid, "viewer")
+    metadb.save_run_state(
+        run_id, RunStatus(run_id=run_id, status="running", rows_processed=7).model_dump(),
+        canvas_id=cid,
+    )
+    metadb.bind_run_owner(run_id, owner_uid, cid)
+    get_deps().run_index.pop(run_id, None)
+    get_deps().run_owner.pop(run_id, None)
+    reader_token = auth.sign(reader_uid)
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/run/{run_id}"
+        async with websockets.connect(
+                ws_url, additional_headers={"Cookie": f"dp_session={reader_token}"}, proxy=None) as ws:
+            first = await _collab_recv(ws)
+            assert first["runId"] == run_id and first["status"] == "running"
+            if revocation == "token":
+                await asyncio.to_thread(metadb.bump_token_epoch, reader_uid)
+                assert auth.verify(reader_token) is None
+            else:
+                await asyncio.to_thread(metadb.unshare_canvas, cid, reader_uid)
+                assert metadb.canvas_role(cid, reader_uid) is None
+            await _expect_ws_policy_close(ws)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        get_deps().run_index.pop(run_id, None)
+        get_deps().run_owner.pop(run_id, None)
         metadb.delete_canvas_cascade(cid)
 
 
@@ -5585,17 +5860,24 @@ def test_planner_partitions_by_placement():
 def test_run_controller_executes_checkpointed_regions(tmp_path):
     # C2: a `checkpoint` splits the run into two regions; the controller materializes the upstream
     # region, then runs the final region reading its ref — the result matches an unsplit run.
+    import uuid
+
     p = _seq_parquet(tmp_path)  # v = 0..999
+    output_name = f"ckpt_out_{uuid.uuid4().hex}"
     gd = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": p}),
         {"id": "f1", "type": "filter", "position": {"x": 0, "y": 0}, "data": {"config": {"predicate": "v < 500", "checkpoint": True}}},
         N("f2", "filter", {"predicate": "v >= 100"}),
-        N("wr", "write", {"name": "ckpt_out"}),
+        N("wr", "write", {"name": output_name}),
     ], "edges": [E("src", "f1"), E("f1", "f2"), E("f2", "wr")]}
     st = _poll(client.post("/api/run", json={"graph": gd, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
     assert st["status"] == "done", st
-    out = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_ckpt_out").uri, "k": 5}).json()
+    table = get_deps().catalog.get_table(f"tbl_{output_name}")
+    out = client.post("/api/data/sample", json={"uri": table.uri, "k": 5}).json()
     assert out["rowCount"] == 400  # v in [100, 500) → 400 rows, split across two regions
+    edges = get_deps().catalog.lineage(table.uri).edges
+    assert any(edge.parent == p and edge.child == table.uri for edge in edges)
+    assert not any(edge.child == table.uri and "/regions/" in edge.parent for edge in edges)
 
 
 def test_default_region_runs_isolated_when_kernel_is_selected():
@@ -5685,6 +5967,119 @@ def test_subgraph_preserves_join_operand_order():
                     requires=ResourceSpec(), cut_inputs=[("upA", None, "j", "a")])
     sub = ctrl._subgraph(graph, region, {"upA": "/tmp/ref.parquet"})
     assert [e.target_handle for e in gg.incoming(sub, "j")] == ["a", "b"]  # ref 'a' first, intra 'b' second
+
+
+def test_region_ref_ids_are_deterministic_collision_safe_and_reused():
+    from hub import graph as gg
+    from hub.models import Graph, ResourceSpec
+    from hub.planner import Region
+    from hub.run_controller import _region_internal_id_base
+
+    real_source = "s3://raw/real"
+    real_ref = "s3://managed/regions/real"
+    ref_base = _region_internal_id_base("ref", "x")
+    first_edge_base = _region_internal_id_base(
+        "edge", "cut-right", "x", None, "z-right", None)
+    graph = Graph(**{"id": "lineage", "version": 1, "nodes": [
+        N("raw", "source", {"uri": real_source}),
+        N("x", "filter", {"predicate": "id > 0"}),
+        # Client-controlled nodes occupy the old predictable ID, the new SHA-derived ref base, and
+        # the first cut-edge base. None may be mistaken for a controller-owned source or edge.
+        N("__ref_x", "source", {"uri": "s3://attacker/old-id"}),
+        N(ref_base, "source", {"uri": "s3://attacker/ref-base"}),
+        N(first_edge_base, "source", {"uri": "s3://attacker/edge-base"}),
+        # Deliberately non-lexical region-node order: reconstruction must follow graph.nodes, not its set.
+        N("z-right", "filter", {"predicate": "id > 0"}),
+        N("a-left", "filter", {"predicate": "id > 0"}),
+        N("join", "join", {}), N("write", "write", {"name": "out"}),
+    ], "edges": [
+        {"id": "raw-x", "source": "raw", "target": "x"},
+        {"id": "cut-right", "source": "x", "target": "z-right"},
+        {"id": "cut-left", "source": "x", "target": "a-left"},
+        # Incoming join order is intentionally different from region-node order and must be preserved.
+        {"id": "left-join", "source": "a-left", "target": "join", "targetHandle": "a"},
+        {"id": "right-join", "source": "z-right", "target": "join", "targetHandle": "b"},
+        {"id": "join-write", "source": "join", "target": "write"},
+    ]})
+    region = Region(
+        id="final", node_ids={"a-left", "z-right", "join", "write"}, output_node="write",
+        backend="default", worker=None, requires=ResourceSpec(),
+        cut_inputs=[("x", None, "z-right", None), ("x", None, "a-left", None)],
+    )
+    sub = get_deps().controller._subgraph(graph, region, {"x": real_ref})
+    repeated = get_deps().controller._subgraph(graph, region, {"x": real_ref})
+
+    assert sub.model_dump(by_alias=True) == repeated.model_dump(by_alias=True)
+    assert [node.id for node in sub.nodes[:4]] == ["z-right", "a-left", "join", "write"]
+    generated_source = next(
+        node for node in sub.nodes
+        if (node.data.get("config") or {}).get("uri") == real_ref)
+    assert generated_source.id.startswith(ref_base + "_")
+    assert generated_source.id not in {node.id for node in graph.nodes}
+    cut_edges = [edge for edge in sub.edges if edge.target in {"z-right", "a-left"}]
+    assert len(cut_edges) == 2
+    assert {edge.source for edge in cut_edges} == {generated_source.id}
+    assert next(edge for edge in cut_edges if edge.target == "z-right").id.startswith(
+        first_edge_base + "_")
+    assert [edge.target_handle for edge in gg.incoming(sub, "join")] == ["a", "b"]
+    assert gg.execution_source_uris(sub, "write") == [real_ref]
+    assert gg.all_upstream_publication_uris(sub, "write") == [real_source]
+
+    node_ids = [node.id for node in sub.nodes]
+    edge_ids = [edge.id for edge in sub.edges]
+    assert len(node_ids) == len(set(node_ids))
+    assert len(edge_ids) == len(set(edge_ids))
+    assert len(node_ids + edge_ids) == len(set(node_ids + edge_ids))
+    dumped = sub.model_dump(by_alias=True)
+    assert "publicationSourceUris" not in dumped and "_publication_source_uris" not in dumped
+
+    # Neither a top-level private-looking key nor user-controlled node data can forge provenance.
+    forged = Graph.model_validate({
+        "id": "forged", "version": 1,
+        "_publication_source_uris": {"source": ["s3://forged/top-level"]},
+        "nodes": [{"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                   "data": {"publicationSourceUris": ["s3://forged/node"],
+                            "config": {"uri": "s3://real/source"}}}],
+        "edges": [],
+    })
+    assert gg.all_upstream_publication_uris(forged, "source") == ["s3://real/source"]
+
+
+def test_region_publication_lineage_survives_multiple_nested_cuts():
+    from hub import graph as gg
+    from hub.models import Graph, ResourceSpec
+    from hub.planner import Region
+
+    source = "s3://raw/original"
+    graph = Graph(**{"id": "nested-lineage", "version": 1, "nodes": [
+        N("source", "source", {"uri": source}),
+        N("stage-one", "filter", {"predicate": "id > 0"}),
+        N("stage-two", "filter", {"predicate": "id > 1"}),
+        N("write", "write", {"name": "out"}),
+    ], "edges": [
+        E("source", "stage-one"), E("stage-one", "stage-two"), E("stage-two", "write"),
+    ]})
+    middle_region = Region(
+        id="middle", node_ids={"stage-two", "write"}, output_node="write",
+        backend="default", worker=None, requires=ResourceSpec(),
+        cut_inputs=[("stage-one", None, "stage-two", None)],
+    )
+    middle_ref = "s3://managed/regions/middle"
+    middle = get_deps().controller._subgraph(
+        graph, middle_region, {"stage-one": middle_ref})
+    assert gg.execution_source_uris(middle, "write") == [middle_ref]
+    assert gg.all_upstream_publication_uris(middle, "write") == [source]
+
+    final_region = Region(
+        id="final", node_ids={"write"}, output_node="write",
+        backend="default", worker=None, requires=ResourceSpec(),
+        cut_inputs=[("stage-two", None, "write", None)],
+    )
+    final_ref = "s3://managed/regions/final"
+    final = get_deps().controller._subgraph(
+        middle, final_region, {"stage-two": final_ref})
+    assert gg.execution_source_uris(final, "write") == [final_ref]
+    assert gg.all_upstream_publication_uris(final, "write") == [source]
 
 
 def test_controller_refuses_unsafe_splits():
@@ -8242,25 +8637,83 @@ def test_ray_ir_carries_transform_output_schema_for_empty_results():
     )
 
 
-def test_ray_sink_attempt_retention_runs_only_after_catalog_publication(tmp_path, monkeypatch):
+@pytest.fixture
+def ray_catalog_object_store():
+    """A real versioned S3-compatible provider for Ray catalog publication tests."""
+    pytest.importorskip("moto")
+    pytest.importorskip("flask")
+    boto3 = pytest.importorskip("boto3")
+    from moto.server import ThreadedMotoServer
+    from hub import metadb
+
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    previous = metadb.get_setting("objectStore", "global", default={}) or {}
+    try:
+        host, port = server.get_host_and_port()
+        endpoint = f"http://{host}:{port}"
+        client = boto3.client(
+            "s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
+            region_name="us-east-1",
+        )
+        client.create_bucket(Bucket="ray-catalog-lifecycle")
+        client.put_bucket_versioning(
+            Bucket="ray-catalog-lifecycle", VersioningConfiguration={"Status": "Enabled"})
+        metadb.set_setting("objectStore", {
+            "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
+            "secretAccessKey": "s", "useSsl": False,
+        }, "global")
+        yield client
+    finally:
+        metadb.set_setting("objectStore", previous, "global")
+        server.stop()
+
+
+def test_ray_sink_attempt_retention_runs_only_after_catalog_publication(
+        tmp_path, monkeypatch, ray_catalog_object_store):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     from hub import metadb
     from hub.deps import Deps
+    from hub import handoff
     from hub.models import Graph
+    from hub.plugins.adapters import object_fs
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
     mod = _load_dp_ray()
     runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+    class ParquetProbe:
+        def schema(self, _uri):
+            from hub.models import ColumnSchema
+            return [ColumnSchema(name="x", type="VARCHAR")]
+
+        def count(self, _uri):
+            return 1
+
+        def fingerprint(self, _uri):
+            return "ray-publication-test"
+
+    monkeypatch.setattr(runner.catalog, "resolve", lambda _uri: ParquetProbe())
     graph = Graph(**{"id": "sink-gc-order", "version": 1, "nodes": [
         _ray_node("w", "write", {"filename": "out.parquet", "writeMode": "overwrite"}),
     ], "edges": []})
-    logical = "s3://bucket/outputs/out.parquet"
-    first = "s3://bucket/outputs/out.attempt-catalog-first"
-    second = "s3://bucket/outputs/out.attempt-catalog-second"
-    failed = "s3://bucket/outputs/out.attempt-catalog-failed"
+    logical = "s3://ray-catalog-lifecycle/outputs/out.parquet"
+    first = "s3://ray-catalog-lifecycle/outputs/out.attempt-catalog-first"
+    second = "s3://ray-catalog-lifecycle/outputs/out.attempt-catalog-second"
+    failed = "s3://ray-catalog-lifecycle/outputs/out.attempt-catalog-failed"
     for uri, run_id in ((first, "catalog-first"), (second, "catalog-second"),
                         (failed, "catalog-failed")):
-        metadb.claim_object_attempt(uri, logical, "sink", run_id)
+        metadb.allocate_object_attempt(
+            logical_uri=logical, kind="sink", run_id=run_id,
+            allocation_key=f"ray-catalog-{run_id}", catalog_key_base="tbl_out",
+            uri_factory=lambda _namespace, _generation, _attempt_id, uri=uri: uri)
+        fs, path = object_fs(uri)
+        table = pa.table({"x": [run_id]})
+        with fs.open_output_stream(path + "/part-00000.parquet") as stream:
+            pq.write_table(table, stream)
+        handoff.write_manifest(uri, run_id=run_id, rows=1, schema=table.schema)
 
     runner._register_outputs(graph, {"outputs": [
         {"step_id": "w", "name": "out", "uri": first, "logical_uri": logical},
@@ -8269,65 +8722,340 @@ def test_ray_sink_attempt_retention_runs_only_after_catalog_publication(tmp_path
     runner._register_outputs(graph, {"outputs": [
         {"step_id": "w", "name": "out", "uri": second, "logical_uri": logical},
     ]})
-    assert metadb.catalog_get(first) is None
+    assert metadb.catalog_get(first)["uri"] == second
+    with metadb.session() as session:
+        assert session.get(metadb.CatalogEntry, first) is None
     assert metadb.catalog_get(second)["id"] == stable_id
     with metadb.session() as session:
-        assert session.get(metadb.ObjectAttempt, first).state == "retiring"
+        assert session.get(metadb.ObjectAttempt, first).state == "superseded"
         assert session.get(metadb.ObjectAttempt, second).state == "published"
 
-    def fail_register(**_kwargs):
-        raise RuntimeError("catalog unavailable")
-
-    monkeypatch.setattr(runner.catalog, "register_output", fail_register)
-    with pytest.raises(RuntimeError, match="catalog unavailable"):
+    # The writer has finished and the controller has captured exact inventory; only publication fails.
+    handoff.prepare_attempt_commit(failed)
+    monkeypatch.setattr(
+        metadb, "catalog_upsert_entry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("catalog unavailable")),
+    )
+    with pytest.raises(RuntimeError, match="atomically publish"):
         runner._register_outputs(graph, {"outputs": [
             {"step_id": "w", "name": "out", "uri": failed, "logical_uri": logical},
         ]})
     with metadb.session() as session:
-        assert session.get(metadb.ObjectAttempt, failed).state == "writing"
+        assert session.get(metadb.ObjectAttempt, failed).state == "abandoned"
         assert session.get(metadb.ObjectAttempt, second).state == "published"
 
     metadb.catalog_delete_entry(second)
-    metadb.retire_object_attempts([second])
-    for uri in (first, second):
-        metadb.mark_object_attempt_retired(uri)
-        metadb.delete_object_attempt(uri)
-    assert metadb.begin_discard_object_attempt(failed) is True
-    metadb.delete_object_attempt(failed)
+    for uri in (first, second, failed):
+        metadb.quarantine_object_attempt(uri, "test cleanup")
 
 
-def test_ray_sink_swallowed_catalog_persist_failure_does_not_publish(tmp_path, monkeypatch):
+def test_ray_sink_swallowed_catalog_persist_failure_does_not_publish(
+        tmp_path, monkeypatch, ray_catalog_object_store):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     from hub import metadb
     from hub.deps import Deps
+    from hub import handoff
     from hub.models import Graph
+    from hub.plugins.adapters import object_fs
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
     mod = _load_dp_ray()
     runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
+    class ParquetProbe:
+        def schema(self, _uri):
+            from hub.models import ColumnSchema
+            return [ColumnSchema(name="x", type="VARCHAR")]
+
+        def count(self, _uri):
+            return 1
+
+        def fingerprint(self, _uri):
+            return "ray-publication-test"
+
+    monkeypatch.setattr(runner.catalog, "resolve", lambda _uri: ParquetProbe())
     graph = Graph(**{"id": "sink-persist-failure", "version": 1, "nodes": [
         _ray_node("w", "write", {"filename": "out.parquet", "writeMode": "overwrite"}),
     ], "edges": []})
-    attempt = "s3://bucket/outputs/out.attempt-persist-failure"
+    attempt = "s3://ray-catalog-lifecycle/outputs/out.attempt-persist-failure"
     metadb.catalog_delete_entry(attempt)
-    metadb.claim_object_attempt(
-        attempt, "s3://bucket/outputs/out.parquet", "sink", "persist-failure"
-    )
+    metadb.allocate_object_attempt(
+        logical_uri="s3://ray-catalog-lifecycle/outputs/out.parquet", kind="sink",
+        run_id="persist-failure", allocation_key="ray-catalog-persist-failure",
+        catalog_key_base="tbl_out",
+        uri_factory=lambda _namespace, _generation, _attempt_id: attempt)
+    fs, path = object_fs(attempt)
+    table = pa.table({"x": ["persist-failure"]})
+    with fs.open_output_stream(path + "/part-00000.parquet") as stream:
+        pq.write_table(table, stream)
+    handoff.write_manifest(
+        attempt, run_id="persist-failure", rows=1, schema=table.schema)
 
     monkeypatch.setattr(
         metadb, "catalog_upsert_entry",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("database unavailable SECRET_SENTINEL")),
     )
-    with pytest.raises(RuntimeError, match="atomically publish"):
+    with pytest.raises(RuntimeError, match="atomically publish") as raised:
         runner._register_outputs(graph, {"outputs": [{
             "step_id": "w", "name": "out", "uri": attempt,
-            "logical_uri": "s3://bucket/outputs/out.parquet",
+            "logical_uri": "s3://ray-catalog-lifecycle/outputs/out.parquet",
         }]})
+    assert "SECRET_SENTINEL" not in str(raised.value)
     assert metadb.catalog_get(attempt) is None
     with metadb.session() as session:
-        assert session.get(metadb.ObjectAttempt, attempt).state == "writing"
-    assert metadb.begin_discard_object_attempt(attempt) is True
-    metadb.delete_object_attempt(attempt)
+        assert session.get(metadb.ObjectAttempt, attempt).state == "abandoned"
+    metadb.quarantine_object_attempt(attempt, "test cleanup")
+
+
+def test_core_managed_publisher_fails_closed_on_unreadable_output(
+        tmp_path, monkeypatch, ray_catalog_object_store):
+    from hub import handoff, metadb
+    from hub.deps import Deps
+    from hub.plugins.adapters import object_fs
+
+    logical = "s3://ray-catalog-lifecycle/outputs/unreadable.parquet"
+    attempt = "s3://ray-catalog-lifecycle/outputs/unreadable.attempt-probe"
+    metadb.allocate_object_attempt(
+        logical_uri=logical, kind="sink", run_id="unreadable-probe",
+        allocation_key="unreadable-probe", catalog_key_base="tbl_unreadable",
+        uri_factory=lambda _namespace, _generation, _attempt_id: attempt)
+    fs, path = object_fs(attempt)
+    with fs.open_output_stream(path + "/part-00000.parquet") as stream:
+        stream.write(b"not-parquet-but-terminal")
+    handoff.write_manifest(attempt, run_id="unreadable-probe", rows=1, schema="x: string")
+
+    catalog = Deps(str(tmp_path / "ws"), str(tmp_path / "data")).catalog
+
+    class BrokenProbe:
+        def schema(self, _uri):
+            raise RuntimeError("schema unavailable")
+
+        def count(self, _uri):
+            raise RuntimeError("count unavailable")
+
+    monkeypatch.setattr(catalog, "resolve", lambda _uri: BrokenProbe())
+    with pytest.raises(RuntimeError, match="schema/count probe failed"):
+        catalog.publish_managed_output("unreadable", attempt)
+    with metadb.session() as session:
+        assert session.get(metadb.ObjectAttempt, attempt).state == "abandoned"
+    metadb.quarantine_object_attempt(attempt, "test cleanup")
+
+
+@pytest.mark.parametrize(("suffix", "marker_key", "marker_body", "should_commit"), [
+    ("empty", "/", b"", True),
+    ("nonempty", "/", b"not-a-directory-marker", False),
+    ("nested", "/nested/", b"", False),
+])
+def test_managed_attempt_inventory_allows_only_empty_exact_root_marker(
+        tmp_path, ray_catalog_object_store, suffix, marker_key, marker_body, should_commit):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub import handoff, metadb
+    from hub.plugins.adapters import object_fs
+
+    logical = f"s3://ray-catalog-lifecycle/outputs/root-marker-{suffix}.parquet"
+    attempt = f"s3://ray-catalog-lifecycle/outputs/root-marker-{suffix}.attempt-test"
+    metadb.allocate_object_attempt(
+        logical_uri=logical, kind="sink", run_id=f"root-marker-{suffix}",
+        allocation_key=f"root-marker-{suffix}", catalog_key_base=f"tbl_root_marker_{suffix}",
+        uri_factory=lambda _namespace, _generation, _attempt_id: attempt)
+    fs, path = object_fs(attempt)
+    bucket, key = path.split("/", 1)
+    ray_catalog_object_store.put_object(
+        Bucket=bucket, Key=key.rstrip("/") + marker_key, Body=marker_body)
+    table = pa.table({"x": [1]})
+    with fs.open_output_stream(path.rstrip("/") + "/part-00000.parquet") as stream:
+        pq.write_table(table, stream)
+    handoff.write_manifest(
+        attempt, run_id=f"root-marker-{suffix}", rows=1, schema=table.schema)
+
+    if should_commit:
+        handoff.prepare_attempt_commit(attempt)
+        inventory = metadb.object_attempt_inventory(attempt)
+        assert any(item["key"] == path.rstrip("/") + "/" and item["size"] == 0
+                   for item in inventory)
+        with metadb.session() as session:
+            assert session.get(metadb.ObjectAttempt, attempt).state == "committed"
+    else:
+        with pytest.raises(RuntimeError, match="inventory could not be proven"):
+            handoff.prepare_attempt_commit(attempt)
+        with metadb.session() as session:
+            assert session.get(metadb.ObjectAttempt, attempt).state == "quarantined"
+    metadb.quarantine_object_attempt(attempt, "test cleanup")
+
+
+def test_ray_managed_publisher_preflight_rejects_lookalike_custom_catalog(tmp_path, monkeypatch):
+    import inspect
+
+    from hub.deps import Deps
+    from hub.ir import lower_to_ir
+    from hub.models import Graph
+
+    mod = _load_dp_ray()
+    runner = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+
+    class LookalikeCatalog:
+        def publish_managed_output(self, **_kwargs):
+            raise AssertionError("custom publisher must not receive lifecycle authority")
+
+    runner.catalog = LookalikeCatalog()
+    graph = Graph(**{"id": "external-managed-preflight", "version": 1, "nodes": [
+        _ray_node("w", "write", {"filename": "out.parquet", "writeMode": "overwrite"}),
+    ], "edges": []})
+    ir = lower_to_ir(graph, "w", runner.node_specs, runner.deps.node_ir)
+    allocated = []
+    monkeypatch.setattr(mod, "allocate_attempt", lambda **kwargs: allocated.append(kwargs))
+    with pytest.raises(RuntimeError, match="core transactional catalog publisher"):
+        runner._claim_sink_attempts(
+            ir, {"w": "s3://external-managed/outputs/out.parquet"}, "external-preflight")
+    assert allocated == []
+    assert "metadb" not in inspect.getsource(runner._register_outputs)
+
+
+def test_ray_rejects_any_multiple_write_sinks_before_allocation(tmp_path, monkeypatch):
+    from hub.deps import Deps
+    from hub.ir import lower_to_ir
+    from hub.models import Graph
+
+    mod = _load_dp_ray()
+    runner = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    graph = Graph(**{"id": "ray-multi-write", "version": 1, "nodes": [
+        _ray_node("first", "write", {"filename": "first.csv"}),
+        _ray_node("second", "write", {"filename": "second.csv"}),
+    ], "edges": []})
+    ir = lower_to_ir(graph, "second", runner.node_specs, runner.deps.node_ir)
+    allocations = []
+    monkeypatch.setattr(mod, "allocate_attempt", lambda **kwargs: allocations.append(kwargs))
+    with pytest.raises(RuntimeError, match="multiple Ray write sinks"):
+        runner._claim_sink_attempts(
+            ir, {"first": "/tmp/first.csv", "second": "/tmp/second.csv"}, "run")
+    assert allocations == []
+
+
+def test_ray_unmanaged_publication_attests_external_catalog_and_all_join_lineage_across_region_cut(
+        tmp_path):
+    from hub import graph as graph_mod
+    from hub.deps import Deps
+    from hub.models import Graph, ResourceSpec
+    from hub.planner import Region
+
+    runner = _load_dp_ray().RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    source_a = str(tmp_path / "a.parquet")
+    source_b = str(tmp_path / "b.parquet")
+    output = str(tmp_path / "joined.csv")
+    registered = {}
+    readbacks = []
+
+    class Catalog:
+        @staticmethod
+        def register_output(**kwargs):
+            registered.update(kwargs)
+            return {"uri": kwargs["uri"], "name": kwargs["name"], "version": "v1"}
+
+        @staticmethod
+        def get_table(uri):
+            readbacks.append(uri)
+            return {"uri": uri, "name": registered["name"], "version": "v1"}
+
+    runner.catalog = Catalog()
+    graph = Graph(**{"id": "ray-lineage", "version": 1, "nodes": [
+        _ray_node("a", "source", {"uri": source_a}),
+        _ray_node("b", "source", {"uri": source_b}),
+        _ray_node("join", "join", {}),
+        _ray_node("transform", "transform", {}),
+        _ray_node("write", "write", {"filename": "joined.csv"}),
+    ], "edges": [
+        {"id": "a-join", "source": "a", "target": "join",
+         "targetHandle": "a", "data": {"wire": "dataset"}},
+        {"id": "b-join", "source": "b", "target": "join",
+         "targetHandle": "b", "data": {"wire": "dataset"}},
+        _ray_edge("join", "transform"),
+        _ray_edge("transform", "write"),
+    ]})
+    expected = graph_mod.all_upstream_source_uris(graph, "write")
+    region = Region(
+        id="final", node_ids={"write"}, output_node="write", backend="default",
+        worker=None, requires=ResourceSpec(),
+        cut_inputs=[("transform", None, "write", None)],
+    )
+    graph = runner.deps.controller._subgraph(
+        graph, region, {"transform": str(tmp_path / "region-ref.parquet")})
+    runner._register_outputs(graph, {"outputs": [{
+        "step_id": "write", "name": "joined", "uri": output,
+        "logical_uri": output,
+    }]}, expected_targets={"write": output}, expected_attempts={})
+
+    assert set(expected) == {source_a, source_b}
+    assert graph_mod.execution_source_uris(graph, "write") == [str(tmp_path / "region-ref.parquet")]
+    assert registered["parents"] == expected
+    assert readbacks == [output]
+
+
+def test_ray_settlement_logs_provider_detail_but_returns_generic_error(
+        tmp_path, monkeypatch, caplog):
+    from hub.deps import Deps
+    from hub.models import Graph, RunStatus
+
+    runner = _load_dp_ray().RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    monkeypatch.setattr(
+        runner, "_register_outputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("SECRET_RAY_CATALOG_DETAIL")))
+    caplog.set_level("ERROR")
+    status = RunStatus(run_id="run", status="running", per_node=[])
+    runner._settle_popen_result(
+        Graph(id="ray-generic", version=1, nodes=[], edges=[]), status,
+        {"status": "done", "rows": 0, "outputs": [{"step_id": "write"}]}, 0)
+    assert status.status == "failed"
+    assert status.error == "Ray output publication failed"
+    assert "SECRET_RAY_CATALOG_DETAIL" not in status.error
+    assert "SECRET_RAY_CATALOG_DETAIL" in caplog.text
+
+
+def test_ray_control_plane_setup_and_preflight_errors_are_generic(
+        tmp_path, monkeypatch, caplog):
+    from hub.deps import Deps
+    from hub.models import CompilePlan, Graph, PlanStep
+
+    runner = _load_dp_ray().RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    graph = Graph(**{"id": "ray-control-error", "version": 1, "nodes": [
+        _ray_node("write", "write", {"filename": "out.csv"}),
+    ], "edges": []})
+    plan = CompilePlan(target_node_id="write", steps=[
+        PlanStep(node_id="write", kind="write", label="write"),
+    ])
+    monkeypatch.setattr(runner, "_ray_unsupported_reason", lambda _ir: None)
+    monkeypatch.setattr(runner, "_dedup_unsupported_reason", lambda _graph, _ir: None)
+    monkeypatch.setattr(runner, "_resource_unsupported_reason", lambda _requires, _ir: None)
+    monkeypatch.setattr(
+        runner, "_source_unsupported_reason", lambda _graph, _target, _ir: None)
+    monkeypatch.setattr(runner, "_resolve_sink_targets", lambda _ir: {"write": "/tmp/out.csv"})
+    monkeypatch.setattr(
+        runner, "_claim_sink_attempts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("SECRET_RAY_ALLOCATION_TOKEN")))
+    caplog.set_level("ERROR")
+    failed = runner.run(plan, graph, "write", "distributed")
+    assert failed.status == "failed"
+    assert failed.error == "Ray sink control-plane setup failed"
+    assert "SECRET_RAY_ALLOCATION_TOKEN" not in failed.error
+    assert "SECRET_RAY_ALLOCATION_TOKEN" in caplog.text
+
+    monkeypatch.setattr(
+        runner, "_resolve_sink_targets",
+        lambda _ir: (_ for _ in ()).throw(
+            RuntimeError("s3://user:SECRET_URI_PASSWORD@example/out")))
+    monkeypatch.setattr(runner, "_requires_ray", lambda *_args, **_kwargs: True)
+    unsupported = runner.run(
+        plan, graph, "write", "distributed", run_id="ray-preflight-secret")
+    assert unsupported.status == "failed"
+    assert "sink preflight failed" in (unsupported.error or "")
+    assert "SECRET_URI_PASSWORD" not in (unsupported.error or "")
+    assert "SECRET_URI_PASSWORD" in caplog.text
 
 
 def test_ray_whole_run_scopes_each_sink_attempt_by_step_and_unstripped_target(tmp_path):
@@ -8783,6 +9511,244 @@ def test_ray_popen_supervisor_erases_sensitive_workdir_and_closes_log(
         assert run_id not in runner._cancel
 
 
+def test_ray_unreaped_driver_stays_nonterminal_and_retains_every_fence(
+        tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    import tempfile
+    import threading
+    from pathlib import Path
+
+    from hub import handoff
+    from hub.deps import Deps
+    from hub.models import Graph, RunStatus
+
+    mod = _load_dp_ray()
+    workspace, data = tmp_path / "workspace", tmp_path / "data"
+    workspace.mkdir()
+    data.mkdir()
+    runner = mod.RayRunner(Deps(str(workspace), str(data)))
+    work = tmp_path / "retained-ray-driver"
+    work.mkdir()
+    emitted, completed, started, lease_events = [], [], [], []
+
+    class Lease:
+        def __enter__(self):
+            lease_events.append("opened")
+            return self
+
+        def check(self):
+            return None
+
+        def __exit__(self, *_args):
+            lease_events.append("closed")
+
+    processes = []
+
+    class UnreapableProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.returncode = None
+            self.reapable = False
+            processes.append(self)
+
+        def poll(self):
+            return self.returncode if self.reapable else None
+
+        def terminate(self):
+            if not self.reapable:
+                raise OSError("terminate unavailable")
+
+        def kill(self):
+            if not self.reapable:
+                raise OSError("kill unavailable")
+
+        def wait(self, timeout=None):
+            if not self.reapable:
+                raise OSError("wait unavailable")
+            return self.returncode
+
+    class DeferredThread:
+        def __init__(self, *args, **kwargs):
+            self.target = kwargs.get("target")
+
+        def start(self):
+            started.append(self.target)
+            raise RuntimeError("thread start unavailable")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda **_kwargs: str(work))
+    monkeypatch.setattr(subprocess, "Popen", UnreapableProcess)
+    monkeypatch.setattr(threading, "Thread", DeferredThread)
+    monkeypatch.setattr(handoff, "managed_read_lease", lambda *_args, **_kwargs: Lease())
+    real_rmtree = shutil.rmtree
+    removed = []
+    monkeypatch.setattr(shutil, "rmtree", lambda path: removed.append(path))
+
+    run_id = "ray-unreaped"
+    graph = Graph(**{
+        "id": "ray-unreaped", "version": 1,
+        "nodes": [_ray_node("source", "source", {"uri": "s3://bucket/source.attempt-x"})],
+        "edges": [],
+    })
+    status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=[])
+    runner.runs[run_id] = status
+    runner._cancel[run_id] = threading.Event()
+    runner._cancel[run_id].set()  # drive the supervisor into its terminate/reap path
+    runner.on_status = lambda _graph, observed: emitted.append(observed.status)
+    runner.on_complete = lambda *_args: completed.append(True)
+
+    runner._supervise(run_id, graph, None, status)
+
+    assert status.status == "running" and status.stalled is True
+    assert status.error == "Ray driver termination is still being reconciled"
+    assert emitted and emitted[-1] == "running"
+    assert completed == [] and removed == []
+    assert work.is_dir() and run_id in runner._cancel
+    assert run_id in runner._unreaped_drivers and started
+    assert lease_events == ["opened"]
+    assert not runner.cancel_acknowledged(run_id)
+
+    assert processes
+    processes[0].reapable = True
+    processes[0].returncode = 0
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    runner._terminate_all()  # the atexit fallback owns reconciliation if Thread.start failed
+
+    assert status.status == "cancelled" and runner.cancel_acknowledged(run_id)
+    assert completed == [True] and not work.exists()
+    assert run_id not in runner._unreaped_drivers
+    assert run_id not in runner._driver_procs and run_id not in runner._driver_workdirs
+    assert lease_events == ["opened", "closed"]
+
+
+def test_ray_clean_done_receipt_wins_late_cancel_and_nonzero_done_stays_private(
+        tmp_path, monkeypatch):
+    import json
+    import subprocess
+    import tempfile
+    import threading
+    from pathlib import Path
+
+    from hub.deps import Deps
+    from hub.models import Graph, RunStatus
+
+    mod = _load_dp_ray()
+    workspace, data = tmp_path / "workspace", tmp_path / "data"
+    workspace.mkdir()
+    data.mkdir()
+    runner = mod.RayRunner(Deps(str(workspace), str(data)))
+    registered = []
+    driver_work = tmp_path / "late-cancel-driver"
+    driver_work.mkdir()
+
+    class DoneProcess:
+        returncode = 0
+
+        def __init__(self, args, **_kwargs):
+            with open(args[-1]) as stream:
+                job = json.load(stream)
+            Path(job["status_file"]).write_text(json.dumps({
+                "status": "done", "rows": 1,
+                "outputs": [{
+                    "step_id": "write", "name": "out", "uri": "/tmp/out.csv",
+                    "logical_uri": "/tmp/out.csv",
+                }],
+                "output_uri": "/tmp/out.csv", "output_table": "out",
+            }))
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(
+        tempfile, "mkdtemp",
+        lambda **_kwargs: str(driver_work),
+    )
+    monkeypatch.setattr(subprocess, "Popen", DoneProcess)
+    monkeypatch.setattr(
+        runner, "_register_outputs",
+        lambda _graph, result: registered.append(result),
+    )
+    run_id = "ray-late-cancel"
+    graph = Graph(id="ray-late-cancel", version=1, nodes=[], edges=[])
+    status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=[])
+    runner.runs[run_id] = status
+    runner._cancel[run_id] = threading.Event()
+    runner._cancel[run_id].set()
+
+    runner._supervise(run_id, graph, None, status)
+
+    assert status.status == "done" and status.output_uri == "/tmp/out.csv"
+    assert len(registered) == 1
+    assert not runner.cancel_acknowledged(run_id)
+
+    failed = RunStatus(run_id="ray-done-nonzero", status="running")
+    runner._settle_popen_result(
+        graph, failed, {
+            "status": "done", "rows": 1,
+            "outputs": [{"step_id": "write"}],
+        }, -9,
+    )
+    assert failed.status == "failed"
+    assert failed.error == "Ray driver exited unsuccessfully after writing a terminal receipt"
+    assert failed.output_uri is None and failed.output_table is None
+    assert len(registered) == 1
+
+
+def test_ray_reconcile_and_shutdown_have_one_terminal_finalizer(tmp_path, monkeypatch):
+    import threading
+
+    from hub.deps import Deps
+
+    runner = _load_dp_ray().RayRunner(
+        Deps(str(tmp_path / "workspace"), str(tmp_path / "data")))
+    barrier = threading.Barrier(2)
+    finalized = []
+
+    class ReapedProcess:
+        returncode = 0
+
+    proc = ReapedProcess()
+    run_id = "ray-one-finalizer"
+    state = {"run_id": run_id, "proc": proc, "work": str(tmp_path / "work")}
+    runner._unreaped_drivers[run_id] = state
+    runner._driver_procs[run_id] = proc
+    runner._driver_workdirs[run_id] = state["work"]
+    runner._cancel[run_id] = threading.Event()
+    monkeypatch.setattr(
+        runner, "_try_reap_driver",
+        lambda _proc: (barrier.wait(timeout=5), True)[1],
+    )
+    monkeypatch.setattr(
+        runner, "_finish_supervision",
+        lambda claimed: finalized.append(claimed),
+    )
+
+    workers = [
+        threading.Thread(target=runner._reconcile_unreaped_driver, args=(run_id,)),
+        threading.Thread(target=runner._terminate_all),
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert finalized == [state]
+    assert run_id not in runner._unreaped_drivers
+    runner._finalizing_drivers.discard(run_id)
+    runner._driver_procs.pop(run_id, None)
+    runner._driver_workdirs.pop(run_id, None)
+    runner._cancel.pop(run_id, None)
+
+
 def test_ray_popen_multi_sink_failure_keeps_partial_output_private_and_untouched(tmp_path, monkeypatch):
     from hub.deps import Deps
     from hub.ir import lower_to_ir
@@ -8895,7 +9861,7 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
         expected_targets=expected_targets, expected_attempts=expected_attempts,
     )
     assert missing_status.status == "failed"
-    assert "incomplete or unexpected sink set" in (missing_status.error or "")
+    assert missing_status.error == "Ray output publication failed"
     assert missing_status.output_uri is None and missing_status.output_table is None
 
     result = {
@@ -9560,7 +10526,8 @@ def test_remote_ray_bounds_local_sources_and_never_dispatches_a_local_region_han
     assert runner._build(SimpleNamespace(op="read", config={"uri": source}), {}) is sentinel
     monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "1")
     assert "above the 1-byte limit" in (
-        runner._source_unsupported_reason(lower_to_ir(graph, "src", runner.node_specs)) or ""
+        runner._source_unsupported_reason(
+            graph, "src", lower_to_ir(graph, "src", runner.node_specs)) or ""
     )
     monkeypatch.setenv("DP_RAY_DRIVER_FALLBACK_MAX_BYTES", "1048576")
 
@@ -9769,6 +10736,7 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
     (tmp_path / "ws").mkdir()
     mod = _load_dp_ray()
     rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     opts = {"num_gpus": 1.0, "resources": {"a100": 0.001}}
     calls = []
     monkeypatch.setenv("DP_RAY_SHUFFLE_PARTITIONS", "4")
@@ -9824,6 +10792,7 @@ def test_ray_explicit_placement_fails_unsupported_shape_while_unpinned_falls_bac
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     graph = Graph(**{"id": "ray-placement", "version": 1, "nodes": [
         _ray_node("src", "source", {"uri": "unused.parquet"}),
         _ray_node("sql", "sql", {"sql": "SELECT * FROM input"}),
@@ -9843,6 +10812,17 @@ def test_ray_explicit_placement_fails_unsupported_shape_while_unpinned_falls_bac
     assert explicit.placement == "distributed"
     assert "explicitly required" in (explicit.error or "")
     assert "sql" in (explicit.error or "")
+    import uuid
+    from sqlalchemy import func, select
+    object_run = f"unsupported-object-{uuid.uuid4().hex}"
+    object_explicit = rr.run_unit(
+        graph, "sql", "s3://no-writer-dispatched/out.parquet",
+        requires=ResourceSpec(labels={"engine": "ray"}), run_id=object_run)
+    assert object_explicit.status == "failed"
+    from hub import metadb
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(metadb.ObjectAttempt).where(
+            metadb.ObjectAttempt.run_id == object_run)) == 0
 
 
 def test_ray_explicit_placement_fails_unadvertised_resources_before_dispatch(tmp_path, monkeypatch):
@@ -9854,6 +10834,7 @@ def test_ray_explicit_placement_fails_unadvertised_resources_before_dispatch(tmp
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     graph = Graph(**{"id": "ray-resource-placement", "version": 1, "nodes": [
         _ray_node("src", "source", {"uri": "unused.parquet"}),
     ], "edges": []})
@@ -10065,12 +11046,22 @@ def test_region_attempt_cleanup_is_scoped_to_an_attempt(tmp_path):
 def test_object_attempt_registry_serializes_publish_and_discard():
     import threading
 
-    from hub import metadb
+    from hub import handoff, metadb
 
     logical = "s3://registry-lock-test/out.parquet"
     uris = [f"s3://registry-lock-test/out.attempt-{suffix}" for suffix in ("a", "b")]
     for index, uri in enumerate(uris):
-        metadb.claim_object_attempt(uri, logical, "sink", f"registry-lock-{index}")
+        metadb.allocate_object_attempt(
+            logical_uri=logical, kind="sink", run_id=f"registry-lock-{index}",
+            allocation_key=f"registry-lock-{index}", catalog_key_base="tbl_out",
+            uri_factory=lambda _namespace, _generation, _attempt_id, uri=uri: uri)
+        key = uri.removeprefix("s3://") + "/part.parquet"
+        metadb.record_object_attempt_commit(uri, [{
+            "member_id": handoff._member_id("unversioned_object", key, "null"),
+            "key": key, "member_type": "unversioned_object", "size": 1,
+            "etag": None, "version_id": None, "upload_id": None,
+            "is_latest": True, "is_commit": False,
+        }])
 
     barrier = threading.Barrier(3)
     errors = []
@@ -10078,9 +11069,11 @@ def test_object_attempt_registry_serializes_publish_and_discard():
     def publish(uri):
         try:
             barrier.wait()
-            metadb.publish_object_attempt(uri)
+            metadb.catalog_upsert_entry(
+                uri, "out", {"id": "tbl_out", "name": "out", "uri": uri})
         except Exception as exc:  # noqa: BLE001 — asserted below after both threads join
             errors.append(exc)
+            metadb.abandon_committed_object_attempt(uri)
 
     threads = [threading.Thread(target=publish, args=(uri,)) for uri in uris]
     for thread in threads:
@@ -10088,22 +11081,27 @@ def test_object_attempt_registry_serializes_publish_and_discard():
     barrier.wait()
     for thread in threads:
         thread.join()
-    assert errors == []
+    assert len(errors) <= 1
     with metadb.session() as session:
-        assert {session.get(metadb.ObjectAttempt, uri).state for uri in uris} == \
-            {"published", "retiring"}
+        states = {uri: session.get(metadb.ObjectAttempt, uri).state for uri in uris}
+        published = [uri for uri, state in states.items() if state == "published"]
+        assert len(published) == 1
+        assert metadb.catalog_get(uris[0])["uri"] == published[0]
+        assert states[next(uri for uri in uris if uri != published[0])] in (
+            "superseded", "abandoned")
 
     fenced = "s3://registry-lock-test/out.attempt-fenced"
-    metadb.claim_object_attempt(fenced, logical, "sink", "registry-lock-fenced")
-    assert metadb.begin_discard_object_attempt(fenced) is True
-    with pytest.raises(RuntimeError, match="discarding"):
-        metadb.publish_object_attempt(fenced)
-    metadb.delete_object_attempt(fenced)
-
-    metadb.retire_object_attempts(uris)
+    metadb.allocate_object_attempt(
+        logical_uri=logical, kind="sink", run_id="registry-lock-fenced",
+        allocation_key="registry-lock-fenced", catalog_key_base="tbl_out",
+        uri_factory=lambda _namespace, _generation, _attempt_id: fenced)
+    assert metadb.mark_object_attempt_terminal(fenced) is True
+    with pytest.raises(RuntimeError, match="terminal proof"):
+        metadb.catalog_upsert_entry(
+            fenced, "out", {"id": "tbl_out", "name": "out", "uri": fenced})
     for uri in uris:
-        metadb.mark_object_attempt_retired(uri)
-        metadb.delete_object_attempt(uri)
+        metadb.quarantine_object_attempt(uri, "test cleanup")
+    metadb.quarantine_object_attempt(fenced, "test cleanup")
 
 
 def test_object_attempt_registry_reaps_superseded_and_fenced_failures(monkeypatch):
@@ -10132,22 +11130,52 @@ def test_object_attempt_registry_reaps_superseded_and_fenced_failures(monkeypatc
             "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
             "secretAccessKey": "s", "useSsl": False,
         }, "global")
+        monkeypatch.setenv("DP_ATTEMPT_INVENTORY_QUIET_SECONDS", "0")
         def land(uri, run_id):
             fs, path = object_fs(uri)
             with fs.open_output_stream(path + "/part-000000.parquet") as stream:
                 stream.write(run_id.encode())
             handoff.write_manifest(uri, run_id=run_id, rows=1, schema="x: int64")
 
+        def reserve(uri, logical_uri, kind, run_id):
+            return metadb.allocate_object_attempt(
+                logical_uri=logical_uri, kind=kind, run_id=run_id,
+                allocation_key=f"legacy-registry-test:{run_id}",
+                catalog_key_base=(f"tbl_{run_id}" if kind == "sink" else None),
+                uri_factory=lambda _namespace, _generation, _attempt_id: uri)
+
+        def reap_until_deleted(uri):
+            import datetime
+
+            for _ in range(5):
+                with metadb.session() as session:
+                    row = session.get(metadb.ObjectAttempt, uri)
+                    if row is None or row.state == "deleted":
+                        return
+                    now = metadb._db_now(session)
+                    if row.quiet_until is not None:
+                        row.quiet_until = now - datetime.timedelta(seconds=1)
+                    if row.next_delete_at is not None:
+                        row.next_delete_at = now - datetime.timedelta(seconds=1)
+                    if row.delete_empty_observed_at is not None:
+                        row.delete_empty_observed_at = now - datetime.timedelta(seconds=1)
+                result = handoff.reap_attempts(
+                    retention_seconds=0, delete_grace_seconds=0)
+                if uri in result["deleted"]:
+                    return
+            raise AssertionError(f"attempt did not pass the final-empty barrier: {uri}")
+
         sink_logical = "s3://bkt/outputs/out.parquet"
         sink_old = "s3://bkt/outputs/out.attempt-old"
         sink_new = "s3://bkt/outputs/out.attempt-new"
         for uri, run_id in ((sink_old, "old"), (sink_new, "new")):
-            handoff.claim_attempt(uri, logical_uri=sink_logical, kind="sink", run_id=run_id)
+            reserve(uri, sink_logical, "sink", run_id)
             land(uri, run_id)
+            handoff.prepare_attempt_commit(uri)
             metadb.catalog_upsert_entry(uri, "out", {"id": f"tbl_{run_id}", "name": "out", "uri": uri})
         cleanup.append(sink_new)
         with metadb.session() as session:
-            assert session.get(metadb.ObjectAttempt, sink_old).state == "retiring"
+            assert session.get(metadb.ObjectAttempt, sink_old).state == "superseded"
             assert session.get(metadb.ObjectAttempt, sink_new).state == "published"
 
         # A generic failure cleanup call cannot delete an already published winner.
@@ -10160,16 +11188,16 @@ def test_object_attempt_registry_reaps_superseded_and_fenced_failures(monkeypatc
 
         first = handoff.reap_attempts(retention_seconds=3600, delete_grace_seconds=3600)
         assert first["deleted"] == []
-        assert metadb.catalog_get(sink_old) is None
-        assert handoff.read_manifest(sink_old) is None  # no new cache/catalog reader can admit it
+        assert metadb.catalog_get(sink_old)["uri"] == sink_new
+        assert handoff.read_manifest(sink_old) is not None  # retirement never mutates objects before GC
         fs, old_path = object_fs(sink_old)
         assert fs.get_file_info(old_path + "/part-000000.parquet").size > 0  # active readers get grace
         with metadb.session() as session:
-            assert session.get(metadb.ObjectAttempt, sink_old).state == "retired"
-        assert sink_old in first["retired"] or first["retired"] == []  # periodic reaper may win the phase
+            assert session.get(metadb.ObjectAttempt, sink_old).state == "superseded"
 
-        second = handoff.reap_attempts(retention_seconds=3600, delete_grace_seconds=0)
-        assert second == {"retired": [], "deleted": [sink_old]}
+        reap_until_deleted(sink_old)
+        with metadb.session() as session:
+            assert session.get(metadb.ObjectAttempt, sink_old).state == "deleted"
 
         # Region retirement follows the exact result-cache pointer swap, not an object-prefix listing or
         # wall-clock guess. An active cache URI is retained; the replaced URI enters the same two phases.
@@ -10177,54 +11205,54 @@ def test_object_attempt_registry_reaps_superseded_and_fenced_failures(monkeypatc
         region_old = "s3://bkt/regions/r_src_hash.attempt-old"
         region_new = "s3://bkt/regions/r_src_hash.attempt-new"
         for uri, run_id in ((region_old, "region-old"), (region_new, "region-new")):
-            handoff.claim_attempt(uri, logical_uri=region_logical, kind="region", run_id=run_id)
+            reserve(uri, region_logical, "region", run_id)
             land(uri, run_id)
+            handoff.prepare_attempt_commit(uri)
         assert metadb.put_result("object-gc-region-key", {"uri": region_old}) == []
         assert metadb.put_result("object-gc-region-key", {"uri": region_new}) == [region_old]
         cleanup.append(region_new)
         region_phase1 = handoff.reap_attempts(retention_seconds=3600, delete_grace_seconds=0)
         with metadb.session() as session:
-            assert session.get(metadb.ObjectAttempt, region_old).state == "retired"
-        assert region_old in region_phase1["retired"] or region_phase1["retired"] == []
-        assert handoff.reap_attempts(retention_seconds=3600, delete_grace_seconds=0) == \
-            {"retired": [], "deleted": [region_old]}
+            assert session.get(metadb.ObjectAttempt, region_old).state == "superseded"
+        assert region_phase1["deleted"] == []
+        reap_until_deleted(region_old)
 
         # RunState and age are not writer-exit proof. Only the supervisor that observed child exit may
         # fence and discard its exact unpublished attempt.
         partial = "s3://bkt/outputs/live.attempt-partial"
-        handoff.claim_attempt(partial, logical_uri="s3://bkt/outputs/live.parquet",
-                              kind="sink", run_id="live-object-gc")
+        reserve(partial, "s3://bkt/outputs/live.parquet", "sink", "live-object-gc")
         partial_fs, partial_path = object_fs(partial)
         with partial_fs.open_output_stream(partial_path + "/part-000000.parquet") as stream:
             stream.write(b"partial")
         metadb.save_run_state("live-object-gc", {"run_id": "live-object-gc", "status": "running"})
-        assert handoff.reap_attempts(retention_seconds=3600, delete_grace_seconds=0) == \
-            {"retired": [], "deleted": []}
+        assert handoff.reap_attempts(
+            retention_seconds=3600, delete_grace_seconds=0)["deleted"] == []
         assert partial_fs.get_file_info(partial_path + "/part-000000.parquet").size > 0
         metadb.save_run_state("live-object-gc", {"run_id": "live-object-gc", "status": "failed"})
-        assert handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0) == \
-            {"retired": [], "deleted": []}
+        assert handoff.reap_attempts(
+            retention_seconds=0, delete_grace_seconds=0)["deleted"] == []
         assert partial_fs.get_file_info(partial_path + "/part-000000.parquet").size > 0
         handoff.discard_attempt(partial)
+        assert partial_fs.get_file_info(partial_path + "/part-000000.parquet").size > 0
+        reap_until_deleted(partial)
         assert partial_fs.get_file_info(partial_path + "/part-000000.parquet").type == \
             pafs.FileType.NotFound
 
         orphan = "s3://bkt/outputs/orphan.attempt-crashed-hub"
-        handoff.claim_attempt(orphan, logical_uri="s3://bkt/outputs/orphan.parquet",
-                              kind="sink", run_id="missing-run-owner")
+        reserve(orphan, "s3://bkt/outputs/orphan.parquet", "sink", "missing-run-owner")
         orphan_fs, orphan_path = object_fs(orphan)
         with orphan_fs.open_output_stream(orphan_path + "/part-000000.parquet") as stream:
             stream.write(b"partial")
-        assert handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0) == \
-            {"retired": [], "deleted": []}
+        assert handoff.reap_attempts(
+            retention_seconds=0, delete_grace_seconds=0)["deleted"] == []
         assert orphan_fs.get_file_info(orphan_path + "/part-000000.parquet").size > 0
         handoff.discard_attempt(orphan)  # explicit terminal-backend acknowledgement in this test
+        reap_until_deleted(orphan)
 
         # A failed driver cannot delete object data merely because its own process is unwinding: remote
         # Ray workers may still be writing. The durable backend reconciler/provider lifecycle owns it.
         worker_failed = "s3://bkt/outputs/worker.attempt-driver-failed"
-        handoff.claim_attempt(worker_failed, logical_uri="s3://bkt/outputs/worker.parquet",
-                              kind="sink", run_id="driver-failed")
+        reserve(worker_failed, "s3://bkt/outputs/worker.parquet", "sink", "driver-failed")
 
         class FailedRemoteWrite:
             def materialize(self):
@@ -10251,6 +11279,7 @@ def test_object_attempt_registry_reaps_superseded_and_fenced_failures(monkeypatc
         with metadb.session() as session:
             assert session.get(metadb.ObjectAttempt, worker_failed).state == "writing"
         handoff.discard_attempt(worker_failed)  # simulated durable terminal acknowledgement
+        reap_until_deleted(worker_failed)
 
         # Missing rows have no tombstone/CAS fence, so generic cleanup must leave legacy data alone.
         legacy = "s3://bkt/outputs/legacy.attempt-unregistered"
@@ -10267,9 +11296,9 @@ def test_object_attempt_registry_reaps_superseded_and_fenced_failures(monkeypatc
         assert any("attempt-new" in key for key in keys)
     finally:
         try:
-            metadb.retire_object_attempts(cleanup)
-            handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0)
-            handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0)
+            metadb.catalog_delete_entry("s3://bkt/outputs/out.attempt-new")
+            metadb.put_result("object-gc-region-key", {"uri": None})
+            reap_until_deleted("s3://bkt/outputs/out.attempt-new")
         except Exception:
             pass
         server.stop()
@@ -10679,7 +11708,7 @@ def test_ray_sort_live_differential(tmp_path):
            sorted((r["k"] is None, r["k"] or 0, r["v"]) for r in duck_rows)  # same multiset of rows
 
 
-def test_ray_region_requires_fail_before_dispatch(tmp_path):
+def test_ray_region_requires_fail_before_dispatch(tmp_path, monkeypatch):
     # An explicit Ray region whose declared resources are not advertised fails before driver dispatch;
     # it never becomes a permanently pending Ray task that looks like a hung run.
     from hub.deps import Deps
@@ -10687,6 +11716,7 @@ def test_ray_region_requires_fail_before_dispatch(tmp_path):
     (tmp_path / "ws").mkdir()
     deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     rr = _load_dp_ray().RayRunner(deps)
+    monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
     g = Graph(**{"id": "c", "version": 1, "nodes": [
         _ray_node("src", "source", {"uri": "unused.parquet"}),
         _ray_node("m", "transform", {"mode": "map", "code": "def fn(row):\n    row['x'] = row['x'] + 1\n    return row"}),

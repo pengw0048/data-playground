@@ -132,6 +132,12 @@ class Registry:
             catalog = CatalogCompat(catalog)
         self.deps.catalog = catalog
 
+    def set_managed_object_provider(self, provider) -> None:
+        """Install the proof-capable exact-object lifecycle provider for managed storage."""
+        from hub.handoff import set_runtime_managed_object_provider
+        self.deps.managed_object_provider = provider
+        set_runtime_managed_object_provider(provider)
+
     def add_embedder(self, fn, model: str = "custom") -> None:
         """Register a text embedder — `fn(list[str]) -> list[list[float]]` — to power the catalog's
         semantic + hybrid search over dataset name/description/columns. Core ships NONE (an embedding
@@ -194,7 +200,9 @@ def _persist_run_state(graph, status) -> None:
     GET /run/{id} + the status WebSocket are answerable from ANY web instance and survive a restart
     (not just the in-memory dict of the instance that accepted the run)."""
     from hub import metadb
-    metadb.save_run_state(status.run_id, status.model_dump(), canvas_id=getattr(graph, "id", None))
+    metadb.save_run_state(
+        status.run_id, status.model_dump(), canvas_id=getattr(graph, "id", None),
+        publish_region=status.status == "done")
 
 
 def _result_get(key):
@@ -204,8 +212,16 @@ def _result_get(key):
     return metadb.get_result(key)
 
 
+def _result_acquire(key, owner, ttl_seconds):
+    from hub import metadb
+    return metadb.acquire_result_cache_pin(key, owner, ttl_seconds)
+
+
 def _result_put(key, doc) -> None:
     from hub import metadb
+    from hub.handoff import prepare_attempt_commit
+    if doc.get("uri"):
+        prepare_attempt_commit(doc["uri"])
     metadb.put_result(key, doc)
 
 
@@ -260,7 +276,7 @@ def _make_spawner(workspace: str, data_dir: str):
 
 
 class Deps:
-    def __init__(self, workspace: str, data_dir: str):
+    def __init__(self, workspace: str, data_dir: str, *, maintain_storage: bool = True):
         self.workspace = workspace
         self.data_dir = data_dir
         self.adapters = default_adapters()
@@ -274,6 +290,7 @@ class Deps:
         self.node_builders: dict[str, object] = {}
         self.node_ir: dict[str, object] = {}  # kind -> ir(node) hook: an engine-neutral emit path (§ IR unify B)
         self.telemetry_sinks: list = []  # reg.add_telemetry_sink — finished-run records fan out here (OTel = plugin)
+        self.managed_object_provider = None
         self.plugins: list[dict] = []
         self._manifests: dict[str, dict] = {}
         from hub.storage import make_storage
@@ -291,7 +308,15 @@ class Deps:
             self.catalog = InMemoryCatalog(data_dir, self.resolve_adapter)
         # recover/clean any temp siblings an interrupted append/compaction left behind BEFORE re-cataloging,
         # so a crash can't surface a half-written staging file as a dataset or leave a compacting one absent.
-        self.storage.recover_orphans()
+        if maintain_storage:
+            self.storage.recover_orphans()
+            prune_results = getattr(self.storage, "prune_results", None)
+            if callable(prune_results):
+                try:
+                    prune_results()  # bounded startup reconciliation for prior process crashes
+                except Exception:  # retryable retention failure must not block serving the workspace
+                    logging.getLogger("hub").warning(
+                        "local result retention failed at startup", exc_info=True)
         # re-register previously written outputs so committed tables survive a kernel restart
         # (they live in storage, separate from the seeded data_dir).
         for uri in self.storage.list_outputs():
@@ -306,13 +331,17 @@ class Deps:
         self.runner.on_complete = _on_complete  # keep finished runs with their canvas (run history)
         self.runner.on_status = _persist_run_state  # mirror live status to the DB (stateless-web reads)
         self.runner.result_get = _result_get  # DB-backed content-addressed result reuse (cross-run/restart)
+        self.runner.result_acquire = _result_acquire
         self.runner.result_put = _result_put
         from hub.subprocess_runner import SubprocessRunner
         # a second, real backend: run jobs in an isolated OS process (Settings → Execution). Selected
         # by name via pick_runner; pod/Ray runners install as plugins over the same protocol.
-        sub = SubprocessRunner(workspace, data_dir, catalog=self.catalog)
+        sub = SubprocessRunner(
+            workspace, data_dir, catalog=self.catalog, storage=self.storage,
+            resolve_adapter=self.resolve_adapter, node_builders=self.node_builders)
         sub.on_complete = _on_complete  # record cancelled/crashed isolated runs the child couldn't
         sub.on_status = _persist_run_state
+        sub.result_put = _result_put
         self.runners = [self.runner, sub]
         # opt-in reference multi-worker pool (DP_POOL_WORKERS): capability-based placement without a
         # cluster — pods are processes with configured capacities. Shows in the Compute view + is
@@ -320,9 +349,13 @@ class Deps:
         from hub.pool_runner import PoolRunner, pool_workers_from_env
         pool_cfg = pool_workers_from_env()
         if pool_cfg:
-            pool = PoolRunner(workspace, data_dir, pool_cfg, node_specs=self.node_specs, catalog=self.catalog)
+            pool = PoolRunner(
+                workspace, data_dir, pool_cfg, node_specs=self.node_specs, catalog=self.catalog,
+                storage=self.storage, resolve_adapter=self.resolve_adapter,
+                node_builders=self.node_builders)
             pool.on_complete = _on_complete
             pool.on_status = _persist_run_state
+            pool.result_put = _result_put
             self.runners.append(pool)
         # per-canvas kernel: runs go to a long-lived, restart-surviving kernel process (one per canvas).
         # Always REGISTERED so it's selectable from Settings → Execution; only the DEFAULT is opt-in
@@ -548,7 +581,10 @@ def get_deps() -> Deps:
     return _deps
 
 
-def set_workspace(workspace: str, data_dir: str | None = None) -> Deps:
+def set_workspace(
+        workspace: str, data_dir: str | None = None, *, maintain_storage: bool = True) -> Deps:
     global _deps
-    _deps = Deps(workspace, data_dir or os.path.join(workspace, "data"))
+    _deps = Deps(
+        workspace, data_dir or os.path.join(workspace, "data"),
+        maintain_storage=maintain_storage)
     return _deps
