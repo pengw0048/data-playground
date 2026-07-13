@@ -2263,10 +2263,146 @@ def test_kernel_child_env_is_allowlisted_but_keeps_auth_mode(monkeypatch):
     assert not {"DP_AUTH_PASSWORD", "OPENAI_API_KEY", "UNRELATED_DEPLOY_TOKEN"} & env.keys()
     assert env["DP_AUTH_MODE"] == "1"           # but the auth-mode signal survives
     assert env["DP_DATABASE_URL"] and env["AWS_SECRET_ACCESS_KEY"]  # explicit residual capabilities
-    # the signal alone enables auth mode with NO usable signing material in the child
+    # The signal alone keeps workload confinement enabled, but is never usable signing material. The
+    # kernel child does not import hub.main, so the hub-only startup guard does not block this process.
     monkeypatch.delenv("DP_AUTH_SECRET")
     monkeypatch.setenv("DP_AUTH_MODE", "1")
     assert auth.auth_enabled() is True and auth._secret() == ""
+    assert auth.verify("local.0.9999999999.forged") is None
+    with pytest.raises(RuntimeError, match="cannot sign a session"):
+        auth.sign("local")
+
+
+@pytest.mark.parametrize("raw_secret", [None, "", "   "])
+def test_auth_mode_without_a_signing_secret_fails_closed(monkeypatch, raw_secret):
+    """DP_AUTH_MODE is a workload marker, not an implicit public HMAC key."""
+    import hashlib
+    import hmac
+
+    from hub import auth
+
+    monkeypatch.setenv("DP_AUTH_MODE", "1")
+    if raw_secret is None:
+        monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
+    else:
+        monkeypatch.setenv("DP_AUTH_SECRET", raw_secret)
+    payload = "local.0.9999999999"
+    forged = f"{payload}.{hmac.new((raw_secret or '').encode(), payload.encode(), hashlib.sha256).hexdigest()}"
+
+    assert auth.auth_enabled() is True  # confinement remains enabled for a workload child
+    assert auth.verify(forged) is None   # an empty/blank key can never authenticate a request
+    with pytest.raises(RuntimeError, match="cannot sign a session"):
+        auth.sign("local")
+    with pytest.raises(RuntimeError, match="cannot authenticate hub sessions"):
+        auth.reject_weak_secret()
+
+
+@pytest.mark.parametrize("raw_secret", ["", "   "])
+def test_blank_secret_without_auth_mode_remains_open_local_mode(monkeypatch, raw_secret):
+    """An empty optional env value is still unconfigured; only DP_AUTH_MODE opts into auth."""
+    from hub import auth
+
+    monkeypatch.delenv("DP_AUTH_MODE", raising=False)
+    monkeypatch.setenv("DP_AUTH_SECRET", raw_secret)
+
+    assert auth.auth_enabled() is False
+    auth.reject_weak_secret()
+    assert auth.verify("local.0.9999999999.forged") is None
+    with pytest.raises(RuntimeError, match="cannot sign a session"):
+        auth.sign("local")
+
+
+@pytest.mark.parametrize("raw_secret", [None, ""])
+def test_hub_startup_rejects_auth_mode_without_a_signing_secret(tmp_path, raw_secret):
+    """Importing the web app is hub startup; fail before opening its metadata database."""
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    if raw_secret is None:
+        env.pop("DP_AUTH_SECRET", None)
+    else:
+        env["DP_AUTH_SECRET"] = raw_secret
+    env["DP_AUTH_MODE"] = "1"
+    env["DP_WORKSPACE"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-c", "import hub.main"],
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "cannot authenticate hub sessions without" in result.stderr
+    assert "non-empty DP_AUTH_SECRET" in result.stderr
+
+
+def test_cli_rejects_marker_only_auth_before_creating_metadata(tmp_path):
+    """The normal `dataplay` path must fail before seed, DB migration, or dependency setup."""
+    import subprocess
+    import sys
+
+    workspace = tmp_path / "workspace"
+    env = dict(os.environ)
+    env.pop("DP_AUTH_SECRET", None)
+    env.pop("DP_DATABASE_URL", None)
+    env["DP_AUTH_MODE"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hub.cli",
+            "--workspace",
+            str(workspace),
+            "--no-open",
+            "--no-seed",
+        ],
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "cannot authenticate hub sessions without" in result.stderr
+    assert not (workspace / "dataplay.db").exists()
+
+
+def test_authenticated_principal_deletion_never_falls_back_to_local_admin(monkeypatch):
+    """Deleting a user between signature verification and principal resolution must return 401."""
+    from fastapi import HTTPException
+
+    from hub import auth, metadb
+    from hub.security import current_user
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "strict-principal-secret")
+    monkeypatch.delenv("DP_AUTH_MODE", raising=False)
+    uid = "principal_deleted_during_auth"
+    with metadb.session() as s:
+        existing = s.get(metadb.User, uid)
+        if existing is not None:
+            s.delete(existing)
+    with metadb.session() as s:
+        s.add(metadb.User(id=uid, name="Deleted during auth"))
+    token = auth.sign(uid)
+    original_verify = auth.verify
+
+    def verify_then_delete(candidate):
+        verified = original_verify(candidate)
+        with metadb.session() as s:
+            user = s.get(metadb.User, verified)
+            if user is not None:
+                s.delete(user)
+        return verified
+
+    monkeypatch.setattr(auth, "verify", verify_then_delete)
+    with pytest.raises(HTTPException) as exc:
+        current_user(x_dp_user=None, dp_session=token)
+    assert exc.value.status_code == 401
+    assert metadb.user_token_epoch("local") is not None  # the fallback admin still exists but was not selected
 
 
 def test_canvas_pip_deps_default_off_under_auth(monkeypatch):
