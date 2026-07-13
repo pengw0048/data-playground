@@ -51,8 +51,8 @@ def schema_for_graph(graph: Graph, resolve_adapter, registry,
                             node_builders=node_builders, node_specs=node_specs, schema_only=True)
     out: dict[str, list | None] = {}
     # run on our own cursor (scope exit drops the views it minted); doesn't block concurrent runs
-    from hub.storage import local_result_read_scope
-    with local_result_read_scope(
+    from hub.storage import source_read_scope
+    with source_read_scope(
             storage, g.execution_source_uris(graph, None),
             owner=f"schema:{uuid.uuid4().hex}"):
         with db.run_scope():

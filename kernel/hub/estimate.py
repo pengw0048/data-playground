@@ -178,11 +178,11 @@ def _sized(rows: int | None, conf: str, width: int, blocking: bool = False) -> S
 def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
                    schemas: dict | None = None, actuals: dict[str, int | None] | None = None,
                    storage=None) -> dict[str, SizeEst]:
-    """Fence managed local sources for the entire fingerprint/count estimation pass."""
+    """Fence managed sources for the entire fingerprint/count estimation pass."""
     import uuid
-    from hub.storage import local_result_read_scope
+    from hub.storage import source_read_scope
 
-    with local_result_read_scope(
+    with source_read_scope(
             storage, g.execution_source_uris(graph, target),
             owner=f"estimate:{uuid.uuid4().hex}"):
         return _estimate_sizes_unfenced(

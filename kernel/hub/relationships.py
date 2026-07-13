@@ -287,10 +287,10 @@ def _configured_join_key(node) -> tuple[list[str], list[str]] | None:
 
 def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | None],
                  catalog, resolve_adapter, storage=None) -> JoinAnalysis:
-    """Fence every managed local input through all uniqueness scans."""
-    from hub.storage import local_result_read_scope
+    """Fence every managed input through all uniqueness scans."""
+    from hub.storage import source_read_scope
 
-    with local_result_read_scope(
+    with source_read_scope(
             storage, g.all_upstream_source_uris(graph, node_id),
             owner=f"join-analysis:{uuid.uuid4().hex}"):
         return _analyze_join_unfenced(

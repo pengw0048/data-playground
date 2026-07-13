@@ -21,6 +21,7 @@ from hub import db, graph as g
 from hub.executors.engine import BuildEngine, NotPreviewable, _dedupe_names
 from hub.executors.preview import _CODE_CELL_KINDS, PREVIEW_BUDGET_S, PREVIEW_SCAN
 from hub.models import ColumnProfile, Graph, ProfileResult
+from hub.storage import ManagedSourceReadError
 from hub.plugins.adapters import display_type
 from hub.sandbox import run_with_timeout
 
@@ -131,8 +132,8 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
         holder: dict = {}
 
         def work() -> ProfileResult:
-            from hub.storage import local_result_read_scope
-            with local_result_read_scope(
+            from hub.storage import source_read_scope
+            with source_read_scope(
                     storage, g.all_upstream_source_uris(graph, node_id),
                     owner=f"profile:{uuid.uuid4().hex}"):
                 with db.run_scope() as scope:
@@ -145,6 +146,8 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
 
         try:
             return run_with_timeout(work, PROFILE_FULL_BUDGET_S, on_timeout=on_timeout)
+        except ManagedSourceReadError as e:
+            return ProfileResult(error=True, reason=str(e))
         except NotPreviewable as e:
             return ProfileResult(not_previewable=True, reason=e.reason)
         except Exception as e:  # noqa: BLE001
@@ -156,8 +159,8 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
     holder: dict = {}
 
     def work() -> ProfileResult:
-        from hub.storage import local_result_read_scope
-        with local_result_read_scope(
+        from hub.storage import source_read_scope
+        with source_read_scope(
                 storage, g.all_upstream_source_uris(graph, node_id),
                 owner=f"profile:{uuid.uuid4().hex}"):
             with db.run_scope() as scope:
@@ -178,6 +181,8 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
 
     try:
         return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
+    except ManagedSourceReadError as e:
+        return ProfileResult(error=True, reason=str(e))
     except NotPreviewable as e:
         return ProfileResult(not_previewable=True, reason=e.reason)
     except Exception as e:  # noqa: BLE001

@@ -19,6 +19,7 @@ from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph
 from hub.security import current_user
 from hub.settings import settings
+from hub.storage import ManagedSourceReadError
 from hub.models import (
     CompilePlan,
     CompileRequest,
@@ -147,8 +148,11 @@ def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.target_node_id)
-    return schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
-                            deps.node_builders, deps.node_specs, storage=deps.storage)
+    try:
+        return schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
+                                deps.node_builders, deps.node_specs, storage=deps.storage)
+    except ManagedSourceReadError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.post("/graph/estimate")
@@ -164,6 +168,8 @@ def graph_estimate(req: CompileRequest, uid: str = Depends(current_user)) -> dic
         sizes = estimate_sizes(
             req.graph, deps.resolve_adapter, actuals=_actuals_for(req.graph, deps),
             storage=deps.storage)
+    except ManagedSourceReadError as e:
+        raise HTTPException(400, str(e))
     except Exception:  # noqa: BLE001 — a hint must never 500
         return {}
     return {nid: {"rows": s.rows, "confidence": s.confidence} for nid, s in sizes.items()}
@@ -183,6 +189,8 @@ def graph_plan(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     try:
         return {"regions": deps.controller.plan_summary(req.graph, req.target_node_id)}
+    except ManagedSourceReadError as e:
+        return {"regions": [], "error": str(e)}
     except Exception as e:  # noqa: BLE001 — a preview must never 500
         return {"regions": [], "error": f"{type(e).__name__}: {e}"}
 
@@ -197,11 +205,14 @@ def join_analysis(req: CompileRequest, uid: str = Depends(current_user)) -> Join
     _reject_invalid(req.graph, deps, req.target_node_id)
     if not req.target_node_id:
         return JoinAnalysis(note="no join node selected")
-    cols = schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
-                            deps.node_builders, deps.node_specs, storage=deps.storage)
-    return rel.analyze_join(
-        req.graph, req.target_node_id, cols, deps.catalog, deps.resolve_adapter,
-        storage=deps.storage)
+    try:
+        cols = schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
+                                deps.node_builders, deps.node_specs, storage=deps.storage)
+        return rel.analyze_join(
+            req.graph, req.target_node_id, cols, deps.catalog, deps.resolve_adapter,
+            storage=deps.storage)
+    except ManagedSourceReadError as e:
+        raise HTTPException(400, str(e))
 
 
 # --------------------------------------------------------------------------- #
@@ -293,11 +304,15 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
     try:  # per-node schemas sharpen the byte width (else a flat default/row makes the byte gate meaningless)
         schemas = schema_for_graph(req_graph, deps.resolve_adapter, deps.registry,
                                    deps.node_builders, deps.node_specs, storage=deps.storage)
+    except ManagedSourceReadError as e:
+        raise HTTPException(400, str(e))
     except Exception:  # noqa: BLE001 — schema inference is best-effort; fall back to default widths
         schemas = None
     try:
         sizes = estimate_sizes(req_graph, deps.resolve_adapter, target=target_node_id, schemas=schemas,
                                actuals=_actuals_for(req_graph, deps), storage=deps.storage)
+    except ManagedSourceReadError as e:
+        raise HTTPException(400, str(e))
     except Exception:  # noqa: BLE001 — a bad estimate must not block the gate
         return None, None, {}
     rows = [s.rows for s in sizes.values() if s.rows is not None]

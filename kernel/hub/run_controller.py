@@ -27,6 +27,7 @@ from hub import graph as g
 from hub import planner
 from hub.executors.engine import BuildEngine
 from hub.models import (Graph, GraphEdge, GraphEdgeData, GraphNode, PerNodeStatus, Position, RunStatus)
+from hub.storage import ManagedSourceReadError
 
 
 def _region_concurrency() -> int:
@@ -84,11 +85,15 @@ class RunController:
                 schemas = schema_for_graph(graph, self.deps.resolve_adapter, self.deps.registry,
                                            self.deps.node_builders, self.deps.node_specs,
                                            storage=self.deps.storage)
+            except ManagedSourceReadError:
+                raise
             except Exception:  # noqa: BLE001
                 schemas = None
             sizes = est_mod.estimate_sizes(
                 graph, self.deps.resolve_adapter, target=target, schemas=schemas,
                 storage=self.deps.storage)  # once — reused by plan()
+        except ManagedSourceReadError:
+            raise
         except Exception:  # noqa: BLE001
             sizes = {}
 
@@ -204,6 +209,8 @@ class RunController:
             try:
                 sizes = est_mod.estimate_sizes(
                     graph, self.deps.resolve_adapter, target=target, storage=self.deps.storage)
+            except ManagedSourceReadError:
+                raise
             except Exception:  # noqa: BLE001 — placement is best-effort; a bad estimate must not block the run
                 return {}
         from hub import placement

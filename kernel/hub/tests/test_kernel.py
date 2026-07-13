@@ -2358,6 +2358,7 @@ def test_local_dataset_path_confined_in_auth_mode(monkeypatch):
     # local paths are confined to the workspace / data dir / DP_DATASET_ROOTS. Open mode = trusted, no confinement.
     import os as _os
     from hub import paths
+    from hub.plugins.adapters import path_of
     from hub.settings import settings
     inside = _os.path.join(settings.data_dir, "some_dataset.parquet")
     monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
@@ -2365,8 +2366,21 @@ def test_local_dataset_path_confined_in_auth_mode(monkeypatch):
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
     paths.ensure_local_uri_allowed(inside)                  # inside a root → allowed
     paths.ensure_local_uri_allowed("s3://bucket/x.parquet")  # object-store → not a local path → allowed
-    with pytest.raises(PermissionError):
-        paths.ensure_local_uri_allowed("/etc/passwd")       # outside every root → rejected
+    for escaped in ("/etc/passwd", "file:///etc/passwd", "FILE:///etc/passwd", "FiLe:///etc/passwd"):
+        with pytest.raises(PermissionError):
+            paths.ensure_local_uri_allowed(escaped)         # scheme case cannot bypass the same root check
+    # urlsplit calls the drive letter a URI scheme; DuckDB calls it a local filename. The shared parser
+    # must follow the executable adapter boundary so Windows cannot skip confinement.
+    monkeypatch.setattr(paths, "allowed_roots", lambda: [_os.path.realpath("/definitely-allowed")])
+    for drive_path in (r"C:\data\secret.csv", "C:/data/secret.csv"):
+        expected_drive = drive_path.replace("/", "\\") if _os.name == "nt" else drive_path
+        assert paths.local_path(drive_path) == expected_drive
+        assert path_of(drive_path) == expected_drive
+        with pytest.raises(PermissionError):
+            paths.ensure_local_uri_allowed(drive_path)
+    win_file_uri = "file:///C:/data/secret.csv"
+    expected = r"C:\data\secret.csv" if _os.name == "nt" else "/C:/data/secret.csv"
+    assert paths.local_path(win_file_uri) == expected
 
 
 def test_canvas_crud_is_per_user():

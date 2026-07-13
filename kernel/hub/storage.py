@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import logging
 import os
 import re
 import shutil
@@ -46,6 +47,25 @@ RESULT_DIR = ".dp-results"
 RESULT_LOCK_DIR = ".locks"
 RESULT_NAMESPACE_FILE = ".namespace-id"
 MAX_MANAGED_EXECUTION_SOURCES = 128
+
+
+class ManagedSourceReadError(Exception):
+    """A typed interactive-source policy/lifecycle failure that callers must not treat as unknown."""
+
+
+class ManagedSourceUnavailable(FileNotFoundError, ManagedSourceReadError):
+    """Public, provider-neutral failure for an interactive managed-source read."""
+
+    def __init__(self):
+        super().__init__("managed source is unavailable or expired")
+
+
+class ManagedSourceLimitExceeded(RuntimeError, ManagedSourceReadError):
+    """The complete source set exceeded the bounded acquisition contract."""
+
+
+class ManagedSourceAccessDenied(PermissionError, ManagedSourceReadError):
+    """A local source failed the shared-deployment path-confinement contract."""
 
 
 class Storage(Protocol):
@@ -159,22 +179,149 @@ def preflight_managed_execution_sources(
     seen: set[str] = set()
     managed_keys: set[str] = set()
     for raw_uri in uris:
-        normalized = str(raw_uri).rstrip("/")
+        from hub.paths import local_path
+
+        raw = str(raw_uri)
+        try:
+            path = local_path(raw)
+        except ValueError:
+            path = raw
+        normalized = ((path.rstrip(os.sep) or os.sep) if path is not None
+                      else raw.rstrip("/"))
         if normalized in seen:
             continue
         seen.add(normalized)
         ordered.append(normalized)
         local = bool(callable(classify_local) and classify_local(normalized))
         if local:
-            path = normalized[len("file://"):] if normalized.startswith("file://") else normalized
-            managed_keys.add(f"local:{path}")
+            managed_keys.add(f"local:{normalized}")
         elif include_object_attempts and has_attempt_path_component(normalized):
             managed_keys.add(f"object:{normalized}")
         if len(managed_keys) > MAX_MANAGED_EXECUTION_SOURCES:
-            raise RuntimeError(
+            raise ManagedSourceLimitExceeded(
                 f"an execution may use at most {MAX_MANAGED_EXECUTION_SOURCES} managed sources; "
                 "split the graph or reduce its managed inputs")
     return ordered
+
+
+def _interactive_source_targets(storage, uris) -> list[tuple[str, str]]:
+    """Normalize and classify a complete interactive read set without acquiring anything."""
+    from hub import metadb
+
+    classify_local = (getattr(storage, "requires_result_read", None)
+                      or getattr(storage, "is_managed_result_uri", None))
+    targets: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw_uri in uris:
+        raw = str(raw_uri)
+        from hub import paths
+
+        try:
+            paths.ensure_local_uri_allowed(raw)
+        except PermissionError as exc:
+            logging.getLogger("hub").warning("interactive source rejected by local-path policy")
+            raise ManagedSourceAccessDenied(str(exc)) from None
+        try:
+            local = paths.local_path(raw)
+        except ValueError:
+            logging.getLogger("hub").warning(
+                "interactive source rejected a non-canonical file URI")
+            raise ManagedSourceUnavailable() from None
+        normalized = ((local.rstrip(os.sep) or os.sep) if local is not None
+                      else raw.rstrip("/"))
+
+        try:
+            local = bool(callable(classify_local) and classify_local(normalized))
+        except Exception:
+            logging.getLogger("hub").exception(
+                "interactive source lifecycle classification failed")
+            raise ManagedSourceUnavailable() from None
+
+        if local:
+            canonical = (normalized[len("file://"):]
+                         if normalized.startswith("file://") else normalized)
+            key = f"local:{canonical}"
+            target = (canonical, "local")
+        elif metadb.object_attempt_namespace_path(normalized):
+            if not metadb.object_attempt_uri_shape(normalized):
+                logging.getLogger("hub").warning(
+                    "interactive source rejected a managed-attempt descendant")
+                raise ManagedSourceUnavailable() from None
+            key = f"object:{normalized}"
+            target = (normalized, "object")
+        else:
+            key = f"unmanaged:{normalized}"
+            target = (normalized, "unmanaged")
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(target)
+
+    managed_count = sum(kind != "unmanaged" for _uri, kind in targets)
+    if managed_count > MAX_MANAGED_EXECUTION_SOURCES:
+        raise ManagedSourceLimitExceeded(
+            f"an interactive read may use at most {MAX_MANAGED_EXECUTION_SOURCES} managed sources; "
+            "split the graph or reduce its managed inputs")
+    return targets
+
+
+@contextlib.contextmanager
+def source_read_scope(storage, uris, *, owner: str, ttl_seconds: float = 300):
+    """Pin every managed source through one complete interactive read.
+
+    Ordinary sources are a no-op. The complete set is classified, normalized, deduplicated, and
+    capped before the first claim. Acquisition/check failures are logged with their internal cause and
+    exposed as one stable provider-neutral error; an exception raised by the read body itself is kept.
+    """
+    targets = _interactive_source_targets(storage, uris)
+    stack = contextlib.ExitStack()
+    guards = []
+    try:
+        acquire_local = getattr(storage, "acquire_result_read", None)
+        from hub.handoff import managed_read_lease
+
+        for uri, kind in targets:
+            if kind == "local":
+                if not callable(acquire_local):
+                    raise RuntimeError("managed local-source reader is unavailable")
+                guards.append(stack.enter_context(acquire_local(uri, owner)))
+            elif kind == "object":
+                guards.append(stack.enter_context(managed_read_lease(
+                    uri, owner=owner, ttl_seconds=ttl_seconds)))
+    except BaseException as acquisition_error:
+        try:
+            stack.close()
+        except BaseException:  # noqa: BLE001 - acquisition failure remains primary
+            logging.getLogger("hub").exception(
+                "interactive source lifecycle rollback failed")
+        if not isinstance(acquisition_error, Exception):
+            # Cancellation and process-control exceptions must retain their identity after every
+            # already-acquired guard has been released.
+            raise
+        logging.getLogger("hub").exception(
+            "interactive source lifecycle acquisition failed")
+        raise ManagedSourceUnavailable() from None
+
+    try:
+        yield guards
+    except BaseException:
+        # Pass the active exception through ExitStack so guard cleanup never replaces the read failure.
+        import sys
+        exc_info = sys.exc_info()
+        try:
+            stack.__exit__(*exc_info)
+        except Exception:  # noqa: BLE001 - preserve the active read/timeout/cancellation failure
+            logging.getLogger("hub").exception(
+                "interactive source lifecycle cleanup failed after read error")
+        raise
+    else:
+        try:
+            # Each guard performs its final identity/lease check before it releases its claim.
+            stack.close()
+        except Exception:
+            logging.getLogger("hub").exception(
+                "interactive source lifecycle final check failed")
+            raise ManagedSourceUnavailable() from None
 
 
 @contextlib.contextmanager
@@ -419,14 +566,19 @@ class LocalStorage:
         if not uri:
             return False
         raw = str(uri)
-        if "://" in raw and not raw.startswith("file://"):
+        from hub.paths import local_path
+
+        try:
+            path = local_path(raw)
+        except ValueError as exc:
+            raise RuntimeError("managed local-result URI is not canonical") from exc
+        if path is None:
             return False
         try:
-            self._result_names(raw)
+            self._result_names(path)
             return True
         except RuntimeError:
             pass
-        path = raw[len("file://"):] if raw.startswith("file://") else raw
         parts = [part.casefold() for part in os.path.normpath(path).split(os.sep) if part]
         reserved_shape = (
             RESULT_DIR.casefold() in parts
@@ -803,8 +955,11 @@ class LocalStorage:
     def acquire_result_read(self, uri: str, owner: str) -> LocalResultReadGuard:
         """Acquire an ephemeral read guard before any existence check or lazy adapter scan."""
         from hub import metadb
+        from hub.paths import local_path
 
-        canonical_uri = uri[len("file://"):] if uri.startswith("file://") else uri
+        canonical_uri = local_path(uri)
+        if canonical_uri is None:
+            raise ValueError("managed local-result reader requires a local URI")
         self.validate_result_uri(canonical_uri)
         _artifact_name, lock_name = self._result_names(canonical_uri)
         reader_id = f"{owner}:{uuid.uuid4().hex}"

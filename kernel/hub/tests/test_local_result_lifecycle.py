@@ -17,7 +17,10 @@ from hub.plugins.runner import _persist_local_result_done
 from hub.storage import (
     MAX_MANAGED_EXECUTION_SOURCES,
     LocalStorage,
+    ManagedSourceLimitExceeded,
+    ManagedSourceUnavailable,
     local_result_read_scope,
+    source_read_scope,
 )
 
 
@@ -564,6 +567,117 @@ def test_read_guard_detects_artifact_inode_replacement(storage):
     storage.prune_results(limit=10)
 
 
+def test_interactive_scope_deduplicates_local_alias_and_ignores_unmanaged(storage, tmp_path):
+    run_id = f"run-{uuid.uuid4().hex}"
+    uri = _ready_result(storage, run_id)
+    _user_id, canvas_id, _doc = _publish_run(storage, run_id, uri)
+    ordinary = tmp_path / "ordinary.parquet"
+    ordinary.write_bytes(b"ordinary")
+    file_uri = pathlib.Path(uri).as_uri()
+
+    with source_read_scope(
+            storage, [uri, file_uri, file_uri.replace("file://", "FILE://"), str(ordinary)],
+            owner="interactive-local") as guards:
+        assert len(guards) == 1
+        assert metadb.local_result_read_active(
+            uri, storage.namespace_id, guards[0].reader_id)
+        metadb.delete_canvas_cascade(canvas_id)
+        storage.prune_results(limit=10)
+        assert pathlib.Path(uri).exists()
+
+    storage.prune_results(limit=10)
+    assert not pathlib.Path(uri).exists()
+
+
+def test_interactive_scope_rejects_noncanonical_file_alias_before_body(storage):
+    run_id = f"run-{uuid.uuid4().hex}"
+    uri = _ready_result(storage, run_id)
+    _user_id, canvas_id, _doc = _publish_run(storage, run_id, uri)
+    file_uri = pathlib.Path(uri).as_uri()
+    aliases = [
+        file_uri + "?download=1",
+        file_uri + "?",
+        file_uri + "#",
+        file_uri.replace("file:///", "file://other-host/"),
+        file_uri.replace("file:///", "file:/"),
+    ]
+    bodies = 0
+    for alias in aliases:
+        with pytest.raises(ManagedSourceUnavailable, match="unavailable or expired"):
+            with source_read_scope(storage, [alias], owner="invalid-file-alias"):
+                bodies += 1
+    assert bodies == 0
+    metadb.delete_canvas_cascade(canvas_id)
+    storage.prune_results(limit=10)
+
+
+def test_warm_preview_reacquires_local_source_guard_on_cache_hit(storage, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub import db
+    from hub.executors.preview import preview_node
+    from hub.models import Graph
+    from hub.relation_cache import RelationCache
+
+    run_id = f"run-{uuid.uuid4().hex}"
+    uri = storage.begin_result(f"plan-{uuid.uuid4().hex}", run_id)
+    pq.write_table(pa.table({"value": [1]}), uri)
+    storage.commit_result(uri, run_id)
+    _user_id, canvas_id, _doc = _publish_run(storage, run_id, uri)
+
+    acquisitions = []
+    scans = 0
+    fingerprints = 0
+    original_acquire = storage.acquire_result_read
+
+    def acquire(source_uri, owner):
+        guard = original_acquire(source_uri, owner)
+        acquisitions.append(guard)
+        return guard
+
+    monkeypatch.setattr(storage, "acquire_result_read", acquire)
+
+    def active() -> bool:
+        return bool(acquisitions and metadb.local_result_read_active(
+            uri, storage.namespace_id, acquisitions[-1].reader_id))
+
+    class Adapter:
+        def fingerprint(self, source_uri):
+            nonlocal fingerprints
+            assert source_uri == uri and active()
+            fingerprints += 1
+            return "stable-local-source"
+
+        def scan(self, source_uri, **_kwargs):
+            nonlocal scans
+            assert source_uri == uri and active()
+            scans += 1
+            return db.conn().sql("SELECT 1 AS value")
+
+    graph = Graph.model_validate({
+        "id": f"warm-{uuid.uuid4().hex}",
+        "version": 1,
+        "nodes": [{
+            "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+            "data": {"config": {"uri": uri}},
+        }],
+        "edges": [],
+    })
+    cache = RelationCache()
+    for _ in range(2):
+        result = preview_node(
+            graph, "source", 5, lambda _uri: Adapter(), {}, cache=cache, storage=storage)
+        assert not result.error and result.rows == [{"value": 1}]
+        assert not active()
+    assert len(acquisitions) == 2 and fingerprints == 2
+    assert scans == 1, "the warm hit must still reacquire the exact local source guard"
+
+    metadb.delete_canvas_cascade(canvas_id)
+    storage.prune_results(limit=10)
+    assert not pathlib.Path(uri).exists()
+
+
 def test_managed_source_cap_fails_before_any_reader_acquisition(storage, monkeypatch):
     uris = [
         os.path.join(
@@ -579,7 +693,7 @@ def test_managed_source_cap_fails_before_any_reader_acquisition(storage, monkeyp
         raise AssertionError("preflight must run before the first acquisition")
 
     monkeypatch.setattr(storage, "acquire_result_read", acquire)
-    with pytest.raises(RuntimeError, match="at most"):
+    with pytest.raises(ManagedSourceLimitExceeded, match="at most"):
         with local_result_read_scope(storage, uris, owner="cap-test"):
             pass
     assert acquired == []
