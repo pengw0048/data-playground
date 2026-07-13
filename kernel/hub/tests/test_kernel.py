@@ -4569,6 +4569,15 @@ async def _collab_recv(ws) -> dict:  # noqa: ANN001 — websockets client protoc
     return json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
 
 
+async def _expect_ws_policy_close(ws) -> None:  # noqa: ANN001 — protocol varies by websockets version
+    import asyncio
+    from websockets.exceptions import ConnectionClosed
+    with pytest.raises(ConnectionClosed) as closed:
+        await asyncio.wait_for(ws.recv(), timeout=3)
+    assert closed.value.rcvd is not None
+    assert closed.value.rcvd.code == 1008
+
+
 def test_collab_relay_gates_viewer_doc_updates(monkeypatch, live_collab_url):
     # A viewer may watch (presence + peers' edits) but its OWN doc updates must not be relayed.
     import asyncio
@@ -4682,6 +4691,98 @@ def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_
     try:
         asyncio.run(scenario())
     finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_logout_revokes_sender_and_recipient(monkeypatch, live_collab_url):
+    # Real logout bumps the session epoch and fences every already-open socket before either document
+    # direction can leak. This intentionally revokes all of the user's sessions, not just this cookie.
+    import asyncio
+    import httpx
+    import websockets
+    from hub import auth, metadb
+    monkeypatch.setenv("DP_AUTH_SECRET", "ws-revocation-test-secret-not-weak-0123456789")
+    cid, owner_uid, revoked_uid = "cvs_token_revoke", "live_owner_t", "live_editor_t"
+    _provision_private_collab_canvas(cid, owner_uid, revoked_uid)
+    metadb.share_canvas(cid, revoked_uid, "editor")
+    owner_cookie = f"dp_session={auth.sign(owner_uid)}"
+    revoked_token = auth.sign(revoked_uid)
+    revoked_cookie = f"dp_session={revoked_token}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner:
+            async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as writer:
+                async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as reader:
+                    async with httpx.AsyncClient(
+                        base_url=live_collab_url, headers={"Cookie": revoked_cookie},
+                    ) as http:
+                        response = await http.post("/api/auth/logout")
+                    assert response.status_code == 200
+                    assert auth.verify(revoked_token) is None
+
+                    await _collab_send(writer, {
+                        "clientId": "revoked-writer", "type": "yjs", "update": "MUST_NOT_RELAY",
+                    })
+                    await _expect_ws_policy_close(writer)
+                    # The presence-only leave is the next ordered room event, proving the rejected
+                    # document was not delivered before the sender was fenced.
+                    expected_leave = {"type": "leave", "clientId": "revoked-writer"}
+                    assert await _collab_recv(owner) == expected_leave
+                    assert await _collab_recv(reader) == expected_leave
+
+                    await _collab_send(owner, {
+                        "clientId": "owner", "type": "yjs", "update": "MUST_NOT_RECEIVE",
+                    })
+                    await _expect_ws_policy_close(reader)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+@pytest.mark.parametrize("revocation", ["token", "share"])
+def test_run_ws_rechecks_session_and_read_access(monkeypatch, live_collab_url, revocation):
+    # A first status frame is the synchronization barrier: after revocation commits, the next stream
+    # boundary must be a 1008 close, never another row-count/error/output-bearing status payload.
+    import asyncio
+    import websockets
+    from hub import auth, metadb
+    from hub.models import RunStatus
+    monkeypatch.setenv("DP_AUTH_SECRET", "ws-revocation-test-secret-not-weak-0123456789")
+    run_id, cid = f"run_ws_revoke_{revocation}", f"cvs_run_ws_revoke_{revocation}"
+    owner_uid, reader_uid = f"run_owner_{revocation}", f"run_reader_{revocation}"
+    _provision_private_collab_canvas(cid, owner_uid, reader_uid)
+    metadb.share_canvas(cid, reader_uid, "viewer")
+    metadb.save_run_state(
+        run_id, RunStatus(run_id=run_id, status="running", rows_processed=7).model_dump(),
+        canvas_id=cid,
+    )
+    metadb.bind_run_owner(run_id, owner_uid, cid)
+    get_deps().run_index.pop(run_id, None)
+    get_deps().run_owner.pop(run_id, None)
+    reader_token = auth.sign(reader_uid)
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/run/{run_id}"
+        async with websockets.connect(
+                ws_url, additional_headers={"Cookie": f"dp_session={reader_token}"}, proxy=None) as ws:
+            first = await _collab_recv(ws)
+            assert first["runId"] == run_id and first["status"] == "running"
+            if revocation == "token":
+                await asyncio.to_thread(metadb.bump_token_epoch, reader_uid)
+                assert auth.verify(reader_token) is None
+            else:
+                await asyncio.to_thread(metadb.unshare_canvas, cid, reader_uid)
+                assert metadb.canvas_role(cid, reader_uid) is None
+            await _expect_ws_policy_close(ws)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        get_deps().run_index.pop(run_id, None)
+        get_deps().run_owner.pop(run_id, None)
         metadb.delete_canvas_cascade(cid)
 
 
