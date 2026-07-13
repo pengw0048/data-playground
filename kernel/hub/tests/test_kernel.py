@@ -680,7 +680,7 @@ def test_request_body_and_graph_complexity_limits(monkeypatch):
     # (2) oversized code on a node → 422 (body itself well under the byte cap)
     big = {"id": "c", "version": 1, "nodes": [N("t", "transform", {"code": "x" * (MAX_CODE_LEN + 1)})], "edges": []}
     assert client.post("/api/graph/compile", json={"graph": big}).status_code == 422
-    # (3) a body over the byte cap → 413 from the middleware (header-only check)
+    # (3) a body over the byte cap → 413 from the middleware
     monkeypatch.setattr(settings, "max_body_bytes", 200)
     payload = {"graph": {"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": "x" * 500})], "edges": []}}
     assert client.post("/api/graph/compile", json=payload).status_code == 413
@@ -2306,10 +2306,146 @@ def test_kernel_child_env_is_allowlisted_but_keeps_auth_mode(monkeypatch):
     assert not {"DP_AUTH_PASSWORD", "OPENAI_API_KEY", "UNRELATED_DEPLOY_TOKEN"} & env.keys()
     assert env["DP_AUTH_MODE"] == "1"           # but the auth-mode signal survives
     assert env["DP_DATABASE_URL"] and env["AWS_SECRET_ACCESS_KEY"]  # explicit residual capabilities
-    # the signal alone enables auth mode with NO usable signing material in the child
+    # The signal alone keeps workload confinement enabled, but is never usable signing material. The
+    # kernel child does not import hub.main, so the hub-only startup guard does not block this process.
     monkeypatch.delenv("DP_AUTH_SECRET")
     monkeypatch.setenv("DP_AUTH_MODE", "1")
     assert auth.auth_enabled() is True and auth._secret() == ""
+    assert auth.verify("local.0.9999999999.forged") is None
+    with pytest.raises(RuntimeError, match="cannot sign a session"):
+        auth.sign("local")
+
+
+@pytest.mark.parametrize("raw_secret", [None, "", "   "])
+def test_auth_mode_without_a_signing_secret_fails_closed(monkeypatch, raw_secret):
+    """DP_AUTH_MODE is a workload marker, not an implicit public HMAC key."""
+    import hashlib
+    import hmac
+
+    from hub import auth
+
+    monkeypatch.setenv("DP_AUTH_MODE", "1")
+    if raw_secret is None:
+        monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
+    else:
+        monkeypatch.setenv("DP_AUTH_SECRET", raw_secret)
+    payload = "local.0.9999999999"
+    forged = f"{payload}.{hmac.new((raw_secret or '').encode(), payload.encode(), hashlib.sha256).hexdigest()}"
+
+    assert auth.auth_enabled() is True  # confinement remains enabled for a workload child
+    assert auth.verify(forged) is None   # an empty/blank key can never authenticate a request
+    with pytest.raises(RuntimeError, match="cannot sign a session"):
+        auth.sign("local")
+    with pytest.raises(RuntimeError, match="cannot authenticate hub sessions"):
+        auth.reject_weak_secret()
+
+
+@pytest.mark.parametrize("raw_secret", ["", "   "])
+def test_blank_secret_without_auth_mode_remains_open_local_mode(monkeypatch, raw_secret):
+    """An empty optional env value is still unconfigured; only DP_AUTH_MODE opts into auth."""
+    from hub import auth
+
+    monkeypatch.delenv("DP_AUTH_MODE", raising=False)
+    monkeypatch.setenv("DP_AUTH_SECRET", raw_secret)
+
+    assert auth.auth_enabled() is False
+    auth.reject_weak_secret()
+    assert auth.verify("local.0.9999999999.forged") is None
+    with pytest.raises(RuntimeError, match="cannot sign a session"):
+        auth.sign("local")
+
+
+@pytest.mark.parametrize("raw_secret", [None, ""])
+def test_hub_startup_rejects_auth_mode_without_a_signing_secret(tmp_path, raw_secret):
+    """Importing the web app is hub startup; fail before opening its metadata database."""
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    if raw_secret is None:
+        env.pop("DP_AUTH_SECRET", None)
+    else:
+        env["DP_AUTH_SECRET"] = raw_secret
+    env["DP_AUTH_MODE"] = "1"
+    env["DP_WORKSPACE"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-c", "import hub.main"],
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "cannot authenticate hub sessions without" in result.stderr
+    assert "non-empty DP_AUTH_SECRET" in result.stderr
+
+
+def test_cli_rejects_marker_only_auth_before_creating_metadata(tmp_path):
+    """The normal `dataplay` path must fail before seed, DB migration, or dependency setup."""
+    import subprocess
+    import sys
+
+    workspace = tmp_path / "workspace"
+    env = dict(os.environ)
+    env.pop("DP_AUTH_SECRET", None)
+    env.pop("DP_DATABASE_URL", None)
+    env["DP_AUTH_MODE"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hub.cli",
+            "--workspace",
+            str(workspace),
+            "--no-open",
+            "--no-seed",
+        ],
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "cannot authenticate hub sessions without" in result.stderr
+    assert not (workspace / "dataplay.db").exists()
+
+
+def test_authenticated_principal_deletion_never_falls_back_to_local_admin(monkeypatch):
+    """Deleting a user between signature verification and principal resolution must return 401."""
+    from fastapi import HTTPException
+
+    from hub import auth, metadb
+    from hub.security import current_user
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "strict-principal-secret")
+    monkeypatch.delenv("DP_AUTH_MODE", raising=False)
+    uid = "principal_deleted_during_auth"
+    with metadb.session() as s:
+        existing = s.get(metadb.User, uid)
+        if existing is not None:
+            s.delete(existing)
+    with metadb.session() as s:
+        s.add(metadb.User(id=uid, name="Deleted during auth"))
+    token = auth.sign(uid)
+    original_verify = auth.verify
+
+    def verify_then_delete(candidate):
+        verified = original_verify(candidate)
+        with metadb.session() as s:
+            user = s.get(metadb.User, verified)
+            if user is not None:
+                s.delete(user)
+        return verified
+
+    monkeypatch.setattr(auth, "verify", verify_then_delete)
+    with pytest.raises(HTTPException) as exc:
+        current_user(x_dp_user=None, dp_session=token)
+    assert exc.value.status_code == 401
+    assert metadb.user_token_epoch("local") is not None  # the fallback admin still exists but was not selected
 
 
 def test_canvas_pip_deps_default_off_under_auth(monkeypatch):
@@ -4593,6 +4729,15 @@ async def _collab_recv(ws) -> dict:  # noqa: ANN001 — websockets client protoc
     return json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
 
 
+async def _expect_ws_policy_close(ws) -> None:  # noqa: ANN001 — protocol varies by websockets version
+    import asyncio
+    from websockets.exceptions import ConnectionClosed
+    with pytest.raises(ConnectionClosed) as closed:
+        await asyncio.wait_for(ws.recv(), timeout=3)
+    assert closed.value.rcvd is not None
+    assert closed.value.rcvd.code == 1008
+
+
 def test_collab_relay_gates_viewer_doc_updates(monkeypatch, live_collab_url):
     # A viewer may watch (presence + peers' edits) but its OWN doc updates must not be relayed.
     import asyncio
@@ -4706,6 +4851,98 @@ def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_
     try:
         asyncio.run(scenario())
     finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_logout_revokes_sender_and_recipient(monkeypatch, live_collab_url):
+    # Real logout bumps the session epoch and fences every already-open socket before either document
+    # direction can leak. This intentionally revokes all of the user's sessions, not just this cookie.
+    import asyncio
+    import httpx
+    import websockets
+    from hub import auth, metadb
+    monkeypatch.setenv("DP_AUTH_SECRET", "ws-revocation-test-secret-not-weak-0123456789")
+    cid, owner_uid, revoked_uid = "cvs_token_revoke", "live_owner_t", "live_editor_t"
+    _provision_private_collab_canvas(cid, owner_uid, revoked_uid)
+    metadb.share_canvas(cid, revoked_uid, "editor")
+    owner_cookie = f"dp_session={auth.sign(owner_uid)}"
+    revoked_token = auth.sign(revoked_uid)
+    revoked_cookie = f"dp_session={revoked_token}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner:
+            async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as writer:
+                async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as reader:
+                    async with httpx.AsyncClient(
+                        base_url=live_collab_url, headers={"Cookie": revoked_cookie},
+                    ) as http:
+                        response = await http.post("/api/auth/logout")
+                    assert response.status_code == 200
+                    assert auth.verify(revoked_token) is None
+
+                    await _collab_send(writer, {
+                        "clientId": "revoked-writer", "type": "yjs", "update": "MUST_NOT_RELAY",
+                    })
+                    await _expect_ws_policy_close(writer)
+                    # The presence-only leave is the next ordered room event, proving the rejected
+                    # document was not delivered before the sender was fenced.
+                    expected_leave = {"type": "leave", "clientId": "revoked-writer"}
+                    assert await _collab_recv(owner) == expected_leave
+                    assert await _collab_recv(reader) == expected_leave
+
+                    await _collab_send(owner, {
+                        "clientId": "owner", "type": "yjs", "update": "MUST_NOT_RECEIVE",
+                    })
+                    await _expect_ws_policy_close(reader)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+@pytest.mark.parametrize("revocation", ["token", "share"])
+def test_run_ws_rechecks_session_and_read_access(monkeypatch, live_collab_url, revocation):
+    # A first status frame is the synchronization barrier: after revocation commits, the next stream
+    # boundary must be a 1008 close, never another row-count/error/output-bearing status payload.
+    import asyncio
+    import websockets
+    from hub import auth, metadb
+    from hub.models import RunStatus
+    monkeypatch.setenv("DP_AUTH_SECRET", "ws-revocation-test-secret-not-weak-0123456789")
+    run_id, cid = f"run_ws_revoke_{revocation}", f"cvs_run_ws_revoke_{revocation}"
+    owner_uid, reader_uid = f"run_owner_{revocation}", f"run_reader_{revocation}"
+    _provision_private_collab_canvas(cid, owner_uid, reader_uid)
+    metadb.share_canvas(cid, reader_uid, "viewer")
+    metadb.save_run_state(
+        run_id, RunStatus(run_id=run_id, status="running", rows_processed=7).model_dump(),
+        canvas_id=cid,
+    )
+    metadb.bind_run_owner(run_id, owner_uid, cid)
+    get_deps().run_index.pop(run_id, None)
+    get_deps().run_owner.pop(run_id, None)
+    reader_token = auth.sign(reader_uid)
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/run/{run_id}"
+        async with websockets.connect(
+                ws_url, additional_headers={"Cookie": f"dp_session={reader_token}"}, proxy=None) as ws:
+            first = await _collab_recv(ws)
+            assert first["runId"] == run_id and first["status"] == "running"
+            if revocation == "token":
+                await asyncio.to_thread(metadb.bump_token_epoch, reader_uid)
+                assert auth.verify(reader_token) is None
+            else:
+                await asyncio.to_thread(metadb.unshare_canvas, cid, reader_uid)
+                assert metadb.canvas_role(cid, reader_uid) is None
+            await _expect_ws_policy_close(ws)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        get_deps().run_index.pop(run_id, None)
+        get_deps().run_owner.pop(run_id, None)
         metadb.delete_canvas_cascade(cid)
 
 

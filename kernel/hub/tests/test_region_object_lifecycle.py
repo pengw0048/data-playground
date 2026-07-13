@@ -182,6 +182,34 @@ def _attempt_refs(uri: str) -> list[str]:
             metadb.ObjectAttemptRef.attempt_uri == uri))]
 
 
+def test_region_allocation_attestation_failure_abandons_attempt(region_env, monkeypatch):
+    controller = region_env.deps.controller
+    allocated: list[str] = []
+    real_allocate = handoff.allocate_attempt
+
+    def track_allocate(**kwargs):
+        handle = real_allocate(**kwargs)
+        allocated.append(handle["uri"])
+        return handle
+
+    def fail_attestation(*_args, **_kwargs):
+        raise RuntimeError("attestation failed")
+
+    monkeypatch.setattr(handoff, "allocate_attempt", track_allocate)
+    monkeypatch.setattr(controller, "_assert_region_attempt", fail_attestation)
+
+    with pytest.raises(RuntimeError, match="region object lifecycle allocation failed"):
+        controller._allocate_region_attempt(
+            logical_uri=region_env.logical_uri,
+            run_id="run-allocation-attestation-failure",
+            region_id=region_env.region.id,
+            cache_key=region_env.cache_key,
+        )
+
+    assert len(allocated) == 1
+    assert _attempt_state(allocated[0]) == "abandoned"
+
+
 def _committed_handle(logical_uri: str) -> dict:
     run_id = f"primitive-{uuid.uuid4().hex}"
     handle = handoff.allocate_attempt(
