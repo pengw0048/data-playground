@@ -10,6 +10,7 @@ built-in relational node.
 """
 
 from hub.sdk import NodeSpec, ParamSpec, PortSpec, ctx
+from hub.sqlpolicy import identifier, quote_identifier
 
 SPEC = NodeSpec(
     kind="redact",
@@ -30,17 +31,18 @@ def build(engine, node, inputs):
     """Contribute one step to the logical plan: SELECT * with the target column replaced by a mask.
 
     `inputs[0]` is the upstream relation. `ctx.sql` runs SQL over it, referencing it as the
-    placeholder token `{input}`, and returns a lazy relation (no materialization).
+    query-scope relation `input`, and returns a lazy relation (no materialization).
     """
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
     col = (cfg.get("column") or "").strip()
     if not col:
         return inputs[0]  # nothing configured yet → passthrough (keeps the node valid/previewable)
     keep = int(cfg.get("keep") or 0)
-    s = f'CAST("{col}" AS VARCHAR)'
+    column = quote_identifier(identifier(col, inputs[0].columns, label="redact column"))
+    s = f"CAST({column} AS VARCHAR)"
     # first `keep` chars kept; the remainder becomes that many '*' (length-preserving-ish mask)
-    masked = f"left({s}, {keep}) || repeat('*', greatest(length({s}) - {keep}, 0))"
-    return ctx.sql(inputs[0], f'SELECT * REPLACE ({masked} AS "{col}") FROM {{input}}')
+    masked = f"left({s}, {keep}) || rpad('', CAST(greatest(length({s}) - {keep}, 0) AS INTEGER), '*')"
+    return ctx.sql(inputs[0], f"SELECT * REPLACE ({masked} AS {column}) FROM input")
 
 
 def register(reg):

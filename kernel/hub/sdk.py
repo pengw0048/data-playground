@@ -7,7 +7,7 @@ from DuckDB SQL, a Polars transform, or an Arrow-batch UDF — all out-of-core, 
 
 Example plugin (`plugins/mypack/__init__.py`):
 
-    from hub.sdk import NodeSpec, PortSpec, ParamSpec, ctx
+    from hub.sdk import NodeSpec, PortSpec, ParamSpec, ctx, identifier, quote_identifier
 
     SPEC = NodeSpec(kind="upper", title="uppercase", category="compute",
                     inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
@@ -15,9 +15,8 @@ Example plugin (`plugins/mypack/__init__.py`):
 
     def build(engine, node, inputs):
         col = node.data.get("config", {}).get("column", "name")
-        # NOTE: {{input}} in an f-string emits the literal {input} token that ctx.sql substitutes with
-        # the input view name. A bare {input} would be interpolated by Python to the builtin `input`.
-        return ctx.sql(inputs[0], f'SELECT * REPLACE (upper("{col}") AS "{col}") FROM {{input}}')
+        column = quote_identifier(identifier(col, inputs[0].columns, label="uppercase column"))
+        return ctx.sql(inputs[0], f"SELECT * REPLACE (upper({column}) AS {column}) FROM input")
 
     def register(reg):
         reg.add_node(SPEC, build)
@@ -33,8 +32,12 @@ import pyarrow as pa
 
 from hub import db
 from hub.nodespecs import NodeSpec, ParamSpec, PortSpec, WireType  # re-export
+from hub.sqlpolicy import bind_input_ctes, identifier, quote_identifier, validate_query
 
-__all__ = ["NodeSpec", "ParamSpec", "PortSpec", "WireType", "ctx", "close_resources"]
+__all__ = [
+    "NodeSpec", "ParamSpec", "PortSpec", "WireType", "ctx", "identifier", "quote_identifier",
+    "close_resources",
+]
 
 _T = TypeVar("_T")
 _RESOURCES: dict[str, object] = {}   # process-global warm handles, kept alive across batches AND runs
@@ -46,14 +49,11 @@ class _Ctx:
     """Safe builders that turn relations into relations without forcing materialization."""
 
     def sql(self, rel, query: str):
-        """Run SQL over `rel`, referenced as the placeholder token ``{input}``. Returns a relation.
-
-        (``{input}`` can't occur in valid SQL, so unlike a bare ``_`` it never rewrites an
-        underscore inside a string literal or LIKE pattern.)
-        """
+        """Run one validated SELECT over `rel`, referenced by the query-scope CTE ``input``."""
+        validated = validate_query(query, 1, con=db.conn())
         name = db.unique_view("sdk")  # process-globally-unique + tracked for cleanup
         rel.create_view(name, replace=True)
-        return db.conn().sql(query.replace("{input}", name))
+        return db.conn().sql(bind_input_ctes(validated, [name]))
 
     def arrow_map(self, rel, fn: Callable[["pa.RecordBatch"], "pa.RecordBatch | list[dict]"]):
         """Apply a Python fn over Arrow batches (the escape hatch). Returns a relation."""

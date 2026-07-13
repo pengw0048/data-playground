@@ -38,17 +38,78 @@ def node_map(graph: Graph) -> dict[str, GraphNode]:
     return {n.id: n for n in graph.nodes}
 
 
-def resolve_source_refs(graph: Graph, resolve) -> None:
-    """Rewrite each `source` node's uri IN PLACE via `resolve` (a name/id → uri function, e.g.
-    catalog.resolve_ref) so a source can name a catalog table instead of only a path/uri. A no-op for
-    real paths/uris and unknown tokens. Called at the graph-consuming API entry points, so the engine,
-    compiler, and estimator all see resolved uris; the persisted canvas doc is untouched."""
-    for n in graph.nodes:
-        if n.type != "source" or not isinstance(n.data, dict):
+_MAX_EXECUTION_SOURCE_NODES = 10_000
+_MAX_LEGACY_SECTION_DEPTH = 64
+
+
+def _execution_source_configs(graph: Graph, roots: list[GraphNode]) -> list[dict]:
+    """Source configs a selected execution cone can actually reach, including section bodies.
+
+    A visual section executes its ``parent_id`` children rather than ordinary graph edges. Older
+    canvases store the same callable nodes under ``config.subnodes``. Keep that precedence identical
+    to ``section._collect_subnodes`` and bound the iterative walk so malformed nested documents cannot
+    turn source ownership/fingerprinting into unbounded recursion.
+    """
+    children: dict[str, list[GraphNode]] = {}
+    for node in graph.nodes:
+        if node.parent_id:
+            children.setdefault(node.parent_id, []).append(node)
+
+    queue: list[tuple[str, object, int]] = [("visual", node, 0) for node in roots]
+    seen_visual: set[str] = set()
+    seen_legacy: set[int] = set()
+    configs: list[dict] = []
+    cursor = 0
+    while cursor < len(queue):
+        if cursor >= _MAX_EXECUTION_SOURCE_NODES:
+            raise RuntimeError("section source traversal exceeds the supported node limit")
+        kind, raw, depth = queue[cursor]
+        cursor += 1
+        if depth > _MAX_LEGACY_SECTION_DEPTH:
+            raise RuntimeError("legacy section nesting exceeds the supported depth")
+
+        if kind == "visual":
+            node = raw
+            if not isinstance(node, GraphNode) or node.id in seen_visual:
+                continue
+            seen_visual.add(node.id)
+            node_type = node.type
+            data = node.data if isinstance(node.data, dict) else {}
+            config = data.get("config") if isinstance(data.get("config"), dict) else {}
+            direct_children = children.get(node.id, [])
+        else:
+            spec = raw
+            if not isinstance(spec, dict) or id(spec) in seen_legacy:
+                continue
+            seen_legacy.add(id(spec))
+            node_type = spec.get("type")
+            config = spec.get("config") if isinstance(spec.get("config"), dict) else {}
+            direct_children = []
+
+        if node_type == "source":
+            configs.append(config)
+        if node_type != "section":
             continue
-        cfg = n.data.get("config")
-        if isinstance(cfg, dict) and (cfg.get("uri") or cfg.get("table")):
-            cfg["uri"] = resolve(cfg.get("uri") or cfg.get("table"))
+        if direct_children:  # visual containment wins; legacy subnodes are fallback-only
+            queue.extend(("visual", child, depth) for child in direct_children)
+            continue
+        subnodes = config.get("subnodes") or []
+        if not isinstance(subnodes, list):
+            raise RuntimeError("legacy section subnodes must be a list")
+        queue.extend(("legacy", child, depth + 1) for child in subnodes)
+    return configs
+
+
+def resolve_source_refs(graph: Graph, resolve) -> None:
+    """Rewrite every executable source binding IN PLACE through the catalog resolver.
+
+    This includes visual and legacy section children. Without that shared traversal the engine could
+    execute an unresolved legacy token while ownership guards protected a different (or no) URI.
+    """
+    for cfg in _execution_source_configs(graph, list(graph.nodes)):
+        value = cfg.get("uri") or cfg.get("table")
+        if value:
+            cfg["uri"] = resolve(value)
 
 
 def incoming(graph: Graph, node_id: str) -> list[GraphEdge]:
@@ -98,15 +159,52 @@ def upstream_chain(graph: Graph, node_id: str) -> list[GraphNode]:
 
 
 def all_upstream_source_uris(graph: Graph, node_id: str) -> list[str]:
-    """Every source URI feeding a node, de-duplicated in stable upstream traversal order."""
+    """Every executable source URI feeding a node, including section-contained sources."""
+    uris: list[str] = []
+    seen: set[str] = set()
+    for config in _execution_source_configs(graph, upstream_chain(graph, node_id)):
+        uri = config.get("uri") or config.get("table")
+        if uri and uri not in seen:
+            seen.add(uri)
+            uris.append(uri)
+    return uris
+
+
+def all_upstream_publication_uris(graph: Graph, node_id: str) -> list[str]:
+    """Original source URIs to record when publishing a derived catalog output.
+
+    Region execution replaces a cut with a physical ref-source. The ref is the URI the runner must
+    read and lease, but catalog lineage must retain the original sources the unsplit graph would have
+    recorded. Only the controller-owned private sidecar can override a synthetic source; client graph
+    data is never trusted as provenance.
+    """
+    overrides = getattr(graph, "_publication_source_uris", {})
     uris: list[str] = []
     seen: set[str] = set()
     for node in upstream_chain(graph, node_id):
         if node.type != "source" or not isinstance(node.data, dict):
             continue
-        config = node.data.get("config")
-        if not isinstance(config, dict):
-            continue
+        configured = overrides.get(node.id)
+        if configured is None:
+            config = node.data.get("config")
+            if not isinstance(config, dict):
+                continue
+            uri = config.get("uri") or config.get("table")
+            configured = (uri,) if uri else ()
+        for uri in configured:
+            if uri and uri not in seen:
+                seen.add(uri)
+                uris.append(uri)
+    return uris
+
+
+def execution_source_uris(graph: Graph, target_node_id: str | None) -> list[str]:
+    """Exact, stable source URI set for the execution cone selected by ``target_node_id``."""
+    if target_node_id is not None:
+        return all_upstream_source_uris(graph, target_node_id)
+    uris: list[str] = []
+    seen: set[str] = set()
+    for config in _execution_source_configs(graph, list(graph.nodes)):
         uri = config.get("uri") or config.get("table")
         if uri and uri not in seen:
             seen.add(uri)

@@ -175,7 +175,9 @@ class Playground:
         d = self.deps
         graph = Graph.model_validate(doc)
         gmod.resolve_source_refs(graph, d.catalog.resolve_ref)
-        res = preview_node(graph, node_id, limit, d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
+        res = preview_node(
+            graph, node_id, limit, d.resolve_adapter, d.registry, d.node_builders, d.node_specs,
+            storage=d.storage)
         if res.not_previewable:
             return {"notPreviewable": True, "reason": res.reason}
         if res.error:
