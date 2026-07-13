@@ -906,9 +906,14 @@ class RunController:
 
         # A placed backend owns its writer lifecycle. It receives only the stable logical target and must
         # return one exact, parent-registered region attempt after its worker can no longer mutate it.
-        with self._region_source_lease_scope(
-                subg, region.output_node, run_id=run_id,
-                region_id=region.id) as source_guards:
+        # Backends that own and renew exact parent-side source leases fence them through worker reaping
+        # themselves. Other backends remain protected by the controller's generic outer lease scope.
+        source_scope = (contextlib.nullcontext([])
+                        if getattr(backend, "manages_source_leases", False)
+                        else self._region_source_lease_scope(
+                            subg, region.output_node, run_id=run_id,
+                            region_id=region.id))
+        with source_scope as source_guards:
             sub = backend.run_unit(
                 subg, region.output_node, logical_uri, requires=region.requires)
             self._track_sub(run_id, backend, sub.run_id)
@@ -919,7 +924,8 @@ class RunController:
             if s.status != "done":
                 raise RuntimeError(
                     f"region {region.id} on {region.backend} {s.status}: {s.error}")
-            self._check_region_source_leases(source_guards)
+            if source_guards:
+                self._check_region_source_leases(source_guards)
         result_uri = s.output_uri or logical_uri
         if tier.is_object:
             try:

@@ -114,6 +114,25 @@ def all_upstream_source_uris(graph: Graph, node_id: str) -> list[str]:
     return uris
 
 
+def execution_source_uris(graph: Graph, target_node_id: str | None) -> list[str]:
+    """Exact, stable source URI set for the execution cone selected by ``target_node_id``."""
+    if target_node_id is not None:
+        return all_upstream_source_uris(graph, target_node_id)
+    uris: list[str] = []
+    seen: set[str] = set()
+    for node in graph.nodes:
+        if node.type != "source" or not isinstance(node.data, dict):
+            continue
+        config = node.data.get("config")
+        if not isinstance(config, dict):
+            continue
+        uri = config.get("uri") or config.get("table")
+        if uri and uri not in seen:
+            seen.add(uri)
+            uris.append(uri)
+    return uris
+
+
 def topo_order(graph: Graph) -> list[GraphNode]:
     nm = node_map(graph)
     order: list[str] = []
