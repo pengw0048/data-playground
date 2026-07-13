@@ -15,7 +15,10 @@ from hub.models import Graph
 
 # Bump when the KEYING SCHEME changes — old cache entries then fall out of the namespace and recompute
 # instead of being served stale. v1 folded requirements + runtime env into the key (P0-CACHE-01).
-CACHE_SCHEMA_VERSION = 1
+# v2 invalidates results produced before the central SQL/expression execution policy; a cache hit happens
+# before BuildEngine lowering, so namespace invalidation is what prevents a legacy unsafe plan from being
+# served without passing the new gate.
+CACHE_SCHEMA_VERSION = 2
 
 
 @functools.lru_cache(maxsize=1)
