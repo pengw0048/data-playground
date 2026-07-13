@@ -20,7 +20,12 @@ def current_user(x_dp_user: str | None = Header(default=None),
     (open internal-tool mode), defaulting to the local user."""
     if auth.auth_enabled():
         uid = auth.verify(dp_session)
-        if not uid:
+        # Authentication mode must never pass a verified identity through resolve_user(): that helper
+        # intentionally falls back to the local admin for unknown X-DP-User values in open dev mode.
+        # Re-check existence to close the verify->resolve deletion race, then retain the exact signed
+        # principal. A concurrent deletion after this check can fail a downstream operation, but it can
+        # never silently change the request into the local administrator.
+        if not uid or metadb.user_token_epoch(uid) is None:
             raise HTTPException(401, "authentication required")
-        return metadb.resolve_user(uid)
+        return uid
     return metadb.resolve_user(x_dp_user)
