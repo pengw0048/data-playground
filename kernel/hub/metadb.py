@@ -1305,6 +1305,12 @@ def _terminal_fence_status(s, run_id: str) -> str | None:
     return s.scalar(select(RunTerminalFence.status).where(RunTerminalFence.run_id == run_id))
 
 
+def terminal_run_status(run_id: str) -> str | None:
+    """Return the permanent terminal fence for ``run_id``, if one has been recorded."""
+    with session() as s:
+        return _terminal_fence_status(s, run_id)
+
+
 def _record_terminal_fence(s, run_id: str, status: str) -> None:
     current = _terminal_fence_status(s, run_id)
     if current is not None and current != status:
@@ -1541,7 +1547,17 @@ def bind_backend_job(run_id: str, ref: dict, status: dict,
 
 
 def _backend_job_doc(row: RunBackendJob) -> dict:
-    return {
+    result = None
+    recovery_error = None
+    if row.result_doc is not None:
+        try:
+            result = json.loads(row.result_doc)
+            if not isinstance(result, dict):
+                raise TypeError("stored backend result is not a JSON object")
+        except (TypeError, ValueError):
+            result = None
+            recovery_error = "stored RunBackendJob.result_doc is not a valid JSON object"
+    doc = {
         "run_id": row.run_id,
         "backend": row.backend,
         "cluster_ref": row.cluster_ref,
@@ -1564,8 +1580,11 @@ def _backend_job_doc(row: RunBackendJob) -> dict:
             row.last_control_observed_at.isoformat() if row.last_control_observed_at else None
         ),
         "recovery_blocked_reason": row.recovery_blocked_reason,
-        "result": json.loads(row.result_doc) if row.result_doc else None,
+        "result": result,
     }
+    if recovery_error:
+        doc["_recovery_error"] = recovery_error
+    return doc
 
 
 def backend_job(run_id: str) -> dict | None:

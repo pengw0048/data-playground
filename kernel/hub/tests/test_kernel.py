@@ -662,6 +662,75 @@ def test_backend_job_liveness_uses_db_clock_and_flags_queued_runs(monkeypatch):
                     session.delete(state)
 
 
+def test_backend_job_reads_isolate_malformed_result_rows():
+    from hub import metadb
+
+    run_ids = [f"malformed_backend_result_{index}" for index in range(2)]
+    try:
+        for index, run_id in enumerate(run_ids):
+            metadb.bind_backend_job(run_id, {
+                "backend": "result-row-isolation-test", "cluster_ref": "test-cluster",
+                "attempt_id": f"attempt-{run_id}", "submission_id": f"submission-{run_id}",
+                "job_uri": f"s3://test-control/{run_id}.dpjob",
+                "result_uri": f"s3://test-control/{run_id}.dpresult",
+            }, {
+                "run_id": run_id, "status": "running", "placement": "distributed", "per_node": [],
+            })
+            with metadb.session() as session:
+                job = session.get(metadb.RunBackendJob, run_id)
+                job.result_doc = "{" if index == 0 else '{"status":"done"}'
+
+        malformed = metadb.backend_job(run_ids[0])
+        assert malformed["result"] is None
+        assert "result_doc" in malformed["_recovery_error"]
+
+        active = {
+            ref["run_id"]: ref
+            for ref, _status in metadb.active_backend_jobs("result-row-isolation-test")
+        }
+        assert set(active) == set(run_ids)
+        assert "result_doc" in active[run_ids[0]]["_recovery_error"]
+        assert active[run_ids[1]]["result"] == {"status": "done"}
+        assert "_recovery_error" not in active[run_ids[1]]
+    finally:
+        with metadb.session() as session:
+            for run_id in run_ids:
+                job = session.get(metadb.RunBackendJob, run_id)
+                state = session.get(metadb.RunState, run_id)
+                if job is not None:
+                    session.delete(job)
+                if state is not None:
+                    session.delete(state)
+
+
+@pytest.mark.parametrize("terminal", ["done", "failed", "cancelled"])
+def test_terminal_run_status_survives_detail_deletion(terminal):
+    from hub import metadb
+
+    run_id = f"terminal_fence_query_{terminal}"
+    try:
+        metadb.save_run_state(run_id, {
+            "run_id": run_id, "status": terminal, "placement": "distributed", "per_node": [],
+        })
+        assert metadb.terminal_run_status(run_id) == terminal
+
+        with metadb.session() as session:
+            state = session.get(metadb.RunState, run_id)
+            if state is not None:
+                session.delete(state)
+
+        assert metadb.get_run_state(run_id) is None
+        assert metadb.terminal_run_status(run_id) == terminal
+    finally:
+        with metadb.session() as session:
+            state = session.get(metadb.RunState, run_id)
+            fence = session.get(metadb.RunTerminalFence, run_id)
+            if state is not None:
+                session.delete(state)
+            if fence is not None:
+                session.delete(fence)
+
+
 def test_sqlite_metadb_uses_wal():
     # the bundled default is SQLite under concurrent daemon-thread writes + polling; WAL + busy_timeout
     # keep those from raising SQLITE_BUSY. Assert the connect hook actually took (sqlite deployments only).
