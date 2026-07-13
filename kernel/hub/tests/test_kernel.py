@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import time
 
@@ -608,6 +609,57 @@ def test_run_progress_and_stall_signal():
     # the terminal status carries a duration too (ms is set BEFORE the flip to 'done', not only in the
     # finally) so a poll that reads 'done' isn't left with ms=0.
     assert done["ms"] >= 0 and "ms" in done
+
+
+def test_backend_job_liveness_uses_db_clock_and_flags_queued_runs(monkeypatch):
+    from hub import metadb
+
+    def utc(value):
+        return value if value.tzinfo is not None else value.replace(tzinfo=datetime.timezone.utc)
+
+    with metadb.session() as session:
+        database_now = metadb._db_now(session)
+    monkeypatch.setattr(
+        metadb, "_now", lambda: utc(database_now) - datetime.timedelta(days=365)
+    )
+    run_ids = ["db_clock_stall_queued", "db_clock_stall_running"]
+    try:
+        for run_id, status in zip(run_ids, ("queued", "running"), strict=True):
+            ref = {
+                "backend": "missing-liveness-test", "cluster_ref": "test-cluster",
+                "attempt_id": f"attempt-{run_id}", "submission_id": f"submission-{run_id}",
+                "job_uri": f"s3://test-control/{run_id}.dpjob",
+                "result_uri": f"s3://test-control/{run_id}.dpresult",
+            }
+            metadb.bind_backend_job(run_id, ref, {
+                "run_id": run_id, "status": status, "placement": "distributed", "per_node": [],
+            })
+            with metadb.session() as session:
+                job = session.get(metadb.RunBackendJob, run_id)
+                current_database_time = metadb._db_now(session)
+                observed_age = (
+                    utc(job.last_control_observed_at) - utc(current_database_time)
+                ).total_seconds()
+                assert abs(observed_age) < 2
+                job.last_control_observed_at = current_database_time - datetime.timedelta(minutes=5)
+
+            assert metadb.run_stalled(run_id, 60) is True
+            response = client.get(f"/api/run/{run_id}")
+            assert response.status_code == 200, response.text
+            assert response.json()["status"] == status
+            assert response.json()["stalled"] is True
+
+            assert metadb.note_backend_control_observed(run_id, ref["attempt_id"], 0) is True
+            assert metadb.run_stalled(run_id, 60) is False
+    finally:
+        with metadb.session() as session:
+            for run_id in run_ids:
+                job = session.get(metadb.RunBackendJob, run_id)
+                state = session.get(metadb.RunState, run_id)
+                if job is not None:
+                    session.delete(job)
+                if state is not None:
+                    session.delete(state)
 
 
 def test_sqlite_metadb_uses_wal():

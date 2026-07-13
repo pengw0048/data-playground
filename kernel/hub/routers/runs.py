@@ -560,7 +560,7 @@ except ValueError:
 def run_status(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
     _require_run_read_access(run_id, uid)  # status carries row counts, paths in errors, output names
     st = _status_or_lost(run_id)
-    if st.status == "running" and metadb.run_stalled(run_id, _STALL_S):
+    if st.status in ("queued", "running") and metadb.run_stalled(run_id, _STALL_S):
         st = st.model_copy(update={"stalled": True})  # copy — don't mutate the runner's live object
     return st
 
@@ -572,13 +572,21 @@ def run_cancel(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
     owner = _runner_for(run_id, fallback=False)
     if owner is not None:
         return owner.cancel(run_id)  # this instance ran it → cancel in-process
+    # A durable plugin may be absent after restart. Keep the authorized cancel intent in SQL so a
+    # recovered plugin can issue the remote stop later; never fake a terminal acknowledgement here.
+    binding = metadb.backend_job(run_id)
+    if binding is not None:
+        persisted = metadb.get_run_state(run_id)
+        if persisted is not None and persisted.get("status") in ("queued", "running"):
+            metadb.request_backend_cancel(run_id)
+            # A terminal publication racing the request remains authoritative over cancellation.
+            return RunStatus(**(metadb.get_run_state(run_id) or persisted))
     # not owned here (the hub restarted, or another stateless instance accepted the run) — route via the
     # DB-backed kernel backend, which resolves the owning kernel from run_states and cancels it (or
     # returns the last-known persisted status). Mirrors _status_or_lost so cancel never 404s a live run.
     kb = deps.kernel_backend()
     if kb is not None:
         return kb.cancel(run_id)
-    from hub import metadb
     persisted = metadb.get_run_state(run_id)
     if persisted is not None:
         return RunStatus(**persisted)

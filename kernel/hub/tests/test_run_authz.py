@@ -107,6 +107,30 @@ def _share_editor_and_viewer() -> None:
     metadb.share_canvas("authz_canvas", "authz_viewer", "viewer")
 
 
+def _bind_missing_backend_run(run_id: str) -> None:
+    metadb.bind_backend_job(run_id, {
+        "backend": "missing-durable-authz-test",
+        "cluster_ref": "test-cluster",
+        "attempt_id": f"attempt-{run_id}",
+        "submission_id": f"submission-{run_id}",
+        "job_uri": f"s3://test-control/{run_id}.dpjob",
+        "result_uri": f"s3://test-control/{run_id}.dpresult",
+        "control_address": "http://missing-control:8265",
+    }, {
+        "run_id": run_id, "status": "queued", "placement": "distributed", "per_node": [],
+    }, canvas_id="authz_canvas")
+
+
+def _delete_backend_test_run(run_id: str) -> None:
+    with metadb.session() as session:
+        job = session.get(metadb.RunBackendJob, run_id)
+        state = session.get(metadb.RunState, run_id)
+        if job is not None:
+            session.delete(job)
+        if state is not None:
+            session.delete(state)
+
+
 def _wait_for_terminal(run_id: str) -> dict:
     for _ in range(200):
         response = client.get(f"/api/run/{run_id}", headers=_hdr("authz_a"))
@@ -280,6 +304,30 @@ def test_run_read_and_cancel_use_different_role_policies(authed):
     assert client.post(f"/api/run/{run_id}/cancel", headers=_hdr("authz_b")).status_code == 404
     assert client.post(f"/api/run/{run_id}/cancel", headers=_hdr("authz_editor")).status_code == 200
     assert client.post(f"/api/run/{run_id}/cancel", headers=_hdr("authz_a")).status_code == 200
+
+
+@pytest.mark.parametrize(("uid", "expected"), [
+    ("authz_a", 200),
+    ("authz_editor", 200),
+    ("authz_viewer", 403),
+    ("authz_b", 404),
+])
+def test_missing_durable_plugin_preserves_authorized_cancel_intent(authed, uid, expected):
+    """Missing plugin recovery must retain cancellation without weakening canvas authorization."""
+    _share_editor_and_viewer()
+    run_id = f"missing_durable_cancel_{uid}"
+    _bind_missing_backend_run(run_id)
+    try:
+        response = client.post(f"/api/run/{run_id}/cancel", headers=_hdr(uid))
+        assert response.status_code == expected, response.text
+        binding = metadb.backend_job(run_id)
+        assert binding is not None
+        assert binding["cancel_requested"] is (expected == 200)
+        if expected == 200:
+            assert response.json()["status"] == "queued", "remote stop has not been acknowledged"
+            assert metadb.get_run_state(run_id)["status"] == "queued"
+    finally:
+        _delete_backend_test_run(run_id)
 
 
 def test_viewer_can_read_completed_output_history_mcp_and_websocket(authed):

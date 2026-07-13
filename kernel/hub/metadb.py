@@ -1496,7 +1496,7 @@ def bind_backend_job(run_id: str, ref: dict, status: dict,
         publication_state="pending",
         # Allocation starts the liveness grace period. Only successful control observations advance it;
         # RunState error writes deliberately do not.
-        last_control_observed_at=_now(),
+        last_control_observed_at=None,
         job_doc=job_payload.decode("utf-8") if job_payload is not None else None,
     )
     try:
@@ -1504,6 +1504,9 @@ def bind_backend_job(run_id: str, ref: dict, status: dict,
             fenced = _terminal_fence_status(s, run_id)
             if fenced is not None:
                 raise TerminalRunIdError(f"run '{run_id}' is already terminal ({fenced})")
+            # Hub clocks may disagree across replicas. Start the external-control liveness grace period
+            # from the metadata server's clock, which also owns every later observation and comparison.
+            row.last_control_observed_at = _db_now(s)
             s.add(row)
             s.flush()
             # Re-check after the insert fence: a concurrent terminal transaction may have deleted the
@@ -1581,9 +1584,9 @@ def backend_job_artifact_payload(run_id: str) -> bytes | None:
 def note_backend_control_observed(
         run_id: str, attempt_id: str, min_interval_s: float = 10.0) -> bool:
     """Throttle the durable liveness clock advanced only by successful backend observations."""
-    now = _now()
-    cutoff = now - datetime.timedelta(seconds=max(0.0, float(min_interval_s)))
     with session() as s:
+        now = _db_now(s)
+        cutoff = now - datetime.timedelta(seconds=max(0.0, float(min_interval_s)))
         updated = s.execute(update(RunBackendJob).where(
             RunBackendJob.run_id == run_id,
             RunBackendJob.attempt_id == attempt_id,
@@ -1951,13 +1954,21 @@ def run_stalled(run_id: str, threshold_s: float) -> bool:
         if r is None or r.updated_at is None:
             return False
         job = s.get(RunBackendJob, run_id)
+        if job is None:
+            return _stale_secs(r.updated_at) > threshold_s
+        now = _db_now(s)
         observed_at = (
             job.last_control_observed_at or job.updated_at or r.updated_at
-            if job is not None else r.updated_at
         )
         if observed_at is None:
             return False
-        return _stale_secs(observed_at) > threshold_s  # normalizes SQLite's naive datetimes
+        # SQLite returns naive timestamps while Postgres returns timezone-aware values. Normalize both
+        # as UTC before comparing, but keep the source of "now" the metadata DB on every backend.
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=datetime.timezone.utc)
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=datetime.timezone.utc)
+        return (now - observed_at).total_seconds() > threshold_s
 
 
 def save_schema_contract(name: str, columns: list[dict]) -> int:
