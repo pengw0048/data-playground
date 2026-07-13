@@ -39,7 +39,8 @@ release-level Job, not a per-Pod initContainer: replicas must not race to migrat
 The reference script can prove this ordering inside its disposable kind cluster, but an operator must
 still stop MCP/headless/external writers that are outside that cluster. Local file-backed SQLite remains
 zero-config and serializes automatic first-run migration with a lock derived from the resolved database
-file path.
+file path. A non-empty database without a recognized Alembic revision is rejected rather than guessed or
+auto-stamped; recover it from a versioned backup or perform an explicit, audited conversion.
 
 ## What the pieces are
 

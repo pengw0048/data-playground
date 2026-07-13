@@ -26,6 +26,17 @@ wait_for_no_pods() {
     sleep 1
   done
 }
+wait_for_no_services() {
+  local selector="$1" deadline=$((SECONDS + 120))
+  while [ -n "$($K get services -l "$selector" -o name)" ]; do
+    if (( SECONDS >= deadline )); then
+      echo "timed out waiting for services matching ${selector} to stop" >&2
+      $K get services -l "$selector" -o wide >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
 cleanup() {
   [ -n "$PF_PID" ] && kill "$PF_PID" 2>/dev/null || true
   if [ "${KEEP:-0}" = "1" ]; then echo "KEEP=1 → leaving cluster '${CLUSTER}' up (kind delete cluster --name ${CLUSTER} to remove)"; else
@@ -57,6 +68,7 @@ wait_for_no_pods app=dp-hub
 $K delete pod -l app=dp-kernel --ignore-not-found --wait=false >/dev/null
 wait_for_no_pods app=dp-kernel
 $K delete service -l app=dp-kernel --ignore-not-found >/dev/null
+wait_for_no_services app=dp-kernel
 $K delete job dp-migrate --ignore-not-found >/dev/null
 $K apply -f "${ROOT}/deploy/k8s/migrate-job.yaml" >/dev/null
 $K wait --for=condition=complete job/dp-migrate --timeout=120s
@@ -95,9 +107,16 @@ echo "run status: $ST"; [ "$ST" = done ] && echo "✓ run completed on the kerne
 
 say "6/6 Restart the kernel → the Pod + Service should be deleted"
 curl -fsS "${H[@]}" -X POST localhost:18471/api/canvas/cv-podverify/kernel/restart >/dev/null
-for i in $(seq 1 30); do [ "$($K get pods -l app=dp-kernel --no-headers 2>/dev/null | wc -l | tr -d ' ')" = 0 ] && break; sleep 1; done
+for i in $(seq 1 30); do
+  PODS="$($K get pods -l app=dp-kernel --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  SERVICES="$($K get services -l app=dp-kernel --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$PODS" = 0 ] && [ "$SERVICES" = 0 ] && break
+  sleep 1
+done
 $K get pods,svc -l app=dp-kernel --no-headers 2>/dev/null
 test "$($K get pods -l app=dp-kernel --no-headers 2>/dev/null | wc -l | tr -d ' ')" = 0 \
   && echo "✓ kernel Pod torn down on restart" || { echo "✗ kernel pod still present after restart"; exit 1; }
+test "$($K get services -l app=dp-kernel --no-headers 2>/dev/null | wc -l | tr -d ' ')" = 0 \
+  && echo "✓ kernel Service torn down on restart" || { echo "✗ kernel service still present after restart"; exit 1; }
 
 say "ALL CHECKS PASSED — the pod substrate spawns, runs, and tears down on a real cluster"

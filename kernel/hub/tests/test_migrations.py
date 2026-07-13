@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -45,9 +46,32 @@ def test_concurrent_fresh_sqlite_startup_is_serialized_across_48_processes(tmp_p
         for _ in range(48)
     ]
     failures = []
+    results = {}
+    timed_out = set()
+    deadline = time.monotonic() + 150
+    try:
+        for index, process in enumerate(processes):
+            remaining = deadline - time.monotonic()
+            if process.poll() is None and remaining <= 0:
+                timed_out.add(index)
+                failures.append(f"process {index}: exceeded the shared 150-second deadline")
+                continue
+            try:
+                results[index] = process.communicate(timeout=max(0, remaining))
+            except subprocess.TimeoutExpired:
+                timed_out.add(index)
+                failures.append(f"process {index}: exceeded the shared 150-second deadline")
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+        for index, process in enumerate(processes):
+            if index not in results:
+                results[index] = process.communicate(timeout=5)
+
     for index, process in enumerate(processes):
-        stdout, stderr = process.communicate(timeout=60)
-        if process.returncode != 0:
+        if process.returncode != 0 and index not in timed_out:
+            stdout, stderr = results[index]
             failures.append(f"process {index}: {stderr or stdout}")
 
     assert not failures, "\n".join(failures)

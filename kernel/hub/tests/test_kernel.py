@@ -3929,6 +3929,7 @@ def test_pod_spawner_builds_manifests_and_conforms_to_the_spi():
     assert cmd[:3] == ["python", "-m", "hub.kernel"]
     assert {"cv-abc", "k1", "tok123", "0.0.0.0"} <= set(cmd)  # our canvas/kernel/token + bind-all
     assert f"{name}.default.svc.cluster.local" in cmd        # advertise-host = the Service DNS
+    assert svc["metadata"]["labels"] == {"app": "dp-kernel", "dp-canvas": name}
     assert svc["spec"]["selector"]["dp-canvas"] == pod["metadata"]["labels"]["dp-canvas"]  # Service → Pod
     sp.kill("cv-abc", "k1")
     assert ("del-pod", name, "default") in api.calls and ("del-svc", name, "default") in api.calls
