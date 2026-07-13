@@ -20,7 +20,8 @@ classifiers = [
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "duckdb>=1.1",
+    # Exact: hub.sqlpolicy audits DuckDB's JSON AST/function catalog contract for this version.
+    "duckdb==1.5.4",
     "pyarrow>=17",
     "polars>=1.9",
     "pydantic>=2.9",

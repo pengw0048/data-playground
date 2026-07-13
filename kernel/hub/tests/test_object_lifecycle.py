@@ -1789,42 +1789,57 @@ def test_isolated_clone_cannot_take_original_namespace_or_inherited_visibility(t
         handoff.set_managed_object_provider(None)
 
 
-def test_app_lifespan_starts_and_stops_object_reaper():
+def test_app_lifespan_starts_and_stops_background_reapers():
     from fastapi.testclient import TestClient
     from hub import main
 
-    def live_reapers():
+    def live_reapers(name: str):
         return [thread for thread in threading.enumerate()
-                if thread.name == "dp-object-attempt-reaper" and thread.is_alive()]
+                if thread.name == name and thread.is_alive()]
 
-    before = len(live_reapers())
+    object_before = len(live_reapers("dp-object-attempt-reaper"))
+    local_before = len(live_reapers("dp-local-result-reaper"))
     with TestClient(main.app):
-        assert len(live_reapers()) == before + 1
+        assert len(live_reapers("dp-object-attempt-reaper")) == object_before + 1
+        assert len(live_reapers("dp-local-result-reaper")) == local_before + 1
         assert main._object_attempt_reaper_thread is not None
-    assert len(live_reapers()) == before
+        assert main._local_result_reaper_thread is not None
+    assert len(live_reapers("dp-object-attempt-reaper")) == object_before
+    assert len(live_reapers("dp-local-result-reaper")) == local_before
     assert main._object_attempt_reaper_thread is None
+    assert main._local_result_reaper_thread is None
 
 
-def test_overlapping_app_lifespans_share_one_object_reaper_until_last_exit():
+def test_overlapping_app_lifespans_share_background_reapers_until_last_exit():
     from fastapi.testclient import TestClient
     from hub import main
 
-    def live_reapers():
+    def live_reapers(name: str):
         return [thread for thread in threading.enumerate()
-                if thread.name == "dp-object-attempt-reaper" and thread.is_alive()]
+                if thread.name == name and thread.is_alive()]
 
-    before = len(live_reapers())
+    object_before = len(live_reapers("dp-object-attempt-reaper"))
+    local_before = len(live_reapers("dp-local-result-reaper"))
     with TestClient(main.app):
-        thread = main._object_attempt_reaper_thread
-        assert thread is not None
-        assert len(live_reapers()) == before + 1
+        object_thread = main._object_attempt_reaper_thread
+        local_thread = main._local_result_reaper_thread
+        assert object_thread is not None
+        assert local_thread is not None
+        assert len(live_reapers("dp-object-attempt-reaper")) == object_before + 1
+        assert len(live_reapers("dp-local-result-reaper")) == local_before + 1
         with TestClient(main.app):
-            assert main._object_attempt_reaper_thread is thread
-            assert len(live_reapers()) == before + 1
-        assert main._object_attempt_reaper_thread is thread
-        assert thread.is_alive()
-    assert len(live_reapers()) == before
+            assert main._object_attempt_reaper_thread is object_thread
+            assert main._local_result_reaper_thread is local_thread
+            assert len(live_reapers("dp-object-attempt-reaper")) == object_before + 1
+            assert len(live_reapers("dp-local-result-reaper")) == local_before + 1
+        assert main._object_attempt_reaper_thread is object_thread
+        assert main._local_result_reaper_thread is local_thread
+        assert object_thread.is_alive()
+        assert local_thread.is_alive()
+    assert len(live_reapers("dp-object-attempt-reaper")) == object_before
+    assert len(live_reapers("dp-local-result-reaper")) == local_before
     assert main._object_attempt_reaper_thread is None
+    assert main._local_result_reaper_thread is None
 
 
 @pytest.mark.parametrize("versioning_enabled", [False, True], ids=["unversioned", "versioned"])

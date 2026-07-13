@@ -119,6 +119,13 @@ def run_section(engine, node, inputs):
         if not spec:
             raise SectionError(f"section calls unknown node '{alias}'")
         data = kw.pop("data", None)  # a handle to bind as this node's input
+        protected = ({"uri", "table"} if spec.get("type") == "source" else
+                     {"subnodes", "script"} if spec.get("type") == "section" else set())
+        overridden = protected & set(kw)
+        if overridden:
+            fields = ", ".join(sorted(overridden))
+            raise SectionError(
+                f"section runtime overrides cannot change protected '{spec['type']}' fields: {fields}")
         conf = {**(spec.get("config") or {}), **kw}  # remaining kwargs override config (e.g. prompt=…)
         nodes = [GraphNode(id=alias, type=spec["type"], position=Position(x=0, y=0), data={"config": conf})]
         # nested sections: carry the aliased node's contained subtree so, when it's itself a section,
@@ -134,7 +141,7 @@ def run_section(engine, node, inputs):
         sub = BuildEngine(mini, engine.resolve_adapter, engine.registry, full=True,
                              node_builders=engine.node_builders, node_specs=engine.node_specs,
                              bound_inputs={alias: data} if data is not None else None,
-                             spill_files=engine.spill_files)  # share the list so sub-node spill is GC'd too
+                             spill_files=engine.spill_files)  # share spill ownership with the parent run
         return _materialize(engine, sub.relation(alias))
 
     def value(handle):

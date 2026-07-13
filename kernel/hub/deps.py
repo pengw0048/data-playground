@@ -276,7 +276,7 @@ def _make_spawner(workspace: str, data_dir: str):
 
 
 class Deps:
-    def __init__(self, workspace: str, data_dir: str):
+    def __init__(self, workspace: str, data_dir: str, *, maintain_storage: bool = True):
         self.workspace = workspace
         self.data_dir = data_dir
         self.adapters = default_adapters()
@@ -308,7 +308,15 @@ class Deps:
             self.catalog = InMemoryCatalog(data_dir, self.resolve_adapter)
         # recover/clean any temp siblings an interrupted append/compaction left behind BEFORE re-cataloging,
         # so a crash can't surface a half-written staging file as a dataset or leave a compacting one absent.
-        self.storage.recover_orphans()
+        if maintain_storage:
+            self.storage.recover_orphans()
+            prune_results = getattr(self.storage, "prune_results", None)
+            if callable(prune_results):
+                try:
+                    prune_results()  # bounded startup reconciliation for prior process crashes
+                except Exception:  # retryable retention failure must not block serving the workspace
+                    logging.getLogger("hub").warning(
+                        "local result retention failed at startup", exc_info=True)
         # re-register previously written outputs so committed tables survive a kernel restart
         # (they live in storage, separate from the seeded data_dir).
         for uri in self.storage.list_outputs():
@@ -573,7 +581,10 @@ def get_deps() -> Deps:
     return _deps
 
 
-def set_workspace(workspace: str, data_dir: str | None = None) -> Deps:
+def set_workspace(
+        workspace: str, data_dir: str | None = None, *, maintain_storage: bool = True) -> Deps:
     global _deps
-    _deps = Deps(workspace, data_dir or os.path.join(workspace, "data"))
+    _deps = Deps(
+        workspace, data_dir or os.path.join(workspace, "data"),
+        maintain_storage=maintain_storage)
     return _deps

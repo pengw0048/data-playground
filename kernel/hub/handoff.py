@@ -35,6 +35,17 @@ def is_attempt_uri(uri: str) -> bool:
     return ATTEMPT_MARKER in uri.rstrip("/").rsplit("/", 1)[-1]
 
 
+def has_attempt_path_component(uri: str) -> bool:
+    """Whether any object-key component is inside the reserved managed-attempt namespace."""
+    raw = str(uri)
+    if not is_object_uri(raw):
+        return False
+    try:
+        return any(ATTEMPT_MARKER in part for part in urlsplit(raw).path.split("/") if part)
+    except ValueError:
+        return False
+
+
 def _object_manifest_path(path: str) -> str:
     """Commit records use a separate prefix so storage lifecycle can expire them before data."""
     parent, name = path.rstrip("/").rsplit("/", 1)
@@ -523,16 +534,27 @@ def prepare_attempt_commit(uri: str) -> None:
 class ManagedReadLeaseGuard:
     """Renew a read lease and expose a fail-closed checkpoint to long-running readers."""
 
-    def __init__(self, lease_id: str | None, ttl_seconds: float):
+    def __init__(self, lease_id: str | None, ttl_seconds: float,
+                 attestation: dict | None = None):
         self.lease_id = lease_id
+        self.attestation = dict(attestation) if attestation is not None else None
         self.ttl_seconds = max(1.0, float(ttl_seconds))
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread = None
         if lease_id:
-            self._thread = threading.Thread(
-                target=self._renew_loop, daemon=True, name="dp-object-read-lease")
-            self._thread.start()
+            try:
+                self._thread = threading.Thread(
+                    target=self._renew_loop, daemon=True, name="dp-object-read-lease")
+                self._thread.start()
+            except Exception:
+                try:
+                    self._release()
+                except Exception:  # noqa: BLE001 — preserve the thread-start failure
+                    logging.getLogger("hub").exception(
+                        "managed artifact read lease rollback failed")
+                self._thread = None
+                raise
 
     def _renew_loop(self) -> None:
         from hub import metadb
@@ -574,10 +596,12 @@ def managed_read_lease(uri: str, *, owner: str | None = None, ttl_seconds: float
                        allow_committed: bool = False):
     """Pin a managed generation for one actual core read; raw URI readers must pin explicitly."""
     from hub import metadb
-    lease = metadb.acquire_object_attempt_lease(
-        uri, "read", owner or f"reader:{uuid.uuid4().hex}", ttl_seconds=ttl_seconds,
+    if has_attempt_path_component(uri) and not is_attempt_uri(uri):
+        raise FileNotFoundError("managed source must reference the exact attempt root")
+    lease, attestation = metadb.acquire_attested_object_read(
+        uri, owner or f"reader:{uuid.uuid4().hex}", ttl_seconds=ttl_seconds,
         allow_committed=allow_committed)
-    guard = ManagedReadLeaseGuard(lease, ttl_seconds)
+    guard = ManagedReadLeaseGuard(lease, ttl_seconds, attestation)
     try:
         yield guard
         guard.check()

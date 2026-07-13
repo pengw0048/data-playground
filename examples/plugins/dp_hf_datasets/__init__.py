@@ -21,6 +21,7 @@ import hashlib
 
 from hub import db
 from hub.plugins.adapters import Relation, relation_columns
+from hub.sqlpolicy import identifier, quote_identifier
 
 
 def _parse(uri: str) -> tuple[str, str | None, str]:
@@ -52,7 +53,8 @@ class HfDatasetsAdapter:
              limit: int | None = None, options: dict | None = None) -> Relation:
         rel = db.conn().from_arrow(_load_arrow(uri))
         if columns:
-            rel = rel.project(", ".join(f'"{c}"' for c in columns))
+            selected = [identifier(c, rel.columns, label="projection column") for c in columns]
+            rel = rel.project(", ".join(quote_identifier(c) for c in selected))
         if predicate:
             rel = rel.filter(predicate)
         if limit is not None:

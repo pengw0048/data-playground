@@ -121,44 +121,71 @@ class RequestBodyLimitMiddleware:
             await self._response(limit)(scope, receive, send)
 
 
-_object_attempt_reaper_lock = threading.Lock()
-_object_attempt_reaper_users = 0
+_reaper_lifecycle_lock = threading.Lock()
+_reaper_lifespan_users = 0
 _object_attempt_reaper_stop: threading.Event | None = None
 _object_attempt_reaper_thread: threading.Thread | None = None
+_local_result_reaper_thread: threading.Thread | None = None
 
 
 @asynccontextmanager
 async def _lifespan(_app):
-    global _object_attempt_reaper_users, _object_attempt_reaper_stop
-    global _object_attempt_reaper_thread
-    with _object_attempt_reaper_lock:
-        if _object_attempt_reaper_users == 0:
-            if _object_attempt_reaper_thread is not None:
-                if _object_attempt_reaper_thread.is_alive():
-                    raise RuntimeError("previous object-attempt reaper has not stopped")
-                _object_attempt_reaper_thread = None
-                _object_attempt_reaper_stop = None
+    global _reaper_lifespan_users, _object_attempt_reaper_stop
+    global _object_attempt_reaper_thread, _local_result_reaper_thread
+    with _reaper_lifecycle_lock:
+        if _reaper_lifespan_users == 0:
+            existing = tuple(
+                thread for thread in (_object_attempt_reaper_thread, _local_result_reaper_thread)
+                if thread is not None
+            )
+            if any(thread.is_alive() for thread in existing):
+                raise RuntimeError("previous background reaper has not stopped")
+            _object_attempt_reaper_stop = None
+            _object_attempt_reaper_thread = None
+            _local_result_reaper_thread = None
+
             stop = threading.Event()
-            thread = threading.Thread(
+            object_thread = threading.Thread(
                 target=_object_attempt_reaper_loop, args=(stop,),
                 daemon=True, name="dp-object-attempt-reaper")
-            thread.start()
+            local_thread = threading.Thread(
+                target=_local_result_reaper_loop, args=(stop,),
+                daemon=True, name="dp-local-result-reaper")
+            try:
+                object_thread.start()
+                local_thread.start()
+            except BaseException:
+                stop.set()
+                for thread in (object_thread, local_thread):
+                    if thread.ident is not None:
+                        thread.join(timeout=5)
+                _object_attempt_reaper_thread = object_thread if object_thread.is_alive() else None
+                _local_result_reaper_thread = local_thread if local_thread.is_alive() else None
+                if _object_attempt_reaper_thread is not None or _local_result_reaper_thread is not None:
+                    _object_attempt_reaper_stop = stop
+                raise
             _object_attempt_reaper_stop = stop
-            _object_attempt_reaper_thread = thread
-        _object_attempt_reaper_users += 1
+            _object_attempt_reaper_thread = object_thread
+            _local_result_reaper_thread = local_thread
+        _reaper_lifespan_users += 1
     try:
         yield
     finally:
-        with _object_attempt_reaper_lock:
-            _object_attempt_reaper_users -= 1
-            if _object_attempt_reaper_users == 0:
+        with _reaper_lifecycle_lock:
+            _reaper_lifespan_users -= 1
+            if _reaper_lifespan_users == 0:
                 assert _object_attempt_reaper_stop is not None
                 assert _object_attempt_reaper_thread is not None
+                assert _local_result_reaper_thread is not None
                 _object_attempt_reaper_stop.set()
                 _object_attempt_reaper_thread.join(timeout=5)
+                _local_result_reaper_thread.join(timeout=5)
                 if not _object_attempt_reaper_thread.is_alive():
-                    _object_attempt_reaper_stop = None
                     _object_attempt_reaper_thread = None
+                if not _local_result_reaper_thread.is_alive():
+                    _local_result_reaper_thread = None
+                if _object_attempt_reaper_thread is None and _local_result_reaper_thread is None:
+                    _object_attempt_reaper_stop = None
 
 
 app = FastAPI(title="Data Playground kernel", version="0.1.0", lifespan=_lifespan)
@@ -228,6 +255,20 @@ def _object_attempt_reaper_loop(stop: threading.Event) -> None:
             reap_attempts()
         except Exception:  # noqa: BLE001 — provider failure must not stop future GC cycles
             logging.getLogger("hub").warning("object attempt GC cycle failed (continuing)", exc_info=True)
+
+
+def _local_result_reaper_loop(stop: threading.Event) -> None:
+    """Run bounded exact local-result retention away from run completion latency."""
+    from hub.deps import get_deps
+
+    while not stop.wait(metadb.KERNEL_STALE_S):
+        try:
+            prune = getattr(get_deps().storage, "prune_results", None)
+            if callable(prune):
+                prune()
+        except Exception:  # one transient DB/filesystem failure must not stop future passes
+            logging.getLogger("hub").warning(
+                "local result GC cycle failed (continuing)", exc_info=True)
 
 def _cross_site_ws(ws: WebSocket) -> bool:
     """A browser page from ANOTHER origin opening this socket (cross-site WebSocket hijacking): the
