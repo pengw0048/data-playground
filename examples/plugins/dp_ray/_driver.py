@@ -39,8 +39,8 @@ def _progress_writer(status_file: str):
 
 
 def main() -> None:
-    from hub.job_artifacts import (RAY_JOB_CANONICAL_FIELDS, RAY_JOB_CONTRACT_VERSION,
-                                   RAY_JOB_ENVELOPE_FIELDS, canonical_json, read_json_artifact,
+    from hub.job_artifacts import (canonical_json, ray_job_canonical_fields,
+                                   ray_job_envelope_fields, read_json_artifact,
                                    require_exact_object, write_json_artifact,
                                    write_json_artifact_once)
 
@@ -53,14 +53,19 @@ def main() -> None:
     job = read_json_artifact(job_uri)
     if jobs_mode:
         expected_attempt, expected_submission, expected_envelope = sys.argv[2:]
-        job = require_exact_object(job, RAY_JOB_ENVELOPE_FIELDS, label="Ray job artifact")
-        canonical = {key: job[key] for key in RAY_JOB_CANONICAL_FIELDS}
+        try:
+            contract_version = int(job.get("contract_version") or 0)
+            canonical_fields = ray_job_canonical_fields(contract_version)
+            envelope_fields = ray_job_envelope_fields(contract_version)
+        except (AttributeError, TypeError, ValueError) as e:
+            raise RuntimeError(str(e)) from e
+        job = require_exact_object(job, envelope_fields, label="Ray job artifact")
+        canonical = {key: job[key] for key in canonical_fields}
         attempt = hashlib.sha256(canonical_json(canonical)).hexdigest()[:24]
-        envelope = {key: job[key] for key in RAY_JOB_ENVELOPE_FIELDS if key != "envelope_sha256"}
+        envelope = {key: job[key] for key in envelope_fields if key != "envelope_sha256"}
         envelope_sha256 = hashlib.sha256(canonical_json(envelope)).hexdigest()
         semantic_env = job["semantic_env"]
-        if (int(job["contract_version"]) != RAY_JOB_CONTRACT_VERSION
-                or job["job_uri"] != job_uri
+        if (job["job_uri"] != job_uri
                 or job["attempt_id"] != expected_attempt
                 or job["submission_id"] != expected_submission
                 or job["envelope_sha256"] != expected_envelope
@@ -138,12 +143,21 @@ def main() -> None:
         ray_opts = mod._ray_opts(job.get("requires"))  # region resource need → per-Ray-task placement
         prog = _progress_writer(status_file)
         _log(f"lowered; {'_run_ir_materialize' if mat else '_run_ir_sync'}; ray_opts={ray_opts}")
+        sink_attempts = job.get("sink_attempts")
+        if jobs_mode and int(job.get("contract_version") or 0) == 2:
+            sink_attempts = {
+                step_id: mod._legacy_v2_attempt_handoff_uri(
+                    logical_uri, job["attempt_id"], scope=step_id
+                )
+                for step_id, logical_uri in (job.get("sink_targets") or {}).items()
+            }
         result = (runner._run_ir_materialize(
             ir, graph, target, mat, ray_opts, prog, job.get("attempt_id")
         ) if mat
                   else runner._run_ir_sync(
                       ir, graph, target, ray_opts, prog, job.get("sink_targets"),
-                      job.get("attempt_id"), job.get("sink_attempts"),
+                      job.get("attempt_id"), sink_attempts,
+                      job.get("sink_contracts") if int(job.get("contract_version") or 0) >= 3 else None,
                   ))
         _log(f"run done: {result.get('status')}")
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read
@@ -151,7 +165,7 @@ def main() -> None:
     finally:
         if jobs_mode:
             result = {
-                "contract_version": RAY_JOB_CONTRACT_VERSION,
+                "contract_version": int(job["contract_version"]),
                 "attempt_id": job["attempt_id"],
                 "submission_id": job["submission_id"],
                 "envelope_sha256": job["envelope_sha256"],

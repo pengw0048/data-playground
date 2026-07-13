@@ -22,19 +22,46 @@ JSON_ARTIFACT_MAX_BYTES = 64 * 1024**2
 # than placing a tens-of-megabytes value in one metadata row.
 JOB_SQL_ENVELOPE_MAX_BYTES = 8 * 1024**2
 
-RAY_JOB_CONTRACT_VERSION = 2
-RAY_JOB_CANONICAL_FIELDS = (
+RAY_JOB_CONTRACT_VERSION = 3
+RAY_JOB_CANONICAL_FIELDS_V2 = (
     "contract_version", "run_id", "graph", "target", "sink_targets", "materialize_uri", "requires",
     "code_ref", "cluster_ref", "artifact_prefix", "workspace", "data_dir", "entrypoint", "module",
     "semantic_env", "semantic_env_sha256",
 )
-RAY_JOB_ENVELOPE_FIELDS = RAY_JOB_CANONICAL_FIELDS + (
+RAY_JOB_CANONICAL_FIELDS_V3 = (
+    "contract_version", "run_id", "graph", "target", "sink_targets", "sink_contracts",
+    "materialize_uri", "requires", "code_ref", "cluster_ref", "artifact_prefix", "workspace",
+    "data_dir", "entrypoint", "module", "semantic_env", "semantic_env_sha256",
+)
+RAY_JOB_CANONICAL_FIELDS = RAY_JOB_CANONICAL_FIELDS_V3
+_RAY_JOB_BINDING_FIELDS = (
     "backend", "submission_id", "attempt_id", "job_uri", "result_uri", "durable", "envelope_sha256",
 )
+RAY_JOB_ENVELOPE_FIELDS_V2 = RAY_JOB_CANONICAL_FIELDS_V2 + _RAY_JOB_BINDING_FIELDS
+RAY_JOB_ENVELOPE_FIELDS_V3 = RAY_JOB_CANONICAL_FIELDS_V3 + _RAY_JOB_BINDING_FIELDS
+RAY_JOB_ENVELOPE_FIELDS = RAY_JOB_ENVELOPE_FIELDS_V3
 RAY_JOB_RESULT_FIELDS = (
     "contract_version", "attempt_id", "submission_id", "envelope_sha256", "status", "rows", "error",
     "output_uri", "output_table", "outputs",
 )
+
+
+def ray_job_canonical_fields(contract_version: int) -> tuple[str, ...]:
+    """Return the exact hash-bound field set for a supported durable Jobs contract."""
+    if contract_version == 2:
+        return RAY_JOB_CANONICAL_FIELDS_V2
+    if contract_version == 3:
+        return RAY_JOB_CANONICAL_FIELDS_V3
+    raise ValueError(f"unsupported Ray job artifact contract_version {contract_version}")
+
+
+def ray_job_envelope_fields(contract_version: int) -> tuple[str, ...]:
+    """Return the exact envelope field set for a supported durable Jobs contract."""
+    if contract_version == 2:
+        return RAY_JOB_ENVELOPE_FIELDS_V2
+    if contract_version == 3:
+        return RAY_JOB_ENVELOPE_FIELDS_V3
+    raise ValueError(f"unsupported Ray job artifact contract_version {contract_version}")
 
 
 class ArtifactNotFound(FileNotFoundError):
