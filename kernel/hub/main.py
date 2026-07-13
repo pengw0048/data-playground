@@ -142,7 +142,9 @@ app.include_router(catalog.router, prefix="/api", dependencies=_GATE)
 app.include_router(runs.router, prefix="/api", dependencies=_GATE)
 app.include_router(workspace.router, prefix="/api", dependencies=_GATE)
 
-auth.reject_weak_secret()  # fail fast on a shipped/known-weak DP_AUTH_SECRET (forgeable sessions)
+# Fail before opening the metadata DB when the hub has a missing/known-weak signing secret. A spawned
+# kernel child keeps DP_AUTH_MODE only for confinement and never imports this web-app module.
+auth.reject_weak_secret()
 metadb.init_db()  # create metadata tables (idempotent) + seed the default local user
 # user-added datasets survive restart via the per-row catalog_entries store (register_output
 # write-throughs there); the catalog serves them straight from the DB with indexed, paginated
