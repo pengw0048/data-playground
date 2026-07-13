@@ -416,7 +416,6 @@ class LocalRunner:
                 status.progress = 1.0
                 status.stalled = False
                 status.ms = int((time.time() - started) * 1000)
-                status.status = "done"
                 from hub import metadb
                 managed_result = bool(
                     target and nm.get(target) and nm[target].type not in ("write", "assert")
@@ -429,13 +428,18 @@ class LocalRunner:
                     # cache pointer, keep any cache-hit pin through best-effort history persistence, and
                     # never expose terminal done when the primary durable terminal write fails.
                     try:
-                        self._emit(graph, status, strict=True)
+                        persisted = status.model_copy(deep=True)
+                        persisted.status = "done"
+                        self._emit(graph, persisted, strict=True)
                     except Exception as exc:
                         logging.getLogger("hub").exception(
                             "managed full result publication failed")
                         raise RuntimeError("full result publication failed") from exc
                     terminal_persisted = True
+                    status.status = "done"
                     self._complete(graph, target, status)
+                else:
+                    status.status = "done"
                 if cacheable:
                     try:
                         self._cache_put(phash, {

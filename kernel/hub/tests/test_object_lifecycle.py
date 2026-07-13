@@ -955,13 +955,24 @@ def test_local_runner_terminal_persistence_failure_never_exposes_done(tmp_path, 
     phash = runner._plan_hash(graph, "source")
     metadb.put_result(phash, {"uri": handle["uri"], "rows": 1, "table": None})
     runner.result_acquire = metadb.acquire_result_cache_pin
-    runner.on_status = lambda _graph, status: (
-        (_ for _ in ()).throw(RuntimeError("terminal persistence unavailable"))
-        if status.status == "done" else None)
+    persistence_started = threading.Event()
+    allow_failure = threading.Event()
+
+    def persist(_graph, status):
+        if status.status != "done":
+            return
+        persistence_started.set()
+        assert allow_failure.wait(timeout=5)
+        raise RuntimeError("terminal persistence unavailable")
+
+    runner.on_status = persist
     caplog.set_level("ERROR", logger="hub")
     plan = compiler.compile_plan(
         graph, "source", deps.registry, deps.node_specs, deps.node_ir)
     started = runner.run(plan, graph, "source", "local")
+    assert persistence_started.wait(timeout=5)
+    assert runner.status(started.run_id).status == "running"
+    allow_failure.set()
     deadline = time.monotonic() + 5
     while runner.status(started.run_id).status not in ("done", "failed", "cancelled"):
         assert time.monotonic() < deadline
