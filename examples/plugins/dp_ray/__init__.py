@@ -1509,8 +1509,9 @@ class RayRunner:
             status.error = f"ray driver exited without a terminal status (rc={returncode})"
             return
         should_publish = (
-            result.get("status") == "done" and expected_targets is not None
-        ) or (expected_targets is None and bool(result.get("outputs")))
+            result["status"] == "done"
+            and (expected_targets is not None or bool(result.get("outputs")))
+        )
         if should_publish:
             try:
                 if expected_targets is None and expected_attempts is None:
@@ -1526,9 +1527,14 @@ class RayRunner:
                     result, status="failed",
                     error=f"{prior}catalog registration failed: {type(exc).__name__}: {exc}",
                 )
+        # Failed/cancelled outputs stay private as cleanup evidence. A URI shape is not ownership proof,
+        # so retiring those artifacts requires the future ownership-aware artifact lifecycle.
         status.status = result["status"]
         status.error = result.get("error")
-        status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
+        if status.status == "done":
+            status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
+        else:
+            status.output_uri = status.output_table = None
         status.rows_processed = status.total_rows = int(result.get("rows") or 0)
         if status.status == "done":
             status.progress = 1.0
