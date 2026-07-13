@@ -13,6 +13,7 @@ from hub import db, graph as g
 from hub.executors.engine import BuildEngine, NotPreviewable
 from hub.models import Graph, SampleResult
 from hub.sandbox import run_with_timeout
+from hub.storage import ManagedSourceReadError
 
 PREVIEW_SCAN = 2000       # rows read at each source during preview (bounds transforms too)
 PREVIEW_BUDGET_S = 8.0
@@ -52,8 +53,8 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
     def work() -> SampleResult:
         # run on our OWN cursor (created on THIS worker thread so its thread-local binding is correct),
         # not the process-global lock — a slow preview no longer blocks other users' work
-        from hub.storage import local_result_read_scope
-        with local_result_read_scope(
+        from hub.storage import source_read_scope
+        with source_read_scope(
                 storage, g.all_upstream_source_uris(graph, node_id),
                 owner=f"preview:{uuid.uuid4().hex}"):
             with db.run_scope() as scope:
@@ -74,6 +75,8 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
 
     try:
         return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
+    except ManagedSourceReadError as e:
+        return SampleResult(error=True, reason=str(e))
     except NotPreviewable as e:
         return SampleResult(not_previewable=True, reason=e.reason)     # honest P8 state
     except Exception as e:  # noqa: BLE001

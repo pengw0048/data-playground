@@ -47,7 +47,7 @@ def _count_fragments(uri: str, cap: int) -> "int | None":
         q = f"SELECT count(*) FROM (SELECT 1 FROM glob({_lit(pattern)}) LIMIT {int(cap)})"
         with db.lock():
             return int(db.conn().sql(q).fetchone()[0])
-    p = path_of(uri) if uri.startswith("file://") else uri
+    p = path_of(uri)
     if os.path.isdir(p):
         n = seen = 0
         for f in _glob.iglob(os.path.join(p, "**", "*"), recursive=True):
@@ -94,18 +94,21 @@ def _cold_objects(uri: str, cap: int) -> int:
 
 def source_preflight(uri: str, fragment_warn: "int | None" = None, cap: int = 200_000) -> dict:
     """A cheap pre-run probe of one source uri → {uri, fragments, cold, warnings}. Best-effort throughout."""
+    from hub.paths import canonical_data_uri
+
+    read_uri = canonical_data_uri(uri)
     warn_at = _FRAGMENT_WARN if fragment_warn is None else fragment_warn
     warnings: list[str] = []
     frags = None
     try:
-        frags = _count_fragments(uri, cap)
+        frags = _count_fragments(read_uri, cap)
     except Exception:  # noqa: BLE001 — a probe failure must never block the plan
         frags = None
     if frags is not None and frags >= warn_at:
         warnings.append(f"{frags:,} files/fragments — many small files make reads slow and can OOM; compact first")
     cold = 0
     try:
-        cold = _cold_objects(uri, cap)
+        cold = _cold_objects(read_uri, cap)
     except Exception:  # noqa: BLE001
         cold = 0
     if cold:
