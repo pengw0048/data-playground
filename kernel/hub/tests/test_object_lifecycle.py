@@ -1805,6 +1805,28 @@ def test_app_lifespan_starts_and_stops_object_reaper():
     assert main._object_attempt_reaper_thread is None
 
 
+def test_overlapping_app_lifespans_share_one_object_reaper_until_last_exit():
+    from fastapi.testclient import TestClient
+    from hub import main
+
+    def live_reapers():
+        return [thread for thread in threading.enumerate()
+                if thread.name == "dp-object-attempt-reaper" and thread.is_alive()]
+
+    before = len(live_reapers())
+    with TestClient(main.app):
+        thread = main._object_attempt_reaper_thread
+        assert thread is not None
+        assert len(live_reapers()) == before + 1
+        with TestClient(main.app):
+            assert main._object_attempt_reaper_thread is thread
+            assert len(live_reapers()) == before + 1
+        assert main._object_attempt_reaper_thread is thread
+        assert thread.is_alive()
+    assert len(live_reapers()) == before
+    assert main._object_attempt_reaper_thread is None
+
+
 @pytest.mark.parametrize("versioning_enabled", [False, True], ids=["unversioned", "versioned"])
 def test_moto_exact_root_marker_is_inventoried_and_exactly_reaped(versioning_enabled):
     pytest.importorskip("moto")

@@ -121,24 +121,44 @@ class RequestBodyLimitMiddleware:
             await self._response(limit)(scope, receive, send)
 
 
-_object_attempt_reaper_stop = threading.Event()
+_object_attempt_reaper_lock = threading.Lock()
+_object_attempt_reaper_users = 0
+_object_attempt_reaper_stop: threading.Event | None = None
 _object_attempt_reaper_thread: threading.Thread | None = None
 
 
 @asynccontextmanager
 async def _lifespan(_app):
-    global _object_attempt_reaper_stop, _object_attempt_reaper_thread
-    _object_attempt_reaper_stop = threading.Event()
-    _object_attempt_reaper_thread = threading.Thread(
-        target=_object_attempt_reaper_loop, args=(_object_attempt_reaper_stop,),
-        daemon=True, name="dp-object-attempt-reaper")
-    _object_attempt_reaper_thread.start()
+    global _object_attempt_reaper_users, _object_attempt_reaper_stop
+    global _object_attempt_reaper_thread
+    with _object_attempt_reaper_lock:
+        if _object_attempt_reaper_users == 0:
+            if _object_attempt_reaper_thread is not None:
+                if _object_attempt_reaper_thread.is_alive():
+                    raise RuntimeError("previous object-attempt reaper has not stopped")
+                _object_attempt_reaper_thread = None
+                _object_attempt_reaper_stop = None
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=_object_attempt_reaper_loop, args=(stop,),
+                daemon=True, name="dp-object-attempt-reaper")
+            thread.start()
+            _object_attempt_reaper_stop = stop
+            _object_attempt_reaper_thread = thread
+        _object_attempt_reaper_users += 1
     try:
         yield
     finally:
-        _object_attempt_reaper_stop.set()
-        _object_attempt_reaper_thread.join(timeout=5)
-        _object_attempt_reaper_thread = None
+        with _object_attempt_reaper_lock:
+            _object_attempt_reaper_users -= 1
+            if _object_attempt_reaper_users == 0:
+                assert _object_attempt_reaper_stop is not None
+                assert _object_attempt_reaper_thread is not None
+                _object_attempt_reaper_stop.set()
+                _object_attempt_reaper_thread.join(timeout=5)
+                if not _object_attempt_reaper_thread.is_alive():
+                    _object_attempt_reaper_stop = None
+                    _object_attempt_reaper_thread = None
 
 
 app = FastAPI(title="Data Playground kernel", version="0.1.0", lifespan=_lifespan)
