@@ -1,0 +1,20 @@
+# Run once, with application replicas stopped, before deploying a build with a new Alembic head.
+# Jobs are immutable: release automation should give each execution a unique name, or delete this
+# reference Job before re-applying it. Never turn this into a per-Pod initContainer.
+apiVersion: batch/v1
+kind: Job
+metadata: { name: dp-migrate, namespace: dp }
+spec:
+  backoffLimit: 3
+  template:
+    metadata: { labels: { app: dp-migrate } }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: dataplay:podverify # replace with the exact application release image
+          imagePullPolicy: IfNotPresent
+          command: ["dataplay", "migrate", "--workspace", "/data"]
+          env:
+            - { name: DP_DATABASE_URL, value: "postgresql+psycopg://dp:dp@postgres:5432/dp" }
+            - { name: DP_WORKSPACE, value: "/data" }

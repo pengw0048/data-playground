@@ -1,15 +1,17 @@
 """Session auth — a signed, non-spoofable identity, opt-in via env.
 
 DEFAULT (no DP_AUTH_SECRET): open, internal-tool mode — identity is the X-DP-User header (dev). Set
-DP_AUTH_SECRET to require a signed session cookie; DP_AUTH_PASSWORD may seed the first admin on startup.
+DP_AUTH_SECRET to require a signed session cookie; DP_AUTH_PASSWORD may seed the first admin during the
+one-shot ``dataplay migrate`` release step (or serialized local-SQLite initialization).
 /auth/login checks the user's stored password hash and issues an HMAC-signed, time-limited token; a raw
 header is no longer trusted, and tokens can't be forged without the secret.
 
 Identity is PER-USER: /auth/login verifies the submitted password against that user's own scrypt hash
 (users.password_hash), so knowing the shared instance password no longer lets you sign in as someone
-else. DP_AUTH_PASSWORD is one-time BOOTSTRAP input: initialization consumes it after seeding the default
-user's hash (or confirming a hash already exists). Admins then create users with their own passwords and
-everyone can rotate their own. SSO/OIDC would slot into the same /auth/login + session plumbing later.
+else. DP_AUTH_PASSWORD is one-time BOOTSTRAP input: migration consumes it after seeding the default
+user's hash (or confirming a hash already exists). Application replicas must not receive it. Admins then
+create users with their own passwords and everyone can rotate their own. SSO/OIDC would slot into the
+same /auth/login + session plumbing later.
 """
 
 from __future__ import annotations
@@ -24,7 +26,9 @@ _TTL_SECONDS = 7 * 24 * 3600  # sessions expire after a week
 
 
 def _secret() -> str:
-    return os.environ.get("DP_AUTH_SECRET", "")
+    # Whitespace is never meaningful signing material. A configured-but-blank value is rejected by
+    # metadata startup/migration; canonicalizing here keeps every auth decision on the same semantics.
+    return os.environ.get("DP_AUTH_SECRET", "").strip()
 
 
 def auth_enabled() -> bool:
@@ -115,6 +119,8 @@ def verify_password(pw: str, stored: str | None) -> bool:
 
 
 def bootstrap_password() -> str:
-    """Optional DP_AUTH_PASSWORD — seeds the default user's credential on first init so an existing
-    shared-password deployment keeps working after upgrade. Not a login path on its own."""
+    """Optional DP_AUTH_PASSWORD — one-shot migration input for the default user's credential.
+
+    It is not a login path and must not be present in a production service process.
+    """
     return os.environ.get("DP_AUTH_PASSWORD", "")

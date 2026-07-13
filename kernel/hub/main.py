@@ -109,7 +109,7 @@ app.include_router(runs.router, prefix="/api", dependencies=_GATE)
 app.include_router(workspace.router, prefix="/api", dependencies=_GATE)
 
 auth.reject_weak_secret()  # fail fast on a shipped/known-weak DP_AUTH_SECRET (forgeable sessions)
-metadb.init_db()  # create metadata tables (idempotent) + seed the default local user
+metadb.init_db()  # SQLite: locked local init; production DB: strict schema-head check, never DDL
 # user-added datasets survive restart via the per-row catalog_entries store (register_output
 # write-throughs there); the catalog serves them straight from the DB with indexed, paginated
 # queries (no import-time re-register loop, no load-everything-into-memory on read).
@@ -371,12 +371,18 @@ def livez() -> dict:
 @app.get("/api/readyz")
 def readyz():
     # readiness = can this instance actually serve? Real dep checks (not a static ok): the metadata DB
-    # answers, and the DuckDB engine is responsive (not wedged). 503 (not 200) when not ready, so a load
-    # balancer / k8s readiness probe pulls the instance out of rotation instead of routing to a dead one.
+    # answers, is still at this build's exact schema head, and the DuckDB engine is responsive (not
+    # wedged). 503 makes a load balancer / k8s probe pull an unsafe instance out of rotation.
     from fastapi.responses import JSONResponse
 
     from hub import db, metadb
-    checks = {"db": metadb.ping(), "engine": db.responsive(3.0)}
+    db_ok = metadb.ping()
+    checks = {
+        "db": db_ok,
+        # Do not launch a second potentially blocking DB connection after ping has already timed out.
+        "schema": metadb.schema_at_head() if db_ok else False,
+        "engine": db.responsive(3.0),
+    }
     ready = all(checks.values())
     return JSONResponse({"ready": ready, "checks": checks}, status_code=200 if ready else 503)
 

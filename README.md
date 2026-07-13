@@ -363,14 +363,34 @@ Two *runtime* things still have **instance affinity** — they need routing, not
   `DP_KERNEL_SPAWNER=pod` (`kernel[pod]`) to run each canvas's kernel as a k8s Pod + Service — a
   reference `KernelSpawner` you verify + tailor to your cluster (RBAC, image, data mounts).
 
-**With Docker.** `docker compose up` builds one image (the web app baked in) and runs it against
-Postgres — the shared, restart-durable setup above. `Dockerfile` is the single-image build
-(`docker build -t dataplay .`); `docker-compose.yml` adds Postgres, volumes, and documents
-`deploy.replicas` + sticky routing for the multi-instance case. Set `DP_AUTH_SECRET`,
-`DP_AUTH_PASSWORD`, and `DP_DATASET_ROOTS` for a multi-user deployment; TLS is operator-specific
-(front it with nginx/Caddy). `DP_AUTH_PASSWORD` bootstraps the first admin on first boot — log in as
-user `local` with it, create per-user accounts, then each user rotates their own password in-app
-(changing the env var later does not rotate it). Without it a fresh auth-on deploy is locked out.
+**With Docker.** `Dockerfile` builds one image with the web app baked in; Compose runs that exact image
+for both the application and the release migrator against restart-durable Postgres. Set `DP_IMAGE` to
+the immutable tag or digest being released and `DP_AUTH_SECRET` to a random signing secret. First boot
+requires a transient `DP_AUTH_PASSWORD` so the built-in `local` administrator can log in:
+
+```bash
+docker compose up -d postgres
+export DP_AUTH_PASSWORD                 # supply it from your secret manager
+docker compose run --rm migrate
+unset DP_AUTH_PASSWORD
+docker compose up -d kernel
+```
+
+Later upgrades deliberately trade zero downtime for a simple, safe migration contract. First stop any
+MCP, headless, or other writers that run outside this Compose project, then:
+
+```bash
+docker compose stop kernel              # stop the Compose-managed application writer
+docker compose run --rm migrate          # no DP_AUTH_PASSWORD after an admin credential exists
+docker compose up -d kernel
+```
+
+Application replicas never run schema DDL. Server, MCP, headless, and kernel processes refuse to start
+unless Postgres is already at the build's exact Alembic head, and `/api/readyz` checks the same
+contract. Local SQLite still migrates automatically under a lock tied to the resolved database file.
+The Compose file also documents volumes, `deploy.replicas`, and sticky routing for multi-instance use;
+TLS remains operator-specific (front the service with nginx/Caddy). After first login, create per-user
+accounts and rotate passwords in-app; rerunning the migrator never overwrites an existing credential.
 
 ---
 
