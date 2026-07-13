@@ -1528,7 +1528,7 @@ class RayRunner:
         for output in outputs:
             step_id, name, uri = output["step_id"], output["name"], output["uri"]
             logical_uri = output.get("logical_uri")
-            parents = g.all_upstream_source_uris(graph, step_id)
+            parents = g.all_upstream_publication_uris(graph, step_id)
             managed_attempt = bool(logical_uri and is_object_uri(uri) and is_attempt_uri(uri))
             if managed_attempt:
                 publish = core_managed_publisher(self.catalog)
