@@ -59,15 +59,16 @@ export function KernelBadge({ kernelUp, kernelInfo }: { kernelUp: boolean; kerne
     }
   }, [canvasId])
 
-  // Refresh on mount / canvas change, and — only while the popover is OPEN — poll every 3s. A closed
-  // badge runs no steady-state timer.
+  // Fetch live status only while the popover is OPEN, then poll every 3s (the last status is cached, so
+  // a reopened badge shows the previous state instantly). A closed badge issues NO request — this keeps
+  // a freshly-loaded canvas (whose client-side id may not exist server-side yet) from querying the
+  // kernel endpoint and logging a 404 console error, and adds no steady-state load.
   useEffect(() => {
-    if (!canvasId) { setStatus(null); setOffline(false); return }
+    if (!open || !canvasId || !canvasRole) return
     void refresh()
-    if (!open) return
     const id = window.setInterval(() => void refresh(), 3_000)
     return () => window.clearInterval(id)
-  }, [canvasId, open, refresh])
+  }, [open, canvasId, canvasRole, refresh])
 
   const cat = category(kernelUp, offline, status)
 

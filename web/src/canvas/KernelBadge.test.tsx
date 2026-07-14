@@ -42,18 +42,18 @@ describe('KernelBadge', () => {
     })
     render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     const badge = await screen.findByTestId('kernel-badge')
-    await waitFor(() => expect(badge).toHaveTextContent('kernel · warm'))
-
-    fireEvent.click(badge)
+    fireEvent.click(badge)  // opening the popover triggers the status fetch (no request while closed)
     expect(await screen.findByText('Execution kernel')).toBeInTheDocument()
-    expect(screen.getByText(/3 cached/)).toBeInTheDocument()
+    expect(await screen.findByText(/3 cached/)).toBeInTheDocument()
     expect(screen.getByText(/2m 5s/)).toBeInTheDocument()  // 125s uptime
+    await waitFor(() => expect(badge).toHaveTextContent('kernel · warm'))
   })
 
   it('degrades to offline (keeping the badge) when the kernel-state fetch fails', async () => {
     mocks.kernelState.mockRejectedValue(new Error('network down'))
     render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     const badge = await screen.findByTestId('kernel-badge')
+    fireEvent.click(badge)  // open → the fetch fails → the dot degrades to offline
     await waitFor(() => expect(badge).toHaveTextContent('kernel · offline'))
   })
 
@@ -61,6 +61,7 @@ describe('KernelBadge', () => {
     mocks.kernelState.mockResolvedValue({ exists: false })
     render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     const badge = await screen.findByTestId('kernel-badge')
+    fireEvent.click(badge)  // open → fetch returns no lease → cold
     await waitFor(() => expect(badge).toHaveTextContent('kernel · cold'))
   })
 
