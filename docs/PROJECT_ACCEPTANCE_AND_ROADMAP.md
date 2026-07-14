@@ -17,16 +17,16 @@ and a long-term product idea is not a release blocker.
 | --- | --- |
 | Audit date | 2026-07-13 |
 | Accepted source baseline | `origin/main` at `fb9c76f96738a048cb8e66aaafb56bf10c249281` |
-| README narrative cross-check | Ready [PR #5](https://github.com/pengw0048/data-playground/pull/5) at `95e64098b4dad09d458b102e4e8222b113badb06`; not part of accepted `main` until merged |
-| Pending Ray Jobs evidence | Draft, currently conflicting [PR #79](https://github.com/pengw0048/data-playground/pull/79) at `1726d0ccacf7455ff1a450809a7f27619c8682dc` |
+| README narrative cross-check | Ready and green [PR #5](https://github.com/pengw0048/data-playground/pull/5) at `052da1ce3edf12d678d017dac73199532a4f61e0`; not part of accepted `main` until merged |
+| Pending Ray Jobs evidence | Ready and mergeable [PR #79](https://github.com/pengw0048/data-playground/pull/79) at `a841dd8f5440608ac9c1e28969f822b5ba3c9bad`; all seven exact-head GitHub checks passed |
 | Product stage | Pre-1.0 (`0.1.0`), with a local or trusted-team scope |
 | Audit method | Source, tests, CI workflows, deployment references, and documentation were inspected together |
 
 README PR #5 was used only to align the product framing and security language; it is not evidence that a
 runtime capability has landed. PR #79 is reviewed as **pending evidence**, not as accepted `main`
 behavior. Its durable Ray Jobs lifecycle and `docs/RAY_JOBS.md` are not counted as complete until the PR
-is rebased, merged, and its required checks pass on the final head. Refresh all three SHAs before using
-this document as release evidence after any branch changes.
+is merged. All seven required checks passed on the named final head; merging is the remaining acceptance
+gate. Refresh all three SHAs before using this document as release evidence after any branch changes.
 
 ### Status vocabulary
 
@@ -61,7 +61,7 @@ deployment profile:
 | --- | --- | --- | --- |
 | **A — Local workstation** | One user, or users who fully trust one another and the machine | **Capable beta; nearest to releasable** | Release artifacts, install/upgrade evidence, supported-version CI, and backup/restore procedures are not yet a complete release contract |
 | **B — Trusted-team shared service** | Authenticated team sharing a workspace, metadata DB, storage, and compute trust boundary | **Architecturally supported, not production-certified** | Catalog/data authorization, secret storage, SSO/identity integration, auditability, observability, recovery drills, and deployment hardening remain incomplete |
-| **C — Distributed Ray execution** | Selected supported graph shapes on a controlled Ray cluster | **Validated reference backend, not a production deployment** | `main` lacks a durable Jobs lifecycle; PR #79 is pending. Live capacity/backpressure, scoped identity, active-failure tests, observability, HA/upgrade runbooks, and operator topology certification remain open |
+| **C — Distributed Ray execution** | Selected supported graph shapes on a controlled Ray cluster | **Validated reference backend, not a production deployment** | `main` lacks a durable Jobs lifecycle; ready PR #79 is pending merge. Live capacity/backpressure, scoped identity, active-failure tests, observability, HA/upgrade runbooks, and operator topology certification remain open |
 | **D — Mutually distrusting tenants** | Users must be isolated from one another despite arbitrary code and data access attempts | **Non-goal** | The Python and SQL controls are not an OS security boundary; kernels share deployment credentials and the workspace data plane is shared |
 
 The highest-value path is therefore not to add more surface area immediately. It is to make Profiles A
@@ -445,13 +445,13 @@ should strengthen context and lifecycle contracts, not add parallel organization
   a generic controller is not required to certify a Ray-only deployment.
 - **Evidence:** `main` exposes generic [`ExecutionBackend`](../kernel/hub/backends.py) and optional
   [`PlaceableBackend`](../kernel/hub/backends.py), but no generic restart-durable job-control contract.
-  Pending [PR #79](https://github.com/pengw0048/data-playground/pull/79) proposes a Ray-specific,
+  Pending [PR #79](https://github.com/pengw0048/data-playground/pull/79) now freezes a Ray-specific,
   restart-durable whole-graph Jobs lifecycle while explicitly leaving the multi-region parent in memory.
 - **Impact:** A future provider whose confirmed boundary matches durable job control should not copy
   Ray-specific retry, cancellation, fencing, and publication semantics. Providers that own only trigger,
   queue, placement, or data behavior need a smaller port instead.
 - **Acceptance criteria:**
-  1. First freeze PR #79's invariants with tests: prepare/bind before submit, deterministic idempotency,
+  1. Reuse PR #79's tested invariants: prepare/bind before submit, deterministic idempotency,
      authoritative absence rules, observable status normalization, cancel intent before stop, stop
      acknowledgement, recovery, result verification, and single-publisher fencing.
   2. Confirm at least one non-Ray provider has the same durable lifecycle boundary; otherwise keep the
@@ -728,17 +728,30 @@ cluster IAM, admission control, production storage, KubeRay policy, or incident 
 ### RAY-01 — Pending durable Jobs lifecycle
 
 - **Status:** Certification gate for Profile C; pending PR #79, not Accepted.
-- **Pending evidence:** Draft [PR #79](https://github.com/pengw0048/data-playground/pull/79) at the snapshot
+- **Pending evidence:** Ready, mergeable [PR #79](https://github.com/pengw0048/data-playground/pull/79) at the snapshot
   SHA proposes official Ray Jobs API submission, durable SQL binding, recovery, cancellation intent,
   authoritative-absence rules, result-envelope verification, publication leasing, and whole-graph
   restart reattachment. Its own
-  [`RAY_JOBS.md` snapshot](https://github.com/pengw0048/data-playground/blob/1726d0ccacf7455ff1a450809a7f27619c8682dc/docs/RAY_JOBS.md)
+  [`RAY_JOBS.md` snapshot](https://github.com/pengw0048/data-playground/blob/a841dd8f5440608ac9c1e28969f822b5ba3c9bad/docs/RAY_JOBS.md)
   explicitly limits the contract to whole-graph execution; multi-region parent orchestration remains in
-  memory. GitHub currently reports the PR as conflicting with `main`; green checks from its existing head
-  are not current-baseline acceptance evidence until it is rebased and rerun.
+  memory. The branch was rebuilt on the accepted `main` baseline, independently release-gate reviewed,
+  locally passed the evidence matrix below, and passed all seven final-head GitHub checks. None of this is
+  accepted `main` behavior until the exact head merges.
+- **Integration and final-fix local evidence:** full kernel/SQLite `1036 passed, 43 skipped`; PostgreSQL migration
+  `2 passed`; clean PostgreSQL Ray Jobs lifecycle `96 passed, 1 skipped`; PostgreSQL object/GC and
+  backend-publication lock races `24 passed`; retained-auth paths `8 passed, 1 SQLite-only skipped`;
+  and a freshly built real Ray head/worker + PostgreSQL 16 + versioned MinIO acceptance run passed
+  restart reattachment, frozen-source generation, exactly-once catalog/history projection, cancellation,
+  missing-result, and corrupt-result scenarios. After the final Popen sink-binding fix, all 11 Ray
+  compatibility tests and the focused Jobs driver tests passed, and a freshly rebuilt head, two workers,
+  and MinIO differential run passed through the worker-direct whole-graph overwrite gate that had exposed
+  the regression. The terminal-result follow-up then made `SUCCEEDED`, `STOPPED`, and post-reconciliation
+  corruption share one durable quarantine contract, while retaining autonomous retry through a transient
+  control outage; the complete Ray Jobs unit file passed `98 passed, 2 skipped`, nine focused quarantine
+  tests passed, and independent final review found no P0/P1/P2.
 - **Acceptance criteria before merge:**
-  1. Rebase or rebuild onto current `main`, then audit the complete diff for regressions in capabilities,
-     migrations, security controls, lifecycle tests, and documentation before reviewing the new feature.
+  1. Keep the current-main rebuild and complete-diff regression audit intact; re-run them if the head or
+     base changes.
   2. All requested review threads are resolved with tests for the exact lifecycle invariant changed.
   3. Unit, PostgreSQL lifecycle, real Ray Jobs service, and existing multi-node differential checks pass
      on the final PR head.
@@ -902,7 +915,7 @@ Required behavior:
 - recover after process restart and fence duplicate supervisors/publishers;
 - verify and publish results through an idempotent catalog boundary.
 
-Ray should prove this controller after PR #79 freezes its invariants. Another integration should use the
+Ray should prove this controller from the invariants frozen in PR #79. Another integration should use the
 controller only if its owner confirms that the lifecycle boundary fits; otherwise add the smallest
 generic execution, trigger, or queue port proven by its contract rather than copying the state machine.
 
@@ -993,16 +1006,16 @@ Every internal adapter must pass the same minimum review:
 ## Roadmap
 
 The time bands are sequencing guides, not date commitments. Security/release work can proceed in parallel
-with PR #79 review, but adapter implementation depends on generic contracts and owner-confirmed internal
+with PR #79's merge, but adapter implementation depends on generic contracts and owner-confirmed internal
 semantics.
 
 ### Near term: 0–6 weeks
 
-**Goal:** make Profile A releasable, make Profile B's boundaries explicit, and bring PR #79 through a
-current-main rebase, regression audit, final review, and merge.
+**Goal:** make Profile A releasable, make Profile B's boundaries explicit, and merge PR #79's reviewed,
+exact-head-green current-main rebuild.
 
-1. **Rebase or rebuild PR #79 on current `main`**, audit the resulting diff for regressions, and merge
-   only after its final lifecycle tests and review are green; update the Ray baseline here after merge.
+1. **Merge PR #79's current clean, exact-head-green head**; re-run the regression audit if the head or
+   base changes, then update the Ray baseline here.
 2. **Land this acceptance report** and retire the stale feature-count inventory.
 3. **Close agent egress risk** with metadata-only default, explicit sample-value policy, UI disclosure,
    and audit events.
@@ -1074,7 +1087,7 @@ hard to review; unrelated rows should not be combined merely because they touch 
 | Order | PR theme | Depends on | Acceptance focus | Explicitly out of scope |
 | ---: | --- | --- | --- | --- |
 | 00 | Acceptance report and capability pointers | None | Snapshot, evidence links, status vocabulary, no stale counts | Product implementation |
-| 01 | Rebase and finish durable Ray Jobs PR #79 | Existing PR | Current-main regression audit, exact lifecycle invariants, final-head CI, honest limits | Generic controller extraction, new sinks |
+| 01 | Finish and merge durable Ray Jobs PR #79 | Existing PR | Preserve the completed current-main regression audit, exact lifecycle invariants, final-head CI, honest limits | Generic controller extraction, new sinks |
 | 02 | Agent data-egress policy | None | Metadata-only default, value opt-in, sanitizer, disclosure, agent-egress event fixture adopted by 12 | Full DLP, catalog ACL, cross-domain audit schema |
 | 03 | Secret references and `SecretResolver` | None | No plaintext DB secrets, destructive migration, redaction tests | Vendor-specific secret manager |
 | 04 | Shared-mode transport guard | None | Secure-cookie/TLS/proxy startup checks | Certificate/ingress management |
@@ -1176,9 +1189,10 @@ The complete fault-control and degraded-run sequence is owned by
 
 ### Pending Ray Jobs
 
-Until PR #79 merges, use its final PR checks and exact-head test instructions as pending evidence. Do not
-copy a green run from an earlier SHA into a release certification. After merge, the repository should own
-a real Ray Jobs service acceptance workflow in addition to unit/fake-control tests.
+Until PR #79 merges, use only its exact-head checks and test instructions as pending evidence. Its final
+head adds a path-gated real Ray Jobs service acceptance workflow alongside unit/fake-control tests, but
+that workflow is not repository-owned `main` behavior until merge. Never copy a green run from another
+SHA into release certification.
 
 ### Documentation integrity
 
@@ -1205,7 +1219,7 @@ For this report and future edits:
 | UX and accessibility | [`web/src/views/Shell.tsx`](../web/src/views/Shell.tsx), [`web/src/index.css`](../web/src/index.css), [`web/package.json`](../web/package.json) |
 | Release and deployment | [`Dockerfile`](../Dockerfile), [`docker-compose.yml`](../docker-compose.yml), [`deploy/README.md`](../deploy/README.md), [`kernel/pyproject.toml`](../kernel/pyproject.toml) |
 | Ray backend | [RAY.md](RAY.md), [`examples/plugins/dp_ray`](../examples/plugins/dp_ray/), [`docker/ray/Dockerfile`](../docker/ray/Dockerfile), [`ray-validation.yml`](../.github/workflows/ray-validation.yml) |
-| Pending durable Ray Jobs | [PR #79](https://github.com/pengw0048/data-playground/pull/79) and its immutable [`RAY_JOBS.md` snapshot](https://github.com/pengw0048/data-playground/blob/1726d0ccacf7455ff1a450809a7f27619c8682dc/docs/RAY_JOBS.md) |
+| Pending durable Ray Jobs | [PR #79](https://github.com/pengw0048/data-playground/pull/79) and its immutable [`RAY_JOBS.md` snapshot](https://github.com/pengw0048/data-playground/blob/a841dd8f5440608ac9c1e28969f822b5ba3c9bad/docs/RAY_JOBS.md) |
 | CI and test ownership | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), [`.github/workflows/ray-validation.yml`](../.github/workflows/ray-validation.yml), [`kernel/hub/tests`](../kernel/hub/tests/), [`web/e2e`](../web/e2e/) |
 
 ## Decision record and non-goals
