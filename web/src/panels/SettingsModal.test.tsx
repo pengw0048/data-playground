@@ -134,7 +134,7 @@ describe('SettingsModal — plugin config form', () => {
 
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent('Could not save global setting "agentApiKey": HTTP 500: write failed')
-    expect(alert).toHaveTextContent('1 of 6 updates completed before the failure. Server settings may be partially updated; your edits remain here.')
+    expect(alert).toHaveTextContent('1 of 7 updates completed before the failure. Server settings may be partially updated; your edits remain here.')
     expect(screen.getByDisplayValue('edited-model')).toBeVisible()
     expect(screen.queryByText('Saved')).toBeNull()
 
