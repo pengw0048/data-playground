@@ -60,8 +60,8 @@ test.describe('minimum viewport support', () => {
 
     await goToFilesShell(page)
 
-    // Navigation rail: four destinations plus Settings.
-    for (const id of ['rail-files', 'rail-tables', 'rail-transforms', 'rail-relationships', 'rail-settings'] as const) {
+    // Navigation rail: three destinations plus Settings (Relationships is reached from a table drawer).
+    for (const id of ['rail-files', 'rail-tables', 'rail-transforms', 'rail-settings'] as const) {
       await expectFullyInViewport(page, page.getByTestId(id), id)
     }
 
@@ -70,8 +70,6 @@ test.describe('minimum viewport support', () => {
     await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
     await page.getByTestId('rail-transforms').click()
     await expect(page.getByRole('heading', { name: 'Transforms' })).toBeVisible()
-    await page.getByTestId('rail-relationships').click()
-    await expect(page.getByText('Relationships (ER)')).toBeVisible()
     await page.getByTestId('rail-files').click()
     await expect(page.getByRole('heading', { name: 'Recents' })).toBeVisible()
 

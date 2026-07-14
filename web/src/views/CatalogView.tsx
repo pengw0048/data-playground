@@ -515,6 +515,7 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
   onDeleted: () => void; onOpenTable: (t: CatalogTable) => void; onColumn: (name: string) => void
 }) {
   const pushToast = useStore((s) => s.pushToast)
+  const openRelationships = useStore((s) => s.openRelationships)
   const [name, setName] = useState(table.name)
   const [folder, setFolder] = useState(table.folder ?? '')
   const [tags, setTags] = useState((table.tags ?? []).join(', '))
@@ -600,6 +601,13 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
   const children = (lin?.edges ?? []).filter((e) => e.parent === table.uri)
   const nameOf = (u: string) => lin?.nodes.find((n) => n.uri === u)?.name ?? u.split('/').slice(-1)[0]
 
+  const declaredPk = table.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
+  const togglePk = async (col: string) => {
+    const next = declaredPk.includes(col) ? declaredPk.filter((c) => c !== col) : [...declaredPk, col]
+    try { onChanged(await api.declareKey(table.id, next)) }
+    catch (e) { pushToast(errorMessage(e), 'error') }
+  }
+
   return (
     <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
       <div role="dialog" aria-modal="true" aria-label={table.name}
@@ -635,18 +643,25 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
             </div>
           </section>
 
-          {/* columns — click one to browse every table that has it */}
+          {/* columns — the 🔑 toggles the declared primary key; the name filters the list to tables with it */}
           <section>
             <div className="mb-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Columns</div>
             <div className="max-h-[220px] overflow-y-auto rounded-lg border border-border">
-              {table.columns.map((c) => (
-                <button key={c.name} onClick={() => onColumn(c.name)} title={`Filter the list to tables with column "${c.name}"`}
-                  className="flex w-full items-center gap-2 border-b border-border/60 px-3 py-1 text-left last:border-0 hover:bg-accent">
-                  <span className="w-3 text-center text-[10px]">{c.capabilities?.includes('key') ? '🔑' : ''}</span>
-                  <span className="dp-mono flex-1 truncate text-[11.5px]">{c.name}</span>
-                  <span className="text-[10px] text-muted-foreground">{c.type}</span>
-                </button>
-              ))}
+              {table.columns.map((c) => {
+                const isPk = declaredPk.includes(c.name)
+                return (
+                  <div key={c.name} className="flex w-full items-center gap-1 border-b border-border/60 px-2 py-1 last:border-0 hover:bg-accent">
+                    <button onClick={() => void togglePk(c.name)} data-testid={`detail-pk-${c.name}`}
+                      title={isPk ? 'Declared primary key — click to clear' : 'Click to declare as the primary key'}
+                      className={`w-5 shrink-0 text-center text-[11px] ${isPk ? '' : 'opacity-25 hover:opacity-70'}`}>🔑</button>
+                    <button onClick={() => onColumn(c.name)} title={`Filter the list to tables with column "${c.name}"`}
+                      className="flex min-w-0 flex-1 items-center gap-2 text-left">
+                      <span className="dp-mono flex-1 truncate text-[11.5px]">{c.name}</span>
+                      <span className="text-[10px] text-muted-foreground">{c.type}</span>
+                    </button>
+                  </div>
+                )
+              })}
             </div>
           </section>
 
@@ -703,6 +718,10 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
             </> : null}
           </section>
 
+          <button onClick={() => openRelationships(table.uri)} data-testid="detail-relationships"
+            className="inline-flex items-center gap-1.5 self-start text-[11.5px] text-primary hover:underline">
+            <Icon name="lineage" size={12} /> View relationship graph →
+          </button>
           {table.folder && (
             <button onClick={() => onFolder(table.folder!)} className="self-start text-[11.5px] text-primary hover:underline">Browse folder “{table.folder}” →</button>
           )}

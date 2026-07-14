@@ -55,27 +55,25 @@ describe('ERDiagram request truth', () => {
   })
   afterEach(() => cleanup())
 
-  it('shows offline/catalog, folder, and relationship load failures with independent retries', async () => {
+  it('shows catalog and relationship load failures with independent retries', async () => {
     mocks.tablesPage.mockRejectedValueOnce(new Error('Failed to fetch')).mockResolvedValueOnce(PAGE)
-    mocks.facets.mockRejectedValueOnce(new Error('HTTP 500: facets failed')).mockResolvedValueOnce({ folders: [{ value: 'sales', count: 2 }], tags: [], owners: [] })
     mocks.relationships.mockRejectedValueOnce(new Error('HTTP 401: relationships denied')).mockResolvedValueOnce([])
     render(<ERDiagram />)
 
-    expect(await screen.findByText(/Couldn't load datasets: Failed to fetch/i)).toBeInTheDocument()
-    expect(screen.getByText(/Couldn't load folders: HTTP 500/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Couldn't load: Failed to fetch/i)).toBeInTheDocument()
     expect(screen.getByText(/Couldn't load declared relationships: HTTP 401/i)).toBeInTheDocument()
     expect(screen.queryByText(/No datasets registered/i)).toBeNull()
 
     fireEvent.click(screen.getByTestId('er-catalog-retry'))
-    fireEvent.click(screen.getByTestId('er-folders-retry'))
     fireEvent.click(screen.getByTestId('er-relationships-retry'))
     expect(await screen.findByText('orders')).toBeInTheDocument()
     await waitFor(() => expect(screen.queryAllByRole('alert')).toHaveLength(0))
 
+    // switching folder must not leave the previous folder's rows under the new filter
     mocks.tablesPage.mockRejectedValueOnce(new Error('HTTP 503: sales folder unavailable'))
     fireEvent.change(screen.getByTestId('er-folder'), { target: { value: 'sales' } })
-    expect(await screen.findByText(/Couldn't load datasets: HTTP 503/i)).toBeInTheDocument()
-    expect(screen.queryByText('orders')).toBeNull()  // never show the previous folder under the new filter
+    expect(await screen.findByText(/Couldn't load: HTTP 503/i)).toBeInTheDocument()
+    expect(screen.queryByText('orders')).toBeNull()
     fireEvent.click(screen.getByTestId('er-catalog-retry'))
     expect(await screen.findByText('orders')).toBeInTheDocument()
   })

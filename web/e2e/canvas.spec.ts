@@ -264,6 +264,7 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
     await page.getByText('Settings', { exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
+    await page.getByRole('button', { name: 'Destinations' }).click()  // master-detail: switch to the Destinations pane
     // datasets live on the Tables page now, not in Settings — add an output destination (a real, consumed setting)
     await page.getByPlaceholder('e.g. S3 exports').fill('scratch')
     await page.getByPlaceholder('/path/to/dir').fill('/tmp/dp-scratch')
@@ -421,20 +422,23 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('toolbar')).toBeVisible()
   })
 
-  test('the relationships (ER) view renders the catalog as entities', async ({ page }) => {
+  test('the relationships graph opens focused from a table and widens to the catalog', async ({ page }) => {
     await fresh(page)
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to files').click()
-    await page.getByTestId('rail-relationships').click()
-    // the ER canvas mounts with the seeded datasets as draggable entities (with their columns)
-    await expect(page.getByText('Relationships (ER)')).toBeVisible({ timeout: 10_000 })
+    await page.getByTestId('rail-tables').click()
+    await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
+    // search keeps this robust to list order, then open the dataset's drawer → View relationship graph
+    await page.getByTestId('catalog-search').fill('events')
+    await page.getByText('events', { exact: true }).click()
+    await page.getByTestId('detail-relationships').click()
+    // the graph mounts focused on that table (its columns are visible on the entity)
+    await expect(page.getByText('Relationships', { exact: true })).toBeVisible({ timeout: 10_000 })
     const entities = page.locator('.react-flow__node')
-    // the catalog is fetched + laid out async on a fresh e2e DB (first-boot seed) — a slow CI runner can
-    // take a beat to mount every entity node, so give these the same 10s headroom as the heading.
-    await expect(entities.filter({ hasText: 'events' }).first()).toBeVisible({ timeout: 10_000 })
-    await expect(entities.filter({ hasText: 'images' }).first()).toBeVisible({ timeout: 10_000 })
-    // a key column is present in the entity (id) — the material for join hints
     await expect(entities.filter({ hasText: 'events' }).first().getByText('user_id')).toBeVisible({ timeout: 10_000 })
+    // "show all" widens to the whole catalog — other seeded datasets appear as entities too
+    await page.getByTestId('er-clear-focus').click()
+    await expect(entities.filter({ hasText: 'images' }).first()).toBeVisible({ timeout: 10_000 })
   })
 
   test('a failing run surfaces an error toast (not a silent failure)', async ({ page }) => {

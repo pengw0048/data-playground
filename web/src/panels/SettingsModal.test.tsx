@@ -44,6 +44,8 @@ describe('SettingsModal — plugin config form', () => {
   it('renders declared fields, saves them as plugin.<pack>.<key>, and skips a blank secret', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
 
+    // Plugins is its own pane now (master-detail) — switch to it before editing its fields
+    fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
     // the url field is pre-filled from config_values; the secret token prompts for a reference
     const url = await screen.findByDisplayValue('existing')
     const tok = screen.getByPlaceholderText(/env:VAR or file:\/path/i)
@@ -66,7 +68,7 @@ describe('SettingsModal — plugin config form', () => {
   it('surfaces a save failure instead of a false "Saved" (UX-01)', async () => {
     putSetting.mockRejectedValueOnce(new Error('save failed'))  // first write rejects
     render(<SettingsModal onClose={vi.fn()} />)
-    await screen.findByDisplayValue('existing')  // wait for load
+    await screen.findByPlaceholderText('anthropic/claude-opus-4-8')  // wait for load (agent pane is default)
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() => expect(state.pushToast).toHaveBeenCalledWith('Could not save global setting "agentModel": save failed', 'error'))
     expect(screen.getByRole('alert')).toHaveTextContent('No update was confirmed. Your edits remain here.')
@@ -89,7 +91,7 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.queryByPlaceholderText('anthropic/claude-opus-4-8')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Retry loading' }))
-    expect(await screen.findByDisplayValue('existing')).toBeVisible()
+    expect(await screen.findByPlaceholderText('anthropic/claude-opus-4-8')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
   })
 
@@ -127,8 +129,7 @@ describe('SettingsModal — plugin config form', () => {
       return { ok: true }
     })
     render(<SettingsModal onClose={vi.fn()} />)
-    await screen.findByDisplayValue('existing')
-    const model = screen.getByPlaceholderText('anthropic/claude-opus-4-8')
+    const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
     fireEvent.change(model, { target: { value: 'edited-model' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 

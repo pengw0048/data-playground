@@ -58,7 +58,8 @@ function Rail({ onSettings }: { onSettings: () => void }) {
         {item('files', 'clock', 'Recents')}
         {item('tables', 'db', 'Tables')}
         {item('transforms', 'fx', 'Transforms')}
-        {item('relationships', 'lineage', 'Relationships')}
+        {/* Relationships is reached from a table's detail drawer (Tables → open a dataset → View relationships),
+            not a top-level destination — it is always a graph focused on some table. */}
         <Button variant="ghost" onClick={onSettings} data-testid="rail-settings"
           className="h-auto w-full justify-start gap-2.5 px-2.5 py-2 text-[13px] font-medium text-muted-foreground">
           <Icon name="settings" size={15} /> Settings
