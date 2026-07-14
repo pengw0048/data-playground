@@ -32,6 +32,12 @@ async function openSettings(page: Page) {
   await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
 }
 
+/** Catalog rows load async; on a busy data_dir the seeded name may sit past the first page — search first. */
+async function expectCatalogTable(page: Page, name: string) {
+  await page.getByTestId('catalog-search').fill(name)
+  await expect(page.getByRole('button', { name: `Open table ${name}`, exact: true })).toBeVisible({ timeout: 15_000 })
+}
+
 /** Fail the build only on serious/critical axe hits; moderate/minor are documented in the PR.
  *  `color-contrast` is excluded: muted 9.5–11px labels fail AA by design today and are deferred with
  *  the typography follow-up called out in #118. Semantics / names / focus / nested-interactive stay gated. */
@@ -62,50 +68,51 @@ async function tabUntil(page: Page, target: Locator, max = 50) {
 }
 
 test.describe('accessibility gate', () => {
-  test('axe smoke: Files, Canvas, Tables, Settings, running, and error states', async ({ page }) => {
-    test.setTimeout(60_000)
+  // Split the old monolithic axe smoke into isolated tests. One long test on a single page let prior
+  // steps (Settings overlay, aborted /run mock residue, slow catalog fetch) interfere with later
+  // assertions — especially the error toast — while canvas.spec's identical toast path passed.
+  test('axe smoke: empty canvas', async ({ page }) => {
     await fresh(page)
-
-    // Canvas (empty editor chrome)
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expectNoSeriousAxe(page, 'Canvas')
+  })
 
-    // Files
+  test('axe smoke: Files', async ({ page }) => {
+    await fresh(page)
     await goFiles(page)
     await expect(page.getByTestId('new-file')).toBeVisible()
     await expectNoSeriousAxe(page, 'Files')
+  })
 
-    // Tables
+  test('axe smoke: Tables', async ({ page }) => {
+    await fresh(page)
+    await goFiles(page)
     await page.getByTestId('rail-tables').click()
     await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
-    await expect(page.getByText('images', { exact: true })).toBeVisible()
+    await expectCatalogTable(page, 'images')
     await expectNoSeriousAxe(page, 'Tables')
+  })
 
-    // Settings (modal over the canvas)
-    await page.getByTestId('rail-files').click()
-    await page.getByTestId('new-file').click()
-    await expect(page.getByTestId('toolbar')).toBeVisible()
+  test('axe smoke: Settings modal', async ({ page }) => {
+    await fresh(page)
     await openSettings(page)
     await expectNoSeriousAxe(page, 'Settings', { keepOverlay: true })
-    await page.keyboard.press('Escape')
+  })
 
-    // Error state FIRST — a clean failing run surfaces a toast (same path as canvas.spec.ts). It runs
-    // before the mocked running-state below: the run-mock aborts a request, and that residue must not
-    // leak into the real error run (which is what left the canvas empty + toast-less on CI).
+  test('axe smoke: error state surfaces a toast', async ({ page }) => {
+    // Same clean failing-run path as canvas.spec.ts — isolated so nothing can leave residue.
     await fresh(page)
-    // On slow CI the New-file render can lag the palette click; wait for the interactive empty canvas.
     await expect(page.getByText('Add a dataset source to begin', { exact: false })).toBeVisible()
     await addNode(page, 'Sources & sinks', 'source')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
-    const errInsp = page.getByTestId('inspector')
-    await errInsp.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
-    await errInsp.getByRole('button', { name: 'Count rows' }).click()
+    const inspector = page.getByTestId('inspector')
+    await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
+    await inspector.getByRole('button', { name: 'Count rows' }).click()
     await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
     await expectNoSeriousAxe(page, 'Error', { keepOverlay: true })
-    await expect(page.getByTestId('toast')).toBeHidden({ timeout: 10_000 })  // let it auto-dismiss
+  })
 
-    // Running state LAST — hold POST /run while we scan the running glyph, then abort + unroute. Kept
-    // last so the mocked/aborted run leaves no residue for a subsequent real run.
+  test('axe smoke: running state', async ({ page }) => {
     await fresh(page)
     await expect(page.getByText('Add a dataset source to begin', { exact: false })).toBeVisible()
     await addNode(page, 'Sources & sinks', 'source')
