@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import type { PluginInfo, ResourceSpec } from '../types/api'
 import { useStore } from '../store/graph'
@@ -56,7 +56,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [pcfg, setPcfg] = useState<Record<string, Record<string, string>>>({})  // pack → edited { key: value }
   const [active, setActive] = useState('agent')
-  const scrollRef = useRef<HTMLDivElement>(null)
   // /api/me is authoritative. Missing capabilities must fail closed: open/single-user mode also
   // receives global_settings, so there is no need for a permissive fallback while identity loads.
   const canGlobal = currentUser?.capabilities?.includes('global_settings') === true
@@ -175,7 +174,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     setG((prev) => ({ ...prev, destinations: [...dests, { id, name, backend: dest.backend, root }] }))
     setDest({ name: '', backend: 'local', root: '' })
   }
-  const go = (id: string) => { setActive(id); document.getElementById(`set-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
+  const go = (id: string) => setActive(id)  // master-detail: the nav switches the visible pane
   const runners = kernelInfo?.runners ?? ['local-out-of-core']
 
   return (
@@ -217,8 +216,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             ))}
           </nav>
 
-          {/* content — all sections rendered; the nav scroll-jumps to them */}
-          <div ref={scrollRef} className="min-w-0 flex-1 overflow-y-auto px-[22px] py-[18px]">
+          {/* content — only the active pane renders (master-detail); the nav switches panes */}
+          <div className="min-w-0 flex-1 overflow-y-auto px-[22px] py-[18px]">
             {loading ? <div className="text-[12.5px] text-muted-foreground">loading…</div> : loadError ? (
               <div role="alert" className="mx-auto flex h-full max-w-[440px] flex-col items-center justify-center text-center">
                 <div className="text-[13px] font-semibold text-foreground">Settings could not be loaded</div>
@@ -228,7 +227,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               </div>
             ) : (
               <div className="flex flex-col gap-[26px]">
-                {canGlobal && <Section id="agent" title="Agent (LLM)">
+                {canGlobal && active === 'agent' && <Section id="agent" title="Agent (LLM)">
                   <Field label="Model"><Input value={val('agentModel')} placeholder="anthropic/claude-opus-4-8" onChange={(e) => set('agentModel', e.target.value)} /></Field>
                   <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">e.g. anthropic/claude-opus-4-8 · openai/gpt-5 · google/gemini-2.5-pro · ollama/llama3.3</div>
                   <Field label="API key"><Input value={val('agentApiKey')} placeholder="env:ANTHROPIC_API_KEY or file:/run/secrets/agent_key" onChange={(e) => set('agentApiKey', e.target.value)} /></Field>
@@ -267,7 +266,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   </label>
                 </Section>}
 
-                <Section id="execution" title="Execution backend">
+                {active === 'execution' && <Section id="execution" title="Execution backend">
                   {!canGlobal && <div className="mb-3 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] text-muted-foreground">Workspace-wide settings are managed by an administrator. You can still change your runner preference.</div>}
                   <Field label="Runner">
                     <Select value={(u.backend ? String(u.backend) : INHERIT)} onValueChange={(v) => setU((p) => ({ ...p, backend: v }))}>
@@ -312,9 +311,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     ))}
                     {(kernelInfo?.backends ?? []).length === 0 && <div className="text-[11.5px] text-muted-foreground">No backends reported.</div>}
                   </div>
-                </Section>
+                </Section>}
 
-                {canGlobal && <Section id="destinations" title="Destinations">
+                {canGlobal && active === 'destinations' && <Section id="destinations" title="Destinations">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
                     Named places to save outputs / open files: a local directory, or an object-store prefix (s3://, gs://).
                   </p>
@@ -358,7 +357,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   </div>
                 </Section>}
 
-                {canGlobal && <Section id="plugins" title="Plugins">
+                {canGlobal && active === 'plugins' && <Section id="plugins" title="Plugins">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
                     Loaded plugin packs. A pack that declares config fields (in its <code>dataplay.toml</code>) can be set here.
                     Changes take effect on the next kernel start.
@@ -422,7 +421,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   {configurable.length === 0 && <div className="text-[11.5px] text-muted-foreground">No plugin declares configurable settings.</div>}
                 </Section>}
 
-                {canGlobal && <Section id="members" title="Members">
+                {canGlobal && active === 'members' && <Section id="members" title="Members">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
                     People who can sign in and be added as collaborators.
                     {authEnabled
