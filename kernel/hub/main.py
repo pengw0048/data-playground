@@ -51,6 +51,26 @@ class _RequestBodyTooLarge(HTTPException):
         )
 
 
+class TrustedProxyHeadersMiddleware:
+    """Honor X-Forwarded-* only when the immediate peer is listed in DP_TRUSTED_PROXIES.
+
+    Reads the allow-list at request time so ASGI imports (not just ``dataplay``/uvicorn) honor the
+    same declared proxies, and so tests can monkeypatch the env without rebuilding the app. When the
+    list is empty the ASGI peer address is left untouched — matching local-mode rate-limit identity.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        trusted = auth.trusted_proxies()
+        if not trusted:
+            await self.app(scope, receive, send)
+            return
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+        await ProxyHeadersMiddleware(self.app, trusted_hosts=trusted)(scope, receive, send)
+
+
 class RequestBodyLimitMiddleware:
     """Limit non-upload request body bytes as downstream consumers receive them from ASGI."""
 
@@ -216,6 +236,9 @@ app.add_middleware(
 # An endpoint that ignores its body does not drain it into application memory. Dataset uploads remain
 # exempt because /catalog/upload streams and independently enforces DP_MAX_UPLOAD_BYTES as bytes arrive.
 app.add_middleware(RequestBodyLimitMiddleware)
+# Shared-mode reverse proxies declare DP_TRUSTED_PROXIES; normalize client/scheme from X-Forwarded-*
+# only for those peers so login rate limiting keys the real client and spoofed headers are ignored.
+app.add_middleware(TrustedProxyHeadersMiddleware)
 # EVERY /api route requires a resolved user (open mode → local; auth mode → a valid session). Only the
 # workspace PUBLIC router (auth status/login/logout + the login roster) is reachable pre-login. This
 # keeps auth the SECURE DEFAULT — a route is gated unless it is explicitly put on the public router —
@@ -226,9 +249,11 @@ app.include_router(catalog.router, prefix="/api", dependencies=_GATE)
 app.include_router(runs.router, prefix="/api", dependencies=_GATE)
 app.include_router(workspace.router, prefix="/api", dependencies=_GATE)
 
-# Fail before opening the metadata DB when the hub has a missing/known-weak signing secret. A spawned
-# kernel child keeps DP_AUTH_MODE only for confinement and never imports this web-app module.
+# Fail before opening the metadata DB when the hub has a missing/known-weak signing secret, or when
+# shared mode lacks Secure cookies / an explicit TLS or trusted-proxy declaration. A spawned kernel
+# child keeps DP_AUTH_MODE only for confinement and never imports this web-app module.
 auth.reject_weak_secret()
+auth.reject_unsafe_transport()
 metadb.init_db()  # SQLite: locked local init; production DB: strict schema-head check, never DDL
 # user-added datasets survive restart via the per-row catalog_entries store (register_output
 # write-throughs there); the catalog serves them straight from the DB with indexed, paginated
