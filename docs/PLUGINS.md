@@ -164,6 +164,20 @@ finished run with `canvas_id`, `run_id`, `status`, `rows`, `ms`, `error`, `outpu
 and `per_node` (`[{node_id, label, status, rows, ms}]`). Core ships no exporter. A sink that raises is
 caught and logged, never failing the run. See `dp_run_log`.
 
+A catalog used by an at-least-once durable runner also implements the runtime-checkable
+`DurableCatalogPublisher` capability from `backends.py`: one idempotency key per output through
+`register_output_idempotent`, plus one run-level `record_usage_idempotent` call over all distinct source
+parents. The output method must return a matching `CatalogPublicationReceipt` only after the provider can
+durably read the registered reference; returning `None` or an optimistic in-memory object blocks terminal
+publication. A provider that does not need popularity can make the usage call a durable idempotent no-op.
+
+That capability alone does not opt an external catalog into managed-output publication for the bundled Ray
+Jobs v3 backend. Jobs v3 freezes a pre-probed catalog plan in SQL and coordinates it with core
+object-attempt references, lineage, usage, and terminal publication. A graph with a write sink therefore
+requires the built-in DB-backed catalog and fails before allocation or remote submission when another
+catalog is installed. Supporting an external provider here needs a future prepared-plan/replay protocol,
+not just the two idempotent methods above.
+
 Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter. Runners are picked by
 `pick_runner` (Settings → Execution, else the first that `can_run`). Built-ins go through these same
 seams — DuckDB/Lance adapters, InMemoryCatalog, and local runners are the first implementations
@@ -181,6 +195,18 @@ local→local, shared object storage (`DP_STORAGE_URL`) when a remote backend is
 activates only when a `place()`-capable backend is registered (`DP_POOL_WORKERS`, or a plugin —
 `dp_ray` claims a region tagged `config.requires.labels.engine=ray`). With only the local kernel it is
 a no-op. `POST /graph/plan` returns the plan; the Inspector's Run plan preview renders it.
+
+A backend that can durably own a pinned graph but cannot yet recover multi-region orchestration can
+instead implement `WholeGraphRequirementBackend.accepts_whole_graph(requires)`. This admission seam
+routes the whole graph to that backend without making `place()` claim a region. Once claimed, unsupported
+pinned work must fail explicitly; it must not fall back to an engine that does not satisfy the
+requirement.
+
+A backend that allocates workload identity or artifacts can implement
+`PreboundRunIdentityBackend.preallocate_run_id()`. The method only mints an ID and must have no external
+side effects. The hub durably binds that ID to the authorized creator/canvas before calling
+`run(..., run_id=...)`, and the backend must preserve the supplied ID. This ordering gives identity
+providers a reliable principal without exposing hub database credentials to workers.
 
 Two substrates are selected by setting rather than `register(reg)` — a built-in keyword or a dotted
 path to your class (`pkg.module:Class`):
