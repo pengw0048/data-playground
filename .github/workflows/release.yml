@@ -100,6 +100,10 @@ jobs:
           echo "pushed ${IMAGE}:${VERSION} @ ${DIGEST}"
           # Container /api/version identity: run briefly and assert.
           docker run -d --name dp-release-ver -p 8473:8471 "${IMAGE}:${VERSION}"
+          for i in $(seq 1 60); do
+            curl -fsS --max-time 2 http://127.0.0.1:8473/api/livez >/dev/null 2>&1 && break
+            sleep 1
+          done
           python3 scripts/release_smoke.py \
             --base-url http://127.0.0.1:8473 \
             --expect-version "${VERSION}" \
