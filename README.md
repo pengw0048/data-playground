@@ -192,7 +192,27 @@ docker compose up -d kernel
 Sign in as `local` with the bootstrap password. Keep `DP_AUTH_SECRET` stable. Before a later migration,
 stop every process that writes the metadata database. The [Kubernetes reference](deploy/README.md)
 documents that release contract, the PodSpawner validation path, and what must be adapted for a real
-deployment. An HTTPS deployment must terminate TLS and set `DP_AUTH_SECURE_COOKIE=1`.
+deployment.
+
+### Deployment modes
+
+`DP_DEPLOYMENT_MODE` selects how strict the hub is about transport settings:
+
+| Mode | When to use | Startup behavior |
+| --- | --- | --- |
+| `local` (default) | Laptop / zero-config HTTP on loopback | Unchanged: plain HTTP works; `dp_session` stays `HttpOnly` + `SameSite=Lax` without `Secure` unless you opt in |
+| `shared` | Multi-user service behind TLS | Fails before binding if auth, Secure cookies, or a transport declaration is missing |
+
+Shared mode requires all of:
+
+1. `DP_AUTH_SECRET` — signed session cookies (already required by Compose)
+2. `DP_AUTH_SECURE_COOKIE=1` — browsers will only send `dp_session` over HTTPS
+3. Either `DP_AUTH_DIRECT_TLS=1` (TLS terminates at the hub process) or
+   `DP_TRUSTED_PROXIES=<proxy-ip>[,...]` (TLS terminates at those reverse proxies; only they may set
+   `X-Forwarded-For` / `X-Forwarded-Proto` used for login rate limiting)
+
+Unset mode keeps today's localhost defaults. The Compose reference sets `shared` with Secure cookies and
+`DP_AUTH_DIRECT_TLS=1`; swap in `DP_TRUSTED_PROXIES` when a proxy terminates TLS instead.
 
 ## Documentation
 

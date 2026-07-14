@@ -1,9 +1,14 @@
-# Data Playground — Postgres-backed, restart-durable single-instance setup.
+# Data Playground — Postgres-backed, restart-durable shared-service reference setup.
 #
 # Follow the README's explicit migrate-then-start release sequence. A plain `docker compose up` never
 # runs DDL. The app is served on http://localhost:8471 with metadata (users, canvases, run state,
 # catalog) in Postgres. To run several stateless web instances, set `deploy.replicas` (or run more
 # `kernel` services) behind a load balancer that sticky-routes /ws/collab/{canvas_id} by canvas id.
+#
+# Shared mode (DP_DEPLOYMENT_MODE=shared) fails closed unless Secure session cookies and an explicit
+# transport declaration are set. Terminate TLS at a reverse proxy (prefer DP_TRUSTED_PROXIES=<proxy>)
+# or at the hub (DP_AUTH_DIRECT_TLS=1). Plain HTTP browsers will not send Secure cookies — put TLS
+# in front before exposing this beyond a laptop smoke test.
 services:
   migrate:
     # Release tool only: `docker compose up` must never race this with an existing writer. Run it
@@ -37,6 +42,13 @@ services:
       # per-user auth (signed session cookies). REQUIRED — compose refuses to start without it, so
       # sessions can't be forged with a shipped default. Generate one: `openssl rand -hex 32`.
       DP_AUTH_SECRET: "${DP_AUTH_SECRET:?set DP_AUTH_SECRET to a random secret, e.g. openssl rand -hex 32}"
+      # Shared-service transport guard (see README "Deployment modes"). Refuses startup without
+      # Secure cookies plus either DP_AUTH_DIRECT_TLS=1 or DP_TRUSTED_PROXIES=<proxy-ip>[,...].
+      DP_DEPLOYMENT_MODE: shared
+      DP_AUTH_SECURE_COOKIE: "1"
+      # Reference default: operator-terminated TLS at the hub edge. When a reverse proxy terminates
+      # TLS instead, replace this with DP_TRUSTED_PROXIES listing that proxy (and drop DIRECT_TLS).
+      DP_AUTH_DIRECT_TLS: "1"
       # multi-user: confine dataset reads to these roots (see kernel/hub/paths.py). The workspace
       # volume is /data; add more host roots you mount if users load datasets from them.
       DP_DATASET_ROOTS: "/data"
