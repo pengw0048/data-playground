@@ -58,6 +58,31 @@ jobs:
           if threshold not in ORDER:
               sys.exit(f"Unknown FAIL_ON_SEVERITY={threshold!r}")
 
+          def cvss_band(score) -> str | None:
+              # CVSS v3/v4 base score -> qualitative band. groups[].max_severity is the source-agnostic
+              # severity OSV exposes (populated for OSV/PYSEC records that carry no database_specific).
+              try:
+                  s = float(score)
+              except (TypeError, ValueError):
+                  return None
+              if s >= 9.0:
+                  return "critical"
+              if s >= 7.0:
+                  return "high"
+              if s >= 4.0:
+                  return "moderate"
+              if s > 0.0:
+                  return "low"
+              return None
+
+          def severity_of(vuln: dict, group_max: dict) -> str:
+              # CVSS (max_severity) first, GHSA database_specific.severity next; unknown last.
+              band = cvss_band(group_max.get(vuln.get("id")))
+              if band:
+                  return band
+              raw = str((vuln.get("database_specific") or {}).get("severity") or "").lower()
+              return raw if raw in ORDER else "unknown"
+
           base_sha = os.environ["GITHUB_BASE_SHA"]
           head_sha = os.environ["GITHUB_SHA"]
           lockfiles = ["kernel/uv.lock", "web/package-lock.json"]
@@ -84,9 +109,19 @@ jobs:
               for result in data.get("results") or []:
                   for pkg in result.get("packages") or []:
                       meta = pkg.get("package") or {}
-                      key_base = (meta.get("ecosystem"), meta.get("name"), meta.get("version"))
+                      # Map every vuln id (and its aliases) to the group's CVSS max_severity.
+                      group_max: dict = {}
+                      for grp in pkg.get("groups") or []:
+                          ms = grp.get("max_severity")
+                          if ms in (None, ""):
+                              continue
+                          for vid in grp.get("ids") or []:
+                              group_max[vid] = ms
+                      # Key without version so an advisory already present at base is not re-flagged
+                      # merely because the PR bumped the package version.
+                      key_base = (meta.get("ecosystem"), meta.get("name"))
                       for vuln in pkg.get("vulnerabilities") or []:
-                          sev = str((vuln.get("database_specific") or {}).get("severity") or "unknown").lower()
+                          sev = severity_of(vuln, group_max)
                           key = key_base + (vuln.get("id"),)
                           found[key] = {
                               "id": vuln.get("id"),
@@ -112,9 +147,12 @@ jobs:
           failing = []
           for v in sorted(new, key=lambda x: (x["severity"], x["pkg"] or "", x["id"] or "")):
               level = ORDER.get(v["severity"], 0)
-              mark = "FAIL" if level >= ORDER[threshold] else "info"
+              # Fail closed: a newly introduced vuln with no severity from any source is treated as
+              # meeting the threshold rather than passing silently at level 0.
+              fail = level >= ORDER[threshold] or v["severity"] == "unknown"
+              mark = "FAIL" if fail else "info"
               print(f"  [{mark}] {v['severity'].upper():8} {v['id']}  {v['ecosystem']}:{v['pkg']}@{v['version']}")
-              if level >= ORDER[threshold]:
+              if fail:
                   failing.append(v)
 
           if failing:
