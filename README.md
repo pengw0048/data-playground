@@ -202,6 +202,7 @@ terminate TLS and set `DP_AUTH_SECURE_COOKIE=1`.
 | Guide | Use it for |
 | --- | --- |
 | [5-minute tour](docs/TUTORIAL.md) | Build and run a first pipeline on the seeded data |
+| [Browser and viewport support](docs/BROWSER_SUPPORT.md) | Desktop-first scope, minimum viewport, tested browsers, and input model |
 | [Catalog](docs/CATALOG.md) | Browse, search, curate, and integrate catalog and lineage data |
 | [Plugins](docs/PLUGINS.md) | Add nodes or connect another data, catalog, destination, or execution system |
 | [MCP](docs/MCP.md) | Connect an external agent over HTTP or stdio |
@@ -209,6 +210,9 @@ terminate TLS and set `DP_AUTH_SECURE_COOKIE=1`.
 | [Kubernetes reference](deploy/README.md) | Validate and adapt the per-canvas Pod substrate |
 | [Contributing](.github/CONTRIBUTING.md) | Development loop, tests, and plugin contribution guidelines |
 | [Security policy](.github/SECURITY.md) | Trust boundary and private vulnerability reporting |
+
+The workbench is desktop-first (minimum **1280×720**, Chromium tested in CI, keyboard + mouse). See
+[browser and viewport support](docs/BROWSER_SUPPORT.md) for the full statement.
 
 ## Development
 
