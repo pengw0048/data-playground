@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import uuid
 
 from fastapi.testclient import TestClient
 
@@ -379,6 +380,44 @@ def test_run_status_and_cancel_are_recoverable(monkeypatch):
     assert st["status"] == "done" and st["runId"] == rid
     # cancel on an already-finished run is a no-op returning it unchanged (not an error)
     assert data("cancel_run", {"runId": rid})["status"] == "done"
+
+
+def test_cancel_run_persists_durable_intent_when_plugin_is_unavailable():
+    from hub import metadb
+
+    run_id = f"mcp_missing_durable_cancel_{uuid.uuid4().hex}"
+    ref = {
+        "backend": "missing-mcp-durable-cancel-test",
+        "cluster_ref": "test-cluster",
+        "attempt_id": f"attempt-{run_id}",
+        "submission_id": f"submission-{run_id}",
+        "job_uri": f"s3://test-control/{run_id}.dpjob",
+        "result_uri": f"s3://test-control/{run_id}.dpresult",
+    }
+    status = {
+        "run_id": run_id,
+        "status": "running",
+        "placement": "distributed",
+        "per_node": [],
+    }
+    try:
+        metadb.preallocate_run_owner(run_id, metadb.DEFAULT_USER_ID, None)
+        _stored, created = metadb.bind_backend_job(run_id, ref, status)
+        assert created is True
+
+        cancelled = data("cancel_run", {"runId": run_id})
+
+        assert cancelled["runId"] == run_id and cancelled["status"] == "running"
+        assert cancelled["timedOut"] is True
+        assert metadb.backend_job(run_id)["cancel_requested"] is True
+    finally:
+        with metadb.session() as session:
+            job = session.get(metadb.RunBackendJob, run_id)
+            state = session.get(metadb.RunState, run_id)
+            if job is not None:
+                session.delete(job)
+            if state is not None:
+                session.delete(state)
 
 
 def test_run_envelope_flags_a_non_terminal_run_as_timed_out():
