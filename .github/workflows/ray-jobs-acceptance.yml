@@ -1,0 +1,73 @@
+name: Ray Jobs acceptance
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/ray-jobs-acceptance.yml"
+      - "docker-compose.ray-jobs.yml"
+      - "docker/ray/**"
+      - "scripts/ray-jobs-acceptance.sh"
+      - "examples/plugins/dp_ray/**"
+      - "kernel/pyproject.toml"
+      - "kernel/uv.lock"
+      - "kernel/hub/job_artifacts.py"
+      - "kernel/hub/backends.py"
+      - "kernel/hub/destinations.py"
+      - "kernel/hub/ray_jobs_acceptance.py"
+      - "kernel/hub/ray_jobs_acceptance_entrypoint.py"
+      - "kernel/hub/routers/runs.py"
+      - "kernel/hub/workload_env.py"
+      - "kernel/hub/metadb.py"
+      - "kernel/hub/models.py"
+      - "kernel/hub/mcp.py"
+      - "kernel/hub/routers/workspace.py"
+      - "kernel/hub/handoff.py"
+      - "kernel/hub/storage.py"
+      - "kernel/hub/sinks.py"
+      - "kernel/hub/db.py"
+      - "kernel/hub/deps.py"
+      - "kernel/hub/compiler.py"
+      - "kernel/hub/graph.py"
+      - "kernel/hub/ir.py"
+      - "kernel/hub/placement.py"
+      - "kernel/hub/ray_compat.py"
+      - "kernel/hub/relationships.py"
+      - "kernel/hub/sqlanalyze.py"
+      - "kernel/hub/sqlpolicy.py"
+      - "kernel/hub/executors/**"
+      - "kernel/hub/plugins/**"
+      - "kernel/hub/migrations/**"
+  workflow_dispatch:
+  schedule:
+    - cron: "43 6 * * 3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ray-jobs-acceptance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lifecycle:
+    name: Restart, cancel, and result integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      COMPOSE_PROJECT_NAME: dp-ray-jobs-${{ github.run_id }}-${{ github.run_attempt }}
+      DP_RAY_JOBS_DIAGNOSTICS_DIR: ${{ github.workspace }}/ray-jobs-diagnostics
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Run real Ray Jobs lifecycle acceptance
+        run: scripts/ray-jobs-acceptance.sh
+
+      - name: Upload lifecycle diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ray-jobs-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ray-jobs-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14

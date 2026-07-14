@@ -24,9 +24,13 @@ pre-existing connection wedges once `ray.init()` has run in the same process. So
 subprocess (`_driver.py`) whose OWN process holds its DuckDB + Ray (`ray.init` before any DuckDB). The hub
 resolves logical destinations before dispatch and owns catalog registration after the driver returns;
 the driver receives physical sink URIs and never reads that control-plane state. This is the same
-process-isolation boundary the built-in SubprocessRunner uses. The local supervisor is still an explicit
-production boundary: it acknowledges cancellation only after the child exits, but does not yet preserve
-job ownership or reconcile that lifecycle across a hub restart; see `docs/RAY.md`.
+process-isolation boundary the built-in SubprocessRunner uses. With no `DP_RAY_JOBS_ADDRESS`, development
+retains that local Popen driver. When a Jobs address is configured, the same driver runs as an official
+Ray Job with a deterministic submission ID, immutable input/result artifacts in shared object storage,
+and a durable SQL backend binding. Replacement hubs reattach through `JobSubmissionClient`; cancellation
+waits for an acknowledged stop and one publication lease owner commits catalog/history effects. The
+remote driver receives data-plane credentials only, never the hub metadata DB identity. See
+`docs/RAY_JOBS.md` for the production contract and tradeoffs.
 
 The `uv` fix. If the kernel is launched via `uv run` (common), Ray's default behavior
 (`RAY_ENABLE_UV_RUN_RUNTIME_ENV`) re-launches its WORKERS through `uv` too — which builds a fresh,
@@ -54,22 +58,29 @@ import logging
 import os
 import posixpath
 import re
+import shlex
 import sys
 import threading
 import time
 import uuid
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 from hub import db, graph as g
+from hub.backends import DurableCatalogPublisher
 from hub.handoff import (allocate_attempt, attempt_has_commit_record, attempt_has_contents,
-                         discard_attempt, is_attempt_uri, lookup_attempt, read_manifest,
-                         validate_shards, write_manifest)
+                         discard_attempt, has_attempt_path_component, is_attempt_uri,
+                         lookup_attempt, read_manifest, validate_shards, write_manifest)
 from hub.sinks import SinkSpec, commit_sink, expected_sink_uri, preflight_sink
 from hub.sqlanalyze import agg_has_order_sensitive, window_needs_order  # AST (DuckDB's own parser), shared
 from hub.ir import (CLEAN_OPS, CLEAN_TRANSFORM_MODES, lower_to_ir, parse_group_keys, parse_sort_keys,
                     plan_is_clean, plan_is_distributable)
-from hub.models import PerNodeStatus, ResourceSpec, RunStatus, WorkerInfo
-from hub.placement import satisfies
+from hub.job_artifacts import (RAY_JOB_CONTRACT_VERSION, RAY_JOB_RESULT_FIELDS, ArtifactCorrupt,
+                               ArtifactNotFound, JsonArtifactStore, canonical_json,
+                               json_artifact_payload, ray_job_canonical_fields,
+                               ray_job_envelope_fields, require_exact_object)
+from hub.models import (CatalogPublicationReceipt, PerNodeStatus, ResourceSpec, RunBackendRef,
+                        RunStatus, WorkerInfo)
+from hub.placement import node_requires, satisfies
 from hub.sqlpolicy import (
     FragmentKind,
     SQLPolicyError,
@@ -78,7 +89,10 @@ from hub.sqlpolicy import (
     validate_fragment,
     validate_identifier_alias,
 )
-from hub.workload_env import build_workload_env, prepare_workload_graph
+from hub.workload_env import (build_workload_credential_env, build_workload_env,
+                              build_workload_semantic_env, prepare_workload_graph)
+
+log = logging.getLogger("hub")
 
 # the relational ops THIS backend claims beyond the map-style clean subset (ARC3). The engine does NOT
 # reimplement these on Ray operators — it lets RAY do only the SHUFFLE (hash-partition rows by the op's
@@ -120,6 +134,130 @@ _DRIVER_FALLBACK_MAX_BATCHES = 20_000
 _PARQUET_FRAGMENT_LIMIT = 10_000
 _PARQUET_EXTENSIONS = (".parquet", ".pq")
 _HIVE_DEFAULT_PARTITION = "__HIVE_DEFAULT_PARTITION__"
+_JOBS_BACKEND = "ray-jobs"
+_JOB_TERMINAL = frozenset({"SUCCEEDED", "FAILED", "STOPPED"})
+_RESULT_RECONCILIATION_STATES = frozenset({
+    "result_fencing", "result_submitted", "result_stop_fenced",
+})
+_CANCEL_FENCE_ENTRYPOINT = "sleep 86400"
+_CONTROL_OBSERVATION_WRITE_S = 10.0
+_JOBS_CLIENT_ENV_LOCK = threading.Lock()
+_GPU_BATCH_ROWS_DEFAULT = 4096
+_GPU_BATCH_ROWS_MAX = 65536
+_JOB_CONTRACT_VERSION = RAY_JOB_CONTRACT_VERSION
+_JOB_RESULT_FIELDS = RAY_JOB_RESULT_FIELDS
+
+
+class ArtifactContractError(RuntimeError):
+    """A readable shared artifact does not match its immutable SQL/backend binding."""
+
+
+class JobsConfigurationDrift(RuntimeError):
+    """The current operator configuration points at a different durable execution namespace."""
+
+
+class JobsConfigurationUnavailable(RuntimeError):
+    """A replacement process lacks the local production contract needed to reattach safely."""
+
+
+class TerminalResultMissing(RuntimeError):
+    """Ray succeeded but no result object appeared during the authoritative-not-found grace period."""
+
+
+class DurableTerminalObserved(RuntimeError):
+    """A permanent terminal run fence replaced retention-pruned backend detail."""
+
+
+class PublicationEffectsWon(RuntimeError):
+    """A terminal publisher crossed the write-ahead barrier before remote control did."""
+
+
+def _float_env(name: str, default: float, minimum: float = 0.01) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _gpu_batch_rows() -> int:
+    """Validated finite GPU batch size; large operator values are capped to bound task memory."""
+    raw = os.environ.get("DP_RAY_GPU_BATCH_ROWS", "").strip()
+    if not raw:
+        return _GPU_BATCH_ROWS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError("DP_RAY_GPU_BATCH_ROWS must be a positive integer") from e
+    if value <= 0:
+        raise ValueError("DP_RAY_GPU_BATCH_ROWS must be a positive integer")
+    return min(value, _GPU_BATCH_ROWS_MAX)
+
+
+_ACCELERATOR_CANON: dict[str, str] | None = None
+
+
+def _accelerator_canon_map() -> dict[str, str]:
+    """Case-insensitive index from any known Ray accelerator name to its exact-case constant."""
+    global _ACCELERATOR_CANON
+    if _ACCELERATOR_CANON is None:
+        table: dict[str, str] = {}
+        try:
+            from ray.util import accelerators as _acc
+            for name in dir(_acc):
+                value = getattr(_acc, name)
+                if name.isupper() and isinstance(value, str):
+                    table[value.upper()] = value
+        except Exception:  # noqa: BLE001
+            pass
+        _ACCELERATOR_CANON = table
+    return _ACCELERATOR_CANON
+
+
+def _canonical_accelerator_type(value: object) -> str:
+    """Resolve operator input to a stable ``accelerator_type`` key.
+
+    A known Ray family maps to its exact canonical spelling (e.g. ``Intel-GAUDI``) so case-sensitive
+    Ray scheduling matches; anything else (including any input when Ray is not importable) is uppercased.
+    Both sides of the hub capacity comparison run through here, so the match stays consistent.
+    """
+    text = str(value or "").strip()
+    return _accelerator_canon_map().get(text.upper(), text.upper())
+
+
+def _job_status_name(value) -> str:
+    """Normalize Ray's JobStatus enum and lightweight fake-client strings."""
+    raw = getattr(value, "value", value)
+    return str(raw or "").rsplit(".", 1)[-1].upper()
+
+
+def _job_attempt_id(job: dict) -> str:
+    try:
+        fields = ray_job_canonical_fields(int(job.get("contract_version") or 0))
+    except (TypeError, ValueError) as e:
+        raise ArtifactContractError(str(e)) from e
+    missing = [key for key in fields if key not in job]
+    if missing:
+        raise ArtifactContractError(f"Ray job artifact is missing canonical fields: {', '.join(missing)}")
+    canonical = {key: job[key] for key in fields}
+    return hashlib.sha256(canonical_json(canonical)).hexdigest()[:24]
+
+
+def _job_envelope_sha256(job: dict) -> str:
+    try:
+        fields = ray_job_envelope_fields(int(job.get("contract_version") or 0))
+    except (TypeError, ValueError) as e:
+        raise ArtifactContractError(str(e)) from e
+    envelope = {key: job[key] for key in fields if key != "envelope_sha256"}
+    return hashlib.sha256(canonical_json(envelope)).hexdigest()
+
+
+def _semantic_env_sha256(env: dict[str, str]) -> str:
+    return hashlib.sha256(canonical_json(env)).hexdigest()
+
+
+def _jobs_submission_id(run_id: str, attempt_id: str) -> str:
+    safe_run = re.sub(r"[^A-Za-z0-9_-]+", "-", run_id).strip("-")[-32:] or "run"
+    return f"dp-{safe_run}-{attempt_id[:12]}"
 
 
 def _secure_duckdb_connection():
@@ -439,7 +577,9 @@ def _native_parquet_plan(uri: str, adapter: object) -> dict | None:
     except RuntimeError:
         raise
     except Exception as exc:  # noqa: BLE001 — any listing/footer uncertainty disables native execution
-        raise RuntimeError(f"could not prove native Parquet layout/schema for '{uri}': {exc}") from exc
+        raise RuntimeError(
+            f"native Parquet proof unavailable (code=parquet_proof_unavailable,type={type(exc).__name__})"
+        ) from exc
 
 
 def _read_native_parquet(ray, plan: dict, ray_opts: dict | None = None):
@@ -500,9 +640,10 @@ def _attempt_component(base_name: str, readable: str, digest: str, limit: int, u
     return component
 
 
-def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None, *,
-                         namespace: str | None = None, generation: int | None = None,
-                         attempt_id: str | None = None) -> str:
+def _attempt_handoff_uri_for_owner(
+        uri: str, run_id: str, scope: str | None, owner: str | None, *,
+        namespace: str | None = None, generation: int | None = None,
+        attempt_id: str | None = None) -> str:
     """Return an immutable region-output prefix for one execution attempt.
 
     The controller suggests a stable, content-addressed URI. Writing a multi-object Ray result directly
@@ -516,12 +657,6 @@ def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None, *,
            else str(run_id))
     readable = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-") or "attempt"
     readable = readable[:64].rstrip("._-") or "attempt"
-    from hub.plugins.adapters import is_object_uri
-    if is_object_uri(uri) and namespace is None:
-        from hub import metadb
-        owner = metadb.object_attempt_owner_id()
-    else:
-        owner = None
     # Hash the complete, unmodified logical URI before stripping its extension. `out.parquet` and
     # `out.pq` otherwise share one physical base. A whole-graph write also scopes by step ID so fan-out
     # sinks in one run can never reattach each other. Canonical JSON prevents delimiter ambiguity.
@@ -556,17 +691,40 @@ def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None, *,
     return f"{parent}/{component}" if separator else component
 
 
+def _attempt_handoff_uri(uri: str, run_id: str, scope: str | None = None, *,
+                         namespace: str | None = None, generation: int | None = None,
+                         attempt_id: str | None = None) -> str:
+    """Return the current installation-owned or allocated immutable output prefix."""
+    from hub.plugins.adapters import is_object_uri
+
+    owner = None
+    if is_object_uri(uri) and namespace is None:
+        from hub import metadb
+        owner = metadb.object_attempt_owner_id()
+    return _attempt_handoff_uri_for_owner(
+        uri, run_id, scope, owner, namespace=namespace,
+        generation=generation, attempt_id=attempt_id,
+    )
+
+
+def _attempt_allocation_key(uri: str, run_id: str, kind: str,
+                            scope: str | None = None) -> str:
+    """Return the stable registry key shared by allocation and read-only recovery."""
+    logical_hash = hashlib.sha256(str(uri).encode()).hexdigest()
+    return json.dumps({
+        "kind": kind, "runId": str(run_id), "scope": scope, "logical": logical_hash,
+    }, sort_keys=True, separators=(",", ":"))
+
+
 def _allocate_handoff_uri(uri: str, run_id: str, kind: str,
                           scope: str | None = None,
-                          catalog_key_base: str | None = None) -> str:
+                          catalog_key_base: str | None = None,
+                          require_live_preallocation: bool = False) -> str:
     """Use durable allocation for object writes and a process-private path for local writes."""
     from hub.plugins.adapters import is_object_uri
     if not is_object_uri(uri):
         return _attempt_handoff_uri(uri, run_id, scope=scope)
-    logical_hash = hashlib.sha256(str(uri).encode()).hexdigest()
-    allocation_key = json.dumps({
-        "kind": kind, "runId": str(run_id), "scope": scope, "logical": logical_hash,
-    }, sort_keys=True, separators=(",", ":"))
+    allocation_key = _attempt_allocation_key(uri, run_id, kind, scope)
     if kind == "region":
         prior = lookup_attempt(
             logical_uri=uri, kind=kind, run_id=run_id, allocation_key=allocation_key)
@@ -575,6 +733,7 @@ def _allocate_handoff_uri(uri: str, run_id: str, kind: str,
     handle = allocate_attempt(
         logical_uri=uri, kind=kind, run_id=run_id, allocation_key=allocation_key,
         catalog_key_base=catalog_key_base,
+        require_live_preallocation=require_live_preallocation,
         uri_factory=lambda storage_namespace, allocated_generation, allocated_id:
         _attempt_handoff_uri(
             uri, run_id, scope=scope, namespace=storage_namespace,
@@ -779,14 +938,23 @@ def _ray_child_env() -> dict[str, str]:
     child["PATH"] = os.path.dirname(sys.executable) + os.pathsep + child.get("PATH", "")
     child["RAY_DATA_DISABLE_PROGRESS_BARS"] = "1"
     child["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+    child["DP_RAY_GPU_BATCH_ROWS"] = str(_gpu_batch_rows())
+    return child
+
+
+def _ray_jobs_env(job: dict) -> dict[str, str]:
+    """Frozen non-secret semantics plus the operator's current rotatable data credentials."""
+    child = dict(job["semantic_env"])
+    child.update(build_workload_credential_env())
     return child
 
 
 def _ray_opts(requires: dict | None) -> dict:
     """Map the region's resolved resource need (the planner's `requires`) to per-Ray-task placement
     options, so a Ray cluster schedules the region's map tasks onto a worker that has the resource:
-    `gpu` → num_gpus (each map task needs a GPU); a non-`engine` label `k=v` → a custom resource named
-    `v` (fractional so many tasks share one node — declare it on the node via `ray start --resources`).
+    `gpu` → num_gpus (each map task needs a GPU), `gpuType` → Ray's exact accelerator_type fence; a
+    non-`engine` label `k=v` → a custom resource named `v` (fractional so many tasks share one node —
+    declare it on the node via `ray start --resources`).
     cpu/mem are omitted: they're per-REGION aggregates, not the per-TASK cost Ray schedules on."""
     if not requires:
         return {}
@@ -795,10 +963,19 @@ def _ray_opts(requires: dict | None) -> dict:
     if requires.get("gpu") or gpu_type:
         # A type-only requirement means "one GPU of this type" throughout placement/UI semantics.
         opts["num_gpus"] = float(requires.get("gpu") or 1)
+    if gpu_type:
+        # Ray's typed accelerator option adds the canonical ``accelerator_type:<type>`` resource fence.
+        # num_gpus alone can otherwise land an A100-pinned task on any available GPU model.
+        opts["accelerator_type"] = _canonical_accelerator_type(gpu_type)
     res = {str(v): 0.001 for k, v in (requires.get("labels") or {}).items() if k != "engine" and v}
     if res:
         opts["resources"] = res
     return opts
+
+
+def _gpu_batch_size(ray_opts: dict | None) -> int | None:
+    opts = ray_opts or {}
+    return _gpu_batch_rows() if (opts.get("num_gpus") or opts.get("accelerator_type")) else None
 
 
 def _advertised_ray_labels() -> dict[str, str]:
@@ -843,8 +1020,9 @@ def _make_mapper(config: dict):
 
 class RayRunner:
     name = "ray-data"
+    durable_backend = _JOBS_BACKEND
 
-    def __init__(self, deps):
+    def __init__(self, deps, jobs_client_factory=None, artifact_store=None, recover: bool = True):
         self.deps = deps
         self.base = deps.runner            # the local out-of-core runner — estimate, fallback, lineage reuse
         self.resolve_adapter = deps.resolve_adapter
@@ -864,8 +1042,29 @@ class RayRunner:
         self._driver_procs: dict[str, object] = {}
         self._driver_workdirs: dict[str, str] = {}
         self._retained_workdirs: dict[str, str] = {}
+        self._settled: dict[str, threading.Event] = {}
+        self._supervising: set[str] = set()
+        self._cancel_stop_sent: set[str] = set()
+        self._backend_refs: dict[str, dict] = {}
+        self._control_observed_monotonic: dict[str, float] = {}
+        self._recovery_blocked: set[str] = set()
         self._lock = threading.Lock()
+        self.jobs_address = os.environ.get("DP_RAY_JOBS_ADDRESS", "").strip()
+        # Presence of the plugin is enough to own/recover an existing binding: its durable SQL row carries
+        # the original control address. A new submission still requires ``jobs_address`` below.
+        self.durable_available = True
+        self._jobs_client_factory = jobs_client_factory
+        self._artifacts = artifact_store or JsonArtifactStore()
+        self._jobs_poll_s = _float_env("DP_RAY_JOBS_POLL_S", 1.0)
+        self._jobs_cancel_timeout_s = _float_env("DP_RAY_JOBS_CANCEL_TIMEOUT_S", 30.0)
+        self._jobs_result_timeout_s = _float_env("DP_RAY_JOBS_RESULT_TIMEOUT_S", 30.0)
+        self._submission_lease_s = _float_env("DP_RAY_JOBS_SUBMISSION_LEASE_S", 30.0, 1.0)
+        self._publication_lease_s = _float_env("DP_RAY_JOBS_PUBLICATION_LEASE_S", 60.0, 5.0)
+        self._jobs_request_timeout_s = _float_env("DP_RAY_JOBS_REQUEST_TIMEOUT_S", 30.0, 1.0)
+        self._max_lease_hold_s = _float_env("DP_RAY_JOBS_MAX_LEASE_HOLD_S", 300.0, 1.0)
         atexit.register(self._terminate_all)
+        if recover:
+            self._recover_jobs()
 
     def _terminate_all(self) -> None:
         """Fence local drivers at shutdown; clean only writers whose exit is proven."""
@@ -922,11 +1121,93 @@ class RayRunner:
     def estimate(self, plan, rows, byts=None):
         return self.base.estimate(plan, rows, byts)  # reuse the hub-side confirm gate verbatim
 
+    def _refresh_recovery_blocked_terminal(self, status: RunStatus) -> bool:
+        """Converge a stale local recovery diagnostic behind the authoritative terminal fence."""
+        from hub import metadb
+
+        run_id = status.run_id
+        terminal = metadb.terminal_run_status(run_id)
+        if terminal not in ("done", "failed", "cancelled"):
+            return False
+        persisted = metadb.get_run_state(run_id)
+        canonical = None
+        if persisted is not None:
+            try:
+                candidate = RunStatus.model_validate(persisted)
+                if candidate.run_id == run_id and candidate.status == terminal:
+                    canonical = candidate
+            except Exception:  # malformed retained detail falls back to the compact terminal fence
+                pass
+        if canonical is not None:
+            self._copy_status(status, canonical)
+        elif not self._converge_terminal_fence(status):
+            return False
+        with self._lock:
+            self._recovery_blocked.discard(run_id)
+            self._settled.setdefault(run_id, threading.Event()).set()
+        self._prune_terminal_runs()
+        return True
+
     def status(self, run_id: str) -> RunStatus:
-        return self.runs[run_id]
+        st = self.runs.get(run_id)
+        if st is None:
+            st = self._reattach_job(run_id)
+        if st is None:
+            raise KeyError(run_id)
+        if run_id in self._recovery_blocked:
+            self._refresh_recovery_blocked_terminal(st)
+        ref = getattr(st, "backend_ref", None)
+        if (st.status in ("queued", "running") and ref and ref.backend == _JOBS_BACKEND
+                and run_id not in self._recovery_blocked):
+            self._ensure_jobs_supervisor(run_id)
+        return st
 
     def cancel(self, run_id: str) -> RunStatus:
         st = self.runs.get(run_id)
+        if st and run_id in self._recovery_blocked:
+            self._refresh_recovery_blocked_terminal(st)
+        ref = getattr(st, "backend_ref", None) if st else None
+        if st and run_id in self._recovery_blocked and st.status in ("queued", "running"):
+            from hub import metadb
+
+            if not metadb.request_backend_cancel(run_id):
+                self._refresh_recovery_blocked_terminal(st)
+                return self.runs.get(run_id, st)
+            if self._refresh_recovery_blocked_terminal(st):
+                return st
+            if run_id in self._cancel:
+                self._cancel[run_id].set()
+            suffix = "cancellation recorded; repair the malformed durable binding before remote stop can resume"
+            if suffix not in (st.error or ""):
+                st.error = f"{st.error}; {suffix}" if st.error else suffix
+                metadb.save_run_state(run_id, st.model_dump())
+            self._refresh_recovery_blocked_terminal(st)
+            return st
+        if st and ref and ref.backend == _JOBS_BACKEND and st.status in ("queued", "running"):
+            from hub import metadb
+            if not metadb.request_backend_cancel(run_id):
+                self._refresh_recovery_blocked_terminal(st)
+                return self.runs.get(run_id, st)
+            ev = self._cancel.get(run_id)
+            if ev:
+                ev.set()
+            settled = self._settled.get(run_id)
+            if settled:
+                # STOPPED is an acknowledgement, not a request label. The supervisor issues stop_job and
+                # keeps polling the official Jobs API; timeout leaves the run non-terminal because the
+                # remote entrypoint may still publish.
+                acknowledged = settled.wait(self._jobs_cancel_timeout_s + self._jobs_poll_s * 2)
+                current = self.runs.get(run_id, st)
+                if not acknowledged and current.status in ("queued", "running"):
+                    if self._refresh_recovery_blocked_terminal(current):
+                        return current
+                    # Do not make the synchronous API response depend on the supervisor winning a polling
+                    # boundary race. The supervisor persists the same diagnostic and keeps reattaching.
+                    current.error = self._cancel_timeout_error()
+                    metadb.save_run_state(current.run_id, current.model_dump())
+                    self._refresh_recovery_blocked_terminal(current)
+                return current
+            return self.runs.get(run_id, st)
         if st and st.status in ("queued", "running"):
             ev = self._cancel.get(run_id)
             if ev:
@@ -937,13 +1218,796 @@ class RayRunner:
         return st
 
     def cancel_acknowledged(self, run_id: str) -> bool:
-        """True only after the isolated driver has exited and can no longer publish."""
+        st = self.runs.get(run_id)
+        ref = getattr(st, "backend_ref", None) if st else None
+        if ref and ref.backend == _JOBS_BACKEND:
+            settled = self._settled.get(run_id)
+            return bool(st.status == "cancelled" and settled and settled.is_set())
         with self._lock:
             return run_id in self._cancel_ack
 
     def _acknowledge_cancel(self, run_id: str) -> None:
         with self._lock:
             self._cancel_ack.add(run_id)
+
+    def _cancel_timeout_error(self) -> str:
+        return (
+            f"Ray stop was not acknowledged within {self._jobs_cancel_timeout_s:g}s; "
+            "the run remains non-terminal and supervision continues"
+        )
+
+    def logs(self, run_id: str) -> str:
+        """Do not expose remote raw logs until an operator-only diagnostics surface exists."""
+        st = self.status(run_id)
+        if not st.backend_ref or st.backend_ref.backend != _JOBS_BACKEND:
+            raise KeyError(f"run '{run_id}' is not a Ray Jobs run")
+        return "Ray diagnostics are available only through protected operator tooling"
+
+    @staticmethod
+    def _stable_exception(context: str, error: BaseException, code: str) -> str:
+        """Safe projection for shared state/logs: never include remote exception text or identifiers."""
+        return f"{context} (code={code},type={type(error).__name__})"
+
+    @staticmethod
+    def _public_remote_error(error: object) -> str:
+        """Expose a stable code/type only; remote text can contain rotated credentials or user data."""
+        match = re.match(r"\s*([A-Za-z_][A-Za-z0-9_.]{0,79})\s*:", str(error or ""))
+        error_type = match.group(1).rsplit(".", 1)[-1] if match else "RemoteExecutionError"
+        return f"Ray execution failed ({error_type}; code=ray_execution_failed)"
+
+    @staticmethod
+    def _validate_control_address(address: str) -> str:
+        parsed = urlparse(address)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise RuntimeError("DP_RAY_JOBS_ADDRESS must be an http(s) Ray Jobs API address")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise RuntimeError(
+                "DP_RAY_JOBS_ADDRESS must not contain credentials, query parameters, or fragments"
+            )
+        return address.rstrip("/")
+
+    def _jobs_client(self, address: str | None = None):
+        address = self._validate_control_address(str(address or self.jobs_address or "").strip())
+        if self._jobs_client_factory is not None:
+            return self._jobs_client_factory(address)
+        try:
+            from ray.job_submission import JobSubmissionClient
+        except ImportError as e:
+            raise RuntimeError(
+                "Ray Jobs mode requires the optional ray[default,data] dependencies on the submitting hub"
+            ) from e
+        # Ray's SDK intentionally lets RAY_ADDRESS override even an explicit HTTP ``address`` argument.
+        # A hub may legitimately carry RAY_ADDRESS=auto for another backend, so pin the official, higher-
+        # priority API-server variable only for client construction and restore the process environment.
+        marker = object()
+        with _JOBS_CLIENT_ENV_LOCK:
+            previous = os.environ.get("RAY_API_SERVER_ADDRESS", marker)
+            os.environ["RAY_API_SERVER_ADDRESS"] = address
+            try:
+                request_timeout_s = self._jobs_request_timeout_s
+
+                class BoundedJobSubmissionClient(JobSubmissionClient):
+                    def _do_request(self, method, endpoint, **kwargs):
+                        kwargs.setdefault("timeout", request_timeout_s)
+                        return super()._do_request(method, endpoint, **kwargs)
+
+                return BoundedJobSubmissionClient(address)
+            finally:
+                if previous is marker:
+                    os.environ.pop("RAY_API_SERVER_ADDRESS", None)
+                else:
+                    os.environ["RAY_API_SERVER_ADDRESS"] = previous
+
+    def _jobs_contract(self, *, recovery: bool = False) -> dict[str, str]:
+        """Validate the production contract before creating any durable binding or remote job."""
+        from hub.plugins.adapters import is_object_uri
+
+        values = {
+            "control_address": os.environ.get("DP_RAY_JOBS_ADDRESS", "").strip(),
+            "entrypoint": os.environ.get("DP_RAY_JOBS_ENTRYPOINT", "").strip(),
+            "module": os.environ.get(
+                "DP_RAY_JOBS_MODULE", "/app/examples/plugins/dp_ray/__init__.py"
+            ).strip(),
+            "code_ref": os.environ.get("DP_RAY_JOBS_CODE_REF", "").strip(),
+            "cluster_ref": os.environ.get("DP_RAY_JOBS_CLUSTER_REF", "").strip(),
+            "workspace": os.environ.get("DP_RAY_JOBS_WORKSPACE", "").strip(),
+            "data_dir": os.environ.get("DP_RAY_JOBS_DATA_DIR", "").strip(),
+            "storage": os.environ.get("DP_STORAGE_URL", "").strip(),
+        }
+        env_names = {
+            "control_address": "DP_RAY_JOBS_ADDRESS", "entrypoint": "DP_RAY_JOBS_ENTRYPOINT",
+            "module": "DP_RAY_JOBS_MODULE", "code_ref": "DP_RAY_JOBS_CODE_REF",
+            "cluster_ref": "DP_RAY_JOBS_CLUSTER_REF", "workspace": "DP_RAY_JOBS_WORKSPACE",
+            "data_dir": "DP_RAY_JOBS_DATA_DIR",
+        }
+        missing = [env_names[key] for key in env_names if not values[key]]
+        if not values["storage"]:
+            missing.append("DP_STORAGE_URL")
+        if missing:
+            error = JobsConfigurationUnavailable if recovery else RuntimeError
+            raise error(
+                "Ray Jobs mode is incomplete; configure image-baked code and shared artifacts: "
+                + ", ".join(missing)
+            )
+        values["control_address"] = self._validate_control_address(values["control_address"])
+        prefix = os.environ.get("DP_RAY_JOBS_ARTIFACT_PREFIX", "").strip()
+        values["artifact_prefix"] = prefix or f"{values['storage'].rstrip('/')}/__ray_jobs__"
+        if not is_object_uri(values["storage"]) or not is_object_uri(values["artifact_prefix"]):
+            raise RuntimeError(
+                "Ray Jobs mode requires object storage shared by hub, driver, and workers; set "
+                "DP_STORAGE_URL and DP_RAY_JOBS_ARTIFACT_PREFIX to s3://, r2://, gs://, or gcs:// URIs"
+            )
+        return values
+
+    def _validate_jobs_io(self, ir, sink_targets: dict[str, str] | None = None,
+                          materialize_uri: str | None = None) -> None:
+        from hub.plugins.adapters import is_object_uri
+
+        if len(sink_targets or {}) > 1:
+            raise RuntimeError(
+                "multiple Ray write sinks require atomic batch publication, which is not enabled"
+            )
+        local_reads = [s.config.get("uri") for s in ir.steps
+                       if s.op == "read" and not is_object_uri(str(s.config.get("uri") or ""))]
+        local_writes = [uri for uri in (sink_targets or {}).values() if not is_object_uri(uri)]
+        unsupported_sinks = []
+        for step in ir.steps:
+            if step.op != "write":
+                continue
+            target_uri = (sink_targets or {}).get(step.id)
+            if target_uri is None:
+                raise RuntimeError(f"Ray Jobs write sink '{step.id}' has no resolved target")
+            spec = SinkSpec.from_config(step.config, step.config.get("title"))
+            if not _worker_direct_parquet_sink(
+                    spec, target_uri, self.resolve_adapter(target_uri)):
+                unsupported_sinks.append(step.id)
+        append_steps = [s.id for s in ir.steps if s.op == "write"
+                        and SinkSpec.from_config(s.config, s.config.get("title")).mode == "append"]
+        partition_steps = [s.id for s in ir.steps if s.op == "write"
+                           and SinkSpec.from_config(s.config, s.config.get("title")).partition_by]
+        if materialize_uri and not is_object_uri(materialize_uri):
+            local_writes.append(materialize_uri)
+        if local_reads or local_writes:
+            raise RuntimeError(
+                "Ray Jobs runs off-host and accepts only shared object-store inputs/outputs; "
+                f"non-shared inputs={local_reads or 'none'}, outputs={local_writes or 'none'}"
+            )
+        if append_steps:
+            raise RuntimeError(
+                "Ray Jobs durable retries require idempotent sinks; file-adapter append is not safe after "
+                f"cluster job-metadata loss (write steps: {append_steps}). Use overwrite or a transactional sink."
+            )
+        if partition_steps:
+            raise RuntimeError(
+                "Ray Jobs object-store sinks do not yet support partitionBy through the shared adapter "
+                f"contract (write steps: {partition_steps})"
+            )
+        if unsupported_sinks:
+            raise RuntimeError(
+                "Ray Jobs production mode supports only built-in, overwrite, non-partitioned "
+                "Parquet sinks with hub-managed object attempts; unsupported write steps: "
+                f"{unsupported_sinks}"
+            )
+
+    def _validate_jobs_catalog_publication(self, sink_targets: dict[str, str]) -> None:
+        """Fail before allocation/submission unless managed write-ahead publication is available."""
+        if not sink_targets:
+            return
+        from hub.plugins.catalog import (
+            core_managed_publication_planner,
+            core_managed_publisher,
+        )
+
+        if (not isinstance(self.catalog, DurableCatalogPublisher)
+                or core_managed_publication_planner(self.catalog) is None
+                or core_managed_publisher(self.catalog) is None):
+            raise RuntimeError(
+                "Ray Jobs managed sinks require the core write-ahead catalog planner and publisher"
+            )
+
+    def _jobs_source_attempts(self, graph, target) -> list[str]:
+        """Freeze exact managed source roots; ordinary object URIs need no lifecycle pin."""
+        from hub.storage import preflight_managed_execution_sources
+
+        sources = preflight_managed_execution_sources(
+            self.deps.storage, g.execution_source_uris(graph, target)
+        )
+        managed: set[str] = set()
+        for source in sources:
+            uri = str(source).rstrip("/")
+            if not has_attempt_path_component(uri):
+                continue
+            if not is_attempt_uri(uri):
+                raise RuntimeError(
+                    "Ray Jobs managed sources must reference an exact object-attempt root"
+                )
+            managed.add(uri)
+        return sorted(managed)
+
+    def _make_jobs_artifacts(self, run_id: str, graph, target, *, sink_targets=None,
+                             sink_contracts=None, source_attempts=None,
+                             materialize_uri=None, requires=None) -> tuple[dict, dict]:
+        from hub import metadb
+
+        cfg = self._jobs_contract()
+        if sink_targets and sink_contracts is None:
+            raise RuntimeError(
+                "Ray Jobs sink contracts must be allocated and frozen before artifact creation"
+            )
+        created_by, _auth_canvas_id = metadb.run_auth(run_id)
+        if not created_by:
+            raise RuntimeError(
+                "Ray Jobs requires a durable run owner before artifact allocation"
+            )
+        graph_doc = prepare_workload_graph(graph)
+        semantic_env = build_workload_semantic_env()
+        semantic_env.update({
+            "DP_RAY_JOB_MODE": "1",
+            # Remote jobs execute only dependencies already present in the image. Never let a replay
+            # inherit a changed hub setting and perform an unpinned network-time installation.
+            "DP_CANVAS_PIP_DEPS": "0",
+            "DP_WORKSPACE": cfg["workspace"],
+            "DP_DATA_DIR": cfg["data_dir"],
+            "RAY_DATA_DISABLE_PROGRESS_BARS": "1",
+            "RAY_ENABLE_UV_RUN_RUNTIME_ENV": "0",
+            "DP_RAY_GPU_BATCH_ROWS": str(_gpu_batch_rows()),
+        })
+        canonical = {
+            "contract_version": _JOB_CONTRACT_VERSION,
+            "run_id": run_id,
+            "graph": graph_doc,
+            "target": target,
+            "source_attempts": source_attempts or [],
+            "sink_targets": sink_targets,
+            "sink_contracts": sink_contracts or {},
+            "materialize_uri": materialize_uri,
+            "requires": requires,
+            "code_ref": cfg["code_ref"],
+            "cluster_ref": cfg["cluster_ref"],
+            "artifact_prefix": cfg["artifact_prefix"],
+            "workspace": cfg["workspace"],
+            "data_dir": cfg["data_dir"],
+            "entrypoint": cfg["entrypoint"],
+            "module": cfg["module"],
+            "semantic_env": semantic_env,
+            "semantic_env_sha256": _semantic_env_sha256(semantic_env),
+        }
+        attempt_id = _job_attempt_id(canonical)
+        submission_id = _jobs_submission_id(run_id, attempt_id)
+        base = f"{cfg['artifact_prefix'].rstrip('/')}/{submission_id}"
+        ref = {
+            "backend": _JOBS_BACKEND,
+            "cluster_ref": cfg["cluster_ref"],
+            "submission_id": submission_id,
+            "attempt_id": attempt_id,
+            "job_uri": f"{base}/job.dpjob",
+            "result_uri": f"{base}/result.dpresult",
+            "code_ref": cfg["code_ref"],
+            "control_address": cfg["control_address"],
+            "cancel_requested": False,
+            "durable": True,
+        }
+        job = {**canonical, **ref, "result_uri": ref["result_uri"]}
+        # SQL-only routing fields are not disclosed to the workload envelope.
+        job.pop("control_address", None)
+        job.pop("cancel_requested", None)
+        job["envelope_sha256"] = _job_envelope_sha256(job)
+        return ref, job
+
+    @staticmethod
+    def _ref_model(ref: dict) -> RunBackendRef:
+        return RunBackendRef.model_validate(ref)
+
+    @staticmethod
+    def _validated_sink_contracts(job: dict) -> dict[str, dict[str, str]]:
+        contracts = job.get("sink_contracts")
+        raw_targets = job.get("sink_targets")
+        targets = {} if raw_targets is None else raw_targets
+        if not isinstance(contracts, dict) or not isinstance(targets, dict):
+            raise ArtifactContractError("Ray job sink contracts and targets must be objects")
+        if set(contracts) != set(targets):
+            raise ArtifactContractError("Ray job sink contracts do not match its sink target set")
+        if len(targets) > 1:
+            raise ArtifactContractError(
+                "Ray Jobs supports at most one write sink until atomic batch publication is available"
+            )
+        validated: dict[str, dict[str, str]] = {}
+        fields = {"name", "logical_uri", "physical_uri", "writer"}
+        for step_id, contract in contracts.items():
+            if not isinstance(step_id, str) or not step_id or not isinstance(contract, dict):
+                raise ArtifactContractError("Ray job contains an invalid sink contract")
+            if set(contract) != fields or any(
+                    not isinstance(contract.get(key), str) or not contract[key]
+                    for key in fields):
+                raise ArtifactContractError(f"Ray job sink contract '{step_id}' is incomplete")
+            logical_uri = contract["logical_uri"]
+            physical_uri = contract["physical_uri"]
+            writer = contract["writer"]
+            if logical_uri != targets.get(step_id):
+                raise ArtifactContractError(
+                    f"Ray job sink contract '{step_id}' changed its logical target"
+                )
+            if writer != "worker-direct-parquet":
+                raise ArtifactContractError(
+                    f"Ray job sink contract '{step_id}' has an unsupported writer"
+                )
+            if physical_uri == logical_uri or not is_attempt_uri(physical_uri):
+                raise ArtifactContractError(
+                    f"Ray job sink contract '{step_id}' has no managed physical attempt"
+                )
+            validated[step_id] = contract
+        return validated
+
+    @staticmethod
+    def _validated_source_attempts(job: dict) -> list[str]:
+        raw = job.get("source_attempts")
+        if (not isinstance(raw, list)
+                or any(not isinstance(uri, str) or not uri for uri in raw)):
+            raise ArtifactContractError("Ray job source_attempts must be a list of exact URIs")
+        canonical = sorted(set(uri.rstrip("/") for uri in raw))
+        if raw != canonical:
+            raise ArtifactContractError("Ray job source_attempts must be sorted and unique")
+        try:
+            from hub.models import Graph
+            graph = Graph.model_validate(job.get("graph"))
+            graph_managed: set[str] = set()
+            for source in g.execution_source_uris(graph, job.get("target")):
+                uri = str(source).rstrip("/")
+                if not has_attempt_path_component(uri):
+                    continue
+                if not is_attempt_uri(uri):
+                    raise ArtifactContractError(
+                        "Ray job graph contains a managed-source descendant instead of its exact root"
+                    )
+                graph_managed.add(uri)
+        except ArtifactContractError:
+            raise
+        except Exception as e:
+            raise ArtifactContractError("Ray job graph has an invalid managed-source contract") from e
+        if canonical != sorted(graph_managed):
+            raise ArtifactContractError(
+                "Ray job source_attempts do not match its hash-bound execution graph"
+            )
+        return canonical
+
+    @staticmethod
+    def _validate_jobs_source_pins(job: dict) -> list[dict]:
+        """Attest SQL-owned source generations and their exact envelope URI order."""
+        from hub import metadb
+
+        expected = RayRunner._validated_source_attempts(job)
+        try:
+            pins = metadb.backend_source_pins(str(job.get("run_id") or ""))
+        except RuntimeError as e:
+            raise ArtifactContractError(
+                "Ray job durable source-generation pins failed attestation"
+            ) from e
+        if pins is None:
+            raise ArtifactContractError("Ray job has no durable backend source-pin owner")
+        malformed = any(
+            not isinstance(pin, dict)
+            or set(pin) != {"uri", "generation"}
+            or not isinstance(pin.get("uri"), str)
+            or isinstance(pin.get("generation"), bool)
+            or not isinstance(pin.get("generation"), int)
+            or pin["generation"] < 1
+            for pin in pins
+        )
+        if malformed or [pin["uri"] for pin in pins] != expected:
+            raise ArtifactContractError(
+                "Ray job source attempts do not match its durable source-generation pins"
+            )
+        return pins
+
+    def _validate_job_artifact_integrity(
+            self, ref: RunBackendRef, status: RunStatus, job: dict) -> None:
+        """Validate immutable execution bytes without consulting this process's current config."""
+        try:
+            version = int(job.get("contract_version") or 0)
+            if version != _JOB_CONTRACT_VERSION:
+                raise ValueError(
+                    f"unsupported Ray job artifact contract_version {version}"
+                )
+            envelope_fields = ray_job_envelope_fields(version)
+        except (AttributeError, TypeError, ValueError) as e:
+            raise ArtifactContractError(str(e)) from e
+        try:
+            require_exact_object(job, envelope_fields, label="Ray job artifact")
+        except ArtifactCorrupt as e:
+            raise ArtifactContractError(str(e)) from e
+        attempt_id = _job_attempt_id(job)
+        expected = {
+            "backend": ref.backend,
+            "cluster_ref": ref.cluster_ref,
+            "submission_id": ref.submission_id,
+            "attempt_id": ref.attempt_id,
+            "job_uri": ref.job_uri,
+            "result_uri": ref.result_uri,
+            "code_ref": ref.code_ref,
+            "durable": True,
+        }
+        for key, value in expected.items():
+            if job.get(key) != value:
+                raise ArtifactContractError(
+                    f"Ray job artifact {key} does not match its durable backend binding"
+                )
+        if job.get("run_id") != status.run_id:
+            raise ArtifactContractError("Ray job artifact run_id does not match its RunStatus")
+        if attempt_id != ref.attempt_id:
+            raise ArtifactContractError("Ray job artifact content hash does not match attempt_id")
+        if _job_envelope_sha256(job) != job["envelope_sha256"]:
+            raise ArtifactContractError("Ray job artifact envelope hash does not match its content")
+        semantic_env = job.get("semantic_env")
+        if not isinstance(semantic_env, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in semantic_env.items()):
+            raise ArtifactContractError("Ray job artifact semantic_env must be a string map")
+        if _semantic_env_sha256(semantic_env) != job.get("semantic_env_sha256"):
+            raise ArtifactContractError("Ray job artifact semantic environment hash does not match")
+        if _jobs_submission_id(status.run_id, attempt_id) != ref.submission_id:
+            raise ArtifactContractError("Ray job artifact submission_id is not deterministic")
+        self._validated_source_attempts(job)
+        self._validated_sink_contracts(job)
+
+    def _validate_job_reattach_config(self, job: dict) -> None:
+        """Require current code/cluster compatibility only before a submit or replay."""
+        current = self._jobs_contract(recovery=True)
+        if job.get("cluster_ref") != current["cluster_ref"]:
+            raise JobsConfigurationDrift(
+                "DP_RAY_JOBS_CLUSTER_REF changed; restore the original cluster identity before reattaching"
+            )
+        if job.get("artifact_prefix") != current["artifact_prefix"]:
+            raise JobsConfigurationDrift(
+                "DP_RAY_JOBS_ARTIFACT_PREFIX changed; restore the original artifact namespace before reattaching"
+            )
+        for key in ("code_ref", "entrypoint", "module", "workspace", "data_dir"):
+            if job.get(key) != current[key]:
+                raise JobsConfigurationDrift(
+                    f"Ray Jobs {key} changed; restore the original image contract before reattaching"
+                )
+
+    def _validate_job_artifact(self, ref: RunBackendRef, status: RunStatus, job: dict) -> None:
+        """Compatibility wrapper for callers that explicitly require integrity and reattachability."""
+        self._validate_job_artifact_integrity(ref, status, job)
+        self._validate_job_reattach_config(job)
+
+    def _read_or_materialize_job_artifact(
+            self, ref: RunBackendRef, status: RunStatus) -> dict:
+        """Read the object artifact, recreating the exact canonical bytes after a post-bind crash."""
+        from hub import metadb
+
+        durable_payload = metadb.backend_job_artifact_payload(status.run_id)
+        try:
+            candidate = self._artifacts.read(ref.job_uri)
+        except (ArtifactNotFound, FileNotFoundError):
+            if durable_payload is None:  # nullable keeps pre-upgrade/manual rows recoverable when object exists
+                raise
+            try:
+                candidate = json.loads(durable_payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                raise ArtifactCorrupt("durable SQL job envelope is not valid JSON") from e
+            if not isinstance(candidate, dict):
+                raise ArtifactCorrupt("durable SQL job envelope must contain a JSON object")
+            # The payload was bounded and hash-bound before the SQL commit. Rewriting that exact object
+            # identity is safe for concurrent replacement supervisors; they all carry identical bytes.
+            self._artifacts.write(ref.job_uri, candidate)
+            candidate = self._artifacts.read(ref.job_uri)
+        if durable_payload is not None and canonical_json(candidate) != durable_payload:
+            raise ArtifactContractError(
+                "Ray job artifact does not match its durable SQL envelope"
+            )
+        return candidate
+
+    def _durable_sql_job_envelope(self, ref: RunBackendRef, status: RunStatus) -> dict:
+        """Load and validate the hash-bound SQL copy without requiring object-store availability."""
+        from hub import metadb
+
+        payload = metadb.backend_job_artifact_payload(status.run_id)
+        if payload is None:
+            raise ArtifactNotFound("durable SQL job envelope is unavailable")
+        try:
+            candidate = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise ArtifactCorrupt("durable SQL job envelope is not valid JSON") from e
+        if not isinstance(candidate, dict):
+            raise ArtifactCorrupt("durable SQL job envelope must contain a JSON object")
+        if canonical_json(candidate) != payload:
+            raise ArtifactCorrupt("durable SQL job envelope is not canonical JSON")
+        self._validate_job_artifact_integrity(ref, status, candidate)
+        self._validate_jobs_source_pins(candidate)
+        self._validate_jobs_sink_attempts(candidate)
+        return candidate
+
+    def _validate_job_result(self, job: dict, result: dict) -> dict:
+        try:
+            require_exact_object(result, _JOB_RESULT_FIELDS, label="Ray result artifact")
+        except ArtifactCorrupt as e:
+            raise ArtifactContractError(str(e)) from e
+        try:
+            version = int(job.get("contract_version") or 0)
+        except (TypeError, ValueError) as e:
+            raise ArtifactContractError("unsupported Ray job artifact contract_version") from e
+        if version != _JOB_CONTRACT_VERSION:
+            raise ArtifactContractError(
+                f"unsupported Ray job artifact contract_version {version}"
+            )
+        if int(result.get("contract_version") or 0) != version:
+            raise ArtifactContractError("Ray result contract_version does not match its job")
+        try:
+            ray_job_envelope_fields(version)
+        except ValueError as e:
+            raise ArtifactContractError(str(e)) from e
+        if result.get("attempt_id") != job["attempt_id"]:
+            raise ArtifactContractError("Ray result attempt_id does not match the durable backend binding")
+        if result.get("submission_id") != job["submission_id"]:
+            raise ArtifactContractError("Ray result submission_id does not match the durable backend binding")
+        if result.get("envelope_sha256") != job["envelope_sha256"]:
+            raise ArtifactContractError("Ray result envelope hash does not match the submitted job")
+        if result.get("status") not in ("done", "failed", "cancelled"):
+            raise ArtifactContractError("Ray result artifact is not terminal")
+        rows = result.get("rows", 0)
+        if isinstance(rows, bool) or not isinstance(rows, int) or not 0 <= rows <= (1 << 63) - 1:
+            raise ArtifactContractError("Ray result rows must be a non-negative signed 64-bit integer")
+        outputs = result.get("outputs")
+        if not isinstance(outputs, list):
+            raise ArtifactContractError("Ray result outputs must be a list")
+        for key in ("error", "output_uri", "output_table"):
+            if result.get(key) is not None and not isinstance(result[key], str):
+                raise ArtifactContractError(f"Ray result {key} must be a string or null")
+        raw_sink_targets = job.get("sink_targets")
+        sink_targets = {} if raw_sink_targets is None else raw_sink_targets
+        if not isinstance(sink_targets, dict):
+            raise ArtifactContractError("Ray job sink_targets must be an object or null")
+        if job.get("materialize_uri"):
+            if result["status"] != "done":
+                if outputs or result.get("output_uri") or result.get("output_table"):
+                    raise ArtifactContractError(
+                        "failed/cancelled Ray region results cannot expose partial outputs"
+                    )
+                return result
+            if result.get("error"):
+                raise ArtifactContractError("successful Ray results cannot contain an error")
+            requested = str(job["materialize_uri"])
+            expected_uri = requested[:-len(".parquet")] if requested.lower().endswith(".parquet") else requested
+            if result.get("output_uri") != expected_uri or outputs:
+                raise ArtifactContractError("Ray region result does not match its materialization target")
+            return result
+
+        expected: dict[str, set[tuple[str, str, str]]] = {}
+        for step_id, contract in self._validated_sink_contracts(job).items():
+            expected[step_id] = {(
+                contract["name"], contract["physical_uri"], contract["logical_uri"]
+            )}
+        actual: dict[str, tuple[str, str, str]] = {}
+        normalized_outputs: list[dict[str, str]] = []
+        for output in outputs:
+            allowed_fields = {"step_id", "name", "uri", "logical_uri"}
+            valid_field_sets = (allowed_fields,)
+            if (not isinstance(output, dict) or set(output) not in valid_field_sets
+                    or not all(output.get(key) for key in ("step_id", "name", "uri"))):
+                raise ArtifactContractError("Ray result contains an incomplete catalog output")
+            step_id = str(output["step_id"])
+            if step_id in actual:
+                raise ArtifactContractError(f"Ray result repeats write step '{step_id}'")
+            logical_uri = str(output.get("logical_uri") or sink_targets.get(step_id) or "")
+            if not logical_uri:
+                raise ArtifactContractError("Ray result contains an incomplete logical sink identity")
+            actual[step_id] = (str(output["name"]), str(output["uri"]), logical_uri)
+            normalized_outputs.append({
+                "step_id": step_id, "name": str(output["name"]), "uri": str(output["uri"]),
+                "logical_uri": logical_uri,
+            })
+        if result["status"] != "done":
+            # A driver can fail after one immutable sink committed. Keep exact, hash-bound sink evidence
+            # private in the result artifact for later cleanup, but never project it into public status or
+            # catalog. Unknown/mismatched URIs remain contract corruption.
+            if result.get("output_uri") or result.get("output_table"):
+                raise ArtifactContractError(
+                    "failed/cancelled Ray results cannot expose a primary output"
+                )
+            if any(step_id not in expected or value not in expected[step_id]
+                   for step_id, value in actual.items()):
+                raise ArtifactContractError(
+                    "Ray partial outputs do not match the hash-bound job sinks"
+                )
+            return result
+        if result.get("error"):
+            raise ArtifactContractError("successful Ray results cannot contain an error")
+        if set(actual) != set(expected) or any(
+                value not in expected[step_id] for step_id, value in actual.items()):
+            raise ArtifactContractError("Ray result catalog outputs do not match the hash-bound job sinks")
+        if expected:
+            pair = (result.get("output_table"), result.get("output_uri"))
+            allowed_pairs = {
+                (name, uri) for options in expected.values()
+                for name, uri, _logical_uri in options
+            }
+            if pair not in allowed_pairs:
+                raise ArtifactContractError("Ray result primary output does not match a hash-bound job sink")
+        elif outputs or result.get("output_uri") or result.get("output_table"):
+            raise ArtifactContractError("Ray non-sink result returned an unexpected catalog output")
+        if normalized_outputs != outputs:
+            result = {**result, "outputs": normalized_outputs}
+        return result
+
+    def _install_jobs_status(self, status: RunStatus, binding: dict | None = None) -> None:
+        run_id = status.run_id
+        with self._lock:
+            self.runs[run_id] = status
+            self._cancel.setdefault(run_id, threading.Event())
+            self._settled.setdefault(run_id, threading.Event())
+            if binding:
+                self._backend_refs[run_id] = dict(binding)
+                if binding.get("cancel_requested"):
+                    self._cancel[run_id].set()
+            if status.status in ("done", "failed", "cancelled"):
+                self._settled[run_id].set()
+        # Status/cancel routing is normally installed by start_run. Recovery happens during plugin loading,
+        # so it must restore the same owner index explicitly for this replacement process.
+        if hasattr(self.deps, "run_index"):
+            self.deps.run_index[run_id] = self
+        if status.status in ("done", "failed", "cancelled"):
+            self._prune_terminal_runs()
+
+    def _prune_terminal_runs(self) -> None:
+        from hub.plugins.runner import _MAX_RUNS
+
+        terminal = {"done", "failed", "cancelled"}
+        with self._lock:
+            for run_id, status in list(self.runs.items()):
+                if status.status in terminal:
+                    self._cancel.pop(run_id, None)
+            while len(self.runs) > _MAX_RUNS:
+                victim = next((rid for rid, status in self.runs.items() if status.status in terminal), None)
+                if victim is None:
+                    break
+                self.runs.pop(victim, None)
+                self._cancel.pop(victim, None)
+                self._settled.pop(victim, None)
+                self._backend_refs.pop(victim, None)
+                self._control_observed_monotonic.pop(victim, None)
+                self._recovery_blocked.discard(victim)
+                self._cancel_stop_sent.discard(victim)
+                if getattr(self.deps, "run_index", {}).get(victim) is self:
+                    self.deps.run_index.pop(victim, None)
+
+    def _ensure_jobs_supervisor(self, run_id: str) -> bool:
+        with self._lock:
+            if run_id in self._supervising:
+                return True
+            self._supervising.add(run_id)
+        try:
+            threading.Thread(target=self._supervise_jobs, args=(run_id,), daemon=True,
+                             name=f"dp-ray-job-{run_id}").start()
+            return True
+        except Exception as exc:  # SQL binding already owns this live run; a later status poll retries
+            with self._lock:
+                self._supervising.discard(run_id)
+            status = self.runs.get(run_id)
+            if status is not None and status.status in ("queued", "running"):
+                status.error = (
+                    "Ray Jobs supervisor unavailable; retrying "
+                    f"(code=supervisor_start_failed,type={type(exc).__name__})"
+                )
+                try:
+                    from hub import metadb
+                    metadb.save_run_state(run_id, status.model_dump())
+                except Exception:  # the next status/recovery pass still retries process-locally
+                    pass
+            return False
+
+    def _recover_jobs(self) -> None:
+        from hub import metadb
+
+        try:
+            rows = list(metadb.active_backend_jobs(_JOBS_BACKEND))
+        except Exception:  # noqa: BLE001 — a transient boot-time DB error defers recovery, never fails load
+            log.warning("ray_jobs_recovery_deferred backend=%s", _JOBS_BACKEND)
+            return
+        for ref, doc in rows:
+            try:
+                effects_ready = (
+                    ref.get("publication_state") == "effects_started"
+                    and isinstance(ref.get("publication_effects"), dict)
+                )
+                if ref.get("recovery_blocked_reason") and not effects_ready:
+                    raise RuntimeError(str(ref["recovery_blocked_reason"]))
+                if ref.get("_recovery_error") and not effects_ready:
+                    raise ValueError(str(ref["_recovery_error"]))
+                if doc.get("_recovery_error"):
+                    if not effects_ready:
+                        raise ValueError(str(doc["_recovery_error"]))
+                    staged_terminal = ref["publication_effects"]["terminal_status"]
+                    live_status = str(doc.get("status") or "queued")
+                    if live_status not in ("queued", "running"):
+                        live_status = "queued"
+                    status = RunStatus(
+                        run_id=str(ref["run_id"]), status=live_status,
+                        placement="distributed", per_node=[],
+                        target_node_id=staged_terminal.get("target_node_id"),
+                        error="Ray terminal publication recovering",
+                    )
+                else:
+                    status = RunStatus.model_validate(doc)
+                status.backend_ref = self._ref_model(ref)
+                self._install_jobs_status(status, ref)
+                self._ensure_jobs_supervisor(status.run_id)
+            except Exception as exc:  # noqa: BLE001 — isolate and surface each damaged active row
+                run_id = str(ref.get("run_id") or doc.get("run_id") or "")
+                if not run_id:
+                    log.warning(
+                        "ray_jobs_recovery_blocked missing_run_id backend=%s error_type=%s",
+                        _JOBS_BACKEND, type(exc).__name__,
+                    )
+                    continue
+                reason = self._stable_exception(
+                    "Ray Jobs recovery blocked", exc, "recovery_blocked"
+                )
+                live_status = str(doc.get("status") or "queued")
+                if live_status not in ("queued", "running"):
+                    live_status = "queued"
+                blocked = RunStatus(
+                    run_id=run_id, status=live_status, placement="distributed", per_node=[], error=reason,
+                    target_node_id=(doc.get("target_node_id")
+                                    if isinstance(doc.get("target_node_id"), str) else None),
+                )
+                try:
+                    blocked.backend_ref = self._ref_model(ref)
+                except Exception:  # the durable row itself may be the malformed recovery input
+                    pass
+                if ref.get("cancel_requested"):
+                    blocked.error = (
+                        f"{reason}; cancellation recorded; repair the malformed durable binding "
+                        "before remote stop can resume"
+                    )[:2000]
+                try:
+                    marked = metadb.mark_backend_recovery_blocked(
+                        run_id, _JOBS_BACKEND, blocked.model_dump(), reason
+                    )
+                except Exception:  # noqa: BLE001 — per-row isolation must survive its own DB write
+                    log.warning("ray_jobs_recovery_mark_failed run_id=%s backend=%s",
+                                run_id, _JOBS_BACKEND)
+                    continue
+                if not marked:  # a terminal publisher or repair won the race; do not install stale state
+                    log.warning(
+                        "ray_jobs_recovery_blocked_race run_id=%s backend=%s",
+                        run_id, _JOBS_BACKEND,
+                        extra={"dataplay_run_id": run_id, "dataplay_backend": _JOBS_BACKEND},
+                    )
+                    continue
+                with self._lock:
+                    self.runs[run_id] = blocked
+                    self._backend_refs[run_id] = dict(ref)
+                    self._cancel.setdefault(run_id, threading.Event())
+                    if ref.get("cancel_requested"):
+                        self._cancel[run_id].set()
+                    self._settled.setdefault(run_id, threading.Event())
+                    self._recovery_blocked.add(run_id)
+                if hasattr(self.deps, "run_index"):
+                    self.deps.run_index[run_id] = self
+                log.warning(
+                    "ray_jobs_recovery_blocked run_id=%s backend=%s error_type=%s code=%s",
+                    run_id, _JOBS_BACKEND, type(exc).__name__, "recovery_blocked",
+                    extra={
+                        "dataplay_run_id": run_id,
+                        "dataplay_backend": _JOBS_BACKEND,
+                        "dataplay_error_type": type(exc).__name__,
+                    },
+                )
+
+    def _reattach_job(self, run_id: str) -> RunStatus | None:
+        from hub import metadb
+
+        ref = metadb.backend_job(run_id)
+        doc = metadb.get_run_state(run_id)
+        if not ref or ref.get("backend") != _JOBS_BACKEND or not doc:
+            return None
+        status = RunStatus.model_validate(doc)
+        status.backend_ref = self._ref_model(ref)
+        self._install_jobs_status(status, ref)
+        if status.status in ("queued", "running"):
+            self._ensure_jobs_supervisor(run_id)
+        return status
 
     # -- PlaceableBackend (region dispatch, Phase C3) ---------------------- #
     # dp_ray advertises ONE synthetic worker labelled engine=ray. place() claims a region ONLY when it
@@ -966,13 +2030,29 @@ class RayRunner:
         except ValueError:
             cpu = 0
         cap = ResourceSpec(cpu=cpu or None, mem=os.environ.get("DP_RAY_MEM", "1000GB"),
-                           gpu=gpu or None, gpu_type=(os.environ.get("DP_RAY_GPU_TYPE") or None) if gpu else None,
+                           gpu=gpu or None,
+                           gpu_type=(_canonical_accelerator_type(os.environ.get("DP_RAY_GPU_TYPE"))
+                                     or None) if gpu else None,
                            labels=_advertised_ray_labels())
         return [WorkerInfo(id="ray", capacity=cap, state="idle")]
 
     def place(self, requires) -> "str | None":
+        # RunController's parent orchestration is currently in-memory. Advertising this backend for a
+        # production Jobs region would make the sub-job durable while losing the logical parent and all
+        # later regions on hub restart. Whole-graph RayRunner.run remains restart-reattachable.
+        if self.jobs_address:
+            return None
         labels = getattr(requires, "labels", None) or {}
         return "ray" if labels.get("engine") == "ray" else None
+
+    def accepts_whole_graph(self, requires) -> bool:
+        """Claim hard Ray pins in Jobs mode without claiming non-durable region orchestration."""
+        return bool(self.jobs_address and self._requires_ray(requires))
+
+    @staticmethod
+    def preallocate_run_id() -> str:
+        """Mint a logical ID without allocating artifacts or contacting Ray."""
+        return f"run_{uuid.uuid4().hex}"
 
     def reachable_tiers(self):
         # A same-host reference cluster (worker-direct LOCAL reads) reaches local + object. But an
@@ -980,7 +2060,9 @@ class RayRunner:
         # controller route a region handoff to local and silently produce a result the remote workers
         # can't read. So when the operator marks the cluster remote (DP_RAY_REMOTE), reach is object-only,
         # and the controller correctly refuses a handoff with no shared object store.
-        remote = os.environ.get("DP_RAY_REMOTE", "").strip().lower() in ("1", "true", "yes", "on")
+        remote = bool(self.jobs_address) or os.environ.get("DP_RAY_REMOTE", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
         return ("object",) if remote else ("local", "object")
 
     def run_unit(self, graph, output_node, output_uri, requires=None, run_id=None) -> RunStatus:
@@ -990,10 +2072,15 @@ class RayRunner:
         shards). `requires` (the planner's resolved region need) is passed to Ray so its map tasks are
         scheduled onto a matching worker. Unsupported unpinned work falls back locally; an explicit Ray
         requirement fails before dispatch."""
-        run_id = run_id or f"unit_{uuid.uuid4().hex[:10]}"
+        if self.jobs_address:
+            raise RuntimeError(
+                "Ray Jobs supports durable whole-graph runs only; region orchestration is not yet durable"
+            )
+        run_id = run_id or f"unit_{uuid.uuid4().hex}"
         ir = lower_to_ir(graph, output_node, self.node_specs, self.deps.node_ir)
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", target_node_id=output_node,
                            per_node=[PerNodeStatus(node_id=output_node, status="queued", label=output_node)])
+        req = requires.model_dump() if hasattr(requires, "model_dump") else requires
         with self._lock:
             prior = self.runs.get(run_id)
             if prior is not None:
@@ -1003,6 +2090,8 @@ class RayRunner:
         reason = self._source_unsupported_reason(graph, output_node, ir)
         reason = reason or self._ray_unsupported_reason(ir)
         reason = reason or self._dedup_unsupported_reason(graph, ir)
+        cone = g.upstream_chain(graph, output_node) if output_node else graph.nodes
+        reason = reason or self._gpu_type_conflict_reason(graph, cone)
         reason = reason or self._resource_unsupported_reason(requires, ir)
         if _remote_ray():
             from hub.plugins.adapters import is_object_uri
@@ -1019,7 +2108,9 @@ class RayRunner:
             attempt_uri = _allocate_handoff_uri(output_uri, run_id, "region")
         except Exception as e:  # noqa: BLE001 — a control-plane allocation must precede object writes
             status.status = "failed"
-            status.error = f"object attempt allocation failed: {type(e).__name__}: {e}"
+            status.error = self._stable_exception(
+                "Object attempt allocation failed", e, "object_attempt_allocation_failed"
+            )
             for item in status.per_node:
                 item.status = "failed"
             return status
@@ -1046,7 +2137,6 @@ class RayRunner:
                 graph, output_node, attempt_uri, run_id, status=status)
         with self._lock:
             self._cancel[run_id] = threading.Event()
-        req = requires.model_dump() if hasattr(requires, "model_dump") else requires
         # Never let retries/concurrent attempts overwrite the same multi-object prefix. The controller
         # caches the returned URI only after this sub-run is terminal, so this physical attempt prefix is
         # the atomic publication boundary; an interrupted attempt can leave only an unreferenced orphan.
@@ -1063,7 +2153,7 @@ class RayRunner:
         """
         from hub.executors.engine import BuildEngine
         from hub.plugins.adapters import is_object_uri
-        run_id = run_id or f"unit_{uuid.uuid4().hex[:10]}"
+        run_id = run_id or f"unit_{uuid.uuid4().hex}"
         status = status or RunStatus(
             run_id=run_id, status="running", placement="local", target_node_id=output_node,
             per_node=[PerNodeStatus(node_id=output_node, status="running", label=output_node)])
@@ -1111,7 +2201,10 @@ class RayRunner:
         except Exception as e:  # noqa: BLE001
             if owns_prefix:
                 discard_attempt(attempt_uri)  # synchronous writer stopped; safe to remove only our prefix
-            status.status, status.error = "failed", f"{type(e).__name__}: {e}"
+            status.status = "failed"
+            status.error = self._stable_exception(
+                "Ray local materialization failed", e, "local_materialization_failed"
+            )
         for p in status.per_node:
             p.status = status.status
         return status
@@ -1148,7 +2241,10 @@ class RayRunner:
                 try:
                     SinkSpec.from_config(s.config, s.config.get("title"))
                 except (TypeError, ValueError) as exc:
-                    return f"write node '{s.id}' has unsupported sink semantics: {exc}"
+                    return (
+                        "write node has unsupported sink semantics "
+                        f"(code=sink_semantics_unsupported,type={type(exc).__name__})"
+                    )
             if s.op == "aggregate":
                 if not parse_group_keys(s.config.get("groupBy", "")):
                     return f"aggregate node '{s.id}' needs a non-empty bare-column GROUP BY"
@@ -1208,7 +2304,8 @@ class RayRunner:
     @staticmethod
     def _requires_ray(requires, graph=None, target=None) -> bool:
         raw = requires.model_dump() if hasattr(requires, "model_dump") else (requires or {})
-        if (raw.get("labels") or {}).get("engine") == "ray":
+        if raw.get("gpu") or raw.get("gpu_type") or raw.get("gpuType") \
+                or (raw.get("labels") or {}).get("engine") == "ray":
             return True
         if graph is None:
             return False
@@ -1222,13 +2319,36 @@ class RayRunner:
         try:
             req = requires if isinstance(requires, ResourceSpec) else ResourceSpec(**requires)
         except Exception as exc:  # noqa: BLE001
-            return f"invalid Ray resource requirement: {exc}"
+            return (
+                "invalid Ray resource requirement "
+                f"(code=resource_requirement_invalid,type={type(exc).__name__})"
+            )
+        if req.gpu_type:
+            req = req.model_copy(update={"gpu_type": _canonical_accelerator_type(req.gpu_type)})
         workers = self.workers()
         if not any(satisfies(worker.capacity, req) for worker in workers):
             wanted = req.model_dump(by_alias=True, exclude_none=True)
             offered = [worker.capacity.model_dump(by_alias=True, exclude_none=True) for worker in workers]
             return f"requested resources {wanted} exceed advertised Ray capacity {offered}"
         labels = {k: v for k, v in (req.labels or {}).items() if k != "engine"}
+        gpu_pinned = bool(req.gpu or req.gpu_type)
+        if gpu_pinned:
+            try:
+                _gpu_batch_rows()
+            except ValueError as exc:
+                return str(exc)
+        if ir is not None and gpu_pinned:
+            whole_partition = sorted({
+                step.op for step in ir.steps if step.op in {"aggregate", "window", "dedup"}
+            })
+            if whole_partition:
+                # These operators deliberately run one complete hash partition per DuckDB UDF call.
+                # Giving that call a GPU claim while leaving batch_size=None is an unbounded-memory lie;
+                # splitting it into finite GPU batches would break group/window/distinct correctness.
+                return (
+                    "GPU placement cannot safely batch whole-partition operator(s): "
+                    + ", ".join(whole_partition)
+                )
         if ir is not None and (req.gpu or req.gpu_type or labels) and any(
                 step.op == "sort" for step in ir.steps):
             # Ray 2.56 Dataset.sort/repartition expose no ray_remote_args. Claiming the region while its
@@ -1266,7 +2386,10 @@ class RayRunner:
             try:
                 adapter = self.resolve_adapter(uri)
             except Exception as exc:  # noqa: BLE001
-                return f"source '{uri}' adapter resolution failed: {type(exc).__name__}: {exc}"
+                return (
+                    "Ray source adapter resolution failed "
+                    f"(code=source_adapter_unavailable,type={type(exc).__name__})"
+                )
             if not _is_builtin_adapter(adapter):
                 return (
                     f"source '{uri}' is claimed by adapter '{type(adapter).__name__}', which has no explicit "
@@ -1289,10 +2412,23 @@ class RayRunner:
                 _require_driver_fallback(_physical_source_bytes(uri), f"source '{uri}'")
             except RuntimeError as exc:
                 return str(exc)
+
+    def _gpu_type_conflict_reason(self, graph, nodes) -> str | None:
+        types = {
+            _canonical_accelerator_type(requirement.gpu_type)
+            for node in nodes
+            for requirement in [node_requires(node, self.node_specs)]
+            if requirement is not None and requirement.gpu_type
+        }
+        if len(types) > 1:
+            return (
+                "one Ray execution region cannot satisfy multiple GPU types: "
+                + ", ".join(sorted(types))
+            )
         return None
 
     def _unsupported_status(self, graph, target, reason, *, run_id=None, plan=None) -> RunStatus:
-        run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"
+        run_id = run_id or f"run_{uuid.uuid4().hex}"
         per_node = ([PerNodeStatus(node_id=s.node_id, status="failed", label=s.label) for s in plan.steps]
                     if plan is not None else
                     [PerNodeStatus(node_id=target, status="failed", label=target)])
@@ -1335,7 +2471,9 @@ class RayRunner:
                 targets[step.id] = uri
         return targets
 
-    def _claim_sink_attempts(self, ir, targets: dict[str, str], run_id: str) -> dict[str, str]:
+    def _claim_sink_attempts(
+            self, ir, targets: dict[str, str], run_id: str, *,
+            require_live_preallocation: bool = False) -> dict[str, str]:
         """Precompute and register worker-direct sink attempts in the hub control plane.
 
         The isolated driver intentionally has a private metadata DB, so it must receive the exact physical
@@ -1370,13 +2508,98 @@ class RayRunner:
             for step, target_uri, spec in managed_steps:
                 attempt_uri = _allocate_handoff_uri(
                     target_uri, run_id, "sink", scope=step.id,
-                    catalog_key_base=f"tbl_{spec.name}")
+                    catalog_key_base=f"tbl_{spec.name}",
+                    require_live_preallocation=require_live_preallocation)
                 attempts[step.id] = attempt_uri
             return attempts
         except Exception:
             for attempt_uri in attempts.values():
                 discard_attempt(attempt_uri)
             raise
+
+    def _freeze_jobs_sink_contracts(
+            self, ir, targets: dict[str, str], run_id: str,
+            sink_attempts: dict[str, str] | None = None) -> dict[str, dict[str, str]]:
+        """Freeze allocated writer identities before a durable Jobs attempt is bound."""
+        sink_attempts = sink_attempts or {}
+        contracts: dict[str, dict[str, str]] = {}
+        for step in ir.steps:
+            if step.op != "write":
+                continue
+            logical_uri = targets[step.id]
+            spec = SinkSpec.from_config(step.config, step.config.get("title"))
+            direct = _worker_direct_parquet_sink(
+                spec, logical_uri, self.resolve_adapter(logical_uri)
+            )
+            if not direct:
+                raise RuntimeError(
+                    f"Ray Jobs write sink '{step.id}' is not a hub-managed direct Parquet sink"
+                )
+            if step.id not in sink_attempts:
+                raise RuntimeError(
+                    f"Ray Jobs direct sink '{step.id}' has no allocated object attempt"
+                )
+            contracts[step.id] = {
+                "name": spec.name,
+                "logical_uri": logical_uri,
+                "physical_uri": sink_attempts[step.id],
+                "writer": "worker-direct-parquet",
+            }
+        if set(sink_attempts) != set(contracts):
+            raise RuntimeError("Ray Jobs sink allocation set does not match its frozen writer set")
+        self._validate_jobs_sink_attempts({
+            "run_id": run_id, "sink_targets": targets, "sink_contracts": contracts,
+        }, allowed_states={"writing"})
+        return contracts
+
+    @staticmethod
+    def _validate_jobs_sink_attempts(
+            job: dict, *, allowed_states: set[str] | None = None) -> dict[str, dict]:
+        """Resolve frozen direct sinks through the exact allocation key without reopening writers."""
+        handles: dict[str, dict] = {}
+        for step_id, contract in RayRunner._validated_sink_contracts(job).items():
+            if contract.get("writer") != "worker-direct-parquet":
+                continue
+            allocation_key = _attempt_allocation_key(
+                contract["logical_uri"], job["run_id"], "sink", step_id
+            )
+            try:
+                handle = lookup_attempt(
+                    logical_uri=contract["logical_uri"], kind="sink",
+                    run_id=job["run_id"], allocation_key=allocation_key,
+                )
+            except Exception as e:  # registry/provider identity failure is contract failure
+                raise ArtifactContractError(
+                    f"Ray job sink contract '{step_id}' could not verify its object attempt"
+                ) from e
+            if handle is None:
+                raise ArtifactContractError(
+                    f"Ray job sink contract '{step_id}' has no object-attempt allocation"
+                )
+            expected = {
+                "uri": contract["physical_uri"],
+                "logical_uri": contract["logical_uri"],
+                "kind": "sink",
+                "run_id": job["run_id"],
+                "allocation_key": allocation_key,
+            }
+            if any(handle.get(key) != value for key, value in expected.items()):
+                raise ArtifactContractError(
+                    f"Ray job sink contract '{step_id}' changed its allocated object identity"
+                )
+            if allowed_states is not None and handle.get("state") not in allowed_states:
+                raise ArtifactContractError(
+                    f"Ray job sink contract '{step_id}' is not writable "
+                    f"(state={handle.get('state')})"
+                )
+            handles[step_id] = handle
+        return handles
+
+    def _prepare_jobs_submission(self, job: dict) -> None:
+        """Gate replay on current code and exact still-writable parent-owned attempts."""
+        self._validate_job_reattach_config(job)
+        self._validate_jobs_source_pins(job)
+        self._validate_jobs_sink_attempts(job, allowed_states={"writing"})
 
     def _sink_targets_runnable(self, ir) -> bool:
         try:
@@ -1430,25 +2653,55 @@ class RayRunner:
         # region; otherwise final GPU/custom-resource pins silently bypass placement enforcement.
         cone = g.upstream_chain(graph, target_node_id) if target_node_id else graph.nodes
         requires = graph_requires(graph, self.node_specs, nodes=cone)
+        reason = reason or self._gpu_type_conflict_reason(graph, cone)
         reason = reason or self._resource_unsupported_reason(requires, ir)
         if reason and self._requires_ray(requires, graph, target_node_id):
             return self._unsupported_status(graph, target_node_id, reason, run_id=run_id, plan=plan)
         if reason:
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)  # safe fallback
         try:
-            sink_targets = self._resolve_sink_targets(ir)
-        except Exception:  # noqa: BLE001 — resolve/adapter uncertainty ⇒ local or explicit failure
+            if self.jobs_address:
+                # Production mode must fail closed. Falling back locally because a remote sink/config is invalid
+                # would violate an explicit Ray placement request and hide a deployment error.
+                self._jobs_contract()
+                sink_targets = self._resolve_sink_targets(ir)
+                self._validate_jobs_io(ir, sink_targets=sink_targets)
+                self._validate_jobs_catalog_publication(sink_targets)
+                source_attempts = self._jobs_source_attempts(graph, target_node_id)
+            else:
+                sink_targets = self._resolve_sink_targets(ir)
+        except Exception as exc:  # noqa: BLE001 — resolve/adapter uncertainty ⇒ local or explicit failure
+            if self.jobs_address:
+                raise
             logging.getLogger(__name__).exception("Ray sink preflight failed")
             if self._requires_ray(requires, graph, target_node_id):
                 return self._unsupported_status(
-                    graph, target_node_id, "sink preflight failed",
+                    graph, target_node_id,
+                    self._stable_exception(
+                        "Ray sink preflight failed", exc, "sink_preflight_failed"
+                    ),
                     run_id=run_id, plan=plan,
                 )
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)
-        run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"
+        run_id = run_id or f"run_{uuid.uuid4().hex}"
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=per_node,
                            target_node_id=target_node_id)
+        if self.jobs_address:
+            sink_attempts = self._claim_sink_attempts(
+                ir, sink_targets, run_id, require_live_preallocation=True
+            )
+            # The router's leased run preallocation owns allocation-to-bind rollback. It can atomically
+            # prove that no backend row exists and terminalize every attempt for this run; doing that here
+            # with a check-then-cleanup would race another hub binding the same logical run.
+            sink_contracts = self._freeze_jobs_sink_contracts(
+                ir, sink_targets, run_id, sink_attempts
+            )
+            return self._start_jobs(
+                status, graph, target_node_id, sink_targets=sink_targets,
+                sink_contracts=sink_contracts, source_attempts=source_attempts,
+                requires=requires.model_dump(),
+            )
         with self._lock:
             self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()
@@ -1456,10 +2709,12 @@ class RayRunner:
         self._emit(graph, status)
         try:
             sink_attempts = self._claim_sink_attempts(ir, sink_targets, run_id)
-        except Exception:  # noqa: BLE001 — never dispatch an object write the hub cannot track
+        except Exception as exc:  # noqa: BLE001 — never dispatch an object write the hub cannot track
             logging.getLogger(__name__).exception("Ray sink control-plane setup failed")
             status.status = "failed"
-            status.error = "Ray sink control-plane setup failed"
+            status.error = self._stable_exception(
+                "Object sink attempt allocation failed", exc, "sink_attempt_allocation_failed"
+            )
             for item in status.per_node:
                 item.status = "failed"
             self._emit(graph, status)
@@ -1481,6 +2736,42 @@ class RayRunner:
                          daemon=True).start()
         return status
 
+    def _start_jobs(self, status: RunStatus, graph, target, *, sink_targets=None, sink_contracts=None,
+                    source_attempts=None, materialize_uri=None, requires=None) -> RunStatus:
+        """Bind the hash-bound job contract before materializing or submitting its deterministic ID."""
+        from hub import metadb
+
+        ref, job = self._make_jobs_artifacts(
+            status.run_id, graph, target, sink_targets=sink_targets,
+            sink_contracts=sink_contracts, source_attempts=source_attempts,
+            materialize_uri=materialize_uri, requires=requires,
+        )
+        self._jobs_client(ref["control_address"])  # validate SDK + endpoint before SQL ownership
+        job_payload = json_artifact_payload(job, label="Ray job artifact")
+        status.backend_ref = self._ref_model(ref)
+        stored, created = metadb.bind_backend_job(
+            status.run_id, ref, status.model_dump(), canvas_id=getattr(graph, "id", None),
+            job_payload=job_payload, source_uris=job["source_attempts"],
+        )
+        # The SQL commit is the ownership handoff. From this point onward no object-store read/write may
+        # escape back to the caller: the locally installed supervisor owns materialization, retries, and
+        # cancellation. A racing duplicate simply reattaches the stored canonical binding/payload.
+        persisted = metadb.get_run_state(status.run_id)
+        current = self.runs.get(status.run_id)
+        if not created and current is not None:
+            # An idempotent duplicate in this process must not replace the object the active supervisor is
+            # mutating; doing so would strand callers on a stale queued copy while the old copy completes.
+            status = current
+        elif not created and persisted:
+            status = RunStatus.model_validate(persisted)
+        status.backend_ref = self._ref_model(stored)
+        self._install_jobs_status(status, stored)
+        if status.status in ("queued", "running"):
+            # Persist backend_ref before the asynchronous submit. This is the restart handoff point.
+            self._emit(graph, status)
+            self._ensure_jobs_supervisor(status.run_id)
+        return status
+
     def _emit(self, graph, status) -> None:
         if self.on_status:
             try:
@@ -1488,13 +2779,24 @@ class RayRunner:
             except Exception:  # noqa: BLE001 — never let persistence break a run
                 pass
 
-    def _register_outputs(self, graph, result, *, expected_targets=None, expected_attempts=None) -> None:
+    def _register_outputs(self, graph, result, job: dict | None = None, *,
+                          expected_targets=None, expected_attempts=None) -> None:
         """Publish driver-written outputs through the hub-owned catalog/control plane."""
         from hub.plugins.adapters import is_object_uri
         from hub.plugins.catalog import (
             core_managed_publisher,
             publish_unmanaged_output_attested,
         )
+        durable_catalog = self.catalog if job and isinstance(
+            self.catalog, DurableCatalogPublisher
+        ) else None
+        register_once = getattr(durable_catalog, "register_output_idempotent", None)
+        usage_once = getattr(durable_catalog, "record_usage_idempotent", None)
+        if job and durable_catalog is None:
+            raise RuntimeError(
+                "Ray Jobs requires the DurableCatalogPublisher capability: "
+                "register_output_idempotent(...) and record_usage_idempotent(idempotency_key, parents)"
+            )
         nodes = {node.id: node for node in graph.nodes}
         outputs = result.get("outputs") or []
         if expected_targets is not None:
@@ -1525,10 +2827,12 @@ class RayRunner:
                     raise RuntimeError(
                         f"ray driver returned an unexpected physical URI for sink '{step_id}'")
 
+        run_parents: list[str] = []
         for output in outputs:
             step_id, name, uri = output["step_id"], output["name"], output["uri"]
             logical_uri = output.get("logical_uri")
-            parents = g.all_upstream_publication_uris(graph, step_id)
+            parents = list(dict.fromkeys(g.all_upstream_publication_uris(graph, step_id)))
+            run_parents.extend(parents)
             managed_attempt = bool(logical_uri and is_object_uri(uri) and is_attempt_uri(uri))
             if managed_attempt:
                 publish = core_managed_publisher(self.catalog)
@@ -1546,10 +2850,1483 @@ class RayRunner:
                 if not isinstance(receipt, dict) or receipt.get("uri") != uri:
                     raise RuntimeError(
                         f"core publisher returned an invalid receipt for sink '{step_id}'")
+            elif register_once is not None:
+                idempotency_key = f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}"
+                raw_receipt = register_once(
+                    idempotency_key=idempotency_key,
+                    name=name, uri=uri, version=None, parents=parents, pipeline="canvas",
+                )
+                try:
+                    receipt = CatalogPublicationReceipt.model_validate(raw_receipt)
+                except Exception as e:  # noqa: BLE001 — a durable receipt is the publication boundary
+                    raise RuntimeError(
+                        "durable catalog publisher returned no valid output receipt"
+                    ) from e
+                if receipt.idempotency_key != idempotency_key or receipt.uri != uri:
+                    raise RuntimeError(
+                        "durable catalog publisher returned a receipt for a different output effect"
+                    )
             else:
                 publish_unmanaged_output_attested(
                     self.catalog, name=name, uri=uri, version=None,
                     parents=parents, pipeline="canvas")
+        if usage_once and (result.get("outputs") or []):
+            usage_once(
+                idempotency_key=f"{_JOBS_BACKEND}:{job['attempt_id']}",
+                parents=list(dict.fromkeys(run_parents)),
+            )
+
+    @staticmethod
+    def _listed_job_status(jobs, submission_id: str) -> str | None:
+        if isinstance(jobs, dict):
+            info = jobs.get(submission_id)
+            if info is None:
+                return None
+            value = getattr(info, "status", info.get("status") if isinstance(info, dict) else info)
+            return _job_status_name(value)
+        for info in jobs or []:
+            jid = (getattr(info, "submission_id", None) or getattr(info, "job_id", None)
+                   or (info.get("submission_id") or info.get("job_id") if isinstance(info, dict) else None))
+            if jid == submission_id:
+                value = getattr(info, "status", info.get("status") if isinstance(info, dict) else None)
+                return _job_status_name(value)
+        return None
+
+    def _find_job(self, client, submission_id: str) -> str | None:
+        """Authoritatively distinguish missing from an ambiguous status request failure.
+
+        ``get_job_status`` raises RuntimeError for both not-found and transport failures. A successful
+        ``list_jobs`` is therefore the second, cluster-authoritative check; if listing also fails we do
+        not submit because that could double-run an already accepted job.
+        """
+        try:
+            return _job_status_name(client.get_job_status(submission_id))
+        except Exception as status_error:  # noqa: BLE001
+            try:
+                return self._listed_job_status(client.list_jobs(), submission_id)
+            except Exception as list_error:  # noqa: BLE001
+                raise RuntimeError(
+                    "Ray Jobs discovery unavailable "
+                    f"(code=job_discovery_unavailable,status_type={type(status_error).__name__},"
+                    f"list_type={type(list_error).__name__})"
+                ) from list_error
+
+    @staticmethod
+    def _remote_job_metadata(client, submission_id: str) -> dict[str, str]:
+        info = client.get_job_info(submission_id)
+        metadata = getattr(info, "metadata", None)
+        if metadata is None and isinstance(info, dict):
+            metadata = info.get("metadata")
+        if not isinstance(metadata, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in metadata.items()):
+            raise RuntimeError("Ray job metadata is missing or malformed")
+        return metadata
+
+    @staticmethod
+    def _note_submission_winner(run_id: str, attempt_id: str) -> None:
+        """Persist a visible workload unless terminal effects already won the SQL race."""
+        from hub import metadb
+
+        if metadb.note_backend_submission_observed(run_id, attempt_id):
+            return
+        current = metadb.backend_job(run_id) or {}
+        if current.get("publication_state") in ("effects_started", "published"):
+            raise PublicationEffectsWon(run_id)
+        if current.get("submission_state") in (
+                "submitted", "stopping", "result_submitted"):
+            return
+        raise RuntimeError("Ray workload winner lost its durable SQL binding")
+
+    def _validate_remote_workload_winner(
+            self, client, run_id: str, attempt_id: str, code_ref: str) -> None:
+        metadata = self._remote_job_metadata(client, _jobs_submission_id(run_id, attempt_id))
+        if (metadata.get("dataplay_run_id") != run_id
+                or metadata.get("dataplay_attempt_id") != attempt_id
+                or metadata.get("dataplay_code_ref") != code_ref
+                or metadata.get("dataplay_stop_fence") is not None):
+            raise RuntimeError("Ray workload metadata does not match its durable execution binding")
+
+    def _persist_fencing_winner(
+            self, client, status: RunStatus, ref: RunBackendRef, binding: dict,
+            *, reason: str) -> bool:
+        """Classify the remote deterministic ID and atomically persist which submit won its race."""
+        from hub import metadb
+
+        metadata = self._remote_job_metadata(client, ref.submission_id)
+        if (metadata.get("dataplay_run_id") != status.run_id
+                or metadata.get("dataplay_attempt_id") != ref.attempt_id):
+            raise RuntimeError("Ray job metadata does not match its durable execution binding")
+        fence_reason = metadata.get("dataplay_stop_fence")
+        if fence_reason is not None:
+            current_binding = metadb.backend_job(status.run_id) or binding
+            allowed_reasons = set()
+            if current_binding.get("cancel_requested"):
+                allowed_reasons.add("cancellation")
+            if current_binding.get("quarantine_reason"):
+                allowed_reasons.add("quarantine")
+            if current_binding.get("submission_state") in (
+                    *_RESULT_RECONCILIATION_STATES, "result_fenced"):
+                allowed_reasons.add("result-reconciliation")
+            if fence_reason not in allowed_reasons:
+                raise RuntimeError("Ray stop-fence metadata does not match its durable control intent")
+            if not metadb.note_backend_stop_fence_accepted(
+                    status.run_id, ref.attempt_id, binding.get("submission_owner")):
+                current = metadb.backend_job(status.run_id) or {}
+                expected = (
+                    ("result_stop_fenced", "result_fenced")
+                    if fence_reason == "result-reconciliation" else ("fence_stopping",)
+                )
+                if current.get("publication_state") in ("effects_started", "published"):
+                    raise PublicationEffectsWon(status.run_id)
+                if current.get("submission_state") not in expected:
+                    raise RuntimeError("Ray stop-fence winner lost its durable SQL ownership")
+            return True
+        if metadata.get("dataplay_code_ref") != ref.code_ref:
+            raise RuntimeError("Ray workload metadata does not match its durable code binding")
+        self._note_submission_winner(status.run_id, ref.attempt_id)
+        return False
+
+    def _bounded_lease_keepalive(
+            self, done: threading.Event, interval: float, renew) -> None:
+        """Renew one SQL owner for a bounded wall-clock interval, then permit takeover."""
+        deadline = time.monotonic() + self._max_lease_hold_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or done.wait(min(interval, remaining)):
+                return
+            if time.monotonic() >= deadline:
+                return
+            try:
+                if not renew():
+                    return
+            except Exception:  # noqa: BLE001 — the owner CAS and finite deadline stay authoritative
+                pass
+
+    def _ensure_job_submitted(self, client, job: dict) -> str:
+        from hub import metadb
+
+        submission_id = job["submission_id"]
+        existing = self._find_job(client, submission_id)
+        if existing:
+            self._validate_remote_workload_winner(
+                client, job["run_id"], job["attempt_id"], job["code_ref"])
+            self._note_submission_winner(job["run_id"], job["attempt_id"])
+            return existing
+        owner = uuid.uuid4().hex
+        claim = metadb.claim_backend_submission_after_missing(
+            job["run_id"], job["attempt_id"], owner, self._submission_lease_s
+        )
+        if claim == "cancelled":
+            return "CANCEL_REQUESTED"
+        if claim in ("busy", "submitted"):
+            return "SUBMITTING"
+        if claim != "claimed":
+            raise RuntimeError(f"Ray Jobs submission claim is {claim}")
+        child_env = _ray_jobs_env(job)
+        child_env.pop("DP_DATABASE_URL", None)  # defense in depth: workload profile already excludes it
+        entrypoint = " ".join((
+            job["entrypoint"], shlex.quote(job["job_uri"]), shlex.quote(job["attempt_id"]),
+            shlex.quote(job["submission_id"]), shlex.quote(job["envelope_sha256"]),
+        ))
+        metadata = {
+            "job_name": f"Data Playground {job['run_id']}",
+            "dataplay_run_id": job["run_id"],
+            "dataplay_attempt_id": job["attempt_id"],
+            "dataplay_code_ref": job["code_ref"],
+        }
+        keepalive_done = threading.Event()
+
+        def _keepalive() -> None:
+            interval = max(0.25, self._submission_lease_s / 3)
+            self._bounded_lease_keepalive(
+                keepalive_done, interval,
+                lambda: metadb.renew_backend_submission(
+                    job["run_id"], job["attempt_id"], owner,
+                    self._submission_lease_s,
+                ),
+            )
+
+        threading.Thread(target=_keepalive, daemon=True,
+                         name=f"dp-ray-submit-{job['run_id']}").start()
+        try:
+            returned = client.submit_job(
+                entrypoint=entrypoint,
+                submission_id=submission_id,
+                runtime_env={"env_vars": child_env},
+                metadata=metadata,
+            )
+            if returned and str(returned) != submission_id:
+                raise RuntimeError(
+                    f"Ray Jobs returned submission id {returned!r}, expected deterministic id {submission_id!r}"
+                )
+            self._note_submission_winner(job["run_id"], job["attempt_id"])
+            return "PENDING"
+        except Exception:  # noqa: BLE001 — an accepted submit can race the response; re-check before failing
+            existing = self._find_job(client, submission_id)
+            if existing:
+                self._validate_remote_workload_winner(
+                    client, job["run_id"], job["attempt_id"], job["code_ref"])
+                self._note_submission_winner(job["run_id"], job["attempt_id"])
+                return existing
+            # A timeout/disconnect can return before the server accepts the still-in-flight HTTP request.
+            # Preserve the linearized claim; lease-based replay or the cancel-fence path will reconcile it.
+            raise
+        finally:
+            keepalive_done.set()
+
+    def _job_failure(self, client, submission_id: str) -> str:
+        del client, submission_id
+        return "RemoteJobFailed: remote job reported failure"
+
+    def _read_job_result(self, job: dict) -> dict:
+        deadline = time.monotonic() + self._jobs_result_timeout_s
+        last_error = None
+        while time.monotonic() <= deadline:
+            try:
+                return self._validate_job_result(job, self._artifacts.read(job["result_uri"]))
+            except ArtifactContractError:
+                raise  # readable but untrusted content will not become valid through consistency delay
+            except ArtifactCorrupt as e:
+                raise ArtifactContractError(str(e)) from e
+            except (ArtifactNotFound, FileNotFoundError) as e:
+                # A successful entrypoint may become visible before its just-written object. Only an
+                # authoritative absence gets this bounded consistency grace period.
+                last_error = e
+                time.sleep(min(self._jobs_poll_s, 0.25))
+            except Exception:
+                # Transport/auth/5xx is ambiguous, not evidence that a SUCCEEDED job omitted its result.
+                # Keep the run non-terminal and let a fresh supervisor retry after storage recovers.
+                raise
+        raise TerminalResultMissing(
+            f"Ray job succeeded without a readable terminal result artifact: {last_error}"
+        )
+
+    def _terminal_result_if_present(self, job: dict) -> dict | None:
+        """Use immutable terminal evidence before replaying a job whose Ray metadata disappeared."""
+        try:
+            raw = self._artifacts.read(job["result_uri"])
+        except (ArtifactNotFound, FileNotFoundError):  # authoritative absence permits replay/cancellation
+            return None
+        except ArtifactCorrupt as e:
+            return {"status": "failed", "rows": 0, "outputs": [], "artifact_invalid": True,
+                    "error": self._stable_exception(
+                        "Ray result artifact rejected", e, "result_artifact_invalid"
+                    )}
+        try:
+            result = self._validate_job_result(job, raw)
+        except Exception as e:
+            return {"status": "failed", "rows": 0, "outputs": [], "artifact_invalid": True,
+                    "error": self._stable_exception(
+                        "Ray result artifact rejected", e, "result_artifact_invalid"
+                    )}
+        return result
+
+    def _result_contract_error_if_present(self, job: dict) -> Exception | None:
+        """Detect readable corruption without treating an early valid result as terminal evidence."""
+        try:
+            raw = self._artifacts.read(job["result_uri"])
+        except (ArtifactNotFound, FileNotFoundError):
+            return None
+        except ArtifactCorrupt as e:
+            return e
+        except Exception:  # transport/auth is ambiguous and must not quarantine a real job
+            return None
+        try:
+            self._validate_job_result(job, raw)
+        except Exception as e:  # exact, readable contract mismatch
+            return e
+        return None
+
+    @staticmethod
+    def _copy_status(target: RunStatus, source: RunStatus) -> None:
+        for field in RunStatus.model_fields:
+            if field != "status":
+                setattr(target, field, getattr(source, field))
+        # Pollers use terminal status as the publication barrier. Copy it last so they cannot observe a
+        # new terminal label paired with stale rows/output/per-node fields from the previous live state.
+        target.status = source.status
+
+    @staticmethod
+    def _converge_terminal_fence(status: RunStatus) -> bool:
+        """Stop stale local supervision after retention prunes the winning backend/status detail."""
+        from hub import metadb
+
+        terminal = metadb.terminal_run_status(status.run_id)
+        if terminal not in ("done", "failed", "cancelled"):
+            return False
+        status.status = terminal
+        if terminal == "done":
+            status.progress, status.error = 1.0, None
+        elif terminal == "cancelled":
+            status.error = None
+        else:
+            status.error = "Run failed (code=terminal_details_pruned)"
+        if terminal != "done":
+            status.output_uri = status.output_table = None
+        for node in status.per_node:
+            node.status = "done" if terminal == "done" else terminal
+        return True
+
+    def _apply_job_result(self, status: RunStatus, result: dict, *, remote: bool = True) -> None:
+        status.status = result["status"]
+        status.error = (
+            (self._public_remote_error(result["error"]) if remote
+             else "Ray Jobs artifact rejected (code=artifact_contract_invalid)")
+            if result.get("error") else None
+        )
+        status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
+        status.rows_processed = status.total_rows = int(result.get("rows") or 0)
+        if status.status == "done":
+            status.progress = 1.0
+        for node in status.per_node:
+            node.status = "done" if status.status == "done" else status.status
+
+    def _prepare_job_publication_effects(
+            self, job: dict, graph, result: dict) -> tuple[list[dict], dict | None]:
+        """Preflight object/schema reads and freeze every managed SQL effect before the barrier."""
+        from hub import metadb
+        from hub.plugins.catalog import core_managed_publication_planner
+
+        outputs = sorted(result.get("outputs") or [], key=lambda item: item["step_id"])
+        if not outputs:
+            return [], None
+        planner = core_managed_publication_planner(self.catalog)
+        if planner is None:
+            raise RuntimeError("Ray Jobs managed outputs require the core catalog planner")
+        nodes = {node.id: node for node in graph.nodes}
+        plans: list[dict] = []
+        run_parents: list[str] = []
+        for output in outputs:
+            step_id = output["step_id"]
+            node = nodes.get(step_id)
+            if node is None or node.type != "write":
+                raise RuntimeError(f"Ray driver returned an unknown sink '{step_id}'")
+            spec = SinkSpec.from_config(node.data.get("config") or {}, node.data.get("title"))
+            if output["name"] != spec.name:
+                raise RuntimeError(f"Ray driver returned an unexpected name for sink '{step_id}'")
+            parents = list(dict.fromkeys(g.all_upstream_publication_uris(graph, step_id)))
+            run_parents.extend(parents)
+            plans.append(planner(
+                run_id=job["run_id"], step_id=step_id,
+                idempotency_key=f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}",
+                name=output["name"], uri=output["uri"], version=None,
+                parents=parents, pipeline="canvas",
+            ))
+        usage = None
+        if plans:
+            usage = metadb.catalog_prepare_usage_publication(
+                job["run_id"], f"{_JOBS_BACKEND}:{job['attempt_id']}",
+                list(dict.fromkeys(run_parents)),
+            )
+        return plans, usage
+
+    def _apply_job_publication_effects(self, effects: dict) -> None:
+        """Replay only frozen SQL effects; no artifact, manifest, schema, or Ray reads are allowed."""
+        from hub import metadb
+
+        for plan in effects["catalog_effects"]:
+            receipt = metadb.catalog_apply_managed_publication(plan)
+            if (not isinstance(receipt, dict)
+                    or receipt.get("event_key") != plan["event_key"]
+                    or receipt.get("uri") != plan["uri"]
+                    or receipt.get("version") != plan["version"]):
+                raise RuntimeError(
+                    f"core publisher returned an invalid staged receipt for '{plan['step_id']}'")
+        if effects["usage_effect"] is not None:
+            metadb.catalog_apply_usage_publication(effects["usage_effect"])
+
+    def _jobs_graph_from_durable_sql(
+            self, ref: RunBackendRef, candidate: RunStatus):
+        """Best-effort telemetry context from immutable SQL only after effects have started."""
+        from hub import metadb
+        from hub.models import Graph
+
+        payload = metadb.backend_job_artifact_payload(candidate.run_id)
+        if payload is None:
+            return None
+        job = json.loads(payload.decode("utf-8"))
+        if not isinstance(job, dict) or canonical_json(job) != payload:
+            return None
+        self._validate_job_artifact_integrity(ref, candidate, job)
+        return Graph.model_validate(job["graph"])
+
+    def _publish_job_result(self, job: dict, graph, target, status: RunStatus, result: dict, *,
+                            artifact_error: bool = False) -> None:
+        """Stage terminal effects once, replay them, then atomically expose the canonical terminal."""
+        from hub import metadb
+
+        ref = status.backend_ref
+        if ref is None or ref.backend != _JOBS_BACKEND:
+            raise RuntimeError("Ray Jobs publication has no durable backend reference")
+        owner = uuid.uuid4().hex
+        while True:
+            claim = metadb.claim_backend_publication(
+                status.run_id, ref.attempt_id, owner, self._publication_lease_s
+            )
+            if claim == "published":
+                canonical = metadb.backend_job(status.run_id)
+                if not canonical or not canonical.get("result"):
+                    if self._converge_terminal_fence(status):
+                        return
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                self._copy_status(status, RunStatus.model_validate(canonical["result"]))
+                return
+            if claim == "busy":
+                time.sleep(self._jobs_poll_s)
+                continue
+            if claim == "submission":
+                # A submit or stop-fence request linearized first. Its eventual remote outcome can
+                # invalidate the terminal observation that brought us here, so return to supervision
+                # and discover it again instead of waiting under a stale publication candidate.
+                return
+            if claim == "lost":
+                if self._converge_terminal_fence(status):
+                    return
+                raise RuntimeError("Ray result lost the durable attempt publication fence")
+
+            keepalive_done = threading.Event()
+
+            def _keepalive() -> None:
+                interval = max(1.0, self._publication_lease_s / 3)
+                self._bounded_lease_keepalive(
+                    keepalive_done, interval,
+                    lambda: metadb.renew_backend_publication(
+                        status.run_id, ref.attempt_id, owner,
+                        self._publication_lease_s,
+                    ),
+                )
+
+            threading.Thread(target=_keepalive, daemon=True,
+                             name=f"dp-ray-publish-{status.run_id}").start()
+            try:
+                if claim == "effects":
+                    effects = metadb.backend_publication_effects(
+                        status.run_id, ref.attempt_id)
+                    if effects is None:
+                        raise RuntimeError("Ray publication lost its staged effects plan")
+                else:
+                    # Never expose a terminal in-memory object until the durable winner CAS succeeds.
+                    candidate = status.model_copy(deep=True)
+                    self._apply_job_result(
+                        candidate, result,
+                        remote=not artifact_error and "contract_version" in job,
+                    )
+                    validated_result = None
+                    sink_attempts = None
+                    catalog_effects: list[dict] = []
+                    usage_effect = None
+                    try:
+                        if "sink_contracts" in job and "sink_targets" in job:
+                            handles = self._validate_jobs_sink_attempts(job)
+                            sink_attempts = {
+                                step_id: handle["uri"] for step_id, handle in handles.items()
+                            }
+                        if candidate.status == "done":
+                            validated_result = self._validate_job_result(job, dict(result))
+                            if graph is None:
+                                raise ArtifactContractError(
+                                    "successful Ray Jobs publication has no hash-bound graph")
+                            catalog_effects, usage_effect = \
+                                self._prepare_job_publication_effects(
+                                    job, graph, validated_result)
+                        stage = metadb.begin_backend_publication_effects(
+                            status.run_id, ref.attempt_id, owner, candidate.model_dump(),
+                            validated_result, sink_attempts,
+                            catalog_effects=catalog_effects, usage_effect=usage_effect,
+                        )
+                    except metadb.BackendPublicationConflict as conflict:
+                        # Required catalog projection irreversibly lost to unregister/a newer current
+                        # generation before the barrier. Publish a sanitized failure and atomically
+                        # retire the exact committed/writing sinks instead of exposing false success.
+                        if candidate.status != "done":
+                            raise
+                        candidate = status.model_copy(deep=True)
+                        self._apply_job_result(candidate, {
+                            "status": "failed", "rows": 0, "outputs": [],
+                            "error": self._stable_exception(
+                                "Ray output publication conflicted", conflict,
+                                "catalog_publication_conflict",
+                            ),
+                        })
+                        stage = metadb.begin_backend_publication_effects(
+                            status.run_id, ref.attempt_id, owner, candidate.model_dump(),
+                            None, sink_attempts, catalog_effects=[], usage_effect=None,
+                        )
+                    except metadb.BackendPublicationBusy as busy:
+                        status.error = self._stable_exception(
+                            "Ray result publication waiting for catalog", busy,
+                            "catalog_publication_busy",
+                        )
+                        metadb.save_run_state(status.run_id, status.model_dump())
+                        time.sleep(self._jobs_poll_s)
+                        continue
+                    except Exception as e:
+                        # Pre-effects object/schema/control failures are retryable and cannot leak a
+                        # partial catalog projection because begin has not linearized yet.
+                        status.error = self._stable_exception(
+                            "Ray result publication preflight unavailable", e,
+                            "publication_preflight_unavailable",
+                        )
+                        metadb.save_run_state(status.run_id, status.model_dump())
+                        time.sleep(self._jobs_poll_s)
+                        continue
+                    if stage == "quarantined":
+                        return
+                    if stage == "submission":
+                        return
+                    if stage in ("published", "lost"):
+                        continue
+                    if stage == "busy":
+                        time.sleep(self._jobs_poll_s)
+                        continue
+                    effects = metadb.backend_publication_effects(
+                        status.run_id, ref.attempt_id)
+                    if effects is None:
+                        raise RuntimeError("Ray publication failed to attest its staged effects plan")
+
+                candidate = RunStatus.model_validate(effects["terminal_status"])
+                try:
+                    self._apply_job_publication_effects(effects)
+                except Exception as e:
+                    status.error = self._stable_exception(
+                        "Ray result publication waiting for staged effects", e,
+                        "publication_effect_unavailable",
+                    )
+                    metadb.save_run_state(status.run_id, status.model_dump())
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                if metadb.finish_backend_publication(
+                        status.run_id, ref.attempt_id, owner, candidate.model_dump()):
+                    self._copy_status(status, candidate)
+                    telemetry_graph = None
+                    try:
+                        telemetry_graph = self._jobs_graph_from_durable_sql(ref, candidate)
+                    except Exception:
+                        log.warning(
+                            "ray_jobs_terminal_telemetry_context_unavailable run_id=%s",
+                            status.run_id, exc_info=True,
+                        )
+                    if telemetry_graph is not None and getattr(
+                            telemetry_graph, "id", None) != "_region":
+                        from hub.deps import _emit_telemetry
+                        per_node = [node.model_dump() for node in (status.per_node or [])] or None
+                        _emit_telemetry(
+                            self.deps, telemetry_graph, candidate.target_node_id,
+                            status, per_node)
+                    return
+                binding = metadb.backend_job(status.run_id)
+                if (candidate.status != "failed" and binding
+                        and binding.get("publication_state") != "published"
+                        and binding.get("quarantine_reason")):
+                    # Quarantine cannot cross effects_started; this only handles a pending preflight
+                    # loser that observed the fence before begin linearized.
+                    return
+            finally:
+                keepalive_done.set()
+            # Ownership changed or the DB write was interrupted. Read the canonical winner on the next loop;
+            # catalog upsert + run-history-by-run_id make a lease-recovery replay idempotent after a crash.
+            time.sleep(self._jobs_poll_s)
+
+    def _quarantine_invalid_job(self, status: RunStatus, ref: RunBackendRef, error: Exception) -> bool:
+        """Persist the corruption fence, stop the SQL-bound attempt, then publish failure."""
+        from hub import metadb
+
+        reason = self._stable_exception(
+            "Ray Jobs artifact rejected", error, "artifact_contract_invalid"
+        )
+        if not metadb.request_backend_quarantine(status.run_id, reason):
+            # A terminal publication that won first is authoritative. A stale corruption observer
+            # must converge from retained detail or the permanent terminal fence, never stop a remote
+            # submission that no longer belongs to a live backend binding.
+            canonical = metadb.backend_job(status.run_id)
+            if (canonical
+                    and canonical.get("publication_state") == "effects_started"):
+                self._publish_job_result(
+                    {}, None, status.target_node_id, status, {}, artifact_error=True)
+                return True
+            if (canonical and canonical.get("publication_state") == "published"
+                    and canonical.get("result")):
+                try:
+                    winner = RunStatus.model_validate(canonical["result"])
+                    if (winner.run_id == status.run_id
+                            and winner.status in ("done", "failed", "cancelled")):
+                        self._copy_status(status, winner)
+                        return True
+                except (TypeError, ValueError):
+                    pass
+            if self._converge_terminal_fence(status):
+                return True
+            raise RuntimeError(
+                "Ray quarantine fence was rejected without an authoritative terminal result"
+            )
+        binding = metadb.backend_job(status.run_id) or {}
+        self._backend_refs[status.run_id] = binding
+        return self._resume_quarantined_job(status, ref, binding)
+
+    def _resume_quarantined_job(self, status: RunStatus, ref: RunBackendRef, binding: dict) -> bool:
+        """Return true only after the durable quarantine reaches terminal publication."""
+        from hub import metadb
+
+        reason = "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
+        if binding.get("submission_state") in _RESULT_RECONCILIATION_STATES:
+            status.error = reason + "; waiting for durable result reconciliation"
+            metadb.save_run_state(status.run_id, status.model_dump())
+            return False
+        try:
+            settled_result_fence = binding.get("submission_state") == "result_fenced"
+            state = None
+            if not settled_result_fence:
+                client = self._jobs_client(binding.get("control_address"))
+                state = self._find_job(client, ref.submission_id)
+                self._note_jobs_control_observed(status, ref)
+                if state is not None:
+                    self._persist_fencing_winner(
+                        client, status, ref, binding, reason="quarantine"
+                    )
+                    binding = self._refresh_jobs_binding(status.run_id)
+                if state is None:
+                    if binding.get("submission_state") in ("stopping", "fence_stopping"):
+                        self._settle_stop_control(status.run_id, ref.attempt_id)
+                    else:
+                        state, _accepted_fence = self._fence_missing_stop(
+                            client, status, ref, reason="quarantine"
+                        )
+                    if state in ("SUBMITTING", "FENCING"):
+                        return False
+                    if state == "MISSING":
+                        state = None
+                if state and state not in _JOB_TERMINAL:
+                    if status.run_id not in self._cancel_stop_sent:
+                        client.stop_job(ref.submission_id)
+                        self._cancel_stop_sent.add(status.run_id)
+                    state = self._find_job(client, ref.submission_id)
+                    self._note_jobs_control_observed(status, ref)
+                    if state is not None and state not in _JOB_TERMINAL:
+                        status.error = reason + "; remote job quarantined, waiting for STOPPED"
+                        metadb.save_run_state(status.run_id, status.model_dump())
+                        return False
+                binding = self._refresh_jobs_binding(status.run_id)
+                if (state is None or state in _JOB_TERMINAL) and binding.get(
+                        "submission_state") in ("stopping", "fence_stopping"):
+                    self._settle_stop_control(status.run_id, ref.attempt_id)
+        except PublicationEffectsWon:
+            raise
+        except Exception as control_error:  # cannot prove the untrusted remote execution stopped
+            status.error = self._stable_exception(
+                "Ray quarantine control unavailable; run remains non-terminal",
+                control_error, "quarantine_control_unavailable",
+            )
+            metadb.save_run_state(status.run_id, status.model_dump())
+            return False
+
+        try:
+            trusted_job = self._durable_sql_job_envelope(ref, status)
+        except Exception:
+            # Corruption may include the SQL copy itself. Never act on untrusted sink URIs; quarantine
+            # still converges the backend binding through its independently stored attempt ID.
+            trusted_job = {"attempt_id": ref.attempt_id}
+        self._publish_job_result(
+            trusted_job, None, status.target_node_id, status,
+            {"status": "failed", "error": reason, "rows": 0, "outputs": []},
+            artifact_error=True,
+        )
+        return True
+
+    def _persist_jobs_live_error(self, status: RunStatus, message: str) -> None:
+        from hub import metadb
+
+        status.error = message
+        metadb.save_run_state(status.run_id, status.model_dump())
+
+    def _note_jobs_control_observed(self, status: RunStatus, ref: RunBackendRef) -> None:
+        """Advance durable liveness after a successful Jobs status/list observation, at bounded rate."""
+        from hub import metadb
+
+        now = time.monotonic()
+        with self._lock:
+            previous = self._control_observed_monotonic.get(status.run_id)
+            if previous is not None and now - previous < _CONTROL_OBSERVATION_WRITE_S:
+                return
+            self._control_observed_monotonic[status.run_id] = now
+        try:
+            metadb.note_backend_control_observed(
+                status.run_id, ref.attempt_id, _CONTROL_OBSERVATION_WRITE_S
+            )
+        except Exception:
+            # A failed durable write must remain retryable; process-local throttling is not authoritative.
+            with self._lock:
+                self._control_observed_monotonic.pop(status.run_id, None)
+            raise
+
+    def _refresh_jobs_binding(self, run_id: str) -> dict:
+        from hub import metadb
+
+        binding = metadb.backend_job(run_id)
+        if not binding:
+            status = self.runs.get(run_id)
+            if status is not None and self._converge_terminal_fence(status):
+                raise DurableTerminalObserved(run_id)
+            raise RuntimeError(f"durable Ray Jobs binding for '{run_id}' disappeared")
+        if (binding.get("_recovery_error")
+                and binding.get("publication_state") != "effects_started"):
+            raise RuntimeError(str(binding["_recovery_error"]))
+        self._backend_refs[run_id] = binding
+        if binding.get("cancel_requested"):
+            self._cancel[run_id].set()
+        return binding
+
+    def _resume_staged_binding(
+            self, status: RunStatus, ref: RunBackendRef, binding: dict) -> bool:
+        """Resume a write-ahead plan before consulting any mutable control or artifact state."""
+        if binding.get("publication_state") != "effects_started":
+            return False
+        self._publish_job_result(
+            {}, None, status.target_node_id, status, {}, artifact_error=True)
+        return True
+
+    def _resume_settled_result_fence(
+            self, status: RunStatus, ref: RunBackendRef, binding: dict,
+            job: dict | None = None, graph=None, target=None) -> bool:
+        """Publish after a terminal reconciliation fence without mistaking it for a workload."""
+        if binding.get("submission_state") != "result_fenced":
+            return False
+        if binding.get("quarantine_reason"):
+            return self._resume_quarantined_job(status, ref, binding)
+        try:
+            self._publish_reconciled_result(job, graph, target, status)
+        except (ArtifactNotFound, ArtifactCorrupt, ArtifactContractError) as error:
+            return self._quarantine_invalid_job(status, ref, error)
+        return True
+
+    def _resume_publication_winner(self, status: RunStatus, ref: RunBackendRef) -> bool:
+        """Yield remote control to a publisher that already crossed or completed the barrier."""
+        binding = self._refresh_jobs_binding(status.run_id)
+        if binding.get("publication_state") not in ("effects_started", "published"):
+            return False
+        self._publish_job_result(
+            {}, None, status.target_node_id, status, {}, artifact_error=True)
+        return True
+
+    @staticmethod
+    def _settle_result_reconciliation(run_id: str, attempt_id: str) -> None:
+        from hub import metadb
+
+        if metadb.settle_backend_result_reconciliation(run_id, attempt_id):
+            return
+        current = metadb.backend_job(run_id) or {}
+        if current.get("publication_state") in ("effects_started", "published"):
+            raise PublicationEffectsWon(run_id)
+        if current.get("submission_state") in ("submitted", "result_fenced"):
+            return
+        raise RuntimeError("Ray result reconciliation lost its durable SQL state")
+
+    @staticmethod
+    def _settle_stop_control(run_id: str, attempt_id: str) -> None:
+        from hub import metadb
+
+        if metadb.settle_backend_stop_control(run_id, attempt_id):
+            return
+        current = metadb.backend_job(run_id) or {}
+        if current.get("publication_state") in ("effects_started", "published"):
+            raise PublicationEffectsWon(run_id)
+        if current.get("submission_state") in ("submitted", "stop_fenced"):
+            return
+        raise RuntimeError("Ray stop control lost its durable SQL state")
+
+    def _drive_result_reconciliation(
+            self, status: RunStatus, ref: RunBackendRef,
+            binding: dict) -> tuple[object, bool]:
+        """Fence an uncertain replay before trusting a result observed after metadata loss.
+
+        The caller invokes this only after a valid, hash-bound result was observed while the
+        deterministic Ray ID was authoritatively missing, or while resuming the durable states created
+        by that decision. ``ready`` means every possible writer is terminal/absent and SQL no longer
+        carries a result-reconciliation state, so the result object may be read again and published.
+        """
+        from hub import metadb
+
+        client = self._jobs_client(binding.get("control_address"))
+        submission_state = binding.get("submission_state")
+        state: str | None
+        if submission_state == "submitting":
+            # The caller already observed authoritative metadata loss. Claiming the fixed-ID fence is
+            # the next linearization point; a delayed workload submit can still win the same Ray ID.
+            state, _accepted_fence = self._fence_missing_stop(
+                client, status, ref, reason="result-reconciliation"
+            )
+        elif submission_state == "result_fencing":
+            state = self._find_job(client, ref.submission_id)
+            self._note_jobs_control_observed(status, ref)
+            if state is None:
+                state, _accepted_fence = self._fence_missing_stop(
+                    client, status, ref, reason="result-reconciliation"
+                )
+            else:
+                self._persist_fencing_winner(
+                    client, status, ref, binding, reason="result-reconciliation"
+                )
+        elif submission_state in ("result_submitted", "result_stop_fenced"):
+            state = self._find_job(client, ref.submission_id)
+            self._note_jobs_control_observed(status, ref)
+        else:
+            raise RuntimeError(
+                f"Ray result reconciliation has invalid submission state {submission_state!r}"
+            )
+
+        if state in ("SUBMITTING", "FENCING", "REOBSERVE"):
+            return client, False
+
+        current = self._refresh_jobs_binding(status.run_id)
+        current_state = current.get("submission_state")
+        if state in (None, "MISSING"):
+            if current_state in ("result_submitted", "result_stop_fenced"):
+                self._settle_result_reconciliation(status.run_id, ref.attempt_id)
+            elif current_state not in ("queued", "submitted", "stop_fenced"):
+                return client, False
+            return client, True
+
+        if current_state not in ("result_submitted", "result_stop_fenced"):
+            raise RuntimeError("Ray result reconciliation has no durable remote winner")
+        if state not in _JOB_TERMINAL:
+            if status.run_id not in self._cancel_stop_sent:
+                client.stop_job(ref.submission_id)
+                self._cancel_stop_sent.add(status.run_id)
+            state = self._find_job(client, ref.submission_id)
+            self._note_jobs_control_observed(status, ref)
+            if state is not None and state not in _JOB_TERMINAL:
+                self._persist_jobs_live_error(
+                    status,
+                    "Ray result reconciliation fenced a stale replay; waiting for it to stop",
+                )
+                return client, False
+
+        self._settle_result_reconciliation(status.run_id, ref.attempt_id)
+        return client, True
+
+    def _publish_reconciled_result(
+            self, job: dict | None, graph, target, status: RunStatus) -> None:
+        """Re-read terminal evidence only after result reconciliation fenced every writer."""
+        if job is None:
+            ref = status.backend_ref
+            if ref is None or ref.backend != _JOBS_BACKEND:
+                raise RuntimeError("Ray result reconciliation has no durable backend reference")
+            job = self._durable_sql_job_envelope(ref, status)
+            from hub.models import Graph
+            graph = Graph.model_validate(job["graph"])
+            target = job.get("target")
+        completed = self._terminal_result_if_present(job)
+        if completed is None:
+            completed = {
+                "status": "failed", "rows": 0, "outputs": [],
+                "error": (
+                    "TerminalResultMissing: result artifact disappeared after "
+                    "remote replay reconciliation"
+                ),
+            }
+        elif completed.get("artifact_invalid"):
+            ref = status.backend_ref
+            if ref is None or ref.backend != _JOBS_BACKEND:
+                raise RuntimeError("Ray result reconciliation has no durable backend reference")
+            self._quarantine_invalid_job(
+                status, ref, ArtifactContractError(completed["error"])
+            )
+            return
+        self._publish_job_result(job, graph, target, status, completed)
+
+    def _fence_missing_stop(self, client, status: RunStatus, ref: RunBackendRef,
+                            *, reason: str) -> tuple[str, bool]:
+        """Reserve an expired uncertain submission ID with a fixed stoppable job.
+
+        A delayed original request and this fence use the same Ray submission ID, so Ray accepts at
+        most one. Whichever wins becomes visible and can be stopped without local job artifacts/config.
+        """
+        from hub import metadb
+
+        owner = uuid.uuid4().hex
+        claim = metadb.claim_backend_stop_fence(
+            status.run_id, ref.attempt_id, owner, self._submission_lease_s,
+            result_reconcile=reason == "result-reconciliation",
+        )
+        if claim == "not_needed":
+            if reason == "result-reconciliation":
+                # A concurrent observer may have changed ``submitting`` to ``submitted`` because the
+                # delayed workload appeared after our missing observation. Discard that stale result
+                # candidate and require a fresh status/list read before publication.
+                return "REOBSERVE", False
+            return "MISSING", False
+        if claim == "settled_missing":
+            # The remote ID was previously accepted (real job or fixed stop fence). Authoritative
+            # metadata loss ends execution, but a trusted result artifact may still prove completion.
+            return "STOPPED", False
+        if claim == "busy":
+            self._persist_jobs_live_error(
+                status, f"Ray {reason} is waiting for an already-linearized submit to settle"
+            )
+            return "SUBMITTING", False
+        if claim != "claimed":
+            raise RuntimeError(f"Ray cancellation submission fence is {claim}")
+
+        try:
+            returned = client.submit_job(
+                entrypoint=_CANCEL_FENCE_ENTRYPOINT,
+                submission_id=ref.submission_id,
+                runtime_env={},
+                metadata={
+                    "job_name": f"Data Playground {reason} fence {status.run_id}",
+                    "dataplay_run_id": status.run_id,
+                    "dataplay_attempt_id": ref.attempt_id,
+                    "dataplay_stop_fence": reason,
+                },
+            )
+            if returned and str(returned) != ref.submission_id:
+                raise RuntimeError(
+                    f"Ray Jobs returned submission id {returned!r}, expected {ref.submission_id!r}"
+                )
+        except Exception as submit_error:  # the original workload may have won the same remote ID
+            existing = self._find_job(client, ref.submission_id)
+            if existing is not None:
+                binding = metadb.backend_job(status.run_id) or {}
+                try:
+                    accepted_fence = self._persist_fencing_winner(
+                        client, status, ref, binding, reason=reason
+                    )
+                except PublicationEffectsWon:
+                    raise
+                except Exception as metadata_error:
+                    self._persist_jobs_live_error(
+                        status, self._stable_exception(
+                            f"Ray {reason} winner metadata is invalid; control remains non-terminal",
+                            metadata_error, "stop_fence_metadata_invalid",
+                        ),
+                    )
+                    return "FENCING", False
+                return existing, accepted_fence
+            self._persist_jobs_live_error(
+                status, self._stable_exception(
+                    f"Ray {reason} fence submission is uncertain; retrying after its DB lease",
+                    submit_error, "stop_fence_submit_uncertain",
+                ),
+            )
+            return "FENCING", False
+
+        if not metadb.note_backend_stop_fence_accepted(
+                status.run_id, ref.attempt_id, owner):
+            current = metadb.backend_job(status.run_id) or {}
+            if current.get("publication_state") in ("effects_started", "published"):
+                raise PublicationEffectsWon(status.run_id)
+            expected = (
+                "result_stop_fenced"
+                if reason == "result-reconciliation" else "fence_stopping"
+            )
+            if current.get("submission_state") != expected:
+                raise RuntimeError("Ray stop-fence acceptance lost its durable SQL ownership")
+        state = self._find_job(client, ref.submission_id)
+        if state is None:
+            self._persist_jobs_live_error(
+                status, f"Ray accepted the {reason} fence; waiting for it to become stoppable"
+            )
+            return "FENCING", True
+        return state, True
+
+    def _cancel_control_state(self, status: RunStatus, ref: RunBackendRef,
+                              binding: dict) -> tuple[bool, object | None, str | None]:
+        """Drive persisted cancel intent using only the durable SQL routing handle.
+
+        ``MISSING`` means a successful Jobs listing authoritatively proved that no remote execution
+        exists. ``None`` means control was ambiguous and the run must remain non-terminal.
+        """
+        if not (binding.get("cancel_requested") or self._cancel[status.run_id].is_set()):
+            return False, None, None
+        if binding.get("submission_state") in _RESULT_RECONCILIATION_STATES:
+            # Result reconciliation already owns a stronger writer fence. The main supervisor resumes
+            # that durable state before user cancellation, then re-evaluates the still-persisted intent.
+            return True, None, "SUBMITTING"
+        try:
+            client = self._jobs_client(binding.get("control_address"))
+            state = self._find_job(client, ref.submission_id)
+            self._note_jobs_control_observed(status, ref)
+            cancel_fenced = binding.get("submission_state") in (
+                "fence_stopping", "stop_fenced")
+            if state is not None:
+                cancel_fenced = self._persist_fencing_winner(
+                    client, status, ref, binding, reason="cancellation"
+                )
+                binding = self._refresh_jobs_binding(status.run_id)
+                cancel_fenced = binding.get("submission_state") == "fence_stopping"
+            if state is None:
+                if binding.get("submission_state") in ("stopping", "fence_stopping"):
+                    cancel_fenced = binding.get("submission_state") == "fence_stopping"
+                    self._settle_stop_control(status.run_id, ref.attempt_id)
+                    return True, client, "STOPPED"
+                state, accepted_fence = self._fence_missing_stop(
+                    client, status, ref, reason="cancellation")
+                cancel_fenced = cancel_fenced or accepted_fence
+                if state in ("MISSING", "SUBMITTING", "FENCING"):
+                    return True, client, state
+            if state not in _JOB_TERMINAL and status.run_id not in self._cancel_stop_sent:
+                client.stop_job(ref.submission_id)
+                self._cancel_stop_sent.add(status.run_id)
+                state = self._find_job(client, ref.submission_id)
+                self._note_jobs_control_observed(status, ref)
+            binding = self._refresh_jobs_binding(status.run_id)
+            if (state is None or state in _JOB_TERMINAL) and binding.get(
+                    "submission_state") in ("stopping", "fence_stopping"):
+                cancel_fenced = binding.get("submission_state") == "fence_stopping"
+                self._settle_stop_control(status.run_id, ref.attempt_id)
+            if state is None or (cancel_fenced and state in _JOB_TERMINAL):
+                state = "STOPPED"  # the fixed fence carries no user result to reconcile
+            return True, client, state
+        except PublicationEffectsWon:
+            raise
+        except Exception as e:  # noqa: BLE001 — ambiguity can hide a still-running remote attempt
+            self._persist_jobs_live_error(
+                status, self._stable_exception(
+                    "Ray cancellation control unavailable; retrying", e,
+                    "cancellation_control_unavailable",
+                ),
+            )
+            return True, None, None
+
+    def _publish_cancelled_binding(
+            self, status: RunStatus, binding: dict, job: dict | None = None) -> None:
+        ref = status.backend_ref
+        if job is None:
+            if ref is None:
+                raise RuntimeError("cancelled Ray Jobs binding has no durable backend reference")
+            try:
+                job = self._durable_sql_job_envelope(ref, status)
+            except (ArtifactNotFound, ArtifactCorrupt, ArtifactContractError):
+                # Durable cancel intent plus remote stop proof authorizes begin to derive this exact
+                # binding's active sinks from SQL even when its hash-bound envelope is unavailable.
+                job = {"attempt_id": ref.attempt_id}
+        self._publish_job_result(
+            job, None, status.target_node_id, status,
+            {"status": "cancelled", "rows": 0, "outputs": []},
+        )
+
+    def _supervise_jobs(self, run_id: str) -> None:
+        from hub import metadb
+
+        status = self.runs[run_id]
+        ref = status.backend_ref
+        assert ref is not None and ref.backend == _JOBS_BACKEND
+        settled = self._settled[run_id]
+        graph = target = job = client = terminal_result = None
+        state: str | None = None
+        try:
+            # Recover the trusted execution envelope. Cancel control still uses only the durable SQL
+            # handle, but no cancellation terminal may outrank an already hash-bound result artifact.
+            while job is None:
+                binding = self._refresh_jobs_binding(run_id)
+                if self._resume_staged_binding(status, ref, binding):
+                    return
+                if self._resume_settled_result_fence(status, ref, binding):
+                    return
+                if binding.get("submission_state") in _RESULT_RECONCILIATION_STATES:
+                    client, ready = self._drive_result_reconciliation(
+                        status, ref, binding)
+                    if ready:
+                        self._publish_reconciled_result(
+                            job, graph, target, status)
+                        return
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                if binding.get("quarantine_reason"):
+                    if self._resume_quarantined_job(status, ref, binding):
+                        return
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                cancelling = bool(
+                    binding.get("cancel_requested") or self._cancel[status.run_id].is_set()
+                )
+                try:
+                    candidate = self._read_or_materialize_job_artifact(ref, status)
+                except (ArtifactNotFound, FileNotFoundError) as e:
+                    # A cancel-requested binding that never left queued cannot race a submit: the DB
+                    # submit claim observes cancel_requested. It therefore needs no artifact to stop.
+                    if (cancelling and binding.get("submission_state") == "queued"):
+                        self._publish_cancelled_binding(status, binding)
+                        return
+                    if cancelling:
+                        _requested, cancel_client, cancel_state = self._cancel_control_state(
+                            status, ref, binding
+                        )
+                        client = cancel_client or client
+                        if cancel_state in ("MISSING", "STOPPED", "SUCCEEDED", "FAILED"):
+                            state = cancel_state
+                    self._persist_jobs_live_error(
+                        status, self._stable_exception(
+                            "Ray Jobs artifact missing; retrying", e, "job_artifact_missing"
+                        )
+                    )
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                except (ArtifactCorrupt, ArtifactContractError) as e:
+                    if self._quarantine_invalid_job(status, ref, e):
+                        return
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                except Exception as e:  # noqa: BLE001 — transport/auth is ambiguous, not corruption
+                    if cancelling:
+                        _requested, cancel_client, cancel_state = self._cancel_control_state(
+                            status, ref, binding
+                        )
+                        client = cancel_client or client
+                        if cancel_state in ("MISSING", "STOPPED", "SUCCEEDED", "FAILED"):
+                            state = cancel_state
+                    self._persist_jobs_live_error(
+                        status, self._stable_exception(
+                            "Ray Jobs artifact unavailable; retrying", e,
+                            "job_artifact_unavailable",
+                        )
+                    )
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                try:
+                    self._validate_job_artifact_integrity(ref, status, candidate)
+                    from hub.models import Graph
+                    graph, target = Graph.model_validate(candidate["graph"]), candidate.get("target")
+                except Exception as e:  # readable contract corruption must be stopped before publication
+                    if self._quarantine_invalid_job(status, ref, e):
+                        return
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                try:
+                    # Source pins are SQL-owned generation attestations; sink validation is a read-only
+                    # exact allocation lookup. Neither check reopens or advances a writer.
+                    self._validate_jobs_source_pins(candidate)
+                    self._validate_jobs_sink_attempts(candidate)
+                except ArtifactContractError as e:
+                    if self._quarantine_invalid_job(status, ref, e):
+                        return
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                except Exception as e:  # metadata transport failure is ambiguous, not corruption
+                    self._persist_jobs_live_error(
+                        status, self._stable_exception(
+                            "Ray Jobs source-pin attestation unavailable; retrying", e,
+                            "source_pin_attestation_unavailable",
+                        )
+                    )
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                job = candidate
+
+            completed = None
+            result_read_failed = False
+            if cancelling:
+                try:
+                    completed = self._terminal_result_if_present(job)
+                except Exception:
+                    # A result-store outage is "unknown", not "absent": stopping the remote job is
+                    # still valid, but a terminal cancellation must not bury a possibly-committed
+                    # success, so defer publication to the state loop until the object can be read.
+                    result_read_failed = True
+            if completed is not None and completed.get("artifact_invalid"):
+                self._quarantine_invalid_job(
+                    status, ref, ArtifactContractError(completed["error"])
+                )
+                return
+            if cancelling and state in ("STOPPED", "MISSING"):
+                if result_read_failed:
+                    self._persist_jobs_live_error(
+                        status, "Ray Jobs result unavailable after stop; retrying")
+                    state = None
+                elif completed is not None:
+                    self._publish_job_result(job, graph, target, status, completed)
+                    return
+                else:
+                    self._publish_cancelled_binding(status, binding, job)
+                    return
+
+            # Establish backend state. A result object is never consulted while Ray explicitly reports a
+            # live state; it is strong terminal evidence only after authoritative job-metadata loss.
+            while state is None:
+                binding = self._refresh_jobs_binding(run_id)
+                if self._resume_staged_binding(status, ref, binding):
+                    return
+                if self._resume_settled_result_fence(
+                        status, ref, binding, job, graph, target):
+                    return
+                if binding.get("quarantine_reason"):
+                    if self._resume_quarantined_job(status, ref, binding):
+                        return
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                if binding.get("submission_state") in _RESULT_RECONCILIATION_STATES:
+                    # Once a reconciliation fence is claimed the binding leaves "submitting", so this
+                    # loop must keep re-driving it (mirroring loops 1 and 3) rather than treating the
+                    # fence job as a live workload and spinning forever.
+                    client, ready = self._drive_result_reconciliation(status, ref, binding)
+                    if ready:
+                        self._publish_reconciled_result(job, graph, target, status)
+                        return
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                cancel_intent = bool(
+                    binding.get("cancel_requested") or self._cancel[status.run_id].is_set()
+                )
+                if cancel_intent:
+                    try:
+                        completed = self._terminal_result_if_present(job)
+                    except Exception:
+                        completed = None  # control may stop, but terminal publication still waits for storage
+                    if completed is not None and completed.get("artifact_invalid"):
+                        self._quarantine_invalid_job(
+                            status, ref, ArtifactContractError(completed["error"])
+                        )
+                        return
+                cancelling, cancel_client, cancel_state = self._cancel_control_state(status, ref, binding)
+                if cancelling:
+                    client = cancel_client or client
+                    if cancel_state in ("STOPPED", "MISSING"):
+                        completed = self._terminal_result_if_present(job)
+                        if completed is not None and completed.get("artifact_invalid"):
+                            # A driver that flushed a corrupt result during the stop window must go
+                            # through the same durable quarantine as any other invalid terminal.
+                            self._quarantine_invalid_job(
+                                status, ref, ArtifactContractError(completed["error"])
+                            )
+                            return
+                        if completed is not None:
+                            self._publish_job_result(job, graph, target, status, completed)
+                        else:
+                            self._publish_cancelled_binding(status, binding, job)
+                        return
+                    if cancel_state in ("SUCCEEDED", "FAILED"):
+                        state = cancel_state
+                        break
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                try:
+                    client = self._jobs_client(binding.get("control_address"))
+                    state = self._find_job(client, ref.submission_id)
+                    self._note_jobs_control_observed(status, ref)
+                    if state is not None:
+                        self._validate_remote_workload_winner(
+                            client, status.run_id, ref.attempt_id, ref.code_ref)
+                        self._note_submission_winner(
+                            status.run_id, ref.attempt_id)
+                    else:
+                        completed = self._terminal_result_if_present(job)
+                        if completed is not None:
+                            if completed.get("artifact_invalid"):
+                                self._quarantine_invalid_job(
+                                    status, ref, ArtifactContractError(completed["error"])
+                                )
+                                return
+                            if binding.get("submission_state") == "submitting":
+                                client, ready = self._drive_result_reconciliation(
+                                    status, ref, binding)
+                                if ready:
+                                    self._publish_reconciled_result(
+                                        job, graph, target, status)
+                                    return
+                                state = None
+                            else:
+                                terminal_result, state = completed, "SUCCEEDED"
+                        else:
+                            self._prepare_jobs_submission(job)
+                            state = self._ensure_job_submitted(client, job)
+                            if state == "CANCEL_REQUESTED":
+                                self._cancel[run_id].set()
+                                state = None
+                    status.error = None
+                except ArtifactContractError as e:
+                    if self._quarantine_invalid_job(status, ref, e):
+                        return
+                    state = None
+                    time.sleep(self._jobs_poll_s)
+                except Exception as e:  # noqa: BLE001 — accepted submit/control outage is ambiguous
+                    self._persist_jobs_live_error(
+                        status, self._stable_exception(
+                            "Ray Jobs control plane unavailable; retrying", e,
+                            "control_plane_unavailable",
+                        )
+                    )
+                    state = None
+                    time.sleep(self._jobs_poll_s)
+
+            last_visible = None
+            while state not in _JOB_TERMINAL:
+                binding = self._refresh_jobs_binding(run_id)
+                if self._resume_staged_binding(status, ref, binding):
+                    return
+                if self._resume_settled_result_fence(
+                        status, ref, binding, job, graph, target):
+                    return
+                if binding.get("submission_state") in _RESULT_RECONCILIATION_STATES:
+                    client, ready = self._drive_result_reconciliation(
+                        status, ref, binding)
+                    if ready:
+                        self._publish_reconciled_result(
+                            job, graph, target, status)
+                        return
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                if binding.get("quarantine_reason"):
+                    if self._resume_quarantined_job(status, ref, binding):
+                        return
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                cleared_live_error = False
+                cancel_intent = bool(
+                    binding.get("cancel_requested") or self._cancel[status.run_id].is_set()
+                )
+                if cancel_intent:
+                    try:
+                        completed = self._terminal_result_if_present(job)
+                    except Exception:
+                        completed = None
+                    if completed is not None and completed.get("artifact_invalid"):
+                        self._quarantine_invalid_job(
+                            status, ref, ArtifactContractError(completed["error"])
+                        )
+                        return
+                cancelling, cancel_client, cancel_state = self._cancel_control_state(status, ref, binding)
+                if cancelling:
+                    client = cancel_client or client
+                    if cancel_state in ("STOPPED", "MISSING"):
+                        state = "STOPPED"
+                        break
+                    if cancel_state in ("SUCCEEDED", "FAILED"):
+                        state = cancel_state
+                        break
+                    # A live/ambiguous cancel never reaches replay or result publication.
+                    state = cancel_state or state
+                else:
+                    try:
+                        assert client is not None
+                        observed = self._find_job(client, ref.submission_id)
+                        self._note_jobs_control_observed(status, ref)
+                        if observed is not None:
+                            self._validate_remote_workload_winner(
+                                client, status.run_id, ref.attempt_id, ref.code_ref)
+                            self._note_submission_winner(
+                                status.run_id, ref.attempt_id)
+                            state = observed
+                            if observed not in _JOB_TERMINAL:
+                                invalid_result = self._result_contract_error_if_present(job)
+                                if invalid_result is not None:
+                                    if self._quarantine_invalid_job(status, ref, invalid_result):
+                                        return
+                        else:
+                            # Only authoritative metadata loss opens the result/replay path. An exact,
+                            # hash-bound result is terminal proof; missing allows an overwrite-safe replay.
+                            completed = self._terminal_result_if_present(job)
+                            if completed is not None:
+                                if completed.get("artifact_invalid"):
+                                    self._quarantine_invalid_job(
+                                        status, ref,
+                                        ArtifactContractError(completed["error"]),
+                                    )
+                                    return
+                                if binding.get("submission_state") == "submitting":
+                                    client, ready = self._drive_result_reconciliation(
+                                        status, ref, binding)
+                                    if ready:
+                                        self._publish_reconciled_result(
+                                            job, graph, target, status)
+                                        return
+                                    state = "METADATA_MISSING"
+                                else:
+                                    terminal_result, state = completed, "SUCCEEDED"
+                            else:
+                                self._prepare_jobs_submission(job)
+                                state = self._ensure_job_submitted(client, job)
+                                if state == "CANCEL_REQUESTED":
+                                    self._cancel[run_id].set()
+                                    state = "METADATA_MISSING"
+                        cleared_live_error = status.error is not None
+                        status.error = None
+                    except ArtifactContractError as e:
+                        if self._quarantine_invalid_job(status, ref, e):
+                            return
+                        time.sleep(self._jobs_poll_s)
+                        continue
+                    except Exception as e:  # noqa: BLE001 — no terminal claim on ambiguous control/storage
+                        self._persist_jobs_live_error(
+                            status, self._stable_exception(
+                                "Ray status/control plane unavailable; retrying", e,
+                                "status_control_unavailable",
+                            )
+                        )
+                        state = "METADATA_MISSING"
+                visible = "running" if state == "RUNNING" else "queued"
+                if visible != last_visible or cleared_live_error:
+                    status.status = visible
+                    from hub import metadb
+                    metadb.save_run_state(status.run_id, status.model_dump())
+                    last_visible = visible
+                time.sleep(self._jobs_poll_s)
+
+            result = None
+            if terminal_result is not None:
+                result = terminal_result
+            elif state == "STOPPED":
+                stopped_result = self._terminal_result_if_present(job)
+                if stopped_result is not None and stopped_result.get("artifact_invalid"):
+                    self._quarantine_invalid_job(
+                        status, ref, ArtifactContractError(stopped_result["error"])
+                    )
+                else:
+                    result = stopped_result or {
+                        "status": "cancelled", "rows": 0, "outputs": []
+                    }
+            elif state == "FAILED":
+                result = {"status": "failed", "error": self._job_failure(client, ref.submission_id),
+                          "rows": 0, "outputs": []}
+            else:
+                try:
+                    result = self._read_job_result(job)
+                except ArtifactContractError as e:
+                    # Result corruption must win the same durable quarantine fence whether it is
+                    # observed immediately before or after Ray reports a terminal state. A transient
+                    # control failure leaves result unset so the normal supervisor tail reschedules.
+                    self._quarantine_invalid_job(status, ref, e)
+                except TerminalResultMissing as e:
+                    # Ray is authoritatively terminal here. Missing terminal evidence becomes a failed
+                    # run; transport/auth errors propagate and remain reattachable.
+                    result = {"status": "failed",
+                              "error": f"{type(e).__name__}: result artifact rejected",
+                              "rows": 0, "outputs": []}
+            if result is not None:
+                self._publish_job_result(job, graph, target, status, result)
+        except PublicationEffectsWon as publication_winner:
+            try:
+                if not self._resume_publication_winner(status, ref):
+                    raise RuntimeError(
+                        "Ray remote control yielded without a durable publication winner"
+                    ) from publication_winner
+            except Exception as resume_error:  # retain a live owner for the next supervisor
+                self._persist_jobs_live_error(
+                    status, self._stable_exception(
+                        "Ray publication winner recovery interrupted; retrying", resume_error,
+                        "publication_winner_recovery_interrupted",
+                    ),
+                )
+        except DurableTerminalObserved:
+            pass  # permanent fence already converged the local object; finally stops supervision
+        except Exception as e:  # noqa: BLE001 — retain ownership; a fresh supervisor retries reattachment
+            self._persist_jobs_live_error(
+                status, self._stable_exception(
+                    "Ray Jobs supervision interrupted; retrying", e,
+                    "supervision_interrupted",
+                )
+            )
+        finally:
+            if status.status in ("done", "failed", "cancelled"):
+                settled.set()
+            with self._lock:
+                self._supervising.discard(run_id)
+            self._prune_terminal_runs()
+            # Every non-terminal exit, including an early return after a transient quarantine/control
+            # failure, must retain an autonomous supervisor. API status polling is not a liveness owner.
+            if status.status in ("queued", "running"):
+                time.sleep(self._jobs_poll_s)
+                self._ensure_jobs_supervisor(run_id)
 
     def _supervise(self, run_id, graph, target, status, materialize_uri=None, requires=None,
                    sink_targets=None, sink_attempts=None) -> None:
@@ -1583,9 +4360,11 @@ class RayRunner:
                 materialize_uri=materialize_uri, requires=requires,
                 sink_targets=sink_targets, sink_attempts=sink_attempts,
             )
-        except Exception:  # noqa: BLE001 — provider/process detail belongs only in server logs
+        except Exception as exc:  # noqa: BLE001 — provider/process detail belongs only in server logs
             logging.getLogger(__name__).exception("Ray supervisor setup failed")
-            supervisor_error = "Ray execution supervisor failed"
+            supervisor_error = self._stable_exception(
+                "Ray supervisor setup failed", exc, "supervisor_setup_failed"
+            )
 
         state = {
             "run_id": run_id, "graph": graph, "target": target, "status": status,
@@ -1683,9 +4462,11 @@ class RayRunner:
                 except (ValueError, OSError):
                     pass
                 time.sleep(0.2)
-        except Exception:  # noqa: BLE001 — keep user-visible status non-terminal until reap proof
+        except Exception as exc:  # noqa: BLE001 — keep user-visible status non-terminal until reap proof
             logging.getLogger(__name__).exception("Ray driver supervision failed")
-            supervisor_error = "Ray execution supervisor failed"
+            supervisor_error = self._stable_exception(
+                "Ray driver control failed", exc, "driver_control_failed"
+            )
         finally:
             # A parent-side error must not leave the credential-bearing child running while its work
             # directory is erased. Terminate first, then close the inherited log descriptor.
@@ -1857,12 +4638,13 @@ class RayRunner:
             return
         if not (result and result.get("status") in ("done", "failed", "cancelled")):
             status.status = "failed"
-            status.error = f"ray driver exited without a terminal status (rc={returncode})"
+            status.error = "Ray driver exited without a terminal status (code=driver_result_missing)"
             return
         should_publish = (
             result["status"] == "done"
             and (expected_targets is not None or bool(result.get("outputs")))
         )
+        shared_error = None
         if should_publish:
             try:
                 if expected_targets is None and expected_attempts is None:
@@ -1872,13 +4654,18 @@ class RayRunner:
                         graph, result, expected_targets=expected_targets,
                         expected_attempts=expected_attempts,
                     )
-            except Exception:  # noqa: BLE001 — local parity: catalog commit failure fails the run
+            except Exception as exc:  # noqa: BLE001 — local parity: catalog commit failure fails the run
                 logging.getLogger(__name__).exception("Ray output publication failed")
-                result = dict(result, status="failed", error="Ray output publication failed")
+                shared_error = self._stable_exception(
+                    "Catalog registration failed", exc, "catalog_registration_failed"
+                )
+                result = dict(result, status="failed", error=None)
         # Failed/cancelled outputs stay private. Remote attempts remain fenced as writing until the
         # backend can prove every worker is terminal; the ownership reaper deliberately never guesses.
         status.status = result["status"]
-        status.error = result.get("error")
+        # Local Popen driver shares the hub's host and trust boundary, so its failure text is surfaced
+        # verbatim; only cross-boundary Jobs results are reduced to a stable code by _apply_job_result.
+        status.error = shared_error or (str(result["error"]) if result.get("error") else None)
         if status.status == "done":
             status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
         else:
@@ -1888,7 +4675,8 @@ class RayRunner:
             status.progress = 1.0
 
     def _run_ir_sync(self, ir, graph, target, ray_opts=None, progress=None, sink_targets=None,
-                     attempt_id: str | None = None, sink_attempts=None) -> dict:
+                     attempt_id: str | None = None, sink_attempts=None,
+                     sink_contracts=None) -> dict:
         """Child side (in the driver subprocess, Ray already init'd): execute the clean IR synchronously
         and return a result dict for the parent. Reuses _build/_commit; the fresh-process DuckDB is safe
         because Ray was init'd before it was created. Sink targets are physical URIs resolved by the hub;
@@ -1900,12 +4688,20 @@ class RayRunner:
             rows, out_uri, out_table = 0, None, None
             for step in ir.steps:
                 if step.op == "write":
-                    target_uri = (sink_targets or {}).get(step.id)
+                    frozen = (sink_contracts or {}).get(step.id)
+                    target_uri = (
+                        frozen.get("logical_uri") if isinstance(frozen, dict)
+                        else (sink_targets or {}).get(step.id)
+                    )
                     if not target_uri:
                         raise RuntimeError(f"missing hub-resolved target URI for write step '{step.id}'")
                     rows, out_uri, out_table = self._commit(
                         step, datasets, target_uri, attempt_id=attempt_id, ray_opts=ray_opts,
-                        attempt_uri=(sink_attempts or {}).get(step.id),
+                        attempt_uri=(
+                            frozen.get("physical_uri") if isinstance(frozen, dict)
+                            else (sink_attempts or {}).get(step.id)
+                        ),
+                        writer=frozen.get("writer") if isinstance(frozen, dict) else None,
                     )
                     outputs.append({"step_id": step.id, "name": out_table, "uri": out_uri,
                                     "logical_uri": target_uri})
@@ -1972,7 +4768,11 @@ class RayRunner:
         if step.op in CLEAN_TRANSFORM_MODES:
             # `opts` (num_gpus / custom resources from the region's requires) makes Ray schedule each map
             # task onto a worker that has the resource — the planner's placement, honored on the cluster.
-            result = parent.map_batches(_make_mapper(step.config), batch_format="pyarrow", **opts)
+            batch_size = _gpu_batch_size(opts)
+            batch_kwargs = {"batch_size": batch_size} if batch_size is not None else {}
+            result = parent.map_batches(
+                _make_mapper(step.config), batch_format="pyarrow", **batch_kwargs, **opts
+            )
             if step.op == "filter":
                 return _remember_ray_schema(result, _known_ray_schema(parent))
             # A schema-changing UDF's outputSchema is only an empty-result fallback unless enforcement is
@@ -2078,7 +4878,8 @@ class RayRunner:
                 con.close()
 
         result = left.map_batches(
-            _join_block, batch_format="pyarrow", batch_size=None, **(ray_opts or {})
+            _join_block, batch_format="pyarrow", batch_size=_gpu_batch_size(ray_opts),
+            **(ray_opts or {})
         )
         empty_sql = join_sql(
             left_arrow_schema.names if left_arrow_schema is not None else [], right_columns, "_l", "_r",
@@ -2101,6 +4902,11 @@ class RayRunner:
         per-partition results equals the single-node DuckDB result BYTE-FOR-BYTE — it IS DuckDB, running
         the same SQL the single-node engine runs, with DuckDB's exact schema. This one mechanism backs
         aggregate/window (and extends to join/dedup) — no operator is reimplemented on Ray."""
+        if _gpu_batch_size(ray_opts) is not None:
+            raise RuntimeError(
+                "GPU placement cannot execute a whole hash partition without breaking batch bounds"
+            )
+
         def _run(tbl):                                          # runs on a WORKER, one complete-groups partition
             con = _secure_duckdb_connection()
             try:
@@ -2186,13 +4992,20 @@ class RayRunner:
     def _commit(self, step, datasets, target_uri: str, *,
                 attempt_id: str | None = None,
                 ray_opts: dict | None = None,
-                attempt_uri: str | None = None) -> tuple[int, str, str]:
+                attempt_uri: str | None = None,
+                writer: str | None = None) -> tuple[int, str, str]:
         cfg = step.config
         spec = SinkSpec.from_config(cfg, cfg.get("title"))
         ds = datasets[step.inputs[0][0]]
-        adapter = self.resolve_adapter(target_uri)
         attempt_id = attempt_id or f"driver_{uuid.uuid4().hex}"
-        if _worker_direct_parquet_sink(spec, target_uri, adapter):
+        if writer is not None and writer not in ("worker-direct-parquet", "adapter-compat"):
+            raise RuntimeError(f"unsupported frozen Ray sink writer {writer!r}")
+        adapter = None if writer == "worker-direct-parquet" else self.resolve_adapter(target_uri)
+        worker_direct = (
+            writer == "worker-direct-parquet" if writer is not None
+            else _worker_direct_parquet_sink(spec, target_uri, adapter)
+        )
+        if worker_direct:
             actual_uri = attempt_uri or _attempt_handoff_uri(target_uri, attempt_id, scope=step.id)
             from hub.plugins.adapters import is_object_uri
             if is_object_uri(target_uri) and attempt_uri is None:

@@ -176,10 +176,12 @@ boundary and private vulnerability-reporting path.
 ### Docker reference setup
 
 The Compose file is an authenticated, Postgres-backed reference setup. It deliberately separates the
-release migration from application startup:
+release migration from application startup. Export every required secret first — Compose fails closed
+if `DP_AUTH_SECRET` or `DP_POSTGRES_PASSWORD` is unset:
 
 ```bash
 export DP_AUTH_SECRET="$(openssl rand -hex 32)"
+export DP_POSTGRES_PASSWORD="$(openssl rand -hex 32)"
 export DP_AUTH_PASSWORD="choose-an-initial-password"
 
 docker compose build
@@ -189,10 +191,11 @@ unset DP_AUTH_PASSWORD
 docker compose up -d kernel
 ```
 
-Sign in as `local` with the bootstrap password. Keep `DP_AUTH_SECRET` stable. Before a later migration,
-stop every process that writes the metadata database. The [Kubernetes reference](deploy/README.md)
-documents that release contract, the PodSpawner validation path, and what must be adapted for a real
-deployment. An HTTPS deployment must terminate TLS and set `DP_AUTH_SECURE_COOKIE=1`.
+Sign in as `local` with the bootstrap password. Keep `DP_AUTH_SECRET` and `DP_POSTGRES_PASSWORD`
+stable across restarts. Before a later migration, stop every process that writes the metadata
+database. The [Kubernetes reference](deploy/README.md) documents that release contract, the
+PodSpawner validation path, and what must be adapted for a real deployment. An HTTPS deployment must
+terminate TLS and set `DP_AUTH_SECURE_COOKIE=1`.
 
 ## Documentation
 
