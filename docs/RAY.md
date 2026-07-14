@@ -9,6 +9,10 @@ The Compose and KubeRay files in this repository are validation harnesses, not d
 green differential does not certify an operator's IAM, capacity, KubeRay configuration, or incident
 procedures. The final section separates backend guarantees from deployment responsibilities.
 
+For whole-graph execution, the optional [Ray Jobs lifecycle](RAY_JOBS.md) now persists an attempt and
+submission binding, reattaches after hub restart, persists cancel intent, and atomically publishes
+terminal SQL state/history. It does not make the in-memory multi-region parent orchestration durable.
+
 ## Current execution contract
 
 Install the Ray extra, load [`examples/plugins/dp_ray`](../examples/plugins/dp_ray/), and select
@@ -21,6 +25,14 @@ capacity with `DP_RAY_NUM_CPUS`, `DP_RAY_MEM`, `DP_RAY_GPUS`, `DP_RAY_GPU_TYPE`,
 as `DP_RAY_LABELS=pool=a100,zone=use1`. Each non-engine label value must also exist as a Ray custom
 resource on the matching node (for example `--resources='{"a100": 1}'`). An explicit Ray placement that
 does not match this advertised capacity fails before dispatch instead of becoming an unschedulable task.
+`gpuType` is a hard placement pin: it is canonicalized to Ray's exact `accelerator_type` resource, not
+reduced to a generic `num_gpus` request. One execution region cannot combine different GPU types.
+
+GPU clean transforms and broadcast joins use a finite row batch. `DP_RAY_GPU_BATCH_ROWS` defaults to
+`4096`; it must be positive and is capped at `65536`. The parsed value is frozen into a durable Jobs
+attempt, including the default. GPU-pinned aggregate, window, and dedup fail before dispatch because their
+correctness requires one complete hash partition (`batch_size=None`); splitting it to satisfy GPU batching
+would change results. GPU/custom-pinned sort remains unsupported by Ray 2.56's public API.
 
 The backend conservatively falls back to the local DuckDB runner when it cannot prove that a graph is
 safe to distribute.
@@ -28,10 +40,10 @@ safe to distribute.
 | operation | distributed today | important boundary |
 |---|---|---|
 | `map`, `filter`, `flat_map`, `map_batches` | yes | uses the same compiled transform operator as the local engine |
-| grouped `aggregate` | yes, for bare-column group keys | global, expression-key, and order-sensitive aggregates fall back |
-| `window` | yes, for a bare-column partition key | order-sensitive forms without sufficient ordering fall back |
-| full-row `dedup` | yes | keyed dedup and schemas containing floating-point values fall back |
-| `join` | broadcast `inner`, `left`, and `cross` | the materialized right side must fit the configured driver fallback limit |
+| grouped `aggregate` | yes, for bare-column group keys | global, expression-key, order-sensitive, and GPU-pinned aggregates fail/fall back as appropriate |
+| `window` | yes, for a bare-column partition key | order-sensitive forms without a sufficient order fall back; GPU pins fail loud |
+| full-row `dedup` | yes | keyed dedup and floating-point schemas fall back to the local engine; GPU pins fail loud |
+| `join` | broadcast `inner`, `left`, and `cross` | the materialized right side must fit the driver fallback limit; GPU maps use finite batches |
 | `sort` | plain-column keys | the final ordered result is coalesced to one worker; Ray 2.56 cannot resource-pin its range shuffle, so GPU/custom-resource sorts fail before dispatch |
 | SQL, sections, metrics/charts, opaque plugin nodes | no | local fallback |
 
@@ -125,7 +137,9 @@ dispatch until distributed schema enforcement is implemented.
 ## What the validation gate proves
 
 The automated Compose gate starts a Ray head, two worker containers, a separate driver node, and MinIO.
-It requires:
+Before that CPU-only topology starts, a logical-resource Ray check (no NVIDIA runtime) proves typed
+accelerator affinity, a wrong-GPU task remaining pending, finite GPU `map_batches`, and Ray 2.56's typed
+read/write remote options. The distributed gate then requires:
 
 1. a real hash-shuffle to span at least two Ray node IDs;
 2. native MinIO Parquet reads feeding distributed GROUP BY and broadcast join results to match DuckDB in
@@ -174,13 +188,13 @@ identity underneath the persistent workers.
 | object-store Parquet scale-out reads | implemented | operate with least-privilege credentials and validate representative production datasets |
 | bounded adapter compatibility | implemented | tune or disable the limit from measured workload/driver memory; native connectors are preferable |
 | whole-graph Parquet overwrite data path | implemented | use shared object storage for remote clusters and tune the built-in deletion grace to the workload |
-| durable job lifecycle | missing | persisted Ray submission/attempt ID, restart reconciliation, acknowledged cancel, timeout, and fencing |
+| durable job lifecycle | partial | whole-graph Jobs has persisted attempt/submission/control routing, restart reconciliation, durable acknowledged cancel, exact artifact fencing, and atomic terminal SQL publication; the multi-region parent and active-failure staging remain open |
 | atomic region publication | implemented | distributed and local-fallback handoffs use immutable per-attempt prefixes; the controller validates the success manifest before cache publication |
-| workload isolation | partial | environment/control-plane separation exists; replace broad data credentials with attempt-scoped identity and enforce cluster policy |
-| cluster health and placement truth | missing | live resource/health discovery, backpressure, and fail-loud behavior for an explicit Ray pin |
+| workload isolation | partial | one-shot drivers use an explicit allowlist and private metadata DB; scoped per-attempt storage identity and enforced cluster/IAM policy remain open |
+| cluster health and placement truth | partial | target-cone requirements, static advertised-capacity admission, GPU/custom task options, and fail-loud unsupported shapes are implemented; live discovery/backpressure remain open |
 | runtime compatibility | partial | one supported Ray range and a driver/worker/core/plugin version handshake |
 | resilience | partial | active-job worker/head/driver failure tests, retry policy, and orphan cleanup |
-| observability | partial | durable job IDs, queue/retry/spill/storage metrics, retained structured logs, traces, and alerts |
+| observability | partial | durable job IDs, control-observation liveness, shared status, and visible recovery-blocked diagnoses exist; queue/retry/spill/storage metrics, authenticated log integration, traces, and alerts remain open |
 | deployment security and HA | operator-owned | immutable images, secrets/IAM, TLS/network policy, pod security, quotas, autoscaling, and HA storage |
 
 ## What remains before production ownership
@@ -188,17 +202,20 @@ identity underneath the persistent workers.
 The correctness fences above are implemented and tested, but they are not by themselves a production
 certification. The backend still needs the following before it should own production workloads:
 
-1. Replace local subprocess ownership with a durable Ray job lifecycle that survives kernel/hub restarts
-   and supports idempotent submission, cancellation, timeout, retry, and attempt fencing.
+1. Make the multi-region parent orchestration durable, then exercise head/worker/driver loss during an
+   active Jobs run with bounded retry and recovery assertions.
 2. Replace broad data-plane credentials with attempt/dataset-scoped identities and enforce per-run
    namespace, network, pod-security, and quota boundaries on the target cluster.
 3. Discover live cluster capacity and health, enforce admission/backpressure, and reject an explicit Ray
    placement when its requirements cannot be honored.
-4. Pin and verify the supported Ray/runtime image contract across the submitting process and every worker.
+4. Pin and verify the supported Ray/runtime image contract across the submitting process and every worker,
+   including upgrade and rollback behavior.
 5. Add alerts for failed manifests, object-store GC errors, spill pressure, queue delay, retries, and
    resource saturation; keep provider lifecycle rules for versioned objects and incomplete uploads.
 6. Pass staging gates on the intended production topology: active-job failure injection, representative
-   large workloads, SLOs/alerts, upgrade/rollback, and recovery runbooks.
+   large workloads, SLOs/alerts, upgrade/rollback, IAM validation, and recovery runbooks.
+7. Shard durable supervision or add ownership/backoff before large hub fleets: every current hub polls
+   every active Jobs row, so request volume grows with hubs × active jobs.
 
 Object storage holds immutable shards plus `_dp_commits/<attempt>/` manifests. Ownership and lifecycle state
 live in the shared metadata database's indexed attempt, lease, ref, and exact-member inventory tables. The

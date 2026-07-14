@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import tomllib
@@ -15,6 +16,14 @@ from hub import ray_compat
 
 
 _ROOT = Path(__file__).resolve().parents[3]
+
+
+def _load_ray_driver():
+    path = _ROOT / "examples/plugins/dp_ray/_driver.py"
+    spec = importlib.util.spec_from_file_location("dp_ray_driver_contract_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class _Probe:
@@ -111,6 +120,36 @@ def test_ray_dependency_image_and_kuberay_manifest_share_one_version_contract():
     assert "pip install --no-cache-dir uv==" in dockerfile
     manifest = (_ROOT / "deploy/kuberay/raycluster.yaml").read_text()
     assert f'rayVersion: "{ray_compat.SUPPORTED_RAY_VERSION}"' in manifest
+
+
+def test_ray_validation_runs_the_logical_gpu_contract_without_mutating_cpu_clusters():
+    workflow = (_ROOT / ".github/workflows/ray-validation.yml").read_text()
+    assert "python -m hub.ray_gpu_contract_check" in workflow
+    assert "--gpus" not in workflow
+    assert "NVIDIA_VISIBLE_DEVICES" not in workflow
+
+
+def test_ray_driver_preserves_popen_sink_attempt_binding():
+    driver = _load_ray_driver()
+    calls = []
+
+    class Runner:
+        def _run_ir_sync(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return {"status": "done"}
+
+    sink_attempts = {"write": "s3://bucket/output.attempt-run"}
+    result = driver._run_job(
+        Runner(), "ir", "graph", "write", {"num_cpus": 1}, lambda *_args: None,
+        {
+            "attempt_id": "run",
+            "sink_targets": {"write": "s3://bucket/output.parquet"},
+            "sink_attempts": sink_attempts,
+        },
+    )
+
+    assert result == {"status": "done"}
+    assert calls[0][1] == {"sink_attempts": sink_attempts, "sink_contracts": None}
 
 
 def _assert_restricted_pod(pod: dict, container_name: str) -> None:
