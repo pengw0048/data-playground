@@ -4199,6 +4199,7 @@ class RayRunner:
                     last_visible = visible
                 time.sleep(self._jobs_poll_s)
 
+            result = None
             if terminal_result is not None:
                 result = terminal_result
             elif state == "STOPPED":
@@ -4210,13 +4211,19 @@ class RayRunner:
             else:
                 try:
                     result = self._read_job_result(job)
-                except (ArtifactContractError, TerminalResultMissing) as e:
-                    # Ray is authoritatively terminal here. Readable corruption/missing terminal evidence
-                    # becomes a failed run; transport/auth errors propagate and remain reattachable.
+                except ArtifactContractError as e:
+                    # Result corruption must win the same durable quarantine fence whether it is
+                    # observed immediately before or after Ray reports a terminal state. A transient
+                    # control failure leaves result unset so the normal supervisor tail reschedules.
+                    self._quarantine_invalid_job(status, ref, e)
+                except TerminalResultMissing as e:
+                    # Ray is authoritatively terminal here. Missing terminal evidence becomes a failed
+                    # run; transport/auth errors propagate and remain reattachable.
                     result = {"status": "failed",
                               "error": f"{type(e).__name__}: result artifact rejected",
                               "rows": 0, "outputs": []}
-            self._publish_job_result(job, graph, target, status, result)
+            if result is not None:
+                self._publish_job_result(job, graph, target, status, result)
         except PublicationEffectsWon as publication_winner:
             try:
                 if not self._resume_publication_winner(status, ref):
@@ -4245,9 +4252,11 @@ class RayRunner:
             with self._lock:
                 self._supervising.discard(run_id)
             self._prune_terminal_runs()
-        if status.status in ("queued", "running"):
-            time.sleep(self._jobs_poll_s)
-            self._ensure_jobs_supervisor(run_id)
+            # Every non-terminal exit, including an early return after a transient quarantine/control
+            # failure, must retain an autonomous supervisor. API status polling is not a liveness owner.
+            if status.status in ("queued", "running"):
+                time.sleep(self._jobs_poll_s)
+                self._ensure_jobs_supervisor(run_id)
 
     def _supervise(self, run_id, graph, target, status, materialize_uri=None, requires=None,
                    sink_targets=None, sink_attempts=None) -> None:

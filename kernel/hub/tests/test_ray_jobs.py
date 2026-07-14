@@ -3237,6 +3237,77 @@ def test_early_result_never_beats_running_and_corruption_waits_for_stopped(jobs_
     assert final.error == "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
 
 
+def test_terminal_remote_result_corruption_uses_durable_quarantine(jobs_config):
+    module, deps, original, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    original._ensure_jobs_supervisor = lambda _run_id: None
+    status = original.run(
+        plan, graph, "write", "distributed",
+        run_id=f"run_jobs_terminal_corrupt_result_{uuid.uuid4().hex}",
+    )
+    ref = status.backend_ref
+    assert ref is not None
+    job = _materialize_bound_job(original, status)
+    physical_uri = job["sink_contracts"]["write"]["physical_uri"]
+    _write_success(store, status)
+    corrupt = store.read(ref.result_uri)
+    corrupt["unexpected"] = "field"
+    store.write(ref.result_uri, corrupt)
+    client.put(ref.submission_id, "SUCCEEDED", metadata=_workload_metadata(status))
+
+    original_get_status = client.get_job_status
+    original_list_jobs = client.list_jobs
+    get_status_calls = 0
+    list_failures = 0
+    status_outage_injected = False
+    fail_next_list = False
+
+    def transient_get_status(submission_id: str):
+        nonlocal get_status_calls, status_outage_injected, fail_next_list
+        get_status_calls += 1
+        binding = metadb.backend_job(status.run_id)
+        if binding["quarantine_reason"] is not None and not status_outage_injected:
+            status_outage_injected = True
+            fail_next_list = True
+            raise ConnectionError("transient status outage during quarantine")
+        return original_get_status(submission_id)
+
+    def transient_list_jobs():
+        nonlocal list_failures, fail_next_list
+        if fail_next_list:
+            fail_next_list = False
+            list_failures += 1
+            raise ConnectionError("transient list outage during quarantine")
+        return original_list_jobs()
+
+    client.get_job_status = transient_get_status
+    client.list_jobs = transient_list_jobs
+
+    recovered = module.RayRunner(
+        deps, jobs_client_factory=client, artifact_store=store, recover=True
+    )
+    # Poll SQL directly: calling runner.status() would itself restart a missing supervisor and hide a
+    # liveness regression in the supervisor's normal retry tail.
+    deadline = time.monotonic() + 2
+    while metadb.backend_job(status.run_id)["publication_state"] != "published" \
+            and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert metadb.backend_job(status.run_id)["publication_state"] == "published"
+    final = recovered.status(status.run_id)
+
+    assert final.status == "failed"
+    assert final.error == "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
+    binding = metadb.backend_job(status.run_id)
+    assert binding["publication_state"] == "published"
+    assert "artifact_contract_invalid" in binding["quarantine_reason"]
+    assert status_outage_injected and get_status_calls >= 3 and list_failures == 1
+    assert client.submit_calls == [] and client.stop_calls == []
+    with metadb.session() as session:
+        assert session.get(metadb.CatalogEntry, physical_uri) is None
+        assert session.get(metadb.ObjectAttempt, physical_uri).state == "abandoned"
+
+
 def test_trusted_result_wins_cancel_without_local_jobs_config_or_ray_metadata(jobs_config, monkeypatch):
     module, deps, original, client, store = _runner(jobs_config)
     graph = _graph()
