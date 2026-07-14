@@ -123,6 +123,68 @@ class RequestBodyLimitMiddleware:
             await self._response(limit)(scope, receive, send)
 
 
+class RequestIdMiddleware:
+    """Mint/echo ``X-Request-Id``, bind it for the request, and emit bounded HTTP metrics (OPS-01)."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        from hub.observability import (
+            MetricName, MetricUnit, emit_metric, normalize_request_id,
+            reset_request_id, route_class, set_request_id,
+        )
+
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        raw = next(
+            (value.decode("latin1") for name, value in scope.get("headers", ())
+             if name.lower() == b"x-request-id"),
+            None,
+        )
+        request_id = normalize_request_id(raw)
+        state = scope.setdefault("state", {})
+        if isinstance(state, dict):
+            state["request_id"] = request_id
+        token = set_request_id(request_id)
+        started = time.perf_counter()
+        status_code = 0
+
+        async def send_with_id(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message.get("status") or 0)
+                headers = list(message.get("headers") or [])
+                headers = [(n, v) for n, v in headers if n.lower() != b"x-request-id"]
+                headers.append((b"x-request-id", request_id.encode("latin1")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        try:
+            if scope["type"] == "websocket":
+                await self.app(scope, receive, send)
+            else:
+                await self.app(scope, receive, send_with_id)
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                path = scope.get("path") or ""
+                method = (scope.get("method") or "GET").upper()
+                outcome = "success" if 200 <= status_code < 400 else (
+                    "denied" if status_code in (401, 403) else "failure")
+                labels = {
+                    "method": method if method in (
+                        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS") else "OTHER",
+                    "route_class": route_class(path),
+                    "outcome": outcome,
+                }
+                emit_metric(MetricName.HTTP_REQUESTS, 1.0, labels=labels, request_id=request_id)
+                emit_metric(MetricName.HTTP_DURATION_MS, elapsed_ms, unit=MetricUnit.MILLISECONDS,
+                            labels=labels, request_id=request_id)
+        finally:
+            reset_request_id(token)
+
+
 _reaper_lifecycle_lock = threading.Lock()
 _reaper_lifespan_users = 0
 _object_attempt_reaper_stop: threading.Event | None = None
@@ -216,6 +278,9 @@ app.add_middleware(
 # An endpoint that ignores its body does not drain it into application memory. Dataset uploads remain
 # exempt because /catalog/upload streams and independently enforces DP_MAX_UPLOAD_BYTES as bytes arrive.
 app.add_middleware(RequestBodyLimitMiddleware)
+# OPS-01: every HTTP response echoes X-Request-Id; the id is available via contextvar for run/audit
+# correlation. Installed after body-limit so it is the outer middleware (runs first / finishes last).
+app.add_middleware(RequestIdMiddleware)
 # EVERY /api route requires a resolved user (open mode → local; auth mode → a valid session). Only the
 # workspace PUBLIC router (auth status/login/logout + the login roster) is reachable pre-login. This
 # keeps auth the SECURE DEFAULT — a route is gated unless it is explicitly put on the public router —
@@ -516,6 +581,8 @@ def mcp_http_delete():
 @app.get("/api/health")     # back-compat alias for /api/livez
 @app.get("/api/livez")
 def livez() -> dict:
+    from hub.observability import MetricName, emit_metric
+    emit_metric(MetricName.KERNEL_HEALTH, 1.0, labels={"probe": "livez", "ready": "true"})
     return {"ok": True}     # the process is up and serving — a pure liveness signal (no dep checks)
 
 
@@ -527,6 +594,7 @@ def readyz():
     from fastapi.responses import JSONResponse
 
     from hub import db, metadb
+    from hub.observability import MetricName, emit_metric
     db_ok = metadb.ping()
     checks = {
         "db": db_ok,
@@ -535,6 +603,8 @@ def readyz():
         "engine": db.responsive(3.0),
     }
     ready = all(checks.values())
+    emit_metric(MetricName.KERNEL_HEALTH, 1.0 if ready else 0.0,
+                labels={"probe": "readyz", "ready": "true" if ready else "false"})
     return JSONResponse({"ready": ready, "checks": checks}, status_code=200 if ready else 503)
 
 

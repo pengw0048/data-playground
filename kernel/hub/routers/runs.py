@@ -390,19 +390,34 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and not confirmed:
         raise RunNeedsConfirm(est)
+    from hub.observability import (
+        AuditAction, AuditOutcome, emit_audit, get_request_id, invoke_backend_run,
+    )
+    request_id = get_request_id()
     # a run that splits across placement regions (a placed node / checkpoint / fan-out) is owned by the
     # RunController; a single default region returns None → the base runner, exactly as before. Hand it the
     # schema+actual-aware `sizes` we just computed so cost-based placement routes on the SAME measured
     # widths the gate saw — not a second, coarse re-estimate.
-    overall = deps.controller.run(graph, target_node_id, uid, sizes=sizes)
+    overall = deps.controller.run(graph, target_node_id, uid, sizes=sizes, request_id=request_id)
     if overall is not None:
         status, owner = overall, deps.controller
     else:
-        status, owner = runner.run(plan, graph, target_node_id, est.placement), runner
+        status = invoke_backend_run(
+            runner, plan, graph, target_node_id, est.placement, request_id=request_id)
+        owner = runner
+    if request_id and not status.request_id:
+        status.request_id = request_id
     deps.run_index[status.run_id] = owner  # so status/cancel/ws reach the right owner
     deps.run_owner[status.run_id] = uid  # fast in-process creator lookup; auth-mode runs are canvas-bound
     if auth.auth_enabled():  # persist the owner so authz survives restart / other stateless instances
-        metadb.bind_run_owner(status.run_id, uid, auth_canvas)
+        metadb.bind_run_owner(status.run_id, uid, auth_canvas, request_id=request_id)
+    elif request_id:
+        # Open mode has no durable owner bind; still stamp request_id for OPS-01 correlation.
+        metadb.bind_run_request_id(status.run_id, request_id, canvas_id=auth_canvas or getattr(graph, "id", None))
+    emit_audit(AuditAction.JOB_SUBMIT, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="run", resource_id=status.run_id, run_id=status.run_id,
+               request_id=request_id,
+               attrs={"placement": str(status.placement or "local")[:32]})
     # bound both (insertion-ordered) so they can't grow for the process lifetime — the runners
     # themselves only retain the last _MAX_RUNS, and _status_or_lost already tolerates a missing id.
     while len(deps.run_index) > _RUN_INDEX_MAX:
@@ -520,19 +535,28 @@ def run_status(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
 
 @router.post("/run/{run_id}/cancel", response_model=RunStatus)
 def run_cancel(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
+    from hub.observability import AuditAction, AuditOutcome, emit_audit, get_request_id
     _require_run_mutate_access(run_id, uid)  # only owner/editor may disrupt a shared canvas run
     deps = get_deps()
     owner = deps.run_index.get(run_id)
     if owner is not None:
-        return owner.cancel(run_id)  # this instance ran it → cancel in-process
-    # not owned here (the hub restarted, or another stateless instance accepted the run) — route via the
-    # DB-backed kernel backend, which resolves the owning kernel from run_states and cancels it (or
-    # returns the last-known persisted status). Mirrors _status_or_lost so cancel never 404s a live run.
-    kb = deps.kernel_backend()
-    if kb is not None:
-        return kb.cancel(run_id)
-    from hub import metadb
-    persisted = metadb.get_run_state(run_id)
-    if persisted is not None:
-        return RunStatus(**persisted)
-    raise HTTPException(404, f"run '{run_id}' not found")
+        status = owner.cancel(run_id)  # this instance ran it → cancel in-process
+    else:
+        # not owned here (the hub restarted, or another stateless instance accepted the run) — route via the
+        # DB-backed kernel backend, which resolves the owning kernel from run_states and cancels it (or
+        # returns the last-known persisted status). Mirrors _status_or_lost so cancel never 404s a live run.
+        kb = deps.kernel_backend()
+        if kb is not None:
+            status = kb.cancel(run_id)
+        else:
+            from hub import metadb
+            persisted = metadb.get_run_state(run_id)
+            if persisted is not None:
+                status = RunStatus(**persisted)
+            else:
+                raise HTTPException(404, f"run '{run_id}' not found")
+    emit_audit(AuditAction.JOB_CANCEL, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="run", resource_id=run_id, run_id=run_id,
+               request_id=get_request_id(),
+               attrs={"status": str(getattr(status, "status", "unknown"))[:32]})
+    return status

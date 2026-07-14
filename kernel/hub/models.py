@@ -325,6 +325,9 @@ class RunStatus(Wire):
     error: str | None = None
     output_uri: str | None = None
     output_table: str | None = None
+    # HTTP/WebSocket request id that started this run (OPS-01). Optional so legacy/plugin backends
+    # that omit it still deserialize; durable copy also lives on run_states / run_records.
+    request_id: str | None = None
 
 
 class PlanStep(Wire):

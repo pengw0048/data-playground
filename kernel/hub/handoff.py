@@ -528,7 +528,25 @@ def prepare_attempt_commit(uri: str) -> None:
         metadb.record_object_attempt_commit(uri, inventory)
     except Exception as exc:
         metadb.quarantine_object_attempt(uri, "committed inventory conflicted with lifecycle state")
+        _emit_publication_metric(outcome="failure", error_class="storage", attempt_uri=uri)
         raise RuntimeError("managed object attempt commit conflicted with lifecycle state") from exc
+    _emit_publication_metric(outcome="success", error_class="none", attempt_uri=uri)
+
+
+def _emit_publication_metric(*, outcome: str, error_class: str, attempt_uri: str | None = None) -> None:
+    """OPS-01 publication boundary metric — never raises into the publication path.
+
+    ``attempt_uri`` is accepted for future correlation but is never used as a metric label (URIs are
+    unbounded cardinality). Attempt identity rides on ``MetricEvent.attempt_id`` only when a caller
+    already has the short id.
+    """
+    try:
+        from hub.observability import MetricName, emit_metric
+        _ = attempt_uri
+        emit_metric(MetricName.PUBLICATION, 1.0,
+                    labels={"kind": "publication", "outcome": outcome, "error_class": error_class})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class ManagedReadLeaseGuard:
@@ -723,6 +741,25 @@ def reap_attempts(*, retention_seconds: float | None = None,
                 metadb.fail_object_attempt_delete(item, "exact provider deletion failed")
             logging.getLogger("hub").warning(
                 "object attempt GC failed (continuing)", exc_info=True)
+            try:
+                from hub.observability import MetricName, emit_metric
+                emit_metric(MetricName.STORAGE_GC, 1.0,
+                            labels={"kind": "gc", "outcome": "failure", "error_class": "storage"})
+                emit_metric(MetricName.PROVIDER_ERRORS, 1.0,
+                            labels={"kind": "gc", "error_class": "storage"})
+            except Exception:  # noqa: BLE001 — observability must never block GC
+                pass
+    try:
+        from hub.observability import MetricName, emit_metric
+        for outcome, key in (("success", "deleted"), ("success", "observed"),
+                             ("failure", "quarantined")):
+            count = len(result.get(key, []))
+            if count:
+                emit_metric(MetricName.STORAGE_GC, float(count),
+                            labels={"kind": "gc", "outcome": outcome,
+                                    "error_class": "storage" if outcome == "failure" else "none"})
+    except Exception:  # noqa: BLE001
+        pass
     return result
 
 

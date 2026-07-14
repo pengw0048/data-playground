@@ -78,7 +78,13 @@ class ExecutionBackend(Protocol):
         ...
 
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None, placement: Placement) -> RunStatus:
-        """Start a run; return its initial status (poll via status(run_id))."""
+        """Start a run; return its initial status (poll via status(run_id)).
+
+        Optional keyword-only extensions (feature-detected by ``hub.observability.invoke_backend_run``):
+        ``run_id``, ``request_id``, ``attempt_id`` — correlate the hub-minted run with the HTTP/
+        WebSocket request and (when applicable) a managed object attempt. Built-in runners accept them;
+        plugins may omit them until they opt in.
+        """
         ...
 
     def status(self, run_id: str) -> RunStatus: ...
