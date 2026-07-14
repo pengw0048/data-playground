@@ -6319,16 +6319,29 @@ def catalog_folders_list() -> list[dict]:
                 for r in s.scalars(select(CatalogFolder).order_by(CatalogFolder.path))]
 
 
+class FolderExistsError(ValueError):
+    """The folder already exists, or a concurrent create won the race — the route maps this to 409."""
+
+
 def catalog_folder_create(path: str) -> str:
-    """Create an empty folder (+ its ancestor entity rows). Errors if the folder already exists (as an
-    entity or via any entry). Returns the normalized path."""
+    """Create an empty folder (+ its ancestor entity rows). Raises FolderExistsError if the folder
+    already exists (as an entity or via any entry) OR a concurrent create wins the race, so the loser
+    gets a stable conflict rather than a false success. Returns the normalized path."""
+    from sqlalchemy.exc import IntegrityError
     path = _normalize_folder_path(path)
     if not path:
         raise ValueError("folder path cannot be empty")
     with session() as s:
         if _folder_exists(s, path):
-            raise ValueError(f"folder '{path}' already exists")
-        _ensure_folder_rows(s, _folder_ancestors(path))
+            raise FolderExistsError(f"folder '{path}' already exists")
+        _ensure_folder_rows(s, _folder_ancestors(path)[:-1])  # parents tolerantly
+        sp = s.begin_nested()
+        try:
+            s.add(CatalogFolder(path=path))  # the target itself: a race here is a real conflict
+            s.flush()
+        except IntegrityError:
+            sp.rollback()
+            raise FolderExistsError(f"folder '{path}' already exists")
     return path
 
 
@@ -7167,7 +7180,10 @@ def _validate_cred_fields(kind: str, fields: dict | None) -> dict:
     if kind not in CRED_KINDS:
         raise ValueError(f"unknown credential kind {kind!r}; must be one of {list(CRED_KINDS)}")
     allowed = CRED_FIELD_ALLOWLIST[kind]
-    fields = {k: v for k, v in dict(fields or {}).items() if k in allowed}  # unknown keys never persist
+    fields = dict(fields or {})
+    extra = [k for k in fields if k not in allowed]
+    if extra:  # reject, not silently drop — a stray key is a client bug, and dropping hides it
+        raise ValueError(f"unknown credential field(s) {extra}; allowed for {kind}: {list(allowed)}")
     if kind == "object_store":
         return validate_secret_setting_value("objectStore", fields)
     ref = validate_secret_setting_value("agentApiKey", fields.get("apiKey"))
@@ -7216,33 +7232,46 @@ def cred_delete(cred_id: str) -> None:
             s.delete(c)
 
 
+class CredResolutionError(RuntimeError):
+    """An explicit (or configured-default) credential reference did not resolve to a cred of the right
+    kind. Resolution RAISES rather than silently falling back to ambient/legacy — using a different
+    identity for a configured reference is worse than a loud failure."""
+
+
 def cred_object_store_config(cred_id: str | None = None) -> dict:
-    """Unresolved object-store fields. An EXPLICIT (non-empty) ``cred_id`` fails CLOSED: a missing or
-    wrong-kind id returns {} (ambient env), never another named account. Only ``None`` falls back to
-    the default object-store cred (``defaultObjectStoreCredId``), then the legacy ``objectStore``."""
+    """Unresolved object-store fields. An EXPLICIT (non-empty) ``cred_id`` — or a configured
+    ``defaultObjectStoreCredId`` — that is missing/wrong-kind RAISES CredResolutionError (never silently
+    uses ambient or the legacy ``objectStore`` identity). Only when NO default is configured does it
+    fall back to the legacy setting (the pre-cred behaviour)."""
     if cred_id:
         c = cred_get(cred_id)
-        return dict(c["fields"]) if c and c.get("kind") == "object_store" else {}
+        if not c or c.get("kind") != "object_store":
+            raise CredResolutionError(f"object-store credential '{cred_id}' not found")
+        return dict(c["fields"])
     default_id = get_setting("defaultObjectStoreCredId", "global")
     if default_id:
         c = cred_get(default_id)
-        if c and c.get("kind") == "object_store":
-            return dict(c["fields"])
+        if not c or c.get("kind") != "object_store":
+            raise CredResolutionError(f"default object-store credential '{default_id}' is missing or not an object store")
+        return dict(c["fields"])
     return dict(get_setting("objectStore", "global", default={}) or {})
 
 
 def cred_agent_api_key_ref(cred_id: str | None = None) -> str:
-    """The agent apiKey reference. An EXPLICIT (non-empty) ``cred_id`` fails CLOSED (missing/wrong-kind
-    → ""); only ``None`` falls back to the ``agentCredId`` setting, then legacy ``agentApiKey``. Returns
-    a reference string, never a resolved value."""
+    """The agent apiKey reference. An EXPLICIT (non-empty) ``cred_id`` — or a configured ``agentCredId``
+    — that is missing/wrong-kind RAISES CredResolutionError; only when neither is set does it fall back
+    to the legacy ``agentApiKey``. Returns a reference string, never a resolved value."""
     if cred_id:
         c = cred_get(cred_id)
-        return str(c["fields"].get("apiKey") or "") if c and c.get("kind") == "agent" else ""
-    resolved = get_setting("agentCredId", "global")
-    if resolved:
-        c = cred_get(resolved)
-        if c and c.get("kind") == "agent":
-            return str(c["fields"].get("apiKey") or "")
+        if not c or c.get("kind") != "agent":
+            raise CredResolutionError(f"agent credential '{cred_id}' not found")
+        return str(c["fields"].get("apiKey") or "")
+    default_id = get_setting("agentCredId", "global")
+    if default_id:
+        c = cred_get(default_id)
+        if not c or c.get("kind") != "agent":
+            raise CredResolutionError(f"default agent credential '{default_id}' is missing or not an agent cred")
+        return str(c["fields"].get("apiKey") or "")
     return get_setting("agentApiKey", "global") or ""
 
 

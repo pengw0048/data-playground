@@ -212,34 +212,32 @@ def test_destination_cred_reaches_ensure_object_store_on_write(monkeypatch, tmp_
     assert runner._run_object_store_cfg(plan, {"write": node}) == DEST_CFG
 
 
-def test_unknown_cred_field_never_persists_or_round_trips():
-    # #161 review P0: an unknown field must be dropped (not validated-but-kept), so a raw secret can't
-    # ride in an unredacted key and be GET-returned.
-    try:
-        cid = client.post("/api/creds", json={
-            "name": "leaky", "kind": "object_store",
-            "fields": {"accessKeyId": "env:AK", "password": "raw-secret", "token": "also-raw"},
-        }).json()["id"]
-        listed = next(c for c in client.get("/api/creds").json() if c["id"] == cid)
-        assert "password" not in listed["fields"] and "token" not in listed["fields"]
-        stored = metadb.cred_get(cid)["fields"]  # unredacted — prove it never persisted
-        assert "password" not in stored and "token" not in stored
-    finally:
-        _delete_all_creds()
+def test_unknown_cred_field_is_rejected():
+    # #161 re-review: an unknown field is REJECTED (400), not silently dropped — a stray key is a bug,
+    # and dropping would hide it. No cred is created.
+    r = client.post("/api/creds", json={
+        "name": "leaky", "kind": "object_store",
+        "fields": {"accessKeyId": "env:AK", "password": "raw-secret"},
+    })
+    assert r.status_code == 400, r.text
+    assert "unknown credential field" in r.json()["detail"]
 
 
-def test_explicit_missing_or_wrong_kind_cred_fails_closed():
-    # #161 review P1: only None may use a default; a non-empty explicit id that is missing/wrong-kind
-    # must NOT silently resolve to the default account.
+def test_explicit_missing_or_wrong_kind_cred_raises():
+    # #161 re-review: only None may use a default; a non-empty explicit id (or a configured-but-broken
+    # default) that is missing/wrong-kind RAISES — never silently resolves to another identity.
+    import pytest
     try:
         cid = client.post("/api/creds", json={
             "name": "dflt", "kind": "object_store", "fields": {"accessKeyId": "env:AK"}}).json()["id"]
         metadb.set_setting("defaultObjectStoreCredId", cid, scope="global", scope_id="")
         assert metadb.cred_object_store_config(None).get("accessKeyId") == "env:AK"  # None → default
-        assert metadb.cred_object_store_config("no-such-cred") == {}                 # missing → closed
+        with pytest.raises(metadb.CredResolutionError):
+            metadb.cred_object_store_config("no-such-cred")                          # explicit missing → raise
         agent = client.post("/api/creds", json={
             "name": "ag", "kind": "agent", "fields": {"apiKey": "env:K"}}).json()["id"]
-        assert metadb.cred_object_store_config(agent) == {}                          # wrong-kind → closed
+        with pytest.raises(metadb.CredResolutionError):
+            metadb.cred_object_store_config(agent)                                   # wrong-kind → raise
     finally:
         metadb.set_setting("defaultObjectStoreCredId", "", scope="global", scope_id="")
         _delete_all_creds()

@@ -485,6 +485,23 @@ class InMemoryCatalog:
         self._embed_one(t)  # description/tags changed → refresh the semantic vector
         return t
 
+    # -- folder namespace mutation ---------------------------------------------------------------- #
+    # This provider's browse() reads the same metadb these write, so folder create/rename/delete are
+    # authoritative here. An external provider that owns its own namespace must override these (or set
+    # folders_mutable=False) — the routes call the provider, not metadb, so local state is never a
+    # silent side effect for a provider that doesn't support folder mutation.
+    def list_folders(self) -> list[dict]:
+        return metadb.catalog_folders_list()
+
+    def create_folder(self, path: str) -> str:
+        return metadb.catalog_folder_create(path)
+
+    def rename_folder(self, old: str, new: str) -> None:
+        metadb.catalog_folder_rename(old, new)
+
+    def delete_folder(self, path: str) -> None:
+        metadb.catalog_folder_delete(path)
+
     def resolve_ref(self, ref: str) -> str:
         """Resolve a source reference to a uri: a real path / scheme'd uri passes through; a bare
         catalog NAME or ID resolves to its uri (so an API/agent client can point a source at 'events')."""

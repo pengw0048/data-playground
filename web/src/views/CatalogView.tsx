@@ -513,14 +513,14 @@ function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revis
         </div>
       )}
       {root?.map((f) => <FolderBranch key={f.path} node={f} depth={0} selected={selected} onSelect={onSelect}
-        onRenamed={onRenamed} onDeleted={onDeleted} mutable={mutable} />)}
+        onRenamed={onRenamed} onDeleted={onDeleted} mutable={mutable} revision={revision} />)}
       {root?.length === 0 && !loading && !error && <div className="px-2 py-1 text-[11px] text-muted-foreground">No folders yet</div>}
     </div>
   )
 }
 
-function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, mutable }:
-  { node: FolderNode; depth: number; selected: string; onSelect: (f: string) => void; mutable: boolean }
+function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, mutable, revision }:
+  { node: FolderNode; depth: number; selected: string; onSelect: (f: string) => void; mutable: boolean; revision: number }
   & Pick<FolderActions, 'onRenamed' | 'onDeleted'>) {
   const pushToast = useStore((s) => s.pushToast)
   const [open, setOpen] = useState(false)
@@ -538,6 +538,14 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
     const next = !open; setOpen(next)
     if (next && kids === null && !loading) void loadKids()
   }
+  // a catalog change (create/rename/delete/register) can alter this branch's children — refetch its
+  // already-loaded kids so an open branch never shows a stale nested path
+  const firstRev = useRef(revision)
+  useEffect(() => {
+    if (revision === firstRev.current) return
+    firstRev.current = revision
+    if (open && kids !== null) void loadKids()
+  }, [revision])  // eslint-disable-line react-hooks/exhaustive-deps
   const rename = async () => {
     const next = window.prompt(`Rename folder “${node.path}” to:`, node.path)?.trim()
     if (!next || next === node.path) return
@@ -584,7 +592,7 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
         </div>
       )}
       {open && kids?.map((k) => <FolderBranch key={k.path} node={k} depth={depth + 1} selected={selected} onSelect={onSelect}
-        onRenamed={onRenamed} onDeleted={onDeleted} mutable={mutable} />)}
+        onRenamed={onRenamed} onDeleted={onDeleted} mutable={mutable} revision={revision} />)}
     </div>
   )
 }

@@ -21,7 +21,7 @@ function fmtUptime(s: number): string {
   return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`
 }
 
-type Category = 'offline' | 'cold' | 'stale' | 'warm'
+type Category = 'offline' | 'cold' | 'starting' | 'stale' | 'warm'
 
 // A truly-absent lease (cold, muted) is NOT the same as a transient failure (offline, red): a failed
 // poll keeps the last-known status and only flips the dot to offline — it never fabricates 'cold'.
@@ -29,13 +29,15 @@ function category(kernelUp: boolean, offline: boolean, status: CanvasKernelStatu
   if (!kernelUp || offline) return 'offline'
   if (!status || !status.exists) return 'cold'
   if (status.reachable === false || status.stale) return 'stale'  // a live lease we can't reach is NOT warm
+  if (status.state === 'starting') return 'starting'              // spawning — not yet ready/green
   return 'warm'
 }
 
 const DOT: Record<Category, string> = {
   offline: color.failed,   // red — hub/kernel unreachable
   cold: color.queued,      // muted — no live kernel (spawns on next run)
-  stale: color.stale,      // amber — lease heartbeat gone stale
+  starting: color.stale,   // amber — spawning, not ready yet
+  stale: color.stale,      // amber — lease heartbeat gone stale / unreachable
   warm: color.latest,      // green — live + healthy
 }
 
@@ -66,13 +68,13 @@ export function KernelBadge({ kernelUp, kernelInfo }: { kernelUp: boolean; kerne
   // switching canvases must never show the previous canvas's kernel: reset + invalidate any in-flight
   useEffect(() => { setStatus(null); setOffline(false); seq.current++ }, [canvasId])
 
-  // Refresh on canvas change and on run lifecycle (event-driven, so the always-visible badge stays
-  // truthful without a steady-state timer); poll every 3s only while the popover is OPEN. The kernel
-  // endpoint returns {exists:false} for a not-yet-persisted canvas, so this never logs a 404.
+  // Refresh on canvas change and run lifecycle (event-driven), and poll on a BOUNDED interval — fast
+  // (3s) while the popover is open, slow (30s) while closed so a kernel that dies/starts while closed
+  // is still detected without hammering. The endpoint returns {exists:false} for a not-yet-persisted
+  // canvas, so this never logs a 404.
   useEffect(() => {
     void refresh()
-    if (!open) return
-    const id = window.setInterval(() => void refresh(), 3_000)
+    const id = window.setInterval(() => void refresh(), open ? 3_000 : 30_000)
     return () => window.clearInterval(id)
   }, [refresh, runActive, open])
 
@@ -99,8 +101,9 @@ export function KernelBadge({ kernelUp, kernelInfo }: { kernelUp: boolean; kerne
     : (status?.memoryLimit ? `${status.memoryLimit} limit` : null)
   const stateText = cat === 'offline' ? 'offline'
     : cat === 'cold' ? 'cold (starts on next run)'
-      : cat === 'stale' ? (status?.reachable === false ? 'unreachable' : 'stale')
-        : (status?.state ?? 'ready')
+      : cat === 'starting' ? 'starting…'
+        : cat === 'stale' ? (status?.reachable === false ? 'unreachable' : 'stale')
+          : (status?.state ?? 'ready')
 
   return (
     <Popover open={open} onOpenChange={setOpen}>

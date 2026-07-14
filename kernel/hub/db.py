@@ -164,10 +164,17 @@ def _maybe_sandbox_fs(c: duckdb.DuckDBPyConnection) -> None:
             return
         from hub import metadb
         from hub.plugins.adapters import is_object_uri
-        # an object store may be configured EITHER via the DB setting OR the DP_STORAGE_URL env var
-        # (creds then from the AWS chain) — both need external access on, or httpfs/s3 fails closed (P0-STOR-01)
+        # an object store may be configured via the default cred / legacy DB setting, the DP_STORAGE_URL
+        # env var, OR a per-destination object-store credential — ALL need external access on, or
+        # httpfs/s3 fails closed (P0-STOR-01). A destination-only S3 install must not stay sandboxed.
         storage_url = (os.environ.get("DP_STORAGE_URL") or "").strip()
-        if metadb.cred_object_store_config(None) or is_object_uri(storage_url):
+        try:
+            has_default_object_store = bool(metadb.cred_object_store_config(None))
+        except metadb.CredResolutionError:
+            has_default_object_store = True  # configured-but-broken default still means an object store is intended
+        dests = metadb.get_setting("destinations", "global", default=[]) or []
+        has_object_store_dest = any(isinstance(d, dict) and d.get("backend") in ("s3", "gs") for d in dests)
+        if has_default_object_store or is_object_uri(storage_url) or has_object_store_dest:
             import logging
             logging.getLogger("hub").warning(
                 "FS sandbox DISABLED: an object store is configured, so DuckDB runs with external access "
