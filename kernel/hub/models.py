@@ -40,6 +40,24 @@ class Wire(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Credentials (first-class Cred entity — references only, never raw secret bytes)
+# --------------------------------------------------------------------------- #
+class Cred(Wire):
+    id: str
+    name: str
+    kind: str  # 'object_store' | 'agent'
+    fields: dict = {}
+    created_at: str | None = None
+
+
+class CredUpsert(Wire):
+    id: str | None = None
+    name: str
+    kind: str
+    fields: dict = {}
+
+
+# --------------------------------------------------------------------------- #
 # Schema / catalog
 # --------------------------------------------------------------------------- #
 class ColumnSchema(Wire):

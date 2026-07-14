@@ -255,6 +255,14 @@ export const api = {
   // loaded plugin packs (name/version/error + any declared [[config]] schema & current values)
   plugins: () => req<PluginInfo[]>('/plugins'),
 
+  // credentials (first-class Cred entity — refs only; admin-only)
+  listCreds: () => req<Cred[]>('/creds'),
+  createCred: (body: { name: string; kind: CredKind; fields: Record<string, string> }) =>
+    req<Cred>('/creds', { method: 'POST', body: JSON.stringify(body) }),
+  updateCred: (id: string, body: { name: string; kind: CredKind; fields: Record<string, string> }) =>
+    req<Cred>(`/creds/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  deleteCred: (id: string) => req<{ ok: boolean }>(`/creds/${id}`, { method: 'DELETE' }),
+
   // destinations (save/open "places" — local + pluggable object stores)
   destinations: () => req<{ destinations: DestinationPreset[]; backends: string[] }>('/destinations'),
   browseDestination: (destinationId: string, path = '') =>
@@ -290,7 +298,9 @@ export const api = {
     req<{ ok: boolean }>(`/canvas/${canvasId}/share/${userId}`, { method: 'DELETE' }),
 }
 
-export interface DestinationPreset { id: string; name: string; backend: string; root: string }
+export type CredKind = 'object_store' | 'agent'
+export interface Cred { id: string; name: string; kind: CredKind; fields: Record<string, string>; createdAt?: string | null }
+export interface DestinationPreset { id: string; name: string; backend: string; root: string; credId?: string | null }
 export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export interface PerNodeStat { node_id: string; status: string; rows?: number | null; ms?: number | null; label?: string | null }

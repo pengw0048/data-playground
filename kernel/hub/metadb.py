@@ -560,6 +560,20 @@ class Setting(Base):
     __table_args__ = (UniqueConstraint("scope", "scope_id", "key", name="uq_setting"),)
 
 
+class CredEntity(Base):
+    """A named credential — a first-class entity a destination or the agent references by id.
+
+    ``fields`` stores only secret REFERENCES (``env:VAR`` / ``file:/path``), never raw secret bytes.
+    ``kind`` is 'object_store' (fields = the objectStore subkeys) or 'agent' (fields = {apiKey: ref}).
+    """
+    __tablename__ = "creds"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    name: Mapped[str] = mapped_column(String)
+    kind: Mapped[str] = mapped_column(String)  # 'object_store' | 'agent'
+    fields_json: Mapped[str] = mapped_column(Text, default="{}")  # JSON dict of secret references
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class AgentEgressEvent(Base):
     """Value-free audit of a catalog-reading agent tool call under a hosted model (SEC-01).
 
@@ -6945,6 +6959,87 @@ def set_setting(key: str, value, scope: str = "global", scope_id: str = "") -> N
             row.value = json.dumps(value)
         else:
             s.add(Setting(scope=scope, scope_id=scope_id, key=key, value=json.dumps(value)))
+
+
+CRED_KINDS = ("object_store", "agent")
+
+
+def _cred_row(c: CredEntity) -> dict:
+    return {"id": c.id, "name": c.name, "kind": c.kind,
+            "fields": json.loads(c.fields_json or "{}"),
+            "createdAt": c.created_at.isoformat() if c.created_at else None}
+
+
+def creds_list() -> list[dict]:
+    with session() as s:
+        return [_cred_row(c) for c in s.scalars(select(CredEntity).order_by(CredEntity.created_at))]
+
+
+def cred_get(cred_id: str | None) -> dict | None:
+    if not cred_id:
+        return None
+    with session() as s:
+        c = s.get(CredEntity, cred_id)
+        return _cred_row(c) if c else None
+
+
+def _validate_cred_fields(kind: str, fields: dict | None) -> dict:
+    """Normalize cred fields to references only; raise ValueError on unknown kind or a raw secret."""
+    from hub.secrets import validate_secret_setting_value
+    if kind not in CRED_KINDS:
+        raise ValueError(f"unknown credential kind {kind!r}; must be one of {list(CRED_KINDS)}")
+    fields = dict(fields or {})
+    if kind == "object_store":
+        return validate_secret_setting_value("objectStore", fields)
+    ref = validate_secret_setting_value("agentApiKey", fields.get("apiKey"))
+    return {"apiKey": ref} if ref else {}
+
+
+def cred_upsert(cred_id: str | None, name: str, kind: str, fields: dict | None) -> dict:
+    """Create or update a credential. Rejects raw secret bytes — fields must be env:/file: references."""
+    fields = _validate_cred_fields(kind, fields)
+    with session() as s:
+        c = s.get(CredEntity, cred_id) if cred_id else None
+        if c is None:
+            c = CredEntity(id=cred_id or _uid(), name=name, kind=kind, fields_json=json.dumps(fields))
+            s.add(c)
+        else:
+            c.name, c.kind, c.fields_json = name, kind, json.dumps(fields)
+        s.flush()
+        return _cred_row(c)
+
+
+def cred_delete(cred_id: str) -> None:
+    with session() as s:
+        c = s.get(CredEntity, cred_id)
+        if c is not None:
+            s.delete(c)
+
+
+def cred_object_store_config(cred_id: str | None = None) -> dict:
+    """Unresolved object-store fields for ``cred_id``; when None (or missing) fall back to the default
+    object-store cred (``defaultObjectStoreCredId``), then to the legacy global ``objectStore`` setting."""
+    if cred_id:
+        c = cred_get(cred_id)
+        if c and c.get("kind") == "object_store":
+            return dict(c["fields"])
+    default_id = get_setting("defaultObjectStoreCredId", "global")
+    if default_id:
+        c = cred_get(default_id)
+        if c and c.get("kind") == "object_store":
+            return dict(c["fields"])
+    return dict(get_setting("objectStore", "global", default={}) or {})
+
+
+def cred_agent_api_key_ref(cred_id: str | None = None) -> str:
+    """The agent apiKey reference for ``cred_id`` (or the ``agentCredId`` setting), else the legacy
+    ``agentApiKey`` setting. Returns a reference string, never a resolved value."""
+    resolved = cred_id or get_setting("agentCredId", "global")
+    if resolved:
+        c = cred_get(resolved)
+        if c and c.get("kind") == "agent":
+            return str(c["fields"].get("apiKey") or "")
+    return get_setting("agentApiKey", "global") or ""
 
 
 def record_agent_egress_event(event: dict) -> None:

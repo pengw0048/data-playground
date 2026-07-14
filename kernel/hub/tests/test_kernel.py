@@ -3365,7 +3365,7 @@ def test_object_store_destination_browse_binds_untrusted_prefix(monkeypatch):
             return Result()
 
     con = Connection()
-    monkeypatch.setattr(db, "ensure_object_store", lambda: None)
+    monkeypatch.setattr(db, "ensure_object_store", lambda *a, **k: None)
     monkeypatch.setattr(db, "lock", nullcontext)
     monkeypatch.setattr(db, "conn", lambda: con)
 

@@ -13,11 +13,19 @@ const PACK = {
 const getSettings = vi.fn()
 const plugins = vi.fn()
 const putSetting = vi.fn()
+const listCreds = vi.fn()
+const createCred = vi.fn()
+const updateCred = vi.fn()
+const deleteCred = vi.fn()
 vi.mock('../api/client', () => ({
   api: {
     getSettings: () => getSettings(),
     plugins: () => plugins(),
     putSetting: (...a: unknown[]) => putSetting(...a),
+    listCreds: () => listCreds(),
+    createCred: (...a: unknown[]) => createCred(...a),
+    updateCred: (...a: unknown[]) => updateCred(...a),
+    deleteCred: (...a: unknown[]) => deleteCred(...a),
     createUser: async () => ({}),
     restartKernel: async () => ({}),
   },
@@ -38,6 +46,10 @@ describe('SettingsModal — plugin config form', () => {
     getSettings.mockReset().mockResolvedValue({ global: {}, user: {} })
     plugins.mockReset().mockResolvedValue([PACK])
     putSetting.mockReset().mockResolvedValue({ ok: true })
+    listCreds.mockReset().mockResolvedValue([])
+    createCred.mockReset().mockImplementation(async (b) => ({ id: 'new-cred', ...b }))
+    updateCred.mockReset().mockImplementation(async (id, b) => ({ id, ...b }))
+    deleteCred.mockReset().mockResolvedValue({ ok: true })
     state.currentUser.capabilities = ['global_settings']
   })
 
@@ -134,7 +146,7 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent('Could not save global setting "agentApiKey": HTTP 500: write failed')
+    expect(alert).toHaveTextContent('Could not save global setting "agentBaseUrl": HTTP 500: write failed')
     expect(alert).toHaveTextContent('1 of 7 updates completed before the failure. Server settings may be partially updated; your edits remain here.')
     expect(screen.getByDisplayValue('edited-model')).toBeVisible()
     expect(screen.queryByText('Saved')).toBeNull()
@@ -142,5 +154,76 @@ describe('SettingsModal — plugin config form', () => {
     putSetting.mockResolvedValue({ ok: true })
     fireEvent.click(screen.getByRole('button', { name: 'Retry save' }))
     expect(await screen.findByText('Saved')).toBeVisible()
+  })
+
+  it('creates an object-store credential from the Credentials pane (references only)', async () => {
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Credentials' }))
+
+    fireEvent.change(screen.getByLabelText('Credential name'), { target: { value: 'Prod S3' } })
+    fireEvent.change(screen.getByLabelText('accessKeyId'), { target: { value: 'env:AWS_ACCESS_KEY_ID' } })
+    fireEvent.change(screen.getByLabelText('region'), { target: { value: 'us-east-1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add credential' }))
+
+    // kind defaults to object_store; blank secretAccessKey/endpoint are omitted (never a raw/blank secret)
+    await waitFor(() => expect(createCred).toHaveBeenCalledWith({
+      name: 'Prod S3', kind: 'object_store',
+      fields: { accessKeyId: 'env:AWS_ACCESS_KEY_ID', region: 'us-east-1' },
+    }))
+    expect(await screen.findByText('Prod S3')).toBeVisible()  // the created cred lands in the list
+  })
+
+  it('edits and deletes a credential', async () => {
+    listCreds.mockResolvedValue([{ id: 'c1', name: 'Old', kind: 'agent', fields: { apiKey: 'env:K' } }])
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Credentials' }))
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit credential Old' }))
+    const nameInput = screen.getByLabelText('Credential name') as HTMLInputElement
+    expect(nameInput.value).toBe('Old')  // form loaded from the cred
+    fireEvent.change(nameInput, { target: { value: 'New' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save credential' }))
+    await waitFor(() => expect(updateCred).toHaveBeenCalledWith('c1', { name: 'New', kind: 'agent', fields: { apiKey: 'env:K' } }))
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove credential New' }))
+    await waitFor(() => expect(deleteCred).toHaveBeenCalledWith('c1'))
+  })
+
+  it('saves the selected agent + default object-store credential references', async () => {
+    getSettings.mockResolvedValue({ global: { agentCredId: 'a1', defaultObjectStoreCredId: 'o1' }, user: {} })
+    listCreds.mockResolvedValue([
+      { id: 'a1', name: 'Agent key', kind: 'agent', fields: {} },
+      { id: 'o1', name: 'Store', kind: 'object_store', fields: {} },
+    ])
+    render(<SettingsModal onClose={vi.fn()} />)
+    await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    // creds are referenced by id in settings; the raw agentApiKey/objectStore keys are gone
+    await waitFor(() => expect(putSetting).toHaveBeenCalledWith('global', 'agentCredId', 'a1'))
+    expect(putSetting).toHaveBeenCalledWith('global', 'defaultObjectStoreCredId', 'o1')
+    expect(putSetting).not.toHaveBeenCalledWith('global', 'agentApiKey', expect.anything())
+    expect(putSetting).not.toHaveBeenCalledWith('global', 'objectStore', expect.anything())
+  })
+
+  it('tags an object-store destination with a credential and shows it', async () => {
+    getSettings.mockResolvedValue({
+      global: { destinations: [{ id: 'd1', name: 'Exports', backend: 's3', root: 's3://b/p', credId: 'c1' }] },
+      user: {},
+    })
+    listCreds.mockResolvedValue([{ id: 'c1', name: 'Prod S3', kind: 'object_store', fields: {} }])
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Destinations' }))
+
+    // the destination row shows its bound credential's name
+    expect(await screen.findByText('Exports')).toBeVisible()
+    expect(screen.getByText('Prod S3')).toBeVisible()
+    // a local add-form has no cred picker; it appears only for object-store backends
+    expect(screen.queryByLabelText('Destination credential')).toBeNull()
+
+    // switching the new-destination backend to s3 reveals the object-store credential picker
+    fireEvent.click(screen.getByLabelText('Destination backend'))
+    fireEvent.click(await screen.findByRole('option', { name: 's3' }))
+    expect(await screen.findByLabelText('Destination credential')).toBeVisible()
   })
 })

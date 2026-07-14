@@ -32,13 +32,14 @@ from hub.settings import settings
 def _agent_config() -> tuple[str, str | None, str | None]:
     """Resolve (model, api_key, base_url): global DB settings (set in the UI) override env/defaults.
 
-    ``agentApiKey`` is stored as a secret reference (``env:…`` / ``file:…``); the material value is
-    resolved here and never written back into settings.
+    The agent's API key is stored as a secret reference (``env:…`` / ``file:…``) on the referenced
+    ``agent`` cred (or the legacy ``agentApiKey`` setting); the material value is resolved here and
+    never written back into settings.
     """
     from hub import metadb
     from hub.secrets import SecretResolveError, resolve_secret_value
     model = metadb.get_setting("agentModel", "global") or settings.agent_model
-    stored_key = metadb.get_setting("agentApiKey", "global")
+    stored_key = metadb.cred_agent_api_key_ref()
     try:
         api_key = resolve_secret_value(stored_key) if stored_key else None
     except SecretResolveError:
