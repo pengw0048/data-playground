@@ -1,7 +1,7 @@
 """agent egress audit events (SEC-01 AgentDataPolicy)
 
-Revision ID: 0022_agent_egress_events
-Revises: 0021_local_result_artifacts
+Revision ID: 0023_agent_egress_events
+Revises: 0022_backend_jobs
 Create Date: 2026-07-14
 """
 
@@ -9,8 +9,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision = "0022_agent_egress_events"
-down_revision = "0021_local_result_artifacts"
+revision = "0023_agent_egress_events"
+down_revision = "0022_backend_jobs"
 branch_labels = None
 depends_on = None
 

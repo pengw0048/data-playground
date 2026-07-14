@@ -8,6 +8,7 @@ in ``sanitize_tool_result`` so individual tools cannot accidentally bypass the p
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -209,4 +210,8 @@ def record_tool_audit(policy: AgentDataPolicy, tool: str, tool_input: dict, resu
         # Never persist sample rows — events are metadata-only by construction.
         if "rows" in event:
             raise ValueError("agent egress audit must not carry raw rows")
-        metadb.record_agent_egress_event(event)
+        # Best-effort: a transient metadata-DB error must not abort an otherwise-successful tool call.
+        try:
+            metadb.record_agent_egress_event(event)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("agent egress audit write failed", exc_info=True)
