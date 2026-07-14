@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
 
 import duckdb
 import pyarrow as pa
@@ -19,7 +18,7 @@ import pyarrow as pa
 from hub import db, graph as g, sandbox
 from hub.ir import resolve_config  # single source of built-in node config resolution (shared with the IR)
 from hub.models import PREVIEWABLE_MODES, ColumnSchema, Graph, GraphNode
-from hub.plugins.adapters import display_type, relation_columns
+from hub.plugins.adapters import display_type
 from hub.plugins.capabilities import tag_columns
 # The faithful-preview SQL gates parse with DuckDB's OWN parser (hub.sqlanalyze) rather than regex, so
 # detection matches execution exactly — handling quoting / string literals / a column named `input2` /

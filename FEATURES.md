@@ -11,6 +11,7 @@ drifted as the project changed. Use the owning documents and executable checks i
 - [Ray](docs/RAY.md) — exact distributed support boundary and production-readiness gates.
 - [MCP](docs/MCP.md) — agent integration, transports, tools, and authentication boundary.
 - [Tutorial](docs/TUTORIAL.md) — runnable first workflow.
+- [Browser and viewport support](docs/BROWSER_SUPPORT.md) — desktop-first viewport, browsers, and input model.
 - [Contributing](.github/CONTRIBUTING.md) and [security policy](.github/SECURITY.md) — development,
   review, and vulnerability-reporting paths.
 

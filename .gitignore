@@ -39,6 +39,7 @@ kernel/_web/
 *.db-journal
 *.db-wal
 *.db-shm
+*.migrate.lock
 
 # kernel e2e/pytest artifacts
 kernel/test-results/

@@ -143,9 +143,26 @@ input, textarea, select { font-family: inherit; }
 .react-flow__edge.selected .react-flow__edge-path,
 .react-flow__edge:hover .react-flow__edge-path { stroke: #7f8792; }
 .react-flow__node { font-family: var(--font-sans); }
-.react-flow__node:focus, .react-flow__node:focus-visible { outline: none; }
+/* Keyboard focus model: React Flow nodes are tabbable (nodesFocusable default true). Tab reaches a
+   node; Enter/Space selects it; arrow keys move a selected node when editable. Selection (mouse or
+   keyboard) paints the card chrome; focus-visible paints this ring so keyboard users always see
+   where Tab landed — previously outline:none removed the indicator with no replacement.
+   box-shadow (not outline) so it wins cleanly over React Flow / Tailwind outline resets. */
+.react-flow__node:focus { outline: none; }
+.react-flow__node:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--focus);
+  border-radius: 2px;
+}
 .react-flow__controls { box-shadow: none; border-radius: 10px; overflow: hidden; }
 .react-flow__minimap { border-radius: 10px; overflow: hidden; border: 1px solid hsl(var(--border)); }
+
+/* Files home cards — visible focus for the open/delete controls (native buttons). */
+.dp-file-card:focus-visible,
+.dp-file-card button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
 
 /* dots grid */
 .react-flow__background { color: var(--dots); }
@@ -177,6 +194,10 @@ input, textarea, select { font-family: inherit; }
   outline: none;
 }
 .dp-input:focus { border-color: hsl(var(--primary)); }
+.dp-input:focus-visible {
+  border-color: hsl(var(--primary));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus) 35%, transparent);
+}
 
 /* connect-from-port menu + floating chrome sit above the canvas */
 .dp-float { position: absolute; z-index: 20; }

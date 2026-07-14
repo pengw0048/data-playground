@@ -54,6 +54,50 @@ def auth_enabled() -> bool:
 # token signed with it is forgeable. reject_weak_secret() is called once at startup (main.py).
 _WEAK_SECRETS = {"change-me-in-production", "changeme", "secret", "dev", "test"}
 
+# Declared deployment modes. ``local`` (default) keeps zero-config localhost HTTP; ``shared`` fails
+# closed unless Secure cookies and an explicit TLS/trusted-proxy transport declaration are present.
+_DEPLOYMENT_MODES = frozenset({"local", "shared"})
+
+
+def deployment_mode() -> str:
+    """Return the declared deployment mode (`local` or `shared`).
+
+    Unset/blank means ``local`` — the zero-config laptop path. Any other value is rejected so a typo
+    cannot silently leave a shared service without transport guards.
+    """
+    raw = os.environ.get("DP_DEPLOYMENT_MODE", "").strip().lower()
+    if not raw:
+        return "local"
+    if raw not in _DEPLOYMENT_MODES:
+        raise RuntimeError(
+            f"DP_DEPLOYMENT_MODE={raw!r} is not supported; use 'local' (default) or 'shared'.")
+    return raw
+
+
+def secure_cookie_enabled() -> bool:
+    """Whether ``dp_session`` cookies must carry the Secure attribute.
+
+    Presence of ``DP_AUTH_SECURE_COOKIE`` opts in (same truthiness as the historical cookie path:
+    any non-empty value enables Secure). Shared mode refuses to start without this.
+    """
+    return bool(os.environ.get("DP_AUTH_SECURE_COOKIE"))
+
+
+def direct_tls_declared() -> bool:
+    """Operator declaration that TLS terminates at the hub process itself (not a reverse proxy)."""
+    return bool(os.environ.get("DP_AUTH_DIRECT_TLS"))
+
+
+def trusted_proxies() -> list[str]:
+    """CIDRs/IPs whose X-Forwarded-* headers the hub may trust for client identity.
+
+    Empty means the ASGI peer address is authoritative and forwarded headers are ignored.
+    """
+    raw = os.environ.get("DP_TRUSTED_PROXIES", "").strip()
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
 
 def reject_weak_secret() -> None:
     secret = _signing_secret()
@@ -66,6 +110,34 @@ def reject_weak_secret() -> None:
         raise RuntimeError(
             "DP_AUTH_SECRET is a known-weak/default value — sessions signed with it are forgeable. "
             "Set a real random secret, e.g. `openssl rand -hex 32`.")
+
+
+def reject_unsafe_transport() -> None:
+    """Fail closed when shared mode is missing secure-cookie / TLS / trusted-proxy expectations.
+
+    Called once at hub startup alongside :func:`reject_weak_secret` from ``hub.main`` and the
+    ``dataplay`` CLI so a misconfigured shared deployment never binds a port.
+    """
+    if deployment_mode() != "shared":
+        return
+    if _signing_secret() is None:
+        raise RuntimeError(
+            "DP_DEPLOYMENT_MODE=shared requires authentication. "
+            "Set DP_AUTH_SECRET to a random secret, e.g. `openssl rand -hex 32`.")
+    if not secure_cookie_enabled():
+        raise RuntimeError(
+            "DP_DEPLOYMENT_MODE=shared refuses Secure-less session cookies. "
+            "Set DP_AUTH_SECURE_COOKIE=1 after terminating TLS at the hub or a reverse proxy.")
+    proxies = trusted_proxies()
+    if "*" in proxies:
+        raise RuntimeError(
+            "DP_TRUSTED_PROXIES=* trusts every peer and is not allowed in shared mode. "
+            "List the proxy addresses or CIDRs that terminate TLS in front of the hub.")
+    if not direct_tls_declared() and not proxies:
+        raise RuntimeError(
+            "DP_DEPLOYMENT_MODE=shared requires an explicit transport declaration. "
+            "Set DP_AUTH_DIRECT_TLS=1 if TLS terminates at the hub process, "
+            "or DP_TRUSTED_PROXIES=<proxy-ip>[,...] if a reverse proxy forwards client addresses.")
 
 
 def _mac(payload: str) -> str:

@@ -1,4 +1,4 @@
-.PHONY: setup run dev-kernel dev-web build test e2e e2e-install seed clean
+.PHONY: setup run dev-kernel dev-web build test lint e2e e2e-install seed clean
 
 # One-time setup: kernel deps + sample data + web deps.
 # web/dist is gitignored so a fresh clone lacks it; the kernel wheel force-includes ../web/dist, so
@@ -24,6 +24,12 @@ build:
 
 test:
 	cd kernel && uv run pytest -q
+
+# Python lint + static types (issue #111). No Ray / no browser — matches the CI python-quality job.
+# Ruff covers kernel/ and examples/plugins/; basedpyright covers hub/ under the committed lenient config.
+lint:
+	cd kernel && uv run ruff check --config pyproject.toml . ../examples/plugins
+	cd kernel && uv run basedpyright
 
 # One-time: download the Playwright browser used by the E2E suite.
 e2e-install:

@@ -275,7 +275,7 @@ def _sql_str(s: str) -> str:
 
 def _object_store_fingerprint(cfg: dict) -> tuple:
     config = tuple(cfg.get(key) for key in (
-        "accessKeyId", "secretAccessKey", "region", "endpoint", "useSsl",
+        "accessKeyId", "secretAccessKey", "sessionToken", "region", "endpoint", "useSsl",
     ))
     explicit_keys = bool(cfg.get("accessKeyId") and cfg.get("secretAccessKey"))
     environment = () if explicit_keys else tuple(os.environ.get(key) for key in _CREDENTIAL_ENV_KEYS)
@@ -306,6 +306,8 @@ def _publish_object_store(cfg: dict) -> None:
             if explicit_keys:
                 parts = [f"TYPE {kind}", f"KEY_ID '{_sql_str(cfg['accessKeyId'])}'",
                          f"SECRET '{_sql_str(cfg['secretAccessKey'])}'"]
+                if kind == "s3" and cfg.get("sessionToken"):
+                    parts.append(f"SESSION_TOKEN '{_sql_str(cfg['sessionToken'])}'")
                 if cfg.get("region"):
                     parts.append(f"REGION '{_sql_str(cfg['region'])}'")
                 endpoint = str(cfg.get("endpoint") or "").strip()
@@ -342,10 +344,12 @@ def ensure_object_store() -> None:
     A run scope owns a long rollback-only transaction.  Creating its secret there would make two
     concurrent runs conflict on the shared catalog even though both use the same credentials.  The
     base connection instead performs one short, serialized autocommit publication per config; scoped
-    cursors consume that committed secret without writing the catalog themselves.
+    cursors consume that committed secret without writing the catalog themselves. Secret subkeys in
+    the ``objectStore`` setting are references; material values are resolved here only.
     """
     from hub import metadb
-    _publish_object_store(metadb.get_setting("objectStore", "global", default={}) or {})
+    from hub.secrets import resolve_object_store
+    _publish_object_store(resolve_object_store(metadb.get_setting("objectStore", "global", default={}) or {}))
 
 
 def _prime_object_store_before_scope() -> None:
@@ -363,7 +367,17 @@ def _prime_object_store_before_scope() -> None:
                 and scheme not in ("s3", "s3a", "s3n", "gs", "gcs")):
             return
         from hub import metadb
+        from hub.secrets import resolve_object_store
         cfg = metadb.get_setting("objectStore", "global", default={}) or {}
+        if not cfg and scheme in ("s3", "s3a", "s3n", "gs", "gcs"):
+            # Only a one-shot workload (subrun / Ray driver) with no hub settings DB reconstructs its
+            # config from the allowlisted data-plane environment; a hub with an empty setting keeps its
+            # ambient credential chain instead of adopting the workers' data-plane keys.
+            from hub.workload_env import (data_plane_object_store_config,
+                                          is_ephemeral_workload)
+            if is_ephemeral_workload():
+                cfg = data_plane_object_store_config(scheme=scheme)
+        cfg = resolve_object_store(cfg)  # hub settings hold env:/file: references; resolve in-process
         if not _obj_store_loaded or _object_store_fingerprint(cfg) != _obj_store_secret_config:
             _publish_object_store(cfg)
     except Exception:  # noqa: BLE001 — defer setup failure until an object-store operation actually runs

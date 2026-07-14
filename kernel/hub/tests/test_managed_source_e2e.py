@@ -39,7 +39,9 @@ def _assert_disposable_child_metadata(job_dir, endpoint: str) -> None:
     assert row is not None
     object_store = json.loads(row[0])
     assert object_store["endpoint"] == endpoint
-    assert object_store["accessKeyId"] == "k"
+    assert object_store["accessKeyId"] == "env:DP_S3_KEY"
+    assert object_store["secretAccessKey"] == "env:DP_S3_SECRET"
+    assert "k" not in json.dumps(object_store)  # material credential must not land in worker metadata
 
 
 @pytest.mark.parametrize("backend", ["local-subprocess", "local-pool"])

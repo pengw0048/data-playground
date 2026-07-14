@@ -241,14 +241,15 @@ trusted local product crosses into a shared service or an external model/provide
 
 ### SEC-03 — Secret redaction is not secret storage
 
-- **Status:** Confirmed gap, P1 for Profiles B and C.
-- **Evidence:** [`routers/workspace.py`](../kernel/hub/routers/workspace.py) redacts `agentApiKey`, object-
-  store access keys, and plugin fields marked secret on `GET /settings`, but
-  [`Setting`](../kernel/hub/metadb.py) stores the JSON value in the metadata database. The agent reads
-  `agentApiKey` directly from that setting in [`agent.py`](../kernel/hub/agent.py).
-- **Impact:** Database readers, backups, support bundles, or accidental diagnostics can recover provider,
-  object-store, and plugin credentials. Rotating one secret also remains coupled to application settings
-  rather than a dedicated secret system.
+- **Status:** Addressed in core — settings store `env:` / `file:` secret references; `hub.secrets.SecretResolver`
+  resolves them only in-process (agent, object-store clients, plugin `reg.config`). Alembic revision
+  `0022_secret_refs` deletes legacy plaintext values. Vendor secret-manager resolvers remain out of core
+  and register via `reg.add_secret_resolver`.
+- **Evidence:** [`hub/secrets.py`](../kernel/hub/secrets.py), [`routers/workspace.py`](../kernel/hub/routers/workspace.py),
+  [`migrations/versions/0022_secret_refs.py`](../kernel/hub/migrations/versions/0022_secret_refs.py),
+  [`tests/test_secret_refs.py`](../kernel/hub/tests/test_secret_refs.py).
+- **Impact:** Database readers, backups, and diagnostic dumps no longer recover provider, object-store, or
+  plugin credentials from settings rows.
 - **Acceptance criteria:**
   1. Persistent settings contain a secret reference, never the secret value.
   2. A generic `SecretResolver` supports at least environment/file references for OSS use and allows an
