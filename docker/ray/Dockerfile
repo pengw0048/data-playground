@@ -26,9 +26,10 @@ COPY --chown=10001:10001 examples/ ./examples/
 USER 10001:10001
 RUN touch ./web/dist/.keep
 WORKDIR /app/kernel
-# --frozen: install EXACTLY the checked-in uv.lock (fail if drifted) → reproducible. --no-dev: no test
-# tooling in the validation image. [ray] extra = the exact ABI-pinned Ray that validate_ray_cluster checks.
-RUN uv sync --frozen --no-dev --extra ray
+# --locked: install from the checked-in uv.lock and FAIL if pyproject/lock drifted (uv's --frozen
+# installs the lock without that check). --no-dev: no test tooling in the validation image.
+# [ray] extra = the exact ABI-pinned Ray that validate_ray_cluster checks.
+RUN uv sync --locked --no-dev --extra ray
 # KubeRay starts raylets through a login shell, which resets PATH on Debian.
 # Keep the venv-owned interpreter but expose the Ray CLI from the standard login-shell PATH.
 USER root
