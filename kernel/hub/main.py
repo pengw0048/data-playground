@@ -540,15 +540,21 @@ def readyz():
 
 @app.get("/api/version")
 def version() -> dict:
-    # deployment identity for operability — sha + the pluggable-backend choices + core lib versions.
-    # SECRETS ARE REDACTED: the DB is reported as its dialect only (never the DP_DATABASE_URL creds).
+    # deployment identity for operability — package version + sha + the pluggable-backend choices +
+    # core lib versions. SECRETS ARE REDACTED: the DB is reported as its dialect only (never the
+    # DP_DATABASE_URL creds).
     import platform
+    from importlib.metadata import PackageNotFoundError, version as pkg_version
 
     import duckdb
     import pyarrow
 
     from hub import auth
     from hub.settings import settings
+    try:
+        package_version = pkg_version("data-playground")
+    except PackageNotFoundError:  # bare source tree without an install — release builds always install
+        package_version = "unknown"
     sha = os.environ.get("DP_GIT_SHA", "").strip()
     if not sha:
         try:
@@ -562,6 +568,7 @@ def version() -> dict:
     # echoed to an unauthenticated caller.
     _db, _storage = settings.database_url, os.environ.get("DP_STORAGE_URL", "").strip()
     return {
+        "version": package_version,
         "sha": sha,
         "spawner": settings.kernel_spawner,
         "db": (_db.split("://", 1)[0] if "://" in _db else "sqlite"),   # dialect only — never the creds

@@ -5,6 +5,24 @@ Data Playground can run each canvas's execution kernel as its own Kubernetes **P
 any hub can reach/kill it by resolving the canvas → Service DNS from the shared DB. This directory is a
 **reference** deployment + an end-to-end verification you can run locally on [kind](https://kind.sigs.k8s.io).
 
+## Release artifact smoke (local)
+
+After building a wheel or running a container, the same offline starter-canvas smoke that CI runs in
+`.github/workflows/release-artifacts.yml` is:
+
+```bash
+# Hub already serving (e.g. dataplay --no-open --workspace /tmp/ws):
+python3 scripts/release_smoke.py --base-url http://127.0.0.1:8471 --expect-version 0.1.0
+
+# Version surfaces must agree (pyproject / package.json / wheel /api/version / image label):
+python3 scripts/check_release_versions.py \
+  --pyproject kernel/pyproject.toml --package-json web/package.json \
+  --require pyproject,package_json
+```
+
+Build order for a shippable wheel: `cd web && npm ci && npm run build`, then `cd kernel && uv build`.
+`scripts/check_wheel_has_spa.py` fails if the wheel still contains the `hatch_build.py` placeholder UI.
+
 ## Verify it locally (kind)
 
 ```bash

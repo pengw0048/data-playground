@@ -30,6 +30,11 @@ def test_observability_livez_readyz_version(monkeypatch):
     v = client.get("/api/version").json()
     assert v["auth"] in ("enabled", "open") and v["spawner"] and v["duckdb"] and v["python"]
     assert v["db"] and "://" not in v["db"], "DB reported as dialect only — no creds leaked"
+    # REL-01 / issue #114: package version is part of release identity (existing fields unchanged).
+    assert isinstance(v.get("version"), str) and v["version"], "package version must be present"
+    from importlib.metadata import version as pkg_version
+    assert v["version"] == pkg_version("data-playground")
+    assert set(v) >= {"version", "sha", "spawner", "db", "storage", "auth", "python", "duckdb", "pyarrow"}
     # a BARE-PATH storage override must NOT echo the internal path to an unauthenticated caller
     monkeypatch.setenv("DP_STORAGE_URL", "/mnt/secret-internal/customer-data")
     assert client.get("/api/version").json()["storage"] == "local", "bare storage path leaked"
