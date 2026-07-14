@@ -6,7 +6,7 @@ the catalog, open a canvas, wire typed nodes, **write the `transform` Python**, 
 against real rows, run it, and read the rows it produced. The canvas it builds shows up in the
 browser like any other.
 
-This is the mirror image of the [built-in agent](../README.md#the-agent-optional): there the kernel
+This is the mirror image of the [built-in agent](../README.md#agents-and-automation): there the kernel
 calls a model; here a model calls the kernel. No API key required.
 
 ## Two ways to connect
