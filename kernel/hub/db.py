@@ -367,10 +367,13 @@ def _prime_object_store_before_scope() -> None:
         from hub import metadb
         cfg = metadb.get_setting("objectStore", "global", default={}) or {}
         if not cfg and scheme in ("s3", "s3a", "s3n", "gs", "gcs"):
-            # One-shot remote drivers have a private empty metadata DB. Read only the explicitly
-            # allowlisted data-plane environment; never persist credentials into the temporary DB.
-            from hub.workload_env import data_plane_object_store_config
-            cfg = data_plane_object_store_config(scheme=scheme)
+            # Only a one-shot workload (subrun / Ray driver) with no hub settings DB reconstructs its
+            # config from the allowlisted data-plane environment; a hub with an empty setting keeps its
+            # ambient credential chain instead of adopting the workers' data-plane keys.
+            from hub.workload_env import (data_plane_object_store_config,
+                                          is_ephemeral_workload)
+            if is_ephemeral_workload():
+                cfg = data_plane_object_store_config(scheme=scheme)
         if not _obj_store_loaded or _object_store_fingerprint(cfg) != _obj_store_secret_config:
             _publish_object_store(cfg)
     except Exception:  # noqa: BLE001 — defer setup failure until an object-store operation actually runs

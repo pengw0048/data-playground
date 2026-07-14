@@ -418,19 +418,21 @@ class Playground:
                 if terminal is not None:
                     return self._run_envelope(terminal, None)
                 return self._run_envelope(RunStatus(**persisted), None)
-        terminal = _pruned_terminal_status(run_id)
-        if terminal is not None:
-            return self._run_envelope(terminal, None)
-        kb = self.deps.kernel_backend()
-        if kb is not None:
-            return self._run_envelope(kb.cancel(run_id), None)
+        # A finished run needs no cancel: return its full persisted detail, or the compact fence only
+        # when that detail was genuinely pruned — never let the fence shadow a live terminal RunState.
         persisted = metadb.get_run_state(run_id)
+        if persisted is not None and persisted.get("status") in ("done", "failed", "cancelled"):
+            return self._run_envelope(RunStatus(**persisted), None)
         if persisted is None:
             terminal = _pruned_terminal_status(run_id)
             if terminal is not None:
                 return self._run_envelope(terminal, None)
-            raise ToolError(f"unknown runId '{run_id}' (not started this session, or evicted)")
-        return self._run_envelope(RunStatus(**persisted), None)
+        kb = self.deps.kernel_backend()
+        if kb is not None:
+            return self._run_envelope(kb.cancel(run_id), None)
+        if persisted is not None:
+            return self._run_envelope(RunStatus(**persisted), None)
+        raise ToolError(f"unknown runId '{run_id}' (not started this session, or evicted)")
 
     def sample_result(self, args: dict) -> dict:
         """Sample the OUTPUT dataset a run materialized (by its runId) — closes the author→run→inspect

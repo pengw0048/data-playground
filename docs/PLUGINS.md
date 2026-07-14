@@ -122,7 +122,7 @@ Ray Jobs v3 backend. Jobs v3 freezes a pre-probed catalog plan in SQL and coordi
 object-attempt references, lineage, usage, and terminal publication. A graph with a write sink therefore
 requires the built-in DB-backed catalog and fails before allocation or remote submission when another
 catalog is installed. Supporting an external provider here
-requires a future prepared-plan/replay protocol, not only the two legacy idempotent methods above.
+requires a future prepared-plan/replay protocol, not only the two idempotent methods above.
 
 Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter; runners are picked
 by `pick_runner` (respects the Settings → Execution choice, else the first that `can_run`). **The

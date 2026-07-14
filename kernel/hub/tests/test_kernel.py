@@ -4317,6 +4317,26 @@ def test_cancel_falls_back_to_db_status_when_not_owned_here():
     assert r.json()["status"] in ("running", "cancelled", "failed")
 
 
+def test_cancel_returns_full_terminal_detail_not_the_pruned_fence():
+    # a finished run whose full RunState detail still exists (and thus also has a terminal fence) must
+    # return that detail on cancel, never the compact fence projection that drops outputs / fabricates
+    # a 'terminal_details_pruned' error.
+    from hub import metadb
+    metadb.save_run_state(
+        "run_cancel_done",
+        {"run_id": "run_cancel_done", "status": "done", "per_node": [],
+         "output_uri": "s3://cancel-detail/out.parquet", "output_table": "out",
+         "rows_processed": 42, "progress": 1.0},
+        canvas_id="cv_cancel_done", kernel_id="k_none")  # no live kernel owns it
+    get_deps().run_index.pop("run_cancel_done", None)     # this process doesn't own it
+    assert metadb.terminal_run_status("run_cancel_done") == "done"  # a fence row exists alongside detail
+    body = client.post("/api/run/run_cancel_done/cancel").json()
+    assert body["status"] == "done"
+    assert body["outputUri"] == "s3://cancel-detail/out.parquet"
+    assert body["outputTable"] == "out"
+    assert body.get("error") is None
+
+
 def test_kernel_for_run_none_when_owning_kernel_fenced_out():
     # after a takeover (k_old replaced by k_new on one canvas), cancel must NOT be routed to k_new — it
     # never ran the run. kernel_for_run returns None so the backend falls back to the persisted status.
@@ -9940,6 +9960,16 @@ def test_ray_clean_done_receipt_wins_late_cancel_and_nonzero_done_stays_private(
     assert failed.error == "Ray driver exited unsuccessfully after writing a terminal receipt"
     assert failed.output_uri is None and failed.output_table is None
     assert len(registered) == 1
+
+    # Local Popen driver errors surface verbatim (same host/trust boundary), unlike remote Jobs runs
+    # whose text is reduced to a stable code by _apply_job_result.
+    local_failure = RunStatus(run_id="ray-local-failure", status="running")
+    runner._settle_popen_result(
+        graph, local_failure,
+        {"status": "failed", "error": "Binder Error: column X not found"}, 0,
+    )
+    assert local_failure.status == "failed"
+    assert local_failure.error == "Binder Error: column X not found"
 
 
 def test_ray_reconcile_and_shutdown_have_one_terminal_finalizer(tmp_path, monkeypatch):

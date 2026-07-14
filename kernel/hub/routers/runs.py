@@ -667,19 +667,21 @@ def run_cancel(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
                 return RunStatus(**current)
             terminal = _pruned_terminal_status(run_id)
             return terminal if terminal is not None else RunStatus(**persisted)
-    terminal = _pruned_terminal_status(run_id)
-    if terminal is not None:
-        return terminal
+    # A finished run needs no cancel: return its full persisted detail, or the compact fence only when
+    # that detail was genuinely pruned — never let the fence shadow a still-present terminal RunState.
+    persisted = metadb.get_run_state(run_id)
+    if persisted is not None and persisted.get("status") in ("done", "failed", "cancelled"):
+        return RunStatus(**persisted)
+    if persisted is None:
+        terminal = _pruned_terminal_status(run_id)
+        if terminal is not None:
+            return terminal
     # not owned here (the hub restarted, or another stateless instance accepted the run) — route via the
     # DB-backed kernel backend, which resolves the owning kernel from run_states and cancels it (or
     # returns the last-known persisted status). Mirrors _status_or_lost so cancel never 404s a live run.
     kb = deps.kernel_backend()
     if kb is not None:
         return kb.cancel(run_id)
-    persisted = metadb.get_run_state(run_id)
     if persisted is not None:
         return RunStatus(**persisted)
-    terminal = _pruned_terminal_status(run_id)
-    if terminal is not None:
-        return terminal
     raise HTTPException(404, f"run '{run_id}' not found")

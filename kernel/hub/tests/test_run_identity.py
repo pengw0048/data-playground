@@ -294,16 +294,30 @@ def test_backend_bind_rejects_wrong_authorization_canvas_without_consuming_lease
     assert metadb.discard_run_preallocation(run_id, token, "owner", canvas_id) is True
 
 
-def test_finish_without_backend_requires_terminal_status_and_terminalizes_attempt():
-    run_id = f"finish-no-backend-{uuid.uuid4().hex}"
+def test_finish_without_backend_consumes_lease_for_a_live_local_run():
+    # A prebound runner that owns the run locally (Popen / unsupported-shape fallback) returns a live,
+    # non-terminal status with no backend binding. That must release the preallocation fence and keep
+    # the run live — never fabricate a terminal failure or abandon the live writer's attempt.
+    run_id = f"finish-live-local-{uuid.uuid4().hex}"
     token = metadb.preallocate_run_owner(run_id, "owner", None)
     attempt = _sink_attempt(run_id)
 
-    with pytest.raises(RuntimeError, match="live run has no durable backend"):
-        metadb.finish_run_preallocation(run_id, token, _status(run_id, "queued"))
+    assert metadb.finish_run_preallocation(run_id, token, _status(run_id, "queued")) is True
     with metadb.session() as session:
-        assert session.get(metadb.RunState, run_id).preallocation_token == token
+        state = session.get(metadb.RunState, run_id)
+        assert state is not None and state.status == "queued"
+        assert state.preallocation_token is None and state.preallocation_expires_at is None
+        assert session.get(metadb.RunTerminalFence, run_id) is None
         assert session.get(metadb.ObjectAttempt, attempt["uri"]).state == "writing"
+    # A live local run left in the shared test DB would otherwise look like a boot orphan to later
+    # reaper assertions; terminate it the way its in-process supervisor would.
+    metadb.save_run_state(run_id, {**_status(run_id, "failed"), "error": "test cleanup"})
+
+
+def test_finish_without_backend_terminalizes_attempt_on_terminal_status():
+    run_id = f"finish-no-backend-{uuid.uuid4().hex}"
+    token = metadb.preallocate_run_owner(run_id, "owner", None)
+    attempt = _sink_attempt(run_id)
 
     failed = {**_status(run_id, "failed"), "error": "unsupported before submission"}
     assert metadb.finish_run_preallocation(run_id, token, failed) is True

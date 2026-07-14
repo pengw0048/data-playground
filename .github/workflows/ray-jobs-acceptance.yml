@@ -19,6 +19,8 @@ on:
       - "kernel/hub/workload_env.py"
       - "kernel/hub/metadb.py"
       - "kernel/hub/models.py"
+      - "kernel/hub/mcp.py"
+      - "kernel/hub/routers/workspace.py"
       - "kernel/hub/handoff.py"
       - "kernel/hub/storage.py"
       - "kernel/hub/sinks.py"

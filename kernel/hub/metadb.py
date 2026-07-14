@@ -1351,7 +1351,16 @@ def finish_run_preallocation(run_id: str, token: str, status_doc: dict) -> bool:
                 or not secrets.compare_digest(state.preallocation_token, str(token))):
             return False
         if status not in _TERMINAL_RUN:
-            raise RuntimeError("preallocated live run has no durable backend binding")
+            # A prebound runner that owns the run locally (no external backend — e.g. the Popen path or
+            # an unsupported-shape fallback) consumes the lease and keeps supervising in-process. Only
+            # release the preallocation fence; never abandon the live writer's attempts or clobber a
+            # status the concurrent supervisor has already advanced past preallocation.
+            if state.status in _PREALLOCATION_STATES:
+                state.status = status
+                state.doc = json.dumps(status_doc, default=str)
+            state.preallocation_token = None
+            state.preallocation_expires_at = None
+            return True
         _abandon_run_preallocation_attempts(s, run_id)
         state.status = status
         state.doc = json.dumps(status_doc, default=str)
@@ -6000,12 +6009,15 @@ def catalog_apply_usage_publication(plan: dict) -> bool:
                 # Concurrent unregister/replacement takes the logical lock in the same order, so a
                 # missing exact current entry is corruption, not a benign liveness transition.
                 raise RuntimeError("catalog usage logical identity has no exact current entry")
-            entry.usage += 1
+            # A read-popularity bump must not advance updated_at (the 'recently updated' sort key).
+            s.execute(update(CatalogEntry).where(CatalogEntry.uri == entry.uri)
+                      .values(usage=CatalogEntry.usage + 1, updated_at=CatalogEntry.updated_at))
             logical.usage += 1
         for uri in uri_ids:
             entry = entries.get(uri)
             if entry is not None and entry.logical_id is None:
-                entry.usage += 1
+                s.execute(update(CatalogEntry).where(CatalogEntry.uri == entry.uri)
+                          .values(usage=CatalogEntry.usage + 1, updated_at=CatalogEntry.updated_at))
         return True
 
 

@@ -77,6 +77,23 @@ class FlakyJobArtifacts(MemoryArtifacts):
         super().write(uri, value)
 
 
+class CountedFlakyArtifacts(MemoryArtifacts):
+    """Fails a fixed number of job and result reads, so a specific outage window can be reproduced."""
+    def __init__(self):
+        super().__init__()
+        self.job_read_failures = 0
+        self.result_read_failures = 0
+
+    def read(self, uri: str) -> dict:
+        if uri.endswith(".dpjob") and self.job_read_failures > 0:
+            self.job_read_failures -= 1
+            raise ConnectionError("job object store transiently unavailable")
+        if uri.endswith(".dpresult") and self.result_read_failures > 0:
+            self.result_read_failures -= 1
+            raise ConnectionError("result object store transiently unavailable")
+        return super().read(uri)
+
+
 class FakeJobsClient:
     def __init__(self):
         self.jobs: dict[str, dict] = {}
@@ -1681,6 +1698,52 @@ def test_result_candidate_is_reobserved_when_remote_submit_settles_first(jobs_co
     assert status.status == "done"
 
 
+def test_result_reconciliation_initiated_from_state_loop_converges(jobs_config):
+    # When the state-establishment loop initiates reconciliation (binding still "submitting", job
+    # artifact readable, Ray metadata lost, valid result present), it must keep re-driving the fence
+    # across iterations. Otherwise the next iteration finds the loop's own stop fence and validates it
+    # as a live workload forever — a permanent wedge on a healthy cluster and database.
+    module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_reconcile_state_loop_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    assert ref is not None
+    _materialize_bound_job(runner, status)  # the job artifact is readable, so loop 1 exits with a job
+    _write_success(store, status)            # a valid hash-bound result is present
+    assert metadb.claim_backend_submission_after_missing(
+        status.run_id, ref.attempt_id, "crashed-submit-owner", 5) == "claimed"
+    with metadb.session() as session:
+        session.get(metadb.RunBackendJob, status.run_id).submission_lease_until = (
+            metadb._db_now(session) - datetime.timedelta(seconds=1))
+    assert metadb.backend_job(status.run_id)["submission_state"] == "submitting"
+    assert ref.submission_id not in client.jobs  # authoritative Ray metadata loss
+
+    # Real Ray's stop is asynchronous: the reconciliation fence stays live for at least one poll after
+    # stop, so the first drive returns not-ready and the loop must re-drive on the next iteration.
+    def async_stop(submission_id: str) -> bool:
+        with client.lock:
+            client.stop_calls.append(submission_id)
+        return True
+
+    client.stop_job = async_stop
+
+    recovered = module.RayRunner(
+        deps, jobs_client_factory=client, artifact_store=store, recover=True)
+    deadline = time.monotonic() + 5
+    while (metadb.backend_job(status.run_id)["submission_state"]
+           not in ("result_stop_fenced", "result_fenced", "published")
+           and time.monotonic() < deadline):
+        time.sleep(0.01)
+    # The state loop claimed its own stop fence; let it settle and require the loop to converge.
+    client.set_status(ref.submission_id, "STOPPED")
+    final = _wait(recovered, status.run_id)
+    assert final.status == "done"
+    assert metadb.backend_job(status.run_id)["submission_state"] == "result_fenced"
+
+
 def test_result_reconciliation_survives_uncertain_fence_submission(jobs_config):
     module, deps, runner, client, store = _runner(jobs_config)
     graph = _graph()
@@ -3038,6 +3101,38 @@ def test_ray_jobs_storage_outage_after_succeeded_never_publishes_false_failure(j
     assert _wait(runner, status.run_id).status == "done"
 
 
+def test_result_store_outage_during_cancel_stop_does_not_bury_a_success(jobs_config):
+    # After a cancel reaches STOPPED, a transient result-store read failure is "unknown", not "absent":
+    # the supervisor must not publish a terminal cancellation over a committed success. Once the store
+    # recovers, the genuine success wins the cancel race.
+    store = CountedFlakyArtifacts()
+    _module, deps, runner, client, store = _runner(jobs_config, store=store)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_cancel_store_outage_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    assert ref is not None
+    _materialize_bound_job(runner, status)  # job artifact present in the store
+    _write_success(store, status)            # a committed, hash-bound success result is present
+    client.put(ref.submission_id, "RUNNING", metadata=_workload_metadata(status))
+    assert metadb.note_backend_submission_observed(status.run_id, ref.attempt_id) is True
+    assert metadb.request_backend_cancel(status.run_id) is True
+    runner._cancel[status.run_id].set()
+    # Loop 1's cancel path sets state=STOPPED on the first (failed) job read; then the inter-loop result
+    # read fails once — the exact window where a swallowed error would bury the success as cancelled.
+    store.job_read_failures = 1
+    store.result_read_failures = 1
+
+    runner._supervise_jobs(status.run_id)
+
+    final = runner.status(status.run_id)
+    assert final.status == "done"
+    assert store.result_read_failures == 0
+    assert metadb.backend_job(status.run_id)["publication_state"] == "published"
+
+
 def test_ray_jobs_configuration_drift_never_resubmits_to_another_cluster(jobs_config, monkeypatch):
     module, deps, original, client, store = _runner(jobs_config)
     graph = _graph()
@@ -3350,6 +3445,37 @@ def test_terminal_remote_result_corruption_uses_durable_quarantine(
     with metadb.session() as session:
         assert session.get(metadb.CatalogEntry, physical_uri) is None
         assert session.get(metadb.ObjectAttempt, physical_uri).state == "abandoned"
+
+
+def test_corrupt_result_flushed_during_cancel_stop_uses_durable_quarantine(jobs_config):
+    # A driver that flushes an invalid terminal result inside the cancel stop window must go through
+    # the same durable quarantine as any other corrupt result, not publish as a plain remote failure.
+    _module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    status = runner.run(plan, graph, "write", "distributed",
+                        run_id=f"run_jobs_cancel_corrupt_{uuid.uuid4().hex}")
+    ref = status.backend_ref
+    assert ref is not None
+    _wait_submitted(client, ref.submission_id)
+
+    original_stop = client.stop_job
+
+    def stop_and_flush_corrupt(submission_id: str):
+        _write_success(store, status)
+        corrupt = store.read(ref.result_uri)
+        corrupt["unexpected"] = "field"
+        store.write(ref.result_uri, corrupt)
+        return original_stop(submission_id)
+
+    client.stop_job = stop_and_flush_corrupt
+
+    runner.cancel(status.run_id)
+    final = _wait(runner, status.run_id)
+    assert final.status == "failed"
+    assert final.error == "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
+    binding = metadb.backend_job(status.run_id)
+    assert "artifact_contract_invalid" in binding["quarantine_reason"]
 
 
 def test_trusted_result_wins_cancel_without_local_jobs_config_or_ray_metadata(jobs_config, monkeypatch):

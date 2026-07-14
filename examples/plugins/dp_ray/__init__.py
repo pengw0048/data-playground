@@ -193,9 +193,34 @@ def _gpu_batch_rows() -> int:
     return min(value, _GPU_BATCH_ROWS_MAX)
 
 
+_ACCELERATOR_CANON: dict[str, str] | None = None
+
+
+def _accelerator_canon_map() -> dict[str, str]:
+    """Case-insensitive index from any known Ray accelerator name to its exact-case constant."""
+    global _ACCELERATOR_CANON
+    if _ACCELERATOR_CANON is None:
+        table: dict[str, str] = {}
+        try:
+            from ray.util import accelerators as _acc
+            for name in dir(_acc):
+                value = getattr(_acc, name)
+                if name.isupper() and isinstance(value, str):
+                    table[value.upper()] = value
+        except Exception:  # noqa: BLE001
+            pass
+        _ACCELERATOR_CANON = table
+    return _ACCELERATOR_CANON
+
+
 def _canonical_accelerator_type(value: object) -> str:
-    """Match Ray's canonical ``accelerator_type:<TYPE>`` resource names for operator input."""
-    return str(value or "").strip().upper()
+    """Resolve operator input to Ray's exact-case ``accelerator_type`` constant.
+
+    Ray matches ``accelerator_type`` case-sensitively, so a known family maps to its canonical spelling
+    (e.g. ``Intel-GAUDI``) and an unknown value passes through stripped rather than being uppercased.
+    """
+    text = str(value or "").strip()
+    return _accelerator_canon_map().get(text.upper(), text)
 
 
 def _job_status_name(value) -> str:
@@ -1873,7 +1898,12 @@ class RayRunner:
     def _recover_jobs(self) -> None:
         from hub import metadb
 
-        for ref, doc in metadb.active_backend_jobs(_JOBS_BACKEND):
+        try:
+            rows = list(metadb.active_backend_jobs(_JOBS_BACKEND))
+        except Exception:  # noqa: BLE001 — a transient boot-time DB error defers recovery, never fails load
+            log.warning("ray_jobs_recovery_deferred backend=%s", _JOBS_BACKEND)
+            return
+        for ref, doc in rows:
             try:
                 effects_ready = (
                     ref.get("publication_state") == "effects_started"
@@ -1929,9 +1959,14 @@ class RayRunner:
                         f"{reason}; cancellation recorded; repair the malformed durable binding "
                         "before remote stop can resume"
                     )[:2000]
-                marked = metadb.mark_backend_recovery_blocked(
-                    run_id, _JOBS_BACKEND, blocked.model_dump(), reason
-                )
+                try:
+                    marked = metadb.mark_backend_recovery_blocked(
+                        run_id, _JOBS_BACKEND, blocked.model_dump(), reason
+                    )
+                except Exception:  # noqa: BLE001 — per-row isolation must survive its own DB write
+                    log.warning("ray_jobs_recovery_mark_failed run_id=%s backend=%s",
+                                run_id, _JOBS_BACKEND)
+                    continue
                 if not marked:  # a terminal publisher or repair won the race; do not install stale state
                     log.warning(
                         "ray_jobs_recovery_blocked_race run_id=%s backend=%s",
@@ -3979,24 +4014,31 @@ class RayRunner:
                 job = candidate
 
             completed = None
+            result_read_failed = False
             if cancelling:
                 try:
                     completed = self._terminal_result_if_present(job)
                 except Exception:
-                    # Cancellation can still stop the SQL-bound remote job during a result-store outage;
-                    # publication remains non-terminal until a later supervisor can validate the object.
-                    pass
+                    # A result-store outage is "unknown", not "absent": stopping the remote job is
+                    # still valid, but a terminal cancellation must not bury a possibly-committed
+                    # success, so defer publication to the state loop until the object can be read.
+                    result_read_failed = True
             if completed is not None and completed.get("artifact_invalid"):
                 self._quarantine_invalid_job(
                     status, ref, ArtifactContractError(completed["error"])
                 )
                 return
             if cancelling and state in ("STOPPED", "MISSING"):
-                if completed is not None:
+                if result_read_failed:
+                    self._persist_jobs_live_error(
+                        status, "Ray Jobs result unavailable after stop; retrying")
+                    state = None
+                elif completed is not None:
                     self._publish_job_result(job, graph, target, status, completed)
+                    return
                 else:
                     self._publish_cancelled_binding(status, binding, job)
-                return
+                    return
 
             # Establish backend state. A result object is never consulted while Ray explicitly reports a
             # live state; it is strong terminal evidence only after authoritative job-metadata loss.
@@ -4009,6 +4051,16 @@ class RayRunner:
                     return
                 if binding.get("quarantine_reason"):
                     if self._resume_quarantined_job(status, ref, binding):
+                        return
+                    time.sleep(self._jobs_poll_s)
+                    continue
+                if binding.get("submission_state") in _RESULT_RECONCILIATION_STATES:
+                    # Once a reconciliation fence is claimed the binding leaves "submitting", so this
+                    # loop must keep re-driving it (mirroring loops 1 and 3) rather than treating the
+                    # fence job as a live workload and spinning forever.
+                    client, ready = self._drive_result_reconciliation(status, ref, binding)
+                    if ready:
+                        self._publish_reconciled_result(job, graph, target, status)
                         return
                     time.sleep(self._jobs_poll_s)
                     continue
@@ -4030,6 +4082,13 @@ class RayRunner:
                     client = cancel_client or client
                     if cancel_state in ("STOPPED", "MISSING"):
                         completed = self._terminal_result_if_present(job)
+                        if completed is not None and completed.get("artifact_invalid"):
+                            # A driver that flushed a corrupt result during the stop window must go
+                            # through the same durable quarantine as any other invalid terminal.
+                            self._quarantine_invalid_job(
+                                status, ref, ArtifactContractError(completed["error"])
+                            )
+                            return
                         if completed is not None:
                             self._publish_job_result(job, graph, target, status, completed)
                         else:
@@ -4603,10 +4662,9 @@ class RayRunner:
         # Failed/cancelled outputs stay private. Remote attempts remain fenced as writing until the
         # backend can prove every worker is terminal; the ownership reaper deliberately never guesses.
         status.status = result["status"]
-        status.error = (
-            shared_error
-            or (self._public_remote_error(result["error"]) if result.get("error") else None)
-        )
+        # Local Popen driver shares the hub's host and trust boundary, so its failure text is surfaced
+        # verbatim; only cross-boundary Jobs results are reduced to a stable code by _apply_job_result.
+        status.error = shared_error or (str(result["error"]) if result.get("error") else None)
         if status.status == "done":
             status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
         else:

@@ -42,7 +42,7 @@ safe to distribute.
 | `map`, `filter`, `flat_map`, `map_batches` | yes | uses the same compiled transform operator as the local engine |
 | grouped `aggregate` | yes, for bare-column group keys | global, expression-key, order-sensitive, and GPU-pinned aggregates fail/fall back as appropriate |
 | `window` | yes, for a bare-column partition key | order-sensitive forms without a sufficient order fall back; GPU pins fail loud |
-| full-row `dedup` | yes | keyed dedup, floating-point schemas, and GPU pins are rejected |
+| full-row `dedup` | yes | keyed dedup and floating-point schemas fall back to the local engine; GPU pins fail loud |
 | `join` | broadcast `inner`, `left`, and `cross` | the materialized right side must fit the driver fallback limit; GPU maps use finite batches |
 | `sort` | plain-column keys | the final ordered result is coalesced to one worker; Ray 2.56 cannot resource-pin its range shuffle, so GPU/custom-resource sorts fail before dispatch |
 | SQL, sections, metrics/charts, opaque plugin nodes | no | local fallback |

@@ -150,12 +150,21 @@ def initialize_ephemeral_metadata(directory: str) -> str:
     os.makedirs(directory, exist_ok=True)
     url = "sqlite:///" + os.path.join(os.path.abspath(directory), "workload-metadata.db")
     os.environ["DP_DATABASE_URL"] = url
+    # Marks this process as a one-shot workload with no hub settings DB, so object-store adapters may
+    # reconstruct their config from the allowlisted data-plane environment. The hub never sets this.
+    os.environ["DP_WORKLOAD_EPHEMERAL"] = "1"
     from hub import metadb
     metadb.init_db()
     object_store = _object_store_execution_config()
     if object_store:
         metadb.set_setting("objectStore", object_store, "global")
     return url
+
+
+def is_ephemeral_workload(source: Mapping[str, str] | None = None) -> bool:
+    """True inside a one-shot workload process (subrun / Ray driver) with no hub settings DB."""
+    src = os.environ if source is None else source
+    return src.get("DP_WORKLOAD_EPHEMERAL") == "1"
 
 
 def data_plane_object_store_config(source: Mapping[str, str] | None = None,

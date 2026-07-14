@@ -101,6 +101,25 @@ def _postgres_lock_timeout(seconds: int = 2):
         engine.dispose()
 
 
+def test_usage_publication_bumps_popularity_without_touching_updated_at():
+    """A read-popularity bump must not advance the 'recently updated' sort key."""
+    uri = f"mem://usage-updated-at/{uuid.uuid4().hex}/parent.parquet"
+    metadb.catalog_upsert_entry(uri, "usage_parent", {"id": "tbl_usage_parent", "name": "usage_parent"})
+    old = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+    with metadb.session() as s:
+        s.get(metadb.CatalogEntry, uri).updated_at = old
+    try:
+        plan = metadb.catalog_prepare_usage_publication(
+            f"run-{uuid.uuid4().hex}", f"event-{uuid.uuid4().hex}", [uri])
+        assert metadb.catalog_apply_usage_publication(plan) is True
+        with metadb.session() as s:
+            entry = s.get(metadb.CatalogEntry, uri)
+            assert entry.usage == 1
+            assert entry.updated_at.replace(tzinfo=datetime.timezone.utc) == old
+    finally:
+        metadb.catalog_delete_prefix("mem://usage-updated-at/")
+
+
 def test_postgres_concurrent_first_sink_publishers_reserve_one_logical_identity():
     if metadb.engine().dialect.name != "postgresql":
         pytest.skip("requires a real PostgreSQL metadata database")

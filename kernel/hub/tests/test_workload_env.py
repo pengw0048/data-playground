@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import subprocess
 import sys
@@ -240,6 +241,30 @@ def test_data_plane_object_store_config_uses_only_allowlisted_worker_identity():
     assert data_plane_object_store_config(mixed, scheme="gcs") == {
         "endpoint": "http://gcs:4443", "useSsl": False
     }
+
+
+def test_object_store_env_fallback_is_gated_to_ephemeral_workloads(monkeypatch):
+    # A hub with an empty objectStore setting must keep its ambient credential chain; only a one-shot
+    # workload (subrun / Ray driver) may reconstruct config from the DP_S3_* data-plane environment.
+    from hub import metadb, workload_env
+    from hub.plugins import adapters
+
+    monkeypatch.setattr(metadb, "get_setting", lambda *a, **k: {})
+    calls: list[str] = []
+    monkeypatch.setattr(
+        workload_env, "data_plane_object_store_config",
+        lambda *a, **k: calls.append("hit") or {"accessKeyId": "x", "secretAccessKey": "y"})
+
+    monkeypatch.delenv("DP_WORKLOAD_EPHEMERAL", raising=False)
+    with contextlib.suppress(Exception):  # a hub keeps its ambient chain — the fallback must not run
+        adapters.object_fs("s3://bkt/obj")
+    assert calls == []
+
+    monkeypatch.setenv("DP_WORKLOAD_EPHEMERAL", "1")
+    assert workload_env.is_ephemeral_workload() is True
+    with contextlib.suppress(Exception):  # driver/subrun reconstructs config from the allowlisted env
+        adapters.object_fs("s3://bkt/obj")
+    assert calls == ["hit"]
 
 
 def test_workload_graph_inlines_named_schema_contract_without_mutating_source():
