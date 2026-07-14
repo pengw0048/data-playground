@@ -124,19 +124,20 @@ test.describe('accessibility gate', () => {
     await addNode(page, 'Shape', 'filter')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
     // Rename so the Files Open control is unambiguous (many untitled canvases accumulate per e2e DB).
+    const canvasName = `a11y-keyboard-${Date.now()}`
     await page.getByTestId('file-menu').click()
     const nameInput = page.getByPlaceholder('untitled')
     await expect(nameInput).toBeVisible()
-    await nameInput.fill('a11y-keyboard-canvas')
+    await nameInput.fill(canvasName)
     await page.keyboard.press('Escape') // close menu
-    await expect(page.getByTestId('file-menu')).toContainText('a11y-keyboard-canvas')
+    await expect(page.getByTestId('file-menu')).toContainText(canvasName)
     await expect(page.getByTestId('autosave')).toContainText(/saved/i, { timeout: 8_000 })
     const canvasHash = await page.evaluate(() => location.hash)
     await goFiles(page)
 
     // Click the heading so the next Tab starts a keyboard session (:focus-visible applies).
     await page.getByRole('heading', { name: 'Recents' }).click()
-    const openCard = page.getByRole('button', { name: 'Open a11y-keyboard-canvas' })
+    const openCard = page.getByRole('button', { name: `Open ${canvasName}` })
     expect(await tabUntil(page, openCard)).toBe(true)
     await expect(openCard).toBeFocused()
     const focusVisible = await openCard.evaluate((el) => el.matches(':focus-visible'))
