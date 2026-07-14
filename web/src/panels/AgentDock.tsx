@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { roleCanEdit, useStore } from '../store/graph'
-import { api } from '../api/client'
+import { api, type AgentDataDisclosure } from '../api/client'
 import { color, kindAccent } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { cn } from '@/lib/utils'
@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input'
 // tools (add/connect/set_config). We apply its graph to the canvas only when it did change it.
 // Requires a configured model (DP_AGENT_MODEL + a provider key, set in Settings — the key stays in
 // the kernel, never the browser). With no model it is simply unavailable — no rule-based stand-in.
+// Before the first message, we show a data-egress disclosure from the workspace AgentDataPolicy.
 export function AgentDock() {
   const open = useStore((s) => s.agentOpen)
   const setOpen = useStore((s) => s.setAgentOpen)
@@ -19,12 +20,24 @@ export function AgentDock() {
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
-  const [llm, setLlm] = useState<{ available: boolean; model?: string; reason?: string } | null>(null)
+  const [llm, setLlm] = useState<{
+    available: boolean
+    model?: string
+    provider?: string
+    reason?: string
+    disclosure?: AgentDataDisclosure
+  } | null>(null)
 
   useEffect(() => {
     if (!open) return
     if (!canEdit) { setOpen(false); return }
-    api.agentStatus().then((s) => setLlm({ available: s.available, model: s.model, reason: s.reason })).catch(() => setLlm({ available: false, reason: 'kernel offline' }))
+    api.agentStatus().then((s) => setLlm({
+      available: s.available,
+      model: s.model,
+      provider: s.provider,
+      reason: s.reason,
+      disclosure: s.disclosure ?? s.policy,
+    })).catch(() => setLlm({ available: false, reason: 'kernel offline' }))
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }  // Esc closes the dock
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -33,6 +46,7 @@ export function AgentDock() {
   if (!open || !canEdit) return null
 
   const ready = !!llm?.available
+  const disclosure = llm?.disclosure
   const submit = async () => {
     if (!roleCanEdit(useStore.getState().canvasRole)) return
     const intent = text.trim()
@@ -55,7 +69,7 @@ export function AgentDock() {
           runTerminal(res.graph)
         }
       } else {
-        setLlm({ available: false, reason: res.reason })
+        setLlm({ available: false, reason: res.reason, disclosure: res.disclosure ?? res.policy })
         push({ role: 'agent', text: `Agent unavailable — ${res.reason ?? 'no model configured'}. Set a model in Settings.` })
       }
     } catch (e) {
@@ -91,8 +105,29 @@ export function AgentDock() {
               </div>
             </div>
           ) : log.length === 0 && (
-            <div className="text-[11.5px] leading-relaxed text-muted-foreground">
-              Describe an outcome — e.g. <i>“sample images, filter where is_valid, write a table”</i>.
+            <div className="flex flex-col gap-2">
+              {ready && disclosure && (
+                <div
+                  data-testid="agent-egress-disclosure"
+                  role="note"
+                  className="rounded-md border border-border bg-muted/40 px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground"
+                >
+                  <div className="font-semibold text-foreground">Before you send</div>
+                  <div className="mt-1">
+                    Provider <span data-testid="agent-disclosure-provider">{disclosure.provider ?? llm?.provider ?? 'unknown'}</span>
+                    {' · '}
+                    model <span data-testid="agent-disclosure-model">{disclosure.model ?? llm?.model ?? 'unknown'}</span>
+                  </div>
+                  <div className="mt-1" data-testid="agent-disclosure-values">
+                    {disclosure.rowValuesMayLeave
+                      ? 'Sample row values may leave this deployment under the active AgentDataPolicy.'
+                      : 'Sample row values will not leave this deployment (metadata-only). Catalog names and columns may still be sent to the model.'}
+                  </div>
+                </div>
+              )}
+              <div className="text-[11.5px] leading-relaxed text-muted-foreground">
+                Describe an outcome — e.g. <i>“sample images, filter where is_valid, write a table”</i>.
+              </div>
             </div>
           )}
           {log.map((m, i) => (
