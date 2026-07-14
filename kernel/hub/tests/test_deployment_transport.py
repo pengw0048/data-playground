@@ -187,9 +187,9 @@ def test_local_mode_login_cookie_has_no_secure_flag(monkeypatch):
     assert response.status_code == 200
     set_cookie = _set_cookie_header(response)
     assert "dp_session=" in set_cookie
-    assert "HttpOnly" in set_cookie
-    assert "SameSite=lax" in set_cookie.lower() or "SameSite=Lax" in set_cookie
-    assert "Secure" not in set_cookie
+    assert "httponly" in set_cookie.lower()
+    assert "samesite=lax" in set_cookie.lower()
+    assert "secure" not in set_cookie.lower()
 
 
 def test_shared_direct_tls_issues_secure_cookie_on_login_and_password_change(monkeypatch):
