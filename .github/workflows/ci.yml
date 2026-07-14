@@ -59,6 +59,39 @@ jobs:
       - name: Verify the release migration contract
         run: cd kernel && uv run pytest -q hub/tests/test_postgres_migration_smoke.py
 
+  backup-restore-drill:
+    name: backup/restore drill (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb
+        env:
+          POSTGRES_USER: dp
+          POSTGRES_PASSWORD: dp-test-only
+          POSTGRES_DB: dataplay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dp -d dataplay_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      DP_TEST_DATABASE_URL: postgresql+psycopg://dp:dp-test-only@127.0.0.1:5432/dataplay_test
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Placeholder web build
+        run: mkdir -p web/dist
+      - name: Install PostgreSQL client tools
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Install kernel with PostgreSQL support
+        run: cd kernel && uv sync --extra dev --extra postgres
+      - name: Run isolated restore drill
+        # -s keeps BACKUP_RESTORE_DRILL RPO/RTO evidence lines in the job log.
+        run: cd kernel && uv run pytest -s -q hub/tests/test_backup_restore_drill.py::test_postgres_object_store_isolated_restore_drill
+
   e2e:
     name: e2e (Playwright — real UI on the real kernel)
     runs-on: ubuntu-latest

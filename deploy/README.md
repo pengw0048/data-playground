@@ -40,7 +40,7 @@ The reference script can prove this ordering inside its disposable kind cluster,
 still stop MCP/headless/external writers that are outside that cluster. Local file-backed SQLite remains
 zero-config and serializes automatic first-run migration with a lock derived from the resolved database
 file path. A non-empty database without a recognized Alembic revision is rejected rather than guessed or
-auto-stamped; recover it from a versioned backup or perform an explicit, audited conversion.
+auto-stamped; recover it from a versioned backup (see [BACKUP_RESTORE.md](../docs/BACKUP_RESTORE.md)) or perform an explicit, audited conversion.
 
 ## What the pieces are
 
