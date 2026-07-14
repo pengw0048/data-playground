@@ -8,7 +8,6 @@ they can't leak into the rest of the suite.
 
 from __future__ import annotations
 
-import contextlib
 
 import pytest
 from fastapi.testclient import TestClient

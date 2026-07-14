@@ -2267,7 +2267,7 @@ def claim_backend_submission_after_missing(run_id: str, attempt_id: str, owner: 
     could forget that an older, already-linearized request may still arrive at Ray.
     """
     with session() as s:
-        now = s.scalar(select(func.current_timestamp()))
+        now = _db_now(s)
         lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
         updated = s.execute(
             update(RunBackendJob).where(
@@ -2308,7 +2308,7 @@ def renew_backend_submission(run_id: str, attempt_id: str, owner: str,
                              lease_seconds: float = 30.0) -> bool:
     """Keep a live, already-linearized external submit from being reclaimed mid-request."""
     with session() as s:
-        now = s.scalar(select(func.current_timestamp()))
+        now = _db_now(s)
         lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
         updated = s.execute(
             update(RunBackendJob).where(
@@ -2353,7 +2353,7 @@ def claim_backend_stop_fence(run_id: str, attempt_id: str, owner: str,
     one can be accepted. This turns an otherwise unknowable crashed-owner state into stoppable evidence.
     """
     with session() as s:
-        now = s.scalar(select(func.current_timestamp()))
+        now = _db_now(s)
         lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
         intent = (
             RunBackendJob.submission_state.in_(("submitting", "result_fencing"))
@@ -3003,7 +3003,7 @@ def claim_backend_publication(run_id: str, attempt_id: str, owner: str,
     with session() as s:
         # Derive every deadline from the metadata DB server's clock. Hub/pod wall-clock skew must not
         # let one supervisor steal a live lease early or write a deadline far into the future.
-        now = s.scalar(select(func.current_timestamp()))
+        now = _db_now(s)
         lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
         result = s.execute(
             update(RunBackendJob).where(
@@ -3176,7 +3176,7 @@ def renew_backend_publication(run_id: str, attempt_id: str, owner: str,
                               lease_seconds: float = 30.0) -> bool:
     """Extend an active publication lease while catalog/history side effects are in flight."""
     with session() as s:
-        now = s.scalar(select(func.current_timestamp()))
+        now = _db_now(s)
         lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
         updated = s.execute(
             update(RunBackendJob).where(

@@ -48,7 +48,16 @@ semantic = ["sentence-transformers>=2.2"]  # the examples/plugins/dp_semantic_ca
 # /api/healthz endpoint on every pod; it also supplies the official Jobs SDK. ``ray[data]`` alone omits
 # the dashboard HTTP server used by both contracts.
 ray = ["ray[data,default]==2.56.0"]  # exact: dp_ray validates this private hash-shuffle ABI on every node
-dev = ["pytest>=8.0", "httpx>=0.27", "moto[s3,server]>=5.0", "data-playground[agent]", "data-playground[lance]"]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+    "moto[s3,server]>=5.0",
+    "data-playground[agent]",
+    "data-playground[lance]",
+    # QA-01: Python lint + static-type baseline (see [tool.ruff] / [tool.basedpyright] below).
+    "ruff>=0.11",
+    "basedpyright>=1.28",
+]
 
 [project.urls]
 Homepage = "https://github.com/pengw0048/data-playground"
@@ -81,3 +90,55 @@ filterwarnings = [
     "error::DeprecationWarning:hub.*",
     "ignore:There is no current event loop:DeprecationWarning",
 ]
+
+# ---------------------------------------------------------------------------
+# Python quality baseline (issue #111 / QA-01)
+# Local: `make lint`  (= ruff on kernel/ + examples/plugins/, then basedpyright on hub/)
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+target-version = "py311"
+src = ["hub"]
+# Cover the packaged tree; plugins are linted via an extra path in `make lint` / CI
+# (`uv run ruff check --config pyproject.toml . ../examples/plugins`) so this ignore set applies there too.
+
+[tool.ruff.lint]
+# Correctness-oriented starter set (Ruff's recommended default: pycodestyle errors + pyflakes).
+# No isort / format / pedantic flake8 plugins — those are reformatting churn for a later ratchet.
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+    # Stylistic / density choices already common in tests and compact helpers — not correctness.
+    "E401",  # multiple imports on one line
+    "E701",  # multiple statements on one line (colon)
+    "E702",  # multiple statements on one line (semicolon)
+    "E731",  # lambda assigned to a name (fine as a sentinel in tests)
+    "E741",  # ambiguous variable name (l/O/I) — noisy without buying safety here
+]
+
+[tool.basedpyright]
+# Why basedpyright (not mypy): fine-grained `report*` dials let us commit a clean, lenient baseline
+# TODAY and ratchet one diagnostic at a time without littering `# type: ignore`. It still catches
+# undefined names and declared-type assignment errors under this config (see issue #111 AC4).
+include = ["hub"]
+exclude = ["hub/tests", "**/__pycache__"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+# Third-party / optional extras (ray, lance, pyiceberg, …) are not always installed in the
+# `dev` extra — don't fail the gate on missing stubs or import resolution for those.
+reportMissingImports = "none"
+reportMissingModuleSource = "none"
+reportMissingTypeStubs = "none"
+# Deferred diagnostics (explicit per-rule, not a blanket ignore): present on the tree today and
+# too large for this PR. Turn each back to "error" in a follow-up once the call sites are ready.
+reportArgumentType = "none"
+reportOptionalMemberAccess = "none"
+reportAttributeAccessIssue = "none"
+reportReturnType = "none"
+reportPrivateImportUsage = "none"
+reportOptionalSubscript = "none"
+reportCallIssue = "none"
+reportGeneralTypeIssues = "none"
+reportRedeclaration = "none"
+reportOptionalIterable = "none"
+reportOptionalCall = "none"
+reportOperatorIssue = "none"

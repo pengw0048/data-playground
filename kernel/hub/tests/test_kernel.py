@@ -924,7 +924,6 @@ def test_kernel_liveness_counts_in_process_preview_profile():
 def test_dp_execution_is_the_third_precedence_tier(tmp_path, monkeypatch):
     # precedence: per-user > workspace > DP_EXECUTION > kernel default. With no user/global setting,
     # DP_EXECUTION (settings.execution) is honored — the tier only incidentally covered before.
-    from hub import handoff
     from hub.deps import Deps
     from hub.settings import settings
     monkeypatch.setattr(settings, "execution", "local-out-of-core")
@@ -1268,7 +1267,7 @@ def test_high_precision_decimal_previews_exactly():
 
 def test_plugin_run_applies_lowering(tmp_path):
     # the critical bug: plugin lowerings were dropped on a full run → untransformed writes
-    from hub.sdk import NodeSpec, PortSpec, ParamSpec, ctx
+    from hub.sdk import NodeSpec, PortSpec, ctx
     deps = get_deps()
     spec = NodeSpec(kind="const42", title="const42", category="compute",
                     inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
@@ -1829,7 +1828,7 @@ def test_append_concurrent_same_base_no_data_loss(tmp_path, monkeypatch):
 
     assert not errors, f"concurrent append raised: {errors[:3]}"
     ds = uris[0]  # every append returns the same part-dir uri (name sans extension)
-    with db.run_scope() as sc:
+    with db.run_scope():
         got = a.scan(ds).aggregate("count(*)").fetchone()[0]
         distinct = a.scan(ds).aggregate("count(distinct id)").fetchone()[0]
     assert got == n_threads * per_thread, f"lost rows under concurrent append+compaction: {got} != {n_threads * per_thread}"
@@ -2714,7 +2713,7 @@ def test_canvas_pip_deps_default_off_under_auth(monkeypatch):
 
 def test_per_user_password_is_not_a_skeleton_key(monkeypatch):
     # with auth on, a password authenticates ONLY its own user — no shared/skeleton password.
-    from hub import auth, metadb
+    from hub import auth
     from hub.metadb import User, session
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
     bid = "bella_u"
@@ -2739,7 +2738,7 @@ def test_per_user_password_is_not_a_skeleton_key(monkeypatch):
 def test_first_admin_bootstrap_from_env_password(monkeypatch):
     # P0-DEPLOY-01: a fresh auth-on deploy needs a first-admin credential before application replicas
     # start. The one-shot migration consumes DP_AUTH_PASSWORD and closes that bootstrap lockout.
-    from hub import auth, metadb
+    from hub import metadb
     client.cookies.clear()
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")     # auth on
     metadb.set_user_password("local", None)            # simulate the fresh/pre-bootstrap admin
@@ -2762,8 +2761,6 @@ def test_api_routes_require_auth_when_enabled(monkeypatch):
     # SECURE DEFAULT: with auth enabled, the whole /api surface needs a session — the high-impact routes
     # (/run code-exec, /data file-read, POST /users self-registration) used to be wide open. Only the
     # login roster + auth status/login stay public.
-    from hub import auth, metadb
-    from hub.metadb import User, session
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
     client.cookies.clear()
     g = {"id": "x", "version": 1, "nodes": [N("s", "source", {"uri": "/etc/hosts"})], "edges": []}
@@ -6070,7 +6067,6 @@ def test_run_routes_to_a_capability_matching_backend(tmp_path, monkeypatch):
     import json
 
     from hub.deps import Deps
-    from hub.ir import lower_to_ir
     from hub.models import Graph
     from hub.routers.runs import _route_by_capability
     monkeypatch.setenv("DP_POOL_WORKERS", json.dumps([{"name": "gpu", "cpu": 16, "gpu": 2, "gpu_type": "a100"}]))
@@ -6485,7 +6481,6 @@ def test_grain_propagates_through_relational_ops():
 def test_join_analysis_warns_on_fanout():
     # P2: when the best join isn't 1:1, warn that rows fan out. events-aggregated-by-user_id (unique
     # user_id) joined to raw events (user_id repeats) is 1:N.
-    d = get_deps()
     ev = _uri("events")
     graph = {"id": "c", "version": 1, "nodes": [
         N("l0", "source", {"uri": ev}),
@@ -6569,7 +6564,6 @@ def test_declared_key_overrides_inference_and_grain():
 
 def test_relationship_crud_and_leads_join_analysis():
     # declared relationships persist (Settings, cross-instance) and TRUMP measurement in join analysis.
-    d = get_deps()
     ev, img = _uri("events"), _uri("images")
     rel = {"leftUri": img, "leftColumns": ["id"], "rightUri": ev, "rightColumns": ["user_id"], "cardinality": "1:N"}
     try:
@@ -9797,7 +9791,6 @@ def test_ray_unreaped_driver_stays_nonterminal_and_retains_every_fence(
     import subprocess
     import tempfile
     import threading
-    from pathlib import Path
 
     from hub import handoff
     from hub.deps import Deps
@@ -10621,7 +10614,6 @@ def test_ray_compatibility_sources_are_size_bounded_before_adapter_scan(tmp_path
     workspace.mkdir()
     mod = _load_dp_ray()
     runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
-    table = pa.table({"x": [1, 2]})
     sentinel = SimpleNamespace()
     scans = []
     source = tmp_path / "small.csv"

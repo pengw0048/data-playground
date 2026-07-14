@@ -145,7 +145,7 @@ def resolve_secret_value(value: Any, *, allow_plaintext: bool = True) -> Any:
     if allow_plaintext:
         return value
     raise SecretResolveError(
-        f"expected a secret reference (env:VAR or file:/path), got a raw value")
+        "expected a secret reference (env:VAR or file:/path), got a raw value")
 
 
 def resolve_object_store(cfg: dict | None) -> dict:

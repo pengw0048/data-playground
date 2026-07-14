@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 from hub import graph as g
 from hub.ir import resolve_config
-from hub.models import Graph, GraphNode
+from hub.models import Graph
 
 # ops whose result needs ~O(input) memory (a hash/sort build) → they set a region's working-set need;
 # streaming ops (scan/filter/select/map/sample/limit/write) need ~O(1) and don't.

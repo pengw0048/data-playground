@@ -3895,7 +3895,6 @@ def test_managed_catalog_persist_failure_cannot_publish_terminal_done(
         time.sleep(0.01)
 
     job = store.read(status.backend_ref.job_uri)
-    logical_uri = job["sink_targets"]["write"]
     output_uri = job["sink_contracts"]["write"]["physical_uri"]
     assert runner.status(status.run_id).status in ("queued", "running")
     binding = metadb.backend_job(status.run_id)

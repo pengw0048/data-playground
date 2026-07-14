@@ -829,7 +829,6 @@ class RunController:
         across runs when the region's plan hash is unchanged. Runs in-process for a default region, or
         in the target worker's PROCESS for a placed region (C3). The output lands on the tier reachable
         by both producer and consumers (local, or a shared object store for a remote handoff — Phase C)."""
-        from hub import tiers as tier_mod
         cancel = (self._stop.get(run_id) or self._cancel.get(run_id)
                   or threading.Event())
         if cancel.is_set():
