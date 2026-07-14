@@ -1,15 +1,15 @@
 """correlate durable runs with HTTP request / trace ids
 
-Revision ID: 0022_run_request_id
-Revises: 0021_local_result_artifacts
+Revision ID: 0025_run_request_id
+Revises: 0024_secret_refs
 Create Date: 2026-07-14
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0022_run_request_id"
-down_revision = "0021_local_result_artifacts"
+revision = "0025_run_request_id"
+down_revision = "0024_secret_refs"
 branch_labels = None
 depends_on = None
 

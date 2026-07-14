@@ -17,6 +17,8 @@ with no embedder the catalog still does lexical + faceted search offline, zero e
 from __future__ import annotations
 
 import inspect
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -25,6 +27,7 @@ from hub import metadb
 from hub.models import (
     CatalogBrowse,
     CatalogPage,
+    CatalogPublicationReceipt,
     CatalogQuery,
     CatalogTable,
     Facets,
@@ -103,7 +106,8 @@ class InMemoryCatalog:
              folder: str = "", tags: list[str] | None = None, owner: str | None = None,
              description: str | None = None, parents: list[str] | None = None,
              pipeline: str | None = None, *, strict_probe: bool = False,
-             strict_persist: bool = False) -> CatalogTable:
+             strict_persist: bool = False, _persist_table: bool = True,
+             _embed_table: bool = True) -> CatalogTable:
         import hashlib as _h
         # schema/count probe (may touch disk/network) OUTSIDE the lock so a slow adapter doesn't block
         # concurrent catalog reads; only the version/collision compute + upsert below is serialized.
@@ -149,9 +153,12 @@ class InMemoryCatalog:
                 columns=columns, keys=keys, meta=meta, folder=folder, tags=tags,
                 owner=owner, description=description,
             )
-            self._persist(
-                table, parents=parents, pipeline=pipeline, strict=strict_persist)
-        self._embed_one(table)  # best-effort semantic index (no-op without an embedder)
+            if _persist_table:
+                self._persist(
+                    table, parents=parents, pipeline=pipeline,
+                    strict=strict_persist)
+        if _embed_table:
+            self._embed_one(table)  # best-effort semantic index (no-op without an embedder)
         return table
 
     @staticmethod
@@ -292,13 +299,14 @@ class InMemoryCatalog:
         return LineageResult(nodes=nodes, edges=kept, truncated=truncated)
 
     # -- CatalogProvider: write-back -------------------------------------- #
-    def _add_edge(self, parent: str, child: str, pipeline: str | None, column: str | None = None) -> None:
+    def _add_edge(self, parent: str, child: str, pipeline: str | None,
+                  column: str | None = None) -> bool:
         if parent == child:
-            return
+            return False
         try:
-            metadb.catalog_add_edge(parent, child, pipeline, column)
+            return metadb.catalog_add_edge(parent, child, pipeline, column)
         except Exception:  # noqa: BLE001
-            pass
+            return False
 
     def register(self, table: CatalogTable, parents: list[str] | None = None,
                  pipeline: str | None = None) -> None:
@@ -309,12 +317,18 @@ class InMemoryCatalog:
     def register_output(self, name: str, uri: str, version: str | None = None,
                         parents: list[str] | None = None, pipeline: str | None = None,
                         folder: str = "", tags: list[str] | None = None, owner: str | None = None,
-                        description: str | None = None) -> CatalogTable:
+                        description: str | None = None,
+                        _bump_usage: bool = True, _require_durable: bool = False) -> CatalogTable:
         table = self._add(name=name, uri=uri, version=version, meta=pipeline, folder=folder,
                           tags=tags, owner=owner, description=description,
-                          parents=parents, pipeline=pipeline)
-        for parent in parents or []:
-            metadb.catalog_bump_usage(parent)  # a derived output READ its parent → popularity signal
+                          parents=parents, pipeline=pipeline,
+                          strict_probe=_require_durable,
+                          strict_persist=_require_durable)
+        parent_uris = list(dict.fromkeys(parents or []))
+        if _bump_usage:
+            # Local/legacy calls are one completed run each and retain their per-call popularity bump.
+            for parent in parent_uris:
+                metadb.catalog_bump_usage(parent)
         return table
 
     def publish_output_strict(self, name: str, uri: str, version: str | None = None,
@@ -332,10 +346,68 @@ class InMemoryCatalog:
                 log.warning("catalog usage bump failed after strict publication", exc_info=True)
         return table
 
+    def prepare_managed_output_publication(
+            self, *, run_id: str, step_id: str, idempotency_key: str, name: str, uri: str,
+            version: str | None = None, parents: list[str] | None = None,
+            pipeline: str | None = None) -> dict:
+        """Commit exact inventory and freeze schema/catalog metadata before effects can win."""
+        if not run_id or not step_id or not idempotency_key:
+            raise ValueError("managed publication run, step_id, and idempotency_key are required")
+        from hub.handoff import managed_read_lease, prepare_attempt_commit
+
+        prepare_attempt_commit(uri)
+        try:
+            deadline = float(os.environ.get("DP_RUN_DEADLINE_S", "3600"))
+        except ValueError:
+            deadline = 3600.0
+        ttl = max(300.0, deadline + 300.0)
+        with managed_read_lease(
+                uri, owner=f"catalog-plan:{name}", ttl_seconds=ttl,
+                allow_committed=True) as guard:
+            guard.check()
+            table = self._add(
+                name=name, uri=uri, version=version, meta=pipeline,
+                parents=parents, pipeline=pipeline, strict_probe=True,
+                _persist_table=False, _embed_table=False,
+            )
+        identity = metadb.managed_catalog_publication_identity(uri, run_id)
+        plan = {
+            "contract_version": 1,
+            "run_id": str(run_id),
+            "step_id": str(step_id),
+            "ref_key": f"{run_id}:{step_id}",
+            "generation": identity["generation"],
+            "event_key": str(idempotency_key),
+            "name": str(name),
+            "uri": str(uri).rstrip("/"),
+            "version": table.version,
+            "parents": list(dict.fromkeys(str(parent).rstrip("/") for parent in (parents or []))),
+            "pipeline": pipeline,
+            "table_doc": table.model_dump(by_alias=True),
+        }
+        canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"), default=str)
+        plan["fingerprint"] = "managed-output:v1:sha256:" + hashlib.sha256(
+            canonical.encode()
+        ).hexdigest()
+        return plan
+
     def publish_managed_output(self, name: str, uri: str, version: str | None = None,
                                parents: list[str] | None = None,
-                               pipeline: str | None = None) -> dict:
+                               pipeline: str | None = None, *,
+                               idempotency_key: str | None = None,
+                               prepared_plan: dict | None = None) -> dict:
         """Core single-sink publication: inventory proof, catalog pointer, ref, and state commit."""
+        if prepared_plan is not None:
+            if not idempotency_key or (
+                    prepared_plan.get("event_key") != idempotency_key
+                    or prepared_plan.get("name") != name
+                    or prepared_plan.get("uri") != str(uri).rstrip("/")
+                    or prepared_plan.get("version") != version
+                    or prepared_plan.get("parents") != list(dict.fromkeys(
+                        str(parent).rstrip("/") for parent in (parents or [])))
+                    or prepared_plan.get("pipeline") != pipeline):
+                raise RuntimeError("managed publication arguments changed after effects staging")
+            return metadb.catalog_apply_managed_publication(prepared_plan)
         existing = metadb.catalog_managed_publication_receipt(uri)
         if existing is not None:
             return {**existing, "table": self.get_table(uri)}
@@ -365,6 +437,28 @@ class InMemoryCatalog:
         if receipt is None:
             raise RuntimeError("core managed publication did not return a durable receipt")
         return {**receipt, "table": table}
+
+    def register_output_idempotent(
+        self, idempotency_key: str, **kwargs
+    ) -> CatalogPublicationReceipt:
+        """Durable-executor write projection keyed by one logical output effect.
+
+        Catalog entries/lineage remain URI-idempotent. The Jobs publisher records one separate aggregate
+        usage event after every output is registered, so a multi-sink run does not overcount parents.
+        """
+        if not idempotency_key:
+            raise ValueError("idempotency_key is required")
+        table = self.register_output(_bump_usage=False, _require_durable=True, **kwargs)
+        metadb.catalog_record_output_publication(
+            idempotency_key, table.uri, table.version
+        )
+        return CatalogPublicationReceipt(
+            idempotency_key=idempotency_key, uri=table.uri, version=table.version
+        )
+
+    def record_usage_idempotent(self, idempotency_key: str, parents: list[str]) -> bool:
+        """Count each distinct parent once for one durable run, independently of output cardinality."""
+        return metadb.catalog_bump_usage_once(idempotency_key, parents)
 
     def set_metadata(self, uri: str, *, folder: str | None = None, tags: list[str] | None = None,
                      owner: str | None = None, description: str | None = None) -> CatalogTable:
@@ -598,6 +692,11 @@ class InMemoryCatalog:
 def core_managed_publisher(catalog):
     """Return the core lifecycle publisher only; a lookalike custom method cannot claim this authority."""
     return catalog.publish_managed_output if type(catalog) is InMemoryCatalog else None
+
+
+def core_managed_publication_planner(catalog):
+    """Return the core pre-effects planner; custom lookalikes cannot mint lifecycle authority."""
+    return catalog.prepare_managed_output_publication if type(catalog) is InMemoryCatalog else None
 
 
 def core_unmanaged_publisher(catalog):

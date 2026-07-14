@@ -11,6 +11,10 @@ copy of the graph; run_agent returns the (possibly unchanged) graph + a transcri
 plan/build mode — the model decides per message whether to just answer or to call the mutating
 tools; the frontend applies the graph only when it actually did. With no provider configured the
 agent is simply unavailable (no rule-based stand-in).
+
+Hosted-model tool results pass through the workspace ``AgentDataPolicy`` sanitizer (SEC-01): the
+default is metadata-only, so sample row values never leave unless an admin opts into sample-values
+or marks the configured endpoint as local.
 """
 
 from __future__ import annotations
@@ -19,28 +23,44 @@ from dataclasses import dataclass
 from typing import Any
 
 from hub import graph_ops
+from hub.agent_policy import load_agent_data_policy, record_tool_audit, sanitize_tool_result
 from hub.executors.preview import preview_node
 from hub.models import Graph
 from hub.settings import settings
 
 
 def _agent_config() -> tuple[str, str | None, str | None]:
-    """Resolve (model, api_key, base_url): global DB settings (set in the UI) override env/defaults."""
+    """Resolve (model, api_key, base_url): global DB settings (set in the UI) override env/defaults.
+
+    ``agentApiKey`` is stored as a secret reference (``env:…`` / ``file:…``); the material value is
+    resolved here and never written back into settings.
+    """
     from hub import metadb
+    from hub.secrets import SecretResolveError, resolve_secret_value
     model = metadb.get_setting("agentModel", "global") or settings.agent_model
-    api_key = metadb.get_setting("agentApiKey", "global") or settings.agent_api_key
+    stored_key = metadb.get_setting("agentApiKey", "global")
+    try:
+        api_key = resolve_secret_value(stored_key) if stored_key else None
+    except SecretResolveError:
+        # A broken reference (unset env var / missing file) must degrade to unavailable, not 500 the
+        # polled agent status endpoint.
+        api_key = None
+    api_key = api_key or settings.agent_api_key
     base_url = metadb.get_setting("agentBaseUrl", "global") or settings.agent_base_url
     return model, api_key, base_url
 
 
 def agent_status() -> dict:
-    """Whether the LLM agent is usable, and why not if not (provider-agnostic)."""
+    """Whether the LLM agent is usable, why not if not, and the active data-egress disclosure."""
     model, api_key, base_url = _agent_config()
+    policy = load_agent_data_policy(model=model, base_url=base_url)
+    disclosure = policy.disclosure()
     try:
         import pydantic_ai  # noqa: F401  — the in-process harness
     except Exception:  # noqa: BLE001
-        return {"available": False, "model": model,
-                "reason": "install the agent extra: uv pip install -e 'kernel[agent]'"}
+        return {"available": False, "model": model, "provider": policy.provider,
+                "reason": "install the agent extra: uv pip install -e 'kernel[agent]'",
+                "policy": disclosure, "disclosure": disclosure}
     # a local/self-hosted endpoint OR an explicit key (env or UI setting) needs no env-var provider key
     preconfigured = bool(base_url) or bool(api_key)
     missing: list[str] = []
@@ -52,7 +72,14 @@ def agent_status() -> dict:
             missing = []
     available = preconfigured or not missing
     reason = "" if available else f"set {' or '.join(missing) or 'a provider API key'} to use model '{model}'"
-    return {"available": available, "reason": reason, "model": model}
+    return {
+        "available": available,
+        "reason": reason,
+        "model": model,
+        "provider": policy.provider,
+        "policy": disclosure,
+        "disclosure": disclosure,
+    }
 
 
 _SYSTEM = """\
@@ -82,8 +109,9 @@ you then need one row per parent, add an `aggregate`. Set the join's `on` (same-
 - Configure with the params shown by list_node_kinds. For a `filter`, set `predicate` to a SQL \
 boolean expression over the columns. For `sql`, write a query using `input` as the table name. For \
 `transform`, write a Python function `def fn(row): ...` (mode "map") that returns the row.
-- Use `preview(node_id)` to SEE real sample rows and verify a step before continuing. Adapt to \
-what the data actually looks like.
+- Use `preview(node_id)` to verify a step. Under the default metadata-only egress policy it may \
+return columns and row count without sample values — that is intentional. Adapt using metadata \
+when values are withheld.
 - Build the MINIMUM graph that achieves the outcome. Don't add nodes they didn't ask for.
 - Before you finish, call `validate` to confirm there are no typed-wire errors and no unintended \
 join fan-out. Then STOP calling tools and reply with a one-sentence summary of what you built.
@@ -102,11 +130,21 @@ class _Ctx:
     wg: dict              # working graph {id, version, nodes, edges}
     seq: list             # id counter [int]
     transcript: list      # [{tool, input, result}] for the UI
+    policy: Any           # resolved AgentDataPolicy for this run
 
 
 def _new_id(ctx: _Ctx, kind: str) -> str:
     ctx.seq[0] += 1
     return f"{kind}_a{ctx.seq[0]}"
+
+
+def _finish(ctx: _Ctx, tool: str, tool_input: dict, result: dict) -> dict:
+    """Sanitize → audit → transcript. The single egress gate for every tool result."""
+    policy = ctx.policy
+    sanitized = sanitize_tool_result(result, allows_sample_values=policy.allows_sample_values)
+    record_tool_audit(policy, tool, tool_input, sanitized)
+    ctx.transcript.append({"tool": tool, "input": tool_input, "result": sanitized})
+    return sanitized
 
 
 try:
@@ -124,8 +162,7 @@ try:
                            "columns": [c.name for c in t.columns],
                            "keys": [k.columns for k in t.keys]}
                           for t in ctx.deps.kdeps.catalog.list_tables(None)]}
-        ctx.deps.transcript.append({"tool": "list_catalog", "input": {}, "result": out})
-        return out
+        return _finish(ctx.deps, "list_catalog", {}, out)
 
     @_agent.tool
     def join_hints(ctx: RunContext[_Ctx], left_uri: str, right_uri: str) -> dict:
@@ -137,8 +174,7 @@ try:
             out = graph_ops.join_hints(ctx.deps.kdeps, left_uri, right_uri)
         except Exception as e:  # noqa: BLE001
             out = {"error": f"{type(e).__name__}: {e}"}
-        ctx.deps.transcript.append({"tool": "join_hints", "input": {"left_uri": left_uri, "right_uri": right_uri}, "result": out})
-        return out
+        return _finish(ctx.deps, "join_hints", {"left_uri": left_uri, "right_uri": right_uri}, out)
 
     @_agent.tool
     def validate(ctx: RunContext[_Ctx]) -> dict:
@@ -149,15 +185,13 @@ try:
             out = graph_ops.validate_graph(ctx.deps.kdeps, ctx.deps.wg)
         except Exception as e:  # noqa: BLE001
             out = {"error": f"{type(e).__name__}: {e}"}
-        ctx.deps.transcript.append({"tool": "validate", "input": {}, "result": out})
-        return out
+        return _finish(ctx.deps, "validate", {}, out)
 
     @_agent.tool
     def list_node_kinds(ctx: RunContext[_Ctx]) -> dict:
         """List available node kinds with their params and input/output ports."""
         out = {"kinds": graph_ops.node_kinds(ctx.deps.kdeps)}
-        ctx.deps.transcript.append({"tool": "list_node_kinds", "input": {}, "result": out})
-        return out
+        return _finish(ctx.deps, "list_node_kinds", {}, out)
 
     @_agent.tool
     def add_node(ctx: RunContext[_Ctx], kind: str, title: str | None = None,
@@ -168,8 +202,7 @@ try:
                                      _new_id(ctx.deps, kind), kind, title, config)
         except graph_ops.GraphOpError as e:
             out = {"error": f"{e}. Call list_node_kinds."}
-        ctx.deps.transcript.append({"tool": "add_node", "input": {"kind": kind, "title": title, "config": config}, "result": out})
-        return out
+        return _finish(ctx.deps, "add_node", {"kind": kind, "title": title, "config": config}, out)
 
     @_agent.tool
     def connect(ctx: RunContext[_Ctx], source_id: str, target_id: str,
@@ -180,8 +213,8 @@ try:
                                     source_id, target_id, target_handle)
         except graph_ops.GraphOpError as e:
             out = {"error": str(e)}
-        ctx.deps.transcript.append({"tool": "connect", "input": {"source_id": source_id, "target_id": target_id, "target_handle": target_handle}, "result": out})
-        return out
+        return _finish(ctx.deps, "connect",
+                       {"source_id": source_id, "target_id": target_id, "target_handle": target_handle}, out)
 
     @_agent.tool
     def set_config(ctx: RunContext[_Ctx], node_id: str, config: dict) -> dict:
@@ -190,12 +223,12 @@ try:
             out = graph_ops.set_config(ctx.deps.wg, node_id, config)
         except graph_ops.GraphOpError as e:
             out = {"error": str(e)}
-        ctx.deps.transcript.append({"tool": "set_config", "input": {"node_id": node_id, "config": config}, "result": out})
-        return out
+        return _finish(ctx.deps, "set_config", {"node_id": node_id, "config": config}, out)
 
     @_agent.tool
     def preview(ctx: RunContext[_Ctx], node_id: str) -> dict:
-        """Preview a node over a small sample. Returns columns and up to 8 rows."""
+        """Preview a node over a small sample. Returns columns and up to 8 rows when policy allows;
+        under metadata-only, columns and row count stay but sample values are withheld."""
         d = ctx.deps.kdeps
         if not graph_ops.find_node(ctx.deps.wg, node_id):
             out: dict = {"error": "node_id not found"}
@@ -211,8 +244,7 @@ try:
                     out = {"columns": [c.name for c in res.columns], "rows": res.rows[:8], "row_count": res.row_count}
             except Exception as e:  # noqa: BLE001
                 out = {"error": f"{type(e).__name__}: {e}"}
-        ctx.deps.transcript.append({"tool": "preview", "input": {"node_id": node_id}, "result": out})
-        return out
+        return _finish(ctx.deps, "preview", {"node_id": node_id}, out)
 
 except ImportError:  # pydantic_ai not installed — agent_status() reports it; run_agent raises
     _agent = None
@@ -240,11 +272,15 @@ def _build_model(model: str, api_key: str | None, base_url: str | None):
     return infer_model(model.replace("/", ":", 1))
 
 
-def run_agent(outcome: str, graph: dict, deps, model=None) -> dict:
-    """Run the tool-use loop; return {graph, transcript, summary}. `model` is injected in tests."""
+def run_agent(outcome: str, graph: dict, deps, model=None, policy=None) -> dict:
+    """Run the tool-use loop; return {graph, transcript, summary}. `model`/`policy` injected in tests."""
     if _agent is None:
         raise RuntimeError("agent extra not installed: from a clone, run `uv pip install -e 'kernel[agent]'`")
     from pydantic_ai.usage import UsageLimits
+
+    cfg_model, _, cfg_base = _agent_config()
+    effective_policy = policy if policy is not None else load_agent_data_policy(
+        model=cfg_model, base_url=cfg_base)
 
     wg = {
         "id": graph.get("id", "canvas"), "version": graph.get("version", 1),
@@ -252,7 +288,7 @@ def run_agent(outcome: str, graph: dict, deps, model=None) -> dict:
         "edges": [dict(e) for e in graph.get("edges", [])],
     }
     existing_ids = {n["id"] for n in wg["nodes"]}
-    ctx = _Ctx(kdeps=deps, wg=wg, seq=[0], transcript=[])
+    ctx = _Ctx(kdeps=deps, wg=wg, seq=[0], transcript=[], policy=effective_policy)
     m = model if model is not None else _build_model(*_agent_config())
 
     prompt = (f"{outcome}\n\n(The canvas currently has {len(wg['nodes'])} node(s) and "
@@ -270,4 +306,5 @@ def run_agent(outcome: str, graph: dict, deps, model=None) -> dict:
         summary = (f"Stopped at the {settings.agent_max_steps}-step limit — returning the partial build "
                    "so far. Ask me to continue if it's incomplete.")
     graph_ops.layout_new(wg, existing_ids)
-    return {"graph": wg, "transcript": ctx.transcript, "summary": summary}
+    return {"graph": wg, "transcript": ctx.transcript, "summary": summary,
+            "policy": effective_policy.disclosure()}

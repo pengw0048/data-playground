@@ -24,7 +24,7 @@ Schema version for typed models in [`kernel/hub/observability.py`](../kernel/hub
 
 | Hop | Behavior |
 | --- | --- |
-| HTTP entry | Middleware reads `X-Request-Id` (or mints `req_<hex>`), sets a contextvar, echoes the header on every response. |
+| HTTP entry | Middleware reads `X-Request-Id` (or mints `req_<hex>`), sets a contextvar, echoes the header on every handled response (a framework-level 500 short-circuits before the middleware). |
 | WebSocket entry | Same mint/normalize from the handshake `X-Request-Id` header into the contextvar. |
 | Run start | `start_run` stamps `RunStatus.request_id` and persists it on `run_states.request_id`. |
 | Durable history | Finished runs store `run_records.request_id`. |
@@ -53,8 +53,8 @@ users, or URIs must **not** enlarge the label set.
 | --- | --- | --- | --- | --- |
 | `dp.http.requests` | counter | `1` | `method`, `route_class`, `outcome` | Every HTTP response leave |
 | `dp.http.duration_ms` | histogram | `ms` | `method`, `route_class`, `outcome` | Every HTTP response leave |
-| `dp.run.state_transitions` | counter | `1` | `status`, `outcome`, `placement` | Run status transitions at finish (and queue→running when available) |
-| `dp.run.duration_ms` | histogram | `ms` | `status`, `outcome`, `placement` | Finished run (`RunStatus.ms`) |
+| `dp.run.state_transitions` | counter | `1` | `status`, `outcome`, `placement`, `error_class` | Run status transitions at finish (and queue→running when available) |
+| `dp.run.duration_ms` | histogram | `ms` | `status`, `outcome`, `placement`, `error_class` | Finished run (`RunStatus.ms`) |
 | `dp.run.queue_delay_ms` | histogram | `ms` | `placement`, `backend` | When queue delay is known (reserved; emitted when measured) |
 | `dp.run.retries` | counter | `1` | `backend`, `error_class` | Retryable backend/storage retry (reserved for adapters) |
 | `dp.run.cancel_latency_ms` | histogram | `ms` | `backend`, `outcome` | Cancel acknowledgement path (reserved when measured) |
@@ -74,7 +74,7 @@ resource_id?, request_id?, run_id?, attempt_id?, attrs, ts}`.
 | `auth.login` | success / failure | principal = user id | Password never present |
 | `auth.logout` | success | principal = user id | |
 | `auth.password_change` | success / failure | principal = user id | |
-| `admin.settings_change` | success / denied | principal = admin; resource = setting key | Values redacted; secret keys noted only as `secret=true` |
+| `admin.settings_change` | success / denied | principal = admin; resource = setting key | Values redacted; secret keys noted only as `sensitive=true` |
 | `sharing.change` | success / denied | principal = owner; resource = canvas id | `attrs.op` = `share` / `unshare` / `visibility` |
 | `dataset.access` | success / denied | resource = dataset id | Emitted when access checks exist |
 | `dataset.mutation` | success / failure / denied | resource = dataset id | Register / delete / upload |

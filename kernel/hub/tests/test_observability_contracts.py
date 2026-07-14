@@ -90,6 +90,19 @@ def test_audit_attrs_reject_secret_shaped_values():
                    attrs={"note": "api_key=abcd"})
 
 
+def test_settings_change_audit_reaches_sinks():
+    """Regression: admin.settings_change must reach sinks. It was silently dropped when put_setting
+    tagged secret keys with an attr named 'secret', which the secret-name guard rejects — so the attrs
+    shape put_setting emits (scope + sensitive) must stay guard-safe and emittable."""
+    sink = InMemoryObservabilitySink().register()
+    event = emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.SUCCESS, principal_id="admin",
+                       resource_type="setting", resource_id="agentApiKey",
+                       attrs={"scope": "global", "sensitive": "true"})
+    assert event is not None  # not rejected at construction (a 'secret'-named attr would be)
+    changes = [e for e in sink.audits if e.action == AuditAction.ADMIN_SETTINGS_CHANGE]
+    assert changes and changes[-1].attrs.get("sensitive") == "true"
+
+
 def test_inmemory_sink_records_shape_valid_events_and_redacts_fixtures():
     sink = InMemoryObservabilitySink().register()
     secret = "super-secret-token-VALUE"
