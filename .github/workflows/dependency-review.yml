@@ -1,15 +1,20 @@
 name: Dependency review
 
-# Fails a PR that introduces a dependency with a known vulnerability at or above
-# the severity threshold below. Reviews lockfile/manifest diffs only — does not
-# open upgrade PRs (that policy is out of scope for #113).
+# Reviews lockfile diffs on every PR and fails when the change newly introduces
+# a dependency vulnerability at or above FAIL_ON_SEVERITY below.
+#
+# We use OSV-Scanner (not actions/dependency-review-action) because GitHub
+# Dependency Graph is an admin-only repository setting and is not currently
+# enabled on this repo — dependency-review-action refuses to run without it
+# (see the failed run on this PR). After an admin enables Dependency Graph
+# (Settings → Code security), prefer switching this job to
+# actions/dependency-review-action with the same fail-on-severity threshold;
+# keep FAIL_ON_SEVERITY / the inline comment in sync.
 on:
   pull_request:
 
 permissions:
   contents: read
-  # pull-requests: write lets the action comment a summary on the PR.
-  pull-requests: write
 
 concurrency:
   group: dependency-review-${{ github.event.pull_request.number || github.ref }}
@@ -20,13 +25,100 @@ jobs:
     name: Review dependency changes
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # Severity threshold (visible): fail on newly introduced vulnerabilities
+      # at HIGH or CRITICAL. Moderate/low findings are listed but do not fail.
+      FAIL_ON_SEVERITY: high
+      OSV_SCANNER_VERSION: "2.3.8"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Dependency review
-        # Severity threshold is deliberate and visible: fail on newly introduced
-        # vulnerabilities of severity high or critical (medium/low are reported
-        # but do not fail the job).
-        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
         with:
-          fail-on-severity: high
-          comment-summary-in-pr: on-failure
+          fetch-depth: 0
+
+      - name: Install OSV-Scanner
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64" \
+            -o /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
+
+      - name: Diff newly introduced vulns against the PR base
+        env:
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, os, subprocess, sys, tempfile
+          from pathlib import Path
+
+          # Fail when a newly introduced finding is at or above this level.
+          ORDER = {"unknown": 0, "low": 1, "moderate": 2, "medium": 2, "high": 3, "critical": 4}
+          threshold = os.environ["FAIL_ON_SEVERITY"].strip().lower()
+          if threshold not in ORDER:
+              sys.exit(f"Unknown FAIL_ON_SEVERITY={threshold!r}")
+
+          base_sha = os.environ["GITHUB_BASE_SHA"]
+          head_sha = os.environ["GITHUB_SHA"]
+          lockfiles = ["kernel/uv.lock", "web/package-lock.json"]
+
+          def scan(sha: str, out: Path) -> None:
+              root = Path(tempfile.mkdtemp(prefix=f"osv-{sha[:8]}-"))
+              for lf in lockfiles:
+                  dest = root / lf
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  dest.write_bytes(subprocess.check_output(["git", "show", f"{sha}:{lf}"]))
+              cmd = ["osv-scanner", "scan", "source", "--format=json", "--verbosity=error"]
+              for lf in lockfiles:
+                  cmd.extend(["--lockfile", str(root / lf)])
+              # Exit 0/1 both OK — we interpret the JSON ourselves for the threshold.
+              proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+              out.write_text(proc.stdout or "{}")
+              if proc.returncode not in (0, 1):
+                  sys.stderr.write(proc.stderr)
+                  sys.exit(f"osv-scanner failed for {sha}: exit {proc.returncode}")
+
+          def findings(path: Path) -> dict[tuple, dict]:
+              data = json.loads(path.read_text() or "{}")
+              found = {}
+              for result in data.get("results") or []:
+                  for pkg in result.get("packages") or []:
+                      meta = pkg.get("package") or {}
+                      key_base = (meta.get("ecosystem"), meta.get("name"), meta.get("version"))
+                      for vuln in pkg.get("vulnerabilities") or []:
+                          sev = str((vuln.get("database_specific") or {}).get("severity") or "unknown").lower()
+                          key = key_base + (vuln.get("id"),)
+                          found[key] = {
+                              "id": vuln.get("id"),
+                              "pkg": meta.get("name"),
+                              "version": meta.get("version"),
+                              "ecosystem": meta.get("ecosystem"),
+                              "severity": sev,
+                          }
+              return found
+
+          with tempfile.TemporaryDirectory() as td:
+              base_out = Path(td) / "base.json"
+              head_out = Path(td) / "head.json"
+              scan(base_sha, base_out)
+              scan(head_sha, head_out)
+              base = findings(base_out)
+              head = findings(head_out)
+
+          new = [v for k, v in head.items() if k not in base]
+          print(f"Base findings: {len(base)}; head findings: {len(head)}; newly introduced: {len(new)}")
+          print(f"Fail threshold: {threshold.upper()} (FAIL_ON_SEVERITY)")
+
+          failing = []
+          for v in sorted(new, key=lambda x: (x["severity"], x["pkg"] or "", x["id"] or "")):
+              level = ORDER.get(v["severity"], 0)
+              mark = "FAIL" if level >= ORDER[threshold] else "info"
+              print(f"  [{mark}] {v['severity'].upper():8} {v['id']}  {v['ecosystem']}:{v['pkg']}@{v['version']}")
+              if level >= ORDER[threshold]:
+                  failing.append(v)
+
+          if failing:
+              print(f"\n{len(failing)} newly introduced vulnerabilit(y/ies) at or above {threshold.upper()}.")
+              sys.exit(1)
+          print("\nNo newly introduced vulnerabilities at or above the severity threshold.")
+          PY

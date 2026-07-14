@@ -15,7 +15,7 @@ Repository-owned GitHub Actions enforce the following supply-chain and security 
 
 | Gate | Workflow | When it runs |
 | --- | --- | --- |
-| Dependency review | `dependency-review.yml` | Every pull request — fails on newly introduced vulnerabilities at severity **high** or above |
+| Dependency review | `dependency-review.yml` | Every pull request — OSV-Scanner diffs lockfiles vs the PR base and fails on newly introduced vulnerabilities at severity **high** or above (`FAIL_ON_SEVERITY`; switches to `actions/dependency-review-action` once Dependency Graph is enabled) |
 | SAST (CodeQL) | `codeql.yml` | Pull requests, pushes to `main`, weekly schedule, and `workflow_dispatch` — results on the **Code scanning** tab |
 | Secret scanning (CI) | `secret-scan.yml` | Pull requests and pushes to `main` — [gitleaks](https://github.com/gitleaks/gitleaks) fails the job on detected secrets |
 | Application image scan | `image-scan.yml` | Path-gated on `Dockerfile` / lockfile changes, weekly schedule, and `workflow_dispatch` — Trivy fails on fixable **CRITICAL/HIGH** |
