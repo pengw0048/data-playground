@@ -166,7 +166,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
   return (
     <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
-      <DialogContent className="dp-modal-overlay flex flex-col gap-0 overflow-hidden p-0 w-[94vw] max-w-[940px] h-[min(680px,90vh)]">
+      <DialogContent data-testid="settings-modal" className="dp-modal-overlay flex flex-col gap-0 overflow-hidden p-0 w-[94vw] max-w-[940px] h-[min(680px,90vh)]">
         {/* header */}
         <div className="flex items-center gap-2 border-b border-border py-3 pl-[18px] pr-12">
           <span className="flex items-center text-muted-foreground"><Icon name="settings" size={15} /></span>
