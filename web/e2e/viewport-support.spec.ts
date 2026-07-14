@@ -1,6 +1,6 @@
 import { test, expect, type Page, type Locator } from '@playwright/test'
 import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { MIN_VIEWPORT } from '../support/min-viewport'
 
 // Smoke that every core desktop surface remains visible, unclipped, and operable at the declared
@@ -44,7 +44,7 @@ async function openCanvasWithSource(page: Page) {
 
 test.describe('minimum viewport support', () => {
   test('docs quote the shared MIN_VIEWPORT constant', () => {
-    const docPath = resolve(__dirname, '../../docs/BROWSER_SUPPORT.md')
+    const docPath = fileURLToPath(new URL('../../docs/BROWSER_SUPPORT.md', import.meta.url))
     const doc = readFileSync(docPath, 'utf8')
     const quoted = `${MIN_VIEWPORT.width}×${MIN_VIEWPORT.height}`
     expect(
@@ -88,6 +88,12 @@ test.describe('minimum viewport support', () => {
     const node = page.locator('.react-flow__node').first()
     await expectFullyInViewport(page, node, 'canvas node')
     await expectFullyInViewport(page, page.getByTestId('inspector'), 'inspector')
+    // Inspector run control stays reachable at the minimum viewport (sources label it Count rows).
+    await expectFullyInViewport(
+      page,
+      page.getByTestId('inspector').getByRole('button', { name: 'Count rows' }),
+      'inspector run control',
+    )
 
     await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
     const dataPanel = page.getByTestId('panel-data')
@@ -97,7 +103,12 @@ test.describe('minimum viewport support', () => {
     await dataPanel.getByTitle('Close').click()
     await expect(dataPanel).toHaveCount(0)
 
-    await page.getByTestId('inspector').getByRole('button', { name: 'Count rows' }).click()
+    // Cheap runs do not auto-open the floating run panel — open Run details from the node menu.
+    await node.click()
+    await node.getByRole('button', { name: 'More' }).click()
+    const runDetails = page.getByText('Run details', { exact: true })
+    await expect(runDetails).toBeVisible()
+    await runDetails.click()
     const runPanel = page.getByTestId('panel-run')
     await expectFullyInViewport(page, runPanel, 'run panel')
     await expect(runPanel.getByText(/estimating|rows|ESTIMATE|DONE|FAILED/i).first()).toBeVisible()

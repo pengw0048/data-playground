@@ -34,8 +34,10 @@ export default defineConfig({
     },
     {
       // Explicit minimum-viewport proof for docs/BROWSER_SUPPORT.md — imports MIN_VIEWPORT so the
-      // documented claim and this project cannot drift without a failing review/test.
+      // documented claim and this project cannot drift without a failing review/test. Depends on
+      // chromium so the shared e2e kernel DB is not mutated by both projects at once.
       name: 'chromium-min-viewport',
+      dependencies: ['chromium'],
       testMatch: '**/viewport-support.spec.ts',
       use: {
         ...devices['Desktop Chrome'],
