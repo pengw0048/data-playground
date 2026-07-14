@@ -1,0 +1,17 @@
+{
+  // Docs voice: keep lines readable in editors, ignore purely stylistic MD rules that
+  // fight dense technical reference prose.
+  "MD013": { "line_length": 120, "code_blocks": false, "tables": false },
+  "MD024": false,
+  "MD025": false,
+  "MD026": false,
+  "MD029": false,
+  "MD033": false,
+  "MD034": false,
+  "MD036": false,
+  "MD040": false,
+  "MD041": false,
+  "MD046": false,
+  "MD049": { "style": "asterisk" },
+  "MD050": { "style": "asterisk" }
+}
