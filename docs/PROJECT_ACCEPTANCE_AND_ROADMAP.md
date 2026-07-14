@@ -15,18 +15,17 @@ and a long-term product idea is not a release blocker.
 
 | Field | Snapshot |
 | --- | --- |
-| Audit date | 2026-07-13 |
-| Accepted source baseline | `origin/main` at `fb9c76f96738a048cb8e66aaafb56bf10c249281` |
-| README narrative cross-check | Ready and green [PR #5](https://github.com/pengw0048/data-playground/pull/5) at `052da1ce3edf12d678d017dac73199532a4f61e0`; not part of accepted `main` until merged |
-| Pending Ray Jobs evidence | Ready and mergeable [PR #79](https://github.com/pengw0048/data-playground/pull/79) at `a841dd8f5440608ac9c1e28969f822b5ba3c9bad`; all seven exact-head GitHub checks passed |
+| Audit date | 2026-07-14 |
+| Accepted source baseline | `origin/main` at `65ae06b0f9ef62329f7dd672c96e693c75eb0b11` |
+| README narrative cross-check | [PR #5](https://github.com/pengw0048/data-playground/pull/5) merged as `65a5f9be36e999098d5bd817fd85f0e5a47f1cf6` on `main` |
+| Durable Ray Jobs evidence | [PR #79](https://github.com/pengw0048/data-playground/pull/79) merged as `27e7de8a320e3d6180dc2aca8d0d9008d2f1e76e` on `main`; the durable whole-graph Ray Jobs lifecycle and `docs/RAY_JOBS.md` are now in-repo and re-verified green |
 | Product stage | Pre-1.0 (`0.1.0`), with a local or trusted-team scope |
 | Audit method | Source, tests, CI workflows, deployment references, and documentation were inspected together |
 
-README PR #5 was used only to align the product framing and security language; it is not evidence that a
-runtime capability has landed. PR #79 is reviewed as **pending evidence**, not as accepted `main`
-behavior. Its durable Ray Jobs lifecycle and `docs/RAY_JOBS.md` are not counted as complete until the PR
-is merged. All seven required checks passed on the named final head; merging is the remaining acceptance
-gate. Refresh all three SHAs before using this document as release evidence after any branch changes.
+README PR #5 aligned the product framing and security language and is now merged on `main`. PR #79 is
+merged on `main` too: its durable whole-graph Ray Jobs lifecycle and `docs/RAY_JOBS.md` are part of the
+accepted source baseline and have been re-verified green on `main`. All three SHAs above are merged
+commits; refresh them if this document is reused as release evidence after later branch changes.
 
 ### Status vocabulary
 
@@ -61,12 +60,12 @@ deployment profile:
 | --- | --- | --- | --- |
 | **A — Local workstation** | One user, or users who fully trust one another and the machine | **Capable beta; nearest to releasable** | Release artifacts, install/upgrade evidence, supported-version CI, and backup/restore procedures are not yet a complete release contract |
 | **B — Trusted-team shared service** | Authenticated team sharing a workspace, metadata DB, storage, and compute trust boundary | **Architecturally supported, not production-certified** | Catalog/data authorization, secret storage, SSO/identity integration, auditability, observability, recovery drills, and deployment hardening remain incomplete |
-| **C — Distributed Ray execution** | Selected supported graph shapes on a controlled Ray cluster | **Validated reference backend, not a production deployment** | `main` lacks a durable Jobs lifecycle; ready PR #79 is pending merge. Live capacity/backpressure, scoped identity, active-failure tests, observability, HA/upgrade runbooks, and operator topology certification remain open |
+| **C — Distributed Ray execution** | Selected supported graph shapes on a controlled Ray cluster | **Validated reference backend, not a production deployment** | `main` now has the durable whole-graph Jobs lifecycle (PR #79 merged as `27e7de8a`). Live capacity/backpressure, scoped identity, active-failure tests, observability, HA/upgrade runbooks, and operator topology certification remain open |
 | **D — Mutually distrusting tenants** | Users must be isolated from one another despite arbitrary code and data access attempts | **Non-goal** | The Python and SQL controls are not an OS security boundary; kernels share deployment credentials and the workspace data plane is shared |
 
 The highest-value path is therefore not to add more surface area immediately. It is to make Profiles A
 and B explicit, finish the small set of cross-cutting security/release/operations controls, complete the
-Ray lifecycle gate, and then prove any generic integration contracts before connecting internal systems
+remaining Ray deployment certification (RAY-02), and then prove any generic integration contracts before connecting internal systems
 through adapters rather than embedding organization-specific behavior in the core.
 
 ## Product acceptance
@@ -176,7 +175,7 @@ scopes follow in the domain sections.
 | DATA-03 | Search scale | Future capability | Large catalogs and integrations | Local semantic search loads and scores the full embedding matrix in each process; a remote provider boundary is a future scale path, not a defect in the local profile |
 | UX-01 | Accessibility | Confirmed gap | P2 / A-B | Some clickable cards are not keyboard semantics, canvas focus outlines are removed, very small text is common, and no automated accessibility gate exists |
 | UX-02 | Viewport support | Certification gate | A-B | The workbench is effectively desktop-first, but the minimum supported viewport/input model is neither declared nor tested |
-| RAY-01 | Lifecycle | Certification gate | C | Durable whole-graph Ray Jobs is pending PR #79 and must not be represented as accepted `main` behavior |
+| RAY-01 | Lifecycle | Accepted | C | Durable whole-graph Ray Jobs lifecycle merged as `27e7de8a` on `main` with `docs/RAY_JOBS.md`, re-verified green by `ci.yml` plus `ray-validation.yml` and `ray-jobs-acceptance.yml` |
 | RAY-02 | Deployment | Certification gate | C | Live capacity/backpressure, scoped workload identity, active-job failure injection, operational telemetry, and HA/upgrade evidence remain open |
 | DOC-01 | Documentation | Documentation change | This PR | The stale numeric feature inventory is retired in favor of maintained capability and acceptance documents |
 
@@ -243,10 +242,10 @@ trusted local product crosses into a shared service or an external model/provide
 
 - **Status:** Addressed in core — settings store `env:` / `file:` secret references; `hub.secrets.SecretResolver`
   resolves them only in-process (agent, object-store clients, plugin `reg.config`). Alembic revision
-  `0022_secret_refs` deletes legacy plaintext values. Vendor secret-manager resolvers remain out of core
+  `0024_secret_refs` deletes legacy plaintext values. Vendor secret-manager resolvers remain out of core
   and register via `reg.add_secret_resolver`.
 - **Evidence:** [`hub/secrets.py`](../kernel/hub/secrets.py), [`routers/workspace.py`](../kernel/hub/routers/workspace.py),
-  [`migrations/versions/0022_secret_refs.py`](../kernel/hub/migrations/versions/0022_secret_refs.py),
+  [`migrations/versions/0024_secret_refs.py`](../kernel/hub/migrations/versions/0024_secret_refs.py),
   [`tests/test_secret_refs.py`](../kernel/hub/tests/test_secret_refs.py).
 - **Impact:** Database readers, backups, and diagnostic dumps no longer recover provider, object-store, or
   plugin credentials from settings rows.
@@ -442,11 +441,11 @@ should strengthen context and lifecycle contracts, not add parallel organization
 
 ### ARCH-01 — Extract a generic durable-job control contract
 
-- **Status:** Future capability and integration enabler. Profile C's current lifecycle gate is RAY-01;
-  a generic controller is not required to certify a Ray-only deployment.
+- **Status:** Future capability and integration enabler. Profile C's whole-graph lifecycle is covered by
+  the accepted RAY-01; a generic controller is not required to certify a Ray-only deployment.
 - **Evidence:** `main` exposes generic [`ExecutionBackend`](../kernel/hub/backends.py) and optional
   [`PlaceableBackend`](../kernel/hub/backends.py), but no generic restart-durable job-control contract.
-  Pending [PR #79](https://github.com/pengw0048/data-playground/pull/79) now freezes a Ray-specific,
+  [PR #79](https://github.com/pengw0048/data-playground/pull/79), merged as `27e7de8a`, froze a Ray-specific,
   restart-durable whole-graph Jobs lifecycle while explicitly leaving the multi-region parent in memory.
 - **Impact:** A future provider whose confirmed boundary matches durable job control should not copy
   Ray-specific retry, cancellation, fencing, and publication semantics. Providers that own only trigger,
@@ -729,18 +728,19 @@ sensitivity, worker-direct Parquet behavior, and a fresh degraded-cluster run af
 That gate proves backend correctness for the tested shapes. It does not prove active-job reconstruction,
 cluster IAM, admission control, production storage, KubeRay policy, or incident response.
 
-### RAY-01 — Pending durable Jobs lifecycle
+### RAY-01 — Durable whole-graph Jobs lifecycle
 
-- **Status:** Certification gate for Profile C; pending PR #79, not Accepted.
-- **Pending evidence:** Ready, mergeable [PR #79](https://github.com/pengw0048/data-playground/pull/79) at the snapshot
-  SHA proposes official Ray Jobs API submission, durable SQL binding, recovery, cancellation intent,
-  authoritative-absence rules, result-envelope verification, publication leasing, and whole-graph
-  restart reattachment. Its own
-  [`RAY_JOBS.md` snapshot](https://github.com/pengw0048/data-playground/blob/a841dd8f5440608ac9c1e28969f822b5ba3c9bad/docs/RAY_JOBS.md)
-  explicitly limits the contract to whole-graph execution; multi-region parent orchestration remains in
-  memory. The branch was rebuilt on the accepted `main` baseline, independently release-gate reviewed,
-  locally passed the evidence matrix below, and passed all seven final-head GitHub checks. None of this is
-  accepted `main` behavior until the exact head merges.
+- **Status:** Accepted. The durable whole-graph Ray Jobs lifecycle is on `main`; Profile C's remaining
+  production certification is tracked separately in RAY-02.
+- **Merged evidence:** [PR #79](https://github.com/pengw0048/data-playground/pull/79), merged as
+  `27e7de8a320e3d6180dc2aca8d0d9008d2f1e76e` on `main`, delivers official Ray Jobs API submission, durable
+  SQL binding, recovery, cancellation intent, authoritative-absence rules, result-envelope verification,
+  publication leasing, and whole-graph restart reattachment. The in-repo
+  [`RAY_JOBS.md`](RAY_JOBS.md) limits the contract to whole-graph execution; multi-region parent
+  orchestration remains in memory. The durable Ray Jobs lifecycle was re-verified green on `main` by
+  `ci.yml` (the #79 merge push run) plus fresh `workflow_dispatch` runs of
+  [`ray-validation.yml`](../.github/workflows/ray-validation.yml) and
+  [`ray-jobs-acceptance.yml`](../.github/workflows/ray-jobs-acceptance.yml).
 - **Integration and final-fix local evidence:** full kernel/SQLite `1036 passed, 43 skipped`; PostgreSQL migration
   `2 passed`; clean PostgreSQL Ray Jobs lifecycle `96 passed, 1 skipped`; PostgreSQL object/GC and
   backend-publication lock races `24 passed`; retained-auth paths `8 passed, 1 SQLite-only skipped`;
@@ -753,24 +753,19 @@ cluster IAM, admission control, production storage, KubeRay policy, or incident 
   corruption share one durable quarantine contract, while retaining autonomous retry through a transient
   control outage; the complete Ray Jobs unit file passed `98 passed, 2 skipped`, nine focused quarantine
   tests passed, and independent final review found no P0/P1/P2.
-- **Acceptance criteria before merge:**
-  1. Keep the current-main rebuild and complete-diff regression audit intact; re-run them if the head or
-     base changes.
-  2. All requested review threads are resolved with tests for the exact lifecycle invariant changed.
-  3. Unit, PostgreSQL lifecycle, real Ray Jobs service, and existing multi-node differential checks pass
-     on the final PR head.
-  4. Restart, duplicate supervisor, cancel race, ambiguous control failure, result corruption, catalog
-     retry, and stale/missing configuration cases remain fail-closed.
-  5. Documentation clearly separates whole-graph durability from multi-region parent durability and
-     backend correctness from deployment readiness.
-  6. After merge, update this document's baseline and move only the proven lifecycle item to Accepted.
+- **Merged and verified:** the current-main rebuild and complete-diff regression audit landed with the
+  merge; unit, PostgreSQL lifecycle, real Ray Jobs service, and multi-node differential checks passed on
+  the merged head; and restart, duplicate supervisor, cancel race, ambiguous control failure, result
+  corruption, catalog retry, and stale/missing configuration cases remain fail-closed. This refresh
+  updates the baseline and moves RAY-01 to Accepted; the documentation continues to separate whole-graph
+  durability from multi-region parent durability, and backend correctness from deployment readiness.
 
 ### RAY-02 — Remaining production certification
 
 - **Status:** Certification gate for Profile C.
 - **Evidence:** [Ray readiness](RAY.md) lists partial or missing live cluster truth, workload isolation,
-  active-job resilience, observability, and operator-owned deployment security/HA. Pending PR #79 does
-  not claim to close those gates.
+  active-job resilience, observability, and operator-owned deployment security/HA. The now-merged durable
+  Ray Jobs lifecycle (PR #79) does not close those gates.
 - **Acceptance criteria:**
   1. **Capacity and backpressure:** discover live resources/health, impose bounded admission/queueing, and
      fail an explicit placement when requirements cannot be honored.
@@ -1009,17 +1004,17 @@ Every internal adapter must pass the same minimum review:
 
 ## Roadmap
 
-The time bands are sequencing guides, not date commitments. Security/release work can proceed in parallel
-with PR #79's merge, but adapter implementation depends on generic contracts and owner-confirmed internal
-semantics.
+The time bands are sequencing guides, not date commitments. Security/release work can proceed
+independently now that PR #79 has merged, while adapter implementation depends on generic contracts and
+owner-confirmed internal semantics.
 
 ### Near term: 0–6 weeks
 
-**Goal:** make Profile A releasable, make Profile B's boundaries explicit, and merge PR #79's reviewed,
-exact-head-green current-main rebuild.
+**Goal:** make Profile A releasable and make Profile B's boundaries explicit; the durable Ray Jobs
+lifecycle (PR #79) has already landed on `main` as `27e7de8a`.
 
-1. **Merge PR #79's current clean, exact-head-green head**; re-run the regression audit if the head or
-   base changes, then update the Ray baseline here.
+1. **Durable Ray Jobs lifecycle landed** (PR #79 merged as `27e7de8a`); the Ray baseline in this report is
+   updated to match.
 2. **Land this acceptance report** and retire the stale feature-count inventory.
 3. **Close agent egress risk** with metadata-only default, explicit sample-value policy, UI disclosure,
    and audit events.
@@ -1091,7 +1086,7 @@ hard to review; unrelated rows should not be combined merely because they touch 
 | Order | PR theme | Depends on | Acceptance focus | Explicitly out of scope |
 | ---: | --- | --- | --- | --- |
 | 00 | Acceptance report and capability pointers | None | Snapshot, evidence links, status vocabulary, no stale counts | Product implementation |
-| 01 | Finish and merge durable Ray Jobs PR #79 | Existing PR | Preserve the completed current-main regression audit, exact lifecycle invariants, final-head CI, honest limits | Generic controller extraction, new sinks |
+| 01 | Durable Ray Jobs lifecycle (PR #79, landed as `27e7de8a`) | Existing PR | Preserved the current-main regression audit, exact lifecycle invariants, final-head CI, honest limits | Generic controller extraction, new sinks |
 | 02 | Agent data-egress policy | None | Metadata-only default, value opt-in, sanitizer, disclosure, agent-egress event fixture adopted by 12 | Full DLP, catalog ACL, cross-domain audit schema |
 | 03 | Secret references and `SecretResolver` | None | No plaintext DB secrets, destructive migration, redaction tests | Vendor-specific secret manager |
 | 04 | Shared-mode transport guard | None | Secure-cookie/TLS/proxy startup checks | Certificate/ingress management |
@@ -1191,12 +1186,12 @@ docker compose -f docker-compose.ray.yml down -v
 The complete fault-control and degraded-run sequence is owned by
 [`ray-validation.yml`](../.github/workflows/ray-validation.yml) and documented in [RAY.md](RAY.md).
 
-### Pending Ray Jobs
+### Durable Ray Jobs
 
-Until PR #79 merges, use only its exact-head checks and test instructions as pending evidence. Its final
-head adds a path-gated real Ray Jobs service acceptance workflow alongside unit/fake-control tests, but
-that workflow is not repository-owned `main` behavior until merge. Never copy a green run from another
-SHA into release certification.
+PR #79 is merged on `main` as `27e7de8a`, so the durable Ray Jobs lifecycle and its path-gated real Ray
+Jobs service acceptance workflow ([`ray-jobs-acceptance.yml`](../.github/workflows/ray-jobs-acceptance.yml))
+are now repository-owned `main` behavior alongside the unit/fake-control tests. For release certification,
+still link the exact CI run on the release SHA; never copy a green run from an unrelated SHA.
 
 ### Documentation integrity
 
@@ -1223,7 +1218,7 @@ For this report and future edits:
 | UX and accessibility | [`web/src/views/Shell.tsx`](../web/src/views/Shell.tsx), [`web/src/index.css`](../web/src/index.css), [`web/package.json`](../web/package.json) |
 | Release and deployment | [`Dockerfile`](../Dockerfile), [`docker-compose.yml`](../docker-compose.yml), [`deploy/README.md`](../deploy/README.md), [`kernel/pyproject.toml`](../kernel/pyproject.toml) |
 | Ray backend | [RAY.md](RAY.md), [`examples/plugins/dp_ray`](../examples/plugins/dp_ray/), [`docker/ray/Dockerfile`](../docker/ray/Dockerfile), [`ray-validation.yml`](../.github/workflows/ray-validation.yml) |
-| Pending durable Ray Jobs | [PR #79](https://github.com/pengw0048/data-playground/pull/79) and its immutable [`RAY_JOBS.md` snapshot](https://github.com/pengw0048/data-playground/blob/a841dd8f5440608ac9c1e28969f822b5ba3c9bad/docs/RAY_JOBS.md) |
+| Durable Ray Jobs | [PR #79](https://github.com/pengw0048/data-playground/pull/79) (merged as `27e7de8a`), [RAY_JOBS.md](RAY_JOBS.md), and [`ray-jobs-acceptance.yml`](../.github/workflows/ray-jobs-acceptance.yml) |
 | CI and test ownership | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), [`.github/workflows/ray-validation.yml`](../.github/workflows/ray-validation.yml), [`kernel/hub/tests`](../kernel/hub/tests/), [`web/e2e`](../web/e2e/) |
 
 ## Decision record and non-goals
@@ -1249,7 +1244,7 @@ For this report and future edits:
 
 Re-run this acceptance review when any of the following occurs:
 
-- PR #79 merges or its lifecycle contract changes;
+- the durable Ray Jobs lifecycle contract changes;
 - Plugin API v2 or a first Luma adapter lands;
 - a tagged release is prepared;
 - Profile B is proposed for real users or sensitive data;
