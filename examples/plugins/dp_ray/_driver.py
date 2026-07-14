@@ -38,6 +38,26 @@ def _progress_writer(status_file: str):
     return emit
 
 
+def _run_job(runner, ir, graph, target, ray_opts, progress, job: dict):
+    """Dispatch one verified job while preserving each control plane's sink binding."""
+    materialize_uri = job.get("materialize_uri")
+    if materialize_uri:
+        return runner._run_ir_materialize(
+            ir, graph, target, materialize_uri, ray_opts, progress, job.get("attempt_id")
+        )
+    return runner._run_ir_sync(
+        ir,
+        graph,
+        target,
+        ray_opts,
+        progress,
+        job.get("sink_targets"),
+        job.get("attempt_id"),
+        sink_attempts=job.get("sink_attempts"),
+        sink_contracts=job.get("sink_contracts"),
+    )
+
+
 def main() -> None:
     from hub.job_artifacts import (canonical_json, ray_job_canonical_fields,
                                    ray_job_envelope_fields, read_json_artifact,
@@ -139,17 +159,13 @@ def main() -> None:
         runner = mod.RayRunner(deps)
         graph, target = Graph(**job["graph"]), job["target"]
         ir = lower_to_ir(graph, target, deps.node_specs, deps.node_ir)
-        mat = job.get("materialize_uri")
         ray_opts = mod._ray_opts(job.get("requires"))  # region resource need → per-Ray-task placement
         prog = _progress_writer(status_file)
-        _log(f"lowered; {'_run_ir_materialize' if mat else '_run_ir_sync'}; ray_opts={ray_opts}")
-        result = (runner._run_ir_materialize(
-            ir, graph, target, mat, ray_opts, prog, job.get("attempt_id")
-        ) if mat
-                  else runner._run_ir_sync(
-                      ir, graph, target, ray_opts, prog, job.get("sink_targets"),
-                      job.get("attempt_id"), None, job.get("sink_contracts"),
-                  ))
+        _log(
+            f"lowered; {'_run_ir_materialize' if job.get('materialize_uri') else '_run_ir_sync'}; "
+            f"ray_opts={ray_opts}"
+        )
+        result = _run_job(runner, ir, graph, target, ray_opts, prog, job)
         _log(f"run done: {result.get('status')}")
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read
         result = {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}
