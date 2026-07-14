@@ -45,6 +45,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Cheap OPS-02 gate: prove the Ray image builds reproducibly and the dp_ray version handshake
+  # accepts the image itself. Independent of the heavy multi-node differential matrix below.
+  image-smoke:
+    name: Ray image smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COMPOSE_PROJECT_NAME: dp-ray-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Build Ray image
+        run: docker compose -f docker-compose.ray.yml build ray-head
+
+      - name: Require non-root uid and pinned Ray CLI
+        run: |
+          set -euo pipefail
+          uid=$(docker run --rm dp-ray:local id -u)
+          test "$uid" = "10001"
+          docker run --rm dp-ray:local ray --version | tee /tmp/ray-version.txt
+          grep -Fq "2.56.0" /tmp/ray-version.txt
+
+      - name: Require the runtime version handshake inside a single-node Ray
+        run: |
+          set -euo pipefail
+          # One container = one Ray head. Exercising validate_ray_cluster here catches an image that
+          # built cleanly but shipped the wrong Ray before the 40-minute differential pays for it.
+          docker run --rm --shm-size=1gb dp-ray:local /bin/sh -ec '
+            ray start --head --num-cpus=1 --object-store-memory=536870912 --dashboard-host=0.0.0.0
+            python -c "import ray; from hub.ray_compat import validate_ray_cluster; ray.init(address=\"auto\", configure_logging=False, log_to_driver=False); report = validate_ray_cluster(ray); print(\"version handshake OK:\", \", \".join(f\"{n}={v}\" for n, v in report.items())); ray.shutdown()"
+            ray stop >/dev/null 2>&1
+          '
+
   multi-node-differential:
     name: Ray (${{ matrix.scenario }})
     runs-on: ubuntu-latest

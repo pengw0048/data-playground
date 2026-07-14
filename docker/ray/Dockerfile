@@ -7,10 +7,14 @@
 # Ray's supported `data,default` dependency set. `default` is required by KubeRay's dashboard-agent
 # /api/healthz probe on port 52365; a data-only install starts raylets but never serves that endpoint.
 # The driver runs inside this image too, and dp_ray handshakes every live node before data execution.
-FROM python:3.12-slim
+#
+# Base image pinned to a digest (not a mutable :tag) so a rebuild is reproducible and can't silently
+# pull a changed base — resolve a new digest with `docker buildx imagetools inspect <img>:<tag>` (OPS-02).
+FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir uv
+# Pin uv so the installer itself can't drift under a rebuild (OPS-02).
+RUN pip install --no-cache-dir uv==0.11.28
 RUN groupadd --gid 10001 dataplay \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin dataplay
 WORKDIR /app
@@ -22,7 +26,9 @@ COPY --chown=10001:10001 examples/ ./examples/
 USER 10001:10001
 RUN touch ./web/dist/.keep
 WORKDIR /app/kernel
-RUN uv sync --extra ray
+# --frozen: install EXACTLY the checked-in uv.lock (fail if drifted) → reproducible. --no-dev: no test
+# tooling in the validation image. [ray] extra = the exact ABI-pinned Ray that validate_ray_cluster checks.
+RUN uv sync --frozen --no-dev --extra ray
 # KubeRay starts raylets through a login shell, which resets PATH on Debian.
 # Keep the venv-owned interpreter but expose the Ray CLI from the standard login-shell PATH.
 USER root
