@@ -438,9 +438,10 @@ async def ws_run(ws: WebSocket, run_id: str):
 
 
 # --- realtime collaboration: a broadcast room per canvas (presence + live doc updates) ---------- #
-# A dumb relay: clients hold the canvas; the server fans out each message (presence/cursor or a doc
-# update) to the room's other peers, and tells peers when someone leaves. This is a usable first
-# version (last-write-wins on the doc); a CRDT (Yjs) is the conflict-free hardening.
+# A dumb relay: clients hold the canvas; the server fans out presence/cursor and opaque Yjs CRDT
+# updates to the room's other peers. On join it sends {"type": "room-state", "peerCount": N}, where
+# N excludes the receiver; on every leave it updates remaining peers with the same shape. That lets a
+# browser seed only when the relay authoritatively says it has no peers, without interpreting Yjs.
 _collab_rooms: dict[str, set[WebSocket]] = {}
 _collab_ids: dict[WebSocket, str] = {}  # socket -> its clientId (for leave notifications)
 
@@ -510,9 +511,11 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
             return
     await ws.accept()
     room = _collab_rooms.setdefault(canvas_id, set())
+    peer_count = len(room)
     room.add(ws)
     _collab_sessions[ws] = _CollabSession(uid, token)
     try:
+        await ws.send_json({"type": "room-state", "peerCount": peer_count})
         while True:
             msg = await ws.receive_json()
             if isinstance(msg, dict) and msg.get("clientId"):
@@ -550,6 +553,13 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
                     await peer.send_json({"type": "leave", "clientId": cid})
                 except Exception:  # noqa: BLE001
                     room.discard(peer)
+        # This is deliberately independent of clientId: a peer can disappear before announcing
+        # presence, and a waiting joiner must still learn that no peer remains to answer ysync.
+        for peer in list(room):
+            try:
+                await peer.send_json({"type": "room-state", "peerCount": len(room) - 1})
+            except Exception:  # noqa: BLE001
+                room.discard(peer)
         if not room:
             _collab_rooms.pop(canvas_id, None)
 

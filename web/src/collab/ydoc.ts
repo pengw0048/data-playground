@@ -73,8 +73,8 @@ function pushDocToY(doc: CanvasDoc): void {
   }, 'store')
 }
 
-/** Start CRDT sync for a canvas. `send` broadcasts a binary Y update to the room. Returns handlers
- * the transport calls for incoming messages. Seeds the shared doc from the store's current doc. */
+/** Start CRDT sync for a canvas. `send` broadcasts a binary Y update to the room. The relay's
+ * room-state handshake decides when the local store is allowed to seed the shared doc. */
 export function startYSync(send: (u: Uint8Array) => void): void {
   ydoc = new Y.Doc()
   broadcast = send
@@ -112,17 +112,21 @@ export function startYSync(send: (u: Uint8Array) => void): void {
   })
 }
 
-/** Seed Y from the store's current doc IFF nothing has arrived from peers — i.e. we're the first
- * client in the room. Called on a short delay after joining. Idempotent. */
+/** Seed Y from the store only after the relay authoritatively reports no other room members. */
 export function hydrateIfEmpty(): void {
   if (ready || !active) return
   if (nodes().size === 0 && edges().size === 0) pushDocToY(useStore.getState().doc)  // no peer state → we seed it
   ready = true
 }
 
-/** Whether we hold any shared state — used to skip empty ysync replies (avoids full-doc storms). */
-export function hasYState(): boolean {
-  return nodes().size > 0 || edges().size > 0
+/** Apply the relay's room-state contract: zero peers means first client or the last peer vanished. */
+export function hydrateFromRoomState(peerCount: number): void {
+  if (peerCount === 0) hydrateIfEmpty()
+}
+
+/** A peer answered our state-vector request. Even an empty reply makes it safe to accept local edits. */
+export function markYSyncReady(): void {
+  if (active) ready = true
 }
 
 export function stopYSync(): void {
