@@ -82,27 +82,40 @@ test.describe('accessibility gate', () => {
     await expectNoSeriousAxe(page, 'Settings')
     await page.keyboard.press('Escape')
 
-    // Running state — delay POST /run so the card stays in the running phase while we scan.
+    // Running state — hold POST /run while we scan, then abort + unroute before the error step.
+    // Error toasts auto-dismiss in 7s; keep running/error as separate setups so a slow CI axe pass
+    // cannot race that window (the coupled setup failed in GH Actions).
     await addNode(page, 'Sources & sinks', 'source')
     const inspector = page.getByTestId('inspector')
     await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
+    let releaseRun: (() => void) | undefined
+    const held = new Promise<void>((resolve) => { releaseRun = resolve })
+    let finishHold: (() => void) | undefined
+    const holdFinished = new Promise<void>((resolve) => { finishHold = resolve })
     await page.route(/\/run$/, async (route) => {
       if (route.request().method() !== 'POST') {
         await route.continue()
         return
       }
-      // Hold long enough for the axe scan; then let the request fail naturally for the error state.
-      await new Promise((r) => setTimeout(r, 2_500))
-      await route.continue()
+      await held
+      try { await route.abort('timedout') } catch { /* unroute may already have cleared it */ }
+      finishHold!()
     })
     await inspector.getByRole('button', { name: 'Count rows' }).click()
     await expect(page.locator('.dp-running-glyph').first()).toBeVisible({ timeout: 10_000 })
     await expectNoSeriousAxe(page, 'Running')
-
-    // Error state — after the delayed /run completes, the missing dataset surfaces an error toast.
-    await expect(page.getByTestId('toast')).toBeVisible({ timeout: 20_000 })
-    await expectNoSeriousAxe(page, 'Error')
+    releaseRun!()
+    await holdFinished
     await page.unroute(/\/run$/)
+
+    // Error state — dedicated failing run (same path as canvas.spec.ts).
+    await fresh(page)
+    await addNode(page, 'Sources & sinks', 'source')
+    const errInsp = page.getByTestId('inspector')
+    await errInsp.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
+    await errInsp.getByRole('button', { name: 'Count rows' }).click()
+    await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
+    await expectNoSeriousAxe(page, 'Error')
   })
 
   test('keyboard: open a canvas from Files and focus a node', async ({ page }) => {
