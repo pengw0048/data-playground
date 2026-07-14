@@ -1,0 +1,148 @@
+import { test, expect, type Page, type Locator } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
+
+// Accessibility gate for issue #118: keyboard contract on Files/Canvas + one axe smoke suite that
+// fails the build on serious/critical violations across the primary surfaces.
+
+async function fresh(page: Page) {
+  await page.goto('/')
+  await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
+  const previous = await page.evaluate(() => location.hash)
+  await page.getByTestId('file-menu').click()
+  await page.getByText('New file').click()
+  await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
+  await expect(page.locator('.react-flow__node')).toHaveCount(0)
+}
+
+async function addNode(page: Page, category: string, kindTitle: string) {
+  await page.getByRole('button', { name: category, exact: true }).click()
+  const menu = page.locator('.dp-panel', { hasText: kindTitle }).last()
+  await menu.getByText(kindTitle, { exact: true }).click()
+}
+
+async function goFiles(page: Page) {
+  await page.getByTestId('app-menu').click()
+  await page.getByText('Back to files').click()
+  await expect(page.getByRole('heading', { name: 'Recents' })).toBeVisible()
+}
+
+async function openSettings(page: Page) {
+  await page.getByTestId('app-menu').click()
+  await page.getByText('Settings', { exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
+}
+
+/** Fail the build only on serious/critical axe hits; moderate/minor are documented in the PR. */
+async function expectNoSeriousAxe(page: Page, label: string) {
+  const results = await new AxeBuilder({ page })
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+    .analyze()
+  const gated = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical')
+  expect(gated, `${label}: ${gated.map((v) => `${v.id} (${v.impact}): ${v.help}`).join('; ') || 'ok'}`).toEqual([])
+}
+
+/** Tab until `target` is the active element (or contains it). */
+async function tabUntil(page: Page, target: Locator, max = 50) {
+  for (let i = 0; i < max; i++) {
+    const hit = await target.evaluate((el) => el === document.activeElement || el.contains(document.activeElement)).catch(() => false)
+    if (hit) return true
+    await page.keyboard.press('Tab')
+  }
+  return target.evaluate((el) => el === document.activeElement || el.contains(document.activeElement))
+}
+
+test.describe('accessibility gate', () => {
+  test('axe smoke: Files, Canvas, Tables, Settings, running, and error states', async ({ page }) => {
+    await fresh(page)
+
+    // Canvas (empty editor chrome)
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expectNoSeriousAxe(page, 'Canvas')
+
+    // Files
+    await goFiles(page)
+    await expect(page.getByTestId('new-file')).toBeVisible()
+    await expectNoSeriousAxe(page, 'Files')
+
+    // Tables
+    await page.getByTestId('rail-tables').click()
+    await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
+    await expect(page.getByText('images', { exact: true })).toBeVisible()
+    await expectNoSeriousAxe(page, 'Tables')
+
+    // Settings (modal over the canvas)
+    await page.getByTestId('rail-files').click()
+    await page.getByTestId('new-file').click()
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await openSettings(page)
+    await expectNoSeriousAxe(page, 'Settings')
+    await page.keyboard.press('Escape')
+
+    // Running state — hold POST /run so the card stays in the running phase while we scan.
+    await addNode(page, 'Sources & sinks', 'source')
+    const inspector = page.getByTestId('inspector')
+    await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
+    let releaseRun: (() => void) | null = null
+    const held = new Promise<void>((resolve) => { releaseRun = resolve })
+    await page.route('**/run', async (route) => {
+      if (route.request().method() === 'POST' && !route.request().url().includes('/estimate')) {
+        await held
+      }
+      await route.continue()
+    })
+    await inspector.getByRole('button', { name: 'Count rows' }).click()
+    await expect(page.locator('.dp-running-glyph').first()).toBeVisible({ timeout: 10_000 })
+    await expectNoSeriousAxe(page, 'Running')
+    releaseRun!()
+    await page.unroute('**/run')
+
+    // Error state — a failing run surfaces the error toast; scan with it visible.
+    await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
+    await expectNoSeriousAxe(page, 'Error')
+  })
+
+  test('keyboard: open a canvas from Files and focus a node', async ({ page }) => {
+    // Setup (pointer OK): a canvas with one node, then return to Files so the keyboard path starts there.
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    const canvasHash = await page.evaluate(() => location.hash)
+    await goFiles(page)
+
+    // Click the heading so the next Tab starts a keyboard session (:focus-visible applies).
+    await page.getByRole('heading', { name: 'Recents' }).click()
+    const openCard = page.getByRole('button', { name: /^Open / }).first()
+    expect(await tabUntil(page, openCard)).toBe(true)
+    await expect(openCard).toBeFocused()
+    const focusVisible = await openCard.evaluate((el) => el.matches(':focus-visible'))
+    expect(focusVisible, 'focused file Open control should match :focus-visible').toBe(true)
+    await page.keyboard.press('Enter')
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe(canvasHash)
+
+    // Move focus onto a canvas node with Tab only (never click the node). Click the pane first so
+    // focus leaves chrome menus; Tab then walks React Flow's focusable nodes.
+    await page.locator('.react-flow__pane').click({ position: { x: 24, y: 24 } })
+    const node = page.locator('.react-flow__node').first()
+    await expect(node).toBeVisible()
+    expect(await tabUntil(page, node, 60)).toBe(true)
+    const nodeFocusVisible = await node.evaluate((el) => el.matches(':focus-visible'))
+    expect(nodeFocusVisible, 'focused canvas node should match :focus-visible').toBe(true)
+    const nodeOutline = await node.evaluate((el) => {
+      const s = getComputedStyle(el)
+      return { outlineWidth: s.outlineWidth, outlineStyle: s.outlineStyle, outlineColor: s.outlineColor }
+    })
+    expect(nodeOutline.outlineStyle !== 'none' && nodeOutline.outlineWidth !== '0px',
+      `focused canvas node needs a visible outline; got ${JSON.stringify(nodeOutline)}`).toBe(true)
+  })
+
+  test('keyboard: Space opens a recent file from Files', async ({ page }) => {
+    await fresh(page)
+    await goFiles(page)
+    await page.getByRole('heading', { name: 'Recents' }).click()
+    const openCard = page.getByRole('button', { name: /^Open / }).first()
+    expect(await tabUntil(page, openCard)).toBe(true)
+    await page.keyboard.press('Space')
+    await expect(page.getByTestId('toolbar')).toBeVisible({ timeout: 10_000 })
+  })
+})
