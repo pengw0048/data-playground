@@ -89,18 +89,33 @@ test.describe('accessibility gate', () => {
     await expectNoSeriousAxe(page, 'Settings', { keepOverlay: true })
     await page.keyboard.press('Escape')
 
-    // Running state — hold POST /run while we scan, then abort + unroute before the error step.
-    // Error toasts auto-dismiss in 7s; keep running/error as separate setups so a slow CI axe pass
-    // cannot race that window (the coupled setup failed in GH Actions).
+    // Error state FIRST — a clean failing run surfaces a toast (same path as canvas.spec.ts). It runs
+    // before the mocked running-state below: the run-mock aborts a request, and that residue must not
+    // leak into the real error run (which is what left the canvas empty + toast-less on CI).
+    await fresh(page)
+    // On slow CI the New-file render can lag the palette click; wait for the interactive empty canvas.
+    await expect(page.getByText('Add a dataset source to begin', { exact: false })).toBeVisible()
     await addNode(page, 'Sources & sinks', 'source')
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    const errInsp = page.getByTestId('inspector')
+    await errInsp.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
+    await errInsp.getByRole('button', { name: 'Count rows' }).click()
+    await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
+    await expectNoSeriousAxe(page, 'Error', { keepOverlay: true })
+    await expect(page.getByTestId('toast')).toBeHidden({ timeout: 10_000 })  // let it auto-dismiss
+
+    // Running state LAST — hold POST /run while we scan the running glyph, then abort + unroute. Kept
+    // last so the mocked/aborted run leaves no residue for a subsequent real run.
+    await fresh(page)
+    await expect(page.getByText('Add a dataset source to begin', { exact: false })).toBeVisible()
+    await addNode(page, 'Sources & sinks', 'source')
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
     const inspector = page.getByTestId('inspector')
     await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
     let releaseRun: (() => void) | undefined
     const held = new Promise<void>((resolve) => { releaseRun = resolve })
     let finishHold: (() => void) | undefined
     const holdFinished = new Promise<void>((resolve) => { finishHold = resolve })
-    // times: 1 — handle only this run's POST and auto-remove, so a slow-CI unroute race can't leave the
-    // handler live to abort the later error-state run (which must reach the backend to surface a toast).
     await page.route(/\/run$/, async (route) => {
       if (route.request().method() !== 'POST') {
         await route.continue()
@@ -116,19 +131,6 @@ test.describe('accessibility gate', () => {
     releaseRun!()
     await holdFinished
     await page.unroute(/\/run$/)
-
-    // Error state — dedicated failing run (same path as canvas.spec.ts).
-    await fresh(page)
-    // Wait for the freshly-created canvas to be interactive before driving the palette — on slow CI the
-    // New-file render can lag the click, leaving the node unadded (empty canvas → no run → no toast).
-    await expect(page.getByText('Add a dataset source to begin', { exact: false })).toBeVisible()
-    await addNode(page, 'Sources & sinks', 'source')
-    await expect(page.locator('.react-flow__node')).toHaveCount(1)
-    const errInsp = page.getByTestId('inspector')
-    await errInsp.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
-    await errInsp.getByRole('button', { name: 'Count rows' }).click()
-    await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
-    await expectNoSeriousAxe(page, 'Error', { keepOverlay: true })
   })
 
   test('keyboard: open a canvas from Files and focus a node', async ({ page }) => {
