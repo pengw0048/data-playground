@@ -85,7 +85,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       : Promise.resolve([] as PluginInfo[])
     Promise.all([settings, pluginPacks]).then(([nextSettings, nextPlugins]) => {
       if (cancelled) return
-      setG(nextSettings.global)
+      const global = { ...nextSettings.global }
+      const policy = (global.agentDataPolicy && typeof global.agentDataPolicy === 'object')
+        ? global.agentDataPolicy as { level?: string; endpointIsLocal?: boolean }
+        : null
+      global.agentDataPolicyLevel = policy?.level || 'metadata-only'
+      global.agentDataPolicyEndpointIsLocal = Boolean(policy?.endpointIsLocal)
+      setG(global)
       setU(nextSettings.user)
       setPlugins(nextPlugins)
       setLoading(false)
@@ -122,6 +128,14 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       for (const key of ['agentModel', 'agentApiKey', 'agentBaseUrl']) {
         updates.push({ scope: 'global', key, value: g[key] ?? '' })
       }
+      updates.push({
+        scope: 'global',
+        key: 'agentDataPolicy',
+        value: {
+          level: String(g.agentDataPolicyLevel || 'metadata-only'),
+          endpointIsLocal: Boolean(g.agentDataPolicyEndpointIsLocal),
+        },
+      })
       updates.push({ scope: 'global', key: 'destinations', value: dests })
       updates.push({ scope: 'global', key: 'objectStore', value: obj })
       for (const [pack, fields] of Object.entries(pcfg)) {
@@ -219,6 +233,37 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">e.g. anthropic/claude-opus-4-8 · openai/gpt-5 · google/gemini-2.5-pro · ollama/llama3.3</div>
                   <Field label="API key"><Input type="password" value={val('agentApiKey')} placeholder="sk-… (or blank to use an env var)" onChange={(e) => set('agentApiKey', e.target.value)} /></Field>
                   <Field label="Base URL"><Input value={val('agentBaseUrl')} placeholder="http://localhost:11434 (optional)" onChange={(e) => set('agentBaseUrl', e.target.value)} /></Field>
+                  <Field label="Data policy">
+                    <Select
+                      value={String(g.agentDataPolicyLevel || 'metadata-only')}
+                      onValueChange={(v) => setG((prev) => ({ ...prev, agentDataPolicyLevel: v }))}
+                    >
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="metadata-only">metadata-only (default for hosted models)</SelectItem>
+                        <SelectItem value="sample-values">sample-values (send up to 8 preview rows)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">
+                    Hosted providers default to metadata-only so catalog identity may leave but sample cell values do not.
+                    Opt into sample-values only when that third-party egress is acceptable.
+                  </div>
+                  <label className="mb-2 flex items-start gap-2 text-[11.5px] text-foreground">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={Boolean(g.agentDataPolicyEndpointIsLocal)}
+                      onChange={(e) => setG((prev) => ({ ...prev, agentDataPolicyEndpointIsLocal: e.target.checked }))}
+                    />
+                    <span>
+                      Treat Base URL as a local / self-hosted endpoint
+                      <span className="mt-0.5 block text-[10.5px] text-muted-foreground">
+                        When set, sample values may reach that endpoint without the sample-values opt-in.
+                        Does nothing unless a Base URL is configured.
+                      </span>
+                    </span>
+                  </label>
                 </Section>}
 
                 <Section id="execution" title="Execution backend">

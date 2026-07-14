@@ -480,6 +480,24 @@ class Setting(Base):
     __table_args__ = (UniqueConstraint("scope", "scope_id", "key", name="uq_setting"),)
 
 
+class AgentEgressEvent(Base):
+    """Value-free audit of a catalog-reading agent tool call under a hosted model (SEC-01).
+
+    Carries provider/model/tool/dataset/columns/row_count — never raw sample values. A later
+    telemetry-contracts slice can adopt this shape into a cross-domain schema.
+    """
+    __tablename__ = "agent_egress_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)
+    provider: Mapped[str] = mapped_column(String, default="")
+    model: Mapped[str] = mapped_column(String, default="")
+    tool: Mapped[str] = mapped_column(String, default="", index=True)
+    dataset: Mapped[str | None] = mapped_column(Text, nullable=True)
+    columns_json: Mapped[str] = mapped_column(Text, default="[]")  # JSON list of column names
+    row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    event_json: Mapped[str] = mapped_column(Text, default="{}")  # full value-free event payload
+
+
 class CatalogRelationship(Base):
     """An owner-declared join relationship, ONE ROW each (keyed by an orientation-insensitive rel_key)
     — not a single JSON blob, so two instances declaring different relationships can't clobber each
@@ -4446,3 +4464,45 @@ def set_setting(key: str, value, scope: str = "global", scope_id: str = "") -> N
             row.value = json.dumps(value)
         else:
             s.add(Setting(scope=scope, scope_id=scope_id, key=key, value=json.dumps(value)))
+
+
+def record_agent_egress_event(event: dict) -> None:
+    """Persist one value-free agent egress audit event (provider/model/tool/dataset/columns/rowCount)."""
+    columns = event.get("columns") or []
+    if not isinstance(columns, list):
+        columns = list(columns)
+    with session() as s:
+        s.add(AgentEgressEvent(
+            provider=str(event.get("provider") or ""),
+            model=str(event.get("model") or ""),
+            tool=str(event.get("tool") or ""),
+            dataset=(None if event.get("dataset") is None else str(event.get("dataset"))),
+            columns_json=json.dumps(columns),
+            row_count=event.get("rowCount") if event.get("rowCount") is not None else event.get("row_count"),
+            event_json=json.dumps(event, default=str),
+        ))
+
+
+def list_agent_egress_events(*, limit: int = 200) -> list[dict]:
+    """Return recent agent egress audit events as plain dicts (newest last within the window)."""
+    with session() as s:
+        rows = s.scalars(
+            select(AgentEgressEvent).order_by(AgentEgressEvent.id.desc()).limit(max(1, int(limit)))
+        ).all()
+        out = []
+        for row in reversed(rows):
+            try:
+                payload = json.loads(row.event_json)
+            except Exception:  # noqa: BLE001
+                payload = {
+                    "provider": row.provider,
+                    "model": row.model,
+                    "tool": row.tool,
+                    "dataset": row.dataset,
+                    "columns": json.loads(row.columns_json or "[]"),
+                    "rowCount": row.row_count,
+                }
+            payload["id"] = row.id
+            payload["createdAt"] = row.created_at.isoformat() if row.created_at else None
+            out.append(payload)
+        return out
