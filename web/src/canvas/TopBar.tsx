@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { roleCanEdit, useStore } from '../store/graph'
 import { examples } from '../examples'
-import { color } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import {
@@ -20,6 +19,7 @@ import { VersionHistoryModal } from '../panels/VersionHistoryModal'
 import { ShareModal } from '../panels/ShareModal'
 import { crdtUndoActive } from '../collab/undo'
 import { resolvedTheme, toggleTheme } from '../theme/mode'
+import { KernelBadge } from './KernelBadge'
 
 export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
@@ -67,13 +67,7 @@ export function TopBar() {
 
       <div style={{ position: 'absolute', top: 16, right: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 10 }}>
         <PeerAvatars />
-        <div
-          title={kernelInfo ? `${kernelInfo.backend} · ${kernelInfo.runners.join(', ')}` : 'kernel offline'}
-          className="flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground shadow-sm"
-        >
-          <span className="h-2 w-2 rounded-full" style={{ background: kernelUp ? color.latest : color.failed }} />
-          kernel · {kernelUp ? 'warm' : 'offline'}
-        </div>
+        <KernelBadge kernelUp={kernelUp} kernelInfo={kernelInfo} />
         <Button onClick={rerunAll} disabled={!canEdit} title={canEdit ? 'Re-run the whole graph' : 'View-only canvas'} size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
           <Icon name="refresh" size={13} /> Rerun all
         </Button>

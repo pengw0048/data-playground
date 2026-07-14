@@ -25,6 +25,27 @@ export interface KernelInfo {
   backends: BackendInfo[]
 }
 
+export interface RelationCacheStats {
+  entries: number
+  bytes: number
+  maxEntries: number
+  maxBytes: number
+  tooBig: number
+}
+
+// GET /canvas/{id}/kernel: the lease state, merged with the kernel's own /status when reachable.
+export interface CanvasKernelStatus {
+  exists: boolean
+  state?: string
+  stale?: boolean
+  relationCache?: RelationCacheStats
+  memoryLimit?: string | null
+  memoryRssBytes?: number
+  uptimeSeconds?: number
+  inflight?: number
+  activeRuns?: number
+}
+
 export interface KeyInfo { columns: string[]; confidence: 'declared' | 'verified' | 'inferred'; unique?: boolean | null }
 
 export interface CatalogTable {

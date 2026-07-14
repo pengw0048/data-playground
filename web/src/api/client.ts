@@ -1,5 +1,6 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
+  CanvasKernelStatus,
   CatalogBrowse, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PluginInfo, ProcessorDescriptor, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunStatus, SampleResult,
@@ -235,7 +236,7 @@ export const api = {
 
   runStatus: (runId: string) => req<RunStatus>(`/run/${runId}`),
   activeRuns: (canvasId: string) => req<RunStatus[]>(`/canvas/${encodeURIComponent(canvasId)}/active-runs`),
-  kernelState: (canvasId: string) => req<{ exists: boolean; state?: string; stale?: boolean }>(`/canvas/${encodeURIComponent(canvasId)}/kernel`),
+  kernelState: (canvasId: string) => req<CanvasKernelStatus>(`/canvas/${encodeURIComponent(canvasId)}/kernel`),
   restartKernel: (canvasId: string) => req<{ ok: boolean; restarted: boolean }>(`/canvas/${encodeURIComponent(canvasId)}/kernel/restart`, { method: 'POST' }),
   cancelRun: (runId: string) => req<RunStatus>(`/run/${runId}/cancel`, { method: 'POST' }),
 

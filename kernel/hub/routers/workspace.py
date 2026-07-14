@@ -481,12 +481,24 @@ def canvas_active_runs(canvas_id: str, uid: str = Depends(current_user)) -> list
 
 @router.get("/canvas/{canvas_id}/kernel")
 def canvas_kernel(canvas_id: str, uid: str = Depends(current_user)) -> dict:
-    """The per-canvas execution kernel's state (Jupyter-style), or {exists:false} if none is running.
-    Token/endpoint are internal — only state + staleness are surfaced."""
+    """The per-canvas execution kernel's live state (Jupyter-style), or {exists:false} if none is
+    running. Token/endpoint are internal — only lease state + the kernel's own /status are surfaced.
+    Read-only: this NEVER spawns a kernel, and the /status proxy fast-fails so a dead kernel can't
+    stall the request."""
     if metadb.canvas_role(canvas_id, uid) is None:
         raise HTTPException(404, "not found")
     k = metadb.get_kernel(canvas_id)
-    return {"exists": False} if k is None else {"exists": True, "state": k["state"], "stale": k["stale"]}
+    if k is None:
+        return {"exists": False}
+    out: dict = {"exists": True, "state": k["state"], "stale": k["stale"]}
+    if k.get("endpoint") and k.get("token") and not k["stale"]:
+        from hub import kernel_backend
+        try:
+            out.update(kernel_backend._get(k["endpoint"], "/status", k["token"],
+                                            timeout=2.0, connect_retries=0))
+        except Exception:  # noqa: BLE001 — unreachable/slow kernel: surface lease state only
+            pass
+    return out
 
 
 @router.post("/canvas/{canvas_id}/kernel/restart")

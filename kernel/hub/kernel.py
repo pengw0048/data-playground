@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+import time
 
 from pydantic import BaseModel
+
+_STARTED_AT = time.monotonic()  # process start, for uptimeSeconds in /status
 
 
 class RunBody(BaseModel):
@@ -43,6 +47,46 @@ def _liveness_busy(inflight_count: int, runs) -> bool:
     idle-ttl would be recycled out from under itself. Module-level + pure so it's unit-testable."""
     return inflight_count > 0 or any(
         getattr(s, "status", None) in ("queued", "running") for s in runs.values())
+
+
+def _rss_bytes() -> int | None:
+    """Current resident set size in bytes, or None if unavailable (never faked)."""
+    try:
+        with open("/proc/self/statm") as f:  # Linux (prod pods): current resident pages
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # peak; bytes on macOS, KiB on Linux
+        return rss if sys.platform == "darwin" else rss * 1024
+    except (ImportError, ValueError, OSError, AttributeError):
+        return None
+
+
+def _runs_snapshot(runs, lock) -> list:
+    """Snapshot the runner's run-status values under its lock (mirror _liveness_busy's read) so a
+    concurrent start/finish can't raise 'dictionary changed size during iteration'."""
+    if lock is None:
+        return list(runs.values())
+    with lock:
+        return list(runs.values())
+
+
+def _status_payload(relation_cache, memory_limit, inflight: int, runs, lock, started_at: float) -> dict:
+    """Assemble the kernel /status body. Module-level + pure so it's unit-testable without a live kernel."""
+    snapshot = _runs_snapshot(runs, lock)
+    out = {
+        "relationCache": relation_cache.stats(),
+        "memoryLimit": memory_limit,
+        "uptimeSeconds": max(0.0, time.monotonic() - started_at),
+        "inflight": inflight,
+        "activeRuns": sum(1 for s in snapshot if getattr(s, "status", None) in ("queued", "running")),
+    }
+    rss = _rss_bytes()
+    if rss is not None:
+        out["memoryRssBytes"] = rss
+    return out
 
 
 def main() -> None:
@@ -223,6 +267,15 @@ def main() -> None:
     def cancel(body: dict, x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)
         return run_runner.cancel(body["run_id"]).model_dump()  # the runner that OWNS the run (isolated child mgr)
+
+    @app.get("/status")
+    def status(x_dp_kernel_token: str = Header(None)):
+        _auth(x_dp_kernel_token)
+        with _inflight_lock:
+            inflight = _inflight[0]
+        mem = os.environ.get("DP_MEMORY_LIMIT") or os.environ.get("DP_KERNEL_MEM")
+        return _status_payload(warm, mem, inflight, run_runner.runs,
+                               getattr(run_runner, "_lock", None), _STARTED_AT)
 
     @app.post("/shutdown")
     def shutdown(x_dp_kernel_token: str = Header(None)):

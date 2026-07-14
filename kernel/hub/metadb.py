@@ -6751,7 +6751,8 @@ def get_kernel(canvas_id: str) -> dict | None:
         if r is None:
             return None
         return {"canvas_id": r.canvas_id, "kernel_id": r.kernel_id, "endpoint": r.endpoint,
-                "token": r.token, "state": r.state, "stale": _kernel_stale(r)}
+                "token": r.token, "state": r.state, "stale": _kernel_stale(r),
+                "started_at": r.started_at}
 
 
 def active_runs(canvas_id: str) -> list[dict]:
