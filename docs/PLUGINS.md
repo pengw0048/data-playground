@@ -160,9 +160,17 @@ it. Default is `NullImporter` (501). Core auto-lays out an imported graph left u
 Built-in `local` / `s3` / `gs` go through the same registry.
 
 `reg.add_telemetry_sink(fn)` exports finished-run telemetry. `fn(record: dict)` is called once per
-finished run with `canvas_id`, `run_id`, `status`, `rows`, `ms`, `error`, `output_table`, `placement`,
-and `per_node` (`[{node_id, label, status, rows, ms}]`). Core ships no exporter. A sink that raises is
-caught and logged, never failing the run. See `dp_run_log`.
+finished run with `canvas_id`, `run_id`, `request_id`, `status`, `rows`, `ms`, `error`, `output_table`,
+`placement`, and `per_node` (`[{node_id, label, status, rows, ms}]`). Core ships no exporter. A sink that
+raises or times out is caught and logged, never failing the run. It stays as a compatibility seam
+alongside the typed `MetricEvent` / `AuditEvent` sinks below — see [`OBSERVABILITY.md`](OBSERVABILITY.md)
+and `dp_run_log`.
+
+`reg.add_metric_sink(fn)` exports ops metrics (OPS-01). `fn(MetricEvent)` receives low-cardinality
+counters, histograms, and gauges. `reg.add_audit_sink(fn)` exports the security/ops audit trail
+(OPS-01): `fn(AuditEvent)` for auth, sharing, settings, and job submit/cancel events, with agent-egress,
+secret-ref, and policy-denial schemas defined for later issues. Core ships no exporter for either; both
+are documented in [`OBSERVABILITY.md`](OBSERVABILITY.md).
 
 A catalog used by an at-least-once durable runner also implements the runtime-checkable
 `DurableCatalogPublisher` capability from `backends.py`: one idempotency key per output through

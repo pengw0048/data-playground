@@ -359,10 +359,13 @@ class SubprocessRunner:
                 f"core publisher returned an invalid receipt for sink '{step_id}'")
 
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
-            placement: Placement, run_id: str | None = None) -> RunStatus:
+            placement: Placement, run_id: str | None = None,
+            request_id: str | None = None, attempt_id: str | None = None) -> RunStatus:
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
         per = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
-        status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=per)
+        _ = attempt_id  # OPS-01 port parity; managed publication stamps attempts itself
+        status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=per,
+                           target_node_id=target_node_id, request_id=request_id)
         job_extra: dict = {"runId": run_id}
         try:
             source_leases = self._claim_source_leases(graph, target_node_id, run_id)

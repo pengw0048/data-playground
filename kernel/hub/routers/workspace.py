@@ -175,10 +175,13 @@ def auth_status(dp_session: str | None = Cookie(default=None)) -> dict:
 
 @public_router.post("/auth/login")
 async def auth_login(body: LoginBody, response: Response, request: Request) -> dict:
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     if not auth.auth_enabled():
         # This endpoint is async so authenticated password work can use explicit admission. Preserve the
         # old sync endpoint's off-event-loop DB behavior for the open-mode identity lookup.
         user_id = await run_in_threadpool(metadb.resolve_user, body.user_id)
+        emit_audit(AuditAction.AUTH_LOGIN, AuditOutcome.SUCCESS, principal_id=user_id,
+                   resource_type="user", resource_id=user_id, attrs={"mode": "open"})
         return {"ok": True, "userId": user_id}
     uid = body.user_id
     client_host = _client_host(request)
@@ -192,12 +195,16 @@ async def auth_login(body: LoginBody, response: Response, request: Request) -> d
     _admit_attempt(auth_admission.login_attempts, attempt_key)
     epoch = await _run_password_work(_login_password_work, uid, body.password)
     if epoch is None:
+        emit_audit(AuditAction.AUTH_LOGIN, AuditOutcome.FAILURE, principal_id=uid,
+                   resource_type="user", resource_id=uid, attrs={"mode": "auth"})
         raise HTTPException(401, "invalid user or password")
     # Secure flag opt-in for HTTPS deployments (default off so localhost http installs still work).
     # Shared mode refuses startup unless DP_AUTH_SECURE_COOKIE is set (see auth.reject_unsafe_transport).
     response.set_cookie("dp_session", auth.sign_at_epoch(uid, epoch), httponly=True, samesite="lax",
                         secure=auth.secure_cookie_enabled())
     auth_admission.login_attempts.reset(attempt_key)
+    emit_audit(AuditAction.AUTH_LOGIN, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="user", resource_id=uid, attrs={"mode": "auth"})
     return {"ok": True, "userId": uid}
 
 
@@ -205,6 +212,7 @@ async def auth_login(body: LoginBody, response: Response, request: Request) -> d
 async def change_password(body: PasswordChangeBody, response: Response, request: Request,
                           identity: RequestIdentity = Depends(current_identity)) -> dict:
     """Set/rotate the CURRENT user's password. If one is already set, the old password must match."""
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     uid = identity.user_id
     attempt_key = _password_attempt_key(_client_host(request), uid)
     _admit_attempt(auth_admission.password_change_attempts, attempt_key)
@@ -213,6 +221,8 @@ async def change_password(body: PasswordChangeBody, response: Response, request:
     if auth.auth_enabled():  # re-issue THIS session's cookie at the new epoch so the caller isn't logged out
         response.set_cookie("dp_session", auth.sign_at_epoch(uid, epoch), httponly=True, samesite="lax",
                             secure=auth.secure_cookie_enabled())
+    emit_audit(AuditAction.AUTH_PASSWORD_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="user", resource_id=uid)
     return {"ok": True}
 
 
@@ -220,9 +230,12 @@ async def change_password(body: PasswordChangeBody, response: Response, request:
 def auth_logout(response: Response, dp_session: str | None = Cookie(default=None)) -> dict:
     # Sessions are stateless apart from the per-user epoch, so logout revokes every session issued
     # at the current epoch. Keep this route public so an expired/invalid cookie can still be cleared.
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     uid = auth.verify(dp_session) if auth.auth_enabled() else None
     if uid is not None:
         metadb.bump_token_epoch(uid)
+        emit_audit(AuditAction.AUTH_LOGOUT, AuditOutcome.SUCCESS, principal_id=uid,
+                   resource_type="user", resource_id=uid)
     response.delete_cookie("dp_session")
     return {"ok": True}
 
@@ -414,25 +427,37 @@ def get_shares(canvas_id: str, uid: str = Depends(current_user)) -> dict:
 
 @router.post("/canvas/{canvas_id}/share")
 def add_share(canvas_id: str, body: dict, uid: str = Depends(current_user)) -> dict:
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     if metadb.canvas_role(canvas_id, uid) != "owner":
+        emit_audit(AuditAction.SHARING_CHANGE, AuditOutcome.DENIED, principal_id=uid,
+                   resource_type="canvas", resource_id=canvas_id, attrs={"op": "share"})
         raise HTTPException(403, "only the owner can share")
     if "visibility" in body:
         if body["visibility"] not in ("private", "workspace", "workspace_view"):
             raise HTTPException(400, "invalid visibility")
         metadb.set_visibility(canvas_id, body["visibility"])
+        emit_audit(AuditAction.SHARING_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+                   resource_type="canvas", resource_id=canvas_id, attrs={"op": "visibility"})
     if body.get("userId"):
         role = body.get("role", "editor")
         if role not in metadb.SHARE_ROLES:  # never let a share grant 'owner' — that's a privilege escalation
             raise HTTPException(422, f"invalid role {role!r}; must be one of {list(metadb.SHARE_ROLES)}")
         metadb.share_canvas(canvas_id, body["userId"], role)
+        emit_audit(AuditAction.SHARING_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+                   resource_type="canvas", resource_id=canvas_id, attrs={"op": "share"})
     return {"ok": True}
 
 
 @router.delete("/canvas/{canvas_id}/share/{user_id}")
 def remove_share(canvas_id: str, user_id: str, uid: str = Depends(current_user)) -> dict:
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     if metadb.canvas_role(canvas_id, uid) != "owner":
+        emit_audit(AuditAction.SHARING_CHANGE, AuditOutcome.DENIED, principal_id=uid,
+                   resource_type="canvas", resource_id=canvas_id, attrs={"op": "unshare"})
         raise HTTPException(403, "only the owner can unshare")
     metadb.unshare_canvas(canvas_id, user_id)
+    emit_audit(AuditAction.SHARING_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="canvas", resource_id=canvas_id, attrs={"op": "unshare"})
     return {"ok": True}
 
 
@@ -522,15 +547,27 @@ def get_settings(uid: str = Depends(current_user)) -> dict:
 
 @router.put("/settings")
 def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     if body.scope == "global":
-        _require_admin(uid)  # instance-wide settings (object-store creds, agent key, destinations) — admin only
+        try:
+            _require_admin(uid)  # instance-wide settings (object-store creds, agent key, destinations) — admin only
+        except HTTPException:
+            emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.DENIED, principal_id=uid,
+                       resource_type="setting", resource_id=body.key, attrs={"scope": body.scope})
+            raise
     scope_id = uid if body.scope == "user" else ""
     value = body.value
+    plugin_secrets = _plugin_secret_keys()
     if body.scope == "global":
         from hub.secrets import validate_secret_setting_value
         try:
-            value = validate_secret_setting_value(body.key, value, plugin_secrets=_plugin_secret_keys())
+            value = validate_secret_setting_value(body.key, value, plugin_secrets=plugin_secrets)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
     metadb.set_setting(body.key, value, scope=body.scope, scope_id=scope_id)
+    is_secret = body.key in ("agentApiKey", "objectStore") or body.key in plugin_secrets
+    # attr key must avoid validate_audit_attrs' secret-name regex, else this event is rejected + dropped.
+    emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="setting", resource_id=body.key,
+               attrs={"scope": body.scope, "sensitive": "true" if is_secret else "false"})
     return {"ok": True}

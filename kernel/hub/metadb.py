@@ -92,6 +92,8 @@ class RunRecord(Base):
     # The runner's real id links durable history back to the logical run. Nullable for records written
     # before migration 0018; `id` remains the history row's own primary key.
     run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # HTTP/WebSocket request id that started the run (OPS-01). Nullable for legacy rows / non-HTTP starts.
+    request_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String)
     rows: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -130,6 +132,8 @@ class RunState(Base):
     kernel_id: Mapped[str | None] = mapped_column(String, nullable=True)  # owning kernel (None = in-process/subprocess run, dies with the hub)
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # the run's creator uid (durable owner, for authz)
     auth_canvas_id: Mapped[str | None] = mapped_column(String, nullable=True)  # the real canvas it was authorized against (None = ad-hoc)
+    # HTTP/WebSocket request id that started the run (OPS-01). Mirrored from RunStatus.request_id.
+    request_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     preallocation_token: Mapped[str | None] = mapped_column(String, nullable=True)
     preallocation_expires_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
@@ -1209,10 +1213,12 @@ def _backfill_terminal_fence_identity(s, state: RunState) -> None:
             setattr(fence, field, expected)
 
 
-def bind_run_owner(run_id: str, uid: str, auth_canvas_id: str | None) -> None:
+def bind_run_owner(run_id: str, uid: str, auth_canvas_id: str | None,
+                   request_id: str | None = None) -> None:
     """Persist a run's creator (authoritative, unspoofable owner) and the real canvas it was authorized
     against (None for an ad-hoc graph). Missing identity fields may be filled once; an established
-    principal, authorization canvas, or operational canvas is never overwritten."""
+    principal, authorization canvas, or operational canvas is never overwritten.
+    `request_id` (OPS-01) correlates the durable run with the HTTP/WebSocket entry that started it."""
     run_id, uid = str(run_id), str(uid)
     auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
     with session() as s:
@@ -1223,7 +1229,7 @@ def bind_run_owner(run_id: str, uid: str, auth_canvas_id: str | None) -> None:
             if fenced is not None:
                 raise TerminalRunIdError(f"run '{run_id}' is already terminal ({fenced})")
             s.add(RunState(run_id=run_id, canvas_id=auth_canvas_id, status="queued", doc="{}",
-                           created_by=uid, auth_canvas_id=auth_canvas_id))
+                           created_by=uid, auth_canvas_id=auth_canvas_id, request_id=request_id))
             return
         if r.created_by is not None:
             _assert_bound_run_identity(r, uid, auth_canvas_id)
@@ -1237,7 +1243,28 @@ def bind_run_owner(run_id: str, uid: str, auth_canvas_id: str | None) -> None:
         r.auth_canvas_id = auth_canvas_id
         if auth_canvas_id is not None and r.canvas_id is None:
             r.canvas_id = auth_canvas_id
+        if request_id and not r.request_id:
+            r.request_id = request_id
         _backfill_terminal_fence_identity(s, r)
+
+
+def bind_run_request_id(run_id: str, request_id: str, canvas_id: str | None = None) -> None:
+    """Stamp OPS-01 request_id on a run_state without altering ownership fields (open-mode starts)."""
+    if not run_id or not request_id:
+        return
+    with session() as s:
+        r = s.get(RunState, run_id)
+        if r is None:
+            s.add(RunState(run_id=run_id, canvas_id=canvas_id, status="queued", doc="{}",
+                           request_id=request_id))
+        elif not r.request_id:
+            r.request_id = request_id
+
+
+def run_request_id(run_id: str) -> str | None:
+    with session() as s:
+        r = s.get(RunState, run_id)
+        return r.request_id if r else None
 
 
 def preallocate_run_owner(
@@ -1458,7 +1485,8 @@ _RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (old
 def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None, status: str,
                        rows: int | None = None, ms: int | None = None, error: str | None = None,
                        output_table: str | None = None, per_node: list[dict] | None = None,
-                       run_id: str | None = None, output_uri: str | None = None) -> bool:
+                       run_id: str | None = None, output_uri: str | None = None,
+                       request_id: str | None = None) -> bool:
     """Session-scoped history upsert shared by normal completion and backend publication."""
     if not canvas_id:
         return False
@@ -1475,6 +1503,8 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None, 
         rec = RunRecord(id=_uid(), canvas_id=canvas_id, run_id=run_id)
         s.add(rec)
     rid = rec.id
+    if request_id and not rec.request_id:
+        rec.request_id = request_id
     rec.target_node_id, rec.status = target_node_id, status
     rec.rows, rec.ms, rec.error = rows, ms, error
     rec.output_table, rec.output_uri = output_table, output_uri
@@ -1499,11 +1529,13 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None, 
 def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
                rows: int | None = None, ms: int | None = None, error: str | None = None,
                output_table: str | None = None, per_node: list[dict] | None = None,
-               run_id: str | None = None, output_uri: str | None = None) -> bool:
+               run_id: str | None = None, output_uri: str | None = None,
+               request_id: str | None = None) -> bool:
     """Persist a finished run under its canvas. No-op (returns False) without a real canvas — an ad-hoc
     API run or an internal region sub-run (graph id '_region'). Returns True when a row was written.
     Prunes this canvas's history to the newest _RUN_HISTORY_MAX rows so the local DB can't grow without
-    bound (one row per run, forever) — mirrors the ResultCache / CanvasVersion caps."""
+    bound (one row per run, forever) — mirrors the ResultCache / CanvasVersion caps.
+    `request_id` (OPS-01) is the HTTP/WebSocket id that started the run."""
     if not canvas_id:
         return False
     if status != "done" and _local_result_candidate(output_uri) is not None:
@@ -1513,7 +1545,7 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
         return _upsert_run_record(
             s, canvas_id=canvas_id, target_node_id=target_node_id, status=status,
             rows=rows, ms=ms, error=error, output_table=output_table, per_node=per_node,
-            run_id=run_id, output_uri=output_uri,
+            run_id=run_id, output_uri=output_uri, request_id=request_id,
         )
 
 
@@ -1623,7 +1655,7 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
     with session() as s:
         rows = s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id)
                          .order_by(RunRecord.created_at.desc()).limit(limit)).all()
-        return [{"id": r.id, "runId": r.run_id, "status": r.status,
+        return [{"id": r.id, "runId": r.run_id, "requestId": r.request_id, "status": r.status,
                  "targetNodeId": r.target_node_id, "rows": r.rows,
                  "ms": r.ms, "error": r.error, "outputTable": r.output_table,
                  "outputUri": r.output_uri,
@@ -1728,11 +1760,13 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                 raise RunStatePublicationRejected(
                     "run state was deleted before terminal publication")
         payload = json.dumps(status, default=str)
+        request_id = status.get("request_id") or status.get("requestId")
         fenced = _terminal_fence_status(s, run_id)
         if fenced is not None and (r is None or st != fenced):
             return
         if r is None:
-            s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload, kernel_id=kernel_id))
+            s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload,
+                           kernel_id=kernel_id, request_id=request_id))
         else:
             # Make terminal monotonicity an UPDATE predicate, not a prior ORM read. A transaction can load
             # queued, pause while another supervisor atomically publishes done, then otherwise flush its
@@ -1742,6 +1776,8 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                 values["canvas_id"] = func.coalesce(RunState.canvas_id, canvas_id)
             if kernel_id:
                 values["kernel_id"] = func.coalesce(RunState.kernel_id, kernel_id)
+            if request_id:
+                values["request_id"] = func.coalesce(RunState.request_id, request_id)
             updated = s.execute(update(RunState).where(
                 RunState.run_id == run_id,
                 or_(RunState.status.not_in(_TERMINAL_RUN), RunState.status == st),

@@ -24,6 +24,8 @@ class RunBody(BaseModel):
     graph: dict
     target: str | None = None
     placement: str = "local"
+    request_id: str | None = None  # OPS-01: HTTP/WebSocket id that started this run
+    attempt_id: str | None = None  # OPS-01: optional managed-object attempt correlation
 
 
 class PreviewBody(BaseModel):
@@ -191,7 +193,8 @@ def main() -> None:
         graph = Graph(**body.graph)
         _ensure_deps(graph)
         plan = compiler.compile_plan(graph, body.target, deps.registry, deps.node_specs, deps.node_ir)
-        st = run_runner.run(plan, graph, body.target, body.placement, run_id=body.run_id)
+        st = run_runner.run(plan, graph, body.target, body.placement, run_id=body.run_id,
+                            request_id=body.request_id, attempt_id=body.attempt_id)
         return st.model_dump()
 
     @app.post("/preview")
