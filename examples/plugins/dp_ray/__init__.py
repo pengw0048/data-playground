@@ -677,7 +677,6 @@ def _declared_ray_schema(config: dict):
     columns = config.get("outputSchema")
     if not isinstance(columns, list) or not columns:
         return None
-    import duckdb
 
     from hub.executors.engine import _duck_type
 
@@ -1554,7 +1553,6 @@ class RayRunner:
     def _supervise(self, run_id, graph, target, status, materialize_uri=None, requires=None,
                    sink_targets=None, sink_attempts=None) -> None:
         """Run one local Ray driver in an isolated temporary directory and always erase it."""
-        import shutil
         import tempfile
 
         work = tempfile.mkdtemp(prefix="dp_ray_")

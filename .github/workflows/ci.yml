@@ -29,6 +29,24 @@ jobs:
         # this makes an intermittent deadlock actionable instead of ending with only "operation canceled".
         run: cd kernel && uv run pytest -q -o faulthandler_timeout=60
 
+  python-quality:
+    # QA-01 / issue #111 — Ruff + basedpyright. No Ray, no browsers; a few minutes on ubuntu-latest.
+    name: python quality (ruff + basedpyright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      # hatchling force-includes ../web/dist; the quality job never serves the SPA.
+      - name: Placeholder web build
+        run: mkdir -p web/dist
+      - name: Install kernel (dev extra — includes ruff + basedpyright)
+        run: cd kernel && uv sync --extra dev
+      - name: Ruff (kernel + examples/plugins)
+        run: cd kernel && uv run ruff check . ../examples/plugins
+      - name: basedpyright (hub, lenient committed baseline)
+        run: cd kernel && uv run basedpyright
+
   postgres-migration:
     name: migration contract (PostgreSQL 16)
     runs-on: ubuntu-latest

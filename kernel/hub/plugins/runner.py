@@ -10,9 +10,7 @@ Content-addressed: an unchanged plan (by node config + source fingerprint) is se
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import inspect
-import json
 import logging
 import os
 import threading
