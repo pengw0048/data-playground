@@ -214,13 +214,14 @@ def _accelerator_canon_map() -> dict[str, str]:
 
 
 def _canonical_accelerator_type(value: object) -> str:
-    """Resolve operator input to Ray's exact-case ``accelerator_type`` constant.
+    """Resolve operator input to a stable ``accelerator_type`` key.
 
-    Ray matches ``accelerator_type`` case-sensitively, so a known family maps to its canonical spelling
-    (e.g. ``Intel-GAUDI``) and an unknown value passes through stripped rather than being uppercased.
+    A known Ray family maps to its exact canonical spelling (e.g. ``Intel-GAUDI``) so case-sensitive
+    Ray scheduling matches; anything else (including any input when Ray is not importable) is uppercased.
+    Both sides of the hub capacity comparison run through here, so the match stays consistent.
     """
     text = str(value or "").strip()
-    return _accelerator_canon_map().get(text.upper(), text)
+    return _accelerator_canon_map().get(text.upper(), text.upper())
 
 
 def _job_status_name(value) -> str:
