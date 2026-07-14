@@ -5781,10 +5781,11 @@ def catalog_managed_publication_receipt(uri: str) -> dict | None:
 
 
 def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: str | None,
-                         tags: list[str]) -> None:
-    """Update ONLY the organization fields of an entry (folder/owner/description/tags) — both the
-    indexed columns AND the mirrored fields inside the stored doc, so a re-read is consistent without
-    re-probing the dataset. Unknown or inactive managed targets fail closed."""
+                         tags: list[str], name: str | None = None) -> None:
+    """Update ONLY the organization fields of an entry (folder/owner/description/tags, and an optional
+    friendly `name` rename) — both the indexed columns AND the mirrored fields inside the stored doc,
+    so a re-read is consistent without re-probing the dataset. Unknown or inactive managed targets
+    fail closed."""
     with session() as s:
         target = _lock_catalog_mutation_targets(s, [uri])[0]
         if not target["known"]:
@@ -5795,7 +5796,11 @@ def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: 
         except (ValueError, TypeError):
             doc = {}
         doc["folder"], doc["owner"], doc["description"], doc["tags"] = folder, owner, description, list(tags)
+        if name:
+            doc["name"] = name
         r.folder, r.owner, r.description, r.doc = folder, owner, description, json.dumps(doc, default=str)
+        if name:
+            r.name = name
         if logical is not None:
             logical.governance_doc = json.dumps(
                 _catalog_governance(doc), default=str, sort_keys=True)

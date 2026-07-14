@@ -209,8 +209,11 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
 }
 
 function IconBtn({ name, label, onClick, disabled }: { name: IconName; label: string; onClick: () => void; disabled?: boolean }) {
+  // enabled reads as clearly interactive (foreground); disabled falls to a faded muted tone so the
+  // "nothing to undo/redo" state is unmistakable rather than a subtle opacity shift on the same color
   return (
-    <Button variant="ghost" size="icon" aria-label={label} title={label} onClick={onClick} disabled={disabled} className="h-7 w-7 text-muted-foreground">
+    <Button variant="ghost" size="icon" aria-label={label} title={label} onClick={onClick} disabled={disabled}
+      className={cn('h-7 w-7', disabled ? 'text-muted-foreground' : 'text-foreground')}>
       <Icon name={name} size={14} />
     </Button>
   )

@@ -232,13 +232,15 @@ def set_table_metadata(table_id: str, req: CatalogMetadata) -> CatalogTable:
     except KeyError:
         raise HTTPException(404, f"table '{table_id}' not found")
     sent = req.model_fields_set
-    # absent field → None (provider preserves); explicit null → "" (provider clears)
+    # absent field → None (provider preserves); explicit null → "" (provider clears). name is
+    # rename-only: a blank name is ignored (a dataset always keeps a name), never cleared.
     return cat.set_metadata(
         table.uri,
         folder=(req.folder or "") if "folder" in sent else None,
         tags=req.tags if "tags" in sent else None,
         owner=(req.owner or "") if "owner" in sent else None,
-        description=(req.description or "") if "description" in sent else None)
+        description=(req.description or "") if "description" in sent else None,
+        name=req.name if "name" in sent else None)
 
 
 @router.get("/catalog/lineage", response_model=LineageResult)
@@ -266,6 +268,23 @@ def unregister_table(table_id: str) -> dict:
     if not get_deps().catalog.unregister(table_id):
         raise HTTPException(404, f"table '{table_id}' not found")
     return {"ok": True}
+
+
+class UnregisterManyRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    ids: list[str]
+
+
+@router.post("/catalog/tables/delete")
+def unregister_tables(req: UnregisterManyRequest) -> dict:
+    """Batch-remove datasets from the catalog (the Tables view's multi-select delete). Returns which
+    ids were removed and which were already gone, so a partial result is reported honestly."""
+    cat = get_deps().catalog
+    deleted: list[str] = []
+    missing: list[str] = []
+    for tid in req.ids:
+        (deleted if cat.unregister(tid) else missing).append(tid)
+    return {"deleted": deleted, "missing": missing}
 
 
 class JoinSuggestRequest(BaseModel):

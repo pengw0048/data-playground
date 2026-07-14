@@ -449,7 +449,7 @@ function RunPlan({ nodeId }: { nodeId: string }) {
               {r.backend === 'default' ? 'local' : r.backend}
             </span>
             <span className="dp-mono flex-1 truncate text-foreground">{r.outputNode}</span>
-            <span className="tabular-nums text-muted-foreground">{r.confidence === 'unknown' ? '' : `~${fmt(r.rows)}`}</span>
+            <span className="tabular-nums text-muted-foreground" title={r.confidence === 'bounded' ? 'Estimated upper bound' : undefined}>{r.confidence === 'unknown' ? '' : `${r.confidence === 'bounded' ? '≤ ' : ''}${fmt(r.rows)}`}</span>
             {multi && i < regions.length - 1 && r.tier && (
               <span className="rounded bg-muted px-1.5 py-px text-[9px] text-muted-foreground" title="materialization tier for the handoff">→ {r.tier}</span>
             )}
@@ -500,10 +500,11 @@ export function PortRow({ dir, name, wire, schema }: {
         {badge && (
           <button type="button" disabled={!expandable} onClick={() => setOpen((o) => !o)}
             title={expandable ? (open ? 'Hide columns' : 'Show columns') : undefined}
-            className={cn('rounded px-1.5 py-px text-[9.5px]',
+            className={cn('inline-flex items-center gap-0.5 rounded px-1.5 py-px text-[9.5px]',
               cols === null ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300'
                 : 'bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-300',
               expandable && 'cursor-pointer hover:opacity-80')}>
+            {expandable && <Icon name={open ? 'chevronDown' : 'chevronRight'} size={9} />}
             {badge}
           </button>
         )}

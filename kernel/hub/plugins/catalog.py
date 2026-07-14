@@ -461,10 +461,12 @@ class InMemoryCatalog:
         return metadb.catalog_bump_usage_once(idempotency_key, parents)
 
     def set_metadata(self, uri: str, *, folder: str | None = None, tags: list[str] | None = None,
-                     owner: str | None = None, description: str | None = None) -> CatalogTable:
+                     owner: str | None = None, description: str | None = None,
+                     name: str | None = None) -> CatalogTable:
         """Update a dataset's organization (folder/tags/owner/description). None → field unchanged;
         for owner/description an empty string CLEARS the field (there's no meaningful empty owner),
         so a client can unset without a sentinel. folder='' files at the root; tags=[] clears tags.
+        A non-blank `name` renames the dataset's friendly name (blank/None keeps the current one).
         Raises KeyError if the uri isn't registered."""
         cur = metadb.catalog_get(uri)
         if cur is None:
@@ -476,6 +478,7 @@ class InMemoryCatalog:
             folder=(folder if folder is not None else cur.get("folder") or "").strip("/"),
             owner=own, description=desc,
             tags=[str(t).strip() for t in (tags if tags is not None else cur.get("tags") or []) if str(t).strip()],
+            name=(name.strip() or None) if name is not None else None,
         )
         t = self.get_table(uri)
         self._embed_one(t)  # description/tags changed → refresh the semantic vector

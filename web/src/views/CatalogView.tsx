@@ -47,8 +47,8 @@ export function CatalogView() {
   const [facets, setFacets] = useState<Facets>({ folders: [], tags: [], owners: [] })
   const [selected, setSelected] = useState<CatalogTable | null>(null)
   const [dialog, setDialog] = useState(false)
-  const [uri, setUri] = useState('')
-  const [registering, setRegistering] = useState(false)
+  const [registerOpen, setRegisterOpen] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [catalogRevision, setCatalogRevision] = useState(0)
   const seq = useRef(0)
   const loadingMore = useRef(false)
@@ -67,7 +67,7 @@ export function CatalogView() {
     setLoading(true); setError(null); setLoadingMoreState(false); setLoadMoreError(null)
     // A changed filter must not leave the previous query's rows/facets visible while the new
     // request is in flight. The loading state below is the only claim we can make until it returns.
-    setItems([]); setTotal(0); setHasMore(false)
+    setItems([]); setTotal(0); setHasMore(false); setSelectedIds(new Set())  // a new query invalidates the old selection
     setFacets((cur) => ({ folders: [], tags: [], owners: [], semanticAvailable: cur.semanticAvailable }))
     try {
       let page: { items: CatalogTable[]; total: number; hasMore: boolean }
@@ -128,17 +128,35 @@ export function CatalogView() {
   const clearFilters = () => { setFolder(''); setTags([]); setOwner(''); setHasColumns([]); setRawQ(''); setQ('') }
   const hasFilters = !!(folder || tags.length || owner || hasColumns.length || q)
 
-  const register = async () => {
-    const u = uri.trim(); if (!u) return
-    setRegistering(true)
+  const onRegistered = (t: CatalogTable) => {
+    setRegisterOpen(false)
+    setCatalogRevision((v) => v + 1)
+    pushToast(`Registered “${t.name}”`, 'success')
+    void loadFirst()
+  }
+  const toggleSelect = (id: string) => setSelectedIds((cur) => {
+    const next = new Set(cur)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
+  const clearSelection = () => setSelectedIds(new Set())
+  const selectAllLoaded = () => setSelectedIds(new Set(items.map((t) => t.id)))
+  const useSelected = () => {
+    const ts = items.filter((t) => selectedIds.has(t.id)); if (!ts.length) return
+    rememberTables(ts)
+    ts.forEach((t) => addToCanvas('source', { uri: t.uri, tableId: t.id }, t.name))
+    clearSelection()
+  }
+  const deleteSelected = async () => {
+    const ids = [...selectedIds]; if (!ids.length) return
+    if (!window.confirm(`Remove ${ids.length} dataset${ids.length === 1 ? '' : 's'} from the catalog?`)) return
     try {
-      await api.registerFile(u)
-      setUri('')
-      setCatalogRevision((v) => v + 1)
-      await loadFirst()
-    }
-    catch (e) { pushToast((e as Error).message, 'error') }
-    finally { setRegistering(false) }
+      const res = await api.unregisterTables(ids)
+      pushToast(res.missing.length
+        ? `Removed ${res.deleted.length}, ${res.missing.length} already gone`
+        : `Removed ${res.deleted.length} dataset${res.deleted.length === 1 ? '' : 's'}`, 'success')
+    } catch (e) { pushToast(errorMessage(e), 'error') }
+    clearSelection(); setCatalogRevision((v) => v + 1); await loadFirst()
   }
   const onUpload = async (f?: File) => {
     if (!f) return
@@ -157,13 +175,9 @@ export function CatalogView() {
         <h1 className="text-[20px] font-bold text-foreground">Tables</h1>
         <span className="text-[12px] text-muted-foreground">{total.toLocaleString()} datasets</span>
         <span className="flex-1" />
-        <input value={uri} onChange={(e) => setUri(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void register() }}
-          disabled={registering}
-          data-testid="register-dataset" placeholder="Register a path / uri…"
-          className="w-[260px] rounded-lg border border-border bg-card px-3 py-1.5 text-[12.5px] outline-none focus:border-primary disabled:opacity-60" />
-        <button onClick={() => void register()} disabled={registering || !uri.trim()}
-          className="rounded-lg bg-foreground px-3.5 py-1.5 text-[12.5px] font-semibold text-background disabled:opacity-50">
-          {registering ? 'Registering…' : 'Register'}
+        <button onClick={() => setRegisterOpen(true)} data-testid="register-dataset" title="Register a dataset by path / uri"
+          className="inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3.5 py-1.5 text-[12.5px] font-semibold text-background">
+          <Icon name="plus" size={13} /> Register
         </button>
         <button onClick={() => fileRef.current?.click()} title="Upload a dataset file"
           className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3.5 py-1.5 text-[12.5px] font-semibold text-foreground">
@@ -212,6 +226,24 @@ export function CatalogView() {
         </div>
       )}
 
+      {selectedIds.size > 0 && (
+        <div className="flex items-center gap-2 px-7 pb-2 text-[12px]" data-testid="catalog-selection-bar">
+          <span className="font-semibold text-foreground">{selectedIds.size} selected</span>
+          <button onClick={useSelected} className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 font-semibold text-primary hover:bg-accent">
+            <Icon name="plus" size={11} /> Use
+          </button>
+          <button onClick={() => void deleteSelected()} data-testid="catalog-delete-selected"
+            className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 font-semibold text-destructive hover:bg-accent">
+            <Icon name="trash" size={11} /> Delete
+          </button>
+          <button onClick={clearSelection} className="rounded-md px-2 py-1 text-muted-foreground hover:text-foreground">Clear</button>
+          <span className="flex-1" />
+          {selectedIds.size < items.length && (
+            <button onClick={selectAllLoaded} className="text-[11px] text-muted-foreground underline">Select all {items.length} loaded</button>
+          )}
+        </div>
+      )}
+
       {/* body: folder tree | list | facets */}
       <div className="flex min-h-0 flex-1 border-t border-border">
         <div className="w-[220px] flex-[0_0_220px] overflow-y-auto border-r border-border p-2">
@@ -237,7 +269,8 @@ export function CatalogView() {
               emptyNote={<div className="grid h-full place-items-center text-[13px] text-muted-foreground">
                 {loading ? 'Loading…' : hasFilters ? 'No datasets match these filters.' : 'No datasets registered — add one above.'}
               </div>}
-              renderRow={(t) => <TableRow t={t} onOpen={() => setSelected(t)} onUse={() => use(t)} onFolder={setFolder} />}
+              renderRow={(t) => <TableRow t={t} selected={selectedIds.has(t.id)} selectionActive={selectedIds.size > 0}
+                onToggleSelect={() => toggleSelect(t.id)} onOpen={() => setSelected(t)} onUse={() => use(t)} onFolder={setFolder} />}
             />
           )}
           <div className="border-t border-border px-4 py-1.5 text-[11px] text-muted-foreground">
@@ -290,6 +323,12 @@ export function CatalogView() {
           await loadFirst()
           setDialog(false)
         }} />}
+      {registerOpen && <RegisterModal onClose={() => setRegisterOpen(false)} onRegistered={onRegistered} />}
+
+      {/* known folder paths → autocomplete for every folder input (register modal + detail drawer) */}
+      <datalist id="dp-folder-options">
+        {facets.folders.map((f) => <option key={f.value} value={f.value} />)}
+      </datalist>
     </div>
   )
 }
@@ -342,15 +381,23 @@ function FacetRow({ label, count, active, onClick }: { label: string; count: num
   )
 }
 
-function TableRow({ t, onOpen, onUse, onFolder }: { t: CatalogTable; onOpen: () => void; onUse: () => void; onFolder: (f: string) => void }) {
-  // Open / folder / Use are sibling controls — a single role=button wrapping nested buttons is both
-  // invalid HTML and an axe nested-interactive failure on the Tables surface.
+function TableRow({ t, selected, selectionActive, onToggleSelect, onOpen, onUse, onFolder }: {
+  t: CatalogTable; selected: boolean; selectionActive: boolean; onToggleSelect: () => void
+  onOpen: () => void; onUse: () => void; onFolder: (f: string) => void
+}) {
+  // Checkbox / Open / folder / Use are sibling controls — a single role=button wrapping nested buttons
+  // is both invalid HTML and an axe nested-interactive failure on the Tables surface.
   return (
     <div
-      className="group mx-1 flex h-[54px] items-center gap-2 rounded-lg border border-border bg-card pr-2 hover:border-primary/40 hover:bg-accent"
+      className={`group mx-1 flex h-[54px] items-center gap-2 rounded-lg border bg-card pr-2 hover:border-primary/40 hover:bg-accent ${selected ? 'border-primary/60' : 'border-border'}`}
       style={{ opacity: t.missing ? 0.55 : 1 }}>
+      <label onClick={(e) => e.stopPropagation()}
+        className={`flex h-full shrink-0 cursor-pointer items-center pl-2.5 ${!selected && !selectionActive ? 'opacity-0 group-hover:opacity-100 focus-within:opacity-100' : ''}`}>
+        <input type="checkbox" checked={selected} onChange={onToggleSelect} aria-label={`Select ${t.name}`}
+          className="h-3.5 w-3.5 cursor-pointer accent-primary" />
+      </label>
       <button type="button" onClick={onOpen} aria-label={`Open table ${t.name}`}
-        className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-lg border-0 bg-transparent px-3 text-left text-inherit">
+        className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-lg border-0 bg-transparent pl-1 pr-3 text-left text-inherit">
         <Icon name="db" size={16} style={{ color: color.text3 }} />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
@@ -468,6 +515,7 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
   onDeleted: () => void; onOpenTable: (t: CatalogTable) => void; onColumn: (name: string) => void
 }) {
   const pushToast = useStore((s) => s.pushToast)
+  const [name, setName] = useState(table.name)
   const [folder, setFolder] = useState(table.folder ?? '')
   const [tags, setTags] = useState((table.tags ?? []).join(', '))
   const [owner, setOwner] = useState(table.owner ?? '')
@@ -541,7 +589,7 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
     setBusy(true)
     try {
       const next = await api.setTableMetadata(table.id, {
-        folder: folder.trim(), owner: owner.trim() || null, description: description.trim() || null,
+        name: name.trim() || undefined, folder: folder.trim(), owner: owner.trim() || null, description: description.trim() || null,
         tags: tags.split(',').map((t) => t.trim()).filter(Boolean),
       })
       pushToast('Saved', 'success'); onChanged(next)
@@ -577,7 +625,8 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
           {/* organization editor */}
           <section className="flex flex-col gap-2 rounded-lg border border-border p-3">
             <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Organization</div>
-            <Field label="Folder"><input value={folder} onChange={(e) => setFolder(e.target.value)} placeholder="prod/images" className="dp-input" data-testid="detail-folder" /></Field>
+            <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} placeholder="friendly name" className="dp-input" data-testid="detail-name" /></Field>
+            <Field label="Folder"><input value={folder} onChange={(e) => setFolder(e.target.value)} list="dp-folder-options" placeholder="prod/images" className="dp-input" data-testid="detail-folder" /></Field>
             <Field label="Tags"><input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="gold, pii (comma-separated)" className="dp-input" /></Field>
             <Field label="Owner"><input value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="team or person" className="dp-input" /></Field>
             <Field label="Description"><textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} className="dp-input resize-y" /></Field>
@@ -675,6 +724,69 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <span className="text-[10.5px] text-muted-foreground">{label}</span>
       {children}
     </label>
+  )
+}
+
+// Register modal — the URI is required; name/folder/tags/owner/description are all optional curation
+// the backend register already accepts. Folder autocompletes from the shared #dp-folder-options list.
+function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegistered: (t: CatalogTable) => void }) {
+  const pushToast = useStore((s) => s.pushToast)
+  const [uri, setUri] = useState('')
+  const [name, setName] = useState('')
+  const [folder, setFolder] = useState('')
+  const [tags, setTags] = useState('')
+  const [owner, setOwner] = useState('')
+  const [description, setDescription] = useState('')
+  const [busy, setBusy] = useState(false)
+  const closeRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => { closeRef.current?.focus() }, [])
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  const stem = uri.trim().replace(/\/+$/, '').split(/[\\/]/).pop()?.replace(/\.[^.]+$/, '') ?? ''
+  const submit = async () => {
+    const u = uri.trim(); if (!u || busy) return
+    setBusy(true)
+    try {
+      const t = await api.registerDataset({
+        uri: u,
+        name: name.trim() || undefined,
+        folder: folder.trim() || undefined,
+        tags: tags.split(',').map((x) => x.trim()).filter(Boolean),
+        owner: owner.trim() || undefined,
+        description: description.trim() || undefined,
+      })
+      onRegistered(t)
+    } catch (e) { pushToast(errorMessage(e), 'error') }
+    finally { setBusy(false) }
+  }
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={onClose}>
+      <div role="dialog" aria-modal="true" aria-label="Register a dataset" data-testid="register-modal"
+        className="flex w-[460px] max-w-full flex-col gap-3 rounded-xl border border-border bg-card p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-2">
+          <h2 className="flex-1 text-[15px] font-bold text-foreground">Register a dataset</h2>
+          <button ref={closeRef} onClick={onClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
+        </div>
+        <Field label="Path / URI">
+          <input autoFocus value={uri} onChange={(e) => setUri(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) void submit() }}
+            placeholder="/data/events.parquet or s3://bucket/key" className="dp-input" data-testid="register-uri" />
+        </Field>
+        <Field label="Name (optional)"><input value={name} onChange={(e) => setName(e.target.value)} placeholder={stem || 'defaults to the file name'} className="dp-input" /></Field>
+        <Field label="Folder (optional)"><input value={folder} onChange={(e) => setFolder(e.target.value)} list="dp-folder-options" placeholder="prod/images" className="dp-input" /></Field>
+        <Field label="Tags (optional)"><input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="gold, pii (comma-separated)" className="dp-input" /></Field>
+        <Field label="Owner (optional)"><input value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="team or person" className="dp-input" /></Field>
+        <Field label="Description (optional)"><textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} className="dp-input resize-y" /></Field>
+        <div className="flex justify-end gap-2">
+          <button onClick={onClose} className="rounded-md border border-border bg-card px-3 py-1.5 text-[12.5px] font-semibold text-foreground hover:bg-accent">Cancel</button>
+          <button onClick={() => void submit()} disabled={busy || !uri.trim()} data-testid="register-submit"
+            className="rounded-md bg-foreground px-3.5 py-1.5 text-[12.5px] font-semibold text-background disabled:opacity-50">{busy ? 'Registering…' : 'Register'}</button>
+        </div>
+      </div>
+    </div>
   )
 }
 

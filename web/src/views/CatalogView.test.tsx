@@ -5,8 +5,8 @@ import type { CatalogTable } from '../types/api'
 
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), facets: vi.fn(), catalogTree: vi.fn(), searchCatalog: vi.fn(),
-  registerFile: vi.fn(), lineage: vi.fn(), sample: vi.fn(), table: vi.fn(),
-  setTableMetadata: vi.fn(), unregisterTable: vi.fn(),
+  registerFile: vi.fn(), registerDataset: vi.fn(), lineage: vi.fn(), sample: vi.fn(), table: vi.fn(),
+  setTableMetadata: vi.fn(), unregisterTable: vi.fn(), unregisterTables: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 
@@ -123,5 +123,49 @@ describe('CatalogView request and mutation truth', () => {
     await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(2))
     fireEvent.click(screen.getByTestId('detail-unregister'))
     await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(3))
+  })
+})
+
+describe('CatalogView selection, register modal, and rename', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.tablesPage.mockResolvedValue({ items: [TABLE, TABLE_2], total: 2, hasMore: false })
+    mocks.facets.mockResolvedValue(FACETS)
+    mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [], tables: [] })
+    mocks.searchCatalog.mockResolvedValue([])
+    mocks.lineage.mockResolvedValue({ nodes: [], edges: [] })
+    mocks.setTableMetadata.mockResolvedValue(TABLE)
+    mocks.unregisterTables.mockResolvedValue({ deleted: ['t1', 't2'], missing: [] })
+    mocks.registerDataset.mockResolvedValue(TABLE)
+    store.uploadDataset.mockResolvedValue(null)
+  })
+  afterEach(() => cleanup())
+
+  it('multi-selects rows and batch-deletes them in one request', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByLabelText('Select orders'))
+    fireEvent.click(screen.getByLabelText('Select customers'))
+    expect(screen.getByText('2 selected')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('catalog-delete-selected'))
+    await waitFor(() => expect(mocks.unregisterTables).toHaveBeenCalledWith(['t1', 't2']))
+  })
+
+  it('registers a dataset through the modal with the full payload', async () => {
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByTestId('register-dataset'))
+    fireEvent.change(screen.getByTestId('register-uri'), { target: { value: '/data/events.parquet' } })
+    fireEvent.click(screen.getByTestId('register-submit'))
+    await waitFor(() => expect(mocks.registerDataset).toHaveBeenCalledWith(
+      expect.objectContaining({ uri: '/data/events.parquet' })))
+  })
+
+  it('renames a dataset from the detail drawer', async () => {
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByText('orders'))
+    fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'daily orders' } })
+    fireEvent.click(screen.getByTestId('detail-save'))
+    await waitFor(() => expect(mocks.setTableMetadata).toHaveBeenCalledWith('t1',
+      expect.objectContaining({ name: 'daily orders' })))
   })
 })

@@ -76,8 +76,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const warnings = useSchemaWarnings(id)   // soft cue: config references a column not in the input
   const sizeEst = useStore((s) => s.sizes[id])   // conservative pre-run size estimate (card hint)
   // the action shelf is revealed on hover / sole-selection / while running, so a resting card is clean
-  // and a multi-card marquee doesn't strand a shelf under every selected node
-  const showShelf = soleSelected || hover || busy
+  // and a multi-card marquee doesn't strand a shelf under every selected node. An off (disabled or
+  // downstream-of-disabled) node only shows it when selected — brushing past shouldn't pop a dead toolbar.
+  const showShelf = soleSelected || busy || (hover && !off)
 
   const tag = (spec?.tag ?? kind).toUpperCase()
 
@@ -159,11 +160,12 @@ export function NodeCard({ id, data, children, metaOverride }: {
               </div>
             )}
 
-            {/* size hint — a conservative estimate before you run; only when confidently estimable and
-                the node has no real last-run count to show instead. Unknown counts show nothing. */}
-            {!(data.status === 'latest' && data.lastRun) && sizeEst && sizeEst.rows != null && sizeEst.confidence !== 'unknown' && (
-              <div className="mt-0.5 truncate text-[10.5px] tabular-nums text-muted-foreground/70" title="Estimated output rows (before running)">
-                ~{sizeEst.rows.toLocaleString()} {sizeEst.rows === 1 ? 'row' : 'rows'}
+            {/* size hint — a pre-run estimate. A source's exact count already lives in the meta line, and
+                a bounded (filter/dedup) shows a "≤" upper bound rather than a misleading "~". Unknown → nothing. */}
+            {!(data.status === 'latest' && data.lastRun) && kind !== 'source' && sizeEst && sizeEst.rows != null && sizeEst.confidence !== 'unknown' && (
+              <div className="mt-0.5 truncate text-[10.5px] tabular-nums text-muted-foreground/70"
+                title={sizeEst.confidence === 'bounded' ? 'Estimated upper bound — a filter or dedup may output fewer' : 'Estimated output rows (before running)'}>
+                {sizeEst.confidence === 'bounded' ? '≤ ' : ''}{sizeEst.rows.toLocaleString()} {sizeEst.rows === 1 ? 'row' : 'rows'}
               </div>
             )}
 
@@ -211,7 +213,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
           )}
           <ActionIcon name="clock" label="History" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
           {hasCode && <ActionIcon name="code" label={canEdit ? 'Edit code' : 'View code'} onClick={() => openCodeFullscreen(id, kind === 'sql' ? 'sql' : 'code', kind === 'sql' ? 'sql' : 'python')} />}
-          <MoreMenu id={id} kind={kind} canEdit={canEdit} />
+          <MoreMenu id={id} kind={kind} canEdit={canEdit} disabled={disabled} bypassed={bypassed} />
         </div>
       )}
     </div>
@@ -280,7 +282,7 @@ function EditableTitle({ id, title, onRename, selected, canEdit }: { id: string;
   )
 }
 
-function MoreMenu({ id, kind, canEdit }: { id: string; kind: string; canEdit: boolean }) {
+function MoreMenu({ id, kind, canEdit, disabled, bypassed }: { id: string; kind: string; canEdit: boolean; disabled: boolean; bypassed: boolean }) {
   const [open, setOpen] = useState(false)
   const { bypass, disable, duplicate, removeNode, openPanel } = useStore.getState()
   const canBypass = getSpec(kind)?.canBypass
@@ -324,8 +326,8 @@ function MoreMenu({ id, kind, canEdit }: { id: string; kind: string; canEdit: bo
         {canEdit && item('rename', 'Rename', () => window.dispatchEvent(new CustomEvent('dp-rename', { detail: { id } })))}
         {item('play', 'Run details', () => openPanel(id, 'run'))}
         {canEdit && item('duplicate', 'Duplicate', () => duplicate(id))}
-        {canEdit && canBypass && item('power', 'Bypass (pass data through)', () => bypass(id))}
-        {canEdit && item('mute', 'Disable (+ downstream)', () => disable(id))}
+        {canEdit && canBypass && item('power', bypassed ? 'Un-bypass' : 'Bypass (pass data through)', () => bypass(id))}
+        {canEdit && item('mute', disabled ? 'Enable' : 'Disable (+ downstream)', () => disable(id))}
         {item('export', 'Export data', () => exportNode(id))}
         {item('lineage', 'Lineage', () => openPanel(id, 'lineage'))}
         {canEdit && <DropdownMenuSeparator />}

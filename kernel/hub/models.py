@@ -230,6 +230,7 @@ class CatalogMetadata(Wire):
     tags: list[str] | None = None
     owner: str | None = None
     description: str | None = None
+    name: str | None = None          # optional friendly rename; blank keeps the current name
 
 
 # --------------------------------------------------------------------------- #

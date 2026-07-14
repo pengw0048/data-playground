@@ -2,7 +2,7 @@
 import type {
   CatalogBrowse, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  PluginInfo, ProcessorDescriptor, ProfileResult, Relationship, RunEstimate, RunStatus, SampleResult,
+  PluginInfo, ProcessorDescriptor, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -152,6 +152,9 @@ export const api = {
   nodes: () => req<BackendNodeSpec[]>('/nodes'),
   registerFile: (uri: string, name?: string) =>
     req<CatalogTable>('/catalog/register', { method: 'POST', body: JSON.stringify({ uri, name }) }),
+  // register with the full curation payload (the Register modal): name/folder/tags/owner/description
+  registerDataset: (r: RegisterRequest) =>
+    req<CatalogTable>('/catalog/register', { method: 'POST', body: JSON.stringify(r) }),
   // upload a dataset file's bytes (raw body; name in a header) → lands in shared storage + registers
   uploadFile: (file: File) =>
     req<CatalogTable>('/catalog/upload', { method: 'POST', body: file, headers: { 'X-Upload-Filename': encodeURIComponent(file.name) } }),
@@ -171,6 +174,8 @@ export const api = {
   setTableMetadata: (id: string, meta: CatalogMetadata) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),
   unregisterTable: (id: string) => req<{ ok: boolean }>(`/catalog/tables/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  unregisterTables: (ids: string[]) =>
+    req<{ deleted: string[]; missing: string[] }>('/catalog/tables/delete', { method: 'POST', body: JSON.stringify({ ids }) }),
   lineage: (uri: string, depth = 6, maxNodes = 500) =>
     req<LineageResult>(`/catalog/lineage?uri=${encodeURIComponent(uri)}&depth=${depth}&maxNodes=${maxNodes}`),
 
