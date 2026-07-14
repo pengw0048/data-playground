@@ -1,0 +1,188 @@
+name: Release artifacts
+
+# Build-and-smoke contract for versioned installables (issue #114 / REL-01 slice 10).
+# Builds the SPA + wheel + application image from a clean checkout, proves each artifact
+# installs and runs an offline starter canvas, and enforces one version identity.
+# Publishing / tagging / SBOM / signing is issue #115.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel-smoke:
+    name: wheel build + clean-install smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Read package version
+        id: ver
+        run: |
+          V=$(python3 -c "import re,pathlib; t=pathlib.Path('kernel/pyproject.toml').read_text(); print(re.search(r'(?m)^version\s*=\s*\"([^\"]+)\"', t).group(1))")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "package version: $V"
+
+      - name: Build SPA
+        run: cd web && npm ci && npm run build
+
+      - name: Build wheel
+        run: |
+          cd kernel
+          uv build --wheel --out-dir dist
+          ls -la dist
+
+      - name: Reject placeholder SPA in wheel
+        run: python3 scripts/check_wheel_has_spa.py kernel/dist/*.whl
+
+      - name: Install wheel into fresh venv outside the checkout
+        run: |
+          VENV="/tmp/dp-wheel-venv"
+          # uv venv keeps the install outside the repo so /api/version cannot fall back to
+          # `git rev-parse` against the checkout when DP_GIT_SHA is unset.
+          uv venv "$VENV"
+          uv pip install --python "$VENV" kernel/dist/*.whl
+          "$VENV/bin/python" -c "import importlib.metadata as m; print('installed', m.version('data-playground'))"
+
+      - name: Start dataplay from the wheel install
+        run: |
+          VENV="/tmp/dp-wheel-venv"
+          WS="/tmp/dp-wheel-workspace"
+          rm -rf "$WS"
+          mkdir -p "$WS"
+          # Explicit SHA so a wheel install (no .git) still reports a build identity. Image job
+          # asserts non-unknown without this env via Dockerfile ARG; wheel installs set it here.
+          export DP_GIT_SHA="${GITHUB_SHA}"
+          nohup "$VENV/bin/dataplay" --host 127.0.0.1 --port 8471 --no-open --workspace "$WS" \
+            > /tmp/dp-wheel-hub.log 2>&1 &
+          echo $! > /tmp/dp-wheel-hub.pid
+
+      - name: Starter-canvas smoke (wheel)
+        run: |
+          python3 scripts/release_smoke.py \
+            --base-url http://127.0.0.1:8471 \
+            --expect-version "${{ steps.ver.outputs.version }}" \
+            --ready-timeout 120
+          curl -fsS http://127.0.0.1:8471/api/version > /tmp/wheel-api-version.json
+          cat /tmp/wheel-api-version.json
+
+      - name: Version identity (wheel surfaces)
+        run: |
+          python3 scripts/check_release_versions.py \
+            --pyproject kernel/pyproject.toml \
+            --package-json web/package.json \
+            --wheel kernel/dist/*.whl \
+            --api-version-json /tmp/wheel-api-version.json \
+            --git-tag \
+            --require pyproject,package_json,wheel,api
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: data-playground-wheel
+          path: kernel/dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Stop hub
+        if: always()
+        run: |
+          if [ -f /tmp/dp-wheel-hub.pid ]; then kill "$(cat /tmp/dp-wheel-hub.pid)" || true; fi
+          tail -n 80 /tmp/dp-wheel-hub.log || true
+
+  image-smoke:
+    name: image build + container smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Read package version
+        id: ver
+        run: |
+          V=$(python3 -c "import re,pathlib; t=pathlib.Path('kernel/pyproject.toml').read_text(); print(re.search(r'(?m)^version\s*=\s*\"([^\"]+)\"', t).group(1))")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build application image
+        run: |
+          docker build \
+            --build-arg "DP_VERSION=${{ steps.ver.outputs.version }}" \
+            --build-arg "DP_GIT_SHA=${{ steps.ver.outputs.sha }}" \
+            -t "data-playground:ci" \
+            .
+
+      - name: Assert OCI version label
+        id: label
+        run: |
+          LABEL=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' data-playground:ci)
+          echo "version=$LABEL" >> "$GITHUB_OUTPUT"
+          test -n "$LABEL"
+          test "$LABEL" = "${{ steps.ver.outputs.version }}"
+
+      - name: Run container
+        run: |
+          docker run -d --name dp-image-smoke \
+            -p 8472:8471 \
+            -e DP_ALLOW_INSECURE_BIND=1 \
+            data-playground:ci
+          # Non-root: the process must not be uid 0.
+          UID_IN_CTR=$(docker exec dp-image-smoke id -u)
+          echo "container uid=$UID_IN_CTR"
+          test "$UID_IN_CTR" != "0"
+          test "$UID_IN_CTR" = "10001"
+          # uv run may still be resolving the project on first boot — poll until the port accepts TCP.
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 2 http://127.0.0.1:8472/api/livez >/dev/null 2>&1; then
+              echo "hub accepting connections after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Starter-canvas smoke (image)
+        run: |
+          python3 scripts/release_smoke.py \
+            --base-url http://127.0.0.1:8472 \
+            --expect-version "${{ steps.ver.outputs.version }}" \
+            --expect-sha-not-unknown \
+            --ready-timeout 180
+          curl -fsS http://127.0.0.1:8472/api/version > /tmp/image-api-version.json
+          cat /tmp/image-api-version.json
+          # SHA must equal the build arg (full GITHUB_SHA), not "unknown".
+          python3 - <<'PY'
+          import json
+          body = json.load(open("/tmp/image-api-version.json"))
+          assert body["sha"] and body["sha"] != "unknown", body
+          print("sha ok:", body["sha"][:12], "…")
+          PY
+
+      - name: Version identity (image surfaces)
+        run: |
+          python3 scripts/check_release_versions.py \
+            --pyproject kernel/pyproject.toml \
+            --package-json web/package.json \
+            --api-version-json /tmp/image-api-version.json \
+            --image-label "${{ steps.label.outputs.version }}" \
+            --git-tag \
+            --require pyproject,package_json,api,image
+
+      - name: Dump container logs
+        if: always()
+        run: docker logs dp-image-smoke || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f dp-image-smoke || true
