@@ -59,7 +59,7 @@ function Rail({ onSettings }: { onSettings: () => void }) {
         {item('tables', 'db', 'Tables')}
         {item('transforms', 'fx', 'Transforms')}
         {item('relationships', 'lineage', 'Relationships')}
-        <Button variant="ghost" onClick={onSettings}
+        <Button variant="ghost" onClick={onSettings} data-testid="rail-settings"
           className="h-auto w-full justify-start gap-2.5 px-2.5 py-2 text-[13px] font-medium text-muted-foreground">
           <Icon name="settings" size={15} /> Settings
         </Button>

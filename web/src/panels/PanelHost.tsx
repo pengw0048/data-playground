@@ -90,7 +90,7 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
   const panelMaxHeight = Math.min(620, window.innerHeight - top - 16)
 
   return (
-    <div className="dp-float dp-panel" style={{ position: 'fixed', left, top, width, zIndex: 25 }}>
+    <div className="dp-float dp-panel" data-testid={`panel-${kind}`} style={{ position: 'fixed', left, top, width, zIndex: 25 }}>
       <div
         style={{
           background: 'hsl(var(--card))',  // themed — the panel content uses text-foreground, which flips

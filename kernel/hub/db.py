@@ -275,7 +275,7 @@ def _sql_str(s: str) -> str:
 
 def _object_store_fingerprint(cfg: dict) -> tuple:
     config = tuple(cfg.get(key) for key in (
-        "accessKeyId", "secretAccessKey", "region", "endpoint", "useSsl",
+        "accessKeyId", "secretAccessKey", "sessionToken", "region", "endpoint", "useSsl",
     ))
     explicit_keys = bool(cfg.get("accessKeyId") and cfg.get("secretAccessKey"))
     environment = () if explicit_keys else tuple(os.environ.get(key) for key in _CREDENTIAL_ENV_KEYS)
@@ -306,6 +306,8 @@ def _publish_object_store(cfg: dict) -> None:
             if explicit_keys:
                 parts = [f"TYPE {kind}", f"KEY_ID '{_sql_str(cfg['accessKeyId'])}'",
                          f"SECRET '{_sql_str(cfg['secretAccessKey'])}'"]
+                if kind == "s3" and cfg.get("sessionToken"):
+                    parts.append(f"SESSION_TOKEN '{_sql_str(cfg['sessionToken'])}'")
                 if cfg.get("region"):
                     parts.append(f"REGION '{_sql_str(cfg['region'])}'")
                 endpoint = str(cfg.get("endpoint") or "").strip()
@@ -364,6 +366,14 @@ def _prime_object_store_before_scope() -> None:
             return
         from hub import metadb
         cfg = metadb.get_setting("objectStore", "global", default={}) or {}
+        if not cfg and scheme in ("s3", "s3a", "s3n", "gs", "gcs"):
+            # Only a one-shot workload (subrun / Ray driver) with no hub settings DB reconstructs its
+            # config from the allowlisted data-plane environment; a hub with an empty setting keeps its
+            # ambient credential chain instead of adopting the workers' data-plane keys.
+            from hub.workload_env import (data_plane_object_store_config,
+                                          is_ephemeral_workload)
+            if is_ephemeral_workload():
+                cfg = data_plane_object_store_config(scheme=scheme)
         if not _obj_store_loaded or _object_store_fingerprint(cfg) != _obj_store_secret_config:
             _publish_object_store(cfg)
     except Exception:  # noqa: BLE001 — defer setup failure until an object-store operation actually runs

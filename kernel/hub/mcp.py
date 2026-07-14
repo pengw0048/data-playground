@@ -388,23 +388,51 @@ class Playground:
         from fastapi import HTTPException as HTTPExc
 
         from hub import metadb
-        from hub.routers.runs import _require_run_mutate_access
+        from hub.models import RunStatus
+        from hub.routers.runs import (
+            _pruned_terminal_status,
+            _require_run_mutate_access,
+            _runner_for,
+        )
         run_id = self._req(args, "runId")
         try:
             _require_run_mutate_access(run_id, self.user_id)
         except HTTPExc as e:
             raise ToolError(str(e.detail))
-        owner = self.deps.run_index.get(run_id)
+        owner = _runner_for(run_id, fallback=False)
         if owner is not None:
             return self._run_envelope(owner.cancel(run_id), None)
+        # A durable plugin may be absent after restart. Mirror the HTTP cancel route: persist the
+        # authorized intent before falling back to a kernel backend, so recovery can stop the remote
+        # job instead of silently losing the request.
+        binding = metadb.backend_job(run_id)
+        if binding is not None:
+            persisted = metadb.get_run_state(run_id)
+            if persisted is not None and persisted.get("status") in ("queued", "running"):
+                metadb.request_backend_cancel(run_id)
+                # Terminal publication racing the request remains authoritative over cancellation.
+                current = metadb.get_run_state(run_id)
+                if current is not None:
+                    return self._run_envelope(RunStatus(**current), None)
+                terminal = _pruned_terminal_status(run_id)
+                if terminal is not None:
+                    return self._run_envelope(terminal, None)
+                return self._run_envelope(RunStatus(**persisted), None)
+        # A finished run needs no cancel: return its full persisted detail, or the compact fence only
+        # when that detail was genuinely pruned — never let the fence shadow a live terminal RunState.
+        persisted = metadb.get_run_state(run_id)
+        if persisted is not None and persisted.get("status") in ("done", "failed", "cancelled"):
+            return self._run_envelope(RunStatus(**persisted), None)
+        if persisted is None:
+            terminal = _pruned_terminal_status(run_id)
+            if terminal is not None:
+                return self._run_envelope(terminal, None)
         kb = self.deps.kernel_backend()
         if kb is not None:
             return self._run_envelope(kb.cancel(run_id), None)
-        persisted = metadb.get_run_state(run_id)
-        if persisted is None:
-            raise ToolError(f"unknown runId '{run_id}' (not started this session, or evicted)")
-        from hub.models import RunStatus
-        return self._run_envelope(RunStatus(**persisted), None)
+        if persisted is not None:
+            return self._run_envelope(RunStatus(**persisted), None)
+        raise ToolError(f"unknown runId '{run_id}' (not started this session, or evicted)")
 
     def sample_result(self, args: dict) -> dict:
         """Sample the OUTPUT dataset a run materialized (by its runId) — closes the author→run→inspect
