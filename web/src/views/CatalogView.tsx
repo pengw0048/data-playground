@@ -355,7 +355,7 @@ function Chip({ label, onClear }: { label: string; onClear: () => void }) {
   return (
     <span className="inline-flex items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground">
       {label}
-      <button onClick={onClear} className="opacity-60 hover:opacity-100"><Icon name="close" size={10} /></button>
+      <button type="button" onClick={onClear} aria-label={`Remove filter ${label}`} className="opacity-60 hover:opacity-100"><Icon name="close" size={10} /></button>
     </span>
   )
 }
