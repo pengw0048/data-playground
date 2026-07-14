@@ -395,7 +395,10 @@ def restore_canvas(canvas_id: str, req: RestoreRequest, uid: str = Depends(curre
 @router.delete("/canvas/{canvas_id}")
 def delete_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
     if metadb.canvas_role(canvas_id, uid) == "owner":  # only the owner can delete
-        metadb.delete_canvas_cascade(canvas_id)  # also drop shares + run history + versions (no FK cascade)
+        try:
+            metadb.delete_canvas_cascade(canvas_id)  # also drop shares + run history + versions (no FK cascade)
+        except metadb.ActiveBackendJobsError as e:
+            raise HTTPException(409, str(e))
     return {"ok": True}
 
 

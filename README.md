@@ -176,10 +176,12 @@ boundary and private vulnerability-reporting path.
 ### Docker reference setup
 
 The Compose file is an authenticated, Postgres-backed reference setup. It deliberately separates the
-release migration from application startup:
+release migration from application startup. Export every required secret first — Compose fails closed
+if `DP_AUTH_SECRET` or `DP_POSTGRES_PASSWORD` is unset:
 
 ```bash
 export DP_AUTH_SECRET="$(openssl rand -hex 32)"
+export DP_POSTGRES_PASSWORD="$(openssl rand -hex 32)"
 export DP_AUTH_PASSWORD="choose-an-initial-password"
 
 docker compose build
@@ -189,10 +191,10 @@ unset DP_AUTH_PASSWORD
 docker compose up -d kernel
 ```
 
-Sign in as `local` with the bootstrap password. Keep `DP_AUTH_SECRET` stable. Before a later migration,
-stop every process that writes the metadata database. The [Kubernetes reference](deploy/README.md)
-documents that release contract, the PodSpawner validation path, and what must be adapted for a real
-deployment.
+Sign in as `local` with the bootstrap password. Keep `DP_AUTH_SECRET` and `DP_POSTGRES_PASSWORD`
+stable across restarts. Before a later migration, stop every process that writes the metadata
+database. The [Kubernetes reference](deploy/README.md) documents that release contract, the
+PodSpawner validation path, and what must be adapted for a real deployment.
 
 ### Deployment modes
 
@@ -219,6 +221,7 @@ Unset mode keeps today's localhost defaults. The Compose reference sets `shared`
 | Guide | Use it for |
 | --- | --- |
 | [5-minute tour](docs/TUTORIAL.md) | Build and run a first pipeline on the seeded data |
+| [Browser and viewport support](docs/BROWSER_SUPPORT.md) | Desktop-first scope, minimum viewport, tested browsers, and input model |
 | [Catalog](docs/CATALOG.md) | Browse, search, curate, and integrate catalog and lineage data |
 | [Plugins](docs/PLUGINS.md) | Add nodes or connect another data, catalog, destination, or execution system |
 | [MCP](docs/MCP.md) | Connect an external agent over HTTP or stdio |
@@ -226,6 +229,9 @@ Unset mode keeps today's localhost defaults. The Compose reference sets `shared`
 | [Kubernetes reference](deploy/README.md) | Validate and adapt the per-canvas Pod substrate |
 | [Contributing](.github/CONTRIBUTING.md) | Development loop, tests, and plugin contribution guidelines |
 | [Security policy](.github/SECURITY.md) | Trust boundary and private vulnerability reporting |
+
+The workbench is desktop-first (minimum **1280×720**, Chromium tested in CI, keyboard + mouse). See
+[browser and viewport support](docs/BROWSER_SUPPORT.md) for the full statement.
 
 ## Development
 

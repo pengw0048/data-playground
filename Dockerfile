@@ -15,7 +15,8 @@ RUN npm run build          # → /web/dist
 
 # --- 2. kernel + the bundled SPA ---
 FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf AS app
-RUN pip install --no-cache-dir uv
+# Pin uv so the installer itself can't drift under a rebuild (OPS-02).
+RUN pip install --no-cache-dir uv==0.11.28
 WORKDIR /app
 COPY kernel/ ./kernel/
 # the SPA at ../web/dist relative to kernel/ — where pyproject's force-include bundles it into

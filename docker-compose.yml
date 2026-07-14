@@ -5,6 +5,11 @@
 # catalog) in Postgres. To run several stateless web instances, set `deploy.replicas` (or run more
 # `kernel` services) behind a load balancer that sticky-routes /ws/collab/{canvas_id} by canvas id.
 #
+# Operator-owned (not provided by this file): network/firewall policy, IAM and secret-manager wiring,
+# Postgres/storage durability and backups, resource quotas, TLS termination + cookies
+# (`DP_AUTH_SECURE_COOKIE=1` behind HTTPS), and any high-availability topology. This is a reference
+# composition, not a complete production deployment.
+#
 # Shared mode (DP_DEPLOYMENT_MODE=shared) fails closed unless Secure session cookies and an explicit
 # transport declaration are set. Terminate TLS at a reverse proxy (prefer DP_TRUSTED_PROXIES=<proxy>)
 # or at the hub (DP_AUTH_DIRECT_TLS=1). Plain HTTP browsers will not send Secure cookies — put TLS
@@ -18,7 +23,7 @@ services:
     build: .
     command: ["dataplay", "migrate", "--workspace", "/data"]
     environment:
-      DP_DATABASE_URL: "postgresql+psycopg://dp:dp@postgres:5432/dataplay"
+      DP_DATABASE_URL: "postgresql+psycopg://dp:${DP_POSTGRES_PASSWORD:?set DP_POSTGRES_PASSWORD to a strong password, e.g. openssl rand -hex 32}@postgres:5432/dataplay"
       # Bootstrap is owned by this one-shot release step, never by an application replica. It is
       # required only until a login-capable admin exists; `run --rm` removes the transient container.
       DP_AUTH_SECRET: "${DP_AUTH_SECRET:?set DP_AUTH_SECRET to a random secret, e.g. openssl rand -hex 32}"
@@ -38,7 +43,7 @@ services:
       - "8471:8471"
     environment:
       # shared metadata DB → the web tier is stateless (run state + catalog + canvases all live here)
-      DP_DATABASE_URL: "postgresql+psycopg://dp:dp@postgres:5432/dataplay"
+      DP_DATABASE_URL: "postgresql+psycopg://dp:${DP_POSTGRES_PASSWORD:?set DP_POSTGRES_PASSWORD to a strong password, e.g. openssl rand -hex 32}@postgres:5432/dataplay"
       # per-user auth (signed session cookies). REQUIRED — compose refuses to start without it, so
       # sessions can't be forged with a shipped default. Generate one: `openssl rand -hex 32`.
       DP_AUTH_SECRET: "${DP_AUTH_SECRET:?set DP_AUTH_SECRET to a random secret, e.g. openssl rand -hex 32}"
@@ -63,10 +68,12 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:16
+    # Digest-pinned (not a mutable :tag) so a pull can't silently change the image — resolve a new
+    # digest with `docker buildx imagetools inspect postgres:16` (same pattern as the Dockerfile).
+    image: postgres:16@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
     environment:
       POSTGRES_USER: dp
-      POSTGRES_PASSWORD: dp
+      POSTGRES_PASSWORD: "${DP_POSTGRES_PASSWORD:?set DP_POSTGRES_PASSWORD to a strong password, e.g. openssl rand -hex 32}"
       POSTGRES_DB: dataplay
     volumes:
       - dp-pg:/var/lib/postgresql/data

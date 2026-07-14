@@ -107,6 +107,31 @@ def _share_editor_and_viewer() -> None:
     metadb.share_canvas("authz_canvas", "authz_viewer", "viewer")
 
 
+def _bind_missing_backend_run(run_id: str) -> None:
+    metadb.preallocate_run_owner(run_id, "authz_a", "authz_canvas")
+    metadb.bind_backend_job(run_id, {
+        "backend": "missing-durable-authz-test",
+        "cluster_ref": "test-cluster",
+        "attempt_id": f"attempt-{run_id}",
+        "submission_id": f"submission-{run_id}",
+        "job_uri": f"s3://test-control/{run_id}.dpjob",
+        "result_uri": f"s3://test-control/{run_id}.dpresult",
+        "control_address": "http://missing-control:8265",
+    }, {
+        "run_id": run_id, "status": "queued", "placement": "distributed", "per_node": [],
+    }, canvas_id="authz_canvas")
+
+
+def _delete_backend_test_run(run_id: str) -> None:
+    with metadb.session() as session:
+        job = session.get(metadb.RunBackendJob, run_id)
+        state = session.get(metadb.RunState, run_id)
+        if job is not None:
+            session.delete(job)
+        if state is not None:
+            session.delete(state)
+
+
 def _wait_for_terminal(run_id: str) -> dict:
     for _ in range(200):
         response = client.get(f"/api/run/{run_id}", headers=_hdr("authz_a"))
@@ -280,6 +305,218 @@ def test_run_read_and_cancel_use_different_role_policies(authed):
     assert client.post(f"/api/run/{run_id}/cancel", headers=_hdr("authz_b")).status_code == 404
     assert client.post(f"/api/run/{run_id}/cancel", headers=_hdr("authz_editor")).status_code == 200
     assert client.post(f"/api/run/{run_id}/cancel", headers=_hdr("authz_a")).status_code == 200
+
+
+@pytest.mark.parametrize(("uid", "expected"), [
+    ("authz_a", 200),
+    ("authz_editor", 200),
+    ("authz_viewer", 403),
+    ("authz_b", 404),
+])
+def test_missing_durable_plugin_preserves_authorized_cancel_intent(authed, uid, expected):
+    """Missing plugin recovery must retain cancellation without weakening canvas authorization."""
+    _share_editor_and_viewer()
+    run_id = f"missing_durable_cancel_{uid}"
+    _bind_missing_backend_run(run_id)
+    try:
+        response = client.post(f"/api/run/{run_id}/cancel", headers=_hdr(uid))
+        assert response.status_code == expected, response.text
+        binding = metadb.backend_job(run_id)
+        assert binding is not None
+        assert binding["cancel_requested"] is (expected == 200)
+        if expected == 200:
+            assert response.json()["status"] == "queued", "remote stop has not been acknowledged"
+            assert metadb.get_run_state(run_id)["status"] == "queued"
+    finally:
+        _delete_backend_test_run(run_id)
+
+
+def test_status_projects_terminal_fence_after_bounded_detail_is_pruned():
+    from hub.routers import runs as run_routes
+
+    run_id = "pruned_terminal_status_authz"
+    metadb.save_run_state(run_id, {
+        "run_id": run_id, "status": "done", "per_node": [], "progress": 1.0,
+    })
+    try:
+        with metadb.session() as session:
+            session.delete(session.get(metadb.RunState, run_id))
+        status = run_routes._status_or_lost(run_id)
+        assert (status.status, status.progress, status.error) == ("done", 1.0, None)
+    finally:
+        with metadb.session() as session:
+            fence = session.get(metadb.RunTerminalFence, run_id)
+            if fence is not None:
+                session.delete(fence)
+
+
+def test_fast_terminal_before_owner_bind_backfills_retained_identity(authed):
+    """A tiny local run may finish before start_run persists its creator after runner.run returns."""
+    from hub.routers import runs as run_routes
+
+    _share_editor_and_viewer()
+    run_id = "fast_terminal_before_owner_bind_authz"
+    with metadb.session() as session:
+        session.add(metadb.RunState(
+            run_id=run_id, canvas_id="authz_canvas", status="running",
+            doc='{"run_id":"fast_terminal_before_owner_bind_authz","status":"running"}',
+        ))
+    metadb.save_run_state(run_id, {
+        "run_id": run_id, "status": "done", "per_node": [], "progress": 1.0,
+    }, canvas_id="authz_canvas")
+    assert metadb.terminal_run_identity(run_id) == (None, None, "authz_canvas")
+
+    try:
+        metadb.bind_run_owner(run_id, "authz_editor", "authz_canvas")
+        metadb.bind_run_owner(run_id, "authz_editor", "authz_canvas")
+        assert metadb.terminal_run_identity(run_id) == (
+            "authz_editor", "authz_canvas", "authz_canvas",
+        )
+        with metadb.session() as session:
+            session.delete(session.get(metadb.RunState, run_id))
+        get_deps().run_owner.pop(run_id, None)
+        metadb.unshare_canvas("authz_canvas", "authz_editor")
+
+        # Read access follows the immutable creator after detail pruning. Mutate access still follows
+        # the creator's current role on the real canvas, so revoking the editor share remains effective.
+        assert run_routes._run_read_access(run_id, "authz_editor") is True
+        assert run_routes._run_mutate_access(run_id, "authz_editor") is False
+        response = client.get(f"/api/run/{run_id}", headers=_hdr("authz_editor"))
+        assert response.status_code == 200 and response.json()["status"] == "done"
+    finally:
+        get_deps().run_owner.pop(run_id, None)
+        with metadb.session() as session:
+            state = session.get(metadb.RunState, run_id)
+            fence = session.get(metadb.RunTerminalFence, run_id)
+            if state is not None:
+                session.delete(state)
+            if fence is not None:
+                session.delete(fence)
+
+
+def test_pruned_terminal_fence_preserves_run_authorization(authed):
+    """Bounded status retention must not revoke the creator or current canvas collaborators."""
+    _share_editor_and_viewer()
+    run_id = "pruned_terminal_identity_authz"
+    metadb.bind_run_owner(run_id, "authz_a", "authz_canvas")
+    metadb.save_run_state(run_id, {
+        "run_id": run_id, "status": "done", "per_node": [], "progress": 1.0,
+    }, canvas_id="authz_canvas")
+    try:
+        with metadb.session() as session:
+            session.delete(session.get(metadb.RunState, run_id))
+        get_deps().run_owner.pop(run_id, None)
+
+        assert metadb.terminal_run_identity(run_id) == (
+            "authz_a", "authz_canvas", "authz_canvas",
+        )
+        for uid, expected in [
+            ("authz_a", 200), ("authz_editor", 200),
+            ("authz_viewer", 200), ("authz_b", 404),
+        ]:
+            response = client.get(f"/api/run/{run_id}", headers=_hdr(uid))
+            assert response.status_code == expected, response.text
+            if expected == 200:
+                assert response.json()["status"] == "done"
+        for uid, expected in [
+            ("authz_a", 200), ("authz_editor", 200),
+            ("authz_viewer", 403), ("authz_b", 404),
+        ]:
+            response = client.post(f"/api/run/{run_id}/cancel", headers=_hdr(uid))
+            assert response.status_code == expected, response.text
+
+        # Deleting the authorization canvas preserves only the opaque resurrection fence. Reusing its
+        # ID must not transfer retained-run access to the replacement owner, and stale process-local
+        # ownership must not override the identity-cleared durable fence.
+        get_deps().run_owner[run_id] = "authz_a"
+        metadb.delete_canvas_cascade("authz_canvas")
+        claim = client.post("/api/canvas", json={"id": "authz_canvas", "name": "replacement"},
+                            headers=_hdr("authz_b"))
+        assert claim.status_code == 200, claim.text
+        assert metadb.terminal_run_status(run_id) == "done"
+        assert metadb.terminal_run_identity(run_id) == (None, None, None)
+        assert client.get(f"/api/run/{run_id}", headers=_hdr("authz_a")).status_code == 404
+        assert client.get(f"/api/run/{run_id}", headers=_hdr("authz_b")).status_code == 404
+    finally:
+        get_deps().run_owner.pop(run_id, None)
+        with metadb.session() as session:
+            state = session.get(metadb.RunState, run_id)
+            fence = session.get(metadb.RunTerminalFence, run_id)
+            if state is not None:
+                session.delete(state)
+            if fence is not None:
+                session.delete(fence)
+
+
+def test_pruned_legacy_terminal_fence_preserves_canvas_roles(authed):
+    """Pre-owner-metadata runs retain their existing best-effort canvas authorization."""
+    _share_editor_and_viewer()
+    run_id = "pruned_legacy_terminal_identity_authz"
+    with metadb.session() as session:
+        session.add(metadb.RunState(
+            run_id=run_id, canvas_id="authz_canvas", status="running",
+            doc='{"run_id":"pruned_legacy_terminal_identity_authz","status":"running"}',
+        ))
+    metadb.save_run_state(run_id, {
+        "run_id": run_id, "status": "done", "per_node": [], "progress": 1.0,
+    }, canvas_id="authz_canvas")
+    try:
+        with metadb.session() as session:
+            session.delete(session.get(metadb.RunState, run_id))
+        get_deps().run_owner.pop(run_id, None)
+        assert metadb.terminal_run_identity(run_id) == (None, None, "authz_canvas")
+
+        for uid, expected in [
+            ("authz_a", 200), ("authz_editor", 200),
+            ("authz_viewer", 200), ("authz_b", 404),
+        ]:
+            assert client.get(f"/api/run/{run_id}", headers=_hdr(uid)).status_code == expected
+        for uid, expected in [
+            ("authz_a", 200), ("authz_editor", 200),
+            ("authz_viewer", 403), ("authz_b", 404),
+        ]:
+            assert client.post(f"/api/run/{run_id}/cancel", headers=_hdr(uid)).status_code == expected
+    finally:
+        with metadb.session() as session:
+            state = session.get(metadb.RunState, run_id)
+            fence = session.get(metadb.RunTerminalFence, run_id)
+            if state is not None:
+                session.delete(state)
+            if fence is not None:
+                session.delete(fence)
+
+
+def test_missing_plugin_cancel_projects_terminal_when_publication_prunes_detail(monkeypatch):
+    from hub.routers import runs as run_routes
+
+    run_id = "pruned_terminal_cancel_authz"
+    live = {"run_id": run_id, "status": "running", "per_node": []}
+    observations = iter((live, None))
+    monkeypatch.setattr(run_routes, "_require_run_mutate_access", lambda *_args: None)
+    monkeypatch.setattr(run_routes, "_runner_for", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(metadb, "backend_job", lambda _run_id: {"backend": "missing"})
+    monkeypatch.setattr(metadb, "get_run_state", lambda _run_id: next(observations))
+    monkeypatch.setattr(metadb, "request_backend_cancel", lambda _run_id: False)
+    monkeypatch.setattr(metadb, "terminal_run_status", lambda _run_id: "done")
+
+    status = run_routes.run_cancel(run_id, uid="authz_a")
+
+    assert (status.status, status.progress, status.error) == ("done", 1.0, None)
+
+
+def test_cancel_projects_terminal_when_publication_prunes_binding_before_lookup(monkeypatch):
+    from hub.routers import runs as run_routes
+
+    run_id = "pruned_terminal_cancel_before_binding_authz"
+    monkeypatch.setattr(run_routes, "_require_run_mutate_access", lambda *_args: None)
+    monkeypatch.setattr(run_routes, "_runner_for", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(metadb, "backend_job", lambda _run_id: None)
+    monkeypatch.setattr(metadb, "get_run_state", lambda _run_id: None)
+    monkeypatch.setattr(metadb, "terminal_run_status", lambda _run_id: "done")
+
+    status = run_routes.run_cancel(run_id, uid="authz_a")
+
+    assert (status.status, status.progress, status.error) == ("done", 1.0, None)
 
 
 def test_viewer_can_read_completed_output_history_mcp_and_websocket(authed):
