@@ -14,7 +14,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0027_catalog_folders"
-down_revision = "0025_run_request_id"
+down_revision = "0026_creds"
 branch_labels = None
 depends_on = None
 
