@@ -338,7 +338,7 @@ def _publish_object_store(cfg: dict) -> None:
         _obj_store_secret_config = fingerprint
 
 
-def ensure_object_store() -> None:
+def ensure_object_store(cfg: dict | None = None) -> None:
     """Publish httpfs + credentials on the base connection for object-store consumers.
 
     A run scope owns a long rollback-only transaction.  Creating its secret there would make two
@@ -346,10 +346,14 @@ def ensure_object_store() -> None:
     base connection instead performs one short, serialized autocommit publication per config; scoped
     cursors consume that committed secret without writing the catalog themselves. Secret subkeys in
     the ``objectStore`` setting are references; material values are resolved here only.
+
+    When ``cfg`` is omitted, falls back to the global ``objectStore`` setting (legacy path).
     """
     from hub import metadb
     from hub.secrets import resolve_object_store
-    _publish_object_store(resolve_object_store(metadb.get_setting("objectStore", "global", default={}) or {}))
+    if cfg is None:
+        cfg = metadb.get_setting("objectStore", "global", default={}) or {}
+    _publish_object_store(resolve_object_store(cfg))
 
 
 def _prime_object_store_before_scope() -> None:

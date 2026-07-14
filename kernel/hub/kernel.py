@@ -224,6 +224,19 @@ def main() -> None:
         _auth(x_dp_kernel_token)
         return run_runner.cancel(body["run_id"]).model_dump()  # the runner that OWNS the run (isolated child mgr)
 
+    @app.get("/status")
+    def status(x_dp_kernel_token: str = Header(None)):
+        _auth(x_dp_kernel_token)
+        mem = os.environ.get("DP_MEMORY_LIMIT") or os.environ.get("DP_KERNEL_MEM")
+        with _inflight_lock:
+            inflight = _inflight[0]
+        return {
+            "relationCache": warm.stats(),
+            "memoryLimit": mem,
+            "inflight": inflight,
+            "activeRuns": sum(1 for s in run_runner.runs.values() if getattr(s, "status", None) in ("queued", "running")),
+        }
+
     @app.post("/shutdown")
     def shutdown(x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)

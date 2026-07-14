@@ -25,6 +25,37 @@ export interface KernelInfo {
   backends: BackendInfo[]
 }
 
+export interface RelationCacheStats {
+  entries: number
+  bytes: number
+  maxEntries: number
+  maxBytes: number
+  tooBig: number
+}
+
+export interface CanvasKernelStatus {
+  exists: boolean
+  state?: string
+  stale?: boolean
+  relationCache?: RelationCacheStats
+  memoryLimit?: string | null
+  inflight?: number
+  activeRuns?: number
+}
+
+export interface Cred {
+  id: string
+  name: string
+  kind: 'object_store' | 'agent'
+  fields: Record<string, string>
+  createdAt?: string | null
+}
+
+export interface CatalogFolder {
+  path: string
+  createdAt?: string | null
+}
+
 export interface KeyInfo { columns: string[]; confidence: 'declared' | 'verified' | 'inferred'; unique?: boolean | null }
 
 export interface CatalogTable {

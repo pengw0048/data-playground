@@ -51,6 +51,17 @@ class RelationCache:
             self._lru.move_to_end(key)
         return self._relation(table)
 
+    def stats(self) -> dict:
+        """Snapshot of cache occupancy for kernel status reporting."""
+        with self._lock:
+            return {
+                "entries": len(self._lru),
+                "bytes": self._bytes,
+                "maxEntries": self.max,
+                "maxBytes": self.max_bytes,
+                "tooBig": len(self._toobig),
+            }
+
     def put(self, key: str, view_name: str):
         """Materialize a bounded view into Arrow and cache it without catalog DDL."""
         with self._lock:

@@ -4,7 +4,7 @@ import type { ReactNode } from 'react'
 import type { CatalogTable } from '../types/api'
 
 const mocks = vi.hoisted(() => ({
-  tablesPage: vi.fn(), facets: vi.fn(), catalogTree: vi.fn(), searchCatalog: vi.fn(),
+  tablesPage: vi.fn(), facets: vi.fn(), catalogTree: vi.fn(), catalogFolders: vi.fn(), searchCatalog: vi.fn(),
   registerFile: vi.fn(), registerDataset: vi.fn(), lineage: vi.fn(), sample: vi.fn(), table: vi.fn(),
   setTableMetadata: vi.fn(), unregisterTable: vi.fn(), unregisterTables: vi.fn(),
 }))
@@ -44,6 +44,7 @@ describe('CatalogView request and mutation truth', () => {
     mocks.tablesPage.mockResolvedValue({ items: [TABLE], total: 1, hasMore: false })
     mocks.facets.mockResolvedValue(FACETS)
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [], tables: [] })
+    mocks.catalogFolders.mockResolvedValue([])
     mocks.searchCatalog.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ nodes: [], edges: [] })
     mocks.sample.mockResolvedValue({ columns: TABLE.columns, rows: [{ order_id: 1 }], truncated: false, notPreviewable: false, wire: 'dataset' })
@@ -132,6 +133,7 @@ describe('CatalogView selection, register modal, and rename', () => {
     mocks.tablesPage.mockResolvedValue({ items: [TABLE, TABLE_2], total: 2, hasMore: false })
     mocks.facets.mockResolvedValue(FACETS)
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [], tables: [] })
+    mocks.catalogFolders.mockResolvedValue([])
     mocks.searchCatalog.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ nodes: [], edges: [] })
     mocks.setTableMetadata.mockResolvedValue(TABLE)

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
-import type { PluginInfo, ResourceSpec } from '../types/api'
+import type { Cred, PluginInfo, ResourceSpec } from '../types/api'
 import { useStore } from '../store/graph'
 import { Icon, type IconName } from '../ui/Icon'
 import { cn } from '@/lib/utils'
@@ -18,6 +18,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 const CATS: { id: string; label: string; icon: IconName }[] = [
   { id: 'agent', label: 'Agent', icon: 'sparkle' },
   { id: 'execution', label: 'Execution', icon: 'db' },
+  { id: 'credentials', label: 'Credentials', icon: 'link' },
   { id: 'destinations', label: 'Destinations', icon: 'export' },
   { id: 'plugins', label: 'Plugins', icon: 'grid' },
   { id: 'members', label: 'Members', icon: 'users' },
@@ -51,7 +52,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [saving, setSaving] = useState(false)
   const [saveFailure, setSaveFailure] = useState<SaveFailure | null>(null)
   const [savedMsg, setSavedMsg] = useState('')
-  const [dest, setDest] = useState({ name: '', backend: 'local', root: '' })
+  const [dest, setDest] = useState({ name: '', backend: 'local', root: '', credId: '' })
+  const [creds, setCreds] = useState<Cred[]>([])
+  const [credDraft, setCredDraft] = useState<{ name: string; kind: 'object_store' | 'agent'; fields: Record<string, string> }>({ name: '', kind: 'object_store', fields: {} })
   const [newUser, setNewUser] = useState({ name: '', password: '' })
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [pcfg, setPcfg] = useState<Record<string, Record<string, string>>>({})  // pack → edited { key: value }
@@ -82,7 +85,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     const pluginPacks = canGlobal
       ? api.plugins().catch((error) => { throw new Error(`Plugins request failed: ${errorMessage(error)}`) })
       : Promise.resolve([] as PluginInfo[])
-    Promise.all([settings, pluginPacks]).then(([nextSettings, nextPlugins]) => {
+    const credList = canGlobal
+      ? api.creds().catch((error) => { throw new Error(`Credentials request failed: ${errorMessage(error)}`) })
+      : Promise.resolve([] as Cred[])
+    Promise.all([settings, pluginPacks, credList]).then(([nextSettings, nextPlugins, nextCreds]) => {
       if (cancelled) return
       const global = { ...nextSettings.global }
       const policy = (global.agentDataPolicy && typeof global.agentDataPolicy === 'object')
@@ -93,6 +99,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       setG(global)
       setU(nextSettings.user)
       setPlugins(nextPlugins)
+      setCreds(nextCreds)
       setLoading(false)
     }).catch((error) => {
       if (cancelled) return
@@ -115,16 +122,16 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
   const val = (k: string) => (g[k] == null ? '' : String(g[k]))
   const set = (k: string, v: string) => setG((prev) => ({ ...prev, [k]: v }))
-  const dests = (Array.isArray(g.destinations) ? g.destinations : []) as { id: string; name: string; backend: string; root: string }[]
-  const obj = (g.objectStore && typeof g.objectStore === 'object' ? g.objectStore : {}) as Record<string, string>
-  const setObj = (k: string, v: string) => setG((prev) => ({ ...prev, objectStore: { ...(prev.objectStore as object ?? {}), [k]: v } }))
+  const dests = (Array.isArray(g.destinations) ? g.destinations : []) as { id: string; name: string; backend: string; root: string; credId?: string }[]
+  const objectStoreCreds = creds.filter((c) => c.kind === 'object_store')
+  const agentCreds = creds.filter((c) => c.kind === 'agent')
   const save = async () => {
     if (loading || loadError || saving) return
     const updates: { scope: 'global' | 'user'; key: string; value: unknown }[] = []
     // Only admins may write global settings. Non-admins see just their per-user runner preference,
     // so the request list mirrors exactly what the UI says they can change.
     if (canGlobal) {
-      for (const key of ['agentModel', 'agentApiKey', 'agentBaseUrl']) {
+      for (const key of ['agentModel', 'agentCredId', 'agentBaseUrl']) {
         updates.push({ scope: 'global', key, value: g[key] ?? '' })
       }
       updates.push({
@@ -136,7 +143,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         },
       })
       updates.push({ scope: 'global', key: 'destinations', value: dests })
-      updates.push({ scope: 'global', key: 'objectStore', value: obj })
       for (const [pack, fields] of Object.entries(pcfg)) {
         const schema = plugins.find((p) => p.name === pack)?.config ?? []
         for (const [key, value] of Object.entries(fields)) {
@@ -171,8 +177,28 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     const name = dest.name.trim(), root = dest.root.trim()
     if (!name || !root) return
     const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Math.abs(Math.floor(Math.random() * 1e6))}`
-    setG((prev) => ({ ...prev, destinations: [...dests, { id, name, backend: dest.backend, root }] }))
-    setDest({ name: '', backend: 'local', root: '' })
+    setG((prev) => ({ ...prev, destinations: [...dests, {
+      id, name, backend: dest.backend, root,
+      ...(dest.backend !== 'local' && dest.credId ? { credId: dest.credId } : {}),
+    }] }))
+    setDest({ name: '', backend: 'local', root: '', credId: '' })
+  }
+  const addCred = async () => {
+    const name = credDraft.name.trim()
+    if (!name) return
+    try {
+      const created = await api.createCred({ name, kind: credDraft.kind, fields: credDraft.fields })
+      setCreds((prev) => [...prev, created])
+      setCredDraft({ name: '', kind: 'object_store', fields: {} })
+      pushToast(`Added credential ${name}`, 'success')
+    } catch (e) { pushToast((e as Error).message, 'error') }
+  }
+  const removeCred = async (id: string) => {
+    try {
+      await api.deleteCred(id)
+      setCreds((prev) => prev.filter((c) => c.id !== id))
+      pushToast('Credential deleted', 'success')
+    } catch (e) { pushToast((e as Error).message, 'error') }
   }
   const go = (id: string) => setActive(id)  // master-detail: the nav switches the visible pane
   const runners = kernelInfo?.runners ?? ['local-out-of-core']
@@ -230,8 +256,16 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 {canGlobal && active === 'agent' && <Section id="agent" title="Agent (LLM)">
                   <Field label="Model"><Input value={val('agentModel')} placeholder="anthropic/claude-opus-4-8" onChange={(e) => set('agentModel', e.target.value)} /></Field>
                   <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">e.g. anthropic/claude-opus-4-8 · openai/gpt-5 · google/gemini-2.5-pro · ollama/llama3.3</div>
-                  <Field label="API key"><Input value={val('agentApiKey')} placeholder="env:ANTHROPIC_API_KEY or file:/run/secrets/agent_key" onChange={(e) => set('agentApiKey', e.target.value)} /></Field>
-                  <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">Store a secret reference (`env:VAR` or `file:/path`), never the key itself. Leave blank to rely on the provider&apos;s env var.</div>
+                  <Field label="Credential">
+                    <Select value={val('agentCredId') || '__none__'} onValueChange={(v) => set('agentCredId', v === '__none__' ? '' : v)}>
+                      <SelectTrigger aria-label="Agent credential"><SelectValue placeholder="None (env var fallback)" /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__none__">None (env var fallback)</SelectItem>
+                        {agentCreds.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">Pick an agent credential (env:/file: references only). Manage credentials in the Credentials pane.</div>
                   <Field label="Base URL"><Input value={val('agentBaseUrl')} placeholder="http://localhost:11434 (optional)" onChange={(e) => set('agentBaseUrl', e.target.value)} /></Field>
                   <Field label="Data policy">
                     <Select
@@ -313,6 +347,48 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   </div>
                 </Section>}
 
+                {canGlobal && active === 'credentials' && <Section id="credentials" title="Credentials">
+                  <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
+                    Named credential profiles for object stores and the LLM agent. Fields store references (`env:VAR` / `file:/path`) only — never secret bytes.
+                  </p>
+                  <div className="mb-2 flex flex-col gap-1">
+                    {creds.map((c) => (
+                      <div key={c.id} className="flex items-center gap-2 text-xs text-foreground">
+                        <span className="font-semibold">{c.name}</span>
+                        <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{c.kind.replace('_', ' ')}</Badge>
+                        <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[10.5px] text-muted-foreground">{c.id}</span>
+                        <button onClick={() => void removeCred(c.id)} aria-label={`Delete credential ${c.name}`}
+                          className="grid place-items-center text-muted-foreground transition-colors hover:text-foreground"><Icon name="trash" size={12} /></button>
+                      </div>
+                    ))}
+                    {creds.length === 0 && <div className="text-[11.5px] text-muted-foreground">No credentials yet.</div>}
+                  </div>
+                  <div className="rounded-md border border-border p-3">
+                    <div className="mb-2 text-[12px] font-semibold text-foreground">New credential</div>
+                    <Field label="Name"><Input value={credDraft.name} onChange={(e) => setCredDraft((p) => ({ ...p, name: e.target.value }))} placeholder="e.g. Prod S3" /></Field>
+                    <Field label="Kind">
+                      <Select value={credDraft.kind} onValueChange={(v) => setCredDraft((p) => ({ ...p, kind: v as 'object_store' | 'agent', fields: {} }))}>
+                        <SelectTrigger aria-label="Credential kind"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="object_store">Object store</SelectItem>
+                          <SelectItem value="agent">Agent (LLM)</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </Field>
+                    {credDraft.kind === 'object_store' ? (
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <Input value={credDraft.fields.accessKeyId ?? ''} placeholder="env:AWS_ACCESS_KEY_ID" onChange={(e) => setCredDraft((p) => ({ ...p, fields: { ...p.fields, accessKeyId: e.target.value } }))} />
+                        <Input value={credDraft.fields.secretAccessKey ?? ''} placeholder="env:AWS_SECRET_ACCESS_KEY" onChange={(e) => setCredDraft((p) => ({ ...p, fields: { ...p.fields, secretAccessKey: e.target.value } }))} />
+                        <Input value={credDraft.fields.region ?? ''} placeholder="region" onChange={(e) => setCredDraft((p) => ({ ...p, fields: { ...p.fields, region: e.target.value } }))} />
+                        <Input value={credDraft.fields.endpoint ?? ''} placeholder="endpoint (optional)" onChange={(e) => setCredDraft((p) => ({ ...p, fields: { ...p.fields, endpoint: e.target.value } }))} />
+                      </div>
+                    ) : (
+                      <Input value={credDraft.fields.apiKey ?? ''} placeholder="env:ANTHROPIC_API_KEY" onChange={(e) => setCredDraft((p) => ({ ...p, fields: { apiKey: e.target.value } }))} />
+                    )}
+                    <Button size="sm" className="mt-2" onClick={() => void addCred()}>Add credential</Button>
+                  </div>
+                </Section>}
+
                 {canGlobal && active === 'destinations' && <Section id="destinations" title="Destinations">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
                     Named places to save outputs / open files: a local directory, or an object-store prefix (s3://, gs://).
@@ -323,6 +399,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                         <span className="flex items-center text-muted-foreground"><Icon name="export" size={12} /></span>
                         <span className="font-semibold">{d.name}</span>
                         <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{d.backend}</Badge>
+                        {d.credId && <Badge variant="outline" className="rounded px-1.5 py-0 text-[10px] font-normal">cred</Badge>}
                         <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-muted-foreground">{d.root}</span>
                         <button onClick={() => setG((prev) => ({ ...prev, destinations: dests.filter((_, j) => j !== i) }))}
                           aria-label={`Remove destination ${d.name}`}
@@ -331,9 +408,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     ))}
                     {dests.length === 0 && <div className="text-[11.5px] text-muted-foreground">Only the default "Workspace outputs".</div>}
                   </div>
-                  <div className="flex gap-1.5">
+                  <div className="flex flex-wrap gap-1.5">
                     <Input value={dest.name} onChange={(e) => setDest({ ...dest, name: e.target.value })} placeholder="e.g. S3 exports" className="w-[120px] shrink-0" aria-label="Destination name" />
-                    <Select value={dest.backend} onValueChange={(v) => setDest({ ...dest, backend: v })}>
+                    <Select value={dest.backend} onValueChange={(v) => setDest({ ...dest, backend: v, credId: v === 'local' ? '' : dest.credId })}>
                       <SelectTrigger className="w-[84px] shrink-0" aria-label="Destination backend"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="local">local</SelectItem>
@@ -341,19 +418,19 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                         <SelectItem value="gs">gs</SelectItem>
                       </SelectContent>
                     </Select>
+                    {dest.backend !== 'local' && (
+                      <Select value={dest.credId || '__none__'} onValueChange={(v) => setDest({ ...dest, credId: v === '__none__' ? '' : v })}>
+                        <SelectTrigger className="w-[130px] shrink-0" aria-label="Destination credential"><SelectValue placeholder="Credential" /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="__none__">Default / env</SelectItem>
+                          {objectStoreCreds.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
+                        </SelectContent>
+                      </Select>
+                    )}
                     <Input value={dest.root} onChange={(e) => setDest({ ...dest, root: e.target.value })} onKeyDown={(e) => { if (e.key === 'Enter') addDest() }}
                       placeholder={dest.backend === 'local' ? '/path/to/dir' : `${dest.backend}://bucket/prefix`}
-                      className="min-w-0 flex-1" />
+                      className="min-w-[140px] flex-1" />
                     <Button onClick={addDest} className="shrink-0">Add</Button>
-                  </div>
-
-                  <div className="mb-1.5 mt-4 text-[11.5px] font-semibold text-foreground">Object-store credentials</div>
-                  <div className="mb-2 text-[10.5px] text-muted-foreground">Leave blank to use the environment (AWS_* / ~/.aws / instance role). Credential fields store references (`env:VAR` / `file:/path`), not the secret bytes.</div>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    <Input value={obj.accessKeyId ?? ''} placeholder="env:AWS_ACCESS_KEY_ID" onChange={(e) => setObj('accessKeyId', e.target.value)} />
-                    <Input value={obj.secretAccessKey ?? ''} placeholder="env:AWS_SECRET_ACCESS_KEY" onChange={(e) => setObj('secretAccessKey', e.target.value)} />
-                    <Input value={obj.region ?? ''} placeholder="region (e.g. us-east-1)" onChange={(e) => setObj('region', e.target.value)} />
-                    <Input value={obj.endpoint ?? ''} placeholder="endpoint (MinIO/R2, optional)" onChange={(e) => setObj('endpoint', e.target.value)} />
                   </div>
                 </Section>}
 

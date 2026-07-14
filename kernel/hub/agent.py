@@ -38,7 +38,8 @@ def _agent_config() -> tuple[str, str | None, str | None]:
     from hub import metadb
     from hub.secrets import SecretResolveError, resolve_secret_value
     model = metadb.get_setting("agentModel", "global") or settings.agent_model
-    stored_key = metadb.get_setting("agentApiKey", "global")
+    cred_id = metadb.get_setting("agentCredId", "global")
+    stored_key = metadb.cred_agent_api_key_ref(str(cred_id) if cred_id else None)
     try:
         api_key = resolve_secret_value(stored_key) if stored_key else None
     except SecretResolveError:

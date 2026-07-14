@@ -68,10 +68,12 @@ class ObjectStoreBackend:
         self.kind = kind
 
     def browse(self, root: str, path: str) -> dict:
-        from hub import db
+        from hub import db, metadb
+        from hub.secrets import resolve_object_store
         try:
             prefix = self._safe_prefix(root, path)
-            db.ensure_object_store()
+            cfg = resolve_object_store(metadb.cred_object_store_config(getattr(self, "_cred_id", None)))
+            db.ensure_object_store(cfg)
             with db.lock():
                 rows = db.conn().execute("SELECT file FROM glob(?)", [f"{prefix}/*"]).fetchall()
         except Exception as e:  # noqa: BLE001 — no creds / bad bucket → say so honestly
@@ -158,6 +160,11 @@ def browse(workspace: str, dest_id: str, path: str) -> dict:
     b = _BACKENDS.get(d.get("backend", "local"))
     if not b:
         return {"path": path, "entries": [], "error": f"no backend for '{d.get('backend')}'"}
+    cred_id = d.get("credId") or d.get("cred_id")
+    if cred_id and hasattr(b, "_cred_id"):
+        b._cred_id = cred_id  # noqa: SLF001 — per-request cred binding for object-store browse
+    elif hasattr(b, "_cred_id"):
+        b._cred_id = metadb.get_setting("defaultObjectStoreCredId", "global") or None
     res = b.browse(d.get("root", ""), path or "")
     res["writable"] = True  # both local and object-store backends can write
     return res

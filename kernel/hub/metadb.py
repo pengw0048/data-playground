@@ -587,6 +587,23 @@ class CatalogRelationship(Base):
     doc: Mapped[str] = mapped_column(Text)
 
 
+class CatalogFolderEntity(Base):
+    """A first-class catalog folder — may exist empty. The path string on catalog entries stays in sync."""
+    __tablename__ = "catalog_folders"
+    path: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class CredEntity(Base):
+    """Named credential profile — fields JSON holds env:/file: references only."""
+    __tablename__ = "creds"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    kind: Mapped[str] = mapped_column(String)
+    fields_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class CatalogDeclaredKey(Base):
     """An owner-declared primary key, ONE ROW per stable catalog key (columns as JSON) — same
     per-row isolation as CatalogRelationship (no shared-blob lost update)."""
@@ -5801,6 +5818,14 @@ def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: 
         r.folder, r.owner, r.description, r.doc = folder, owner, description, json.dumps(doc, default=str)
         if name:
             r.name = name
+        # ensure first-class folder entities exist for the assigned path
+        norm = _normalize_folder_path(folder)
+        if norm:
+            parts = norm.split("/")
+            for i in range(1, len(parts) + 1):
+                fp = "/".join(parts[:i])
+                if s.get(CatalogFolderEntity, fp) is None:
+                    s.add(CatalogFolderEntity(path=fp))
         if logical is not None:
             logical.governance_doc = json.dumps(
                 _catalog_governance(doc), default=str, sort_keys=True)
@@ -6250,8 +6275,11 @@ def catalog_tree(prefix: str = "", table_limit: int = 100
         folder_counts = s.execute(
             select(CatalogEntry.folder, func.count()).where(CatalogEntry.folder != "")
             .group_by(CatalogEntry.folder)).all()
+        # merge in first-class folder entities (incl. empty ones)
+        entity_paths = {row.path for row in s.scalars(select(CatalogFolderEntity))}
         children: dict[str, int] = {}
-        for folder, cnt in folder_counts:
+        all_paths = entity_paths | {f for f, _ in folder_counts if f}
+        for folder in all_paths:
             f = (folder or "").strip("/")
             if p:
                 if f != p and not f.startswith(p + "/"):
@@ -6259,6 +6287,16 @@ def catalog_tree(prefix: str = "", table_limit: int = 100
             segs = f.split("/")
             if len(segs) <= depth:
                 continue  # this folder is AT the prefix (no deeper child segment)
+            child_path = "/".join(segs[: depth + 1])
+            children[child_path] = children.get(child_path, 0)
+        for folder, cnt in folder_counts:
+            f = (folder or "").strip("/")
+            if p:
+                if f != p and not f.startswith(p + "/"):
+                    continue
+            segs = f.split("/")
+            if len(segs) <= depth:
+                continue
             child_path = "/".join(segs[: depth + 1])
             children[child_path] = children.get(child_path, 0) + int(cnt)
         child_list = sorted(
@@ -6626,6 +6664,174 @@ def catalog_delete_relationship(rel_key: str) -> None:
         r = s.get(CatalogRelationship, rel_key)
         if r is not None:
             s.delete(r)
+
+
+# ---- catalog folders (first-class entities) ---------------------------------
+
+def _normalize_folder_path(path: str) -> str:
+    return (path or "").strip().strip("/")
+
+
+def catalog_folders_list() -> list[dict]:
+    with session() as s:
+        rows = list(s.scalars(select(CatalogFolderEntity).order_by(CatalogFolderEntity.path)))
+        return [{"path": r.path, "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
+
+
+def catalog_folder_create(path: str) -> dict:
+    p = _normalize_folder_path(path)
+    if not p:
+        raise ValueError("folder path is required")
+    if ".." in p.split("/") or any(not seg for seg in p.split("/")):
+        raise ValueError("invalid folder path")
+    with session() as s:
+        if s.get(CatalogFolderEntity, p) is not None:
+            raise ValueError(f"folder '{p}' already exists")
+        # ensure parent folder entities exist for intermediate segments
+        parts = p.split("/")
+        for i in range(1, len(parts)):
+            parent = "/".join(parts[:i])
+            if s.get(CatalogFolderEntity, parent) is None:
+                s.add(CatalogFolderEntity(path=parent))
+        row = CatalogFolderEntity(path=p)
+        s.add(row)
+        s.flush()
+        return {"path": row.path, "createdAt": row.created_at.isoformat() if row.created_at else None}
+
+
+def catalog_folder_rename(old_path: str, new_path: str) -> None:
+    old = _normalize_folder_path(old_path)
+    new = _normalize_folder_path(new_path)
+    if not old or not new:
+        raise ValueError("both old and new folder paths are required")
+    with session() as s:
+        if s.get(CatalogFolderEntity, old) is None:
+            raise ValueError(f"folder '{old}' not found")
+        if s.get(CatalogFolderEntity, new) is not None:
+            raise ValueError(f"folder '{new}' already exists")
+        # rename folder entity rows (old subtree)
+        folder_rows = list(s.scalars(
+            select(CatalogFolderEntity).where(
+                (CatalogFolderEntity.path == old) | CatalogFolderEntity.path.like(old + "/%"))))
+        for row in folder_rows:
+            suffix = row.path[len(old):].lstrip("/")
+            row.path = new if not suffix else f"{new}/{suffix}"
+        # sync catalog entry folder strings
+        entry_rows = list(s.scalars(
+            select(CatalogEntry).where(
+                (CatalogEntry.folder == old) | CatalogEntry.folder.like(old + "/%"))))
+        for row in entry_rows:
+            suffix = row.folder[len(old):].lstrip("/") if row.folder.startswith(old) else ""
+            row.folder = new if not suffix else f"{new}/{suffix}"
+            doc = json.loads(row.doc)
+            doc["folder"] = row.folder
+            row.doc = json.dumps(doc, default=str)
+
+
+def catalog_folder_delete(path: str) -> None:
+    """Delete a folder entity; reparent its datasets to the parent folder (or root)."""
+    p = _normalize_folder_path(path)
+    if not p:
+        raise ValueError("folder path is required")
+    parent = p.rsplit("/", 1)[0] if "/" in p else ""
+    with session() as s:
+        if s.get(CatalogFolderEntity, p) is None:
+            raise ValueError(f"folder '{p}' not found")
+        # reparent catalog entries
+        entry_rows = list(s.scalars(
+            select(CatalogEntry).where(
+                (CatalogEntry.folder == p) | CatalogEntry.folder.like(p + "/%"))))
+        for row in entry_rows:
+            if row.folder == p:
+                row.folder = parent
+            else:
+                suffix = row.folder[len(p):].lstrip("/")
+                row.folder = f"{parent}/{suffix}".strip("/") if parent else suffix
+            doc = json.loads(row.doc)
+            doc["folder"] = row.folder
+            row.doc = json.dumps(doc, default=str)
+        # delete folder entities in subtree
+        folder_rows = list(s.scalars(
+            select(CatalogFolderEntity).where(
+                (CatalogFolderEntity.path == p) | CatalogFolderEntity.path.like(p + "/%"))))
+        for row in folder_rows:
+            s.delete(row)
+
+
+# ---- credentials (first-class Cred entities) --------------------------------
+
+def _cred_to_wire(row: CredEntity) -> dict:
+    fields = json.loads(row.fields_json or "{}")
+    return {
+        "id": row.id,
+        "name": row.name,
+        "kind": row.kind,
+        "fields": fields if isinstance(fields, dict) else {},
+        "createdAt": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def creds_list() -> list[dict]:
+    with session() as s:
+        return [_cred_to_wire(r) for r in s.scalars(select(CredEntity).order_by(CredEntity.name))]
+
+
+def cred_get(cred_id: str) -> dict | None:
+    with session() as s:
+        row = s.get(CredEntity, cred_id)
+        return None if row is None else _cred_to_wire(row)
+
+
+def cred_upsert(cred_id: str, name: str, kind: str, fields: dict) -> dict:
+    from hub.secrets import OBJECT_STORE_SECRET_SUBKEYS, validate_secret_setting_value
+    clean = dict(fields or {})
+    if kind == "object_store":
+        validate_secret_setting_value("objectStore", clean)
+    elif kind == "agent":
+        key = clean.get("apiKey", "")
+        if key:
+            validate_secret_setting_value("agentApiKey", key)
+    else:
+        raise ValueError(f"unknown cred kind '{kind}'")
+    with session() as s:
+        row = s.get(CredEntity, cred_id)
+        payload = json.dumps(clean, default=str)
+        if row is None:
+            row = CredEntity(id=cred_id, name=name, kind=kind, fields_json=payload)
+            s.add(row)
+        else:
+            row.name, row.kind, row.fields_json = name, kind, payload
+        s.flush()
+        return _cred_to_wire(row)
+
+
+def cred_delete(cred_id: str) -> None:
+    with session() as s:
+        row = s.get(CredEntity, cred_id)
+        if row is not None:
+            s.delete(row)
+
+
+def cred_object_store_config(cred_id: str | None) -> dict:
+    """Return unresolved object-store config dict for a cred id (refs, not material values)."""
+    if not cred_id:
+        return get_setting("objectStore", "global", default={}) or {}
+    row_doc = cred_get(cred_id)
+    if row_doc is None or row_doc.get("kind") != "object_store":
+        return {}
+    return dict(row_doc.get("fields") or {})
+
+
+def cred_agent_api_key_ref(cred_id: str | None) -> str | None:
+    """Return the apiKey reference for an agent cred, or fall back to legacy agentApiKey setting."""
+    if cred_id:
+        row_doc = cred_get(cred_id)
+        if row_doc and row_doc.get("kind") == "agent":
+            key = (row_doc.get("fields") or {}).get("apiKey")
+            if key:
+                return str(key)
+    stored = get_setting("agentApiKey", "global")
+    return str(stored) if stored else None
 
 
 def catalog_declared_keys(uris: list[str] | None = None) -> dict[str, list]:

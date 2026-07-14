@@ -28,6 +28,9 @@ from hub.settings import settings
 from hub.storage import ManagedSourceReadError, source_read_scope
 from hub.models import (
     CatalogBrowse,
+    CatalogFolder,
+    CatalogFolderCreate,
+    CatalogFolderRename,
     CatalogMetadata,
     CatalogQuery,
     CatalogTable,
@@ -331,6 +334,40 @@ def delete_relationship(rel: Relationship) -> list[Relationship]:
     """POST (not DELETE) — the relationship identity is a body, and DELETE-with-body is unreliable."""
     get_deps().catalog.remove_relationship(rel)
     return get_deps().catalog.relationships()
+
+
+@router.get("/catalog/folders", response_model=list[CatalogFolder])
+def list_folders() -> list[CatalogFolder]:
+    return [CatalogFolder(**f) for f in metadb.catalog_folders_list()]
+
+
+@router.post("/catalog/folders", response_model=CatalogFolder)
+def create_folder(req: CatalogFolderCreate) -> CatalogFolder:
+    try:
+        return CatalogFolder(**metadb.catalog_folder_create(req.path))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.put("/catalog/folders/rename")
+def rename_folder(req: CatalogFolderRename) -> dict:
+    try:
+        metadb.catalog_folder_rename(req.old_path, req.new_path)
+        return {"ok": True}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/catalog/folders/delete")
+def delete_folder(body: dict) -> dict:
+    path = body.get("path") or body.get("folder")
+    if not path:
+        raise HTTPException(400, "path is required")
+    try:
+        metadb.catalog_folder_delete(str(path))
+        return {"ok": True}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.post("/catalog/join-suggestions", response_model=list[JoinSuggestion])

@@ -47,6 +47,22 @@ def _kernel_child_env() -> dict:
     return build_workload_env(include_metadata_db=True)
 
 
+def _get(endpoint: str, path: str, token: str, timeout: float = 5.0, connect_retries: int = 2) -> dict:
+    req = urllib.request.Request(
+        f"http://{endpoint}{path}",
+        headers={"X-DP-Kernel-Token": token}, method="GET")
+    for attempt in range(connect_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"kernel {path} → {e.code}: {e.read().decode(errors='replace')[:400]}") from e
+        except (urllib.error.URLError, OSError):
+            if attempt >= connect_retries:
+                raise
+            time.sleep(0.5)
+
+
 def _post(endpoint: str, path: str, token: str, body: dict, timeout: float = 60.0, connect_retries: int = 20) -> dict:
     req = urllib.request.Request(
         f"http://{endpoint}{path}", data=json.dumps(body).encode(),

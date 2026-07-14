@@ -235,8 +235,23 @@ export const api = {
 
   runStatus: (runId: string) => req<RunStatus>(`/run/${runId}`),
   activeRuns: (canvasId: string) => req<RunStatus[]>(`/canvas/${encodeURIComponent(canvasId)}/active-runs`),
-  kernelState: (canvasId: string) => req<{ exists: boolean; state?: string; stale?: boolean }>(`/canvas/${encodeURIComponent(canvasId)}/kernel`),
+  kernelState: (canvasId: string) => req<import('../types/api').CanvasKernelStatus>(`/canvas/${encodeURIComponent(canvasId)}/kernel`),
   restartKernel: (canvasId: string) => req<{ ok: boolean; restarted: boolean }>(`/canvas/${encodeURIComponent(canvasId)}/kernel/restart`, { method: 'POST' }),
+
+  creds: () => req<import('../types/api').Cred[]>('/creds'),
+  createCred: (body: { name: string; kind: 'object_store' | 'agent'; fields: Record<string, string> }) =>
+    req<import('../types/api').Cred>('/creds', { method: 'POST', body: JSON.stringify(body) }),
+  updateCred: (id: string, body: { name?: string; fields?: Record<string, string> }) =>
+    req<import('../types/api').Cred>(`/creds/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(body) }),
+  deleteCred: (id: string) => req<{ ok: boolean }>(`/creds/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  catalogFolders: () => req<import('../types/api').CatalogFolder[]>('/catalog/folders'),
+  createCatalogFolder: (path: string) =>
+    req<import('../types/api').CatalogFolder>('/catalog/folders', { method: 'POST', body: JSON.stringify({ path }) }),
+  renameCatalogFolder: (oldPath: string, newPath: string) =>
+    req<{ ok: boolean }>('/catalog/folders/rename', { method: 'PUT', body: JSON.stringify({ oldPath, newPath }) }),
+  deleteCatalogFolder: (path: string) =>
+    req<{ ok: boolean }>('/catalog/folders/delete', { method: 'POST', body: JSON.stringify({ path }) }),
   cancelRun: (runId: string) => req<RunStatus>(`/run/${runId}/cancel`, { method: 'POST' }),
 
   agentStatus: () => req<AgentStatus>('/agent'),
@@ -290,7 +305,7 @@ export const api = {
     req<{ ok: boolean }>(`/canvas/${canvasId}/share/${userId}`, { method: 'DELETE' }),
 }
 
-export interface DestinationPreset { id: string; name: string; backend: string; root: string }
+export interface DestinationPreset { id: string; name: string; backend: string; root: string; credId?: string }
 export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export interface PerNodeStat { node_id: string; status: string; rows?: number | null; ms?: number | null; label?: string | null }

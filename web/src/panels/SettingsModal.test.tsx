@@ -12,13 +12,17 @@ const PACK = {
 }
 const getSettings = vi.fn()
 const plugins = vi.fn()
+const creds = vi.fn()
 const putSetting = vi.fn()
 vi.mock('../api/client', () => ({
   api: {
     getSettings: () => getSettings(),
     plugins: () => plugins(),
+    creds: () => creds(),
     putSetting: (...a: unknown[]) => putSetting(...a),
     createUser: async () => ({}),
+    createCred: async () => ({}),
+    deleteCred: async () => ({}),
     restartKernel: async () => ({}),
   },
 }))
@@ -37,6 +41,7 @@ describe('SettingsModal — plugin config form', () => {
     vi.clearAllMocks()
     getSettings.mockReset().mockResolvedValue({ global: {}, user: {} })
     plugins.mockReset().mockResolvedValue([PACK])
+    creds.mockReset().mockResolvedValue([])
     putSetting.mockReset().mockResolvedValue({ ok: true })
     state.currentUser.capabilities = ['global_settings']
   })
@@ -114,7 +119,7 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.queryByRole('button', { name: 'Plugins' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Members' })).toBeNull()
     expect(screen.queryByPlaceholderText('anthropic/claude-opus-4-8')).toBeNull()
-    expect(screen.queryByPlaceholderText('access key id')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Credentials' })).toBeNull()
     expect(screen.queryByPlaceholderText('Name')).toBeNull()
     expect(plugins).not.toHaveBeenCalled()
 
@@ -134,8 +139,8 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent('Could not save global setting "agentApiKey": HTTP 500: write failed')
-    expect(alert).toHaveTextContent('1 of 7 updates completed before the failure. Server settings may be partially updated; your edits remain here.')
+    expect(alert).toHaveTextContent('Could not save global setting "agentCredId": HTTP 500: write failed')
+    expect(alert).toHaveTextContent('1 of 6 updates completed before the failure. Server settings may be partially updated; your edits remain here.')
     expect(screen.getByDisplayValue('edited-model')).toBeVisible()
     expect(screen.queryByText('Saved')).toBeNull()
 

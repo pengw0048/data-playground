@@ -18,7 +18,7 @@ from pydantic.alias_generators import to_camel
 from sqlalchemy import select as _sa_select
 
 from hub import auth, auth_admission, metadb
-from hub.models import RunStatus
+from hub.models import Cred, CredCreate, CredUpdate, RunStatus
 from hub.security import RequestIdentity, current_identity, current_user
 
 router = APIRouter()
@@ -486,7 +486,16 @@ def canvas_kernel(canvas_id: str, uid: str = Depends(current_user)) -> dict:
     if metadb.canvas_role(canvas_id, uid) is None:
         raise HTTPException(404, "not found")
     k = metadb.get_kernel(canvas_id)
-    return {"exists": False} if k is None else {"exists": True, "state": k["state"], "stale": k["stale"]}
+    if k is None:
+        return {"exists": False}
+    out: dict = {"exists": True, "state": k["state"], "stale": k["stale"]}
+    if k.get("endpoint") and k.get("token"):
+        from hub import kernel_backend
+        try:
+            out.update(kernel_backend._get(k["endpoint"], "/status", k["token"]))
+        except Exception:  # noqa: BLE001 — unreachable kernel; surface lease state only
+            pass
+    return out
 
 
 @router.post("/canvas/{canvas_id}/kernel/restart")
@@ -515,6 +524,46 @@ def canvas_kernel_restart(canvas_id: str, uid: str = Depends(current_user)) -> d
     # never deletes a newer kernel that already took over the canvas.
     metadb.drop_kernel(canvas_id, k["kernel_id"])
     return {"ok": True, "restarted": True}
+
+
+# ---- credentials (first-class Cred entities) --------------------------------
+
+@router.get("/creds", response_model=list[Cred])
+def list_creds(uid: str = Depends(current_user)) -> list[Cred]:
+    _require_admin(uid)
+    return [Cred(**c) for c in metadb.creds_list()]
+
+
+@router.post("/creds", response_model=Cred)
+def create_cred(req: CredCreate, uid: str = Depends(current_user)) -> Cred:
+    _require_admin(uid)
+    import uuid
+    cid = f"cred-{uuid.uuid4().hex[:12]}"
+    try:
+        return Cred(**metadb.cred_upsert(cid, req.name, req.kind, req.fields))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.put("/creds/{cred_id}", response_model=Cred)
+def update_cred(cred_id: str, req: CredUpdate, uid: str = Depends(current_user)) -> Cred:
+    _require_admin(uid)
+    existing = metadb.cred_get(cred_id)
+    if existing is None:
+        raise HTTPException(404, "cred not found")
+    name = req.name if req.name is not None else existing["name"]
+    fields = req.fields if req.fields is not None else existing.get("fields", {})
+    try:
+        return Cred(**metadb.cred_upsert(cred_id, name, existing["kind"], fields))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.delete("/creds/{cred_id}")
+def delete_cred(cred_id: str, uid: str = Depends(current_user)) -> dict:
+    _require_admin(uid)
+    metadb.cred_delete(cred_id)
+    return {"ok": True}
 
 
 # Secret-bearing settings store references (env:VAR / file:/path), never the material value. GET

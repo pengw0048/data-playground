@@ -211,6 +211,40 @@ class FolderNode(Wire):
     table_count: int = 0
 
 
+class CatalogFolder(Wire):
+    """A first-class folder entity — may exist with zero datasets."""
+    path: str
+    created_at: str | None = None
+
+
+class CatalogFolderCreate(Wire):
+    path: str
+
+
+class CatalogFolderRename(Wire):
+    old_path: str
+    new_path: str
+
+
+class Cred(Wire):
+    """A named credential profile — fields hold env:/file: references only, never secret bytes."""
+    id: str
+    name: str
+    kind: Literal["object_store", "agent"] = "object_store"
+    fields: dict[str, str] = {}
+
+
+class CredCreate(Wire):
+    name: str
+    kind: Literal["object_store", "agent"] = "object_store"
+    fields: dict[str, str] = {}
+
+
+class CredUpdate(Wire):
+    name: str | None = None
+    fields: dict[str, str] | None = None
+
+
 class CatalogBrowse(Wire):
     """One level of the browse tree at a prefix: the immediate child folders (with subtree counts) and
     the tables filed directly at this prefix — a bounded sample (`total_tables`/`truncated` signal
