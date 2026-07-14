@@ -137,7 +137,7 @@ def _request(
         except json.JSONDecodeError:
             payload = raw
         raise SmokeError(f"{method} {path} → HTTP {exc.code}: {payload}") from exc
-    except urllib.error.URLError as exc:
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         raise SmokeError(f"{method} {path} failed: {exc}") from exc
 
 
