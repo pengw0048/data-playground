@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import time
 
@@ -615,6 +616,129 @@ def test_run_progress_and_stall_signal():
     assert done["ms"] >= 0 and "ms" in done
 
 
+def test_backend_job_liveness_uses_db_clock_and_flags_queued_runs(monkeypatch):
+    from hub import metadb
+
+    def utc(value):
+        return value if value.tzinfo is not None else value.replace(tzinfo=datetime.timezone.utc)
+
+    with metadb.session() as session:
+        database_now = metadb._db_now(session)
+    monkeypatch.setattr(
+        metadb, "_now", lambda: utc(database_now) - datetime.timedelta(days=365)
+    )
+    run_ids = ["db_clock_stall_queued", "db_clock_stall_running"]
+    try:
+        for run_id, status in zip(run_ids, ("queued", "running"), strict=True):
+            ref = {
+                "backend": "missing-liveness-test", "cluster_ref": "test-cluster",
+                "attempt_id": f"attempt-{run_id}", "submission_id": f"submission-{run_id}",
+                "job_uri": f"s3://test-control/{run_id}.dpjob",
+                "result_uri": f"s3://test-control/{run_id}.dpresult",
+            }
+            metadb.preallocate_run_owner(run_id, metadb.DEFAULT_USER_ID, None)
+            metadb.bind_backend_job(run_id, ref, {
+                "run_id": run_id, "status": status, "placement": "distributed", "per_node": [],
+            })
+            with metadb.session() as session:
+                job = session.get(metadb.RunBackendJob, run_id)
+                current_database_time = metadb._db_now(session)
+                observed_age = (
+                    utc(job.last_control_observed_at) - utc(current_database_time)
+                ).total_seconds()
+                assert abs(observed_age) < 2
+                job.last_control_observed_at = current_database_time - datetime.timedelta(minutes=5)
+
+            assert metadb.run_stalled(run_id, 60) is True
+            response = client.get(f"/api/run/{run_id}")
+            assert response.status_code == 200, response.text
+            assert response.json()["status"] == status
+            assert response.json()["stalled"] is True
+
+            assert metadb.note_backend_control_observed(run_id, ref["attempt_id"], 0) is True
+            assert metadb.run_stalled(run_id, 60) is False
+    finally:
+        with metadb.session() as session:
+            for run_id in run_ids:
+                job = session.get(metadb.RunBackendJob, run_id)
+                state = session.get(metadb.RunState, run_id)
+                if job is not None:
+                    session.delete(job)
+                if state is not None:
+                    session.delete(state)
+
+
+def test_backend_job_reads_isolate_malformed_result_rows():
+    from hub import metadb
+
+    run_ids = [f"malformed_backend_result_{index}" for index in range(2)]
+    try:
+        for index, run_id in enumerate(run_ids):
+            metadb.preallocate_run_owner(run_id, metadb.DEFAULT_USER_ID, None)
+            metadb.bind_backend_job(run_id, {
+                "backend": "result-row-isolation-test", "cluster_ref": "test-cluster",
+                "attempt_id": f"attempt-{run_id}", "submission_id": f"submission-{run_id}",
+                "job_uri": f"s3://test-control/{run_id}.dpjob",
+                "result_uri": f"s3://test-control/{run_id}.dpresult",
+            }, {
+                "run_id": run_id, "status": "running", "placement": "distributed", "per_node": [],
+            })
+            with metadb.session() as session:
+                job = session.get(metadb.RunBackendJob, run_id)
+                if index == 0:
+                    job.result_doc = "{"
+
+        malformed = metadb.backend_job(run_ids[0])
+        assert malformed["result"] is None
+        assert "result_doc" in malformed["_recovery_error"]
+
+        active = {
+            ref["run_id"]: ref
+            for ref, _status in metadb.active_backend_jobs("result-row-isolation-test")
+        }
+        assert set(active) == set(run_ids)
+        assert "result_doc" in active[run_ids[0]]["_recovery_error"]
+        assert active[run_ids[1]]["result"] is None
+        assert "_recovery_error" not in active[run_ids[1]]
+    finally:
+        with metadb.session() as session:
+            for run_id in run_ids:
+                job = session.get(metadb.RunBackendJob, run_id)
+                state = session.get(metadb.RunState, run_id)
+                if job is not None:
+                    session.delete(job)
+                if state is not None:
+                    session.delete(state)
+
+
+@pytest.mark.parametrize("terminal", ["done", "failed", "cancelled"])
+def test_terminal_run_status_survives_detail_deletion(terminal):
+    from hub import metadb
+
+    run_id = f"terminal_fence_query_{terminal}"
+    try:
+        metadb.save_run_state(run_id, {
+            "run_id": run_id, "status": terminal, "placement": "distributed", "per_node": [],
+        })
+        assert metadb.terminal_run_status(run_id) == terminal
+
+        with metadb.session() as session:
+            state = session.get(metadb.RunState, run_id)
+            if state is not None:
+                session.delete(state)
+
+        assert metadb.get_run_state(run_id) is None
+        assert metadb.terminal_run_status(run_id) == terminal
+    finally:
+        with metadb.session() as session:
+            state = session.get(metadb.RunState, run_id)
+            fence = session.get(metadb.RunTerminalFence, run_id)
+            if state is not None:
+                session.delete(state)
+            if fence is not None:
+                session.delete(fence)
+
+
 def test_sqlite_metadb_uses_wal():
     # the bundled default is SQLite under concurrent daemon-thread writes + polling; WAL + busy_timeout
     # keep those from raising SQLITE_BUSY. Assert the connect hook actually took (sqlite deployments only).
@@ -769,6 +893,8 @@ def test_stale_kernel_is_reaped_and_its_run_failed():
     assert metadb.get_kernel("cv_stale") is None
     metadb.reap_orphaned_runs()
     assert metadb.get_run_state("run_stale")["status"] == "failed"
+    with metadb.session() as session:
+        assert session.get(metadb.RunTerminalFence, "run_stale").status == "failed"
 
 
 def test_claim_kernel_takes_over_a_stale_lease():
@@ -803,7 +929,6 @@ def test_kernel_liveness_counts_in_process_preview_profile():
 def test_dp_execution_is_the_third_precedence_tier(tmp_path, monkeypatch):
     # precedence: per-user > workspace > DP_EXECUTION > kernel default. With no user/global setting,
     # DP_EXECUTION (settings.execution) is honored — the tier only incidentally covered before.
-    from hub import handoff
     from hub.deps import Deps
     from hub.settings import settings
     monkeypatch.setattr(settings, "execution", "local-out-of-core")
@@ -1147,7 +1272,7 @@ def test_high_precision_decimal_previews_exactly():
 
 def test_plugin_run_applies_lowering(tmp_path):
     # the critical bug: plugin lowerings were dropped on a full run → untransformed writes
-    from hub.sdk import NodeSpec, PortSpec, ParamSpec, ctx
+    from hub.sdk import NodeSpec, PortSpec, ctx
     deps = get_deps()
     spec = NodeSpec(kind="const42", title="const42", category="compute",
                     inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
@@ -1228,23 +1353,40 @@ def test_sandbox_blocks_format_string_escape():
     assert "__" in (r.get("reason") or "")
 
 
-def test_settings_redacts_secrets():
-    # GET /settings must not disclose the LLM key or object-store secrets in plaintext; a PUT that
-    # echoes the redaction sentinel preserves the stored secret (doesn't overwrite it with dots).
-    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "sk-super-secret"})
-    client.put("/api/settings", json={"scope": "global", "key": "objectStore",
-                                      "value": {"accessKeyId": "AKIA", "secretAccessKey": "shh", "region": "us-east-1"}})
-    g = client.get("/api/settings").json()["global"]
-    assert g["agentApiKey"] == "__redacted__"                    # key not disclosed
-    assert g["objectStore"]["secretAccessKey"] == "__redacted__" and g["objectStore"]["accessKeyId"] == "__redacted__"
-    assert g["objectStore"]["region"] == "us-east-1"             # non-secret still visible
-    # saving back the redacted view keeps the real secrets (a no-op edit doesn't wipe them)
-    client.put("/api/settings", json={"scope": "global", "key": "objectStore",
-                                      "value": {"accessKeyId": "__redacted__", "secretAccessKey": "__redacted__", "region": "eu-west-1"}})
+def test_settings_stores_secret_references_not_plaintext():
+    # Secret-bearing settings store env:/file: references. GET echoes the reference (not sensitive);
+    # PUT rejects a raw credential so the metadata DB never holds the secret bytes.
     from hub import metadb
+
+    bad = client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "sk-super-secret"})
+    assert bad.status_code == 400 and "secret reference" in bad.json()["detail"]
+    assert client.put("/api/settings", json={
+        "scope": "global", "key": "objectStore",
+        "value": {"accessKeyId": "AKIA", "secretAccessKey": "shh", "region": "us-east-1"},
+    }).status_code == 400
+
+    assert client.put("/api/settings", json={
+        "scope": "global", "key": "agentApiKey", "value": "env:DP_FIXTURE_AGENT_KEY",
+    }).status_code == 200
+    assert client.put("/api/settings", json={
+        "scope": "global", "key": "objectStore",
+        "value": {
+            "accessKeyId": "env:DP_FIXTURE_ACCESS_KEY",
+            "secretAccessKey": "env:DP_FIXTURE_SECRET_KEY",
+            "sessionToken": "env:DP_FIXTURE_SESSION_TOKEN",
+            "region": "us-east-1",
+        },
+    }).status_code == 200
+    g = client.get("/api/settings").json()["global"]
+    assert g["agentApiKey"] == "env:DP_FIXTURE_AGENT_KEY"
+    assert g["objectStore"]["accessKeyId"] == "env:DP_FIXTURE_ACCESS_KEY"
+    assert g["objectStore"]["secretAccessKey"] == "env:DP_FIXTURE_SECRET_KEY"
+    assert g["objectStore"]["sessionToken"] == "env:DP_FIXTURE_SESSION_TOKEN"
+    assert g["objectStore"]["region"] == "us-east-1"
     stored = metadb.get_setting("objectStore", "global")
-    assert stored["secretAccessKey"] == "shh" and stored["accessKeyId"] == "AKIA" and stored["region"] == "eu-west-1"
-    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": ""})  # restore
+    assert stored["secretAccessKey"] == "env:DP_FIXTURE_SECRET_KEY"
+    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": ""})
+    client.put("/api/settings", json={"scope": "global", "key": "objectStore", "value": {}})
 
 
 def test_user_scoped_settings_are_isolated_per_user():
@@ -1691,7 +1833,7 @@ def test_append_concurrent_same_base_no_data_loss(tmp_path, monkeypatch):
 
     assert not errors, f"concurrent append raised: {errors[:3]}"
     ds = uris[0]  # every append returns the same part-dir uri (name sans extension)
-    with db.run_scope() as sc:
+    with db.run_scope():
         got = a.scan(ds).aggregate("count(*)").fetchone()[0]
         distinct = a.scan(ds).aggregate("count(distinct id)").fetchone()[0]
     assert got == n_threads * per_thread, f"lost rows under concurrent append+compaction: {got} != {n_threads * per_thread}"
@@ -1935,6 +2077,99 @@ def test_output_version_is_content_addressed_and_flags_schema_drift(tmp_path, ca
         t3 = cat.register_output(name="out", uri=p, parents=[])
     assert t3.version != t1.version, "a changed schema must produce a new version"
     assert any("schema changed" in r.getMessage() for r in caplog.records), "schema drift must be surfaced"
+
+
+def test_catalog_output_receipt_attests_exact_unmanaged_version(tmp_path):
+    from hub import metadb
+
+    token = os.urandom(8).hex()
+    uri = str(tmp_path / f"receipt-{token}.parquet")
+    other_uri = str(tmp_path / f"receipt-other-{token}.parquet")
+    event_key = f"receipt-{token}"
+    wrong_version_key = f"receipt-wrong-version-{token}"
+    metadb.catalog_upsert_entry(uri, "receipt", {
+        "id": f"tbl_receipt_{token}", "name": "receipt", "uri": uri,
+        "version": "v1", "columns": [], "tags": [],
+    })
+    metadb.catalog_upsert_entry(other_uri, "receipt-other", {
+        "id": f"tbl_receipt_other_{token}", "name": "receipt-other", "uri": other_uri,
+        "version": "v1", "columns": [], "tags": [],
+    })
+    try:
+        metadb.catalog_record_output_publication(event_key, uri + "/", "v1")
+        metadb.catalog_record_output_publication(event_key, uri, "v1")
+        with metadb.session() as session:
+            receipt = session.get(metadb.CatalogPublicationEvent, event_key)
+            assert (receipt.effect_type, receipt.uri, receipt.version) == (
+                "output", uri, "v1")
+
+        with pytest.raises(RuntimeError, match="version does not match"):
+            metadb.catalog_record_output_publication(wrong_version_key, uri, "v2")
+        with metadb.session() as session:
+            assert session.get(metadb.CatalogPublicationEvent, wrong_version_key) is None
+
+        with pytest.raises(RuntimeError, match="publication key collision"):
+            metadb.catalog_record_output_publication(event_key, other_uri, "v1")
+    finally:
+        metadb.catalog_delete_entry(uri)
+        metadb.catalog_delete_entry(other_uri)
+
+
+def test_catalog_usage_counts_runs_and_deduplicates_one_publication_event(tmp_path, monkeypatch):
+    import duckdb
+
+    from hub import metadb
+    from hub.backends import DurableCatalogPublisher
+    from hub.deps import Deps
+
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    assert isinstance(d.catalog, DurableCatalogPublisher)
+    source = str(tmp_path / "source.parquet")
+    output = str(tmp_path / "output.parquet")
+    output_two = str(tmp_path / "output-two.parquet")
+    duckdb.connect().execute(f"COPY (SELECT 1 AS id) TO '{source}' (FORMAT PARQUET)")
+    duckdb.connect().execute(f"COPY (SELECT 2 AS id) TO '{output}' (FORMAT PARQUET)")
+    duckdb.connect().execute(f"COPY (SELECT 3 AS id) TO '{output_two}' (FORMAT PARQUET)")
+    d.catalog.register_output(name="source", uri=source, parents=[])
+
+    receipt = d.catalog.register_output_idempotent(
+        "attempt-a:write-one", name="output", uri=output, parents=[source], pipeline="canvas"
+    )
+    assert receipt.idempotency_key == "attempt-a:write-one" and receipt.uri == output
+    d.catalog.register_output_idempotent(
+        "attempt-a:write-two", name="output-two", uri=output_two, parents=[source], pipeline="canvas"
+    )
+    assert metadb.catalog_get(source)["usage"] == 0, "output count is not run popularity"
+    d.catalog.record_usage_idempotent("attempt-a", [source, source])
+    d.catalog.record_usage_idempotent("attempt-a", [source])
+    assert metadb.catalog_get(source)["usage"] == 1, "one multi-sink run counts its parent once"
+
+    d.catalog.register_output_idempotent(
+        "attempt-b:write", name="output", uri=output, parents=[source], pipeline="canvas"
+    )
+    d.catalog.record_usage_idempotent("attempt-b", [source])
+    assert metadb.catalog_get(source)["usage"] == 2, "two real runs sharing one lineage edge count twice"
+
+    original = metadb.catalog_bump_usage_once
+    crashed = False
+
+    def _commit_then_crash(event_key, uris):
+        nonlocal crashed
+        applied = original(event_key, uris)
+        if not crashed:
+            crashed = True
+            raise ConnectionError("publisher crashed after usage commit")
+        return applied
+
+    monkeypatch.setattr(metadb, "catalog_bump_usage_once", _commit_then_crash)
+    with pytest.raises(ConnectionError, match="after usage commit"):
+        d.catalog.record_usage_idempotent("attempt-c", [source])
+    d.catalog.record_usage_idempotent("attempt-c", [source])
+    assert metadb.catalog_get(source)["usage"] == 3
+
+    d.catalog.register_output(name="output", uri=output, parents=[source], pipeline="canvas")
+    d.catalog.register_output(name="output", uri=output, parents=[source], pipeline="canvas")
+    assert metadb.catalog_get(source)["usage"] == 5, "legacy/local run calls retain per-run popularity"
 
 
 def test_object_output_version_bumps_on_overwrite(tmp_path):
@@ -2483,7 +2718,7 @@ def test_canvas_pip_deps_default_off_under_auth(monkeypatch):
 
 def test_per_user_password_is_not_a_skeleton_key(monkeypatch):
     # with auth on, a password authenticates ONLY its own user — no shared/skeleton password.
-    from hub import auth, metadb
+    from hub import auth
     from hub.metadb import User, session
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
     bid = "bella_u"
@@ -2508,7 +2743,7 @@ def test_per_user_password_is_not_a_skeleton_key(monkeypatch):
 def test_first_admin_bootstrap_from_env_password(monkeypatch):
     # P0-DEPLOY-01: a fresh auth-on deploy needs a first-admin credential before application replicas
     # start. The one-shot migration consumes DP_AUTH_PASSWORD and closes that bootstrap lockout.
-    from hub import auth, metadb
+    from hub import metadb
     client.cookies.clear()
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")     # auth on
     metadb.set_user_password("local", None)            # simulate the fresh/pre-bootstrap admin
@@ -2531,8 +2766,6 @@ def test_api_routes_require_auth_when_enabled(monkeypatch):
     # SECURE DEFAULT: with auth enabled, the whole /api surface needs a session — the high-impact routes
     # (/run code-exec, /data file-read, POST /users self-registration) used to be wide open. Only the
     # login roster + auth status/login stay public.
-    from hub import auth, metadb
-    from hub.metadb import User, session
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
     client.cookies.clear()
     g = {"id": "x", "version": 1, "nodes": [N("s", "source", {"uri": "/etc/hosts"})], "edges": []}
@@ -2627,10 +2860,11 @@ def test_settings_global_and_user_scope():
 
 
 def test_agent_activates_from_settings_key(monkeypatch):
-    # setting a provider key via /settings (the UI path) must make the agent available — no env var
+    # A secret-reference agentApiKey setting must make the agent available — no direct provider env var.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("DP_FIXTURE_AGENT_FROM_UI", "sk-from-ui")
     assert client.get("/api/agent").json()["available"] is False
-    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "sk-from-ui"})
+    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "env:DP_FIXTURE_AGENT_FROM_UI"})
     try:
         assert client.get("/api/agent").json()["available"] is True
     finally:
@@ -4103,6 +4337,26 @@ def test_cancel_falls_back_to_db_status_when_not_owned_here():
     assert r.json()["status"] in ("running", "cancelled", "failed")
 
 
+def test_cancel_returns_full_terminal_detail_not_the_pruned_fence():
+    # a finished run whose full RunState detail still exists (and thus also has a terminal fence) must
+    # return that detail on cancel, never the compact fence projection that drops outputs / fabricates
+    # a 'terminal_details_pruned' error.
+    from hub import metadb
+    metadb.save_run_state(
+        "run_cancel_done",
+        {"run_id": "run_cancel_done", "status": "done", "per_node": [],
+         "output_uri": "s3://cancel-detail/out.parquet", "output_table": "out",
+         "rows_processed": 42, "progress": 1.0},
+        canvas_id="cv_cancel_done", kernel_id="k_none")  # no live kernel owns it
+    get_deps().run_index.pop("run_cancel_done", None)     # this process doesn't own it
+    assert metadb.terminal_run_status("run_cancel_done") == "done"  # a fence row exists alongside detail
+    body = client.post("/api/run/run_cancel_done/cancel").json()
+    assert body["status"] == "done"
+    assert body["outputUri"] == "s3://cancel-detail/out.parquet"
+    assert body["outputTable"] == "out"
+    assert body.get("error") is None
+
+
 def test_kernel_for_run_none_when_owning_kernel_fenced_out():
     # after a takeover (k_old replaced by k_new on one canvas), cancel must NOT be routed to k_new — it
     # never ran the run. kernel_for_run returns None so the backend falls back to the persisted status.
@@ -4329,9 +4583,8 @@ def test_sql_catalog_reference_plugin(tmp_path):
 
 
 def test_plugin_secret_not_leaked_via_settings():
-    # a plugin's secret [[config]] field must NOT be readable in plaintext via GET /api/settings (only
-    # admins can PUT global settings, but any authenticated user can GET them) — the same "secrets never
-    # echo" contract /api/plugins upholds. And PUT with the redaction sentinel must keep the stored secret.
+    # A plugin's secret [[config]] field stores a reference, never the material token. GET echoes the
+    # reference; PUT rejects a raw secret. Non-secret plugin config remains a normal string setting.
     import json as _json
 
     from hub import metadb
@@ -4343,15 +4596,18 @@ def test_plugin_secret_not_leaked_via_settings():
                        {"key": "host", "type": "string"}]}
     deps.plugins.append(fake)
     try:
-        client.put("/api/settings", json={"scope": "global", "key": "plugin.dp_secretpk.token", "value": "sk-LEAK-xyz"})
-        client.put("/api/settings", json={"scope": "global", "key": "plugin.dp_secretpk.host", "value": "db.internal"})
+        bad = client.put("/api/settings", json={
+            "scope": "global", "key": "plugin.dp_secretpk.token", "value": "sk-LEAK-xyz"})
+        assert bad.status_code == 400 and "secret reference" in bad.json()["detail"]
+        client.put("/api/settings", json={
+            "scope": "global", "key": "plugin.dp_secretpk.token", "value": "env:DP_SECRET_PK_TOKEN"})
+        client.put("/api/settings", json={
+            "scope": "global", "key": "plugin.dp_secretpk.host", "value": "db.internal"})
         r = client.get("/api/settings").json()
-        assert r["global"]["plugin.dp_secretpk.token"] == "__redacted__"   # secret redacted
-        assert "sk-LEAK-xyz" not in _json.dumps(r)                          # value never in the payload
-        assert r["global"]["plugin.dp_secretpk.host"] == "db.internal"      # non-secret still visible
-        # PUT of the redaction sentinel keeps the stored secret (doesn't overwrite with dots)
-        client.put("/api/settings", json={"scope": "global", "key": "plugin.dp_secretpk.token", "value": "__redacted__"})
-        assert metadb.get_setting("plugin.dp_secretpk.token", "global") == "sk-LEAK-xyz"
+        assert r["global"]["plugin.dp_secretpk.token"] == "env:DP_SECRET_PK_TOKEN"
+        assert "sk-LEAK-xyz" not in _json.dumps(r)
+        assert r["global"]["plugin.dp_secretpk.host"] == "db.internal"
+        assert metadb.get_setting("plugin.dp_secretpk.token", "global") == "env:DP_SECRET_PK_TOKEN"
     finally:
         deps.plugins.remove(fake)
         metadb.set_setting("plugin.dp_secretpk.token", "", "global")
@@ -5816,7 +6072,6 @@ def test_run_routes_to_a_capability_matching_backend(tmp_path, monkeypatch):
     import json
 
     from hub.deps import Deps
-    from hub.ir import lower_to_ir
     from hub.models import Graph
     from hub.routers.runs import _route_by_capability
     monkeypatch.setenv("DP_POOL_WORKERS", json.dumps([{"name": "gpu", "cpu": 16, "gpu": 2, "gpu_type": "a100"}]))
@@ -6231,7 +6486,6 @@ def test_grain_propagates_through_relational_ops():
 def test_join_analysis_warns_on_fanout():
     # P2: when the best join isn't 1:1, warn that rows fan out. events-aggregated-by-user_id (unique
     # user_id) joined to raw events (user_id repeats) is 1:N.
-    d = get_deps()
     ev = _uri("events")
     graph = {"id": "c", "version": 1, "nodes": [
         N("l0", "source", {"uri": ev}),
@@ -6315,7 +6569,6 @@ def test_declared_key_overrides_inference_and_grain():
 
 def test_relationship_crud_and_leads_join_analysis():
     # declared relationships persist (Settings, cross-instance) and TRUMP measurement in join analysis.
-    d = get_deps()
     ev, img = _uri("events"), _uri("images")
     rel = {"leftUri": img, "leftColumns": ["id"], "rightUri": ev, "rightColumns": ["user_id"], "cardinality": "1:N"}
     try:
@@ -9031,7 +9284,10 @@ def test_ray_settlement_logs_provider_detail_but_returns_generic_error(
         Graph(id="ray-generic", version=1, nodes=[], edges=[]), status,
         {"status": "done", "rows": 0, "outputs": [{"step_id": "write"}]}, 0)
     assert status.status == "failed"
-    assert status.error == "Ray output publication failed"
+    assert status.error == (
+        "Catalog registration failed "
+        "(code=catalog_registration_failed,type=RuntimeError)"
+    )
     assert "SECRET_RAY_CATALOG_DETAIL" not in status.error
     assert "SECRET_RAY_CATALOG_DETAIL" in caplog.text
 
@@ -9061,7 +9317,10 @@ def test_ray_control_plane_setup_and_preflight_errors_are_generic(
     caplog.set_level("ERROR")
     failed = runner.run(plan, graph, "write", "distributed")
     assert failed.status == "failed"
-    assert failed.error == "Ray sink control-plane setup failed"
+    assert failed.error == (
+        "Object sink attempt allocation failed "
+        "(code=sink_attempt_allocation_failed,type=RuntimeError)"
+    )
     assert "SECRET_RAY_ALLOCATION_TOKEN" not in failed.error
     assert "SECRET_RAY_ALLOCATION_TOKEN" in caplog.text
 
@@ -9537,7 +9796,6 @@ def test_ray_unreaped_driver_stays_nonterminal_and_retains_every_fence(
     import subprocess
     import tempfile
     import threading
-    from pathlib import Path
 
     from hub import handoff
     from hub.deps import Deps
@@ -9721,6 +9979,16 @@ def test_ray_clean_done_receipt_wins_late_cancel_and_nonzero_done_stays_private(
     assert failed.output_uri is None and failed.output_table is None
     assert len(registered) == 1
 
+    # Local Popen driver errors surface verbatim (same host/trust boundary), unlike remote Jobs runs
+    # whose text is reduced to a stable code by _apply_job_result.
+    local_failure = RunStatus(run_id="ray-local-failure", status="running")
+    runner._settle_popen_result(
+        graph, local_failure,
+        {"status": "failed", "error": "Binder Error: column X not found"}, 0,
+    )
+    assert local_failure.status == "failed"
+    assert local_failure.error == "Binder Error: column X not found"
+
 
 def test_ray_reconcile_and_shutdown_have_one_terminal_finalizer(tmp_path, monkeypatch):
     import threading
@@ -9881,7 +10149,10 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
         expected_targets=expected_targets, expected_attempts=expected_attempts,
     )
     assert missing_status.status == "failed"
-    assert missing_status.error == "Ray output publication failed"
+    assert missing_status.error == (
+        "Catalog registration failed "
+        "(code=catalog_registration_failed,type=RuntimeError)"
+    )
     assert missing_status.output_uri is None and missing_status.output_table is None
 
     result = {
@@ -10348,7 +10619,6 @@ def test_ray_compatibility_sources_are_size_bounded_before_adapter_scan(tmp_path
     workspace.mkdir()
     mod = _load_dp_ray()
     runner = mod.RayRunner(Deps(str(workspace), str(tmp_path / "data")))
-    table = pa.table({"x": [1, 2]})
     sentinel = SimpleNamespace()
     scans = []
     source = tmp_path / "small.csv"
@@ -10633,10 +10903,24 @@ def test_ray_opts_maps_region_requires_to_ray_task_placement():
     assert ropts({"gpu": 2}) == {"num_gpus": 2.0}
     assert ropts({"labels": {"engine": "ray"}}) == {}  # the claim label is not a placement resource
     assert ropts({"labels": {"engine": "ray", "pool": "a100"}}) == {"resources": {"a100": 0.001}}
-    assert ropts({"gpu_type": "a100"}) == {"num_gpus": 1.0}
+    assert ropts({"gpu_type": "a100"}) == {"num_gpus": 1.0, "accelerator_type": "A100"}
     assert ropts({"cpu": 8, "mem": "64GB"}) == {}  # aggregates — not mapped to per-task options
     both = ropts({"gpu": 1, "labels": {"pool": "gpu1"}})
     assert both == {"num_gpus": 1.0, "resources": {"gpu1": 0.001}}
+
+
+def test_ray_gpu_batch_rows_are_validated_capped_and_frozen(monkeypatch):
+    mod = _load_dp_ray()
+    monkeypatch.delenv("DP_RAY_GPU_BATCH_ROWS", raising=False)
+    assert mod._gpu_batch_rows() == mod._GPU_BATCH_ROWS_DEFAULT
+    monkeypatch.setenv("DP_RAY_GPU_BATCH_ROWS", "8192")
+    assert mod._gpu_batch_rows() == 8192
+    monkeypatch.setenv("DP_RAY_GPU_BATCH_ROWS", str(mod._GPU_BATCH_ROWS_MAX * 10))
+    assert mod._gpu_batch_rows() == mod._GPU_BATCH_ROWS_MAX
+    for invalid in ("0", "-1", "many"):
+        monkeypatch.setenv("DP_RAY_GPU_BATCH_ROWS", invalid)
+        with pytest.raises(ValueError, match="positive integer"):
+            mod._gpu_batch_rows()
 
 
 def test_ray_custom_labels_are_advertised_to_the_pre_dispatch_gate(tmp_path, monkeypatch):
@@ -10757,7 +11041,7 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
     mod = _load_dp_ray()
     rr = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
     monkeypatch.setattr(rr, "_source_unsupported_reason", lambda *_args: None)
-    opts = {"num_gpus": 1.0, "resources": {"a100": 0.001}}
+    gpu_opts = {"num_gpus": 1.0, "accelerator_type": "A100", "resources": {"a100": 0.001}}
     calls = []
     monkeypatch.setenv("DP_RAY_SHUFFLE_PARTITIONS", "4")
 
@@ -10777,6 +11061,9 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
         def size_bytes(self):
             return 8
 
+        def count(self):
+            return 1
+
         def repartition(self, *args, **kwargs):
             return self
 
@@ -10787,13 +11074,39 @@ def test_ray_relational_compute_forwards_task_resources_and_rejects_pinned_sort(
         def to_arrow_refs(self):
             return self.refs
 
-    rr._shuffle_duckdb(_Data(), ["k"], "SELECT DISTINCT * FROM _blk", opts)
+    with pytest.raises(RuntimeError, match="whole hash partition"):
+        rr._shuffle_duckdb(_Data(), ["k"], "SELECT DISTINCT * FROM _blk", gpu_opts)
+    rr._shuffle_duckdb(_Data(), ["k"], "SELECT DISTINCT * FROM _blk", {"resources": {"a100": 0.001}})
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda refs: [pa.table({"k": [1]})]))
     step = SimpleNamespace(inputs=[("left", None), ("right", None)],
                            config={"how": "inner", "on": "k"})
-    rr._build_join(step, {"left": _Data(), "right": _Data(["ref"])}, opts)
+    rr._build_join(step, {"left": _Data(), "right": _Data(["ref"])}, gpu_opts)
     assert len(calls) == 2
-    assert all(call["num_gpus"] == 1.0 and call["resources"] == {"a100": 0.001} for call in calls)
+    assert calls[0]["batch_size"] is None and calls[0]["resources"] == {"a100": 0.001}
+    assert calls[1]["batch_size"] == mod._GPU_BATCH_ROWS_DEFAULT
+    assert calls[1]["num_gpus"] == 1.0 and calls[1]["accelerator_type"] == "A100"
+    transform = SimpleNamespace(
+        op="map", inputs=[("parent", None)],
+        config={"mode": "map", "code": "def fn(row): return row"},
+    )
+    rr._build(transform, {"parent": _Data()}, gpu_opts)
+    assert calls[2]["batch_size"] == mod._GPU_BATCH_ROWS_DEFAULT
+    assert calls[2]["accelerator_type"] == "A100"
+
+    monkeypatch.setenv("DP_RAY_GPUS", "2")
+    monkeypatch.setenv("DP_RAY_GPU_TYPE", "a100")
+    gpu_req = ResourceSpec(gpu_type="a100", labels={"engine": "ray"})
+    for op in ("aggregate", "window", "dedup"):
+        reason = rr._resource_unsupported_reason(
+            gpu_req, SimpleNamespace(steps=[SimpleNamespace(op=op)])
+        )
+        assert "whole-partition" in reason and op in reason
+    monkeypatch.setenv("DP_RAY_GPU_BATCH_ROWS", "0")
+    reason = rr._resource_unsupported_reason(
+        gpu_req, SimpleNamespace(steps=[SimpleNamespace(op="map")])
+    )
+    assert "positive integer" in reason
+    monkeypatch.delenv("DP_RAY_GPU_BATCH_ROWS")
 
     graph = Graph(**{"id": "ray-pinned-sort", "version": 1, "nodes": [
         _ray_node("src", "source", {"uri": "unused.parquet"}),
@@ -10843,6 +11156,18 @@ def test_ray_explicit_placement_fails_unsupported_shape_while_unpinned_falls_bac
     with metadb.session() as session:
         assert session.scalar(select(func.count()).select_from(metadb.ObjectAttempt).where(
             metadb.ObjectAttempt.run_id == object_run)) == 0
+
+    # A GPU claim is itself a hard Ray placement pin. Omitting labels.engine must never turn it
+    # into a local DuckDB execution that silently ignores the requested accelerator.
+    gpu_explicit = rr.run_unit(
+        graph,
+        "src",
+        str(tmp_path / "must-gpu.parquet"),
+        requires=ResourceSpec(gpu=1),
+    )
+    assert gpu_explicit.status == "failed"
+    assert gpu_explicit.placement == "distributed"
+    assert "requested resources" in (gpu_explicit.error or "")
 
 
 def test_ray_explicit_placement_fails_unadvertised_resources_before_dispatch(tmp_path, monkeypatch):
@@ -11119,6 +11444,9 @@ def test_object_attempt_registry_serializes_publish_and_discard():
     with pytest.raises(RuntimeError, match="terminal proof"):
         metadb.catalog_upsert_entry(
             fenced, "out", {"id": "tbl_out", "name": "out", "uri": fenced})
+    # Unregister the durable catalog pointer before quarantining its physical attempt. Cleanup must
+    # exercise the same ownership boundary as production rather than bypassing a live reference.
+    metadb.catalog_delete_entry(published[0])
     for uri in uris:
         metadb.quarantine_object_attempt(uri, "test cleanup")
     metadb.quarantine_object_attempt(fenced, "test cleanup")

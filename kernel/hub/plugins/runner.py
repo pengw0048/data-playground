@@ -10,9 +10,7 @@ Content-addressed: an unchanged plan (by node config + source fingerprint) is se
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import inspect
-import json
 import logging
 import os
 import threading
@@ -322,7 +320,8 @@ class LocalRunner:
 
     # -- run --------------------------------------------------------------- #
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
-            placement: Placement, run_id: str | None = None, cancel_check=None) -> RunStatus:
+            placement: Placement, run_id: str | None = None, cancel_check=None,
+            request_id: str | None = None, attempt_id: str | None = None) -> RunStatus:
         if sum(step.kind == "write" for step in plan.steps) > 1:
             raise RuntimeError(
                 "local runs support one write sink until atomic multi-sink publication is enabled")
@@ -333,8 +332,10 @@ class LocalRunner:
                     "local write sinks require catalog registration with read-back support")
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
+        # attempt_id is accepted for OPS-01 port parity (managed publication stamps its own attempts).
+        _ = attempt_id
         status = RunStatus(run_id=run_id, status="queued", placement=placement, per_node=per_node,
-                           target_node_id=target_node_id)
+                           target_node_id=target_node_id, request_id=request_id)
         with self._lock:
             self.runs[run_id] = status
             self._cancel[run_id] = _CancelToken(cancel_check)

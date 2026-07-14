@@ -135,12 +135,18 @@ class KernelBackend:
         return k["endpoint"], k["token"]
 
     # -- ExecutionBackend -------------------------------------------------- #
-    def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None, placement) -> RunStatus:
+    def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None, placement,
+            run_id: str | None = None, request_id: str | None = None,
+            attempt_id: str | None = None) -> RunStatus:
         canvas_id = getattr(graph, "id", None) or "canvas"
-        run_id = f"run_{os.urandom(5).hex()}"  # hub-authoritative id, threaded into the kernel
+        run_id = run_id or f"run_{os.urandom(5).hex()}"  # hub-authoritative id, threaded into the kernel
         endpoint, token = self._ensure_kernel(canvas_id)
-        body = {"run_id": run_id, "graph": graph.model_dump(), "target": target_node_id, "placement": placement}
-        return RunStatus(**_post(endpoint, "/run", token, body))
+        body = {"run_id": run_id, "graph": graph.model_dump(), "target": target_node_id,
+                "placement": placement, "request_id": request_id, "attempt_id": attempt_id}
+        status = RunStatus(**_post(endpoint, "/run", token, body))
+        if request_id and not status.request_id:
+            status.request_id = request_id
+        return status
 
     def preview(self, graph: Graph, node_id: str, k: int, offset: int) -> dict:
         """Run a sample preview on the canvas's warm kernel (so it shares the kernel's engine + cache)."""

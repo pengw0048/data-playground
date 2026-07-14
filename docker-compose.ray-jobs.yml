@@ -1,0 +1,124 @@
+# Restart-durable Ray Jobs acceptance topology.
+#
+# This is intentionally separate from docker-compose.ray.yml: the differential gate validates data
+# semantics, while this topology validates the external control-plane lifecycle against real services.
+# All Data Playground/Ray processes use the same image built from docker/ray/Dockerfile.
+
+x-jobs-env: &jobs-env
+  DP_DATABASE_URL: "postgresql+psycopg://dp:dp-acceptance-only@postgres:5432/dataplay"
+  DP_WORKSPACE: "/tmp/dataplay-workspace"
+  DP_DATA_DIR: "/tmp/dataplay-data"
+  DP_RAY_JOBS_ADDRESS: "http://ray-head:8265"
+  DP_RAY_JOBS_CLUSTER_REF: "compose-ray-jobs"
+  DP_RAY_JOBS_ENTRYPOINT: "/app/kernel/.venv/bin/python /app/kernel/hub/ray_jobs_acceptance_entrypoint.py"
+  DP_RAY_JOBS_MODULE: "/app/examples/plugins/dp_ray/__init__.py"
+  DP_RAY_JOBS_CODE_REF: "${DP_RAY_JOBS_CODE_REF:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+  DP_RAY_JOBS_WORKSPACE: "/app/kernel"
+  DP_RAY_JOBS_DATA_DIR: "/tmp/dataplay-data"
+  DP_STORAGE_URL: "s3://dpray/outputs"
+  DP_RAY_JOBS_ARTIFACT_PREFIX: "s3://dpray/control/ray-jobs"
+  DP_RAY_JOBS_POLL_S: "0.25"
+  DP_RAY_JOBS_CANCEL_TIMEOUT_S: "20"
+  DP_RAY_JOBS_RESULT_TIMEOUT_S: "3"
+  DP_RAY_JOBS_SUBMISSION_LEASE_S: "8"
+  DP_RAY_JOBS_PUBLICATION_LEASE_S: "12"
+  DP_RUN_DEADLINE_S: "180"
+  DP_CANVAS_PIP_DEPS: "0"
+  DP_RAY_REMOTE: "1"
+  DP_RAY_NUM_CPUS: "4"
+  DP_S3_ENDPOINT: "http://minio:9000"
+  DP_S3_BUCKET: "dpray"
+  DP_S3_KEY: "dpminio"
+  DP_S3_SECRET: "dpminio123"
+  AWS_ENDPOINT_URL: "http://minio:9000"
+  AWS_ENDPOINT_URL_S3: "http://minio:9000"
+  AWS_ACCESS_KEY_ID: "dpminio"
+  AWS_SECRET_ACCESS_KEY: "dpminio123"
+  AWS_REGION: "us-east-1"
+  RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+  __RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR: "hub.ray_compat.patch_hash_shuffle"
+
+services:
+  postgres:
+    image: postgres:16@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
+    environment:
+      POSTGRES_USER: dp
+      POSTGRES_PASSWORD: dp-acceptance-only
+      POSTGRES_DB: dataplay
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dp -d dataplay"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    networks: [dprayjobs]
+
+  minio:
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: dpminio
+      MINIO_ROOT_PASSWORD: dpminio123
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    networks: [dprayjobs]
+
+  ray-head:
+    image: dp-ray:local
+    build: { context: ., dockerfile: docker/ray/Dockerfile }
+    command: ["ray", "start", "--head", "--port=6379", "--num-cpus=2", "--object-store-memory=536870912", "--dashboard-host=0.0.0.0", '--resources={"engine_ray":100}', "--block"]
+    environment:
+      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+      __RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR: "hub.ray_compat.patch_hash_shuffle"
+    healthcheck:
+      test: ["CMD-SHELL", "ray status >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8265/api/version >/dev/null"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+      start_period: 5s
+    shm_size: "1gb"
+    networks: [dprayjobs]
+
+  ray-worker:
+    image: dp-ray:local
+    depends_on:
+      ray-head: { condition: service_healthy }
+    command: ["ray", "start", "--address=ray-head:6379", "--num-cpus=2", "--object-store-memory=536870912", '--resources={"engine_ray":100}', "--block"]
+    environment:
+      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+      __RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR: "hub.ray_compat.patch_hash_shuffle"
+    shm_size: "1gb"
+    networks: [dprayjobs]
+
+  storage-init:
+    image: dp-ray:local
+    depends_on:
+      minio: { condition: service_healthy }
+    environment: *jobs-env
+    command: ["python", "-m", "hub.ray_jobs_acceptance", "bootstrap-storage"]
+    networks: [dprayjobs]
+
+  migrate:
+    image: dp-ray:local
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment: *jobs-env
+    command: ["dataplay", "migrate", "--workspace", "/tmp/dataplay-workspace", "--data-dir", "/tmp/dataplay-data"]
+    networks: [dprayjobs]
+
+  jobs-check:
+    image: dp-ray:local
+    depends_on:
+      postgres: { condition: service_healthy }
+      minio: { condition: service_healthy }
+      ray-head: { condition: service_healthy }
+    working_dir: /app/kernel
+    environment: *jobs-env
+    command: ["python", "-m", "hub.ray_jobs_acceptance", "submit-restart"]
+    shm_size: "1gb"
+    networks: [dprayjobs]
+
+networks:
+  dprayjobs: {}
