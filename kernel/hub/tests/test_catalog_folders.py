@@ -93,14 +93,15 @@ def test_rename_cascades_over_the_union_without_a_folder_entity(tmp_path):
         _wipe(["x", "z"], [uri])
 
 
-def test_delete_reparents_datasets_to_the_parent(tmp_path):
+def test_delete_reparents_datasets_preserving_structure(tmp_path):
     t = _register(tmp_path, "deepds", "a/b/c")
     uri = t["uri"]
     try:
         r = client.post("/api/catalog/folders/delete", json={"path": "a/b"})
         assert r.status_code == 200, r.text
-        # a/b (and its subtree a/b/c) is gone; the dataset flattens up to the parent 'a'
-        assert _raw_folder(uri) == ("a", "a")
+        # deleting a/b moves its subtree UP one level to the parent 'a', PRESERVING structure:
+        # a/b/c -> a/c (not flattened to 'a'); nothing under a/b remains
+        assert _raw_folder(uri) == ("a/c", "a/c")
         assert not any(f["path"].startswith("a/b") for f in metadb.catalog_folders_list())
     finally:
         _wipe(["a"], [uri])
@@ -153,3 +154,25 @@ def test_migration_0027_backfills_one_row_per_folder_and_ancestor(tmp_path):
         with metadb.engine().connect() as conn:
             paths = {r[0] for r in conn.execute(text("SELECT path FROM catalog_folders"))}
         assert paths == {"x", "x/y", "p"}, "distinct folders + ancestors backfilled; root-filed rows ignored"
+
+
+def test_rename_into_descendant_is_rejected(tmp_path):
+    # #161 review #6: renaming a folder into its own descendant would self-nest — must be rejected.
+    t = _register(tmp_path, "descds", "a")
+    uri = t["uri"]
+    try:
+        r = client.put("/api/catalog/folders/rename", json={"oldPath": "a", "newPath": "a/b"})
+        assert r.status_code == 400, r.text
+        assert "itself" in r.json()["detail"]
+    finally:
+        _wipe(["a"], [uri])
+
+
+def test_folder_mutation_501_when_provider_unsupported(monkeypatch):
+    # #161 review #4: a catalog provider that doesn't own the local folder store must not have a
+    # local-only mutation reported as success.
+    from hub.deps import get_deps
+    monkeypatch.setattr(get_deps().catalog, "folders_mutable", False, raising=False)
+    assert client.post("/api/catalog/folders", json={"path": "x"}).status_code == 501
+    assert client.put("/api/catalog/folders/rename", json={"oldPath": "x", "newPath": "y"}).status_code == 501
+    assert client.post("/api/catalog/folders/delete", json={"path": "x"}).status_code == 501

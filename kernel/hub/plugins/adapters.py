@@ -95,7 +95,7 @@ def object_fs(uri: str):
     from hub.secrets import resolve_object_store
     scheme, _, rest = uri.partition("://")
     scheme = scheme.lower()
-    cfg = metadb.get_setting("objectStore", "global", default={}) or {}
+    cfg = metadb.cred_object_store_config(None)  # default cred → legacy objectStore (unified resolver)
     if not cfg:
         # Only a one-shot workload (subrun / Ray driver) with no hub settings DB falls back to the
         # allowlisted data-plane environment; a hub keeps its ambient credential chain.

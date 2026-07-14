@@ -906,10 +906,15 @@ class LocalRunner:
             raise RuntimeError(f"schema contract on '{title}' violated — {'; '.join(parts)}")
 
     def _run_object_store_cfg(self, plan: CompilePlan, nm: dict) -> dict | None:
-        """Resolved object-store credentials for this run's write destination (the first object-store
-        sink with a resolvable cred), or None. Bound before the scope so writes use that credential."""
+        """The single object-store credential this run's write sink(s) use, or None when no sink targets
+        an object store. A run executes on ONE cursor whose secret is frozen at scope start, so it can
+        carry only ONE object-store identity: if sinks target object stores with DIFFERENT credentials
+        we reject the run here rather than silently binding the first (which would write to the wrong
+        account). An object-store sink with ambient/instance-role creds resolves to {} — still bound
+        (env), never skipped as if it were a local sink (None)."""
         from hub import destinations
         from hub.sinks import SinkSpec
+        cfgs: list[dict] = []
         for step in plan.steps:
             if step.kind != "write":
                 continue
@@ -919,9 +924,15 @@ class LocalRunner:
             data = node.data if isinstance(node.data, dict) else {}
             spec = SinkSpec.from_config(data.get("config", {}), data.get("title"))
             cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
-            if cfg:
-                return cfg
-        return None
+            if cfg is not None:  # None = not an object store; {} = object store with ambient creds
+                cfgs.append(cfg)
+        if not cfgs:
+            return None
+        if any(c != cfgs[0] for c in cfgs[1:]):
+            raise RuntimeError(
+                "this run writes to object-store destinations with different credentials; a run uses a "
+                "single object-store identity — split them into separate runs")
+        return cfgs[0]
 
     def _commit_write(self, node, graph: Graph, engine: BuildEngine, status: RunStatus,
                       cached: dict | None, cancel: _CancelToken, pre_publish=None) -> int:

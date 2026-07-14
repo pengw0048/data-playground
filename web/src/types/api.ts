@@ -38,6 +38,7 @@ export interface CanvasKernelStatus {
   exists: boolean
   state?: string
   stale?: boolean
+  reachable?: boolean   // false = a live lease whose HTTP /status could not be reached (degraded, not warm)
   relationCache?: RelationCacheStats
   memoryLimit?: string | null
   memoryRssBytes?: number

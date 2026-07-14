@@ -6293,14 +6293,22 @@ def _folder_exists(s, path: str) -> bool:
 
 
 def _ensure_folder_rows(s, paths) -> None:
-    """Insert a CatalogFolder row for every path not already present."""
-    want = list(dict.fromkeys(paths))
+    """Insert a CatalogFolder row for every path not already present. Conflict-safe: a concurrent
+    creator that wins the check-then-insert race just leaves the row present (no duplicate-PK 500)."""
+    from sqlalchemy.exc import IntegrityError
+    want = list(dict.fromkeys(p for p in paths if p))
     if not want:
         return
     have = {p for (p,) in s.execute(select(CatalogFolder.path).where(CatalogFolder.path.in_(want)))}
     for p in want:
-        if p not in have:
+        if p in have:
+            continue
+        sp = s.begin_nested()
+        try:
             s.add(CatalogFolder(path=p))
+            s.flush()
+        except IntegrityError:
+            sp.rollback()  # another writer inserted this path between the check and our insert
 
 
 def catalog_folders_list() -> list[dict]:
@@ -6354,6 +6362,8 @@ def catalog_folder_rename(old: str, new: str) -> None:
             raise ValueError(f"folder '{old}' not found")
         if new == old:
             return
+        if new.startswith(old + "/"):  # a folder can't become its own descendant (self-nesting)
+            raise ValueError("cannot move a folder into itself")
         if _folder_exists(s, new):
             raise ValueError(f"folder '{new}' already exists")
         like = _like_escape(old) + "/%"
@@ -6368,30 +6378,43 @@ def catalog_folder_rename(old: str, new: str) -> None:
 
 
 def catalog_folder_delete(path: str) -> None:
-    """Delete a folder, reparenting every dataset under it (== path or path/…) to the folder's PARENT
-    (flattened), then removing the folder subtree's entity rows. Operates over the UNION of folder
-    entities and entry `folder` strings. Raises ValueError if the folder is unknown."""
+    """Delete a folder, moving everything under it UP one level to the folder's parent while PRESERVING
+    descendant structure (deleting 'research' turns 'research/vision/raw' into 'vision/raw', not a flat
+    dump), then removing the deleted node. Nothing is lost — datasets and subfolders are re-homed, not
+    deleted. Operates over the UNION of folder entities and entry `folder` strings; raises ValueError
+    if the folder is unknown."""
     path = _normalize_folder_path(path)
     if not path:
         raise ValueError("folder path cannot be empty")
     parent = path.rsplit("/", 1)[0] if "/" in path else ""
+
+    def _reparent(folder: str) -> str:
+        if folder == path:
+            return parent
+        rel = folder[len(path) + 1:]  # strip the deleted "path/" prefix, keep the rest
+        return f"{parent}/{rel}" if parent else rel
+
     with session() as s:
         if not _folder_exists(s, path):
             raise ValueError(f"folder '{path}' not found")
         like = _like_escape(path) + "/%"
-        rows = list(s.scalars(select(CatalogEntry).where(or_(
-            CatalogEntry.folder == path, CatalogEntry.folder.like(like, escape="\\")))))
-        for r in rows:
-            r.folder = parent
+        for r in s.scalars(select(CatalogEntry).where(or_(
+                CatalogEntry.folder == path, CatalogEntry.folder.like(like, escape="\\")))):
+            r.folder = _reparent(r.folder)
             try:
                 doc = json.loads(r.doc)
             except (ValueError, TypeError):
                 doc = {}
-            doc["folder"] = parent
+            doc["folder"] = r.folder
             r.doc = json.dumps(doc, default=str)
+        # descendant folder entities move up one level; only the deleted node itself is removed
+        moved = list(s.scalars(select(CatalogFolder).where(CatalogFolder.path.like(like, escape="\\"))))
+        targets = [_reparent(row.path) for row in moved]
         for row in s.scalars(select(CatalogFolder).where(or_(
                 CatalogFolder.path == path, CatalogFolder.path.like(like, escape="\\")))):
             s.delete(row)
+        s.flush()
+        _ensure_folder_rows(s, targets)
 
 
 def catalog_tree(prefix: str = "", table_limit: int = 100
@@ -7130,12 +7153,21 @@ def cred_get(cred_id: str | None) -> dict | None:
         return _cred_row(c) if c else None
 
 
+CRED_FIELD_ALLOWLIST: dict[str, tuple[str, ...]] = {
+    "object_store": ("accessKeyId", "secretAccessKey", "sessionToken", "region", "endpoint"),
+    "agent": ("apiKey",),
+}
+
+
 def _validate_cred_fields(kind: str, fields: dict | None) -> dict:
-    """Normalize cred fields to references only; raise ValueError on unknown kind or a raw secret."""
+    """Normalize cred fields to a per-kind ALLOWLIST of references only, DROPPING any unknown key so a
+    raw secret can't be smuggled into an unvalidated/unredacted field and round-tripped. Raises
+    ValueError on an unknown kind or a raw secret in a known secret field."""
     from hub.secrets import validate_secret_setting_value
     if kind not in CRED_KINDS:
         raise ValueError(f"unknown credential kind {kind!r}; must be one of {list(CRED_KINDS)}")
-    fields = dict(fields or {})
+    allowed = CRED_FIELD_ALLOWLIST[kind]
+    fields = {k: v for k, v in dict(fields or {}).items() if k in allowed}  # unknown keys never persist
     if kind == "object_store":
         return validate_secret_setting_value("objectStore", fields)
     ref = validate_secret_setting_value("agentApiKey", fields.get("apiKey"))
@@ -7151,12 +7183,33 @@ def cred_upsert(cred_id: str | None, name: str, kind: str, fields: dict | None) 
             c = CredEntity(id=cred_id or _uid(), name=name, kind=kind, fields_json=json.dumps(fields))
             s.add(c)
         else:
-            c.name, c.kind, c.fields_json = name, kind, json.dumps(fields)
+            if c.kind != kind:  # a kind change would silently repoint every binding at a wrong identity
+                raise ValueError("cannot change a credential's kind")
+            c.name, c.fields_json = name, json.dumps(fields)
         s.flush()
         return _cred_row(c)
 
 
+def cred_references(cred_id: str) -> list[str]:
+    """Human-readable places a cred id is bound (default/agent/destinations), so deletion can refuse to
+    strand a live reference (which would otherwise fail open to another identity)."""
+    refs: list[str] = []
+    if get_setting("defaultObjectStoreCredId", "global") == cred_id:
+        refs.append("the default object store")
+    if get_setting("agentCredId", "global") == cred_id:
+        refs.append("the agent")
+    for d in get_setting("destinations", "global", default=[]) or []:
+        if isinstance(d, dict) and (d.get("credId") or d.get("cred_id")) == cred_id:
+            refs.append(f"destination '{d.get('name') or d.get('id')}'")
+    return refs
+
+
 def cred_delete(cred_id: str) -> None:
+    """Delete a credential. Refuses (ValueError) if it is still bound anywhere — detach it first, so a
+    dangling explicit reference can't silently resolve to a different account."""
+    refs = cred_references(cred_id)
+    if refs:
+        raise ValueError(f"credential is in use by {', '.join(refs)} — detach it first")
     with session() as s:
         c = s.get(CredEntity, cred_id)
         if c is not None:
@@ -7164,12 +7217,12 @@ def cred_delete(cred_id: str) -> None:
 
 
 def cred_object_store_config(cred_id: str | None = None) -> dict:
-    """Unresolved object-store fields for ``cred_id``; when None (or missing) fall back to the default
-    object-store cred (``defaultObjectStoreCredId``), then to the legacy global ``objectStore`` setting."""
+    """Unresolved object-store fields. An EXPLICIT (non-empty) ``cred_id`` fails CLOSED: a missing or
+    wrong-kind id returns {} (ambient env), never another named account. Only ``None`` falls back to
+    the default object-store cred (``defaultObjectStoreCredId``), then the legacy ``objectStore``."""
     if cred_id:
         c = cred_get(cred_id)
-        if c and c.get("kind") == "object_store":
-            return dict(c["fields"])
+        return dict(c["fields"]) if c and c.get("kind") == "object_store" else {}
     default_id = get_setting("defaultObjectStoreCredId", "global")
     if default_id:
         c = cred_get(default_id)
@@ -7179,9 +7232,13 @@ def cred_object_store_config(cred_id: str | None = None) -> dict:
 
 
 def cred_agent_api_key_ref(cred_id: str | None = None) -> str:
-    """The agent apiKey reference for ``cred_id`` (or the ``agentCredId`` setting), else the legacy
-    ``agentApiKey`` setting. Returns a reference string, never a resolved value."""
-    resolved = cred_id or get_setting("agentCredId", "global")
+    """The agent apiKey reference. An EXPLICIT (non-empty) ``cred_id`` fails CLOSED (missing/wrong-kind
+    → ""); only ``None`` falls back to the ``agentCredId`` setting, then legacy ``agentApiKey``. Returns
+    a reference string, never a resolved value."""
+    if cred_id:
+        c = cred_get(cred_id)
+        return str(c["fields"].get("apiKey") or "") if c and c.get("kind") == "agent" else ""
+    resolved = get_setting("agentCredId", "global")
     if resolved:
         c = cred_get(resolved)
         if c and c.get("kind") == "agent":

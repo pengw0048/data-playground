@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback, useEffect, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
 import type { CanvasKernelStatus, KernelInfo } from '../types/api'
 import { roleCanEdit, useStore } from '../store/graph'
@@ -28,7 +28,7 @@ type Category = 'offline' | 'cold' | 'stale' | 'warm'
 function category(kernelUp: boolean, offline: boolean, status: CanvasKernelStatus | null): Category {
   if (!kernelUp || offline) return 'offline'
   if (!status || !status.exists) return 'cold'
-  if (status.stale) return 'stale'
+  if (status.reachable === false || status.stale) return 'stale'  // a live lease we can't reach is NOT warm
   return 'warm'
 }
 
@@ -43,32 +43,38 @@ export function KernelBadge({ kernelUp, kernelInfo }: { kernelUp: boolean; kerne
   const canvasId = useStore((s) => s.doc.id)
   const canvasRole = useStore((s) => s.canvasRole)
   const pushToast = useStore((s) => s.pushToast)
+  // a run starting/finishing warms/changes the kernel — refresh the always-visible badge on that edge
+  const runActive = useStore((s) => Object.values(s.runs).some((r) => r.phase === 'running' || r.phase === 'estimating'))
   const canEdit = roleCanEdit(canvasRole)
   const [open, setOpen] = useState(false)
   const [status, setStatus] = useState<CanvasKernelStatus | null>(null)
   const [offline, setOffline] = useState(false)
   const [restarting, setRestarting] = useState(false)
+  const seq = useRef(0)  // discards a late response from a previous canvas / superseded poll
 
   const refresh = useCallback(async () => {
     if (!canvasId) return
+    const s = ++seq.current
     try {
-      setStatus(await api.kernelState(canvasId))
-      setOffline(false)
+      const next = await api.kernelState(canvasId)
+      if (s === seq.current) { setStatus(next); setOffline(false) }
     } catch {
-      setOffline(true)  // transient/unreachable — keep last-known status, don't fabricate 'cold'
+      if (s === seq.current) setOffline(true)  // transient — keep last-known, don't fabricate 'cold'
     }
   }, [canvasId])
 
-  // Fetch live status only while the popover is OPEN, then poll every 3s (the last status is cached, so
-  // a reopened badge shows the previous state instantly). A closed badge issues NO request — this keeps
-  // a freshly-loaded canvas (whose client-side id may not exist server-side yet) from querying the
-  // kernel endpoint and logging a 404 console error, and adds no steady-state load.
+  // switching canvases must never show the previous canvas's kernel: reset + invalidate any in-flight
+  useEffect(() => { setStatus(null); setOffline(false); seq.current++ }, [canvasId])
+
+  // Refresh on canvas change and on run lifecycle (event-driven, so the always-visible badge stays
+  // truthful without a steady-state timer); poll every 3s only while the popover is OPEN. The kernel
+  // endpoint returns {exists:false} for a not-yet-persisted canvas, so this never logs a 404.
   useEffect(() => {
-    if (!open || !canvasId || !canvasRole) return
     void refresh()
+    if (!open) return
     const id = window.setInterval(() => void refresh(), 3_000)
     return () => window.clearInterval(id)
-  }, [open, canvasId, canvasRole, refresh])
+  }, [refresh, runActive, open])
 
   const cat = category(kernelUp, offline, status)
 
@@ -93,7 +99,8 @@ export function KernelBadge({ kernelUp, kernelInfo }: { kernelUp: boolean; kerne
     : (status?.memoryLimit ? `${status.memoryLimit} limit` : null)
   const stateText = cat === 'offline' ? 'offline'
     : cat === 'cold' ? 'cold (starts on next run)'
-      : cat === 'stale' ? 'stale' : (status?.state ?? 'ready')
+      : cat === 'stale' ? (status?.reachable === false ? 'unreachable' : 'stale')
+        : (status?.state ?? 'ready')
 
   return (
     <Popover open={open} onOpenChange={setOpen}>

@@ -56,6 +56,7 @@ class InMemoryCatalog:
     cross-instance); there is no in-memory table map to go stale."""
 
     name = "in-memory"
+    folders_mutable = True  # this provider's browse() reads the same metadb folder CRUD writes to
 
     def __init__(self, data_dir: str, resolve_adapter):
         self.data_dir = data_dir

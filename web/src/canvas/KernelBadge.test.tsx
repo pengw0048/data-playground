@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   state: {
     doc: { id: 'canvas-1' },
     canvasRole: 'owner' as 'owner' | 'editor' | 'viewer' | null,
+    runs: {} as Record<string, { phase: string }>,
   },
 }))
 
@@ -31,6 +32,7 @@ describe('KernelBadge', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.state.canvasRole = 'owner'
+    mocks.state.doc.id = 'canvas-1'
     mocks.restartKernel.mockResolvedValue({ ok: true, restarted: true })
   })
 
@@ -85,5 +87,19 @@ describe('KernelBadge', () => {
     render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     fireEvent.click(await screen.findByTestId('kernel-badge'))
     expect(await screen.findByRole('button', { name: /Restart kernel/ })).toBeDisabled()
+  })
+
+  it('resets to the new canvas on switch (never shows the previous canvas state)', async () => {
+    // #161 review #7: switching from a warm canvas to a cold one must not keep the warm badge.
+    mocks.state.doc.id = 'canvas-A'
+    mocks.kernelState.mockResolvedValue({ exists: true, state: 'ready', stale: false })
+    const { rerender } = render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
+    const badge = await screen.findByTestId('kernel-badge')
+    await waitFor(() => expect(badge).toHaveTextContent('kernel · warm'))
+
+    mocks.kernelState.mockResolvedValue({ exists: false })  // canvas B has no live kernel
+    mocks.state.doc.id = 'canvas-B'
+    rerender(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
+    await waitFor(() => expect(badge).toHaveTextContent('kernel · cold'))
   })
 })

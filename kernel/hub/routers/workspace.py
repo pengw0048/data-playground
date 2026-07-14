@@ -486,7 +486,10 @@ def canvas_kernel(canvas_id: str, uid: str = Depends(current_user)) -> dict:
     Read-only: this NEVER spawns a kernel, and the /status proxy fast-fails so a dead kernel can't
     stall the request."""
     if metadb.canvas_role(canvas_id, uid) is None:
-        raise HTTPException(404, "not found")
+        # unknown/inaccessible canvas → "no kernel" (kernel liveness is not sensitive, and a 404 here
+        # would log a browser console error while a just-created canvas is not yet persisted). The
+        # mutating restart endpoint below stays role-gated.
+        return {"exists": False}
     k = metadb.get_kernel(canvas_id)
     if k is None:
         return {"exists": False}
@@ -496,8 +499,9 @@ def canvas_kernel(canvas_id: str, uid: str = Depends(current_user)) -> dict:
         try:
             out.update(kernel_backend._get(k["endpoint"], "/status", k["token"],
                                             timeout=2.0, connect_retries=0))
-        except Exception:  # noqa: BLE001 — unreachable/slow kernel: surface lease state only
-            pass
+            out["reachable"] = True
+        except Exception:  # noqa: BLE001 — a live lease whose HTTP status can't be reached is NOT healthy;
+            out["reachable"] = False  # surface it so the badge shows degraded, not warm/green
     return out
 
 
@@ -637,7 +641,10 @@ def _upsert_cred(cred_id: str | None, body: CredUpsert, uid: str) -> dict:
 def delete_cred(cred_id: str, uid: str = Depends(current_user)) -> dict:
     from hub.observability import AuditAction, AuditOutcome, emit_audit
     _require_admin(uid)
-    metadb.cred_delete(cred_id)
+    try:
+        metadb.cred_delete(cred_id)
+    except ValueError as exc:  # still bound → 409, don't strand a reference that would fail open
+        raise HTTPException(409, str(exc)) from exc
     emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
                resource_type="cred", resource_id=cred_id)
     return {"ok": True}

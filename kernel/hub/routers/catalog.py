@@ -216,9 +216,18 @@ def list_folders() -> list[CatalogFolder]:
     return [CatalogFolder(path=f["path"]) for f in metadb.catalog_folders_list()]
 
 
+def _require_folder_mutation() -> None:
+    """Folder create/rename/delete write local metadb, which is authoritative only when the active
+    catalog provider reads from it. A provider that owns an external namespace must not have a
+    local-only mutation reported as success — it reports the capability off and we refuse here."""
+    if not getattr(get_deps().catalog, "folders_mutable", False):
+        raise HTTPException(501, "this catalog provider does not support folder mutation")
+
+
 @router.post("/catalog/folders", response_model=CatalogFolder)
 def create_folder(req: FolderCreateRequest) -> CatalogFolder:
     """Create an EMPTY folder (fill it later). 400 if it already exists or the path is invalid."""
+    _require_folder_mutation()
     try:
         return CatalogFolder(path=metadb.catalog_folder_create(req.path))
     except ValueError as e:
@@ -229,6 +238,7 @@ def create_folder(req: FolderCreateRequest) -> CatalogFolder:
 def rename_folder(req: FolderRenameRequest) -> dict:
     """Rename a folder, cascading to every dataset and subfolder under it. Works whether the folder is a
     created entity or exists only because a dataset was registered into it. 400 on unknown/collision."""
+    _require_folder_mutation()
     try:
         metadb.catalog_folder_rename(req.old_path, req.new_path)
     except ValueError as e:
@@ -238,7 +248,8 @@ def rename_folder(req: FolderRenameRequest) -> dict:
 
 @router.post("/catalog/folders/delete")
 def delete_folder(req: FolderDeleteRequest) -> dict:
-    """Delete a folder, reparenting its datasets (whole subtree) to the folder's parent. 400 if unknown."""
+    """Delete a folder, moving its datasets + subfolders up to the parent (structure preserved). 400 if unknown."""
+    _require_folder_mutation()
     try:
         metadb.catalog_folder_delete(req.path)
     except ValueError as e:

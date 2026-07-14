@@ -13,6 +13,7 @@ vi.mock('../api/client', () => ({ api: mocks }))
 
 const store = vi.hoisted(() => ({
   addToCanvas: vi.fn(), rememberTables: vi.fn(), uploadDataset: vi.fn(), pushToast: vi.fn(),
+  kernelInfo: { capabilities: ['catalog.folder_mutation'] },  // folder mutation UI is capability-gated
 }))
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
 
