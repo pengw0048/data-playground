@@ -239,7 +239,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                       value={String(g.agentDataPolicyLevel || 'metadata-only')}
                       onValueChange={(v) => setG((prev) => ({ ...prev, agentDataPolicyLevel: v }))}
                     >
-                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectTrigger aria-label="Data policy"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="metadata-only">metadata-only (default for hosted models)</SelectItem>
                         <SelectItem value="sample-values">sample-values (send up to 8 preview rows)</SelectItem>
