@@ -28,6 +28,7 @@ from hub.settings import settings
 from hub.storage import ManagedSourceReadError, source_read_scope
 from hub.models import (
     CatalogBrowse,
+    CatalogFolder,
     CatalogMetadata,
     CatalogQuery,
     CatalogTable,
@@ -190,6 +191,59 @@ def catalog_tree(prefix: str = "") -> CatalogBrowse:
     """One level of the folder/browse tree at `prefix`: immediate child folders (with subtree counts) +
     the tables filed directly here. Lets a UI lazily expand a folder tree of any size."""
     return get_deps().catalog.browse(prefix)
+
+
+class FolderCreateRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    path: str
+
+
+class FolderRenameRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    old_path: str
+    new_path: str
+
+
+class FolderDeleteRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    path: str
+
+
+@router.get("/catalog/folders", response_model=list[CatalogFolder])
+def list_folders() -> list[CatalogFolder]:
+    """Every folder entity — including EMPTY ones. Powers the folder-name autocomplete (unioned with the
+    entry-derived folder facets on the client)."""
+    return [CatalogFolder(path=f["path"]) for f in metadb.catalog_folders_list()]
+
+
+@router.post("/catalog/folders", response_model=CatalogFolder)
+def create_folder(req: FolderCreateRequest) -> CatalogFolder:
+    """Create an EMPTY folder (fill it later). 400 if it already exists or the path is invalid."""
+    try:
+        return CatalogFolder(path=metadb.catalog_folder_create(req.path))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.put("/catalog/folders/rename")
+def rename_folder(req: FolderRenameRequest) -> dict:
+    """Rename a folder, cascading to every dataset and subfolder under it. Works whether the folder is a
+    created entity or exists only because a dataset was registered into it. 400 on unknown/collision."""
+    try:
+        metadb.catalog_folder_rename(req.old_path, req.new_path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@router.post("/catalog/folders/delete")
+def delete_folder(req: FolderDeleteRequest) -> dict:
+    """Delete a folder, reparenting its datasets (whole subtree) to the folder's parent. 400 if unknown."""
+    try:
+        metadb.catalog_folder_delete(req.path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
 
 
 @router.get("/catalog/search", response_model=list[CatalogTable])

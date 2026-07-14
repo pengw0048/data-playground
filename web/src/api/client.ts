@@ -1,7 +1,7 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
   CanvasKernelStatus,
-  CatalogBrowse, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
+  CatalogBrowse, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PluginInfo, ProcessorDescriptor, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
@@ -169,6 +169,14 @@ export const api = {
     req<Facets>(`/catalog/facets${catalogQuery(params)}`),
   catalogTree: (prefix = '') =>
     req<CatalogBrowse>(`/catalog/tree${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`),
+  // folder entities (incl. empty ones) — used for the folder-name autocomplete + tree editing
+  catalogFolders: () => req<CatalogFolder[]>('/catalog/folders'),
+  createFolder: (path: string) =>
+    req<CatalogFolder>('/catalog/folders', { method: 'POST', body: JSON.stringify({ path }) }),
+  renameFolder: (oldPath: string, newPath: string) =>
+    req<{ ok: boolean }>('/catalog/folders/rename', { method: 'PUT', body: JSON.stringify({ oldPath, newPath }) }),
+  deleteFolder: (path: string) =>
+    req<{ ok: boolean }>('/catalog/folders/delete', { method: 'POST', body: JSON.stringify({ path }) }),
   searchCatalog: (params: CatalogQueryParams, mode: 'lexical' | 'semantic' | 'hybrid' = 'hybrid') =>
     req<CatalogTable[]>(`/catalog/search${catalogSearchQuery(params, mode)}`),
   table: (id: string) => req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}`),
