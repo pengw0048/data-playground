@@ -178,7 +178,7 @@ export function CatalogView() {
         <div className="relative flex-1">
           <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"><Icon name="search" size={13} /></span>
           <input value={rawQ} onChange={(e) => setRawQ(e.target.value)} data-testid="catalog-search"
-            placeholder="Search by name, folder, description, or column…"
+            placeholder="Search by name, folder, description, or column…" aria-label="Search tables"
             className="w-full rounded-lg border border-border bg-card py-1.5 pl-8 pr-3 text-[13px] outline-none focus:border-primary" />
         </div>
         {q && facets.semanticAvailable && (
@@ -191,7 +191,8 @@ export function CatalogView() {
           </div>
         )}
         <select value={`${sort}:${order}`} onChange={(e) => { const [s, o] = e.target.value.split(':'); setSort(s as Sort); setOrder(o as 'asc' | 'desc') }}
-          disabled={semantic} className="rounded-lg border border-border bg-card px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-50" data-testid="catalog-sort">
+          disabled={semantic} aria-label="Sort tables"
+          className="rounded-lg border border-border bg-card px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-50" data-testid="catalog-sort">
           <option value="name:asc">Name A–Z</option>
           <option value="name:desc">Name Z–A</option>
           <option value="rows:desc">Most rows</option>
@@ -342,31 +343,37 @@ function FacetRow({ label, count, active, onClick }: { label: string; count: num
 }
 
 function TableRow({ t, onOpen, onUse, onFolder }: { t: CatalogTable; onOpen: () => void; onUse: () => void; onFolder: (f: string) => void }) {
+  // Open / folder / Use are sibling controls — a single role=button wrapping nested buttons is both
+  // invalid HTML and an axe nested-interactive failure on the Tables surface.
   return (
-    <div onClick={onOpen} role="button" tabIndex={0}
-      onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onOpen() } }}
-      className="group mx-1 flex h-[54px] cursor-pointer items-center gap-3 rounded-lg border border-border bg-card px-3 hover:border-primary/40 hover:bg-accent"
+    <div
+      className="group mx-1 flex h-[54px] items-center gap-2 rounded-lg border border-border bg-card pr-2 hover:border-primary/40 hover:bg-accent"
       style={{ opacity: t.missing ? 0.55 : 1 }}>
-      <Icon name="db" size={16} style={{ color: color.text3 }} />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="truncate text-[13px] font-semibold text-foreground">{t.name}</span>
-          {t.missing && <span className="rounded bg-destructive/10 px-1.5 text-[9.5px] font-semibold text-destructive">missing</span>}
-          {(t.tags ?? []).slice(0, 3).map((tag) => (
-            <span key={tag} className="rounded-full bg-muted px-1.5 text-[9.5px] text-muted-foreground">#{tag}</span>
-          ))}
+      <button type="button" onClick={onOpen} aria-label={`Open table ${t.name}`}
+        className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-lg border-0 bg-transparent px-3 text-left text-inherit">
+        <Icon name="db" size={16} style={{ color: color.text3 }} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="truncate text-[13px] font-semibold text-foreground">{t.name}</span>
+            {t.missing && <span className="rounded bg-destructive/10 px-1.5 text-[9.5px] font-semibold text-destructive">missing</span>}
+            {(t.tags ?? []).slice(0, 3).map((tag) => (
+              <span key={tag} className="rounded-full bg-muted px-1.5 text-[9.5px] text-muted-foreground">#{tag}</span>
+            ))}
+          </div>
+          <div className="truncate text-[11px] text-muted-foreground">{t.folder ?? t.uri}</div>
         </div>
-        <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-          {t.folder
-            ? <button onClick={(e) => { e.stopPropagation(); onFolder(t.folder!) }} className="truncate hover:text-foreground hover:underline">📁 {t.folder}</button>
-            : <span className="truncate">{t.uri}</span>}
-        </div>
-      </div>
-      <span className="text-[11px] text-muted-foreground">{t.columns?.length ?? 0} cols</span>
-      {t.rowCount != null && <span className="text-[11px] text-muted-foreground">· {t.rowCount.toLocaleString()} rows</span>}
-      {t.owner && <span className="hidden text-[11px] text-muted-foreground lg:inline">· @{t.owner}</span>}
-      <button onClick={(e) => { e.stopPropagation(); onUse() }}
-        className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-semibold text-primary opacity-0 group-hover:opacity-100">
+        <span className="text-[11px] text-muted-foreground">{t.columns?.length ?? 0} cols</span>
+        {t.rowCount != null && <span className="text-[11px] text-muted-foreground">· {t.rowCount.toLocaleString()} rows</span>}
+        {t.owner && <span className="hidden text-[11px] text-muted-foreground lg:inline">· @{t.owner}</span>}
+      </button>
+      {t.folder && (
+        <button type="button" onClick={() => onFolder(t.folder!)} aria-label={`Browse folder ${t.folder}`}
+          className="shrink-0 truncate text-[11px] text-muted-foreground hover:text-foreground hover:underline">
+          Folder
+        </button>
+      )}
+      <button type="button" onClick={onUse} aria-label={`Use table ${t.name}`}
+        className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[11px] font-semibold text-primary opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100">
         <Icon name="plus" size={12} /> Use
       </button>
     </div>

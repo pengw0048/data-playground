@@ -120,10 +120,10 @@ function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport }: { onS
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <button data-testid="app-menu" title="Menu"
+        <button data-testid="app-menu" title="Menu" aria-label="App menu"
           className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border-0 bg-transparent px-1 py-0.5 text-[13.5px] font-bold text-foreground">
-          <span className="grid h-5 w-5 place-items-center rounded-[5px] bg-foreground text-xs font-bold text-background">D</span>
-          <span className="text-muted-foreground"><Icon name="chevronDown" size={12} /></span>
+          <span className="grid h-5 w-5 place-items-center rounded-[5px] bg-foreground text-xs font-bold text-background" aria-hidden>D</span>
+          <span className="text-muted-foreground" aria-hidden><Icon name="chevronDown" size={12} /></span>
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-[210px]">

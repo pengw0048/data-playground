@@ -258,6 +258,7 @@ function EditableTitle({ id, title, onRename, selected, canEdit }: { id: string;
       <input
         autoFocus
         value={val}
+        aria-label="Node title"
         onChange={(e) => setVal(e.target.value)}
         onClick={(e) => e.stopPropagation()}
         onBlur={() => { setEditing(false); if (val.trim()) onRename(id, val.trim()) }}

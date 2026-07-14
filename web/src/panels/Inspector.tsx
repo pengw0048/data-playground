@@ -121,6 +121,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           <input
             value={name}
             disabled={!canEdit}
+            aria-label="Node title"
             onChange={(e) => setName(e.target.value)}
             onBlur={() => { if (name.trim() && name !== node.data.title) rename(nodeId, name.trim()) }}
             onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}

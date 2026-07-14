@@ -192,21 +192,24 @@ function FilesContent() {
       } />
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 16, padding: '4px 28px 28px' }}>
         {files.map((f) => {
+          const title = f.name || 'untitled'
           const meta = [relTime(f.updatedAt), f.version != null ? `v${f.version}` : ''].filter(Boolean).join(' · ')
           return (
-          <div key={f.id} className="dp-file-card" onClick={() => openFile(f.id)}
-            style={{ cursor: 'pointer', borderRadius: 12, border: `1px solid ${color.border}`, background: 'hsl(var(--card))', overflow: 'hidden', boxShadow: shadow.card }}>
-            <div style={{ height: 132, background: 'linear-gradient(135deg, hsl(var(--muted)), hsl(var(--accent)))', position: 'relative' }}>
-              <CanvasThumb seed={f.id} />
-            </div>
-            <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: color.ink, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name || 'untitled'}</div>
+          // Open and delete are sibling controls (not a nested button-in-button). The card chrome is a
+          // non-interactive wrapper so each action is its own Tab stop with native button semantics.
+          <div key={f.id} className="dp-file-card" style={{ position: 'relative', borderRadius: 12, border: `1px solid ${color.border}`, background: 'hsl(var(--card))', overflow: 'hidden', boxShadow: shadow.card }}>
+            <button type="button" onClick={() => openFile(f.id)} aria-label={`Open ${title}`}
+              style={{ display: 'block', width: '100%', margin: 0, padding: 0, border: 'none', background: 'transparent', cursor: 'pointer', textAlign: 'left', color: 'inherit', font: 'inherit' }}>
+              <div style={{ height: 132, background: 'linear-gradient(135deg, hsl(var(--muted)), hsl(var(--accent)))', position: 'relative' }}>
+                <CanvasThumb seed={f.id} />
+              </div>
+              <div style={{ padding: '10px 12px', paddingRight: f.role === 'owner' ? 36 : 12 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: color.ink, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{title}</div>
                 {meta && <div style={{ fontSize: 11, color: color.text3, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{meta}</div>}
               </div>
-              {f.role === 'owner' && <button title="Delete" onClick={(e) => { e.stopPropagation(); deleteFile(f.id) }}
-                style={{ border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer', padding: 2 }}><Icon name="trash" size={13} /></button>}
-            </div>
+            </button>
+            {f.role === 'owner' && <button type="button" title="Delete" aria-label={`Delete ${title}`} onClick={() => deleteFile(f.id)}
+              style={{ position: 'absolute', right: 10, bottom: 12, border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer', padding: 2, zIndex: 1 }}><Icon name="trash" size={13} /></button>}
           </div>
           )
         })}
@@ -217,8 +220,9 @@ function FilesContent() {
               No files yet — open a runnable example, or “New file”.
             </div>
             {examples.map((ex) => (
-              <div key={ex.key} className="dp-file-card" onClick={() => { void newFromExample(ex.key) }} title={ex.blurb}
-                style={{ cursor: 'pointer', borderRadius: 12, border: `1px solid ${color.border}`, background: 'hsl(var(--card))', overflow: 'hidden', boxShadow: shadow.card }}>
+              <button key={ex.key} type="button" className="dp-file-card" onClick={() => { void newFromExample(ex.key) }}
+                title={ex.blurb} aria-label={`Open example ${ex.name}`}
+                style={{ display: 'block', width: '100%', margin: 0, padding: 0, cursor: 'pointer', borderRadius: 12, border: `1px solid ${color.border}`, background: 'hsl(var(--card))', overflow: 'hidden', boxShadow: shadow.card, textAlign: 'left', color: 'inherit', font: 'inherit' }}>
                 <div style={{ height: 132, background: 'linear-gradient(135deg, hsl(var(--muted)), hsl(var(--accent)))', position: 'relative' }}>
                   <CanvasThumb seed={ex.key} />
                 </div>
@@ -226,7 +230,7 @@ function FilesContent() {
                   <div style={{ fontSize: 13, fontWeight: 600, color: color.ink }}>{ex.name}</div>
                   <div style={{ fontSize: 11, color: color.text3, marginTop: 2, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{ex.blurb}</div>
                 </div>
-              </div>
+              </button>
             ))}
           </>
         )}
