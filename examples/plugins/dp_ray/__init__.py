@@ -3690,10 +3690,13 @@ class RayRunner:
                 ),
             }
         elif completed.get("artifact_invalid"):
-            completed = {
-                "status": "failed", "rows": 0, "outputs": [],
-                "error": "ArtifactContractError: reconciled result artifact was rejected",
-            }
+            ref = status.backend_ref
+            if ref is None or ref.backend != _JOBS_BACKEND:
+                raise RuntimeError("Ray result reconciliation has no durable backend reference")
+            self._quarantine_invalid_job(
+                status, ref, ArtifactContractError(completed["error"])
+            )
+            return
         self._publish_job_result(job, graph, target, status, completed)
 
     def _fence_missing_stop(self, client, status: RunStatus, ref: RunBackendRef,
@@ -4204,7 +4207,14 @@ class RayRunner:
                 result = terminal_result
             elif state == "STOPPED":
                 stopped_result = self._terminal_result_if_present(job)
-                result = stopped_result or {"status": "cancelled", "rows": 0, "outputs": []}
+                if stopped_result is not None and stopped_result.get("artifact_invalid"):
+                    self._quarantine_invalid_job(
+                        status, ref, ArtifactContractError(stopped_result["error"])
+                    )
+                else:
+                    result = stopped_result or {
+                        "status": "cancelled", "rows": 0, "outputs": []
+                    }
             elif state == "FAILED":
                 result = {"status": "failed", "error": self._job_failure(client, ref.submission_id),
                           "rows": 0, "outputs": []}

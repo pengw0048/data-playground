@@ -1597,6 +1597,48 @@ def test_valid_result_fences_expired_uncertain_submit_before_publication(
     assert metadb.backend_job(status.run_id)["publication_state"] == "published"
 
 
+def test_reconciled_result_corruption_uses_durable_quarantine(jobs_config):
+    _module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(
+        plan, graph, "write", "distributed",
+        run_id=f"run_jobs_result_reconcile_corrupt_{uuid.uuid4().hex}",
+    )
+    ref = status.backend_ref
+    assert ref is not None
+    job = _materialize_bound_job(runner, status)
+    physical_uri = job["sink_contracts"]["write"]["physical_uri"]
+    _write_success(store, status)
+    assert metadb.claim_backend_submission_after_missing(
+        status.run_id, ref.attempt_id, "crashed-submit-owner", 5
+    ) == "claimed"
+    with metadb.session() as session:
+        session.get(metadb.RunBackendJob, status.run_id).submission_lease_until = (
+            metadb._db_now(session) - datetime.timedelta(seconds=1)
+        )
+
+    control, ready = runner._drive_result_reconciliation(
+        status, ref, metadb.backend_job(status.run_id)
+    )
+    assert control is client and ready is True
+    corrupt = store.read(ref.result_uri)
+    corrupt["unexpected"] = "field"
+    store.write(ref.result_uri, corrupt)
+
+    runner._publish_reconciled_result(job, graph, "write", status)
+
+    assert status.status == "failed"
+    assert status.error == "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
+    binding = metadb.backend_job(status.run_id)
+    assert binding["publication_state"] == "published"
+    assert "artifact_contract_invalid" in binding["quarantine_reason"]
+    with metadb.session() as session:
+        assert session.get(metadb.CatalogEntry, physical_uri) is None
+        assert session.get(metadb.ObjectAttempt, physical_uri).state == "abandoned"
+
+
 def test_result_candidate_is_reobserved_when_remote_submit_settles_first(jobs_config):
     _module, deps, runner, client, store = _runner(jobs_config)
     graph = _graph()
@@ -3237,7 +3279,9 @@ def test_early_result_never_beats_running_and_corruption_waits_for_stopped(jobs_
     assert final.error == "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
 
 
-def test_terminal_remote_result_corruption_uses_durable_quarantine(jobs_config):
+@pytest.mark.parametrize("remote_status", ["SUCCEEDED", "STOPPED"])
+def test_terminal_remote_result_corruption_uses_durable_quarantine(
+        jobs_config, remote_status):
     module, deps, original, client, store = _runner(jobs_config)
     graph = _graph()
     plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
@@ -3254,7 +3298,7 @@ def test_terminal_remote_result_corruption_uses_durable_quarantine(jobs_config):
     corrupt = store.read(ref.result_uri)
     corrupt["unexpected"] = "field"
     store.write(ref.result_uri, corrupt)
-    client.put(ref.submission_id, "SUCCEEDED", metadata=_workload_metadata(status))
+    client.put(ref.submission_id, remote_status, metadata=_workload_metadata(status))
 
     original_get_status = client.get_job_status
     original_list_jobs = client.list_jobs
