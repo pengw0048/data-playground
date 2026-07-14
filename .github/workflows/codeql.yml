@@ -1,0 +1,53 @@
+name: CodeQL
+
+# Static analysis for Python (kernel/) and JavaScript/TypeScript (web/).
+# Results upload to the repository Security → Code scanning tab.
+# Heavy enough that a weekly schedule + workflow_dispatch accompany PR runs;
+# the job itself has a timeout cap. Findings already on main should be filed
+# as follow-up issues rather than suppressed here without comment.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Mondays 04:27 UTC — offset from Ray validation (05:17) and image-scan.
+    - cron: "27 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # Required to upload SARIF results to the code-scanning tab.
+      security-events: write
+      # Required for private repos / CodeQL packs; harmless on public.
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # javascript-typescript covers web/; python covers kernel/.
+        language: [javascript-typescript, python]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3.37.0
+        with:
+          languages: ${{ matrix.language }}
+          # Interpreted languages — no compiled build step.
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3.37.0
+        with:
+          category: "/language:${{ matrix.language }}"
