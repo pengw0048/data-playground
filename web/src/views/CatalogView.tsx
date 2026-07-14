@@ -178,7 +178,7 @@ export function CatalogView() {
         <div className="relative flex-1">
           <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"><Icon name="search" size={13} /></span>
           <input value={rawQ} onChange={(e) => setRawQ(e.target.value)} data-testid="catalog-search"
-            placeholder="Search by name, folder, description, or column…"
+            placeholder="Search by name, folder, description, or column…" aria-label="Search tables"
             className="w-full rounded-lg border border-border bg-card py-1.5 pl-8 pr-3 text-[13px] outline-none focus:border-primary" />
         </div>
         {q && facets.semanticAvailable && (
@@ -191,7 +191,8 @@ export function CatalogView() {
           </div>
         )}
         <select value={`${sort}:${order}`} onChange={(e) => { const [s, o] = e.target.value.split(':'); setSort(s as Sort); setOrder(o as 'asc' | 'desc') }}
-          disabled={semantic} className="rounded-lg border border-border bg-card px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-50" data-testid="catalog-sort">
+          disabled={semantic} aria-label="Sort tables"
+          className="rounded-lg border border-border bg-card px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-50" data-testid="catalog-sort">
           <option value="name:asc">Name A–Z</option>
           <option value="name:desc">Name Z–A</option>
           <option value="rows:desc">Most rows</option>
