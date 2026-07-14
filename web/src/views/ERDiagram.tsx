@@ -7,36 +7,39 @@ import { useStore } from '../store/graph'
 import { api } from '../api/client'
 import { resolvedTheme } from '../theme/mode'
 import { MiniSelect } from '../ui/controls'
+import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import type { CatalogTable, Relationship, JoinSuggestion, Cardinality } from '../types/api'
+import type { CatalogTable, Relationship, JoinSuggestion, Cardinality, LineageEdge } from '../types/api'
 import { cn } from '@/lib/utils'
 
-// The ER / "UML" view: every catalog dataset is an entity (columns, primary key badged); declared
-// relationships are solid edges labelled with their cardinality, and name-based candidate joins are
-// dashed hints. Click a column to declare its primary key; drag between two tables to declare a join
-// (its keys + measured cardinality come from the join-suggestion engine); click a solid edge to drop it.
+// The relationship graph: entities are catalog datasets, declared joins are solid edges labelled with
+// cardinality. It opens FOCUSED on one table (reached from a table's detail drawer) and shows that
+// table plus its neighbours within N hops; "Show all" widens to the whole catalog (capped). A second
+// mode swaps the join graph for the data-lineage (provenance) graph. Primary keys are declared in the
+// table drawer, so entity columns here are read-only.
 
-type EntityData = { table: CatalogTable; pk: string[]; onToggle: (col: string) => void }
+type EntityData = { table: CatalogTable; pk: string[]; focused: boolean; onFocus: () => void }
 
 function EntityNode({ data }: { data: EntityData }) {
-  const { table, pk, onToggle } = data
+  const { table, pk, focused, onFocus } = data
   return (
-    <div className="w-[240px] overflow-hidden rounded-lg border border-border bg-card shadow-sm">
+    <div className={cn('w-[240px] overflow-hidden rounded-lg border bg-card shadow-sm', focused ? 'border-primary ring-2 ring-primary/20' : 'border-border')}>
       <Handle type="target" position={Position.Left} className="!h-2 !w-2 !border-0 !bg-primary" />
-      <div className="truncate border-b border-border bg-muted px-3 py-1.5 text-[12px] font-semibold text-foreground">{table.name}</div>
+      <button onClick={onFocus} title="Focus the graph on this table"
+        className="flex w-full items-center gap-1.5 truncate border-b border-border bg-muted px-3 py-1.5 text-left text-[12px] font-semibold text-foreground hover:bg-accent">
+        <Icon name="lineage" size={11} /> <span className="truncate">{table.name}</span>
+      </button>
       <div className="flex max-h-[220px] flex-col overflow-y-auto py-1">
         {table.columns.map((c) => {
           const isPk = pk.includes(c.name)
           const isKey = c.capabilities?.includes('key')
           return (
-            <button key={c.name} onClick={() => onToggle(c.name)}
-              title={isPk ? 'declared primary key — click to clear' : 'click to declare as the primary key'}
-              className={cn('flex items-center gap-1.5 px-3 py-0.5 text-left text-[11px] hover:bg-accent', isPk && 'font-semibold text-foreground')}>
+            <div key={c.name} className={cn('flex items-center gap-1.5 px-3 py-0.5 text-left text-[11px]', isPk && 'font-semibold text-foreground')}>
               <span className="w-3 text-center text-[10px]">{isPk ? '🔑' : isKey ? '·' : ''}</span>
               <span className="dp-mono flex-1 truncate">{c.name}</span>
               <span className="text-[9.5px] text-muted-foreground">{c.type}</span>
-            </button>
+            </div>
           )
         })}
       </div>
@@ -60,9 +63,7 @@ function keyColsLower(t: CatalogTable): string[] {
 }
 
 // cheap client-side "these could plausibly join": a shared NON-generic key name (e.g. both have
-// `user_id`), or an FK-style `id` <-> `<thing>_id` match. Deliberately NOT bare-`id` <-> bare-`id`:
-// every table has a surrogate `id`, so matching those would draw a complete-graph hairball of
-// meaningless hints. A real join needs a qualified signal.
+// `user_id`), or an FK-style `id` <-> `<thing>_id` match. Deliberately NOT bare-`id` <-> bare-`id`.
 const BARE_KEYS = ['id', 'uuid', 'guid', 'pk']
 function sharesKey(a: CatalogTable, b: CatalogTable): boolean {
   const ka = keyColsLower(a), kb = keyColsLower(b)
@@ -71,109 +72,125 @@ function sharesKey(a: CatalogTable, b: CatalogTable): boolean {
   return sharedNonBare || fk(ka, kb) || fk(kb, ka)
 }
 
-// The ER view renders one ENTITY per table + O(n²) join hints, so it operates on a BOUNDED set — a
-// single folder (or all), capped — rather than the whole catalog (which can be thousands of tables).
+// BFS the declared-relationship graph from a root uri out to `hops`, returning every reachable uri
+// (root included). This is dagster's `+table+`: the neighbourhood, not the whole catalog.
+function joinNeighbourhood(rootUri: string, rels: Relationship[], hops: number): string[] {
+  const adj = new Map<string, Set<string>>()
+  const link = (a: string, b: string) => { (adj.get(a) ?? adj.set(a, new Set()).get(a)!).add(b) }
+  for (const r of rels) { link(r.leftUri, r.rightUri); link(r.rightUri, r.leftUri) }
+  const seen = new Set([rootUri])
+  let frontier = [rootUri]
+  for (let h = 0; h < hops; h++) {
+    const next: string[] = []
+    for (const u of frontier) for (const v of adj.get(u) ?? []) if (!seen.has(v)) { seen.add(v); next.push(v) }
+    frontier = next
+    if (!frontier.length) break
+  }
+  return [...seen]
+}
+
+// The graph renders one ENTITY per table + O(n²) join hints, so it operates on a BOUNDED set.
 const ER_CAP = 60
+const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
 
 export function ERDiagram() {
   const pushToast = useStore((s) => s.pushToast)
-  const [catalog, setCatalog] = useState<CatalogTable[]>([])
+  const erFocusUri = useStore((s) => s.erFocusUri)
+  const openTables = useStore((s) => s.setView)
+
+  // focus === null → the global / folder view; otherwise the neighbourhood of that uri
+  const [focus, setFocus] = useState<string | null>(erFocusUri)
+  const [hops, setHops] = useState(1)
+  const [mode, setMode] = useState<'joins' | 'lineage'>('joins')
   const [folder, setFolder] = useState('')
   const [folders, setFolders] = useState<string[]>([])
+  const [search, setSearch] = useState('')
+  const [showSuggestions, setShowSuggestions] = useState(false)
+  const [showHelp, setShowHelp] = useState(false)
+
+  const [tables, setTables] = useState<CatalogTable[]>([])
   const [total, setTotal] = useState(0)
+  const [linEdges, setLinEdges] = useState<LineageEdge[]>([])
   const [rels, setRels] = useState<Relationship[]>([])
-  const [catalogLoading, setCatalogLoading] = useState(true)
-  const [catalogError, setCatalogError] = useState<string | null>(null)
-  const [foldersLoading, setFoldersLoading] = useState(true)
-  const [foldersError, setFoldersError] = useState<string | null>(null)
-  const [relsLoading, setRelsLoading] = useState(true)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [relsError, setRelsError] = useState<string | null>(null)
   const [pending, setPending] = useState<{
     left: CatalogTable; right: CatalogTable; suggestions: JoinSuggestion[]
     suggestionsLoading: boolean; suggestionsError: string | null
   } | null>(null)
-  // node layout survives navigation (the view unmounts) via localStorage, keyed by table id
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>(loadPositions)
-  const catalogRequest = useRef(0)
-  const foldersRequest = useRef(0)
-  const relsRequest = useRef(0)
-  const loadedFolder = useRef<string | null>(null)
-
-  const reload = useCallback(async () => {
-    const s = ++catalogRequest.current
-    // Rows from another folder are not a valid stale view for the newly selected folder. A same-
-    // folder refresh failure (for example after declaring a key) keeps the last graph and labels it.
-    if (loadedFolder.current !== folder) { setCatalog([]); setTotal(0) }
-    setCatalogLoading(true); setCatalogError(null)
-    try {
-      const page = await api.tablesPage({ folder: folder || undefined, limit: ER_CAP, sort: 'usage', order: 'desc' })
-      if (s !== catalogRequest.current) return
-      setCatalog(page.items); setTotal(page.total); loadedFolder.current = folder
-    } catch (e) {
-      if (s === catalogRequest.current) setCatalogError(errorMessage(e))
-    } finally {
-      if (s === catalogRequest.current) setCatalogLoading(false)
-    }
-  }, [folder])
+  const [reloadKey, setReloadKey] = useState(0)
+  const dataReq = useRef(0)
+  const relsReq = useRef(0)
 
   const loadRelationships = useCallback(async () => {
-    const s = ++relsRequest.current
-    setRelsLoading(true); setRelsError(null)
-    try {
-      const next = await api.relationships()
-      if (s === relsRequest.current) setRels(next)
-    } catch (e) {
-      if (s === relsRequest.current) setRelsError(errorMessage(e))
-    } finally {
-      if (s === relsRequest.current) setRelsLoading(false)
-    }
-  }, [])
-
-  const loadFolders = useCallback(async () => {
-    const s = ++foldersRequest.current
-    setFoldersLoading(true); setFoldersError(null)
-    try {
-      const next = await api.facets()
-      if (s === foldersRequest.current) setFolders(next.folders.map((x) => x.value))
-    } catch (e) {
-      if (s === foldersRequest.current) setFoldersError(errorMessage(e))
-    } finally {
-      if (s === foldersRequest.current) setFoldersLoading(false)
-    }
+    const s = ++relsReq.current
+    setRelsError(null)
+    try { const next = await api.relationships(); if (s === relsReq.current) setRels(next) }
+    catch (e) { if (s === relsReq.current) setRelsError(errorMessage(e)) }
   }, [])
 
   useEffect(() => {
-    void loadRelationships(); void loadFolders()
-    return () => { relsRequest.current += 1; foldersRequest.current += 1 }
-  }, [loadRelationships, loadFolders])
-  useEffect(() => {
-    void reload()
-    return () => { catalogRequest.current += 1 }
-  }, [reload])
-  const refreshCatalog = reload  // local reload after a key/relationship edit
-  const visibleCatalog = loadedFolder.current === folder ? catalog : []
+    void loadRelationships()
+    api.facets().then((f) => setFolders(f.folders.map((x) => x.value))).catch(() => {})
+    return () => { relsReq.current += 1 }
+  }, [loadRelationships])
 
-  const byUri = useMemo(() => Object.fromEntries(visibleCatalog.map((t) => [t.uri, t.id])), [visibleCatalog])
+  // a genuinely new query (focus/folder/mode/hops) must not show the previous query's rows while the
+  // next request is in flight; a plain retry (reloadKey) keeps the last graph.
+  useEffect(() => { setTables([]); setTotal(0); setLinEdges([]) }, [focus, folder, mode, hops])
+
+  // recompute the visible entity set whenever the query (focus / hops / mode / folder / rels) changes
+  const focusName = tables.find((t) => t.uri === focus)?.name ?? focus?.split('/').slice(-1)[0]
+  useEffect(() => {
+    const s = ++dataReq.current
+    setLoading(true); setError(null)
+    ;(async () => {
+      try {
+        if (focus) {
+          if (mode === 'lineage') {
+            const lin = await api.lineage(focus, hops, ER_CAP)
+            const uris = [...new Set(lin.nodes.map((n) => n.uri))]
+            const page = uris.length ? await api.tablesPage({ uris, limit: ER_CAP }) : { items: [], total: 0, hasMore: false }
+            if (s !== dataReq.current) return
+            setTables(page.items); setTotal(page.items.length); setLinEdges(lin.edges)
+          } else {
+            const uris = joinNeighbourhood(focus, rels, hops)
+            const page = await api.tablesPage({ uris, limit: ER_CAP })
+            if (s !== dataReq.current) return
+            setTables(page.items); setTotal(page.items.length); setLinEdges([])
+          }
+        } else {
+          const page = await api.tablesPage({ folder: folder || undefined, limit: ER_CAP, sort: 'usage', order: 'desc' })
+          if (s !== dataReq.current) return
+          setTables(page.items); setTotal(page.total); setLinEdges([])
+        }
+      } catch (e) {
+        if (s === dataReq.current) setError(errorMessage(e))
+      } finally {
+        if (s === dataReq.current) setLoading(false)
+      }
+    })()
+    return () => { dataReq.current += 1 }
+  }, [focus, hops, mode, folder, rels, reloadKey])
+
+  const refresh = useCallback(() => setReloadKey((k) => k + 1), [])
+
+  const visible = useMemo(() => {
+    if (focus || !search.trim()) return tables
+    const q = search.trim().toLowerCase()
+    return tables.filter((t) => t.name.toLowerCase().includes(q) || (t.folder ?? '').toLowerCase().includes(q))
+  }, [tables, focus, search])
+
+  const byUri = useMemo(() => Object.fromEntries(visible.map((t) => [t.uri, t.id])), [visible])
   const pkOf = (t: CatalogTable) => t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
 
-  // clicking a column toggles its membership in the declared primary key — so clicking several
-  // columns builds a COMPOSITE key (in click order); clicking a member again removes it.
-  const toggleCol = useCallback(async (tableId: string, col: string) => {
-    const t = visibleCatalog.find((x) => x.id === tableId)
-    if (!t) return
-    const cur = t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
-    const next = cur.includes(col) ? cur.filter((c) => c !== col) : [...cur, col]
-    try {
-      await api.declareKey(tableId, next)
-      await refreshCatalog()
-    } catch (e) { pushToast(String((e as Error).message || e), 'error') }
-  }, [visibleCatalog, refreshCatalog, pushToast])
-
-  const nodes: Node[] = useMemo(() => visibleCatalog.map((t, i) => ({
+  const nodes: Node[] = useMemo(() => visible.map((t, i) => ({
     id: t.id, type: 'entity',
     position: positions[t.id] ?? { x: (i % 3) * 300, y: Math.floor(i / 3) * 300 },
-    data: { table: t, pk: pkOf(t), onToggle: (col: string) => toggleCol(t.id, col) } satisfies EntityData,
-  })), [visibleCatalog, positions, toggleCol])
+    data: { table: t, pk: pkOf(t), focused: t.uri === focus, onFocus: () => setFocus(t.uri) } satisfies EntityData,
+  })), [visible, positions, focus])
 
   const edges: Edge[] = useMemo(() => {
     const out: Edge[] = []
@@ -189,9 +206,18 @@ export function ERDiagram() {
         style: { stroke: 'var(--primary)', strokeWidth: 1.5 }, data: { rel: r },
       })
     })
-    for (let a = 0; a < visibleCatalog.length; a++)
-      for (let b = a + 1; b < visibleCatalog.length; b++) {
-        const ta = visibleCatalog[a], tb = visibleCatalog[b]
+    if (mode === 'lineage') linEdges.forEach((e, i) => {
+      const s = byUri[e.parent], t = byUri[e.child]
+      if (!s || !t) return
+      out.push({
+        id: `l${i}`, source: s, target: t, selectable: false,
+        markerEnd: { type: MarkerType.ArrowClosed },
+        style: { stroke: 'var(--muted-foreground)', strokeWidth: 1.5 },
+      })
+    })
+    if (showSuggestions) for (let a = 0; a < visible.length; a++)
+      for (let b = a + 1; b < visible.length; b++) {
+        const ta = visible[a], tb = visible[b]
         if (declared.has([ta.id, tb.id].sort().join('|')) || !sharesKey(ta, tb)) continue
         out.push({
           id: `c-${ta.id}-${tb.id}`, source: ta.id, target: tb.id, selectable: false,
@@ -199,42 +225,33 @@ export function ERDiagram() {
         })
       }
     return out
-  }, [rels, visibleCatalog, byUri])
+  }, [rels, visible, byUri, mode, linEdges, showSuggestions])
 
-  // dragging between two entities opens the picker (choose a suggested key or set columns/cardinality
-  // by hand) rather than blindly declaring the top suggestion — needed for tables with several FKs.
   const loadSuggestions = useCallback(async (left: CatalogTable, right: CatalogTable) => {
     setPending((cur) => cur?.left.id === left.id && cur.right.id === right.id
       ? { ...cur, suggestionsLoading: true, suggestionsError: null }
       : { left, right, suggestions: [], suggestionsLoading: true, suggestionsError: null })
     try {
       const suggestions = await api.joinSuggestions(left.uri, right.uri)
-      setPending((cur) => cur?.left.id === left.id && cur.right.id === right.id
-        ? { ...cur, suggestions, suggestionsLoading: false }
-        : cur)
+      setPending((cur) => cur?.left.id === left.id && cur.right.id === right.id ? { ...cur, suggestions, suggestionsLoading: false } : cur)
     } catch (e) {
-      setPending((cur) => cur?.left.id === left.id && cur.right.id === right.id
-        ? { ...cur, suggestionsLoading: false, suggestionsError: errorMessage(e) }
-        : cur)
+      setPending((cur) => cur?.left.id === left.id && cur.right.id === right.id ? { ...cur, suggestionsLoading: false, suggestionsError: errorMessage(e) } : cur)
     }
   }, [])
   const onConnect = useCallback((c: Connection) => {
-    const s = visibleCatalog.find((t) => t.id === c.source), t = visibleCatalog.find((x) => x.id === c.target)
+    const s = visible.find((t) => t.id === c.source), t = visible.find((x) => x.id === c.target)
     if (!s || !t || s.id === t.id) return
     void loadSuggestions(s, t)
-  }, [visibleCatalog, loadSuggestions])
+  }, [visible, loadSuggestions])
 
   const onEdgeClick = useCallback(async (_e: React.MouseEvent, edge: Edge) => {
     const rel = (edge.data as { rel?: Relationship } | undefined)?.rel
     if (!rel || !window.confirm(`Remove declared relationship ${rel.leftColumns.join('+')} = ${rel.rightColumns.join('+')}?`)) return
-    try { setRels(await api.deleteRelationship(rel)) } catch (e) { pushToast(String((e as Error).message || e), 'error') }
+    try { setRels(await api.deleteRelationship(rel)) } catch (e) { pushToast(errorMessage(e), 'error') }
   }, [pushToast])
 
   const onNodesChange = useCallback((changes: NodeChange[]) => {
     setPositions((p) => {
-      // React Flow reports dimension measurements through this same callback. Re-rendering controlled
-      // nodes for a measurement drops its internal measured size, so it becomes hidden and is measured
-      // again forever. Positions are the only user state this view owns; leave all other changes alone.
       if (!changes.some((ch) => ch.type === 'position' && ch.position)) return p
       const next = { ...p }
       for (const ch of changes) if (ch.type === 'position' && ch.position) next[ch.id] = ch.position
@@ -243,48 +260,92 @@ export function ERDiagram() {
     })
   }, [])
 
-  const capped = total > visibleCatalog.length
+  const capped = !focus && total > visible.length
 
   return (
     <div className="relative h-full w-full">
-      <div className="absolute left-3 top-3 z-10 flex max-w-[360px] flex-col gap-1.5 rounded-md border border-border bg-card/90 px-3 py-2 text-[10.5px] leading-relaxed text-muted-foreground backdrop-blur">
+      <div className="absolute left-3 top-3 z-10 flex w-[320px] flex-col gap-2 rounded-lg border border-border bg-card/95 px-3 py-2.5 text-[11px] text-muted-foreground shadow-sm backdrop-blur">
         <div className="flex items-center gap-2">
-          <span className="text-[12px] font-semibold text-foreground">Relationships (ER)</span>
-          <select value={folder} onChange={(e) => setFolder(e.target.value)}
-            className="ml-auto rounded border border-border bg-card px-1.5 py-0.5 text-[10.5px] outline-none" data-testid="er-folder">
-            <option value="">All folders</option>
-            {folders.map((f) => <option key={f} value={f}>{f}</option>)}
-          </select>
+          <span className="text-[12.5px] font-semibold text-foreground">Relationships</span>
+          <span className="flex-1" />
+          <button onClick={() => setShowHelp((v) => !v)} aria-label="How this works" title="How this works"
+            className="grid h-5 w-5 place-items-center rounded-full border border-border text-[11px] font-bold hover:bg-accent">?</button>
         </div>
-        🔑 click column(s) to declare the primary key · drag between two tables to declare a join · click a solid edge to remove · dashed = possible join
-        {catalogLoading && <span data-testid="er-catalog-loading">Loading datasets…</span>}
-        {catalogError && (
+
+        {focus ? (
+          <div className="flex flex-col gap-2" data-testid="er-focus-bar">
+            <div className="flex items-center gap-1.5">
+              <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-primary">Focused: {focusName}</span>
+              <button onClick={() => setFocus(null)} className="text-[10.5px] underline hover:text-foreground" data-testid="er-clear-focus">show all</button>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[10.5px]">Hops</span>
+              <div className="inline-flex items-center rounded-md border border-border">
+                <button onClick={() => setHops((h) => Math.max(1, h - 1))} className="px-1.5 py-0.5 hover:bg-accent" aria-label="Fewer hops">−</button>
+                <span className="w-5 text-center text-[11px] font-semibold text-foreground" data-testid="er-hops">{hops}</span>
+                <button onClick={() => setHops((h) => Math.min(5, h + 1))} className="px-1.5 py-0.5 hover:bg-accent" aria-label="More hops">+</button>
+              </div>
+              <span className="flex-1" />
+              <div className="inline-flex rounded-md border border-border p-0.5 text-[10.5px]">
+                {(['joins', 'lineage'] as const).map((m) => (
+                  <button key={m} onClick={() => setMode(m)} data-testid={`er-mode-${m}`}
+                    className={cn('rounded px-1.5 py-0.5', mode === m ? 'bg-accent font-semibold text-foreground' : 'hover:text-foreground')}>{m}</button>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-1.5">
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Filter by name…" data-testid="er-search"
+              className="min-w-0 flex-1 rounded border border-border bg-card px-2 py-1 text-[11px] outline-none focus:border-primary" />
+            <select value={folder} onChange={(e) => setFolder(e.target.value)} data-testid="er-folder"
+              className="rounded border border-border bg-card px-1.5 py-1 text-[10.5px] outline-none">
+              <option value="">All folders</option>
+              {folders.map((f) => <option key={f} value={f}>{f}</option>)}
+            </select>
+          </div>
+        )}
+
+        <div className="flex items-center gap-2 text-[10px]">
+          <span className="inline-flex items-center gap-1"><span className="inline-block h-0 w-3 border-t-[1.5px] border-primary" /> declared join</span>
+          {mode === 'lineage' && <span className="inline-flex items-center gap-1"><span className="inline-block h-0 w-3 border-t-[1.5px] border-muted-foreground" /> lineage</span>}
+          <label className="ml-auto inline-flex cursor-pointer items-center gap-1">
+            <input type="checkbox" checked={showSuggestions} onChange={(e) => setShowSuggestions(e.target.checked)} data-testid="er-suggestions-toggle" className="h-3 w-3 accent-primary" />
+            suggestions
+          </label>
+        </div>
+
+        {showHelp && (
+          <div className="rounded-md border border-border bg-muted/40 p-2 text-[10.5px] leading-relaxed">
+            Drag from one entity to another to declare a join. Click a solid edge to remove it. Click an entity title to
+            re-focus the graph on it. Declare a primary key from a table's detail drawer (Tables → open a dataset).
+          </div>
+        )}
+
+        {loading && <span data-testid="er-catalog-loading">Loading…</span>}
+        {error && (
           <span role="alert" className="text-destructive">
-            Couldn't load datasets: {catalogError}{visibleCatalog.length ? ' (showing stale graph)' : ''}{' '}
-            <button onClick={() => void reload()} data-testid="er-catalog-retry" className="font-semibold underline">Retry</button>
+            Couldn't load: {error}{' '}
+            <button onClick={refresh} data-testid="er-catalog-retry" className="font-semibold underline">Retry</button>
           </span>
         )}
-        {foldersLoading && <span>Loading folders…</span>}
-        {foldersError && (
-          <span role="alert" className="text-destructive">
-            Couldn't load folders: {foldersError}{folders.length ? ' (showing stale folders)' : ''}{' '}
-            <button onClick={() => void loadFolders()} data-testid="er-folders-retry" className="font-semibold underline">Retry</button>
-          </span>
-        )}
-        {relsLoading && <span>Loading declared relationships…</span>}
         {relsError && (
           <span role="alert" className="text-destructive">
-            Couldn't load declared relationships: {relsError}{rels.length ? ' (showing stale relationships)' : ''}{' '}
+            Couldn't load declared relationships: {relsError}{' '}
             <button onClick={() => void loadRelationships()} data-testid="er-relationships-retry" className="font-semibold underline">Retry</button>
           </span>
         )}
-        {capped && <span className="text-[10px] text-amber-600">Showing {visibleCatalog.length} of {total} — pick a folder to focus the diagram.</span>}
+        {capped && <span className="text-[10px] text-amber-600">Showing {visible.length} of {total} — focus a table or pick a folder.</span>}
       </div>
-      {!catalogLoading && !catalogError && visibleCatalog.length === 0 && (
+
+      {!loading && !error && visible.length === 0 && (
         <div className="pointer-events-none absolute inset-0 z-[5] grid place-items-center text-[13px] text-muted-foreground">
-          {total === 0 && !folder ? 'No datasets registered yet — add some in Tables.' : 'No datasets in this folder.'}
+          {focus ? 'No neighbours at this hop distance.' : total === 0 ? (
+            <span className="pointer-events-auto">No datasets registered yet — add some in <button onClick={() => openTables('tables')} className="underline">Tables</button>.</span>
+          ) : 'No datasets in this folder.'}
         </div>
       )}
+
       <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange}
         onConnect={onConnect} onEdgeClick={onEdgeClick} fitView minZoom={0.2} colorMode={resolvedTheme()}
         proOptions={{ hideAttribution: true }}>
@@ -292,8 +353,6 @@ export function ERDiagram() {
         <Controls showInteractive={false} />
       </ReactFlow>
       {pending && (
-        // keyed by the pair so switching pending pairs REMOUNTS (re-seeds lc/rc/card) — otherwise a
-        // rapid second drag would reuse the dialog with the first pair's stale columns
         <RelationshipDialog key={`${pending.left.id}|${pending.right.id}`}
           left={pending.left} right={pending.right} suggestions={pending.suggestions}
           suggestionsLoading={pending.suggestionsLoading} suggestionsError={pending.suggestionsError}
@@ -306,7 +365,6 @@ export function ERDiagram() {
 }
 
 const CARDINALITIES: Cardinality[] = ['1:1', '1:N', 'N:1', 'N:M', 'unknown']
-const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
 
 // Pick the join key(s) + cardinality when declaring a relationship: seed from the ranked suggestions,
 // or toggle columns on each side by hand (equal counts) and choose the cardinality.
@@ -323,8 +381,6 @@ function RelationshipDialog({ left, right, suggestions, suggestionsLoading, sugg
   const [keysTouched, setKeysTouched] = useState(false)
   const [busy, setBusy] = useState(false)
 
-  // Suggestions now load inside the open dialog. Preserve the old top-suggestion seeding behavior,
-  // but never overwrite columns/cardinality the user already chose while that request was pending.
   useEffect(() => {
     if (!top || keysTouched) return
     setLc(top.leftColumns); setRc(top.rightColumns); setCard(top.cardinality)
@@ -333,7 +389,7 @@ function RelationshipDialog({ left, right, suggestions, suggestionsLoading, sugg
   const toggle = (arr: string[], set: (v: string[]) => void, col: string) => {
     setKeysTouched(true)
     set(arr.includes(col) ? arr.filter((c) => c !== col) : [...arr, col])
-    setCard('unknown')  // hand-editing the key invalidates a cardinality that was MEASURED for another key
+    setCard('unknown')
   }
   const pick = (s: JoinSuggestion) => { setKeysTouched(true); setLc(s.leftColumns); setRc(s.rightColumns); setCard(s.cardinality) }
   const ok = lc.length > 0 && lc.length === rc.length
@@ -342,7 +398,7 @@ function RelationshipDialog({ left, right, suggestions, suggestionsLoading, sugg
     try {
       onDeclared(await api.addRelationship({ leftUri: left.uri, leftColumns: lc, rightUri: right.uri, rightColumns: rc, cardinality: card, confidence: 'declared' }))
       pushToast(`declared ${left.name} → ${right.name} (${card})`, 'success')
-    } catch (e) { pushToast(String((e as Error).message || e), 'error'); setBusy(false) }
+    } catch (e) { pushToast(errorMessage(e), 'error'); setBusy(false) }
   }
 
   const colList = (t: CatalogTable, arr: string[], set: (v: string[]) => void) => (

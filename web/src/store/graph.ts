@@ -242,6 +242,8 @@ interface Store {
   // -- app shell (Figma-style views) --
   view: DpView
   setView: (v: DpView) => void
+  erFocusUri: string | null                       // the table the relationship graph opens focused on (null = global)
+  openRelationships: (uri: string | null) => void
   // drop a catalog dataset / library transform onto the open canvas and navigate to it (Tables/Transforms)
   addToCanvas: (kind: string, config: Partial<NodeConfig>, title?: string) => void
   // a full-viewport Monaco editor for one node's code param (opened from the Inspector)
@@ -341,6 +343,8 @@ export const useStore = create<Store>((set, get) => ({
   canvasRole: null,
   view: 'canvas',
   setView: (view) => set({ view }),
+  erFocusUri: null,
+  openRelationships: (uri) => set({ erFocusUri: uri, view: 'relationships' }),
   addToCanvas: (kind, config, title) => {
     if (!roleCanEdit(get().canvasRole)) {
       get().pushToast('This canvas is view-only', 'info')
