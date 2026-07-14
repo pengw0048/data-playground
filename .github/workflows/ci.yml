@@ -29,6 +29,48 @@ jobs:
         # this makes an intermittent deadlock actionable instead of ending with only "operation canceled".
         run: cd kernel && uv run pytest -q -o faulthandler_timeout=60
 
+  # QA-01 / #112: declared Python support is 3.11–3.13 via requires-python + classifiers, but
+  # kernel/.python-version pins 3.12. This cheap matrix proves each declared version can install
+  # from the lockfile, import the package / CLI entry point, and pass the core-contract subset.
+  # The full suite stays on the pinned primary version in kernel-tests above — not in this matrix.
+  # Local: cd kernel && uv run pytest -q hub/tests/test_graph_validation.py hub/tests/test_sqlpolicy.py hub/tests/test_migrations.py
+  kernel-python-matrix:
+    name: kernel (Python ${{ matrix.python }} — install/import/core-contract)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    env:
+      # Override the committed kernel/.python-version pin for every uv invocation in this job.
+      # Without this, `uv run` re-syncs the venv back to 3.12 and every matrix leg silently lies.
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      # hatch_build.py creates a placeholder web/dist when missing, so no Node/npm steps here.
+      - name: Install kernel (dev extra, lock-faithful)
+        run: cd kernel && uv sync --frozen --extra dev
+      - name: Prove the matrix interpreter is active
+        # Bare `python -VV` on the runner is the system interpreter; uv run uses the venv.
+        run: cd kernel && uv run python -VV
+      - name: Import smoke
+        run: |
+          cd kernel
+          uv run python -c "import hub"
+          uv run dataplay --help
+      - name: Core-contract subset
+        # Explicit path list (graph structure validation, SQL AST policy, SQLite migration
+        # startup contracts). Intentionally no Ray, browser, Node, or PostgreSQL.
+        run: >-
+          cd kernel && uv run pytest -q
+          hub/tests/test_graph_validation.py
+          hub/tests/test_sqlpolicy.py
+          hub/tests/test_migrations.py
+
   postgres-migration:
     name: migration contract (PostgreSQL 16)
     runs-on: ubuntu-latest
