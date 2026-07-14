@@ -119,7 +119,11 @@ test.describe('accessibility gate', () => {
 
     // Error state — dedicated failing run (same path as canvas.spec.ts).
     await fresh(page)
+    // Wait for the freshly-created canvas to be interactive before driving the palette — on slow CI the
+    // New-file render can lag the click, leaving the node unadded (empty canvas → no run → no toast).
+    await expect(page.getByText('Add a dataset source to begin', { exact: false })).toBeVisible()
     await addNode(page, 'Sources & sinks', 'source')
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
     const errInsp = page.getByTestId('inspector')
     await errInsp.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
     await errInsp.getByRole('button', { name: 'Count rows' }).click()
