@@ -25,6 +25,40 @@ python3 scripts/check_release_versions.py \
 Build order for a shippable wheel: `cd web && npm ci && npm run build`, then `cd kernel && uv build`.
 `scripts/check_wheel_has_spa.py` fails if the wheel still contains the `hatch_build.py` placeholder UI.
 
+## Release artifact smoke (local)
+
+After building a wheel or running a container, the same offline starter-canvas smoke that CI runs in
+`.github/workflows/release-artifacts.yml` is:
+
+```bash
+# Hub already serving (e.g. dataplay --no-open --workspace /tmp/ws):
+python3 scripts/release_smoke.py --base-url http://127.0.0.1:8471 --expect-version 0.1.0
+
+# Version surfaces must agree (pyproject / package.json / wheel /api/version / image label):
+python3 scripts/check_release_versions.py \
+  --pyproject kernel/pyproject.toml --package-json web/package.json \
+  --require pyproject,package_json
+```
+
+Build order for a shippable wheel: `cd web && npm ci && npm run build`, then `cd kernel && uv build`.
+`scripts/check_wheel_has_spa.py` fails if the wheel still contains the `hatch_build.py` placeholder UI.
+
+### Verifying a published release (checksums + attestations)
+
+```bash
+# After downloading the GitHub Release assets for tag vX.Y.Z:
+sha256sum -c SHA256SUMS
+
+gh attestation verify ./data_playground-X.Y.Z-py3-none-any.whl \
+  --repo pengw0048/data-playground
+gh attestation verify oci://ghcr.io/pengw0048/data-playground:X.Y.Z \
+  --repo pengw0048/data-playground
+```
+
+Tagged releases are produced by `.github/workflows/release.yml` (wheel + `SHA256SUMS` + SBOMs on the
+GitHub Release, application image on GHCR, build-provenance attestations). See `CHANGELOG.md` for
+supported Python/browser/deployment profiles, the Alembic range, and rollback constraints.
+
 ## Verify it locally (kind)
 
 ```bash

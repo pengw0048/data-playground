@@ -122,7 +122,7 @@ jobs:
       - name: Install kernel with PostgreSQL support
         run: cd kernel && uv sync --extra dev --extra postgres
       - name: Verify the release migration contract
-        run: cd kernel && uv run pytest -q hub/tests/test_postgres_migration_smoke.py
+        run: cd kernel && uv run pytest -q hub/tests/test_postgres_migration_smoke.py hub/tests/test_upgrade_smoke.py::test_postgres_upgrade_preserves_fixture_data
       - name: Verify durable lifecycle concurrency contracts
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
