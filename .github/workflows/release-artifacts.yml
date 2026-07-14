@@ -148,6 +148,14 @@ jobs:
           echo "container uid=$UID_IN_CTR"
           test "$UID_IN_CTR" != "0"
           test "$UID_IN_CTR" = "10001"
+          # uv run may still be resolving the project on first boot — poll until the port accepts TCP.
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 2 http://127.0.0.1:8472/api/livez >/dev/null 2>&1; then
+              echo "hub accepting connections after ${i}s"
+              break
+            fi
+            sleep 1
+          done
 
       - name: Starter-canvas smoke (image)
         run: |
