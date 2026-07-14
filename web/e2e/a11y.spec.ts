@@ -99,6 +99,8 @@ test.describe('accessibility gate', () => {
     const held = new Promise<void>((resolve) => { releaseRun = resolve })
     let finishHold: (() => void) | undefined
     const holdFinished = new Promise<void>((resolve) => { finishHold = resolve })
+    // times: 1 — handle only this run's POST and auto-remove, so a slow-CI unroute race can't leave the
+    // handler live to abort the later error-state run (which must reach the backend to surface a toast).
     await page.route(/\/run$/, async (route) => {
       if (route.request().method() !== 'POST') {
         await route.continue()
@@ -107,7 +109,7 @@ test.describe('accessibility gate', () => {
       await held
       try { await route.abort('timedout') } catch { /* unroute may already have cleared it */ }
       finishHold!()
-    })
+    }, { times: 1 })
     await inspector.getByRole('button', { name: 'Count rows' }).click()
     await expect(page.locator('.dp-running-glyph').first()).toBeVisible({ timeout: 10_000 })
     await expectNoSeriousAxe(page, 'Running')
