@@ -598,9 +598,9 @@ def test_migration_0020_quarantines_unsafe_legacy_and_removes_managed_visibility
     eng.dispose()
 
 
-def test_migration_0020_adds_backend_job_binding_without_rewriting_run_state(
+def test_migration_0022_preserves_history_and_backfills_terminal_fences(
         tmp_path, monkeypatch):
-    """Legacy RunStatus JSON remains valid while the durable binding/publication table is added."""
+    """The linear 0021 -> 0022 upgrade preserves history/state while fencing terminal runs."""
     import json as _json
 
     import sqlalchemy as sa
@@ -611,41 +611,106 @@ def test_migration_0020_adds_backend_job_binding_without_rewriting_run_state(
     url = f"sqlite:///{tmp_path}/backend-jobs.db"
     monkeypatch.setattr(live_settings, "database_url", url)
     cfg = metadb._alembic_cfg()
-    command.upgrade(cfg, "0019_object_attempts")
+    command.upgrade(cfg, "0021_local_result_artifacts")
     eng = sa.create_engine(url)
     legacy = {"run_id": "legacy-live", "status": "running", "per_node": []}
     legacy_terminal = {"run_id": "legacy-done", "status": "done", "per_node": []}
     with eng.begin() as connection:
         connection.execute(sa.text(
+            "INSERT INTO users (id, name) VALUES ('legacy-user', 'Legacy User')"
+        ))
+        connection.execute(sa.text(
+            "INSERT INTO canvases (id, owner_id, name, version, doc) "
+            "VALUES ('legacy-canvas', 'legacy-user', 'Legacy', 1, '{}')"
+        ))
+        # Preserve both history rows. The newer row keeps the logical link; the older duplicate becomes
+        # ordinary nullable legacy history so the new uniqueness boundary does not destroy audit data.
+        connection.execute(sa.text("""
+            INSERT INTO run_records
+                (id, canvas_id, run_id, status, rows, error, output_uri, created_at)
+            VALUES
+                ('history-older', 'legacy-canvas', 'duplicate-run', 'failed', 3,
+                 'original failure', 's3://legacy/older', '2026-07-01 00:00:00'),
+                ('history-newer', 'legacy-canvas', 'duplicate-run', 'done', 7,
+                 NULL, 's3://legacy/newer', '2026-07-02 00:00:00'),
+                ('history-undated', 'legacy-canvas', 'duplicate-run', 'cancelled', 5,
+                 'legacy clock unavailable', 's3://legacy/undated', NULL),
+                ('history-unlinked', 'legacy-canvas', NULL, 'done', 11,
+                 NULL, 's3://legacy/unlinked', '2026-07-03 00:00:00')
+        """))
+        connection.execute(sa.text(
             "INSERT INTO run_states (run_id, status, doc) VALUES (:run_id, 'running', :doc)"
         ), {"run_id": legacy["run_id"], "doc": _json.dumps(legacy)})
-        connection.execute(sa.text(
-            "INSERT INTO run_states (run_id, status, doc) VALUES (:run_id, 'done', :doc)"
-        ), {"run_id": legacy_terminal["run_id"], "doc": _json.dumps(legacy_terminal)})
-    command.upgrade(cfg, "head")
+        connection.execute(sa.text("""
+            INSERT INTO run_states
+                (run_id, canvas_id, status, doc, created_by, auth_canvas_id)
+            VALUES (:run_id, 'legacy-canvas', 'done', :doc, 'legacy-user', 'legacy-canvas')
+        """), {"run_id": legacy_terminal["run_id"], "doc": _json.dumps(legacy_terminal)})
+    command.upgrade(cfg, "0022_backend_jobs")
     with eng.connect() as connection:
-        assert _json.loads(connection.execute(
-            sa.text("SELECT doc FROM run_states WHERE run_id='legacy-live'")
-        ).scalar_one()) == legacy
+        assert connection.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one() == \
+            "0022_backend_jobs"
+        states = {
+            row.run_id: (row.status, _json.loads(row.doc))
+            for row in connection.execute(sa.text(
+                "SELECT run_id, status, doc FROM run_states ORDER BY run_id"
+            ))
+        }
+        assert states == {
+            "legacy-done": ("done", legacy_terminal),
+            "legacy-live": ("running", legacy),
+        }
+        history = {
+            row.id: (row.run_id, row.status, row.rows, row.error, row.output_uri)
+            for row in connection.execute(sa.text("""
+                SELECT id, run_id, status, rows, error, output_uri
+                FROM run_records ORDER BY id
+            """))
+        }
+        assert history == {
+            "history-newer": ("duplicate-run", "done", 7, None, "s3://legacy/newer"),
+            "history-older": (None, "failed", 3, "original failure", "s3://legacy/older"),
+            "history-undated": (
+                None, "cancelled", 5, "legacy clock unavailable", "s3://legacy/undated"
+            ),
+            "history-unlinked": (None, "done", 11, None, "s3://legacy/unlinked"),
+        }
         columns = {row[1] for row in connection.execute(sa.text("PRAGMA table_info('run_backend_jobs')"))}
         assert {"run_id", "attempt_id", "submission_id", "control_address", "cancel_requested",
                 "quarantine_reason", "submission_state", "submission_owner",
                 "submission_lease_until", "publication_state", "last_control_observed_at",
-                "recovery_blocked_reason", "job_doc", "result_doc"} <= columns
+                "recovery_blocked_reason", "job_doc", "publication_doc", "result_doc"} <= columns
         tables = {row[0] for row in connection.execute(
             sa.text("SELECT name FROM sqlite_master WHERE type='table'")
         )}
         assert {"catalog_publication_events", "run_terminal_fences"} <= tables
+        fence_columns = {row[1] for row in connection.execute(
+            sa.text("PRAGMA table_info('run_terminal_fences')")
+        )}
+        assert {"run_id", "status", "created_by", "auth_canvas_id", "canvas_id"} <= fence_columns
         receipt_columns = {row[1] for row in connection.execute(
             sa.text("PRAGMA table_info('catalog_publication_events')")
         )}
-        assert {"event_key", "effect_type", "uri", "version"} <= receipt_columns
-        assert connection.execute(sa.text(
-            "SELECT status FROM run_terminal_fences WHERE run_id='legacy-done'"
-        )).scalar_one() == "done"
+        assert {"event_key", "effect_type", "uri", "version", "fingerprint"} <= receipt_columns
+        assert connection.execute(sa.text("""
+            SELECT status, created_by, auth_canvas_id, canvas_id
+            FROM run_terminal_fences WHERE run_id='legacy-done'
+        """)).one() == ("done", "legacy-user", "legacy-canvas", "legacy-canvas")
         assert connection.execute(sa.text(
             "SELECT COUNT(*) FROM run_terminal_fences WHERE run_id='legacy-live'"
         )).scalar_one() == 0
+    with pytest.raises(sa.exc.IntegrityError):
+        with eng.begin() as connection:
+            connection.execute(sa.text("""
+                INSERT INTO run_records (id, canvas_id, run_id, status, created_at)
+                VALUES ('history-conflict', 'legacy-canvas', 'duplicate-run', 'done', CURRENT_TIMESTAMP)
+            """))
+    # Nullable legacy links remain unrestricted after the uniqueness constraint is installed.
+    with eng.begin() as connection:
+        connection.execute(sa.text("""
+            INSERT INTO run_records (id, canvas_id, run_id, status, created_at)
+            VALUES ('history-unlinked-2', 'legacy-canvas', NULL, 'failed', CURRENT_TIMESTAMP)
+        """))
     eng.dispose()
 
 

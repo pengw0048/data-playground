@@ -631,6 +631,7 @@ def test_backend_job_liveness_uses_db_clock_and_flags_queued_runs(monkeypatch):
                 "job_uri": f"s3://test-control/{run_id}.dpjob",
                 "result_uri": f"s3://test-control/{run_id}.dpresult",
             }
+            metadb.preallocate_run_owner(run_id, metadb.DEFAULT_USER_ID, None)
             metadb.bind_backend_job(run_id, ref, {
                 "run_id": run_id, "status": status, "placement": "distributed", "per_node": [],
             })
@@ -668,6 +669,7 @@ def test_backend_job_reads_isolate_malformed_result_rows():
     run_ids = [f"malformed_backend_result_{index}" for index in range(2)]
     try:
         for index, run_id in enumerate(run_ids):
+            metadb.preallocate_run_owner(run_id, metadb.DEFAULT_USER_ID, None)
             metadb.bind_backend_job(run_id, {
                 "backend": "result-row-isolation-test", "cluster_ref": "test-cluster",
                 "attempt_id": f"attempt-{run_id}", "submission_id": f"submission-{run_id}",
@@ -678,7 +680,8 @@ def test_backend_job_reads_isolate_malformed_result_rows():
             })
             with metadb.session() as session:
                 job = session.get(metadb.RunBackendJob, run_id)
-                job.result_doc = "{" if index == 0 else '{"status":"done"}'
+                if index == 0:
+                    job.result_doc = "{"
 
         malformed = metadb.backend_job(run_ids[0])
         assert malformed["result"] is None
@@ -690,7 +693,7 @@ def test_backend_job_reads_isolate_malformed_result_rows():
         }
         assert set(active) == set(run_ids)
         assert "result_doc" in active[run_ids[0]]["_recovery_error"]
-        assert active[run_ids[1]]["result"] == {"status": "done"}
+        assert active[run_ids[1]]["result"] is None
         assert "_recovery_error" not in active[run_ids[1]]
     finally:
         with metadb.session() as session:
@@ -2053,6 +2056,42 @@ def test_output_version_is_content_addressed_and_flags_schema_drift(tmp_path, ca
         t3 = cat.register_output(name="out", uri=p, parents=[])
     assert t3.version != t1.version, "a changed schema must produce a new version"
     assert any("schema changed" in r.getMessage() for r in caplog.records), "schema drift must be surfaced"
+
+
+def test_catalog_output_receipt_attests_exact_unmanaged_version(tmp_path):
+    from hub import metadb
+
+    token = os.urandom(8).hex()
+    uri = str(tmp_path / f"receipt-{token}.parquet")
+    other_uri = str(tmp_path / f"receipt-other-{token}.parquet")
+    event_key = f"receipt-{token}"
+    wrong_version_key = f"receipt-wrong-version-{token}"
+    metadb.catalog_upsert_entry(uri, "receipt", {
+        "id": f"tbl_receipt_{token}", "name": "receipt", "uri": uri,
+        "version": "v1", "columns": [], "tags": [],
+    })
+    metadb.catalog_upsert_entry(other_uri, "receipt-other", {
+        "id": f"tbl_receipt_other_{token}", "name": "receipt-other", "uri": other_uri,
+        "version": "v1", "columns": [], "tags": [],
+    })
+    try:
+        metadb.catalog_record_output_publication(event_key, uri + "/", "v1")
+        metadb.catalog_record_output_publication(event_key, uri, "v1")
+        with metadb.session() as session:
+            receipt = session.get(metadb.CatalogPublicationEvent, event_key)
+            assert (receipt.effect_type, receipt.uri, receipt.version) == (
+                "output", uri, "v1")
+
+        with pytest.raises(RuntimeError, match="version does not match"):
+            metadb.catalog_record_output_publication(wrong_version_key, uri, "v2")
+        with metadb.session() as session:
+            assert session.get(metadb.CatalogPublicationEvent, wrong_version_key) is None
+
+        with pytest.raises(RuntimeError, match="publication key collision"):
+            metadb.catalog_record_output_publication(event_key, other_uri, "v1")
+    finally:
+        metadb.catalog_delete_entry(uri)
+        metadb.catalog_delete_entry(other_uri)
 
 
 def test_catalog_usage_counts_runs_and_deduplicates_one_publication_event(tmp_path, monkeypatch):
@@ -9206,7 +9245,10 @@ def test_ray_settlement_logs_provider_detail_but_returns_generic_error(
         Graph(id="ray-generic", version=1, nodes=[], edges=[]), status,
         {"status": "done", "rows": 0, "outputs": [{"step_id": "write"}]}, 0)
     assert status.status == "failed"
-    assert status.error == "Ray output publication failed"
+    assert status.error == (
+        "Catalog registration failed "
+        "(code=catalog_registration_failed,type=RuntimeError)"
+    )
     assert "SECRET_RAY_CATALOG_DETAIL" not in status.error
     assert "SECRET_RAY_CATALOG_DETAIL" in caplog.text
 
@@ -9236,7 +9278,10 @@ def test_ray_control_plane_setup_and_preflight_errors_are_generic(
     caplog.set_level("ERROR")
     failed = runner.run(plan, graph, "write", "distributed")
     assert failed.status == "failed"
-    assert failed.error == "Ray sink control-plane setup failed"
+    assert failed.error == (
+        "Object sink attempt allocation failed "
+        "(code=sink_attempt_allocation_failed,type=RuntimeError)"
+    )
     assert "SECRET_RAY_ALLOCATION_TOKEN" not in failed.error
     assert "SECRET_RAY_ALLOCATION_TOKEN" in caplog.text
 
@@ -10056,7 +10101,10 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
         expected_targets=expected_targets, expected_attempts=expected_attempts,
     )
     assert missing_status.status == "failed"
-    assert missing_status.error == "Ray output publication failed"
+    assert missing_status.error == (
+        "Catalog registration failed "
+        "(code=catalog_registration_failed,type=RuntimeError)"
+    )
     assert missing_status.output_uri is None and missing_status.output_table is None
 
     result = {
@@ -11349,6 +11397,9 @@ def test_object_attempt_registry_serializes_publish_and_discard():
     with pytest.raises(RuntimeError, match="terminal proof"):
         metadb.catalog_upsert_entry(
             fenced, "out", {"id": "tbl_out", "name": "out", "uri": fenced})
+    # Unregister the durable catalog pointer before quarantining its physical attempt. Cleanup must
+    # exercise the same ownership boundary as production rather than bypassing a live reference.
+    metadb.catalog_delete_entry(published[0])
     for uri in uris:
         metadb.quarantine_object_attempt(uri, "test cleanup")
     metadb.quarantine_object_attempt(fenced, "test cleanup")

@@ -67,6 +67,18 @@ def _state(uri: str) -> str:
         return session.get(metadb.ObjectAttempt, uri).state
 
 
+def _retire_terminal_run_state(run_id: str) -> None:
+    """Simulate terminal RunState retention cleanup without an illegal status transition."""
+    with metadb.session() as session:
+        state = session.get(metadb.RunState, str(run_id), with_for_update=True)
+        assert state is not None and state.status in metadb._TERMINAL_RUN
+        backend = session.get(metadb.RunBackendJob, str(run_id), with_for_update=True)
+        if backend is not None:
+            session.delete(backend)
+        metadb._replace_attempt_ref(session, "run_state", str(run_id), None)
+        session.delete(state)
+
+
 @contextlib.contextmanager
 def _postgres_lock_timeout(seconds: int = 2):
     if metadb.engine().dialect.name != "postgresql":
@@ -228,10 +240,153 @@ def test_postgres_cache_replacement_reader_pin_and_gc_are_atomic():
         "run_id": run_id, "status": "done", "output_uri": pinned_uri})
     metadb.release_result_cache_pin(pin_id)
     assert _state(pinned_uri) == "published"
-    metadb.save_run_state(run_id, {"run_id": run_id, "status": "failed"})
+    _retire_terminal_run_state(run_id)
     metadb.put_result(cache_key, {"uri": None})
     for handle in (old, new):
         metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_postgres_gc_rechecks_refs_after_waiting_for_attempt_lock():
+    if metadb.engine().dialect.name != "postgresql":
+        pytest.skip("requires a real PostgreSQL metadata database")
+    from sqlalchemy import event
+
+    handle = _handle(logical=(
+        f"s3://lifecycle-tests/{uuid.uuid4().hex}/gc-publication-race.parquet"))
+    _commit(handle)
+    metadb.release_object_attempt_lease(handle["write_lease_id"])
+    metadb.release_object_attempt_lease(handle["publish_lease_id"])
+    ref_key = f"gc-publication-{uuid.uuid4().hex}"
+    select_started = threading.Event()
+    actions: list[dict] = []
+    errors: list[BaseException] = []
+    thread_name = f"gc-publication-race-{uuid.uuid4().hex}"
+
+    def before_cursor_execute(
+            _connection, _cursor, statement, _parameters, _context, _executemany) -> None:
+        if (threading.current_thread().name == thread_name
+                and "FROM object_attempts" in statement
+                and "object_attempts.state =" in statement
+                and "object_attempts.terminal_proof_at" in statement
+                and "FOR UPDATE" in statement):
+            select_started.set()
+
+    def collect_gc() -> None:
+        try:
+            actions.extend(metadb.object_attempt_gc_batch(0, 0))
+        except BaseException as exc:  # noqa: BLE001 - asserted after the interleaving
+            errors.append(exc)
+
+    thread = threading.Thread(target=collect_gc, name=thread_name)
+    with _postgres_lock_timeout(5):
+        engine = metadb.engine()
+        event.listen(engine, "before_cursor_execute", before_cursor_execute)
+        try:
+            with metadb.session() as publisher:
+                attempt = publisher.get(
+                    metadb.ObjectAttempt, handle["uri"], with_for_update=True)
+                assert attempt is not None and attempt.state == "committed"
+                publisher.add(metadb.ObjectAttemptRef(
+                    ref_type="backend_publication", ref_key=ref_key,
+                    attempt_uri=attempt.uri, generation=attempt.generation,
+                ))
+                publisher.flush()
+                thread.start()
+                assert select_started.wait(timeout=3)
+                time.sleep(0.05)
+                assert thread.is_alive(), "GC did not wait for the publication attempt lock"
+            thread.join(timeout=8)
+        finally:
+            event.remove(engine, "before_cursor_execute", before_cursor_execute)
+    assert not thread.is_alive()
+    assert errors == []
+    assert handle["uri"] not in {action["uri"] for action in actions}
+    with metadb.session() as session:
+        attempt = session.get(metadb.ObjectAttempt, handle["uri"])
+        ref = session.get(metadb.ObjectAttemptRef, {
+            "ref_type": "backend_publication", "ref_key": ref_key,
+        })
+        assert attempt is not None and attempt.state == "committed"
+        assert ref is not None and ref.attempt_uri == handle["uri"]
+
+    with metadb.session() as session:
+        session.get(metadb.ObjectAttempt, handle["uri"], with_for_update=True)
+        ref = session.get(metadb.ObjectAttemptRef, {
+            "ref_type": "backend_publication", "ref_key": ref_key,
+        }, with_for_update=True)
+        assert ref is not None
+        session.delete(ref)
+    metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_postgres_quarantine_rechecks_refs_after_waiting_for_attempt_lock():
+    if metadb.engine().dialect.name != "postgresql":
+        pytest.skip("requires a real PostgreSQL metadata database")
+    from sqlalchemy import event
+
+    handle = _handle(logical=(
+        f"s3://lifecycle-tests/{uuid.uuid4().hex}/quarantine-publication-race.parquet"))
+    _commit(handle)
+    ref_key = f"quarantine-publication-{uuid.uuid4().hex}"
+    select_started = threading.Event()
+    errors: list[BaseException] = []
+    thread_name = f"quarantine-publication-race-{uuid.uuid4().hex}"
+
+    def before_cursor_execute(
+            _connection, _cursor, statement, _parameters, _context, _executemany) -> None:
+        if (threading.current_thread().name == thread_name
+                and "FROM object_attempts" in statement
+                and "object_attempts.uri =" in statement
+                and "FOR UPDATE" in statement):
+            select_started.set()
+
+    def quarantine() -> None:
+        try:
+            metadb.quarantine_object_attempt(handle["uri"], "publication race")
+        except BaseException as exc:  # noqa: BLE001 - the durable-reference rejection is asserted
+            errors.append(exc)
+
+    thread = threading.Thread(target=quarantine, name=thread_name)
+    with _postgres_lock_timeout(5):
+        engine = metadb.engine()
+        event.listen(engine, "before_cursor_execute", before_cursor_execute)
+        try:
+            with metadb.session() as publisher:
+                attempt = publisher.get(
+                    metadb.ObjectAttempt, handle["uri"], with_for_update=True)
+                assert attempt is not None and attempt.state == "committed"
+                publisher.add(metadb.ObjectAttemptRef(
+                    ref_type="backend_publication", ref_key=ref_key,
+                    attempt_uri=attempt.uri, generation=attempt.generation,
+                ))
+                publisher.flush()
+                thread.start()
+                assert select_started.wait(timeout=3)
+                time.sleep(0.05)
+                assert thread.is_alive(), "quarantine did not wait for the publication attempt lock"
+            thread.join(timeout=8)
+        finally:
+            event.remove(engine, "before_cursor_execute", before_cursor_execute)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "durable reference" in str(errors[0])
+    with metadb.session() as session:
+        attempt = session.get(metadb.ObjectAttempt, handle["uri"])
+        ref = session.get(metadb.ObjectAttemptRef, {
+            "ref_type": "backend_publication", "ref_key": ref_key,
+        })
+        assert attempt is not None and attempt.state == "committed"
+        assert ref is not None and ref.attempt_uri == handle["uri"]
+
+    with metadb.session() as session:
+        session.get(metadb.ObjectAttempt, handle["uri"], with_for_update=True)
+        ref = session.get(metadb.ObjectAttemptRef, {
+            "ref_type": "backend_publication", "ref_key": ref_key,
+        }, with_for_update=True)
+        assert ref is not None
+        session.delete(ref)
+    metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
 def test_postgres_result_pin_release_and_expiry_cleanup_share_lock_order():
@@ -846,6 +1001,77 @@ def test_catalog_overwrite_keeps_stable_identity_and_governance():
     metadb.quarantine_object_attempt(second["uri"], "test cleanup")
 
 
+def test_durable_usage_follows_logical_identity_across_aliases_and_generations(tmp_path):
+    token = uuid.uuid4().hex
+    logical_uri = f"s3://lifecycle-tests/{token}/usage.parquet"
+    first = _handle("sink", logical=logical_uri)
+    second = _handle("sink", logical=logical_uri)
+    unmanaged_uri = str(tmp_path / f"unmanaged-{token}.parquet")
+    _commit(first)
+    metadb.catalog_upsert_entry(first["uri"], "usage", {
+        "id": "ignored", "name": "usage", "uri": first["uri"],
+        "version": "v1", "columns": [], "tags": [],
+    })
+    with metadb.session() as session:
+        attempt = session.get(metadb.ObjectAttempt, first["uri"])
+        logical_id = attempt.logical_id
+        logical_row = session.get(metadb.CatalogLogicalDataset, logical_id)
+        catalog_key = logical_row.catalog_key
+
+    first_event = f"usage-first-{token}"
+    second_event = f"usage-second-{token}"
+    managed_output_event = f"managed-output-{token}"
+    try:
+        with pytest.raises(RuntimeError, match="core object-lifecycle"):
+            metadb.catalog_record_output_publication(
+                managed_output_event, first["uri"], "v1")
+        with metadb.session() as session:
+            assert session.get(metadb.CatalogPublicationEvent, managed_output_event) is None
+
+        assert metadb.catalog_bump_usage_once(first_event, [
+            first["uri"], logical_uri, catalog_key, logical_id,
+        ]) is True
+        assert metadb.catalog_bump_usage_once(first_event, [logical_id]) is False
+        with metadb.session() as session:
+            logical_row = session.get(metadb.CatalogLogicalDataset, logical_id)
+            entry = session.get(metadb.CatalogEntry, logical_row.current_uri)
+            event = session.get(metadb.CatalogPublicationEvent, first_event)
+            assert logical_row.usage == entry.usage == 1
+            assert event.effect_type == "usage"
+            assert event.uri.startswith("usage:v1:sha256:") and event.version is None
+
+        _commit(second)
+        metadb.catalog_upsert_entry(second["uri"], "usage", {
+            "id": "ignored", "name": "usage", "uri": second["uri"],
+            "version": "v2", "columns": [], "tags": [],
+        })
+        assert metadb.catalog_get(second["uri"])["usage"] == 1
+        assert metadb.catalog_bump_usage_once(first_event, [second["uri"]]) is False
+
+        assert metadb.catalog_bump_usage_once(second_event, [
+            first["uri"], second["uri"], catalog_key,
+        ]) is True
+        with metadb.session() as session:
+            logical_row = session.get(metadb.CatalogLogicalDataset, logical_id)
+            entry = session.get(metadb.CatalogEntry, logical_row.current_uri)
+            assert logical_row.usage == entry.usage == 2
+
+        metadb.catalog_upsert_entry(unmanaged_uri, "unmanaged", {
+            "id": f"tbl_unmanaged_{token}", "name": "unmanaged", "uri": unmanaged_uri,
+            "version": "v1", "columns": [], "tags": [],
+        })
+        with pytest.raises(RuntimeError, match="publication key collision"):
+            metadb.catalog_bump_usage_once(second_event, [unmanaged_uri])
+        assert metadb.catalog_get(unmanaged_uri)["usage"] == 0
+    finally:
+        if metadb.catalog_get(unmanaged_uri) is not None:
+            metadb.catalog_delete_entry(unmanaged_uri)
+        if metadb.catalog_get(logical_id) is not None:
+            metadb.catalog_delete_entry(logical_id)
+        metadb.quarantine_object_attempt(first["uri"], "test cleanup")
+        metadb.quarantine_object_attempt(second["uri"], "test cleanup")
+
+
 def test_read_lease_wins_or_observes_explicit_gc_miss():
     reader_first = _handle()
     _commit(reader_first)
@@ -899,7 +1125,7 @@ def test_result_cache_pin_keeps_replaced_generation_published_until_run_owns_it(
             "ref_type": "result_reader", "ref_key": pin_id}) is None
         assert session.get(metadb.ObjectAttemptLease, pin_id) is None
 
-    metadb.save_run_state(run_id, {"run_id": run_id, "status": "failed"})
+    _retire_terminal_run_state(run_id)
     assert _state(old["uri"]) == "superseded"
     metadb.put_result(cache_key, {"uri": None})
     metadb.quarantine_object_attempt(old["uri"], "test cleanup")
@@ -918,7 +1144,7 @@ def test_done_run_state_is_primary_owner_for_noncacheable_committed_region():
         ref = session.get(metadb.ObjectAttemptRef, {
             "ref_type": "run_state", "ref_key": run_id})
         assert ref is not None and ref.attempt_uri == handle["uri"]
-    metadb.save_run_state(run_id, {"run_id": run_id, "status": "failed"})
+    _retire_terminal_run_state(run_id)
     assert _state(handle["uri"]) == "superseded"
     metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
@@ -2284,7 +2510,7 @@ def test_moto_subprocess_backends_publish_parent_owned_object_full_result(
         phash = deps.runner._plan_hash(graph, "source")
         assert metadb.get_result(phash)["uri"] == final.output_uri
 
-        metadb.save_run_state(final.run_id, {"run_id": final.run_id, "status": "failed"})
+        _retire_terminal_run_state(final.run_id)
         metadb.put_result(phash, {"uri": None})
         metadb.quarantine_object_attempt(final.output_uri, "test cleanup")
     finally:

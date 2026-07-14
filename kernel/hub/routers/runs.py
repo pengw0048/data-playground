@@ -4,7 +4,9 @@ the execution routes (and where a run writes). Split out of main.py; all authed 
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -415,15 +417,57 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             run_id = str(preallocate())
             if not run_id:
                 raise RuntimeError("execution backend returned an empty preallocated run id")
+            operational_canvas = auth_canvas
+            if operational_canvas is None:
+                graph_id = str(getattr(graph, "id", "") or "")
+                if graph_id and metadb.canvas_exists(graph_id):
+                    operational_canvas = graph_id
             # This commit is the authorization boundary: external artifacts, workload identity, and
             # submission are forbidden until the logical run has an authoritative principal.
-            metadb.bind_run_owner(run_id, uid, auth_canvas)
-            identity_prebound = True
-            status = runner.run(
-                plan, graph, target_node_id, est.placement, run_id=run_id
+            token = metadb.preallocate_run_owner(
+                run_id, uid, auth_canvas, operational_canvas_id=operational_canvas
             )
-            if status.run_id != run_id:
-                raise RuntimeError("execution backend did not preserve its prebound run id")
+            keepalive_stop = threading.Event()
+
+            def _renew_preallocation() -> None:
+                interval = max(1.0, metadb.RUN_PREALLOCATION_TTL_SECONDS / 3)
+                while not keepalive_stop.wait(interval):
+                    try:
+                        if not metadb.renew_run_preallocation(run_id, token):
+                            return
+                    except Exception:  # the final bind/finish transaction remains authoritative
+                        logging.getLogger("hub").exception(
+                            "run preallocation lease renewal failed")
+
+            keepalive = threading.Thread(
+                target=_renew_preallocation, daemon=True,
+                name=f"run-preallocation-{run_id}",
+            )
+            try:
+                keepalive.start()
+                status = runner.run(
+                    plan, graph, target_node_id, est.placement, run_id=run_id
+                )
+                if status.run_id != run_id:
+                    raise RuntimeError("execution backend did not preserve its prebound run id")
+                if not metadb.finish_run_preallocation(
+                        run_id, token, status.model_dump()):
+                    raise RuntimeError("execution backend lost its prebound run identity")
+                identity_prebound = True
+            except BaseException:
+                # Exact-token cleanup is a no-op once a backend binding exists. If metadata is
+                # temporarily unavailable, boot/periodic recovery expires the same DB-clock lease.
+                try:
+                    metadb.discard_run_preallocation(
+                        run_id, token, uid, auth_canvas)
+                except Exception:
+                    logging.getLogger("hub").exception(
+                        "run preallocation cleanup deferred to recovery")
+                raise
+            finally:
+                keepalive_stop.set()
+                if keepalive.ident is not None:
+                    keepalive.join(timeout=1.0)
         else:
             status = runner.run(plan, graph, target_node_id, est.placement)
         owner = runner
@@ -456,14 +500,13 @@ def _run_read_access(run_id: str, uid: str | None) -> bool:
 
     Open mode is one trusted user. In auth mode, the creator or any current collaborator on the REAL
     canvas may read status/output. A legacy ad-hoc run remains private to its creator, and a later
-    canvas that reuses the graph id cannot claim it.
+    canvas that reuses the graph id cannot claim it. A compact terminal fence preserves the same policy
+    after bounded RunState detail is pruned.
     """
     if not auth.auth_enabled():
         return True
     if not uid:
         return False
-    if get_deps().run_owner.get(run_id) == uid:  # fast in-process path (before the DB bind lands)
-        return True
     creator, auth_canvas = metadb.run_auth(run_id)
     if creator is not None:
         if creator == uid:
@@ -471,7 +514,19 @@ def _run_read_access(run_id: str, uid: str | None) -> bool:
         return bool(auth_canvas and metadb.canvas_role(auth_canvas, uid) is not None)
     # a legacy run persisted before the creator column existed → best-effort canvas grant
     cid = metadb.run_canvas_id(run_id)
-    return bool(cid and metadb.canvas_role(cid, uid) is not None)
+    if cid:
+        return metadb.canvas_role(cid, uid) is not None
+    retained = metadb.terminal_run_identity(run_id)
+    if retained is not None:
+        creator, auth_canvas, cid = retained
+        if creator is not None:
+            if creator == uid:
+                return True
+            return bool(auth_canvas and metadb.canvas_role(auth_canvas, uid) is not None)
+        return bool(cid and metadb.canvas_role(cid, uid) is not None)
+    # Only the short window before a durable bind lands may trust process-local ownership. A retained
+    # fence, including an identity-cleared fence after canvas deletion, is authoritative over this cache.
+    return get_deps().run_owner.get(run_id) == uid
 
 
 def _run_mutate_access(run_id: str, uid: str | None) -> bool:
@@ -479,8 +534,8 @@ def _run_mutate_access(run_id: str, uid: str | None) -> bool:
 
     A real-canvas run follows the caller's CURRENT canvas role: owner/editor may mutate; viewer may
     only observe. A legacy ad-hoc run has no canvas role, so its creator remains its sole operator.
-    Rows without durable creator metadata fall back to the persisted canvas role, then the in-process
-    owner only when there is no persisted canvas association at all.
+    Rows without durable creator metadata fall back to the persisted canvas role. The in-process owner
+    is trusted only before either durable RunState identity or a terminal fence exists.
     """
     if not auth.auth_enabled():
         return True
@@ -494,6 +549,14 @@ def _run_mutate_access(run_id: str, uid: str | None) -> bool:
     cid = metadb.run_canvas_id(run_id)
     if cid:
         return metadb.canvas_role(cid, uid) in _RUN_MUTATE_ROLES
+    retained = metadb.terminal_run_identity(run_id)
+    if retained is not None:
+        creator, auth_canvas, cid = retained
+        if creator is not None:
+            if auth_canvas:
+                return metadb.canvas_role(auth_canvas, uid) in _RUN_MUTATE_ROLES
+            return creator == uid
+        return bool(cid and metadb.canvas_role(cid, uid) in _RUN_MUTATE_ROLES)
     return get_deps().run_owner.get(run_id) == uid
 
 
@@ -534,6 +597,22 @@ def _runner_for(run_id: str, *, fallback: bool = True):
     return owner if owner is not None else (deps.runner if fallback else None)
 
 
+def _pruned_terminal_status(run_id: str) -> RunStatus | None:
+    """Project the permanent terminal fence when bounded status detail has been pruned."""
+    terminal = metadb.terminal_run_status(run_id)
+    if terminal not in ("done", "failed", "cancelled"):
+        return None
+    return RunStatus(
+        run_id=run_id,
+        status=terminal,
+        progress=1.0 if terminal == "done" else None,
+        error=(
+            "Run failed (code=terminal_details_pruned)"
+            if terminal == "failed" else None
+        ),
+    )
+
+
 def _status_or_lost(run_id: str) -> RunStatus:
     """This run's status, resolved in order: (1) the owning runner's in-memory status (freshest — this
     instance ran it); (2) the shared DB (run_states) — so ANOTHER stateless web instance, or this one
@@ -546,6 +625,9 @@ def _status_or_lost(run_id: str) -> RunStatus:
         persisted = metadb.get_run_state(run_id)
         if persisted is not None:
             return RunStatus(**persisted)
+        terminal = _pruned_terminal_status(run_id)
+        if terminal is not None:
+            return terminal
         return RunStatus(run_id=run_id, status="failed",
                          error="run not found — it was evicted or the kernel restarted")
 
@@ -580,7 +662,14 @@ def run_cancel(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
         if persisted is not None and persisted.get("status") in ("queued", "running"):
             metadb.request_backend_cancel(run_id)
             # A terminal publication racing the request remains authoritative over cancellation.
-            return RunStatus(**(metadb.get_run_state(run_id) or persisted))
+            current = metadb.get_run_state(run_id)
+            if current is not None:
+                return RunStatus(**current)
+            terminal = _pruned_terminal_status(run_id)
+            return terminal if terminal is not None else RunStatus(**persisted)
+    terminal = _pruned_terminal_status(run_id)
+    if terminal is not None:
+        return terminal
     # not owned here (the hub restarted, or another stateless instance accepted the run) — route via the
     # DB-backed kernel backend, which resolves the owning kernel from run_states and cancels it (or
     # returns the last-known persisted status). Mirrors _status_or_lost so cancel never 404s a live run.
@@ -590,4 +679,7 @@ def run_cancel(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
     persisted = metadb.get_run_state(run_id)
     if persisted is not None:
         return RunStatus(**persisted)
+    terminal = _pruned_terminal_status(run_id)
+    if terminal is not None:
+        return terminal
     raise HTTPException(404, f"run '{run_id}' not found")

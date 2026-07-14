@@ -58,18 +58,23 @@ def _object_commit_dir(path: str) -> str:
 
 def allocate_attempt(*, logical_uri: str, kind: str, run_id: str, allocation_key: str,
                      uri_factory, write_lease_seconds: float = 3600,
-                     catalog_key_base: str | None = None) -> dict:
+                     catalog_key_base: str | None = None,
+                     require_live_preallocation: bool = False) -> dict:
     """Control-plane allocation for a namespaced, generation-fenced physical object URI."""
     if not is_object_uri(logical_uri):
         return {"uri": uri_factory("local", 1, uuid.uuid4().hex), "generation": 1}
     from hub import metadb
     logical_uri = metadb.validate_managed_object_uri(logical_uri)
     namespace = metadb.object_storage_namespace()
+    # Namespace ownership is installation-scoped and must precede local attempt ownership. The optional
+    # run gate remains inside the allocation transaction; a clone conflict therefore cannot leave a DB
+    # attempt whose external prefix belongs to another installation.
     ensure_storage_namespace_claim(logical_uri, namespace)
     return metadb.allocate_object_attempt(
         logical_uri=logical_uri, kind=kind, run_id=run_id, allocation_key=allocation_key,
         uri_factory=uri_factory, write_lease_seconds=write_lease_seconds,
         expected_namespace=namespace, catalog_key_base=catalog_key_base,
+        require_live_preallocation=require_live_preallocation,
     )
 
 

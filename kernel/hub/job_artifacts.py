@@ -24,9 +24,10 @@ JOB_SQL_ENVELOPE_MAX_BYTES = 8 * 1024**2
 
 RAY_JOB_CONTRACT_VERSION = 3
 RAY_JOB_CANONICAL_FIELDS = (
-    "contract_version", "run_id", "graph", "target", "sink_targets", "sink_contracts",
-    "materialize_uri", "requires", "code_ref", "cluster_ref", "artifact_prefix", "workspace",
-    "data_dir", "entrypoint", "module", "semantic_env", "semantic_env_sha256",
+    "contract_version", "run_id", "graph", "target", "source_attempts", "sink_targets",
+    "sink_contracts", "materialize_uri", "requires", "code_ref", "cluster_ref",
+    "artifact_prefix", "workspace", "data_dir", "entrypoint", "module", "semantic_env",
+    "semantic_env_sha256",
 )
 _RAY_JOB_BINDING_FIELDS = (
     "backend", "submission_id", "attempt_id", "job_uri", "result_uri", "durable", "envelope_sha256",

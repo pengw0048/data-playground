@@ -430,10 +430,12 @@ optional `PlaceableBackend` — `workers()` / `place(requires)` / `run_unit(grap
 output to a tier URI; a production backend should keep both paths worker-direct. The bundled **`dp_ray`**
 plugin is the working reference: it proves real Ray Data region dispatch and worker-direct Parquet shard
 outputs, while same-host local Parquet may also be read directly. Object-store/non-Parquet inputs and
-whole-graph sinks currently pass through the driver, so use the [documented support boundary](docs/RAY.md)
-rather than treating the validation harness as a production deployment. The plugin keeps its local
-Popen driver for development and optionally adds a restart-reattachable Ray Jobs control-plane lifecycle
-for whole-graph runs, with persisted cancel intent and atomic terminal SQL publication; see
+Popen compatibility sink paths currently pass through the driver. Ray Jobs instead supports one narrow,
+worker-direct, managed Parquet overwrite sink and rejects other sink contracts before submission, so use
+the [documented support boundary](docs/RAY.md) rather than treating the validation harness as a production
+deployment. The plugin keeps its local Popen driver for development and optionally adds a
+restart-reattachable Ray Jobs control-plane lifecycle for whole-graph runs, with persisted cancel intent
+and atomic terminal SQL publication; see
 **[Durable Ray Jobs execution](docs/RAY_JOBS.md)**.
 
 ---

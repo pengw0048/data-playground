@@ -13,6 +13,25 @@ This is a durable lifecycle implementation, not a claim that the whole Ray backe
 deployment is production-ready. The remaining scale, isolation, health, and resilience gates are in
 [`RAY.md`](RAY.md).
 
+## Real-service acceptance gate
+
+The restart contract has a separate, path-gated acceptance workflow so it does not make the Ray data
+differential slower. Run it locally with:
+
+```bash
+scripts/ray-jobs-acceptance.sh
+```
+
+It builds one image for the hub-side Jobs client, Ray head, worker, and remote entrypoint, then starts
+PostgreSQL 16 and a versioned MinIO bucket. The gate proves that a submitting hub can exit while the
+official Ray job is `RUNNING`, a new process reattaches to the same deterministic submission, and the
+terminal run-history/catalog effects occur once. Before that restart, it replaces a managed source's
+catalog generation and proves the recovered job still reads its hash-bound generation, then releases the
+durable source pin at terminal publication. Separate scenarios require an official `STOPPED`
+cancellation acknowledgement and prove that a `SUCCEEDED` job with a missing or corrupt result receipt
+is published as failed without exposing its output. Logs, service state, image identity, and disk/Docker
+diagnostics are retained as workflow artifacts on both success and failure.
+
 ## Required contract
 
 ```bash
@@ -33,24 +52,49 @@ DP_RAY_JOBS_ARTIFACT_PREFIX=s3://data-playground/control/ray-jobs
 
 `DP_RAY_JOBS_MODULE` has the reference-image default shown above, but setting it explicitly makes a
 custom image contract easier to audit. The Jobs address must be HTTP(S) and must not contain userinfo,
-query parameters, or fragments; credentials belong in the Jobs client's supported configuration, not in
-SQL, artifacts, logs, or URLs.
+query parameters, or fragments. The reference client does not expose token/header/cookie, client-certificate,
+or custom-CA configuration. Its endpoint must therefore be protected by a private network or authenticated
+service mesh and use the process's ordinary TLS trust; a Jobs endpoint that requires application-level
+credentials or direct mTLS is not supported yet. Workload credentials authenticate data access only, not
+submit/status/stop control. The job envelope contains the complete graph and arbitrary plugin configuration,
+and `result.dpresult` can retain raw workload exception text and output metadata. Operators must treat the
+SQL copy plus both object artifacts as sensitive control-plane data and use secret references instead of
+embedding credential values in graph configuration.
 
-Jobs mode rejects incomplete image/cluster identity, host-local input or output paths, partitioned file
-sinks, and append file sinks before submission. Replay after authoritative Ray job-metadata loss is safe
-only for overwrite/idempotent sinks. A transactional external sink may provide a stronger contract.
+`DP_RAY_JOBS_CODE_REF` and `DP_RAY_JOBS_CLUSTER_REF` are operator assertions that the implementation
+hash-binds and compares; Data Playground does not independently read a container digest or Ray cluster UUID.
+The deployment system must inject an immutable image digest and a stable cluster identity, then verify that
+attestation outside this plugin. See the remaining runtime-image gate in [`RAY.md`](RAY.md#what-remains-before-production-ownership).
+
+The production Jobs sink contract is deliberately narrow: it supports only the built-in file adapter
+writing non-partitioned Parquet in overwrite mode, backed by a core-managed immutable object attempt.
+CSV, JSON, custom-adapter, and adapter-compatibility sinks remain available to the local/Popen Ray path;
+an explicit Jobs placement rejects them before allocating or submitting a remote job. Jobs mode also
+rejects incomplete image/cluster identity and host-local input or output paths before submission. A
+future transactional external sink can provide a stronger idempotency contract, but that extension is
+not implemented by the reference Jobs backend today.
 
 ## Execution envelope and TOCTOU boundary
 
 The hub resolves sinks and schema references, then creates an exact-field JSON envelope containing the
-graph, target, target-cone resources, code/module/entrypoint identity, remote paths, and a frozen non-secret
-semantic environment. Unknown or missing fields are corruption. The canonical contract produces an
-attempt ID; the complete envelope produces a second SHA-256 binding.
+complete graph, target, target-cone resources, code/module/entrypoint identity, remote paths, and a frozen
+allowlisted semantic environment. Unknown or missing fields are corruption. The canonical contract
+produces an attempt ID; the complete envelope produces a second SHA-256 binding. The allowlisted
+environment excludes known secrets, but the hub cannot prove that arbitrary plugin configuration is
+secret-free; artifact and metadata-store access controls remain mandatory.
 
 Durable Jobs currently supports contract version 3 only. That version freezes each sink's writer mode,
 logical URI, and physical attempt URI before submission. Earlier experimental versions were never
 released and are intentionally not replayed: an unsupported version is quarantined and stopped rather
 than submitted under semantics that cannot satisfy the current ownership contract.
+
+A release must bump the contract version for any incompatible envelope or result change. The current
+implementation has no mixed-version decoder, so that release requires draining active Jobs runs before
+upgrading the hubs and Ray image. Rolling hub replacement is supported only when no metadata migration is
+required, every process uses the same exact Alembic head, every replacement keeps the v3 reader, and the
+image asserted by each active run's `code_ref` remains available. For any schema or contract change,
+stop new submissions, drain active Jobs, stop all metadata writers, run the one-shot migration, and then
+upgrade the hubs and Ray image.
 
 The Ray entrypoint receives four independent arguments: job URI, expected attempt ID, expected submission
 ID, and expected envelope hash. `_driver.py` rereads the object and verifies the exact field set, both
@@ -87,49 +131,88 @@ API keys are never sent to the driver.
 
 1. The hub first commits `run_id`, authorized `created_by`, and `auth_canvas_id`. Only then may it allocate
    a write-once job envelope. A future workload-identity provider observes that principal in the hub-side
-   launch context; raw principal/canvas identity is not copied into Ray artifacts or submission metadata.
+   launch context. The authorization principal and `auth_canvas_id` are not copied into Ray artifacts or
+   submission metadata; the graph's own ID remains part of the complete graph envelope.
 2. One SQL transaction binds `run_id` to backend, cluster, submission, attempt, object URIs, code ref,
    the non-secret Jobs control address, and a private canonical copy of the hash-bound job envelope while
    updating the prebound queued `run_states` row. The JSON artifact is capped at 64 MiB; its metadata-row
-   copy has a separate 8 MiB ceiling and contains neither raw owner/auth identity nor data credentials.
-   Oversized jobs fail before the binding transaction. Only after that commit does the hub materialize
+   copy has a separate 8 MiB ceiling. System-generated identity fields and the semantic environment omit
+   owner/auth data and known credential variables, but arbitrary graph/plugin configuration is preserved
+   verbatim and may itself be sensitive. Oversized jobs fail before the binding transaction. Only after
+   that commit does the hub materialize
    `job.dpjob`; a replacement supervisor recreates the exact bytes if the first hub crashes between phases.
 3. Status plus a successful Jobs listing distinguish an absent job from an ambiguous API failure. Only
    authoritative absence opens submission/replay. SQL then linearizes exactly one request with a
    DB-clock lease and a CAS that requires `cancel_requested=false`; an expired-owner reclaim moves
    directly to the new owner in that same CAS, and recovery must query Ray again before attempting it.
    A timeout/disconnect never releases the claim after one immediate missing check because the HTTP
-   request may still be accepted later.
+   request may still be accepted later. Official Jobs API requests carry a finite connect/read timeout,
+   and lease renewal stops after a bounded continuous ownership window; a wedged caller therefore cannot
+   exclude a replacement supervisor forever.
 4. A result cannot beat an explicit `PENDING`/`RUNNING` Jobs status. Readable result corruption while the
    job is live triggers stop/quarantine, and terminal failure is published only after Ray reports terminal
    or successful listing proves the job absent. A valid hash-bound result is terminal evidence when Ray's
-   job metadata is authoritatively gone.
+   job metadata is authoritatively gone and no submit request remains unsettled. If an expired `submitting`
+   lease could still deliver a delayed request, SQL first records `result_fencing`; the hub races an inert
+   fence under the same deterministic ID, stops whichever request Ray accepted, records
+   `result_submitted` or `result_stop_fenced`, and re-reads the result only after that writer is terminal.
+   A terminated fixed fence settles to the publication-eligible `result_fenced` state so its provenance
+   survives a crash before publication; it is never reinterpreted as workload metadata. This internal
+   reconciliation never fabricates user cancellation intent and survives process restart.
 5. On `SUCCEEDED`, the hub reads and verifies the exact result envelope. Missing results receive a bounded
    consistency grace period; transport/auth failures remain non-terminal and retry. A failed/cancelled
    envelope may retain a hash-bound subset of committed sink URIs as private cleanup evidence, but it must
    not name a primary output and those URIs never enter public status or catalog publication.
-6. Supervisors compete for a renewable SQL publication lease. Catalog projection is a required,
-   idempotent effect and is retried on failure. Every output must return a durable receipt only after its
-   catalog reference is readable; a method return without that receipt cannot publish terminal success.
-   One database transaction then CAS-publishes the backend result, public terminal `RunState`, and
-   run-history row. Telemetry is best-effort after that barrier.
+6. Supervisors compete for a renewable SQL publication lease. Before any catalog mutation, the winner
+   commits exact object inventory, probes the output schema, and freezes one canonical terminal plan in
+   `publication_doc`. The same transaction moves the job from `pending` to `effects_started`; successful
+   plans pin their exact sink generations, while failed/cancelled plans terminalize every bound sink and
+   release its writer leases. Pending publication and submit/fence claims are mutually exclusive: a remote
+   observation atomically invalidates a pre-effects terminal candidate, while `effects_started` prevents a
+   stale observer from submitting or stopping work. Raw remote failure text is never copied into this
+   recovery plan. Publication renewal uses the same bounded continuous ownership window, so an owner
+   blocked in provider preflight eventually yields its lease; a late return remains fenced by the owner
+   CAS, while an `effects_started` winner replays only the frozen idempotent SQL plan.
+7. `effects_started` is a write-ahead catalog barrier. A replacement supervisor replays only the prepared
+   SQL plan: it does not reread Ray state, job/result artifacts, manifests, or output schemas. Catalog
+   pointer, lineage, attempt state, and an exact event receipt commit together; run-level usage has a
+   separate stable-identity receipt. A later overwrite or unregister waits for the temporary publication
+   reference. If it committed before this plan reached the barrier, the stale publication fails with an
+   explicit conflict instead of reporting `done` without a readable catalog projection.
+8. After every required receipt exists, one database transaction CAS-publishes the backend result, public
+   terminal `RunState`, and run-history row. It transfers output ownership to the retained run state before
+   releasing temporary publication and source references; if bounded detail retention prunes that state,
+   the exact attempt becomes eligible for the normal supersession/GC policy while the compact run-ID fence
+   still prevents resurrection. Telemetry is best-effort only after that terminal barrier.
 
-External catalog providers must implement the runtime-checkable `DurableCatalogPublisher` capability:
-`register_output_idempotent(idempotency_key, ...)` and
-`record_usage_idempotent(idempotency_key, parents)` with durable idempotency. Publication is at-least-once
-at that provider boundary. `register_output_idempotent` must not return until the output reference is
-durably readable and must return a matching `CatalogPublicationReceipt`; Jobs validates its key and URI.
-Multiple independent sinks are not one cross-dataset transaction. Output keys remain per sink, while one
-separate run-level usage event aggregates every distinct parent across all sinks. Thus two real runs
-increment popularity twice, a two-sink run increments a shared parent once, and a crash/retry does not
-increment it again. Permanent lineage-edge existence is not a run-usage event.
+Jobs v3 managed outputs currently require the built-in DB-backed catalog. A graph with a write sink rejects
+an external catalog before object allocation or Ray submission, even if that provider implements the older
+`DurableCatalogPublisher` capability. That interface can acknowledge an at-least-once write, but it cannot freeze a pre-probed plan,
+participate in the core object-attempt barrier, or replay exact output/lineage/usage receipts without
+rereading mutable artifacts. A future external integration needs an explicit prepared-plan protocol with
+those semantics; accepting the older interface here would fail only after remote execution had already
+completed.
+
+Output publication keys are per sink, while one separate run-level usage event aggregates every distinct
+parent for the run. Parent aliases are resolved to stable logical or exact-URI identities before the
+write-ahead barrier: a generation replacement receives the usage on its logical dataset, while an
+unregister becomes an idempotent no-op and never resurrects the dataset. Two real runs therefore increment
+popularity twice, while a crash/retry does not increment it again; permanent lineage-edge existence is not
+a run-usage event. The current Jobs v3
+backend admits at most one write sink and rejects a multi-sink graph before allocation. The catalog
+publisher primitive can represent multiple outputs, but it does not provide a cross-dataset transaction,
+so the reference Jobs backend will not expose that shape until atomic batch publication exists.
 
 Terminal `RunState` and backend-detail rows share the normal bounded retention policy. Pruning happens in
 the same terminal publication transaction and leaves `run_records` history intact. A separate compact,
-permanent terminal run-ID fence is not pruned; it prevents stale supervisors or duplicate binds from
-resurrecting a completed run even when no history row exists or bounded history has aged out. A stale
-supervisor that loses its publication claim or finds the backend row already pruned consults this fence,
-converges its local status, and stops supervising instead of restarting forever.
+permanent terminal run-ID fence is not pruned. It retains terminal status plus the creator, authorized
+canvas, and legacy operational canvas identifiers needed to apply the same current authorization policy
+after detailed state is gone; these fields stay in SQL and are never copied to Ray artifacts. Deleting a
+canvas clears those authorization identifiers while preserving the opaque anti-resurrection fence, so a
+new canvas using the same ID cannot inherit an old run. The fence prevents stale supervisors or duplicate
+binds from resurrecting a completed run even when no history row exists or bounded history has aged out.
+A stale supervisor that loses its publication claim or finds the backend row already pruned consults this
+fence, converges its local status, and stops supervising instead of restarting forever.
 
 ## Recovery and cancellation
 
@@ -159,10 +242,15 @@ it does not prove an earlier HTTP request can no longer arrive. For a crashed ow
 the hub therefore submits a fixed, inert, stoppable fence job under that exact same ID after lease expiry.
 Ray accepts either the delayed workload or the fence, never both; the winner is then stopped and observed.
 The hub validates the winner's Ray Job metadata before atomically recording whether the inert fence or
-the bound workload owns that ID; a lost submit response cannot turn an instantly successful fence into a
-missing-result workload failure. A concurrent real `SUCCEEDED`/`FAILED` is reconciled normally. If metadata disappears for a previously
+the bound workload owns that ID. A live workload enters `stopping`; an accepted inert fence enters
+`fence_stopping`. Both states exclude terminal publication until `stop_job` is followed by terminal status
+or authoritative absence, at which point SQL settles them to `submitted` or `stop_fenced`. A lost submit
+response therefore cannot turn an instantly successful fence into a missing-result workload failure, and
+a stale publisher cannot cross the effects barrier between winner observation and remote stop. A
+concurrent real `SUCCEEDED`/`FAILED` is reconciled normally. If metadata disappears for a previously
 accepted ID, cancellation still verifies the hash-bound terminal result; trusted completion wins over a
-later cancel request, while a never-linearized queued attempt can cancel directly from authoritative absence.
+later cancel request, while a never-linearized queued attempt can cancel directly from authoritative
+absence.
 
 Cancellation cannot undo a sink committed before stop. `cancelled` means execution was authoritatively
 stopped, not that no physical side effect occurred.
@@ -174,6 +262,8 @@ stopped, not that no physical side effect occurred.
 | `DP_RAY_JOBS_RESULT_TIMEOUT_S` | `30` | Missing-result grace period after `SUCCEEDED` |
 | `DP_RAY_JOBS_SUBMISSION_LEASE_S` | `30` | DB-clock lease around an already-linearized Jobs submit |
 | `DP_RAY_JOBS_PUBLICATION_LEASE_S` | `60` | Renewable single-publisher lease |
+| `DP_RAY_JOBS_REQUEST_TIMEOUT_S` | `30` | Connect/read timeout for every official Jobs API request |
+| `DP_RAY_JOBS_MAX_LEASE_HOLD_S` | `300` | Maximum continuous renewal window for one submit/publication owner |
 
 ## Logs and operator access
 
@@ -190,10 +280,19 @@ authentication boundary. Do not expose port 8265 directly to end users.
 - Object-store reads and whole-graph file sinks remain driver-funneled in several paths.
 - Live capacity/health discovery, admission backpressure, scoped per-attempt identity, active-job fault
   injection, HA/upgrade runbooks, and production observability remain open readiness gates.
+- Operators must configure finite metadata-database connection and statement timeouts. The bounded owner
+  window prevents application keepalives from renewing forever, but it cannot interrupt a database driver
+  call that the deployment itself permits to block indefinitely.
+- `DP_RAY_JOBS_REQUEST_TIMEOUT_S` covers only Jobs API HTTP. Artifact/object-store calls currently use
+  provider defaults, and whole-graph Jobs runs have no automatic execution deadline; provider deadlines,
+  admission quotas, and operator cancellation for runaway work remain production readiness gates.
 - Every hub that loads the durable backend currently supervises every active Jobs row. At larger hub ×
   active-job counts this amplifies Jobs API/object-store polling; sharded ownership/backoff is remaining
   control-plane operations work.
-- Job/result artifacts are retained until operator lifecycle rules remove them. No foreground recursive
-  cleanup scans a shared bucket.
+- Job/result artifacts, including raw negative result details, are retained until operator lifecycle rules
+  remove them. No foreground recursive cleanup scans a shared bucket.
+- Prepared Jobs publication writes catalog metadata directly in SQL and does not invoke the optional
+  semantic embedder. The output is immediately available to catalog/lexical reads, but semantic search
+  picks it up only when the catalog's background reindex runs (for example after embedder setup/restart).
 - Dynamic `working_dir` and per-run pip upload are intentionally unsupported; code is image-baked and
-  identified by `DP_RAY_JOBS_CODE_REF`.
+  bound to the operator-supplied `DP_RAY_JOBS_CODE_REF` assertion.

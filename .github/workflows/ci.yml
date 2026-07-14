@@ -30,7 +30,7 @@ jobs:
         run: cd kernel && uv run pytest -q -o faulthandler_timeout=60
 
   postgres-migration:
-    name: migration contract (PostgreSQL 16)
+    name: migration and lifecycle contracts (PostgreSQL 16)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     services:
@@ -58,6 +58,13 @@ jobs:
         run: cd kernel && uv sync --extra dev --extra postgres
       - name: Verify the release migration contract
         run: cd kernel && uv run pytest -q hub/tests/test_postgres_migration_smoke.py
+      - name: Verify durable lifecycle concurrency contracts
+        run: >-
+          cd kernel && uv run pytest -q -o faulthandler_timeout=60
+          hub/tests/test_backend_recovery_fences.py
+          hub/tests/test_backend_sink_cleanup.py
+          hub/tests/test_backend_source_pins.py
+          hub/tests/test_run_identity.py
 
   e2e:
     name: e2e (Playwright — real UI on the real kernel)

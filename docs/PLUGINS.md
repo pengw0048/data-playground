@@ -117,6 +117,13 @@ parents. The output method must return a matching `CatalogPublicationReceipt` on
 durably read the registered reference; returning `None` or an optimistic in-memory object blocks terminal
 publication. Providers that do not need popularity can make the latter a durable idempotent no-op.
 
+That capability alone does **not** opt an external catalog into managed-output publication for the bundled
+Ray Jobs v3 backend. Jobs v3 freezes a pre-probed catalog plan in SQL and coordinates it with core
+object-attempt references, lineage, usage, and terminal publication. A graph with a write sink therefore
+requires the built-in DB-backed catalog and fails before allocation or remote submission when another
+catalog is installed. Supporting an external provider here
+requires a future prepared-plan/replay protocol, not only the two legacy idempotent methods above.
+
 Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter; runners are picked
 by `pick_runner` (respects the Settings → Execution choice, else the first that `can_run`). **The
 built-ins go through these same seams — the DuckDB/Lance adapters, the InMemoryCatalog, and the local
