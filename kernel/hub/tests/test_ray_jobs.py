@@ -22,6 +22,8 @@ from hub.compiler import compile_plan
 from hub.deps import Deps
 from hub.models import CatalogPublicationReceipt, Graph, GraphNode, ResourceSpec, RunStatus
 
+_RAY_JOBS_BACKEND = "ray-jobs"
+
 
 def _load_dp_ray():
     source = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_ray" / "__init__.py"
@@ -299,7 +301,9 @@ def jobs_config(monkeypatch, tmp_path):
     workspace, data = tmp_path / "workspace", tmp_path / "data"
     workspace.mkdir()
     data.mkdir()
-    return workspace, data
+    _scrub_leaked_ray_jobs()
+    yield workspace, data
+    _scrub_leaked_ray_jobs()
 
 
 def _graph(name: str = "jobs_out", source: str = "s3://shared/input.parquet") -> Graph:
@@ -434,9 +438,77 @@ def _workload_metadata(status) -> dict[str, str]:
 
 def _retire_inert_test_run(status) -> None:
     """Keep disabled-supervisor fixtures from leaking active SQL rows into later recovery tests."""
+    run_id = status.run_id if hasattr(status, "run_id") else status["run_id"]
     doc = status.model_dump() if hasattr(status, "model_dump") else dict(status)
-    doc.update(status="failed", error="test fixture retired without a live supervisor")
-    metadb.save_run_state(status.run_id, doc)
+    doc.update(run_id=run_id, status="failed", error="test fixture retired without a live supervisor")
+    metadb.save_run_state(run_id, doc)
+
+
+def _scrub_leaked_ray_jobs() -> None:
+    """Terminalize reattachable Ray Jobs rows so recover=True cannot pick up earlier tests."""
+    for ref, doc in list(metadb.active_backend_jobs(_RAY_JOBS_BACKEND)):
+        run_id = str(ref.get("run_id") or doc.get("run_id") or "")
+        if not run_id:
+            continue
+        payload = dict(doc)
+        payload.setdefault("run_id", run_id)
+        payload.setdefault("placement", "distributed")
+        payload.setdefault("per_node", [])
+        _retire_inert_test_run(payload)
+
+
+def _wait_publication_state(run_id: str, state: str, *, timeout: float = 10.0,
+                            runner=None) -> dict:
+    deadline = time.monotonic() + timeout
+    binding = metadb.backend_job(run_id)
+    while binding.get("publication_state") != state and time.monotonic() < deadline:
+        if runner is not None:
+            runner.status(run_id)
+        time.sleep(0.01)
+        binding = metadb.backend_job(run_id)
+    assert binding.get("publication_state") == state
+    return binding
+
+
+def _wait_run_state_updated_at_stable(run_id: str, *, stable_s: float = 0.12,
+                                      timeout: float = 2.0) -> datetime.datetime:
+    """Return an updated_at that stayed unchanged for stable_s (same-state poll quiescence)."""
+    deadline = time.monotonic() + timeout
+    last_at: datetime.datetime | None = None
+    stable_since: float | None = None
+    while time.monotonic() < deadline:
+        with metadb.session() as session:
+            current = session.get(metadb.RunState, run_id).updated_at
+        if last_at is not None and current == last_at:
+            if stable_since is None:
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= stable_s:
+                return current
+        else:
+            stable_since = None
+        last_at = current
+        time.sleep(0.01)
+    raise AssertionError(f"RunState.updated_at for {run_id} did not stabilize within {timeout}s")
+
+
+def _wait_control_calls_stable(client: FakeJobsClient, expected: tuple[int, int, int],
+                               *, timeout: float = 2.0, stable_s: float = 0.05) -> None:
+    deadline = time.monotonic() + timeout
+    stable_since: float | None = None
+    while time.monotonic() < deadline:
+        current = (
+            len(client.status_calls), len(client.submit_calls), len(client.stop_calls)
+        )
+        if current == expected:
+            if stable_since is None:
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= stable_s:
+                return
+        else:
+            stable_since = None
+        time.sleep(0.01)
+    current = (len(client.status_calls), len(client.submit_calls), len(client.stop_calls))
+    raise AssertionError(f"control calls did not stabilize at {expected}: last={current}")
 
 
 def _publish_test_backend_done(status) -> None:
@@ -2310,8 +2382,7 @@ def test_same_state_control_recovery_clears_durable_error_without_write_churn(jo
     while metadb.get_run_state(status.run_id)["error"] is not None and time.monotonic() < deadline:
         time.sleep(0.01)
     assert metadb.get_run_state(status.run_id)["error"] is None
-    with metadb.session() as session:
-        cleared_at = session.get(metadb.RunState, status.run_id).updated_at
+    cleared_at = _wait_run_state_updated_at_stable(status.run_id)
     time.sleep(0.08)  # several 10ms same-state polls must not rewrite the full RunState document
     with metadb.session() as session:
         assert session.get(metadb.RunState, status.run_id).updated_at == cleared_at
@@ -2506,12 +2577,9 @@ def test_staged_effects_recover_from_sql_after_artifacts_and_catalog_change(
 
     monkeypatch.setattr(metadb, "catalog_apply_managed_publication", pause_effects)
     _complete(store, client, status)
-    deadline = time.monotonic() + 5
-    binding = metadb.backend_job(status.run_id)
-    while binding["publication_state"] != "effects_started" and time.monotonic() < deadline:
-        time.sleep(0.01)
-        binding = metadb.backend_job(status.run_id)
-    assert binding["publication_state"] == "effects_started"
+    _wait_publication_state(
+        status.run_id, "effects_started", runner=original_runner,
+    )
 
     with store.lock:
         store.values[ref.job_uri] = {"corrupt": True}
@@ -2522,8 +2590,7 @@ def test_staged_effects_recover_from_sql_after_artifacts_and_catalog_change(
     control_calls = (len(client.status_calls), len(client.submit_calls), len(client.stop_calls))
     recovered = module.RayRunner(
         deps, jobs_client_factory=client, artifact_store=store, recover=True)
-    time.sleep(0.05)
-    assert (len(client.status_calls), len(client.submit_calls), len(client.stop_calls)) == control_calls
+    _wait_control_calls_stable(client, control_calls)
 
     release_effects.set()
     final = _wait(recovered, status.run_id)
