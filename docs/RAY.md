@@ -1,75 +1,96 @@
 # Ray backend: support and production readiness
 
-`dp_ray` is a working distributed execution backend for Data Playground. Its supported data path is
-designed to fail closed: large Parquet inputs and simple Parquet overwrite outputs stay off the driver,
-while every remaining compatibility collect has an explicit byte ceiling. The multi-node differential in
-[`ray-validation.yml`](../.github/workflows/ray-validation.yml) verifies that contract on Ray and MinIO.
+`dp_ray` is a working distributed execution backend for Data Playground. Its supported data path fails
+closed: large Parquet inputs and simple Parquet overwrite outputs stay off the driver, and every
+remaining compatibility collect has an explicit byte ceiling. The multi-node differential in
+[`ray-validation.yml`](../.github/workflows/ray-validation.yml) verifies that contract on Ray and
+MinIO.
 
-The Compose and KubeRay files in this repository are validation harnesses, not deployment manifests. A
-green differential does not certify an operator's IAM, capacity, KubeRay configuration, or incident
+The Compose and KubeRay files in this repository are validation harnesses, not deployment manifests.
+A green differential does not certify an operator's IAM, capacity, KubeRay configuration, or incident
 procedures. The final section separates backend guarantees from deployment responsibilities.
 
 ## Current execution contract
 
 Install the Ray extra, load [`examples/plugins/dp_ray`](../examples/plugins/dp_ray/), and select
-`ray-data` in Settings or with `DP_EXECUTION=ray-data`. A placed region is claimed only when its resolved
-requirements contain `labels.engine=ray`. Set `DP_RAY_REMOTE=1` when Ray workers do not share the
-kernel's filesystem; remote placement then requires a configured object-storage tier.
+`ray-data` in Settings or with `DP_EXECUTION=ray-data`. A placed region is claimed only when its
+resolved requirements contain `labels.engine=ray`. Set `DP_RAY_REMOTE=1` when Ray workers do not share
+the kernel's filesystem; remote placement then requires a configured object-storage tier.
 
 The hub cannot inspect cluster resources without connecting a driver, so operators declare admission
-capacity with `DP_RAY_NUM_CPUS`, `DP_RAY_MEM`, `DP_RAY_GPUS`, `DP_RAY_GPU_TYPE`, and optional labels such
-as `DP_RAY_LABELS=pool=a100,zone=use1`. Each non-engine label value must also exist as a Ray custom
-resource on the matching node (for example `--resources='{"a100": 1}'`). An explicit Ray placement that
-does not match this advertised capacity fails before dispatch instead of becoming an unschedulable task.
+capacity with `DP_RAY_NUM_CPUS`, `DP_RAY_MEM`, `DP_RAY_GPUS`, `DP_RAY_GPU_TYPE`, and optional labels
+such as `DP_RAY_LABELS=pool=a100,zone=use1`. Each non-engine label value must also exist as a Ray
+custom resource on the matching node (for example `--resources='{"a100": 1}'`). An explicit Ray
+placement that does not match this advertised capacity fails before dispatch instead of becoming an
+unschedulable task.
 
-The backend conservatively falls back to the local DuckDB runner when it cannot prove that a graph is
-safe to distribute.
+The backend falls back to the local DuckDB runner when it cannot prove that a graph is safe to
+distribute.
 
-| operation | distributed today | important boundary |
-|---|---|---|
-| `map`, `filter`, `flat_map`, `map_batches` | yes | uses the same compiled transform operator as the local engine |
-| grouped `aggregate` | yes, for bare-column group keys | global, expression-key, and order-sensitive aggregates fall back |
-| `window` | yes, for a bare-column partition key | order-sensitive forms without sufficient ordering fall back |
-| full-row `dedup` | yes | keyed dedup and schemas containing floating-point values fall back |
-| `join` | broadcast `inner`, `left`, and `cross` | the materialized right side must fit the configured driver fallback limit |
-| `sort` | plain-column keys | the final ordered result is coalesced to one worker; Ray 2.56 cannot resource-pin its range shuffle, so GPU/custom-resource sorts fail before dispatch |
-| SQL, sections, metrics/charts, opaque plugin nodes | no | local fallback |
+Supported operations today:
+
+- `map`, `filter`, `flat_map`, `map_batches` — distributed; uses the same compiled transform operator
+  as the local engine
+- grouped `aggregate` — yes for bare-column group keys; global, expression-key, and order-sensitive
+  aggregates fall back
+- `window` — yes for a bare-column partition key; order-sensitive forms without sufficient ordering
+  fall back
+- full-row `dedup` — yes; keyed dedup and schemas with floating-point values fall back
+- `join` — broadcast `inner`, `left`, and `cross`; the materialized right side must fit the configured
+  driver fallback limit
+- `sort` — plain-column keys; the final ordered result is coalesced to one worker. Ray 2.56 cannot
+  resource-pin its range shuffle, so GPU/custom-resource sorts fail before dispatch
+- SQL, sections, metrics/charts, opaque plugin nodes — not distributed; local fallback
 
 ### Data movement
 
-| path | current behavior |
-|---|---|
-| local/shared Parquet file or parts directory | same-host Ray workers read it directly; a remote cluster uses only the bounded driver stream or falls back before dispatch |
-| object-store Parquet file or shard prefix | only the exact built-in `DuckDBAdapter` may use `ray.data.read_parquet`; it receives a credentials-aware filesystem, exact fragment list, full adapter-oracle schema, selected columns, and typed dataset-rooted Hive partitioning |
-| built-in CSV/JSON/local IPC or a Parquet layout whose native proof fails | compatibility scan only when stored and decoded sizes are known below the driver fallback limit |
-| object IPC, Lance, Iceberg, Hugging Face, or a plugin adapter | no implicit driver scan; local fallback (or fail-loud for an explicit Ray pin) until the adapter exposes a dedicated bounded/distributed capability |
-| placed-region output | workers write an immutable directory/prefix of Parquet shards; `_DP_SUCCESS.json` is written last |
-| whole-graph unpartitioned Parquet overwrite | workers write an immutable attempt prefix; the returned/catalog URI is that completed prefix, not the stable logical filename |
-| append, partitioned overwrite, CSV, JSON, Arrow, Lance, or plugin sink | normal adapter/sink semantics through the bounded compatibility path |
+Local or shared Parquet (file or parts directory): same-host Ray workers read it directly. A remote
+cluster uses only the bounded driver stream or falls back before dispatch.
+
+Object-store Parquet (file or shard prefix): only the exact built-in `DuckDBAdapter` may use
+`ray.data.read_parquet`. It receives a credentials-aware filesystem, exact fragment list, full
+adapter-oracle schema, selected columns, and typed dataset-rooted Hive partitioning.
+
+Built-in CSV/JSON/local IPC, or a Parquet layout whose native proof fails: compatibility scan only
+when stored and decoded sizes are known below the driver fallback limit.
+
+Object IPC, Lance, Iceberg, Hugging Face, or a plugin adapter: no implicit driver scan. Local fallback
+(or fail-loud for an explicit Ray pin) until the adapter exposes a dedicated bounded/distributed
+capability.
+
+Placed-region output: workers write an immutable directory/prefix of Parquet shards;
+`_DP_SUCCESS.json` is written last.
+
+Whole-graph unpartitioned Parquet overwrite: workers write an immutable attempt prefix; the
+returned/catalog URI is that completed prefix, not the stable logical filename.
+
+Append, partitioned overwrite, CSV, JSON, Arrow, Lance, or plugin sink: normal adapter/sink semantics
+through the bounded compatibility path.
 
 `DP_RAY_DRIVER_FALLBACK_MAX_BYTES` is an integer byte count with a default of `67108864` (64 MiB).
 Built-in compatibility sources are checked against stored physical bytes before `adapter.scan`, then
 decoded in small record batches whose cumulative Arrow bytes are checked and transferred to Ray one
-batch at a time; the driver never concatenates the source into one Arrow table. Ray Dataset sinks
-and broadcast sides are materialized (and may spill) and checked with `Dataset.size_bytes()` before
+batch at a time; the driver never concatenates the source into one Arrow table. Ray Dataset sinks and
+broadcast sides are materialized (and may spill) and checked with `Dataset.size_bytes()` before
 block/reference collection. An unknown size or a value above the limit fails with guidance; it never
-means "collect anyway."
+means “collect anyway.”
 
 Native Parquet discovery processes at most 10,000 files and reads each physical footer before dispatch.
-`pyarrow.unify_schemas(..., promote_options="permissive")` preserves compatible drift such as `int32` to
-`int64`; incompatible drift takes the bounded built-in path or falls back. The exact `DuckDBAdapter`
-metadata schema is the semantic oracle for physical and partition column order/types. Ray 2.56 native
-Hive is limited to proven `int64` and string partition fields with consistent, unique keys. The Hive
-directory-key order must also match the exact adapter metadata order; otherwise Ray 2.56 reorders the
-materialized columns and the source takes the bounded/local path. The Hive default-partition sentinel,
-DATE/other partition types, duplicate keys, and inconsistent layouts also take the bounded/local path. A
-flat dataset below an ancestor such as `tenant=acme` remains native without leaking that ancestor. A
-genuinely Hive-partitioned dataset below a Hive-looking root/ancestor falls back because DuckDB parses the
-ancestor while exact-root Ray intentionally does not.
+`pyarrow.unify_schemas(..., promote_options="permissive")` preserves compatible drift such as `int32`
+to `int64`; incompatible drift takes the bounded built-in path or falls back. The exact
+`DuckDBAdapter` metadata schema is the semantic oracle for physical and partition column order/types.
+Ray 2.56 native Hive is limited to proven `int64` and string partition fields with consistent, unique
+keys. The Hive directory-key order must also match the exact adapter metadata order; otherwise Ray
+2.56 reorders the materialized columns and the source takes the bounded/local path. The Hive
+default-partition sentinel, DATE/other partition types, duplicate keys, and inconsistent layouts also
+take the bounded/local path. A flat dataset below an ancestor such as `tenant=acme` remains native
+without leaking that ancestor. A genuinely Hive-partitioned dataset below a Hive-looking root/ancestor
+falls back because DuckDB parses the ancestor while exact-root Ray intentionally does not.
+
 Compact prefixes before the 10,000-file ceiling. The ceiling bounds retained metadata and footer work,
-but PyArrow's object-store listing API may materialize the provider's prefix response before the count is
-known; data bytes remain worker-direct, while very large metadata listings still require compaction or a
-future catalog-backed fragment manifest.
+but PyArrow's object-store listing API may materialize the provider's prefix response before the count
+is known; data bytes remain worker-direct, while very large metadata listings still require compaction
+or a future catalog-backed fragment manifest.
 
 Increasing this limit trades compatibility for driver-memory risk. Prefer Parquet on shared/object
 storage or the local backend instead. A remote Ray cluster must use an object-store destination for
@@ -77,40 +98,42 @@ worker-direct Parquet output; a local destination makes the graph fall back befo
 
 ### Managed object publication and deletion
 
-Each Ray run currently supports at most one write sink, regardless of sink type. A graph with two or more
-write sinks fails before any attempt is allocated or writer is dispatched; atomic batch publication is
-required before that limit can be lifted. Managed object writes require the core catalog authority that can
-atomically swap the logical pointer, ownership reference, and attempt state. Unmanaged writes require a
-catalog with durable registration and exact read-back attestation.
+Each Ray run currently supports at most one write sink, regardless of sink type. A graph with two or
+more write sinks fails before any attempt is allocated or writer is dispatched; atomic batch
+publication is required before that limit can be lifted. Managed object writes require the core catalog
+authority that can atomically swap the logical pointer, ownership reference, and attempt state.
+Unmanaged writes require a catalog with durable registration and exact read-back attestation.
 
-Core provides a built-in lifecycle provider for S3 and compatible endpoints that implement its complete API
-contract. [R2's S3 compatibility API](https://developers.cloudflare.com/r2/api/s3/api/) currently omits the
-bucket-versioning/version-list operations this provider uses, so `r2://`, GCS, or another scheme must register a
-`ManagedObjectProvider` as documented in [PLUGINS.md](PLUGINS.md); a plain PyArrow filesystem is read-capable
-but intentionally fails managed writes because it cannot prove hidden versions, delete markers, incomplete
-multipart uploads, or conditional namespace ownership. The S3 identity needs, in addition to ordinary
-read/write permissions, permission to read bucket versioning, list object versions and multipart uploads,
-get/conditionally put the `_dp_control/namespaces/<namespace>.json` marker, delete exact object versions and
-delete markers, and abort multipart uploads. In AWS IAM terms this includes `s3:GetBucketVersioning`,
+Core provides a built-in lifecycle provider for S3 and compatible endpoints that implement its complete
+API contract. [R2's S3 compatibility API](https://developers.cloudflare.com/r2/api/s3/api/) currently
+omits the bucket-versioning/version-list operations this provider uses, so `r2://`, GCS, or another
+scheme must register a `ManagedObjectProvider` as documented in [PLUGINS.md](PLUGINS.md). A plain
+PyArrow filesystem is read-capable but intentionally fails managed writes because it cannot prove
+hidden versions, delete markers, incomplete multipart uploads, or conditional namespace ownership.
+
+The S3 identity needs, in addition to ordinary read/write permissions, permission to read bucket
+versioning, list object versions and multipart uploads, get/conditionally put the
+`_dp_control/namespaces/<namespace>.json` marker, delete exact object versions and delete markers, and
+abort multipart uploads. In AWS IAM terms this includes `s3:GetBucketVersioning`,
 `s3:ListBucketVersions`, `s3:ListBucketMultipartUploads`, `s3:GetObject`, `s3:PutObject`,
 `s3:DeleteObject`, `s3:DeleteObjectVersion`, and `s3:AbortMultipartUpload`; the endpoint must preserve
 `If-Match` and `If-None-Match` semantics on the marker write.
 
-The metadata database owns a stable storage namespace. Before managed allocation/commit validation or GC,
-core verifies that namespace against the provider-side conditional marker. An offline metadata clone must
-call `isolate_cloned_object_storage(expected, replacement)` before provider access. This destructive clone
-isolation rotates both owner and namespace, quarantines inherited attempts, removes inherited refs/cache/
-catalog visibility, and clears copied marker claims; it does not touch the original installation's marker.
-The isolated clone cannot read or delete the original namespace. An audited disaster-recovery takeover of an
-old namespace is a separate capability and is not implemented; changing `DP_STORAGE_NAMESPACE` alone is
-rejected.
+The metadata database owns a stable storage namespace. Before managed allocation/commit validation or
+GC, core verifies that namespace against the provider-side conditional marker. An offline metadata
+clone must call `isolate_cloned_object_storage(expected, replacement)` before provider access. This
+destructive clone isolation rotates both owner and namespace, quarantines inherited attempts, removes
+inherited refs/cache/catalog visibility, and clears copied marker claims; it does not touch the
+original installation's marker. The isolated clone cannot read or delete the original namespace. An
+audited disaster-recovery takeover of an old namespace is a separate capability and is not
+implemented; changing `DP_STORAGE_NAMESPACE` alone is rejected.
 
-Superseded/abandoned attempts become eligible only after ownership refs and leases are gone and
-the configured retention/grace has elapsed. The reaper inventories only that exact generation, persists
+Superseded/abandoned attempts become eligible only after ownership refs and leases are gone and the
+configured retention/grace has elapsed. The reaper inventories only that exact generation, persists
 stable member identities, deletes versions/delete markers/uploads exactly, and then requires two
 database-clock-separated empty observations. A late shard, version, marker, or upload during deletion
-quarantines the attempt instead of declaring it deleted. `writing` attempts are never reaped from age or
-`RunState`; they still require an authoritative writer-stop transition.
+quarantines the attempt instead of declaring it deleted. `writing` attempts are never reaped from age
+or `RunState`; they still require an authoritative writer-stop transition.
 
 Append, partitioning, destination selection, and non-Parquet formats retain the shared sink contract;
 they are not silently converted into overwrite Parquet. Empty Parquet results publish one typed empty
@@ -118,24 +141,24 @@ shard plus the manifest so their schema remains readable. Filters, relational op
 deduplication preserve or derive empty-result schemas. Schema-changing Python transforms must declare
 `outputSchema`; without that contract, an empty result fails instead of publishing a misleading schema.
 These transforms materialize once inside Ray so non-empty downstream operators use the actual runtime
-schema rather than a stale declaration; this adds a stage boundary but does not collect data to the driver.
-Transforms with `enforceSchema=true` fall back to the local engine; an explicit Ray pin fails before
-dispatch until distributed schema enforcement is implemented.
+schema rather than a stale declaration; this adds a stage boundary but does not collect data to the
+driver. Transforms with `enforceSchema=true` fall back to the local engine; an explicit Ray pin fails
+before dispatch until distributed schema enforcement is implemented.
 
 ## What the validation gate proves
 
-The automated Compose gate starts a Ray head, two worker containers, a separate driver node, and MinIO.
-It requires:
+The automated Compose gate starts a Ray head, two worker containers, a separate driver node, and
+MinIO. It requires:
 
-1. a real hash-shuffle to span at least two Ray node IDs;
-2. native MinIO Parquet reads feeding distributed GROUP BY and broadcast join results to match DuckDB in
-   Arrow schema and row values;
+1. a real hash-shuffle to span at least two Ray node IDs
+2. native MinIO Parquet reads feeding distributed GROUP BY and broadcast join results to match DuckDB
+   in Arrow schema and row values
 3. native Parquet reads to unify compatible physical footer drift, exclude a flat-root Hive-looking
-   ancestor, and preserve typed numeric/string Hive columns through a real aggregate and broadcast join;
+   ancestor, and preserve typed numeric/string Hive columns through a real aggregate and broadcast join
 4. a whole-graph Parquet overwrite to publish an immutable, manifested, worker-written prefix and
-   register that actual URI;
-5. the schema, aggregate-row, and join-row fault controls to each fail;
-6. a fresh run to pass after one worker is stopped between runs.
+   register that actual URI
+5. the schema, aggregate-row, and join-row fault controls to each fail
+6. a fresh run to pass after one worker is stopped between runs
 
 The last check proves that the remaining cluster accepts a new degraded-cluster run. It does not kill a
 worker during an active job and does not prove in-flight task reconstruction. KubeRay validation is
@@ -163,79 +186,94 @@ docker compose -f docker-compose.ray.yml down -v
 ```
 
 Build the shared image before creating any cluster container, and keep `--no-deps` on every ephemeral
-driver run. This prevents a differential from recreating the head service and replacing the GCS cluster
-identity underneath the persistent workers.
+driver run. This prevents a differential from recreating the head service and replacing the GCS
+cluster identity underneath the persistent workers.
 
 ## Production-readiness matrix
 
-| gate | status | production-capable requirement |
-|---|---|---|
-| selected-operator semantic parity | partial | extend multi-node differentials to every claimed operator and edge type |
-| object-store Parquet scale-out reads | implemented | operate with least-privilege credentials and validate representative production datasets |
-| bounded adapter compatibility | implemented | tune or disable the limit from measured workload/driver memory; native connectors are preferable |
-| whole-graph Parquet overwrite data path | implemented | use shared object storage for remote clusters and tune the built-in deletion grace to the workload |
-| durable job lifecycle | missing | persisted Ray submission/attempt ID, restart reconciliation, acknowledged cancel, timeout, and fencing |
-| atomic region publication | implemented | distributed and local-fallback handoffs use immutable per-attempt prefixes; the controller validates the success manifest before cache publication |
-| workload isolation | partial | environment/control-plane separation exists; replace broad data credentials with attempt-scoped identity and enforce cluster policy |
-| cluster health and placement truth | missing | live resource/health discovery, backpressure, and fail-loud behavior for an explicit Ray pin |
-| runtime compatibility | partial | one supported Ray range and a driver/worker/core/plugin version handshake |
-| resilience | partial | active-job worker/head/driver failure tests, retry policy, and orphan cleanup |
-| observability | partial | durable job IDs, queue/retry/spill/storage metrics, retained structured logs, traces, and alerts |
-| deployment security and HA | operator-owned | immutable images, secrets/IAM, TLS/network policy, pod security, quotas, autoscaling, and HA storage |
+Current status versus what production ownership still needs:
+
+- Selected-operator semantic parity — partial; extend multi-node differentials to every claimed
+  operator and edge type
+- Object-store Parquet scale-out reads — implemented; operate with least-privilege credentials and
+  validate representative production datasets
+- Bounded adapter compatibility — implemented; tune or disable the limit from measured
+  workload/driver memory; native connectors are preferable
+- Whole-graph Parquet overwrite data path — implemented; use shared object storage for remote
+  clusters and tune the built-in deletion grace to the workload
+- Durable job lifecycle — missing; persisted Ray submission/attempt ID, restart reconciliation,
+  acknowledged cancel, timeout, and fencing
+- Atomic region publication — implemented; distributed and local-fallback handoffs use immutable
+  per-attempt prefixes; the controller validates the success manifest before cache publication
+- Workload isolation — partial; environment/control-plane separation exists; replace broad data
+  credentials with attempt-scoped identity and enforce cluster policy
+- Cluster health and placement truth — missing; live resource/health discovery, backpressure, and
+  fail-loud behavior for an explicit Ray pin
+- Runtime compatibility — partial; one supported Ray range and a driver/worker/core/plugin version
+  handshake
+- Resilience — partial; active-job worker/head/driver failure tests, retry policy, and orphan cleanup
+- Observability — partial; durable job IDs, queue/retry/spill/storage metrics, retained structured
+  logs, traces, and alerts
+- Deployment security and HA — operator-owned; immutable images, secrets/IAM, TLS/network policy, pod
+  security, quotas, autoscaling, and HA storage
 
 ## What remains before production ownership
 
 The correctness fences above are implemented and tested, but they are not by themselves a production
 certification. The backend still needs the following before it should own production workloads:
 
-1. Replace local subprocess ownership with a durable Ray job lifecycle that survives kernel/hub restarts
-   and supports idempotent submission, cancellation, timeout, retry, and attempt fencing.
+1. Replace local subprocess ownership with a durable Ray job lifecycle that survives kernel/hub
+   restarts and supports idempotent submission, cancellation, timeout, retry, and attempt fencing.
 2. Replace broad data-plane credentials with attempt/dataset-scoped identities and enforce per-run
    namespace, network, pod-security, and quota boundaries on the target cluster.
-3. Discover live cluster capacity and health, enforce admission/backpressure, and reject an explicit Ray
-   placement when its requirements cannot be honored.
-4. Pin and verify the supported Ray/runtime image contract across the submitting process and every worker.
+3. Discover live cluster capacity and health, enforce admission/backpressure, and reject an explicit
+   Ray placement when its requirements cannot be honored.
+4. Pin and verify the supported Ray/runtime image contract across the submitting process and every
+   worker.
 5. Add alerts for failed manifests, object-store GC errors, spill pressure, queue delay, retries, and
    resource saturation; keep provider lifecycle rules for versioned objects and incomplete uploads.
-6. Pass staging gates on the intended production topology: active-job failure injection, representative
-   large workloads, SLOs/alerts, upgrade/rollback, and recovery runbooks.
+6. Pass staging gates on the intended production topology: active-job failure injection,
+   representative large workloads, SLOs/alerts, upgrade/rollback, and recovery runbooks.
 
-Object storage holds immutable shards plus `_dp_commits/<attempt>/` manifests. Ownership and lifecycle state
-live in the shared metadata database's indexed attempt, lease, ref, and exact-member inventory tables. The
-parent registers physical attempt URIs before dispatch. Region attempts publish in the same transaction as
-their result-cache pointer; whole-graph overwrites atomically advance a monotonic logical catalog pointer,
-release the provisional publication lease, and supersede only the prior published generation. A committed
-attempt whose publisher crashes remains fenced by its durable publication lease and becomes abandoned only
-after that lease expires and retention eligibility is re-evaluated. GC never lists a shared parent prefix or
-chooses a winner from object mtimes/client clocks.
+Object storage holds immutable shards plus `_dp_commits/<attempt>/` manifests. Ownership and lifecycle
+state live in the shared metadata database's indexed attempt, lease, ref, and exact-member inventory
+tables. The parent registers physical attempt URIs before dispatch. Region attempts publish in the same
+transaction as their result-cache pointer; whole-graph overwrites atomically advance a monotonic
+logical catalog pointer, release the provisional publication lease, and supersede only the prior
+published generation. A committed attempt whose publisher crashes remains fenced by its durable
+publication lease and becomes abandoned only after that lease expires and retention eligibility is
+re-evaluated. GC never lists a shared parent prefix or chooses a winner from object mtimes/client
+clocks.
 
-Failed/cancelled object attempts are deleted only after durable backend reconciliation proves every writer
-stopped; local driver exit alone is insufficient because remote Ray tasks can outlive it. The periodic
-reaper never infers that a `writing` attempt is dead from `RunState`, age, or a local deadline: an
-independent driver or durable Ray Job can survive a hub crash. Unreconciled attempts therefore require
-backend terminal/stop acknowledgement or a provider lifecycle rule; time alone is not a safe write fence.
-`DP_ATTEMPT_RETENTION_SECONDS` does not authorize deleting an unacknowledged writer.
+Failed/cancelled object attempts are deleted only after durable backend reconciliation proves every
+writer stopped; local driver exit alone is insufficient because remote Ray tasks can outlive it. The
+periodic reaper never infers that a `writing` attempt is dead from `RunState`, age, or a local
+deadline: an independent driver or durable Ray Job can survive a hub crash. Unreconciled attempts
+therefore require backend terminal/stop acknowledgement or a provider lifecycle rule; time alone is
+not a safe write fence. `DP_ATTEMPT_RETENTION_SECONDS` does not authorize deleting an unacknowledged
+writer.
 
-The immutable generation remains for `DP_ATTEMPT_DELETE_GRACE_SECONDS` (one day by default) after it loses
-visibility so readers that already resolved and leased the old URI can finish. The automatic grace cannot be
-configured below the run deadline; raise it for longer external readers. The built-in S3 provider deletes
-versioned history and incomplete uploads by exact identity rather than issuing an unversioned delete. A
-provider lifecycle rule remains useful as a last-resort bound for crash-orphaned writers that never receive
-terminal proof, but it is not treated as lifecycle acknowledgement by core.
+The immutable generation remains for `DP_ATTEMPT_DELETE_GRACE_SECONDS` (one day by default) after it
+loses visibility so readers that already resolved and leased the old URI can finish. The automatic
+grace cannot be configured below the run deadline; raise it for longer external readers. The built-in
+S3 provider deletes versioned history and incomplete uploads by exact identity rather than issuing an
+unversioned delete. A provider lifecycle rule remains useful as a last-resort bound for crash-orphaned
+writers that never receive terminal proof, but it is not treated as lifecycle acknowledgement by core.
 
-Local region handoffs are retained for the same correctness reason. The hub does not evict files by age or
-directory count: an mtime cannot prove that a cache entry, catalog version, concurrent hub, or active reader
-no longer references an artifact. Monitor local region capacity until an ownership-aware artifact ledger with
-exact-key cleanup is implemented.
+Local region handoffs are retained for the same correctness reason. The hub does not evict files by age
+or directory count: an mtime cannot prove that a cache entry, catalog version, concurrent hub, or
+active reader no longer references an artifact. Monitor local region capacity until an ownership-aware
+artifact ledger with exact-key cleanup is implemented.
 
-`run_unit` mints a random attempt ID by default and enforces one owner per ID inside a runner. A caller that
-supplies deterministic IDs must fence ownership in its durable control plane. A committed retry reattaches;
-an existing partial/mismatched prefix or a manifest owned by another raw attempt ID fails closed and is
-never overwritten. Attempt paths keep a readable run slug (capped at 64 characters) plus a 128-bit SHA-256
-suffix over the complete raw attempt ID and unmodified logical URI. Whole-graph sinks also include the
-write-step ID in that digest, so fan-out writes and `.parquet`/`.pq` targets cannot collide after extension
-stripping. The manifest keeps the overall raw attempt ID for restart reattachment and auditability.
+`run_unit` mints a random attempt ID by default and enforces one owner per ID inside a runner. A caller
+that supplies deterministic IDs must fence ownership in its durable control plane. A committed retry
+reattaches; an existing partial/mismatched prefix or a manifest owned by another raw attempt ID fails
+closed and is never overwritten. Attempt paths keep a readable run slug (capped at 64 characters) plus
+a 128-bit SHA-256 suffix over the complete raw attempt ID and unmodified logical URI. Whole-graph
+sinks also include the write-step ID in that digest, so fan-out writes and `.parquet`/`.pq` targets
+cannot collide after extension stripping. The manifest keeps the overall raw attempt ID for restart
+reattachment and auditability.
 
-Repository changes can make the backend production-capable and provide repeatable validation. A specific
-deployment is production-ready only after its IAM, network, storage, KubeRay, capacity, and operational
-gates also pass.
+Repository changes can make the backend production-capable and provide repeatable validation. A
+specific deployment is production-ready only after its IAM, network, storage, KubeRay, capacity, and
+operational gates also pass.
