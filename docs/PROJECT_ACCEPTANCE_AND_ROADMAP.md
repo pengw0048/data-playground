@@ -680,10 +680,13 @@ evidence that cannot be inferred from unit tests.
 ### OPS-03 — Prove backup and restore
 
 - **Status:** Certification gate for every profile that stores work users care about.
-- **Evidence:** [Deployment documentation](../deploy/README.md) tells operators to recover an unrecognized
-  database from a versioned backup, while [Ray documentation](RAY.md) explains managed object namespace
-  ownership and says audited disaster-recovery takeover is not implemented. No repository-owned backup
-  tool, restore drill, recovery-time objective, or cross-store consistency procedure is present.
+- **Evidence:** [BACKUP_RESTORE.md](BACKUP_RESTORE.md) documents the backup set, consistency
+  ordering, and isolated-clone restore for SQLite/local and PostgreSQL/object-store profiles.
+  `kernel/hub/tests/test_backup_restore_drill.py` restores a fixture backup, asserts canvases /
+  catalog / runs / lineage / artifacts, proves `isolate_cloned_object_storage`, refuses mismatched
+  `DP_STORAGE_NAMESPACE` without isolation, and prints `BACKUP_RESTORE_DRILL RPO` / `RTO_MS`
+  evidence (SQLite in `kernel-tests`; PostgreSQL in the `backup-restore-drill` CI job). Audited
+  disaster-recovery takeover of an existing namespace remains unimplemented ([RAY.md](RAY.md)).
 - **Acceptance criteria:**
   1. Document exactly what must be backed up for each profile: metadata DB, workspace/canvas files,
      object-store generations/manifests, secret references, and release identity.
