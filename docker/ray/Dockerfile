@@ -22,7 +22,10 @@ COPY --chown=10001:10001 examples/ ./examples/
 USER 10001:10001
 RUN touch ./web/dist/.keep
 WORKDIR /app/kernel
-RUN uv sync --extra ray
+# The image is also the hub-side client used by the durable Ray Jobs acceptance gate. PostgreSQL is
+# the production metadata store for that lifecycle; keeping one image avoids validating a client/runtime
+# combination that differs from the Ray nodes which actually execute the job.
+RUN uv sync --extra ray --extra postgres
 # KubeRay starts raylets through a login shell, which resets PATH on Debian.
 # Keep the venv-owned interpreter but expose the Ray CLI from the standard login-shell PATH.
 USER root
