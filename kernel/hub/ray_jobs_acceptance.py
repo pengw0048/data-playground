@@ -561,7 +561,7 @@ def bad_result(mode: str) -> None:
                 f"error={final.error!r}"
             )
     elif (remote != "SUCCEEDED"
-            or "ArtifactContractError" not in (final.error or "")
+            or "artifact_contract_invalid" not in (final.error or "")
             or "TerminalResultMissing" in (final.error or "")):
         raise AssertionError(
             f"corrupt-result check did not fail on the artifact contract: remote={remote}, "
