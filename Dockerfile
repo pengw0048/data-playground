@@ -25,7 +25,8 @@ LABEL org.opencontainers.image.title="Data Playground" \
       org.opencontainers.image.source="https://github.com/pengw0048/data-playground"
 ENV DP_GIT_SHA=${DP_GIT_SHA}
 
-RUN pip install --no-cache-dir uv
+# Pin uv so the installer itself can't drift under a rebuild (OPS-02).
+RUN pip install --no-cache-dir uv==0.11.28
 WORKDIR /app
 COPY kernel/ ./kernel/
 # the SPA at ../web/dist relative to kernel/ — where pyproject's force-include bundles it into

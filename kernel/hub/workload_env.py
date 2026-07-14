@@ -42,19 +42,50 @@ _WORKLOAD_RUNTIME_ENV = frozenset({
     "DP_LOG_LEVEL",
     "DP_RAY_GPUS", "DP_RAY_GPU_TYPE", "DP_RAY_MEM", "DP_RAY_NUM_CPUS", "DP_RAY_LABELS",
     "DP_RAY_REMOTE", "DP_RAY_SHUFFLE_PARTITIONS", "DP_RAY_DRIVER_FALLBACK_MAX_BYTES",
+    "DP_RAY_GPU_BATCH_ROWS",
     "RAY_ADDRESS", "RAY_DATA_DEFAULT_SHUFFLE_STRATEGY",
 })
 
 # Current compatibility bridge for the data plane. These identities remain broad; replacing them with
 # attempt/dataset-scoped SecretRefs is separate architecture work. Listing them explicitly prevents an
 # unrelated provider/control credential from hitchhiking merely because it also lives in os.environ.
+_DATA_CONNECTION_ENV = frozenset({
+    "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3",
+    "GOOGLE_CLOUD_PROJECT",
+    "DP_S3_ENDPOINT", "DP_S3_BUCKET",
+    "DP_GCS_ENDPOINT",
+})
+
+# Rotatable identities and credential-file selectors are deliberately separate from execution
+# semantics. Durable jobs snapshot the semantic environment into their hash-bound envelope, while a
+# replay receives the operator's current credential values so normal key rotation does not change the
+# logical attempt.
 _DATA_CREDENTIAL_ENV = frozenset({
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-    "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3",
     "AWS_PROFILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE",
-    "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
-    "DP_S3_ENDPOINT", "DP_S3_KEY", "DP_S3_SECRET", "DP_S3_BUCKET",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "DP_S3_KEY", "DP_S3_SECRET",
 })
+
+
+def _derived_auth_mode(src: Mapping[str, str], env: dict[str, str]) -> None:
+    if str(src.get("DP_AUTH_SECRET") or "").strip() or src.get("DP_AUTH_MODE") == "1":
+        env["DP_AUTH_MODE"] = "1"
+
+
+def build_workload_semantic_env(*, source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return non-secret execution settings suitable for a durable, hash-bound snapshot."""
+    src = os.environ if source is None else source
+    keys = set(_WORKLOAD_RUNTIME_ENV) | set(_DATA_CONNECTION_ENV)
+    env = {key: str(src[key]) for key in keys if src.get(key) not in (None, "")}
+    _derived_auth_mode(src, env)
+    return env
+
+
+def build_workload_credential_env(*, source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return only rotatable data-plane credentials/references for the next workload launch."""
+    src = os.environ if source is None else source
+    return {key: str(src[key]) for key in _DATA_CREDENTIAL_ENV if src.get(key) not in (None, "")}
 
 
 def build_workload_env(*, include_metadata_db: bool = False, include_host_runtime: bool = True,
@@ -66,7 +97,7 @@ def build_workload_env(*, include_metadata_db: bool = False, include_host_runtim
     ``source`` is injectable so pod-manifest and regression tests do not mutate global state.
     """
     src = os.environ if source is None else source
-    keys = set(_WORKLOAD_RUNTIME_ENV) | set(_DATA_CREDENTIAL_ENV)
+    keys = set(_WORKLOAD_RUNTIME_ENV) | set(_DATA_CONNECTION_ENV) | set(_DATA_CREDENTIAL_ENV)
     if include_host_runtime:
         keys.update(_HOST_RUNTIME_ENV)
     if include_metadata_db:
@@ -75,8 +106,7 @@ def build_workload_env(*, include_metadata_db: bool = False, include_host_runtim
 
     # Auth mode controls filesystem/path confinement, but children never receive material that can sign
     # sessions or bootstrap an administrator. This derived boolean is the only auth value they need.
-    if str(src.get("DP_AUTH_SECRET") or "").strip() or src.get("DP_AUTH_MODE") == "1":
-        env["DP_AUTH_MODE"] = "1"
+    _derived_auth_mode(src, env)
     return env
 
 
@@ -85,8 +115,11 @@ def _object_store_execution_config(source: Mapping[str, str] | None = None) -> d
 
     One-shot workers intentionally cannot read the hub settings DB. The object-store adapters still use
     the ``objectStore`` setting as their common DuckDB/Arrow configuration contract, so copy only this
-    already-allowlisted execution capability into the worker's private DB. No catalog, identity, auth,
-    or other control-plane setting crosses the boundary.
+    already-allowlisted execution capability into the worker's private DB — as *secret references*
+    (``env:DP_S3_KEY`` / ``env:DP_S3_SECRET``), never the material values. The allowlisted env vars
+    remain the only sanctioned channel for the resolved credential to reach the worker; adapters resolve
+    the references in-process. No catalog, identity, auth, or other control-plane setting crosses the
+    boundary.
     """
     src = os.environ if source is None else source
     key, secret = src.get("DP_S3_KEY"), src.get("DP_S3_SECRET")
@@ -97,7 +130,8 @@ def _object_store_execution_config(source: Mapping[str, str] | None = None) -> d
         return {}
     cfg: dict[str, Any] = {}
     if key and secret:
-        cfg.update(accessKeyId=str(key), secretAccessKey=str(secret))
+        # Store references so the worker's private metadata DB never contains the credential bytes.
+        cfg.update(accessKeyId="env:DP_S3_KEY", secretAccessKey="env:DP_S3_SECRET")
     if endpoint:
         cfg["endpoint"] = endpoint
         cfg["useSsl"] = not endpoint.lower().startswith("http://")
@@ -113,19 +147,61 @@ def initialize_ephemeral_metadata(directory: str) -> str:
     Deps constructs the default catalog through metadata tables even when the graph already carries
     physical source URIs. Initializing those tables locally preserves normal engine/plugin composition
     without granting access to users, catalog policy, run state, or credentials in the hub DB. The only
-    setting seeded is object-store execution config reconstructed from the explicit workload environment;
-    this keeps DuckDB and Arrow adapters aligned without restoring the hub database identity. Call before
-    importing ``hub.settings``/``hub.deps`` in the child.
+    setting seeded is object-store execution config reconstructed from the explicit workload environment
+    as secret references (``env:DP_S3_KEY`` / ``env:DP_S3_SECRET``); this keeps DuckDB and Arrow adapters
+    aligned without restoring the hub database identity or writing credential bytes into the worker DB.
+    Prefer calling before importing ``hub.settings``/``hub.deps`` in the child; when those are already
+    imported (tests), this also rebinds ``settings.database_url`` and resets the metadb engine.
     """
     os.makedirs(directory, exist_ok=True)
     url = "sqlite:///" + os.path.join(os.path.abspath(directory), "workload-metadata.db")
     os.environ["DP_DATABASE_URL"] = url
+    # Marks this process as a one-shot workload with no hub settings DB, so object-store adapters may
+    # reconstruct their config from the allowlisted data-plane environment. The hub never sets this.
+    os.environ["DP_WORKLOAD_EPHEMERAL"] = "1"
     from hub import metadb
+    from hub.settings import settings
+    settings.database_url = url
+    if metadb._engine is not None:
+        metadb._engine.dispose()
+    metadb._engine = metadb._Session = None
     metadb.init_db()
     object_store = _object_store_execution_config()
     if object_store:
         metadb.set_setting("objectStore", object_store, "global")
     return url
+
+
+def is_ephemeral_workload(source: Mapping[str, str] | None = None) -> bool:
+    """True inside a one-shot workload process (subrun / Ray driver) with no hub settings DB."""
+    src = os.environ if source is None else source
+    return src.get("DP_WORKLOAD_EPHEMERAL") == "1"
+
+
+def data_plane_object_store_config(source: Mapping[str, str] | None = None,
+                                   scheme: str | None = None) -> dict[str, Any]:
+    """Translate only allowlisted data-plane environment into the private worker metadata shape."""
+    src = os.environ if source is None else source
+    if (scheme or "").lower() in ("gs", "gcs"):
+        endpoint = src.get("DP_GCS_ENDPOINT")
+        return ({"endpoint": endpoint, "useSsl": not str(endpoint).lower().startswith("http://")}
+                if endpoint else {})
+    key = src.get("DP_S3_KEY") or src.get("AWS_ACCESS_KEY_ID")
+    secret = src.get("DP_S3_SECRET") or src.get("AWS_SECRET_ACCESS_KEY")
+    endpoint = (src.get("DP_S3_ENDPOINT") or src.get("AWS_ENDPOINT_URL_S3")
+                or src.get("AWS_ENDPOINT_URL"))
+    cfg: dict[str, Any] = {}
+    if key and secret:
+        cfg["accessKeyId"], cfg["secretAccessKey"] = key, secret
+    if src.get("AWS_SESSION_TOKEN"):
+        cfg["sessionToken"] = src["AWS_SESSION_TOKEN"]
+    if endpoint:
+        cfg["endpoint"] = endpoint
+        cfg["useSsl"] = not str(endpoint).lower().startswith("http://")
+    region = src.get("AWS_REGION") or src.get("AWS_DEFAULT_REGION")
+    if region:
+        cfg["region"] = region
+    return cfg
 
 
 def prepare_workload_graph(graph: Any) -> dict:

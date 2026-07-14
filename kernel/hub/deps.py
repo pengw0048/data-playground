@@ -64,20 +64,37 @@ class Registry:
         setting `plugin.<pack>.<key>`) > the field's declared `env` var > its declared `default` > the
         `default` arg. Fields are declared in the pack's dataplay.toml `[[config]]`. Call this inside
         register() to configure the pack; a value changed in the UI takes effect on the next kernel
-        start (plugins register once at startup — same as the env vars it falls back to)."""
+        start (plugins register once at startup — same as the env vars it falls back to).
+
+        When the field is ``secret``, the stored setting is a secret reference (``env:…`` / ``file:…``)
+        and is resolved here; the material value never lives in the settings row.
+        """
         pack = self._pack
         schema = self.deps._manifests.get(pack, {}).get("config", []) if pack else []
         field = next((f for f in schema if isinstance(f, dict) and f.get("key") == key), None)
+        secret = bool(field and field.get("secret"))
         if pack:
             from hub import metadb
             v = metadb.get_setting(f"plugin.{pack}.{key}", "global", default=None)
             if v not in (None, ""):
+                if secret:
+                    from hub.secrets import resolve_secret_value
+                    return resolve_secret_value(v)
                 return v
         if field and field.get("env") and os.environ.get(field["env"]) not in (None, ""):
             return os.environ[field["env"]]
         if field and field.get("default") is not None:
             return field["default"]
         return default
+
+    def add_secret_resolver(self, scheme: str, resolver) -> None:
+        """Register a pluggable SecretResolver for ``scheme:…`` references (see ``hub.secrets``).
+
+        Core ships ``env`` and ``file``. An organization-specific backend (Vault, cloud KMS, …) is a
+        plugin that calls this during ``register(reg)`` — core never imports a vendor client.
+        """
+        from hub.secrets import register_resolver
+        register_resolver(scheme, resolver, replace=True)
 
     def add_node(self, spec: NodeSpec, build: "NodeBuilder | None" = None, ir=None) -> None:
         # `build` is the node's build callable — see hub.backends.NodeBuilder for its exact
@@ -102,10 +119,22 @@ class Registry:
 
     def add_telemetry_sink(self, sink) -> None:
         """Register a callback invoked once per FINISHED run with a normalized telemetry record (a dict:
-        canvas_id/run_id/status/rows/ms/error/output_table/placement/per_node). Core ships no exporter —
-        an OTel/StatsD/log sink is a plugin. A sink that raises is logged and swallowed, never failing a run."""
+        canvas_id/run_id/request_id/status/rows/ms/error/output_table/placement/per_node). Core ships no
+        exporter — an OTel/StatsD/log sink is a plugin. A sink that raises or times out is logged and
+        swallowed, never failing a run. See also add_metric_sink / add_audit_sink (OPS-01 contracts)."""
         if callable(sink):
             self.deps.telemetry_sinks.append(sink)
+
+    def add_metric_sink(self, sink) -> None:
+        """Register a MetricEvent consumer (OPS-01). See docs/OBSERVABILITY.md. Isolation matches
+        add_telemetry_sink — a broken/slow sink never fails a request or run."""
+        from hub.observability import add_metric_sink
+        add_metric_sink(sink)
+
+    def add_audit_sink(self, sink) -> None:
+        """Register an AuditEvent consumer (OPS-01). See docs/OBSERVABILITY.md."""
+        from hub.observability import add_audit_sink
+        add_audit_sink(sink)
 
     def add_adapter(self, adapter) -> None:
         self.deps.adapters.insert(0, adapter)  # plugins claim uris before defaults
@@ -167,32 +196,44 @@ def _persist_run(deps, graph, target, status) -> None:
     (canvas id == graph.id), including the per-node breakdown (durable telemetry), then fan the
     finished-run telemetry record out to any plugin sinks."""
     from hub import metadb
+    from hub.observability import (
+        MetricName, MetricUnit, emit_metric, finished_run_metric_labels, get_request_id,
+    )
     per_node = [p.model_dump() for p in (status.per_node or [])] or None
+    request_id = getattr(status, "request_id", None) or get_request_id()
     metadb.record_run(canvas_id=getattr(graph, "id", None), target_node_id=target, status=status.status,
                       rows=status.total_rows, ms=status.ms, error=status.error,
                       output_table=status.output_table, per_node=per_node,
-                      run_id=status.run_id, output_uri=status.output_uri)
+                      run_id=status.run_id, output_uri=status.output_uri, request_id=request_id)
     # The RunController runs each region as an internal sub-graph with the sentinel id '_region' (see
     # run_controller._subgraph); its base-runner completion must NOT leak to sinks as a phantom run — the
     # controller fires the real, user-facing completion once for the whole logical run.
     if getattr(graph, "id", None) != "_region":
-        _emit_telemetry(deps, graph, target, status, per_node)
+        _emit_telemetry(deps, graph, target, status, per_node, request_id=request_id)
+        labels = finished_run_metric_labels(status.status, status.placement)
+        emit_metric(MetricName.RUN_FINISHED, 1.0, labels=labels,
+                    request_id=request_id, run_id=status.run_id)
+        emit_metric(MetricName.RUN_STATE, 1.0, labels=labels,
+                    request_id=request_id, run_id=status.run_id)
+        if status.ms is not None:
+            emit_metric(MetricName.RUN_DURATION_MS, float(status.ms), unit=MetricUnit.MILLISECONDS,
+                        labels=labels, request_id=request_id, run_id=status.run_id)
 
 
-def _emit_telemetry(deps, graph, target, status, per_node) -> None:
+def _emit_telemetry(deps, graph, target, status, per_node, *, request_id=None) -> None:
     """Fan a finished run's normalized telemetry record out to registered sinks (reg.add_telemetry_sink).
-    Core ships NO exporter — an OTel/StatsD/etc. sink is a plugin. A broken sink never breaks a run."""
+    Core ships NO exporter — an OTel/StatsD/etc. sink is a plugin. A broken or slow sink never breaks a run."""
+    from hub.observability import fanout_sinks  # same timeout isolation as metric/audit sinks
+
     sinks = getattr(deps, "telemetry_sinks", None)
     if not sinks:
         return
+    rid = request_id if request_id is not None else getattr(status, "request_id", None)
     record = {"canvas_id": getattr(graph, "id", None), "target_node_id": target, "run_id": status.run_id,
+              "request_id": rid,
               "status": status.status, "rows": status.total_rows, "ms": status.ms, "error": status.error,
               "output_table": status.output_table, "placement": status.placement, "per_node": per_node}
-    for sink in sinks:
-        try:
-            sink(record)
-        except Exception:
-            logging.getLogger("hub").warning("telemetry sink failed", exc_info=True)
+    fanout_sinks(list(sinks), record, kind="telemetry")
 
 
 def _persist_run_state(graph, status) -> None:
@@ -572,12 +613,25 @@ _deps: Deps | None = None
 _deps_lock = __import__("threading").Lock()
 
 
+def _note_unhandled_backend_jobs(deps: Deps) -> None:
+    """Run the shared-run diagnostic only in the global control-plane composition root.
+
+    Kernel and one-shot driver ``Deps`` instances can point at private metadata or represent a single
+    canvas. They must never diagnose or mutate ownership of unrelated shared backend runs.
+    """
+    from hub import metadb
+    metadb.note_unhandled_backend_jobs({
+        str(r.durable_backend) for r in deps.runners if getattr(r, "durable_backend", None)
+    })
+
+
 def get_deps() -> Deps:
     global _deps
     if _deps is None:
         with _deps_lock:  # double-checked: concurrent first requests must not build Deps twice
             if _deps is None:
                 _deps = Deps(settings.workspace, settings.data_dir)
+                _note_unhandled_backend_jobs(_deps)
     return _deps
 
 

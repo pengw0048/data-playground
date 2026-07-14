@@ -6,12 +6,9 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # A manual dispatch runs the reusable build-and-smoke workflow only; publish is push-tag-gated
+  # below, so a dispatch is inherently a dry run (no dead input needed to express that).
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Build + smoke only (skip publish/attest)"
-        type: boolean
-        default: true
 
 permissions:
   contents: read

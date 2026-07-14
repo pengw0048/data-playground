@@ -14,11 +14,6 @@ on:
 permissions:
   contents: read
 
-env:
-  # Package version surfaces must agree; read once for image build-args.
-  # (Workflow still fails via scripts/check_release_versions.py if they drift.)
-  PYTHON_VERSION: "3.12"
-
 jobs:
   wheel-smoke:
     name: wheel build + clean-install smoke
