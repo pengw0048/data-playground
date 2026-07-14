@@ -6,6 +6,14 @@
 # service runs the byte-identical differential INSIDE the network so the Ray Client version always matches
 # the cluster and it reaches minio/ray-head by DNS.
 #
+# VALIDATION-ONLY CREDENTIALS: the MinIO user/secret below (dp-ray-validation-only / …) exist solely so
+# this harness stays zero-config for CI. They must NEVER be copied into a shared or production
+# deployment — supply real IAM/object-store credentials there instead.
+#
+# Operator-owned (not provided by this harness): network/firewall policy, IAM and secret-manager wiring,
+# object-store durability and backups, resource quotas, TLS, and any high-availability topology. No host
+# ports are published; services stay on the isolated `dpray` network.
+#
 #   docker compose -f docker-compose.ray.yml build ray-head
 #   docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 ray-head ray-worker minio createbucket
 #   docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # differential; exits 0 on PASS
@@ -45,17 +53,19 @@ services:
     networks: [dpray]
 
   minio:
-    image: minio/minio
+    # Digest-pinned — resolve a new digest with `docker buildx imagetools inspect minio/minio:<tag>`.
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: dpminio
-      MINIO_ROOT_PASSWORD: dpminio123
+      MINIO_ROOT_USER: dp-ray-validation-only
+      MINIO_ROOT_PASSWORD: dp-ray-validation-only-not-for-shared-use
     networks: [dpray]
 
   createbucket:
-    image: minio/mc
+    # Digest-pinned — resolve a new digest with `docker buildx imagetools inspect minio/mc:<tag>`.
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3
     depends_on: [minio]
-    entrypoint: ["/bin/sh", "-c", "until mc alias set m http://minio:9000 dpminio dpminio123; do sleep 1; done; mc mb -p m/dpray; exit 0"]
+    entrypoint: ["/bin/sh", "-c", "until mc alias set m http://minio:9000 dp-ray-validation-only dp-ray-validation-only-not-for-shared-use; do sleep 1; done; mc mb -p m/dpray; exit 0"]
     networks: [dpray]
 
   driver:
@@ -71,8 +81,8 @@ services:
       DP_RAY_SHUFFLE_PARTITIONS: "4"
       DP_MULTINODE_FAULT: "${DP_MULTINODE_FAULT:-}"
       DP_S3_ENDPOINT: "http://minio:9000"
-      DP_S3_KEY: "dpminio"
-      DP_S3_SECRET: "dpminio123"
+      DP_S3_KEY: "dp-ray-validation-only"
+      DP_S3_SECRET: "dp-ray-validation-only-not-for-shared-use"
       DP_S3_BUCKET: "dpray"
       DP_STORAGE_URL: "s3://dpray/outputs"
     # JOIN the already-running cluster as a node (so ray.init(address=auto) connects locally — an
