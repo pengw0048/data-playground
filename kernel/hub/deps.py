@@ -572,12 +572,25 @@ _deps: Deps | None = None
 _deps_lock = __import__("threading").Lock()
 
 
+def _note_unhandled_backend_jobs(deps: Deps) -> None:
+    """Run the shared-run diagnostic only in the global control-plane composition root.
+
+    Kernel and one-shot driver ``Deps`` instances can point at private metadata or represent a single
+    canvas. They must never diagnose or mutate ownership of unrelated shared backend runs.
+    """
+    from hub import metadb
+    metadb.note_unhandled_backend_jobs({
+        str(r.durable_backend) for r in deps.runners if getattr(r, "durable_backend", None)
+    })
+
+
 def get_deps() -> Deps:
     global _deps
     if _deps is None:
         with _deps_lock:  # double-checked: concurrent first requests must not build Deps twice
             if _deps is None:
                 _deps = Deps(settings.workspace, settings.data_dir)
+                _note_unhandled_backend_jobs(_deps)
     return _deps
 
 

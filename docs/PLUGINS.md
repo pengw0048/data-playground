@@ -113,6 +113,20 @@ entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest
 | `reg.add_destination(backend)` | a save/open-dialog **"place"** (a browsable/writable location) | `DestinationBackend` Protocol (`destinations.py`): `kind` + `browse(root, path)` (→ `{path, entries:[{name, kind, uri}], error?}`) + `target_uri(root, path, filename)`. Claims a place `kind`; a user adds a preset (backend + root) in Settings → Destinations. Built-in `local`/`s3`/`gs` go through the same registry. |
 | `reg.add_telemetry_sink(fn)` | run observability (export finished-run telemetry) | `fn(record: dict)` invoked once per FINISHED run with a normalized record: `canvas_id/run_id/status/rows/ms/error/output_table/placement/per_node` (`per_node` = `[{node_id, label, status, rows, ms}]`). Core ships **no** exporter (offline-first) — an OTel/StatsD/warehouse sink is a plugin; a sink that raises is caught + logged, never failing the run. See `dp_run_log`. |
 
+Catalogs used by an at-least-once durable runner additionally implement the runtime-checkable
+`DurableCatalogPublisher` capability from `backends.py`: one idempotency key per output through
+`register_output_idempotent`, plus one run-level `record_usage_idempotent` call over all distinct source
+parents. The output method must return a matching `CatalogPublicationReceipt` only after the provider can
+durably read the registered reference; returning `None` or an optimistic in-memory object blocks terminal
+publication. Providers that do not need popularity can make the latter a durable idempotent no-op.
+
+That capability alone does **not** opt an external catalog into managed-output publication for the bundled
+Ray Jobs v3 backend. Jobs v3 freezes a pre-probed catalog plan in SQL and coordinates it with core
+object-attempt references, lineage, usage, and terminal publication. A graph with a write sink therefore
+requires the built-in DB-backed catalog and fails before allocation or remote submission when another
+catalog is installed. Supporting an external provider here
+requires a future prepared-plan/replay protocol, not only the two idempotent methods above.
+
 Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter; runners are picked
 by `pick_runner` (respects the Settings → Execution choice, else the first that `can_run`). **The
 built-ins go through these same seams — the DuckDB/Lance adapters, the InMemoryCatalog, and the local
@@ -127,6 +141,17 @@ input from the given tier URI and writing its output to `output_uri`, so workers
 directly), and `reachable_tiers()` (which storage tiers this backend can read/write — e.g. `("object",)` for
 a remote cluster, `("local","object")` for one sharing the hub's disk). The core feature-detects these, so a
 non-distributed backend omits them.
+
+A backend that can durably own a pinned graph but cannot yet recover multi-region orchestration can instead
+implement `WholeGraphRequirementBackend.accepts_whole_graph(requires)`. This admission seam routes the
+entire graph to that backend without making `place()` claim a region. Once claimed, unsupported pinned work
+must fail explicitly; it must not fall back to an engine that does not satisfy the requirement.
+
+An external backend that allocates workload identity or artifacts can implement
+`PreboundRunIdentityBackend.preallocate_run_id()`. The method only mints an ID and must have no external
+side effects. The hub durably binds that ID to the authorized creator/canvas before calling
+`run(..., run_id=...)`; the backend must preserve the supplied ID. This ordering gives identity providers a
+reliable principal without exposing hub database credentials to workers.
 
 **How placement + tiering drive `run_unit`.** A run splits into regions (maximal same-backend subgraphs, cut
 at a backend change / fan-out / `checkpoint`). A region is placed by a cost estimate — a conservative per-node
