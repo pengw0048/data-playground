@@ -5,8 +5,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 const importPipeline = vi.fn()
 vi.mock('../api/client', () => ({ api: { importPipeline: (...a: unknown[]) => importPipeline(...a) } }))
 
-const newFile = vi.fn(async () => {})
-const applyAgentGraph = vi.fn()
+const newFile = vi.fn(async () => ({ ok: true as const, canvasId: 'fresh', persistence: 'remote' as const }))
+const applyAgentGraph = vi.fn(() => true)
 const pushToast = vi.fn()
 vi.mock('../store/graph', () => ({
   useStore: (sel: (s: unknown) => unknown) => sel({ newFile, applyAgentGraph, pushToast }),
@@ -21,7 +21,11 @@ function typeConfig(text: string) {
 const importBtn = () => screen.getByRole('button', { name: /import/i })
 
 describe('ImportPipelineModal', () => {
-  beforeEach(() => vi.clearAllMocks())
+  beforeEach(() => {
+    vi.clearAllMocks()
+    newFile.mockResolvedValue({ ok: true, canvasId: 'fresh', persistence: 'remote' })
+    applyAgentGraph.mockReturnValue(true)
+  })
 
   it('drops a returned graph onto a FRESH canvas (newFile before apply) and toasts success', async () => {
     const graph = { nodes: [{ id: 'src', type: 'source', position: { x: 0, y: 0 }, data: {} }], edges: [] }
@@ -32,7 +36,7 @@ describe('ImportPipelineModal', () => {
     typeConfig('{"source":"x"}')
     fireEvent.click(importBtn())
 
-    await waitFor(() => expect(applyAgentGraph).toHaveBeenCalledWith(graph))
+    await waitFor(() => expect(applyAgentGraph).toHaveBeenCalledWith(graph, 'fresh'))
     expect(importPipeline).toHaveBeenCalledWith('{"source":"x"}')
     expect(newFile).toHaveBeenCalled()  // imported into a fresh file (applyAgentGraph REPLACES the canvas)
     expect(newFile.mock.invocationCallOrder[0]).toBeLessThan(applyAgentGraph.mock.invocationCallOrder[0])
@@ -61,5 +65,36 @@ describe('ImportPipelineModal', () => {
 
     await waitFor(() => expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('no graph'), 'info'))
     expect(applyAgentGraph).not.toHaveBeenCalled()
+  })
+
+  it('does not replace the current graph when creating the import canvas is rejected', async () => {
+    const graph = { nodes: [{ id: 'src', type: 'source', position: { x: 0, y: 0 }, data: {} }], edges: [] }
+    importPipeline.mockResolvedValue({ graph })
+    newFile.mockResolvedValue({ ok: false })
+    const onClose = vi.fn()
+    render(<ImportPipelineModal onClose={onClose} />)
+
+    typeConfig('{"source":"x"}')
+    fireEvent.click(importBtn())
+
+    await waitFor(() => expect(newFile).toHaveBeenCalled())
+    expect(applyAgentGraph).not.toHaveBeenCalled()
+    expect(pushToast).not.toHaveBeenCalledWith(expect.stringContaining('Imported'), 'success')
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  it('does not report a successful import when the created canvas is no longer active', async () => {
+    const graph = { nodes: [{ id: 'src', type: 'source', position: { x: 0, y: 0 }, data: {} }], edges: [] }
+    importPipeline.mockResolvedValue({ graph })
+    applyAgentGraph.mockReturnValue(false)
+    const onClose = vi.fn()
+    render(<ImportPipelineModal onClose={onClose} />)
+
+    typeConfig('{"source":"x"}')
+    fireEvent.click(importBtn())
+
+    await waitFor(() => expect(applyAgentGraph).toHaveBeenCalledWith(graph, 'fresh'))
+    expect(pushToast).not.toHaveBeenCalledWith(expect.stringContaining('Imported'), 'success')
+    expect(onClose).not.toHaveBeenCalled()
   })
 })
