@@ -113,8 +113,11 @@ def test_ray_dependency_image_and_kuberay_manifest_share_one_version_contract():
     lock = (_ROOT / "kernel/uv.lock").read_text()
     assert f'specifier = "=={ray_compat.SUPPORTED_RAY_VERSION}"' in lock
     dockerfile = (_ROOT / "docker/ray/Dockerfile").read_text()
-    assert "uv sync --extra ray" in dockerfile
+    assert "uv sync --locked --no-dev --extra ray" in dockerfile
     assert "uv pip install 'ray" not in dockerfile
+    # Digest-pinned base + exact uv installer: a mutable tag or unpinned pip install would reopen OPS-02.
+    assert "FROM python:3.12-slim@sha256:" in dockerfile
+    assert "pip install --no-cache-dir uv==" in dockerfile
     manifest = (_ROOT / "deploy/kuberay/raycluster.yaml").read_text()
     assert f'rayVersion: "{ray_compat.SUPPORTED_RAY_VERSION}"' in manifest
 

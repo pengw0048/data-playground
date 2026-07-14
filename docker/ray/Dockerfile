@@ -7,10 +7,14 @@
 # Ray's supported `data,default` dependency set. `default` is required by KubeRay's dashboard-agent
 # /api/healthz probe on port 52365; a data-only install starts raylets but never serves that endpoint.
 # The driver runs inside this image too, and dp_ray handshakes every live node before data execution.
-FROM python:3.12-slim
+#
+# Base image pinned to a digest (not a mutable :tag) so a rebuild is reproducible and can't silently
+# pull a changed base — resolve a new digest with `docker buildx imagetools inspect <img>:<tag>` (OPS-02).
+FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir uv
+# Pin uv so the installer itself can't drift under a rebuild (OPS-02).
+RUN pip install --no-cache-dir uv==0.11.28
 RUN groupadd --gid 10001 dataplay \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin dataplay
 WORKDIR /app
@@ -22,10 +26,10 @@ COPY --chown=10001:10001 examples/ ./examples/
 USER 10001:10001
 RUN touch ./web/dist/.keep
 WORKDIR /app/kernel
-# The image is also the hub-side client used by the durable Ray Jobs acceptance gate. PostgreSQL is
-# the production metadata store for that lifecycle; keeping one image avoids validating a client/runtime
-# combination that differs from the Ray nodes which actually execute the job.
-RUN uv sync --extra ray --extra postgres
+# --locked: install from the checked-in uv.lock and FAIL if pyproject/lock drifted; --no-dev: no test
+# tooling. [ray] = ABI-pinned Ray validate_ray_cluster checks; [postgres] = hub-side client for the
+# durable Ray Jobs acceptance gate (its production metadata store).
+RUN uv sync --locked --no-dev --extra ray --extra postgres
 # KubeRay starts raylets through a login shell, which resets PATH on Debian.
 # Keep the venv-owned interpreter but expose the Ray CLI from the standard login-shell PATH.
 USER root
