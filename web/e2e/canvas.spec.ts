@@ -1,4 +1,5 @@
 import { test, expect, type Page, type Locator } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
 
 // These specs encode, as assertions, the interaction/visual invariants behind bugs a human had
 // to find by hand (menu positioning, node overlap, disabled affordances, no forced popups, the
@@ -450,6 +451,11 @@ test.describe('Data Playground canvas', () => {
     // a source's run is a full count/scan — the Inspector labels it "Count rows"
     await inspector.getByRole('button', { name: 'Count rows' }).click()
     await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
+    // #118 error-state axe gate — colocated with the stable toast path (the duplicate a11y.spec
+    // copy flaked under CI parallelism even though this test passed in the same job).
+    const axe = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).disableRules(['color-contrast']).analyze()
+    const gated = axe.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical')
+    expect(gated, gated.map((v) => `${v.id} (${v.impact})`).join('; ') || 'ok').toEqual([])
   })
 
   test('two clients on the same canvas see each other (realtime presence)', async ({ page }) => {
