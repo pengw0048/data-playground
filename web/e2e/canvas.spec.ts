@@ -264,6 +264,7 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
     await page.getByText('Settings', { exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
+    await page.getByRole('button', { name: 'Destinations' }).click()  // master-detail: switch to the Destinations pane
     // datasets live on the Tables page now, not in Settings — add an output destination (a real, consumed setting)
     await page.getByPlaceholder('e.g. S3 exports').fill('scratch')
     await page.getByPlaceholder('/path/to/dir').fill('/tmp/dp-scratch')
