@@ -90,8 +90,8 @@ class Registry:
     def add_secret_resolver(self, scheme: str, resolver) -> None:
         """Register a pluggable SecretResolver for ``scheme:…`` references (see ``hub.secrets``).
 
-        Core ships ``env`` and ``file``. An organization-specific backend (Vault, cloud KMS, …) is a
-        plugin that calls this during ``register(reg)`` — core never imports a vendor client.
+        Core ships ``env`` and ``file``. A third-party backend (such as a secret manager) is a plugin
+        that calls this during ``register(reg)`` — core never imports a vendor client.
         """
         from hub.secrets import register_resolver
         register_resolver(scheme, resolver, replace=True)

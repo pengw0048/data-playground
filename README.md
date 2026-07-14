@@ -120,11 +120,11 @@ with `DP_PLUGINS`.
 | `KernelSpawner` | Another per-canvas runtime substrate, such as Kubernetes Pods |
 | Registry hooks | Destinations, pipeline importers, embedders, viewers, processors, managed-object providers, and telemetry sinks |
 
-These ports are also the intended boundary for internal platforms: keep catalog/search, scheduling, and
+These ports are also the intended boundary for external services: keep catalog/search, scheduling, and
 compute-specific clients in optional adapter packages while the open-source core remains offline-first
-and provider-agnostic. Identity and policy integration should extend generic contracts instead of adding
-organization-specific branches to core. A typed plugin node is rendered and wired without custom
-frontend code.
+and provider-agnostic. Identity and policy integrations should extend generic contracts instead of adding
+provider-specific branches to core. A typed plugin node is rendered and wired without custom frontend
+code.
 
 Start with the [plugin guide](docs/PLUGINS.md) and the tested reference packages in
 [`examples/plugins/`](examples/plugins/).

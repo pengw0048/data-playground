@@ -322,8 +322,8 @@ def register(reg):
 
 When `secret = true`, the Settings UI and `PUT /api/settings` accept only a secret reference
 (`env:VAR_NAME` or `file:/path/to/secret`), never the material token. `reg.config` resolves the
-reference in-process during `register()`. To add an organization-specific backend (Vault, cloud KMS),
-call `reg.add_secret_resolver("vault", resolve_fn)` — core ships only `env` and `file`.
+reference in-process during `register()`. To add a third-party backend (such as a secret manager), call
+`reg.add_secret_resolver("vault", resolve_fn)` — core ships only `env` and `file`.
 
 `GET /api/plugins` surfaces each pack's schema and current values (for secrets, the reference string,
 not the resolved credential). A changed setting applies on the next kernel start — plugins register

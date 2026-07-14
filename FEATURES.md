@@ -4,8 +4,8 @@ The previous item-by-item feature inventory was retired because manual totals an
 drifted as the project changed. Use the owning documents and executable checks instead:
 
 - [README.md](README.md) — product promise, current user-facing capabilities, architecture, and scope.
-- [Project acceptance and roadmap](docs/PROJECT_ACCEPTANCE_AND_ROADMAP.md) — evidence snapshot,
-  deployment profiles, confirmed gaps, certification gates, and prioritized roadmap.
+- [Project acceptance and roadmap](docs/PROJECT_ACCEPTANCE_AND_ROADMAP.md) — public scope,
+  deployment profiles, release evidence, and generic extension boundaries.
 - [Catalog](docs/CATALOG.md) — catalog discovery, search, curation, and lineage behavior.
 - [Plugins](docs/PLUGINS.md) — public extension seams and reference plugins.
 - [Ray](docs/RAY.md) — exact distributed support boundary and production-readiness gates.
