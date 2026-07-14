@@ -8,6 +8,29 @@ Use GitHub's private vulnerability reporting: on the repository's **Security** t
 **Report a vulnerability** ([Security Advisories](https://github.com/pengw0048/data-playground/security/advisories/new)).
 We'll acknowledge the report and work with you on a fix and disclosure timeline.
 
+## Automated scanning
+
+Repository-owned GitHub Actions enforce the following supply-chain and security gates
+(see `.github/workflows/`):
+
+| Gate | Workflow | When it runs |
+| --- | --- | --- |
+| Dependency review | `dependency-review.yml` | Every pull request — OSV-Scanner diffs lockfiles vs the PR base and fails on newly introduced vulnerabilities at severity **high** or above (`FAIL_ON_SEVERITY`; switches to `actions/dependency-review-action` once Dependency Graph is enabled) |
+| SAST (CodeQL) | `codeql.yml` | Pull requests, pushes to `main`, weekly schedule, and `workflow_dispatch` — results on the **Code scanning** tab |
+| Secret scanning (CI) | `secret-scan.yml` | Pull requests and pushes to `main` — [gitleaks](https://github.com/gitleaks/gitleaks) fails the job on detected secrets |
+| Application image scan | `image-scan.yml` | Path-gated on `Dockerfile` / lockfile changes, weekly schedule, and `workflow_dispatch` — Trivy fails on fixable **CRITICAL/HIGH** |
+
+### GitHub-native secret scanning (admin settings)
+
+In addition to the gitleaks CI job, maintainers should keep these repository settings enabled
+(Settings → Code security):
+
+- **Secret scanning** — alert on known secret patterns in the default branch and history
+- **Push protection** — block pushes that contain known secrets
+
+These toggles are admin-only and cannot be expressed in YAML; record changes here when the
+enabled state is confirmed or deliberately changed.
+
 ## Scope — what is and isn't a security boundary
 
 Data Playground is a local-first tool. Read this before deciding whether a behavior is a

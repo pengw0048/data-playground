@@ -1,0 +1,51 @@
+name: Image scan
+
+# Build the root application Dockerfile and scan for OS/library CVEs.
+# Path-gated + weekly schedule + workflow_dispatch, matching ray-validation.yml
+# so ordinary docs/web-only PRs are not billed for a full image rebuild.
+# The Ray image (docker/ray/Dockerfile) is out of scope — see #109.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/image-scan.yml"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "kernel/uv.lock"
+      - "kernel/pyproject.toml"
+      - "web/package-lock.json"
+      - "web/package.json"
+  workflow_dispatch:
+  schedule:
+    # Mondays 06:17 UTC — after Ray validation (05:17).
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-scan-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trivy:
+    name: Build + Trivy (fixable CRITICAL/HIGH)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Build application image
+        run: docker build -t dataplay:scan .
+
+      - name: Run Trivy vulnerability scanner
+        # Fail on fixable CRITICAL and HIGH only (ignore-unfixed: true). Do not
+        # broaden ignore rules or drop severities without an inline comment and
+        # a follow-up issue for anything suppressed — see #113 acceptance.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: dataplay:scan
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          vuln-type: os,library
