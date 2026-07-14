@@ -31,6 +31,18 @@ In addition to the gitleaks CI job, maintainers should keep these repository set
 These toggles are admin-only and cannot be expressed in YAML; record changes here when the
 enabled state is confirmed or deliberately changed.
 
+### Known accepted advisories
+
+Advisories the dependency-review gate reports but does not block (severity below its HIGH threshold),
+kept here rather than silenced in CI (per [#148](https://github.com/pengw0048/data-playground/issues/148)):
+
+- **`dompurify` (moderate/low)** — pulled in transitively by `monaco-editor` in `web/package-lock.json`
+  (~16 moderate/low DOMPurify sanitizer/mXSS advisories; no HIGH/CRITICAL). Accepted: the app's only
+  consumer is the Monaco code editor's own internal rendering with a non-attacker-controlled config, so
+  the exposure is low, and a transitive bump is pinned by `monaco-editor`. Revisit when `monaco-editor`
+  ships a `dompurify` ≥ 3.4.11, or force it via a `package.json` override if a concrete exploit path
+  through Monaco is found.
+
 ## Scope — what is and isn't a security boundary
 
 Data Playground is a local-first tool. Read this before deciding whether a behavior is a
