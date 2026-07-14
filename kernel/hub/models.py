@@ -223,6 +223,12 @@ class CatalogBrowse(Wire):
     truncated: bool = False
 
 
+class CatalogFolder(Wire):
+    """A first-class browse folder. Additive to the per-dataset `folder` path string: it lets an EMPTY
+    folder exist and be renamed/deleted, so a folder can be created up front and filled later."""
+    path: str
+
+
 class CatalogMetadata(Wire):
     """The owner-editable organization fields of a dataset (everything but the probed schema/rows).
     A PUT of this is how a table gets filed into a folder, tagged, owned, or described."""

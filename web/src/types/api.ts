@@ -64,6 +64,7 @@ export interface CatalogPage { items: CatalogTable[]; total: number; hasMore: bo
 export interface FacetValue { value: string; count: number }
 export interface Facets { folders: FacetValue[]; tags: FacetValue[]; owners: FacetValue[]; semanticAvailable?: boolean }
 export interface FolderNode { name: string; path: string; tableCount: number }
+export interface CatalogFolder { path: string }
 export interface CatalogBrowse { prefix: string; folders: FolderNode[]; tables: CatalogTable[] }
 export interface CatalogMetadata { folder?: string; tags?: string[]; owner?: string | null; description?: string | null; name?: string | null }
 export interface RegisterRequest { uri: string; name?: string; folder?: string; tags?: string[]; owner?: string; description?: string }

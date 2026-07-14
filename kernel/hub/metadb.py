@@ -250,6 +250,16 @@ class CatalogEntry(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, index=True)
 
 
+class CatalogFolder(Base):
+    """A first-class browse folder. Additive to the `folder` path string on CatalogEntry (which the
+    external CatalogProvider namespace mapping still owns): a folder entity lets an EMPTY folder exist
+    and be renamed/deleted, while rename/delete operate over the UNION of these paths and the distinct
+    entry `folder` strings — so a folder created by simply registering a dataset is editable too."""
+    __tablename__ = "catalog_folders"
+    path: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class CatalogTag(Base):
     """One (dataset uri → tag) membership. A join table (not a JSON blob on the entry) so a tag filter
     / a tag facet is an indexed query, and two instances tagging concurrently can't clobber each other."""
@@ -6237,6 +6247,139 @@ def catalog_facets(q: str | None = None, folder: str | None = None, tags: list[s
     return {"folders": folders, "tags": tag_counts, "owners": owners}
 
 
+def _normalize_folder_path(path: str) -> str:
+    """A folder path with surrounding slashes stripped and each segment validated. Rejects empty
+    segments and `.`/`..` so a path can't escape its namespace. '' means the tree root."""
+    p = (path or "").strip().strip("/")
+    if not p:
+        return ""
+    segs = [seg.strip() for seg in p.split("/")]
+    if any(not seg or seg in (".", "..") for seg in segs):
+        raise ValueError(f"invalid folder path: '{path}'")
+    return "/".join(segs)
+
+
+def _folder_ancestors(path: str) -> list[str]:
+    """Every prefix of `path` including itself, e.g. 'x/y/z' -> ['x', 'x/y', 'x/y/z']."""
+    segs = path.split("/")
+    return ["/".join(segs[: i + 1]) for i in range(len(segs))]
+
+
+def _folder_exists(s, path: str) -> bool:
+    """True when `path` is a known folder — a folder entity at/under it OR any entry filed at/under it."""
+    like = _like_escape(path) + "/%"
+    if s.get(CatalogFolder, path) is not None:
+        return True
+    if s.scalar(select(CatalogFolder.path).where(
+            CatalogFolder.path.like(like, escape="\\")).limit(1)) is not None:
+        return True
+    return s.scalar(select(CatalogEntry.uri).where(or_(
+        CatalogEntry.folder == path,
+        CatalogEntry.folder.like(like, escape="\\"))).limit(1)) is not None
+
+
+def _ensure_folder_rows(s, paths) -> None:
+    """Insert a CatalogFolder row for every path not already present."""
+    want = list(dict.fromkeys(paths))
+    if not want:
+        return
+    have = {p for (p,) in s.execute(select(CatalogFolder.path).where(CatalogFolder.path.in_(want)))}
+    for p in want:
+        if p not in have:
+            s.add(CatalogFolder(path=p))
+
+
+def catalog_folders_list() -> list[dict]:
+    """Every folder entity, as {path, created_at}. Empty folders live only here (entry-derived folders
+    are additionally discovered from CatalogEntry.folder), so this powers the folder-name autocomplete."""
+    with session() as s:
+        return [{"path": r.path, "created_at": r.created_at}
+                for r in s.scalars(select(CatalogFolder).order_by(CatalogFolder.path))]
+
+
+def catalog_folder_create(path: str) -> str:
+    """Create an empty folder (+ its ancestor entity rows). Errors if the folder already exists (as an
+    entity or via any entry). Returns the normalized path."""
+    path = _normalize_folder_path(path)
+    if not path:
+        raise ValueError("folder path cannot be empty")
+    with session() as s:
+        if _folder_exists(s, path):
+            raise ValueError(f"folder '{path}' already exists")
+        _ensure_folder_rows(s, _folder_ancestors(path))
+    return path
+
+
+def _rewrite_entry_folders(s, old: str, new: str) -> None:
+    """Repoint every entry under `old` (== old or old/…) to `new`, updating both the indexed `folder`
+    column and the mirrored `folder` inside the stored doc JSON."""
+    like = _like_escape(old) + "/%"
+    rows = list(s.scalars(select(CatalogEntry).where(or_(
+        CatalogEntry.folder == old, CatalogEntry.folder.like(like, escape="\\")))))
+    for r in rows:
+        target = new + (r.folder or "")[len(old):]
+        r.folder = target
+        try:
+            doc = json.loads(r.doc)
+        except (ValueError, TypeError):
+            doc = {}
+        doc["folder"] = target
+        r.doc = json.dumps(doc, default=str)
+
+
+def catalog_folder_rename(old: str, new: str) -> None:
+    """Rename a folder, cascading to every dataset and subfolder under it. Operates over the UNION of
+    folder entities and entry `folder` strings, so a folder that exists only because a dataset was
+    registered into it is renameable too. Raises ValueError if `old` is unknown or `new` already exists."""
+    old = _normalize_folder_path(old)
+    new = _normalize_folder_path(new)
+    if not old or not new:
+        raise ValueError("folder path cannot be empty")
+    with session() as s:
+        if not _folder_exists(s, old):
+            raise ValueError(f"folder '{old}' not found")
+        if new == old:
+            return
+        if _folder_exists(s, new):
+            raise ValueError(f"folder '{new}' already exists")
+        like = _like_escape(old) + "/%"
+        moved_entities = list(s.scalars(select(CatalogFolder).where(or_(
+            CatalogFolder.path == old, CatalogFolder.path.like(like, escape="\\")))))
+        targets = [new + row.path[len(old):] for row in moved_entities]
+        for row in moved_entities:
+            s.delete(row)
+        s.flush()
+        _rewrite_entry_folders(s, old, new)
+        _ensure_folder_rows(s, list(targets) + _folder_ancestors(new))
+
+
+def catalog_folder_delete(path: str) -> None:
+    """Delete a folder, reparenting every dataset under it (== path or path/…) to the folder's PARENT
+    (flattened), then removing the folder subtree's entity rows. Operates over the UNION of folder
+    entities and entry `folder` strings. Raises ValueError if the folder is unknown."""
+    path = _normalize_folder_path(path)
+    if not path:
+        raise ValueError("folder path cannot be empty")
+    parent = path.rsplit("/", 1)[0] if "/" in path else ""
+    with session() as s:
+        if not _folder_exists(s, path):
+            raise ValueError(f"folder '{path}' not found")
+        like = _like_escape(path) + "/%"
+        rows = list(s.scalars(select(CatalogEntry).where(or_(
+            CatalogEntry.folder == path, CatalogEntry.folder.like(like, escape="\\")))))
+        for r in rows:
+            r.folder = parent
+            try:
+                doc = json.loads(r.doc)
+            except (ValueError, TypeError):
+                doc = {}
+            doc["folder"] = parent
+            r.doc = json.dumps(doc, default=str)
+        for row in s.scalars(select(CatalogFolder).where(or_(
+                CatalogFolder.path == path, CatalogFolder.path.like(like, escape="\\")))):
+            s.delete(row)
+
+
 def catalog_tree(prefix: str = "", table_limit: int = 100
                  ) -> tuple[list[tuple[str, str, int]], list[dict], int]:
     """One level of the browse tree at `prefix`: (child_folders, direct_tables, direct_total).
@@ -6250,8 +6393,11 @@ def catalog_tree(prefix: str = "", table_limit: int = 100
         folder_counts = s.execute(
             select(CatalogEntry.folder, func.count()).where(CatalogEntry.folder != "")
             .group_by(CatalogEntry.folder)).all()
+        # merge in folder ENTITY paths (count 0) so an empty folder — created directly or emptied by a
+        # move/delete — still appears in the tree alongside the entry-derived folders
+        entity_paths = [(pth, 0) for (pth,) in s.execute(select(CatalogFolder.path)).all()]
         children: dict[str, int] = {}
-        for folder, cnt in folder_counts:
+        for folder, cnt in list(folder_counts) + entity_paths:
             f = (folder or "").strip("/")
             if p:
                 if f != p and not f.startswith(p + "/"):
