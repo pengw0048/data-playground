@@ -3,13 +3,13 @@ name: Release artifacts
 # Build-and-smoke contract for versioned installables (issue #114 / REL-01 slice 10).
 # Builds the SPA + wheel + application image from a clean checkout, proves each artifact
 # installs and runs an offline starter canvas, and enforces one version identity.
-# Publishing / tagging / SBOM / signing is issue #115.
+# Publishing / tagging / SBOM / signing is issue #115 (see release.yml, which calls this workflow).
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read

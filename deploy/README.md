@@ -23,6 +23,22 @@ python3 scripts/check_release_versions.py \
 Build order for a shippable wheel: `cd web && npm ci && npm run build`, then `cd kernel && uv build`.
 `scripts/check_wheel_has_spa.py` fails if the wheel still contains the `hatch_build.py` placeholder UI.
 
+### Verifying a published release (checksums + attestations)
+
+```bash
+# After downloading the GitHub Release assets for tag vX.Y.Z:
+sha256sum -c SHA256SUMS
+
+gh attestation verify ./data_playground-X.Y.Z-py3-none-any.whl \
+  --repo pengw0048/data-playground
+gh attestation verify oci://ghcr.io/pengw0048/data-playground:X.Y.Z \
+  --repo pengw0048/data-playground
+```
+
+Tagged releases are produced by `.github/workflows/release.yml` (wheel + `SHA256SUMS` + SBOMs on the
+GitHub Release, application image on GHCR, build-provenance attestations). See `CHANGELOG.md` for
+supported Python/browser/deployment profiles, the Alembic range, and rollback constraints.
+
 ## Verify it locally (kind)
 
 ```bash
