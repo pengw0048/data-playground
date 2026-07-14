@@ -42,7 +42,7 @@ def _clean_sinks():
 
 def _labels_for(name: MetricName) -> dict[str, str]:
     if name in (MetricName.HTTP_REQUESTS, MetricName.HTTP_DURATION_MS):
-        return {"method": "GET", "route_class": "/api/livez", "outcome": "success"}
+        return {"method": "GET", "route_class": "api.livez", "outcome": "success"}
     if name == MetricName.KERNEL_HEALTH:
         return {"probe": "livez", "ready": "true"}
     if name in (MetricName.PUBLICATION, MetricName.STORAGE_GC, MetricName.PROVIDER_ERRORS):
@@ -95,7 +95,7 @@ def test_inmemory_sink_records_shape_valid_events_and_redacts_fixtures():
     secret = "super-secret-token-VALUE"
     row_sample = "PII_ROW_VALUE_ALICE"
     emit_metric(MetricName.HTTP_REQUESTS, 1.0,
-                labels={"method": "GET", "route_class": "/api/livez", "outcome": "success"},
+                labels={"method": "GET", "route_class": "api.livez", "outcome": "success"},
                 request_id="req_test")
     emit_audit(AuditAction.AUTH_LOGIN, AuditOutcome.SUCCESS, principal_id="alice",
                attrs={"mode": "open"})
@@ -187,9 +187,9 @@ def test_run_persists_request_id_on_durable_record(tmp_path):
         if s.get(Canvas, canvas_id) is None:
             s.add(Canvas(id=canvas_id, owner_id="local", name="obs", doc="{}"))
     metadb.bind_run_request_id("run_persist01", "req_persisted_01", canvas_id=canvas_id)
-    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"), maintain_storage=False)
     (tmp_path / "ws").mkdir(exist_ok=True)
     (tmp_path / "data").mkdir(exist_ok=True)
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"), maintain_storage=False)
     g = Graph(id=canvas_id, version=1, nodes=[], edges=[])
     st = RunStatus(run_id="run_persist01", status="done", total_rows=3, ms=11,
                    placement="local", request_id="req_persisted_01",

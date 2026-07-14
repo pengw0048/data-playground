@@ -182,33 +182,33 @@ def normalize_request_id(raw: str | None) -> str:
 
 
 def route_class(path: str) -> str:
-    """Map a URL path to a low-cardinality route class (no path IDs)."""
+    """Map a URL path to a low-cardinality route class (no path IDs, no URI-shaped values)."""
     if not path:
         return "other"
     if path.startswith("/api/run"):
-        return "/api/run"
+        return "api.run"
     if path.startswith("/api/auth"):
-        return "/api/auth"
+        return "api.auth"
     if path.startswith("/api/catalog"):
-        return "/api/catalog"
+        return "api.catalog"
     if path.startswith("/api/canvas"):
-        return "/api/canvas"
+        return "api.canvas"
     if path.startswith("/api/settings"):
-        return "/api/settings"
+        return "api.settings"
     if path.startswith("/api/data"):
-        return "/api/data"
+        return "api.data"
     if path in ("/api/livez", "/api/health"):
-        return "/api/livez"
+        return "api.livez"
     if path == "/api/readyz":
-        return "/api/readyz"
+        return "api.readyz"
     if path == "/api/version":
-        return "/api/version"
+        return "api.version"
     if path.startswith("/api/"):
-        return "/api/other"
+        return "api.other"
     if path.startswith("/ws/"):
-        return "/ws"
+        return "ws"
     if path == "/mcp":
-        return "/mcp"
+        return "mcp"
     return "other"
 
 

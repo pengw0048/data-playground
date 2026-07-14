@@ -43,6 +43,9 @@ Each metric is a typed `MetricEvent`: `{schema_version, name, type, unit, value,
 `status`, `outcome`, `placement`, `backend`, `method`, `route_class`, `action`, `kind`, `error_class`,
 `probe`, `ready`.
 
+`route_class` values are dotted buckets such as `api.run`, `api.auth`, `api.livez` (never raw URL paths
+or path IDs).
+
 Cardinality bound: every label value is a short enum/bucket (≤ 64 chars). Distinct canvases, datasets,
 users, or URIs must **not** enlarge the label set.
 
