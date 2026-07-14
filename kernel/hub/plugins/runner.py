@@ -449,9 +449,12 @@ class LocalRunner:
         provisional_result: RunStatus | None = None
         nm = g.node_map(graph)
         rows_seen = 0
+        # Bind the write destination's object-store credential BEFORE the run scope opens, so the scope
+        # cursor snapshots that secret (DuckDB freezes a cursor's secret view at transaction start).
+        run_object_store_cfg = self._run_object_store_cfg(plan, nm)
         # Run on our OWN DuckDB cursor (db.run_scope), NOT the process-global lock: a long run no
         # longer serializes every other user's preview/sample/run, and a failure here can't wedge them.
-        with db.run_scope() as scope:
+        with db.object_store_binding(run_object_store_cfg), db.run_scope() as scope:
             with self._lock:
                 self._scopes[run_id] = scope  # cancel() interrupts this scope's cursor
             try:
@@ -902,13 +905,38 @@ class LocalRunner:
                 parts.append("type-changed " + str([f"{c['name']}:{c['from']}→{c['to']}" for c in changed]))
             raise RuntimeError(f"schema contract on '{title}' violated — {'; '.join(parts)}")
 
+    def _run_object_store_cfg(self, plan: CompilePlan, nm: dict) -> dict | None:
+        """Resolved object-store credentials for this run's write destination (the first object-store
+        sink with a resolvable cred), or None. Bound before the scope so writes use that credential."""
+        from hub import destinations
+        from hub.sinks import SinkSpec
+        for step in plan.steps:
+            if step.kind != "write":
+                continue
+            node = nm.get(step.node_id)
+            if node is None:
+                continue
+            data = node.data if isinstance(node.data, dict) else {}
+            spec = SinkSpec.from_config(data.get("config", {}), data.get("title"))
+            cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
+            if cfg:
+                return cfg
+        return None
+
     def _commit_write(self, node, graph: Graph, engine: BuildEngine, status: RunStatus,
                       cached: dict | None, cancel: _CancelToken, pre_publish=None) -> int:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+        from hub import destinations
         from hub.sinks import SinkCommit, SinkSpec, commit_sink, preflight_sink
         spec = SinkSpec.from_config(cfg, node.data.get("title") if isinstance(node.data, dict) else None)
         if cancel.is_set():
             raise RuntimeError("run cancelled before output commit")
+        # Bind this destination's credential at the object-store open (the scope cursor already
+        # snapshotted it via the run-level binding; this makes the per-write credential explicit).
+        os_cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
+        if os_cfg is not None:
+            with db.lock():
+                db.ensure_object_store(os_cfg)
         # content-addressed skip: an identical overwrite plan already wrote this, so re-running is a
         # no-op. append is NOT idempotent (it must add a part every run), so it never uses the cache.
         if spec.mode != "append" and cached and cached.get("table") and cached.get("uri") and self._output_exists(cached["uri"]):

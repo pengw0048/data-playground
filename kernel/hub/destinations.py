@@ -21,14 +21,14 @@ from hub import metadb
 @runtime_checkable
 class DestinationBackend(Protocol):
     kind: str
-    def browse(self, root: str, path: str) -> dict: ...          # {path, entries:[{name,kind,uri}], error?}
+    def browse(self, root: str, path: str, cred_id: str | None = None) -> dict: ...  # {path, entries:[{name,kind,uri}], error?}
     def target_uri(self, root: str, path: str, filename: str) -> str: ...
 
 
 class LocalBackend:
     kind = "local"
 
-    def browse(self, root: str, path: str) -> dict:
+    def browse(self, root: str, path: str, cred_id: str | None = None) -> dict:
         top = os.path.realpath(root)
         base = os.path.realpath(os.path.join(top, path.lstrip("/")))
         if not (base == top or base.startswith(top + os.sep)):  # never escape the destination root
@@ -67,12 +67,16 @@ class ObjectStoreBackend:
     def __init__(self, kind: str):
         self.kind = kind
 
-    def browse(self, root: str, path: str) -> dict:
-        from hub import db
+    def browse(self, root: str, path: str, cred_id: str | None = None) -> dict:
+        from hub import db, metadb
+        from hub.secrets import resolve_object_store
         try:
             prefix = self._safe_prefix(root, path)
-            db.ensure_object_store()
+            # Resolve the destination's credential per request and publish it right before the glob,
+            # both under the base lock so the just-published secret is the one this listing uses.
+            cfg = resolve_object_store(metadb.cred_object_store_config(cred_id))
             with db.lock():
+                db.ensure_object_store(cfg)
                 rows = db.conn().execute("SELECT file FROM glob(?)", [f"{prefix}/*"]).fetchall()
         except Exception as e:  # noqa: BLE001 — no creds / bad bucket → say so honestly
             return {"path": path, "entries": [], "error": str(e)}
@@ -158,9 +162,23 @@ def browse(workspace: str, dest_id: str, path: str) -> dict:
     b = _BACKENDS.get(d.get("backend", "local"))
     if not b:
         return {"path": path, "entries": [], "error": f"no backend for '{d.get('backend')}'"}
-    res = b.browse(d.get("root", ""), path or "")
+    res = b.browse(d.get("root", ""), path or "", d.get("credId"))
     res["writable"] = True  # both local and object-store backends can write
     return res
+
+
+def object_store_cred_cfg(workspace: str, dest_id: str | None) -> dict | None:
+    """Resolved object-store credentials for an object-store destination's cred (falls back to the
+    default cred / legacy setting), or None when the destination is not an object store. The write
+    path calls this to bind the destination's credentials before the object-store open."""
+    if not dest_id:
+        return None
+    d = _find(workspace, dest_id)
+    if not d or d.get("backend") not in ("s3", "gs"):
+        return None
+    from hub import metadb
+    from hub.secrets import resolve_object_store
+    return resolve_object_store(metadb.cred_object_store_config(d.get("credId")))
 
 
 def target_uri(workspace: str, dest_id: str, path: str, filename: str) -> str:
