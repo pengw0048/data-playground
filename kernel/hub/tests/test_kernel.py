@@ -1349,23 +1349,40 @@ def test_sandbox_blocks_format_string_escape():
     assert "__" in (r.get("reason") or "")
 
 
-def test_settings_redacts_secrets():
-    # GET /settings must not disclose the LLM key or object-store secrets in plaintext; a PUT that
-    # echoes the redaction sentinel preserves the stored secret (doesn't overwrite it with dots).
-    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "sk-super-secret"})
-    client.put("/api/settings", json={"scope": "global", "key": "objectStore",
-                                      "value": {"accessKeyId": "AKIA", "secretAccessKey": "shh", "region": "us-east-1"}})
-    g = client.get("/api/settings").json()["global"]
-    assert g["agentApiKey"] == "__redacted__"                    # key not disclosed
-    assert g["objectStore"]["secretAccessKey"] == "__redacted__" and g["objectStore"]["accessKeyId"] == "__redacted__"
-    assert g["objectStore"]["region"] == "us-east-1"             # non-secret still visible
-    # saving back the redacted view keeps the real secrets (a no-op edit doesn't wipe them)
-    client.put("/api/settings", json={"scope": "global", "key": "objectStore",
-                                      "value": {"accessKeyId": "__redacted__", "secretAccessKey": "__redacted__", "region": "eu-west-1"}})
+def test_settings_stores_secret_references_not_plaintext():
+    # Secret-bearing settings store env:/file: references. GET echoes the reference (not sensitive);
+    # PUT rejects a raw credential so the metadata DB never holds the secret bytes.
     from hub import metadb
+
+    bad = client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "sk-super-secret"})
+    assert bad.status_code == 400 and "secret reference" in bad.json()["detail"]
+    assert client.put("/api/settings", json={
+        "scope": "global", "key": "objectStore",
+        "value": {"accessKeyId": "AKIA", "secretAccessKey": "shh", "region": "us-east-1"},
+    }).status_code == 400
+
+    assert client.put("/api/settings", json={
+        "scope": "global", "key": "agentApiKey", "value": "env:DP_FIXTURE_AGENT_KEY",
+    }).status_code == 200
+    assert client.put("/api/settings", json={
+        "scope": "global", "key": "objectStore",
+        "value": {
+            "accessKeyId": "env:DP_FIXTURE_ACCESS_KEY",
+            "secretAccessKey": "env:DP_FIXTURE_SECRET_KEY",
+            "sessionToken": "env:DP_FIXTURE_SESSION_TOKEN",
+            "region": "us-east-1",
+        },
+    }).status_code == 200
+    g = client.get("/api/settings").json()["global"]
+    assert g["agentApiKey"] == "env:DP_FIXTURE_AGENT_KEY"
+    assert g["objectStore"]["accessKeyId"] == "env:DP_FIXTURE_ACCESS_KEY"
+    assert g["objectStore"]["secretAccessKey"] == "env:DP_FIXTURE_SECRET_KEY"
+    assert g["objectStore"]["sessionToken"] == "env:DP_FIXTURE_SESSION_TOKEN"
+    assert g["objectStore"]["region"] == "us-east-1"
     stored = metadb.get_setting("objectStore", "global")
-    assert stored["secretAccessKey"] == "shh" and stored["accessKeyId"] == "AKIA" and stored["region"] == "eu-west-1"
-    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": ""})  # restore
+    assert stored["secretAccessKey"] == "env:DP_FIXTURE_SECRET_KEY"
+    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": ""})
+    client.put("/api/settings", json={"scope": "global", "key": "objectStore", "value": {}})
 
 
 def test_user_scoped_settings_are_isolated_per_user():
@@ -2841,10 +2858,11 @@ def test_settings_global_and_user_scope():
 
 
 def test_agent_activates_from_settings_key(monkeypatch):
-    # setting a provider key via /settings (the UI path) must make the agent available — no env var
+    # A secret-reference agentApiKey setting must make the agent available — no direct provider env var.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("DP_FIXTURE_AGENT_FROM_UI", "sk-from-ui")
     assert client.get("/api/agent").json()["available"] is False
-    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "sk-from-ui"})
+    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "env:DP_FIXTURE_AGENT_FROM_UI"})
     try:
         assert client.get("/api/agent").json()["available"] is True
     finally:
@@ -4563,9 +4581,8 @@ def test_sql_catalog_reference_plugin(tmp_path):
 
 
 def test_plugin_secret_not_leaked_via_settings():
-    # a plugin's secret [[config]] field must NOT be readable in plaintext via GET /api/settings (only
-    # admins can PUT global settings, but any authenticated user can GET them) — the same "secrets never
-    # echo" contract /api/plugins upholds. And PUT with the redaction sentinel must keep the stored secret.
+    # A plugin's secret [[config]] field stores a reference, never the material token. GET echoes the
+    # reference; PUT rejects a raw secret. Non-secret plugin config remains a normal string setting.
     import json as _json
 
     from hub import metadb
@@ -4577,15 +4594,18 @@ def test_plugin_secret_not_leaked_via_settings():
                        {"key": "host", "type": "string"}]}
     deps.plugins.append(fake)
     try:
-        client.put("/api/settings", json={"scope": "global", "key": "plugin.dp_secretpk.token", "value": "sk-LEAK-xyz"})
-        client.put("/api/settings", json={"scope": "global", "key": "plugin.dp_secretpk.host", "value": "db.internal"})
+        bad = client.put("/api/settings", json={
+            "scope": "global", "key": "plugin.dp_secretpk.token", "value": "sk-LEAK-xyz"})
+        assert bad.status_code == 400 and "secret reference" in bad.json()["detail"]
+        client.put("/api/settings", json={
+            "scope": "global", "key": "plugin.dp_secretpk.token", "value": "env:DP_SECRET_PK_TOKEN"})
+        client.put("/api/settings", json={
+            "scope": "global", "key": "plugin.dp_secretpk.host", "value": "db.internal"})
         r = client.get("/api/settings").json()
-        assert r["global"]["plugin.dp_secretpk.token"] == "__redacted__"   # secret redacted
-        assert "sk-LEAK-xyz" not in _json.dumps(r)                          # value never in the payload
-        assert r["global"]["plugin.dp_secretpk.host"] == "db.internal"      # non-secret still visible
-        # PUT of the redaction sentinel keeps the stored secret (doesn't overwrite with dots)
-        client.put("/api/settings", json={"scope": "global", "key": "plugin.dp_secretpk.token", "value": "__redacted__"})
-        assert metadb.get_setting("plugin.dp_secretpk.token", "global") == "sk-LEAK-xyz"
+        assert r["global"]["plugin.dp_secretpk.token"] == "env:DP_SECRET_PK_TOKEN"
+        assert "sk-LEAK-xyz" not in _json.dumps(r)
+        assert r["global"]["plugin.dp_secretpk.host"] == "db.internal"
+        assert metadb.get_setting("plugin.dp_secretpk.token", "global") == "env:DP_SECRET_PK_TOKEN"
     finally:
         deps.plugins.remove(fake)
         metadb.set_setting("plugin.dp_secretpk.token", "", "global")

@@ -194,12 +194,13 @@ def test_ephemeral_worker_seeds_only_allowlisted_object_store_execution_config(t
 
     assert url.endswith("/workload-metadata.db")
     assert seeded == [("objectStore", {
-        "accessKeyId": "data-key",
-        "secretAccessKey": "data-secret",
+        "accessKeyId": "env:DP_S3_KEY",
+        "secretAccessKey": "env:DP_S3_SECRET",
         "endpoint": "http://minio:9000",
         "useSsl": False,
         "region": "us-east-1",
     }, "global")]
+    assert "data-key" not in repr(seeded) and "data-secret" not in repr(seeded)
     assert "must-not-cross" not in repr(seeded)
 
 

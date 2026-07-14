@@ -92,6 +92,7 @@ def object_fs(uri: str):
     import pyarrow.fs as pafs
 
     from hub import metadb
+    from hub.secrets import resolve_object_store
     scheme, _, rest = uri.partition("://")
     scheme = scheme.lower()
     cfg = metadb.get_setting("objectStore", "global", default={}) or {}
@@ -101,6 +102,7 @@ def object_fs(uri: str):
         from hub.workload_env import data_plane_object_store_config, is_ephemeral_workload
         if is_ephemeral_workload():
             cfg = data_plane_object_store_config(scheme=scheme)
+    cfg = resolve_object_store(cfg)  # hub settings hold env:/file: references; resolve in-process
     endpoint = str(cfg.get("endpoint") or "").strip()
     if scheme in ("s3", "r2"):
         kw: dict = {}

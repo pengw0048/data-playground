@@ -492,46 +492,29 @@ def canvas_kernel_restart(canvas_id: str, uid: str = Depends(current_user)) -> d
     return {"ok": True, "restarted": True}
 
 
-# Secrets never leave the kernel in plaintext. GET redacts them to a sentinel (fields are password
-# inputs, so it just shows dots); PUT treats the sentinel as "unchanged" and preserves the stored value.
-_REDACTED = "__redacted__"
-_SECRET_SUBKEYS = ("accessKeyId", "secretAccessKey")  # within the objectStore setting
+# Secret-bearing settings store references (env:VAR / file:/path), never the material value. GET
+# returns the reference string as-is (it is not sensitive). PUT accepts only references (or empty to
+# clear) for agentApiKey, objectStore credential subkeys, and plugin [[config]] fields marked secret.
 
 
 def _plugin_secret_keys() -> set[str]:
-    """Setting keys `plugin.<pack>.<field>` whose declared [[config]] field is `secret` — so GET redacts
-    them and PUT treats the redaction sentinel as 'unchanged', exactly like agentApiKey. A plugin's secret
-    (an API token / DB password) must not be readable by a non-admin via GET /settings the way /api/plugins
-    already avoids. Sourced from the loaded plugins' schemas; never crashes settings."""
-    out: set[str] = set()
-    try:
-        from hub.deps import get_deps
-        for p in get_deps().plugins:
-            for f in (p.get("config") or []):
-                if isinstance(f, dict) and f.get("secret") and f.get("key"):
-                    out.add(f"plugin.{p['name']}.{f['key']}")
-    except Exception:  # noqa: BLE001
-        pass
-    return out
-
-
-def _redact_global(key: str, value, secret_keys: set[str] = frozenset()):
-    if key == "agentApiKey" or key in secret_keys:
-        return _REDACTED if value else value
-    if key == "objectStore" and isinstance(value, dict):
-        return {k: (_REDACTED if k in _SECRET_SUBKEYS and v else v) for k, v in value.items()}
-    return value
+    """Setting keys `plugin.<pack>.<field>` whose declared [[config]] field is `secret`."""
+    from hub.secrets import plugin_secret_setting_keys
+    return plugin_secret_setting_keys()
 
 
 @router.get("/settings")
 def get_settings(uid: str = Depends(current_user)) -> dict:
-    secret_keys = _plugin_secret_keys()
+    from hub.secrets import redact_global_setting
+    plugin_secrets = _plugin_secret_keys()
     with metadb.session() as s:
         rows = s.scalars(_sa_select(metadb.Setting))
         out: dict = {"global": {}, "user": {}}
         for r in rows:
             if r.scope == "global":
-                out["global"][r.key] = _redact_global(r.key, json.loads(r.value), secret_keys)
+                # References are safe to echo; mask any residual legacy plaintext for a secret key.
+                out["global"][r.key] = redact_global_setting(
+                    r.key, json.loads(r.value), plugin_secrets=plugin_secrets)
             elif r.scope == "user" and r.scope_id == uid:
                 out["user"][r.key] = json.loads(r.value)
         return out
@@ -543,11 +526,11 @@ def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
         _require_admin(uid)  # instance-wide settings (object-store creds, agent key, destinations) — admin only
     scope_id = uid if body.scope == "user" else ""
     value = body.value
-    if body.scope == "global":  # a redaction sentinel means "keep what's stored" — never overwrite a secret with dots
-        stored = metadb.get_setting(body.key, "global", default=None)
-        if value == _REDACTED and (body.key == "agentApiKey" or body.key in _plugin_secret_keys()):
-            value = stored  # never overwrite a secret with the dots sentinel echoed by GET
-        elif body.key == "objectStore" and isinstance(value, dict) and isinstance(stored, dict):
-            value = {**value, **{k: stored.get(k) for k in _SECRET_SUBKEYS if value.get(k) == _REDACTED}}
+    if body.scope == "global":
+        from hub.secrets import validate_secret_setting_value
+        try:
+            value = validate_secret_setting_value(body.key, value, plugin_secrets=_plugin_secret_keys())
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     metadb.set_setting(body.key, value, scope=body.scope, scope_id=scope_id)
     return {"ok": True}

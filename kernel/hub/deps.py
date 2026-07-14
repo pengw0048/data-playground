@@ -64,20 +64,37 @@ class Registry:
         setting `plugin.<pack>.<key>`) > the field's declared `env` var > its declared `default` > the
         `default` arg. Fields are declared in the pack's dataplay.toml `[[config]]`. Call this inside
         register() to configure the pack; a value changed in the UI takes effect on the next kernel
-        start (plugins register once at startup — same as the env vars it falls back to)."""
+        start (plugins register once at startup — same as the env vars it falls back to).
+
+        When the field is ``secret``, the stored setting is a secret reference (``env:…`` / ``file:…``)
+        and is resolved here; the material value never lives in the settings row.
+        """
         pack = self._pack
         schema = self.deps._manifests.get(pack, {}).get("config", []) if pack else []
         field = next((f for f in schema if isinstance(f, dict) and f.get("key") == key), None)
+        secret = bool(field and field.get("secret"))
         if pack:
             from hub import metadb
             v = metadb.get_setting(f"plugin.{pack}.{key}", "global", default=None)
             if v not in (None, ""):
+                if secret:
+                    from hub.secrets import resolve_secret_value
+                    return resolve_secret_value(v)
                 return v
         if field and field.get("env") and os.environ.get(field["env"]) not in (None, ""):
             return os.environ[field["env"]]
         if field and field.get("default") is not None:
             return field["default"]
         return default
+
+    def add_secret_resolver(self, scheme: str, resolver) -> None:
+        """Register a pluggable SecretResolver for ``scheme:…`` references (see ``hub.secrets``).
+
+        Core ships ``env`` and ``file``. An organization-specific backend (Vault, cloud KMS, …) is a
+        plugin that calls this during ``register(reg)`` — core never imports a vendor client.
+        """
+        from hub.secrets import register_resolver
+        register_resolver(scheme, resolver, replace=True)
 
     def add_node(self, spec: NodeSpec, build: "NodeBuilder | None" = None, ir=None) -> None:
         # `build` is the node's build callable — see hub.backends.NodeBuilder for its exact

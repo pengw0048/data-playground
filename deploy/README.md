@@ -69,6 +69,11 @@ Harden for your cluster: a real image registry and pull secrets, resource reques
 NetworkPolicy for the kernel command channel, and pod cleanup. The hub's periodic reaper tears down a
 dead kernel's Pod and Service; still set a sensible `DP_KERNEL_IDLE_TTL`.
 
+Store credential-bearing settings as secret references (`env:VAR` or `file:/path`) — the agent API
+key, object-store keys, and plugin secret fields — never plaintext, and inject the material values
+through the Pod environment or mounted secret files. After upgrading past the SEC-03 migration,
+re-enter any cleared legacy plaintext settings as references (see the root README).
+
 ## Notes from real-cluster verification
 
 A Pod cold start (schedule plus heavy imports) is slower than a local process. Ready-wait is

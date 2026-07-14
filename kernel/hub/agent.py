@@ -30,10 +30,22 @@ from hub.settings import settings
 
 
 def _agent_config() -> tuple[str, str | None, str | None]:
-    """Resolve (model, api_key, base_url): global DB settings (set in the UI) override env/defaults."""
+    """Resolve (model, api_key, base_url): global DB settings (set in the UI) override env/defaults.
+
+    ``agentApiKey`` is stored as a secret reference (``env:…`` / ``file:…``); the material value is
+    resolved here and never written back into settings.
+    """
     from hub import metadb
+    from hub.secrets import SecretResolveError, resolve_secret_value
     model = metadb.get_setting("agentModel", "global") or settings.agent_model
-    api_key = metadb.get_setting("agentApiKey", "global") or settings.agent_api_key
+    stored_key = metadb.get_setting("agentApiKey", "global")
+    try:
+        api_key = resolve_secret_value(stored_key) if stored_key else None
+    except SecretResolveError:
+        # A broken reference (unset env var / missing file) must degrade to unavailable, not 500 the
+        # polled agent status endpoint.
+        api_key = None
+    api_key = api_key or settings.agent_api_key
     base_url = metadb.get_setting("agentBaseUrl", "global") or settings.agent_base_url
     return model, api_key, base_url
 
