@@ -81,6 +81,14 @@ class CatalogTable(Wire):
     usage: int = 0  # how often this dataset has been read (popularity signal; drives "most used" sort)
 
 
+class CatalogPublicationReceipt(Wire):
+    """Durable acknowledgement returned by an idempotent catalog output publication."""
+    idempotency_key: str
+    uri: str
+    version: str | None = None
+    durable: Literal[True] = True
+
+
 Cardinality = Literal["1:1", "1:N", "N:1", "N:M", "unknown"]
 
 
@@ -311,6 +319,22 @@ class PerNodeStatus(Wire):
     error: str | None = None  # set on the step that failed — the error (+ a fix hint) attributed to its node
 
 
+class RunBackendRef(Wire):
+    """Durable handle for a run owned by an external execution control plane.
+
+    The handle is intentionally provider-neutral and contains no credentials. A backend can reconstruct
+    its supervisor from this record plus its own operator configuration after the hub/kernel restarts.
+    """
+    backend: str
+    cluster_ref: str | None = None
+    submission_id: str
+    attempt_id: str
+    job_uri: str
+    result_uri: str
+    code_ref: str | None = None
+    durable: bool = True
+
+
 class RunStatus(Wire):
     run_id: str
     status: Literal["queued", "running", "done", "failed", "cancelled"]
@@ -325,6 +349,7 @@ class RunStatus(Wire):
     error: str | None = None
     output_uri: str | None = None
     output_table: str | None = None
+    backend_ref: RunBackendRef | None = None
 
 
 class PlanStep(Wire):

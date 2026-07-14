@@ -93,14 +93,23 @@ def object_fs(uri: str):
 
     from hub import metadb
     from hub.secrets import resolve_object_store
-    cfg = resolve_object_store(metadb.get_setting("objectStore", "global", default={}) or {})
     scheme, _, rest = uri.partition("://")
     scheme = scheme.lower()
+    cfg = metadb.get_setting("objectStore", "global", default={}) or {}
+    if not cfg:
+        # Only a one-shot workload (subrun / Ray driver) with no hub settings DB falls back to the
+        # allowlisted data-plane environment; a hub keeps its ambient credential chain.
+        from hub.workload_env import data_plane_object_store_config, is_ephemeral_workload
+        if is_ephemeral_workload():
+            cfg = data_plane_object_store_config(scheme=scheme)
+    cfg = resolve_object_store(cfg)  # hub settings hold env:/file: references; resolve in-process
     endpoint = str(cfg.get("endpoint") or "").strip()
     if scheme in ("s3", "r2"):
         kw: dict = {}
         if cfg.get("accessKeyId") and cfg.get("secretAccessKey"):
             kw["access_key"], kw["secret_key"] = cfg["accessKeyId"], cfg["secretAccessKey"]
+        if cfg.get("sessionToken"):
+            kw["session_token"] = cfg["sessionToken"]
         if cfg.get("region"):
             kw["region"] = cfg["region"]
         if endpoint:  # MinIO / R2 / custom S3-compatible endpoint

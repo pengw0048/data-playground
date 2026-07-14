@@ -85,7 +85,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       : Promise.resolve([] as PluginInfo[])
     Promise.all([settings, pluginPacks]).then(([nextSettings, nextPlugins]) => {
       if (cancelled) return
-      setG(nextSettings.global)
+      const global = { ...nextSettings.global }
+      const policy = (global.agentDataPolicy && typeof global.agentDataPolicy === 'object')
+        ? global.agentDataPolicy as { level?: string; endpointIsLocal?: boolean }
+        : null
+      global.agentDataPolicyLevel = policy?.level || 'metadata-only'
+      global.agentDataPolicyEndpointIsLocal = Boolean(policy?.endpointIsLocal)
+      setG(global)
       setU(nextSettings.user)
       setPlugins(nextPlugins)
       setLoading(false)
@@ -122,6 +128,14 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       for (const key of ['agentModel', 'agentApiKey', 'agentBaseUrl']) {
         updates.push({ scope: 'global', key, value: g[key] ?? '' })
       }
+      updates.push({
+        scope: 'global',
+        key: 'agentDataPolicy',
+        value: {
+          level: String(g.agentDataPolicyLevel || 'metadata-only'),
+          endpointIsLocal: Boolean(g.agentDataPolicyEndpointIsLocal),
+        },
+      })
       updates.push({ scope: 'global', key: 'destinations', value: dests })
       updates.push({ scope: 'global', key: 'objectStore', value: obj })
       for (const [pack, fields] of Object.entries(pcfg)) {
@@ -166,7 +180,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
   return (
     <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
-      <DialogContent className="dp-modal-overlay flex flex-col gap-0 overflow-hidden p-0 w-[94vw] max-w-[940px] h-[min(680px,90vh)]">
+      <DialogContent data-testid="settings-modal" className="dp-modal-overlay flex flex-col gap-0 overflow-hidden p-0 w-[94vw] max-w-[940px] h-[min(680px,90vh)]">
         {/* header */}
         <div className="flex items-center gap-2 border-b border-border py-3 pl-[18px] pr-12">
           <span className="flex items-center text-muted-foreground"><Icon name="settings" size={15} /></span>
@@ -220,13 +234,44 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   <Field label="API key"><Input value={val('agentApiKey')} placeholder="env:ANTHROPIC_API_KEY or file:/run/secrets/agent_key" onChange={(e) => set('agentApiKey', e.target.value)} /></Field>
                   <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">Store a secret reference (`env:VAR` or `file:/path`), never the key itself. Leave blank to rely on the provider&apos;s env var.</div>
                   <Field label="Base URL"><Input value={val('agentBaseUrl')} placeholder="http://localhost:11434 (optional)" onChange={(e) => set('agentBaseUrl', e.target.value)} /></Field>
+                  <Field label="Data policy">
+                    <Select
+                      value={String(g.agentDataPolicyLevel || 'metadata-only')}
+                      onValueChange={(v) => setG((prev) => ({ ...prev, agentDataPolicyLevel: v }))}
+                    >
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="metadata-only">metadata-only (default for hosted models)</SelectItem>
+                        <SelectItem value="sample-values">sample-values (send up to 8 preview rows)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">
+                    Hosted providers default to metadata-only so catalog identity may leave but sample cell values do not.
+                    Opt into sample-values only when that third-party egress is acceptable.
+                  </div>
+                  <label className="mb-2 flex items-start gap-2 text-[11.5px] text-foreground">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={Boolean(g.agentDataPolicyEndpointIsLocal)}
+                      onChange={(e) => setG((prev) => ({ ...prev, agentDataPolicyEndpointIsLocal: e.target.checked }))}
+                    />
+                    <span>
+                      Treat Base URL as a local / self-hosted endpoint
+                      <span className="mt-0.5 block text-[10.5px] text-muted-foreground">
+                        When set, sample values may reach that endpoint without the sample-values opt-in.
+                        Does nothing unless a Base URL is configured.
+                      </span>
+                    </span>
+                  </label>
                 </Section>}
 
                 <Section id="execution" title="Execution backend">
                   {!canGlobal && <div className="mb-3 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] text-muted-foreground">Workspace-wide settings are managed by an administrator. You can still change your runner preference.</div>}
                   <Field label="Runner">
                     <Select value={(u.backend ? String(u.backend) : INHERIT)} onValueChange={(v) => setU((p) => ({ ...p, backend: v }))}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectTrigger aria-label="Runner"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value={INHERIT}>Workspace default{g.backend ? ` (${String(g.backend)})` : ` (${runners[0]})`}</SelectItem>
                         {runners.map((r) => <SelectItem key={r} value={r}>{r}</SelectItem>)}
@@ -281,15 +326,16 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                         <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{d.backend}</Badge>
                         <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-muted-foreground">{d.root}</span>
                         <button onClick={() => setG((prev) => ({ ...prev, destinations: dests.filter((_, j) => j !== i) }))}
+                          aria-label={`Remove destination ${d.name}`}
                           className="grid place-items-center text-muted-foreground transition-colors hover:text-foreground"><Icon name="close" size={12} /></button>
                       </div>
                     ))}
                     {dests.length === 0 && <div className="text-[11.5px] text-muted-foreground">Only the default "Workspace outputs".</div>}
                   </div>
                   <div className="flex gap-1.5">
-                    <Input value={dest.name} onChange={(e) => setDest({ ...dest, name: e.target.value })} placeholder="e.g. S3 exports" className="w-[120px] shrink-0" />
+                    <Input value={dest.name} onChange={(e) => setDest({ ...dest, name: e.target.value })} placeholder="e.g. S3 exports" className="w-[120px] shrink-0" aria-label="Destination name" />
                     <Select value={dest.backend} onValueChange={(v) => setDest({ ...dest, backend: v })}>
-                      <SelectTrigger className="w-[84px] shrink-0"><SelectValue /></SelectTrigger>
+                      <SelectTrigger className="w-[84px] shrink-0" aria-label="Destination backend"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="local">local</SelectItem>
                         <SelectItem value="s3">s3</SelectItem>
@@ -347,12 +393,12 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                           <Field key={f.key} label={f.label}>
                             {f.type === 'select' && f.options ? (
                               <Select value={pval(p.name, f.key, p.config_values?.[f.key])} onValueChange={(v) => setPval(p.name, f.key, v)}>
-                                <SelectTrigger><SelectValue placeholder={ph} /></SelectTrigger>
+                                <SelectTrigger aria-label={f.label}><SelectValue placeholder={ph} /></SelectTrigger>
                                 <SelectContent>{f.options.map((o) => <SelectItem key={o} value={o}>{o}</SelectItem>)}</SelectContent>
                               </Select>
                             ) : f.type === 'bool' ? (
                               <Select value={pval(p.name, f.key, p.config_values?.[f.key]) || 'false'} onValueChange={(v) => setPval(p.name, f.key, v)}>
-                                <SelectTrigger><SelectValue /></SelectTrigger>
+                                <SelectTrigger aria-label={f.label}><SelectValue /></SelectTrigger>
                                 <SelectContent><SelectItem value="true">true</SelectItem><SelectItem value="false">false</SelectItem></SelectContent>
                               </Select>
                             ) : (
@@ -362,6 +408,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                                   ? (pcfg[p.name]?.[f.key] ?? (storedRef == null ? '' : String(storedRef)))
                                   : pval(p.name, f.key, p.config_values?.[f.key])}
                                 placeholder={ph}
+                                aria-label={f.label}
                                 onChange={(e) => setPval(p.name, f.key, e.target.value)}
                               />
                             )}

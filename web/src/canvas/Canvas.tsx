@@ -380,6 +380,12 @@ export function Canvas() {
         nodesDraggable={canEdit}
         nodesConnectable={canEdit}
         edgesReconnectable={canEdit}
+        // Explicit keyboard a11y: Tab cycles focusable nodes; Enter/Space selects the focused node.
+        // Focus ring is styled in index.css (.react-flow__node:focus-visible). Edges stay focusable
+        // too (library default) so wire selection matches mouse selection via keyboard.
+        nodesFocusable
+        edgesFocusable
+        disableKeyboardA11y={false}
         onPaneClick={() => { select(null); setMenu(null); useStore.setState({ openPanels: {} }) }}
         onNodeClick={(e, n) => { if (!e.shiftKey && !e.metaKey && !e.ctrlKey) select(n.id) }}
         defaultEdgeOptions={{ type: 'wire' }}

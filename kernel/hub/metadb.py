@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import threading
 import uuid
 from pathlib import Path
@@ -23,7 +24,7 @@ from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String,
-    Text, UniqueConstraint, create_engine, exists, func, or_, select, update,
+    Text, UniqueConstraint, and_, create_engine, exists, func, or_, select, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
@@ -100,6 +101,7 @@ class RunRecord(Base):
     output_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
     per_node: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON: durable per-node breakdown
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (UniqueConstraint("canvas_id", "run_id", name="uq_run_record_canvas_run"),)
 
 
 class CanvasVersion(Base):
@@ -128,7 +130,70 @@ class RunState(Base):
     kernel_id: Mapped[str | None] = mapped_column(String, nullable=True)  # owning kernel (None = in-process/subprocess run, dies with the hub)
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)  # the run's creator uid (durable owner, for authz)
     auth_canvas_id: Mapped[str | None] = mapped_column(String, nullable=True)  # the real canvas it was authorized against (None = ad-hoc)
+    preallocation_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    preallocation_expires_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class RunBackendJob(Base):
+    """Durable binding between one logical run and one external backend attempt.
+
+    ``run_id`` and ``(backend, submission_id)`` are unique, so concurrent submitters converge on the same
+    attempt. The publication lease elects one reattaching supervisor to register terminal outputs/history;
+    another supervisor can take over only after the lease expires.
+    """
+    __tablename__ = "run_backend_jobs"
+    run_id: Mapped[str] = mapped_column(String, primary_key=True)
+    backend: Mapped[str] = mapped_column(String, index=True)
+    cluster_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    attempt_id: Mapped[str] = mapped_column(String)
+    submission_id: Mapped[str] = mapped_column(String)
+    job_uri: Mapped[str] = mapped_column(Text)
+    result_uri: Mapped[str] = mapped_column(Text)
+    code_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    control_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    quarantine_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submission_state: Mapped[str] = mapped_column(String, default="queued", server_default="queued")
+    submission_owner: Mapped[str | None] = mapped_column(String, nullable=True)
+    submission_lease_until: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    publication_state: Mapped[str] = mapped_column(String, default="pending")
+    publication_owner: Mapped[str | None] = mapped_column(String, nullable=True)
+    publication_lease_until: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_control_observed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recovery_blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Private control-plane copy of the immutable workload envelope. It lets recovery materialize the
+    # object artifact after a crash between the SQL binding commit and object-store creation.
+    job_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Immutable write-ahead terminal/effect plan while publication_state == effects_started.
+    publication_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    __table_args__ = (UniqueConstraint("backend", "submission_id", name="uq_run_backend_submission"),)
+
+
+class RunTerminalFence(Base):
+    """Compact permanent run fence plus the minimum identity needed to authorize retained status."""
+    __tablename__ = "run_terminal_fences"
+    run_id: Mapped[str] = mapped_column(String, primary_key=True)
+    status: Mapped[str] = mapped_column(String)
+    created_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    auth_canvas_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    canvas_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class ActiveBackendJobsError(RuntimeError):
+    """A canvas cannot be deleted while external work can still produce side effects."""
+
+
+class TerminalRunIdError(RuntimeError):
+    """A completed logical run id cannot be rebound after its retained detail is pruned."""
 
 
 class SchemaContract(Base):
@@ -221,6 +286,17 @@ class CatalogEdge(Base):
     column: Mapped[str | None] = mapped_column(String, nullable=True)
     pipeline: Mapped[str | None] = mapped_column(String, nullable=True)
     __table_args__ = (UniqueConstraint("parent", "child", name="uq_catalog_edge"),)
+
+
+class CatalogPublicationEvent(Base):
+    """One durable catalog effect from an idempotent external-run publication."""
+    __tablename__ = "catalog_publication_events"
+    event_key: Mapped[str] = mapped_column(String, primary_key=True)
+    effect_type: Mapped[str] = mapped_column(String, default="usage")
+    uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    version: Mapped[str | None] = mapped_column(String, nullable=True)
+    fingerprint: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class ResultCache(Base):
@@ -478,6 +554,24 @@ class Setting(Base):
     key: Mapped[str] = mapped_column(String)
     value: Mapped[str] = mapped_column(Text)  # JSON-encoded
     __table_args__ = (UniqueConstraint("scope", "scope_id", "key", name="uq_setting"),)
+
+
+class AgentEgressEvent(Base):
+    """Value-free audit of a catalog-reading agent tool call under a hosted model (SEC-01).
+
+    Carries provider/model/tool/dataset/columns/row_count — never raw sample values. A later
+    telemetry-contracts slice can adopt this shape into a cross-domain schema.
+    """
+    __tablename__ = "agent_egress_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)
+    provider: Mapped[str] = mapped_column(String, default="")
+    model: Mapped[str] = mapped_column(String, default="")
+    tool: Mapped[str] = mapped_column(String, default="", index=True)
+    dataset: Mapped[str | None] = mapped_column(Text, nullable=True)
+    columns_json: Mapped[str] = mapped_column(Text, default="[]")  # JSON list of column names
+    row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    event_json: Mapped[str] = mapped_column(Text, default="{}")  # full value-free event payload
 
 
 class CatalogRelationship(Base):
@@ -984,17 +1078,314 @@ def run_canvas_id(run_id: str) -> str | None:
         return r.canvas_id if r else None
 
 
+RUN_PREALLOCATION_TTL_SECONDS = 30.0
+_PREALLOCATION_STATES = ("allocating", "queued")
+_RESULT_RECONCILIATION_STATES = (
+    "result_fencing", "result_submitted", "result_stop_fenced",
+)
+_UNSETTLED_BACKEND_SUBMISSION_STATES = (
+    "submitting", "fencing", "stopping", "fence_stopping",
+    *_RESULT_RECONCILIATION_STATES,
+)
+
+
+def _lock_authorized_run_canvas(s, canvas_id: str | None) -> Canvas | None:
+    """Lock a real authorization canvas before its run identity row."""
+    if canvas_id is None:
+        return None
+    canvas = s.get(Canvas, str(canvas_id), with_for_update=True)
+    if canvas is None:
+        raise RuntimeError("authorized run canvas does not exist")
+    return canvas
+
+
+def _lock_existing_run_identity(
+        s, run_id: str, requested_canvas_id: str | None = None) -> RunState | None:
+    """Lock an existing run in the global Canvas -> RunState order.
+
+    The first read is an immutable identity hint, not an ownership decision. Re-read the RunState under
+    lock after taking the real canvas lock and reject a concurrent identity replacement.
+    """
+    identity = s.execute(select(
+        RunState.auth_canvas_id, RunState.canvas_id, RunState.preallocation_token,
+    ).where(RunState.run_id == str(run_id))).one_or_none()
+    auth_canvas_id, preallocated_canvas_id, preallocation_token = (
+        identity if identity is not None else (None, None, None)
+    )
+    canvas_ids = {str(auth_canvas_id)} if auth_canvas_id is not None else set()
+    if preallocation_token is not None and preallocated_canvas_id is not None:
+        canvas_ids.add(str(preallocated_canvas_id))
+    requested_canvas_id = str(requested_canvas_id) if requested_canvas_id is not None else None
+    requested_exists = False
+    if requested_canvas_id is not None:
+        requested_exists = s.scalar(select(Canvas.id).where(
+            Canvas.id == requested_canvas_id)) is not None
+        if requested_exists:
+            canvas_ids.add(requested_canvas_id)
+    locked_canvases = {
+        canvas_id: s.get(
+            Canvas, canvas_id, with_for_update=True, populate_existing=True)
+        for canvas_id in sorted(canvas_ids)
+    }
+    if auth_canvas_id is not None and locked_canvases.get(str(auth_canvas_id)) is None:
+        raise RuntimeError("authorized run canvas does not exist")
+    if (preallocation_token is not None and preallocated_canvas_id is not None
+            and locked_canvases.get(str(preallocated_canvas_id)) is None):
+        raise RuntimeError("preallocated run canvas no longer exists")
+    if requested_exists and locked_canvases.get(str(requested_canvas_id)) is None:
+        raise RuntimeError("requested run canvas was deleted during backend binding")
+    state = s.get(RunState, str(run_id), with_for_update=True, populate_existing=True)
+    consumed_preallocation = bool(
+        state is not None
+        and preallocation_token is not None
+        and preallocated_canvas_id is None
+        and requested_canvas_id is not None
+        and state.auth_canvas_id == auth_canvas_id
+        and state.canvas_id == requested_canvas_id
+        and state.preallocation_token is None
+        and state.preallocation_expires_at is None
+    )
+    if state is not None and (
+            state.auth_canvas_id != auth_canvas_id
+            or (state.canvas_id != preallocated_canvas_id
+                and not consumed_preallocation)):
+        raise RuntimeError("run authorization identity changed concurrently")
+    return state
+
+
+def _run_preallocation_deadline(s, ttl_seconds: float) -> datetime.datetime:
+    ttl = max(1.0, _gc_seconds(ttl_seconds, "run preallocation ttl"))
+    margin = 1.0 if s.get_bind().dialect.name == "sqlite" else 0.0
+    return _db_now(s) + datetime.timedelta(seconds=ttl + margin)
+
+
+def _run_preallocation_active(
+        expires_at: datetime.datetime | None, now: datetime.datetime) -> bool:
+    if expires_at is None:
+        return False
+    if expires_at.tzinfo is None and now.tzinfo is not None:
+        expires_at = expires_at.replace(tzinfo=now.tzinfo)
+    elif expires_at.tzinfo is not None and now.tzinfo is None:
+        now = now.replace(tzinfo=expires_at.tzinfo)
+    return expires_at > now
+
+
+def _assert_bound_run_identity(
+        state: RunState, uid: str, auth_canvas_id: str | None) -> None:
+    """Validate a previously bound principal without reclassifying its authorization scope."""
+    if state.created_by != str(uid) or state.auth_canvas_id != auth_canvas_id:
+        raise RuntimeError("run id is already bound to a different authorization identity")
+    if auth_canvas_id is not None and state.canvas_id != auth_canvas_id:
+        raise RuntimeError("run id is already bound to a different canvas")
+
+
+def _backfill_terminal_fence_identity(s, state: RunState) -> None:
+    """Fill a fast terminal fence only from this exact, authoritatively bound RunState.
+
+    A local worker can finish between its initial status write and ``bind_run_owner``. In that narrow
+    window the terminal fence already has the operational canvas but not the creator/auth canvas. Never
+    overwrite an existing identity, and never refill a fence whose canvas handle was severed by canvas
+    deletion.
+    """
+    # Flush the identity first. If terminal publication already won on SQLite (where FOR UPDATE is a
+    # no-op), this updates only the identity columns after its commit; if binding won, the write lock
+    # keeps publication behind this transaction. The ORM status may still be the pre-publication value,
+    # so refresh it after observing a fence before validating the now-linearized pair.
+    s.flush()
+    fence = s.get(RunTerminalFence, state.run_id, with_for_update=True)
+    if fence is None:
+        return
+    s.refresh(state)
+    if state.status not in ("done", "failed", "cancelled") or fence.status != state.status:
+        raise RuntimeError("terminal run fence does not match its bound run state")
+    if fence.canvas_id != state.canvas_id:
+        raise RuntimeError("terminal run fence canvas identity does not match its bound run state")
+    for field in ("created_by", "auth_canvas_id"):
+        expected = getattr(state, field)
+        current = getattr(fence, field)
+        if current is not None and current != expected:
+            raise RuntimeError("terminal run fence has a different authorization identity")
+        if current is None:
+            setattr(fence, field, expected)
+
+
 def bind_run_owner(run_id: str, uid: str, auth_canvas_id: str | None) -> None:
     """Persist a run's creator (authoritative, unspoofable owner) and the real canvas it was authorized
-    against (None for an ad-hoc graph). Upserts so it works whether the run_state row exists yet."""
+    against (None for an ad-hoc graph). Missing identity fields may be filled once; an established
+    principal, authorization canvas, or operational canvas is never overwritten."""
+    run_id, uid = str(run_id), str(uid)
+    auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
     with session() as s:
-        r = s.get(RunState, run_id)
+        _lock_authorized_run_canvas(s, auth_canvas_id)
+        r = s.get(RunState, run_id, with_for_update=True)
         if r is None:
+            fenced = _terminal_fence_status(s, run_id)
+            if fenced is not None:
+                raise TerminalRunIdError(f"run '{run_id}' is already terminal ({fenced})")
             s.add(RunState(run_id=run_id, canvas_id=auth_canvas_id, status="queued", doc="{}",
                            created_by=uid, auth_canvas_id=auth_canvas_id))
-        else:
-            r.created_by = uid
-            r.auth_canvas_id = auth_canvas_id
+            return
+        if r.created_by is not None:
+            _assert_bound_run_identity(r, uid, auth_canvas_id)
+            _backfill_terminal_fence_identity(s, r)
+            return
+        if r.auth_canvas_id is not None:
+            raise RuntimeError("unowned run has an existing authorization canvas")
+        if auth_canvas_id is not None and r.canvas_id not in (None, auth_canvas_id):
+            raise RuntimeError("run id is already bound to a different canvas")
+        r.created_by = uid
+        r.auth_canvas_id = auth_canvas_id
+        if auth_canvas_id is not None and r.canvas_id is None:
+            r.canvas_id = auth_canvas_id
+        _backfill_terminal_fence_identity(s, r)
+
+
+def preallocate_run_owner(
+        run_id: str, uid: str, auth_canvas_id: str | None,
+        ttl_seconds: float = RUN_PREALLOCATION_TTL_SECONDS, *,
+        operational_canvas_id: str | None = None) -> str:
+    """Create one leased run identity before an external backend may allocate durable effects."""
+    run_id, uid = str(run_id), str(uid)
+    auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
+    operational_canvas_id = (
+        str(operational_canvas_id) if operational_canvas_id is not None else auth_canvas_id
+    )
+    if auth_canvas_id is not None and operational_canvas_id != auth_canvas_id:
+        raise RuntimeError("authorized run canvas and operational canvas must match")
+    token = secrets.token_urlsafe(32)
+    with session() as s:
+        for canvas_id in sorted({
+                value for value in (auth_canvas_id, operational_canvas_id) if value is not None}):
+            if s.get(Canvas, canvas_id, with_for_update=True) is None:
+                raise RuntimeError("preallocated run canvas does not exist")
+        state = s.get(RunState, run_id, with_for_update=True)
+        if state is not None:
+            raise RuntimeError(f"run '{run_id}' is already allocated")
+        fenced = _terminal_fence_status(s, run_id)
+        if fenced is not None:
+            raise TerminalRunIdError(f"run '{run_id}' is already terminal ({fenced})")
+        s.add(RunState(
+            run_id=run_id, canvas_id=operational_canvas_id, status="queued",
+            doc=json.dumps({"run_id": run_id, "status": "queued"}),
+            created_by=uid, auth_canvas_id=auth_canvas_id,
+            preallocation_token=token,
+            preallocation_expires_at=_run_preallocation_deadline(s, ttl_seconds),
+        ))
+    return token
+
+
+def renew_run_preallocation(
+        run_id: str, token: str,
+        ttl_seconds: float = RUN_PREALLOCATION_TTL_SECONDS) -> bool:
+    """Extend one still-live, unbound preallocation using the metadata database clock."""
+    with session() as s:
+        state = _lock_existing_run_identity(s, str(run_id))
+        if state is None or state.status not in _PREALLOCATION_STATES:
+            return False
+        backend = s.get(RunBackendJob, str(run_id), with_for_update=True)
+        now = _db_now(s)
+        if (backend is not None or state.preallocation_token is None
+                or not secrets.compare_digest(state.preallocation_token, str(token))
+                or not _run_preallocation_active(state.preallocation_expires_at, now)):
+            return False
+        state.preallocation_expires_at = _run_preallocation_deadline(s, ttl_seconds)
+        return True
+
+
+def _abandon_run_preallocation_attempts(
+        s, run_id: str, *, quiet_seconds: float = 60) -> None:
+    """Install writer-terminal proof for attempts that never reached a durable backend binding."""
+    attempts = list(s.scalars(select(ObjectAttempt).where(
+        ObjectAttempt.run_id == str(run_id),
+        ObjectAttempt.state.in_(("allocated", "writing")),
+    ).order_by(ObjectAttempt.uri).with_for_update()))
+    if not attempts:
+        return
+    now = _db_now(s)
+    quiet_until = now + datetime.timedelta(
+        seconds=_gc_seconds(quiet_seconds, "quiet_seconds"))
+    uris = [attempt.uri for attempt in attempts]
+    for attempt in attempts:
+        attempt.state = "abandoned"
+        attempt.terminal_proof_at = now
+        attempt.quiet_until = quiet_until
+    for lease in s.scalars(select(ObjectAttemptLease).where(
+            ObjectAttemptLease.attempt_uri.in_(uris),
+            ObjectAttemptLease.lease_type.in_(("write", "publish")))):
+        s.delete(lease)
+
+
+def discard_run_preallocation(
+        run_id: str, token: str, uid: str, auth_canvas_id: str | None) -> bool:
+    """Permanently discard one exact unbound run identity after synchronous startup fails."""
+    run_id, uid = str(run_id), str(uid)
+    auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
+    with session() as s:
+        state = _lock_existing_run_identity(s, run_id)
+        if state is None or state.status not in _PREALLOCATION_STATES:
+            return False
+        backend = s.get(RunBackendJob, run_id, with_for_update=True)
+        if (backend is not None or state.preallocation_token is None
+                or not secrets.compare_digest(state.preallocation_token, str(token))
+                or state.created_by != uid or state.auth_canvas_id != auth_canvas_id):
+            return False
+        if auth_canvas_id is not None and state.canvas_id != auth_canvas_id:
+            return False
+        _abandon_run_preallocation_attempts(s, run_id)
+        _replace_attempt_ref(s, "run_state", run_id, None)
+        _record_terminal_fence(s, run_id, "failed")
+        s.delete(state)
+        return True
+
+
+def finish_run_preallocation(run_id: str, token: str, status_doc: dict) -> bool:
+    """Settle a synchronous prebound return, or confirm its durable backend consumed the lease."""
+    run_id = str(run_id)
+    status_doc = dict(status_doc)
+    if str(status_doc.get("run_id") or "") != run_id:
+        raise ValueError("preallocated run status does not match its run id")
+    status = str(status_doc.get("status") or "")
+    with session() as s:
+        state = _lock_existing_run_identity(s, run_id)
+        if state is None:
+            fenced = _terminal_fence_status(s, run_id)
+            return status in _TERMINAL_RUN and fenced == status
+        if state.created_by is None:
+            return False
+        backend = s.get(RunBackendJob, run_id, with_for_update=True)
+        if backend is not None:
+            if (state.preallocation_token is not None
+                    or state.preallocation_expires_at is not None):
+                raise RuntimeError("backend binding did not consume its run preallocation")
+            backend_ref = status_doc.get("backend_ref")
+            if (not isinstance(backend_ref, dict) or (
+                    str(backend_ref.get("backend") or ""),
+                    str(backend_ref.get("attempt_id") or ""),
+                    str(backend_ref.get("submission_id") or ""),
+            ) != (backend.backend, backend.attempt_id, backend.submission_id)):
+                raise RuntimeError("returned status does not match the durable backend binding")
+            return True
+        if (state.preallocation_token is None
+                or not secrets.compare_digest(state.preallocation_token, str(token))):
+            return False
+        if status not in _TERMINAL_RUN:
+            # A prebound runner that owns the run locally (no external backend — e.g. the Popen path or
+            # an unsupported-shape fallback) consumes the lease and keeps supervising in-process. Only
+            # release the preallocation fence; never abandon the live writer's attempts or clobber a
+            # status the concurrent supervisor has already advanced past preallocation.
+            if state.status in _PREALLOCATION_STATES:
+                state.status = status
+                state.doc = json.dumps(status_doc, default=str)
+            state.preallocation_token = None
+            state.preallocation_expires_at = None
+            return True
+        _abandon_run_preallocation_attempts(s, run_id)
+        state.status = status
+        state.doc = json.dumps(status_doc, default=str)
+        state.preallocation_token = None
+        state.preallocation_expires_at = None
+        _record_terminal_fence(s, run_id, status)
+        return True
 
 
 def run_auth(run_id: str) -> tuple[str | None, str | None]:
@@ -1064,6 +1455,47 @@ def list_canvases_for(uid: str) -> list[dict]:
 _RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (older history is pruned)
 
 
+def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None, status: str,
+                       rows: int | None = None, ms: int | None = None, error: str | None = None,
+                       output_table: str | None = None, per_node: list[dict] | None = None,
+                       run_id: str | None = None, output_uri: str | None = None) -> bool:
+    """Session-scoped history upsert shared by normal completion and backend publication."""
+    if not canvas_id:
+        return False
+    if status != "done" and _local_result_candidate(output_uri) is not None:
+        output_uri = None
+        output_table = None
+    if s.get(Canvas, canvas_id, with_for_update=True) is None:
+        return False
+    rec = (s.scalar(select(RunRecord).where(
+        RunRecord.run_id == run_id, RunRecord.canvas_id == canvas_id
+    ).limit(1).with_for_update())
+           if run_id else None)
+    if rec is None:
+        rec = RunRecord(id=_uid(), canvas_id=canvas_id, run_id=run_id)
+        s.add(rec)
+    rid = rec.id
+    rec.target_node_id, rec.status = target_node_id, status
+    rec.rows, rec.ms, rec.error = rows, ms, error
+    rec.output_table, rec.output_uri = output_table, output_uri
+    rec.per_node = json.dumps(per_node, default=str) if per_node else None
+    s.flush()
+    stale = list(s.scalars(select(RunRecord).where(
+        RunRecord.canvas_id == canvas_id, RunRecord.id != rid
+    ).order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
+      .offset(max(0, _RUN_HISTORY_MAX - 1)).with_for_update()))
+    _replace_attempt_ref(s, "run_record", rid, output_uri)
+    for obj in stale:
+        _replace_attempt_ref(s, "run_record", obj.id, None)
+        s.delete(obj)
+    if stale:
+        _lock_local_result_registry(s)
+    sync_local_result_owner(s, "run_record", rid, output_uri)
+    for obj in stale:
+        _drop_local_result_owner_locked(s, "run_record", obj.id)
+    return True
+
+
 def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
                rows: int | None = None, ms: int | None = None, error: str | None = None,
                output_table: str | None = None, per_node: list[dict] | None = None,
@@ -1078,29 +1510,11 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
         output_uri = None
         output_table = None
     with session() as s:
-        if s.get(Canvas, canvas_id, with_for_update=True) is None:
-            return False  # ad-hoc / unsaved-canvas / internal region run → don't dangle a run row
-        rid = _uid()
-        s.add(RunRecord(id=rid, canvas_id=canvas_id, run_id=run_id, target_node_id=target_node_id,
-                        status=status, rows=rows, ms=ms, error=error, output_table=output_table,
-                        output_uri=output_uri,
-                        per_node=json.dumps(per_node, default=str) if per_node else None))
-        s.flush()
-        stale = list(s.scalars(select(RunRecord).where(
-            RunRecord.canvas_id == canvas_id
-        ).order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
-          .offset(_RUN_HISTORY_MAX).with_for_update()))
-        _replace_attempt_ref(s, "run_record", rid, output_uri)
-        for obj in stale:
-            _replace_attempt_ref(s, "run_record", obj.id, None)
-            s.delete(obj)
-        if stale:
-            _lock_local_result_registry(s)
-        # Global lifecycle lock order: object-attempt rows above, then the local registry.
-        sync_local_result_owner(s, "run_record", rid, output_uri)
-        for obj in stale:
-            _drop_local_result_owner_locked(s, "run_record", obj.id)
-        return True
+        return _upsert_run_record(
+            s, canvas_id=canvas_id, target_node_id=target_node_id, status=status,
+            rows=rows, ms=ms, error=error, output_table=output_table, per_node=per_node,
+            run_id=run_id, output_uri=output_uri,
+        )
 
 
 def delete_canvas_cascade(canvas_id: str) -> None:
@@ -1110,6 +1524,26 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         canvas = s.get(Canvas, canvas_id, with_for_update=True)
         if canvas is None:
             return
+        active = s.scalar(
+            select(RunState.run_id)
+            .outerjoin(RunBackendJob, RunBackendJob.run_id == RunState.run_id)
+            .where(
+                or_(RunState.canvas_id == canvas_id, RunState.auth_canvas_id == canvas_id),
+                or_(
+                    RunState.preallocation_token.is_not(None),
+                    and_(
+                        RunBackendJob.run_id.is_not(None),
+                        RunState.status.in_(("queued", "running")),
+                    ),
+                ),
+            )
+            .order_by(RunState.run_id).limit(1)
+        )
+        if active:
+            raise ActiveBackendJobsError(
+                f"canvas '{canvas_id}' has active external run '{active}'; "
+                "cancel it and wait for terminal status"
+            )
         shares = list(s.scalars(select(CanvasShare).where(
             CanvasShare.canvas_id == canvas_id
         ).order_by(CanvasShare.user_id).with_for_update()))
@@ -1122,6 +1556,10 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         run_states = list(s.scalars(select(RunState).where(
             (RunState.canvas_id == canvas_id) | (RunState.auth_canvas_id == canvas_id)
         ).order_by(RunState.run_id).with_for_update()))
+        terminal_fences = list(s.scalars(select(RunTerminalFence).where(
+            (RunTerminalFence.canvas_id == canvas_id)
+            | (RunTerminalFence.auth_canvas_id == canvas_id)
+        ).order_by(RunTerminalFence.run_id).with_for_update()))
         local_owners: list[tuple[str, str]] = [("canvas", canvas_id)]
         for sh in shares:
             s.delete(sh)
@@ -1135,9 +1573,18 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         # also drop this canvas's run_states — else auth_canvas_id/canvas_id dangle into a reusable id
         # namespace and a later canvas re-created under the same id could re-grant its old runs (P0-AUTH-02)
         for rs in run_states:
+            job = s.get(RunBackendJob, rs.run_id)
+            if job is not None:
+                s.delete(job)
             _replace_attempt_ref(s, "run_state", rs.run_id, None)
             local_owners.append(("run_state", rs.run_id))
             s.delete(rs)
+        # Keep the opaque anti-resurrection fence, but sever every authorization handle into a deleted,
+        # reusable canvas namespace. A replacement canvas must never inherit retained runs.
+        for fence in terminal_fences:
+            fence.created_by = None
+            fence.auth_canvas_id = None
+            fence.canvas_id = None
         _lock_local_result_registry(s)
         for owner_kind, owner_key in sorted(local_owners):
             _drop_local_result_owner_locked(s, owner_kind, owner_key)
@@ -1192,6 +1639,48 @@ class RunStatePublicationRejected(RuntimeError):
     """A definitive owner-row race loss, never an unknown database commit outcome."""
 
 
+def _terminal_fence_status(s, run_id: str) -> str | None:
+    return s.scalar(select(RunTerminalFence.status).where(RunTerminalFence.run_id == run_id))
+
+
+def terminal_run_status(run_id: str) -> str | None:
+    """Return the permanent terminal fence for ``run_id``, if one has been recorded."""
+    with session() as s:
+        return _terminal_fence_status(s, run_id)
+
+
+def terminal_run_identity(
+        run_id: str) -> tuple[str | None, str | None, str | None] | None:
+    """Return retained ``(creator, auth canvas, legacy canvas)`` identity for a terminal run."""
+    with session() as s:
+        row = s.execute(select(
+            RunTerminalFence.created_by,
+            RunTerminalFence.auth_canvas_id,
+            RunTerminalFence.canvas_id,
+        ).where(RunTerminalFence.run_id == str(run_id))).one_or_none()
+        return tuple(row) if row is not None else None
+
+
+def _record_terminal_fence(s, run_id: str, status: str) -> None:
+    current = s.get(RunTerminalFence, str(run_id), with_for_update=True)
+    if current is not None and current.status != status:
+        raise RuntimeError(
+            f"run '{run_id}' is permanently fenced as {current.status}, not {status}"
+        )
+    if current is None:
+        identity = s.execute(select(
+            RunState.created_by, RunState.auth_canvas_id, RunState.canvas_id,
+        ).where(RunState.run_id == str(run_id))).one_or_none()
+        created_by, auth_canvas_id, canvas_id = (
+            identity if identity is not None else (None, None, None)
+        )
+        s.add(RunTerminalFence(
+            run_id=str(run_id), status=status, created_by=created_by,
+            auth_canvas_id=auth_canvas_id, canvas_id=canvas_id,
+        ))
+        s.flush()
+
+
 def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                    kernel_id: str | None = None, *, publish_region: bool = False) -> None:
     """Upsert a run's live status (the runner calls this on each transition). `status` is a RunStatus
@@ -1199,8 +1688,9 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
     stamps the owning kernel so the boot-time reaper fails a run only when its kernel is gone. When a run
     reaches a terminal status, prunes finished run_states to the newest _RUN_STATE_MAX (each row holds a
     full RunStatus JSON, so unbounded growth is a real local-DB leak) — live rows are never touched, so
-    the reaper and in-flight status lookups are unaffected; an evicted OLD run just 404s on GET /run/{id}
-    (its durable per-canvas history lives in run_records)."""
+    the reaper and in-flight status lookups are unaffected. An evicted old run retains an authorized,
+    synthetic terminal status through its compact identity fence, while detailed status fields are gone;
+    durable per-canvas history remains separate."""
     status = dict(status)
     st = str(status.get("status", "running"))
     if st != "done" and _local_result_candidate(_result_doc_uri(status)) is not None:
@@ -1238,16 +1728,29 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                 raise RunStatePublicationRejected(
                     "run state was deleted before terminal publication")
         payload = json.dumps(status, default=str)
+        fenced = _terminal_fence_status(s, run_id)
+        if fenced is not None and (r is None or st != fenced):
+            return
         if r is None:
             s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload, kernel_id=kernel_id))
         else:
-            r.status = st
-            r.doc = payload
-            if canvas_id and not r.canvas_id:
-                r.canvas_id = canvas_id
-            if kernel_id and not r.kernel_id:
-                r.kernel_id = kernel_id
+            # Make terminal monotonicity an UPDATE predicate, not a prior ORM read. A transaction can load
+            # queued, pause while another supervisor atomically publishes done, then otherwise flush its
+            # stale queued object over the terminal result.
+            values = {"status": st, "doc": payload}
+            if canvas_id:
+                values["canvas_id"] = func.coalesce(RunState.canvas_id, canvas_id)
+            if kernel_id:
+                values["kernel_id"] = func.coalesce(RunState.kernel_id, kernel_id)
+            updated = s.execute(update(RunState).where(
+                RunState.run_id == run_id,
+                or_(RunState.status.not_in(_TERMINAL_RUN), RunState.status == st),
+            ).values(**values))
+            if not updated.rowcount:
+                return
         s.flush()
+        if st in _TERMINAL_RUN:
+            _record_terminal_fence(s, run_id, st)
         stale = []
         if st in _TERMINAL_RUN:
             # Re-evaluate age after every candidate lock; delete only rows included in the one
@@ -1268,6 +1771,9 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
             s, "run_state", run_id, output_uri, publish=publish_region)
         if st in _TERMINAL_RUN:
             for obj in stale:
+                job = s.get(RunBackendJob, obj.run_id)
+                if job is not None:
+                    s.delete(job)
                 _replace_attempt_ref(s, "run_state", obj.run_id, None)
                 s.delete(obj)
             _lock_local_result_registry(s)
@@ -1318,8 +1824,6 @@ def local_result_run_state_receipt(
             and artifact.state == "ready"
             and artifact.writer_run_id is None
             and artifact.writer_token is None)
-
-
 def get_run_state(run_id: str) -> dict | None:
     """The last-persisted RunStatus dict for a run, or None if unknown to this instance's DB."""
     with session() as s:
@@ -1327,16 +1831,1468 @@ def get_run_state(run_id: str) -> dict | None:
         return json.loads(r.doc) if r else None
 
 
+def _backend_source_ref_prefix(run_id: str) -> str:
+    return f"{str(run_id)}:"
+
+
+def _backend_source_pins_in_session(
+        s, run_id: str, *, lock: bool) -> list[tuple[ObjectAttemptRef, ObjectAttempt]]:
+    """Read exact ordered source pins after the caller has locked the RunBackendJob owner row."""
+    prefix = _backend_source_ref_prefix(run_id)
+    refs_stmt = select(ObjectAttemptRef).where(
+        ObjectAttemptRef.ref_type == "backend_source",
+        ObjectAttemptRef.ref_key.startswith(prefix, autoescape=True),
+    ).order_by(ObjectAttemptRef.ref_key)
+    if lock:
+        refs_stmt = refs_stmt.with_for_update()
+    refs = list(s.scalars(refs_stmt))
+    indexed: dict[int, ObjectAttemptRef] = {}
+    for ref in refs:
+        suffix = ref.ref_key[len(prefix):]
+        if not suffix.isdigit() or int(suffix) in indexed:
+            raise RuntimeError("backend source pin index is malformed")
+        indexed[int(suffix)] = ref
+    if sorted(indexed) != list(range(len(indexed))):
+        raise RuntimeError("backend source pin order is incomplete")
+    uris = sorted({ref.attempt_uri for ref in refs})
+    attempts_stmt = select(ObjectAttempt).where(
+        ObjectAttempt.uri.in_(uris)).order_by(ObjectAttempt.uri)
+    if lock:
+        attempts_stmt = attempts_stmt.with_for_update()
+    attempts = {attempt.uri: attempt for attempt in s.scalars(attempts_stmt)} if uris else {}
+    pins: list[tuple[ObjectAttemptRef, ObjectAttempt]] = []
+    for index in range(len(indexed)):
+        ref = indexed[index]
+        attempt = attempts.get(ref.attempt_uri)
+        if (attempt is None or attempt.generation != ref.generation
+                or attempt.state != "published"):
+            raise RuntimeError("backend source pin no longer attests a published generation")
+        pins.append((ref, attempt))
+    return pins
+
+
+def _bind_backend_source_pins(
+        s, run_id: str, source_uris: list[str]) -> list[tuple[ObjectAttemptRef, ObjectAttempt]]:
+    """Lock published source generations and create their run-scoped durable owner refs."""
+    uris = sorted(set(source_uris))
+    attempts = {attempt.uri: attempt for attempt in s.scalars(
+        select(ObjectAttempt).where(ObjectAttempt.uri.in_(uris))
+        .order_by(ObjectAttempt.uri).with_for_update())} if uris else {}
+    pins: list[tuple[ObjectAttemptRef, ObjectAttempt]] = []
+    for index, uri in enumerate(source_uris):
+        attempt = attempts.get(uri)
+        if attempt is None or attempt.state != "published":
+            raise RuntimeError(
+                "backend source must be an exact published managed object attempt")
+        ref = ObjectAttemptRef(
+            ref_type="backend_source", ref_key=f"{run_id}:{index}",
+            attempt_uri=attempt.uri, generation=attempt.generation,
+        )
+        s.add(ref)
+        pins.append((ref, attempt))
+    s.flush()
+    return pins
+
+
+def _release_backend_source_pins(
+        s, pins: list[tuple[ObjectAttemptRef, ObjectAttempt]]) -> None:
+    """Release source owners and retire generations whose last durable pointer disappeared."""
+    if not pins:
+        return
+    attempts = {attempt.uri: attempt for _ref, attempt in pins}
+    for ref, _attempt in pins:
+        s.delete(ref)
+    s.flush()
+    now = _db_now(s)
+    for uri in sorted(attempts):
+        _maybe_supersede(s, attempts[uri], now)
+
+
+def backend_source_pins(run_id: str) -> list[dict] | None:
+    """Attest the exact ordered managed source generations for one recoverable backend job."""
+    with session() as s:
+        job = s.get(RunBackendJob, str(run_id), with_for_update=True)
+        if job is None:
+            return None
+        pins = _backend_source_pins_in_session(s, str(run_id), lock=True)
+        return [
+            {"uri": attempt.uri, "generation": ref.generation}
+            for ref, attempt in pins
+        ]
+
+
+def bind_backend_job(run_id: str, ref: dict, status: dict,
+                     canvas_id: str | None = None,
+                     job_payload: bytes | None = None,
+                     source_uris: list[str] | None = None) -> tuple[dict, bool]:
+    """Atomically bind a logical run to one external attempt and its recoverable queued state.
+
+    Returns ``(stored_ref, created)``. A caller whose deterministic attempt differs from ``stored_ref``
+    must not submit: another request already owns this logical run id. The backend row and ``run_states``
+    handoff commit together, so a process cannot die in between and leave a binding recovery cannot join.
+    """
+    if job_payload is not None:
+        from hub.job_artifacts import JOB_SQL_ENVELOPE_MAX_BYTES
+
+        if len(job_payload) > JOB_SQL_ENVELOPE_MAX_BYTES:
+            raise ValueError(
+                f"Ray durable SQL job envelope exceeds the {JOB_SQL_ENVELOPE_MAX_BYTES}-byte limit"
+            )
+    if source_uris is not None and not isinstance(source_uris, list):
+        raise ValueError("backend source_uris must be an ordered list")
+    normalized_sources = [
+        _validated_object_uri(str(uri), attempt=True) for uri in (source_uris or [])
+    ]
+    if normalized_sources != sorted(set(normalized_sources)):
+        raise ValueError("backend source_uris must be canonical, sorted, and unique")
+    run_id = str(run_id)
+    status = dict(status)
+    if str(status.get("run_id") or "") != run_id:
+        raise ValueError("backend run status does not match its run id")
+    requested_canvas_id = str(canvas_id) if canvas_id is not None else None
+    row = RunBackendJob(
+        run_id=run_id,
+        backend=str(ref["backend"]),
+        cluster_ref=str(ref.get("cluster_ref") or "") or None,
+        attempt_id=str(ref["attempt_id"]),
+        submission_id=str(ref["submission_id"]),
+        job_uri=str(ref["job_uri"]),
+        result_uri=str(ref["result_uri"]),
+        code_ref=str(ref.get("code_ref") or "") or None,
+        control_address=str(ref.get("control_address") or "") or None,
+        cancel_requested=bool(ref.get("cancel_requested", False)),
+        submission_state="queued",
+        publication_state="pending",
+        # Allocation starts the liveness grace period. Only successful control observations advance it;
+        # RunState error writes deliberately do not.
+        last_control_observed_at=None,
+        job_doc=job_payload.decode("utf-8") if job_payload is not None else None,
+    )
+    def bind_operational_canvas(state: RunState) -> None:
+        if (state.auth_canvas_id is not None
+                and requested_canvas_id != state.auth_canvas_id):
+            raise RuntimeError("backend run canvas does not match its authorization canvas")
+        if requested_canvas_id is None:
+            return
+        if state.canvas_id is None:
+            state.canvas_id = requested_canvas_id
+        elif state.canvas_id != requested_canvas_id:
+            raise RuntimeError("backend run canvas changed after identity allocation")
+
+    try:
+        with session() as s:
+            state = _lock_existing_run_identity(
+                s, run_id, requested_canvas_id=requested_canvas_id)
+            if state is None or state.created_by is None:
+                raise RuntimeError("backend run requires a preallocated owner identity")
+            fenced = _terminal_fence_status(s, run_id)
+            if fenced is not None:
+                raise TerminalRunIdError(f"run '{run_id}' is already terminal ({fenced})")
+            bind_operational_canvas(state)
+            existing = s.get(RunBackendJob, run_id, with_for_update=True)
+            if existing is not None:
+                pins = _backend_source_pins_in_session(s, run_id, lock=True)
+                if [attempt.uri for _ref, attempt in pins] != normalized_sources:
+                    raise RuntimeError("backend run source generations changed after binding")
+                return _backend_job_doc(existing), False
+            now = _db_now(s)
+            if (state.status not in _PREALLOCATION_STATES
+                    or state.preallocation_token is None
+                    or not _run_preallocation_active(state.preallocation_expires_at, now)):
+                raise RuntimeError("backend run requires a live preallocation lease")
+            # Hub clocks may disagree across replicas. Start the external-control liveness grace period
+            # from the metadata server's clock, which also owns every later observation and comparison.
+            row.last_control_observed_at = now
+            s.add(row)
+            s.flush()
+            _bind_backend_source_pins(s, run_id, normalized_sources)
+            # The backend handoff consumes the preallocation in the same transaction. From this point a
+            # boot reaper sees either the complete binding or the still-leased preallocation, never a gap.
+            state.status = str(status.get("status") or "queued")
+            state.doc = json.dumps(status, default=str)
+            state.preallocation_token = None
+            state.preallocation_expires_at = None
+            return _backend_job_doc(row), True
+    except IntegrityError:
+        with session() as s:
+            state = _lock_existing_run_identity(
+                s, run_id, requested_canvas_id=requested_canvas_id)
+            if state is None or state.created_by is None:
+                raise
+            fenced = _terminal_fence_status(s, run_id)
+            if fenced is not None:
+                raise TerminalRunIdError(f"run '{run_id}' is already terminal ({fenced})")
+            bind_operational_canvas(state)
+            existing = s.get(RunBackendJob, run_id, with_for_update=True)
+            if existing is None:
+                raise
+            pins = _backend_source_pins_in_session(s, run_id, lock=True)
+            if [attempt.uri for _ref, attempt in pins] != normalized_sources:
+                raise RuntimeError("backend run source generations changed after binding")
+            return _backend_job_doc(existing), False
+
+
+def _backend_job_doc(row: RunBackendJob) -> dict:
+    result = None
+    publication_effects = None
+    recovery_error = None
+    if row.result_doc is not None:
+        try:
+            result = json.loads(row.result_doc)
+            if not isinstance(result, dict):
+                raise TypeError("stored backend result is not a JSON object")
+        except (TypeError, ValueError):
+            result = None
+            recovery_error = "stored RunBackendJob.result_doc is not a valid JSON object"
+    if row.publication_doc is not None:
+        try:
+            publication_effects = _decode_backend_publication_effects(
+                row.publication_doc, row.run_id, row.attempt_id
+            )
+        except (TypeError, ValueError):
+            publication_effects = None
+            recovery_error = "stored RunBackendJob.publication_doc is not a valid effects plan"
+    try:
+        from hub.models import RunStatus
+
+        if row.publication_state == "pending":
+            if row.publication_doc is not None or row.result_doc is not None:
+                raise ValueError("pending publication contains terminal documents")
+        elif row.publication_state == _BACKEND_PUBLICATION_EFFECTS_STATE:
+            if publication_effects is None or row.result_doc is not None:
+                raise ValueError("effects_started publication has an invalid document pairing")
+            _validate_backend_publication_effects_binding(row, publication_effects)
+        elif row.publication_state == "published":
+            if row.publication_doc is not None or result is None:
+                raise ValueError("published backend has an invalid document pairing")
+            final = RunStatus.model_validate(result)
+            if (final.model_dump() != result or final.run_id != row.run_id
+                    or final.status not in _TERMINAL_RUN):
+                raise ValueError("published backend result is not a canonical terminal RunStatus")
+            expected_payload = json.dumps(
+                result, sort_keys=True, separators=(",", ":"), default=str)
+            if row.result_doc != expected_payload:
+                raise ValueError("published backend result is not canonically encoded")
+        else:
+            raise ValueError("backend publication has an unsupported state")
+    except (TypeError, ValueError, RuntimeError) as exc:
+        publication_effects = None if row.publication_state == \
+            _BACKEND_PUBLICATION_EFFECTS_STATE else publication_effects
+        result = None if row.publication_state == "published" else result
+        pairing_error = f"stored RunBackendJob state/doc pairing is invalid: {exc}"
+        recovery_error = (
+            f"{recovery_error}; {pairing_error}" if recovery_error else pairing_error
+        )
+    doc = {
+        "run_id": row.run_id,
+        "backend": row.backend,
+        "cluster_ref": row.cluster_ref,
+        "attempt_id": row.attempt_id,
+        "submission_id": row.submission_id,
+        "job_uri": row.job_uri,
+        "result_uri": row.result_uri,
+        "code_ref": row.code_ref,
+        "control_address": row.control_address,
+        "cancel_requested": bool(row.cancel_requested),
+        "quarantine_reason": row.quarantine_reason,
+        "submission_state": row.submission_state,
+        "submission_owner": row.submission_owner,
+        "submission_lease_until": (
+            row.submission_lease_until.isoformat() if row.submission_lease_until else None
+        ),
+        "durable": True,
+        "publication_state": row.publication_state,
+        "last_control_observed_at": (
+            row.last_control_observed_at.isoformat() if row.last_control_observed_at else None
+        ),
+        "recovery_blocked_reason": row.recovery_blocked_reason,
+        "result": result,
+        # A staged effects plan is private control state, never a canonical terminal result.
+        "publication_effects": publication_effects,
+    }
+    if recovery_error:
+        doc["_recovery_error"] = recovery_error
+    return doc
+
+
+def backend_job(run_id: str) -> dict | None:
+    with session() as s:
+        row = s.get(RunBackendJob, run_id)
+        return _backend_job_doc(row) if row else None
+
+
+def backend_job_artifact_payload(run_id: str) -> bytes | None:
+    """Private canonical envelope bytes used only to recover the external job artifact."""
+    with session() as s:
+        row = s.get(RunBackendJob, run_id)
+        return row.job_doc.encode("utf-8") if row and row.job_doc else None
+
+
+def note_backend_control_observed(
+        run_id: str, attempt_id: str, min_interval_s: float = 10.0) -> bool:
+    """Throttle the durable liveness clock advanced only by successful backend observations."""
+    with session() as s:
+        now = _db_now(s)
+        cutoff = now - datetime.timedelta(seconds=max(0.0, float(min_interval_s)))
+        updated = s.execute(update(RunBackendJob).where(
+            RunBackendJob.run_id == run_id,
+            RunBackendJob.attempt_id == attempt_id,
+            or_(RunBackendJob.last_control_observed_at.is_(None),
+                RunBackendJob.last_control_observed_at <= cutoff),
+        ).values(last_control_observed_at=now))
+        return bool(updated.rowcount)
+
+
+def mark_backend_recovery_blocked(
+        run_id: str, backend: str, status: dict, reason: str) -> bool:
+    """Persist a non-terminal, operator-visible fence for a malformed active backend row."""
+    run_id, backend = str(run_id), str(backend)
+    status = dict(status)
+    bounded = str(reason)[:2000]
+    with session() as s:
+        canvas_id = s.scalar(select(RunState.canvas_id).where(
+            RunState.run_id == run_id))
+        state = _lock_existing_run_identity(
+            s, run_id, requested_canvas_id=canvas_id)
+        if state is None or state.status not in ("queued", "running"):
+            return False
+        job = s.get(RunBackendJob, run_id, with_for_update=True)
+        if (job is None or job.backend != backend
+                or job.publication_state == "published"):
+            return False
+        requested_status = str(status.get("status") or state.status)
+        if requested_status not in ("queued", "running"):
+            return False
+        if status.get("run_id") not in (None, run_id):
+            return False
+        status["run_id"], status["status"] = run_id, requested_status
+        job.recovery_blocked_reason = bounded
+        state.status = requested_status
+        state.doc = json.dumps(status, default=str)
+        return True
+
+
+def active_backend_jobs(backend: str) -> list[tuple[dict, dict]]:
+    """Return ``(backend_ref, RunStatus doc)`` for reattachable non-terminal jobs."""
+    out: list[tuple[dict, dict]] = []
+    with session() as s:
+        rows = s.execute(
+            select(RunBackendJob, RunState).join(RunState, RunState.run_id == RunBackendJob.run_id)
+            .where(RunBackendJob.backend == backend, RunState.status.in_(("queued", "running")))
+        ).all()
+        for job, state in rows:
+            try:
+                doc = json.loads(state.doc)
+                if not isinstance(doc, dict):
+                    raise TypeError("stored RunStatus is not a JSON object")
+            except (TypeError, ValueError):
+                doc = {
+                    "run_id": state.run_id,
+                    "status": state.status,
+                    "per_node": [],
+                    "_recovery_error": "stored RunStatus is not a valid JSON object",
+                }
+            out.append((_backend_job_doc(job), doc))
+    return out
+
+
+def request_backend_cancel(run_id: str) -> bool:
+    """Persist cancel intent before any process-local event or remote stop request is issued."""
+    with session() as s:
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.publication_state == "pending",
+            )
+            .values(cancel_requested=True)
+        )
+        return bool(updated.rowcount)
+
+
+def request_backend_quarantine(run_id: str, reason: str) -> bool:
+    """Win the pre-effects corruption race, or reject a stale observer after effects started."""
+    with session() as s:
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.publication_state == "pending",
+            )
+            .values(quarantine_reason=str(reason)[:4000])
+        )
+        return bool(updated.rowcount)
+
+
+def claim_backend_submission_after_missing(run_id: str, attempt_id: str, owner: str,
+                                           lease_seconds: float = 30.0) -> str:
+    """Linearize or reclaim one submit after Ray status+list authoritatively report it missing.
+
+    A single CAS claims a fresh queued attempt, a metadata-lost submitted attempt, or an expired
+    submitting owner. Reclaim never exposes an intermediate queued state where concurrent cancellation
+    could forget that an older, already-linearized request may still arrive at Ray.
+    """
+    with session() as s:
+        now = s.scalar(select(func.current_timestamp()))
+        lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                RunBackendJob.publication_state == "pending",
+                or_(RunBackendJob.publication_owner.is_(None),
+                    RunBackendJob.publication_lease_until.is_(None),
+                    RunBackendJob.publication_lease_until < now),
+                RunBackendJob.cancel_requested.is_(False),
+                RunBackendJob.quarantine_reason.is_(None),
+                or_(
+                    RunBackendJob.submission_state == "queued",
+                    RunBackendJob.submission_state == "submitted",
+                    and_(
+                        RunBackendJob.submission_state == "submitting",
+                        or_(RunBackendJob.submission_lease_until.is_(None),
+                            RunBackendJob.submission_lease_until < now),
+                    ),
+                ),
+            ).values(submission_state="submitting", submission_owner=owner,
+                     submission_lease_until=lease,
+                     publication_owner=None, publication_lease_until=None)
+        )
+        if updated.rowcount:
+            return "claimed"
+        row = s.get(RunBackendJob, run_id)
+        if row is None or row.attempt_id != attempt_id:
+            return "lost"
+        if row.quarantine_reason:
+            return "quarantined"
+        if row.cancel_requested:
+            return "cancelled"
+        return "busy"
+
+
+def renew_backend_submission(run_id: str, attempt_id: str, owner: str,
+                             lease_seconds: float = 30.0) -> bool:
+    """Keep a live, already-linearized external submit from being reclaimed mid-request."""
+    with session() as s:
+        now = s.scalar(select(func.current_timestamp()))
+        lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                RunBackendJob.publication_state == "pending",
+                RunBackendJob.submission_state == "submitting",
+                RunBackendJob.submission_owner == owner,
+            ).values(submission_lease_until=lease)
+        )
+        return bool(updated.rowcount)
+
+
+def note_backend_submission_observed(run_id: str, attempt_id: str) -> bool:
+    """Persist a visible remote winner and invalidate any pre-effects terminal candidate."""
+    with session() as s:
+        row = s.get(RunBackendJob, str(run_id), with_for_update=True)
+        if (row is None or row.attempt_id != str(attempt_id)
+                or row.publication_state != "pending"
+                or row.submission_state in (
+                    "stop_fenced", "result_stop_fenced", "result_fenced")):
+            return False
+        if row.submission_state in _RESULT_RECONCILIATION_STATES:
+            row.submission_state = "result_submitted"
+        elif row.cancel_requested or row.quarantine_reason:
+            # A live workload observed under durable stop intent must keep publication blocked until
+            # the same control loop records terminal/absent proof after stop_job.
+            row.submission_state = "stopping"
+        else:
+            row.submission_state = "submitted"
+        row.submission_owner = row.submission_lease_until = None
+        row.publication_owner = row.publication_lease_until = None
+        return True
+
+
+def claim_backend_stop_fence(run_id: str, attempt_id: str, owner: str,
+                             lease_seconds: float = 30.0, *,
+                             result_reconcile: bool = False) -> str:
+    """Claim an expired uncertain submit so stop intent can reserve its deterministic Ray ID.
+
+    The fixed remote fence job and a delayed original submit race on the same Ray submission ID; only
+    one can be accepted. This turns an otherwise unknowable crashed-owner state into stoppable evidence.
+    """
+    with session() as s:
+        now = s.scalar(select(func.current_timestamp()))
+        lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
+        intent = (
+            RunBackendJob.submission_state.in_(("submitting", "result_fencing"))
+            if result_reconcile else
+            and_(
+                or_(RunBackendJob.cancel_requested.is_(True),
+                    RunBackendJob.quarantine_reason.is_not(None)),
+                RunBackendJob.submission_state.in_(("submitting", "fencing")),
+            )
+        )
+        updated = s.execute(update(RunBackendJob).where(
+            RunBackendJob.run_id == run_id,
+            RunBackendJob.attempt_id == attempt_id,
+            RunBackendJob.publication_state == "pending",
+            or_(RunBackendJob.publication_owner.is_(None),
+                RunBackendJob.publication_lease_until.is_(None),
+                RunBackendJob.publication_lease_until < now),
+            intent,
+            or_(RunBackendJob.submission_lease_until.is_(None),
+                RunBackendJob.submission_lease_until < now),
+        ).values(
+            submission_state=("result_fencing" if result_reconcile else "fencing"),
+            submission_owner=owner, submission_lease_until=lease,
+            publication_owner=None, publication_lease_until=None,
+        ))
+        if updated.rowcount:
+            return "claimed"
+        row = s.get(RunBackendJob, run_id)
+        if row is None or row.attempt_id != attempt_id:
+            return "lost"
+        if row.publication_state != "pending":
+            return "busy"
+        if result_reconcile:
+            if row.submission_state in ("queued", "submitted"):
+                return "not_needed"
+            return "busy"
+        if not (row.cancel_requested or row.quarantine_reason):
+            return "lost"
+        if row.submission_state == "queued":
+            return "not_needed"
+        if row.submission_state in ("submitted", "stop_fenced"):
+            return "settled_missing"
+        return "busy"
+
+
+def note_backend_stop_fence_accepted(
+        run_id: str, attempt_id: str, submission_owner: str | None = None) -> bool:
+    """Record that the fixed stop fence, rather than the original workload, reserved the Ray ID."""
+    with session() as s:
+        row = s.get(RunBackendJob, str(run_id), with_for_update=True)
+        if (row is None or row.attempt_id != str(attempt_id)
+                or row.publication_state != "pending"
+                or row.submission_state not in (
+                    "fencing", "fence_stopping", "stop_fenced",
+                    "result_fencing", "result_stop_fenced",
+                )
+                or (submission_owner is not None
+                    and row.submission_owner != submission_owner)):
+            return False
+        result_reconcile = row.submission_state in (
+            "result_fencing", "result_stop_fenced")
+        if not result_reconcile and not (row.cancel_requested or row.quarantine_reason):
+            return False
+        row.submission_state = (
+            "result_stop_fenced" if result_reconcile else "fence_stopping")
+        row.submission_owner = row.submission_lease_until = None
+        row.publication_owner = row.publication_lease_until = None
+        return True
+
+
+def settle_backend_stop_control(run_id: str, attempt_id: str) -> bool:
+    """Release the publication block only after a durable stop intent observes terminal/absence."""
+    with session() as s:
+        row = s.get(RunBackendJob, str(run_id), with_for_update=True)
+        if (row is None or row.attempt_id != str(attempt_id)
+                or row.publication_state != "pending"
+                or row.submission_state not in ("stopping", "fence_stopping")
+                or not (row.cancel_requested or row.quarantine_reason)):
+            return False
+        row.submission_state = (
+            "submitted" if row.submission_state == "stopping" else "stop_fenced"
+        )
+        row.submission_owner = row.submission_lease_until = None
+        row.publication_owner = row.publication_lease_until = None
+        return True
+
+
+def settle_backend_result_reconciliation(run_id: str, attempt_id: str) -> bool:
+    """Clear the durable result fence only after the caller observed its remote winner terminal."""
+    with session() as s:
+        row = s.get(RunBackendJob, str(run_id), with_for_update=True)
+        if (row is None or row.attempt_id != str(attempt_id)
+                or row.publication_state != "pending"
+                or row.submission_state not in ("result_submitted", "result_stop_fenced")):
+            return False
+        row.submission_state = (
+            "submitted" if row.submission_state == "result_submitted" else "result_fenced"
+        )
+        row.submission_owner = row.submission_lease_until = None
+        row.publication_owner = row.publication_lease_until = None
+        return True
+
+
+def note_unhandled_backend_jobs(available_backends: set[str]) -> int:
+    """Keep external runs live but make a missing plugin/configuration visible after process restart."""
+    available_backends = {str(backend) for backend in available_backends}
+    with session() as s:
+        candidate = (
+            select(
+                RunState.run_id, RunState.canvas_id, RunState.auth_canvas_id,
+            )
+            .join(RunBackendJob, RunBackendJob.run_id == RunState.run_id)
+            .where(
+                RunState.status.in_(("queued", "running")),
+                RunBackendJob.publication_state != "published",
+            )
+            .order_by(RunState.run_id)
+        )
+        if available_backends:
+            candidate = candidate.where(
+                RunBackendJob.backend.not_in(available_backends))
+        hints = {
+            str(run_id): (
+                str(canvas_id) if canvas_id is not None else None,
+                str(auth_canvas_id) if auth_canvas_id is not None else None,
+            )
+            for run_id, canvas_id, auth_canvas_id in s.execute(candidate)
+        }
+        if not hints:
+            return 0
+
+        canvas_ids = sorted({
+            canvas_id
+            for canvas_id, auth_canvas_id in hints.values()
+            for canvas_id in (canvas_id, auth_canvas_id)
+            if canvas_id is not None
+        })
+        locked_canvases = {
+            canvas.id: canvas for canvas in s.scalars(select(Canvas).where(
+                Canvas.id.in_(canvas_ids)
+            ).order_by(Canvas.id).with_for_update())
+        } if canvas_ids else {}
+        run_ids = sorted(hints)
+        states = {
+            state.run_id: state for state in s.scalars(select(RunState).where(
+                RunState.run_id.in_(run_ids)
+            ).order_by(RunState.run_id).with_for_update())
+        }
+        jobs = {
+            job.run_id: job for job in s.scalars(select(RunBackendJob).where(
+                RunBackendJob.run_id.in_(run_ids)
+            ).order_by(RunBackendJob.run_id).with_for_update())
+        }
+
+        changed = 0
+        for run_id in run_ids:
+            state, job = states.get(run_id), jobs.get(run_id)
+            canvas_id, auth_canvas_id = hints[run_id]
+            if (state is None or job is None
+                    or (state.canvas_id, state.auth_canvas_id) != (
+                        canvas_id, auth_canvas_id)
+                    or state.status not in ("queued", "running")
+                    or job.publication_state == "published"
+                    or job.backend in available_backends):
+                continue
+            if auth_canvas_id is not None and auth_canvas_id not in locked_canvases:
+                continue
+            try:
+                doc = json.loads(state.doc)
+                if not isinstance(doc, dict):
+                    raise TypeError("stored RunStatus is not an object")
+            except (TypeError, ValueError):
+                doc = {"per_node": []}
+            doc["run_id"], doc["status"] = state.run_id, state.status
+            if not isinstance(doc.get("per_node"), list):
+                doc["per_node"] = []
+            unavailable_error = (
+                f"durable backend '{job.backend}' is unavailable in this process; "
+                "restore its plugin and control-plane configuration to reattach or cancel"
+            )
+            doc["error"] = unavailable_error
+            try:
+                from hub.models import RunStatus
+                doc = RunStatus.model_validate(doc).model_dump()
+            except (TypeError, ValueError):
+                doc = {
+                    "run_id": state.run_id, "status": state.status,
+                    "per_node": [], "error": unavailable_error,
+                }
+            state.doc = json.dumps(doc, default=str)
+            changed += 1
+        return changed
+
+
+_BACKEND_PUBLICATION_EFFECTS_STATE = "effects_started"
+_BACKEND_PUBLICATION_EFFECTS_VERSION = 1
+_BACKEND_PUBLICATION_EFFECTS_FIELDS = {
+    "contract_version", "run_id", "attempt_id", "terminal_status", "validated_result",
+    "sink_attempts", "catalog_effects", "usage_effect",
+}
+_ACTIVE_BACKEND_SINK_STATES = ("allocated", "writing", "committed")
+
+
+class BackendPublicationConflict(RuntimeError):
+    """A newer catalog generation or unregister won before terminal effects linearized."""
+
+
+class BackendPublicationBusy(RuntimeError):
+    """Another staged backend publication temporarily owns the same logical dataset."""
+
+
+def _validated_backend_publication_effects(
+        run_id: str, attempt_id: str, terminal_status: dict,
+        validated_result: dict | None, sink_attempts: dict,
+        catalog_effects: list[dict], usage_effect: dict | None) -> tuple[dict, str]:
+    """Validate and canonically encode one immutable terminal-effect recovery plan."""
+    from hub.job_artifacts import (
+        JOB_SQL_ENVELOPE_MAX_BYTES, RAY_JOB_CONTRACT_VERSION, RAY_JOB_RESULT_FIELDS,
+    )
+    from hub.models import RunStatus
+
+    run_id, attempt_id = str(run_id), str(attempt_id)
+    if not isinstance(terminal_status, dict) or set(terminal_status) != set(RunStatus.model_fields):
+        raise ValueError("backend publication terminal_status has an invalid field set")
+    candidate = RunStatus.model_validate(terminal_status)
+    if candidate.model_dump() != terminal_status:
+        raise ValueError("backend publication terminal_status is not canonical")
+    if candidate.run_id != run_id or candidate.status not in _TERMINAL_RUN:
+        raise ValueError("backend publication terminal_status is not this run's terminal candidate")
+    if (candidate.backend_ref is None
+            or candidate.backend_ref.attempt_id != attempt_id
+            or not candidate.backend_ref.durable):
+        raise ValueError("backend publication terminal_status has no exact durable attempt")
+    if candidate.status != "done" and (
+            candidate.output_uri is not None or candidate.output_table is not None):
+        raise ValueError("negative backend publication cannot expose output identity")
+
+    if (not isinstance(sink_attempts, dict)
+            or any(not isinstance(step_id, str) or not step_id
+                   or not isinstance(uri, str) or not uri
+                   for step_id, uri in sink_attempts.items())):
+        raise ValueError("backend publication sink_attempts must be an exact step-to-uri object")
+    canonical_sinks = {
+        step_id: _validated_object_uri(uri, attempt=True)
+        for step_id, uri in sorted(sink_attempts.items())
+    }
+    output_by_step: dict[str, dict] = {}
+    if candidate.status == "done":
+        if (not isinstance(validated_result, dict)
+                or set(validated_result) != set(RAY_JOB_RESULT_FIELDS)):
+            raise ValueError("successful backend publication requires an exact validated result")
+        if (validated_result.get("contract_version") != RAY_JOB_CONTRACT_VERSION
+                or validated_result.get("status") != candidate.status
+                or validated_result.get("attempt_id") != attempt_id
+                or validated_result.get("submission_id") != candidate.backend_ref.submission_id):
+            raise ValueError("backend publication validated_result has an invalid attempt contract")
+        if (validated_result.get("rows") != candidate.total_rows
+                or validated_result.get("output_uri") != candidate.output_uri
+                or validated_result.get("output_table") != candidate.output_table):
+            raise ValueError("backend publication result and terminal_status disagree")
+        outputs = validated_result.get("outputs")
+        if not isinstance(outputs, list):
+            raise ValueError("backend publication validated_result outputs must be a list")
+        for output in outputs:
+            if (not isinstance(output, dict)
+                    or set(output) != {"step_id", "name", "uri", "logical_uri"}
+                    or any(not isinstance(output.get(key), str) or not output[key]
+                           for key in ("step_id", "name", "uri", "logical_uri"))):
+                raise ValueError("backend publication contains an invalid output contract")
+            step_id = output["step_id"]
+            if step_id in output_by_step:
+                raise ValueError(f"backend publication repeats output step '{step_id}'")
+            if (_validated_object_uri(output["uri"], attempt=True)
+                    != canonical_sinks.get(step_id)):
+                raise ValueError(
+                    f"backend publication output '{step_id}' does not match its pinned sink")
+            output_by_step[step_id] = dict(output)
+        if set(output_by_step) != set(canonical_sinks):
+            raise ValueError("successful backend outputs do not exactly match staged sink attempts")
+    elif validated_result is not None:
+        # Failed/cancelled result artifacts can contain remote error text and partial user data. The
+        # canonical, sanitized RunStatus is sufficient terminal evidence; never copy raw results into
+        # metadata backups for a negative publication.
+        raise ValueError("negative backend publication must not persist a raw result artifact")
+
+    if not isinstance(catalog_effects, list):
+        raise ValueError("backend publication catalog_effects must be a list")
+    canonical_catalog: list[dict] = []
+    catalog_steps: set[str] = set()
+    for raw_plan in catalog_effects:
+        plan = validate_managed_catalog_publication_plan(raw_plan)
+        step_id = plan["step_id"]
+        if step_id in catalog_steps:
+            raise ValueError(f"backend publication repeats catalog effect '{step_id}'")
+        output = output_by_step.get(step_id)
+        if (output is None or plan["run_id"] != run_id
+                or plan["ref_key"] != f"{run_id}:{step_id}"
+                or plan["event_key"] != f"ray-jobs:{attempt_id}:{step_id}"
+                or plan["name"] != output["name"]
+                or plan["uri"] != output["uri"]):
+            raise ValueError(
+                f"backend publication catalog effect '{step_id}' changed its output identity")
+        catalog_steps.add(step_id)
+        canonical_catalog.append(plan)
+    canonical_catalog.sort(key=lambda plan: plan["step_id"])
+    if candidate.status == "done" and catalog_steps != set(output_by_step):
+        raise ValueError("successful backend publication has an incomplete catalog effect set")
+    if candidate.status != "done" and canonical_catalog:
+        raise ValueError("negative backend publication cannot contain catalog effects")
+
+    canonical_usage = None
+    if usage_effect is not None:
+        canonical_usage = validate_catalog_usage_publication_plan(usage_effect)
+        if (candidate.status != "done" or not canonical_catalog
+                or canonical_usage["run_id"] != run_id
+                or canonical_usage["event_key"] != f"ray-jobs:{attempt_id}"):
+            raise ValueError("backend publication contains an unexpected usage effect")
+    elif candidate.status == "done" and canonical_catalog:
+        raise ValueError("successful sink publication has no frozen usage effect")
+    event_keys = [plan["event_key"] for plan in canonical_catalog]
+    if canonical_usage is not None:
+        event_keys.append(canonical_usage["event_key"])
+    if len(event_keys) != len(set(event_keys)):
+        raise ValueError("backend publication effect event keys are not unique")
+
+    envelope = {
+        "contract_version": _BACKEND_PUBLICATION_EFFECTS_VERSION,
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+        "terminal_status": terminal_status,
+        "validated_result": validated_result,
+        "sink_attempts": canonical_sinks,
+        "catalog_effects": canonical_catalog,
+        "usage_effect": canonical_usage,
+    }
+    payload = json.dumps(
+        envelope, sort_keys=True, separators=(",", ":"), default=str
+    )
+    if len(payload.encode("utf-8")) > JOB_SQL_ENVELOPE_MAX_BYTES:
+        raise ValueError(
+            "backend publication effects plan exceeds the durable SQL envelope limit"
+        )
+    return envelope, payload
+
+
+def _decode_backend_publication_effects(raw: str, run_id: str, attempt_id: str) -> dict:
+    try:
+        envelope = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("backend publication effects plan is not valid JSON") from exc
+    if (not isinstance(envelope, dict)
+            or set(envelope) != _BACKEND_PUBLICATION_EFFECTS_FIELDS
+            or envelope.get("contract_version") != _BACKEND_PUBLICATION_EFFECTS_VERSION
+            or envelope.get("run_id") != str(run_id)
+            or envelope.get("attempt_id") != str(attempt_id)):
+        raise ValueError("backend publication effects plan has an invalid envelope")
+    validated, canonical = _validated_backend_publication_effects(
+        str(run_id), str(attempt_id), envelope.get("terminal_status"),
+        envelope.get("validated_result"), envelope.get("sink_attempts"),
+        envelope.get("catalog_effects"), envelope.get("usage_effect"),
+    )
+    if raw != canonical:
+        raise ValueError("backend publication effects plan is not canonical")
+    return validated
+
+
+def _validate_backend_publication_effects_binding(
+        job: RunBackendJob, effects: dict) -> None:
+    ref = effects.get("terminal_status", {}).get("backend_ref")
+    expected = {
+        "backend": job.backend, "cluster_ref": job.cluster_ref,
+        "submission_id": job.submission_id, "attempt_id": job.attempt_id,
+        "job_uri": job.job_uri, "result_uri": job.result_uri,
+        "code_ref": job.code_ref, "durable": True,
+    }
+    if ref != expected:
+        raise RuntimeError("backend publication effects changed their durable binding")
+
+
+def begin_backend_publication_effects(
+        run_id: str, attempt_id: str, owner: str, terminal_status: dict,
+        validated_result: dict | None, sink_attempts: dict | None,
+        catalog_effects: list[dict] | None = None,
+        usage_effect: dict | None = None) -> str:
+    """Linearize terminal effects against quarantine and durably freeze their replay plan.
+
+    Returns ``started | effects | submission | quarantined | published | busy | lost``. ``effects``
+    means this or a previous lease holder already committed the immutable plan; callers must replay that
+    SQL copy, never an object artifact that may have changed after the decision. ``submission`` means an
+    already-linearized submit/stop-fence request must be re-observed before terminal evidence is fresh.
+    """
+    run_id, attempt_id, owner = str(run_id), str(attempt_id), str(owner)
+    terminal_status = dict(terminal_status)
+    validated_result = dict(validated_result) if validated_result is not None else None
+    catalog_effects = [dict(plan) for plan in (catalog_effects or [])]
+    derive_quarantined_sinks = sink_attempts is None
+    trusted_sinks = dict(sink_attempts) if sink_attempts is not None else None
+    with session() as s:
+        now = _db_now(s)
+        row = s.get(RunBackendJob, run_id, with_for_update=True)
+        if row is None or row.attempt_id != attempt_id:
+            return "lost"
+        if row.publication_state == "published":
+            return "published"
+        if row.publication_state == _BACKEND_PUBLICATION_EFFECTS_STATE:
+            return "effects"
+        if (row.publication_state != "pending" or row.publication_owner != owner
+                or not _run_preallocation_active(row.publication_lease_until, now)):
+            return "busy"
+        if row.submission_state in _UNSETTLED_BACKEND_SUBMISSION_STATES:
+            return "submission"
+
+        terminal = str(terminal_status.get("status") or "")
+        if row.quarantine_reason is not None and terminal != "failed":
+            return "quarantined"
+        derive_authorized = (
+            (row.quarantine_reason is not None and terminal == "failed")
+            or (bool(row.cancel_requested) and terminal == "cancelled")
+        )
+        if derive_quarantined_sinks and not derive_authorized:
+            raise RuntimeError(
+                "only durable quarantine or acknowledged cancellation may derive bound sinks")
+        candidate_ref = terminal_status.get("backend_ref") or {}
+        expected_ref = {
+            "backend": row.backend, "cluster_ref": row.cluster_ref,
+            "submission_id": row.submission_id, "attempt_id": row.attempt_id,
+            "job_uri": row.job_uri, "result_uri": row.result_uri,
+            "code_ref": row.code_ref, "durable": True,
+        }
+        if (not isinstance(candidate_ref, dict)
+                or candidate_ref != expected_ref):
+            raise RuntimeError("backend publication candidate changed its durable binding")
+        if terminal == "done":
+            try:
+                durable_job = json.loads(row.job_doc or "")
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "successful backend publication has no valid durable job envelope") from exc
+            if (not isinstance(durable_job, dict)
+                    or durable_job.get("run_id") != run_id
+                    or durable_job.get("backend") != row.backend
+                    or durable_job.get("submission_id") != row.submission_id
+                    or durable_job.get("attempt_id") != row.attempt_id
+                    or validated_result is None
+                    or validated_result.get("envelope_sha256")
+                    != durable_job.get("envelope_sha256")):
+                raise RuntimeError(
+                    "successful backend publication result changed its durable job envelope")
+
+        attempt_identities = list(s.scalars(select(ObjectAttempt).where(
+            ObjectAttempt.run_id == run_id,
+            ObjectAttempt.kind == "sink",
+        ).order_by(ObjectAttempt.uri)))
+        logical_ids = sorted({attempt.logical_id for attempt in attempt_identities
+                              if attempt.logical_id})
+        locked_logicals = {logical.logical_id: logical for logical in s.scalars(
+            select(CatalogLogicalDataset).where(
+                CatalogLogicalDataset.logical_id.in_(logical_ids))
+            .order_by(CatalogLogicalDataset.logical_id).with_for_update()
+        )} if logical_ids else {}
+        attempts = list(s.scalars(select(ObjectAttempt).where(
+            ObjectAttempt.run_id == run_id,
+            ObjectAttempt.kind == "sink",
+        ).order_by(ObjectAttempt.uri).with_for_update()))
+        active = [row for row in attempts if row.state in _ACTIVE_BACKEND_SINK_STATES]
+        if derive_quarantined_sinks:
+            staged_sinks = {
+                "derived:" + hashlib.sha256(attempt.uri.encode()).hexdigest(): attempt.uri
+                for attempt in active
+            }
+        else:
+            staged_sinks = trusted_sinks or {}
+            canonical_expected = {
+                _validated_object_uri(uri, attempt=True) for uri in staged_sinks.values()
+            }
+            active_uris = {attempt.uri for attempt in active}
+            if (len(canonical_expected) != len(staged_sinks)
+                    or canonical_expected != active_uris):
+                raise RuntimeError(
+                    "backend publication sink plan does not exactly cover all active bound sinks")
+
+        envelope, payload = _validated_backend_publication_effects(
+            run_id, attempt_id, terminal_status, validated_result, staged_sinks,
+            catalog_effects, usage_effect,
+        )
+        by_uri = {attempt.uri: attempt for attempt in active}
+        selected = [(step_id, by_uri[uri]) for step_id, uri in envelope["sink_attempts"].items()]
+        if terminal == "done":
+            selected_logical_ids = [attempt.logical_id for _step_id, attempt in selected]
+            output_by_step = {
+                output["step_id"]: output for output in envelope["validated_result"]["outputs"]
+            }
+            if (None in selected_logical_ids
+                    or len(set(selected_logical_ids)) != len(selected_logical_ids)):
+                raise BackendPublicationConflict(
+                    "one backend publication cannot stage two generations of one logical dataset")
+            for step_id, attempt in selected:
+                if attempt.state != "committed":
+                    raise RuntimeError(
+                        f"backend publication sink '{step_id}' is not committed")
+                if output_by_step[step_id]["logical_uri"].rstrip("/") != attempt.logical_uri:
+                    raise BackendPublicationConflict(
+                        f"backend publication sink '{step_id}' changed its logical target")
+                logical = locked_logicals.get(attempt.logical_id)
+                if (logical is None or logical.state != "active"
+                        or attempt.catalog_epoch != logical.catalog_epoch):
+                    raise BackendPublicationConflict(
+                        f"backend publication sink '{step_id}' was fenced by unregister")
+                if attempt.publish_seq is None or attempt.publish_seq <= logical.current_publish_seq:
+                    raise BackendPublicationConflict(
+                        f"backend publication sink '{step_id}' is not newer than the catalog pointer")
+            existing_backend_refs = list(s.scalars(
+                select(ObjectAttemptRef).join(
+                    ObjectAttempt, ObjectAttempt.uri == ObjectAttemptRef.attempt_uri
+                ).where(
+                    ObjectAttemptRef.ref_type == "backend_publication",
+                    ObjectAttempt.logical_id.in_(selected_logical_ids),
+                ).order_by(ObjectAttemptRef.ref_key).with_for_update()
+            )) if selected_logical_ids else []
+            if existing_backend_refs:
+                raise BackendPublicationBusy(
+                    "another staged backend publication owns a target logical dataset")
+            for step_id, attempt in selected:
+                key = {
+                    "ref_type": "backend_publication",
+                    "ref_key": f"{run_id}:{step_id}",
+                }
+                existing = s.get(ObjectAttemptRef, key, with_for_update=True)
+                if existing is not None and (
+                        existing.attempt_uri != attempt.uri
+                        or existing.generation != attempt.generation):
+                    raise RuntimeError(
+                        f"backend publication sink '{step_id}' changed its pinned attempt")
+                if existing is None:
+                    s.add(ObjectAttemptRef(
+                        **key, attempt_uri=attempt.uri, generation=attempt.generation,
+                    ))
+            plan_by_step = {plan["step_id"]: plan for plan in envelope["catalog_effects"]}
+            for step_id, attempt in selected:
+                plan = plan_by_step[step_id]
+                if plan["generation"] != attempt.generation:
+                    raise RuntimeError(
+                        f"backend publication catalog plan '{step_id}' changed generation")
+        else:
+            committed_uris = [attempt.uri for _step_id, attempt in selected
+                              if attempt.state == "committed"]
+            if committed_uris and s.scalar(select(exists().where(
+                    ObjectAttemptRef.attempt_uri.in_(committed_uris)))):
+                raise RuntimeError(
+                    "cannot terminalize a committed backend sink with a durable owner")
+            uris = [attempt.uri for _step_id, attempt in selected]
+            leases = list(s.scalars(select(ObjectAttemptLease).where(
+                ObjectAttemptLease.attempt_uri.in_(uris),
+                ObjectAttemptLease.lease_type.in_(("write", "publish")),
+            ).order_by(ObjectAttemptLease.lease_id).with_for_update())) if uris else []
+            for _step_id, attempt in selected:
+                _terminalize_bound_backend_sink_attempt(attempt, now)
+            for lease in leases:
+                s.delete(lease)
+
+        row.publication_state = _BACKEND_PUBLICATION_EFFECTS_STATE
+        row.publication_doc = payload
+        s.flush()
+        return "started"
+
+
+def _backend_publication_effects_in_session(
+        s, job: RunBackendJob, *, lock: bool = False) -> dict:
+    if job.publication_state != _BACKEND_PUBLICATION_EFFECTS_STATE or job.publication_doc is None:
+        raise RuntimeError("backend publication has no staged terminal effects")
+    effects = _decode_backend_publication_effects(
+        job.publication_doc, job.run_id, job.attempt_id
+    )
+    _validate_backend_publication_effects_binding(job, effects)
+    if effects["terminal_status"]["status"] != "done":
+        return effects
+    uris = sorted(effects["sink_attempts"].values())
+    attempt_query = select(ObjectAttempt).where(
+        ObjectAttempt.uri.in_(uris)).order_by(ObjectAttempt.uri)
+    if lock:
+        attempt_query = attempt_query.with_for_update()
+    attempts = {row.uri: row for row in s.scalars(attempt_query)} if uris else {}
+    ref_keys = sorted(f"{job.run_id}:{step_id}" for step_id in effects["sink_attempts"])
+    ref_query = select(ObjectAttemptRef).where(
+        ObjectAttemptRef.ref_type == "backend_publication",
+        ObjectAttemptRef.ref_key.in_(ref_keys),
+    ).order_by(ObjectAttemptRef.ref_type, ObjectAttemptRef.ref_key)
+    if lock:
+        ref_query = ref_query.with_for_update()
+    refs = {row.ref_key: row for row in s.scalars(ref_query)} if ref_keys else {}
+    for step_id, uri in effects["sink_attempts"].items():
+        ref = refs.get(f"{job.run_id}:{step_id}")
+        attempt = attempts.get(uri)
+        if (ref is None or attempt is None or ref.attempt_uri != uri
+                or ref.generation != attempt.generation
+                or attempt.run_id != job.run_id or attempt.kind != "sink"):
+            raise RuntimeError(
+                f"backend publication sink '{step_id}' lost its exact temporary reference"
+            )
+    return effects
+
+
+def backend_publication_effects(run_id: str, attempt_id: str) -> dict | None:
+    """Return a staged terminal plan only after attesting every temporary attempt reference."""
+    with session() as s:
+        job = s.get(RunBackendJob, str(run_id))
+        if (job is None or job.attempt_id != str(attempt_id)
+                or job.publication_state != _BACKEND_PUBLICATION_EFFECTS_STATE):
+            return None
+        return _backend_publication_effects_in_session(s, job)
+
+
+def _release_backend_publication_effect_refs(s, job: RunBackendJob, effects: dict) -> None:
+    if effects["terminal_status"]["status"] != "done":
+        return
+    uris = sorted(effects["sink_attempts"].values())
+    attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
+        ObjectAttempt.uri.in_(uris)
+    ).order_by(ObjectAttempt.uri).with_for_update())} if uris else {}
+    ref_keys = sorted(f"{job.run_id}:{step_id}" for step_id in effects["sink_attempts"])
+    refs = {row.ref_key: row for row in s.scalars(select(ObjectAttemptRef).where(
+        ObjectAttemptRef.ref_type == "backend_publication",
+        ObjectAttemptRef.ref_key.in_(ref_keys),
+    ).order_by(ObjectAttemptRef.ref_type, ObjectAttemptRef.ref_key).with_for_update())} \
+        if ref_keys else {}
+    pinned: list[ObjectAttempt] = []
+    for step_id, uri in effects["sink_attempts"].items():
+        ref = refs.get(f"{job.run_id}:{step_id}")
+        attempt = attempts.get(uri)
+        if (ref is None or attempt is None or ref.attempt_uri != uri
+                or ref.generation != attempt.generation):
+            raise RuntimeError(
+                f"backend publication sink '{step_id}' lost its temporary reference"
+            )
+        s.delete(ref)
+        pinned.append(attempt)
+    if pinned:
+        s.flush()
+        now = _db_now(s)
+        for attempt in pinned:
+            _maybe_supersede(s, attempt, now)
+
+
+def claim_backend_publication(run_id: str, attempt_id: str, owner: str,
+                              lease_seconds: float = 30.0) -> str:
+    """Claim a terminal publisher lease: claimed | effects | submission | busy | published | lost."""
+    with session() as s:
+        # Derive every deadline from the metadata DB server's clock. Hub/pod wall-clock skew must not
+        # let one supervisor steal a live lease early or write a deadline far into the future.
+        now = s.scalar(select(func.current_timestamp()))
+        lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
+        result = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                RunBackendJob.publication_state != "published",
+                or_(
+                    RunBackendJob.publication_state == _BACKEND_PUBLICATION_EFFECTS_STATE,
+                    RunBackendJob.submission_state.not_in(
+                        _UNSETTLED_BACKEND_SUBMISSION_STATES),
+                ),
+                or_(RunBackendJob.publication_owner == owner,
+                    RunBackendJob.publication_owner.is_(None),
+                    RunBackendJob.publication_lease_until.is_(None),
+                    RunBackendJob.publication_lease_until < now),
+            ).values(publication_owner=owner, publication_lease_until=lease)
+        )
+        if result.rowcount:
+            state = s.scalar(select(RunBackendJob.publication_state).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+            ))
+            return "effects" if state == _BACKEND_PUBLICATION_EFFECTS_STATE else "claimed"
+        row = s.get(RunBackendJob, run_id)
+        if row is None or row.attempt_id != attempt_id:
+            return "lost"
+        if row.publication_state == "published":
+            return "published"
+        if (row.publication_state == "pending"
+                and row.submission_state in _UNSETTLED_BACKEND_SUBMISSION_STATES):
+            return "submission"
+        return "busy"
+
+
+def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result: dict) -> bool:
+    """Atomically publish backend evidence, public RunState, and durable run history.
+
+    Catalog projection is performed before this transaction by an idempotent provider. This transaction
+    is the terminal visibility barrier: readers can never observe a published backend row paired with a
+    stale live RunState or missing SQL run history.
+    """
+    published = dict(result)
+    terminal = str(published.get("status") or "")
+    if terminal not in _TERMINAL_RUN:
+        raise ValueError("backend publication requires a terminal RunStatus")
+    with session() as s:
+        identity = s.execute(select(
+            RunState.canvas_id, RunState.auth_canvas_id,
+        ).where(RunState.run_id == run_id)).one_or_none()
+        if identity is None:
+            return False
+        canvas_id, auth_canvas_id = identity
+        canvas_ids = {str(auth_canvas_id)} if auth_canvas_id is not None else set()
+        if canvas_id is not None and s.scalar(select(Canvas.id).where(
+                Canvas.id == canvas_id)) is not None:
+            canvas_ids.add(str(canvas_id))
+        locked_canvases = {
+            key: s.get(Canvas, key, with_for_update=True, populate_existing=True)
+            for key in sorted(canvas_ids)
+        }
+        if auth_canvas_id is not None and locked_canvases.get(str(auth_canvas_id)) is None:
+            return False
+        stale_candidate_ids = list(s.scalars(select(RunState.run_id).where(
+            RunState.status.in_(_TERMINAL_RUN), RunState.run_id != str(run_id)
+        ).order_by(RunState.updated_at.desc(), RunState.run_id.desc())
+          .offset(max(0, _RUN_STATE_MAX - 1))))
+        lock_ids = sorted({str(run_id), *stale_candidate_ids})
+        locked = {row.run_id: row for row in s.scalars(select(RunState).where(
+            RunState.run_id.in_(lock_ids)
+        ).order_by(RunState.run_id).with_for_update())}
+        state = locked.get(str(run_id))
+        if state is None:
+            return False
+        job = s.get(RunBackendJob, str(run_id), with_for_update=True)
+        if (job is None or job.attempt_id != str(attempt_id)
+                or job.publication_owner != str(owner)
+                or job.publication_state != _BACKEND_PUBLICATION_EFFECTS_STATE):
+            return False
+        effects = _backend_publication_effects_in_session(s, job, lock=True)
+        if published != effects["terminal_status"]:
+            return False
+        published = dict(effects["terminal_status"])
+        terminal = str(published["status"])
+        if terminal == "done":
+            sink_uris = list(effects["sink_attempts"].values())
+            states = dict(s.execute(select(
+                ObjectAttempt.uri, ObjectAttempt.state,
+            ).where(ObjectAttempt.uri.in_(sink_uris))).all()) if sink_uris else {}
+            if any(states.get(uri) != "published" for uri in sink_uris):
+                return False
+            expected_events = {
+                plan["event_key"]: (
+                    "output", plan["uri"], plan["version"], plan["fingerprint"])
+                for plan in effects["catalog_effects"]
+            }
+            usage = effects["usage_effect"]
+            if usage is not None:
+                expected_events[usage["event_key"]] = (
+                    "usage", None, None, usage["fingerprint"])
+            event_keys = sorted(expected_events)
+            events = {row.event_key: row for row in s.scalars(
+                select(CatalogPublicationEvent).where(
+                    CatalogPublicationEvent.event_key.in_(event_keys))
+                .order_by(CatalogPublicationEvent.event_key).with_for_update()
+            )} if event_keys else {}
+            if any(
+                    key not in events or (
+                        events[key].effect_type, events[key].uri,
+                        events[key].version, events[key].fingerprint,
+                    ) != expected
+                    for key, expected in expected_events.items()):
+                return False
+        source_pins = _backend_source_pins_in_session(s, str(run_id), lock=True)
+        job.publication_state = "published"
+        job.publication_owner = None
+        job.publication_lease_until = None
+        job.recovery_blocked_reason = None
+        job.publication_doc = None
+        job.result_doc = json.dumps(
+            published, sort_keys=True, separators=(",", ":"), default=str)
+        payload = json.dumps(published, default=str)
+        state.status, state.doc = terminal, payload
+        s.flush()
+        _record_terminal_fence(s, run_id, terminal)
+        stale_now = set(s.scalars(select(RunState.run_id).where(
+            RunState.status.in_(_TERMINAL_RUN)
+        ).order_by(RunState.updated_at.desc(), RunState.run_id.desc())
+          .offset(_RUN_STATE_MAX)))
+        prune_current = str(run_id) in stale_now
+        stale = [locked[key] for key in sorted(stale_now & set(stale_candidate_ids))
+                 if key != str(run_id) and key in locked
+                 and locked[key].status in _TERMINAL_RUN]
+        pruned = [*stale, *([state] if prune_current else [])]
+        output_uri = _result_doc_uri(published)
+        _replace_attempt_ref(s, "run_state", run_id, output_uri)
+        _release_backend_publication_effect_refs(s, job, effects)
+        for obj in pruned:
+            stale_job = s.get(RunBackendJob, obj.run_id)
+            if stale_job is not None:
+                s.delete(stale_job)
+            _replace_attempt_ref(s, "run_state", obj.run_id, None)
+            s.delete(obj)
+        per_node = published.get("per_node") or None
+        # Source refs are object-lifecycle owners and must be released before any helper can take the
+        # local-result registry lock. They still share this authoritative transaction, so any later
+        # publication failure restores the backend marker, public state/history, and pins together.
+        _release_backend_source_pins(s, source_pins)
+        _upsert_run_record(
+            s, canvas_id=state.canvas_id, target_node_id=published.get("target_node_id"),
+            status=terminal, rows=published.get("total_rows"), ms=published.get("ms"),
+            error=published.get("error"), output_table=published.get("output_table"),
+            per_node=per_node, run_id=run_id, output_uri=output_uri,
+        )
+        if pruned:
+            _lock_local_result_registry(s)
+        if not prune_current:
+            sync_local_result_owner(s, "run_state", run_id, published)
+        if terminal == "done" and not prune_current:
+            _release_terminal_local_result_writers(
+                s, run_id, allow_unreferenced=False)
+        elif terminal == "done":
+            _release_terminal_local_result_writers(
+                s, run_id, allow_unreferenced=True)
+        for obj in pruned:
+            _drop_local_result_owner_locked(s, "run_state", obj.run_id)
+        return True
+
+
+def renew_backend_publication(run_id: str, attempt_id: str, owner: str,
+                              lease_seconds: float = 30.0) -> bool:
+    """Extend an active publication lease while catalog/history side effects are in flight."""
+    with session() as s:
+        now = s.scalar(select(func.current_timestamp()))
+        lease = now + datetime.timedelta(seconds=max(1.0, lease_seconds))
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                RunBackendJob.publication_owner == owner,
+                RunBackendJob.publication_state != "published",
+                or_(
+                    RunBackendJob.publication_state == _BACKEND_PUBLICATION_EFFECTS_STATE,
+                    and_(
+                        RunBackendJob.publication_state == "pending",
+                        RunBackendJob.quarantine_reason.is_(None),
+                        RunBackendJob.submission_state.not_in(
+                            _UNSETTLED_BACKEND_SUBMISSION_STATES),
+                    ),
+                ),
+            ).values(publication_lease_until=lease)
+        )
+        return bool(updated.rowcount)
+
+
+def backend_publication_owned(run_id: str, attempt_id: str, owner: str) -> bool:
+    """Fence an external side effect immediately before it is issued by a lease holder."""
+    with session() as s:
+        return s.scalar(select(RunBackendJob.run_id).where(
+            RunBackendJob.run_id == run_id,
+            RunBackendJob.attempt_id == attempt_id,
+            RunBackendJob.publication_state == _BACKEND_PUBLICATION_EFFECTS_STATE,
+            RunBackendJob.publication_owner == owner,
+            RunBackendJob.publication_lease_until >= func.current_timestamp(),
+        ).limit(1)) is not None
+
+
+def _terminalize_bound_backend_sink_attempt(
+        row: ObjectAttempt, now: datetime.datetime) -> None:
+    """Apply writer-terminal proof without regressing a published or terminal generation."""
+    if row.state in ("allocated", "writing"):
+        row.state = "abandoned"
+        row.terminal_proof_at = now
+        row.quiet_until = now + datetime.timedelta(seconds=60)
+    elif row.state == "committed":
+        row.state = "abandoned"
+        row.terminal_proof_at = row.terminal_proof_at or now
+    elif row.state == "published" or row.state in _TERMINAL_ATTEMPT_STATES:
+        return
+    else:
+        raise RuntimeError(f"unsupported backend sink attempt state {row.state!r}")
+
+
+def terminalize_bound_backend_sink_attempts(
+        run_id: str, attempt_id: str, publication_owner: str, *,
+        expected_sink_uris: list[str] | None = None) -> bool:
+    """Retire only the exact bound run's sink writers under an active publication lease.
+
+    The caller must first establish from the external control plane that the writer is terminal. This
+    transaction then fences that proof to the exact durable binding and, for a trusted envelope, its
+    hash-bound sink URI set. A corrupt envelope may omit that set only when durable stop/quarantine
+    intent exists. ``False`` means the binding, lease, intent, or sink attestation no longer authorizes
+    cleanup; no attempt is changed in that case.
+    """
+    run_id = str(run_id)
+    attempt_id = str(attempt_id)
+    publication_owner = str(publication_owner)
+    if expected_sink_uris is not None:
+        if not isinstance(expected_sink_uris, list):
+            raise ValueError("expected backend sink URIs must be a list")
+        expected_sink_uris = [
+            _validated_object_uri(str(uri), attempt=True)
+            for uri in expected_sink_uris
+        ]
+        if expected_sink_uris != sorted(set(expected_sink_uris)):
+            raise ValueError(
+                "expected backend sink URIs must be canonical, sorted, and unique")
+    with session() as s:
+        state = _lock_existing_run_identity(s, run_id)
+        if state is None:
+            return False
+        job = s.get(RunBackendJob, run_id, with_for_update=True)
+        now = _db_now(s)
+        if (job is None
+                or job.attempt_id != attempt_id
+                or job.publication_state == "published"
+                or job.publication_owner != publication_owner
+                or not _run_preallocation_active(job.publication_lease_until, now)):
+            return False
+        if expected_sink_uris is None and not (job.cancel_requested
+                or job.quarantine_reason is not None
+                or job.recovery_blocked_reason is not None
+                or state.status in _TERMINAL_RUN):
+            return False
+
+        attempts = list(s.scalars(select(ObjectAttempt).where(
+            ObjectAttempt.run_id == run_id,
+            ObjectAttempt.kind == "sink",
+        ).order_by(ObjectAttempt.uri).with_for_update()))
+        if expected_sink_uris is None:
+            selected = attempts
+        else:
+            by_uri = {row.uri: row for row in attempts}
+            if any(uri not in by_uri for uri in expected_sink_uris):
+                return False
+            active_uris = {
+                row.uri for row in attempts
+                if row.state in ("allocated", "writing", "committed")
+            }
+            if not active_uris.issubset(set(expected_sink_uris)):
+                return False
+            selected = [by_uri[uri] for uri in expected_sink_uris]
+
+        committed_uris = [row.uri for row in selected if row.state == "committed"]
+        if committed_uris and s.scalar(select(exists().where(
+                ObjectAttemptRef.attempt_uri.in_(committed_uris)))):
+            raise RuntimeError("cannot abandon a committed backend sink with a durable owner")
+        uris = [row.uri for row in selected]
+        leases = list(s.scalars(select(ObjectAttemptLease).where(
+            ObjectAttemptLease.attempt_uri.in_(uris),
+            ObjectAttemptLease.lease_type.in_(("write", "publish")),
+        ).order_by(ObjectAttemptLease.lease_id).with_for_update())) if uris else []
+
+        for row in selected:
+            _terminalize_bound_backend_sink_attempt(row, now)
+        for lease in leases:
+            s.delete(lease)
+        return True
+
+
 def run_stalled(run_id: str, threshold_s: float) -> bool:
-    """True if a run's last status update (run_states.updated_at, bumped on every step transition) is
-    older than threshold_s — a soft 'stuck?' hint for a still-running run. A long single step can trip
-    it (no step completed recently ≠ dead), so it's advisory; a genuinely dead kernel is caught by the
-    heartbeat reaper, not this."""
+    """True when neither local status progress nor external control liveness was observed recently.
+
+    Durable backend error text updates must not hide a dead control plane, while successful same-state
+    polls must keep a healthy long-running job from looking stalled. Local runs retain RunState time.
+    """
     with session() as s:
         r = s.get(RunState, run_id)
         if r is None or r.updated_at is None:
             return False
-        return _stale_secs(r.updated_at) > threshold_s  # _stale_secs normalizes SQLite's naive datetimes
+        job = s.get(RunBackendJob, run_id)
+        if job is None:
+            return _stale_secs(r.updated_at) > threshold_s
+        now = _db_now(s)
+        observed_at = (
+            job.last_control_observed_at or job.updated_at or r.updated_at
+        )
+        if observed_at is None:
+            return False
+        # SQLite returns naive timestamps while Postgres returns timezone-aware values. Normalize both
+        # as UTC before comparing, but keep the source of "now" the metadata DB on every backend.
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=datetime.timezone.utc)
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=datetime.timezone.utc)
+        return (now - observed_at).total_seconds() > threshold_s
 
 
 def save_schema_contract(name: str, columns: list[dict]) -> int:
@@ -2358,7 +4314,8 @@ def allocate_object_attempt(*, logical_uri: str, kind: str, run_id: str, allocat
                             uri_factory, write_lease_seconds: float = 3600,
                             publish_lease_seconds: float | None = None,
                             expected_namespace: str | None = None,
-                            catalog_key_base: str | None = None) -> dict:
+                            catalog_key_base: str | None = None,
+                            require_live_preallocation: bool = False) -> dict:
     """Allocate or recover one durable attempt handle before any object write starts.
 
     An active allocation key reuses the exact handle. Once its generation is terminal, the same key
@@ -2371,6 +4328,17 @@ def allocate_object_attempt(*, logical_uri: str, kind: str, run_id: str, allocat
     if kind == "sink" and not str(catalog_key_base or "").strip():
         raise ValueError("managed sink allocation requires a stable catalog key base")
     with session() as s:
+        if require_live_preallocation:
+            state = _lock_existing_run_identity(s, run_id)
+            backend = s.get(RunBackendJob, run_id, with_for_update=True)
+            now = _db_now(s)
+            if (state is None
+                    or state.status not in _PREALLOCATION_STATES
+                    or state.preallocation_token is None
+                    or not _run_preallocation_active(state.preallocation_expires_at, now)
+                    or backend is not None):
+                raise RuntimeError(
+                    "managed sink allocation requires a live unbound run preallocation")
         ident = _installation_identity(s)
         if expected_namespace is not None and ident.storage_namespace != expected_namespace:
             raise RuntimeError("storage namespace changed during provider ownership claim")
@@ -2797,6 +4765,10 @@ def quarantine_object_attempt(uri: str, reason: str) -> None:
     with session() as s:
         row = s.get(ObjectAttempt, str(uri).rstrip("/"), with_for_update=True)
         if row is not None and row.state != "deleted":
+            if s.scalar(select(exists().where(
+                    ObjectAttemptRef.attempt_uri == row.uri))):
+                raise RuntimeError(
+                    "cannot quarantine an object attempt with a durable reference")
             row.state, row.quarantine_reason = "quarantined", str(reason)[:4000]
             row.delete_owner = row.delete_lease_expires_at = None
             for lease in s.scalars(select(ObjectAttemptLease).where(
@@ -2914,8 +4886,28 @@ def object_attempt_gc_batch(retention_seconds: float, grace_seconds: float,
             & (ObjectAttemptLease.expires_at > now)
         )
 
+        def still_unowned(rows: list[ObjectAttempt]) -> list[ObjectAttempt]:
+            """Recheck ownership in a fresh statement after candidate attempt locks are held.
+
+            PostgreSQL evaluates the correlated NOT EXISTS predicates before a conflicting row lock
+            wait. A publisher can therefore commit a ref while GC is waiting and leave the original
+            SELECT snapshot stale. Every ref/lease creator takes the attempt lock first; once these
+            locks are ours, this fresh read both sees prior winners and prevents a later one until commit.
+            """
+            uris = [row.uri for row in rows]
+            if not uris:
+                return []
+            referenced = set(s.scalars(select(ObjectAttemptRef.attempt_uri).where(
+                ObjectAttemptRef.attempt_uri.in_(uris)
+            )))
+            leased = set(s.scalars(select(ObjectAttemptLease.attempt_uri).where(
+                ObjectAttemptLease.attempt_uri.in_(uris),
+                ObjectAttemptLease.expires_at > now,
+            )))
+            return [row for row in rows if row.uri not in referenced and row.uri not in leased]
+
         retention_cutoff = now - datetime.timedelta(seconds=retention)
-        committed_orphans = list(s.scalars(
+        committed_orphans = still_unowned(list(s.scalars(
             select(ObjectAttempt).where(
                 ObjectAttempt.state == "committed",
                 ObjectAttempt.terminal_proof_at.is_not(None),
@@ -2923,12 +4915,12 @@ def object_attempt_gc_batch(retention_seconds: float, grace_seconds: float,
                 no_refs, no_leases,
             ).order_by(ObjectAttempt.created_at, ObjectAttempt.uri)
             .limit(remaining()).with_for_update()
-        ))
+        )))
         for row in committed_orphans:
             row.state = "abandoned"
         s.flush()
 
-        observations = list(s.scalars(
+        observations = still_unowned(list(s.scalars(
             select(ObjectAttempt).where(
                 ObjectAttempt.state == "abandoned",
                 ObjectAttempt.terminal_proof_at.is_not(None),
@@ -2937,13 +4929,13 @@ def object_attempt_gc_batch(retention_seconds: float, grace_seconds: float,
                 no_refs, no_leases,
             ).order_by(ObjectAttempt.created_at, ObjectAttempt.uri)
             .limit(remaining()).with_for_update()
-        ))
+        )))
         actions.extend(_object_attempt_action(row, "observe") for row in observations)
         if remaining() <= 0:
             return actions
 
         grace_cutoff = now - datetime.timedelta(seconds=grace)
-        candidates = list(s.scalars(
+        candidates = still_unowned(list(s.scalars(
             select(ObjectAttempt).where(
                 ObjectAttempt.state.in_(("superseded", "abandoned")),
                 ObjectAttempt.terminal_proof_at.is_not(None),
@@ -2960,12 +4952,12 @@ def object_attempt_gc_batch(retention_seconds: float, grace_seconds: float,
                 no_refs, no_leases,
             ).order_by(ObjectAttempt.created_at, ObjectAttempt.uri)
             .limit(remaining()).with_for_update()
-        ))
+        )))
         for row in candidates:
             row.state, row.next_delete_at = "delete_pending", now
         s.flush()
 
-        claimable = list(s.scalars(
+        claimable = still_unowned(list(s.scalars(
             select(ObjectAttempt).where(
                 or_(
                     (ObjectAttempt.state == "delete_pending")
@@ -2978,7 +4970,7 @@ def object_attempt_gc_batch(retention_seconds: float, grace_seconds: float,
                 no_refs, no_leases,
             ).order_by(ObjectAttempt.created_at, ObjectAttempt.uri)
             .limit(remaining()).with_for_update()
-        ))
+        )))
         for row in claimable:
             owner = uuid.uuid4().hex
             action = "verify_empty" if row.state == "delete_verifying" else "delete"
@@ -3396,9 +5388,49 @@ def _catalog_governance(doc: dict) -> dict:
         "id", "name", "folder", "owner", "description", "tags") if key in doc}
 
 
+def _catalog_apply_lineage_in_session(
+        s, child_key: str, parent_snapshots: list[tuple[str, str | None, int | None]],
+        locked_logicals: dict[str, CatalogLogicalDataset], pipeline: str | None) -> None:
+    """Apply frozen parent tokens without changing a managed child's current generation."""
+    for parent, parent_logical_id, parent_attempt_epoch in parent_snapshots:
+        parent_logical = locked_logicals.get(parent_logical_id) \
+            if parent_logical_id is not None else None
+        current_parent_attempt = s.execute(select(
+            ObjectAttempt.logical_id, ObjectAttempt.catalog_epoch,
+        ).where(ObjectAttempt.uri == parent)).one_or_none() \
+            if parent_attempt_epoch is not None else None
+        parent_attempt_is_current_epoch = (
+            parent_attempt_epoch is None or (
+                current_parent_attempt is not None
+                and current_parent_attempt.logical_id == parent_logical_id
+                and current_parent_attempt.catalog_epoch == parent_attempt_epoch
+                and parent_logical is not None
+                and parent_attempt_epoch == parent_logical.catalog_epoch
+            )
+        )
+        if (parent_logical is not None and parent_logical.state == "active"
+                and parent_logical.current_uri and parent_attempt_is_current_epoch):
+            parent_key = parent_logical.catalog_key
+        elif parent_logical is not None and parent == parent_logical.catalog_key:
+            # A stable key cannot remain on an edge after unregister: it would silently attach the
+            # historical edge to a future registration. Preserve only the raw logical URI instead.
+            parent_key = parent_logical.logical_uri
+        else:
+            parent_key = parent
+        if parent_key == child_key:
+            continue
+        edge = s.scalars(select(CatalogEdge).where(
+            CatalogEdge.parent == parent_key, CatalogEdge.child == child_key).limit(1)).first()
+        if edge is None:
+            s.add(CatalogEdge(parent=parent_key, child=child_key, pipeline=pipeline))
+
+
 def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
                                parents: list[str] | None = None,
-                               pipeline: str | None = None) -> None:
+                               pipeline: str | None = None, *,
+                               publication_event_key: str | None = None,
+                               publication_fingerprint: str | None = None,
+                               backend_publication: dict | None = None) -> None:
     attempt_identity = s.get(ObjectAttempt, uri)
     if attempt_identity is None and object_attempt_uri_shape(uri):
         _validated_object_uri(uri, attempt=True)
@@ -3437,14 +5469,28 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
         if logical is None:
             raise RuntimeError("object sink attempt logical publication identity is missing")
         old_uri = logical.current_uri
-        attempt_uris = sorted({candidate for candidate in (uri, old_uri) if candidate})
+        attempt_uris = sorted({candidate for candidate in (
+            uri, old_uri, *(parent for parent, _logical_id, epoch in parent_snapshots
+                            if epoch is not None),
+        ) if candidate})
         locked_attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
             ObjectAttempt.uri.in_(attempt_uris)).order_by(ObjectAttempt.uri).with_for_update())}
         attempt = locked_attempts.get(uri)
         if attempt is None or (old_uri and old_uri not in locked_attempts):
             raise RuntimeError("catalog publication ownership changed concurrently")
-        s.get(ObjectAttemptRef, {
-            "ref_type": "catalog", "ref_key": logical_id}, with_for_update=True)
+        ref_predicates = [and_(
+            ObjectAttemptRef.ref_type == "catalog",
+            ObjectAttemptRef.ref_key == logical_id,
+        ), and_(
+            ObjectAttemptRef.ref_type == "backend_publication",
+            ObjectAttemptRef.attempt_uri.in_(select(ObjectAttempt.uri).where(
+                ObjectAttempt.logical_id == logical_id)),
+        )]
+        locked_refs = {(row.ref_type, row.ref_key): row for row in s.scalars(
+            select(ObjectAttemptRef).where(or_(*ref_predicates))
+            .order_by(ObjectAttemptRef.ref_type, ObjectAttemptRef.ref_key)
+            .with_for_update()
+        )}
         locked_entries = {row.uri: row for row in s.scalars(select(CatalogEntry).where(
             CatalogEntry.uri.in_(attempt_uris)).order_by(CatalogEntry.uri).with_for_update())}
         if attempt.state not in ("committed", "published"):
@@ -3455,6 +5501,31 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
             raise RuntimeError("catalog publication identity changed concurrently")
         if attempt.catalog_epoch != logical.catalog_epoch:
             raise RuntimeError("object sink attempt was fenced by catalog unregister")
+        if (publication_event_key and publication_fingerprint
+                and _catalog_output_event_receipt_in_session(
+                    s, publication_event_key, uri, str(doc.get("version")),
+                    publication_fingerprint) is not None):
+            return
+        backend_refs = [ref for (ref_type, _ref_key), ref in locked_refs.items()
+                        if ref_type == "backend_publication"]
+        if backend_publication is not None:
+            ref_key = str(backend_publication.get("ref_key") or "")
+            ref = locked_refs.get(("backend_publication", ref_key))
+            if (backend_publication.get("run_id") != attempt.run_id
+                    or backend_publication.get("generation") != attempt.generation
+                    or ref is None or ref.attempt_uri != attempt.uri
+                    or ref.generation != attempt.generation):
+                raise RuntimeError(
+                    "managed catalog publication lost its exact backend temporary reference")
+            if len(backend_refs) != 1:
+                raise BackendPublicationBusy(
+                    "another staged backend publication owns the same logical dataset")
+            if not publication_event_key or not publication_fingerprint:
+                raise RuntimeError(
+                    "managed catalog publication requires an exact durable event identity")
+        elif backend_refs:
+            raise BackendPublicationBusy(
+                "managed catalog publication is fenced by a staged backend publication")
         if attempt.publish_seq <= logical.current_publish_seq:
             raise RuntimeError("object sink attempt publication is older than the current version")
         try:
@@ -3502,37 +5573,122 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
         logical.governance_doc = json.dumps(_catalog_governance(doc), default=str, sort_keys=True)
         _replace_attempt_ref(s, "catalog", logical_id, uri, publish=True)
     child_key = logical.catalog_key if logical is not None else uri
-    for parent, parent_logical_id, parent_attempt_epoch in parent_snapshots:
-        parent_logical = locked_logicals.get(parent_logical_id) \
-            if parent_logical_id is not None else None
-        current_parent_attempt = s.execute(select(
-            ObjectAttempt.logical_id, ObjectAttempt.catalog_epoch,
-        ).where(ObjectAttempt.uri == parent)).one_or_none() \
-            if parent_attempt_epoch is not None else None
-        parent_attempt_is_current_epoch = (
-            parent_attempt_epoch is None or (
-                current_parent_attempt is not None
-                and current_parent_attempt.logical_id == parent_logical_id
-                and current_parent_attempt.catalog_epoch == parent_attempt_epoch
-                and parent_logical is not None
-                and parent_attempt_epoch == parent_logical.catalog_epoch
-            )
+    _catalog_apply_lineage_in_session(
+        s, child_key, parent_snapshots, locked_logicals, pipeline)
+    if publication_event_key:
+        if not publication_fingerprint:
+            raise RuntimeError("managed catalog publication requires an exact effect fingerprint")
+        _catalog_publication_event_once(
+            s, publication_event_key, "output", uri, doc.get("version"),
+            publication_fingerprint,
         )
-        if (parent_logical is not None and parent_logical.state == "active"
-                and parent_logical.current_uri and parent_attempt_is_current_epoch):
-            parent_key = parent_logical.catalog_key
-        elif parent_logical is not None and parent == parent_logical.catalog_key:
-            # A stable key cannot remain on an edge after unregister: it would silently attach the
-            # historical edge to a future registration. Preserve only the raw logical URI instead.
-            parent_key = parent_logical.logical_uri
-        else:
-            parent_key = parent
-        if parent_key == child_key:
-            continue
-        edge = s.scalars(select(CatalogEdge).where(
-            CatalogEdge.parent == parent_key, CatalogEdge.child == child_key).limit(1)).first()
-        if edge is None:
-            s.add(CatalogEdge(parent=parent_key, child=child_key, pipeline=pipeline))
+
+
+_MANAGED_CATALOG_PLAN_FIELDS = {
+    "contract_version", "run_id", "step_id", "ref_key", "generation", "event_key",
+    "name", "uri", "version", "parents", "pipeline", "table_doc", "fingerprint",
+}
+
+
+def validate_managed_catalog_publication_plan(plan: dict) -> dict:
+    """Validate one immutable, pre-probed managed catalog effect without touching its artifact."""
+    from hub.models import CatalogTable
+
+    if not isinstance(plan, dict) or set(plan) != _MANAGED_CATALOG_PLAN_FIELDS:
+        raise ValueError("managed catalog publication plan has an invalid field set")
+    if plan.get("contract_version") != 1:
+        raise ValueError("managed catalog publication plan has an unsupported version")
+    for key in (
+            "run_id", "step_id", "ref_key", "event_key", "name", "uri", "version",
+            "fingerprint"):
+        if not isinstance(plan.get(key), str) or not plan[key]:
+            raise ValueError(f"managed catalog publication plan has an invalid {key}")
+    if plan["ref_key"] != f"{plan['run_id']}:{plan['step_id']}":
+        raise ValueError("managed catalog publication plan has an invalid temporary reference key")
+    if (isinstance(plan.get("generation"), bool)
+            or not isinstance(plan.get("generation"), int)
+            or plan["generation"] < 1):
+        raise ValueError("managed catalog publication plan has an invalid generation")
+    uri = _validated_object_uri(plan["uri"], attempt=True)
+    parents = plan.get("parents")
+    if (not isinstance(parents, list)
+            or any(not isinstance(parent, str) or not parent for parent in parents)
+            or parents != list(dict.fromkeys(parent.rstrip("/") for parent in parents))):
+        raise ValueError("managed catalog publication plan has invalid parents")
+    if plan.get("pipeline") is not None and not isinstance(plan["pipeline"], str):
+        raise ValueError("managed catalog publication plan has an invalid pipeline")
+    if not isinstance(plan.get("table_doc"), dict):
+        raise ValueError("managed catalog publication plan has no exact table document")
+    table = CatalogTable.model_validate(plan["table_doc"])
+    if (table.model_dump(by_alias=True) != plan["table_doc"]
+            or table.name != plan["name"] or table.uri.rstrip("/") != uri
+            or table.version != plan["version"]):
+        raise ValueError("managed catalog publication table document changed after preflight")
+    unsigned = {key: value for key, value in plan.items() if key != "fingerprint"}
+    expected = "managed-output:v1:sha256:" + hashlib.sha256(json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode()).hexdigest()
+    if plan["fingerprint"] != expected:
+        raise ValueError("managed catalog publication fingerprint does not match its plan")
+    return dict(plan)
+
+
+def managed_catalog_publication_identity(uri: str, run_id: str) -> dict:
+    """Return the exact committed sink generation to bind into a pre-effects catalog plan."""
+    normalized, run_id = _validated_object_uri(uri, attempt=True), str(run_id)
+    with session() as s:
+        attempt = s.get(ObjectAttempt, normalized)
+        if (attempt is None or attempt.kind != "sink" or attempt.run_id != run_id
+                or attempt.state != "committed"):
+            raise RuntimeError("managed catalog publication sink is not an exact committed attempt")
+        return {"uri": attempt.uri, "generation": attempt.generation}
+
+
+def _catalog_output_event_receipt_in_session(
+        s, event_key: str, uri: str, version: str,
+        fingerprint: str) -> dict | None:
+    event = s.get(CatalogPublicationEvent, str(event_key), with_for_update=True)
+    if event is None:
+        return None
+    if (event.effect_type != "output" or event.uri != uri or event.version != version
+            or event.fingerprint != fingerprint):
+        raise RuntimeError(f"catalog publication key collision: {event_key}")
+    return {
+        "event_key": event.event_key, "uri": event.uri,
+        "version": event.version, "fingerprint": event.fingerprint,
+    }
+
+
+def catalog_apply_managed_publication(plan: dict) -> dict:
+    """Apply a pre-probed SQL-only managed effect, or attest its exact prior event receipt."""
+    validated = validate_managed_catalog_publication_plan(plan)
+    with session() as s:
+        # A durable event is a complete exact receipt. Replays after finish has released the temporary
+        # ref, or after a later generation became current, must remain successful and side-effect free.
+        receipt = _catalog_output_event_receipt_in_session(
+            s, validated["event_key"], validated["uri"], validated["version"],
+            validated["fingerprint"],
+        )
+        if receipt is not None:
+            return receipt
+        _catalog_upsert_in_session(
+            s, validated["uri"], validated["name"], dict(validated["table_doc"]),
+            parents=validated["parents"], pipeline=validated["pipeline"],
+            publication_event_key=validated["event_key"],
+            publication_fingerprint=validated["fingerprint"],
+            backend_publication={
+                "run_id": validated["run_id"],
+                "ref_key": validated["ref_key"],
+                "generation": validated["generation"],
+            },
+        )
+        receipt = _catalog_output_event_receipt_in_session(
+            s, validated["event_key"], validated["uri"], validated["version"],
+            validated["fingerprint"],
+        )
+        if receipt is None:
+            raise RuntimeError("managed catalog publication did not record its exact event")
+        return receipt
 
 
 def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
@@ -3627,25 +5783,285 @@ def catalog_bump_usage(uri: str, n: int = 1) -> None:
             logical.usage += n
 
 
-def catalog_add_edge(parent: str, child: str, pipeline: str | None = None, column: str | None = None) -> None:
+def _catalog_publication_event_once(
+        s, event_key: str, effect_type: str, uri: str | None,
+        version: str | None, fingerprint: str | None = None) -> bool:
+    """Insert one exact catalog effect identity in the caller's transaction.
+
+    Catalog owner rows are locked before this helper is called. The savepoint contains only the unique
+    event insert, so a concurrent winner can be validated without rolling back the caller's catalog
+    locks or accidentally converting a later catalog mutation error into an idempotent replay.
+    """
+    fingerprint = fingerprint or (
+        "catalog-effect:v1:sha256:" + hashlib.sha256(json.dumps(
+            [effect_type, uri, version], ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()).hexdigest()
+    )
+
+    def validate(event: CatalogPublicationEvent | None) -> None:
+        if (event is None or event.effect_type != effect_type
+                or event.uri != uri or event.version != version
+                or event.fingerprint != fingerprint):
+            raise RuntimeError(f"catalog publication key collision: {event_key}")
+
+    event = s.get(CatalogPublicationEvent, event_key, with_for_update=True)
+    if event is not None:
+        validate(event)
+        return False
+    try:
+        with s.begin_nested():
+            s.add(CatalogPublicationEvent(
+                event_key=event_key, effect_type=effect_type,
+                uri=uri, version=version, fingerprint=fingerprint,
+            ))
+            s.flush()
+    except IntegrityError:
+        # The failed INSERT was isolated to the savepoint. Under READ COMMITTED the winner is visible
+        # after its unique-key wait completes; validate its full effect identity before accepting it.
+        s.expire_all()
+        validate(s.get(CatalogPublicationEvent, event_key, populate_existing=True))
+        return False
+    return True
+
+
+def _lock_exact_unmanaged_catalog_output(
+        s, uri: str, version: str | None) -> CatalogEntry:
+    """Lock and attest the exact unmanaged catalog row behind an output receipt."""
+    if s.get(ObjectAttempt, uri) is not None or object_attempt_uri_shape(uri):
+        raise RuntimeError(
+            "managed catalog output requires the core object-lifecycle publication receipt")
+    entry = s.get(CatalogEntry, uri, with_for_update=True)
+    if entry is None:
+        raise RuntimeError(f"catalog output is not durably readable: {uri}")
+    if entry.logical_id is not None:
+        raise RuntimeError(
+            "managed catalog output requires the core object-lifecycle publication receipt")
+    try:
+        doc = json.loads(entry.doc)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"catalog output has invalid durable metadata: {uri}") from exc
+    if not isinstance(doc, dict) or doc.get("version") != version:
+        raise RuntimeError(f"catalog output version does not match durable metadata: {uri}")
+    return entry
+
+
+def catalog_record_output_publication(event_key: str, uri: str, version: str | None) -> None:
+    """Persist a receipt only after the referenced catalog entry is durably readable.
+
+    The entry upsert and this receipt are separate retry-safe commits: a crash between them leaves an
+    unacknowledged entry that the next call re-upserts, while a crash after the receipt replays the same
+    event. Durable backends must not expose terminal success until this function returns.
+    """
+    if not event_key:
+        raise ValueError("catalog publication event_key is required")
+    normalized = str(uri).rstrip("/") if uri else ""
+    if not normalized:
+        raise ValueError("catalog publication uri is required")
+    with session() as s:
+        _lock_exact_unmanaged_catalog_output(s, normalized, version)
+        _catalog_publication_event_once(
+            s, event_key, "output", normalized, version)
+
+
+def _catalog_usage_effect(
+        s, uris: list[str]) -> tuple[str, list[dict]]:
+    """Resolve aliases to stable identities and return one canonical effect plus unique live targets."""
+    normalized = [str(value).rstrip("/") for value in uris if value]
+    normalized = list(dict.fromkeys(token for token in normalized if token))
+    targets = _lock_catalog_mutation_targets(s, normalized)
+    identities: set[str] = set()
+    unique_targets: dict[str, dict] = {}
+    for target in targets:
+        logical = target["logical"]
+        identity = (
+            f"logical:{logical.logical_id}" if logical is not None
+            else f"uri:{target['current_uri'] or target['token']}"
+        )
+        identities.add(identity)
+        if target["known"]:
+            unique_targets.setdefault(identity, target)
+    canonical = json.dumps(
+        sorted(identities), ensure_ascii=False, separators=(",", ":"))
+    fingerprint = "usage:v1:sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+    return fingerprint, [unique_targets[key] for key in sorted(unique_targets)]
+
+
+def catalog_bump_usage_once(event_key: str, uris: list[str]) -> bool:
+    """Apply one canonical run-level popularity effect to each stable parent identity exactly once."""
+    if not event_key:
+        raise ValueError("catalog publication event_key is required")
+    with session() as s:
+        fingerprint, targets = _catalog_usage_effect(s, uris)
+        if not _catalog_publication_event_once(
+                s, event_key, "usage", fingerprint, None):
+            return False
+        for target in targets:
+            updated = s.execute(
+                update(CatalogEntry).where(
+                    CatalogEntry.uri == target["current_uri"])
+                .values(
+                    usage=CatalogEntry.usage + 1,
+                    updated_at=CatalogEntry.updated_at,
+                )
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("catalog usage target changed concurrently")
+            logical = target["logical"]
+            if logical is not None:
+                logical.usage += 1
+        return True
+
+
+_CATALOG_USAGE_PLAN_FIELDS = {
+    "contract_version", "run_id", "event_key", "identities", "fingerprint",
+}
+_CATALOG_USAGE_IDENTITY_FIELDS = {"kind", "key"}
+
+
+def validate_catalog_usage_publication_plan(plan: dict) -> dict:
+    """Validate one frozen stable-identity usage effect without resolving mutable aliases."""
+    if not isinstance(plan, dict) or set(plan) != _CATALOG_USAGE_PLAN_FIELDS:
+        raise ValueError("catalog usage publication plan has an invalid field set")
+    if plan.get("contract_version") != 1:
+        raise ValueError("catalog usage publication plan has an unsupported version")
+    for key in ("run_id", "event_key", "fingerprint"):
+        if not isinstance(plan.get(key), str) or not plan[key]:
+            raise ValueError(f"catalog usage publication plan has an invalid {key}")
+    identities = plan.get("identities")
+    if not isinstance(identities, list):
+        raise ValueError("catalog usage publication plan identities must be a list")
+    canonical: list[dict[str, str]] = []
+    for identity in identities:
+        if (not isinstance(identity, dict)
+                or set(identity) != _CATALOG_USAGE_IDENTITY_FIELDS
+                or identity.get("kind") not in ("logical", "uri")
+                or not isinstance(identity.get("key"), str)
+                or not identity["key"]):
+            raise ValueError("catalog usage publication plan has an invalid identity")
+        canonical.append({"kind": identity["kind"], "key": identity["key"]})
+    canonical = sorted(canonical, key=lambda item: (item["kind"], item["key"]))
+    if identities != canonical or len({(item["kind"], item["key"])
+                                       for item in canonical}) != len(canonical):
+        raise ValueError("catalog usage publication identities must be canonical and unique")
+    unsigned = {key: value for key, value in plan.items() if key != "fingerprint"}
+    expected = "catalog-usage:v1:sha256:" + hashlib.sha256(json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode()).hexdigest()
+    if plan["fingerprint"] != expected:
+        raise ValueError("catalog usage publication fingerprint does not match its plan")
+    return dict(plan)
+
+
+def catalog_prepare_usage_publication(
+        run_id: str, event_key: str, parents: list[str]) -> dict:
+    """Resolve parent aliases once, before effects, into stable logical or exact URI identities."""
+    run_id, event_key = str(run_id), str(event_key)
+    if not run_id or not event_key or not isinstance(parents, list):
+        raise ValueError("catalog usage publication requires run, event key, and parent list")
+    with session() as s:
+        targets = _lock_catalog_mutation_targets(s, [
+            str(parent).rstrip("/") for parent in parents if parent
+        ])
+        identities = []
+        for target in targets:
+            logical = target["logical"]
+            if logical is not None:
+                identities.append({"kind": "logical", "key": logical.logical_id})
+            else:
+                identities.append({
+                    "kind": "uri", "key": target["current_uri"] or target["token"],
+                })
+    identities = sorted(
+        {(item["kind"], item["key"]) for item in identities}
+    )
+    plan = {
+        "contract_version": 1,
+        "run_id": run_id,
+        "event_key": event_key,
+        "identities": [{"kind": kind, "key": key} for kind, key in identities],
+    }
+    canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"), default=str)
+    plan["fingerprint"] = "catalog-usage:v1:sha256:" + hashlib.sha256(
+        canonical.encode()
+    ).hexdigest()
+    return validate_catalog_usage_publication_plan(plan)
+
+
+def catalog_apply_usage_publication(plan: dict) -> bool:
+    """Apply a staged usage effect once against current generations of frozen identities.
+
+    A logical identity follows generation replacement. An identity unregistered before first apply is
+    deliberately a no-op, while the event is still recorded so terminal publication cannot be blocked
+    or later resurrect the dataset.
+    """
+    validated = validate_catalog_usage_publication_plan(plan)
+    with session() as s:
+        logical_ids = [item["key"] for item in validated["identities"]
+                       if item["kind"] == "logical"]
+        uri_ids = [item["key"] for item in validated["identities"]
+                   if item["kind"] == "uri"]
+        logicals = {row.logical_id: row for row in s.scalars(
+            select(CatalogLogicalDataset).where(
+                CatalogLogicalDataset.logical_id.in_(logical_ids))
+            .order_by(CatalogLogicalDataset.logical_id).with_for_update()
+        )} if logical_ids else {}
+        current_uris = sorted({
+            logical.current_uri for logical in logicals.values()
+            if logical.state == "active" and logical.current_uri
+        })
+        entry_uris = sorted(set(current_uris) | set(uri_ids))
+        entries = {row.uri: row for row in s.scalars(select(CatalogEntry).where(
+            CatalogEntry.uri.in_(entry_uris)
+        ).order_by(CatalogEntry.uri).with_for_update())} if entry_uris else {}
+        if not _catalog_publication_event_once(
+                s, validated["event_key"], "usage", None, None,
+                validated["fingerprint"]):
+            return False
+        for logical_id in logical_ids:
+            logical = logicals.get(logical_id)
+            if logical is None or logical.state != "active" or not logical.current_uri:
+                continue
+            entry = entries.get(logical.current_uri)
+            if entry is None or entry.logical_id != logical_id:
+                # Concurrent unregister/replacement takes the logical lock in the same order, so a
+                # missing exact current entry is corruption, not a benign liveness transition.
+                raise RuntimeError("catalog usage logical identity has no exact current entry")
+            # A read-popularity bump must not advance updated_at (the 'recently updated' sort key).
+            s.execute(update(CatalogEntry).where(CatalogEntry.uri == entry.uri)
+                      .values(usage=CatalogEntry.usage + 1, updated_at=CatalogEntry.updated_at))
+            logical.usage += 1
+        for uri in uri_ids:
+            entry = entries.get(uri)
+            if entry is not None and entry.logical_id is None:
+                s.execute(update(CatalogEntry).where(CatalogEntry.uri == entry.uri)
+                          .values(usage=CatalogEntry.usage + 1, updated_at=CatalogEntry.updated_at))
+        return True
+
+
+def catalog_add_edge(parent: str, child: str, pipeline: str | None = None,
+                     column: str | None = None) -> bool:
     """Write-through a lineage edge; one row per (parent, child). `column` records column-level
-    provenance when known."""
+    provenance when known. Returns whether this call created the edge."""
     if parent == child:
-        return
+        return False
     with session() as s:
         parent_target, child_target = _lock_catalog_mutation_targets(s, [parent, child])
         if not child_target["known"]:
             raise RuntimeError("catalog lineage child is not registered")
         parent_key, child_key = parent_target["catalog_key"], child_target["catalog_key"]
         if parent_key == child_key:
-            return
-        exists = s.scalars(select(CatalogEdge).where(
+            return False
+        edge = s.scalars(select(CatalogEdge).where(
             CatalogEdge.parent == parent_key, CatalogEdge.child == child_key)).first()
-        if exists is None:
+        if edge is None:
             s.add(CatalogEdge(
                 parent=parent_key, child=child_key, pipeline=pipeline, column=column))
-        elif column and not exists.column:
-            exists.column = column
+            s.flush()
+            return True
+        if column and not edge.column:
+            edge.column = column
+        return False
 
 
 def _row_to_doc(r: "CatalogEntry", tags: list[str]) -> dict:
@@ -3895,6 +6311,16 @@ def _delete_catalog_governance(s, catalog_key: str) -> None:
             s.delete(relationship)
 
 
+def _catalog_logicals_have_backend_publication_refs(s, logical_ids: list[str]) -> bool:
+    if not logical_ids:
+        return False
+    return bool(s.scalar(select(exists().where(
+        ObjectAttemptRef.ref_type == "backend_publication",
+        ObjectAttemptRef.attempt_uri == ObjectAttempt.uri,
+        ObjectAttempt.logical_id.in_(logical_ids),
+    ))))
+
+
 def catalog_delete_entry(uri: str) -> None:
     """Remove a catalog entry (unregister) + everything keyed to it (tags/columns/embedding/edges/
     declared key/relationships)."""
@@ -3924,6 +6350,9 @@ def catalog_delete_entry(uri: str) -> None:
             current_attempt = s.get(ObjectAttempt, current_uri, with_for_update=True)
             if current_attempt is None or current_attempt.logical_id != logical.logical_id:
                 raise RuntimeError("catalog unregister ownership changed concurrently")
+            if _catalog_logicals_have_backend_publication_refs(s, [logical.logical_id]):
+                raise RuntimeError(
+                    "catalog unregister is blocked by an active backend publication")
             s.get(ObjectAttemptRef, {
                 "ref_type": "catalog", "ref_key": logical.logical_id}, with_for_update=True)
             entry = s.get(CatalogEntry, current_uri, with_for_update=True)
@@ -3977,6 +6406,9 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
         attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
             ObjectAttempt.uri.in_(managed_uris)).order_by(ObjectAttempt.uri).with_for_update())} \
             if managed_uris else {}
+        if _catalog_logicals_have_backend_publication_refs(s, logical_ids):
+            raise RuntimeError(
+                "catalog unregister is blocked by an active backend publication")
         refs = {row.ref_key: row for row in s.scalars(select(ObjectAttemptRef).where(
             ObjectAttemptRef.ref_type == "catalog",
             ObjectAttemptRef.ref_key.in_(logical_ids),
@@ -4330,17 +6762,28 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
     `only_kernel_runs` distinguishes the two callers: on hub BOOT (default False) a kernel-less run —
     an in-process / subprocess run — belonged to the now-dead previous hub, so it is reaped too. On the
     PERIODIC path (True) a kernel-less run belongs to THIS live hub process (or, across instances, to
-    another live one) and must NOT be reaped mid-flight — only its dead-kernel runs are."""
+    another live one) and must NOT be reaped mid-flight — only its dead-kernel runs are. A leased
+    external preallocation is excluded on both paths; once its DB-clock lease expires, either path may
+    safely terminalize it because no backend writer was durably admitted."""
     n = 0
     with session() as s:
         live = {k.kernel_id for k in s.scalars(select(Kernel)) if not _kernel_stale(k)}
         reaped_run_ids: list[str] = []
+        expired_preallocation = and_(
+            RunState.preallocation_token.is_not(None),
+            or_(RunState.preallocation_expires_at.is_(None),
+                RunState.preallocation_expires_at <= func.now()),
+        )
         candidate = select(RunState).where(
-            RunState.status.in_(("queued", "running")))
+            RunState.status.in_(("allocating", "queued", "running")),
+            ~exists().where(RunBackendJob.run_id == RunState.run_id),
+            or_(RunState.preallocation_token.is_(None), expired_preallocation),
+        )
         if only_kernel_runs:
-            candidate = candidate.where(RunState.kernel_id.is_not(None))
+            dead_kernel = RunState.kernel_id.is_not(None)
             if live:
-                candidate = candidate.where(RunState.kernel_id.not_in(live))
+                dead_kernel = and_(dead_kernel, RunState.kernel_id.not_in(live))
+            candidate = candidate.where(or_(expired_preallocation, dead_kernel))
         elif live:
             candidate = candidate.where(or_(
                 RunState.kernel_id.is_(None), RunState.kernel_id.not_in(live)))
@@ -4350,6 +6793,16 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
         rows = s.scalars(candidate.order_by(
             RunState.run_id).with_for_update()).all()
         for r in rows:
+            # Bind follows RunState -> backend. Taking the same order means an absent backend is proof:
+            # either binding committed first and this row is skipped, or this terminal fence wins and
+            # a delayed binder observes that the preallocation is no longer live.
+            if s.get(RunBackendJob, r.run_id, with_for_update=True) is not None:
+                continue
+            preallocation_expired = r.preallocation_token is not None
+            if preallocation_expired:
+                _abandon_run_preallocation_attempts(s, r.run_id)
+                r.preallocation_token = None
+                r.preallocation_expires_at = None
             try:
                 d = json.loads(r.doc)
             except Exception:  # noqa: BLE001
@@ -4359,10 +6812,15 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
             for key in ("uri", "outputUri", "output_uri", "outputTable", "output_table"):
                 d.pop(key, None)
             d["status"] = "failed"
-            d["error"] = "interrupted — the run's kernel is gone (hub restarted with no live kernel)"
+            d["error"] = (
+                "interrupted before durable backend binding"
+                if preallocation_expired else
+                "interrupted — the run's kernel is gone (hub restarted with no live kernel)"
+            )
             r.status = "failed"
             r.doc = json.dumps(d, default=str)
             _replace_attempt_ref(s, "run_state", r.run_id, None)
+            _record_terminal_fence(s, r.run_id, "failed")
             reaped_run_ids.append(r.run_id)
             n += 1
         if reaped_run_ids:
@@ -4446,3 +6904,45 @@ def set_setting(key: str, value, scope: str = "global", scope_id: str = "") -> N
             row.value = json.dumps(value)
         else:
             s.add(Setting(scope=scope, scope_id=scope_id, key=key, value=json.dumps(value)))
+
+
+def record_agent_egress_event(event: dict) -> None:
+    """Persist one value-free agent egress audit event (provider/model/tool/dataset/columns/rowCount)."""
+    columns = event.get("columns") or []
+    if not isinstance(columns, list):
+        columns = list(columns)
+    with session() as s:
+        s.add(AgentEgressEvent(
+            provider=str(event.get("provider") or ""),
+            model=str(event.get("model") or ""),
+            tool=str(event.get("tool") or ""),
+            dataset=(None if event.get("dataset") is None else str(event.get("dataset"))),
+            columns_json=json.dumps(columns),
+            row_count=event.get("rowCount") if event.get("rowCount") is not None else event.get("row_count"),
+            event_json=json.dumps(event, default=str),
+        ))
+
+
+def list_agent_egress_events(*, limit: int = 200) -> list[dict]:
+    """Return recent agent egress audit events as plain dicts (newest last within the window)."""
+    with session() as s:
+        rows = s.scalars(
+            select(AgentEgressEvent).order_by(AgentEgressEvent.id.desc()).limit(max(1, int(limit)))
+        ).all()
+        out = []
+        for row in reversed(rows):
+            try:
+                payload = json.loads(row.event_json)
+            except Exception:  # noqa: BLE001
+                payload = {
+                    "provider": row.provider,
+                    "model": row.model,
+                    "tool": row.tool,
+                    "dataset": row.dataset,
+                    "columns": json.loads(row.columns_json or "[]"),
+                    "rowCount": row.row_count,
+                }
+            payload["id"] = row.id
+            payload["createdAt"] = row.created_at.isoformat() if row.created_at else None
+            out.append(payload)
+        return out

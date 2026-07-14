@@ -124,6 +124,26 @@ export interface AgentResult {
   summary?: string
   transcript?: { tool: string; input: Record<string, unknown>; result: Record<string, unknown> }[]
   graph?: { nodes: AgentBackendNode[]; edges: AgentBackendEdge[] }
+  policy?: AgentDataDisclosure
+  disclosure?: AgentDataDisclosure
+}
+
+export interface AgentDataDisclosure {
+  provider?: string
+  model?: string
+  level?: string
+  endpointIsLocal?: boolean
+  hosted?: boolean
+  rowValuesMayLeave?: boolean
+}
+
+export interface AgentStatus {
+  available: boolean
+  reason: string
+  model?: string
+  provider?: string
+  policy?: AgentDataDisclosure
+  disclosure?: AgentDataDisclosure
 }
 
 export const api = {
@@ -214,7 +234,7 @@ export const api = {
   restartKernel: (canvasId: string) => req<{ ok: boolean; restarted: boolean }>(`/canvas/${encodeURIComponent(canvasId)}/kernel/restart`, { method: 'POST' }),
   cancelRun: (runId: string) => req<RunStatus>(`/run/${runId}/cancel`, { method: 'POST' }),
 
-  agentStatus: () => req<{ available: boolean; reason: string; model?: string }>('/agent'),
+  agentStatus: () => req<AgentStatus>('/agent'),
   agentAct: (doc: CanvasDoc, outcome: string) =>
     req<AgentResult>('/agent', { method: 'POST', body: JSON.stringify({ outcome, graph: toGraph(doc) }) }),
 

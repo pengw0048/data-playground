@@ -164,6 +164,39 @@ def is_plaintext_secret(value: Any) -> bool:
     return isinstance(value, str) and value != "" and not is_secret_ref(value)
 
 
+def is_registered_secret_ref(value: Any) -> bool:
+    """A well-formed reference whose scheme has a registered resolver (built-in ``env``/``file`` or a
+    plugin's). Shape alone is not enough: a raw ``user:token`` credential is ``scheme:rest``-shaped but
+    would only fail later at resolve time, so the write guard must check the scheme is real."""
+    if not is_secret_ref(value):
+        return False
+    scheme, _ = parse_secret_ref(str(value))
+    return scheme in list_schemes()
+
+
+# Echoed in place of a secret-backed setting that still holds legacy plaintext, so GET never leaks it.
+_REDACTED_DISPLAY = "__redacted__"
+
+
+def redact_secret_for_display(value: Any) -> Any:
+    """Reference strings are safe to echo; a residual plaintext value is masked."""
+    if value in (None, ""):
+        return value
+    if is_secret_ref(value):
+        return value
+    return _REDACTED_DISPLAY
+
+
+def redact_global_setting(key: str, value: Any, *, plugin_secrets: set[str]) -> Any:
+    """Mask residual plaintext in a reference-backed global setting before it leaves an API response."""
+    if key in SCALAR_SECRET_KEYS or key in plugin_secrets:
+        return redact_secret_for_display(value)
+    if key == "objectStore" and isinstance(value, dict):
+        return {k: (redact_secret_for_display(v) if k in OBJECT_STORE_SECRET_SUBKEYS else v)
+                for k, v in value.items()}
+    return value
+
+
 def plugin_secret_setting_keys() -> set[str]:
     """Setting keys ``plugin.<pack>.<field>`` whose ``[[config]]`` declares ``secret = true``."""
     out: set[str] = set()
@@ -206,7 +239,7 @@ def validate_secret_setting_value(key: str, value: Any, *,
             v = out.get(sub)
             if v in (None, ""):
                 continue
-            if not isinstance(v, str) or not is_secret_ref(v):
+            if not isinstance(v, str) or not is_registered_secret_ref(v):
                 raise ValueError(
                     f"objectStore.{sub} must be a secret reference "
                     f"(env:VAR or file:/path), not a raw credential")
@@ -214,7 +247,7 @@ def validate_secret_setting_value(key: str, value: Any, *,
     if key in SCALAR_SECRET_KEYS or key in secrets:
         if value in (None, ""):
             return value if value is not None else ""
-        if not isinstance(value, str) or not is_secret_ref(value):
+        if not isinstance(value, str) or not is_registered_secret_ref(value):
             raise ValueError(
                 f"{key} must be a secret reference (env:VAR or file:/path), not a raw credential")
         return value

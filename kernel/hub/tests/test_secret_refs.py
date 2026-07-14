@@ -203,10 +203,10 @@ def test_secret_ref_migration_clean_and_legacy(tmp_path):
             command.upgrade(metadb._alembic_cfg(), target)
 
     _upgrade_to(clean, "0021_local_result_artifacts")
-    _upgrade_to(clean, "0022_secret_refs")
+    _upgrade_to(clean, "0024_secret_refs")
     with sa.create_engine(f"sqlite:///{clean}").connect() as conn:
         assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar() == (
-            "0022_secret_refs")
+            "0024_secret_refs")
 
     _upgrade_to(legacy, "0021_local_result_artifacts")
     engine = sa.create_engine(f"sqlite:///{legacy}")
@@ -233,7 +233,7 @@ def test_secret_ref_migration_clean_and_legacy(tmp_path):
             "('global', '', 'plugin.dp_x.host', :v)"
         ), {"v": json.dumps("db.internal")})
 
-    _upgrade_to(legacy, "0022_secret_refs")
+    _upgrade_to(legacy, "0024_secret_refs")
     with engine.connect() as conn:
         rows = {r[0]: json.loads(r[1]) for r in conn.execute(
             sa.text("SELECT key, value FROM settings WHERE scope = 'global'")).fetchall()}

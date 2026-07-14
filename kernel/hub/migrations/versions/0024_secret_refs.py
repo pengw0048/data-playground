@@ -1,7 +1,7 @@
 """Strip legacy plaintext secrets from the settings table (SEC-03 / issue 107).
 
-Revision ID: 0022_secret_refs
-Revises: 0021_local_result_artifacts
+Revision ID: 0024_secret_refs
+Revises: 0023_agent_egress_events
 Create Date: 2026-07-14
 """
 
@@ -13,8 +13,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision = "0022_secret_refs"
-down_revision = "0021_local_result_artifacts"
+revision = "0024_secret_refs"
+down_revision = "0023_agent_egress_events"
 branch_labels = None
 depends_on = None
 
