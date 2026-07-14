@@ -74,5 +74,5 @@ catalog/planner. Discovered two ways:
 
 `reg.add_node(spec, build)` registers a typed node; `build(engine, node, inputs) -> relation` builds
 its plan step with the `ctx` helpers (`ctx.sql`, `ctx.arrow_map`, `ctx.polars`). The SPA renders it
-from `/api/nodes` — no frontend code. Org-specific backends (managed catalog, cluster runner, private
+from `/api/nodes` — no frontend code. Private or third-party backends (managed catalog, cluster runner,
 model pipelines) belong in such a pack, never in the core.

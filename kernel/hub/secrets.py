@@ -54,8 +54,8 @@ def register_resolver(scheme: str, resolver: Resolver, *, replace: bool = False)
     """Register a resolver for ``scheme:…`` references.
 
     Built-in schemes are ``env`` and ``file``. Plugins call this (or
-    ``Registry.add_secret_resolver``) during ``register(reg)`` to add organization-specific
-    backends without changing core.
+    ``Registry.add_secret_resolver``) during ``register(reg)`` to add private or third-party backends
+    without changing core.
     """
     key = scheme.lower().strip()
     if not key or not key.isidentifier():

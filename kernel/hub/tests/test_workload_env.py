@@ -21,7 +21,7 @@ _CONTROL_SECRETS = {
     "DP_AGENT_API_KEY": "agent-key",
     "OPENAI_API_KEY": "openai-key",
     "ANTHROPIC_API_KEY": "anthropic-key",
-    "LUMA_CONTROL_TOKEN": "control-token",
+    "EXTERNAL_CONTROL_TOKEN": "control-token",
     "UNRELATED_PROVIDER_SECRET": "provider-secret",
 }
 
