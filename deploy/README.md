@@ -61,6 +61,10 @@ auto-stamped; recover it from a versioned backup or perform an explicit, audited
 - Harden for your cluster: a real image registry + pull secrets, resource requests/limits, a
   NetworkPolicy for the kernel command channel, and pod cleanup (the hub's periodic reaper tears down a
   dead kernel's Pod+Service, but set sensible `DP_KERNEL_IDLE_TTL`).
+- **Credentials in settings:** store secret references (`env:VAR` / `file:/path`) for the agent API key,
+  object-store keys, and plugin secret fields — never plaintext. Inject the material values via the Pod
+  environment or mounted secret files. After upgrading past the SEC-03 migration, re-enter any cleared
+  legacy plaintext settings as references (see the root README).
 
 ## Notes from verifying this end-to-end on a real cluster
 

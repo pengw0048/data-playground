@@ -165,10 +165,27 @@ kernel's OS user. `DP_DATASET_ROOTS` constrains supported file access, and user 
 policy, but neither turns arbitrary Python into a security boundary. A kernel also holds the data and
 metadata credentials needed to execute its canvas.
 
-Canvas sharing is not dataset isolation: the catalog and data engine are workspace-wide. Settings values
-marked as secrets are redacted from API reads, but their stored metadata values are not encrypted. For a
-shared deployment, prefer environment or secret-manager injection and protect metadata backups
-accordingly.
+Canvas sharing is not dataset isolation: the catalog and data engine are workspace-wide. Settings that
+hold credentials (`agentApiKey`, object-store access keys / session tokens, and plugin `[[config]]`
+fields marked `secret`) store a **secret reference** — `env:VAR_NAME` or `file:/path/to/secret` — never
+the secret itself. The hub resolves references only in the process that needs the capability (agent call,
+object-store client, plugin registration). A pluggable `SecretResolver` seam (`hub.secrets` /
+`reg.add_secret_resolver`) lets a future plugin add schemes such as Vault without importing a vendor
+client into core.
+
+After upgrading, run `dataplay migrate`: any legacy plaintext secret values are **deleted** (not
+converted). Re-enter each affected setting as a reference. Example:
+
+```text
+agentApiKey                          = env:ANTHROPIC_API_KEY
+objectStore.accessKeyId              = env:AWS_ACCESS_KEY_ID
+objectStore.secretAccessKey          = env:AWS_SECRET_ACCESS_KEY
+objectStore.sessionToken             = env:AWS_SESSION_TOKEN   # optional
+plugin.<pack>.<secret-field>         = file:/run/secrets/pack_token
+```
+
+Leave credential fields blank to fall back to the process environment / instance role. Protect metadata
+backups accordingly; they now contain references, not credentials.
 
 Run only trusted canvases and plugins. See the [security policy](.github/SECURITY.md) for the exact
 boundary and private vulnerability-reporting path.

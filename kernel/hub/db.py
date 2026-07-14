@@ -342,10 +342,12 @@ def ensure_object_store() -> None:
     A run scope owns a long rollback-only transaction.  Creating its secret there would make two
     concurrent runs conflict on the shared catalog even though both use the same credentials.  The
     base connection instead performs one short, serialized autocommit publication per config; scoped
-    cursors consume that committed secret without writing the catalog themselves.
+    cursors consume that committed secret without writing the catalog themselves. Secret subkeys in
+    the ``objectStore`` setting are references; material values are resolved here only.
     """
     from hub import metadb
-    _publish_object_store(metadb.get_setting("objectStore", "global", default={}) or {})
+    from hub.secrets import resolve_object_store
+    _publish_object_store(resolve_object_store(metadb.get_setting("objectStore", "global", default={}) or {}))
 
 
 def _prime_object_store_before_scope() -> None:
@@ -363,7 +365,8 @@ def _prime_object_store_before_scope() -> None:
                 and scheme not in ("s3", "s3a", "s3n", "gs", "gcs")):
             return
         from hub import metadb
-        cfg = metadb.get_setting("objectStore", "global", default={}) or {}
+        from hub.secrets import resolve_object_store
+        cfg = resolve_object_store(metadb.get_setting("objectStore", "global", default={}) or {})
         if not _obj_store_loaded or _object_store_fingerprint(cfg) != _obj_store_secret_config:
             _publish_object_store(cfg)
     except Exception:  # noqa: BLE001 — defer setup failure until an object-store operation actually runs

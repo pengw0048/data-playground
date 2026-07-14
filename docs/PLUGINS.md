@@ -219,7 +219,7 @@ label = "SQLAlchemy URL"
 env = "DP_SQL_CATALOG_URL"         # env-var fallback (headless / 12-factor)
 placeholder = "postgresql+psycopg://…"
 help = "shown under the field"
-# also: default, secret = true (never echoed to the UI), options = [...] (for a select)
+# also: default, secret = true (store env:/file: reference only), options = [...] (for a select)
 ```
 
 Read the values in `register(reg)` with **`reg.config(key, default=None)`**. Precedence:
@@ -234,7 +234,12 @@ def register(reg):
     reg.set_catalog(SqlCatalog(url, reg.config("table", "datasets")))
 ```
 
-`GET /api/plugins` surfaces each pack's schema + current values (secrets report only *whether* set, never
-the value). A changed setting applies on the **next kernel start** — plugins register once at startup, same
-as the env vars they fall back to. (Config fields need a drop-in `dataplay.toml`; `DP_PLUGINS`/entry-point
-packs still read env directly.) `dp_sql_catalog` is the worked example.
+When `secret = true`, the Settings UI and `PUT /api/settings` accept only a **secret reference**
+(`env:VAR_NAME` or `file:/path/to/secret`), never the material token. `reg.config` resolves the
+reference in-process during `register()`. To add an organization-specific backend (Vault, cloud KMS),
+call `reg.add_secret_resolver("vault", resolve_fn)` — core ships only `env` and `file`.
+
+`GET /api/plugins` surfaces each pack's schema + current values (for secrets, the reference string —
+not the resolved credential). A changed setting applies on the **next kernel start** — plugins register
+once at startup, same as the env vars they fall back to. (Config fields need a drop-in `dataplay.toml`;
+`DP_PLUGINS`/entry-point packs still read env directly.) `dp_sql_catalog` is the worked example.

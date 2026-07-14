@@ -85,8 +85,11 @@ def _object_store_execution_config(source: Mapping[str, str] | None = None) -> d
 
     One-shot workers intentionally cannot read the hub settings DB. The object-store adapters still use
     the ``objectStore`` setting as their common DuckDB/Arrow configuration contract, so copy only this
-    already-allowlisted execution capability into the worker's private DB. No catalog, identity, auth,
-    or other control-plane setting crosses the boundary.
+    already-allowlisted execution capability into the worker's private DB — as *secret references*
+    (``env:DP_S3_KEY`` / ``env:DP_S3_SECRET``), never the material values. The allowlisted env vars
+    remain the only sanctioned channel for the resolved credential to reach the worker; adapters resolve
+    the references in-process. No catalog, identity, auth, or other control-plane setting crosses the
+    boundary.
     """
     src = os.environ if source is None else source
     key, secret = src.get("DP_S3_KEY"), src.get("DP_S3_SECRET")
@@ -97,7 +100,8 @@ def _object_store_execution_config(source: Mapping[str, str] | None = None) -> d
         return {}
     cfg: dict[str, Any] = {}
     if key and secret:
-        cfg.update(accessKeyId=str(key), secretAccessKey=str(secret))
+        # Store references so the worker's private metadata DB never contains the credential bytes.
+        cfg.update(accessKeyId="env:DP_S3_KEY", secretAccessKey="env:DP_S3_SECRET")
     if endpoint:
         cfg["endpoint"] = endpoint
         cfg["useSsl"] = not endpoint.lower().startswith("http://")
@@ -113,14 +117,21 @@ def initialize_ephemeral_metadata(directory: str) -> str:
     Deps constructs the default catalog through metadata tables even when the graph already carries
     physical source URIs. Initializing those tables locally preserves normal engine/plugin composition
     without granting access to users, catalog policy, run state, or credentials in the hub DB. The only
-    setting seeded is object-store execution config reconstructed from the explicit workload environment;
-    this keeps DuckDB and Arrow adapters aligned without restoring the hub database identity. Call before
-    importing ``hub.settings``/``hub.deps`` in the child.
+    setting seeded is object-store execution config reconstructed from the explicit workload environment
+    as secret references (``env:DP_S3_KEY`` / ``env:DP_S3_SECRET``); this keeps DuckDB and Arrow adapters
+    aligned without restoring the hub database identity or writing credential bytes into the worker DB.
+    Prefer calling before importing ``hub.settings``/``hub.deps`` in the child; when those are already
+    imported (tests), this also rebinds ``settings.database_url`` and resets the metadb engine.
     """
     os.makedirs(directory, exist_ok=True)
     url = "sqlite:///" + os.path.join(os.path.abspath(directory), "workload-metadata.db")
     os.environ["DP_DATABASE_URL"] = url
     from hub import metadb
+    from hub.settings import settings
+    settings.database_url = url
+    if metadb._engine is not None:
+        metadb._engine.dispose()
+    metadb._engine = metadb._Session = None
     metadb.init_db()
     object_store = _object_store_execution_config()
     if object_store:

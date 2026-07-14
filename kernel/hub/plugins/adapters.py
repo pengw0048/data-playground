@@ -92,7 +92,8 @@ def object_fs(uri: str):
     import pyarrow.fs as pafs
 
     from hub import metadb
-    cfg = metadb.get_setting("objectStore", "global", default={}) or {}
+    from hub.secrets import resolve_object_store
+    cfg = resolve_object_store(metadb.get_setting("objectStore", "global", default={}) or {})
     scheme, _, rest = uri.partition("://")
     scheme = scheme.lower()
     endpoint = str(cfg.get("endpoint") or "").strip()

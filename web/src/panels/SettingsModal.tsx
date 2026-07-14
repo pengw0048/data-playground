@@ -217,7 +217,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 {canGlobal && <Section id="agent" title="Agent (LLM)">
                   <Field label="Model"><Input value={val('agentModel')} placeholder="anthropic/claude-opus-4-8" onChange={(e) => set('agentModel', e.target.value)} /></Field>
                   <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">e.g. anthropic/claude-opus-4-8 · openai/gpt-5 · google/gemini-2.5-pro · ollama/llama3.3</div>
-                  <Field label="API key"><Input type="password" value={val('agentApiKey')} placeholder="sk-… (or blank to use an env var)" onChange={(e) => set('agentApiKey', e.target.value)} /></Field>
+                  <Field label="API key"><Input value={val('agentApiKey')} placeholder="env:ANTHROPIC_API_KEY or file:/run/secrets/agent_key" onChange={(e) => set('agentApiKey', e.target.value)} /></Field>
+                  <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">Store a secret reference (`env:VAR` or `file:/path`), never the key itself. Leave blank to rely on the provider&apos;s env var.</div>
                   <Field label="Base URL"><Input value={val('agentBaseUrl')} placeholder="http://localhost:11434 (optional)" onChange={(e) => set('agentBaseUrl', e.target.value)} /></Field>
                 </Section>}
 
@@ -302,10 +303,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   </div>
 
                   <div className="mb-1.5 mt-4 text-[11.5px] font-semibold text-foreground">Object-store credentials</div>
-                  <div className="mb-2 text-[10.5px] text-muted-foreground">Leave blank to use the environment (AWS_* / ~/.aws / instance role). Set keys for MinIO / R2 / other S3-compatible endpoints.</div>
+                  <div className="mb-2 text-[10.5px] text-muted-foreground">Leave blank to use the environment (AWS_* / ~/.aws / instance role). Credential fields store references (`env:VAR` / `file:/path`), not the secret bytes.</div>
                   <div className="grid grid-cols-2 gap-1.5">
-                    <Input value={obj.accessKeyId ?? ''} placeholder="access key id" onChange={(e) => setObj('accessKeyId', e.target.value)} />
-                    <Input type="password" value={obj.secretAccessKey ?? ''} placeholder="secret access key" onChange={(e) => setObj('secretAccessKey', e.target.value)} />
+                    <Input value={obj.accessKeyId ?? ''} placeholder="env:AWS_ACCESS_KEY_ID" onChange={(e) => setObj('accessKeyId', e.target.value)} />
+                    <Input value={obj.secretAccessKey ?? ''} placeholder="env:AWS_SECRET_ACCESS_KEY" onChange={(e) => setObj('secretAccessKey', e.target.value)} />
                     <Input value={obj.region ?? ''} placeholder="region (e.g. us-east-1)" onChange={(e) => setObj('region', e.target.value)} />
                     <Input value={obj.endpoint ?? ''} placeholder="endpoint (MinIO/R2, optional)" onChange={(e) => setObj('endpoint', e.target.value)} />
                   </div>
@@ -336,7 +337,11 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                       </div>
                       {p.config!.map((f) => {
                         const isSet = p.config_set?.includes(f.key)
-                        const ph = f.placeholder ?? (f.secret ? (isSet ? '•••••• (set — blank keeps it)' : 'not set')
+                        const storedRef = f.secret
+                          ? (g[`plugin.${p.name}.${f.key}`] ?? p.config_values?.[f.key])
+                          : p.config_values?.[f.key]
+                        const ph = f.placeholder ?? (f.secret
+                          ? (isSet ? String(storedRef ?? 'env:VAR or file:/path') : 'env:VAR or file:/path')
                           : (f.default != null ? String(f.default) : ''))
                         return (
                           <Field key={f.key} label={f.label}>
@@ -352,12 +357,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                               </Select>
                             ) : (
                               <Input
-                                type={f.secret || f.type === 'password' ? 'password' : (f.type === 'int' || f.type === 'float' ? 'number' : 'text')}
-                                value={f.secret ? (pcfg[p.name]?.[f.key] ?? '') : pval(p.name, f.key, p.config_values?.[f.key])}
+                                type={f.type === 'int' || f.type === 'float' ? 'number' : 'text'}
+                                value={f.secret
+                                  ? (pcfg[p.name]?.[f.key] ?? (storedRef == null ? '' : String(storedRef)))
+                                  : pval(p.name, f.key, p.config_values?.[f.key])}
                                 placeholder={ph}
                                 onChange={(e) => setPval(p.name, f.key, e.target.value)}
                               />
                             )}
+                            {f.secret && <div className="mt-1 text-[10.5px] text-muted-foreground">Secret reference only (`env:VAR` / `file:/path`). Blank on save leaves the stored reference unchanged.</div>}
                             {f.help && <div className="mt-1 text-[10.5px] text-muted-foreground">{f.help}</div>}
                           </Field>
                         )
