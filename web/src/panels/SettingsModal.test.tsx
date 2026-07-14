@@ -44,18 +44,18 @@ describe('SettingsModal — plugin config form', () => {
   it('renders declared fields, saves them as plugin.<pack>.<key>, and skips a blank secret', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
 
-    // the url field is pre-filled from config_values; the secret token is not (shows "not set")
+    // the url field is pre-filled from config_values; the secret token prompts for a reference
     const url = await screen.findByDisplayValue('existing')
-    const tok = screen.getByPlaceholderText(/not set/i)
+    const tok = screen.getByPlaceholderText(/env:VAR or file:\/path/i)
 
     fireEvent.change(url, { target: { value: 'new-url' } })
-    fireEvent.change(tok, { target: { value: 'sk-tok' } })
+    fireEvent.change(tok, { target: { value: 'env:DP_X_TOK' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(putSetting).toHaveBeenCalledWith('global', 'plugin.dp_x.url', 'new-url'))
-    expect(putSetting).toHaveBeenCalledWith('global', 'plugin.dp_x.tok', 'sk-tok')  // namespaced per pack
+    expect(putSetting).toHaveBeenCalledWith('global', 'plugin.dp_x.tok', 'env:DP_X_TOK')  // namespaced per pack
 
-    // clearing the secret must NOT write a blank (that would wipe the stored secret) — it's skipped
+    // clearing the secret must NOT write a blank (that would wipe the stored reference) — it's skipped
     putSetting.mockClear()
     fireEvent.change(tok, { target: { value: '' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
