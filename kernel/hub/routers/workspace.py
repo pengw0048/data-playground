@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from typing import Callable, Hashable, TypeVar
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
@@ -83,9 +82,9 @@ class PasswordChangeBody(_StrictAuthBody):
 
 
 def _client_host(request: Request) -> str:
-    # Consume only the peer identity supplied by the ASGI server; this route never parses raw forwarded
-    # headers. Uvicorn may already have normalized request.client from those headers when the immediate
-    # peer is in its configured trusted-proxy set, which is the correct deployment-layer boundary.
+    # Consume only the peer identity supplied by the ASGI stack; this route never parses raw forwarded
+    # headers. TrustedProxyHeadersMiddleware (and uvicorn when DP_TRUSTED_PROXIES is set) may already
+    # have normalized request.client from X-Forwarded-For when the immediate peer is declared trusted.
     return request.client.host if request.client is not None else ""
 
 
@@ -194,9 +193,10 @@ async def auth_login(body: LoginBody, response: Response, request: Request) -> d
     epoch = await _run_password_work(_login_password_work, uid, body.password)
     if epoch is None:
         raise HTTPException(401, "invalid user or password")
-    # Secure flag opt-in for HTTPS deployments (default off so internal http installs still work)
+    # Secure flag opt-in for HTTPS deployments (default off so localhost http installs still work).
+    # Shared mode refuses startup unless DP_AUTH_SECURE_COOKIE is set (see auth.reject_unsafe_transport).
     response.set_cookie("dp_session", auth.sign_at_epoch(uid, epoch), httponly=True, samesite="lax",
-                        secure=bool(os.environ.get("DP_AUTH_SECURE_COOKIE")))
+                        secure=auth.secure_cookie_enabled())
     auth_admission.login_attempts.reset(attempt_key)
     return {"ok": True, "userId": uid}
 
@@ -212,7 +212,7 @@ async def change_password(body: PasswordChangeBody, response: Response, request:
     auth_admission.password_change_attempts.reset(attempt_key)
     if auth.auth_enabled():  # re-issue THIS session's cookie at the new epoch so the caller isn't logged out
         response.set_cookie("dp_session", auth.sign_at_epoch(uid, epoch), httponly=True, samesite="lax",
-                            secure=bool(os.environ.get("DP_AUTH_SECURE_COOKIE")))
+                            secure=auth.secure_cookie_enabled())
     return {"ok": True}
 
 
@@ -395,7 +395,10 @@ def restore_canvas(canvas_id: str, req: RestoreRequest, uid: str = Depends(curre
 @router.delete("/canvas/{canvas_id}")
 def delete_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
     if metadb.canvas_role(canvas_id, uid) == "owner":  # only the owner can delete
-        metadb.delete_canvas_cascade(canvas_id)  # also drop shares + run history + versions (no FK cascade)
+        try:
+            metadb.delete_canvas_cascade(canvas_id)  # also drop shares + run history + versions (no FK cascade)
+        except metadb.ActiveBackendJobsError as e:
+            raise HTTPException(409, str(e))
     return {"ok": True}
 
 

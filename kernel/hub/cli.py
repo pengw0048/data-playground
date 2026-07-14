@@ -387,6 +387,10 @@ def main() -> None:
     # dependency construction can mutate the workspace. DP_AUTH_MODE is also inherited by workload
     # children as a confinement-only marker, but those children do not enter this server path.
     auth.reject_weak_secret()
+    try:
+        auth.reject_unsafe_transport()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
     loopback = args.host in ("127.0.0.1", "::1", "localhost", "")
     if not loopback and not auth.auth_enabled() and os.environ.get("DP_ALLOW_INSECURE_BIND") != "1":
         raise SystemExit(
@@ -427,8 +431,18 @@ def main() -> None:
     if args.open:
         threading.Timer(1.3, lambda: webbrowser.open(url)).start()
     from hub.settings import settings
-    uvicorn.run("hub.main:app", host=args.host, port=args.port, log_level=level,
-                ws_max_size=settings.max_body_bytes)  # SEC-10: explicit/tunable WebSocket frame cap
+    # When the operator declares reverse proxies, tell uvicorn the same allow-list so CLI launches
+    # normalize X-Forwarded-* before the ASGI app (hub.main also installs matching middleware for
+    # direct ASGI imports). Unset DP_TRUSTED_PROXIES keeps uvicorn's localhost-only default.
+    proxies = auth.trusted_proxies()
+    uvicorn.run(
+        "hub.main:app",
+        host=args.host,
+        port=args.port,
+        log_level=level,
+        ws_max_size=settings.max_body_bytes,  # SEC-10: explicit/tunable WebSocket frame cap
+        **({"proxy_headers": True, "forwarded_allow_ips": ",".join(proxies)} if proxies else {}),
+    )
 
 
 if __name__ == "__main__":
