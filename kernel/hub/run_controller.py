@@ -262,12 +262,13 @@ class RunController:
 
     # -- orchestration ----------------------------------------------------- #
     def run(self, graph: Graph, target: str | None, uid: str | None = None,
-            sizes: dict | None = None) -> RunStatus | None:
+            sizes: dict | None = None, request_id: str | None = None) -> RunStatus | None:
         """Start a multi-region run; return None if the graph is a single default region (caller uses
         the base runner unchanged). `uid` carries the caller so a per-user backend preference routes
         default regions to the isolated child too (P0-EXEC-01), not just the global default. `sizes` is
         the caller's already-computed schema+actual-aware estimate — reused for cost-based placement so
-        it routes on the SAME measured widths the confirm-gate saw (else placement re-estimates coarse)."""
+        it routes on the SAME measured widths the confirm-gate saw (else placement re-estimates coarse).
+        `request_id` (OPS-01) correlates the distributed run with the HTTP/WebSocket entry."""
         regions = self.plan(graph, target, sizes=sizes)
         if len(regions) <= 1 and (not regions or regions[0].backend == "default"):
             return None
@@ -278,7 +279,7 @@ class RunController:
         per = [PerNodeStatus(node_id=nid, status="queued", label=nm[nid].type)
                for r in regions for nid in r.node_ids if nid in nm]
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=per,
-                           target_node_id=target)
+                           target_node_id=target, request_id=request_id)
         with self._lock:
             self.runs[run_id] = status
             self._cancel[run_id] = threading.Event()

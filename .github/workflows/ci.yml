@@ -10,6 +10,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least-privilege default for the functional CI suite. Adding this block is the
+# only intentional change to this workflow for #113; jobs and steps are unchanged.
+permissions:
+  contents: read
+
 jobs:
   kernel-tests:
     name: kernel (pytest — engine, plugins, agent)
@@ -43,12 +48,54 @@ jobs:
       - name: Install kernel (dev extra — includes ruff + basedpyright)
         run: cd kernel && uv sync --extra dev
       - name: Ruff (kernel + examples/plugins)
-        run: cd kernel && uv run ruff check . ../examples/plugins
+        run: cd kernel && uv run ruff check --config pyproject.toml . ../examples/plugins
       - name: basedpyright (hub, lenient committed baseline)
         run: cd kernel && uv run basedpyright
 
+  # QA-01 / #112: declared Python support is 3.11–3.13 via requires-python + classifiers, but
+  # kernel/.python-version pins 3.12. This cheap matrix proves each declared version can install
+  # from the lockfile, import the package / CLI entry point, and pass the core-contract subset.
+  # The full suite stays on the pinned primary version in kernel-tests above — not in this matrix.
+  # Local: cd kernel && uv run pytest -q hub/tests/test_graph_validation.py hub/tests/test_sqlpolicy.py hub/tests/test_migrations.py
+  kernel-python-matrix:
+    name: kernel (Python ${{ matrix.python }} — install/import/core-contract)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    env:
+      # Override the committed kernel/.python-version pin for every uv invocation in this job.
+      # Without this, `uv run` re-syncs the venv back to 3.12 and every matrix leg silently lies.
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      # hatch_build.py creates a placeholder web/dist when missing, so no Node/npm steps here.
+      - name: Install kernel (dev extra, lock-faithful)
+        run: cd kernel && uv sync --frozen --extra dev
+      - name: Prove the matrix interpreter is active
+        # Bare `python -VV` on the runner is the system interpreter; uv run uses the venv.
+        run: cd kernel && uv run python -VV
+      - name: Import smoke
+        run: |
+          cd kernel
+          uv run python -c "import hub"
+          uv run dataplay --help
+      - name: Core-contract subset
+        # Explicit path list (graph structure validation, SQL AST policy, SQLite migration
+        # startup contracts). Intentionally no Ray, browser, Node, or PostgreSQL.
+        run: >-
+          cd kernel && uv run pytest -q
+          hub/tests/test_graph_validation.py
+          hub/tests/test_sqlpolicy.py
+          hub/tests/test_migrations.py
+
   postgres-migration:
-    name: migration contract (PostgreSQL 16)
+    name: migration and lifecycle contracts (PostgreSQL 16)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     services:
@@ -76,6 +123,20 @@ jobs:
         run: cd kernel && uv sync --extra dev --extra postgres
       - name: Verify the release migration contract
         run: cd kernel && uv run pytest -q hub/tests/test_postgres_migration_smoke.py
+      - name: Verify durable lifecycle concurrency contracts
+        run: >-
+          cd kernel && uv run pytest -q -o faulthandler_timeout=60
+          hub/tests/test_backend_recovery_fences.py
+          hub/tests/test_backend_sink_cleanup.py
+          hub/tests/test_backend_source_pins.py
+          hub/tests/test_run_identity.py
+          hub/tests/test_object_lifecycle.py
+      - name: Verify durable Ray Jobs lifecycle on PostgreSQL
+        # The PostgreSQL-gated Ray Jobs races skip on SQLite, so kernel-tests never runs them; select
+        # them here by name so a regression cannot pass CI while every check stays green.
+        run: >-
+          cd kernel && uv run pytest -q -o faulthandler_timeout=60
+          hub/tests/test_ray_jobs.py -k postgres
 
   e2e:
     name: e2e (Playwright — real UI on the real kernel)

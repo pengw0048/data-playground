@@ -165,10 +165,27 @@ kernel's OS user. `DP_DATASET_ROOTS` constrains supported file access, and user 
 policy, but neither turns arbitrary Python into a security boundary. A kernel also holds the data and
 metadata credentials needed to execute its canvas.
 
-Canvas sharing is not dataset isolation: the catalog and data engine are workspace-wide. Settings values
-marked as secrets are redacted from API reads, but their stored metadata values are not encrypted. For a
-shared deployment, prefer environment or secret-manager injection and protect metadata backups
-accordingly.
+Canvas sharing is not dataset isolation: the catalog and data engine are workspace-wide. Settings that
+hold credentials (`agentApiKey`, object-store access keys / session tokens, and plugin `[[config]]`
+fields marked `secret`) store a **secret reference** — `env:VAR_NAME` or `file:/path/to/secret` — never
+the secret itself. The hub resolves references only in the process that needs the capability (agent call,
+object-store client, plugin registration). A pluggable `SecretResolver` seam (`hub.secrets` /
+`reg.add_secret_resolver`) lets a future plugin add schemes such as Vault without importing a vendor
+client into core.
+
+After upgrading, run `dataplay migrate`: any legacy plaintext secret values are **deleted** (not
+converted). Re-enter each affected setting as a reference. Example:
+
+```text
+agentApiKey                          = env:ANTHROPIC_API_KEY
+objectStore.accessKeyId              = env:AWS_ACCESS_KEY_ID
+objectStore.secretAccessKey          = env:AWS_SECRET_ACCESS_KEY
+objectStore.sessionToken             = env:AWS_SESSION_TOKEN   # optional
+plugin.<pack>.<secret-field>         = file:/run/secrets/pack_token
+```
+
+Leave credential fields blank to fall back to the process environment / instance role. Protect metadata
+backups accordingly; they now contain references, not credentials.
 
 Run only trusted canvases and plugins. See the [security policy](.github/SECURITY.md) for the exact
 boundary and private vulnerability-reporting path.
@@ -176,10 +193,12 @@ boundary and private vulnerability-reporting path.
 ### Docker reference setup
 
 The Compose file is an authenticated, Postgres-backed reference setup. It deliberately separates the
-release migration from application startup:
+release migration from application startup. Export every required secret first — Compose fails closed
+if `DP_AUTH_SECRET` or `DP_POSTGRES_PASSWORD` is unset:
 
 ```bash
 export DP_AUTH_SECRET="$(openssl rand -hex 32)"
+export DP_POSTGRES_PASSWORD="$(openssl rand -hex 32)"
 export DP_AUTH_PASSWORD="choose-an-initial-password"
 
 docker compose build
@@ -189,16 +208,37 @@ unset DP_AUTH_PASSWORD
 docker compose up -d kernel
 ```
 
-Sign in as `local` with the bootstrap password. Keep `DP_AUTH_SECRET` stable. Before a later migration,
-stop every process that writes the metadata database. The [Kubernetes reference](deploy/README.md)
-documents that release contract, the PodSpawner validation path, and what must be adapted for a real
-deployment. An HTTPS deployment must terminate TLS and set `DP_AUTH_SECURE_COOKIE=1`.
+Sign in as `local` with the bootstrap password. Keep `DP_AUTH_SECRET` and `DP_POSTGRES_PASSWORD`
+stable across restarts. Before a later migration, stop every process that writes the metadata
+database. The [Kubernetes reference](deploy/README.md) documents that release contract, the
+PodSpawner validation path, and what must be adapted for a real deployment.
+
+### Deployment modes
+
+`DP_DEPLOYMENT_MODE` selects how strict the hub is about transport settings:
+
+| Mode | When to use | Startup behavior |
+| --- | --- | --- |
+| `local` (default) | Laptop / zero-config HTTP on loopback | Unchanged: plain HTTP works; `dp_session` stays `HttpOnly` + `SameSite=Lax` without `Secure` unless you opt in |
+| `shared` | Multi-user service behind TLS | Fails before binding if auth, Secure cookies, or a transport declaration is missing |
+
+Shared mode requires all of:
+
+1. `DP_AUTH_SECRET` — signed session cookies (already required by Compose)
+2. `DP_AUTH_SECURE_COOKIE=1` — browsers will only send `dp_session` over HTTPS
+3. Either `DP_AUTH_DIRECT_TLS=1` (TLS terminates at the hub process) or
+   `DP_TRUSTED_PROXIES=<proxy-ip>[,...]` (TLS terminates at those reverse proxies; only they may set
+   `X-Forwarded-For` / `X-Forwarded-Proto` used for login rate limiting)
+
+Unset mode keeps today's localhost defaults. The Compose reference sets `shared` with Secure cookies and
+`DP_AUTH_DIRECT_TLS=1`; swap in `DP_TRUSTED_PROXIES` when a proxy terminates TLS instead.
 
 ## Documentation
 
 | Guide | Use it for |
 | --- | --- |
 | [5-minute tour](docs/TUTORIAL.md) | Build and run a first pipeline on the seeded data |
+| [Browser and viewport support](docs/BROWSER_SUPPORT.md) | Desktop-first scope, minimum viewport, tested browsers, and input model |
 | [Catalog](docs/CATALOG.md) | Browse, search, curate, and integrate catalog and lineage data |
 | [Plugins](docs/PLUGINS.md) | Add nodes or connect another data, catalog, destination, or execution system |
 | [MCP](docs/MCP.md) | Connect an external agent over HTTP or stdio |
@@ -206,6 +246,9 @@ deployment. An HTTPS deployment must terminate TLS and set `DP_AUTH_SECURE_COOKI
 | [Kubernetes reference](deploy/README.md) | Validate and adapt the per-canvas Pod substrate |
 | [Contributing](.github/CONTRIBUTING.md) | Development loop, tests, and plugin contribution guidelines |
 | [Security policy](.github/SECURITY.md) | Trust boundary and private vulnerability reporting |
+
+The workbench is desktop-first (minimum **1280×720**, Chromium tested in CI, keyboard + mouse). See
+[browser and viewport support](docs/BROWSER_SUPPORT.md) for the full statement.
 
 ## Development
 

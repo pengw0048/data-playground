@@ -28,7 +28,7 @@ test:
 # Python lint + static types (issue #111). No Ray / no browser — matches the CI python-quality job.
 # Ruff covers kernel/ and examples/plugins/; basedpyright covers hub/ under the committed lenient config.
 lint:
-	cd kernel && uv run ruff check . ../examples/plugins
+	cd kernel && uv run ruff check --config pyproject.toml . ../examples/plugins
 	cd kernel && uv run basedpyright
 
 # One-time: download the Playwright browser used by the E2E suite.

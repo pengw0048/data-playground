@@ -1,14 +1,14 @@
 # Writing your first plugin
 
-Data Playground is extensibility-first: a plugin adds **nodes, dataset adapters, execution backends,
-capabilities, a catalog, or a pipeline importer** — and a node you register shows up on the canvas,
-**typed, wired, and previewable, with no change to the core**. This guide builds one from the shipped
-example in [`examples/plugins/dp_example/`](../examples/plugins/dp_example/).
+A plugin can add nodes, dataset adapters, execution backends, capabilities, a catalog, or a pipeline
+importer. Register a node and it shows up on the canvas typed, wired, and previewable — no core or
+frontend change. This guide builds from the shipped example in
+[`examples/plugins/dp_example/`](../examples/plugins/dp_example/).
 
 ## The shape of a plugin
 
-A plugin is a Python package with a `register(reg)` function. The kernel calls it once at startup,
-passing a `Registry` you use to add things:
+A plugin is a Python package with a `register(reg)` function. The kernel calls it once at startup and
+passes a `Registry`:
 
 ```python
 # examples/plugins/dp_example/__init__.py
@@ -38,30 +38,29 @@ def register(reg):
     reg.add_node(SPEC, build)
 ```
 
-That's the whole plugin. Two pieces:
+Two pieces:
 
-- **`NodeSpec`** — the typed declaration: `kind` (unique id), typed input/output **ports** (`wire`
-  is the port's type — `dataset`/`sample`/`selection`/`sql-view`/`metric`/`value`; `accepts` lists
-  which wires an input port allows), and **params** (`string`/`text`/`code`/`int`/`float`/`bool`/
-  `select`/`columns`). The SPA renders the card generically from this — no frontend code.
-- **`build(engine, node, inputs)`** — contributes one step to the logical plan. `inputs[0]` is the
-  upstream relation; return a relation. Because it returns a lazy DuckDB relation, it pushes down and
-  runs out-of-core exactly like a built-in node — on a preview sample or at full scale.
+`NodeSpec` is the typed declaration. `kind` is the unique id. Ports use `wire` types
+(`dataset`, `sample`, `selection`, `sql-view`, `metric`, `value`); `accepts` lists which wires an input
+allows. Params are `string`, `text`, `code`, `int`, `float`, `bool`, `select`, or `columns`. The SPA
+renders the card from this schema.
+
+`build(engine, node, inputs)` contributes one step to the logical plan. `inputs[0]` is the upstream
+relation; return a relation. A lazy DuckDB relation pushes down and runs out of core like a built-in —
+on a preview sample or at full scale.
 
 ### The `ctx` builders
 
 `ctx` turns relations into relations without materializing:
 
-- `ctx.sql(rel, "… FROM input …")` — run one validated `SELECT` over `rel`, referenced by the
-  query-scope CTE `input` (no textual placeholder substitution).
-- `ctx.arrow_map(rel, fn)` — apply a Python `fn(pa.RecordBatch) -> RecordBatch | list[dict]` over
-  Arrow batches (the escape hatch when SQL isn't enough).
-- `ctx.polars(rel, fn)` — apply `fn(polars.DataFrame) -> polars.DataFrame`.
-- `ctx.resource(key, factory)` — a WARM handle: an expensive-to-construct object (a loaded model, a media
-  decoder, a DB connection pool, a GPU context) built ONCE by `factory()` and reused across batches AND
-  across runs on the same warm per-canvas kernel, instead of paying the cost per batch. Namespace `key`
-  (e.g. `f"{pack}:{model}"`); thread-safe; for trusted PLUGIN nodes, not the sandboxed `transform` cell.
-  Give the object a `close()`/`__exit__` and the kernel releases it on graceful shutdown. See `dp_warm_resource`.
+- `ctx.sql(rel, "… FROM input …")` — one validated `SELECT` over `rel`, referenced by the query-scope
+  CTE `input` (no textual placeholder substitution)
+- `ctx.arrow_map(rel, fn)` — `fn(pa.RecordBatch) -> RecordBatch | list[dict]` over Arrow batches
+- `ctx.polars(rel, fn)` — `fn(polars.DataFrame) -> polars.DataFrame`
+- `ctx.resource(key, factory)` — a warm handle built once by `factory()` and reused across batches and
+  runs on the same per-canvas kernel. Namespace `key` (for example `f"{pack}:{model}"`). Thread-safe.
+  For trusted plugin nodes, not the sandboxed `transform` cell. Give the object `close()` / `__exit__`
+  and the kernel releases it on graceful shutdown. See `dp_warm_resource`.
 
 Prefer `ctx.sql` when it suffices — it stays in the engine and spills to disk.
 
@@ -69,21 +68,21 @@ Prefer `ctx.sql` when it suffices — it stays in the engine and spills to disk.
 
 Three discovery paths (see `kernel/hub/deps.py`):
 
-1. **Drop-in** — copy the folder into `<workspace>/plugins/<pack>/`. Restart; it's picked up.
+1. Drop-in — copy the folder into `<workspace>/plugins/<pack>/` and restart:
 
    ```bash
-   mkdir -p kernel/plugins
-   cp -R examples/plugins/dp_example kernel/plugins/
+   cp -r examples/plugins/dp_example "$DP_WORKSPACE/plugins/"
    ```
 
-2. **`DP_PLUGINS`** — a comma-separated list of importable module names: `DP_PLUGINS=dp_example`.
-3. **pip entry point** — publish a package exposing the `dataplay.plugins` entry-point group.
+2. `DP_PLUGINS` — comma-separated importable module names, for example `DP_PLUGINS=dp_example`.
 
-Restart the kernel and a **redact** node appears in the toolbar (category `compute`), fully wired.
+3. pip entry point — publish a package exposing the `dataplay.plugins` group.
+
+Restart the kernel and a **redact** node appears in the toolbar under category `compute`.
 
 ## The manifest (`dataplay.toml`)
 
-A drop-in pack may include a manifest. `name` + `version` are required; `min_core_api` is optional:
+A drop-in pack may include a manifest. `name` and `version` are required; `min_core_api` is optional:
 
 ```toml
 name = "dp-example"
@@ -91,125 +90,212 @@ version = "0.1.0"
 # min_core_api = 1       # refuse to load if the kernel's CORE_API_VERSION is older
 ```
 
-`min_core_api` is a forward-compat guard: if your plugin needs a newer core than it's running on, the
-kernel logs it and skips the pack rather than loading a broken plugin. (Enforced for drop-in packs;
-entry-point / `DP_PLUGINS` modules currently bypass it.) A pack with no manifest loads versionless.
+`min_core_api` is a forward-compat guard. If the plugin needs a newer core than it is running on, the
+kernel logs the error and skips the pack. Drop-in packs declare it in `dataplay.toml`; entry-point and
+`DP_PLUGINS` modules use a module-level `MIN_CORE_API` or `min_core_api` attribute. A pack with no
+manifest loads versionless.
 
 ## The rest of the SPI
 
-`register(reg)` can add more than nodes — the same `reg`:
+`register(reg)` can add more than nodes.
 
-| call | extends | contract |
-|---|---|---|
-| `reg.add_node(spec, build[, ir])` | a canvas node | `NodeSpec` + `build(engine, node, inputs) -> relation`. OPTIONAL `ir=ir(node) -> {"op", "config"} \| None`: an engine-neutral emit hook so the node lowers to a real IR op (e.g. a clean `map` with inlined `code`) instead of `opaque` — then a DISTRIBUTED backend runs it, not just DuckDB. See the IR section + `dp_upper`. |
-| `reg.add_adapter(adapter)` | a dataset source/sink (claim a URI scheme) | `DatasetAdapter` Protocol in `kernel/hub/backends.py`: `name/matches/scan/schema/count/fingerprint/write` (+ optional `nearest`) |
-| `reg.add_runner(runner)` | an execution backend (pod/Ray/queue) | `ExecutionBackend` Protocol (`backends.py`): `name/can_run/estimate/run/status/cancel` |
-| `reg.add_capability(cap)` | a declared column capability (+ optional viewer tab) | `id`+`label`; an OPTIONAL `detect(col)->bool` (present → `tag_columns` tags matching columns with the id, no core edit); and an OPTIONAL `viewer = {"kind": …}` — a declarative viewer TAB the SPA renders with a generic renderer (`grid` = media/image grid, `json` = pretty-printed cell), surfaced via `KernelInfo.capability_views`. So a plugin adds a viewer tab with **no frontend code**. See `kernel/hub/plugins/capabilities.py` + `web/src/nodes/capabilities.tsx`. |
-| `reg.add_processor(proc)` | a reusable transform in the library picker | a `Processor` (`id/title/mode/build(params)`); see `kernel/hub/plugins/processors.py` |
-| `reg.set_catalog(catalog)` | the whole dataset catalog provider | `CatalogProvider` Protocol (`backends.py`, the source of truth): the bounded discovery surface `list_page(CatalogQuery)/facets/browse(prefix)/search(q, mode)/search_modes` + `list_tables/get_table/lineage(uri, depth, max_nodes)/relationships/resolve_ref` + write-back/curation `register/register_output/set_metadata/unregister/set_declared_key/add_relationship/remove_relationship`. **`get_table` MUST raise `KeyError` on a miss.** A provider written against the pre-scale protocol (no `list_page`/`facets`/`browse`/`search`) still works — `reg.set_catalog` wraps it in `CatalogCompat`, which synthesizes those from bounded `list_tables()` calls. A read-only external catalog can subclass `InMemoryCatalog` and override only the reads (as `dp_sql_catalog` does — note it overrides `list_page/facets/browse/search` too, so SQL rows appear while browsing). A catalog that *fully* replaces the built-in — not subclassing `InMemoryCatalog` — won't automatically receive run-completion `register_output` write-backs (runners hold the catalog they were built with), so either subclass `InMemoryCatalog` or forward `register_output` to your store. |
-| `reg.set_managed_object_provider(factory)` | exact lifecycle operations for managed object attempts | `factory(uri) -> ManagedObjectProvider`. The provider must set `complete_inventory=True` and `conditional_namespace_claims=True`, enumerate every visible object and incomplete multipart upload plus every version/delete marker the service exposes under the exact attempt data/commit roots, assign stable member IDs, delete or abort each member by exact identity, and read/conditionally write the namespace ownership marker. Core has a `boto3` implementation for `s3://` (including compatible endpoints that pass this API contract); `r2://`, `gs://`, and other schemes fail closed unless a provider is registered. The same factory may be selected headlessly with `DP_MANAGED_OBJECT_PROVIDER=pkg.module:Provider`. |
-| `reg.add_embedder(fn, model)` | semantic + hybrid catalog search | `fn(list[str]) -> list[list[float]]`. The built-in catalog embeds each dataset's name/folder/description/tags/columns, stores a vector per dataset (`catalog_embeddings`), background-reindexes existing entries, and ranks by cosine (+ RRF fusion for `hybrid`). Core ships **no** model; see `dp_semantic_catalog`. With no embedder, `search` falls back to lexical and `facets.semanticAvailable` stays false (the UI hides its "meaning" toggle). |
-| `reg.set_importer(importer)` | `/pipelines/import` (import a foreign pipeline format) | `Importer` Protocol (`plugins/importer.py`): `name` + `import_pipeline(config, params) -> PipelineImport`. Populate `PipelineImport.graph` with a runnable canvas `Graph` (nodes/edges of built-in or plugin kinds) and the SPA drops it onto a fresh canvas and runs it — this is what makes *import a pipeline → runnable canvas* real. Default is a `NullImporter` (501, honest). The core auto-lays-out an imported graph left unpositioned. |
-| `reg.add_destination(backend)` | a save/open-dialog **"place"** (a browsable/writable location) | `DestinationBackend` Protocol (`destinations.py`): `kind` + `browse(root, path)` (→ `{path, entries:[{name, kind, uri}], error?}`) + `target_uri(root, path, filename)`. Claims a place `kind`; a user adds a preset (backend + root) in Settings → Destinations. Built-in `local`/`s3`/`gs` go through the same registry. |
-| `reg.add_telemetry_sink(fn)` | run observability (export finished-run telemetry) | `fn(record: dict)` invoked once per FINISHED run with a normalized record: `canvas_id/run_id/status/rows/ms/error/output_table/placement/per_node` (`per_node` = `[{node_id, label, status, rows, ms}]`). Core ships **no** exporter (offline-first) — an OTel/StatsD/warehouse sink is a plugin; a sink that raises is caught + logged, never failing the run. See `dp_run_log`. |
+`reg.add_node(spec, build[, ir])` registers a canvas node. Optional `ir=ir(node) -> {"op", "config"} |
+None` emits an engine-neutral IR op (for example a clean `map` with inlined `code`) instead of
+`opaque`, so a distributed backend can run it. See the IR section and `dp_upper`.
 
-Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter; runners are picked
-by `pick_runner` (respects the Settings → Execution choice, else the first that `can_run`). **The
-built-ins go through these same seams — the DuckDB/Lance adapters, the InMemoryCatalog, and the local
-runners are just the first implementations registered. Managed immutable-attempt publication is the
-exception: lifecycle ownership, catalog pointer/ref swaps, and deletion fences remain core authority;
-an external catalog cannot acquire that authority by exposing a similarly named method.**
+`reg.add_adapter(adapter)` claims a URI scheme. Implement `DatasetAdapter` in
+`kernel/hub/backends.py`: `name`, `matches`, `scan`, `schema`, `count`, `fingerprint`, `write`, and
+optional `nearest`.
 
-A distributed runner that places work on typed workers (GPU / region routing) can additionally implement
-the optional `PlaceableBackend` Protocol (`backends.py`): `workers()` (advertise capacities), `place(requires)`
-(pick a worker, or None), `run_unit(graph, output_node, output_uri)` (run one placed **region** — reading its
-input from the given tier URI and writing its output to `output_uri`, so workers touch shared storage
-directly), and `reachable_tiers()` (which storage tiers this backend can read/write — e.g. `("object",)` for
-a remote cluster, `("local","object")` for one sharing the hub's disk). The core feature-detects these, so a
-non-distributed backend omits them.
+`reg.add_runner(runner)` adds an execution backend. Implement `ExecutionBackend`: `name`, `can_run`,
+`estimate`, `run`, `status`, `cancel`.
 
-**How placement + tiering drive `run_unit`.** A run splits into regions (maximal same-backend subgraphs, cut
-at a backend change / fan-out / `checkpoint`). A region is placed by a cost estimate — a conservative per-node
-size estimate (`hub/estimate.py`) raises a memory requirement when a blocking region's working set exceeds the
-local budget (`DP_MEMORY_LIMIT`), which `place()` routes to a worker with the memory; a manual `config.requires`
-mem is authoritative. A boundary materializes to the cheapest tier both the producing and consuming backend can
-reach (`reachable_tiers()` ∩), local for a local→local handoff, a shared object store (`DP_STORAGE_URL`) when a
-remote backend is involved. Placement activates only when a `place()`-capable backend is registered
-(`DP_POOL_WORKERS`, or a plugin — `dp_ray` claims a region tagged `config.requires.labels.engine=ray`); with
-only the local kernel it's a no-op. `POST /graph/plan` returns this plan (regions + backend + tier + estimate)
-— the Inspector's *Run plan* preview renders it.
+`reg.add_capability(cap)` declares a column capability. Optional `detect(col) -> bool` tags matching
+columns via `tag_columns`. Optional `viewer = {"kind": …}` adds a declarative viewer tab the SPA
+renders generically (`grid` for media, `json` for pretty-printed cells), surfaced through
+`KernelInfo.capability_views`. See `kernel/hub/plugins/capabilities.py` and
+`web/src/nodes/capabilities.tsx`.
 
-Two substrates are selected by a setting rather than `register(reg)` — set it to a built-in keyword or a
-**dotted path to your own class** (`pkg.module:Class`), so a third implementation needs no core patch:
+`reg.add_processor(proc)` adds a reusable transform to the library picker — a `Processor` with
+`id`, `title`, `mode`, and `build(params)`. See `kernel/hub/plugins/processors.py`.
 
-| setting | selects | built-ins · custom |
-|---|---|---|
-| `DP_KERNEL_SPAWNER` | the per-canvas kernel substrate (`KernelSpawner` Protocol, `backends.py`) | `local` (detached process) · `pod` (k8s Pod+Service) · `pkg.mod:Cls` → `Cls(workspace, data_dir)` |
-| `DP_STORAGE` (else `DP_STORAGE_URL`) | where run outputs persist (`Storage` Protocol, `storage.py`) | local dir / `s3://`·`gs://` via `DP_STORAGE_URL` · `DP_STORAGE=pkg.mod:Cls` → `Cls(workspace)` |
+`reg.set_catalog(catalog)` replaces the dataset catalog provider. The protocol in `backends.py` is
+the source of truth: bounded discovery via `list_page(CatalogQuery)`, `facets`, `browse(prefix)`,
+`search(q, mode)`, `search_modes`, plus `list_tables`, `get_table`, `lineage(uri, depth, max_nodes)`,
+`relationships`, `resolve_ref`, and write-back / curation (`register`, `register_output`,
+`set_metadata`, `unregister`, `set_declared_key`, `add_relationship`, `remove_relationship`).
+`get_table` must raise `KeyError` on a miss. A provider written against the pre-scale protocol (no
+`list_page` / `facets` / `browse` / `search`) still works — `reg.set_catalog` wraps it in
+`CatalogCompat`, which synthesizes those from bounded `list_tables()` calls. A read-only external
+catalog can subclass `InMemoryCatalog` and override only the reads (`dp_sql_catalog` also overrides
+`list_page` / `facets` / `browse` / `search` so SQL rows appear while browsing). A catalog that fully
+replaces the built-in without subclassing will not automatically receive run-completion
+`register_output` write-backs (runners keep the catalog they were built with), so either subclass
+`InMemoryCatalog` or forward `register_output` to your store.
+
+`reg.set_managed_object_provider(factory)` sets lifecycle operations for managed object attempts.
+`factory(uri) -> ManagedObjectProvider`. The provider must set `complete_inventory=True` and
+`conditional_namespace_claims=True`, enumerate every visible object and incomplete multipart upload
+plus every version and delete marker under the exact attempt data/commit roots, assign stable member
+IDs, delete or abort each member by exact identity, and read/conditionally write the namespace
+ownership marker. Core has a `boto3` implementation for `s3://` (including compatible endpoints that
+pass this API contract); `r2://`, `gs://`, and other schemes fail closed unless a provider is
+registered. Select the same factory headlessly with
+`DP_MANAGED_OBJECT_PROVIDER=pkg.module:Provider`.
+
+`reg.add_embedder(fn, model)` powers semantic and hybrid catalog search.
+`fn(list[str]) -> list[list[float]]`. The built-in catalog embeds name/folder/description/tags/columns,
+stores a vector per dataset (`catalog_embeddings`), background-reindexes existing entries, and ranks
+by cosine (plus RRF fusion for `hybrid`). Core ships no model; see `dp_semantic_catalog`. With no
+embedder, `search` falls back to lexical and `facets.semanticAvailable` stays false.
+
+`reg.set_importer(importer)` powers `/pipelines/import`. Implement `Importer` in
+`plugins/importer.py`: `name` plus `import_pipeline(config, params) -> PipelineImport`. Populate
+`PipelineImport.graph` with a runnable canvas `Graph`; the SPA drops it onto a fresh canvas and runs
+it. Default is `NullImporter` (501). Core auto-lays out an imported graph left unpositioned.
+
+`reg.add_destination(backend)` adds a save/open-dialog place. Implement `DestinationBackend` in
+`destinations.py`: `kind`, `browse(root, path)` → `{path, entries:[{name, kind, uri}], error?}`, and
+`target_uri(root, path, filename)`. A user adds a preset (backend + root) in Settings → Destinations.
+Built-in `local` / `s3` / `gs` go through the same registry.
+
+`reg.add_telemetry_sink(fn)` exports finished-run telemetry. `fn(record: dict)` is called once per
+finished run with `canvas_id`, `run_id`, `request_id`, `status`, `rows`, `ms`, `error`, `output_table`,
+`placement`, and `per_node` (`[{node_id, label, status, rows, ms}]`). Core ships no exporter. A sink that
+raises or times out is caught and logged, never failing the run. It stays as a compatibility seam
+alongside the typed `MetricEvent` / `AuditEvent` sinks below — see [`OBSERVABILITY.md`](OBSERVABILITY.md)
+and `dp_run_log`.
+
+`reg.add_metric_sink(fn)` exports ops metrics (OPS-01). `fn(MetricEvent)` receives low-cardinality
+counters, histograms, and gauges. `reg.add_audit_sink(fn)` exports the security/ops audit trail
+(OPS-01): `fn(AuditEvent)` for auth, sharing, settings, and job submit/cancel events, with agent-egress,
+secret-ref, and policy-denial schemas defined for later issues. Core ships no exporter for either; both
+are documented in [`OBSERVABILITY.md`](OBSERVABILITY.md).
+
+A catalog used by an at-least-once durable runner also implements the runtime-checkable
+`DurableCatalogPublisher` capability from `backends.py`: one idempotency key per output through
+`register_output_idempotent`, plus one run-level `record_usage_idempotent` call over all distinct source
+parents. The output method must return a matching `CatalogPublicationReceipt` only after the provider can
+durably read the registered reference; returning `None` or an optimistic in-memory object blocks terminal
+publication. A provider that does not need popularity can make the usage call a durable idempotent no-op.
+
+That capability alone does not opt an external catalog into managed-output publication for the bundled Ray
+Jobs v3 backend. Jobs v3 freezes a pre-probed catalog plan in SQL and coordinates it with core
+object-attempt references, lineage, usage, and terminal publication. A graph with a write sink therefore
+requires the built-in DB-backed catalog and fails before allocation or remote submission when another
+catalog is installed. Supporting an external provider here needs a future prepared-plan/replay protocol,
+not just the two idempotent methods above.
+
+Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter. Runners are picked by
+`pick_runner` (Settings → Execution, else the first that `can_run`). Built-ins go through these same
+seams — DuckDB/Lance adapters, InMemoryCatalog, and local runners are the first implementations
+registered. Managed immutable-attempt publication is the exception: lifecycle ownership, catalog
+pointer/ref swaps, and deletion fences remain core authority.
+
+A distributed runner that places work on typed workers can also implement optional `PlaceableBackend`
+(`backends.py`): `workers()`, `place(requires)`, `run_unit(graph, output_node, output_uri)`, and
+`reachable_tiers()`. Core feature-detects these. A run splits into regions (maximal same-backend
+subgraphs, cut at a backend change, fan-out, or `checkpoint`). A region is placed from a cost estimate
+— `hub/estimate.py` raises a memory requirement when a blocking region's working set exceeds
+`DP_MEMORY_LIMIT`, which `place()` routes to a capable worker. Manual `config.requires` mem wins.
+A boundary materializes to the cheapest tier both backends can reach (`reachable_tiers()` ∩): local for
+local→local, shared object storage (`DP_STORAGE_URL`) when a remote backend is involved. Placement
+activates only when a `place()`-capable backend is registered (`DP_POOL_WORKERS`, or a plugin —
+`dp_ray` claims a region tagged `config.requires.labels.engine=ray`). With only the local kernel it is
+a no-op. `POST /graph/plan` returns the plan; the Inspector's Run plan preview renders it.
+
+A backend that can durably own a pinned graph but cannot yet recover multi-region orchestration can
+instead implement `WholeGraphRequirementBackend.accepts_whole_graph(requires)`. This admission seam
+routes the whole graph to that backend without making `place()` claim a region. Once claimed, unsupported
+pinned work must fail explicitly; it must not fall back to an engine that does not satisfy the
+requirement.
+
+A backend that allocates workload identity or artifacts can implement
+`PreboundRunIdentityBackend.preallocate_run_id()`. The method only mints an ID and must have no external
+side effects. The hub durably binds that ID to the authorized creator/canvas before calling
+`run(..., run_id=...)`, and the backend must preserve the supplied ID. This ordering gives identity
+providers a reliable principal without exposing hub database credentials to workers.
+
+Two substrates are selected by setting rather than `register(reg)` — a built-in keyword or a dotted
+path to your class (`pkg.module:Class`):
+
+- `DP_KERNEL_SPAWNER` — per-canvas kernel substrate (`KernelSpawner` in `backends.py`). Built-ins:
+  `local` (detached process), `pod` (Kubernetes Pod + Service). Custom: `pkg.mod:Cls` →
+  `Cls(workspace, data_dir)`.
+- `DP_STORAGE` (else `DP_STORAGE_URL`) — where run outputs persist (`Storage` in `storage.py`). Local
+  dir / `s3://` / `gs://` via `DP_STORAGE_URL`, or `DP_STORAGE=pkg.mod:Cls` → `Cls(workspace)`.
 
 ## Verifying it
 
-The example is covered by a test that loads it via drop-in discovery and runs its node
-(`test_example_plugin_loads_and_runs` in `kernel/hub/tests/test_kernel.py`) — a good template for
-testing your own. `GET /api/plugins` lists loaded packs (with any load error), and `GET /api/nodes`
-shows your node's schema the SPA renders from.
+The example has a test that loads it via drop-in discovery and runs its node
+(`test_example_plugin_loads_and_runs` in `kernel/hub/tests/test_kernel.py`). `GET /api/plugins` lists
+loaded packs (with any load error). `GET /api/nodes` shows the schema the SPA renders.
 
 ## Reference plugins
 
-`examples/plugins/` ships twelve working plugins — each exercises a different seam end-to-end and has a
-test in `kernel/hub/tests/test_kernel.py` you can copy:
+`examples/plugins/` ships twelve working plugins. Each has a test in
+`kernel/hub/tests/test_kernel.py` you can copy:
 
-| plugin | seam | what it does | extra |
-|---|---|---|---|
-| [`dp_example`](../examples/plugins/dp_example/) | `add_node` | a `redact` compute node (mask a PII column) | — |
-| [`dp_sql_catalog`](../examples/plugins/dp_sql_catalog/) | `set_catalog` | a `CatalogProvider` backed by a SQL `datasets(name, uri)` table — subclasses `InMemoryCatalog`, overrides only the reads; `DP_SQL_CATALOG_URL` / `DP_SQL_CATALOG_TABLE` | uses `sqlalchemy` (core dep) |
-| [`dp_hf_datasets`](../examples/plugins/dp_hf_datasets/) | `add_adapter` | read a Hugging Face Hub dataset as a source: `hf://<id>[@<config>][:<split>]` | `uv sync --project kernel --extra dev --extra hf` |
-| [`dp_iceberg`](../examples/plugins/dp_iceberg/) | `add_adapter` | read an Apache Iceberg table as a source: `iceberg://<catalog>/<namespace>.<table>` (catalog from your pyiceberg config) | `uv sync --project kernel --extra dev --extra iceberg` |
-| [`dp_json_pipeline`](../examples/plugins/dp_json_pipeline/) | `set_importer` | parse a tiny JSON pipeline (`source`/`steps`/`write`) into a runnable canvas graph — import → canvas → run | — |
-| [`dp_ray`](../examples/plugins/dp_ray/) | `add_runner` (+ `PlaceableBackend`) | a **Ray Data reference backend** for clean transforms plus conservatively gated grouped aggregate, partitioned window, full-row dedup, broadcast `inner`/`left`/`cross` join, and plain-key sort. Unpinned choices may fall back to DuckDB; an explicit `config.requires.labels.engine=ray` instead fails loudly when the shape or resources are unsupported. Region outputs are worker-direct Parquet shards; object-store/non-Parquet reads and whole-graph sinks are driver-funneled. Driver and workers must use the pinned Ray 2.56.0 runtime, verified by a startup handshake. See the [support/readiness matrix](RAY.md) | `uv sync --project kernel --extra dev --extra ray` |
-| [`dp_datasets_place`](../examples/plugins/dp_datasets_place/) | `add_destination` | a save/open "place" (`kind='datasets'`) that browses only dataset files, hiding clutter; path-fenced to its root | — |
-| [`dp_json_view`](../examples/plugins/dp_json_view/) | `add_capability` | tags JSON-doc columns (name-based detector) + declares `viewer={"kind":"json"}` → the SPA shows a JSON tab that pretty-prints those cells, no frontend code | — |
-| [`dp_upper`](../examples/plugins/dp_upper/) | `add_node` (+`ir`) | an `upper` node whose DuckDB build + engine-neutral `ir` hook share one generated operator, so it runs on Ray too (a clean `map`), not just DuckDB | — |
-| [`dp_similarity_dedup`](../examples/plugins/dp_similarity_dedup/) | `add_node` | a `similarity-dedup` node: cluster near-duplicate rows by embedding cosine distance → adds `dup_group` + `is_representative` (filter downstream to keep one per cluster). Brute-force O(n²) — preview on a `sample` first; honest scale/accuracy limits in its docstring | — |
-| [`dp_run_log`](../examples/plugins/dp_run_log/) | `add_telemetry_sink` | a telemetry sink that appends one JSON line per finished run to a log file (`DP_RUN_LOG`) — the reference for where an OTel/warehouse exporter plugs in (core ships none; offline-first) | — |
-| [`dp_warm_resource`](../examples/plugins/dp_warm_resource/) | `add_node` (+`ctx.resource`) | a `warm-map` node that builds an expensive handle (a model / decoder / pool) ONCE via `ctx.resource` and reuses it across batches + runs on the warm kernel, instead of reconstructing per batch | — |
+- [`dp_example`](../examples/plugins/dp_example/) — `add_node`: `redact` compute node (mask a PII
+  column)
+- [`dp_sql_catalog`](../examples/plugins/dp_sql_catalog/) — `set_catalog`: SQL-backed
+  `CatalogProvider` subclassing `InMemoryCatalog` and overriding reads.
+  `DP_SQL_CATALOG_URL` / `DP_SQL_CATALOG_TABLE`. Uses `sqlalchemy` (core dep).
+- [`dp_hf_datasets`](../examples/plugins/dp_hf_datasets/) — `add_adapter`:
+  `hf://<id>[@<config>][:<split>]`. Install with `uv pip install -e 'kernel[hf]'`.
+- [`dp_iceberg`](../examples/plugins/dp_iceberg/) — `add_adapter`:
+  `iceberg://<catalog>/<namespace>.<table>` from your pyiceberg config. Install with
+  `uv pip install -e 'kernel[iceberg]'`.
+- [`dp_json_pipeline`](../examples/plugins/dp_json_pipeline/) — `set_importer`: tiny JSON pipeline
+  (`source` / `steps` / `write`) into a runnable canvas graph.
+- [`dp_ray`](../examples/plugins/dp_ray/) — `add_runner` (+ `PlaceableBackend`): Ray Data reference
+  backend. See the [support matrix](RAY.md). Install with `uv pip install -e 'kernel[ray]'`.
+- [`dp_datasets_place`](../examples/plugins/dp_datasets_place/) — `add_destination`: place
+  `kind='datasets'` that browses only dataset files, path-fenced to its root.
+- [`dp_json_view`](../examples/plugins/dp_json_view/) — `add_capability`: tags JSON-doc columns and
+  declares `viewer={"kind":"json"}` so the SPA shows a JSON tab with no frontend code.
+- [`dp_upper`](../examples/plugins/dp_upper/) — `add_node` (+ `ir`): `upper` node whose DuckDB build
+  and IR hook share one generated operator, so it runs on Ray too.
+- [`dp_similarity_dedup`](../examples/plugins/dp_similarity_dedup/) — `add_node`: cluster near-duplicate
+  rows by embedding cosine distance; adds `dup_group` + `is_representative`. Brute-force O(n²) —
+  preview on a `sample` first.
+- [`dp_run_log`](../examples/plugins/dp_run_log/) — `add_telemetry_sink`: appends one JSON line per
+  finished run to `DP_RUN_LOG`.
+- [`dp_warm_resource`](../examples/plugins/dp_warm_resource/) — `add_node` (+ `ctx.resource`): builds
+  an expensive handle once and reuses it across batches and runs on the warm kernel.
 
 The adapters are read-only sources (`write` raises) and import their heavy dependency lazily, so the
-pack loads even without the extra installed and only errors when its URI scheme is actually used. Both
-adapter tests run against an in-memory stand-in (`importorskip` → skipped in CI without the extra), so
-they prove the wiring; verify the network path against your own Hub/warehouse.
+pack loads without the extra installed and only errors when its URI scheme is used. Adapter tests use
+an in-memory stand-in (`importorskip` skips in CI without the extra).
 
 ### Running on another engine — the execution IR
 
-A distributed backend must not re-read node configs and re-implement lowering. Instead it lowers from
-`hub.ir`: `lower_to_ir(graph, target)` reads the configs ONCE into a `CompiledIR` — a topological list of
-`IRStep`s, each a normalized `op` + resolved portable config + input wiring. A backend pattern-matches on
-`op`. `CompiledIR.is_clean()` / `plan_is_clean(plan)` mark the portable map-style subset
-(`read`, `write`, `passthrough`, and per-row/-batch `map`/`filter`/`flat_map`/`map_batches`). Relational
-ops are not clean by default, but a backend may explicitly claim a smaller, proven-safe set through
-`plan_is_distributable` and conservative config/schema gates. Reducing (`metric`/`chart`) and opaque
-steps (`section`, and a plugin node with no `ir` hook) still fall back to DuckDB. `dp_ray` is the worked
-example: it reuses the same `sandbox.compile_operator` for transforms and the same DuckDB relational SQL
-inside complete Ray partitions; its exact supported shapes and scale limits are documented in
-[RAY.md](RAY.md).
+A distributed backend must not re-read node configs and re-implement lowering. It lowers from
+`hub.ir`: `lower_to_ir(graph, target)` reads configs once into a `CompiledIR` — a topological list of
+`IRStep`s, each a normalized `op`, resolved portable config, and input wiring. A backend pattern-matches
+on `op`. `CompiledIR.is_clean()` / `plan_is_clean(plan)` mark the portable map-style subset (`read`,
+`write`, `passthrough`, and per-row/-batch `map` / `filter` / `flat_map` / `map_batches`). Relational
+ops are not clean by default, but a backend may claim a smaller proven-safe set through
+`plan_is_distributable` and conservative config/schema gates. Reducing (`metric` / `chart`) and opaque
+steps (`section`, and a plugin node with no `ir` hook) still fall back to DuckDB. `dp_ray` is the
+worked example; its supported shapes are in [RAY.md](RAY.md).
 
-Two properties make this real rather than a side artifact:
+Two properties keep this honest:
 
-- **One config resolver.** `hub.ir.resolve_config(node)` is the single place built-in node config is read
-  + key-normalized, and the DuckDB engine (`BuildEngine._lower`) reads through it too — so the engine and
-  every backend see the same config and can't diverge.
-- **Plugin nodes can run distributed.** A plugin node that provides an `ir` hook (`reg.add_node(spec,
-  build, ir=…)`) lowers to a real op instead of `opaque`, so it runs on a distributed backend — see
-  `dp_upper`, whose `build` and `ir` share one generated operator. The plan carries each step's `op`, so a
-  backend's `can_run` gates on the plugin node's real op too (not just built-ins).
+- One config resolver. `hub.ir.resolve_config(node)` is the single place built-in node config is read
+  and key-normalized. The DuckDB engine (`BuildEngine._lower`) reads through it too, so the engine and
+  every backend see the same config.
+- Plugin nodes can run distributed. An `ir` hook (`reg.add_node(spec, build, ir=…)`) lowers to a real
+  op instead of `opaque`. `dp_upper`'s `build` and `ir` share one generated operator. The plan carries
+  each step's `op`, so a backend's `can_run` gates on the plugin node's real op too.
 
-(The default engine still lowers directly — it's the reference IR interpreter — rather than executing the
-`CompiledIR` object; that internal convergence is future work.)
+The default engine still lowers directly — it is the reference IR interpreter — rather than executing
+the `CompiledIR` object. That internal convergence is future work.
 
 ## Configuring a plugin
 
-A plugin declares its settings in `dataplay.toml` as `[[config]]` fields (VSCode `contributes.configuration`
-style) — the core renders them into a form in **Settings → Plugins**, no frontend code:
+A plugin declares settings in `dataplay.toml` as `[[config]]` fields. Core renders them into
+Settings → Plugins with no frontend code:
 
 ```toml
 [[config]]
@@ -219,12 +305,12 @@ label = "SQLAlchemy URL"
 env = "DP_SQL_CATALOG_URL"         # env-var fallback (headless / 12-factor)
 placeholder = "postgresql+psycopg://…"
 help = "shown under the field"
-# also: default, secret = true (never echoed to the UI), options = [...] (for a select)
+# also: default, secret = true (store env:/file: reference only), options = [...] (for a select)
 ```
 
-Read the values in `register(reg)` with **`reg.config(key, default=None)`**. Precedence:
-**UI setting (`plugin.<pack>.<key>`) > declared `env` var > declared `default` > the arg default** — so a
-plugin is configurable from the UI *and* still works headless via env:
+Read values in `register(reg)` with `reg.config(key, default=None)`. Precedence: UI setting
+(`plugin.<pack>.<key>`) > declared `env` var > declared `default` > the arg default. A plugin works
+from the UI and headless via env:
 
 ```python
 def register(reg):
@@ -234,7 +320,12 @@ def register(reg):
     reg.set_catalog(SqlCatalog(url, reg.config("table", "datasets")))
 ```
 
-`GET /api/plugins` surfaces each pack's schema + current values (secrets report only *whether* set, never
-the value). A changed setting applies on the **next kernel start** — plugins register once at startup, same
-as the env vars they fall back to. (Config fields need a drop-in `dataplay.toml`; `DP_PLUGINS`/entry-point
-packs still read env directly.) `dp_sql_catalog` is the worked example.
+When `secret = true`, the Settings UI and `PUT /api/settings` accept only a secret reference
+(`env:VAR_NAME` or `file:/path/to/secret`), never the material token. `reg.config` resolves the
+reference in-process during `register()`. To add an organization-specific backend (Vault, cloud KMS),
+call `reg.add_secret_resolver("vault", resolve_fn)` — core ships only `env` and `file`.
+
+`GET /api/plugins` surfaces each pack's schema and current values (for secrets, the reference string,
+not the resolved credential). A changed setting applies on the next kernel start — plugins register
+once at startup, same as their env fallbacks. Config fields need a drop-in `dataplay.toml`;
+`DP_PLUGINS` / entry-point packs still read env directly. `dp_sql_catalog` is the worked example.

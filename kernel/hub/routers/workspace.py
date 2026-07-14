@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from typing import Callable, Hashable, TypeVar
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
@@ -83,9 +82,9 @@ class PasswordChangeBody(_StrictAuthBody):
 
 
 def _client_host(request: Request) -> str:
-    # Consume only the peer identity supplied by the ASGI server; this route never parses raw forwarded
-    # headers. Uvicorn may already have normalized request.client from those headers when the immediate
-    # peer is in its configured trusted-proxy set, which is the correct deployment-layer boundary.
+    # Consume only the peer identity supplied by the ASGI stack; this route never parses raw forwarded
+    # headers. TrustedProxyHeadersMiddleware (and uvicorn when DP_TRUSTED_PROXIES is set) may already
+    # have normalized request.client from X-Forwarded-For when the immediate peer is declared trusted.
     return request.client.host if request.client is not None else ""
 
 
@@ -176,10 +175,13 @@ def auth_status(dp_session: str | None = Cookie(default=None)) -> dict:
 
 @public_router.post("/auth/login")
 async def auth_login(body: LoginBody, response: Response, request: Request) -> dict:
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     if not auth.auth_enabled():
         # This endpoint is async so authenticated password work can use explicit admission. Preserve the
         # old sync endpoint's off-event-loop DB behavior for the open-mode identity lookup.
         user_id = await run_in_threadpool(metadb.resolve_user, body.user_id)
+        emit_audit(AuditAction.AUTH_LOGIN, AuditOutcome.SUCCESS, principal_id=user_id,
+                   resource_type="user", resource_id=user_id, attrs={"mode": "open"})
         return {"ok": True, "userId": user_id}
     uid = body.user_id
     client_host = _client_host(request)
@@ -193,11 +195,16 @@ async def auth_login(body: LoginBody, response: Response, request: Request) -> d
     _admit_attempt(auth_admission.login_attempts, attempt_key)
     epoch = await _run_password_work(_login_password_work, uid, body.password)
     if epoch is None:
+        emit_audit(AuditAction.AUTH_LOGIN, AuditOutcome.FAILURE, principal_id=uid,
+                   resource_type="user", resource_id=uid, attrs={"mode": "auth"})
         raise HTTPException(401, "invalid user or password")
-    # Secure flag opt-in for HTTPS deployments (default off so internal http installs still work)
+    # Secure flag opt-in for HTTPS deployments (default off so localhost http installs still work).
+    # Shared mode refuses startup unless DP_AUTH_SECURE_COOKIE is set (see auth.reject_unsafe_transport).
     response.set_cookie("dp_session", auth.sign_at_epoch(uid, epoch), httponly=True, samesite="lax",
-                        secure=bool(os.environ.get("DP_AUTH_SECURE_COOKIE")))
+                        secure=auth.secure_cookie_enabled())
     auth_admission.login_attempts.reset(attempt_key)
+    emit_audit(AuditAction.AUTH_LOGIN, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="user", resource_id=uid, attrs={"mode": "auth"})
     return {"ok": True, "userId": uid}
 
 
@@ -205,6 +212,7 @@ async def auth_login(body: LoginBody, response: Response, request: Request) -> d
 async def change_password(body: PasswordChangeBody, response: Response, request: Request,
                           identity: RequestIdentity = Depends(current_identity)) -> dict:
     """Set/rotate the CURRENT user's password. If one is already set, the old password must match."""
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     uid = identity.user_id
     attempt_key = _password_attempt_key(_client_host(request), uid)
     _admit_attempt(auth_admission.password_change_attempts, attempt_key)
@@ -212,7 +220,9 @@ async def change_password(body: PasswordChangeBody, response: Response, request:
     auth_admission.password_change_attempts.reset(attempt_key)
     if auth.auth_enabled():  # re-issue THIS session's cookie at the new epoch so the caller isn't logged out
         response.set_cookie("dp_session", auth.sign_at_epoch(uid, epoch), httponly=True, samesite="lax",
-                            secure=bool(os.environ.get("DP_AUTH_SECURE_COOKIE")))
+                            secure=auth.secure_cookie_enabled())
+    emit_audit(AuditAction.AUTH_PASSWORD_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="user", resource_id=uid)
     return {"ok": True}
 
 
@@ -220,9 +230,12 @@ async def change_password(body: PasswordChangeBody, response: Response, request:
 def auth_logout(response: Response, dp_session: str | None = Cookie(default=None)) -> dict:
     # Sessions are stateless apart from the per-user epoch, so logout revokes every session issued
     # at the current epoch. Keep this route public so an expired/invalid cookie can still be cleared.
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     uid = auth.verify(dp_session) if auth.auth_enabled() else None
     if uid is not None:
         metadb.bump_token_epoch(uid)
+        emit_audit(AuditAction.AUTH_LOGOUT, AuditOutcome.SUCCESS, principal_id=uid,
+                   resource_type="user", resource_id=uid)
     response.delete_cookie("dp_session")
     return {"ok": True}
 
@@ -395,7 +408,10 @@ def restore_canvas(canvas_id: str, req: RestoreRequest, uid: str = Depends(curre
 @router.delete("/canvas/{canvas_id}")
 def delete_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
     if metadb.canvas_role(canvas_id, uid) == "owner":  # only the owner can delete
-        metadb.delete_canvas_cascade(canvas_id)  # also drop shares + run history + versions (no FK cascade)
+        try:
+            metadb.delete_canvas_cascade(canvas_id)  # also drop shares + run history + versions (no FK cascade)
+        except metadb.ActiveBackendJobsError as e:
+            raise HTTPException(409, str(e))
     return {"ok": True}
 
 
@@ -411,25 +427,37 @@ def get_shares(canvas_id: str, uid: str = Depends(current_user)) -> dict:
 
 @router.post("/canvas/{canvas_id}/share")
 def add_share(canvas_id: str, body: dict, uid: str = Depends(current_user)) -> dict:
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     if metadb.canvas_role(canvas_id, uid) != "owner":
+        emit_audit(AuditAction.SHARING_CHANGE, AuditOutcome.DENIED, principal_id=uid,
+                   resource_type="canvas", resource_id=canvas_id, attrs={"op": "share"})
         raise HTTPException(403, "only the owner can share")
     if "visibility" in body:
         if body["visibility"] not in ("private", "workspace", "workspace_view"):
             raise HTTPException(400, "invalid visibility")
         metadb.set_visibility(canvas_id, body["visibility"])
+        emit_audit(AuditAction.SHARING_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+                   resource_type="canvas", resource_id=canvas_id, attrs={"op": "visibility"})
     if body.get("userId"):
         role = body.get("role", "editor")
         if role not in metadb.SHARE_ROLES:  # never let a share grant 'owner' — that's a privilege escalation
             raise HTTPException(422, f"invalid role {role!r}; must be one of {list(metadb.SHARE_ROLES)}")
         metadb.share_canvas(canvas_id, body["userId"], role)
+        emit_audit(AuditAction.SHARING_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+                   resource_type="canvas", resource_id=canvas_id, attrs={"op": "share"})
     return {"ok": True}
 
 
 @router.delete("/canvas/{canvas_id}/share/{user_id}")
 def remove_share(canvas_id: str, user_id: str, uid: str = Depends(current_user)) -> dict:
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     if metadb.canvas_role(canvas_id, uid) != "owner":
+        emit_audit(AuditAction.SHARING_CHANGE, AuditOutcome.DENIED, principal_id=uid,
+                   resource_type="canvas", resource_id=canvas_id, attrs={"op": "unshare"})
         raise HTTPException(403, "only the owner can unshare")
     metadb.unshare_canvas(canvas_id, user_id)
+    emit_audit(AuditAction.SHARING_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="canvas", resource_id=canvas_id, attrs={"op": "unshare"})
     return {"ok": True}
 
 
@@ -489,46 +517,29 @@ def canvas_kernel_restart(canvas_id: str, uid: str = Depends(current_user)) -> d
     return {"ok": True, "restarted": True}
 
 
-# Secrets never leave the kernel in plaintext. GET redacts them to a sentinel (fields are password
-# inputs, so it just shows dots); PUT treats the sentinel as "unchanged" and preserves the stored value.
-_REDACTED = "__redacted__"
-_SECRET_SUBKEYS = ("accessKeyId", "secretAccessKey")  # within the objectStore setting
+# Secret-bearing settings store references (env:VAR / file:/path), never the material value. GET
+# returns the reference string as-is (it is not sensitive). PUT accepts only references (or empty to
+# clear) for agentApiKey, objectStore credential subkeys, and plugin [[config]] fields marked secret.
 
 
 def _plugin_secret_keys() -> set[str]:
-    """Setting keys `plugin.<pack>.<field>` whose declared [[config]] field is `secret` — so GET redacts
-    them and PUT treats the redaction sentinel as 'unchanged', exactly like agentApiKey. A plugin's secret
-    (an API token / DB password) must not be readable by a non-admin via GET /settings the way /api/plugins
-    already avoids. Sourced from the loaded plugins' schemas; never crashes settings."""
-    out: set[str] = set()
-    try:
-        from hub.deps import get_deps
-        for p in get_deps().plugins:
-            for f in (p.get("config") or []):
-                if isinstance(f, dict) and f.get("secret") and f.get("key"):
-                    out.add(f"plugin.{p['name']}.{f['key']}")
-    except Exception:  # noqa: BLE001
-        pass
-    return out
-
-
-def _redact_global(key: str, value, secret_keys: set[str] = frozenset()):
-    if key == "agentApiKey" or key in secret_keys:
-        return _REDACTED if value else value
-    if key == "objectStore" and isinstance(value, dict):
-        return {k: (_REDACTED if k in _SECRET_SUBKEYS and v else v) for k, v in value.items()}
-    return value
+    """Setting keys `plugin.<pack>.<field>` whose declared [[config]] field is `secret`."""
+    from hub.secrets import plugin_secret_setting_keys
+    return plugin_secret_setting_keys()
 
 
 @router.get("/settings")
 def get_settings(uid: str = Depends(current_user)) -> dict:
-    secret_keys = _plugin_secret_keys()
+    from hub.secrets import redact_global_setting
+    plugin_secrets = _plugin_secret_keys()
     with metadb.session() as s:
         rows = s.scalars(_sa_select(metadb.Setting))
         out: dict = {"global": {}, "user": {}}
         for r in rows:
             if r.scope == "global":
-                out["global"][r.key] = _redact_global(r.key, json.loads(r.value), secret_keys)
+                # References are safe to echo; mask any residual legacy plaintext for a secret key.
+                out["global"][r.key] = redact_global_setting(
+                    r.key, json.loads(r.value), plugin_secrets=plugin_secrets)
             elif r.scope == "user" and r.scope_id == uid:
                 out["user"][r.key] = json.loads(r.value)
         return out
@@ -536,15 +547,27 @@ def get_settings(uid: str = Depends(current_user)) -> dict:
 
 @router.put("/settings")
 def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
     if body.scope == "global":
-        _require_admin(uid)  # instance-wide settings (object-store creds, agent key, destinations) — admin only
+        try:
+            _require_admin(uid)  # instance-wide settings (object-store creds, agent key, destinations) — admin only
+        except HTTPException:
+            emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.DENIED, principal_id=uid,
+                       resource_type="setting", resource_id=body.key, attrs={"scope": body.scope})
+            raise
     scope_id = uid if body.scope == "user" else ""
     value = body.value
-    if body.scope == "global":  # a redaction sentinel means "keep what's stored" — never overwrite a secret with dots
-        stored = metadb.get_setting(body.key, "global", default=None)
-        if value == _REDACTED and (body.key == "agentApiKey" or body.key in _plugin_secret_keys()):
-            value = stored  # never overwrite a secret with the dots sentinel echoed by GET
-        elif body.key == "objectStore" and isinstance(value, dict) and isinstance(stored, dict):
-            value = {**value, **{k: stored.get(k) for k in _SECRET_SUBKEYS if value.get(k) == _REDACTED}}
+    plugin_secrets = _plugin_secret_keys()
+    if body.scope == "global":
+        from hub.secrets import validate_secret_setting_value
+        try:
+            value = validate_secret_setting_value(body.key, value, plugin_secrets=plugin_secrets)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     metadb.set_setting(body.key, value, scope=body.scope, scope_id=scope_id)
+    is_secret = body.key in ("agentApiKey", "objectStore") or body.key in plugin_secrets
+    # attr key must avoid validate_audit_attrs' secret-name regex, else this event is rejected + dropped.
+    emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="setting", resource_id=body.key,
+               attrs={"scope": body.scope, "sensitive": "true" if is_secret else "false"})
     return {"ok": True}

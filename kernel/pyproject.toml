@@ -45,7 +45,8 @@ hf = ["datasets>=2.0"]  # the examples/plugins/dp_hf_datasets reference adapter 
 iceberg = ["pyiceberg>=0.6"]  # the examples/plugins/dp_iceberg reference adapter (iceberg:// Apache Iceberg)
 semantic = ["sentence-transformers>=2.2"]  # the examples/plugins/dp_semantic_catalog embedder (semantic/hybrid catalog search)
 # ``default`` is Ray's supported dashboard/agent dependency contract. KubeRay v1.6 probes the agent's
-# /api/healthz endpoint on every pod; ``ray[data]`` alone starts Ray but omits that HTTP server.
+# /api/healthz endpoint on every pod; it also supplies the official Jobs SDK. ``ray[data]`` alone omits
+# the dashboard HTTP server used by both contracts.
 ray = ["ray[data,default]==2.56.0"]  # exact: dp_ray validates this private hash-shuffle ABI on every node
 dev = [
     "pytest>=8.0",
@@ -99,7 +100,7 @@ filterwarnings = [
 target-version = "py311"
 src = ["hub"]
 # Cover the packaged tree; plugins are linted via an extra path in `make lint` / CI
-# (`uv run ruff check . ../examples/plugins`).
+# (`uv run ruff check --config pyproject.toml . ../examples/plugins`) so this ignore set applies there too.
 
 [tool.ruff.lint]
 # Correctness-oriented starter set (Ruff's recommended default: pycodestyle errors + pyflakes).

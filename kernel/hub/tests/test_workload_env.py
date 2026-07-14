@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import subprocess
+import sys
 from pathlib import Path
 
-from hub.workload_env import (build_workload_env, initialize_ephemeral_metadata,
-                              prepare_workload_graph)
+import pytest
+
+from hub.workload_env import (build_workload_credential_env, build_workload_env,
+                              build_workload_semantic_env, data_plane_object_store_config,
+                              initialize_ephemeral_metadata, prepare_workload_graph)
 
 
 _CONTROL_SECRETS = {
@@ -26,10 +32,12 @@ def _source() -> dict[str, str]:
         "DP_MEMORY_LIMIT": "2GB",
         "DP_RAY_LABELS": "pool=a100",
         "DP_RAY_DRIVER_FALLBACK_MAX_BYTES": "33554432",
+        "DP_RAY_GPU_BATCH_ROWS": "8192",
         "DP_DATABASE_URL": "postgresql+psycopg://worker:secret@db/dataplay",
         "DP_STORAGE_URL": "s3://data/output",
         "AWS_ACCESS_KEY_ID": "data-key",
         "AWS_SECRET_ACCESS_KEY": "data-secret",
+        "DP_GCS_ENDPOINT": "http://gcs-emulator:4443",
         **_CONTROL_SECRETS,
     }
 
@@ -45,7 +53,9 @@ def test_one_shot_workload_environment_is_allowlisted_without_metadata_identity(
     assert env["PATH"] == "/runtime/bin" and env["DP_MEMORY_LIMIT"] == "2GB"
     assert env["DP_STORAGE_URL"] == "s3://data/output"
     assert env["DP_RAY_LABELS"] == "pool=a100"
+    assert env["DP_RAY_GPU_BATCH_ROWS"] == "8192"
     assert env["AWS_SECRET_ACCESS_KEY"] == "data-secret"
+    assert env["DP_GCS_ENDPOINT"] == "http://gcs-emulator:4443"
     assert "DP_DATABASE_URL" not in env
     assert env["DP_AUTH_MODE"] == "1"  # derived confinement signal, never signing material
 
@@ -73,9 +83,47 @@ def test_blank_auth_secret_does_not_put_open_local_workloads_in_auth_mode():
     source["DP_AUTH_SECRET"] = "   "
 
     env = build_workload_env(include_metadata_db=False, source=source)
+    semantic = build_workload_semantic_env(source=source)
 
     assert "DP_AUTH_SECRET" not in env
     assert "DP_AUTH_MODE" not in env
+    assert "DP_AUTH_MODE" not in semantic
+
+
+def test_durable_workload_environment_separates_semantics_from_rotatable_credentials():
+    semantic = build_workload_semantic_env(source=_source())
+    credentials = build_workload_credential_env(source=_source())
+    assert semantic["DP_MEMORY_LIMIT"] == "2GB"
+    assert semantic["DP_STORAGE_URL"] == "s3://data/output"
+    assert semantic["DP_GCS_ENDPOINT"] == "http://gcs-emulator:4443"
+    assert semantic["DP_RAY_GPU_BATCH_ROWS"] == "8192"
+    assert "AWS_SECRET_ACCESS_KEY" not in semantic
+    assert credentials == {
+        "AWS_ACCESS_KEY_ID": "data-key", "AWS_SECRET_ACCESS_KEY": "data-secret",
+    }
+
+
+def test_readable_malformed_job_artifact_is_corruption_not_missing(tmp_path):
+    from hub.job_artifacts import ArtifactCorrupt, ArtifactNotFound, read_json_artifact
+
+    malformed = tmp_path / "bad.dpjob"
+    malformed.write_text('{"run_id":')
+    with pytest.raises(ArtifactCorrupt):
+        read_json_artifact(str(malformed))
+    with pytest.raises(ArtifactNotFound):
+        read_json_artifact(str(tmp_path / "missing.dpjob"))
+
+
+def test_job_artifact_size_bound_applies_to_writes_and_reads(tmp_path, monkeypatch):
+    from hub import job_artifacts
+
+    monkeypatch.setattr(job_artifacts, "JSON_ARTIFACT_MAX_BYTES", 16)
+    oversized = tmp_path / "oversized.dpjob"
+    with pytest.raises(ValueError, match="16-byte limit"):
+        job_artifacts.write_json_artifact(str(oversized), {"payload": "x" * 32})
+    oversized.write_bytes(b'{' + b'"x":1,' * 8 + b'}')
+    with pytest.raises(job_artifacts.ArtifactCorrupt, match="16-byte limit"):
+        job_artifacts.read_json_artifact(str(oversized))
 
 
 def test_pod_manifest_uses_the_same_explicit_profile(monkeypatch):
@@ -109,6 +157,27 @@ def test_ray_driver_uses_one_shot_profile(monkeypatch):
     assert env["PATH"].startswith(str(Path(module.sys.executable).parent))
 
 
+def test_only_global_control_plane_marks_unhandled_backend_jobs(tmp_path, monkeypatch):
+    from hub import deps as deps_module
+    from hub import metadb
+
+    workspace, data = tmp_path / "workspace", tmp_path / "data"
+    workspace.mkdir()
+    data.mkdir()
+    calls: list[set[str]] = []
+    monkeypatch.setattr(metadb, "note_unhandled_backend_jobs", lambda backends: calls.append(backends) or 0)
+    monkeypatch.setattr(deps_module.settings, "workspace", str(workspace))
+    monkeypatch.setattr(deps_module.settings, "data_dir", str(data))
+
+    deps_module.Deps(str(workspace), str(data))
+    deps_module.set_workspace(str(workspace), str(data))
+    assert calls == []
+
+    monkeypatch.setattr(deps_module, "_deps", None)
+    deps_module.get_deps()
+    assert len(calls) == 1
+
+
 def test_ephemeral_worker_seeds_only_allowlisted_object_store_execution_config(tmp_path, monkeypatch):
     from hub import metadb
 
@@ -125,13 +194,78 @@ def test_ephemeral_worker_seeds_only_allowlisted_object_store_execution_config(t
 
     assert url.endswith("/workload-metadata.db")
     assert seeded == [("objectStore", {
-        "accessKeyId": "data-key",
-        "secretAccessKey": "data-secret",
+        "accessKeyId": "env:DP_S3_KEY",
+        "secretAccessKey": "env:DP_S3_SECRET",
         "endpoint": "http://minio:9000",
         "useSsl": False,
         "region": "us-east-1",
     }, "global")]
+    assert "data-key" not in repr(seeded) and "data-secret" not in repr(seeded)
     assert "must-not-cross" not in repr(seeded)
+
+
+def test_job_artifact_module_does_not_freeze_metadata_settings_before_worker_bootstrap():
+    code = (
+        "import sys; import hub.job_artifacts; "
+        "assert 'hub.settings' not in sys.modules; assert 'hub.metadb' not in sys.modules"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_data_plane_object_store_config_uses_only_allowlisted_worker_identity():
+    cfg = data_plane_object_store_config({
+        "DP_S3_KEY": "job-key",
+        "DP_S3_SECRET": "job-secret",
+        "AWS_SESSION_TOKEN": "job-session",
+        "DP_S3_ENDPOINT": "http://minio:9000",
+        "AWS_REGION": "us-east-1",
+        "DP_DATABASE_URL": "postgresql://control-plane",
+        "DP_AUTH_SECRET": "control-secret",
+    })
+
+    assert cfg == {
+        "accessKeyId": "job-key",
+        "secretAccessKey": "job-secret",
+        "sessionToken": "job-session",
+        "endpoint": "http://minio:9000",
+        "useSsl": False,
+        "region": "us-east-1",
+    }
+    mixed = {
+        "AWS_ACCESS_KEY_ID": "aws-only",
+        "AWS_SECRET_ACCESS_KEY": "aws-secret",
+        "DP_GCS_ENDPOINT": "http://gcs:4443",
+    }
+    assert data_plane_object_store_config(mixed, scheme="s3") == {
+        "accessKeyId": "aws-only", "secretAccessKey": "aws-secret"
+    }
+    assert data_plane_object_store_config(mixed, scheme="gcs") == {
+        "endpoint": "http://gcs:4443", "useSsl": False
+    }
+
+
+def test_object_store_env_fallback_is_gated_to_ephemeral_workloads(monkeypatch):
+    # A hub with an empty objectStore setting must keep its ambient credential chain; only a one-shot
+    # workload (subrun / Ray driver) may reconstruct config from the DP_S3_* data-plane environment.
+    from hub import metadb, workload_env
+    from hub.plugins import adapters
+
+    monkeypatch.setattr(metadb, "get_setting", lambda *a, **k: {})
+    calls: list[str] = []
+    monkeypatch.setattr(
+        workload_env, "data_plane_object_store_config",
+        lambda *a, **k: calls.append("hit") or {"accessKeyId": "x", "secretAccessKey": "y"})
+
+    monkeypatch.delenv("DP_WORKLOAD_EPHEMERAL", raising=False)
+    with contextlib.suppress(Exception):  # a hub keeps its ambient chain — the fallback must not run
+        adapters.object_fs("s3://bkt/obj")
+    assert calls == []
+
+    monkeypatch.setenv("DP_WORKLOAD_EPHEMERAL", "1")
+    assert workload_env.is_ephemeral_workload() is True
+    with contextlib.suppress(Exception):  # driver/subrun reconstructs config from the allowlisted env
+        adapters.object_fs("s3://bkt/obj")
+    assert calls == ["hit"]
 
 
 def test_workload_graph_inlines_named_schema_contract_without_mutating_source():
