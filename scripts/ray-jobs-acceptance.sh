@@ -27,7 +27,8 @@ trap cleanup EXIT
 
 cd "$ROOT"
 docker compose -f "$COMPOSE_FILE" config -q
-docker compose -f "$COMPOSE_FILE" build ray-head
+# Reuse a pre-built dp-ray:local (CI builds it once with a layer cache); build it here for local runs.
+docker image inspect dp-ray:local >/dev/null 2>&1 || docker compose -f "$COMPOSE_FILE" build ray-head
 export DP_RAY_JOBS_CODE_REF
 DP_RAY_JOBS_CODE_REF=$(docker image inspect dp-ray:local --format '{{.Id}}')
 if [[ ! $DP_RAY_JOBS_CODE_REF =~ ^sha256:[0-9a-f]{64}$ ]]; then
