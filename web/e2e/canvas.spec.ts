@@ -248,6 +248,60 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.react-flow__node')).toHaveCount(0) // a new file is a fresh canvas
   })
 
+  test('pipeline import lands a returned graph on its newly created canvas', async ({ page }) => {
+    await fresh(page)
+    const previous = await page.evaluate(() => location.hash)
+    await page.route('**/api/pipelines/import', (route) => route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        config: '{}', params: {}, inputColumns: [], outputColumns: [], stages: [], driverSteps: [],
+        graph: {
+          nodes: [{ id: 'imported-source', type: 'source', position: { x: 80, y: 80 }, data: { title: 'Imported source', config: {} } }],
+          edges: [],
+        },
+      }),
+    }))
+
+    await page.getByTestId('app-menu').click()
+    await page.getByTestId('import-pipeline').click()
+    await page.getByPlaceholder(/my_table_or_uri/).fill('{"source":"x"}')
+    await page.getByRole('button', { name: 'Import', exact: true }).click()
+
+    await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await expect(page.getByText('Imported source', { exact: true })).toBeVisible()
+  })
+
+  test('a rejected import destination preserves the active canvas', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+    const current = await page.evaluate(() => location.hash)
+    await page.route('**/api/pipelines/import', (route) => route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        config: '{}', params: {}, inputColumns: [], outputColumns: [], stages: [], driverSteps: [],
+        graph: {
+          nodes: [{ id: 'imported-source', type: 'source', position: { x: 80, y: 80 }, data: { title: 'Imported source', config: {} } }],
+          edges: [],
+        },
+      }),
+    }))
+    await page.route('**/api/canvas', (route) => {
+      if (route.request().method() !== 'POST') return route.continue()
+      return route.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ detail: 'forbidden' }) })
+    })
+
+    await page.getByTestId('app-menu').click()
+    await page.getByTestId('import-pipeline').click()
+    await page.getByPlaceholder(/my_table_or_uri/).fill('{"source":"x"}')
+    await page.getByRole('button', { name: 'Import', exact: true }).click()
+
+    await expect(page.getByTestId('toast')).toContainText('permission')
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe(current)
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await expect(page.getByRole('heading', { name: 'Import pipeline' })).toBeVisible()
+  })
+
   test('settings modal edits and saves the agent config', async ({ page }) => {
     await page.goto('/')
     await page.getByTestId('app-menu').click()               // Settings lives in the app menu now

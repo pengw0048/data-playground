@@ -296,13 +296,17 @@ describe('graph store — core authority ops', () => {
 
   it('preserves the current canvas when new-file or example creation is forbidden', async () => {
     const before = useStore.getState().doc
+    const beforePast = [emptyTestDoc('undo')]
+    useStore.setState({ past: beforePast, saved: false })
     apiMocks.createCanvas.mockRejectedValue(new KernelError(403, 'forbidden'))
 
-    await useStore.getState().newFile()
+    expect(await useStore.getState().newFile()).toEqual({ ok: false })
     expect(useStore.getState().doc).toBe(before)
     expect(useStore.getState().canvasRole).toBe('owner')
+    expect(useStore.getState().past).toBe(beforePast)
+    expect(useStore.getState().saved).toBe(false)
 
-    await useStore.getState().newFromExample('purchases')
+    expect(await useStore.getState().newFromExample('purchases')).toEqual({ ok: false })
     expect(useStore.getState().doc).toBe(before)
     expect(useStore.getState().canvasRole).toBe('owner')
     expect(useStore.getState().toasts.filter((toast) => toast.msg.includes('permission'))).toHaveLength(2)
@@ -315,7 +319,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.createCanvas.mockRejectedValueOnce(new KernelError(401, 'session expired'))
     const before = useStore.getState().doc
 
-    await useStore.getState().newFile()
+    expect(await useStore.getState().newFile()).toEqual({ ok: false })
 
     expect(useStore.getState().doc).toBe(before)
     expect(useStore.getState().canvasRole).toBeNull()
@@ -328,11 +332,39 @@ describe('graph store — core authority ops', () => {
     const beforeId = useStore.getState().doc.id
     apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
 
-    await useStore.getState().newFile()
+    const created = await useStore.getState().newFile()
 
     expect(useStore.getState().doc.id).not.toBe(beforeId)
     expect(useStore.getState().canvasRole).toBe('owner')
     expect(useStore.getState().view).toBe('canvas')
+    expect(created).toMatchObject({ ok: true, persistence: 'local-draft' })
+  })
+
+  it('reports a remote canvas creation target and only applies an import to that target', async () => {
+    const created = await useStore.getState().newFile()
+    expect(created).toMatchObject({ ok: true, persistence: 'remote' })
+    if (!created.ok) throw new Error('expected a canvas')
+
+    expect(useStore.getState().applyAgentGraph({ nodes: [NODE('imported')], edges: [] }, created.canvasId)).toBe(true)
+    expect(useStore.getState().doc.nodes.map((node) => node.id)).toEqual(['imported'])
+
+    useStore.setState({ doc: emptyTestDoc('other'), view: 'canvas' })
+    expect(useStore.getState().applyAgentGraph({ nodes: [NODE('must-not-apply')], edges: [] }, created.canvasId)).toBe(false)
+    expect(useStore.getState().doc.nodes).toEqual([])
+  })
+
+  it('cancels a pending canvas creation when the researcher navigates away', async () => {
+    let finishCreate!: (value: { ok: boolean }) => void
+    apiMocks.createCanvas.mockImplementationOnce(() => new Promise((resolve) => { finishCreate = resolve }))
+    const before = useStore.getState().doc
+
+    const creating = useStore.getState().newFile()
+    useStore.getState().setView('files')
+    finishCreate({ ok: true })
+
+    expect(await creating).toEqual({ ok: false })
+    expect(useStore.getState().doc).toBe(before)
+    expect(useStore.getState().view).toBe('files')
   })
 })
 
