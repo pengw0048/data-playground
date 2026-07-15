@@ -155,6 +155,26 @@ def _find(workspace: str, dest_id: str) -> dict | None:
     return next((d for d in presets(workspace) if d.get("id") == dest_id), None)
 
 
+def selected_object_store_credential(workspace: str, dest_id: str | None) -> tuple[str, str] | None:
+    """Return the selected credential source and destination label without resolving secret material.
+
+    A destination-specific Cred wins; otherwise an object-store destination inherits the configured
+    default Cred. ``None`` means the user deliberately selected no Cred, so the execution backend may
+    use its ambient workload identity. Local destinations never require an object-store credential.
+    """
+    if not dest_id:
+        return None
+    destination = _find(workspace, dest_id)
+    if not destination or destination.get("backend") not in ("s3", "gs"):
+        return None
+    label = str(destination.get("name") or dest_id).replace("\n", " ").replace("\r", " ")[:120]
+    if str(destination.get("credId") or "").strip():
+        return "destination-specific", label
+    if str(metadb.get_setting("defaultObjectStoreCredId", "global") or "").strip():
+        return "default", label
+    return None
+
+
 def browse(workspace: str, dest_id: str, path: str) -> dict:
     d = _find(workspace, dest_id)
     if not d:

@@ -550,7 +550,16 @@ def graph_plan(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
         return {"regions": []}
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     try:
-        return {"regions": deps.controller.plan_summary(req.graph, req.target_node_id)}
+        regions = deps.controller.plan_summary(req.graph, req.target_node_id)
+        plan = compiler.compile_plan(
+            req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
+        runner = _route_by_capability(
+            deps, deps.pick_runner(plan, uid), req.graph, req.target_node_id)
+        warning = _destination_credential_preflight(deps, runner, plan, req.graph)
+        if warning is not None and regions:
+            region = regions[-1]
+            region["preflight"] = [*(region.get("preflight") or []), warning]
+        return {"regions": regions}
     except ManagedSourceReadError as e:
         return {"regions": [], "error": str(e)}
     except Exception as e:  # noqa: BLE001 — a preview must never 500
@@ -743,6 +752,17 @@ def _route_by_capability(deps, chosen, graph, target_node_id: str | None = None)
     )
 
 
+def _destination_credential_preflight(deps, runner, plan, graph) -> str | None:
+    from hub.backends import destination_credential_error
+    return destination_credential_error(runner, plan, graph, deps.workspace)
+
+
+def _require_destination_credential_preflight(deps, runner, plan, graph) -> None:
+    message = _destination_credential_preflight(deps, runner, plan, graph)
+    if message is not None:
+        raise HTTPException(400, message)
+
+
 @router.post("/run/estimate", response_model=RunEstimate)
 def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunEstimate:
     _require_graph_read_access(req.graph, uid)
@@ -752,8 +772,10 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
+    runner = _route_by_capability(
+        deps, deps.pick_runner(plan, uid), req.graph, req.target_node_id)
+    _require_destination_credential_preflight(deps, runner, plan, req.graph)
     rows, byts, _ = _cone_size(req.graph, req.target_node_id, deps)
-    runner = deps.pick_runner(plan, uid)
     est = runner.estimate(plan, rows, byts)
     return est
 
@@ -794,6 +816,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), graph, target_node_id
     )  # honor requirements only in the target's executable cone
+    _require_destination_credential_preflight(deps, runner, plan, graph)
     rows, byts, sizes = _cone_size(graph, target_node_id, deps)
     est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and not confirmed:

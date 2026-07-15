@@ -1021,6 +1021,12 @@ class RayRunner:
     name = "ray-data"
     durable_backend = _JOBS_BACKEND
 
+    @staticmethod
+    def supports_selected_destination_credentials() -> bool:
+        # Both the local driver and Ray Jobs receive ambient data-plane identity only. A future plugin
+        # transport may opt into this public capability once it can honor the selected Cred exactly.
+        return False
+
     def __init__(self, deps, jobs_client_factory=None, artifact_store=None, recover: bool = True):
         self.deps = deps
         self.base = deps.runner            # the local out-of-core runner — estimate, fallback, lineage reuse
@@ -2071,6 +2077,12 @@ class RayRunner:
         shards). `requires` (the planner's resolved region need) is passed to Ray so its map tasks are
         scheduled onto a matching worker. Unsupported unpinned work falls back locally; an explicit Ray
         requirement fails before dispatch."""
+        from hub import compiler
+        from hub.backends import require_destination_credential_support
+        plan = compiler.compile_plan(
+            graph, output_node, self.deps.registry, self.node_specs, self.deps.node_ir)
+        require_destination_credential_support(
+            self, plan, graph, getattr(self.deps, "workspace", ""))
         if self.jobs_address:
             raise RuntimeError(
                 "Ray Jobs supports durable whole-graph runs only; region orchestration is not yet durable"
@@ -2642,6 +2654,10 @@ class RayRunner:
 
     def run(self, plan, graph, target_node_id, placement, run_id=None) -> RunStatus:
         from hub.placement import graph_requires
+        from hub.backends import require_destination_credential_support
+
+        require_destination_credential_support(
+            self, plan, graph, getattr(self.deps, "workspace", ""))
 
         ir = lower_to_ir(graph, target_node_id, self.node_specs, self.deps.node_ir)
         reason = self._source_unsupported_reason(graph, target_node_id, ir)

@@ -3267,6 +3267,53 @@ def test_ray_jobs_rejects_partitioned_remote_sink_and_durable_region_claim(jobs_
     assert client.submit_calls == []
 
 
+@pytest.mark.parametrize("mode", ["local-ray", "ray-jobs"])
+@pytest.mark.parametrize("selection", ["destination-specific", "default"])
+def test_ray_rejects_selected_destination_credentials_before_driver_or_submission(
+        jobs_config, monkeypatch, mode, selection):
+    from hub import destinations
+    from hub.backends import UnsupportedDestinationCredentialError
+
+    module, deps, _fixture_runner, client, store = _runner(jobs_config)
+    if mode == "local-ray":
+        monkeypatch.delenv("DP_RAY_JOBS_ADDRESS", raising=False)
+    destination = {
+        "id": "exports", "name": "Robotics exports", "backend": "s3", "root": "s3://shared/out",
+    }
+    if selection == "destination-specific":
+        destination["credId"] = "selected-ray-cred"
+    monkeypatch.setattr(destinations, "presets", lambda _workspace: [destination])
+    original_get_setting = metadb.get_setting
+    monkeypatch.setattr(
+        metadb, "get_setting",
+        lambda key, *args, **kwargs: ("default-ray-cred" if selection == "default" else "")
+        if key == "defaultObjectStoreCredId" else original_get_setting(key, *args, **kwargs),
+    )
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "WRONG-RAY-AMBIENT-IDENTITY")
+    runner = module.RayRunner(
+        deps, jobs_client_factory=client, artifact_store=store, recover=False)
+    assert runner.supports_selected_destination_credentials() is False
+    graph = _graph()
+    graph.nodes[-1].data["config"]["destId"] = "exports"
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    monkeypatch.setattr(
+        runner, "_claim_sink_attempts",
+        lambda *_args, **_kwargs: pytest.fail("Ray allocated an attempt before credential preflight"),
+    )
+
+    with pytest.raises(UnsupportedDestinationCredentialError) as caught:
+        runner.run(plan, graph, "write", "distributed")
+
+    message = str(caught.value)
+    assert "ray-data" in message and "Robotics exports" in message and selection in message
+    assert "selected-ray-cred" not in message
+    assert "default-ray-cred" not in message
+    assert "WRONG-RAY-AMBIENT-IDENTITY" not in message
+    assert runner.runs == {}
+    assert client.submit_calls == []
+    assert store.values == {}
+
+
 def test_ray_jobs_whole_graph_admission_is_separate_from_region_placement(jobs_config):
     from hub.routers.runs import _route_by_capability
 

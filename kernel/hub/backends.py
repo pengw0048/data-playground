@@ -10,6 +10,7 @@ becomes a matter of *which backend*, not a core rewrite.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 import duckdb
@@ -90,6 +91,88 @@ class ExecutionBackend(Protocol):
     def status(self, run_id: str) -> RunStatus: ...
 
     def cancel(self, run_id: str) -> RunStatus: ...
+
+
+@runtime_checkable
+class SelectedDestinationCredentialsBackend(Protocol):
+    """Optional execution capability for a backend that can honor a selected destination Cred.
+
+    Backends without this capability are rejected before dispatch when a write inherits either a
+    destination-specific Cred or the configured default Cred. Ambient workload identity remains valid
+    and requires no transport capability.
+    """
+
+    def supports_selected_destination_credentials(self) -> bool: ...
+
+
+@dataclass(frozen=True)
+class DestinationCredentialRequirement:
+    destination_id: str
+    destination_name: str
+    selection: str
+
+
+class UnsupportedDestinationCredentialError(RuntimeError):
+    """A selected execution backend cannot honor the write destination's selected Cred."""
+
+
+def destination_credential_requirement(
+        plan: CompilePlan, graph: Graph, workspace: str) -> DestinationCredentialRequirement | None:
+    """Find the first selected Cred used by an executable write step, without resolving it."""
+    from hub import destinations
+
+    nodes = {node.id: node for node in graph.nodes}
+    for step in plan.steps:
+        if step.kind != "write":
+            continue
+        node = nodes.get(step.node_id)
+        if node is None:
+            continue
+        data = node.data if isinstance(node.data, dict) else {}
+        config = data.get("config", {}) if isinstance(data.get("config", {}), dict) else {}
+        destination_id = str(config.get("destId") or "").strip() or None
+        selected = destinations.selected_object_store_credential(
+            workspace, destination_id)
+        if selected is not None and destination_id is not None:
+            selection, destination_name = selected
+            return DestinationCredentialRequirement(
+                destination_id=destination_id,
+                destination_name=destination_name,
+                selection=selection,
+            )
+    return None
+
+
+def backend_supports_selected_destination_credentials(backend) -> bool:
+    """Feature-detect the explicit capability; missing or broken probes fail closed."""
+    probe = getattr(backend, "supports_selected_destination_credentials", None)
+    if not callable(probe):
+        return False
+    try:
+        return bool(probe())
+    except Exception:  # noqa: BLE001 - an uncertain transport capability must not select another identity
+        return False
+
+
+def destination_credential_error(
+        backend, plan: CompilePlan, graph: Graph, workspace: str) -> str | None:
+    requirement = destination_credential_requirement(plan, graph, workspace)
+    if requirement is None or backend_supports_selected_destination_credentials(backend):
+        return None
+    backend_name = str(getattr(backend, "name", "unknown")).replace("\n", " ").replace("\r", " ")[:120]
+    return (
+        f"Execution backend '{backend_name}' cannot use the {requirement.selection} credential "
+        f"selected for destination '{requirement.destination_name}'. Select 'local-out-of-core' "
+        "for in-process credential resolution, or clear the destination/default credential to use "
+        "ambient workload identity. No run was started."
+    )
+
+
+def require_destination_credential_support(
+        backend, plan: CompilePlan, graph: Graph, workspace: str) -> None:
+    message = destination_credential_error(backend, plan, graph, workspace)
+    if message is not None:
+        raise UnsupportedDestinationCredentialError(message)
 
 
 @runtime_checkable

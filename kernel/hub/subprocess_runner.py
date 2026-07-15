@@ -61,6 +61,10 @@ class SubprocessRunner:
     name = "local-subprocess"
     manages_source_leases = True
 
+    @staticmethod
+    def supports_selected_destination_credentials() -> bool:
+        return False  # the ephemeral child has ambient data identity only; it cannot resolve hub Creds
+
     def __init__(self, workspace: str, data_dir: str, catalog=None, deadline_s: float | None = None,
                  storage=None, resolve_adapter=None, node_builders=None):
         self.workspace = workspace
@@ -384,6 +388,8 @@ class SubprocessRunner:
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
             placement: Placement, run_id: str | None = None,
             request_id: str | None = None, attempt_id: str | None = None) -> RunStatus:
+        from hub.backends import require_destination_credential_support
+        require_destination_credential_support(self, plan, graph, self.workspace)
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
         per = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         _ = attempt_id  # OPS-01 port parity; managed publication stamps attempts itself
@@ -486,6 +492,10 @@ class SubprocessRunner:
         the seam a pod/Ray backend overrides to allocate a pod / submit a job. `requires` (the region's
         resource need) is accepted for signature parity but ignored: a subprocess is one local process,
         so there's no worker to place onto."""
+        from hub import compiler
+        from hub.backends import require_destination_credential_support
+        plan = compiler.compile_plan(graph, output_node)
+        require_destination_credential_support(self, plan, graph, self.workspace)
         run_id = f"unit_{uuid.uuid4().hex[:10]}"
         status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=[])
         materialize_uri = output_uri

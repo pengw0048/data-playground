@@ -359,6 +359,21 @@ describe('graph store — core authority ops', () => {
     )
   })
 
+  it('surfaces unsupported destination credentials from run preflight without starting', async () => {
+    const write = NODE('write', 'write')
+    write.data.config = { destId: 'exports', filename: 'out.parquet' }
+    useStore.setState({
+      doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [write], edges: [] },
+    })
+    const message = "Execution backend 'local-subprocess' cannot use the destination-specific credential selected for destination 'Research exports'. Select 'local-out-of-core' for in-process credential resolution, or clear the destination/default credential to use ambient workload identity. No run was started."
+    apiMocks.estimate.mockRejectedValueOnce(new KernelError(400, message))
+
+    await useStore.getState().requestRun('write')
+
+    expect(useStore.getState().runs.write).toMatchObject({ phase: 'failed', error: message })
+    expect(useStore.getState().toasts.some((toast) => toast.msg === message && toast.kind === 'error')).toBe(true)
+  })
+
   it('reuses one submission id across bounded ambiguous submission retries', async () => {
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     useStore.setState({ doc })
