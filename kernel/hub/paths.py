@@ -10,6 +10,7 @@ NOT local paths and are governed by db.py's SSRF policy (extension autoload disa
 
 from __future__ import annotations
 
+import glob
 import ntpath
 import os
 from urllib.parse import urlsplit
@@ -78,19 +79,55 @@ def canonical_data_uri(uri: str) -> str:
     return parsed.scheme.lower() + raw[len(parsed.scheme):]
 
 
+def checked_local_path(uri: str) -> str | None:
+    """Return a canonical local path after enforcing the deployment's filesystem boundary.
+
+    Adapter filesystem probes must consume this returned value, not re-use the caller's original URI.
+    That keeps parsing, symlink resolution, the allowed-root decision, and the eventual filesystem
+    operation on one spelling. In the trusted open/local product the candidate filesystem root is the
+    declared boundary, preserving intentional arbitrary local-file access; that root is not a sandbox.
+    """
+    raw = str(uri or "")
+    if not raw:
+        return None
+    try:
+        path = local_path(raw)
+    except ValueError as exc:
+        if auth.auth_enabled():
+            raise PermissionError(str(exc)) from None
+        raise
+    if path is None:
+        return None
+    if auth.auth_enabled() and glob.has_magic(path):
+        # A prefix check on the literal pattern is not a check on the files DuckDB later expands. In
+        # particular, an in-root wildcard can match a symlink whose canonical target is outside the root.
+        # Shared mode therefore fails closed until an adapter can canonicalize every concrete match.
+        raise PermissionError("local glob dataset paths are not allowed in shared mode")
+
+    candidate = os.path.realpath(os.path.expanduser(path))
+    if auth.auth_enabled():
+        roots = allowed_roots()
+    else:
+        # Open mode is the trusted localhost tool. Still pass filesystem operations a normalized path
+        # that has crossed an explicit containment check; the candidate's volume root intentionally
+        # permits the whole local filesystem (including non-current drives on Windows).
+        drive, _tail = os.path.splitdrive(candidate)
+        roots = [os.path.realpath(drive + os.sep if drive else os.sep)]
+
+    normalized_candidate = os.path.normcase(candidate)
+    for root in roots:
+        normalized_root = os.path.normcase(os.path.realpath(os.path.expanduser(root)))
+        root_prefix = normalized_root.rstrip(os.sep) + os.sep
+        if normalized_candidate == normalized_root or normalized_candidate.startswith(root_prefix):
+            return candidate
+    raise PermissionError(
+        f"dataset path '{raw}' is outside the allowed roots "
+        f"(the workspace, the data dir, or DP_DATASET_ROOTS)"
+    )
+
+
 def ensure_local_uri_allowed(uri: str) -> None:
     """Raise PermissionError if `uri` is a local path outside the allowed roots (auth mode only)."""
     if not auth.auth_enabled():
         return  # open single-user mode: trusted local tool, no confinement
-    try:
-        path = local_path(uri)
-    except ValueError as exc:
-        raise PermissionError(str(exc)) from None
-    if path is None:
-        return  # s3://, gs://, http(s):// … — not a local path (SSRF handled in db.ensure_object_store)
-    rp = os.path.realpath(os.path.expanduser(path))
-    if not any(rp == root or rp.startswith(root + os.sep) for root in allowed_roots()):
-        raise PermissionError(
-            f"dataset path '{uri}' is outside the allowed roots "
-            f"(the workspace, the data dir, or DP_DATASET_ROOTS)"
-        )
+    checked_local_path(uri)

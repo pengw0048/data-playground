@@ -19,7 +19,7 @@ from collections.abc import Callable
 
 import duckdb
 
-from hub import db
+from hub import db, paths
 from hub.models import ColumnSchema
 from hub.plugins.capabilities import tag_columns
 from hub.sqlpolicy import identifier, identifier_list, quote_identifier
@@ -211,15 +211,23 @@ def relation_columns(rel: Relation) -> list[ColumnSchema]:
 
 
 def _fingerprint_path(p: str) -> str:
+    checked = paths.checked_local_path(p)
+    if checked is None:
+        return "unknown"
+    p = checked
     try:
+        # `p` is the realpath returned after root containment and shared-mode glob rejection.
+        # codeql[py/path-injection]
         if os.path.isdir(p):
             # Best-available, bounded directory identity: the directory inode/mtime usually changes for
             # immediate membership updates, but does not identify arbitrary descendant contents. Never
             # recursively enumerate a dataset during profile preflight/recovery; strong versioned source
             # identity remains #226.
+            # codeql[py/path-injection]
             st = os.stat(p)
             observed = f"dir:{p}:{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
             return hashlib.sha256(observed.encode()).hexdigest()[:16]
+        # codeql[py/path-injection]
         st = os.stat(p)
         return hashlib.sha256(f"{p}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:16]
     except OSError:
@@ -254,7 +262,8 @@ class DuckDBAdapter:
         if uri.startswith("mem://") or is_object_uri(uri):
             return True
         p = uri.lower()
-        if os.path.isdir(uri):
+        local = paths.checked_local_path(uri)
+        if local is not None and os.path.isdir(local):
             return True
         return p.endswith(self._EXTS)
 
@@ -311,16 +320,24 @@ class DuckDBAdapter:
             raise BoundedPreviewUnsupported(
                 "Arrow/Feather/IPC record batches have no strict bounded preview — needs a full pass"
             )
+        local: str | None = None
         if is_object_uri(normalized):
             if not low.endswith((".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson")):
                 raise BoundedPreviewUnsupported(
                     "object-store prefixes have no bounded namespace preview — needs a full pass"
                 )
-        elif os.path.isdir(normalized):
-            raise BoundedPreviewUnsupported(
-                "directory datasets have no bounded namespace preview — needs a full pass"
-            )
-        return self.scan(uri, columns=columns, limit=int(limit), options=options)
+        else:
+            local = paths.checked_local_path(normalized)
+            # `local` is the checked realpath; the read below also consumes this exact spelling.
+            # codeql[py/path-injection]
+            if local is not None and os.path.isdir(local):
+                raise BoundedPreviewUnsupported(
+                    "directory datasets have no bounded namespace preview — needs a full pass"
+                )
+        # The read must consume the exact canonical path that crossed the containment check. Reusing the
+        # original file URI/symlink here would split check from use; remote URIs keep their normalized form.
+        return self.scan(local if local is not None else normalized,
+                         columns=columns, limit=int(limit), options=options)
 
     def _read(self, con: duckdb.DuckDBPyConnection, uri: str, options: dict | None = None) -> Relation:
         uri = _read_uri(uri)
@@ -356,7 +373,8 @@ class DuckDBAdapter:
             # injected. (union_by_name alone disables hive detection, so it must be explicit when wanted.)
             return con.read_parquet(uri.rstrip("/") + "/**/*.parquet", union_by_name=True,
                                     hive_partitioning=self._is_hive_dir(uri, obj=True))
-        p = uri
+        local = paths.checked_local_path(uri)
+        p = local if local is not None else uri
         low = p.lower()
         if os.path.isdir(p):
             return self._read_dir(con, p)
@@ -469,10 +487,15 @@ class DuckDBAdapter:
         normalized = _read_uri(uri)
         if is_object_uri(normalized) or normalized.startswith("mem://"):
             return None
+        local = paths.checked_local_path(normalized)
+        if local is None:
+            return None
         try:
             import pyarrow.parquet as pq
-            if os.path.isfile(normalized) and normalized.lower().endswith((".parquet", ".pq")):
-                return int(pq.ParquetFile(normalized).metadata.num_rows)
+            # `local` is the checked realpath; shared-mode glob patterns have already failed closed.
+            # codeql[py/path-injection]
+            if os.path.isfile(local) and local.lower().endswith((".parquet", ".pq")):
+                return int(pq.ParquetFile(local).metadata.num_rows)
         except Exception:  # noqa: BLE001 - metadata uncertainty means unknown, never a fallback scan
             return None
         return None
@@ -755,7 +778,9 @@ class LanceAdapter:
             import lance  # lazy — only if the optional `lance` extra is installed
         except ModuleNotFoundError as e:  # a clear remediation, not a raw "No module named 'lance'"
             raise ModuleNotFoundError("Lance support is not installed — run: uv pip install -e 'kernel[lance]'") from e
-        return lance.dataset(_read_uri(uri))
+        normalized = _read_uri(uri)
+        local = paths.checked_local_path(normalized)
+        return lance.dataset(local if local is not None else normalized)
 
     def scan(self, uri: str, columns: list[str] | None = None,
              predicate: str | None = None, limit: int | None = None,

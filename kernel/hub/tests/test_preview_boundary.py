@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from hub import db
@@ -381,6 +382,99 @@ def test_partitioned_directory_metadata_count_does_not_enumerate_files(
     )
 
     assert DuckDBAdapter().metadata_count(str(directory)) is None
+
+
+def test_adapter_filesystem_probes_enforce_shared_mode_roots(
+        tmp_path, monkeypatch) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside.parquet"
+    pq.write_table(pa.table({"id": [1, 2, 3]}), outside)
+    sibling = tmp_path / "allowed-sibling"
+    sibling.mkdir()
+    sibling_dataset = sibling / "rows.parquet"
+    pq.write_table(pa.table({"id": [4]}), sibling_dataset)
+    symlink_escape = allowed / "escape.parquet"
+    symlink_escape.symlink_to(outside)
+    monkeypatch.setenv("DP_AUTH_SECRET", "adapter-boundary-secret-0123456789")
+    monkeypatch.delenv("DP_AUTH_MODE", raising=False)
+    monkeypatch.setenv("DP_DATASET_ROOTS", str(allowed))
+
+    adapter = DuckDBAdapter()
+    mixed_case_file_uri = "FiLe" + outside.as_uri()[4:]
+    for uri in (
+        str(outside), outside.as_uri(), mixed_case_file_uri,
+        str(sibling_dataset), str(symlink_escape),
+    ):
+        with pytest.raises(PermissionError, match="outside the allowed roots"):
+            adapter.matches(uri)
+        with pytest.raises(PermissionError, match="outside the allowed roots"):
+            adapter.preview_scan(uri)
+        with pytest.raises(PermissionError, match="outside the allowed roots"):
+            adapter.metadata_count(uri)
+        with pytest.raises(PermissionError, match="outside the allowed roots"):
+            adapter.fingerprint(uri)
+
+    # Validating the literal in-root pattern is insufficient: DuckDB expands it later and would follow
+    # this matched symlink outside the allowed root. Shared mode must reject local globbing before I/O.
+    with pytest.raises(PermissionError, match="glob dataset paths"):
+        with db.run_scope():
+            adapter.scan(str(allowed / "*.parquet")).fetchall()
+
+
+def test_adapter_filesystem_probes_use_checked_canonical_paths(
+        tmp_path, monkeypatch) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    dataset = allowed / "rows.parquet"
+    pq.write_table(pa.table({"id": [1, 2, 3]}), dataset)
+    adapter = DuckDBAdapter()
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "adapter-boundary-secret-0123456789")
+    monkeypatch.delenv("DP_AUTH_MODE", raising=False)
+    monkeypatch.setenv("DP_DATASET_ROOTS", str(allowed))
+    mixed_case_file_uri = "FiLe" + dataset.as_uri()[4:]
+    assert adapter.matches(mixed_case_file_uri)
+    assert adapter.metadata_count(mixed_case_file_uri) == 3
+    assert adapter.fingerprint(mixed_case_file_uri) != "unknown"
+    with db.run_scope():
+        assert adapter.preview_scan(mixed_case_file_uri, limit=2).to_arrow_table().num_rows == 2
+
+    alias = allowed / "alias.parquet"
+    alias.symlink_to(dataset)
+    observed: list[str] = []
+    sentinel = object()
+
+    def scan(uri: str, **_kwargs):
+        observed.append(uri)
+        return sentinel
+
+    monkeypatch.setattr(adapter, "scan", scan)
+    mixed_case_alias_uri = "FiLe" + alias.as_uri()[4:]
+    assert adapter.preview_scan(mixed_case_alias_uri, limit=2) is sentinel
+    assert observed == [str(dataset.resolve())]
+
+    # Open mode is the trusted local product and intentionally retains arbitrary local-file access.
+    monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
+    monkeypatch.delenv("DP_AUTH_MODE", raising=False)
+    outside = tmp_path / "open-mode.parquet"
+    pq.write_table(pa.table({"id": [4, 5]}), outside)
+    open_adapter = DuckDBAdapter()
+    assert open_adapter.metadata_count(str(outside)) == 2
+    assert open_adapter.fingerprint(str(outside)) != "unknown"
+    with db.run_scope():
+        assert open_adapter.scan(str(tmp_path / "*.parquet")).aggregate(
+            "count(*) AS n").fetchone()[0] == 2
+
+
+def test_empty_local_uri_is_not_the_working_directory() -> None:
+    from hub import paths
+
+    adapter = DuckDBAdapter()
+    assert paths.checked_local_path("") is None
+    assert not adapter.matches("")
+    assert adapter.metadata_count("") is None
+    assert adapter.fingerprint("") == "unknown"
 
 
 def test_remote_ipc_schema_only_reads_no_record_batches(tmp_path, monkeypatch) -> None:
