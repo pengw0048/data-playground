@@ -560,7 +560,11 @@ def bad_result(mode: str) -> None:
                 f"missing-result check did not exercise SUCCEEDED-without-receipt: remote={remote}, "
                 f"error={final.error!r}"
             )
-    elif (remote != "SUCCEEDED"
+    # The entrypoint proves a valid receipt before replacing it. The supervisor can observe the
+    # corrupt replacement before Ray publishes SUCCEEDED, in which case the production quarantine
+    # path deliberately stops the still-live job. Both official terminal states preserve the
+    # contract under test; no other state may satisfy this oracle.
+    elif (remote not in ("SUCCEEDED", "STOPPED")
             or "artifact_contract_invalid" not in (final.error or "")
             or "TerminalResultMissing" in (final.error or "")):
         raise AssertionError(
