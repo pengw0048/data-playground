@@ -142,7 +142,7 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().previews.filter?.result?.rows).toEqual([{ value: 'view' }])
   })
 
-  it('scopes profile identity to the deterministic upstream execution cone', () => {
+  it('uses one deterministic target execution identity for previews and profiles', () => {
     const source = NODE('source')
     source.data.config = { uri: 'events.parquet', options: { batchSize: 10, columns: ['event'] } }
     const target = NODE('target', 'filter')
@@ -159,38 +159,53 @@ describe('graph store — core authority ops', () => {
         { id: 'target-edge', source: 'source', target: 'target', data: { wire: 'dataset' as const } },
       ],
     }
-    const identity = profilePlanIdentity(doc, 'target')
+    const identity = previewPlanIdentity(doc, 'target')
+    expect(profilePlanIdentity(doc, 'target')).toBe(identity)
 
     const reordered = structuredClone(doc)
     reordered.nodes.reverse()
     reordered.edges.reverse()
     reordered.requirements.reverse()
+    expect(previewPlanIdentity(reordered, 'target')).toBe(identity)
     expect(profilePlanIdentity(reordered, 'target')).toBe(identity)
 
     const unrelated = structuredClone(doc)
     unrelated.nodes.find((node) => node.id === 'other-source')!.data.config.uri = 'other-v2.parquet'
     unrelated.edges.find((edge) => edge.id === 'other-edge')!.targetHandle = 'replacement-input'
+    expect(previewPlanIdentity(unrelated, 'target')).toBe(identity)
     expect(profilePlanIdentity(unrelated, 'target')).toBe(identity)
-    expect(previewPlanIdentity(unrelated, 'target')).not.toBe(previewPlanIdentity(doc, 'target'))
 
     const visualOnly = structuredClone(doc)
     visualOnly.version = 99
     visualOnly.nodes.find((node) => node.id === 'source')!.position = { x: 900, y: 400 }
     visualOnly.nodes.find((node) => node.id === 'target')!.data.status = 'running'
     visualOnly.edges.find((edge) => edge.id === 'target-edge')!.id = 'layout-only-edge-id'
+    expect(previewPlanIdentity(visualOnly, 'target')).toBe(identity)
     expect(profilePlanIdentity(visualOnly, 'target')).toBe(identity)
 
     const upstreamEdit = structuredClone(doc)
     upstreamEdit.nodes.find((node) => node.id === 'source')!.data.config.uri = 'events-v2.parquet'
+    expect(previewPlanIdentity(upstreamEdit, 'target')).not.toBe(identity)
     expect(profilePlanIdentity(upstreamEdit, 'target')).not.toBe(identity)
 
     const targetEdit = structuredClone(doc)
     targetEdit.nodes.find((node) => node.id === 'target')!.data.config.predicate = 'event = purchase'
+    expect(previewPlanIdentity(targetEdit, 'target')).not.toBe(identity)
     expect(profilePlanIdentity(targetEdit, 'target')).not.toBe(identity)
 
     const executionEdgeEdit = structuredClone(doc)
     executionEdgeEdit.edges.find((edge) => edge.id === 'target-edge')!.sourceHandle = 'filtered'
+    expect(previewPlanIdentity(executionEdgeEdit, 'target')).not.toBe(identity)
     expect(profilePlanIdentity(executionEdgeEdit, 'target')).not.toBe(identity)
+
+    const metric = NODE('metric', 'metric')
+    metric.data.title = 'Revenue'
+    const metricDoc = { ...doc, nodes: [source, metric], edges: [
+      { id: 'source-metric', source: 'source', target: 'metric', data: { wire: 'dataset' as const } },
+    ] }
+    const metricRename = structuredClone(metricDoc)
+    metricRename.nodes.find((node) => node.id === 'metric')!.data.title = 'Average revenue'
+    expect(previewPlanIdentity(metricRename, 'metric')).not.toBe(previewPlanIdentity(metricDoc, 'metric'))
   })
 
   it('keeps an in-flight profile attached across an unrelated branch edit', async () => {

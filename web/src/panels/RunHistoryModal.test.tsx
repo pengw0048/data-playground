@@ -298,6 +298,50 @@ describe('durable full results', () => {
     expect(screen.queryByText('purchase')).not.toBeInTheDocument()
   })
 
+  it('keeps sample-profile responses bound to the latest execution plan', async () => {
+    let finishOld!: (value: any) => void
+    let finishCurrent!: (value: any) => void
+    apiMock.profile
+      .mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishCurrent = resolve }))
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'filter', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: { predicate: 'event = purchase' }, history: [] },
+    }] }
+    useStore.setState({
+      doc, canvasRole: 'owner', profileJobs: {},
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    await waitFor(() => expect(apiMock.profile).toHaveBeenCalledTimes(1))
+
+    const edited = structuredClone(doc)
+    edited.nodes[0].data.config.predicate = 'event = view'
+    act(() => useStore.setState({
+      doc: edited,
+      previews: { target: boundPreview(edited, 'target', sample(0, 10, false)) },
+    } as any))
+    await waitFor(() => expect(apiMock.profile).toHaveBeenCalledTimes(2))
+
+    await act(async () => finishCurrent({ columns: [], rowCount: 20, sampled: true }))
+    expect(await screen.findByText('stats over the previewed sample · 20 rows')).toBeInTheDocument()
+
+    await act(async () => finishOld({ columns: [], rowCount: 10, sampled: true }))
+    expect(screen.getByText('stats over the previewed sample · 20 rows')).toBeInTheDocument()
+    expect(screen.queryByText('stats over the previewed sample · 10 rows')).not.toBeInTheDocument()
+
+    const moved = structuredClone(edited)
+    moved.nodes[0].position = { x: 500, y: 300 }
+    moved.nodes[0].data.status = 'running'
+    act(() => useStore.setState({ doc: moved }))
+    await Promise.resolve()
+    expect(apiMock.profile).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('stats over the previewed sample · 20 rows')).toBeInTheDocument()
+  })
+
   it('shows profile preflight before an explicit confirmed start', async () => {
     apiMock.profileEstimate.mockResolvedValueOnce({
       rows: 10, bytes: 5 * 1024 ** 3, placement: 'local', needsConfirm: true,

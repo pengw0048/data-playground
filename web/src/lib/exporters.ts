@@ -1,6 +1,9 @@
 // Real exports — download the node's data or the whole canvas. No stubs.
 import { api } from '../api/client'
-import { useStore } from '../store/graph'
+import { previewIsCurrent, previewPlanIdentity, useStore } from '../store/graph'
+
+const exportRequestGeneration = new Map<string, number>()
+let nextExportRequestGeneration = 0
 
 function download(filename: string, text: string, mime = 'application/json') {
   const blob = new Blob([text], { type: mime })
@@ -24,17 +27,47 @@ function toCsv(columns: string[], rows: Record<string, unknown>[]): string {
 
 // Export a node's current output (runs a preview to fetch rows) as JSON + CSV.
 export async function exportNode(id: string) {
-  const { doc } = useStore.getState()
+  const initial = useStore.getState()
+  const { doc } = initial
   const node = doc.nodes.find((n) => n.id === id)
   if (!node) return
   const name = (node.data.title || node.type).replace(/[^a-z0-9_-]+/gi, '_')
-  let res = useStore.getState().previews[id]?.result
+  const requestKey = `${doc.id}\u0000${id}`
+  const generation = ++nextExportRequestGeneration
+  exportRequestGeneration.set(requestKey, generation)
+  const planIdentity = previewPlanIdentity(doc, id)
+  const cached = initial.previews[id]
+  let res = cached && previewIsCurrent(cached, doc, id) ? cached.result : undefined
   if (!res) {
     try {
       res = await api.preview(doc, id, 500)
-    } catch {
+    } catch (error) {
+      if (exportRequestGeneration.get(requestKey) === generation) {
+        exportRequestGeneration.delete(requestKey)
+        const current = useStore.getState()
+        if (!current.doc.nodes.some((candidate) => candidate.id === id)
+            || previewPlanIdentity(current.doc, id) !== planIdentity) {
+          current.pushToast('Export cancelled — the graph changed while the sample was loading. Try again.', 'info')
+        } else {
+          current.pushToast(
+            `Export failed${error instanceof Error && error.message ? `: ${error.message}` : ''}`,
+            'error',
+          )
+        }
+      }
       return
     }
+  }
+  // A direct export refresh deliberately stays outside the panel's 50-row pagination state. Fence it
+  // to both the latest export intent for this node and the exact graph snapshot sent to the kernel.
+  // A response for an edited graph is never downloaded as if it belonged to the current document.
+  const current = useStore.getState()
+  if (exportRequestGeneration.get(requestKey) !== generation) return
+  exportRequestGeneration.delete(requestKey)
+  if (!current.doc.nodes.some((candidate) => candidate.id === id)
+      || previewPlanIdentity(current.doc, id) !== planIdentity) {
+    current.pushToast('Export cancelled — the graph changed while the sample was loading. Try again.', 'info')
+    return
   }
   if (!res || res.notPreviewable) {
     download(`${name}.json`, JSON.stringify({ note: 'not sample-previewable — run a full pass', node: node.data }, null, 2))

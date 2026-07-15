@@ -1,5 +1,5 @@
-import { useEffect, useState, type ReactNode } from 'react'
-import { previewIsCurrent, profileJobIsCurrent, roleCanEdit, useStore } from '../store/graph'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { previewIsCurrent, previewPlanIdentity, profileJobIsCurrent, roleCanEdit, useStore } from '../store/graph'
 import { capabilitiesFor } from '../nodes/registry'
 import { api } from '../api/client'
 import { Icon } from '../ui/Icon'
@@ -211,15 +211,36 @@ function StatsView({ nodeId }: { nodeId: string }) {
   const startFullProfile = useStore((s) => s.startFullProfile)
   const cancelFullProfile = useStore((s) => s.cancelFullProfile)
   const [full, setFull] = useState(false)
-  const [st, setSt] = useState<{ loading: boolean; res?: ProfileResult; err?: string }>({ loading: true })
+  const planIdentity = previewPlanIdentity(doc, nodeId)
+  const sampleRequestGeneration = useRef(0)
+  const [sampleState, setSampleState] = useState<{
+    planIdentity: string; loading: boolean; res?: ProfileResult; err?: string
+  }>({ planIdentity, loading: true })
   const loadSample = () => {
-    setSt({ loading: true })
-    api.profile(doc, nodeId)
-      .then((res) => setSt({ loading: false, res }))
-      .catch((e) => setSt({ loading: false, err: e?.message ?? String(e) }))
+    const requestDoc = doc
+    const requestIdentity = previewPlanIdentity(requestDoc, nodeId)
+    const requestGeneration = ++sampleRequestGeneration.current
+    setSampleState({ planIdentity: requestIdentity, loading: true })
+    api.profile(requestDoc, nodeId)
+      .then((res) => {
+        if (sampleRequestGeneration.current !== requestGeneration
+            || previewPlanIdentity(useStore.getState().doc, nodeId) !== requestIdentity) return
+        setSampleState({ planIdentity: requestIdentity, loading: false, res })
+      })
+      .catch((e) => {
+        if (sampleRequestGeneration.current !== requestGeneration
+            || previewPlanIdentity(useStore.getState().doc, nodeId) !== requestIdentity) return
+        setSampleState({ planIdentity: requestIdentity, loading: false, err: e?.message ?? String(e) })
+      })
   }
-  useEffect(() => { if (!full) loadSample() }, [nodeId, full])  // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!full) loadSample()
+    return () => { sampleRequestGeneration.current += 1 }
+  }, [nodeId, full, planIdentity])  // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => setFull(false), [nodeId])
+  // Never paint a sample-profile response bound to another node or execution plan, even for the render
+  // before the effect above starts its replacement request.
+  const st = sampleState.planIdentity === planIdentity ? sampleState : { planIdentity, loading: true }
   const job = currentUserId && profileJob?.principalId === currentUserId
       && profileJobIsCurrent(profileJob, doc, nodeId)
     ? profileJob

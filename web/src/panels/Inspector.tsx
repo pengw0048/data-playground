@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { useStore, nodeRunnable, roleCanEdit } from '../store/graph'
+import { useEffect, useRef, useState } from 'react'
+import { previewPlanIdentity, useStore, nodeRunnable, roleCanEdit } from '../store/graph'
 import { getSpec } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
 import { useSchemaWarnings } from '../nodes/fields'
@@ -545,6 +545,8 @@ function SchemaContract({ nodeId, runnable }: { nodeId: string; runnable: boolea
     && cfg.outputSchemaCodeHash !== codeHash(code)
   const [names, setNames] = useState<string[]>([])       // named contracts available to reference
   const [refCols, setRefCols] = useState<ColumnSchema[]>([])
+  const inferRequestGeneration = useRef(0)
+  useEffect(() => () => { inferRequestGeneration.current += 1 }, [])
   useEffect(() => { api.listSchemas().then((s) => setNames(s.map((x) => x.name))).catch(() => {}) }, [])
   useEffect(() => {
     if (!refName) { setRefCols([]); return }
@@ -570,14 +572,26 @@ function SchemaContract({ nodeId, runnable }: { nodeId: string; runnable: boolea
 
   const infer = async () => {
     setBusy(true); setErr(null)
+    const doc = useStore.getState().doc
+    const planIdentity = previewPlanIdentity(doc, nodeId)
+    const requestGeneration = ++inferRequestGeneration.current
     try {
-      const res = await api.preview(useStore.getState().doc, nodeId, 50, 0)
-      if (res.error || res.notPreviewable) setErr(res.reason || 'could not infer — run needs a full pass')
+      const res = await api.preview(doc, nodeId, 50, 0)
+      if (inferRequestGeneration.current !== requestGeneration
+          || previewPlanIdentity(useStore.getState().doc, nodeId) !== planIdentity) {
+        setErr('The graph changed while the sample was loading. Infer again for the current graph.')
+      } else if (res.error || res.notPreviewable) setErr(res.reason || 'could not infer — run needs a full pass')
       else if (res.columns?.length) commit(res.columns as ColumnSchema[], 'inferred')
       else setErr('no columns produced on the sample')
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'infer failed')
-    } finally { setBusy(false) }
+      if (inferRequestGeneration.current === requestGeneration) {
+        setErr(previewPlanIdentity(useStore.getState().doc, nodeId) === planIdentity
+          ? e instanceof Error ? e.message : 'infer failed'
+          : 'The graph changed while the sample was loading. Infer again for the current graph.')
+      }
+    } finally {
+      if (inferRequestGeneration.current === requestGeneration) setBusy(false)
+    }
   }
 
   return (
