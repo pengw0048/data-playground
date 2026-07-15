@@ -374,7 +374,7 @@ class Deps:
         self.runner.result_get = _result_get  # DB-backed content-addressed result reuse (cross-run/restart)
         self.runner.result_acquire = _result_acquire
         self.runner.result_put = _result_put
-        # Exact full-data profiles are inspection jobs, not materialized graph runs, but they share
+        # Whole-dataset profiles are inspection jobs, not materialized graph runs, but they share
         # the same durable RunState status/cancel/recovery contract.
         from hub.profile_jobs import ProfileJobRunner
         self.profile_runner = ProfileJobRunner(

@@ -58,7 +58,8 @@ let _extEditTimer: ReturnType<typeof setTimeout> | null = null // debounces exte
 let _fileNavigationGeneration = 0 // latest file-open/new navigation wins across async requests
 let _fileListGeneration = 0       // stale same-user list responses cannot overwrite a newer refresh
 let _previewRequestGeneration = 0 // every preview captures its own generation; latest request for a node wins
-let _profileRequestGeneration = 0 // exact-profile jobs use the same latest-wins rule as previews
+let _profileRequestGeneration = 0 // whole-dataset profile jobs use the same latest-wins rule as previews
+let _reattachRunsGeneration = 0   // same-canvas reloads also need latest-navigation-wins recovery
 
 /** A canvas position near `base` that doesn't overlap any existing node (so added nodes never stack). */
 export function freePosition(nodes: CanvasNode[], base: { x: number; y: number }): { x: number; y: number } {
@@ -183,6 +184,13 @@ export function previewPlanIdentity(doc: CanvasDoc, nodeId: string): string {
   })
 }
 
+export async function profilePlanDigest(planIdentity: string): Promise<string> {
+  const subtle = globalThis.crypto?.subtle
+  if (!subtle) throw new Error('Secure digest support is unavailable in this browser')
+  const digest = await subtle.digest('SHA-256', new TextEncoder().encode(planIdentity))
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
 export function previewIsCurrent(preview: PreviewState, doc: CanvasDoc, nodeId: string): boolean {
   return preview.canvasId === doc.id
     && preview.nodeId === nodeId
@@ -205,9 +213,12 @@ interface RunState {
 export interface ProfileJobState {
   canvasId: string
   nodeId: string
+  // Raw identity remains local for synchronous stale-result checks. Only its fixed SHA-256 crosses
+  // the API boundary or enters durable status.
   planIdentity: string
+  planDigest?: string
   requestGeneration: number
-  phase: 'idle' | 'estimating' | 'queued' | 'running' | 'cancelling' | 'done' | 'failed' | 'cancelled'
+  phase: 'idle' | 'estimating' | 'preflight' | 'queued' | 'running' | 'cancelling' | 'done' | 'failed' | 'cancelled'
   estimate?: RunEstimate
   status?: RunStatus
   error?: string
@@ -218,6 +229,13 @@ export function profileJobIsCurrent(job: ProfileJobState, doc: CanvasDoc, nodeId
     && job.nodeId === nodeId
     && doc.nodes.some((node) => node.id === nodeId)
     && job.planIdentity === previewPlanIdentity(doc, nodeId)
+}
+
+function profilePhase(status: RunStatus): ProfileJobState['phase'] {
+  return status.status === 'done' ? 'done'
+    : status.status === 'failed' ? 'failed'
+      : status.status === 'cancelled' ? 'cancelled'
+        : status.status === 'queued' ? 'queued' : 'running'
 }
 
 export interface AgentMsg { role: 'user' | 'agent'; text: string; plan?: string[] }
@@ -287,6 +305,7 @@ interface Store {
   rerunAll: () => void
   cancelRun: (id: string) => Promise<void>
   clearRun: (id: string) => void
+  prepareFullProfile: (id: string) => Promise<void>
   startFullProfile: (id: string) => Promise<void>
   cancelFullProfile: (id: string) => Promise<void>
   promote: (id: string) => Promise<void>
@@ -892,9 +911,9 @@ export const useStore = create<Store>((set, get) => ({
       return { runs: next }
     }),
 
-  // Exact full-dataset statistics are background jobs. Capture the graph identity before estimating
-  // or submitting, cancel a superseded job, and only install status for the latest matching request.
-  startFullProfile: async (id) => {
+  // A whole-dataset profile is always a two-step interaction: preflight first, then an explicit Start.
+  // Capture graph identity around both calls and cancel any superseded scan without ever auto-submitting.
+  prepareFullProfile: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
     const doc = get().doc
     if (!doc.nodes.some((node) => node.id === id)) return
@@ -913,8 +932,11 @@ export const useStore = create<Store>((set, get) => ({
       [id]: { canvasId: doc.id, nodeId: id, planIdentity, requestGeneration, phase: 'estimating' },
     } }))
     let estimate: RunEstimate
+    let planDigest: string
     try {
-      estimate = await api.estimate(doc, id)
+      [estimate, planDigest] = await Promise.all([
+        api.profileEstimate(doc, id), profilePlanDigest(planIdentity),
+      ])
     } catch (e) {
       if (!isCurrent()) return
       set((s) => ({ profileJobs: { ...s.profileJobs, [id]: {
@@ -923,17 +945,40 @@ export const useStore = create<Store>((set, get) => ({
       return
     }
     if (!isCurrent()) return
-    set((s) => ({ profileJobs: { ...s.profileJobs, [id]: { ...(s.profileJobs[id]!), estimate, phase: 'queued' } } }))
+    set((s) => ({ profileJobs: { ...s.profileJobs, [id]: {
+      ...(s.profileJobs[id]!), estimate, planDigest, phase: 'preflight', error: undefined,
+    } } }))
+  },
+
+  startFullProfile: async (id) => {
+    if (!roleCanEdit(get().canvasRole)) return
+    const job = get().profileJobs[id]
+    const doc = get().doc
+    if (!job?.estimate || !job.planDigest || job.phase !== 'preflight'
+        || !profileJobIsCurrent(job, doc, id)) return
+    const { planDigest, requestGeneration } = job
+    const isCurrent = () => {
+      const current = get().profileJobs[id]
+      return current?.requestGeneration === requestGeneration
+        && profileJobIsCurrent(current, get().doc, id)
+    }
+    set((s) => ({ profileJobs: { ...s.profileJobs, [id]: {
+      ...(s.profileJobs[id]!), phase: 'queued', error: undefined,
+    } } }))
     try {
-      const status = await api.fullProfile(doc, id, planIdentity)
+      // This click is the explicit confirmation. The server recomputes admission from the submitted
+      // graph and still rejects a large/unknown direct API call that omits ``confirmed``.
+      const status = await api.fullProfile(doc, id, planDigest, true)
       if (!isCurrent()) {
         void api.cancelRun(status.runId).catch(() => {})
         return
       }
       set((s) => ({ profileJobs: { ...s.profileJobs, [id]: {
-        ...(s.profileJobs[id]!), status, phase: status.status === 'queued' ? 'queued' : 'running',
+        ...(s.profileJobs[id]!), status, phase: profilePhase(status),
       } } }))
-      pollProfile(get, set, id, status.runId, requestGeneration)
+      if (status.status === 'queued' || status.status === 'running') {
+        pollProfile(get, set, id, status.runId, requestGeneration)
+      }
     } catch (e) {
       if (!isCurrent()) return
       set((s) => ({ profileJobs: { ...s.profileJobs, [id]: {
@@ -1561,47 +1606,107 @@ function applyPerNodeStatus(
   })
 }
 
-// On canvas open, re-subscribe to any run still in flight (queued/running) — one that survived a hub
-// restart on its per-canvas kernel. Without this, a reopened tab shows nothing though the run is live.
+// On canvas open, recover normal active runs plus the latest durable profile per node/plan. Profiles
+// include terminal results because one may finish while the canvas is closed; current-plan identity is
+// checked again client-side before any result can enter the view.
 function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void, canvasId: string) {
-  api.activeRuns(canvasId).then((runs) => {
-    for (const st of runs) {
-      const nodeId = st.targetNodeId
-      if (!nodeId || !get().doc.nodes.some((n) => n.id === nodeId)) continue
+  const reattachGeneration = ++_reattachRunsGeneration
+  const current = () => (
+    _reattachRunsGeneration === reattachGeneration && get().doc.id === canvasId
+  )
+  let projectionSucceeded = false
+  const provisionalRequests = new Map<string, number>()
+  const currentPlanByNode = new Map<string, Promise<{ identity: string; digest: string }>>()
+
+  const currentPlan = (nodeId: string) => {
+    let pending = currentPlanByNode.get(nodeId)
+    if (!pending) {
+      const identity = previewPlanIdentity(get().doc, nodeId)
+      pending = profilePlanDigest(identity).then((digest) => ({ identity, digest }))
+      currentPlanByNode.set(nodeId, pending)
+    }
+    return pending
+  }
+
+  const installProfile = async (st: RunStatus, authoritative: boolean) => {
+    const nodeId = st.targetNodeId
+    const doc = get().doc
+    if (!current() || (!authoritative && projectionSucceeded) || !nodeId
+        || !doc.nodes.some((node) => node.id === nodeId)) return
+    const { identity: planIdentity, digest: planDigest } = await currentPlan(nodeId)
+    if (!current() || (!authoritative && projectionSucceeded)
+        || planIdentity !== previewPlanIdentity(get().doc, nodeId)
+        || !st.planDigest || st.planDigest !== planDigest) return
+    const requestGeneration = ++_profileRequestGeneration
+    const phase = profilePhase(st)
+    set((s: Store) => {
+      if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId) return {}
+      return { profileJobs: { ...s.profileJobs, [nodeId]: {
+        canvasId, nodeId, planIdentity, planDigest, requestGeneration,
+        status: st, phase, error: st.error ?? undefined,
+      } } }
+    })
+    if (!authoritative) provisionalRequests.set(nodeId, requestGeneration)
+    if (current() && (st.status === 'queued' || st.status === 'running')) {
+      pollProfile(get, set, nodeId, st.runId, requestGeneration)
+    }
+  }
+
+  // These requests intentionally settle independently: a hung recovery surface must not block the other.
+  void api.activeRuns(canvasId).then((statuses) => {
+    if (!current()) return
+    for (const st of statuses) {
       if (st.jobType === 'profile') {
-        // The persisted identity is the guard against showing an exact profile for a graph revision
-        // that changed while the panel was closed or the client was reconnecting.
-        if (!st.planIdentity || st.planIdentity !== previewPlanIdentity(get().doc, nodeId)) continue
-        const requestGeneration = ++_profileRequestGeneration
-        set((s: Store) => ({ profileJobs: { ...s.profileJobs, [nodeId]: {
-          canvasId, nodeId, planIdentity: st.planIdentity!, requestGeneration,
-          status: st, phase: st.status === 'queued' ? 'queued' : 'running',
-        } } }))
-        pollProfile(get, set, nodeId, st.runId, requestGeneration)
+        void installProfile(st, false).catch(() => {})
         continue
       }
-      set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { phase: 'running' as const, status: st } } }))
-      pollRun(get, set, nodeId, st.runId)
+      const nodeId = st.targetNodeId
+      if (!current() || !nodeId || !get().doc.nodes.some((node) => node.id === nodeId)) continue
+      set((s: Store) => {
+        if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId) return {}
+        return { runs: { ...s.runs, [nodeId]: { phase: 'running' as const, status: st } } }
+      })
+      if (current()) pollRun(get, set, nodeId, st.runId, reattachGeneration)
     }
-  }).catch(() => { /* offline / no such canvas — nothing to reattach */ })
+  }).catch(() => { /* profile projection may still recover; leave current state untouched */ })
+
+  void api.profileJobs(canvasId).then((statuses) => {
+    if (!current()) return
+    projectionSucceeded = true
+    if (provisionalRequests.size) {
+      set((s: Store) => {
+        if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId) return {}
+        const next = { ...s.profileJobs }
+        for (const [nodeId, requestGeneration] of provisionalRequests) {
+          if (next[nodeId]?.requestGeneration === requestGeneration) delete next[nodeId]
+        }
+        return { profileJobs: next }
+      })
+      provisionalRequests.clear()
+    }
+    for (const st of statuses) void installProfile(st, true).catch(() => {})
+  }).catch(() => { /* active profiles remain the provisional in-flight fallback */ })
 }
 
-const _profilePolling = new Set<string>()
+const _profilePolling = new Map<string, symbol>()
 
 function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
                      nodeId: string, runId: string, requestGeneration: number) {
-  if (_profilePolling.has(runId)) return
-  _profilePolling.add(runId)
+  const token = Symbol(runId)
+  _profilePolling.set(runId, token)
+  const ownsPoll = () => _profilePolling.get(runId) === token
+  const stopPolling = () => { if (ownsPoll()) _profilePolling.delete(runId) }
   let failures = 0
   const tick = async () => {
+    if (!ownsPoll()) return
     const job = get().profileJobs[nodeId]
     if (!job || job.requestGeneration !== requestGeneration || job.status?.runId !== runId) {
-      _profilePolling.delete(runId)
+      stopPolling()
       return
     }
     if (!profileJobIsCurrent(job, get().doc, nodeId)) {
       if (job.status.status === 'queued' || job.status.status === 'running') void api.cancelRun(runId).catch(() => {})
-      _profilePolling.delete(runId)
+      stopPolling()
       return
     }
     let status: RunStatus
@@ -1609,6 +1714,7 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
       status = await api.runStatus(runId)
       failures = 0
     } catch (e) {
+      if (!ownsPoll()) return
       if (++failures <= 6) { setTimeout(tick, 800); return }
       const current = get().profileJobs[nodeId]
       if (current?.requestGeneration === requestGeneration && current.status?.runId === runId) {
@@ -1616,25 +1722,23 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
           ...(s.profileJobs[nodeId]!), phase: 'failed', error: (e as Error).message || 'Lost track of full profile',
         } } }))
       }
-      _profilePolling.delete(runId)
+      stopPolling()
       return
     }
+    if (!ownsPoll()) return
     const current = get().profileJobs[nodeId]
     if (!current || current.requestGeneration !== requestGeneration || current.status?.runId !== runId
         || !profileJobIsCurrent(current, get().doc, nodeId)) {
       if (status.status === 'queued' || status.status === 'running') void api.cancelRun(runId).catch(() => {})
-      _profilePolling.delete(runId)
+      stopPolling()
       return
     }
-    const phase = status.status === 'done' ? 'done'
-      : status.status === 'failed' ? 'failed'
-        : status.status === 'cancelled' ? 'cancelled'
-          : status.status === 'queued' ? 'queued' : 'running'
+    const phase = profilePhase(status)
     set((s) => ({ profileJobs: { ...s.profileJobs, [nodeId]: {
       ...(s.profileJobs[nodeId]!), status, phase, error: status.error ?? undefined,
     } } }))
     if (status.status === 'done' || status.status === 'failed' || status.status === 'cancelled') {
-      _profilePolling.delete(runId)
+      stopPolling()
       return
     }
     setTimeout(tick, 300)
@@ -1642,20 +1746,35 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
   void tick()
 }
 
-const _polling = new Set<string>()  // run ids with a live poll loop — dedup so reattach can't double-poll one
+const _polling = new Map<string, { token: symbol; reattachGeneration?: number }>()
 
-function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void, nodeId: string, runId: string) {
-  if (_polling.has(runId)) return  // already polling this run (e.g. reattach after re-open) — one loop only
-  _polling.add(runId)
+function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
+                 nodeId: string, runId: string, reattachGeneration?: number) {
+  const existing = _polling.get(runId)
+  if (existing && (reattachGeneration === undefined
+      || existing.reattachGeneration === reattachGeneration)) return
+  const token = Symbol(runId)
+  _polling.set(runId, { token, reattachGeneration })
+  const ownsPoll = () => _polling.get(runId)?.token === token
+  const stopPolling = () => { if (ownsPoll()) _polling.delete(runId) }
   let fails = 0
   const tick = async () => {
+    if (!ownsPoll()) return
+    if (reattachGeneration !== undefined && _reattachRunsGeneration !== reattachGeneration) {
+      stopPolling()
+      return
+    }
     // stop polling if the node was deleted mid-run (don't re-insert a runs entry for it)
-    if (!get().doc.nodes.some((n) => n.id === nodeId)) { _polling.delete(runId); return }
+    if (!get().doc.nodes.some((n) => n.id === nodeId)) { stopPolling(); return }
     let status: RunStatus
     try {
       status = await api.runStatus(runId)
       fails = 0
     } catch {
+      if (reattachGeneration !== undefined && _reattachRunsGeneration !== reattachGeneration) {
+        stopPolling()
+        return
+      }
       // a transient blip (network hiccup / brief kernel restart) must not strand the node spinning
       // forever — retry a few times with backoff, then give up and surface it instead of hanging.
       if (++fails <= 6) { setTimeout(tick, 800); return }
@@ -1663,7 +1782,12 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       get().updateData(nodeId, { status: 'stale' })
       settleAnimatingNodes(set)  // no final status will arrive — clear every still-animating node, not just the target
       get().pushToast('Lost track of the run — the kernel became unreachable', 'error')
-      _polling.delete(runId)
+      stopPolling()
+      return
+    }
+    if (!ownsPoll()) return
+    if (reattachGeneration !== undefined && _reattachRunsGeneration !== reattachGeneration) {
+      stopPolling()
       return
     }
     set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase: 'running' as const }), status } } }))
@@ -1694,7 +1818,7 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
         }
         void g.refreshCatalog()
       }
-      _polling.delete(runId)
+      stopPolling()
       return
     }
     setTimeout(tick, 300)

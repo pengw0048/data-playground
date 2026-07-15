@@ -10,6 +10,10 @@ import { previewPlanIdentity, useStore } from '../store/graph'
 const apiMock = vi.hoisted(() => ({
   listRuns: vi.fn(),
   sample: vi.fn(),
+  profile: vi.fn(),
+  profileEstimate: vi.fn(),
+  fullProfile: vi.fn(),
+  cancelRun: vi.fn(),
 }))
 
 vi.mock('../api/client', () => ({ api: apiMock }))
@@ -17,6 +21,16 @@ vi.mock('../api/client', () => ({ api: apiMock }))
 beforeEach(() => {
   apiMock.listRuns.mockReset()
   apiMock.sample.mockReset()
+  apiMock.profile.mockReset().mockResolvedValue({ columns: [], rowCount: 10, sampled: true })
+  apiMock.profileEstimate.mockReset().mockResolvedValue({
+    rows: null, bytes: null, placement: 'local', needsConfirm: true,
+  })
+  apiMock.fullProfile.mockReset().mockResolvedValue({
+    runId: 'profile-ui', status: 'done', jobType: 'profile', targetNodeId: 'target',
+    rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    profile: { columns: [], rowCount: 10, sampled: false },
+  })
+  apiMock.cancelRun.mockReset().mockResolvedValue({})
   useStore.setState({
     doc: { id: 'history-canvas', name: 'History', version: 1, nodes: [], edges: [], requirements: [] },
     previews: {}, runs: {},
@@ -181,6 +195,37 @@ describe('durable full results', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Preview out of date')
     expect(screen.getByRole('button', { name: 'Refresh preview' })).toBeInTheDocument()
     expect(screen.queryByText('purchase')).not.toBeInTheDocument()
+  })
+
+  it('shows profile preflight before an explicit confirmed start', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      canvasRole: 'owner',
+      profileJobs: {},
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    await user.click(screen.getByRole('button', { name: 'full dataset' }))
+    expect(screen.getByText('Whole-dataset profile')).toBeInTheDocument()
+    expect(apiMock.profileEstimate).not.toHaveBeenCalled()
+    expect(apiMock.fullProfile).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('button', { name: 'Estimate full profile' }))
+    expect(await screen.findByText('Profile preflight')).toBeInTheDocument()
+    expect(screen.getByText(/distinct counts are approximate/i)).toBeInTheDocument()
+    expect(apiMock.fullProfile).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('button', { name: 'Start whole-dataset profile' }))
+    await waitFor(() => expect(apiMock.fullProfile).toHaveBeenCalledWith(
+      doc, 'target', expect.any(String), true,
+    ))
   })
 })
 

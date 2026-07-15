@@ -16,6 +16,10 @@ from pydantic.alias_generators import to_camel
 WireType = Literal["dataset", "selection", "sample", "sql-view", "metric", "value"]
 NodeStatus = Literal["draft", "latest", "stale", "queued", "running", "failed"]
 Placement = Literal["local", "distributed"]
+PlanDigest = Annotated[
+    str,
+    Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"),
+]
 ProcessorMode = Literal[
     "map",
     "map_batches",
@@ -363,7 +367,7 @@ class RunBackendRef(Wire):
 class RunStatus(Wire):
     run_id: str
     status: Literal["queued", "running", "done", "failed", "cancelled"]
-    # ``run`` materializes a graph result; ``profile`` is an exact full-dataset inspection job.
+    # ``run`` materializes a graph result; ``profile`` is a whole-dataset inspection job.
     # Both share one durable status/cancel/recovery lifecycle, but consumers must not mistake a
     # profile completion for a newly materialized node result.
     job_type: Literal["run", "profile"] = "run"
@@ -378,10 +382,10 @@ class RunStatus(Wire):
     error: str | None = None
     output_uri: str | None = None
     output_table: str | None = None
-    # A profile result is present only on a successful full-profile job. The client also echoes the
-    # graph-affecting identity it submitted, so it can refuse results after a graph revision changed.
+    # A profile result is present only on a successful full-profile job. ``plan_digest`` is the fixed-size
+    # SHA-256 of the client's graph-affecting identity, so durable status never duplicates the raw graph.
     profile: ProfileResult | None = None
-    plan_identity: str | None = None
+    plan_digest: PlanDigest | None = None
     # HTTP/WebSocket request id that started this run (OPS-01). Optional so legacy/plugin backends
     # that omit it still deserialize; durable copy also lives on run_states / run_records.
     request_id: str | None = None
@@ -553,15 +557,23 @@ class PreviewRequest(Wire):
     full: bool = False    # profile only: stats over the WHOLE dataset (a full pass), not the sample
 
 
-class ProfileJobRequest(Wire):
-    """Submit an exact full-dataset profile through the durable job lifecycle.
+class ProfileEstimateRequest(Wire):
+    """Estimate a whole-dataset profile before the user chooses whether to submit it."""
+    graph: Graph
+    node_id: str
 
-    ``plan_identity`` is an opaque client-side graph identity. It is persisted with the job and only
-    used to ensure a late result cannot be presented for a newer canvas revision.
+
+class ProfileJobRequest(Wire):
+    """Submit a whole-dataset profile through the durable job lifecycle.
+
+    ``plan_digest`` is the lowercase SHA-256 of the client-side graph identity. The fixed wire value is
+    persisted with the job so a late result cannot be presented for a newer canvas revision without
+    amplifying the full graph identity across durable status rows.
     """
     graph: Graph
     node_id: str
-    plan_identity: str
+    plan_digest: PlanDigest
+    confirmed: bool = False
 
 
 class EstimateRequest(Wire):

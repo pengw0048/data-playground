@@ -175,6 +175,24 @@ class KernelBackend:
         return _post(endpoint, "/profile", token,
                      {"graph": graph.model_dump(), "node_id": node_id, "full": full})
 
+    def profile_job(self, graph: Graph, node_id: str, plan_digest: str,
+                    run_id: str | None = None, request_id: str | None = None) -> RunStatus:
+        """Queue a whole-dataset profile on the canvas's durable execution owner.
+
+        The kernel stamps its fenced ``kernel_id`` onto the shared RunState. Any stateless hub can
+        therefore route cancellation back to the exact process and DuckDB scope that owns the scan.
+        """
+        canvas_id = getattr(graph, "id", None) or "canvas"
+        run_id = run_id or f"profile_{os.urandom(5).hex()}"
+        endpoint, token = self._ensure_kernel(canvas_id)
+        return RunStatus(**_post(endpoint, "/profile-job", token, {
+            "run_id": run_id,
+            "graph": graph.model_dump(),
+            "node_id": node_id,
+            "plan_digest": plan_digest,
+            "request_id": request_id,
+        }))
+
     def status(self, run_id: str) -> RunStatus:
         d = metadb.get_run_state(run_id)  # the kernel is the writer; the DB is the source of truth
         if d is None:

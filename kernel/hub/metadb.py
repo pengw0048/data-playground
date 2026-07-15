@@ -134,10 +134,48 @@ class RunState(Base):
     auth_canvas_id: Mapped[str | None] = mapped_column(String, nullable=True)  # the real canvas it was authorized against (None = ad-hoc)
     # HTTP/WebSocket request id that started the run (OPS-01). Mirrored from RunStatus.request_id.
     request_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # Fixed-size profile identity fields. Reopen reads the independent ProfileJobLatest projection below;
+    # RunState remains globally bounded detail and must never be used to reconstruct latest-wins state.
+    job_type: Mapped[str] = mapped_column(String, default="run", server_default="run")
+    target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=True)
     preallocation_token: Mapped[str | None] = mapped_column(String, nullable=True)
     preallocation_expires_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class ProfileJobLatest(Base):
+    """Canvas-scoped latest retry for one node/plan, independent of global RunState retention.
+
+    The projection owns a copy of the latest status document so pruning detailed RunState rows can never
+    resurrect an older retry or erase reopen recovery. One bounded row exists per retained plan identity.
+    """
+    __tablename__ = "profile_job_latest"
+    canvas_id: Mapped[str] = mapped_column(String, primary_key=True)
+    target_node_id: Mapped[str] = mapped_column(String, primary_key=True)
+    plan_digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String)
+    doc: Mapped[str] = mapped_column(Text)
+    submitted_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now)
+    __table_args__ = (Index(
+        "ix_profile_job_latest_canvas_submitted", "canvas_id", "submitted_at",
+    ),)
+
+
+class ProfileJobRetention(Base):
+    """Per-canvas cutoff for profile identities evicted from the bounded latest projection."""
+    __tablename__ = "profile_job_retention"
+    canvas_id: Mapped[str] = mapped_column(String, primary_key=True)
+    cutoff_submitted_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    cutoff_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now)
 
 
 class RunBackendJob(Base):
@@ -1591,13 +1629,17 @@ def delete_canvas_cascade(canvas_id: str) -> None:
                         RunBackendJob.run_id.is_not(None),
                         RunState.status.in_(("queued", "running")),
                     ),
+                    and_(
+                        RunState.job_type == "profile",
+                        RunState.status.in_(("queued", "running")),
+                    ),
                 ),
             )
             .order_by(RunState.run_id).limit(1)
         )
         if active:
             raise ActiveBackendJobsError(
-                f"canvas '{canvas_id}' has active external run '{active}'; "
+                f"canvas '{canvas_id}' has active run '{active}'; "
                 "cancel it and wait for terminal status"
             )
         shares = list(s.scalars(select(CanvasShare).where(
@@ -1616,6 +1658,12 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             (RunTerminalFence.canvas_id == canvas_id)
             | (RunTerminalFence.auth_canvas_id == canvas_id)
         ).order_by(RunTerminalFence.run_id).with_for_update()))
+        profile_retention = s.get(ProfileJobRetention, canvas_id, with_for_update=True)
+        profile_latest = list(s.scalars(select(ProfileJobLatest).where(
+            ProfileJobLatest.canvas_id == canvas_id
+        ).order_by(
+            ProfileJobLatest.target_node_id, ProfileJobLatest.plan_digest,
+        ).with_for_update()))
         local_owners: list[tuple[str, str]] = [("canvas", canvas_id)]
         for sh in shares:
             s.delete(sh)
@@ -1626,6 +1674,10 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         for v in versions:
             local_owners.append(("canvas_version", v.id))
             s.delete(v)
+        for latest in profile_latest:
+            s.delete(latest)
+        if profile_retention is not None:
+            s.delete(profile_retention)
         # also drop this canvas's run_states — else auth_canvas_id/canvas_id dangle into a reusable id
         # namespace and a later canvas re-created under the same id could re-grant its old runs (P0-AUTH-02)
         for rs in run_states:
@@ -1689,6 +1741,7 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
 
 _RUN_STATE_MAX = 2000  # cap on TERMINAL run_states — live (queued/running) rows are never pruned
 _TERMINAL_RUN = ("done", "failed", "cancelled")
+_PROFILE_LATEST_MAX = 100  # per canvas; each row retains one latest status document for reopen
 
 
 class RunStatePublicationRejected(RuntimeError):
@@ -1737,6 +1790,96 @@ def _record_terminal_fence(s, run_id: str, status: str) -> None:
         s.flush()
 
 
+def _valid_plan_digest(value: object) -> bool:
+    return (
+        isinstance(value, str) and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _upsert_profile_latest(
+        s, *, canvas_id: str, target_node_id: str, plan_digest: str,
+        run_id: str, payload: str, submitted_at: datetime.datetime) -> None:
+    """Atomically advance one canvas/node/plan pointer and retain its latest status document.
+
+    A status update for the current run refreshes the document. A newer submission replaces the pointer;
+    a late update from an older run is ignored. The projection is pruned independently per canvas and is
+    deliberately unaffected by global RunState detail retention.
+    """
+    def order(ts: datetime.datetime, rid: str) -> tuple[datetime.datetime, str]:
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return ts, str(rid)
+
+    canvas_id, target_node_id = str(canvas_id), str(target_node_id)
+    plan_digest, run_id = str(plan_digest), str(run_id)
+    now = _now()
+    dialect = s.get_bind().dialect.name
+    retention_values = {"canvas_id": canvas_id, "updated_at": now}
+    if dialect in ("postgresql", "sqlite"):
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        s.execute(dialect_insert(ProfileJobRetention).values(
+            **retention_values,
+        ).on_conflict_do_nothing(index_elements=[ProfileJobRetention.canvas_id]))
+    elif s.get(ProfileJobRetention, canvas_id) is None:  # pragma: no cover - fallback dialect
+        s.add(ProfileJobRetention(**retention_values))
+    s.flush()
+    # This one row is the canvas-scoped mutex on PostgreSQL and the first write-lock acquisition on
+    # SQLite. It also retains the eviction watermark that prevents absent identities from resurrecting.
+    retention = s.get(
+        ProfileJobRetention, canvas_id, with_for_update=True, populate_existing=True,
+    )
+    if retention is None:  # pragma: no cover - defensive database contract check
+        raise RuntimeError("profile retention state reservation failed")
+    current = s.get(
+        ProfileJobLatest, (canvas_id, target_node_id, plan_digest),
+        with_for_update=True, populate_existing=True,
+    )
+    incoming_order = order(submitted_at, run_id)
+    cutoff_order = (
+        order(retention.cutoff_submitted_at, retention.cutoff_run_id)
+        if retention.cutoff_submitted_at is not None and retention.cutoff_run_id is not None
+        else None
+    )
+    if current is None:
+        if cutoff_order is not None and incoming_order <= cutoff_order:
+            return
+        s.add(ProfileJobLatest(
+            canvas_id=canvas_id, target_node_id=target_node_id,
+            plan_digest=plan_digest, run_id=run_id, doc=payload,
+            submitted_at=submitted_at, updated_at=now,
+        ))
+    elif current.run_id == run_id:
+        current.doc = payload
+        current.updated_at = now
+    elif incoming_order > order(current.submitted_at, current.run_id):
+        current.run_id = run_id
+        current.doc = payload
+        current.submitted_at = submitted_at
+        current.updated_at = now
+    else:
+        return
+    s.flush()
+    stale = list(s.scalars(select(ProfileJobLatest).where(
+        ProfileJobLatest.canvas_id == canvas_id,
+    ).order_by(
+        ProfileJobLatest.submitted_at.desc(), ProfileJobLatest.run_id.desc(),
+    ).offset(_PROFILE_LATEST_MAX).with_for_update()))
+    if stale:
+        evicted_order, evicted_row = max(
+            (order(row.submitted_at, row.run_id), row) for row in stale
+        )
+        if cutoff_order is None or evicted_order > cutoff_order:
+            retention.cutoff_submitted_at = evicted_row.submitted_at
+            retention.cutoff_run_id = evicted_row.run_id
+            retention.updated_at = now
+    for row in stale:
+        s.delete(row)
+
+
 def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                    kernel_id: str | None = None, *, publish_region: bool = False) -> None:
     """Upsert a run's live status (the runner calls this on each transition). `status` is a RunStatus
@@ -1749,6 +1892,12 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
     durable per-canvas history remains separate."""
     status = dict(status)
     st = str(status.get("status", "running"))
+    job_type = str(status.get("job_type", status.get("jobType", "run")))
+    target_node_id = status.get("target_node_id", status.get("targetNodeId"))
+    plan_digest = status.get("plan_digest", status.get("planDigest"))
+    if job_type == "profile" and (
+            not target_node_id or not _valid_plan_digest(plan_digest)):
+        raise ValueError("profile status requires a target node and lowercase SHA-256 plan digest")
     if st != "done" and _local_result_candidate(_result_doc_uri(status)) is not None:
         for key in ("uri", "outputUri", "output_uri", "outputTable", "output_table"):
             status.pop(key, None)
@@ -1789,8 +1938,11 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
         if fenced is not None and (r is None or st != fenced):
             return
         if r is None:
-            s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload,
-                           kernel_id=kernel_id, request_id=request_id))
+            r = RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload,
+                         kernel_id=kernel_id, request_id=request_id,
+                         job_type=job_type, target_node_id=target_node_id,
+                         plan_digest=plan_digest)
+            s.add(r)
         else:
             # Make terminal monotonicity an UPDATE predicate, not a prior ORM read. A transaction can load
             # queued, pause while another supervisor atomically publishes done, then otherwise flush its
@@ -1802,15 +1954,42 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                 values["kernel_id"] = func.coalesce(RunState.kernel_id, kernel_id)
             if request_id:
                 values["request_id"] = func.coalesce(RunState.request_id, request_id)
+            if job_type == "profile":
+                # ``bind_run_owner`` may have pre-created a generic queued identity. The first profile
+                # status promotes that placeholder once; later writes preserve the same node/plan key.
+                values["job_type"] = "profile"
+                if target_node_id is not None:
+                    values["target_node_id"] = func.coalesce(
+                        RunState.target_node_id, str(target_node_id))
+                if plan_digest is not None:
+                    values["plan_digest"] = func.coalesce(
+                        RunState.plan_digest, plan_digest)
             updated = s.execute(update(RunState).where(
                 RunState.run_id == run_id,
                 or_(RunState.status.not_in(_TERMINAL_RUN), RunState.status == st),
+                or_(plan_digest is None,
+                    RunState.plan_digest.is_(None),
+                    RunState.plan_digest == plan_digest),
+                or_(target_node_id is None,
+                    RunState.target_node_id.is_(None),
+                    RunState.target_node_id == str(target_node_id)),
             ).values(**values))
             if not updated.rowcount:
                 return
         s.flush()
         if st in _TERMINAL_RUN:
             _record_terminal_fence(s, run_id, st)
+        profile_canvas_id = canvas_id or r.canvas_id
+        if job_type == "profile" and profile_canvas_id is not None:
+            _upsert_profile_latest(
+                s,
+                canvas_id=str(profile_canvas_id),
+                target_node_id=str(target_node_id),
+                plan_digest=str(plan_digest),
+                run_id=str(run_id),
+                payload=payload,
+                submitted_at=r.created_at or _now(),
+            )
         stale = []
         if st in _TERMINAL_RUN:
             # Re-evaluate age after every candidate lock; delete only rows included in the one
@@ -7022,6 +7201,30 @@ def active_runs(canvas_id: str) -> list[dict]:
                 out.append(json.loads(r.doc))
             except Exception:  # noqa: BLE001
                 out.append({"run_id": r.run_id, "status": r.status})
+    return out
+
+
+def latest_profile_jobs(canvas_id: str, limit: int = 100) -> list[dict]:
+    """Latest durable profile retry for each ``(node, plan)`` identity on a canvas.
+
+    This reads only the canvas-scoped latest projection. It never reconstructs pointers from globally
+    pruned RunState detail, so an older late-finishing retry cannot reappear after the newer row is evicted.
+    """
+    bounded = min(_PROFILE_LATEST_MAX, max(1, int(limit)))
+    with session() as s:
+        rows = s.execute(select(ProfileJobLatest.doc).where(
+            ProfileJobLatest.canvas_id == str(canvas_id),
+        ).order_by(
+            ProfileJobLatest.submitted_at.desc(), ProfileJobLatest.run_id.desc(),
+        ).limit(bounded)).all()
+    out: list[dict] = []
+    for (doc,) in rows:
+        try:
+            parsed = json.loads(doc)
+        except Exception:  # noqa: BLE001 - retain a bounded best-effort recovery surface
+            continue
+        if isinstance(parsed, dict):
+            out.append(parsed)
     return out
 
 

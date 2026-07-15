@@ -4,8 +4,8 @@ without killing an in-flight run. Launched by hub.kernel_backend.LocalProcessSpa
 `python -m hub.kernel --canvas <id> --kernel-id <id> --token <tok> --workspace ... --port <p>`.
 
 Phase 1 is a COLD kernel: the DuckDB connection + the DB-backed result cache are warm across runs for
-free, but the per-kernel relation cache and preview-on-kernel come in Phase 2. Command channel here is
-just /run, /cancel, /shutdown over token-authed loopback HTTP. The kernel OWNS run_states writes
+free, but the per-kernel relation cache and preview-on-kernel come in Phase 2. The command channel carries
+runs, profiles, cancellation, and shutdown over token-authenticated HTTP. The kernel OWNS run_states writes
 (stamped with its kernel_id) — the single writer; the hub's KernelBackend only reads them.
 """
 
@@ -16,7 +16,7 @@ import os
 import sys
 import time
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 _STARTED_AT = time.monotonic()  # process start, for uptimeSeconds in /status
 
@@ -38,6 +38,14 @@ class PreviewBody(BaseModel):
     k: int = 50
     offset: int = 0
     full: bool = False   # profile only: whole-dataset stats (full pass) instead of the sample
+
+
+class ProfileJobBody(BaseModel):
+    run_id: str
+    graph: dict
+    node_id: str
+    plan_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    request_id: str | None = None
 
 
 def _liveness_busy(inflight_count: int, runs) -> bool:
@@ -73,9 +81,12 @@ def _runs_snapshot(runs, lock) -> list:
         return list(runs.values())
 
 
-def _status_payload(relation_cache, memory_limit, inflight: int, runs, lock, started_at: float) -> dict:
+def _status_payload(relation_cache, memory_limit, inflight: int, runs, lock, started_at: float,
+                    profile_runs=None, profile_lock=None) -> dict:
     """Assemble the kernel /status body. Module-level + pure so it's unit-testable without a live kernel."""
     snapshot = _runs_snapshot(runs, lock)
+    if profile_runs is not None:
+        snapshot.extend(_runs_snapshot(profile_runs, profile_lock))
     out = {
         "relationCache": relation_cache.stats(),
         "memoryLimit": memory_limit,
@@ -87,6 +98,29 @@ def _status_payload(relation_cache, memory_limit, inflight: int, runs, lock, sta
     if rss is not None:
         out["memoryRssBytes"] = rss
     return out
+
+
+def _cancel_owned_run(run_runner, profile_runner, run_id: str, persisted: dict | None):
+    """Cancel on the runner selected by the durable job type, not by the receiving hub's memory."""
+    is_profile = (persisted or {}).get(
+        "job_type", (persisted or {}).get("jobType")) == "profile"
+    if not is_profile:
+        try:
+            profile_runner.status(run_id)
+            is_profile = True
+        except KeyError:
+            pass
+    if is_profile:
+        try:
+            return profile_runner.cancel(run_id)
+        except KeyError:
+            # A fenced replacement kernel cannot own the old in-memory scope. Preserve the last durable
+            # status; the hub will not route here unless this kernel still owns the run's lease.
+            if persisted is not None:
+                from hub.models import RunStatus
+                return RunStatus(**persisted)
+            raise
+    return run_runner.cancel(run_id)
 
 
 def main() -> None:
@@ -130,7 +164,8 @@ def main() -> None:
     warm = RelationCache()  # per-kernel warm cache of preview intermediate relations (dropped on restart)
     # cell-crash-isolation: full RUNS execute in a killable, deadline-bounded child PROCESS by default, so
     # a runaway/segfaulting/OOM cell kills only that run — the warm kernel (and its live previews) survive.
-    # Previews/profile stay in-process on the warm engine (fast, interactive), protected by the reaper.
+    # Previews/sample profiles stay in-process on the warm engine (fast, interactive), protected by the
+    # reaper. Whole-dataset profiles use profile_runner so their own DuckDB scope is independently cancellable.
     # Opt out with DP_KERNEL_ISOLATE_RUNS=0 (runs on the warm in-process engine = the old behavior).
     _isolate = os.environ.get("DP_KERNEL_ISOLATE_RUNS", "1").strip().lower() not in ("0", "false", "no", "off")
     run_runner = deps.runner
@@ -142,12 +177,13 @@ def main() -> None:
     run_runner.on_status = lambda g, st: metadb.save_run_state(
         st.run_id, st.model_dump(), canvas_id=getattr(g, "id", None), kernel_id=kid,
         publish_region=st.status == "done")
+    profile_runner = deps.profile_runner
+    profile_runner.on_status = lambda g, st: metadb.save_run_state(
+        st.run_id, st.model_dump(), canvas_id=getattr(g, "id", None), kernel_id=kid)
 
     last_activity = [time.monotonic()]
-    # in-process preview/profile run IN this kernel (not offloaded to a child), so — unlike /run — they
-    # don't show up in run_runner.runs. Count them explicitly so the idle-TTL watchdog treats the kernel
-    # as BUSY for the WHOLE duration of a long full-dataset profile, not just the instant it started
-    # (else a profile longer than idle-ttl gets its warm kernel recycled out from under it).
+    # In-process preview/sample-profile requests do not show up in either runner, so count them explicitly.
+    # Whole-dataset profile jobs live in profile_runner.runs and are included in the watchdog below.
     _inflight = [0]
     _inflight_lock = threading.Lock()
 
@@ -204,7 +240,9 @@ def main() -> None:
                 retry_result_fences = getattr(deps.storage, "retry_result_fences", None)
                 if callable(retry_result_fences):
                     retry_result_fences(50)  # only this process can close its inherited writer/read FDs
-                busy = _liveness_busy(_inflight[0], run_runner.runs)
+                active = _runs_snapshot(run_runner.runs, getattr(run_runner, "_lock", None))
+                active.extend(_runs_snapshot(profile_runner.runs, getattr(profile_runner, "_lock", None)))
+                busy = _liveness_busy(_inflight[0], {st.run_id: st for st in active})
                 if busy:
                     last_activity[0] = time.monotonic()
                 elif time.monotonic() - last_activity[0] > args.idle_ttl:
@@ -263,10 +301,24 @@ def main() -> None:
                                 deps.node_builders, deps.node_specs, cache=warm, full=body.full,
                                 storage=deps.storage).model_dump()
 
+    @app.post("/profile-job")
+    def profile_job(body: ProfileJobBody, x_dp_kernel_token: str = Header(None)):
+        _auth(x_dp_kernel_token)
+        last_activity[0] = time.monotonic()
+        graph = Graph(**body.graph)
+        _ensure_deps(graph)
+        return profile_runner.run(
+            graph, body.node_id, plan_digest=body.plan_digest, run_id=body.run_id,
+            request_id=body.request_id,
+        ).model_dump()
+
     @app.post("/cancel")
     def cancel(body: dict, x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)
-        return run_runner.cancel(body["run_id"]).model_dump()  # the runner that OWNS the run (isolated child mgr)
+        run_id = str(body["run_id"])
+        return _cancel_owned_run(
+            run_runner, profile_runner, run_id, metadb.get_run_state(run_id),
+        ).model_dump()
 
     @app.get("/status")
     def status(x_dp_kernel_token: str = Header(None)):
@@ -274,8 +326,10 @@ def main() -> None:
         with _inflight_lock:
             inflight = _inflight[0]
         mem = os.environ.get("DP_MEMORY_LIMIT") or os.environ.get("DP_KERNEL_MEM")
-        return _status_payload(warm, mem, inflight, run_runner.runs,
-                               getattr(run_runner, "_lock", None), _STARTED_AT)
+        return _status_payload(
+            warm, mem, inflight, run_runner.runs, getattr(run_runner, "_lock", None), _STARTED_AT,
+            profile_runner.runs, getattr(profile_runner, "_lock", None),
+        )
 
     @app.post("/shutdown")
     def shutdown(x_dp_kernel_token: str = Header(None)):

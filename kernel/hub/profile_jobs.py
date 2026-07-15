@@ -1,7 +1,8 @@
-"""Cancellable durable jobs for exact full-dataset column profiles.
+"""Cancellable durable jobs for whole-dataset column profiles.
 
-Small sample profiles stay on the interactive preview path. Exact profiles can scan an entire graph,
-so this runner deliberately uses the same queued/running/terminal status contract as normal runs.
+Small sample profiles stay on the interactive preview path. Whole-dataset profiles can scan an entire
+graph, so this runner deliberately uses the same queued/running/terminal status contract as normal
+runs. Coverage is complete, while distinct counts remain approximate by design.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ _MAX_PROFILE_JOBS = 100
 
 
 class ProfileJobRunner:
-    """A small job owner for exact profiles; status persistence is injected by :mod:`hub.deps`."""
+    """A small job owner for full profiles; status persistence is injected by :mod:`hub.deps`."""
 
     name = "local-profile"
     cancel_acknowledges_stop = True
@@ -36,7 +37,8 @@ class ProfileJobRunner:
         self._scopes: dict[str, object] = {}
         self._lock = threading.Lock()
 
-    def run(self, graph: Graph, node_id: str, *, plan_identity: str, run_id: str | None = None) -> RunStatus:
+    def run(self, graph: Graph, node_id: str, *, plan_digest: str, run_id: str | None = None,
+            request_id: str | None = None) -> RunStatus:
         run_id = run_id or f"profile_{uuid.uuid4().hex[:10]}"
         status = RunStatus(
             run_id=run_id,
@@ -45,7 +47,8 @@ class ProfileJobRunner:
             target_node_id=node_id,
             placement="local",
             per_node=[PerNodeStatus(node_id=node_id, status="queued", label="Full profile")],
-            plan_identity=plan_identity,
+            plan_digest=plan_digest,
+            request_id=request_id,
         )
         with self._lock:
             self.runs[run_id] = status
@@ -105,7 +108,15 @@ class ProfileJobRunner:
                 scope_callback=remember_scope,
             )
         except Exception as exc:  # noqa: BLE001 - job workers must always reach a visible terminal state
-            self._terminal(graph, run_id, "failed", started, error=f"{type(exc).__name__}: {exc}")
+            with self._lock:
+                cancelled = bool(self._cancel.get(run_id) and self._cancel[run_id].is_set())
+            if cancelled:
+                # DuckDB reports its cursor interrupt as an exception. The accepted cancel intent is
+                # the authoritative terminal cause; do not present a user-requested stop as a failure.
+                self._terminal(graph, run_id, "cancelled", started)
+            else:
+                self._terminal(graph, run_id, "failed", started,
+                               error=f"{type(exc).__name__}: {exc}")
             return
         with self._lock:
             cancelled = bool(self._cancel.get(run_id) and self._cancel[run_id].is_set())

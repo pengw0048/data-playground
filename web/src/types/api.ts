@@ -204,7 +204,7 @@ export interface RunStatus {
   outputUri?: string | null
   outputTable?: string | null
   profile?: ProfileResult | null
-  planIdentity?: string | null
+  planDigest?: string | null
 }
 
 export interface PlanStep {

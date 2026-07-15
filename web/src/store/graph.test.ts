@@ -4,7 +4,8 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
   listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
-  estimate: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
+  estimate: vi.fn(), profileEstimate: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
+  activeRuns: vi.fn(), profileJobs: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
   api: new Proxy({}, {
@@ -20,12 +21,18 @@ vi.mock('../api/client', () => ({
             ? apiMocks.preview
             : property === 'estimate'
               ? apiMocks.estimate
+              : property === 'profileEstimate'
+                ? apiMocks.profileEstimate
               : property === 'fullProfile'
                 ? apiMocks.fullProfile
                 : property === 'runStatus'
                   ? apiMocks.runStatus
                   : property === 'cancelRun'
                     ? apiMocks.cancelRun
+                    : property === 'activeRuns'
+                      ? apiMocks.activeRuns
+                      : property === 'profileJobs'
+                        ? apiMocks.profileJobs
           : async () => ({}),
   }),
   KernelError: class KernelError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status } },
@@ -65,9 +72,12 @@ describe('graph store — core authority ops', () => {
     apiMocks.deleteCanvas.mockReset().mockResolvedValue({ ok: true })
     apiMocks.preview.mockReset()
     apiMocks.estimate.mockReset().mockResolvedValue({ rows: 10, bytes: 100, placement: 'local', needsConfirm: false })
+    apiMocks.profileEstimate.mockReset().mockResolvedValue({ rows: 10, bytes: 100, placement: 'local', needsConfirm: false })
     apiMocks.fullProfile.mockReset()
     apiMocks.runStatus.mockReset()
     apiMocks.cancelRun.mockReset().mockResolvedValue({})
+    apiMocks.activeRuns.mockReset().mockResolvedValue([])
+    apiMocks.profileJobs.mockReset().mockResolvedValue([])
     useStore.setState({ currentUser: { id: 'alice', name: 'Alice' } })
     useStore.setState({
       doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] },
@@ -136,6 +146,7 @@ describe('graph store — core authority ops', () => {
       doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] },
     })
 
+    await useStore.getState().prepareFullProfile('source')
     const pending = useStore.getState().startFullProfile('source')
     await submittedJob
     useStore.getState().updateConfig('source', { uri: 'new-events.parquet' })
@@ -145,6 +156,176 @@ describe('graph store — core authority ops', () => {
 
     expect(apiMocks.cancelRun).toHaveBeenCalledWith('profile-old')
     expect(useStore.getState().profileJobs.source?.status).toBeUndefined()
+  })
+
+  it('keeps a whole-dataset profile behind visible preflight and an explicit start', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    apiMocks.profileEstimate.mockResolvedValueOnce({
+      rows: null, bytes: null, placement: 'local', needsConfirm: true,
+    })
+
+    await useStore.getState().prepareFullProfile('source')
+
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'preflight', estimate: { needsConfirm: true },
+    })
+    expect(apiMocks.fullProfile).not.toHaveBeenCalled()
+
+    apiMocks.fullProfile.mockResolvedValueOnce({
+      runId: 'profile-confirmed', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    })
+    await useStore.getState().startFullProfile('source')
+
+    expect(apiMocks.fullProfile).toHaveBeenCalledWith(
+      doc, 'source', useStore.getState().profileJobs.source.planDigest, true,
+    )
+  })
+
+  it('recovers a profile that finished while closed but ignores a stale plan on reopen', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    // Capture the real digest without coupling this regression to identity serialization details.
+    useStore.setState({ doc: current })
+    await useStore.getState().prepareFullProfile('source')
+    const planDigest = useStore.getState().profileJobs.source.planDigest
+    useStore.setState({ profileJobs: {} })
+    apiMocks.profileJobs.mockResolvedValueOnce([{
+      runId: 'finished-away', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest, rowsProcessed: 4, totalRows: 4, ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 4, sampled: false },
+    }])
+    apiMocks.activeRuns.mockRejectedValueOnce(new Error('transient active-run lookup failure'))
+
+    useStore.getState().loadDoc(current, 'owner')
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source?.status?.runId).toBe('finished-away'))
+    expect(useStore.getState().profileJobs.source?.phase).toBe('done')
+
+    apiMocks.profileJobs.mockResolvedValueOnce([{
+      runId: 'stale-plan', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest: '0'.repeat(64), rowsProcessed: 4, totalRows: 4, ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 4, sampled: false },
+    }])
+    useStore.getState().loadDoc(current, 'owner')
+    await vi.waitFor(() => expect(apiMocks.profileJobs).toHaveBeenCalledTimes(2))
+    expect(useStore.getState().profileJobs.source).toBeUndefined()
+  })
+
+  it('falls back to active profile recovery when the latest-profile request fails', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc: current })
+    await useStore.getState().prepareFullProfile('source')
+    const planDigest = useStore.getState().profileJobs.source.planDigest
+    useStore.setState({ profileJobs: {} })
+    apiMocks.profileJobs.mockRejectedValueOnce(new Error('transient latest-profile lookup failure'))
+    apiMocks.activeRuns.mockResolvedValueOnce([{
+      runId: 'active-fallback', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }])
+    let finishStatus!: (status: any) => void
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise((resolve) => { finishStatus = resolve }))
+
+    useStore.getState().loadDoc(current, 'owner')
+
+    await vi.waitFor(() => expect(
+      useStore.getState().profileJobs.source?.status?.runId,
+    ).toBe('active-fallback'))
+    expect(useStore.getState().profileJobs.source?.phase).toBe('running')
+    finishStatus({
+      runId: 'active-fallback', status: 'cancelled', jobType: 'profile', targetNodeId: 'source',
+      planDigest, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    })
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source?.phase).toBe('cancelled'))
+  })
+
+  it('recovers an authoritative profile while active-runs remains pending', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc: current })
+    await useStore.getState().prepareFullProfile('source')
+    const planDigest = useStore.getState().profileJobs.source.planDigest
+    useStore.setState({ profileJobs: {} })
+    let finishActive!: (statuses: any[]) => void
+    apiMocks.activeRuns.mockImplementationOnce(() => new Promise((resolve) => { finishActive = resolve }))
+    apiMocks.profileJobs.mockResolvedValueOnce([{
+      runId: 'projection-first', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest, rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 10, sampled: false },
+    }])
+
+    useStore.getState().loadDoc(current, 'owner')
+
+    await vi.waitFor(() => expect(
+      useStore.getState().profileJobs.source?.status?.runId,
+    ).toBe('projection-first'))
+    finishActive([])
+  })
+
+  it('uses active profile provisionally while projection is pending, then yields to projection', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc: current })
+    await useStore.getState().prepareFullProfile('source')
+    const planDigest = useStore.getState().profileJobs.source.planDigest
+    useStore.setState({ profileJobs: {} })
+    let finishProjection!: (statuses: any[]) => void
+    apiMocks.profileJobs.mockImplementationOnce(() => new Promise((resolve) => { finishProjection = resolve }))
+    apiMocks.activeRuns.mockResolvedValueOnce([{
+      runId: 'provisional-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }])
+    let finishStatus!: (status: any) => void
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise((resolve) => { finishStatus = resolve }))
+
+    useStore.getState().loadDoc(current, 'owner')
+
+    await vi.waitFor(() => expect(
+      useStore.getState().profileJobs.source?.status?.runId,
+    ).toBe('provisional-active'))
+    finishProjection([{
+      runId: 'authoritative-terminal', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest, rowsProcessed: 10, totalRows: 10, ms: 20, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 10, sampled: false },
+    }])
+    await vi.waitFor(() => expect(
+      useStore.getState().profileJobs.source?.status?.runId,
+    ).toBe('authoritative-terminal'))
+    finishStatus({
+      runId: 'provisional-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest, rowsProcessed: 2, totalRows: 10, ms: 20, placement: 'local', perNode: [],
+    })
+    await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledWith('provisional-active'))
+    expect(useStore.getState().profileJobs.source?.status?.runId).toBe('authoritative-terminal')
+  })
+
+  it('ignores an older same-canvas reattach response after a newer reload', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc: current })
+    await useStore.getState().prepareFullProfile('source')
+    const planDigest = useStore.getState().profileJobs.source.planDigest
+    useStore.setState({ profileJobs: {} })
+    let finishOld!: (statuses: any[]) => void
+    let finishNew!: (statuses: any[]) => void
+    apiMocks.profileJobs
+      .mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishNew = resolve }))
+
+    useStore.getState().loadDoc(current, 'owner')
+    useStore.getState().loadDoc(current, 'owner')
+    finishNew([{
+      runId: 'newer-reattach', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest, rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 10, sampled: false },
+    }])
+    await vi.waitFor(() => expect(
+      useStore.getState().profileJobs.source?.status?.runId,
+    ).toBe('newer-reattach'))
+    finishOld([{
+      runId: 'older-reattach', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest, rowsProcessed: 5, totalRows: 5, ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 5, sampled: false },
+    }])
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(useStore.getState().profileJobs.source?.status?.runId).toBe('newer-reattach')
   })
 
   it('blocks a preview response when the graph topology changes', async () => {

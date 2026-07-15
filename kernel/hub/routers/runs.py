@@ -29,6 +29,7 @@ from hub.models import (
     EstimateRequest,
     JoinAnalysis,
     PreviewRequest,
+    ProfileEstimateRequest,
     ProfileJobRequest,
     ProfileResult,
     RunEstimate,
@@ -142,7 +143,7 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
 def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> ProfileResult:
     """Bounded, interactive column statistics over a preview sample.
 
-    Exact profiles scan the full relation and therefore go through ``/run/profile-job`` instead of
+    Whole-dataset profiles scan the full relation and therefore go through ``/run/profile-job`` instead of
     silently occupying this synchronous preview route.
     """
     _require_graph_read_access(req.graph, uid)
@@ -160,28 +161,96 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
                         deps.node_builders, deps.node_specs, full=False, storage=deps.storage)
 
 
-@router.post("/run/profile-job", response_model=RunStatus)
-def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -> RunStatus:
-    """Queue an exact full-dataset profile with normal run status, cancellation, and recovery semantics."""
-    auth_canvas = None
-    if auth.auth_enabled():
-        cid, role = _require_graph_read_access(req.graph, uid)
-        assert cid is not None and role is not None
-        if role not in _RUN_MUTATE_ROLES:
-            raise HTTPException(403, f"canvas '{cid}' requires owner or editor to start a full profile")
-        auth_canvas = cid
+def _profile_job_estimate(graph, node_id: str, deps) -> RunEstimate:
+    """Estimate the whole-dataset scan and normalize its admission contract.
+
+    The normal local runner intentionally lets an entirely unknown job fail fast. A profile is different:
+    it will scan whatever relation the node resolves to, so unknown cost requires explicit confirmation.
+    Known-small means at least one measured cost signal exists and neither known signal is over its gate.
+    """
+    plan = compiler.compile_plan(graph, node_id, deps.registry, deps.node_specs, deps.node_ir)
+    rows, byts, _ = _cone_size(graph, node_id, deps)
+    backend = deps.kernel_backend() or deps.runner
+    estimate = backend.estimate(plan, rows, byts)
+    unknown = rows is None and byts is None
+    breakdown = estimate.breakdown or "size unknown"
+    if "whole-dataset profile" not in breakdown:
+        breakdown = f"{breakdown} · whole-dataset profile"
+    return estimate.model_copy(update={
+        "needs_confirm": bool(estimate.needs_confirm or unknown),
+        "breakdown": breakdown,
+    })
+
+
+@router.post("/run/profile-estimate", response_model=RunEstimate)
+def estimate_full_profile(req: ProfileEstimateRequest,
+                          uid: str = Depends(current_user)) -> RunEstimate:
+    """Preflight a whole-dataset profile without starting any work."""
+    _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     _reject_invalid(req.graph, deps, req.node_id)
-    status = deps.profile_runner.run(req.graph, req.node_id, plan_identity=req.plan_identity)
-    deps.run_index[status.run_id] = deps.profile_runner
-    deps.run_owner[status.run_id] = uid
-    if auth.auth_enabled():
-        metadb.bind_run_owner(status.run_id, uid, auth_canvas)
-    while len(deps.run_index) > _RUN_INDEX_MAX:
-        deps.run_index.pop(next(iter(deps.run_index)))
-    while len(deps.run_owner) > _RUN_INDEX_MAX:
-        deps.run_owner.pop(next(iter(deps.run_owner)))
+    return _profile_job_estimate(req.graph, req.node_id, deps)
+
+
+@router.post("/run/profile-job", response_model=RunStatus)
+def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -> RunStatus:
+    """Queue a whole-dataset profile with durable ownership, cancellation, and recovery semantics."""
+    from hub.observability import (
+        AuditAction, AuditOutcome, emit_audit, error_class, get_request_id,
+    )
+    request_id = get_request_id()
+    status = None
+    try:
+        auth_canvas = None
+        if auth.auth_enabled():
+            cid, role = _require_graph_read_access(req.graph, uid)
+            assert cid is not None and role is not None
+            if role not in _RUN_MUTATE_ROLES:
+                raise HTTPException(403, f"canvas '{cid}' requires owner or editor to start a full profile")
+            auth_canvas = cid
+        deps = get_deps()
+        graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
+        _reject_invalid(req.graph, deps, req.node_id)
+        estimate = _profile_job_estimate(req.graph, req.node_id, deps)
+        if estimate.needs_confirm and not req.confirmed:
+            raise HTTPException(409, "full profile needs confirmation (large or unknown whole-dataset scan)")
+        owner = deps.kernel_backend()
+        if owner is None:
+            raise HTTPException(503, "canvas execution kernel is unavailable")
+        status = owner.profile_job(
+            req.graph, req.node_id, req.plan_digest, request_id=request_id,
+        )
+        deps.run_index[status.run_id] = owner
+        deps.run_owner[status.run_id] = uid
+        if auth.auth_enabled():
+            metadb.bind_run_owner(
+                status.run_id, uid, auth_canvas, request_id=request_id,
+            )
+        elif request_id:
+            metadb.bind_run_request_id(
+                status.run_id, request_id, canvas_id=getattr(req.graph, "id", None),
+            )
+        while len(deps.run_index) > _RUN_INDEX_MAX:
+            deps.run_index.pop(next(iter(deps.run_index)))
+        while len(deps.run_owner) > _RUN_INDEX_MAX:
+            deps.run_owner.pop(next(iter(deps.run_owner)))
+    except Exception as exc:
+        run_id = getattr(status, "run_id", None)
+        emit_audit(
+            AuditAction.JOB_SUBMIT, AuditOutcome.FAILURE,
+            principal_id=uid, resource_type="run", resource_id=run_id,
+            run_id=run_id, request_id=request_id,
+            attrs={"job_type": "profile", "error_class": error_class(exc)},
+        )
+        raise
+    assert status is not None
+    emit_audit(
+        AuditAction.JOB_SUBMIT, AuditOutcome.SUCCESS,
+        principal_id=uid, resource_type="run", resource_id=status.run_id,
+        run_id=status.run_id, request_id=request_id,
+        attrs={"job_type": "profile", "placement": str(status.placement or "local")[:32]},
+    )
     return status
 
 

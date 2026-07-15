@@ -1686,6 +1686,55 @@
         "title": "ProcessorDescriptor",
         "type": "object"
       },
+      "ProfileEstimateRequest": {
+        "description": "Estimate a whole-dataset profile before the user chooses whether to submit it.",
+        "properties": {
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          },
+          "nodeId": {
+            "title": "Nodeid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "graph",
+          "nodeId"
+        ],
+        "title": "ProfileEstimateRequest",
+        "type": "object"
+      },
+      "ProfileJobRequest": {
+        "description": "Submit a whole-dataset profile through the durable job lifecycle.\n\n``plan_digest`` is the lowercase SHA-256 of the client-side graph identity. The fixed wire value is\npersisted with the job so a late result cannot be presented for a newer canvas revision without\namplifying the full graph identity across durable status rows.",
+        "properties": {
+          "confirmed": {
+            "default": false,
+            "title": "Confirmed",
+            "type": "boolean"
+          },
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          },
+          "nodeId": {
+            "title": "Nodeid",
+            "type": "string"
+          },
+          "planDigest": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Plandigest",
+            "type": "string"
+          }
+        },
+        "required": [
+          "graph",
+          "nodeId",
+          "planDigest"
+        ],
+        "title": "ProfileJobRequest",
+        "type": "object"
+      },
       "ProfileResult": {
         "properties": {
           "columns": {
@@ -2158,6 +2207,15 @@
             ],
             "title": "Error"
           },
+          "jobType": {
+            "default": "run",
+            "enum": [
+              "run",
+              "profile"
+            ],
+            "title": "Jobtype",
+            "type": "string"
+          },
           "ms": {
             "default": 0,
             "title": "Ms",
@@ -2201,6 +2259,30 @@
             ],
             "title": "Placement",
             "type": "string"
+          },
+          "planDigest": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plandigest"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProfileResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "progress": {
             "anyOf": [
@@ -3654,6 +3736,92 @@
           }
         },
         "summary": "Canvas Kernel Restart"
+      }
+    },
+    "/api/canvas/{canvas_id}/profile-jobs": {
+      "get": {
+        "description": "Latest durable profile attempt for each node/plan identity, including terminal attempts.\n\nUnlike ``active-runs``, this bounded recovery surface lets a profile that finished while the canvas\nwas closed reappear on reopen. The client still verifies the fixed plan digest against its current\ngraph identity before presenting the result.",
+        "operationId": "canvas_profile_jobs_api_canvas__canvas_id__profile_jobs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "canvas_id",
+            "required": true,
+            "schema": {
+              "title": "Canvas Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RunStatus"
+                  },
+                  "title": "Response Canvas Profile Jobs Api Canvas  Canvas Id  Profile Jobs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Canvas Profile Jobs"
       }
     },
     "/api/canvas/{canvas_id}/restore": {
@@ -8279,7 +8447,7 @@
     },
     "/api/run/profile": {
       "post": {
-        "description": "Per-column stats (null/distinct/min/max/mean) over a node's output — the previewed sample, or the\nWHOLE dataset (a full pass) when `full` is set.",
+        "description": "Bounded, interactive column statistics over a preview sample.\n\nWhole-dataset profiles scan the full relation and therefore go through ``/run/profile-job`` instead of\nsilently occupying this synchronous preview route.",
         "operationId": "run_profile_api_run_profile_post",
         "parameters": [
           {
@@ -8358,6 +8526,172 @@
           }
         },
         "summary": "Run Profile"
+      }
+    },
+    "/api/run/profile-estimate": {
+      "post": {
+        "description": "Preflight a whole-dataset profile without starting any work.",
+        "operationId": "estimate_full_profile_api_run_profile_estimate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileEstimateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunEstimate"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Estimate Full Profile"
+      }
+    },
+    "/api/run/profile-job": {
+      "post": {
+        "description": "Queue a whole-dataset profile with durable ownership, cancellation, and recovery semantics.",
+        "operationId": "run_full_profile_api_run_profile_job_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileJobRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Run Full Profile"
       }
     },
     "/api/run/{run_id}": {

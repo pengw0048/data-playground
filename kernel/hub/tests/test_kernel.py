@@ -166,6 +166,8 @@ def test_profile_returns_column_stats():
 
 
 def test_full_profile_uses_cancellable_job_lifecycle():
+    import hashlib
+
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("images")}),
         N("sel", "select", {"select": "id, width, height, width*height AS area"}),
@@ -175,13 +177,15 @@ def test_full_profile_uses_cancellable_job_lifecycle():
     assert legacy.status_code == 200 and legacy.json()["error"] is True
     assert "cancellable jobs" in legacy.json()["reason"]
 
+    plan_digest = hashlib.sha256(b"revision-1").hexdigest()
     submit = client.post("/api/run/profile-job", json={
-        "graph": g, "nodeId": "sel", "planIdentity": "revision-1",
-    })
+        "graph": g, "nodeId": "sel", "planDigest": plan_digest,
+    }, headers={"X-Request-Id": "req_profile_kernel_01"})
     assert submit.status_code == 200, submit.text
     started = submit.json()
     assert started["jobType"] == "profile"
-    assert started["planIdentity"] == "revision-1"
+    assert started["planDigest"] == plan_digest
+    assert started["requestId"] == "req_profile_kernel_01"
 
     deadline = time.monotonic() + 5
     status = started
