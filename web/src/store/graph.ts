@@ -327,7 +327,7 @@ interface Store {
   refreshFiles: () => Promise<boolean>  // true only when this user's authoritative list was refreshed
   refreshUsers: () => Promise<void>
   openFile: (id: string) => Promise<boolean>
-  newFile: () => Promise<CanvasCreationResult>
+  newFile: (options?: { signal?: AbortSignal }) => Promise<CanvasCreationResult>
   newFromExample: (key: string) => Promise<CanvasCreationResult>
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
@@ -1045,19 +1045,39 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  newFile: async () => {
+  newFile: async (options) => {
     const generation = ++_fileNavigationGeneration
     const userId = get().currentUser?.id ?? null
     const doc = emptyDoc()
+    const signal = options?.signal
+    const isCurrent = () => !signal?.aborted
+      && generation === _fileNavigationGeneration
+      && (get().currentUser?.id ?? null) === userId
+    const cleanUpCancelledRemoteDraft = async () => {
+      // Canvas IDs are client-generated, so DELETE is safe even when an aborted POST never committed.
+      // If this best-effort cleanup fails, the server keeps an empty, recoverable draft. The import
+      // graph is never applied to it and it becomes visible on the next ordinary file-list refresh.
+      try { await api.deleteCanvas(doc.id) } catch { /* retain the empty remote draft */ }
+    }
     let persistence: CanvasPersistence = 'remote'
+    if (signal?.aborted) return { ok: false }
     try {
-      const created = await api.createCanvas(doc)
+      const created = await api.createCanvas(doc, { signal })
       if (!created.ok) return { ok: false }
-      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
+      if (!isCurrent()) {
+        if (signal) await cleanUpCancelledRemoteDraft()
+        return { ok: false }
+      }
       rememberRole(userId, doc.id, 'owner') // create response confirms ownership
-      await get().refreshFiles()
+      // A cancellable import must not leave an await gap between the final validity check and
+      // activation: Cancel/navigation could otherwise interleave after the remote canvas exists.
+      // Refresh the list after activation instead; its own generation/user guards make it safe.
+      if (!signal) await get().refreshFiles()
     } catch (e) {
-      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
+      if (!isCurrent() || (e as Error)?.name === 'AbortError') {
+        if (signal) await cleanUpCancelledRemoteDraft()
+        return { ok: false }
+      }
       if (e instanceof KernelError) {
         if (e.status === 401) {
           rememberRole(userId, get().doc.id, null)
@@ -1076,11 +1096,15 @@ export const useStore = create<Store>((set, get) => ({
       // collision-resistant local draft and a later PUT can create it as the current user's canvas.
       persistence = 'local-draft'
     }
-    if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
+    if (!isCurrent()) {
+      if (signal && persistence === 'remote') await cleanUpCancelledRemoteDraft()
+      return { ok: false }
+    }
     get().loadDoc(doc, 'owner')
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
     set({ view: 'canvas' })
+    if (signal && persistence === 'remote') void get().refreshFiles()
     return { ok: true, canvasId: doc.id, persistence }
   },
 

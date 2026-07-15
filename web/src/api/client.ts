@@ -197,8 +197,10 @@ export const api = {
     inputColumns: string[]; outputSchema: ColumnSchema[]; blurb?: string
   }) => req<ProcessorDescriptor>('/processors/promote', { method: 'POST', body: JSON.stringify(body) }),
 
-  importPipeline: (config: string, params?: Record<string, unknown>) =>
-    req<PipelineImport>('/pipelines/import', { method: 'POST', body: JSON.stringify({ config, params }) }),
+  importPipeline: (config: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal }) =>
+    req<PipelineImport>('/pipelines/import', {
+      method: 'POST', body: JSON.stringify({ config, params }), signal: options?.signal,
+    }),
 
   compile: (doc: CanvasDoc, targetNodeId?: string) =>
     req<CompilePlan>('/graph/compile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
@@ -282,8 +284,10 @@ export const api = {
   // per-user canvases (multi-file)
   listCanvases: () => req<CanvasFile[]>('/canvas'),
   getCanvas: (id: string) => req<CanvasDoc>(`/canvas/${id}`),
-  createCanvas: (doc: CanvasDoc) =>
-    req<{ ok: boolean; id: string }>('/canvas', { method: 'POST', body: JSON.stringify(doc) }),
+  createCanvas: (doc: CanvasDoc, options?: { signal?: AbortSignal }) =>
+    req<{ ok: boolean; id: string }>('/canvas', {
+      method: 'POST', body: JSON.stringify(doc), signal: options?.signal,
+    }),
   saveCanvas: (doc: CanvasDoc, keepalive = false) =>  // keepalive: let the PUT survive a tab-close flush
     req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc), keepalive }),
   deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),

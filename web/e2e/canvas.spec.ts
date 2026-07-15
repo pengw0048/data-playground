@@ -311,6 +311,113 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByRole('heading', { name: 'Import pipeline' })).toBeVisible()
   })
 
+  test('navigation cancels a pending pipeline importer without creating or navigating to a canvas', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+    let destinationPosts = 0
+    await page.route('**/api/canvas', async (route) => {
+      if (route.request().method() === 'POST') destinationPosts += 1
+      await route.continue()
+    })
+
+    let releaseImport!: () => void
+    const importHeld = new Promise<void>((resolve) => { releaseImport = resolve })
+    let markImportStarted!: () => void
+    const importStarted = new Promise<void>((resolve) => { markImportStarted = resolve })
+    let markImportRouteDone!: () => void
+    const importRouteDone = new Promise<void>((resolve) => { markImportRouteDone = resolve })
+    await page.route('**/api/pipelines/import', async (route) => {
+      markImportStarted()
+      await importHeld
+      try {
+        await route.fulfill({
+          contentType: 'application/json',
+          body: JSON.stringify({
+            config: '{}', params: {}, inputColumns: [], outputColumns: [], stages: [], driverSteps: [],
+            graph: {
+              nodes: [{ id: 'late-import', type: 'source', position: { x: 80, y: 80 }, data: { title: 'Late import', config: {} } }],
+              edges: [],
+            },
+          }),
+        })
+      } catch { /* the AbortController may dispose the intercepted request before this late reply */ }
+      markImportRouteDone()
+    })
+
+    await page.getByTestId('app-menu').click()
+    await page.getByTestId('import-pipeline').click()
+    await page.getByPlaceholder(/my_table_or_uri/).fill('{"source":"slow"}')
+    await page.getByRole('button', { name: 'Import', exact: true }).click()
+    await importStarted
+
+    await page.evaluate(() => { location.hash = '#/files' })
+    await expect(page.getByRole('heading', { name: 'Import pipeline' })).toBeHidden()
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/files')
+    releaseImport()
+    await importRouteDone
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+
+    expect(destinationPosts).toBe(0)
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/files')
+  })
+
+  test('Cancel during destination creation cleans up a committed remote draft and preserves the canvas', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+    const current = await page.evaluate(() => location.hash)
+    await page.route('**/api/pipelines/import', (route) => route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        config: '{}', params: {}, inputColumns: [], outputColumns: [], stages: [], driverSteps: [],
+        graph: {
+          nodes: [{ id: 'must-not-apply', type: 'source', position: { x: 80, y: 80 }, data: { title: 'Must not apply', config: {} } }],
+          edges: [],
+        },
+      }),
+    }))
+
+    let createdId = ''
+    let deletedId = ''
+    await page.route('**/api/canvas/*', async (route) => {
+      if (route.request().method() !== 'DELETE') return route.continue()
+      deletedId = route.request().url().split('/').pop() ?? ''
+      const response = await route.fetch()
+      await route.fulfill({ response })
+    })
+    let releaseCreateResponse!: () => void
+    const createResponseHeld = new Promise<void>((resolve) => { releaseCreateResponse = resolve })
+    let markCanvasCommitted!: () => void
+    const canvasCommitted = new Promise<void>((resolve) => { markCanvasCommitted = resolve })
+    let markCreateRouteDone!: () => void
+    const createRouteDone = new Promise<void>((resolve) => { markCreateRouteDone = resolve })
+    await page.route('**/api/canvas', async (route) => {
+      if (route.request().method() !== 'POST') return route.continue()
+      createdId = (route.request().postDataJSON() as { id: string }).id
+      const response = await route.fetch() // commit remotely, but hold the response from the browser
+      markCanvasCommitted()
+      await createResponseHeld
+      try { await route.fulfill({ response }) } catch { /* canceled request */ }
+      markCreateRouteDone()
+    })
+
+    await page.getByTestId('app-menu').click()
+    await page.getByTestId('import-pipeline').click()
+    await page.getByPlaceholder(/my_table_or_uri/).fill('{"source":"x"}')
+    await page.getByRole('button', { name: 'Import', exact: true }).click()
+    await canvasCommitted
+
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Import pipeline' })).toBeHidden()
+    releaseCreateResponse()
+    await createRouteDone
+
+    await expect.poll(() => deletedId).toBe(createdId)
+    await expect.poll(async () => page.evaluate(async (id) => (await fetch(`/api/canvas/${id}`)).status, createdId)).toBe(404)
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe(current)
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await expect(page.getByText('Must not apply', { exact: true })).toHaveCount(0)
+  })
+
   test('settings modal edits and saves the agent config', async ({ page }) => {
     await page.goto('/')
     await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
