@@ -10,8 +10,10 @@
   use whole-graph admission instead and therefore cannot silently fall back to local execution.
 
 This is a durable lifecycle implementation, not a claim that the whole Ray backend or the example
-deployment is production-ready. The remaining scale, isolation, health, and resilience gates are in
-[`RAY.md`](RAY.md).
+deployment is production-ready. The remaining scale, health, resilience, and operator gates are in
+[`RAY.md`](RAY.md). It operates within the trusted-workspace boundary in
+[Supported deployments and trust model](SUPPORT.md): workers, runtime images, plugins, storage
+administrators, and operators are trusted with the workspace.
 
 ## Real-service acceptance gate
 
@@ -27,9 +29,10 @@ scripts/ray-jobs-acceptance.sh
 It builds one image for the hub-side Jobs client, Ray head, worker, and remote entrypoint, then starts
 PostgreSQL 16 and a versioned MinIO bucket. The gate proves that a submitting hub can exit while the
 official Ray job is `RUNNING`, a new process reattaches to the same deterministic submission, and the
-terminal run-history/catalog effects occur once. Before that restart, it replaces a managed source's
-catalog generation and proves the recovered job still reads its hash-bound generation, then releases the
-durable source pin at terminal publication. Separate scenarios require an official `STOPPED`
+terminal run history and logical catalog state converge to one publication. Before that restart, it
+replaces a managed source's catalog generation and proves the recovered job still reads its hash-bound
+generation, then releases the durable source pin at terminal publication. Separate scenarios require an
+official `STOPPED`
 cancellation acknowledgement and prove that a `SUCCEEDED` job with a missing or corrupt result receipt
 is published as failed without exposing its output. Logs, service state, image identity, and disk/Docker
 diagnostics are retained as workflow artifacts on both success and failure.
@@ -66,9 +69,10 @@ embedding credential values in graph configuration.
 `DP_RAY_JOBS_CODE_REF` and `DP_RAY_JOBS_CLUSTER_REF` are operator assertions that the implementation
 hash-binds and compares; Data Playground does not independently read a container digest or Ray cluster UUID.
 The deployment system must inject an immutable image digest and a stable cluster identity, then verify that
-attestation outside this plugin. See the remaining runtime-image gate in [`RAY.md`](RAY.md#what-remains-before-production-ownership).
+attestation outside this plugin. See the remaining runtime-image gate in
+[`RAY.md`](RAY.md#production-ownership-gates).
 
-The production Jobs sink contract is deliberately narrow: it supports only the built-in file adapter
+The durable Jobs sink contract is deliberately narrow: it supports only the built-in file adapter
 writing non-partitioned Parquet in overwrite mode, backed by a core-managed immutable object attempt.
 CSV, JSON, custom-adapter, and adapter-compatibility sinks remain available to the local/Popen Ray path;
 an explicit Jobs placement rejects them before allocating or submitting a remote job. Jobs mode also
@@ -115,8 +119,8 @@ storage boundary:
 - bucket administrators remain trusted, and retention/lifecycle rules must outlive maximum recovery time.
 
 Prefer distinct hub and Ray service identities. The current workload allowlist can pass `AWS_*`,
-`DP_S3_*`, or Google credential references for compatibility; those remain broad capabilities, so a
-deployment that forwards one shared credential has not achieved tenant isolation.
+`DP_S3_*`, or Google credential references for compatibility; those remain broad capabilities. This is
+compatible with the trusted-team profile, but it does not provide mutually hostile tenant isolation.
 
 ## Frozen semantics and credential rotation
 
@@ -280,13 +284,15 @@ authentication boundary. Do not expose port 8265 directly to end users.
 - Durable Jobs covers whole-graph execution only. Region data publication uses manifest v2, but the
   multi-region parent is not restart-durable.
 - Object-store reads and whole-graph file sinks remain driver-funneled in several paths.
-- Live capacity/health discovery, admission backpressure, scoped per-attempt identity, active-job fault
-  injection, HA/upgrade runbooks, and production observability remain open readiness gates.
+- Live capacity/health discovery, admission backpressure, active-job fault injection, HA/upgrade
+  runbooks, and production observability remain open readiness gates. Scoped per-attempt identity is
+  defense in depth for a trusted team and would be required for the unsupported hostile-tenant profile.
 - Operators must configure finite metadata-database connection and statement timeouts. The bounded owner
   window prevents application keepalives from renewing forever, but it cannot interrupt a database driver
   call that the deployment itself permits to block indefinitely.
 - `DP_RAY_JOBS_REQUEST_TIMEOUT_S` covers only Jobs API HTTP. Artifact/object-store calls currently use
-  provider defaults, and whole-graph Jobs runs have no automatic execution deadline; provider deadlines,
+  provider defaults, and whole-graph Jobs runs have no automatic execution deadline.
+  `DP_RUN_DEADLINE_S` applies to the local/Popen driver, not a submitted Ray Job; provider deadlines,
   admission quotas, and operator cancellation for runaway work remain production readiness gates.
 - Every hub that loads the durable backend currently supervises every active Jobs row. At larger hub ×
   active-job counts this amplifies Jobs API/object-store polling; sharded ownership/backoff is remaining

@@ -7,6 +7,10 @@ remaining compatibility collect has an explicit byte ceiling. The multi-node dif
 MinIO when a pull request changes its owned execution paths, on a weekly schedule, on demand, and as a
 required version-release gate.
 
+These claims use the trusted-workspace boundary in [Supported deployments and trust model](SUPPORT.md).
+Workers, runtime images, execution plugins, and cluster administrators are trusted with the workspace;
+the backend does not claim mutually hostile tenant isolation.
+
 The Compose and KubeRay files in this repository are validation harnesses, not deployment manifests.
 A green differential does not certify an operator's IAM, capacity, KubeRay configuration, or incident
 procedures. The final section separates backend guarantees from deployment responsibilities.
@@ -228,13 +232,14 @@ Current status versus what production ownership still needs:
   workload/driver memory; native connectors are preferable
 - Whole-graph Parquet overwrite data path — implemented; use shared object storage for remote
   clusters and tune the built-in deletion grace to the workload
-- Durable job lifecycle — partial; whole-graph Jobs has persisted attempt/submission/control routing,
-  restart reconciliation, durable acknowledged cancel, exact artifact fencing, and atomic terminal SQL
-  publication; the multi-region parent and active-failure staging remain open
+- Durable whole-graph Jobs lifecycle — implemented for the documented v3 contract: persisted
+  attempt/submission/control routing, restart reconciliation, durable acknowledged cancel, exact
+  artifact fencing, and atomic terminal SQL publication; this does not extend to the multi-region parent
 - Atomic region publication — implemented; distributed and local-fallback handoffs use immutable
   per-attempt prefixes; the controller validates the success manifest before cache publication
-- Workload isolation — partial; one-shot drivers use an explicit allowlist and a private metadata DB;
-  scoped per-attempt storage identity and enforced cluster/IAM policy remain open
+- Trusted-workspace process hygiene — implemented in core: one-shot drivers use an explicit environment
+  allowlist and a private metadata DB, without hub auth or metadata credentials; cluster/IAM enforcement
+  remains operator-owned
 - Cluster health and placement truth — partial; target-cone requirements, static advertised-capacity
   admission, GPU/custom task options, and fail-loud unsupported shapes are implemented; live
   discovery/backpressure remain open
@@ -247,25 +252,43 @@ Current status versus what production ownership still needs:
 - Deployment security and HA — operator-owned; immutable images, secrets/IAM, TLS/network policy, pod
   security, quotas, autoscaling, and HA storage
 
-## What remains before production ownership
+## Production ownership gates
 
-The correctness fences above are implemented and tested, but they are not by themselves a production
-certification. The backend still needs the following before it should own production workloads:
+The correctness fences above are implemented and tested, but production ownership is specific to a
+deployment and workload shape. Within the supported trusted-team profile, separate remaining backend
+work from checks that only an operator can perform.
 
-1. Make the multi-region parent orchestration durable, then exercise head/worker/driver loss during an
-   active Jobs run with bounded retry and recovery assertions.
-2. Replace broad data-plane credentials with attempt/dataset-scoped identities and enforce per-run
-   namespace, network, pod-security, and quota boundaries on the target cluster.
+### Remaining backend work
+
+1. Make the multi-region parent orchestration durable before using placed multi-region graphs where hub
+   restart survival is required. Whole-graph Jobs already has the narrower durable lifecycle.
+2. Exercise head, worker, and driver loss during active jobs with bounded retry, recovery, and orphan
+   assertions on the real-service gate.
 3. Discover live cluster capacity and health, enforce admission/backpressure, and reject an explicit
-   Ray placement when its requirements cannot be honored.
-4. Pin and verify the supported Ray/runtime image contract across the submitting process and every
-   worker, including upgrade and rollback behavior.
-5. Add alerts for failed manifests, object-store GC errors, spill pressure, queue delay, retries, and
-   resource saturation; keep provider lifecycle rules for versioned objects and incomplete uploads.
-6. Pass staging gates on the intended production topology: active-job failure injection, representative
-   large workloads, SLOs/alerts, upgrade/rollback, IAM validation, and recovery runbooks.
-7. Shard durable supervision or add ownership/backoff before large hub fleets: every current hub polls
+   placement when current—not only statically advertised—resources cannot honor it.
+4. Expand semantic differentials over every claimed operator/edge shape and verify the supported
+   Ray/core/plugin version handshake across submitter and workers.
+5. Add a protected operator log/metrics path, automatic whole-graph execution deadlines, bounded
+   object-store calls, and alerts for failed manifests, GC errors, spill pressure, queue delay, retries,
+   and resource saturation.
+6. Shard durable supervision or add ownership/backoff before large hub fleets: every current hub polls
    every active Jobs row, so request volume grows with hubs × active jobs.
+
+### Operator acceptance for a concrete deployment
+
+1. Protect the Ray Jobs endpoint; attest immutable runtime images and the stable cluster identity bound
+   by `DP_RAY_JOBS_CODE_REF` and `DP_RAY_JOBS_CLUSTER_REF`.
+2. Configure TLS/network policy, data-plane IAM, secret rotation, finite database and object-store
+   timeouts, quotas, and an infrastructure deadline or cancellation policy for runaway Jobs.
+3. Configure storage lifecycle rules for incomplete/versioned objects and control artifacts, then prove
+   backup/restore and orphan cleanup against the deployment's recovery window.
+4. Validate representative large workloads, capacity and saturation behavior, SLOs/alerts, HA,
+   upgrade/rollback, failure recovery, and incident runbooks on the intended topology.
+
+Attempt- or dataset-scoped identities, per-user cluster namespaces, and adversarial workload isolation
+can be useful defense in depth. They become required if the project ever expands to mutually hostile
+tenants, which [is not a supported profile](SUPPORT.md#deployment-profiles); they are not an implicit
+prerequisite for a trusted-team deployment.
 
 Object storage holds immutable shards plus `_dp_commits/<attempt>/` manifests. Ownership and lifecycle
 state live in the shared metadata database's indexed attempt, lease, ref, and exact-member inventory
