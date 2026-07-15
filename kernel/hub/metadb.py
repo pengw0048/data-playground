@@ -78,7 +78,7 @@ class CanvasShare(Base):
     canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), index=True)
     user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), index=True)
     role: Mapped[str] = mapped_column(String, default="editor")  # 'editor' | 'viewer' — never 'owner'
-    # keep this in lockstep with migration 0015; ownership is by Canvas.owner_id alone, never a share
+    # Ownership is by Canvas.owner_id alone; a share can never grant the owner role.
     __table_args__ = (
         UniqueConstraint("canvas_id", "user_id", name="uq_share"),
         CheckConstraint("role IN ('editor', 'viewer')", name="ck_share_role"),
@@ -90,10 +90,11 @@ class RunRecord(Base):
     __tablename__ = "run_records"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
     canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), index=True)
-    # The runner's real id links durable history back to the logical run. Nullable for records written
-    # before migration 0018; `id` remains the history row's own primary key.
+    # The runner's real id links durable history back to the logical run. Nullable because callers may
+    # retain diagnostic history without a live logical run; `id` is the history row's own primary key.
     run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
-    # HTTP/WebSocket request id that started the run (OPS-01). Nullable for legacy rows / non-HTTP starts.
+    # HTTP/WebSocket request id that started the run (OPS-01). Nullable for non-HTTP starts and
+    # backends that do not propagate a request id.
     request_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String)
@@ -1961,8 +1962,7 @@ def finish_run_preallocation(run_id: str, token: str, status_doc: dict) -> bool:
 
 
 def run_auth(run_id: str) -> tuple[str | None, str | None]:
-    """(creator uid, authorized real-canvas id) for a run, or (None, None) if unknown / a legacy run
-    persisted before these columns existed."""
+    """Return a run's creator and authorized real-canvas id, or nulls if identity is unavailable."""
     with session() as s:
         r = s.get(RunState, run_id)
         return (r.created_by, r.auth_canvas_id) if r else (None, None)
@@ -2243,7 +2243,7 @@ def terminal_run_status(run_id: str) -> str | None:
 
 def terminal_run_identity(
         run_id: str) -> tuple[str | None, str | None, str | None] | None:
-    """Return retained ``(creator, auth canvas, legacy canvas)`` identity for a terminal run."""
+    """Return retained ``(creator, auth canvas, operational canvas)`` identity for a terminal run."""
     with session() as s:
         row = s.execute(select(
             RunTerminalFence.created_by,

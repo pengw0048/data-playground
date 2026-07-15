@@ -124,8 +124,9 @@ dead kernel's Pod and Service; still set a sensible `DP_KERNEL_IDLE_TTL`.
 
 Store credential-bearing settings as secret references (`env:VAR` or `file:/path`) — the agent API
 key, object-store keys, and plugin secret fields — never plaintext, and inject the material values
-through the Pod environment or mounted secret files. After upgrading past the SEC-03 migration,
-re-enter any cleared legacy plaintext settings as references (see the root README).
+through the Pod environment or mounted secret files. The current pre-1.0 baseline contains no
+conversion path for old plaintext settings; recreate a pre-reset database and enter references in the
+fresh installation (see the root README).
 
 ## Notes from real-cluster verification
 

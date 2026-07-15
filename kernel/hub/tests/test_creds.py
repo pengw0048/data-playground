@@ -1,8 +1,7 @@
 """Credentials as a first-class Cred entity (issue #156).
 
-Covers: PUT/POST validation rejects raw secrets (references only), cred CRUD round-trip, migration
-0026 backfill (objectStore + agentApiKey -> seeded creds, destinations tagged), and a destination's
-credId reaching ``db.ensure_object_store`` on a write open.
+Covers: PUT/POST validation rejects raw secrets (references only), credential CRUD round-trip,
+and a destination's credId reaching ``db.ensure_object_store`` on a write open.
 """
 
 from __future__ import annotations
@@ -12,8 +11,6 @@ import json
 import os
 
 import pytest
-import sqlalchemy as sa
-from alembic import command
 from fastapi.testclient import TestClient
 
 from hub import metadb
@@ -21,21 +18,6 @@ from hub.main import app
 from hub.settings import settings
 
 client = TestClient(app)
-
-
-@contextlib.contextmanager
-def _isolated_metadata(url: str):
-    original_url = settings.database_url
-    original_engine, original_session = metadb._engine, metadb._Session
-    settings.database_url = url
-    metadb._engine = metadb._Session = None
-    try:
-        yield
-    finally:
-        if metadb._engine is not None:
-            metadb._engine.dispose()
-        settings.database_url = original_url
-        metadb._engine, metadb._Session = original_engine, original_session
 
 
 def _delete_all_creds() -> None:
@@ -356,58 +338,6 @@ def test_cred_crud_round_trip():
         assert all(c["id"] != cid for c in client.get("/api/creds").json())
     finally:
         _delete_all_creds()
-
-
-def test_migration_0026_backfills_creds_and_tags_destinations(tmp_path):
-    legacy = tmp_path / "legacy.db"
-
-    def _upgrade_to(target: str) -> None:
-        with _isolated_metadata(f"sqlite:///{legacy}"):
-            command.upgrade(metadb._alembic_cfg(), target)
-
-    _upgrade_to("0025_run_request_id")
-    engine = sa.create_engine(f"sqlite:///{legacy}")
-    with engine.begin() as conn:
-        for key, value in (
-            ("objectStore", {"accessKeyId": "env:AK", "secretAccessKey": "env:SK",
-                             "region": "us-east-1"}),
-            ("agentApiKey", "env:AGENT"),
-            ("destinations", [
-                {"id": "s3d", "name": "S3", "backend": "s3", "root": "s3://b/p"},
-                {"id": "loc", "name": "Local", "backend": "local", "root": "/tmp/out"},
-            ]),
-        ):
-            conn.execute(sa.text(
-                "INSERT INTO settings (scope, scope_id, key, value) VALUES ('global','',:k,:v)"),
-                {"k": key, "v": json.dumps(value)})
-    engine.dispose()
-
-    _upgrade_to("0026_creds")
-
-    with _isolated_metadata(f"sqlite:///{legacy}"):
-        creds = {c["kind"]: c for c in metadb.creds_list()}
-        assert creds["object_store"]["fields"]["accessKeyId"] == "env:AK"
-        assert creds["agent"]["fields"] == {"apiKey": "env:AGENT"}
-
-        assert metadb.get_setting("defaultObjectStoreCredId") == "cred-object-store-default"
-        assert metadb.get_setting("agentCredId") == "cred-agent-default"
-
-        dests = {d["id"]: d for d in metadb.get_setting("destinations")}
-        assert dests["s3d"]["credId"] == "cred-object-store-default"  # object-store dest tagged
-        assert "credId" not in dests["loc"]                          # local dest untouched
-
-        # a default cred configured this way reaches everything through cred_object_store_config(None)
-        assert metadb.cred_object_store_config(None)["accessKeyId"] == "env:AK"
-        assert metadb.cred_agent_api_key_ref() == "env:AGENT"
-
-
-def test_migration_0026_is_a_noop_without_legacy_settings(tmp_path):
-    clean = tmp_path / "clean.db"
-    with _isolated_metadata(f"sqlite:///{clean}"):
-        command.upgrade(metadb._alembic_cfg(), "0026_creds")
-        assert metadb.creds_list() == []
-        assert metadb.get_setting("defaultObjectStoreCredId") is None
-        assert metadb.get_setting("agentCredId") is None
 
 
 def test_destination_cred_reaches_ensure_object_store_on_write(monkeypatch, tmp_path):

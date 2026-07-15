@@ -173,8 +173,13 @@ object-store client, plugin registration). A pluggable `SecretResolver` seam (`h
 `reg.add_secret_resolver`) lets a future plugin add schemes such as Vault without importing a vendor
 client into core.
 
-After upgrading, run `dataplay migrate`: any legacy plaintext secret values are **deleted** (not
-converted). Re-enter each affected setting as a reference. Example:
+> [!WARNING]
+> The metadata schema was reset to one baseline before the first public release. Databases created
+> by earlier commits are intentionally unsupported: stop every process, preserve any input data or
+> plugins you need, and start with a new workspace/SQLite database or an empty PostgreSQL schema.
+> `dataplay migrate` creates the current schema; it does not convert a pre-reset database.
+
+Credential settings in a fresh database accept secret references such as:
 
 ```text
 agentApiKey                          = env:ANTHROPIC_API_KEY

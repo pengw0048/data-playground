@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import sqlite3
 
 import pytest
 import sqlalchemy as sa
-from alembic import command
 from fastapi.testclient import TestClient
 
 from hub import metadb
@@ -34,21 +32,6 @@ FIXTURE_ACCESS = "FIXTURE-SECRET-ACCESS"
 FIXTURE_SECRET = "FIXTURE-SECRET-SECRETKEY"
 FIXTURE_SESSION = "FIXTURE-SECRET-SESSION"
 FIXTURE_PLUGIN = "FIXTURE-SECRET-PLUGIN"
-
-
-@contextlib.contextmanager
-def _isolated_metadata(url: str):
-    original_url = settings.database_url
-    original_engine, original_session = metadb._engine, metadb._Session
-    settings.database_url = url
-    metadb._engine = metadb._Session = None
-    try:
-        yield
-    finally:
-        if metadb._engine is not None:
-            metadb._engine.dispose()
-        settings.database_url = original_url
-        metadb._engine, metadb._Session = original_engine, original_session
 
 
 def _raw_settings_rows() -> list[tuple[str, str]]:
@@ -191,60 +174,6 @@ def test_ephemeral_metadata_stores_refs_not_fixture_secret(monkeypatch, tmp_path
     store = json.loads(next(r[1] for r in rows if r[0] == "objectStore"))
     assert store["accessKeyId"] == "env:DP_S3_KEY"
     assert store["secretAccessKey"] == "env:DP_S3_SECRET"
-
-
-def test_secret_ref_migration_clean_and_legacy(tmp_path):
-    # AC4: clean DB upgrades; legacy plaintext secrets are deleted with operator instructions.
-    clean = tmp_path / "clean.db"
-    legacy = tmp_path / "legacy.db"
-
-    def _upgrade_to(path, target: str) -> None:
-        with _isolated_metadata(f"sqlite:///{path}"):
-            command.upgrade(metadb._alembic_cfg(), target)
-
-    _upgrade_to(clean, "0021_local_result_artifacts")
-    _upgrade_to(clean, "0024_secret_refs")
-    with sa.create_engine(f"sqlite:///{clean}").connect() as conn:
-        assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar() == (
-            "0024_secret_refs")
-
-    _upgrade_to(legacy, "0021_local_result_artifacts")
-    engine = sa.create_engine(f"sqlite:///{legacy}")
-    with engine.begin() as conn:
-        conn.execute(sa.text(
-            "INSERT INTO settings (scope, scope_id, key, value) VALUES "
-            "('global', '', 'agentApiKey', :v)"
-        ), {"v": json.dumps("sk-LEGACY-AGENT")})
-        conn.execute(sa.text(
-            "INSERT INTO settings (scope, scope_id, key, value) VALUES "
-            "('global', '', 'objectStore', :v)"
-        ), {"v": json.dumps({
-            "accessKeyId": "LEGACY-ACCESS",
-            "secretAccessKey": "LEGACY-SECRET",
-            "sessionToken": "LEGACY-SESSION",
-            "region": "us-east-1",
-        })})
-        conn.execute(sa.text(
-            "INSERT INTO settings (scope, scope_id, key, value) VALUES "
-            "('global', '', 'plugin.dp_x.token', :v)"
-        ), {"v": json.dumps("LEGACY-PLUGIN-TOKEN")})
-        conn.execute(sa.text(
-            "INSERT INTO settings (scope, scope_id, key, value) VALUES "
-            "('global', '', 'plugin.dp_x.host', :v)"
-        ), {"v": json.dumps("db.internal")})
-
-    _upgrade_to(legacy, "0024_secret_refs")
-    with engine.connect() as conn:
-        rows = {r[0]: json.loads(r[1]) for r in conn.execute(
-            sa.text("SELECT key, value FROM settings WHERE scope = 'global'")).fetchall()}
-    assert "agentApiKey" not in rows
-    assert "plugin.dp_x.token" not in rows
-    assert rows.get("plugin.dp_x.host") == "db.internal"
-    store = rows.get("objectStore") or {}
-    assert "accessKeyId" not in store and "secretAccessKey" not in store
-    assert "sessionToken" not in store
-    assert store.get("region") == "us-east-1"
-    assert "LEGACY" not in json.dumps(rows)
 
 
 def test_pluggable_secret_resolver_scheme():
