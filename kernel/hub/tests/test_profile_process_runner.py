@@ -869,7 +869,7 @@ while True: time.sleep(1)
     assert runner.cancel_acknowledged(started.run_id)
     assert processes[0].returncode is not None
     assert marker.stat().st_size == side_effect_size
-    assert started.run_id not in runner._profile_process_groups
+    assert started.run_id not in runner._process_scopes
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group containment")
@@ -903,7 +903,7 @@ time.sleep(0.1)
     assert "without a valid terminal status" in (final.error or "")
     assert processes[0].returncode == 0
     assert marker.stat().st_size == side_effect_size
-    assert started.run_id not in runner._profile_process_groups
+    assert started.run_id not in runner._process_scopes
 
 
 def test_child_cannot_self_report_parent_cancellation(tmp_path, monkeypatch):

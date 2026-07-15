@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import func, select, text
 
 from hub import handoff, metadb
+from hub.process_scope import OwnedProcessScope
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -3103,6 +3104,9 @@ def test_subprocess_parent_discards_object_result_only_after_child_reaped(
     runner.runs[handle["run_id"]] = RunStatus(
         run_id=handle["run_id"], status="running", per_node=[])
     runner._object_results[handle["run_id"]] = {"uri": handle["uri"], "cache_key": None}
+    process = FinishedProcess()
+    runner._process_scopes[handle["run_id"]] = OwnedProcessScope(
+        process, owns_process_group=False)
     if cancelled:
         runner._cancelled.add(handle["run_id"])
     original_discard = handoff.discard_attempt
@@ -3114,7 +3118,7 @@ def test_subprocess_parent_discards_object_result_only_after_child_reaped(
     handoff.discard_attempt = discard_after_reap
     try:
         runner._watch(
-            handle["run_id"], FinishedProcess(), str(status_file), str(job_dir),
+            handle["run_id"], process, str(status_file), str(job_dir),
             Graph.model_validate({"id": "subprocess-fail", "version": 1,
                                   "nodes": [], "edges": []}), None)
         final = runner.status(handle["run_id"])
@@ -3167,6 +3171,9 @@ def test_subprocess_parent_discards_managed_sink_only_after_child_reaped(
         "uri": handle["uri"], "logical_uri": handle["logical_uri"],
         "name": "daily", "parents": [],
     }}
+    process = FinishedProcess()
+    runner._process_scopes[handle["run_id"]] = OwnedProcessScope(
+        process, owns_process_group=False)
     if cancelled:
         runner._cancelled.add(handle["run_id"])
     original_discard = handoff.discard_attempt
@@ -3178,7 +3185,7 @@ def test_subprocess_parent_discards_managed_sink_only_after_child_reaped(
     handoff.discard_attempt = discard_after_reap
     try:
         runner._watch(
-            handle["run_id"], FinishedProcess(), str(status_file), str(job_dir),
+            handle["run_id"], process, str(status_file), str(job_dir),
             Graph.model_validate({"id": "subprocess-sink", "version": 1,
                                   "nodes": [], "edges": []}), None)
         final = runner.status(handle["run_id"])
@@ -3697,7 +3704,10 @@ def test_subprocess_orderly_shutdown_fences_watcher_before_reap_and_discard(tmp_
             raise AssertionError("orderly shutdown should terminate within grace")
 
     runner = SubprocessRunner(str(tmp_path), str(tmp_path))
-    runner._procs[run_id] = Process()
+    process = Process()
+    runner._procs[run_id] = process
+    runner._process_scopes[run_id] = OwnedProcessScope(
+        process, owns_process_group=False)
     runner._object_results[run_id] = {"uri": "s3://shutdown/out.attempt-owned"}
     monkeypatch.setattr(
         handoff, "discard_attempt", lambda _uri: events.append("discard"))
@@ -3862,12 +3872,15 @@ def test_subprocess_malformed_child_status_fails_generically_after_reap_and_clea
         lambda _uri, **_kwargs: events.append("cleanup"))
     runner = SubprocessRunner(str(tmp_path), str(tmp_path))
     runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
-    runner._procs["run"] = Process()
+    process = Process()
+    runner._procs["run"] = process
+    runner._process_scopes["run"] = OwnedProcessScope(
+        process, owns_process_group=False)
     runner._object_results["run"] = {
         "uri": "s3://region-contract/out.attempt-parent", "cache_key": None,
     }
     runner._watch(
-        "run", runner._procs["run"], str(status_file), str(job_dir),
+        "run", process, str(status_file), str(job_dir),
         Graph.model_validate({"id": "malformed", "version": 1,
                               "nodes": [], "edges": []}), None)
 

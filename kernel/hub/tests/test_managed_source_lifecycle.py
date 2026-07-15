@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from hub import handoff, metadb
 from hub.models import Graph, RunStatus
+from hub.process_scope import OwnedProcessScope
 from hub.storage import (
     MAX_MANAGED_EXECUTION_SOURCES,
     ManagedSourceAccessDenied,
@@ -927,6 +928,8 @@ def test_source_lease_lost_after_child_done_blocks_every_publication(
     runner.runs[run_id] = RunStatus(
         run_id=run_id, status="running", placement="local", per_node=[])
     runner._procs[run_id] = process
+    runner._process_scopes[run_id] = OwnedProcessScope(
+        process, owns_process_group=False)
     runner._source_leases[run_id] = {
         "stack": stack,
         "guards": [guard],

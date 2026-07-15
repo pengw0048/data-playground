@@ -11105,6 +11105,84 @@ def test_ray_popen_supervisor_erases_sensitive_workdir_and_closes_log(
         assert run_id not in runner._cancel
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group containment")
+@pytest.mark.parametrize(
+    ("mode", "expected_status"),
+    [("cancel", "cancelled"), ("deadline", "failed")],
+)
+def test_ray_local_driver_fences_descendant_before_terminal(
+        tmp_path, monkeypatch, mode, expected_status):
+    import subprocess
+    import sys
+    import threading
+
+    from hub.deps import Deps
+    from hub.models import Graph, RunStatus
+
+    mod = _load_dp_ray()
+    marker = tmp_path / f"ray-{mode}-descendant"
+    grandchild = f"""
+import os, signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    with open({str(marker)!r}, "a") as output:
+        output.write("x"); output.flush(); os.fsync(output.fileno())
+    time.sleep(0.01)
+"""
+    child = f"""
+import json, os, subprocess, sys, time
+job = json.load(open(sys.argv[1]))
+subprocess.Popen([sys.executable, "-c", {grandchild!r}])
+while not os.path.exists({str(marker)!r}): time.sleep(0.01)
+payload = {{"status": "running", "rows": 0, "outputs": []}}
+tmp = job["status_file"] + ".tmp"
+json.dump(payload, open(tmp, "w")); os.replace(tmp, job["status_file"])
+while True: time.sleep(1)
+"""
+    real_popen = subprocess.Popen
+
+    def popen(command, **kwargs):
+        assert kwargs.get("start_new_session") is True
+        return real_popen([sys.executable, "-c", child, command[-1]], **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setenv("DP_RUN_DEADLINE_S", "0.25" if mode == "deadline" else "10")
+    workspace, data = tmp_path / "workspace", tmp_path / "data"
+    workspace.mkdir()
+    data.mkdir()
+    runner = mod.RayRunner(Deps(str(workspace), str(data)))
+    run_id = f"ray-{mode}-descendant"
+    graph = Graph(id=run_id, version=1, nodes=[], edges=[])
+    status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=[])
+    runner.runs[run_id] = status
+    runner._cancel[run_id] = threading.Event()
+    terminal_emissions = []
+    completions = []
+    runner.on_status = lambda _graph, observed: terminal_emissions.append(observed.status)
+    runner.on_complete = lambda *_args: completions.append(status.status)
+    worker = threading.Thread(
+        target=runner._supervise, args=(run_id, graph, None, status), daemon=True)
+    worker.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not (marker.exists() and marker.stat().st_size):
+        time.sleep(0.01)
+    assert marker.exists() and marker.stat().st_size
+    if mode == "cancel":
+        runner._cancel[run_id].set()
+    worker.join(timeout=8)
+    assert not worker.is_alive()
+    size_at_terminal = marker.stat().st_size
+    time.sleep(0.2)
+
+    assert status.status == expected_status
+    if mode == "deadline":
+        assert "deadline" in (status.error or "")
+    assert marker.stat().st_size == size_at_terminal
+    assert terminal_emissions.count(expected_status) == 1
+    assert completions == [expected_status]
+    assert run_id not in runner._driver_scopes
+
+
 def test_ray_unreaped_driver_stays_nonterminal_and_retains_every_fence(
         tmp_path, monkeypatch):
     import shutil
@@ -11209,7 +11287,7 @@ def test_ray_unreaped_driver_stays_nonterminal_and_retains_every_fence(
     assert status.status == "cancelled" and runner.cancel_acknowledged(run_id)
     assert completed == [True] and not work.exists()
     assert run_id not in runner._unreaped_drivers
-    assert run_id not in runner._driver_procs and run_id not in runner._driver_workdirs
+    assert run_id not in runner._driver_scopes and run_id not in runner._driver_workdirs
     assert lease_events == ["opened", "closed"]
 
 
@@ -11320,9 +11398,12 @@ def test_ray_reconcile_and_shutdown_have_one_terminal_finalizer(tmp_path, monkey
 
     proc = ReapedProcess()
     run_id = "ray-one-finalizer"
-    state = {"run_id": run_id, "proc": proc, "work": str(tmp_path / "work")}
+    from hub.process_scope import OwnedProcessScope
+
+    scope = OwnedProcessScope(proc, owns_process_group=False)
+    state = {"run_id": run_id, "scope": scope, "work": str(tmp_path / "work")}
     runner._unreaped_drivers[run_id] = state
-    runner._driver_procs[run_id] = proc
+    runner._driver_scopes[run_id] = scope
     runner._driver_workdirs[run_id] = state["work"]
     runner._cancel[run_id] = threading.Event()
     monkeypatch.setattr(
@@ -11347,7 +11428,7 @@ def test_ray_reconcile_and_shutdown_have_one_terminal_finalizer(tmp_path, monkey
     assert finalized == [state]
     assert run_id not in runner._unreaped_drivers
     runner._finalizing_drivers.discard(run_id)
-    runner._driver_procs.pop(run_id, None)
+    runner._driver_scopes.pop(run_id, None)
     runner._driver_workdirs.pop(run_id, None)
     runner._cancel.pop(run_id, None)
 
