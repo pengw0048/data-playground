@@ -23,13 +23,16 @@ from hub.observability import (
     MetricType,
     MetricUnit,
     assert_event_redacted,
+    add_audit_sink,
+    add_metric_sink,
     clear_sinks,
+    drain_sinks,
     emit_audit,
     emit_metric,
-    fanout_sinks,
     invoke_backend_run,
     mint_request_id,
     normalize_request_id,
+    shutdown_sinks,
 )
 
 
@@ -99,6 +102,7 @@ def test_settings_change_audit_reaches_sinks():
                        resource_type="setting", resource_id="agentApiKey",
                        attrs={"scope": "global", "sensitive": "true"})
     assert event is not None  # not rejected at construction (a 'secret'-named attr would be)
+    assert drain_sinks()
     changes = [e for e in sink.audits if e.action == AuditAction.ADMIN_SETTINGS_CHANGE]
     assert changes and changes[-1].attrs.get("sensitive") == "true"
 
@@ -112,6 +116,7 @@ def test_inmemory_sink_records_shape_valid_events_and_redacts_fixtures():
                 request_id="req_test")
     emit_audit(AuditAction.AUTH_LOGIN, AuditOutcome.SUCCESS, principal_id="alice",
                attrs={"mode": "open"})
+    assert drain_sinks()
     assert sink.metrics and sink.audits
     for event in (*sink.metrics, *sink.audits):
         assert event.schema_version == SCHEMA_VERSION
@@ -126,6 +131,7 @@ def test_label_cardinality_bounded_across_many_canvases():
                     labels={"status": "done", "outcome": "success", "placement": "local",
                             "error_class": "none"},
                     run_id=f"run_{i:04d}")
+    assert drain_sinks()
     label_sets = sink.label_sets(MetricName.RUN_FINISHED)
     assert len(label_sets) == 50
     assert len(set(label_sets)) == 1  # cardinality does not grow with N
@@ -186,6 +192,48 @@ def test_http_responses_echo_request_id_header():
         assert custom.headers.get("X-Request-Id") == "req_client_supplied_01"
 
 
+def test_http_outcome_is_unchanged_by_throwing_and_blocking_metric_sinks():
+    from hub.main import app
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def raising(_event):
+        raise RuntimeError("metric exporter failed")
+
+    def blocking(_event):
+        started.set()
+        release.wait(timeout=10)
+
+    add_metric_sink(raising)
+    add_metric_sink(blocking)
+    try:
+        with TestClient(app) as client:
+            t0 = time.perf_counter()
+            response = client.get("/api/livez")
+            assert time.perf_counter() - t0 < 1.0
+            assert response.status_code == 200
+            assert response.json() == {"ok": True}
+            assert started.wait(timeout=1)
+            release.set()
+    finally:
+        release.set()
+
+
+def test_observability_registration_survives_repeated_app_lifespans():
+    from hub.main import app
+
+    sink = InMemoryObservabilitySink().register()
+    with TestClient(app) as client:
+        assert client.get("/api/livez").status_code == 200
+    first_count = len(sink.metrics)
+    assert first_count >= 3  # health gauge + request count + request duration
+
+    with TestClient(app) as client:
+        assert client.get("/api/livez").status_code == 200
+    assert len(sink.metrics) >= first_count + 3
+
+
 def test_run_persists_request_id_on_durable_record(tmp_path):
     from hub import metadb
     from hub.deps import Deps, _persist_run
@@ -221,19 +269,24 @@ def test_faulty_and_blocking_sinks_do_not_change_run_results(tmp_path):
     ws.mkdir()
     d = Deps(str(ws), str(tmp_path / "data"), maintain_storage=False)
     blocked = threading.Event()
+    telemetry_received = threading.Event()
+    metric_received = threading.Event()
 
     def raising(_record):
         raise RuntimeError("sink boom")
 
     def blocking(_record):
-        blocked.wait(timeout=30)  # held until test ends — fanout times out
+        blocked.wait(timeout=30)  # held until test cleanup; only this sink's worker is occupied
 
     good: list[dict] = []
+
+    def good_telemetry(record):
+        good.append(record)
+        telemetry_received.set()
+
     Registry(d).add_telemetry_sink(raising)
     Registry(d).add_telemetry_sink(blocking)
-    Registry(d).add_telemetry_sink(good.append)
-
-    metric_sink = InMemoryObservabilitySink().register()
+    Registry(d).add_telemetry_sink(good_telemetry)
 
     def raising_metric(_e):
         raise RuntimeError("metric boom")
@@ -241,23 +294,35 @@ def test_faulty_and_blocking_sinks_do_not_change_run_results(tmp_path):
     def blocking_metric(_e):
         blocked.wait(timeout=30)
 
-    from hub.observability import add_metric_sink
     add_metric_sink(raising_metric)
     add_metric_sink(blocking_metric)
+
+    metrics: list[MetricEvent] = []
+
+    def good_metric(event):
+        metrics.append(event)
+        if event.name == MetricName.RUN_FINISHED:
+            metric_received.set()
+
+    add_metric_sink(good_metric)
 
     g = Graph(id="no_such_canvas", version=1, nodes=[], edges=[])
     st = RunStatus(run_id="run_iso01", status="done", total_rows=7, ms=5, placement="local",
                    request_id="req_iso",
                    per_node=[PerNodeStatus(node_id="n", status="done", rows=7, ms=5)])
     t0 = time.perf_counter()
-    _persist_run(d, g, "n", st)
-    elapsed = time.perf_counter() - t0
-    # Timeouts apply, but the run path must finish (not hang on the 30s wait).
-    assert elapsed < 20
-    assert st.status == "done" and st.total_rows == 7 and st.ms == 5
-    assert good and good[0]["run_id"] == "run_iso01" and good[0]["request_id"] == "req_iso"
-    assert any(m.name == MetricName.RUN_FINISHED for m in metric_sink.metrics)
-    blocked.set()
+    try:
+        _persist_run(d, g, "n", st)
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 1.0
+        assert telemetry_received.wait(timeout=1)
+        assert metric_received.wait(timeout=1)
+        assert st.status == "done" and st.total_rows == 7 and st.ms == 5
+        assert good[0]["run_id"] == "run_iso01" and good[0]["request_id"] == "req_iso"
+        assert any(m.name == MetricName.RUN_FINISHED for m in metrics)
+    finally:
+        blocked.set()
+    assert drain_sinks()
 
 
 def test_legacy_telemetry_sink_still_receives_finished_run_records(tmp_path):
@@ -274,6 +339,7 @@ def test_legacy_telemetry_sink_still_receives_finished_run_records(tmp_path):
         run_id="run_legacy01", status="done", total_rows=2, ms=3, placement="local",
         request_id="req_legacy",
         per_node=[PerNodeStatus(node_id="n", status="done", rows=2, ms=3)]))
+    assert drain_sinks()
     assert len(got) == 1
     assert got[0]["run_id"] == "run_legacy01"
     assert got[0]["request_id"] == "req_legacy"
@@ -319,19 +385,143 @@ def test_normalize_request_id_rejects_unsafe_tokens():
     assert mint_request_id().startswith("req_")
 
 
-def test_fanout_timeout_isolates_blocking_callable():
-    seen: list[int] = []
+def test_blocking_sinks_do_not_delay_or_starve_healthy_sink():
+    release = threading.Event()
+    started = [threading.Event(), threading.Event()]
+    healthy_received = threading.Event()
+    seen: list[MetricEvent] = []
 
-    def block(_):
-        time.sleep(30)
+    def blocking(index):
+        def sink(_event):
+            started[index].set()
+            release.wait(timeout=10)
+        return sink
 
-    def ok(x):
-        seen.append(x)
+    def healthy(event):
+        seen.append(event)
+        if len(seen) == 2:
+            healthy_received.set()
 
-    t0 = time.perf_counter()
-    fanout_sinks([block, ok], 42, kind="test")
-    assert time.perf_counter() - t0 < 10
-    assert seen == [42]
+    add_metric_sink(blocking(0))
+    add_metric_sink(blocking(1))
+    add_metric_sink(healthy)
+    try:
+        t0 = time.perf_counter()
+        emit_metric(MetricName.HTTP_REQUESTS, labels={
+            "method": "GET", "route_class": "api.livez", "outcome": "success",
+        })
+        assert time.perf_counter() - t0 < 1.0
+        assert all(event.wait(timeout=1) for event in started)
+
+        emit_metric(MetricName.HTTP_REQUESTS, labels={
+            "method": "GET", "route_class": "api.livez", "outcome": "success",
+        })
+        assert healthy_received.wait(timeout=1)
+        assert len(seen) == 2
+    finally:
+        release.set()
+    assert drain_sinks()
+
+
+def test_throwing_sink_worker_recovers_for_later_events():
+    recovered = threading.Event()
+    calls = 0
+
+    def flaky(_event):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("first delivery fails")
+        recovered.set()
+
+    add_metric_sink(flaky)
+    for _ in range(2):
+        emit_metric(MetricName.HTTP_REQUESTS, labels={
+            "method": "GET", "route_class": "api.livez", "outcome": "success",
+        })
+    assert recovered.wait(timeout=1)
+    assert drain_sinks()
+    from hub import observability
+    stats = observability._sink_delivery_stats()
+    assert len(stats) == 1
+    assert {key: stats[0][key] for key in (
+        "kind", "accepted", "delivered", "failed", "dropped", "pending", "active",
+    )} == {
+        "kind": "metric", "accepted": 2, "delivered": 1, "failed": 1,
+        "dropped": 0, "pending": 0, "active": False,
+    }
+
+
+def test_sink_queue_saturation_is_bounded_and_logged(caplog):
+    from hub import observability
+
+    release = threading.Event()
+    started = threading.Event()
+
+    def blocking(_event):
+        started.set()
+        release.wait(timeout=10)
+
+    add_metric_sink(blocking)
+    try:
+        emit_metric(MetricName.HTTP_REQUESTS, labels={
+            "method": "GET", "route_class": "api.livez", "outcome": "success",
+        })
+        assert started.wait(timeout=1)
+        for _ in range(observability._SINK_QUEUE_CAPACITY + 1):
+            emit_metric(MetricName.HTTP_REQUESTS, labels={
+                "method": "GET", "route_class": "api.livez", "outcome": "success",
+            })
+        stats = observability._sink_delivery_stats()[0]
+        assert stats["pending"] == observability._SINK_QUEUE_CAPACITY
+        assert stats["dropped"] == 1
+        assert "queue is full" in caplog.text
+        assert "dropped=1" in caplog.text
+        t0 = time.perf_counter()
+        assert drain_sinks(timeout=0.02) is False
+        assert time.perf_counter() - t0 < 0.25
+    finally:
+        release.set()
+    assert drain_sinks()
+
+
+def test_sink_worker_count_is_bounded(monkeypatch):
+    from hub import observability
+
+    monkeypatch.setattr(observability, "_MAX_SINK_WORKERS", 2)
+    add_metric_sink(lambda _event: None)
+    add_audit_sink(lambda _event: None)
+    with pytest.raises(RuntimeError, match="sink limit reached"):
+        add_metric_sink(lambda _event: None)
+    assert len(observability._sink_delivery_stats()) == 2
+
+
+def test_shutdown_flushes_healthy_sinks_and_bounds_wedged_sink_wait():
+    delivered: list[MetricEvent] = []
+    add_metric_sink(delivered.append)
+    emit_metric(MetricName.HTTP_REQUESTS, labels={
+        "method": "GET", "route_class": "api.livez", "outcome": "success",
+    })
+    assert shutdown_sinks(timeout=1)
+    assert len(delivered) == 1
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def wedged(_event):
+        started.set()
+        release.wait(timeout=10)
+
+    add_metric_sink(wedged)
+    emit_metric(MetricName.HTTP_REQUESTS, labels={
+        "method": "GET", "route_class": "api.livez", "outcome": "success",
+    })
+    assert started.wait(timeout=1)
+    try:
+        assert shutdown_sinks(timeout=0.01) is False
+    finally:
+        release.set()
+    assert shutdown_sinks(timeout=1)
 
 
 def test_docs_and_models_agree_on_metric_names():

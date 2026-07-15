@@ -414,8 +414,11 @@ json.dump(payload, open(tmp, "w")); os.replace(tmp, job["statusFile"])
         plan_digest = _digest(f"history-{mode}")
         attempt_order = _admit_profile(metadb, graph, run_id, plan_digest)
         runner = _runner(tmp_path)
+        from hub.observability import drain_sinks, register_sink_delivery
         telemetry = []
-        deps = types.SimpleNamespace(telemetry_sinks=[telemetry.append])
+        deps = types.SimpleNamespace(telemetry_sinks=[
+            register_sink_delivery(telemetry.append, kind="telemetry"),
+        ])
         runner.on_status = lambda observed_graph, status: metadb.save_run_state(
             status.run_id, status.model_dump(), canvas_id=observed_graph.id,
             kernel_id="profile-kernel",
@@ -446,6 +449,7 @@ json.dump(payload, open(tmp, "w")); os.replace(tmp, job["statusFile"])
             ))
         assert records == 1
         assert record is not None and record.status == mode
+        assert drain_sinks()
         assert len(telemetry) == 1 and telemetry[0]["status"] == mode
         assert final.status == mode
 
@@ -463,8 +467,11 @@ def test_profile_history_retry_is_idempotent_after_commit_unknown(tmp_path, monk
         attempt_order = _admit_profile(metadb, graph, run_id, plan_digest)
         runner = _runner(tmp_path)
         runner.publication_retry_wait = lambda _delay: None
+        from hub.observability import drain_sinks, register_sink_delivery
         telemetry = []
-        deps = types.SimpleNamespace(telemetry_sinks=[telemetry.append])
+        deps = types.SimpleNamespace(telemetry_sinks=[
+            register_sink_delivery(telemetry.append, kind="telemetry"),
+        ])
         real_record_run = metadb.record_run
         history_calls = 0
 
@@ -505,6 +512,7 @@ def test_profile_history_retry_is_idempotent_after_commit_unknown(tmp_path, monk
                 ))
         assert history_calls == 2
         assert records == 1
+        assert drain_sinks()
         assert len(telemetry) == 1 and telemetry[0]["run_id"] == run_id
 
 

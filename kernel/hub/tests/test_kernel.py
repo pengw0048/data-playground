@@ -4299,6 +4299,8 @@ def test_telemetry_sink_seam_fires_once_per_finished_run(tmp_path):
     st = RunStatus(run_id="r1", status="done", total_rows=5, ms=12, placement="local",
                    per_node=[PerNodeStatus(node_id="n", status="done", rows=5, ms=12)])
     dm._persist_run(d, g, "n", st)  # no canvas → record_run no-ops, but the sink seam still fans out
+    from hub.observability import drain_sinks
+    assert drain_sinks()
 
     assert len(got) == 1
     rec = got[0]
@@ -4336,6 +4338,8 @@ def test_run_log_reference_plugin_appends_finished_runs(tmp_path, monkeypatch):
         dm._persist_run(d, g, "n", RunStatus(run_id=rid, status=status, total_rows=3, ms=7, placement="local",
                                              per_node=[PerNodeStatus(node_id="n", status=status, rows=3, ms=7)]))
 
+    from hub.observability import drain_sinks
+    assert drain_sinks()
     lines = [json.loads(x) for x in log.read_text().splitlines() if x.strip()]
     assert [x["run_id"] for x in lines] == ["r1", "r2"]  # one JSON line per finished run, in order
     assert lines[0]["status"] == "done" and lines[1]["status"] == "failed"

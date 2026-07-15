@@ -1,8 +1,8 @@
 """Stable observability contracts — metrics, audit events, and request/trace IDs.
 
 Core defines typed, versioned shapes and a pluggable sink seam. It ships no OpenTelemetry,
-Prometheus, or vendor exporter (those are follow-up plugins). A sinking failure or timeout never
-changes request results, run results, or stored data.
+Prometheus, or vendor exporter (those are follow-up plugins). Sink I/O runs behind bounded queues;
+a callback failure or overload never changes request results, run results, or stored data.
 
 See ``docs/OBSERVABILITY.md`` for the authoritative catalog of metric names and audit actions.
 """
@@ -12,8 +12,9 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from collections import deque
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from enum import Enum
@@ -23,18 +24,21 @@ from pydantic import BaseModel, ConfigDict, Field
 
 SCHEMA_VERSION = 1
 REQUEST_ID_HEADER = "X-Request-Id"
-# Bound fan-out so a slow/stuck sink cannot stall runs or HTTP responses.
-_SINK_TIMEOUT_S = 2.0
-_SINK_WORKERS = 4
+# One worker per registered sink keeps a permanently wedged plugin from consuming shared delivery
+# capacity. Both dimensions are hard bounds: at most 32 workers, each retaining at most 256 events.
+_SINK_QUEUE_CAPACITY = 256
+_MAX_SINK_WORKERS = 32
+_SINK_SHUTDOWN_TIMEOUT_S = 1.0
 
 _log = logging.getLogger("hub.observability")
 
 _request_id_var: ContextVar[str | None] = ContextVar("dp_request_id", default=None)
 _metric_sinks: list = []
 _audit_sinks: list = []
-_sink_lock = threading.Lock()
-_executor: ThreadPoolExecutor | None = None
-_executor_lock = threading.Lock()
+_sink_lock = threading.RLock()
+_delivery_lock = threading.Lock()
+_deliveries: set = set()
+_next_delivery_id = 1
 
 # Low-cardinality label keys only. Raw IDs, URIs, user input, and error strings are forbidden.
 ALLOWED_METRIC_LABEL_KEYS = frozenset({
@@ -153,6 +157,197 @@ class AuditEvent(BaseModel):
 
 MetricSink = Callable[[MetricEvent], Any]
 AuditSink = Callable[[AuditEvent], Any]
+
+
+def _log_at_exponential_intervals(count: int) -> bool:
+    """Log the first occurrence and powers of two so a broken sink cannot flood logs."""
+    return count > 0 and (count & (count - 1)) == 0
+
+
+class _SinkDelivery:
+    """One bounded queue and one daemon worker for one registered callback."""
+
+    def __init__(self, sink: Callable[[Any], Any], *, kind: str, delivery_id: int) -> None:
+        self._sink = sink
+        self.kind = kind
+        self.delivery_id = delivery_id
+        self._condition = threading.Condition()
+        self._queue: deque[Any] = deque()
+        self._closing = False
+        self._active = False
+        self._stopped = False
+        self._accepted = 0
+        self._delivered = 0
+        self._failed = 0
+        self._dropped = 0
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name=f"dp-obs-{kind}-{delivery_id}",
+        )
+        self._thread.start()
+
+    def enqueue(self, payload: Any) -> bool:
+        reason: str | None = None
+        log_drop = False
+        with self._condition:
+            if self._closing:
+                reason = "delivery is closed"
+            elif len(self._queue) >= _SINK_QUEUE_CAPACITY:
+                reason = f"queue is full (capacity={_SINK_QUEUE_CAPACITY})"
+            else:
+                self._queue.append(payload)
+                self._accepted += 1
+                self._condition.notify()
+                return True
+            self._dropped += 1
+            log_drop = _log_at_exponential_intervals(self._dropped)
+            dropped = self._dropped
+        if log_drop:
+            _log.warning(
+                "%s sink delivery %d dropped an event: %s (dropped=%d)",
+                self.kind, self.delivery_id, reason, dropped,
+            )
+        return False
+
+    def _run(self) -> None:
+        try:
+            while True:
+                with self._condition:
+                    while not self._queue and not self._closing:
+                        self._condition.wait()
+                    if not self._queue:
+                        return
+                    payload = self._queue.popleft()
+                    self._active = True
+                try:
+                    self._sink(payload)
+                except BaseException:  # noqa: BLE001 — plugin failure must stay inside its worker
+                    with self._condition:
+                        self._failed += 1
+                        log_failure = _log_at_exponential_intervals(self._failed)
+                        failed = self._failed
+                    if log_failure:
+                        _log.warning(
+                            "%s sink delivery %d failed (failures=%d)",
+                            self.kind, self.delivery_id, failed, exc_info=True,
+                        )
+                else:
+                    with self._condition:
+                        self._delivered += 1
+                finally:
+                    with self._condition:
+                        self._active = False
+                        self._condition.notify_all()
+        finally:
+            with self._condition:
+                self._stopped = True
+                self._condition.notify_all()
+
+    def request_close(self) -> None:
+        with self._condition:
+            self._closing = True
+            self._condition.notify_all()
+
+    def join(self, timeout: float) -> None:
+        self._thread.join(timeout=max(0.0, timeout))
+
+    def wait_idle(self, deadline: float) -> bool:
+        with self._condition:
+            while self._queue or self._active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def closed_and_stopped(self) -> bool:
+        with self._condition:
+            return self._closing and self._stopped
+
+    def is_stopped(self) -> bool:
+        with self._condition:
+            return self._stopped
+
+    def snapshot(self) -> dict[str, int | str | bool]:
+        with self._condition:
+            return {
+                "id": self.delivery_id,
+                "kind": self.kind,
+                "accepted": self._accepted,
+                "delivered": self._delivered,
+                "failed": self._failed,
+                "dropped": self._dropped,
+                "pending": len(self._queue),
+                "active": self._active,
+                "closing": self._closing,
+                "stopped": self._stopped,
+            }
+
+
+def _prune_deliveries_locked() -> None:
+    _deliveries.difference_update(
+        [delivery for delivery in _deliveries if delivery.closed_and_stopped()]
+    )
+
+
+def register_sink_delivery(sink: Callable[[Any], Any], *, kind: str) -> _SinkDelivery:
+    """Internal registration primitive used by the public plugin registrar methods."""
+    if not callable(sink):
+        raise TypeError(f"{kind} sink must be callable")
+    global _next_delivery_id
+    with _delivery_lock:
+        _prune_deliveries_locked()
+        if len(_deliveries) >= _MAX_SINK_WORKERS:
+            raise RuntimeError(
+                f"observability sink limit reached ({_MAX_SINK_WORKERS}); "
+                f"refusing additional {kind} sink"
+            )
+        delivery_id = _next_delivery_id
+        _next_delivery_id += 1
+        delivery = _SinkDelivery(sink, kind=kind, delivery_id=delivery_id)
+        _deliveries.add(delivery)
+        return delivery
+
+
+def _delivery_snapshot() -> list[_SinkDelivery]:
+    with _delivery_lock:
+        _prune_deliveries_locked()
+        return sorted(_deliveries, key=lambda delivery: delivery.delivery_id)
+
+
+def _sink_delivery_stats() -> list[dict[str, int | str | bool]]:
+    """Deterministic internal diagnostics for contract tests."""
+    return [delivery.snapshot() for delivery in _delivery_snapshot()]
+
+
+def drain_sinks(timeout: float = _SINK_SHUTDOWN_TIMEOUT_S) -> bool:
+    """Wait for currently queued work without accepting an unbounded wait."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    drained = True
+    for delivery in _delivery_snapshot():
+        if not delivery.wait_idle(deadline):
+            drained = False
+    return drained
+
+
+def shutdown_sinks(timeout: float = _SINK_SHUTDOWN_TIMEOUT_S) -> bool:
+    """Stop all delivery workers, sharing one timeout across every sink."""
+    deliveries = _delivery_snapshot()
+    for delivery in deliveries:
+        delivery.request_close()
+    deadline = time.monotonic() + max(0.0, timeout)
+    for delivery in deliveries:
+        delivery.join(deadline - time.monotonic())
+    stuck = [delivery for delivery in deliveries if not delivery.is_stopped()]
+    if stuck:
+        _log.warning(
+            "observability shutdown left %d wedged sink worker(s) after %.3fs",
+            len(stuck), max(0.0, timeout),
+        )
+    with _delivery_lock:
+        _prune_deliveries_locked()
+    return not stuck
 
 
 def mint_request_id() -> str:
@@ -279,50 +474,40 @@ def _stable_dump(obj: Any) -> str:
 def add_metric_sink(sink: MetricSink) -> None:
     if callable(sink):
         with _sink_lock:
-            _metric_sinks.append(sink)
+            _metric_sinks.append(register_sink_delivery(sink, kind="metric"))
 
 
 def add_audit_sink(sink: AuditSink) -> None:
     if callable(sink):
         with _sink_lock:
-            _audit_sinks.append(sink)
+            _audit_sinks.append(register_sink_delivery(sink, kind="audit"))
 
 
-def clear_sinks() -> None:
-    """Test helper — drop all registered metric/audit sinks."""
+def clear_sinks(timeout: float = _SINK_SHUTDOWN_TIMEOUT_S) -> bool:
+    """Test helper — drop registrations and stop every metric/audit/telemetry worker."""
     with _sink_lock:
         _metric_sinks.clear()
         _audit_sinks.clear()
+    return shutdown_sinks(timeout)
 
 
-def list_metric_sinks() -> list[MetricSink]:
+def list_metric_sinks() -> list[_SinkDelivery]:
     with _sink_lock:
         return list(_metric_sinks)
 
 
-def list_audit_sinks() -> list[AuditSink]:
+def list_audit_sinks() -> list[_SinkDelivery]:
     with _sink_lock:
         return list(_audit_sinks)
 
 
-def _pool() -> ThreadPoolExecutor:
-    global _executor
-    with _executor_lock:
-        if _executor is None:
-            _executor = ThreadPoolExecutor(max_workers=_SINK_WORKERS, thread_name_prefix="dp-obs")
-        return _executor
-
-
-def fanout_sinks(sinks: list[Callable], payload: Any, *, kind: str = "observability") -> None:
-    """Invoke sinks with timeout + exception isolation (OPS-01 failure isolation)."""
-    for sink in sinks:
+def fanout_sinks(sinks: list[_SinkDelivery], payload: Any, *, kind: str = "observability") -> None:
+    """Enqueue once per registered sink without waiting for plugin I/O."""
+    for delivery in sinks:
         try:
-            future = _pool().submit(sink, payload)
-            future.result(timeout=_SINK_TIMEOUT_S)
-        except FuturesTimeout:
-            _log.warning("%s sink timed out after %.1fs", kind, _SINK_TIMEOUT_S)
-        except Exception:  # noqa: BLE001 — isolation: never fail the caller
-            _log.warning("%s sink failed", kind, exc_info=True)
+            delivery.enqueue(payload)
+        except Exception:  # noqa: BLE001 — registration misuse must not fail the caller
+            _log.warning("%s sink delivery rejected", kind, exc_info=True)
 
 
 def emit_metric(

@@ -210,14 +210,10 @@ class RequestIdMiddleware:
                     "outcome": outcome,
                 }
 
-                def _emit_http_metrics() -> None:
-                    emit_metric(MetricName.HTTP_REQUESTS, 1.0, labels=labels, request_id=request_id)
-                    emit_metric(MetricName.HTTP_DURATION_MS, elapsed_ms, unit=MetricUnit.MILLISECONDS,
-                                labels=labels, request_id=request_id)
-
-                # Off the event loop: fanout_sinks blocks on future.result(timeout), so a slow metric
-                # sink would otherwise stall every concurrent request, not just this one.
-                await asyncio.get_running_loop().run_in_executor(None, _emit_http_metrics)
+                # Sink delivery is a bounded enqueue; plugin I/O never runs on the event loop.
+                emit_metric(MetricName.HTTP_REQUESTS, 1.0, labels=labels, request_id=request_id)
+                emit_metric(MetricName.HTTP_DURATION_MS, elapsed_ms, unit=MetricUnit.MILLISECONDS,
+                            labels=labels, request_id=request_id)
         finally:
             reset_request_id(token)
 
@@ -272,6 +268,7 @@ async def _lifespan(_app):
     try:
         yield
     finally:
+        drain_observability = False
         with _reaper_lifecycle_lock:
             _reaper_lifespan_users -= 1
             if _reaper_lifespan_users == 0:
@@ -287,6 +284,12 @@ async def _lifespan(_app):
                     _local_result_reaper_thread = None
                 if _object_attempt_reaper_thread is None and _local_result_reaper_thread is None:
                     _object_attempt_reaper_stop = None
+                drain_observability = True
+        if drain_observability:
+            # Registrations are process-global and may outlive this app lifespan (embedding/tests).
+            # Drain with one shared deadline; daemon workers themselves stop with the process.
+            from hub.observability import drain_sinks
+            drain_sinks()
 
 
 app = FastAPI(title="Data Playground kernel", version="0.1.0", lifespan=_lifespan)
