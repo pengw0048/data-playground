@@ -287,8 +287,18 @@ function MoreMenu({ id, kind, canEdit, disabled, bypassed }: { id: string; kind:
   const { bypass, disable, duplicate, removeNode, openPanel } = useStore.getState()
   const canBypass = getSpec(kind)?.canBypass
 
-  // items call store actions directly (no Dialogs), so onSelect can run inline and let the menu
-  // close normally. role="button" preserves the original buttons' a11y role.
+  const requestRename = () => {
+    // Let Radix finish closing the menu before the title input mounts and takes focus. Dispatching
+    // inline from onSelect races the menu's own focus cleanup: the input can blur and disappear before
+    // the user types, silently leaving the old title in place.
+    setOpen(false)
+    requestAnimationFrame(() => {
+      window.dispatchEvent(new CustomEvent('dp-rename', { detail: { id } }))
+    })
+  }
+
+  // Most items call store actions directly (no Dialogs), so onSelect can run inline and let the menu
+  // close normally. Rename uses the deferred focus handoff above. role="button" preserves a11y.
   const item = (icon: IconName, label: string, fn: () => void, danger = false) => (
     <DropdownMenuItem
       role="button"
@@ -323,7 +333,7 @@ function MoreMenu({ id, kind, canEdit, disabled, bypassed }: { id: string; kind:
         onCloseAutoFocus={(e) => e.preventDefault()}
         onClick={(e) => e.stopPropagation()}
       >
-        {canEdit && item('rename', 'Rename', () => window.dispatchEvent(new CustomEvent('dp-rename', { detail: { id } })))}
+        {canEdit && item('rename', 'Rename', requestRename)}
         {item('play', 'Run details', () => openPanel(id, 'run'))}
         {canEdit && item('duplicate', 'Duplicate', () => duplicate(id))}
         {canEdit && canBypass && item('power', bypassed ? 'Un-bypass' : 'Bypass (pass data through)', () => bypass(id))}
