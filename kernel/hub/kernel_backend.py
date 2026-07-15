@@ -131,6 +131,12 @@ class KernelBackend:
     def estimate(self, plan: CompilePlan, rows, byts=None) -> RunEstimate:
         return self.base.estimate(plan, rows, byts)
 
+    def supports_selected_destination_credentials(self) -> bool:
+        # The default kernel offloads full runs to a metadata-isolated subprocess. Opting out keeps the
+        # run in this long-lived process, where the authoritative Cred resolver is available.
+        isolate = os.environ.get("DP_KERNEL_ISOLATE_RUNS", "1").strip().lower()
+        return isolate in ("0", "false", "no", "off")
+
     # -- kernel lifecycle -------------------------------------------------- #
     def _await_ready(self, canvas_id: str) -> dict:
         deadline = time.monotonic() + KERNEL_START_TIMEOUT_S
@@ -154,6 +160,9 @@ class KernelBackend:
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None, placement,
             run_id: str | None = None, request_id: str | None = None,
             attempt_id: str | None = None) -> RunStatus:
+        from hub.backends import require_destination_credential_support
+        require_destination_credential_support(
+            self, plan, graph, getattr(self.base, "workspace", ""))
         canvas_id = getattr(graph, "id", None) or "canvas"
         run_id = run_id or f"run_{os.urandom(5).hex()}"  # hub-authoritative id, threaded into the kernel
         endpoint, token = self._ensure_kernel(canvas_id)

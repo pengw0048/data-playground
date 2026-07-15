@@ -365,6 +365,7 @@ def test_destination_cred_reaches_ensure_object_store_on_write(monkeypatch, tmp_
     })
     node = {n.id: n for n in graph.nodes}["write"]
     runner = LocalRunner(lambda _uri: object(), {}, object(), str(tmp_path))
+    assert runner.supports_selected_destination_credentials() is True
     status = RunStatus(run_id="r", status="running",
                        per_node=[PerNodeStatus(node_id="write", status="running", label="write")])
 
@@ -379,6 +380,165 @@ def test_destination_cred_reaches_ensure_object_store_on_write(monkeypatch, tmp_
     from hub.models import CompilePlan, PlanStep
     plan = CompilePlan(target_node_id="write", steps=[PlanStep(node_id="write", kind="write", label="write")])
     assert runner._run_object_store_cfg(plan, {"write": node}) == DEST_CFG
+
+
+@pytest.mark.parametrize("selection", ["destination-specific", "default"])
+def test_isolated_subprocess_rejects_selected_destination_credential_before_dispatch(
+        selection, monkeypatch, tmp_path):
+    """A wrong ambient identity must never replace the Cred selected for an isolated write."""
+    from hub import compiler, destinations
+    from hub.backends import UnsupportedDestinationCredentialError
+    from hub.models import Graph
+    from hub.subprocess_runner import SubprocessRunner
+
+    wrong_ambient = "WRONG-AMBIENT-IDENTITY-MUST-NOT-BE-USED"
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", wrong_ambient)
+    destination = {
+        "id": "exports", "name": "Research exports", "backend": "s3", "root": "s3://bucket/out",
+    }
+    if selection == "destination-specific":
+        destination["credId"] = "selected-cred-id"
+    monkeypatch.setattr(destinations, "presets", lambda _workspace: [destination])
+    original_get_setting = metadb.get_setting
+
+    def setting(key, *args, **kwargs):
+        if key == "defaultObjectStoreCredId":
+            return "default-cred-id" if selection == "default" else ""
+        return original_get_setting(key, *args, **kwargs)
+
+    monkeypatch.setattr(metadb, "get_setting", setting)
+    graph = Graph.model_validate({
+        "id": "credential-bound-write", "version": 1,
+        "nodes": [{
+            "id": "write", "type": "write", "position": {"x": 0, "y": 0},
+            "data": {"config": {"destId": "exports", "filename": "out.parquet"}},
+        }],
+        "edges": [],
+    })
+    plan = compiler.compile_plan(graph, "write")
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path))
+    assert runner.supports_selected_destination_credentials() is False
+
+    monkeypatch.setattr(
+        runner, "_claim_source_leases",
+        lambda *_args, **_kwargs: pytest.fail("source leases were claimed before credential preflight"),
+    )
+    monkeypatch.setattr(
+        runner, "_claim_sink_contracts",
+        lambda *_args, **_kwargs: pytest.fail("an object attempt was allocated before credential preflight"),
+    )
+    monkeypatch.setattr(
+        runner, "_spawn",
+        lambda *_args, **_kwargs: pytest.fail("an isolated child was spawned before credential preflight"),
+    )
+    with pytest.raises(UnsupportedDestinationCredentialError) as caught:
+        runner.run(plan, graph, "write", "local")
+
+    message = str(caught.value)
+    assert "local-subprocess" in message
+    assert "Research exports" in message
+    assert selection in message
+    assert "local-out-of-core" in message
+    assert "selected-cred-id" not in message
+    assert "default-cred-id" not in message
+    assert wrong_ambient not in message
+    assert runner.runs == {}
+
+
+def test_isolated_subprocess_keeps_deliberate_ambient_destination_execution(
+        monkeypatch, tmp_path):
+    from hub import compiler, destinations
+    from hub.models import Graph
+    from hub.subprocess_runner import SubprocessRunner
+
+    monkeypatch.setattr(destinations, "presets", lambda _workspace: [{
+        "id": "ambient", "name": "Ambient exports", "backend": "s3", "root": "s3://bucket/out",
+    }])
+    original_get_setting = metadb.get_setting
+    monkeypatch.setattr(
+        metadb, "get_setting",
+        lambda key, *args, **kwargs: "" if key == "defaultObjectStoreCredId"
+        else original_get_setting(key, *args, **kwargs),
+    )
+    graph = Graph.model_validate({
+        "id": "ambient-write", "version": 1,
+        "nodes": [{
+            "id": "write", "type": "write", "position": {"x": 0, "y": 0},
+            "data": {"config": {"destId": "ambient", "filename": "out.parquet"}},
+        }],
+        "edges": [],
+    })
+    plan = compiler.compile_plan(graph, "write")
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path))
+    monkeypatch.setattr(runner, "_claim_source_leases", lambda *_args: {
+        "attempts": {}, "local_sources": {}, "stack": contextlib.ExitStack(), "guards": [],
+    })
+    monkeypatch.setattr(runner, "_claim_sink_contracts", lambda *_args: ({}, {}, {}))
+    monkeypatch.setattr(runner, "_spawn", lambda status, *_args: status)
+
+    status = runner.run(plan, graph, "write", "local")
+    assert status.status == "queued"
+
+
+@pytest.mark.parametrize("backend_name", ["local-subprocess", "kernel"])
+def test_run_api_preflight_surfaces_unsupported_destination_credential(
+        monkeypatch, backend_name):
+    from hub import destinations
+    from hub.deps import get_deps
+    from hub.routers import runs as runs_router
+
+    wrong_ambient = "WRONG-AMBIENT-API-IDENTITY"
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", wrong_ambient)
+    monkeypatch.setattr(destinations, "presets", lambda _workspace: [{
+        "id": "exports", "name": "Research exports", "backend": "s3",
+        "root": "s3://bucket/out", "credId": "private-cred-id",
+    }])
+    deps = get_deps()
+    isolated = next(r for r in deps.runners if r.name == backend_name)
+    if backend_name == "kernel":
+        monkeypatch.delenv("DP_KERNEL_ISOLATE_RUNS", raising=False)
+        monkeypatch.setattr(
+            isolated, "_ensure_kernel",
+            lambda *_args, **_kwargs: pytest.fail("kernel spawned before credential preflight"),
+        )
+    else:
+        monkeypatch.setattr(
+            isolated, "_claim_source_leases",
+            lambda *_args, **_kwargs: pytest.fail("API dispatched before credential preflight"),
+        )
+    monkeypatch.setattr(deps, "pick_runner", lambda _plan, _uid=None: isolated)
+    monkeypatch.setattr(runs_router, "get_deps", lambda: deps)
+    graph = {
+        "id": "credential-api-write", "version": 1,
+        "nodes": [{
+            "id": "write", "type": "write", "position": {"x": 0, "y": 0},
+            "data": {"config": {"destId": "exports", "filename": "out.parquet"}},
+        }],
+        "edges": [],
+    }
+
+    for path in ("/api/run/estimate", "/api/run"):
+        response = client.post(path, json={"graph": graph, "targetNodeId": "write"})
+        assert response.status_code == 400, response.text
+        payload = response.json()
+        assert payload["code"] == "invalid_request"
+        assert payload["retryable"] is False
+        assert backend_name in payload["detail"]
+        assert "Research exports" in payload["detail"]
+        assert "local-out-of-core" in payload["detail"]
+        assert "private-cred-id" not in payload["detail"]
+        assert wrong_ambient not in payload["detail"]
+
+    plan_response = client.post(
+        "/api/graph/plan", json={"graph": graph, "targetNodeId": "write"})
+    assert plan_response.status_code == 200, plan_response.text
+    warnings = [
+        warning
+        for region in plan_response.json()["regions"]
+        for warning in region.get("preflight", [])
+    ]
+    assert any("Research exports" in warning and backend_name in warning
+               for warning in warnings)
 
 
 def test_unknown_cred_field_is_rejected():

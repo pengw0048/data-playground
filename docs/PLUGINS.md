@@ -114,7 +114,11 @@ must not scan rows or perform an unbounded namespace listing. Preflight and reco
 than promising a content hash. Missing capabilities or uncertain metadata are handled as unknown cost.
 
 `reg.add_runner(runner)` adds an execution backend. Implement `ExecutionBackend`: `name`, `can_run`,
-`estimate`, `run`, `status`, `cancel`.
+`estimate`, `run`, `status`, `cancel`. A backend that can honor a destination-specific or configured
+default Cred must also implement `supports_selected_destination_credentials() -> True`. Core treats a
+missing or false capability as ambient-identity-only and rejects the run before dispatch; never claim
+the capability unless the backend uses the selected Cred rather than silently falling back to ambient
+credentials.
 
 `reg.add_capability(cap)` declares a column capability. Optional `detect(col) -> bool` tags matching
 columns via `tag_columns`. Optional `viewer = {"kind": …}` adds a declarative viewer tab the SPA

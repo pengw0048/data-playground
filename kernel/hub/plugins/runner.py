@@ -158,6 +158,10 @@ class LocalRunner:
     name = "local-out-of-core"
     cancel_acknowledges_stop = True  # cancelled is set only after the adapter can no longer publish
 
+    @staticmethod
+    def supports_selected_destination_credentials() -> bool:
+        return True  # this process resolves the selected Cred against the authoritative metadata DB
+
     def __init__(self, resolve_adapter, registry, catalog, workspace: str, node_builders=None,
                  node_specs=None, storage=None):
         self.resolve_adapter = resolve_adapter
