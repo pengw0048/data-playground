@@ -228,8 +228,8 @@ def _ports(node: GraphNode, spec, side: str) -> list[tuple[str, str, bool]]:
         declared = cfg.get("outputs") if isinstance(cfg, dict) else None
         if isinstance(declared, list) and declared:
             return [(str(port), "dataset", False) for port in declared]
-    if spec is None:  # spec-less plugin builders keep the established implicit dataset ports
-        return [("out" if side == "source" else "in", "dataset", False)]
+    if spec is None:  # unknown kinds are reported by the unknown-kind gate, never given implicit ports
+        return []
     if side == "source":
         ports = spec.outputs
     else:
@@ -260,7 +260,7 @@ def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None
 
     ``None`` handles select a conventional default port (``out``/``in`` when present, otherwise the
     first declared port). An explicit handle must exist. Unknown kinds are left to the existing
-    unknown-kind gate; spec-less plugin builders use their implicit single ``in``/``out`` ports.
+    unknown-kind gate; registered plugin kinds use the ports from their required NodeSpec.
     """
     errors: list[str] = []
     nodes: dict[str, GraphNode] = {}
@@ -295,7 +295,7 @@ def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None
             continue
 
         source_spec = node_specs.get(source.type)
-        if source_spec is not None or source.type in INTRINSIC_KINDS:
+        if source_spec is not None:
             output = _port(source, source_spec, edge.source_handle, "source")
             if output is None:
                 if edge.source_handle is None:
@@ -306,7 +306,7 @@ def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None
                     )
 
         target_spec = node_specs.get(target.type)
-        if target_spec is None and target.type not in INTRINSIC_KINDS:
+        if target_spec is None:
             continue
         input_port = _port(target, target_spec, edge.target_handle, "target")
         if input_port is None:
@@ -342,8 +342,7 @@ def type_errors(graph: Graph, node_specs: dict) -> list[str]:
         if not src or not tgt:
             continue
         sspec, tspec = node_specs.get(src.type), node_specs.get(tgt.type)
-        if ((sspec is None and src.type not in INTRINSIC_KINDS)
-                or (tspec is None and tgt.type not in INTRINSIC_KINDS)):
+        if sspec is None or tspec is None:
             continue
         out = _port(src, sspec, e.source_handle, "source")
         inp = _port(tgt, tspec, e.target_handle, "target")
