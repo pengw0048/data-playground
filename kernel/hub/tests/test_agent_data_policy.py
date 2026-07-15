@@ -233,6 +233,14 @@ def test_catalog_reading_tools_emit_value_free_audit_events():
     assert catalog_event["mode"] == "list"
     assert catalog_event["returnedCount"] == len(listed["tables"])
     assert catalog_event["datasetIdentifiersDigest"].startswith("sha256:")
+    preview_events = [e for e in events if e["tool"] == "preview"]
+    assert len(preview_events) == 1
+    assert preview_events[0]["dataset"] == "source_a1"
+    assert preview_events[0]["columns"]
+    join_events = [e for e in events if e["tool"] == "join_hints"]
+    assert len(join_events) == 1
+    assert join_events[0]["dataset"] == f"{uri}|{_uri('events')}"
+    assert "columns" in join_events[0]
 
 
 def test_large_catalog_call_persists_one_bounded_summary_transaction(monkeypatch):
