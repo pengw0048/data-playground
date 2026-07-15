@@ -331,6 +331,17 @@ def test_broken_destination_credential_fails_the_run_not_strands_it(monkeypatch,
                                  per_node=[PerNodeStatus(node_id="write", status="queued", label="write")])
     runner._cancel[rid] = _CancelToken()
 
+    class Pin:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    pin = Pin()
+    monkeypatch.setattr(runner, "_plan_hash", lambda *_: "brk-hash")
+    monkeypatch.setattr(runner, "_plan_cacheable", lambda *_: True)
+    monkeypatch.setattr(runner, "_cache_acquire", lambda *_: (None, pin))
+
     def _raise(_plan, _nm):
         raise metadb.CredResolutionError("object-store credential 'gone' not found")
     monkeypatch.setattr(runner, "_run_object_store_cfg", _raise)
@@ -348,6 +359,7 @@ def test_broken_destination_credential_fails_the_run_not_strands_it(monkeypatch,
     assert runner.runs[rid].status == "failed"
     assert "gone" in (runner.runs[rid].error or "")
     assert rid not in runner._cancel        # cleaned up, not stranded
+    assert pin.closed                       # pre-scope cache ownership is not leaked
     assert completed == ["failed"]           # terminalized through the normal completion path
 
 
@@ -355,7 +367,8 @@ def test_worker_thread_backstop_terminalizes_escape_past_the_run_body(monkeypatc
     # #161 re-review: a failure that escapes _execute (e.g. run-scope/engine setup, before the body's
     # own boundary) must still fail the run via the worker-thread backstop, not kill the daemon thread
     # silently and strand every node in 'running'.
-    from hub.models import PerNodeStatus, RunStatus
+    from hub import db
+    from hub.models import CompilePlan, Graph, PerNodeStatus, RunStatus
     from hub.plugins.runner import LocalRunner, _CancelToken
 
     runner = LocalRunner(lambda _uri: object(), {}, object(), str(tmp_path))
@@ -367,13 +380,27 @@ def test_worker_thread_backstop_terminalizes_escape_past_the_run_body(monkeypatc
     monkeypatch.setattr(runner, "_emit", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_complete", lambda *a, **k: completed.append(runner.runs[rid].status))
 
-    def _boom(*_a, **_k):
-        raise RuntimeError("run scope setup exploded")
-    monkeypatch.setattr(runner, "_execute", _boom)
+    class Pin:
+        closed = False
 
-    runner._execute_guarded(rid, object(), object(), "n")  # must not raise out
+        def close(self):
+            self.closed = True
+
+    pin = Pin()
+    monkeypatch.setattr(runner, "_plan_hash", lambda *_: "esc-hash")
+    monkeypatch.setattr(runner, "_plan_cacheable", lambda *_: True)
+    monkeypatch.setattr(runner, "_cache_acquire", lambda *_: (None, pin))
+
+    @contextlib.contextmanager
+    def _boom_scope():
+        raise RuntimeError("run scope setup exploded")
+        yield
+    monkeypatch.setattr(db, "run_scope", _boom_scope)
+
+    runner._execute_guarded(rid, CompilePlan(), Graph(), None)  # must not raise out
 
     assert runner.runs[rid].status == "failed"
     assert "exploded" in (runner.runs[rid].error or "")
     assert rid not in runner._cancel
+    assert pin.closed  # run-scope setup failure releases ownership before the backstop terminalizes
     assert completed == ["failed"]

@@ -412,6 +412,37 @@ class LocalRunner:
         read_leases = contextlib.ExitStack()
         read_guards = []
         cache_pin = None
+        read_leases_released = False
+        cache_pin_released = False
+
+        def release_read_leases() -> None:
+            nonlocal read_leases_released
+            if read_leases_released:
+                return
+            read_leases_released = True
+            try:
+                read_leases.close()
+            except Exception:  # noqa: BLE001 — lease expiry is the safe fallback
+                logging.getLogger("hub").exception(
+                    "managed read lease cleanup failed after local run")
+
+        def release_cache_pin() -> None:
+            nonlocal cache_pin_released
+            if cache_pin_released:
+                return
+            cache_pin_released = True
+            if cache_pin is not None:
+                try:
+                    cache_pin.close()
+                except Exception:  # retain its process fence on metadata uncertainty
+                    logging.getLogger("hub").exception(
+                        "managed result cache reader release failed")
+
+        def release_guards() -> None:
+            """Release all ownership exactly once when execution fails before run_scope opens."""
+            release_read_leases()
+            release_cache_pin()
+
         try:
             # Fingerprinting for the plan hash is already a real source read. Acquire every exact source
             # guard before it, then retain the guards through the final lazy scan and publication fence.
@@ -449,11 +480,7 @@ class LocalRunner:
                                  node_builders=self.node_builders, node_specs=self.node_specs,
                                  pushdown=True, output_node=target)
         except Exception as exc:  # source ownership/fingerprint failure precedes the main execution scope
-            with contextlib.suppress(Exception):
-                read_leases.close()
-            if cache_pin is not None:
-                with contextlib.suppress(Exception):
-                    cache_pin.close()
+            release_guards()
             status.status = "cancelled" if cancel.is_set() else "failed"
             status.error = None if cancel.is_set() else f"{type(exc).__name__}: {exc}"
             for item in status.per_node:
@@ -478,6 +505,7 @@ class LocalRunner:
         try:
             run_object_store_cfg = self._run_object_store_cfg(plan, nm)
         except Exception as e:  # noqa: BLE001 — any resolution error is a clean run failure, not a strand
+            release_guards()
             status.status, status.error = "failed", str(e)
             self._emit(graph, status)
             with self._lock:
@@ -487,7 +515,20 @@ class LocalRunner:
             return
         # Run on our OWN DuckDB cursor (db.run_scope), NOT the process-global lock: a long run no
         # longer serializes every other user's preview/sample/run, and a failure here can't wedge them.
-        with db.object_store_binding(run_object_store_cfg), db.run_scope() as scope:
+        run_context = contextlib.ExitStack()
+        try:
+            run_context.enter_context(db.object_store_binding(run_object_store_cfg))
+            scope = run_context.enter_context(db.run_scope())
+        except Exception:
+            # ``run_scope`` can fail before yielding, so the body/finally below never runs. Reset the
+            # object-store binding and release every ownership guard before the thread backstop emits
+            # the terminal failure.
+            try:
+                run_context.close()
+            finally:
+                release_guards()
+            raise
+        with run_context:
             with self._lock:
                 self._scopes[run_id] = scope  # cancel() interrupts this scope's cursor
             try:
@@ -724,11 +765,7 @@ class LocalRunner:
                         if p.status == "running":
                             p.status = "failed"
             finally:
-                try:
-                    read_leases.close()
-                except Exception:  # noqa: BLE001 — lease expiry is the safe fallback
-                    logging.getLogger("hub").exception(
-                        "managed read lease cleanup failed after local run")
+                release_read_leases()
                 # scope exit (below) rolls back + drops this run's views on its own cursor
                 for pth in engine.spill_files:  # GC temp parquet spilled this run (outputs already committed)
                     try:
@@ -744,12 +781,7 @@ class LocalRunner:
                     self._scopes.pop(run_id, None)
                 if not terminal_persisted:
                     self._complete(graph, target, status)
-                if cache_pin is not None:
-                    try:
-                        cache_pin.close()
-                    except Exception:  # retain its process fence on metadata uncertainty
-                        logging.getLogger("hub").exception(
-                            "managed result cache reader release failed")
+                release_cache_pin()
                 with self._lock:
                     owned_local = self._owned_result_uris.get(run_id)
                 if terminal_persisted and owned_local is not None:

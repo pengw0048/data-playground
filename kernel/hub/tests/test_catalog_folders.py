@@ -77,12 +77,14 @@ def test_empty_folder_appears_in_browse_tree():
         _wipe(["archive"], [])
 
 
-def test_register_materializes_folder_and_rename_cascades(tmp_path):
+def test_register_normalizes_materializes_folder_and_rename_cascades(tmp_path):
     """#155: registering into 'x/y' MATERIALIZES first-class folder entities (its full ancestry), not
     just an implicit derived string; rename then cascades over both the entities and the entry folder."""
-    t = _register(tmp_path, "unionds", "x/y")
+    t = _register(tmp_path, "unionds", " x / y ")
     uri = t["uri"]
     try:
+        assert t["folder"] == "x/y", "the returned table uses the same canonical path as the entity"
+        assert _raw_folder(uri) == ("x/y", "x/y"), "the indexed column and doc are canonical too"
         paths = {f["path"] for f in metadb.catalog_folders_list()}
         assert {"x", "x/y"} <= paths, "register materializes the assigned folder + its ancestor"
 
@@ -93,6 +95,24 @@ def test_register_materializes_folder_and_rename_cascades(tmp_path):
         assert {"z", "z/y"} <= {f["path"] for f in metadb.catalog_folders_list()}  # entities moved too
     finally:
         _wipe(["x", "z"], [uri])
+
+
+def test_set_metadata_normalizes_and_materializes_folder(tmp_path):
+    t = _register(tmp_path, "curatedds", "")
+    uri = t["uri"]
+    try:
+        r = client.put(
+            f"/api/catalog/tables/{t['id']}/metadata",
+            json={"folder": " curated / daily "},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["folder"] == "curated/daily"
+        assert _raw_folder(uri) == ("curated/daily", "curated/daily")
+        assert {"curated", "curated/daily"} <= {
+            f["path"] for f in metadb.catalog_folders_list()
+        }
+    finally:
+        _wipe(["curated"], [uri])
 
 
 def test_delete_reparents_datasets_preserving_structure(tmp_path):
@@ -120,6 +140,9 @@ def test_route_errors_map_to_400(tmp_path):
                           json={"oldPath": "keep", "newPath": "taken"}).status_code == 400
         assert client.post("/api/catalog/folders/delete", json={"path": "missing"}).status_code == 400
         assert client.post("/api/catalog/folders", json={"path": ".."}).status_code == 400
+        assert client.put(
+            f"/api/catalog/tables/{t['id']}/metadata", json={"folder": "bad//path"}
+        ).status_code == 400
     finally:
         _wipe(["keep", "taken"], [uri])
 

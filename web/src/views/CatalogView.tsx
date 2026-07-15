@@ -547,25 +547,24 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
   const [kids, setKids] = useState<FolderNode[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const loadedRevision = useRef<number | null>(null)
   const isSel = selected === node.path
   const loadKids = async () => {
+    const loadRevision = revision
     setLoading(true); setError(null)
-    try { setKids((await api.catalogTree(node.path)).folders) }
+    try {
+      setKids((await api.catalogTree(node.path)).folders)
+      loadedRevision.current = loadRevision
+    }
     catch (e) { setError(errorMessage(e)) }
     finally { setLoading(false) }
   }
-  const expand = () => {
-    const next = !open; onToggleExpand(node.path)
-    if (next && kids === null && !loading) void loadKids()
-  }
-  // a catalog change (create/rename/delete/register) can alter this branch's children — refetch its
-  // already-loaded kids so an open branch never shows a stale nested path
-  const firstRev = useRef(revision)
+  const expand = () => onToggleExpand(node.path)
+  // Expansion is path-owned by FolderTree. Hydrate a rename-remounted branch whose new path stays open,
+  // and refresh a branch that changed while collapsed before showing its cached children again.
   useEffect(() => {
-    if (revision === firstRev.current) return
-    firstRev.current = revision
-    if (open && kids !== null) void loadKids()
-  }, [revision])  // eslint-disable-line react-hooks/exhaustive-deps
+    if (open && (kids === null || loadedRevision.current !== revision)) void loadKids()
+  }, [open, node.path, revision])  // eslint-disable-line react-hooks/exhaustive-deps
   const rename = async () => {
     const next = window.prompt(`Rename folder “${node.path}” to:`, node.path)?.trim()
     if (!next || next === node.path) return

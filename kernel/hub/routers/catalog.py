@@ -309,13 +309,16 @@ def set_table_metadata(table_id: str, req: CatalogMetadata) -> CatalogTable:
     sent = req.model_fields_set
     # absent field → None (provider preserves); explicit null → "" (provider clears). name is
     # rename-only: a blank name is ignored (a dataset always keeps a name), never cleared.
-    return cat.set_metadata(
-        table.uri,
-        folder=(req.folder or "") if "folder" in sent else None,
-        tags=req.tags if "tags" in sent else None,
-        owner=(req.owner or "") if "owner" in sent else None,
-        description=(req.description or "") if "description" in sent else None,
-        name=req.name if "name" in sent else None)
+    try:
+        return cat.set_metadata(
+            table.uri,
+            folder=(req.folder or "") if "folder" in sent else None,
+            tags=req.tags if "tags" in sent else None,
+            owner=(req.owner or "") if "owner" in sent else None,
+            description=(req.description or "") if "description" in sent else None,
+            name=req.name if "name" in sent else None)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.get("/catalog/lineage", response_model=LineageResult)

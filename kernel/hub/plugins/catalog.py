@@ -135,7 +135,6 @@ class InMemoryCatalog:
         if version is None:
             sig = "|".join(f"{c.name}:{c.type}" for c in columns) + f"|rows={count}|fp={fp}"
             version = "v" + _h.sha256(sig.encode()).hexdigest()[:10]
-        folder = (folder or "").strip("/")
         tags = [str(t).strip() for t in (tags or []) if str(t).strip()]
         with self._lock:
             prior = metadb.catalog_get(uri)  # by uri (PK)
@@ -153,6 +152,7 @@ class InMemoryCatalog:
                 tags = tags or list(prior.get("tags") or [])
                 owner = owner if owner is not None else prior.get("owner")
                 description = description if description is not None else prior.get("description")
+            folder = metadb.catalog_folder_normalize(folder or "")
             self._warn_schema_drift(prior, name, columns, version)
             table = CatalogTable(
                 id=tid, name=name, uri=uri, row_count=count, version=version,

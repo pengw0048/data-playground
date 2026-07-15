@@ -5762,6 +5762,7 @@ def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
     with session() as s:
         normalized = str(uri).rstrip("/")
         payload = dict(doc)
+        payload["folder"] = catalog_folder_normalize(payload.get("folder") or "")
         _catalog_upsert_in_session(
             s, normalized, name, payload, parents=parents, pipeline=pipeline)
         sync_local_result_owner(s, "catalog_entry", normalized, normalized, payload)
@@ -5775,6 +5776,7 @@ def catalog_publish_entries(entries: list[tuple[str, str, dict, list[str] | None
         for uri, name, doc, parents, pipeline in entries:
             normalized = str(uri).rstrip("/")
             payload = dict(doc)
+            payload["folder"] = catalog_folder_normalize(payload.get("folder") or "")
             _catalog_upsert_in_session(
                 s, normalized, name, payload,
                 parents=parents, pipeline=pipeline)
@@ -5811,6 +5813,7 @@ def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: 
     friendly `name` rename) — both the indexed columns AND the mirrored fields inside the stored doc,
     so a re-read is consistent without re-probing the dataset. Unknown or inactive managed targets
     fail closed."""
+    folder = catalog_folder_normalize(folder)
     with session() as s:
         target = _lock_catalog_mutation_targets(s, [uri])[0]
         if not target["known"]:
@@ -6263,7 +6266,7 @@ def catalog_facets(q: str | None = None, folder: str | None = None, tags: list[s
     return {"folders": folders, "tags": tag_counts, "owners": owners}
 
 
-def _normalize_folder_path(path: str) -> str:
+def catalog_folder_normalize(path: str) -> str:
     """A folder path with surrounding slashes stripped and each segment validated. Rejects empty
     segments and `.`/`..` so a path can't escape its namespace. '' means the tree root."""
     p = (path or "").strip().strip("/")
@@ -6320,7 +6323,7 @@ def _materialize_folder(s, raw: str) -> None:
     if not raw:
         return
     try:
-        _ensure_folder_rows(s, _folder_ancestors(_normalize_folder_path(raw)))
+        _ensure_folder_rows(s, _folder_ancestors(catalog_folder_normalize(raw)))
     except ValueError:
         pass
 
@@ -6342,7 +6345,7 @@ def catalog_folder_create(path: str) -> str:
     already exists (as an entity or via any entry) OR a concurrent create wins the race, so the loser
     gets a stable conflict rather than a false success. Returns the normalized path."""
     from sqlalchemy.exc import IntegrityError
-    path = _normalize_folder_path(path)
+    path = catalog_folder_normalize(path)
     if not path:
         raise ValueError("folder path cannot be empty")
     with session() as s:
@@ -6380,8 +6383,8 @@ def catalog_folder_rename(old: str, new: str) -> None:
     """Rename a folder, cascading to every dataset and subfolder under it. Operates over the UNION of
     folder entities and entry `folder` strings, so a folder that exists only because a dataset was
     registered into it is renameable too. Raises ValueError if `old` is unknown or `new` already exists."""
-    old = _normalize_folder_path(old)
-    new = _normalize_folder_path(new)
+    old = catalog_folder_normalize(old)
+    new = catalog_folder_normalize(new)
     if not old or not new:
         raise ValueError("folder path cannot be empty")
     with session() as s:
@@ -6410,7 +6413,7 @@ def catalog_folder_delete(path: str) -> None:
     dump), then removing the deleted node. Nothing is lost — datasets and subfolders are re-homed, not
     deleted. Operates over the UNION of folder entities and entry `folder` strings; raises ValueError
     if the folder is unknown."""
-    path = _normalize_folder_path(path)
+    path = catalog_folder_normalize(path)
     if not path:
         raise ValueError("folder path cannot be empty")
     parent = path.rsplit("/", 1)[0] if "/" in path else ""

@@ -225,5 +225,7 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.click(screen.getByLabelText('Destination backend'))
     fireEvent.click(await screen.findByRole('option', { name: 's3' }))
     expect(await screen.findByLabelText('Destination credential')).toBeVisible()
+    expect(screen.getByText(/Restart the Data Playground server after adding this destination/i)).toBeVisible()
+    expect(screen.getByText(/restarting only the canvas kernel is not enough/i)).toBeVisible()
   })
 })

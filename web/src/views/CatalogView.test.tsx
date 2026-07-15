@@ -197,6 +197,29 @@ describe('CatalogView selection, register modal, and rename', () => {
     expect(await screen.findByText('📁 revenue')).toBeInTheDocument()
   })
 
+  it('rehydrates an expanded branch after rename remounts it under the new path', async () => {
+    let renamed = false
+    mocks.catalogTree.mockImplementation(async (prefix: string) => {
+      if (!prefix) {
+        const path = renamed ? 'revenue' : 'sales'
+        return { prefix: '', folders: [{ name: path, path, tableCount: 1 }], tables: [] }
+      }
+      const path = `${prefix}/daily`
+      return { prefix, folders: [{ name: 'daily', path, tableCount: 1 }], tables: [] }
+    })
+    mocks.renameFolder.mockImplementation(async () => { renamed = true; return { ok: true } })
+    vi.spyOn(window, 'prompt').mockReturnValue('revenue')
+    render(<CatalogView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand folder sales' }))
+    expect(await screen.findByTestId('folder-rename-sales/daily')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('folder-rename-sales'))
+
+    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledWith('revenue'))
+    expect(await screen.findByRole('button', { name: 'Collapse folder revenue' })).toBeInTheDocument()
+    expect(await screen.findByTestId('folder-rename-revenue/daily')).toBeInTheDocument()
+  })
+
   it('deletes a folder from the tree after confirming where its datasets go', async () => {
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [{ name: 'sales', path: 'sales', tableCount: 1 }], tables: [] })
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
