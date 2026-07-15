@@ -1168,7 +1168,9 @@ def test_done_run_state_is_primary_owner_for_noncacheable_committed_region():
     metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
-def test_local_runner_terminal_persistence_failure_never_exposes_done(tmp_path, caplog):
+def test_local_runner_terminal_persistence_failure_releases_cache_pin_before_terminal(
+    tmp_path, caplog, monkeypatch
+):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     from hub import compiler
@@ -1202,6 +1204,26 @@ def test_local_runner_terminal_persistence_failure_never_exposes_done(tmp_path, 
     runner.result_acquire = metadb.acquire_result_cache_pin
     persistence_started = threading.Event()
     allow_failure = threading.Event()
+    release_started = threading.Event()
+    allow_first_release_failure = threading.Event()
+    release_retry_started = threading.Event()
+    allow_release = threading.Event()
+    release_calls = 0
+
+    release_pin = metadb.release_result_cache_pin
+
+    def release_after_observation(pin_id):
+        nonlocal release_calls
+        release_calls += 1
+        if release_calls == 1:
+            release_started.set()
+            assert allow_first_release_failure.wait(timeout=5)
+            raise RuntimeError("transient pin release failure")
+        release_retry_started.set()
+        assert allow_release.wait(timeout=5)
+        release_pin(pin_id)
+
+    monkeypatch.setattr(metadb, "release_result_cache_pin", release_after_observation)
 
     def persist(_graph, status):
         if status.status != "done":
@@ -1218,6 +1240,19 @@ def test_local_runner_terminal_persistence_failure_never_exposes_done(tmp_path, 
     assert persistence_started.wait(timeout=5)
     assert runner.status(started.run_id).status == "running"
     allow_failure.set()
+    assert release_started.wait(timeout=5)
+    # The worker has entered terminal cleanup, but the durable reader still exists.  Pollers must
+    # continue to observe a live run until that ownership receipt is actually released.
+    assert runner.status(started.run_id).status == "running"
+    with metadb.session() as session:
+        assert list(session.scalars(select(metadb.ObjectAttemptRef).where(
+            metadb.ObjectAttemptRef.ref_type == "result_reader",
+            metadb.ObjectAttemptRef.attempt_uri == handle["uri"],
+        )))
+    allow_first_release_failure.set()
+    assert release_retry_started.wait(timeout=5)
+    assert runner.status(started.run_id).status == "running"
+    allow_release.set()
     deadline = time.monotonic() + 5
     while runner.status(started.run_id).status not in ("done", "failed", "cancelled"):
         assert time.monotonic() < deadline
@@ -1227,6 +1262,89 @@ def test_local_runner_terminal_persistence_failure_never_exposes_done(tmp_path, 
     assert "full result publication failed" in (final.error or "")
     assert "terminal persistence unavailable" not in (final.error or "")
     assert "terminal persistence unavailable" in caplog.text
+    with metadb.session() as session:
+        assert not list(session.scalars(select(metadb.ObjectAttemptRef).where(
+            metadb.ObjectAttemptRef.ref_type == "result_reader",
+            metadb.ObjectAttemptRef.attempt_uri == handle["uri"],
+        )))
+    metadb.put_result(phash, {"uri": None})
+    metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_local_runner_cancel_releases_cache_pin_before_terminal(
+    tmp_path, monkeypatch
+):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    from hub import compiler
+    from hub.deps import get_deps
+    from hub.models import ColumnSchema, Graph
+    from hub.plugins.runner import LocalRunner
+
+    deps = get_deps()
+    source = tmp_path / "source.parquet"
+    pq.write_table(pa.table({"value": [1]}), source)
+    graph = Graph.model_validate({
+        "id": "local-cancel-cache-pin", "version": 1,
+        "nodes": [{"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                   "data": {"config": {"uri": str(source)}}}],
+        "edges": [],
+    })
+    handle = _handle(logical=f"s3://lifecycle-tests/{uuid.uuid4().hex}/cached.parquet")
+    _commit(handle)
+
+    class CachedAdapter:
+        @staticmethod
+        def schema(_uri):
+            return [ColumnSchema(name="value", type="BIGINT")]
+
+    runner = LocalRunner(
+        lambda uri: CachedAdapter() if uri == handle["uri"] else deps.resolve_adapter(uri),
+        deps.registry, deps.catalog, str(tmp_path), node_builders=deps.node_builders,
+        node_specs=deps.node_specs)
+    phash = runner._plan_hash(graph, "source")
+    metadb.put_result(phash, {"uri": handle["uri"], "rows": 1, "table": None})
+    runner.result_acquire = metadb.acquire_result_cache_pin
+    cache_acquired = threading.Event()
+    allow_step = threading.Event()
+    release_started = threading.Event()
+    allow_release = threading.Event()
+
+    cache_acquire = runner._cache_acquire
+
+    def acquire_before_step(*args, **kwargs):
+        result = cache_acquire(*args, **kwargs)
+        cache_acquired.set()
+        assert allow_step.wait(timeout=5)
+        return result
+
+    release_pin = metadb.release_result_cache_pin
+
+    def release_after_observation(pin_id):
+        release_started.set()
+        assert allow_release.wait(timeout=5)
+        release_pin(pin_id)
+
+    monkeypatch.setattr(runner, "_cache_acquire", acquire_before_step)
+    monkeypatch.setattr(metadb, "release_result_cache_pin", release_after_observation)
+    plan = compiler.compile_plan(
+        graph, "source", deps.registry, deps.node_specs, deps.node_ir)
+    started = runner.run(plan, graph, "source", "local")
+    assert cache_acquired.wait(timeout=5)
+    assert runner.cancel(started.run_id).status == "running"
+    allow_step.set()
+    assert release_started.wait(timeout=5)
+    assert runner.status(started.run_id).status == "running"
+    with metadb.session() as session:
+        assert list(session.scalars(select(metadb.ObjectAttemptRef).where(
+            metadb.ObjectAttemptRef.ref_type == "result_reader",
+            metadb.ObjectAttemptRef.attempt_uri == handle["uri"],
+        )))
+    allow_release.set()
+    deadline = time.monotonic() + 5
+    while runner.status(started.run_id).status != "cancelled":
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
     with metadb.session() as session:
         assert not list(session.scalars(select(metadb.ObjectAttemptRef).where(
             metadb.ObjectAttemptRef.ref_type == "result_reader",

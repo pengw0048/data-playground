@@ -414,6 +414,7 @@ class LocalRunner:
         cache_pin = None
         read_leases_released = False
         cache_pin_released = False
+        cache_pin_release_warned = False
 
         def release_read_leases() -> None:
             nonlocal read_leases_released
@@ -426,22 +427,32 @@ class LocalRunner:
                 logging.getLogger("hub").exception(
                     "managed read lease cleanup failed after local run")
 
-        def release_cache_pin() -> None:
-            nonlocal cache_pin_released
+        def release_cache_pin() -> bool:
+            nonlocal cache_pin_released, cache_pin_release_warned
             if cache_pin_released:
-                return
-            cache_pin_released = True
+                return True
             if cache_pin is not None:
                 try:
                     cache_pin.close()
                 except Exception:  # retain its process fence on metadata uncertainty
-                    logging.getLogger("hub").exception(
-                        "managed result cache reader release failed")
+                    if not cache_pin_release_warned:
+                        logging.getLogger("hub").exception(
+                            "managed result cache reader release failed; retrying before terminal state")
+                        cache_pin_release_warned = True
+                    return False
+            cache_pin_released = True
+            return True
+
+        def release_cache_pin_before_terminal() -> None:
+            while not release_cache_pin():
+                # Cleanup is part of terminal acknowledgement: keep the shared status live while
+                # metadata is unavailable, then retry the idempotent release without a hot loop.
+                time.sleep(0.1)
 
         def release_guards() -> None:
             """Release all ownership exactly once when execution fails before run_scope opens."""
             release_read_leases()
-            release_cache_pin()
+            release_cache_pin_before_terminal()
 
         try:
             # Fingerprinting for the plan hash is already a real source read. Acquire every exact source
@@ -540,6 +551,7 @@ class LocalRunner:
                     for guard in read_guards:
                         guard.check()
                     if cancel.is_set():
+                        release_cache_pin_before_terminal()
                         status.status = "cancelled"
                         for p in status.per_node:
                             if p.status != "done":
@@ -708,6 +720,12 @@ class LocalRunner:
                         pass
             except Exception as e:  # noqa: BLE001
                 from hub import metadb
+                # A cache-hit reader pin is a durable ownership receipt.  Release it before changing
+                # the shared in-memory status to failed/cancelled: status() is polled concurrently and
+                # a terminal observation must not race the temporary owner that this run no longer
+                # needs.  Successful publication deliberately keeps the pin through its done/history
+                # fence and still releases it in the common finally below.
+                release_cache_pin_before_terminal()
                 terminal_rejected = isinstance(e, metadb.RunStatePublicationRejected)
                 with self._lock:
                     owned_local = self._owned_result_uris.get(run_id)
