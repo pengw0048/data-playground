@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 
 from fastapi.testclient import TestClient
@@ -200,9 +201,18 @@ def test_catalog_reading_tools_emit_value_free_audit_events():
         calls["i"] += 1
         return ModelResponse(parts=[part])
 
-    out = run_agent("inspect catalog", {"nodes": [], "edges": []}, get_deps(),
-                    model=FunctionModel(fn), policy=policy)
+    out = run_agent(
+        "inspect catalog",
+        {"id": "agent-audit-canvas", "nodes": [], "edges": []},
+        get_deps(),
+        model=FunctionModel(fn),
+        policy=policy,
+        principal_id="agent-audit-user",
+        request_id="req-agent-audit",
+    )
     assert not _contains_fixture_value(json.dumps(out["transcript"]))
+    listed = next(item["result"] for item in out["transcript"] if item["tool"] == "list_catalog")
+    assert uri in {table["uri"] for table in listed["tables"]}
 
     events = [e for e in metadb.list_agent_egress_events(limit=500) if e["id"] not in before]
     tools = {e["tool"] for e in events}
@@ -214,7 +224,139 @@ def test_catalog_reading_tools_emit_value_free_audit_events():
         assert e.get("provider") == "anthropic"
         assert e.get("model") == "anthropic/claude-opus-4-8"
         assert "rows" not in e
-        assert "columns" in e
+    catalog_events = [e for e in events if e["tool"] == "list_catalog"]
+    assert len(catalog_events) == 1
+    catalog_event = catalog_events[0]
+    assert catalog_event["principalId"] == "agent-audit-user"
+    assert catalog_event["canvasId"] == "agent-audit-canvas"
+    assert catalog_event["requestId"] == "req-agent-audit"
+    assert catalog_event["mode"] == "list"
+    assert catalog_event["returnedCount"] == len(listed["tables"])
+    assert catalog_event["datasetIdentifiersDigest"].startswith("sha256:")
+    preview_events = [e for e in events if e["tool"] == "preview"]
+    assert len(preview_events) == 1
+    assert preview_events[0]["dataset"] == "source_a1"
+    assert preview_events[0]["columns"]
+    join_events = [e for e in events if e["tool"] == "join_hints"]
+    assert len(join_events) == 1
+    assert join_events[0]["dataset"] == f"{uri}|{_uri('events')}"
+    assert "columns" in join_events[0]
+
+
+def test_large_catalog_call_persists_one_bounded_summary_transaction(monkeypatch):
+    from hub import metadb
+    from hub.agent_policy import (
+        audit_event_for_tool,
+        record_tool_audit,
+        resolve_agent_data_policy,
+    )
+
+    raw_query = "  robot   hand interaction  "
+    secret_dataset = "dataset-04999-private-marker"
+    result = {
+        "tables": [
+            {
+                "name": secret_dataset if index == 4_999 else f"dataset-{index:05d}",
+                "uri": f"s3://research-data/dataset-{index:05d}",
+                "columns": ["feature", "private_value"],
+                "rowCount": index,
+            }
+            for index in range(5_000)
+        ]
+    }
+    transactions = 0
+    persisted = []
+
+    @contextlib.contextmanager
+    def counted_session():
+        nonlocal transactions
+        transactions += 1
+
+        class Session:
+            def add(self, row):
+                persisted.append(row)
+
+        yield Session()
+
+    monkeypatch.setattr(metadb, "session", counted_session)
+    policy = resolve_agent_data_policy(
+        {"level": "metadata-only"}, model="anthropic/claude-opus-4-8", base_url=None
+    )
+    record_tool_audit(
+        policy,
+        "list_catalog",
+        {"query": raw_query, "mode": "hybrid"},
+        result,
+        principal_id="researcher-1",
+        canvas_id="canvas-1",
+        request_id="req-1",
+    )
+
+    assert transactions == len(persisted) == 1
+    row = persisted[0]
+    event = json.loads(row.event_json)
+    assert event == {
+        "provider": "anthropic",
+        "model": "anthropic/claude-opus-4-8",
+        "tool": "list_catalog",
+        "level": "metadata-only",
+        "principalId": "researcher-1",
+        "canvasId": "canvas-1",
+        "requestId": "req-1",
+        "query": "robot hand interaction",
+        "mode": "hybrid",
+        "returnedCount": 5_000,
+        "datasetIdentifiersDigest": event["datasetIdentifiersDigest"],
+    }
+    assert event["datasetIdentifiersDigest"].startswith("sha256:")
+    assert len(row.event_json.encode("utf-8")) <= 1_024
+    assert row.dataset is None and row.columns_json == "[]" and row.row_count is None
+    assert secret_dataset not in row.event_json
+    assert "private_value" not in row.event_json
+
+    secret_query = "api_key=sk-proj-this-must-not-be-persisted"
+    secret_event = audit_event_for_tool(
+        policy, "list_catalog", {"query": secret_query}, {"tables": []}
+    )
+    assert secret_event is not None and secret_event["query"] == "[redacted]"
+    assert secret_query not in json.dumps(secret_event)
+
+    metadata_query_event = audit_event_for_tool(
+        policy, "list_catalog", {"query": "token embeddings"}, {"tables": []}
+    )
+    assert metadata_query_event is not None and metadata_query_event["query"] == "token embeddings"
+
+    long_event = audit_event_for_tool(
+        policy, "list_catalog", {"query": "motion " * 100}, {"tables": []}
+    )
+    assert long_event is not None and long_event["query"].endswith("...")
+    assert len(long_event["query"].encode("utf-8")) <= 128
+
+
+def test_agent_route_supplies_principal_and_request_audit_context(monkeypatch):
+    from hub import metadb
+    from hub.routers import runs
+
+    captured = {}
+
+    def fake_run_agent(outcome, graph, _deps, **kwargs):
+        captured.update(kwargs)
+        return {"graph": graph, "transcript": [], "summary": outcome, "policy": {}}
+
+    monkeypatch.setattr(runs, "agent_status", lambda: {"available": True})
+    monkeypatch.setattr(runs, "run_agent", fake_run_agent)
+    response = client.post(
+        "/api/agent",
+        headers={"X-Request-Id": "req-agent-context"},
+        json={
+            "outcome": "inspect catalog",
+            "graph": {"id": "canvas-agent-context", "nodes": [], "edges": []},
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["principal_id"] == metadb.DEFAULT_USER_ID
+    assert captured["request_id"] == "req-agent-context"
 
 
 def test_agent_status_includes_disclosure():

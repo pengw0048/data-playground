@@ -641,7 +641,14 @@ def agent_act(req: AgentRequest, uid: str = Depends(current_user)) -> dict:
     if not st["available"]:
         return st
     try:
-        out = run_agent(req.outcome, req.graph, get_deps())
+        from hub.observability import get_request_id
+        out = run_agent(
+            req.outcome,
+            req.graph,
+            get_deps(),
+            principal_id=uid,
+            request_id=get_request_id(),
+        )
     except AgentCredentialError:
         # The Cred may be deleted/rotated after the preflight status read. Preserve the same stable,
         # non-secret contract instead of turning the race into a 502 with resolver details.
