@@ -1,12 +1,11 @@
 name: CI
 
-# Auto-runs on push to main + on PRs — the repo is PUBLIC, so GitHub Actions minutes are free/unlimited.
-# (Also manually triggerable via workflow_dispatch.) The per-job timeout caps below stay as hygiene so a
-# hung run can't spin to the 6h default. You can still run the suites locally during dev
+# Required pull-request validation plus an explicit manual entry point. `main` is protected and only
+# accepts up-to-date pull requests, so rerunning the same suite after merge would duplicate evidence.
+# The per-job timeout caps below stay as hygiene so a hung run can't spin to the 6h default. Run the
+# same suites locally during development
 # (`cd kernel && uv run pytest -q`; `cd web && npm run e2e`).
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -196,12 +195,10 @@ jobs:
         run: cd kernel && uv sync --extra dev
       - name: Install Playwright browser
         run: cd web && npx playwright install --with-deps chromium
-      # The tagged subset is the fast researcher-workflow gate. Run it first so a broken canvas target,
-      # stale result, misleading preview export, keyboard path, or axe regression fails with a focused log.
-      - name: Run UX golden-workflow smoke
-        run: cd web && npm run e2e -- --project=chromium --grep @ux-smoke
-      - name: Run remaining E2E
-        run: cd web && npm run e2e -- --grep-invert=@ux-smoke
+      # The Playwright project DAG runs the tagged researcher smoke first, the remaining Chromium
+      # suite second, and the minimum-viewport project last, without executing smoke fixtures twice.
+      - name: Run E2E (UX smoke first)
+        run: cd web && npm run e2e
       - name: Upload report on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

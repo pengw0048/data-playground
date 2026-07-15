@@ -1,8 +1,8 @@
 name: Release
 
 # Tag-triggered release contract (issue #115 / REL-01 slice 11).
-# Reuses the build-and-smoke jobs from release-artifacts.yml, then publishes the wheel,
-# SHA256SUMS, SBOMs, GHCR image, and build-provenance attestations to a GitHub Release.
+# Reuses every heavy production acceptance workflow, then publishes the wheel, SHA256SUMS, SBOMs,
+# GHCR image, and build-provenance attestations to a GitHub Release.
 on:
   push:
     tags: ["v*"]
@@ -31,9 +31,19 @@ jobs:
       contents: read
       issues: read
 
+  ray-validation:
+    uses: ./.github/workflows/ray-validation.yml
+    permissions:
+      contents: read
+
+  ray-jobs-acceptance:
+    uses: ./.github/workflows/ray-jobs-acceptance.yml
+    permissions:
+      contents: read
+
   publish:
     name: publish release + SBOM + attestations
-    needs: [artifacts, ux-acceptance]
+    needs: [artifacts, ux-acceptance, ray-validation, ray-jobs-acceptance]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 40

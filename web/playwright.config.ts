@@ -28,9 +28,23 @@ export default defineConfig({
   // container) point Playwright at it instead of downloading one; unset → Playwright's own browser.
   projects: [
     {
-      // Default suite: Desktop Chrome at its device viewport (today identical to MIN_VIEWPORT).
-      name: 'chromium',
+      // Required researcher workflows run first. Keeping them in a dependency project gives CI a
+      // focused failure and prevents another project's dependency graph from rerunning fixed-id fixtures.
+      name: 'chromium-ux-smoke',
       testIgnore: '**/viewport-support.spec.ts',
+      grep: /@ux-smoke/,
+      use: {
+        ...devices['Desktop Chrome'],
+        ...chromiumLaunch,
+      },
+    },
+    {
+      // Remaining default suite: Desktop Chrome at its device viewport. The smoke dependency must
+      // pass first, and grepInvert makes the two projects a complete, non-overlapping partition.
+      name: 'chromium',
+      dependencies: ['chromium-ux-smoke'],
+      testIgnore: '**/viewport-support.spec.ts',
+      grepInvert: /@ux-smoke/,
       use: {
         ...devices['Desktop Chrome'],
         ...chromiumLaunch,

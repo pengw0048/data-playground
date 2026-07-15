@@ -243,6 +243,7 @@ Unset mode keeps today's localhost defaults. The Compose reference sets `shared`
 | [Plugins](docs/PLUGINS.md) | Add nodes or connect another data, catalog, destination, or execution system |
 | [MCP](docs/MCP.md) | Connect an external agent over HTTP or stdio |
 | [Ray](docs/RAY.md) | Exact distributed support matrix, validation evidence, and production gates |
+| [CI and release gates](docs/CI.md) | Fast PR checks, scheduled acceptance, and the release-blocking contract |
 | [Kubernetes reference](deploy/README.md) | Validate and adapt the per-canvas Pod substrate |
 | [Contributing](.github/CONTRIBUTING.md) | Development loop, tests, and plugin contribution guidelines |
 | [Security policy](.github/SECURITY.md) | Trust boundary and private vulnerability reporting |
@@ -268,8 +269,10 @@ make e2e-install  # one-time browser install
 make e2e
 ```
 
-CI also owns the PostgreSQL migration contract and path-gated multi-node Ray validation. See
-[CONTRIBUTING.md](.github/CONTRIBUTING.md) for the clean-environment commands.
+Required PR CI also owns the PostgreSQL migration contract and researcher-workflow browser smoke.
+Environment-heavy UX, artifact, and Ray acceptance run on schedule, on demand, and before a versioned
+release; they are not repeated after merging to protected `main`. See [CI and release gates](docs/CI.md)
+and [CONTRIBUTING.md](.github/CONTRIBUTING.md) for the exact contracts and clean-environment commands.
 
 ## Contributing
 

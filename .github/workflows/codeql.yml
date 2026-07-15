@@ -7,8 +7,6 @@ name: CodeQL
 # as follow-up issues rather than suppressed here without comment.
 on:
   pull_request:
-  push:
-    branches: [main]
   schedule:
     # Mondays 04:27 UTC — offset from Ray validation (05:17) and image-scan.
     - cron: "27 4 * * 1"
