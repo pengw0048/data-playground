@@ -25,9 +25,10 @@ import asyncio
 from contextlib import asynccontextmanager
 import logging
 import os
+import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
@@ -489,13 +490,21 @@ async def ws_run(ws: WebSocket, run_id: str):
         pass
 
 
-# --- realtime collaboration: a broadcast room per canvas (presence + live doc updates) ---------- #
-# A dumb relay: clients hold the canvas; the server fans out presence/cursor and opaque Yjs CRDT
-# updates to the room's other peers. On join it sends {"type": "room-state", "peerCount": N}, where
-# N counts other owner/editor sockets that may legally answer Yjs sync; membership or role changes
-# refresh that count. This lets a browser seed only when no sync-capable peer exists.
+# --- realtime collaboration: a room per canvas (presence + directed Yjs bootstrap) --------------- #
+# The relay remains opaque to Yjs bytes, but it owns the authenticity and readiness state machine.
+# Exactly one ready writer answers each joiner's state-vector request; when no ready writer exists,
+# exactly one writer is elected to seed. An unsynchronized or read-only socket can never volunteer as
+# authority, and client frames can never impersonate the relay's `type: server` control envelope.
 _collab_rooms: dict[str, set[WebSocket]] = {}
 _collab_ids: dict[WebSocket, str] = {}  # socket -> its clientId (for leave notifications)
+_collab_canvas: dict[WebSocket, str] = {}
+_collab_synced: set[WebSocket] = set()
+_collab_order: dict[WebSocket, int] = {}
+_collab_order_sequence = 0
+_collab_room_locks: dict[str, asyncio.Lock] = {}
+_collab_room_lock_refs: dict[str, int] = {}
+_collab_room_lock_guard = threading.Lock()
+_collab_last_state: dict[WebSocket, tuple[str, str | None]] = {}
 
 
 @dataclass(frozen=True)
@@ -505,7 +514,54 @@ class _CollabSession:
 
 
 _collab_sessions: dict[WebSocket, _CollabSession] = {}
-_COLLAB_DOC_MESSAGES = frozenset(("yjs", "ysync"))
+
+
+@dataclass
+class _CollabSyncPlan:
+    mode: str  # seed | sync | unavailable
+    request_id: str | None
+    responder: WebSocket | None = None
+    attempted_responders: set[WebSocket] = field(default_factory=set)
+    seed_update_seen: bool = False
+    request_sent: bool = False
+    response_forwarded: bool = False
+    timed_out: bool = False
+    timer_task: asyncio.Task[None] | None = None
+
+
+_collab_plans: dict[WebSocket, _CollabSyncPlan] = {}
+_COLLAB_CLIENT_MESSAGES = frozenset(("presence", "yjs", "ysync", "sync-ready"))
+_COLLAB_SERVER_ONLY_MESSAGES = frozenset((
+    "server", "room-state", "leave", "external-edit", "ownership", "authority", "sync-plan",
+    "protocol-error",
+))
+_COLLAB_SYNC_RESPONSE_TIMEOUT_SECONDS = 5.0
+_COLLAB_SYNC_RETRY_SECONDS = 5.0
+
+
+def _retain_collab_room_lock(canvas_id: str) -> asyncio.Lock:
+    """Pin one lock in the registry while a socket/task may wait on or hold it.
+
+    The guard covers the no-await registry transition. Without the reference, a last-leaving socket
+    could pop its lock after a new joiner captured it but before that joiner acquired it, allowing a
+    third connection to create a second lock for the same canvas.
+    """
+    with _collab_room_lock_guard:
+        lock = _collab_room_locks.setdefault(canvas_id, asyncio.Lock())
+        _collab_room_lock_refs[canvas_id] = _collab_room_lock_refs.get(canvas_id, 0) + 1
+        return lock
+
+
+def _release_collab_room_lock(canvas_id: str, lock: asyncio.Lock) -> None:
+    with _collab_room_lock_guard:
+        if _collab_room_locks.get(canvas_id) is not lock:
+            return
+        remaining = _collab_room_lock_refs.get(canvas_id, 0) - 1
+        if remaining > 0:
+            _collab_room_lock_refs[canvas_id] = remaining
+        else:
+            _collab_room_lock_refs.pop(canvas_id, None)
+            _collab_room_locks.pop(canvas_id, None)
 
 
 async def _live_collab_role(ws: WebSocket, canvas_id: str) -> str | None:
@@ -541,39 +597,189 @@ async def _close_revoked_collab_peer(ws: WebSocket, room: set[WebSocket]) -> Non
         pass
 
 
-async def _sync_capable_peer_count(
-    room: set[WebSocket], canvas_id: str, *, exclude: WebSocket | None = None,
-) -> int:
-    """Count peers that can legally answer a Yjs sync request.
+def _ordered_collab_peers(room: set[WebSocket]) -> list[WebSocket]:
+    return sorted(room, key=lambda peer: _collab_order.get(peer, 2**63))
 
-    Viewers receive document updates and may request a sync themselves, but cannot send any Yjs
-    frame back through the relay. Including them in ``room-state.peerCount`` would make a joining
-    editor wait forever for a reply that the authorization gate must drop.
-    """
-    count = 0
-    for peer in list(room):
-        if peer is exclude:
+
+def _new_collab_plan(
+    mode: str, responder: WebSocket | None = None, *, attempted: set[WebSocket] | None = None,
+) -> _CollabSyncPlan:
+    request_id = secrets.token_urlsafe(18) if mode in ("seed", "sync") else None
+    return _CollabSyncPlan(
+        mode=mode, request_id=request_id, responder=responder,
+        attempted_responders=set(attempted or ()),
+    )
+
+
+def _cancel_collab_plan_timer(plan: _CollabSyncPlan) -> None:
+    task, plan.timer_task = plan.timer_task, None
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+
+
+async def _replan_collab_room_locked(room: set[WebSocket], canvas_id: str) -> None:
+    """Recompute deterministic bootstrap ownership. Caller holds this canvas's room lock."""
+    while room:
+        roles: dict[WebSocket, str] = {}
+        for peer in _ordered_collab_peers(room):
+            role = await _live_collab_role(peer, canvas_id)
+            if role is None:
+                await _close_revoked_collab_peer(peer, room)
+            else:
+                roles[peer] = role
+
+        if not room:
+            return
+        ready_writers = [
+            peer for peer in _ordered_collab_peers(room)
+            if peer in _collab_synced and roles.get(peer) in ("owner", "editor")
+        ]
+        unsynced = [peer for peer in _ordered_collab_peers(room) if peer not in _collab_synced]
+        desired: dict[WebSocket, _CollabSyncPlan] = {}
+        if ready_writers:
+            for peer in unsynced:
+                previous = _collab_plans.get(peer)
+                attempted = set(previous.attempted_responders) if previous is not None else set()
+                if previous is not None and previous.mode == "sync" and previous.timed_out:
+                    if previous.responder is not None:
+                        attempted.add(previous.responder)
+                elif (
+                    previous is not None and previous.mode == "sync"
+                    and previous.responder in ready_writers
+                ):
+                    desired[peer] = previous
+                    continue
+                candidates = [responder for responder in ready_writers if responder not in attempted]
+                if candidates:
+                    desired[peer] = _new_collab_plan("sync", candidates[0], attempted=attempted)
+                elif previous is not None and previous.mode == "unavailable":
+                    desired[peer] = previous
+                else:
+                    desired[peer] = _new_collab_plan("unavailable", attempted=attempted)
+        else:
+            writers = [peer for peer in unsynced if roles.get(peer) in ("owner", "editor")]
+            if writers:
+                seed = writers[0]
+                previous = _collab_plans.get(seed)
+                desired[seed] = previous if previous is not None and previous.mode == "seed" else _new_collab_plan("seed")
+
+        for peer in list(_collab_plans):
+            if _collab_canvas.get(peer) == canvas_id and peer not in desired:
+                removed = _collab_plans.pop(peer)
+                _cancel_collab_plan_timer(removed)
+        for peer, plan in desired.items():
+            previous = _collab_plans.get(peer)
+            if previous is not plan:
+                if previous is not None:
+                    _cancel_collab_plan_timer(previous)
+                _collab_plans[peer] = plan
+            if plan.mode == "unavailable" and plan.timer_task is None:
+                _schedule_collab_unavailable_retry(canvas_id, peer, plan)
+
+        send_failed = False
+        for peer in _ordered_collab_peers(room):
+            if peer in _collab_synced:
+                state = ("ready", None)
+            elif (plan := _collab_plans.get(peer)) is not None:
+                state = (plan.mode, plan.request_id if plan.mode != "unavailable" else None)
+            else:
+                state = ("wait", None)
+            if _collab_last_state.get(peer) == state:
+                continue
+            payload: dict[str, str] = {"type": "server", "event": "room-state", "mode": state[0]}
+            if state[1] is not None:
+                payload["requestId"] = state[1]
+            try:
+                await peer.send_json(payload)
+                _collab_last_state[peer] = state
+            except Exception:  # noqa: BLE001 — a dead authority changes every waiter's plan
+                room.discard(peer)
+                send_failed = True
+        if not send_failed:
+            return
+
+
+def _schedule_collab_sync_deadline(
+    canvas_id: str, joiner: WebSocket, plan: _CollabSyncPlan,
+) -> None:
+    """Rotate away from an open-but-silent responder; a deadline never grants readiness itself."""
+    lock = _retain_collab_room_lock(canvas_id)
+
+    async def expire() -> None:
+        await asyncio.sleep(_COLLAB_SYNC_RESPONSE_TIMEOUT_SECONDS)
+        async with lock:
+            room = _collab_rooms.get(canvas_id)
+            current = _collab_plans.get(joiner)
+            if (
+                room is not None and joiner in room and current is plan and plan.mode == "sync"
+                and plan.request_sent and not plan.response_forwarded
+            ):
+                plan.timer_task = None
+                plan.timed_out = True
+                _collab_last_state.pop(joiner, None)
+                await _replan_collab_room_locked(room, canvas_id)
+
+    plan.timer_task = asyncio.create_task(expire())
+    plan.timer_task.add_done_callback(lambda _task: _release_collab_room_lock(canvas_id, lock))
+
+
+def _schedule_collab_unavailable_retry(
+    canvas_id: str, joiner: WebSocket, plan: _CollabSyncPlan,
+) -> None:
+    """Surface unavailable first, then retry ready authorities without ever electing an empty peer."""
+    lock = _retain_collab_room_lock(canvas_id)
+
+    async def retry() -> None:
+        await asyncio.sleep(_COLLAB_SYNC_RETRY_SECONDS)
+        async with lock:
+            room = _collab_rooms.get(canvas_id)
+            if room is not None and joiner in room and _collab_plans.get(joiner) is plan:
+                plan.timer_task = None
+                _collab_plans.pop(joiner, None)
+                _collab_last_state.pop(joiner, None)
+                await _replan_collab_room_locked(room, canvas_id)
+
+    plan.timer_task = asyncio.create_task(retry())
+    plan.timer_task.add_done_callback(lambda _task: _release_collab_room_lock(canvas_id, lock))
+
+
+async def _send_collab_protocol_error(ws: WebSocket, code: str, canvas_id: str) -> None:
+    """Make a rejected client frame observable without echoing membership or document state."""
+    logging.getLogger("hub").warning("collab protocol violation canvas=%s code=%s", canvas_id, code)
+    try:
+        await ws.send_json({"type": "server", "event": "protocol-error", "code": code})
+    except Exception:  # noqa: BLE001 — close still fences the offending socket
+        pass
+    try:
+        await ws.close(code=1008)
+    except Exception:  # noqa: BLE001 — it may already have disconnected
+        pass
+
+
+async def _fanout_collab_locked(
+    room: set[WebSocket], canvas_id: str, sender: WebSocket, payload: dict[str, object],
+) -> None:
+    """Send a sanitized peer frame, fencing recipients whose read access was revoked."""
+    changed = False
+    for peer in _ordered_collab_peers(room):
+        if peer is sender:
             continue
-        role = await _live_collab_role(peer, canvas_id)
-        if role in ("owner", "editor"):
-            count += 1
-    return count
-
-
-async def _broadcast_collab_room_state(room: set[WebSocket], canvas_id: str) -> None:
-    """Refresh each peer's count after a sync-capable socket leaves or loses write access."""
-    for peer in list(room):
-        if peer not in room:
+        if await _live_collab_role(peer, canvas_id) is None:
+            await _close_revoked_collab_peer(peer, room)
+            changed = True
             continue
         try:
-            peer_count = await _sync_capable_peer_count(room, canvas_id, exclude=peer)
-            await peer.send_json({"type": "room-state", "peerCount": peer_count})
-        except Exception:  # noqa: BLE001 — dead peers are removed like ordinary fan-out failures
+            await peer.send_json(payload)
+        except Exception:  # noqa: BLE001
             room.discard(peer)
+            changed = True
+    if changed:
+        await _replan_collab_room_locked(room, canvas_id)
 
 
 @app.websocket("/ws/collab/{canvas_id}")
 async def ws_collab(ws: WebSocket, canvas_id: str):
+    global _collab_order_sequence
     # when auth is enabled, the collab channel is gated exactly like the HTTP canvas routes: a valid
     # signed session cookie + some role on this canvas. (Open mode: unauthenticated, like the rest.)
     if _cross_site_ws(ws):
@@ -593,59 +799,184 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
             await ws.close(code=1008)  # policy violation
             return
     await ws.accept()
-    room = _collab_rooms.setdefault(canvas_id, set())
-    room.add(ws)
     _collab_sessions[ws] = _CollabSession(uid, token)
+    _collab_canvas[ws] = canvas_id
+    _collab_order_sequence += 1
+    _collab_order[ws] = _collab_order_sequence
+    lock = _retain_collab_room_lock(canvas_id)
+    async with lock:
+        room = _collab_rooms.setdefault(canvas_id, set())
+        room.add(ws)
+        await _replan_collab_room_locked(room, canvas_id)
     try:
-        peer_count = await _sync_capable_peer_count(room, canvas_id, exclude=ws)
-        await ws.send_json({"type": "room-state", "peerCount": peer_count})
         while True:
-            msg = await ws.receive_json()
-            if isinstance(msg, dict) and msg.get("clientId"):
-                _collab_ids[ws] = msg["clientId"]
+            try:
+                msg = await ws.receive_json()
+            except WebSocketDisconnect:
+                raise
+            except Exception:  # noqa: BLE001 — malformed JSON is a protocol violation, not a 500
+                async with lock:
+                    await _send_collab_protocol_error(ws, "malformed-json", canvas_id)
+                break
             msg_type = msg.get("type") if isinstance(msg, dict) else None
-            if msg_type in _COLLAB_DOC_MESSAGES:
-                role = await _live_collab_role(ws, canvas_id)
-                if role is None:  # access removed after this socket connected
-                    await _close_revoked_collab_peer(ws, room)
+            if msg_type in _COLLAB_SERVER_ONLY_MESSAGES:
+                async with lock:
+                    await _send_collab_protocol_error(ws, "server-frame-forgery", canvas_id)
+                break
+            if msg_type not in _COLLAB_CLIENT_MESSAGES:
+                async with lock:
+                    await _send_collab_protocol_error(ws, "unknown-frame-type", canvas_id)
+                break
+
+            should_break = False
+            async with lock:
+                if ws not in room:
                     break
-                # A viewer may request/read Yjs sync and send presence, but its own updates must never
-                # be relayed — otherwise an editor peer could merge + autosave a laundered write.
-                if msg_type == "yjs" and role not in ("owner", "editor"):
-                    # The socket may have been counted as a responder before an editor→viewer
-                    # downgrade. Its correlated reply is still blocked, but refresh the room so the
-                    # waiting requester can hydrate when no legal responder remains.
-                    if msg.get("sync") is True:
-                        await _broadcast_collab_room_state(room, canvas_id)
-                    continue
-            for peer in list(room):
-                if peer is not ws:
-                    # A share can be removed while this recipient's socket remains open. Revalidate
-                    # before every document-bearing fan-out; presence remains cheap and viewer-safe.
-                    if msg_type in _COLLAB_DOC_MESSAGES and await _live_collab_role(peer, canvas_id) is None:
-                        await _close_revoked_collab_peer(peer, room)
-                        continue
-                    try:
-                        await peer.send_json(msg)
-                    except Exception:  # noqa: BLE001
-                        room.discard(peer)
+                if msg_type == "presence":
+                    client_id = msg.get("clientId")
+                    if not isinstance(client_id, str) or not client_id or len(client_id) > 128:
+                        await _send_collab_protocol_error(ws, "invalid-presence", canvas_id)
+                        should_break = True
+                    elif ws in _collab_ids and _collab_ids[ws] != client_id:
+                        await _send_collab_protocol_error(ws, "client-id-changed", canvas_id)
+                        should_break = True
+                    else:
+                        _collab_ids[ws] = client_id
+                        payload: dict[str, object] = {"type": "presence", "clientId": client_id}
+                        for field in ("name", "color"):
+                            if isinstance(msg.get(field), str):
+                                payload[field] = msg[field]
+                        cursor = msg.get("cursor")
+                        if isinstance(cursor, dict) and all(isinstance(cursor.get(axis), (int, float)) for axis in ("x", "y")):
+                            payload["cursor"] = {"x": cursor["x"], "y": cursor["y"]}
+                        await _fanout_collab_locked(room, canvas_id, ws, payload)
+                else:
+                    role = await _live_collab_role(ws, canvas_id)
+                    if role is None:
+                        await _close_revoked_collab_peer(ws, room)
+                        should_break = True
+                    elif msg_type == "ysync":
+                        request_id, state_vector = msg.get("requestId"), msg.get("sv")
+                        plan = _collab_plans.get(ws)
+                        if not isinstance(request_id, str) or not isinstance(state_vector, str):
+                            await _send_collab_protocol_error(ws, "invalid-sync-request", canvas_id)
+                            should_break = True
+                        elif plan is not None and plan.mode == "sync" and plan.request_id == request_id:
+                            responder = plan.responder
+                            if (
+                                responder in room and responder in _collab_synced
+                                and await _live_collab_role(responder, canvas_id) in ("owner", "editor")
+                            ):
+                                if not plan.request_sent:
+                                    try:
+                                        await responder.send_json({
+                                            "type": "ysync", "requestId": request_id, "sv": state_vector,
+                                        })
+                                        plan.request_sent = True
+                                        _schedule_collab_sync_deadline(canvas_id, ws, plan)
+                                    except Exception:  # noqa: BLE001 — re-elect without a timer
+                                        room.discard(responder)
+                                        await _replan_collab_room_locked(room, canvas_id)
+                            else:
+                                await _replan_collab_room_locked(room, canvas_id)
+                    elif msg_type == "yjs":
+                        update = msg.get("update")
+                        if not isinstance(update, str):
+                            await _send_collab_protocol_error(ws, "invalid-yjs-update", canvas_id)
+                            should_break = True
+                        elif msg.get("seed") is True:
+                            request_id = msg.get("requestId")
+                            plan = _collab_plans.get(ws)
+                            if (
+                                role in ("owner", "editor") and plan is not None and plan.mode == "seed"
+                                and isinstance(request_id, str) and plan.request_id == request_id
+                            ):
+                                plan.seed_update_seen = True
+                            else:
+                                await _send_collab_protocol_error(ws, "invalid-seed-update", canvas_id)
+                                should_break = True
+                        elif msg.get("sync") is True:
+                            reply_to = msg.get("replyTo")
+                            target: tuple[WebSocket, _CollabSyncPlan] | None = None
+                            if not isinstance(reply_to, str):
+                                await _send_collab_protocol_error(ws, "invalid-sync-response", canvas_id)
+                                should_break = True
+                            else:
+                                target = next((
+                                    (joiner, plan) for joiner, plan in _collab_plans.items()
+                                    if _collab_canvas.get(joiner) == canvas_id and plan.mode == "sync"
+                                    and plan.responder is ws and plan.request_id == reply_to
+                                ), None)
+                            if not should_break and (role not in ("owner", "editor") or ws not in _collab_synced):
+                                await _replan_collab_room_locked(room, canvas_id)
+                            elif not should_break and target is not None and target[0] in room and target[1].request_sent:
+                                joiner, plan = target
+                                try:
+                                    await joiner.send_json({
+                                        "type": "yjs", "sync": True, "replyTo": reply_to, "update": update,
+                                    })
+                                    plan.response_forwarded = True
+                                    _cancel_collab_plan_timer(plan)
+                                except Exception:  # noqa: BLE001
+                                    room.discard(joiner)
+                                    await _replan_collab_room_locked(room, canvas_id)
+                        elif role not in ("owner", "editor"):
+                            # A viewer remains a valid read replica, but its document writes never fan out.
+                            await _replan_collab_room_locked(room, canvas_id)
+                        elif ws not in _collab_synced:
+                            await _send_collab_protocol_error(ws, "update-before-sync", canvas_id)
+                            should_break = True
+                        else:
+                            await _fanout_collab_locked(room, canvas_id, ws, {"type": "yjs", "update": update})
+                    else:  # sync-ready
+                        request_id = msg.get("requestId")
+                        plan = _collab_plans.get(ws)
+                        if not isinstance(request_id, str):
+                            await _send_collab_protocol_error(ws, "invalid-sync-ready", canvas_id)
+                            should_break = True
+                        elif plan is not None and plan.request_id == request_id:
+                            seed_complete = (
+                                plan.mode == "seed" and plan.seed_update_seen and role in ("owner", "editor")
+                            )
+                            sync_complete = plan.mode == "sync" and plan.response_forwarded
+                            if seed_complete or sync_complete:
+                                _collab_synced.add(ws)
+                                completed = _collab_plans.pop(ws, None)
+                                if completed is not None:
+                                    _cancel_collab_plan_timer(completed)
+                                _collab_last_state.pop(ws, None)
+                                await _replan_collab_room_locked(room, canvas_id)
+                            else:
+                                await _send_collab_protocol_error(ws, "premature-sync-ready", canvas_id)
+                                should_break = True
+            if should_break:
+                break
     except WebSocketDisconnect:
         pass
     finally:
-        room.discard(ws)
-        _collab_sessions.pop(ws, None)
-        cid = _collab_ids.pop(ws, None)
-        if cid:  # let peers drop this collaborator's cursor/avatar
-            for peer in list(room):
-                try:
-                    await peer.send_json({"type": "leave", "clientId": cid})
-                except Exception:  # noqa: BLE001
-                    room.discard(peer)
-        # This is deliberately independent of clientId: a peer can disappear before announcing
-        # presence, and a waiting joiner must still learn that no peer remains to answer ysync.
-        await _broadcast_collab_room_state(room, canvas_id)
-        if not room:
-            _collab_rooms.pop(canvas_id, None)
+        try:
+            async with lock:
+                room.discard(ws)
+                _collab_sessions.pop(ws, None)
+                _collab_canvas.pop(ws, None)
+                _collab_synced.discard(ws)
+                _collab_order.pop(ws, None)
+                abandoned = _collab_plans.pop(ws, None)
+                if abandoned is not None:
+                    _cancel_collab_plan_timer(abandoned)
+                _collab_last_state.pop(ws, None)
+                cid = _collab_ids.pop(ws, None)
+                if cid:
+                    for peer in _ordered_collab_peers(room):
+                        try:
+                            await peer.send_json({"type": "server", "event": "leave", "clientId": cid})
+                        except Exception:  # noqa: BLE001
+                            room.discard(peer)
+                await _replan_collab_room_locked(room, canvas_id)
+                if not room:
+                    _collab_rooms.pop(canvas_id, None)
+        finally:
+            _release_collab_room_lock(canvas_id, lock)
 
 
 async def _broadcast_external_edit(canvas_id: str) -> None:
@@ -655,14 +986,23 @@ async def _broadcast_external_edit(canvas_id: str) -> None:
     room = _collab_rooms.get(canvas_id)
     if not room:
         return
-    for peer in list(room):
-        if await _live_collab_role(peer, canvas_id) is None:
-            await _close_revoked_collab_peer(peer, room)
-            continue
-        try:
-            await peer.send_json({"type": "external-edit", "canvasId": canvas_id})
-        except Exception:  # noqa: BLE001 — a dead peer is dropped, exactly like ws_collab's fan-out
-            room.discard(peer)
+    lock = _retain_collab_room_lock(canvas_id)
+    try:
+        async with lock:
+            current_room = _collab_rooms.get(canvas_id)
+            if current_room is not room:
+                return
+            for peer in _ordered_collab_peers(room):
+                if await _live_collab_role(peer, canvas_id) is None:
+                    await _close_revoked_collab_peer(peer, room)
+                    continue
+                try:
+                    await peer.send_json({"type": "server", "event": "external-edit", "canvasId": canvas_id})
+                except Exception:  # noqa: BLE001 — a dead peer is dropped, exactly like ws_collab's fan-out
+                    room.discard(peer)
+            await _replan_collab_room_locked(room, canvas_id)
+    finally:
+        _release_collab_room_lock(canvas_id, lock)
 
 
 # --- MCP over HTTP: the SAME server as `dataplay mcp` (stdio), but served IN-PROCESS by the web app.

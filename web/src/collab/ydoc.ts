@@ -8,10 +8,8 @@ import { useStore } from '../store/graph'
 import { crdtUndo, collabApply } from './undo'
 import type { CanvasDoc, CanvasNode, CanvasEdge } from '../types/graph'
 
-let ydoc = new Y.Doc()
 let applying = false        // a store change currently originates from Y → don't push it back
 let active = false
-let ready = false          // gate local→Y pushes until we've synced peers' state (or confirmed first)
 let lastDoc: CanvasDoc | undefined
 let broadcast: ((u: Uint8Array) => void) | null = null
 let unsub: (() => void) | null = null
@@ -26,9 +24,46 @@ const b64 = {
   dec: (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0)),
 }
 
-function nodes() { return ydoc.getMap<Y.Map<unknown>>('nodes') }
-function edges() { return ydoc.getMap<CanvasEdge>('edges') }
-function meta() { return ydoc.getMap<unknown>('meta') }
+/** One Yjs replica plus the readiness invariant used by the collaboration handshake.
+ *
+ * A replica may answer a state-vector request only after it was either the relay-elected seed or
+ * completed a reply from an already-ready replica. Keeping this next to the Y.Doc makes it impossible
+ * for a merely connected/empty editor to accidentally become an authoritative snapshot source.
+ */
+export class YSyncReplica {
+  readonly doc = new Y.Doc()
+  private ready = false
+
+  isReady(): boolean { return this.ready }
+  markSeedReady(): void { this.ready = true }
+
+  applyRemote(update: string): void {
+    Y.applyUpdate(this.doc, b64.dec(update), 'remote')
+  }
+
+  completeSync(update: string): void {
+    this.applyRemote(update)
+    this.ready = true
+  }
+
+  encodeState(theirStateVector?: string): string | null {
+    if (!this.ready) return null
+    const sv = theirStateVector ? b64.dec(theirStateVector) : undefined
+    return b64.enc(Y.encodeStateAsUpdate(this.doc, sv))
+  }
+
+  encodeStateVector(): string {
+    return b64.enc(Y.encodeStateVector(this.doc))
+  }
+
+  destroy(): void { this.doc.destroy() }
+}
+
+let replica = new YSyncReplica()
+
+function nodes() { return replica.doc.getMap<Y.Map<unknown>>('nodes') }
+function edges() { return replica.doc.getMap<CanvasEdge>('edges') }
+function meta() { return replica.doc.getMap<unknown>('meta') }
 
 // -- Y → CanvasDoc (rebuild the store doc from the shared state) -------------- //
 function yToDoc(base: CanvasDoc): CanvasDoc {
@@ -48,7 +83,7 @@ function yToDoc(base: CanvasDoc): CanvasDoc {
 
 // -- CanvasDoc → Y (diff the store doc into the shared state) ----------------- //
 function pushDocToY(doc: CanvasDoc): void {
-  ydoc.transact(() => {
+  replica.doc.transact(() => {
     if (meta().get('name') !== doc.name) meta().set('name', doc.name)
     const nmap = nodes()
     const ids = new Set(doc.nodes.map((n) => n.id))
@@ -74,15 +109,16 @@ function pushDocToY(doc: CanvasDoc): void {
 }
 
 /** Start CRDT sync for a canvas. `send` broadcasts a binary Y update to the room. The relay's
- * room-state handshake decides when the local store is allowed to seed the shared doc. */
+ * authenticated server envelope decides when the local store may seed the shared doc. */
 export function startYSync(send: (u: Uint8Array) => void): void {
-  ydoc = new Y.Doc()
+  replica.destroy()
+  replica = new YSyncReplica()
   broadcast = send
   active = true
-  ready = false  // do NOT seed Y from the (possibly stale) DB snapshot yet — first try to sync peers'
-                 // live state, so a joiner can't clobber unpersisted edits (hydrateIfEmpty handles "first")
+  // Do NOT seed Y from the (possibly stale) DB snapshot yet. The relay elects exactly one seed only
+  // when no synchronized writer exists; every other client must complete a directed sync first.
 
-  ydoc.on('update', (u: Uint8Array, origin) => {
+  replica.doc.on('update', (u: Uint8Array, origin) => {
     if (origin !== 'store') {          // remote edit / local hydrate / undo-redo → reflect into the store
       applying = true
       // a peer's edit (origin 'remote') must NOT be re-persisted by this client — only local edits and
@@ -106,54 +142,52 @@ export function startYSync(send: (u: Uint8Array) => void): void {
   unsub = useStore.subscribe((s) => {
     if (s.doc === lastDoc) return
     lastDoc = s.doc
-    if (applying || !active || !ready) return  // from Y, or not yet synced → don't echo/clobber
+    if (applying || !active || !replica.isReady()) return  // from Y, or not yet synced → don't echo/clobber
     pushDocToY(s.doc)
   })
 }
 
-/** Seed Y from the store only after the relay authoritatively reports no other room members. */
+/** Seed Y from the store only after the relay elects this socket as the room's unique seed. */
 export function hydrateIfEmpty(): void {
-  if (ready || !active) return
+  if (replica.isReady() || !active) return
   if (nodes().size === 0 && edges().size === 0) pushDocToY(useStore.getState().doc)  // no peer state → we seed it
-  ready = true
+  replica.markSeedReady()
 }
 
-/** Apply the relay's room-state contract: zero peers means first client or the last peer vanished. */
-export function hydrateFromRoomState(peerCount: number): void {
-  if (peerCount === 0) hydrateIfEmpty()
+/** Complete a relay-directed sync atomically: merge the authoritative reply, then become a source. */
+export function completeYSync(update: string): void {
+  if (active) replica.completeSync(update)
 }
 
-/** A peer answered our state-vector request. Even an empty reply makes it safe to accept local edits. */
-export function markYSyncReady(): void {
-  if (active) ready = true
+/** Defense in depth: only a synchronized client may answer a directed state-vector request. */
+export function isYSyncReady(): boolean {
+  return active && replica.isReady()
 }
 
 export function stopYSync(): void {
   active = false
-  ready = false
   unsub?.(); unsub = null
   broadcast = null
   undoMgr?.destroy(); undoMgr = null
   crdtUndo.undo = crdtUndo.redo = crdtUndo.boundary = null  // store falls back to its snapshot stack
-  ydoc.destroy()
-  ydoc = new Y.Doc()
+  replica.destroy()
+  replica = new YSyncReplica()
 }
 
 /** A peer sent a binary Y update — merge it (marks origin 'remote' so it flows into the store). */
 export function applyYUpdate(update: string): void {
   if (!active) return
-  Y.applyUpdate(ydoc, b64.dec(update), 'remote')
+  replica.applyRemote(update)
 }
 
-/** A peer joined and asked for state (their state vector) — reply with everything they're missing. */
-export function encodeYState(theirStateVector?: string): string {
-  const sv = theirStateVector ? b64.dec(theirStateVector) : undefined
-  return b64.enc(Y.encodeStateAsUpdate(ydoc, sv))
+/** The relay selected this ready replica as responder; return what the joiner is missing. */
+export function encodeYState(theirStateVector?: string): string | null {
+  return active ? replica.encodeState(theirStateVector) : null
 }
 
 /** Our state vector, to ask peers for what we're missing when we join. */
 export function encodeYStateVector(): string {
-  return b64.enc(Y.encodeStateVector(ydoc))
+  return replica.encodeStateVector()
 }
 
 export const yUpdateB64 = b64.enc

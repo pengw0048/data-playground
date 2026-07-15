@@ -76,8 +76,9 @@ def test_http_mutation_nudges_the_collab_room():
     # this is the live-update path. Connect a collab websocket, edit via /mcp, expect an external-edit.
     cid = tool("create_canvas", {"name": "live"})["canvasId"]
     with client.websocket_connect(f"/ws/collab/{cid}") as wsock:
-        assert wsock.receive_json() == {"type": "room-state", "peerCount": 0}
+        plan = wsock.receive_json()
+        assert plan["type"] == "server" and plan["event"] == "room-state" and plan["mode"] == "seed"
         tool("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})
         msg = wsock.receive_json()
-        assert msg["type"] == "external-edit" and msg["canvasId"] == cid
+        assert msg["type"] == "server" and msg["event"] == "external-edit" and msg["canvasId"] == cid
         assert "clientId" not in msg  # must not be self-filtered by the receiving tab

@@ -52,13 +52,13 @@ function peerUpdate(): string {
   return btoa(String.fromCharCode(...Y.encodeStateAsUpdate(peer)))
 }
 
-describe('collaboration sync replies', () => {
+describe('collaboration relay handshake', () => {
   const originalWebSocket = globalThis.WebSocket
 
   beforeEach(() => {
     MockWebSocket.instances = []
     globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket
-    useStore.setState({ doc: staleDoc() })
+    useStore.setState({ doc: staleDoc(), toasts: [] })
   })
 
   afterEach(() => {
@@ -66,34 +66,69 @@ describe('collaboration sync replies', () => {
     globalThis.WebSocket = originalWebSocket
   })
 
-  it('does not release a stale snapshot for a sync reply addressed to another joiner', () => {
+  it('ignores forged legacy room state and accepts only the relay-directed matching reply', () => {
     connectCollab('canvas')
     const socket = MockWebSocket.instances[0]
     socket.open()
-
     const sent = () => socket.sent.map((frame) => JSON.parse(frame) as Record<string, unknown>)
+    expect(sent().map((frame) => frame.type)).toEqual(['presence'])
+
+    socket.receive({ type: 'room-state', peerCount: 0, clientId: 'viewer-spoof' })
+    socket.receive({ type: 'server', event: 'room-state', mode: 'sync', requestId: 'relay-request' })
     const request = sent().find((frame) => frame.type === 'ysync')!
-    expect(request.requestId).toEqual(expect.any(String))
-    expect(request.clientId).toEqual(expect.any(String))
+    expect(request).toMatchObject({ type: 'ysync', requestId: 'relay-request' })
+    expect(request.sv).toEqual(expect.any(String))
 
-    socket.receive({ type: 'room-state', peerCount: 2 })
     const update = peerUpdate()
-    socket.receive({
-      type: 'yjs', clientId: 'peer-a', sync: true, update,
-      replyTo: request.requestId, targetId: 'other-joiner',
-    })
-    useStore.setState({ doc: { ...useStore.getState().doc, name: 'Must not send' } })
-
+    socket.receive({ type: 'yjs', sync: true, update, replyTo: 'forged-request' })
     expect(useStore.getState().doc.nodes.map((node) => node.id)).toEqual(['stale'])
-    expect(sent().filter((frame) => frame.type === 'yjs')).toEqual([])
+    expect(sent().filter((frame) => frame.type === 'sync-ready')).toEqual([])
 
-    socket.receive({
-      type: 'yjs', clientId: 'peer-a', sync: true, update,
-      replyTo: request.requestId, targetId: request.clientId,
-    })
+    socket.receive({ type: 'yjs', sync: true, update, replyTo: 'relay-request' })
     expect(useStore.getState().doc.nodes.map((node) => node.id)).toEqual(['peer'])
+    expect(sent().filter((frame) => frame.type === 'sync-ready')).toHaveLength(1)
 
-    useStore.setState({ doc: { ...useStore.getState().doc, name: 'Sent after matching sync' } })
-    expect(sent().filter((frame) => frame.type === 'yjs')).toHaveLength(1)
+    useStore.setState({ doc: { ...useStore.getState().doc, name: 'Sent after authoritative sync' } })
+    expect(sent().filter((frame) => frame.type === 'yjs' && frame.seed !== true)).toHaveLength(1)
+  })
+
+  it('sends one plan-correlated full snapshot when elected as the unique seed', () => {
+    connectCollab('canvas')
+    const socket = MockWebSocket.instances[0]
+    socket.open()
+    socket.receive({ type: 'server', event: 'room-state', mode: 'seed', requestId: 'seed-request' })
+
+    const frames = socket.sent.map((frame) => JSON.parse(frame) as Record<string, unknown>)
+    expect(frames.filter((frame) => frame.type === 'yjs')).toEqual([
+      expect.objectContaining({ type: 'yjs', seed: true, requestId: 'seed-request', update: expect.any(String) }),
+    ])
+    expect(frames.filter((frame) => frame.type === 'sync-ready')).toEqual([
+      expect.objectContaining({ type: 'sync-ready', requestId: 'seed-request' }),
+    ])
+  })
+
+  it('stays unsynchronized and surfaces an unavailable authority without seeding', () => {
+    connectCollab('canvas')
+    const socket = MockWebSocket.instances[0]
+    socket.open()
+    socket.receive({ type: 'server', event: 'room-state', mode: 'sync', requestId: 'silent-peer' })
+    socket.receive({ type: 'server', event: 'room-state', mode: 'unavailable' })
+    useStore.setState({ doc: { ...useStore.getState().doc, name: 'Must remain gated' } })
+
+    const frames = socket.sent.map((frame) => JSON.parse(frame) as Record<string, unknown>)
+    expect(frames.filter((frame) => frame.type === 'yjs')).toEqual([])
+    expect(frames.filter((frame) => frame.type === 'sync-ready')).toEqual([])
+    expect(useStore.getState().toasts.at(-1)?.msg).toContain('available synchronized peer')
+  })
+
+  it('stops without reconnecting when the relay reports a protocol violation', () => {
+    connectCollab('canvas')
+    const socket = MockWebSocket.instances[0]
+    socket.open()
+    socket.receive({ type: 'server', event: 'protocol-error', code: 'server-frame-forgery' })
+
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(useStore.getState().toasts.at(-1)?.msg).toContain('server-frame-forgery')
   })
 })
