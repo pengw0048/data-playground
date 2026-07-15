@@ -9,7 +9,7 @@ import { SECTION_W, SECTION_H } from '../nodes/kinds/section'
 import { WireEdge } from '../wires/WireEdge'
 import { canConnect, portWire, portMulti, getSpec } from '../nodes/registry'
 import { schemaWarnings } from '../nodes/schema'
-import { useStore, newId, freePosition, roleCanEdit } from '../store/graph'
+import { currentPreviews, useStore, newId, freePosition, roleCanEdit } from '../store/graph'
 import { api } from '../api/client'
 import { examples } from '../examples'
 import { kindAccent, color } from '../theme/tokens'
@@ -180,8 +180,9 @@ export function Canvas() {
   // Keyed by a stable membership string so warnedIds only changes IDENTITY when the set actually changes
   // → rfEdges (and every WireEdge) don't rebuild on an unrelated keystroke.
   const warnedKey = useMemo(() => {
+    const boundPreviews = currentPreviews(doc, previews)
     const ids: string[] = []
-    for (const n of doc.nodes) if (schemaWarnings(doc, schemas, previews, catalog, n.id).length) ids.push(n.id)
+    for (const n of doc.nodes) if (schemaWarnings(doc, schemas, boundPreviews, catalog, n.id).length) ids.push(n.id)
     return ids.sort().join(',')
   }, [doc, schemas, previews, catalog])
   const warnedIds = useMemo(() => new Set(warnedKey ? warnedKey.split(',') : []), [warnedKey])

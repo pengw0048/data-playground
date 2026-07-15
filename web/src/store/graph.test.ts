@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 
 // the store module runs autosave side-effects at import; stub the network client so nothing escapes.
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
-const apiMocks = vi.hoisted(() => ({ listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn() }))
+const apiMocks = vi.hoisted(() => ({ listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), preview: vi.fn() }))
 vi.mock('../api/client', () => ({
   api: new Proxy({}, {
     get: (_target, property) => property === 'listCanvases'
@@ -11,7 +11,9 @@ vi.mock('../api/client', () => ({
         ? apiMocks.getCanvas
         : property === 'createCanvas'
           ? apiMocks.createCanvas
-        : async () => ({}),
+          : property === 'preview'
+            ? apiMocks.preview
+          : async () => ({}),
   }),
   KernelError: class KernelError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status } },
   setApiUser: vi.fn(),
@@ -45,6 +47,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.listCanvases.mockReset().mockResolvedValue([])
     apiMocks.getCanvas.mockReset()
     apiMocks.createCanvas.mockReset().mockResolvedValue({ ok: true })
+    apiMocks.preview.mockReset()
     useStore.setState({ currentUser: { id: 'alice', name: 'Alice' } })
     useStore.setState({
       doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] },
@@ -73,6 +76,94 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.nodes).toHaveLength(1)
     useStore.getState().undo()
     expect(useStore.getState().doc.nodes).toHaveLength(0)  // back to the empty baseline
+  })
+
+  it('binds a preview to its canvas and plan identity, then blocks a stale response', async () => {
+    let finish!: (result: ReturnType<typeof previewResult>) => void
+    apiMocks.preview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [],
+        nodes: [NODE('source'), NODE('filter', 'filter')],
+        edges: [{ id: 'source-filter', source: 'source', target: 'filter', data: { wire: 'dataset' } }],
+      },
+    })
+
+    const first = useStore.getState().runPreview('filter')
+    const pending = useStore.getState().previews.filter
+    expect(pending).toMatchObject({ canvasId: 'c', nodeId: 'filter', loading: true, offset: 0 })
+
+    useStore.getState().updateConfig('source', { uri: 'new-events.parquet' })
+    finish(previewResult('purchase'))
+    await first
+
+    expect(useStore.getState().previews.filter?.result).toBeUndefined()
+    apiMocks.preview.mockResolvedValueOnce(previewResult('view'))
+    await useStore.getState().runPreview('filter')
+    expect(useStore.getState().previews.filter?.result?.rows).toEqual([{ value: 'view' }])
+  })
+
+  it('blocks a preview response when the graph topology changes', async () => {
+    let finish!: (result: ReturnType<typeof previewResult>) => void
+    apiMocks.preview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [],
+        nodes: [NODE('source'), NODE('filter', 'filter')],
+        edges: [{ id: 'source-filter', source: 'source', target: 'filter', data: { wire: 'dataset' } }],
+      },
+    })
+
+    const pending = useStore.getState().runPreview('filter')
+    useStore.getState().removeEdge('source-filter')
+    finish(previewResult('old topology'))
+    await pending
+
+    expect(useStore.getState().previews.filter?.result).toBeUndefined()
+  })
+
+  it('keeps only the latest preview or pagination response for a node', async () => {
+    let finishFirst!: (result: ReturnType<typeof previewResult>) => void
+    let finishSecond!: (result: ReturnType<typeof previewResult>) => void
+    apiMocks.preview
+      .mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishSecond = resolve }))
+    useStore.setState({ doc: { id: 'c', version: 1, name: 'test', nodes: [NODE('source')], edges: [], requirements: [] } })
+
+    const first = useStore.getState().runPreview('source', 0)
+    const second = useStore.getState().runPreview('source', 50)
+    finishSecond(previewResult('newer'))
+    await second
+    const latestGeneration = useStore.getState().previews.source?.requestGeneration
+    expect(useStore.getState().previews.source).toMatchObject({ offset: 50, result: previewResult('newer') })
+
+    finishFirst(previewResult('older'))
+    await first
+    expect(useStore.getState().previews.source).toMatchObject({
+      requestGeneration: latestGeneration, offset: 50, result: previewResult('newer'),
+    })
+  })
+
+  it('does not install an in-flight preview after a canvas switch or node deletion', async () => {
+    let finishCanvas!: (result: ReturnType<typeof previewResult>) => void
+    let finishDeleted!: (result: ReturnType<typeof previewResult>) => void
+    apiMocks.preview
+      .mockImplementationOnce(() => new Promise((resolve) => { finishCanvas = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishDeleted = resolve }))
+    useStore.setState({ doc: { id: 'c', version: 1, name: 'test', nodes: [NODE('source')], edges: [], requirements: [] } })
+
+    const onOldCanvas = useStore.getState().runPreview('source')
+    useStore.setState({ doc: emptyTestDoc('other'), previews: {} })
+    finishCanvas(previewResult('old canvas'))
+    await onOldCanvas
+    expect(useStore.getState().previews).toEqual({})
+
+    useStore.setState({ doc: { id: 'other', version: 1, name: 'other', nodes: [NODE('source')], edges: [], requirements: [] } })
+    const onDeletedNode = useStore.getState().runPreview('source')
+    useStore.getState().removeNode('source')
+    finishDeleted(previewResult('deleted node'))
+    await onDeletedNode
+    expect(useStore.getState().previews.source).toBeUndefined()
   })
 
   it('pushToast adds a toast and dismissToast removes it', () => {
@@ -279,4 +370,11 @@ describe('graph store — core authority ops', () => {
 
 function emptyTestDoc(id: string) {
   return { id, version: 1, name: id, nodes: [], edges: [] }
+}
+
+function previewResult(value: string) {
+  return {
+    columns: [{ name: 'value', type: 'VARCHAR', capabilities: [] }],
+    rows: [{ value }], rowCount: 1, hasMore: false, truncated: false,
+  }
 }

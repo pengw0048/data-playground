@@ -1,5 +1,5 @@
 import { Suspense, lazy, useEffect } from 'react'
-import { useStore, nodeRunnable, roleCanEdit } from '../store/graph'
+import { previewIsCurrent, useStore, nodeRunnable, roleCanEdit } from '../store/graph'
 import { useInputColumns } from '../nodes/fields'
 import { Icon } from '../ui/Icon'
 import { MiniSelect } from '../ui/controls'
@@ -13,8 +13,9 @@ const CodeEditor = lazy(() => import('../ui/CodeEditor').then((m) => ({ default:
 // opened from the node card, the Inspector, and code-on-canvas. Edits write straight to the config.
 export function CodeFullscreen() {
   const fs = useStore((s) => s.fullscreenCode)
-  const node = useStore((s) => (fs ? s.doc.nodes.find((n) => n.id === fs.nodeId) : undefined))
-  const runnable = useStore((s) => (fs ? nodeRunnable(s.doc, fs.nodeId) : false))
+  const doc = useStore((s) => s.doc)
+  const node = fs ? doc.nodes.find((n) => n.id === fs.nodeId) : undefined
+  const runnable = fs ? nodeRunnable(doc, fs.nodeId) : false
   const previews = useStore((s) => s.previews)
   const processors = useStore((s) => s.processors)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
@@ -39,7 +40,8 @@ export function CodeFullscreen() {
   // references). Fall back to THIS node's own last-preview columns when the input schema isn't resolved yet
   // — NOT every node's previews (that leaked unrelated columns from across the whole graph).
   const inputNames = inputCols.map((c) => c.name)
-  const own = (previews[fs.nodeId]?.result?.columns ?? []).map((c) => c.name)
+  const preview = previews[fs.nodeId]
+  const own = preview && previewIsCurrent(preview, doc, fs.nodeId) ? (preview.result?.columns ?? []).map((c) => c.name) : []
   const completions = [...new Set(inputNames.length ? inputNames : own)]
 
   return (
