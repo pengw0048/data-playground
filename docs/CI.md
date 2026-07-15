@@ -8,17 +8,18 @@ release must prove the complete artifact, UX, and optional distributed-execution
 
 | Gate | Pull request | Push to `main` | Schedule or manual | `v*` release |
 | --- | --- | --- | --- | --- |
-| Core kernel, web, type, migration, backup, and browser tests | Required | No duplicate run | Manual | Already proved by the required, up-to-date PR |
-| UX golden-workflow smoke | Required inside normal browser CI | No duplicate run | Manual | Already proved by the required, up-to-date PR |
+| Core kernel, web, type, migration, backup, and browser tests | Required | Required integration run | Manual | Latest `main` result is release evidence |
+| UX golden-workflow smoke | Required inside normal browser CI | Repeated inside the integration run | Manual | Latest `main` result is release evidence |
 | Full researcher UX fixture matrix and P0/P1 issue gate | No | No | Daily or manual | Required before publish |
 | Wheel and application-image clean-install smoke | No | No | Manual | Required before publish |
 | Real multi-container Ray differential | No | No | Weekly or manual | Required before publish |
 | Ray Jobs restart/cancel/result acceptance | No | No | Weekly or manual | Required before publish |
-| CodeQL, Gitleaks, dependency review, and path-gated image scan | Relevant PRs | No duplicate run | Scheduled/manual where configured | A release does not bypass an unresolved required result |
+| CodeQL and Gitleaks | Required | Required integration run | Scheduled/manual where configured | A release does not bypass an unresolved result |
+| Dependency review and path-gated image scan | Relevant PRs | Path/workflow-specific | Scheduled/manual where configured | A release does not bypass an unresolved result |
 
-`main` requires an up-to-date pull request and does not accept direct changes, so `push: main` would
-repeat evidence for the same reviewed tree. If repository protection is ever relaxed, restore a default-
-branch validation trigger before allowing direct pushes.
+Direct changes to `main` remain blocked, but pull requests do not have to be rebased after every
+unrelated merge. Core CI, CodeQL, and Gitleaks therefore run again on `main` to validate the integrated
+tree. This default-branch run does not start environment-heavy acceptance workflows.
 
 ## Pull-request feedback
 
@@ -26,8 +27,8 @@ branch validation trigger before allowing direct pushes.
 job runs the tagged `@ux-smoke` scenarios first for a focused failure, then runs the remaining browser
 suite. Heavy Docker clusters and release builds are deliberately absent from the PR event.
 
-Security workflows remain PR-scoped because they inspect the proposed diff or source tree. Superseded
-PR heads use `cancel-in-progress` so only the current revision consumes runners.
+CodeQL and Gitleaks also run on the integrated `main` tree. Superseded PR heads use
+`cancel-in-progress` so only the current revision consumes runners.
 
 ## Heavy acceptance
 
