@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as Y from 'yjs'
 import { useStore } from '../store/graph'
 import type { CanvasDoc } from '../types/graph'
@@ -19,10 +19,11 @@ class MockWebSocket {
   constructor(_url: string) { MockWebSocket.instances.push(this) }
 
   send(data: string): void { this.sent.push(data) }
-  close(): void {
+  close(code = 1000): void {
     this.readyState = MockWebSocket.CLOSED
-    this.onclose?.(new CloseEvent('close'))
+    this.onclose?.({ code } as CloseEvent)
   }
+  serverClose(code: number): void { this.close(code) }
   open(): void {
     this.readyState = MockWebSocket.OPEN
     this.onopen?.(new Event('open'))
@@ -56,6 +57,7 @@ describe('collaboration relay handshake', () => {
   const originalWebSocket = globalThis.WebSocket
 
   beforeEach(() => {
+    vi.useFakeTimers()
     MockWebSocket.instances = []
     globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket
     useStore.setState({ doc: staleDoc(), toasts: [] })
@@ -63,6 +65,7 @@ describe('collaboration relay handshake', () => {
 
   afterEach(() => {
     disconnectCollab()
+    vi.useRealTimers()
     globalThis.WebSocket = originalWebSocket
   })
 
@@ -130,5 +133,57 @@ describe('collaboration relay handshake', () => {
     expect(socket.readyState).toBe(MockWebSocket.CLOSED)
     expect(MockWebSocket.instances).toHaveLength(1)
     expect(useStore.getState().toasts.at(-1)?.msg).toContain('server-frame-forgery')
+  })
+
+  it('recreates an unready replica and gates edits through an unexpected reconnect handshake', () => {
+    connectCollab('canvas')
+    const first = MockWebSocket.instances[0]
+    first.open()
+    first.receive({ type: 'server', event: 'room-state', mode: 'seed', requestId: 'initial-seed' })
+
+    first.serverClose(1006)
+    useStore.setState({ doc: { ...useStore.getState().doc, name: 'Edited while disconnected' } })
+    vi.advanceTimersByTime(1500)
+    const second = MockWebSocket.instances[1]
+    second.open()
+    useStore.setState({ doc: { ...useStore.getState().doc, name: 'Edited before baseline' } })
+    expect(second.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.type === 'yjs')).toEqual([])
+
+    second.receive({ type: 'server', event: 'room-state', mode: 'sync', requestId: 'reconnect-sync' })
+    second.receive({ type: 'yjs', sync: true, replyTo: 'reconnect-sync', update: peerUpdate() })
+    useStore.setState({ doc: { ...useStore.getState().doc, name: 'Edited after baseline' } })
+
+    const frames = second.sent.map((frame) => JSON.parse(frame) as Record<string, unknown>)
+    expect(frames.filter((frame) => frame.type === 'sync-ready')).toHaveLength(1)
+    expect(frames.filter((frame) => frame.type === 'yjs' && frame.seed !== true)).toHaveLength(1)
+  })
+
+  it('treats policy close as terminal and does not enter a reconnect loop', () => {
+    connectCollab('canvas')
+    const socket = MockWebSocket.instances[0]
+    socket.open()
+    socket.serverClose(1008)
+    expect(useStore.getState().toasts.at(-1)?.msg).toContain('access was revoked')
+    vi.advanceTimersByTime(10_000)
+
+    expect(MockWebSocket.instances).toHaveLength(1)
+    useStore.setState({ doc: { ...useStore.getState().doc, name: 'Must stay local' } })
+    expect(socket.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.type === 'yjs')).toEqual([])
+  })
+
+  it('hydrates persisted state before draining a pre-baseline delta into an elected seed', () => {
+    connectCollab('canvas')
+    const socket = MockWebSocket.instances[0]
+    socket.open()
+    socket.receive({ type: 'yjs', update: peerUpdate() })
+    expect(useStore.getState().doc.nodes.map((node) => node.id)).toEqual(['stale'])
+
+    socket.receive({ type: 'server', event: 'room-state', mode: 'seed', requestId: 'safe-seed' })
+    expect(useStore.getState().doc.nodes.map((node) => node.id).sort()).toEqual(['peer', 'stale'])
+    const frame = socket.sent.map((raw) => JSON.parse(raw) as Record<string, unknown>)
+      .find((candidate) => candidate.type === 'yjs' && candidate.seed === true)!
+    const seeded = new Y.Doc()
+    Y.applyUpdate(seeded, Uint8Array.from(atob(frame.update as string), (char) => char.charCodeAt(0)))
+    expect(Array.from(seeded.getMap('nodes').keys()).sort()).toEqual(['peer', 'stale'])
   })
 })

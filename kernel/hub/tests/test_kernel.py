@@ -4433,6 +4433,151 @@ def test_collab_room_lock_survives_last_leave_after_a_joiner_captures_it():
     assert canvas_id not in hub_main._collab_room_lock_refs
 
 
+def test_collab_deadline_progress_isolated_from_slow_role_and_socket_io(monkeypatch):
+    import asyncio
+    from typing import cast
+
+    from fastapi import WebSocket
+    from hub import main as hub_main
+
+    class FakeSocket:
+        def __init__(self, send_gate: asyncio.Event | None = None):
+            self.send_gate = send_gate
+            self.sent: list[dict[str, object]] = []
+            self.closed: list[int] = []
+
+        async def send_json(self, payload: dict[str, object]) -> None:
+            if self.send_gate is not None:
+                await self.send_gate.wait()
+            self.sent.append(payload)
+
+        async def close(self, code: int) -> None:
+            self.closed.append(code)
+
+    monkeypatch.setattr(hub_main, "_COLLAB_SEED_READY_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(hub_main, "_COLLAB_SEND_TIMEOUT_SECONDS", 0.5)
+
+    async def scenario() -> None:
+        canvas_id = "deadline-io-isolation"
+        slow_send_gate, slow_role_gate = asyncio.Event(), asyncio.Event()
+        slow_obj, fast_obj = FakeSocket(slow_send_gate), FakeSocket()
+        slow, fast = cast(WebSocket, slow_obj), cast(WebSocket, fast_obj)
+        lock = hub_main._retain_collab_room_lock(canvas_id)
+        sender_tasks: list[asyncio.Task[None]] = []
+        fanout_task: asyncio.Task[None] | None = None
+        try:
+            async with lock:
+                room = hub_main._collab_rooms.setdefault(canvas_id, set())
+                for order, peer in enumerate((slow, fast), start=1):
+                    outbox: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=8)
+                    hub_main._collab_sessions[peer] = hub_main._CollabSession(None, None)
+                    hub_main._collab_canvas[peer] = canvas_id
+                    hub_main._collab_roles[peer] = "editor"
+                    hub_main._collab_order[peer] = order
+                    hub_main._collab_outboxes[peer] = outbox
+                    room.add(peer)
+                    task = asyncio.create_task(hub_main._run_collab_sender(peer, canvas_id, outbox))
+                    hub_main._collab_sender_tasks[peer] = task
+                    sender_tasks.append(task)
+                hub_main._replan_collab_room_locked(room, canvas_id)
+
+            async def slow_role_lookup(peer: WebSocket, _canvas_id: str) -> str:
+                if peer is slow:
+                    await slow_role_gate.wait()
+                return "editor"
+
+            monkeypatch.setattr(hub_main, "_live_collab_role", slow_role_lookup)
+            fanout_task = asyncio.create_task(hub_main._fanout_collab(
+                canvas_id, lock, None, {"type": "presence", "clientId": "probe"},
+            ))
+
+            started = asyncio.get_running_loop().time()
+            while not any(frame.get("mode") == "seed" for frame in fast_obj.sent):
+                if asyncio.get_running_loop().time() - started > 0.25:
+                    raise AssertionError("seed deadline was blocked by unrelated role/socket I/O")
+                await asyncio.sleep(0.005)
+            assert not fanout_task.done(), "the role lookup should still be blocked"
+            assert slow_obj.sent == [], "the slow websocket send should still be blocked"
+            assert any(frame.get("clientId") == "probe" for frame in fast_obj.sent), (
+                "the healthy peer should not wait for another peer's role lookup"
+            )
+
+            slow_role_gate.set()
+            slow_send_gate.set()
+            await asyncio.wait_for(fanout_task, timeout=0.2)
+        finally:
+            slow_role_gate.set()
+            slow_send_gate.set()
+            if fanout_task is not None:
+                await asyncio.gather(fanout_task, return_exceptions=True)
+            async with lock:
+                room = hub_main._collab_rooms.get(canvas_id, set())
+                for peer in (slow, fast):
+                    if peer in room:
+                        hub_main._detach_collab_peer_locked(peer, canvas_id, room, announce=False)
+                hub_main._replan_collab_room_locked(room, canvas_id)
+            await asyncio.gather(*sender_tasks, return_exceptions=True)
+            hub_main._release_collab_room_lock(canvas_id, lock)
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_collab_cancelled_initial_join_releases_all_lifecycle_state(monkeypatch):
+    import asyncio
+    from typing import cast
+
+    from fastapi import WebSocket
+    from hub import main as hub_main
+
+    class WaitingSocket:
+        headers: dict[str, str] = {}
+        cookies: dict[str, str] = {}
+
+        def __init__(self):
+            self.accepted = asyncio.Event()
+
+        async def accept(self) -> None:
+            self.accepted.set()
+
+        async def receive_json(self) -> dict[str, object]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def close(self, code: int) -> None:
+            del code
+
+    monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
+
+    async def scenario() -> None:
+        canvas_id = "cancelled-initial-collab-join"
+        socket_obj = WaitingSocket()
+        socket = cast(WebSocket, socket_obj)
+        held_lock = hub_main._retain_collab_room_lock(canvas_id)
+        await held_lock.acquire()
+        task = asyncio.create_task(hub_main.ws_collab(socket, canvas_id))
+        await asyncio.wait_for(socket_obj.accepted.wait(), timeout=0.2)
+        while hub_main._collab_room_lock_refs.get(canvas_id, 0) < 2:
+            await asyncio.sleep(0)
+
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()  # cleanup remains shielded even if the ASGI server repeats cancellation
+        held_lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        hub_main._release_collab_room_lock(canvas_id, held_lock)
+
+        assert canvas_id not in hub_main._collab_rooms
+        assert socket not in hub_main._collab_sessions
+        assert socket not in hub_main._collab_canvas
+        assert socket not in hub_main._collab_order
+        assert canvas_id not in hub_main._collab_room_locks
+        assert canvas_id not in hub_main._collab_room_lock_refs
+
+    asyncio.run(scenario())
+
+
 def test_collab_handshake_relays_sync_through_reconnect(live_collab_url):
     # This is intentionally frame-level: the relay remains agnostic to opaque Yjs payloads while a
     # second client deterministically requests A's state on initial join and reconnect, with no sleeps.
@@ -5510,7 +5655,7 @@ def test_collab_relay_gates_viewer_doc_updates(monkeypatch, live_collab_url):
         async with websockets.connect(ws_url, additional_headers={"Cookie": f"dp_session={auth.sign('editor_u')}"}, proxy=None) as ed:
             await _collab_seed(ed)
             async with websockets.connect(ws_url, additional_headers={"Cookie": f"dp_session={auth.sign('viewer_u')}"}, proxy=None) as vw:
-                assert (await _collab_recv(vw))["mode"] == "sync"
+                await _collab_sync(ed, vw)
                 await _collab_send(vw, {"clientId": "V", "type": "yjs", "update": "AAAA"})
                 await _collab_send(vw, {"clientId": "V", "type": "presence", "name": "Val"})
                 got = await _collab_recv(ed)
@@ -5616,6 +5761,200 @@ def test_collab_viewer_only_room_waits_for_a_writer_seed(monkeypatch, live_colla
         metadb.delete_canvas_cascade(cid)
 
 
+def test_collab_revoked_viewer_cannot_inject_presence(monkeypatch, live_collab_url):
+    import asyncio
+    import httpx
+    import websockets
+    from hub import auth, metadb
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    cid, owner_uid, viewer_uid = "cvs_presence_revoke", "presence_owner", "presence_viewer"
+    _provision_private_collab_canvas(cid, owner_uid, viewer_uid)
+    metadb.share_canvas(cid, viewer_uid, "viewer")
+    owner_cookie = f"dp_session={auth.sign(owner_uid)}"
+    viewer_cookie = f"dp_session={auth.sign(viewer_uid)}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(
+            ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None,
+        ) as owner:
+            await _collab_seed(owner)
+            async with websockets.connect(
+                ws_url, additional_headers={"Cookie": viewer_cookie}, proxy=None,
+            ) as viewer:
+                assert (await _collab_recv(viewer))["mode"] == "sync"
+                async with httpx.AsyncClient(
+                    base_url=live_collab_url, headers={"Cookie": owner_cookie},
+                ) as http:
+                    response = await http.delete(f"/api/canvas/{cid}/share/{viewer_uid}")
+                assert response.status_code == 200
+
+                await _collab_send(viewer, {
+                    "type": "presence", "clientId": "revoked", "name": "must-not-relay",
+                })
+                await _expect_ws_policy_close(viewer)
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(owner.recv(), timeout=0.05)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_revoked_joiner_cannot_receive_sync_baseline(monkeypatch, live_collab_url):
+    import asyncio
+    import httpx
+    import websockets
+    from hub import auth, metadb
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    cid, owner_uid, joiner_uid = "cvs_sync_target_revoke", "target_owner", "target_joiner"
+    _provision_private_collab_canvas(cid, owner_uid, joiner_uid)
+    metadb.share_canvas(cid, joiner_uid, "editor")
+    owner_cookie = f"dp_session={auth.sign(owner_uid)}"
+    joiner_cookie = f"dp_session={auth.sign(joiner_uid)}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(
+            ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None,
+        ) as owner:
+            await _collab_seed(owner)
+            async with websockets.connect(
+                ws_url, additional_headers={"Cookie": joiner_cookie}, proxy=None,
+            ) as joiner:
+                plan = await _collab_recv(joiner)
+                await _collab_send(joiner, {
+                    "type": "ysync", "requestId": plan["requestId"], "sv": "joiner-vector",
+                })
+                assert (await _collab_recv(owner))["requestId"] == plan["requestId"]
+
+                async with httpx.AsyncClient(
+                    base_url=live_collab_url, headers={"Cookie": owner_cookie},
+                ) as http:
+                    response = await http.delete(f"/api/canvas/{cid}/share/{joiner_uid}")
+                assert response.status_code == 200
+                await _collab_send(owner, {
+                    "type": "yjs", "sync": True,
+                    "replyTo": plan["requestId"], "update": "must-not-leak",
+                })
+                await _expect_ws_policy_close(joiner)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_live_viewer_promotion_replans_seed_on_presence(monkeypatch, live_collab_url):
+    import asyncio
+    import httpx
+    import websockets
+    from hub import auth, metadb
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    cid, owner_uid, viewer_uid = "cvs_live_promote", "promote_owner", "promote_viewer"
+    _provision_private_collab_canvas(cid, owner_uid, viewer_uid)
+    metadb.share_canvas(cid, viewer_uid, "viewer")
+    owner_cookie = f"dp_session={auth.sign(owner_uid)}"
+    viewer_cookie = f"dp_session={auth.sign(viewer_uid)}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(
+            ws_url, additional_headers={"Cookie": viewer_cookie}, proxy=None,
+        ) as viewer:
+            assert await _collab_recv(viewer) == {
+                "type": "server", "event": "room-state", "mode": "wait",
+            }
+            async with httpx.AsyncClient(
+                base_url=live_collab_url, headers={"Cookie": owner_cookie},
+            ) as http:
+                response = await http.post(
+                    f"/api/canvas/{cid}/share", json={"userId": viewer_uid, "role": "editor"},
+                )
+            assert response.status_code == 200
+
+            await _collab_send(viewer, {
+                "type": "presence", "clientId": "promoted", "name": "now-editor",
+            })
+            seed = await _collab_recv(viewer)
+            assert seed["type"] == "server" and seed["mode"] == "seed"
+            await _collab_send(viewer, {
+                "type": "yjs", "seed": True,
+                "requestId": seed["requestId"], "update": "promoted-state",
+            })
+            await _collab_send(viewer, {
+                "type": "sync-ready", "requestId": seed["requestId"],
+            })
+            assert await _collab_recv(viewer) == {
+                "type": "server", "event": "room-state", "mode": "ready",
+            }
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_baseline_queue_fences_partial_state_during_authority_loss(live_collab_url):
+    import asyncio
+    import websockets
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + "/ws/collab/baseline-authority-loss"
+        async with websockets.connect(ws_url, proxy=None) as authority:
+            await _collab_seed(authority, update="persisted-base")
+            async with websockets.connect(ws_url, proxy=None) as joiner:
+                join_plan = await _collab_recv(joiner)
+                assert join_plan["mode"] == "sync"
+                async with websockets.connect(ws_url, proxy=None) as third:
+                    assert (await _collab_recv(third))["mode"] == "sync"
+
+                    # Before a baseline is queued, an ordinary authority delta is unsafe for both
+                    # empty replicas and must be excluded from fan-out.
+                    await _collab_send(authority, {
+                        "type": "yjs", "update": "unsafe-pre-baseline-delta",
+                    })
+                    for peer in (joiner, third):
+                        with pytest.raises(asyncio.TimeoutError):
+                            await asyncio.wait_for(peer.recv(), timeout=0.05)
+
+                    request_id = join_plan["requestId"]
+                    await _collab_send(joiner, {
+                        "type": "ysync", "requestId": request_id, "sv": "joiner-vector",
+                    })
+                    assert await _collab_recv(authority) == {
+                        "type": "ysync", "requestId": request_id, "sv": "joiner-vector",
+                    }
+                    await _collab_send(authority, {
+                        "type": "yjs", "sync": True,
+                        "replyTo": request_id, "update": "persisted-base",
+                    })
+                    await _collab_send(authority, {
+                        "type": "yjs", "update": "ordered-post-baseline-delta",
+                    })
+
+                    # The per-peer FIFO makes the baseline visible before the concurrent delta.
+                    assert await _collab_recv(joiner) == {
+                        "type": "yjs", "sync": True,
+                        "replyTo": request_id, "update": "persisted-base",
+                    }
+                    assert await _collab_recv(joiner) == {
+                        "type": "yjs", "update": "ordered-post-baseline-delta",
+                    }
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(third.recv(), timeout=0.05)
+
+                    await authority.close()
+                    replacement = await _collab_recv(joiner)
+                    assert replacement["type"] == "server" and replacement["mode"] == "seed"
+
+    asyncio.run(scenario())
+
+
 def test_collab_room_state_rechecks_downgraded_sync_responder(monkeypatch, live_collab_url):
     # A joiner must not remain blocked on a peer that was an editor when counted but became a viewer
     # before answering. The rejected reply refreshes room-state without relaying viewer document data.
@@ -5695,7 +6034,7 @@ def test_collab_rechecks_editor_downgrade_on_the_same_socket(monkeypatch, live_c
         async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner:
             await _collab_seed(owner)
             async with websockets.connect(ws_url, additional_headers={"Cookie": editor_cookie}, proxy=None) as editor:
-                assert (await _collab_recv(editor))["mode"] == "sync"
+                await _collab_sync(owner, editor)
                 async with httpx.AsyncClient(base_url=live_collab_url, headers={"Cookie": owner_cookie}) as http:
                     response = await http.post(f"/api/canvas/{cid}/share", json={"userId": editor_uid, "role": "viewer"})
                 assert response.status_code == 200

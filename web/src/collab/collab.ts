@@ -20,6 +20,8 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let latestYSyncRequestId: string | null = null
 let completedYSyncRequestId: string | null = null
 let unavailableNoticeShown = false
+let pendingYUpdates: string[] = []
+const MAX_PENDING_Y_UPDATES = 256
 
 function myName(): string {
   return useStore.getState().currentUser?.name ?? 'Someone'
@@ -34,12 +36,34 @@ function requestYSync(requestId: string): void {
   send({ type: 'ysync', requestId, sv: encodeYStateVector() })
 }
 
+function resetHandshake(): void {
+  latestYSyncRequestId = null
+  completedYSyncRequestId = null
+  pendingYUpdates = []
+}
+
+function startReplica(): void {
+  stopYSync()
+  resetHandshake()
+  startYSync((u) => {
+    // Hydration itself emits a Yjs update before the seed is marked ready. Suppress that implicit
+    // frame; the explicit plan-correlated seed snapshot below is the only legal bootstrap frame.
+    if (isYSyncReady()) send({ type: 'yjs', update: yUpdateB64(u) })
+  })
+}
+
+function drainPendingYUpdates(): void {
+  const updates = pendingYUpdates
+  pendingYUpdates = []
+  for (const update of updates) applyYUpdate(update)
+}
+
 function stopAfterProtocolError(sock: WebSocket, code: unknown): void {
   if (ws !== sock) return
   roomId = ''
-  latestYSyncRequestId = null
-  completedYSyncRequestId = null
+  resetHandshake()
   ws = null
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
   useStore.getState().clearPeers()
   useStore.getState().pushToast(
     `Collaboration stopped because the relay rejected a protocol frame${typeof code === 'string' ? ` (${code})` : ''}`,
@@ -49,12 +73,25 @@ function stopAfterProtocolError(sock: WebSocket, code: unknown): void {
   try { sock.onclose = null; sock.close() } catch { /* already closed by the relay */ }
 }
 
+function scheduleReconnect(canvasId: string): void {
+  if (roomId !== canvasId || reconnectTimer) return
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    if (roomId !== canvasId) return
+    startReplica()
+    openSocket(canvasId)
+  }, 1500)
+}
+
 function openSocket(canvasId: string): void {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
   let sock: WebSocket
   try {
     sock = new WebSocket(`${proto}://${location.host}/ws/collab/${encodeURIComponent(canvasId)}`)
   } catch {
+    stopYSync()
+    resetHandshake()
+    scheduleReconnect(canvasId)
     return
   }
   ws = sock
@@ -62,6 +99,7 @@ function openSocket(canvasId: string): void {
     send({ type: 'presence', name: myName(), color })
   }
   sock.onmessage = (ev) => {
+    if (ws !== sock) return
     let msg: any
     try { msg = JSON.parse(ev.data) } catch { return }
     if (!msg || typeof msg !== 'object') return
@@ -78,7 +116,10 @@ function openSocket(canvasId: string): void {
         if (msg.mode === 'seed' && typeof msg.requestId === 'string') {
           if (completedYSyncRequestId === msg.requestId) return
           latestYSyncRequestId = msg.requestId
+          // Persisted state is the base. Buffered deltas are applied only after hydration so a
+          // pre-baseline update can never make the document look non-empty and suppress recovery.
           hydrateIfEmpty()
+          drainPendingYUpdates()
           const update = encodeYState()
           if (update === null) return
           // The explicit full snapshot lets the relay prove the elected seed initialized its replica;
@@ -124,9 +165,18 @@ function openSocket(canvasId: string): void {
       if (msg.sync === true) {
         if (typeof msg.replyTo !== 'string' || msg.replyTo !== latestYSyncRequestId) return
         completeYSync(msg.update)
+        drainPendingYUpdates()
         send({ type: 'sync-ready', requestId: msg.replyTo })
         completedYSyncRequestId = msg.replyTo
         latestYSyncRequestId = null
+        return
+      }
+      if (!isYSyncReady()) {
+        if (pendingYUpdates.length >= MAX_PENDING_Y_UPDATES) {
+          stopAfterProtocolError(sock, 'pre-sync-update-overflow')
+          return
+        }
+        pendingYUpdates.push(msg.update)
         return
       }
       applyYUpdate(msg.update)
@@ -150,12 +200,20 @@ function openSocket(canvasId: string): void {
       if (!prev) send({ type: 'presence', name: myName(), color })
     }
   }
-  sock.onclose = () => {
+  sock.onclose = (event) => {
     if (ws !== sock) return
     ws = null
+    useStore.getState().clearPeers()
+    stopYSync()
+    resetHandshake()
+    if (event.code === 1008) {
+      roomId = ''
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+      useStore.getState().pushToast('Live collaboration access was revoked', 'error')
+      return
+    }
     if (roomId === canvasId) {
-      useStore.getState().clearPeers()
-      reconnectTimer = setTimeout(() => { if (roomId === canvasId) openSocket(canvasId) }, 1500)
+      scheduleReconnect(canvasId)
     }
   }
 }
@@ -165,18 +223,13 @@ export function connectCollab(canvasId: string): void {
   disconnectCollab()
   roomId = canvasId
   unavailableNoticeShown = false
-  startYSync((u) => {
-    // Hydration itself emits a Yjs update before the seed is marked ready. Suppress that implicit
-    // frame; the explicit plan-correlated seed snapshot above is the only legal bootstrap frame.
-    if (isYSyncReady()) send({ type: 'yjs', update: yUpdateB64(u) })
-  })
+  startReplica()
   openSocket(canvasId)
 }
 
 export function disconnectCollab(): void {
   roomId = ''
-  latestYSyncRequestId = null
-  completedYSyncRequestId = null
+  resetHandshake()
   unavailableNoticeShown = false
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
   useStore.getState().clearPeers()
