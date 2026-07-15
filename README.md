@@ -98,7 +98,9 @@ flowchart LR
 - Durable state lives in the **metadata database** and **storage**. SQLite and the local filesystem are
   the zero-configuration defaults; Postgres and object storage support shared deployments.
 - Collaboration rooms are process-local, so a multi-instance deployment must route one canvas's
-  WebSocket peers to the same hub instance.
+  WebSocket peers to the same hub instance. Authenticated sockets reuse their admitted session and
+  canvas role for at most five seconds; the next active sender or recipient boundary revalidates and
+  fails closed, bounding session revocation and role-downgrade visibility without per-frame DB reads.
 
 Headless runs and stdio MCP initialize the same graph and execution core directly rather than calling
 the HTTP hub.

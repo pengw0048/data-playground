@@ -4560,6 +4560,7 @@ def test_collab_deadline_progress_isolated_from_slow_role_and_socket_io(monkeypa
 
     monkeypatch.setattr(hub_main, "_COLLAB_SEED_READY_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(hub_main, "_COLLAB_SEND_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(hub_main, "_collab_now", lambda: 100.0)
 
     async def scenario() -> None:
         canvas_id = "deadline-io-isolation"
@@ -4574,7 +4575,9 @@ def test_collab_deadline_progress_isolated_from_slow_role_and_socket_io(monkeypa
                 room = hub_main._collab_rooms.setdefault(canvas_id, set())
                 for order, peer in enumerate((slow, fast), start=1):
                     outbox: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=8)
-                    hub_main._collab_sessions[peer] = hub_main._CollabSession(None, None)
+                    hub_main._collab_sessions[peer] = hub_main._CollabSession(
+                        f"user-{order}", f"token-{order}", "editor", 0.0,
+                    )
                     hub_main._collab_canvas[peer] = canvas_id
                     hub_main._collab_roles[peer] = "editor"
                     hub_main._collab_order[peer] = order
@@ -4623,6 +4626,161 @@ def test_collab_deadline_progress_isolated_from_slow_role_and_socket_io(monkeypa
             await asyncio.gather(*sender_tasks, return_exceptions=True)
             hub_main._release_collab_room_lock(canvas_id, lock)
             await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_collab_authorization_query_characterization(monkeypatch):
+    import asyncio
+    from collections import Counter
+    from typing import cast
+
+    from fastapi import WebSocket
+    from hub import main as hub_main
+
+    class FakeSocket:
+        pass
+
+    now = [100.0]
+    auth_checks: Counter[str] = Counter()
+    role_queries: Counter[str] = Counter()
+    users_by_token = {f"token-{index}": f"user-{index}" for index in range(1, 4)}
+
+    def counted_verify(token: str) -> str | None:
+        auth_checks[token] += 1
+        return users_by_token.get(token)
+
+    def counted_role(_canvas_id: str, user_id: str) -> str:
+        role_queries[user_id] += 1
+        return "editor"
+
+    monkeypatch.setattr(hub_main, "_collab_now", lambda: now[0])
+    monkeypatch.setattr(hub_main.auth, "verify", counted_verify)
+    monkeypatch.setattr(hub_main.metadb, "canvas_role", counted_role)
+
+    async def scenario() -> None:
+        canvas_id = "collab-auth-query-characterization"
+        peers = [cast(WebSocket, FakeSocket()) for _ in range(3)]
+        sender = peers[0]
+        lock = hub_main._retain_collab_room_lock(canvas_id)
+        try:
+            async with lock:
+                room = hub_main._collab_rooms.setdefault(canvas_id, set())
+                for order, peer in enumerate(peers, start=1):
+                    hub_main._collab_sessions[peer] = hub_main._CollabSession(
+                        f"user-{order}", f"token-{order}", "editor", now[0],
+                    )
+                    hub_main._collab_canvas[peer] = canvas_id
+                    hub_main._collab_roles[peer] = "editor"
+                    hub_main._collab_order[peer] = order
+                    hub_main._collab_outboxes[peer] = asyncio.Queue(maxsize=128)
+                    room.add(peer)
+
+            async def emit_frame(frame: int) -> None:
+                assert await hub_main._refresh_collab_sender_role(sender, canvas_id, lock) == "editor"
+                await hub_main._fanout_collab(
+                    canvas_id, lock, sender,
+                    {"type": "presence", "clientId": f"probe-{frame}"},
+                )
+
+            # Admission authorization stays fresh across frame-rate traffic. Before the cache this
+            # exact burst performed 12 session checks + 12 role queries for every peer (36 of each).
+            for frame in range(12):
+                await emit_frame(frame)
+            assert auth_checks == Counter()
+            assert role_queries == Counter()
+
+            # At the exact interval boundary, concurrent frames share one revalidation per connection.
+            interval = hub_main._COLLAB_ROLE_REVALIDATION_INTERVAL_SECONDS
+            now[0] = 100.0 + interval
+            await asyncio.gather(*(emit_frame(frame) for frame in range(12, 24)))
+            assert auth_checks == Counter({token: 1 for token in users_by_token})
+            assert role_queries == Counter({user_id: 1 for user_id in users_by_token.values()})
+
+            # Frame count and recipient fanout cannot add queries while that authorization is fresh.
+            now[0] = 100.0 + (2 * interval) - 0.001
+            for frame in range(24, 36):
+                await emit_frame(frame)
+            assert auth_checks == Counter({token: 1 for token in users_by_token})
+            assert role_queries == Counter({user_id: 1 for user_id in users_by_token.values()})
+
+            # The next fixed boundary adds exactly one session + role query per active connection.
+            now[0] = 100.0 + (2 * interval)
+            await asyncio.gather(*(emit_frame(frame) for frame in range(36, 48)))
+            assert auth_checks == Counter({token: 2 for token in users_by_token})
+            assert role_queries == Counter({user_id: 2 for user_id in users_by_token.values()})
+        finally:
+            async with lock:
+                room = hub_main._collab_rooms.get(canvas_id, set())
+                for peer in peers:
+                    if peer in room:
+                        hub_main._detach_collab_peer_locked(
+                            peer, canvas_id, room, announce=False,
+                        )
+            hub_main._release_collab_room_lock(canvas_id, lock)
+
+    asyncio.run(scenario())
+
+
+def test_collab_role_store_failure_fails_closed_at_revalidation(monkeypatch):
+    import asyncio
+    from typing import cast
+
+    from fastapi import WebSocket
+    from hub import main as hub_main
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.closed: list[int] = []
+
+        async def close(self, code: int) -> None:
+            self.closed.append(code)
+
+    clock = _ManualCollabClock()
+    monkeypatch.setattr(hub_main, "_collab_now", clock)
+    monkeypatch.setattr(hub_main.auth, "verify", lambda _token: "role-store-user")
+    role_queries = 0
+
+    def broken_role_store(_canvas_id: str, _user_id: str) -> str:
+        nonlocal role_queries
+        role_queries += 1
+        raise RuntimeError("role store unavailable")
+
+    monkeypatch.setattr(hub_main.metadb, "canvas_role", broken_role_store)
+
+    async def scenario() -> None:
+        canvas_id = "collab-role-store-failure"
+        socket_obj = FakeSocket()
+        peer = cast(WebSocket, socket_obj)
+        lock = hub_main._retain_collab_room_lock(canvas_id)
+        try:
+            async with lock:
+                room = hub_main._collab_rooms.setdefault(canvas_id, set())
+                hub_main._collab_sessions[peer] = hub_main._CollabSession(
+                    "role-store-user", "token", "editor", clock(),
+                )
+                hub_main._collab_canvas[peer] = canvas_id
+                hub_main._collab_roles[peer] = "editor"
+                hub_main._collab_order[peer] = 1
+                hub_main._collab_outboxes[peer] = asyncio.Queue(maxsize=8)
+                room.add(peer)
+
+            # A transient store problem is not consulted on every healthy frame while admission is fresh.
+            assert await hub_main._refresh_collab_sender_role(peer, canvas_id, lock) == "editor"
+            assert role_queries == 0
+
+            # At the fixed boundary, the failed lookup removes and closes only the affected socket.
+            clock.advance(hub_main._COLLAB_ROLE_REVALIDATION_INTERVAL_SECONDS)
+            assert await hub_main._refresh_collab_sender_role(peer, canvas_id, lock) is None
+            assert role_queries == 1
+            assert peer not in hub_main._collab_rooms.get(canvas_id, set())
+            assert socket_obj.closed == [1008]
+        finally:
+            async with lock:
+                room = hub_main._collab_rooms.get(canvas_id, set())
+                if peer in room:
+                    hub_main._detach_collab_peer_locked(peer, canvas_id, room, announce=False)
+            hub_main._release_collab_room_lock(canvas_id, lock)
 
     asyncio.run(scenario())
 
@@ -5685,6 +5843,31 @@ def _provision_private_collab_canvas(cid: str, owner: str, *users: str) -> None:
                 s.add(User(id=uid, name=uid))
 
 
+class _ManualCollabClock:
+    def __init__(self) -> None:
+        self.value = 100.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+def _manual_collab_clock(monkeypatch) -> _ManualCollabClock:  # noqa: ANN001 — pytest fixture
+    from hub import main as hub_main
+
+    clock = _ManualCollabClock()
+    monkeypatch.setattr(hub_main, "_collab_now", clock)
+    return clock
+
+
+def _expire_collab_authorization(clock: _ManualCollabClock) -> None:
+    from hub import main as hub_main
+
+    clock.advance(hub_main._COLLAB_ROLE_REVALIDATION_INTERVAL_SECONDS)
+
+
 @pytest.fixture(scope="module")
 def live_collab_url():
     """Real single-loop ASGI server for cross-socket tests.
@@ -5907,6 +6090,7 @@ def test_collab_revoked_viewer_cannot_inject_presence(monkeypatch, live_collab_u
     from hub import auth, metadb
 
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    clock = _manual_collab_clock(monkeypatch)
     cid, owner_uid, viewer_uid = "cvs_presence_revoke", "presence_owner", "presence_viewer"
     _provision_private_collab_canvas(cid, owner_uid, viewer_uid)
     metadb.share_canvas(cid, viewer_uid, "viewer")
@@ -5928,6 +6112,7 @@ def test_collab_revoked_viewer_cannot_inject_presence(monkeypatch, live_collab_u
                 ) as http:
                     response = await http.delete(f"/api/canvas/{cid}/share/{viewer_uid}")
                 assert response.status_code == 200
+                _expire_collab_authorization(clock)
 
                 await _collab_send(viewer, {
                     "type": "presence", "clientId": "revoked", "name": "must-not-relay",
@@ -5949,6 +6134,7 @@ def test_collab_revoked_joiner_cannot_receive_sync_baseline(monkeypatch, live_co
     from hub import auth, metadb
 
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    clock = _manual_collab_clock(monkeypatch)
     cid, owner_uid, joiner_uid = "cvs_sync_target_revoke", "target_owner", "target_joiner"
     _provision_private_collab_canvas(cid, owner_uid, joiner_uid)
     metadb.share_canvas(cid, joiner_uid, "editor")
@@ -5975,6 +6161,7 @@ def test_collab_revoked_joiner_cannot_receive_sync_baseline(monkeypatch, live_co
                 ) as http:
                     response = await http.delete(f"/api/canvas/{cid}/share/{joiner_uid}")
                 assert response.status_code == 200
+                _expire_collab_authorization(clock)
                 await _collab_send(owner, {
                     "type": "yjs", "sync": True,
                     "replyTo": plan["requestId"], "update": "must-not-leak",
@@ -5994,6 +6181,7 @@ def test_collab_live_viewer_promotion_replans_seed_on_presence(monkeypatch, live
     from hub import auth, metadb
 
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    clock = _manual_collab_clock(monkeypatch)
     cid, owner_uid, viewer_uid = "cvs_live_promote", "promote_owner", "promote_viewer"
     _provision_private_collab_canvas(cid, owner_uid, viewer_uid)
     metadb.share_canvas(cid, viewer_uid, "viewer")
@@ -6015,6 +6203,7 @@ def test_collab_live_viewer_promotion_replans_seed_on_presence(monkeypatch, live
                     f"/api/canvas/{cid}/share", json={"userId": viewer_uid, "role": "editor"},
                 )
             assert response.status_code == 200
+            _expire_collab_authorization(clock)
 
             await _collab_send(viewer, {
                 "type": "presence", "clientId": "promoted", "name": "now-editor",
@@ -6096,13 +6285,15 @@ def test_collab_baseline_queue_fences_partial_state_during_authority_loss(live_c
 
 def test_collab_room_state_rechecks_downgraded_sync_responder(monkeypatch, live_collab_url):
     # A joiner must not remain blocked on a peer that was an editor when counted but became a viewer
-    # before answering. The rejected reply refreshes room-state without relaying viewer document data.
+    # before answering. At the bounded revalidation boundary, the rejected reply refreshes room-state
+    # without relaying viewer document data.
     import asyncio
     import httpx
     import websockets
     from hub import auth, metadb
 
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    clock = _manual_collab_clock(monkeypatch)
     cid = "cvs_sync_responder_downgrade"
     owner_uid, joiner_uid, responder_uid = "owner_sd", "joiner_sd", "responder_sd"
     _provision_private_collab_canvas(cid, owner_uid, joiner_uid, responder_uid)
@@ -6135,6 +6326,7 @@ def test_collab_room_state_rechecks_downgraded_sync_responder(monkeypatch, live_
                         f"/api/canvas/{cid}/share", json={"userId": responder_uid, "role": "viewer"},
                     )
                 assert response.status_code == 200
+                _expire_collab_authorization(clock)
 
                 await _collab_send(responder, {
                     "type": "yjs", "update": "BLOCKED", "sync": True,
@@ -6155,13 +6347,14 @@ def test_collab_room_state_rechecks_downgraded_sync_responder(monkeypatch, live_
 
 
 def test_collab_rechecks_editor_downgrade_on_the_same_socket(monkeypatch, live_collab_url):
-    # Downgrading a connected editor must take effect without reconnecting: its next Yjs update is
-    # dropped, while viewer-safe presence and incoming document updates keep working on that socket.
+    # After the fixed authorization interval, a connected editor's downgrade takes effect without
+    # reconnecting: its next Yjs update is dropped while viewer-safe traffic keeps working.
     import asyncio
     import httpx
     import websockets
     from hub import auth, metadb
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    clock = _manual_collab_clock(monkeypatch)
     cid, owner_uid, editor_uid = "cvs_live_downgrade", "live_owner_d", "live_editor_d"
     _provision_private_collab_canvas(cid, owner_uid, editor_uid)
     metadb.share_canvas(cid, editor_uid, "editor")
@@ -6177,6 +6370,7 @@ def test_collab_rechecks_editor_downgrade_on_the_same_socket(monkeypatch, live_c
                 async with httpx.AsyncClient(base_url=live_collab_url, headers={"Cookie": owner_cookie}) as http:
                     response = await http.post(f"/api/canvas/{cid}/share", json={"userId": editor_uid, "role": "viewer"})
                 assert response.status_code == 200
+                _expire_collab_authorization(clock)
 
                 await _collab_send(editor, {"clientId": "E", "type": "yjs", "update": "BLOCKED_AFTER_DOWNGRADE"})
                 await _collab_send(editor, {"clientId": "E", "type": "presence", "name": "still watching"})
@@ -6194,13 +6388,14 @@ def test_collab_rechecks_editor_downgrade_on_the_same_socket(monkeypatch, live_c
 
 
 def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_collab_url):
-    # Both sockets were admitted while the user was an editor. After unshare, one cannot relay a Yjs
-    # write and the other is closed instead of receiving the next document update.
+    # Both sockets were admitted while the user was an editor. At the next bounded revalidation after
+    # unshare, one cannot relay a Yjs write and the other closes before receiving a document update.
     import asyncio
     import httpx
     import websockets
     from hub import auth, metadb
     monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    clock = _manual_collab_clock(monkeypatch)
     cid, owner_uid, editor_uid = "cvs_live_remove", "live_owner_r", "live_editor_r"
     _provision_private_collab_canvas(cid, owner_uid, editor_uid)
     metadb.share_canvas(cid, editor_uid, "editor")
@@ -6220,6 +6415,7 @@ def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_
                         async with httpx.AsyncClient(base_url=live_collab_url, headers={"Cookie": owner_cookie}) as http:
                             response = await http.delete(f"/api/canvas/{cid}/share/{editor_uid}")
                         assert response.status_code == 200
+                        _expire_collab_authorization(clock)
 
                         await _collab_send(removed_writer, {"clientId": "RW", "type": "yjs", "update": "MUST_NOT_RELAY"})
                         await _expect_ws_policy_close(removed_writer)
@@ -6235,13 +6431,14 @@ def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_
 
 
 def test_collab_logout_revokes_sender_and_recipient(monkeypatch, live_collab_url):
-    # Real logout bumps the session epoch and fences every already-open socket before either document
-    # direction can leak. This intentionally revokes all of the user's sessions, not just this cookie.
+    # Real logout bumps the session epoch. At the next bounded revalidation, every already-open socket
+    # is fenced before either active document direction proceeds; all of the user's sessions are revoked.
     import asyncio
     import httpx
     import websockets
     from hub import auth, metadb
     monkeypatch.setenv("DP_AUTH_SECRET", "ws-revocation-test-secret-not-weak-0123456789")
+    clock = _manual_collab_clock(monkeypatch)
     cid, owner_uid, revoked_uid = "cvs_token_revoke", "live_owner_t", "live_editor_t"
     _provision_private_collab_canvas(cid, owner_uid, revoked_uid)
     metadb.share_canvas(cid, revoked_uid, "editor")
@@ -6263,6 +6460,7 @@ def test_collab_logout_revokes_sender_and_recipient(monkeypatch, live_collab_url
                         response = await http.post("/api/auth/logout")
                     assert response.status_code == 200
                     assert auth.verify(revoked_token) is None
+                    _expire_collab_authorization(clock)
 
                     await _collab_send(writer, {
                         "clientId": "revoked-writer", "type": "yjs", "update": "MUST_NOT_RELAY",
