@@ -5178,8 +5178,68 @@ def test_collab_room_state_excludes_viewer_only_sync_peers(monkeypatch, live_col
                     "replyTo": "editor-sync", "targetId": "E",
                 })
                 await _collab_send(viewer, {"clientId": "V", "type": "presence", "name": "Val"})
+                assert await _collab_recv(editor) == {"type": "room-state", "peerCount": 0}
                 assert await _collab_recv(editor) == {
                     "clientId": "V", "type": "presence", "name": "Val",
+                }
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_room_state_rechecks_downgraded_sync_responder(monkeypatch, live_collab_url):
+    # A joiner must not remain blocked on a peer that was an editor when counted but became a viewer
+    # before answering. The rejected reply refreshes room-state without relaying viewer document data.
+    import asyncio
+    import httpx
+    import websockets
+    from hub import auth, metadb
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    cid = "cvs_sync_responder_downgrade"
+    owner_uid, joiner_uid, responder_uid = "owner_sd", "joiner_sd", "responder_sd"
+    _provision_private_collab_canvas(cid, owner_uid, joiner_uid, responder_uid)
+    metadb.share_canvas(cid, joiner_uid, "editor")
+    metadb.share_canvas(cid, responder_uid, "editor")
+    owner_cookie = f"dp_session={auth.sign(owner_uid)}"
+    joiner_cookie = f"dp_session={auth.sign(joiner_uid)}"
+    responder_cookie = f"dp_session={auth.sign(responder_uid)}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(
+            ws_url, additional_headers={"Cookie": responder_cookie}, proxy=None,
+        ) as responder:
+            assert await _collab_recv(responder) == {"type": "room-state", "peerCount": 0}
+            async with websockets.connect(
+                ws_url, additional_headers={"Cookie": joiner_cookie}, proxy=None,
+            ) as joiner:
+                assert await _collab_recv(joiner) == {"type": "room-state", "peerCount": 1}
+                await _collab_send(joiner, {
+                    "clientId": "J", "type": "ysync", "requestId": "joiner-sync", "sv": "state",
+                })
+                assert await _collab_recv(responder) == {
+                    "clientId": "J", "type": "ysync", "requestId": "joiner-sync", "sv": "state",
+                }
+
+                async with httpx.AsyncClient(
+                    base_url=live_collab_url, headers={"Cookie": owner_cookie},
+                ) as http:
+                    response = await http.post(
+                        f"/api/canvas/{cid}/share", json={"userId": responder_uid, "role": "viewer"},
+                    )
+                assert response.status_code == 200
+
+                await _collab_send(responder, {
+                    "clientId": "R", "type": "yjs", "update": "BLOCKED", "sync": True,
+                    "replyTo": "joiner-sync", "targetId": "J",
+                })
+                await _collab_send(responder, {"clientId": "R", "type": "presence", "name": "viewer"})
+                assert await _collab_recv(joiner) == {"type": "room-state", "peerCount": 0}
+                assert await _collab_recv(joiner) == {
+                    "clientId": "R", "type": "presence", "name": "viewer",
                 }
 
     try:
