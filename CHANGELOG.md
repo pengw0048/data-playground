@@ -5,6 +5,9 @@ All notable changes to Data Playground are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 uses semver-shaped versions from `kernel/pyproject.toml` / `web/package.json`.
 
+Every release candidate must retain a passing [researcher UX acceptance](docs/UX_ACCEPTANCE.md) result
+for its exact commit before publication.
+
 ## [0.1.0] — 2026-07-14
 
 First tagged release contract for Profile A (local workstation). Artifacts: Python wheel

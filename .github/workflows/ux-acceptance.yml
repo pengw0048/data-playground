@@ -1,0 +1,64 @@
+name: UX acceptance
+
+# The full matrix is intentionally separate from the PR smoke: it exercises large deterministic
+# fixtures and retains diagnostic evidence without making every small UI change wait for it.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: ux-acceptance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full-matrix:
+    name: full researcher workflow matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CI: "true"
+      DP_E2E_FIXTURE_PROFILE: full
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Install and build web
+        run: cd web && npm ci && npm run build
+      - name: Install kernel
+        run: cd kernel && uv sync --extra dev
+      - name: Install Playwright browser
+        run: cd web && npx playwright install --with-deps chromium
+      - name: Run full UX matrix
+        run: cd web && npm run e2e
+      - name: Upload UX diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ux-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            web/playwright-report/
+            web/test-results/
+            web/.e2e-workspace/data/ux-fixtures/manifest.json
+            web/.e2e-workspace/
+            kernel/e2e-test.db*
+          if-no-files-found: warn
+          retention-days: 14
+
+  p1-golden-workflow-blockers:
+    name: P1 golden-workflow issue gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Reject open P1 UX defects
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ux_release_gate.py --repo "$GITHUB_REPOSITORY"

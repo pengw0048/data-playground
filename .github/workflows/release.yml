@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -24,9 +25,15 @@ jobs:
     permissions:
       contents: read
 
+  ux-acceptance:
+    uses: ./.github/workflows/ux-acceptance.yml
+    permissions:
+      contents: read
+      issues: read
+
   publish:
     name: publish release + SBOM + attestations
-    needs: [artifacts]
+    needs: [artifacts, ux-acceptance]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 40
