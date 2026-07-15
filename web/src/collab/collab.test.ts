@@ -13,6 +13,7 @@ class MockWebSocket {
   readyState = MockWebSocket.CONNECTING
   sent: string[] = []
   failNextSend = false
+  failNextClose = false
   onopen: ((event: Event) => void) | null = null
   onmessage: ((event: MessageEvent) => void) | null = null
   onclose: ((event: CloseEvent) => void) | null = null
@@ -27,6 +28,10 @@ class MockWebSocket {
     this.sent.push(data)
   }
   close(code = 1000): void {
+    if (this.failNextClose) {
+      this.failNextClose = false
+      throw new Error('simulated websocket close failure')
+    }
     this.readyState = MockWebSocket.CLOSED
     this.onclose?.({ code } as CloseEvent)
   }
@@ -151,6 +156,22 @@ describe('collaboration relay handshake', () => {
     expect(second.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.type === 'ysync')).toEqual([
       expect.objectContaining({ requestId: 'retry-request', sv: expect.any(String) }),
     ])
+  })
+
+  it('clears stale presence when both a sync request and socket close fail synchronously', () => {
+    connectCollab('canvas')
+    const first = MockWebSocket.instances[0]
+    first.open()
+    first.receive({ type: 'presence', clientId: 'departed-peer', name: 'Departed' })
+    expect(useStore.getState().peers).toHaveProperty('departed-peer')
+    first.failNextSend = true
+    first.failNextClose = true
+
+    first.receive({ type: 'server', event: 'room-state', mode: 'sync', requestId: 'failed-request' })
+
+    expect(useStore.getState().peers).toEqual({})
+    vi.advanceTimersByTime(1500)
+    expect(MockWebSocket.instances).toHaveLength(2)
   })
 
   it('stops without reconnecting when the relay reports a protocol violation', () => {

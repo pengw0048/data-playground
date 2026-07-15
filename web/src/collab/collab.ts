@@ -143,6 +143,7 @@ function openSocket(canvasId: string): void {
               try { sock.close() } catch {
                 if (ws === sock) {
                   ws = null
+                  useStore.getState().clearPeers()
                   stopYSync()
                   resetHandshake()
                   scheduleReconnect(canvasId)
