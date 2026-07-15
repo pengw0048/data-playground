@@ -1446,40 +1446,57 @@ def test_sandbox_blocks_format_string_escape():
     assert "__" in (r.get("reason") or "")
 
 
-def test_settings_stores_secret_references_not_plaintext():
-    # Secret-bearing settings store env:/file: references. GET echoes the reference (not sensitive);
-    # PUT rejects a raw credential so the metadata DB never holds the secret bytes.
+def test_credentials_store_secret_references_and_removed_settings_are_rejected():
+    # Agent/object-store credentials are Creds, not generic settings. Cred APIs reject raw material and
+    # echo safe references; removed setting keys stay unavailable even when given a valid reference.
     from hub import metadb
 
-    bad = client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "sk-super-secret"})
-    assert bad.status_code == 400 and "secret reference" in bad.json()["detail"]
-    assert client.put("/api/settings", json={
-        "scope": "global", "key": "objectStore",
-        "value": {"accessKeyId": "AKIA", "secretAccessKey": "shh", "region": "us-east-1"},
+    for key, value in (("agentApiKey", "env:DP_FIXTURE_AGENT_KEY"), ("objectStore", {})):
+        removed = client.put(
+            "/api/settings", json={"scope": "global", "key": key, "value": value})
+        assert removed.status_code == 400 and "/api/creds" in removed.json()["detail"]
+    assert client.post("/api/creds", json={
+        "name": "raw agent", "kind": "agent", "fields": {"apiKey": "sk-super-secret"},
+    }).status_code == 400
+    assert client.post("/api/creds", json={
+        "name": "raw store", "kind": "object_store",
+        "fields": {"accessKeyId": "AKIA", "secretAccessKey": "shh"},
     }).status_code == 400
 
-    assert client.put("/api/settings", json={
-        "scope": "global", "key": "agentApiKey", "value": "env:DP_FIXTURE_AGENT_KEY",
-    }).status_code == 200
-    assert client.put("/api/settings", json={
-        "scope": "global", "key": "objectStore",
-        "value": {
+    agent_id = store_id = None
+    try:
+        agent_id = client.post("/api/creds", json={
+            "name": "agent", "kind": "agent",
+            "fields": {"apiKey": "env:DP_FIXTURE_AGENT_KEY"},
+        }).json()["id"]
+        store_id = client.post("/api/creds", json={
+            "name": "store", "kind": "object_store", "fields": {
             "accessKeyId": "env:DP_FIXTURE_ACCESS_KEY",
             "secretAccessKey": "env:DP_FIXTURE_SECRET_KEY",
             "sessionToken": "env:DP_FIXTURE_SESSION_TOKEN",
             "region": "us-east-1",
-        },
-    }).status_code == 200
-    g = client.get("/api/settings").json()["global"]
-    assert g["agentApiKey"] == "env:DP_FIXTURE_AGENT_KEY"
-    assert g["objectStore"]["accessKeyId"] == "env:DP_FIXTURE_ACCESS_KEY"
-    assert g["objectStore"]["secretAccessKey"] == "env:DP_FIXTURE_SECRET_KEY"
-    assert g["objectStore"]["sessionToken"] == "env:DP_FIXTURE_SESSION_TOKEN"
-    assert g["objectStore"]["region"] == "us-east-1"
-    stored = metadb.get_setting("objectStore", "global")
-    assert stored["secretAccessKey"] == "env:DP_FIXTURE_SECRET_KEY"
-    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": ""})
-    client.put("/api/settings", json={"scope": "global", "key": "objectStore", "value": {}})
+        }}).json()["id"]
+        metadb.set_setting("agentCredId", agent_id, "global")
+        metadb.set_setting("defaultObjectStoreCredId", store_id, "global")
+
+        global_settings = client.get("/api/settings").json()["global"]
+        assert global_settings["agentCredId"] == agent_id
+        assert global_settings["defaultObjectStoreCredId"] == store_id
+        assert "agentApiKey" not in global_settings and "objectStore" not in global_settings
+        creds = {cred["id"]: cred for cred in client.get("/api/creds").json()}
+        assert creds[agent_id]["fields"]["apiKey"] == "env:DP_FIXTURE_AGENT_KEY"
+        assert creds[store_id]["fields"] == {
+            "accessKeyId": "env:DP_FIXTURE_ACCESS_KEY",
+            "secretAccessKey": "env:DP_FIXTURE_SECRET_KEY",
+            "sessionToken": "env:DP_FIXTURE_SESSION_TOKEN",
+            "region": "us-east-1",
+        }
+    finally:
+        metadb.set_setting("agentCredId", "", "global")
+        metadb.set_setting("defaultObjectStoreCredId", "", "global")
+        for cred_id in (agent_id, store_id):
+            if cred_id:
+                metadb.cred_delete(cred_id)
 
 
 def test_user_scoped_settings_are_isolated_per_user():
@@ -1841,7 +1858,7 @@ def test_concurrent_mixed_format_append_publishes_exactly_one_part(tmp_path, mon
         assert a.scan(base).aggregate("count(*)").fetchone()[0] == 1
 
 
-def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
+def test_append_object_store_overwrite_then_append_no_orphan(tmp_path, object_store_cred):
     # ARC4 transactional append on a REAL object store (moto): overwrite writes s3://…/out.parquet (a single
     # object); a subsequent append writes into the out/ prefix. The prior object must be MIGRATED into the
     # prefix (server-side move) so switching overwrite→append doesn't silently orphan it.
@@ -1850,7 +1867,7 @@ def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
     boto3 = pytest.importorskip("boto3")
     from moto.server import ThreadedMotoServer
 
-    from hub import db, metadb
+    from hub import db
     from hub.plugins.adapters import DuckDBAdapter
     server = ThreadedMotoServer(port=0)
     server.start()
@@ -1859,8 +1876,8 @@ def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
         endpoint = f"http://{host}:{port}"
         boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
                      region_name="us-east-1").create_bucket(Bucket="bkt")
-        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
-                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        object_store_cred({"endpoint": endpoint, "region": "us-east-1",
+                           "accessKeyId": "k", "secretAccessKey": "s"})
         db._obj_store_loaded = False
         a = DuckDBAdapter()
         uri = "s3://bkt/data/out.parquet"
@@ -1875,7 +1892,7 @@ def test_append_object_store_overwrite_then_append_no_orphan(tmp_path):
         assert rows == [(1, 10), (2, 20)], f"object overwrite→append orphaned the prior object: {rows}"
     finally:
         server.stop()
-        metadb.set_setting("objectStore", {}, "global")
+        object_store_cred(None)
 
 
 def test_append_auto_compacts_at_threshold(tmp_path, monkeypatch):
@@ -2097,7 +2114,7 @@ def test_partitioned_local_overwrite_rolls_back_when_publish_fails(tmp_path, mon
                     if ".partition-old-" in name or ".partition-new-" in name]
 
 
-def test_partitioned_object_overwrite_is_rejected_without_mutation():
+def test_partitioned_object_overwrite_is_rejected_without_mutation(object_store_cred):
     # A multi-object Hive prefix cannot be atomically replaced by the file adapter. Reject before deleting
     # any existing object; ordinary single-object overwrite remains supported.
     pytest.importorskip("moto")
@@ -2105,7 +2122,7 @@ def test_partitioned_object_overwrite_is_rejected_without_mutation():
     boto3 = pytest.importorskip("boto3")
     from moto.server import ThreadedMotoServer
 
-    from hub import db, metadb
+    from hub import db
     from hub.plugins.adapters import DuckDBAdapter
     server = ThreadedMotoServer(port=0)
     server.start()
@@ -2114,8 +2131,8 @@ def test_partitioned_object_overwrite_is_rejected_without_mutation():
         endpoint = f"http://{host}:{port}"
         boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
                      region_name="us-east-1").create_bucket(Bucket="bkt")
-        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
-                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        object_store_cred({"endpoint": endpoint, "region": "us-east-1",
+                           "accessKeyId": "k", "secretAccessKey": "s"})
         db._obj_store_loaded = False
         cli = boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
                            region_name="us-east-1")
@@ -2132,7 +2149,7 @@ def test_partitioned_object_overwrite_is_rejected_without_mutation():
         assert cli.head_object(Bucket="bkt", Key="plain.parquet")["ContentLength"] > 0
     finally:
         server.stop()
-        metadb.set_setting("objectStore", {}, "global")
+        object_store_cred(None)
 
 
 def test_arrow_feather_is_streamed_out_of_core(tmp_path, monkeypatch):
@@ -2273,7 +2290,7 @@ def test_catalog_usage_counts_runs_and_deduplicates_one_publication_event(tmp_pa
     assert metadb.catalog_get(source)["usage"] == 5, "legacy/local run calls retain per-run popularity"
 
 
-def test_object_output_version_bumps_on_overwrite(tmp_path):
+def test_object_output_version_bumps_on_overwrite(tmp_path, object_store_cred):
     # ARC4 output-versioning on an object store (#41 review): the object fingerprint is uri-only, so two
     # writes of identical schema+row-count but different DATA would collide to the same version. _add now
     # folds the object's size+mtime (a cheap stat) into the version, so an overwrite bumps it.
@@ -2282,7 +2299,7 @@ def test_object_output_version_bumps_on_overwrite(tmp_path):
     boto3 = pytest.importorskip("boto3")
     from moto.server import ThreadedMotoServer
 
-    from hub import db, metadb
+    from hub import db
     from hub.deps import Deps
     server = ThreadedMotoServer(port=0)
     server.start()
@@ -2291,8 +2308,8 @@ def test_object_output_version_bumps_on_overwrite(tmp_path):
         endpoint = f"http://{host}:{port}"
         boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
                      region_name="us-east-1").create_bucket(Bucket="bkt")
-        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
-                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        object_store_cred({"endpoint": endpoint, "region": "us-east-1",
+                           "accessKeyId": "k", "secretAccessKey": "s"})
         db._obj_store_loaded = False
         d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
         uri = "s3://bkt/out.parquet"
@@ -2305,7 +2322,7 @@ def test_object_output_version_bumps_on_overwrite(tmp_path):
         assert a.version != b.version, "an object overwrite (same schema+rows, different data) must bump the version"
     finally:
         server.stop()
-        metadb.set_setting("objectStore", {}, "global")
+        object_store_cred(None)
 
 
 def test_source_csv_parse_options(tmp_path):
@@ -2987,16 +3004,21 @@ def test_settings_global_and_user_scope():
     assert client.get("/api/settings").json()["user"].get("theme") is None
 
 
-def test_agent_activates_from_settings_key(monkeypatch):
-    # A secret-reference agentApiKey setting must make the agent available — no direct provider env var.
+def test_agent_activates_from_selected_cred(monkeypatch):
+    # A selected Agent Cred makes the Agent available without a provider key in the process environment.
+    from hub import metadb
+
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("DP_FIXTURE_AGENT_FROM_UI", "sk-from-ui")
     assert client.get("/api/agent").json()["available"] is False
-    client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": "env:DP_FIXTURE_AGENT_FROM_UI"})
+    cred_id = metadb.cred_upsert(
+        None, "UI Agent", "agent", {"apiKey": "env:DP_FIXTURE_AGENT_FROM_UI"})["id"]
+    metadb.set_setting("agentCredId", cred_id, "global")
     try:
         assert client.get("/api/agent").json()["available"] is True
     finally:
-        client.put("/api/settings", json={"scope": "global", "key": "agentApiKey", "value": ""})
+        metadb.set_setting("agentCredId", "", "global")
+        metadb.cred_delete(cred_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -3331,7 +3353,7 @@ def test_vector_search_lance_ann_and_external_query(tmp_path):
     assert result2["rows"][0]["id"] == 2
 
 
-def test_object_store_s3_roundtrip_and_browse(tmp_path):
+def test_object_store_s3_roundtrip_and_browse(tmp_path, object_store_cred):
     # REAL object storage via DuckDB httpfs, proven end-to-end against an in-process S3 (moto server):
     # write a dataset to s3://, read it back, and browse the prefix.
     pytest.importorskip("moto")
@@ -3356,8 +3378,8 @@ def test_object_store_s3_roundtrip_and_browse(tmp_path):
         endpoint = f"http://{host}:{port}"
         boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
                      region_name="us-east-1").create_bucket(Bucket="bkt")
-        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
-                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        object_store_cred({"endpoint": endpoint, "region": "us-east-1",
+                           "accessKeyId": "k", "secretAccessKey": "s"})
         db._obj_store_loaded = False  # re-load httpfs + re-register the secret against the moto endpoint
         a = DuckDBAdapter()
         p = _seq_parquet(tmp_path, n=25)
@@ -3373,18 +3395,18 @@ def test_object_store_s3_roundtrip_and_browse(tmp_path):
         assert any(e["name"] == "out.parquet" for e in br["entries"])
     finally:
         server.stop()
-        metadb.set_setting("objectStore", {}, "global")  # restore the default credential chain for other tests
+        object_store_cred(None)  # restore the ambient credential chain for other tests
 
 
-def test_object_store_concurrent_run_scopes_consume_base_published_credentials():
+def test_object_store_concurrent_run_scopes_consume_base_published_credentials(object_store_cred):
     import threading
 
     from hub import db, metadb
 
-    previous = metadb.get_setting("objectStore", "global", default={}) or {}
+    previous_id = metadb.get_setting("defaultObjectStoreCredId", "global", default="") or ""
     configured = {
         "endpoint": "http://example.invalid:9443", "region": "us-east-1",
-        "accessKeyId": "scope-key", "secretAccessKey": "scope-secret", "useSsl": False,
+        "accessKeyId": "scope-key", "secretAccessKey": "scope-secret",
     }
     try:
         # Publish an OLD committed secret first. A cursor keeps that version if replacement happens only
@@ -3398,14 +3420,14 @@ def test_object_store_concurrent_run_scopes_consume_base_published_credentials()
                 base.execute("DROP SECRET IF EXISTS dp_gcs")
         except Exception as exc:  # noqa: BLE001
             pytest.skip(f"httpfs unavailable: {exc}")
-        metadb.set_setting("objectStore", {
+        object_store_cred({
             "endpoint": "https://old.invalid", "region": "us-west-2",
-            "accessKeyId": "old-key", "secretAccessKey": "old-secret", "useSsl": True,
-        }, "global")
+            "accessKeyId": "old-key", "secretAccessKey": "old-secret",
+        })
         db._obj_store_loaded = False
         db._obj_store_secret_config = None
         db.ensure_object_store()
-        metadb.set_setting("objectStore", configured, "global")
+        object_store_cred(configured)
 
         scopes_ready = threading.Barrier(2)
         first_published = threading.Event()
@@ -3453,7 +3475,7 @@ def test_object_store_concurrent_run_scopes_consume_base_published_credentials()
             assert detail and "key_id=scope-key" in detail[0]
             assert "endpoint=example.invalid:9443" in detail[0]
     finally:
-        metadb.set_setting("objectStore", previous, "global")
+        metadb.set_setting("defaultObjectStoreCredId", previous_id, "global")
         db._obj_store_secret_config = None
         db.ensure_object_store()
 
@@ -3531,7 +3553,7 @@ def test_object_store_destination_browse_rejects_paths_outside_root(monkeypatch,
     assert not called
 
 
-def test_object_store_feather_roundtrip(tmp_path):
+def test_object_store_feather_roundtrip(tmp_path, object_store_cred):
     # Arrow/Feather (IPC) has no DuckDB file reader/writer, so it goes through pyarrow's own S3
     # filesystem. Previously a raw "s3://…" string was handed to pyarrow.feather → it wrote/read a
     # LOCAL file of that literal name (silent corruption). Prove a real round-trip over the wire.
@@ -3540,7 +3562,7 @@ def test_object_store_feather_roundtrip(tmp_path):
     boto3 = pytest.importorskip("boto3")
     from moto.server import ThreadedMotoServer
 
-    from hub import db, metadb
+    from hub import db
     from hub.plugins.adapters import DuckDBAdapter, object_fs
 
     server = ThreadedMotoServer(port=0)
@@ -3550,8 +3572,8 @@ def test_object_store_feather_roundtrip(tmp_path):
         endpoint = f"http://{host}:{port}"
         boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
                      region_name="us-east-1").create_bucket(Bucket="bkt")
-        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
-                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        object_store_cred({"endpoint": endpoint, "region": "us-east-1",
+                           "accessKeyId": "k", "secretAccessKey": "s"})
         db._obj_store_loaded = False
         a = DuckDBAdapter()
         p = _seq_parquet(tmp_path, n=17)
@@ -3585,23 +3607,22 @@ def test_object_store_feather_roundtrip(tmp_path):
         assert not any(".tmp-" in k for k in left), left
     finally:
         server.stop()
-        metadb.set_setting("objectStore", {}, "global")
+        object_store_cred(None)
 
 
-def test_object_fs_gcs_hmac_keys_fail_clearly():
+def test_object_fs_gcs_hmac_keys_fail_clearly(object_store_cred):
     # pyarrow's GCS filesystem has no HMAC-key parameter, so feather over gs:// can't reuse the DuckDB
     # HMAC creds — fail with a clear message instead of silently authenticating as a different identity.
-    from hub import metadb
     from hub.plugins.adapters import object_fs
-    metadb.set_setting("objectStore", {"accessKeyId": "k", "secretAccessKey": "s"}, "global")
+    object_store_cred({"accessKeyId": "k", "secretAccessKey": "s"})
     try:
         with pytest.raises(NotImplementedError, match="ADC|Application Default|access token"):
             object_fs("gs://bucket/x.feather")
     finally:
-        metadb.set_setting("objectStore", {}, "global")
+        object_store_cred(None)
 
 
-def test_upload_lands_bytes_in_object_store(tmp_path):
+def test_upload_lands_bytes_in_object_store(tmp_path, object_store_cred):
     # Object-store deployments (multi-instance): uploaded bytes must round-trip through DuckDB httpfs to
     # s3:// so every web instance can read them. _land_upload re-encodes to the SAME format at the target
     # uri (csv stays csv); arrow/feather — which have no object-store reader — normalize to parquet.
@@ -3610,7 +3631,7 @@ def test_upload_lands_bytes_in_object_store(tmp_path):
     boto3 = pytest.importorskip("boto3")
     from moto.server import ThreadedMotoServer
 
-    from hub import db, metadb
+    from hub import db
     from hub.routers.catalog import _land_upload
 
     try:
@@ -3626,8 +3647,8 @@ def test_upload_lands_bytes_in_object_store(tmp_path):
         endpoint = f"http://{host}:{port}"
         boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
                      region_name="us-east-1").create_bucket(Bucket="bkt")
-        metadb.set_setting("objectStore", {"endpoint": endpoint, "region": "us-east-1",
-                                           "accessKeyId": "k", "secretAccessKey": "s", "useSsl": False}, "global")
+        object_store_cred({"endpoint": endpoint, "region": "us-east-1",
+                           "accessKeyId": "k", "secretAccessKey": "s"})
         db._obj_store_loaded = False
         deps = get_deps()
 
@@ -3648,7 +3669,7 @@ def test_upload_lands_bytes_in_object_store(tmp_path):
             assert deps.resolve_adapter(final2).scan(final2).aggregate("count(*) AS c").fetchone()[0] == 3
     finally:
         server.stop()
-        metadb.set_setting("objectStore", {}, "global")
+        object_store_cred(None)
 
 
 def _section(nid, script, params=None, max_runs=200, outputs=None):
@@ -9004,7 +9025,7 @@ def test_sql_fs_sandbox_confines_reads_in_auth_mode(monkeypatch, tmp_path):
 
 def test_object_store_via_env_keeps_external_access_enabled(monkeypatch):
     # P0-STOR-01: auth ON + DP_STORAGE_URL=s3:// (object store via env, creds from the AWS chain, no DB
-    # objectStore setting) must NOT disable external access — else ensure_object_store()'s httpfs load +
+    # object-store Cred) must NOT disable external access — else ensure_object_store()'s httpfs load +
     # s3 read/write fail closed. The object store wins over the FS sandbox (external access stays on).
     import duckdb
     from hub import db
@@ -9296,7 +9317,7 @@ def test_similarity_dedup_plugin_clusters_and_marks_representatives(tmp_path):
     assert ragged_out.height == 2 and "dup_group" not in ragged_out.columns  # passthrough, no crash
 
 
-def test_source_preflight_fragments_cold_and_run_plan(tmp_path, monkeypatch):
+def test_source_preflight_fragments_cold_and_run_plan(tmp_path, monkeypatch, object_store_cred):
     # cluster 14: a cheap pre-run probe flags a huge fragment count / cold-tier source in the run-plan,
     # so a full run fails fast (or warns) instead of hanging or OOMing.
     import duckdb
@@ -9317,10 +9338,9 @@ def test_source_preflight_fragments_cold_and_run_plan(tmp_path, monkeypatch):
     boto3 = pytest.importorskip("boto3")
     pytest.importorskip("moto")
     from moto import mock_aws
-    from hub import metadb
-    # object storage must be CONFIGURED for the probe to run (else it's skipped, avoiding a credential-less
-    # round-trip on every plan). A non-empty setting satisfies the guard; mock_aws intercepts boto3.
-    metadb.set_setting("objectStore", {"region": "us-east-1"}, "global")
+    # Object storage must be configured for the probe to run. A non-empty Cred satisfies the guard;
+    # mock_aws intercepts boto3.
+    object_store_cred({"region": "us-east-1"})
     try:
         with mock_aws():
             s3 = boto3.client("s3", region_name="us-east-1")
@@ -9329,7 +9349,7 @@ def test_source_preflight_fragments_cold_and_run_plan(tmp_path, monkeypatch):
             s3.put_object(Bucket="bkt", Key="d/b.parquet", Body=b"y")  # STANDARD
             assert preflight._cold_objects("s3://bkt/d", 1000) == 1
     finally:
-        metadb.set_setting("objectStore", {}, "global")  # restore for other tests
+        object_store_cred(None)  # restore for other tests
 
     # the run-plan surfaces the source pre-flight (low threshold → the 6-file dir trips it)
     monkeypatch.setattr(preflight, "_FRAGMENT_WARN", 5)
@@ -10239,17 +10259,14 @@ def test_ray_ir_carries_transform_output_schema_for_empty_results():
 
 
 @pytest.fixture
-def ray_catalog_object_store():
+def ray_catalog_object_store(object_store_cred):
     """A real versioned S3-compatible provider for Ray catalog publication tests."""
     pytest.importorskip("moto")
     pytest.importorskip("flask")
     boto3 = pytest.importorskip("boto3")
     from moto.server import ThreadedMotoServer
-    from hub import metadb
-
     server = ThreadedMotoServer(port=0)
     server.start()
-    previous = metadb.get_setting("objectStore", "global", default={}) or {}
     try:
         host, port = server.get_host_and_port()
         endpoint = f"http://{host}:{port}"
@@ -10260,13 +10277,13 @@ def ray_catalog_object_store():
         client.create_bucket(Bucket="ray-catalog-lifecycle")
         client.put_bucket_versioning(
             Bucket="ray-catalog-lifecycle", VersioningConfiguration={"Status": "Enabled"})
-        metadb.set_setting("objectStore", {
+        object_store_cred({
             "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
-            "secretAccessKey": "s", "useSsl": False,
-        }, "global")
+            "secretAccessKey": "s",
+        })
         yield client
     finally:
-        metadb.set_setting("objectStore", previous, "global")
+        object_store_cred(None)
         server.stop()
 
 
@@ -12861,7 +12878,8 @@ def test_object_attempt_registry_serializes_publish_and_discard():
     metadb.quarantine_object_attempt(fenced, "test cleanup")
 
 
-def test_object_attempt_registry_reaps_superseded_and_fenced_failures(monkeypatch):
+def test_object_attempt_registry_reaps_superseded_and_fenced_failures(
+        monkeypatch, object_store_cred):
     pytest.importorskip("moto")
     pytest.importorskip("flask")
     boto3 = pytest.importorskip("boto3")
@@ -12883,10 +12901,10 @@ def test_object_attempt_registry_reaps_superseded_and_fenced_failures(monkeypatc
             region_name="us-east-1",
         )
         client.create_bucket(Bucket="bkt")
-        metadb.set_setting("objectStore", {
+        object_store_cred({
             "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
-            "secretAccessKey": "s", "useSsl": False,
-        }, "global")
+            "secretAccessKey": "s",
+        })
         monkeypatch.setenv("DP_ATTEMPT_INVENTORY_QUIET_SECONDS", "0")
         def land(uri, run_id):
             fs, path = object_fs(uri)
@@ -13059,7 +13077,7 @@ def test_object_attempt_registry_reaps_superseded_and_fenced_failures(monkeypatc
         except Exception:
             pass
         server.stop()
-        metadb.set_setting("objectStore", {}, "global")
+        object_store_cred(None)
 
 
 def test_ray_region_worker_direct_write_and_progress(tmp_path):

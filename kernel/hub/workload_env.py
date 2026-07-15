@@ -1,8 +1,8 @@
 """Explicit environment profiles for processes that execute caller-controlled code.
 
 Worker processes must not inherit the hub's whole environment: it contains session/bootstrap secrets,
-LLM/provider credentials, deployment tokens, and arbitrary operator configuration.  Keep this list
-small and intentional.  Data-engine credentials are still an explicit compatibility capability until
+LLM/provider credentials, deployment tokens, and arbitrary operator configuration. Keep this list
+small and intentional. Data-engine credentials are an explicit execution capability until
 attempt-scoped identities exist; metadata DB access is opt-in only for the long-lived kernel, which
 currently owns its lease, heartbeat, and run-state writes.
 """
@@ -67,6 +67,8 @@ _DATA_CREDENTIAL_ENV = frozenset({
     "DP_S3_KEY", "DP_S3_SECRET",
 })
 
+EPHEMERAL_OBJECT_STORE_CRED_ID = "ephemeral-workload-object-store"
+
 
 def _derived_auth_mode(src: Mapping[str, str], env: dict[str, str]) -> None:
     if str(src.get("DP_AUTH_SECRET") or "").strip() or src.get("DP_AUTH_MODE") == "1":
@@ -111,30 +113,28 @@ def build_workload_env(*, include_metadata_db: bool = False, include_host_runtim
 
 
 def _object_store_execution_config(source: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """Translate the allowlisted legacy S3 environment into the data-plane setting adapters consume.
+    """Translate the allowlisted S3 environment into canonical object-store Cred fields.
 
     One-shot workers intentionally cannot read the hub settings DB. The object-store adapters still use
-    the ``objectStore`` setting as their common DuckDB/Arrow configuration contract, so copy only this
-    already-allowlisted execution capability into the worker's private DB — as *secret references*
-    (``env:DP_S3_KEY`` / ``env:DP_S3_SECRET``), never the material values. The allowlisted env vars
-    remain the only sanctioned channel for the resolved credential to reach the worker; adapters resolve
-    the references in-process. No catalog, identity, auth, or other control-plane setting crosses the
-    boundary.
+    normal Cred resolver contract, so copy only this already-allowlisted execution capability into the
+    worker's private DB — as *secret references* (``env:DP_S3_KEY`` / ``env:DP_S3_SECRET`` /
+    ``env:AWS_SESSION_TOKEN``), never material values. The allowlisted env vars remain the only
+    sanctioned channel for resolved credentials to reach the worker. No catalog, identity, auth, or
+    other control-plane setting crosses the boundary.
     """
     src = os.environ if source is None else source
     key, secret = src.get("DP_S3_KEY"), src.get("DP_S3_SECRET")
     if bool(key) != bool(secret):
         raise RuntimeError("DP_S3_KEY and DP_S3_SECRET must be set together")
     endpoint = str(src.get("DP_S3_ENDPOINT") or "").strip()
-    if not (endpoint or key):
-        return {}
     cfg: dict[str, Any] = {}
     if key and secret:
         # Store references so the worker's private metadata DB never contains the credential bytes.
         cfg.update(accessKeyId="env:DP_S3_KEY", secretAccessKey="env:DP_S3_SECRET")
+        if src.get("AWS_SESSION_TOKEN"):
+            cfg["sessionToken"] = "env:AWS_SESSION_TOKEN"
     if endpoint:
         cfg["endpoint"] = endpoint
-        cfg["useSsl"] = not endpoint.lower().startswith("http://")
     region = src.get("AWS_REGION") or src.get("AWS_DEFAULT_REGION")
     if region or endpoint:
         cfg["region"] = str(region or "us-east-1")
@@ -146,10 +146,10 @@ def initialize_ephemeral_metadata(directory: str) -> str:
 
     Deps constructs the default catalog through metadata tables even when the graph already carries
     physical source URIs. Initializing those tables locally preserves normal engine/plugin composition
-    without granting access to users, catalog policy, run state, or credentials in the hub DB. The only
-    setting seeded is object-store execution config reconstructed from the explicit workload environment
-    as secret references (``env:DP_S3_KEY`` / ``env:DP_S3_SECRET``); this keeps DuckDB and Arrow adapters
-    aligned without restoring the hub database identity or writing credential bytes into the worker DB.
+    without granting access to users, catalog policy, run state, or credentials in the hub DB. A fixed,
+    synthetic object-store Cred is reconstructed from the explicit workload environment and bound as the
+    private database's default. It stores references and connection metadata only, keeping DuckDB and
+    Arrow aligned without restoring the hub database identity or persisting credential bytes.
     Prefer calling before importing ``hub.settings``/``hub.deps`` in the child; when those are already
     imported (tests), this also rebinds ``settings.database_url`` and resets the metadb engine.
     """
@@ -167,8 +167,13 @@ def initialize_ephemeral_metadata(directory: str) -> str:
     metadb._engine = metadb._Session = None
     metadb.init_db()
     object_store = _object_store_execution_config()
-    if object_store:
-        metadb.set_setting("objectStore", object_store, "global")
+    cred = metadb.cred_upsert(
+        EPHEMERAL_OBJECT_STORE_CRED_ID,
+        "Ephemeral workload object store",
+        "object_store",
+        object_store,
+    )
+    metadb.set_setting("defaultObjectStoreCredId", cred["id"], "global")
     return url
 
 

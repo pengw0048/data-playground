@@ -571,9 +571,21 @@ def canvas_kernel_restart(canvas_id: str, uid: str = Depends(current_user)) -> d
     return {"ok": True, "restarted": True}
 
 
-# Secret-bearing settings store references (env:VAR / file:/path), never the material value. GET
-# returns the reference string as-is (it is not sensitive). PUT accepts only references (or empty to
-# clear) for agentApiKey, objectStore credential subkeys, and plugin [[config]] fields marked secret.
+# Plugin settings declared ``secret`` store references (env:VAR / file:/path), never material values.
+# Agent and object-store credentials are first-class Cred entities below; the removed pre-1.0 setting
+# keys are neither returned nor writable through this generic settings API.
+
+
+_REMOVED_CREDENTIAL_SETTINGS = {
+    "agentApiKey": (
+        "agentApiKey is no longer supported; create an agent Cred via /api/creds and bind it with "
+        "agentCredId"
+    ),
+    "objectStore": (
+        "objectStore is no longer supported; create an object_store Cred via /api/creds and bind it "
+        "with defaultObjectStoreCredId or a destination credId"
+    ),
+}
 
 
 def _plugin_secret_keys() -> set[str]:
@@ -584,16 +596,19 @@ def _plugin_secret_keys() -> set[str]:
 
 @router.get("/settings")
 def get_settings(uid: str = Depends(current_user)) -> dict:
-    from hub.secrets import redact_global_setting
+    from hub.secrets import redact_secret_for_display
     plugin_secrets = _plugin_secret_keys()
     with metadb.session() as s:
         rows = s.scalars(_sa_select(metadb.Setting))
         out: dict = {"global": {}, "user": {}}
         for r in rows:
+            if r.key in _REMOVED_CREDENTIAL_SETTINGS:
+                continue
             if r.scope == "global":
-                # References are safe to echo; mask any residual legacy plaintext for a secret key.
-                out["global"][r.key] = redact_global_setting(
-                    r.key, json.loads(r.value), plugin_secrets=plugin_secrets)
+                value = json.loads(r.value)
+                out["global"][r.key] = (
+                    redact_secret_for_display(value) if r.key in plugin_secrets else value
+                )
             elif r.scope == "user" and r.scope_id == uid:
                 out["user"][r.key] = json.loads(r.value)
         return out
@@ -610,16 +625,18 @@ def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
                        resource_type="setting", resource_id=body.key, attrs={"scope": body.scope})
             raise
     scope_id = uid if body.scope == "user" else ""
+    if body.key in _REMOVED_CREDENTIAL_SETTINGS:
+        raise HTTPException(400, _REMOVED_CREDENTIAL_SETTINGS[body.key])
     value = body.value
     plugin_secrets = _plugin_secret_keys()
-    if body.scope == "global":
-        from hub.secrets import validate_secret_setting_value
+    if body.scope == "global" and body.key in plugin_secrets:
+        from hub.secrets import validate_secret_reference
         try:
-            value = validate_secret_setting_value(body.key, value, plugin_secrets=plugin_secrets)
+            value = validate_secret_reference(value, field=body.key)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
     metadb.set_setting(body.key, value, scope=body.scope, scope_id=scope_id)
-    is_secret = body.key in ("agentApiKey", "objectStore") or body.key in plugin_secrets
+    is_secret = body.key in plugin_secrets
     # attr key must avoid validate_audit_attrs' secret-name regex, else this event is rejected + dropped.
     emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
                resource_type="setting", resource_id=body.key,
@@ -633,12 +650,12 @@ def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
 
 
 def _redact_cred(cred: dict) -> dict:
-    from hub.secrets import redact_global_setting, redact_secret_for_display
-    fields = cred.get("fields") or {}
-    if cred.get("kind") == "object_store":
-        fields = redact_global_setting("objectStore", dict(fields), plugin_secrets=set())
-    else:
-        fields = {"apiKey": redact_secret_for_display(fields.get("apiKey"))} if fields.get("apiKey") else {}
+    from hub.secrets import OBJECT_STORE_SECRET_SUBKEYS, redact_secret_for_display
+    fields = dict(cred.get("fields") or {})
+    secret_fields = OBJECT_STORE_SECRET_SUBKEYS if cred.get("kind") == "object_store" else ("apiKey",)
+    for field in secret_fields:
+        if field in fields:
+            fields[field] = redact_secret_for_display(fields[field])
     return {**cred, "fields": fields}
 
 

@@ -164,11 +164,17 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     metadb.record_run(canvas_id, "n1", "done", rows=1, run_id=run_id, output_uri=artifact_uri)
     artifact_rel = str(Path(artifact_uri).resolve().relative_to(Path(storage.root).resolve()))
 
-    metadb.set_setting("objectStore", {
-        "accessKeyId": "drill-access-key",
-        "secretAccessKey": "drill-secret-value",
-        "endpoint": "http://minio:9000",
-    })
+    object_store_cred = metadb.cred_upsert(
+        f"drill-object-store-{uuid.uuid4().hex}",
+        "Backup drill object store",
+        "object_store",
+        {
+            "accessKeyId": "env:DP_BACKUP_DRILL_ACCESS_KEY",
+            "secretAccessKey": "file:/run/secrets/dp-backup-drill-secret",
+            "endpoint": "http://minio:9000",
+        },
+    )
+    metadb.set_setting("defaultObjectStoreCredId", object_store_cred["id"])
 
     handoff.set_managed_object_provider(provider)
     handoff.ensure_storage_namespace_claim(claim_uri, namespace)
@@ -205,7 +211,8 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         "claim_uri": claim_uri,
         "claim_key": claim_key,
         "marker_body": provider.claims[claim_key]["body"],
-        "secret_value": "drill-secret-value",
+        "cred_id": object_store_cred["id"],
+        "secret_ref": "file:/run/secrets/dp-backup-drill-secret",
     }
 
 
@@ -223,9 +230,16 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
         artifact = session.get(metadb.LocalResultArtifact, info["artifact_uri"])
         assert artifact is not None and artifact.state == "ready"
         setting = session.scalar(select(metadb.Setting).where(
-            metadb.Setting.key == "objectStore", metadb.Setting.scope == "global"))
-        assert setting is not None
-        assert json.loads(setting.value)["secretAccessKey"] == info["secret_value"]
+            metadb.Setting.key == "defaultObjectStoreCredId",
+            metadb.Setting.scope == "global"))
+        assert setting is not None and json.loads(setting.value) == info["cred_id"]
+        assert session.scalar(select(metadb.Setting).where(
+            metadb.Setting.key == "objectStore")) is None
+        cred = session.get(metadb.CredEntity, info["cred_id"])
+        assert cred is not None and cred.kind == "object_store"
+        fields = json.loads(cred.fields_json)
+        assert fields["secretAccessKey"] == info["secret_ref"]
+        assert fields["accessKeyId"] == "env:DP_BACKUP_DRILL_ACCESS_KEY"
 
     assert metadb.catalog_get(info["parent_uri"]) is not None
     assert metadb.catalog_get(info["child_uri"]) is not None

@@ -164,7 +164,7 @@ def _maybe_sandbox_fs(c: duckdb.DuckDBPyConnection) -> None:
             return
         from hub import metadb
         from hub.plugins.adapters import is_object_uri
-        # an object store may be configured via the default cred / legacy DB setting, the DP_STORAGE_URL
+        # an object store may be configured via the default Cred, the DP_STORAGE_URL
         # env var, OR a per-destination object-store credential — ALL need external access on, or
         # httpfs/s3 fails closed (P0-STOR-01). A destination-only S3 install must not stay sandboxed.
         storage_url = (os.environ.get("DP_STORAGE_URL") or "").strip()
@@ -365,7 +365,7 @@ def object_store_binding(cfg: dict | None) -> Iterator[None]:
 
 
 def _default_object_store_cfg() -> dict:
-    """The resolved default object-store credentials: the default cred, else the legacy global setting."""
+    """Resolved default object-store Cred fields, or an empty config for the ambient SDK chain."""
     from hub import metadb
     from hub.secrets import resolve_object_store
     return resolve_object_store(metadb.cred_object_store_config(None))
@@ -375,8 +375,8 @@ def ensure_object_store(cfg: dict | None = None) -> None:
     """Publish httpfs + credentials on the base connection for object-store consumers.
 
     ``cfg`` is a resolved object-store config (a destination's credential). With no cfg, adopt the
-    context binding if one is set (a write/browse in progress), else the default cred / legacy setting
-    — so a default cred configured only via the Credentials pane still reaches generic reads.
+    context binding if one is set (a write/browse in progress), else the default Cred or deliberate
+    ambient SDK chain — so a default Cred configured in Settings still reaches generic reads.
 
     A run scope owns a long rollback-only transaction.  Creating its secret there would make two
     concurrent runs conflict on the shared catalog even though both use the same credentials.  The
@@ -413,7 +413,7 @@ def _prime_object_store_before_scope() -> None:
             return
         from hub import metadb
         from hub.secrets import resolve_object_store
-        cfg = metadb.cred_object_store_config(None)  # default cred, else legacy objectStore setting
+        cfg = metadb.cred_object_store_config(None)  # default Cred, else deliberate ambient chain
         if not cfg and scheme in ("s3", "s3a", "s3n", "gs", "gcs"):
             # Only a one-shot workload (subrun / Ray driver) with no hub settings DB reconstructs its
             # config from the allowlisted data-plane environment; a hub with an empty setting keeps its
@@ -422,7 +422,7 @@ def _prime_object_store_before_scope() -> None:
                                           is_ephemeral_workload)
             if is_ephemeral_workload():
                 cfg = data_plane_object_store_config(scheme=scheme)
-        cfg = resolve_object_store(cfg)  # hub settings hold env:/file: references; resolve in-process
+        cfg = resolve_object_store(cfg)  # Cred fields hold SecretRefs; resolve in-process
         if not _obj_store_loaded or _object_store_fingerprint(cfg) != _obj_store_secret_config:
             _publish_object_store(cfg)
     except Exception:  # noqa: BLE001 — defer setup failure until an object-store operation actually runs

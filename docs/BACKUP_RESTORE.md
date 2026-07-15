@@ -12,10 +12,10 @@ steps below differ by profile.
 
 | Item | Why it matters |
 |---|---|
-| **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries/columns/lineage edges/embeddings, settings rows (including secret values), the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). |
+| **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries/columns/lineage edges/embeddings, settings and Cred rows, the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). |
 | **Workspace files** | Under `DP_WORKSPACE`: `dataplay.db` when using SQLite, `outputs/` (run results and local-result artifacts), and `plugins/` (operator-installed packs). |
 | **Object-store generations + namespace marker** | When `DP_STORAGE_URL` points at `s3://` / `gs://` (or compatible), back up object generations under the installation's storage namespace **and** the conditional marker at `_dp_control/namespaces/<namespace>.json`. The metadata DB alone is not enough: `local_result_artifacts` and attempt rows reference exact URIs. |
-| **Secret material** | Settings rows store secret subkeys (`accessKeyId` / `secretAccessKey` on `objectStore`, plus plugin `secret` fields) in **plaintext** today. API GET redacts them; backups do not. Treat every metadata dump as highly confidential. Secret-reference storage is future work. |
+| **Credential references** | Cred rows and plugin `secret` settings contain SecretRefs plus non-secret connection metadata, not resolved credential values. Back up the referenced environment, files, or external secret manager separately; a metadata restore cannot recreate them. |
 | **Release identity** | Record `GET /api/version` (`sha`, `db` dialect, `storage` scheme) and the Alembic revision stored in the metadata DB (`alembic_version.version_num`, also exposed by `metadb.expected_schema_head()` / `metadb.require_schema_at_head()`). A restore must land on a release that understands that schema. |
 
 ### Consistency ordering
@@ -166,9 +166,9 @@ export DP_STORAGE_NAMESPACE="<replacement>"
   acquire the original `_dp_control/namespaces/<old>.json` marker. Audited takeover of an
   existing namespace is unimplemented; changing `DP_STORAGE_NAMESPACE` alone is rejected
   ([RAY.md](RAY.md)).
-- **Not a secrets redesign.** Metadata backups contain plaintext secret setting values.
-  Encrypt backups at rest, restrict who can read them, and rotate credentials after any
-  untrusted exposure.
+- **Not a secret-backend backup.** The metadata database restores Cred and plugin SecretRefs,
+  but it does not restore referenced environment variables, mounted secret files, or an external
+  secret manager. Restore those through the deployment system before exercising the credentials.
 
 ## Automated restore drill
 
@@ -203,6 +203,7 @@ BACKUP_RESTORE_DRILL RTO_MS: <integer milliseconds from restore start to verifie
 
 ## Security warning
 
-Metadata backups currently contain **plaintext secret values** (object-store keys and plugin
-secrets stored in the `settings` table). Protect backup media with access control and
-encryption; do not commit dumps to git; rotate secrets if a backup leaks.
+Metadata backups contain credential identifiers, connection metadata, and SecretRefs. They should
+still be treated as operationally sensitive: protect backup media with access control and encryption,
+and do not commit dumps to git. Resolved secret values live in the referenced environment, file, or
+external resolver and require their own backup and rotation procedures.

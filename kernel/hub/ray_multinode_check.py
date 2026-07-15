@@ -111,7 +111,6 @@ def _load_dp_ray():
 
 def main() -> int:
     endpoint = os.environ["DP_S3_ENDPOINT"]               # http://minio:9000
-    key, secret = os.environ["DP_S3_KEY"], os.environ["DP_S3_SECRET"]
     bucket = os.environ.get("DP_S3_BUCKET", "dpray")
     # the container already joined the cluster (`ray start --address=…` in the entrypoint) → RAY_ADDRESS is
     # "auto" (connect to the local raylet). Only the object store still needs a readiness wait.
@@ -141,8 +140,14 @@ def main() -> int:
     ws, data = tempfile.mkdtemp(prefix="mn_ws_"), tempfile.mkdtemp(prefix="mn_data_")
     metadb.init_db()  # create the metadata schema in this fresh workspace DB (settings/catalog/run_states)
     deps = Deps(ws, data)
-    metadb.set_setting("objectStore", {"accessKeyId": key, "secretAccessKey": secret,
-                                       "endpoint": endpoint, "region": "us-east-1", "useSsl": False}, "global")
+    cred = metadb.cred_upsert(
+        "ray-multinode-check-object-store",
+        "Ray multinode check object store",
+        "object_store",
+        {"accessKeyId": "env:DP_S3_KEY", "secretAccessKey": "env:DP_S3_SECRET",
+         "endpoint": endpoint, "region": "us-east-1"},
+    )
+    metadb.set_setting("defaultObjectStoreCredId", cred["id"], "global")
     src, out_uri = f"s3://{bucket}/src.parquet", f"s3://{bucket}/agg_out.parquet"
 
     db.ensure_object_store()

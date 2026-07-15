@@ -100,7 +100,6 @@ def test_explicit_agent_credential_failures_never_use_ambient_identity(
     created_ids: list[str] = []
     metadb.set_setting("agentModel", "anthropic/credential-test", "global")
     metadb.set_setting("agentBaseUrl", "", "global")
-    metadb.set_setting("agentApiKey", "", "global")
     metadb.set_setting("agentCredId", "", "global")
     monkeypatch.setattr(settings, "agent_api_key", ambient_settings)
     monkeypatch.setenv("ANTHROPIC_API_KEY", ambient_provider)
@@ -156,7 +155,6 @@ def test_explicit_agent_credential_failures_never_use_ambient_identity(
                 assert forbidden not in serialized
     finally:
         metadb.set_setting("agentCredId", "", "global")
-        metadb.set_setting("agentApiKey", "", "global")
         metadb.set_setting("agentModel", "", "global")
         metadb.set_setting("agentBaseUrl", "", "global")
         for cred_id in created_ids:
@@ -168,7 +166,6 @@ def test_no_agent_credential_selection_retains_ambient_default(monkeypatch):
 
     ambient = "ambient-default-agent-key"
     metadb.set_setting("agentCredId", "", "global")
-    metadb.set_setting("agentApiKey", "", "global")
     metadb.set_setting("agentModel", "anthropic/ambient-test", "global")
     metadb.set_setting("agentBaseUrl", "", "global")
     monkeypatch.setattr(settings, "agent_api_key", ambient)
@@ -261,7 +258,6 @@ def test_agent_credential_rotation_and_deletion_do_not_cache_material(
     monkeypatch.setattr(settings, "agent_api_key", ambient_default)
     metadb.set_setting("agentModel", "anthropic/rotation-test", "global")
     metadb.set_setting("agentBaseUrl", "", "global")
-    metadb.set_setting("agentApiKey", "", "global")
     cid = client.post("/api/creds", json={
         "name": "rotating-agent", "kind": "agent",
         "fields": {"apiKey": "env:DP_AGENT_ROTATION_V1"},

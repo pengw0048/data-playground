@@ -84,8 +84,8 @@ def _read_uri(uri: str) -> str:
 
 
 def object_fs(uri: str):
-    """A pyarrow filesystem + in-bucket path for an object-store uri, reading the SAME `objectStore`
-    setting DuckDB's httpfs uses. Only needed for Arrow/Feather (IPC), which DuckDB cannot read or write
+    """A pyarrow filesystem + in-bucket path for an object-store uri, reading the same default Cred
+    DuckDB's httpfs uses. Only needed for Arrow/Feather (IPC), which DuckDB cannot read or write
     as files — parquet/csv/json go straight through DuckDB+httpfs. Returns (filesystem, "bucket/key").
 
     S3/R2 credential parity is full (explicit keys / endpoint for MinIO·R2·any S3-compatible store, else
@@ -99,14 +99,14 @@ def object_fs(uri: str):
     from hub.secrets import resolve_object_store
     scheme, _, rest = uri.partition("://")
     scheme = scheme.lower()
-    cfg = metadb.cred_object_store_config(None)  # default cred → legacy objectStore (unified resolver)
+    cfg = metadb.cred_object_store_config(None)  # default Cred or deliberate ambient chain
     if not cfg:
         # Only a one-shot workload (subrun / Ray driver) with no hub settings DB falls back to the
         # allowlisted data-plane environment; a hub keeps its ambient credential chain.
         from hub.workload_env import data_plane_object_store_config, is_ephemeral_workload
         if is_ephemeral_workload():
             cfg = data_plane_object_store_config(scheme=scheme)
-    cfg = resolve_object_store(cfg)  # hub settings hold env:/file: references; resolve in-process
+    cfg = resolve_object_store(cfg)  # Cred fields hold SecretRefs; resolve in-process
     endpoint = str(cfg.get("endpoint") or "").strip()
     if scheme in ("s3", "r2"):
         kw: dict = {}

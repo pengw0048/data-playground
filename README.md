@@ -167,13 +167,13 @@ kernel's OS user. `DP_DATASET_ROOTS` constrains supported file access, and user 
 policy, but neither turns arbitrary Python into a security boundary. A kernel also holds the data and
 metadata credentials needed to execute its canvas.
 
-Canvas sharing is not dataset isolation: the catalog and data engine are workspace-wide. Settings that
-hold credentials (`agentApiKey`, object-store access keys / session tokens, and plugin `[[config]]`
-fields marked `secret`) store a **secret reference** — `env:VAR_NAME` or `file:/path/to/secret` — never
-the secret itself. The hub resolves references only in the process that needs the capability (agent call,
+Canvas sharing is not dataset isolation: the catalog and data engine are workspace-wide. Agent and
+object-store credentials are first-class Cred entities; plugin `[[config]]` fields marked `secret` remain
+plugin settings. Both store a **secret reference** — `env:VAR_NAME` or `file:/path/to/secret` — never the
+secret itself. The hub resolves references only in the process that needs the capability (agent call,
 object-store client, plugin registration). A pluggable `SecretResolver` seam (`hub.secrets` /
-`reg.add_secret_resolver`) lets a future plugin add schemes such as Vault without importing a vendor
-client into core.
+`reg.add_secret_resolver`) lets a plugin add schemes such as Vault without importing a vendor client into
+core.
 
 > [!WARNING]
 > The metadata schema was reset to one baseline before the first public release. Databases created
@@ -181,18 +181,23 @@ client into core.
 > plugins you need, and start with a new workspace/SQLite database or an empty PostgreSQL schema.
 > `dataplay migrate` creates the current schema; it does not convert a pre-reset database.
 
-Credential settings in a fresh database accept secret references such as:
+Create Agent and object-store Creds under **Settings → Credentials**, then select the Agent Cred, the
+default object-store Cred, or a destination-specific Cred. The API exposes the same model at
+`/api/creds`; bindings remain ordinary non-secret settings (`agentCredId`,
+`defaultObjectStoreCredId`, and `destinations[].credId`). Cred and plugin secret fields accept references
+such as:
 
 ```text
-agentApiKey                          = env:ANTHROPIC_API_KEY
-objectStore.accessKeyId              = env:AWS_ACCESS_KEY_ID
-objectStore.secretAccessKey          = env:AWS_SECRET_ACCESS_KEY
-objectStore.sessionToken             = env:AWS_SESSION_TOKEN   # optional
+Agent Cred.apiKey                    = env:ANTHROPIC_API_KEY
+Object-store Cred.accessKeyId        = env:AWS_ACCESS_KEY_ID
+Object-store Cred.secretAccessKey    = env:AWS_SECRET_ACCESS_KEY
+Object-store Cred.sessionToken       = env:AWS_SESSION_TOKEN   # optional
 plugin.<pack>.<secret-field>         = file:/run/secrets/pack_token
 ```
 
-Leave credential fields blank to fall back to the process environment / instance role. Protect metadata
-backups accordingly; they now contain references, not credentials.
+Leave the Agent selection or object-store Cred fields blank to use the configured provider environment
+or ambient SDK / instance-role chain. Metadata backups contain Cred connection metadata and references,
+not resolved credential values.
 
 Run only trusted canvases and plugins. See the [security policy](.github/SECURITY.md) for the exact
 boundary and private vulnerability-reporting path.
