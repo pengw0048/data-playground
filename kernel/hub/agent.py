@@ -193,6 +193,8 @@ class _Ctx:
     seq: list             # id counter [int]
     transcript: list      # [{tool, input, result}] for the UI
     policy: Any           # resolved AgentDataPolicy for this run
+    principal_id: str | None
+    request_id: str | None
 
 
 def _new_id(ctx: _Ctx, kind: str) -> str:
@@ -204,7 +206,15 @@ def _finish(ctx: _Ctx, tool: str, tool_input: dict, result: dict) -> dict:
     """Sanitize → audit → transcript. The single egress gate for every tool result."""
     policy = ctx.policy
     sanitized = sanitize_tool_result(result, allows_sample_values=policy.allows_sample_values)
-    record_tool_audit(policy, tool, tool_input, sanitized)
+    record_tool_audit(
+        policy,
+        tool,
+        tool_input,
+        sanitized,
+        principal_id=ctx.principal_id,
+        canvas_id=ctx.wg.get("id"),
+        request_id=ctx.request_id,
+    )
     ctx.transcript.append({"tool": tool, "input": tool_input, "result": sanitized})
     return sanitized
 
@@ -346,7 +356,16 @@ def _build_model(model: str, api_key: str | None, base_url: str | None):
     return infer_model(inferred_name, provider_factory=configured_provider)
 
 
-def run_agent(outcome: str, graph: dict, deps, model=None, policy=None) -> dict:
+def run_agent(
+    outcome: str,
+    graph: dict,
+    deps,
+    model=None,
+    policy=None,
+    *,
+    principal_id: str | None = None,
+    request_id: str | None = None,
+) -> dict:
     """Run the tool-use loop; return {graph, transcript, summary}. `model`/`policy` injected in tests."""
     config = _agent_config()
     if _agent is None:
@@ -363,7 +382,15 @@ def run_agent(outcome: str, graph: dict, deps, model=None, policy=None) -> dict:
         "edges": [dict(e) for e in graph.get("edges", [])],
     }
     existing_ids = {n["id"] for n in wg["nodes"]}
-    ctx = _Ctx(kdeps=deps, wg=wg, seq=[0], transcript=[], policy=effective_policy)
+    ctx = _Ctx(
+        kdeps=deps,
+        wg=wg,
+        seq=[0],
+        transcript=[],
+        policy=effective_policy,
+        principal_id=principal_id,
+        request_id=request_id,
+    )
     m = model if model is not None else _build_model(*config)
 
     prompt = (f"{outcome}\n\n(The canvas currently has {len(wg['nodes'])} node(s) and "

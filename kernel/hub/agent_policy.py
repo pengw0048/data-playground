@@ -8,7 +8,9 @@ in ``sanitize_tool_result`` so individual tools cannot accidentally bypass the p
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +25,15 @@ CATALOG_READING_TOOLS = frozenset({"list_catalog", "preview", "join_hints"})
 _VALUE_REFUSAL = (
     "metadata-only: sample row values are withheld under the workspace AgentDataPolicy. "
     "An administrator can enable sample-values, or mark the configured endpoint as local."
+)
+
+_AUDIT_ID_MAX_BYTES = 256
+_AUDIT_QUERY_MAX_BYTES = 128
+_CATALOG_AUDIT_MODES = frozenset({"list", "lexical", "semantic", "hybrid"})
+_SECRET_QUERY_PATTERN = re.compile(
+    r"(?i)(?:\b(?:password|secret|api[_-]?key|credential|authorization)\s*[:=]\s*\S+"
+    r"|\bbearer\s+\S+|\bsk-[A-Za-z0-9_-]{8,}|\bghp_[A-Za-z0-9_-]{8,}"
+    r"|\bgithub_pat_[A-Za-z0-9_-]{8,})"
 )
 
 
@@ -149,40 +160,90 @@ def _strip_row_values(obj: Any) -> Any:
     return obj
 
 
-def audit_events_for_tool(
+def _digest(value: Any) -> str:
+    return f"sha256:{hashlib.sha256(str(value).encode('utf-8', errors='replace')).hexdigest()}"
+
+
+def _bounded_audit_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text.encode("utf-8", errors="replace")) <= _AUDIT_ID_MAX_BYTES:
+        return text
+    return _digest(text)
+
+
+def _bounded_audit_query(value: Any) -> str | None:
+    if value is None:
+        return None
+    query = " ".join(str(value).split())
+    if not query:
+        return None
+    encoded = query.encode("utf-8", errors="replace")
+    if len(encoded) > _AUDIT_QUERY_MAX_BYTES:
+        head = encoded[: _AUDIT_QUERY_MAX_BYTES - 3].decode("utf-8", errors="ignore")
+        query = f"{head}..."
+    if _SECRET_QUERY_PATTERN.search(query):
+        return "[redacted]"
+    return query
+
+
+def _catalog_result_summary(tables: Any) -> tuple[int, str]:
+    """Return a count and constant-size digest without retaining dataset identifiers."""
+    digest = hashlib.sha256()
+    count = 0
+    for table in tables if isinstance(tables, list) else []:
+        if not isinstance(table, dict):
+            continue
+        count += 1
+        identifier = table.get("id") or table.get("uri") or table.get("name") or ""
+        encoded = str(identifier).encode("utf-8", errors="replace")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return count, f"sha256:{digest.hexdigest()}"
+
+
+def audit_event_for_tool(
     policy: AgentDataPolicy,
     tool: str,
     tool_input: dict,
     result: Any,
-) -> list[dict]:
-    """Build value-free audit event dicts for a catalog-reading tool call (hosted models only)."""
+    *,
+    principal_id: str | None = None,
+    canvas_id: str | None = None,
+    request_id: str | None = None,
+) -> dict | None:
+    """Build one value-free audit event for a catalog-reading tool call under a hosted model."""
     if not policy.hosted or tool not in CATALOG_READING_TOOLS:
-        return []
+        return None
     base = {
-        "provider": policy.provider,
-        "model": policy.model,
+        "provider": _bounded_audit_id(policy.provider) or "",
+        "model": _bounded_audit_id(policy.model) or "",
         "tool": tool,
         "level": policy.level,
     }
     if tool == "list_catalog" and isinstance(result, dict):
-        tables = result.get("tables") or []
-        return [
-            {
-                **base,
-                "dataset": t.get("uri") or t.get("name"),
-                "columns": list(t.get("columns") or []),
-                "rowCount": t.get("rowCount"),
-            }
-            for t in tables
-            if isinstance(t, dict)
-        ] or [{**base, "dataset": None, "columns": [], "rowCount": None}]
+        count, identifiers_digest = _catalog_result_summary(result.get("tables"))
+        raw_mode = str(tool_input.get("mode") or "list").strip().lower()
+        mode = raw_mode if raw_mode in _CATALOG_AUDIT_MODES else "other"
+        query = tool_input.get("query", tool_input.get("q"))
+        return {
+            **base,
+            "principalId": _bounded_audit_id(principal_id),
+            "canvasId": _bounded_audit_id(canvas_id),
+            "requestId": _bounded_audit_id(request_id),
+            "query": _bounded_audit_query(query),
+            "mode": mode,
+            "returnedCount": count,
+            "datasetIdentifiersDigest": identifiers_digest,
+        }
     if tool == "preview" and isinstance(result, dict):
-        return [{
+        return {
             **base,
             "dataset": tool_input.get("node_id") or tool_input.get("nodeId"),
             "columns": list(result.get("columns") or []),
             "rowCount": result.get("row_count", result.get("rowCount")),
-        }]
+        }
     if tool == "join_hints":
         left = tool_input.get("left_uri") or tool_input.get("leftUri")
         right = tool_input.get("right_uri") or tool_input.get("rightUri")
@@ -193,25 +254,44 @@ def audit_events_for_tool(
                     continue
                 columns.extend(suggestion.get("leftColumns") or [])
                 columns.extend(suggestion.get("rightColumns") or [])
-        return [{
+        return {
             **base,
             "dataset": f"{left}|{right}" if left or right else None,
             "columns": columns,
             "rowCount": None,
-        }]
-    return [{**base, "dataset": None, "columns": [], "rowCount": None}]
+        }
+    return {**base, "dataset": None, "columns": [], "rowCount": None}
 
 
-def record_tool_audit(policy: AgentDataPolicy, tool: str, tool_input: dict, result: Any) -> None:
-    """Persist value-free audit events for a catalog-reading tool under a hosted model."""
+def record_tool_audit(
+    policy: AgentDataPolicy,
+    tool: str,
+    tool_input: dict,
+    result: Any,
+    *,
+    principal_id: str | None = None,
+    canvas_id: str | None = None,
+    request_id: str | None = None,
+) -> None:
+    """Persist one value-free audit event for a hosted catalog-reading tool call."""
     from hub import metadb
 
-    for event in audit_events_for_tool(policy, tool, tool_input, result):
-        # Never persist sample rows — events are metadata-only by construction.
-        if "rows" in event:
-            raise ValueError("agent egress audit must not carry raw rows")
-        # Best-effort: a transient metadata-DB error must not abort an otherwise-successful tool call.
-        try:
-            metadb.record_agent_egress_event(event)
-        except Exception:  # noqa: BLE001
-            logging.getLogger(__name__).warning("agent egress audit write failed", exc_info=True)
+    event = audit_event_for_tool(
+        policy,
+        tool,
+        tool_input,
+        result,
+        principal_id=principal_id,
+        canvas_id=canvas_id,
+        request_id=request_id,
+    )
+    if event is None:
+        return
+    # Never persist sample rows — events are metadata-only by construction.
+    if "rows" in event:
+        raise ValueError("agent egress audit must not carry raw rows")
+    # Best-effort: a transient metadata-DB error must not abort an otherwise-successful tool call.
+    try:
+        metadb.record_agent_egress_event(event)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning("agent egress audit write failed", exc_info=True)

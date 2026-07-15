@@ -666,8 +666,8 @@ class CredEntity(Base):
 class AgentEgressEvent(Base):
     """Value-free audit of a catalog-reading agent tool call under a hosted model (SEC-01).
 
-    Carries provider/model/tool/dataset/columns/row_count — never raw sample values. A later
-    telemetry-contracts slice can adopt this shape into a cross-domain schema.
+    ``event_json`` never carries raw sample values. Catalog enumeration stores a bounded summary;
+    typed columns retain the small dataset/column evidence used by single-dataset tools such as preview.
     """
     __tablename__ = "agent_egress_events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -8048,7 +8048,7 @@ def cred_agent_api_key_ref(cred_id: str | None = None) -> str:
 
 
 def record_agent_egress_event(event: dict) -> None:
-    """Persist one value-free agent egress audit event (provider/model/tool/dataset/columns/rowCount)."""
+    """Persist one value-free Agent catalog-tool audit event in one metadata transaction."""
     columns = event.get("columns") or []
     if not isinstance(columns, list):
         columns = list(columns)
