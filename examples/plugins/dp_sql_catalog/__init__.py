@@ -5,11 +5,11 @@ This plugin surfaces those rows as Data Playground datasets, so `source` nodes c
 previews/runs read the `uri` through whatever adapter matches it.
 
 It demonstrates the `CatalogProvider` seam (`reg.set_catalog`) via the **read-external catalog** pattern
-the SPI documents: subclass the built-in `InMemoryCatalog`, OVERRIDE only the reads (`list_tables` /
-`get_table`) to sync from SQL, and INHERIT everything else — `resolve_ref`, `lineage`, `relationships`,
-declared keys, and `register_output` — from the parent's local side-store. So an external catalog needs
-no reimplementation of the lineage/ER/write machinery; it only maps its rows to `CatalogTable`s (columns
-+ row count are probed from the `uri` by the inherited adapter path).
+the SPI documents: subclass the built-in `InMemoryCatalog`, OVERRIDE the bounded read surfaces to sync
+from SQL, and INHERIT everything else — `resolve_ref`, `lineage`, `relationships`, declared keys, and
+`register_output` — from the parent's local side-store. So an external catalog needs no reimplementation
+of the lineage/ER/write machinery; it only maps its rows to `CatalogTable`s (columns + row count are
+probed from the `uri` by the inherited adapter path).
 
 Config: `url` = any SQLAlchemy URL (e.g. `postgresql+psycopg://…`, `sqlite:///…`); `table` = the table
 name (default `datasets`, columns `name`, `uri`). Both are declared in `dataplay.toml [[config]]`, so
@@ -64,13 +64,6 @@ class SqlCatalog(InMemoryCatalog):
     def _seed(self) -> None:
         super()._seed()  # keep local data_dir discovery too (harmless if the dir is empty)
         self._sync()
-
-    # sync-then-delegate on EVERY read surface, including the paginated browse/search/facet/tree
-    # endpoints the Tables view uses — not just the legacy list_tables (else a row added in SQL never
-    # shows up while browsing).
-    def list_tables(self, q=None):
-        self._sync()
-        return super().list_tables(q)
 
     def get_table(self, id_or_name):  # inherits the KeyError-on-miss contract
         self._sync()

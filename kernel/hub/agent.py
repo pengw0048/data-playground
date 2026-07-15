@@ -25,7 +25,7 @@ from typing import Any
 from hub import graph_ops
 from hub.agent_policy import load_agent_data_policy, record_tool_audit, sanitize_tool_result
 from hub.executors.preview import preview_node
-from hub.models import Graph
+from hub.models import CatalogQuery, Graph
 from hub.settings import settings
 
 
@@ -233,7 +233,7 @@ try:
         out = {"tables": [{"name": t.name, "uri": t.uri, "rowCount": t.row_count,
                            "columns": [c.name for c in t.columns],
                            "keys": [k.columns for k in t.keys]}
-                          for t in ctx.deps.kdeps.catalog.list_tables(None)]}
+                          for t in ctx.deps.kdeps.catalog.list_page(CatalogQuery(limit=5000)).items]}
         return _finish(ctx.deps, "list_catalog", {}, out)
 
     @_agent.tool

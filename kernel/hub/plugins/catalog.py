@@ -16,7 +16,6 @@ with no embedder the catalog still does lexical + faceted search offline, zero e
 
 from __future__ import annotations
 
-import inspect
 import hashlib
 import json
 import logging
@@ -46,11 +45,6 @@ log = logging.getLogger("hub")
 # a client renders (and the payload) stays sane; `truncated` tells the UI there was more.
 DEFAULT_LINEAGE_DEPTH = 6
 DEFAULT_LINEAGE_MAX_NODES = 500
-# `list_tables(None)` (the back-compat convenience the agent/MCP use) returns at most this many, so a
-# huge catalog can't produce an unbounded list; real browsing uses list_page (paginated) / search.
-LIST_TABLES_CAP = 5000
-
-
 class InMemoryCatalog:
     """The default CatalogProvider. Named for history — it's now DB-backed (the DB is authoritative and
     cross-instance); there is no in-memory table map to go stale."""
@@ -230,11 +224,6 @@ class InMemoryCatalog:
         items = [self._overlay(self._to_table(d), dmap) for d in docs]
         return CatalogPage(items=items, total=total, offset=query.offset, limit=query.limit,
                            has_more=query.offset + len(items) < total)
-
-    def list_tables(self, q: str | None) -> list[CatalogTable]:
-        """Back-compat convenience — a bare (bounded) list, matching one page of the browse query. The
-        agent/MCP call this; the UI uses list_page (paginated) + facets."""
-        return self.list_page(CatalogQuery(q=q, limit=LIST_TABLES_CAP)).items
 
     def facets(self, query: CatalogQuery) -> Facets:
         """Distinct folder/tag/owner values + counts over the active filter set (drill-down)."""
@@ -773,143 +762,3 @@ def publish_unmanaged_output_attested(catalog, *, name: str, uri: str,
     if expected[0] != uri or expected[1] != name or missing in expected or actual != expected:
         raise RuntimeError("catalog publication read-back did not match its receipt")
     return observed
-
-
-class CatalogCompat:
-    """Adapter that lets a provider written against the PRE-scale CatalogProvider protocol (only
-    list_tables/get_table/… — no list_page/facets/browse/search/set_metadata) keep working behind the
-    new discovery routes. `reg.set_catalog` wraps such providers automatically. The fallbacks realize
-    one bounded list_tables() call and filter in Python — the OLD provider's own cost model, so
-    nothing regresses; a provider that wants pushdown implements the new methods and skips the shim.
-    Everything the inner provider DOES have passes straight through (__getattr__)."""
-
-    _FALLBACK_CAP = 5000  # matches LIST_TABLES_CAP — the old surface was already bounded by this
-
-    def __init__(self, inner):
-        self._inner = inner
-        self.name = getattr(inner, "name", "catalog")
-
-    def __getattr__(self, attr):
-        return getattr(self._inner, attr)
-
-    def _all(self, q: str | None) -> list[CatalogTable]:
-        return list(self._inner.list_tables(q) or [])[: self._FALLBACK_CAP]
-
-    @staticmethod
-    def _matches(t: CatalogTable, query: CatalogQuery) -> bool:
-        if query.folder:
-            f = query.folder.strip("/")
-            tf = (t.folder or "").strip("/")
-            if tf != f and not tf.startswith(f + "/"):
-                return False
-        if query.uris and t.uri not in query.uris:
-            return False
-        if query.owner and t.owner != query.owner:
-            return False
-        have_tags = set(t.tags or [])
-        if any(tag not in have_tags for tag in query.tags):
-            return False
-        have_cols = {c.name for c in (t.columns or [])}
-        return not any(c not in have_cols for c in query.has_columns)
-
-    def list_page(self, query: CatalogQuery) -> CatalogPage:
-        if hasattr(self._inner, "list_page"):
-            return self._inner.list_page(query)
-        items = [t for t in self._all(query.q) if self._matches(t, query)]
-        keys = {"name": lambda t: (t.name or "").lower(), "rows": lambda t: t.row_count or 0,
-                "usage": lambda t: getattr(t, "usage", 0) or 0, "folder": lambda t: (t.folder or "").lower(),
-                "updated": lambda t: getattr(t, "updated_at", None) or ""}
-        items.sort(key=keys.get(query.sort, keys["name"]), reverse=query.order == "desc")
-        window = items[query.offset:query.offset + query.limit]
-        return CatalogPage(items=window, total=len(items), offset=query.offset, limit=query.limit,
-                           has_more=query.offset + len(window) < len(items))
-
-    def facets(self, query: CatalogQuery) -> Facets:
-        if hasattr(self._inner, "facets"):
-            return self._inner.facets(query)
-        from collections import Counter
-        items = [t for t in self._all(query.q) if self._matches(t, query)]
-        folders = Counter((t.folder or "").strip("/") for t in items if t.folder)
-        owners = Counter(t.owner for t in items if t.owner)
-        tags = Counter(tag for t in items for tag in (t.tags or []))
-        fv = lambda c: [FacetValue(value=v, count=n) for v, n in c.most_common(100)]  # noqa: E731
-        return Facets(folders=fv(folders), tags=fv(tags), owners=fv(owners))
-
-    def browse(self, prefix: str = "") -> CatalogBrowse:
-        if hasattr(self._inner, "browse"):
-            return self._inner.browse(prefix)
-        p = (prefix or "").strip("/")
-        depth = 0 if not p else p.count("/") + 1
-        items = self._all(None)
-        children: dict[str, int] = {}
-        direct: list[CatalogTable] = []
-        for t in items:
-            f = (t.folder or "").strip("/")
-            if f == p:
-                direct.append(t)
-                continue
-            if p and not f.startswith(p + "/"):
-                continue
-            segs = f.split("/") if f else []
-            if len(segs) > depth:
-                cp = "/".join(segs[: depth + 1])
-                children[cp] = children.get(cp, 0) + 1
-        return CatalogBrowse(
-            prefix=p,
-            folders=[FolderNode(name=cp.split("/")[-1], path=cp, table_count=n)
-                     for cp, n in sorted(children.items(), key=lambda kv: kv[0].lower())],
-            tables=sorted(direct, key=lambda t: (t.name or "").lower())[:100],
-            total_tables=len(direct), truncated=len(direct) > 100)
-
-    def search(self, q: str, mode: str = "hybrid", limit: int = 50,
-               *, query: CatalogQuery | None = None) -> list[CatalogTable]:
-        effective = (query or CatalogQuery()).model_copy(update={
-            "q": q, "limit": limit, "offset": 0,
-        })
-        if hasattr(self._inner, "search"):
-            search = self._inner.search
-            try:
-                params = inspect.signature(search).parameters.values()
-                accepts_query = any(p.name == "query" or p.kind == inspect.Parameter.VAR_KEYWORD
-                                    for p in params)
-            except (TypeError, ValueError):
-                accepts_query = False
-            hits = list((search(q, mode=mode, limit=limit, query=effective)
-                         if accepts_query else search(q, mode=mode, limit=limit)) or [])
-            return [t for t in hits if self._matches(t, effective)][:limit]
-        return [t for t in self._all(q) if self._matches(t, effective)][:limit]
-
-    def search_modes(self) -> list[str]:
-        fn = getattr(self._inner, "search_modes", None)
-        return fn() if callable(fn) else ["lexical"]
-
-    def set_metadata(self, uri: str, **kwargs) -> CatalogTable:
-        fn = getattr(self._inner, "set_metadata", None)
-        if callable(fn):
-            return fn(uri, **kwargs)
-        raise NotImplementedError(f"catalog provider '{self.name}' does not support curation")
-
-    def lineage(self, uri: str, depth: int = DEFAULT_LINEAGE_DEPTH,
-                max_nodes: int = DEFAULT_LINEAGE_MAX_NODES) -> LineageResult:
-        try:
-            return self._inner.lineage(uri, depth=depth, max_nodes=max_nodes)
-        except TypeError:  # old signature: lineage(uri)
-            return self._inner.lineage(uri)
-
-
-def search_with_query(provider, query: CatalogQuery, mode: str, limit: int) -> list[CatalogTable]:
-    """Invoke the structured search contract without breaking an older scaled provider.
-
-    New providers receive the complete query and can filter before ranking. A provider that still has
-    the legacy ``search(q, mode, limit)`` signature is filtered over its bounded result as a compatibility
-    fallback; it remains usable, but should adopt ``query=`` to avoid top-k underfill.
-    """
-    search = provider.search
-    try:
-        params = inspect.signature(search).parameters.values()
-        accepts_query = any(p.name == "query" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
-    except (TypeError, ValueError):
-        accepts_query = False
-    hits = list((search(query.q or "", mode=mode, limit=limit, query=query)
-                 if accepts_query else search(query.q or "", mode=mode, limit=limit)) or [])
-    return [t for t in hits if CatalogCompat._matches(t, query)][:limit]

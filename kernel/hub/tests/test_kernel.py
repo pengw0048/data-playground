@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from hub.deps import get_deps
 from hub.main import app
+from hub.models import CatalogQuery
 
 client = TestClient(app)
 
@@ -357,8 +358,9 @@ def test_full_run_of_a_non_write_target_materializes_an_inspectable_result():
     assert client.get(f"/api/run/{st['runId']}").json()["outputUri"] == uri
     # but the ephemeral result artifact must NOT be re-cataloged into the Tables view on restart
     from hub.deps import get_deps
-    assert not any("__result_" in t.uri for t in get_deps().catalog.list_tables(None))
-    assert not any(t.uri == uri for t in get_deps().catalog.list_tables(None))
+    tables = get_deps().catalog.list_page(CatalogQuery(limit=5000)).items
+    assert not any("__result_" in t.uri for t in tables)
+    assert not any(t.uri == uri for t in tables)
 
 
 def test_transform_arrow_batches():
@@ -3960,7 +3962,8 @@ def test_headless_timeout_cancels_waits_and_never_publishes(tmp_path, monkeypatc
     assert not os.path.exists(output_uri)
     time.sleep(0.2)
     assert not os.path.exists(output_uri), "a cancelled attempt published after the CLI returned"
-    assert not any(t.name == table_name for t in d.catalog.list_tables(None))
+    assert not any(t.name == table_name
+                   for t in d.catalog.list_page(CatalogQuery(limit=5000)).items)
 
 
 def test_headless_timeout_stops_isolated_child_without_late_publish(tmp_path, capsys):
@@ -4010,7 +4013,8 @@ def test_headless_timeout_stops_isolated_child_without_late_publish(tmp_path, ca
     assert not os.path.exists(output_uri)
     time.sleep(0.2)
     assert not os.path.exists(output_uri), "the reaped child published after the CLI returned"
-    assert not any(t.name == table_name for t in d.catalog.list_tables(None))
+    assert not any(t.name == table_name
+                   for t in d.catalog.list_page(CatalogQuery(limit=5000)).items)
 
 
 def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, capsys):
@@ -4079,7 +4083,8 @@ def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, ca
     assert metadb.get_run_state(run_id)["status"] == "cancelled"
     assert not os.path.exists(output_uri)
     assert set(glob.glob(os.path.join(region_root, "*"))) == before, "cancelled handoff published late"
-    assert not any(t.name == table_name for t in d.catalog.list_tables(None))
+    assert not any(t.name == table_name
+                   for t in d.catalog.list_page(CatalogQuery(limit=5000)).items)
 
 
 def test_local_overwrite_cancel_fence_preserves_previous_output(tmp_path):
@@ -5403,7 +5408,7 @@ def test_plugin_capability_detector_tags_columns():
 
 def test_sql_catalog_reference_plugin(tmp_path):
     # the shipped examples/plugins/dp_sql_catalog SqlCatalog surfaces datasets from a SQL (name, uri)
-    # table — the read-external catalog pattern: overrides list_tables/get_table, inherits resolve_ref +
+    # table — the read-external catalog pattern: overrides bounded reads, inherits resolve_ref +
     # the KeyError-on-miss contract. Proves the CatalogProvider seam end-to-end (SQLite; no extra dep).
     import importlib.util
     from pathlib import Path
@@ -5427,7 +5432,7 @@ def test_sql_catalog_reference_plugin(tmp_path):
 
     cat = mod.SqlCatalog(str(tmp_path / "empty"), get_deps().resolve_adapter, dburl, "datasets")
     assert isinstance(cat, __import__("hub.backends", fromlist=["CatalogProvider"]).CatalogProvider)
-    assert "sales" in {t.name for t in cat.list_tables(None)}
+    assert "sales" in {t.name for t in cat.list_page(CatalogQuery(limit=5000)).items}
     t = cat.get_table("sales")
     assert t.uri == p and {c.name for c in t.columns} == {"id", "amt"} and t.row_count == 5
     assert cat.resolve_ref("sales") == p          # inherited: bare name → uri
@@ -5712,7 +5717,8 @@ def test_catalog_entries_are_shared_across_instances(tmp_path):
     # a FRESH catalog with an empty data_dir (a different web instance) seeds nothing locally, but loads
     # the entry from the shared DB on read
     other = InMemoryCatalog(str(tmp_path / "empty_dir"), deps.resolve_adapter)
-    assert "shared_out_x" in [t.name for t in other.list_tables(None)]
+    assert "shared_out_x" in [
+        t.name for t in other.list_page(CatalogQuery(limit=5000)).items]
     assert other.get_table("shared_out_x").uri == uri
 
 
@@ -5736,7 +5742,8 @@ def test_catalog_reflects_updates_and_deletions_across_instances(tmp_path):
     assert deps.catalog.unregister("conv_ds") is True
     with pytest.raises(KeyError):
         peer.get_table("conv_ds")
-    assert "conv_ds" not in [t.name for t in peer.list_tables(None)]
+    assert "conv_ds" not in [
+        t.name for t in peer.list_page(CatalogQuery(limit=5000)).items]
 
 
 def test_pipelines_import_reports_not_configured():
@@ -7161,7 +7168,8 @@ def test_written_outputs_reregister_on_restart(tmp_path):
     uri = d1.storage.output_uri("myout", ".parquet")
     duckdb.connect(":memory:").execute(f"COPY (SELECT 1 AS x) TO '{uri}' (FORMAT PARQUET)")
     d2 = Deps(ws, data)  # simulate restart
-    assert "myout" in [t.name for t in d2.catalog.list_tables(None)]
+    assert "myout" in [
+        t.name for t in d2.catalog.list_page(CatalogQuery(limit=5000)).items]
 
 
 def test_section_runs_its_parentid_children(tmp_path):
