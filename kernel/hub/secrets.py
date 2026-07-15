@@ -15,6 +15,7 @@ back into settings, API responses, logs, telemetry, or job payloads.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -27,40 +28,55 @@ SCALAR_SECRET_KEYS = frozenset({"agentApiKey"})
 Resolver = Callable[[str], str]
 
 _resolvers: dict[str, Resolver] = {}
+_SECRET_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*")
 
 
 class SecretResolveError(RuntimeError):
     """Raised when a secret reference cannot be resolved (missing env, unreadable file, unknown scheme)."""
 
 
+def _canonical_secret_scheme(scheme: Any) -> str | None:
+    """Return one case-insensitive RFC URI scheme, or None when the name is malformed."""
+    if not isinstance(scheme, str) or _SECRET_SCHEME_RE.fullmatch(scheme) is None:
+        return None
+    return scheme.lower()
+
+
+def _split_secret_ref(value: Any) -> tuple[str, str] | None:
+    if not isinstance(value, str):
+        return None
+    scheme, separator, rest = value.partition(":")
+    canonical = _canonical_secret_scheme(scheme)
+    if not separator or not rest or canonical is None:
+        return None
+    return canonical, rest
+
+
 def is_secret_ref(value: Any) -> bool:
     """True when ``value`` looks like a ``scheme:rest`` secret reference string."""
-    if not isinstance(value, str) or ":" not in value:
-        return False
-    scheme, _, rest = value.partition(":")
-    return bool(scheme) and bool(rest) and scheme.isidentifier()
+    return _split_secret_ref(value) is not None
 
 
 def parse_secret_ref(value: str) -> tuple[str, str]:
     """Split ``scheme:rest``; raises ``SecretResolveError`` if the shape is wrong."""
-    if not is_secret_ref(value):
+    parsed = _split_secret_ref(value)
+    if parsed is None:
         raise SecretResolveError(
             f"not a secret reference (expected env:VAR or file:/path, got {value!r})")
-    scheme, _, rest = value.partition(":")
-    return scheme.lower(), rest
+    return parsed
 
 
-def register_resolver(scheme: str, resolver: Resolver, *, replace: bool = False) -> None:
+def register_resolver(scheme: str, resolver: Resolver) -> None:
     """Register a resolver for ``scheme:…`` references.
 
     Built-in schemes are ``env`` and ``file``. Plugins call this (or
     ``Registry.add_secret_resolver``) during ``register(reg)`` to add private or third-party backends
     without changing core.
     """
-    key = scheme.lower().strip()
-    if not key or not key.isidentifier():
+    key = _canonical_secret_scheme(scheme)
+    if key is None:
         raise ValueError(f"invalid secret-reference scheme: {scheme!r}")
-    if key in _resolvers and not replace and _resolvers[key] is not resolver:
+    if key in _resolvers and _resolvers[key] is not resolver:
         raise ValueError(f"secret-reference scheme {key!r} is already registered")
     _resolvers[key] = resolver
 
@@ -68,7 +84,10 @@ def register_resolver(scheme: str, resolver: Resolver, *, replace: bool = False)
 def unregister_resolver(scheme: str) -> None:
     """Remove a previously registered resolver (tests / plugin unload). Built-ins can be restored
     with ``ensure_builtin_resolvers()``."""
-    _resolvers.pop(scheme.lower().strip(), None)
+    key = _canonical_secret_scheme(scheme)
+    if key is None:
+        raise ValueError(f"invalid secret-reference scheme: {scheme!r}")
+    _resolvers.pop(key, None)
 
 
 def list_schemes() -> tuple[str, ...]:
