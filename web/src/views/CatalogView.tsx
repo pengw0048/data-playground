@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../store/graph'
 import { api } from '../api/client'
 import { color, radius } from '../theme/tokens'
@@ -554,8 +554,9 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
     path: string; revision: number; sourceIdentity: KernelInfo | null; generation: number; controller: AbortController
   } | null>(null)
   const mounted = useRef(false)
-  const currentIdentity = useRef({ path: node.path, revision, sourceIdentity, open })
-  currentIdentity.current = { path: node.path, revision, sourceIdentity, open }
+  const currentIdentity = useRef<{
+    path: string; revision: number; sourceIdentity: KernelInfo | null; open: boolean
+  } | null>(null)
   const isSel = selected === node.path
 
   const invalidateChildRequest = useCallback(() => {
@@ -564,13 +565,19 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
     activeRequest.current = null
   }, [])
 
-  useEffect(() => {
+  // Request authority belongs to the committed branch identity. Never publish render-phase props to
+  // this ref: concurrent React may abandon that render after this branch has run, and an in-flight
+  // response must still be judged against the identity users actually see. Layout cleanup fences and
+  // aborts the previous committed identity before a replacement identity can become authoritative.
+  useLayoutEffect(() => {
     mounted.current = true
+    currentIdentity.current = { path: node.path, revision, sourceIdentity, open }
     return () => {
+      currentIdentity.current = null
       mounted.current = false
       invalidateChildRequest()
     }
-  }, [invalidateChildRequest])
+  }, [invalidateChildRequest, node.path, open, revision, sourceIdentity])
 
   const loadKids = useCallback(async () => {
     invalidateChildRequest()
@@ -582,14 +589,18 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
       controller: new AbortController(),
     }
     activeRequest.current = request
-    const isCurrent = () => mounted.current
-      && activeRequest.current === request
-      && request.generation === requestGeneration.current
-      && !request.controller.signal.aborted
-      && currentIdentity.current.path === request.path
-      && currentIdentity.current.revision === request.revision
-      && currentIdentity.current.sourceIdentity === request.sourceIdentity
-      && currentIdentity.current.open
+    const isCurrent = () => {
+      const identity = currentIdentity.current
+      return mounted.current
+        && activeRequest.current === request
+        && request.generation === requestGeneration.current
+        && !request.controller.signal.aborted
+        && identity !== null
+        && identity.path === request.path
+        && identity.revision === request.revision
+        && identity.sourceIdentity === request.sourceIdentity
+        && identity.open
+    }
     setLoading(true); setError(null)
     try {
       const browse = await api.catalogTree(request.path, { signal: request.controller.signal })
@@ -614,7 +625,12 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
     }
   }, [invalidateChildRequest, node.path, revision, sourceIdentity])
 
-  const expand = () => onToggleExpand(node.path)
+  const expand = () => {
+    // Collapse revokes this generation in the event handler, before React schedules/commits the new
+    // closed identity. The layout cleanup below remains the authoritative fence for every other change.
+    if (open) invalidateChildRequest()
+    onToggleExpand(node.path)
+  }
   // Expansion is path-owned by FolderTree. Hydrate a rename-remounted branch whose new path stays open,
   // and refresh a branch that changed while collapsed before showing its cached children again.
   useEffect(() => {

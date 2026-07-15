@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ReactNode } from 'react'
+import { Suspense, startTransition, type ReactNode } from 'react'
 import type { CatalogTable } from '../types/api'
 
 const mocks = vi.hoisted(() => ({
@@ -406,6 +406,43 @@ describe('CatalogView folder child request identity', () => {
     await act(async () => { oldProvider.resolve(tree('A', ['A/old-provider'])); await oldProvider.promise })
     expect(screen.queryByText('📁 old-provider')).toBeNull()
     expect(screen.getByText('📁 new-provider')).toBeInTheDocument()
+  })
+
+  it('lets the committed provider request finish when a newer provider render is abandoned', async () => {
+    const committedBranch = deferred<ReturnType<typeof tree>>()
+    const blockedRender = deferred<void>()
+    let blockCommit = false
+    mocks.catalogTree.mockImplementation((prefix: string) => {
+      if (!prefix) return Promise.resolve(tree('', ['A']))
+      return committedBranch.promise
+    })
+    function BlockAfterCatalog() {
+      if (blockCommit) throw blockedRender.promise
+      return null
+    }
+    function Shell({ version }: { version: number }) {
+      return <Suspense fallback={<div data-testid="blocked-provider-render">blocked {version}</div>}>
+        <CatalogView />
+        <BlockAfterCatalog />
+      </Suspense>
+    }
+    const view = render(<Shell version={0} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
+    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledWith('A', expect.anything()))
+
+    blockCommit = true
+    store.kernelInfo = { capabilities: ['catalog.folder_mutation'] }
+    await act(async () => {
+      startTransition(() => view.rerender(<Shell version={1} />))
+    })
+    expect(screen.queryByTestId('blocked-provider-render')).toBeNull()
+
+    await act(async () => {
+      committedBranch.resolve(tree('A', ['A/committed-provider']))
+      await committedBranch.promise
+    })
+    expect(await screen.findByText('📁 committed-provider')).toBeInTheDocument()
   })
 
   it('aborts an old-path request after rename and hydrates the remapped expanded branch', async () => {
