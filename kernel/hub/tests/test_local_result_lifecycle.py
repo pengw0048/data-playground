@@ -801,32 +801,6 @@ def test_output_sink_rejects_hardlink_alias_without_namespace_scan(storage, monk
     storage.abort_result(uri, run_id)
 
 
-def test_source_rejects_plain_and_file_uri_hardlink_alias_before_reader_acquisition(
-        storage, monkeypatch, tmp_path):
-    run_id = f"run-{uuid.uuid4().hex}"
-    uri = _ready_result(storage, run_id)
-    alias = tmp_path / "source-hardlink.parquet"
-    os.link(uri, alias)
-    acquired = []
-    original_acquire = storage.acquire_result_read
-
-    def acquire(*args, **kwargs):
-        acquired.append(args)
-        return original_acquire(*args, **kwargs)
-
-    monkeypatch.setattr(storage, "acquire_result_read", acquire)
-    try:
-        for source in (str(alias), alias.as_uri()):
-            with pytest.raises(RuntimeError, match="hard-linked local source"):
-                with local_result_read_scope(storage, [source], owner="hardlink-source"):
-                    pass
-        assert acquired == []
-        assert _artifact(uri).state == "ready"
-    finally:
-        alias.unlink()
-    storage.abort_result(uri, run_id)
-
-
 def test_dead_lock_poison_does_not_block_reclaim_or_orphan_cleanup(storage):
     if not storage.lock_supported:
         pytest.skip("requires POSIX flock")

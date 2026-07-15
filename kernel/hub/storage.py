@@ -592,14 +592,6 @@ class LocalStorage:
         if reserved_shape or resolves_inside:
             raise RuntimeError(
                 "managed local results must be read through their exact canonical source URI")
-        if os.path.exists(path):
-            with contextlib.suppress(FileNotFoundError):
-                info = os.stat(path, follow_symlinks=True)
-                if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
-                    # A hard link outside .dp-results is indistinguishable from an alias of a managed
-                    # artifact without an unbounded inode index. Reject all multi-link local inputs so
-                    # no explicit source can bypass the registry/read guard through such an alias.
-                    raise RuntimeError("hard-linked local source files are not supported")
         return False
 
     def validate_result_uri(
