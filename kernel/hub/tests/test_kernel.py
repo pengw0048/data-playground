@@ -4212,15 +4212,95 @@ def test_run_log_reference_plugin_appends_finished_runs(tmp_path, monkeypatch):
     assert lines[0]["status"] == "done" and lines[1]["status"] == "failed"
 
 
-def test_collab_relay_broadcasts_and_leave():
+def test_collab_relay_broadcasts_and_leave(live_collab_url):
     # the collab room relays a peer's message to others and tells them when a peer leaves
-    with client.websocket_connect("/ws/collab/room1") as b:
-        with client.websocket_connect("/ws/collab/room1") as a:
-            a.send_json({"clientId": "A", "type": "presence", "name": "Ann"})
-            got = b.receive_json()
-            assert got["clientId"] == "A" and got["type"] == "presence"
-        leave = b.receive_json()  # a disconnected → b is told to drop A
-        assert leave == {"type": "leave", "clientId": "A"}
+    import asyncio
+    import websockets
+
+    async def scenario() -> None:
+        url = live_collab_url.replace("http://", "ws://") + "/ws/collab/room1"
+        async with websockets.connect(url, proxy=None) as b:
+            assert await _collab_recv(b) == {"type": "room-state", "peerCount": 0}
+            async with websockets.connect(url, proxy=None) as a:
+                assert await _collab_recv(a) == {"type": "room-state", "peerCount": 1}
+                await _collab_send(a, {"clientId": "A", "type": "presence", "name": "Ann"})
+                got = await _collab_recv(b)
+                assert got["clientId"] == "A" and got["type"] == "presence"
+            assert await _collab_recv(b) == {"type": "leave", "clientId": "A"}
+            assert await _collab_recv(b) == {"type": "room-state", "peerCount": 0}
+
+    asyncio.run(scenario())
+
+
+def test_collab_room_state_tracks_first_and_last_peer(live_collab_url):
+    # The relay, not client timing, is authoritative about whether a new socket has peer state to ask for.
+    import asyncio
+    import websockets
+
+    async def scenario() -> None:
+        url = live_collab_url.replace("http://", "ws://") + "/ws/collab/room-state"
+        async with websockets.connect(url, proxy=None) as first:
+            assert await _collab_recv(first) == {"type": "room-state", "peerCount": 0}
+            async with websockets.connect(url, proxy=None) as second:
+                assert await _collab_recv(second) == {"type": "room-state", "peerCount": 1}
+            assert await _collab_recv(first) == {"type": "room-state", "peerCount": 0}
+        async with websockets.connect(url, proxy=None) as fresh:
+            assert await _collab_recv(fresh) == {"type": "room-state", "peerCount": 0}
+
+    asyncio.run(scenario())
+
+
+def test_collab_handshake_relays_sync_through_reconnect(live_collab_url):
+    # This is intentionally frame-level: the relay remains agnostic to opaque Yjs payloads while a
+    # second client deterministically requests A's state on initial join and reconnect, with no sleeps.
+    import asyncio
+    import websockets
+
+    async def scenario() -> None:
+        url = live_collab_url.replace("http://", "ws://") + "/ws/collab/sync-reconnect"
+        async with websockets.connect(url, proxy=None) as a:
+            assert await _collab_recv(a) == {"type": "room-state", "peerCount": 0}
+            async with websockets.connect(url, proxy=None) as b:
+                assert await _collab_recv(b) == {"type": "room-state", "peerCount": 1}
+                await _collab_send(b, {"clientId": "B", "type": "ysync", "requestId": "b-sync", "sv": "b-state"})
+                assert await _collab_recv(a) == {"clientId": "B", "type": "ysync", "requestId": "b-sync", "sv": "b-state"}
+                await _collab_send(a, {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True, "replyTo": "b-sync", "targetId": "B"})
+                assert await _collab_recv(b) == {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True, "replyTo": "b-sync", "targetId": "B"}
+            assert await _collab_recv(a) == {"type": "leave", "clientId": "B"}
+            assert await _collab_recv(a) == {"type": "room-state", "peerCount": 0}
+            async with websockets.connect(url, proxy=None) as b_reconnected:
+                assert await _collab_recv(b_reconnected) == {"type": "room-state", "peerCount": 1}
+                await _collab_send(b_reconnected, {"clientId": "B2", "type": "ysync", "requestId": "b2-sync", "sv": "b2-state"})
+                assert await _collab_recv(a) == {"clientId": "B2", "type": "ysync", "requestId": "b2-sync", "sv": "b2-state"}
+                await _collab_send(a, {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True, "replyTo": "b2-sync", "targetId": "B2"})
+                assert await _collab_recv(b_reconnected) == {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True, "replyTo": "b2-sync", "targetId": "B2"}
+
+    asyncio.run(scenario())
+
+
+def test_collab_room_state_unblocks_joiner_when_unannounced_peer_vanishes(live_collab_url):
+    # A peer can disconnect before sending a clientId, so leave alone cannot unblock a waiting joiner.
+    # room-state is still sent; the now-ready joiner can then serve a later peer's sync request.
+    import asyncio
+    import websockets
+
+    async def scenario() -> None:
+        url = live_collab_url.replace("http://", "ws://") + "/ws/collab/vanished-peer"
+        async with websockets.connect(url, proxy=None) as peer:
+            assert await _collab_recv(peer) == {"type": "room-state", "peerCount": 0}
+            async with websockets.connect(url, proxy=None) as joiner:
+                assert await _collab_recv(joiner) == {"type": "room-state", "peerCount": 1}
+                await peer.close()
+                assert await _collab_recv(joiner) == {"type": "room-state", "peerCount": 0}
+                await _collab_send(joiner, {"clientId": "J", "type": "yjs", "update": "J-edit"})
+                async with websockets.connect(url, proxy=None) as later:
+                    assert await _collab_recv(later) == {"type": "room-state", "peerCount": 1}
+                    await _collab_send(later, {"clientId": "L", "type": "ysync", "requestId": "later-sync", "sv": "later-state"})
+                    assert await _collab_recv(joiner) == {"clientId": "L", "type": "ysync", "requestId": "later-sync", "sv": "later-state"}
+                    await _collab_send(joiner, {"clientId": "J", "type": "yjs", "update": "J-edit", "sync": True, "replyTo": "later-sync", "targetId": "L"})
+                    assert await _collab_recv(later) == {"clientId": "J", "type": "yjs", "update": "J-edit", "sync": True, "replyTo": "later-sync", "targetId": "L"}
+
+    asyncio.run(scenario())
 
 
 def test_collab_ws_requires_auth_when_enabled(monkeypatch):
@@ -5044,7 +5124,9 @@ def test_collab_relay_gates_viewer_doc_updates(monkeypatch, live_collab_url):
     async def scenario() -> None:
         ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
         async with websockets.connect(ws_url, additional_headers={"Cookie": f"dp_session={auth.sign('editor_u')}"}, proxy=None) as ed:
+            assert await _collab_recv(ed) == {"type": "room-state", "peerCount": 0}
             async with websockets.connect(ws_url, additional_headers={"Cookie": f"dp_session={auth.sign('viewer_u')}"}, proxy=None) as vw:
+                assert await _collab_recv(vw) == {"type": "room-state", "peerCount": 1}
                 await _collab_send(vw, {"clientId": "V", "type": "yjs", "update": "AAAA"})
                 await _collab_send(vw, {"clientId": "V", "type": "presence", "name": "Val"})
                 got = await _collab_recv(ed)
@@ -5052,6 +5134,113 @@ def test_collab_relay_gates_viewer_doc_updates(monkeypatch, live_collab_url):
                 await _collab_send(ed, {"clientId": "E", "type": "yjs", "update": "BBBB"})
                 got2 = await _collab_recv(vw)
                 assert got2["type"] == "yjs" and got2["clientId"] == "E"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_room_state_excludes_viewer_only_sync_peers(monkeypatch, live_collab_url):
+    # A viewer receives ysync requests but cannot return a Yjs frame, so an editor joining a
+    # viewer-only room must hydrate immediately instead of waiting for an impossible reply.
+    import asyncio
+    import websockets
+    from hub import auth, metadb
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    cid = "cvs_viewer_first_sync"
+    _provision_private_collab_canvas(cid, "owner_u", "editor_u", "viewer_u")
+    metadb.share_canvas(cid, "editor_u", "editor")
+    metadb.share_canvas(cid, "viewer_u", "viewer")
+    viewer_cookie = f"dp_session={auth.sign('viewer_u')}"
+    editor_cookie = f"dp_session={auth.sign('editor_u')}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(
+            ws_url, additional_headers={"Cookie": viewer_cookie}, proxy=None,
+        ) as viewer:
+            assert await _collab_recv(viewer) == {"type": "room-state", "peerCount": 0}
+            async with websockets.connect(
+                ws_url, additional_headers={"Cookie": editor_cookie}, proxy=None,
+            ) as editor:
+                assert await _collab_recv(editor) == {"type": "room-state", "peerCount": 0}
+                await _collab_send(editor, {
+                    "clientId": "E", "type": "ysync", "requestId": "editor-sync", "sv": "state",
+                })
+                assert await _collab_recv(viewer) == {
+                    "clientId": "E", "type": "ysync", "requestId": "editor-sync", "sv": "state",
+                }
+                # A viewer cannot use a correlated reply to launder a document write through editor.
+                await _collab_send(viewer, {
+                    "clientId": "V", "type": "yjs", "update": "BLOCKED", "sync": True,
+                    "replyTo": "editor-sync", "targetId": "E",
+                })
+                await _collab_send(viewer, {"clientId": "V", "type": "presence", "name": "Val"})
+                assert await _collab_recv(editor) == {"type": "room-state", "peerCount": 0}
+                assert await _collab_recv(editor) == {
+                    "clientId": "V", "type": "presence", "name": "Val",
+                }
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
+def test_collab_room_state_rechecks_downgraded_sync_responder(monkeypatch, live_collab_url):
+    # A joiner must not remain blocked on a peer that was an editor when counted but became a viewer
+    # before answering. The rejected reply refreshes room-state without relaying viewer document data.
+    import asyncio
+    import httpx
+    import websockets
+    from hub import auth, metadb
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    cid = "cvs_sync_responder_downgrade"
+    owner_uid, joiner_uid, responder_uid = "owner_sd", "joiner_sd", "responder_sd"
+    _provision_private_collab_canvas(cid, owner_uid, joiner_uid, responder_uid)
+    metadb.share_canvas(cid, joiner_uid, "editor")
+    metadb.share_canvas(cid, responder_uid, "editor")
+    owner_cookie = f"dp_session={auth.sign(owner_uid)}"
+    joiner_cookie = f"dp_session={auth.sign(joiner_uid)}"
+    responder_cookie = f"dp_session={auth.sign(responder_uid)}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(
+            ws_url, additional_headers={"Cookie": responder_cookie}, proxy=None,
+        ) as responder:
+            assert await _collab_recv(responder) == {"type": "room-state", "peerCount": 0}
+            async with websockets.connect(
+                ws_url, additional_headers={"Cookie": joiner_cookie}, proxy=None,
+            ) as joiner:
+                assert await _collab_recv(joiner) == {"type": "room-state", "peerCount": 1}
+                await _collab_send(joiner, {
+                    "clientId": "J", "type": "ysync", "requestId": "joiner-sync", "sv": "state",
+                })
+                assert await _collab_recv(responder) == {
+                    "clientId": "J", "type": "ysync", "requestId": "joiner-sync", "sv": "state",
+                }
+
+                async with httpx.AsyncClient(
+                    base_url=live_collab_url, headers={"Cookie": owner_cookie},
+                ) as http:
+                    response = await http.post(
+                        f"/api/canvas/{cid}/share", json={"userId": responder_uid, "role": "viewer"},
+                    )
+                assert response.status_code == 200
+
+                await _collab_send(responder, {
+                    "clientId": "R", "type": "yjs", "update": "BLOCKED", "sync": True,
+                    "replyTo": "joiner-sync", "targetId": "J",
+                })
+                await _collab_send(responder, {"clientId": "R", "type": "presence", "name": "viewer"})
+                assert await _collab_recv(joiner) == {"type": "room-state", "peerCount": 0}
+                assert await _collab_recv(joiner) == {
+                    "clientId": "R", "type": "presence", "name": "viewer",
+                }
 
     try:
         asyncio.run(scenario())
@@ -5076,7 +5265,9 @@ def test_collab_rechecks_editor_downgrade_on_the_same_socket(monkeypatch, live_c
     async def scenario() -> None:
         ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
         async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner:
+            assert await _collab_recv(owner) == {"type": "room-state", "peerCount": 0}
             async with websockets.connect(ws_url, additional_headers={"Cookie": editor_cookie}, proxy=None) as editor:
+                assert await _collab_recv(editor) == {"type": "room-state", "peerCount": 1}
                 async with httpx.AsyncClient(base_url=live_collab_url, headers={"Cookie": owner_cookie}) as http:
                     response = await http.post(f"/api/canvas/{cid}/share", json={"userId": editor_uid, "role": "viewer"})
                 assert response.status_code == 200
@@ -5114,9 +5305,13 @@ def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_
     async def scenario() -> None:
         ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
         async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner_a:
+            assert await _collab_recv(owner_a) == {"type": "room-state", "peerCount": 0}
             async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner_b:
+                assert await _collab_recv(owner_b) == {"type": "room-state", "peerCount": 1}
                 async with websockets.connect(ws_url, additional_headers={"Cookie": editor_cookie}, proxy=None) as removed_writer:
+                    assert await _collab_recv(removed_writer) == {"type": "room-state", "peerCount": 2}
                     async with websockets.connect(ws_url, additional_headers={"Cookie": editor_cookie}, proxy=None) as removed_reader:
+                        assert await _collab_recv(removed_reader) == {"type": "room-state", "peerCount": 3}
                         async with httpx.AsyncClient(base_url=live_collab_url, headers={"Cookie": owner_cookie}) as http:
                             response = await http.delete(f"/api/canvas/{cid}/share/{editor_uid}")
                         assert response.status_code == 200
@@ -5131,10 +5326,18 @@ def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_
                         for watcher in (owner_a, owner_b, removed_reader):
                             leave = await _collab_recv(watcher)
                             assert leave == {"type": "leave", "clientId": "RW"}
+                            expected_peers = 2 if watcher is removed_reader else 1
+                            assert await _collab_recv(watcher) == {
+                                "type": "room-state", "peerCount": expected_peers,
+                            }
 
                         await _collab_send(owner_b, {"clientId": "OB", "type": "yjs", "update": "AFTER_REMOVAL"})
-                        got = await _collab_recv(owner_a)
-                        assert got["type"] == "yjs" and got["update"] == "AFTER_REMOVAL"
+                        # Closing the revoked reader emits a peer-count update concurrently with
+                        # owner_b's relay frame, so either frame may arrive first at owner_a.
+                        got = [await _collab_recv(owner_a), await _collab_recv(owner_a)]
+                        assert {msg["type"] for msg in got} == {"room-state", "yjs"}
+                        assert {msg["peerCount"] for msg in got if msg["type"] == "room-state"} == {1}
+                        assert {msg["update"] for msg in got if msg["type"] == "yjs"} == {"AFTER_REMOVAL"}
                         with pytest.raises(ConnectionClosed) as reader_closed:
                             await _collab_recv(removed_reader)
                         assert reader_closed.value.rcvd and reader_closed.value.rcvd.code == 1008
@@ -5163,8 +5366,11 @@ def test_collab_logout_revokes_sender_and_recipient(monkeypatch, live_collab_url
     async def scenario() -> None:
         ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
         async with websockets.connect(ws_url, additional_headers={"Cookie": owner_cookie}, proxy=None) as owner:
+            assert await _collab_recv(owner) == {"type": "room-state", "peerCount": 0}
             async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as writer:
+                assert await _collab_recv(writer) == {"type": "room-state", "peerCount": 1}
                 async with websockets.connect(ws_url, additional_headers={"Cookie": revoked_cookie}, proxy=None) as reader:
+                    assert await _collab_recv(reader) == {"type": "room-state", "peerCount": 2}
                     async with httpx.AsyncClient(
                         base_url=live_collab_url, headers={"Cookie": revoked_cookie},
                     ) as http:
@@ -5181,6 +5387,8 @@ def test_collab_logout_revokes_sender_and_recipient(monkeypatch, live_collab_url
                     expected_leave = {"type": "leave", "clientId": "revoked-writer"}
                     assert await _collab_recv(owner) == expected_leave
                     assert await _collab_recv(reader) == expected_leave
+                    assert await _collab_recv(owner) == {"type": "room-state", "peerCount": 0}
+                    assert await _collab_recv(reader) == {"type": "room-state", "peerCount": 1}
 
                     await _collab_send(owner, {
                         "clientId": "owner", "type": "yjs", "update": "MUST_NOT_RECEIVE",

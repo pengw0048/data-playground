@@ -1,5 +1,5 @@
 import { useStore } from '../store/graph'
-import { startYSync, stopYSync, applyYUpdate, encodeYState, encodeYStateVector, yUpdateB64, hydrateIfEmpty, hasYState } from './ydoc'
+import { startYSync, stopYSync, applyYUpdate, encodeYState, encodeYStateVector, yUpdateB64, hydrateFromRoomState, markYSyncReady } from './ydoc'
 
 // Realtime collaboration over the kernel's per-canvas room (/ws/collab/{id}): PRESENCE (who's here +
 // live cursors) AND live co-editing (a Yjs CRDT — see ydoc.ts). One connection per open canvas, with
@@ -13,7 +13,8 @@ let ws: WebSocket | null = null
 let roomId = ''
 let cursorTimer: ReturnType<typeof setTimeout> | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
-let hydrateTimer: ReturnType<typeof setTimeout> | null = null
+let latestYSyncRequestId: string | null = null
+let ysyncRequestSequence = 0
 
 function myName(): string {
   return useStore.getState().currentUser?.name ?? 'Someone'
@@ -21,6 +22,11 @@ function myName(): string {
 
 function send(msg: Record<string, unknown>): void {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ...msg, clientId }))
+}
+
+function requestYSync(): void {
+  latestYSyncRequestId = `${clientId}:${++ysyncRequestSequence}`
+  send({ type: 'ysync', requestId: latestYSyncRequestId, sv: encodeYStateVector() })
 }
 
 function openSocket(canvasId: string): void {
@@ -34,18 +40,35 @@ function openSocket(canvasId: string): void {
   ws = sock
   sock.onopen = () => {
     send({ type: 'presence', name: myName(), color })   // announce arrival
-    send({ type: 'ysync', sv: encodeYStateVector() })   // ask peers for edits we're missing (CRDT sync step 1)
-    // if no peer has answered shortly, we're the first here → seed the shared doc from our snapshot
-    if (hydrateTimer) clearTimeout(hydrateTimer)
-    hydrateTimer = setTimeout(() => hydrateIfEmpty(), 800)
+    requestYSync()  // ask peers for edits we're missing (CRDT sync step 1)
   }
   sock.onmessage = (ev) => {
     let msg: any
     try { msg = JSON.parse(ev.data) } catch { return }
     if (!msg || msg.clientId === clientId) return
     const st = useStore.getState()
-    if (msg.type === 'yjs' && typeof msg.update === 'string') { applyYUpdate(msg.update); return }
-    if (msg.type === 'ysync') { if (hasYState()) send({ type: 'yjs', update: encodeYState(msg.sv) }); return }  // reply only if we have state (avoids empty-doc storms)
+    if (msg.type === 'room-state' && Number.isInteger(msg.peerCount) && msg.peerCount >= 0) {
+      hydrateFromRoomState(msg.peerCount)
+      return
+    }
+    if (msg.type === 'yjs' && typeof msg.update === 'string') {
+      // A sync response is broadcast by the relay, so only its intended requester may apply it or
+      // become ready. Ordinary live Yjs edits remain room-wide and are handled below.
+      if (msg.sync === true) {
+        if (msg.targetId !== clientId || msg.replyTo !== latestYSyncRequestId) return
+        applyYUpdate(msg.update)
+        markYSyncReady()  // a matching empty Y.Doc reply still confirms this request was answered
+        return
+      }
+      applyYUpdate(msg.update)
+      return
+    }
+    // Every peer acknowledges ysync, including an empty document. `replyTo` + `targetId` correlate
+    // that broadcast reply to the requester's latest state vector, so another joiner cannot unlock it.
+    if (msg.type === 'ysync' && typeof msg.requestId === 'string' && typeof msg.clientId === 'string') {
+      send({ type: 'yjs', update: encodeYState(msg.sv), sync: true, replyTo: msg.requestId, targetId: msg.clientId })
+      return
+    }
     if (msg.type === 'external-edit') { st.applyExternalEdit(msg.canvasId); return }  // an MCP agent edited this canvas out-of-band → refetch + apply live
     if (msg.type === 'leave') { st.dropPeer(msg.clientId); return }
     if (msg.type === 'presence') {
@@ -55,7 +78,7 @@ function openSocket(canvasId: string): void {
         color: msg.color ?? prev?.color ?? '#888',
         cursor: msg.cursor ?? prev?.cursor,  // a plain presence (no cursor) must not blank the cursor
       })
-      if (!prev) { send({ type: 'presence', name: myName(), color }); send({ type: 'ysync', sv: encodeYStateVector() }) }  // greet + resync
+      if (!prev) { send({ type: 'presence', name: myName(), color }); requestYSync() }  // greet + resync
     }
   }
   sock.onclose = () => {
@@ -78,8 +101,8 @@ export function connectCollab(canvasId: string): void {
 
 export function disconnectCollab(): void {
   roomId = ''
+  latestYSyncRequestId = null
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
-  if (hydrateTimer) { clearTimeout(hydrateTimer); hydrateTimer = null }
   useStore.getState().clearPeers()
   stopYSync()
   if (ws) {

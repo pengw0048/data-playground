@@ -438,9 +438,10 @@ async def ws_run(ws: WebSocket, run_id: str):
 
 
 # --- realtime collaboration: a broadcast room per canvas (presence + live doc updates) ---------- #
-# A dumb relay: clients hold the canvas; the server fans out each message (presence/cursor or a doc
-# update) to the room's other peers, and tells peers when someone leaves. This is a usable first
-# version (last-write-wins on the doc); a CRDT (Yjs) is the conflict-free hardening.
+# A dumb relay: clients hold the canvas; the server fans out presence/cursor and opaque Yjs CRDT
+# updates to the room's other peers. On join it sends {"type": "room-state", "peerCount": N}, where
+# N counts other owner/editor sockets that may legally answer Yjs sync; membership or role changes
+# refresh that count. This lets a browser seed only when no sync-capable peer exists.
 _collab_rooms: dict[str, set[WebSocket]] = {}
 _collab_ids: dict[WebSocket, str] = {}  # socket -> its clientId (for leave notifications)
 
@@ -488,6 +489,37 @@ async def _close_revoked_collab_peer(ws: WebSocket, room: set[WebSocket]) -> Non
         pass
 
 
+async def _sync_capable_peer_count(
+    room: set[WebSocket], canvas_id: str, *, exclude: WebSocket | None = None,
+) -> int:
+    """Count peers that can legally answer a Yjs sync request.
+
+    Viewers receive document updates and may request a sync themselves, but cannot send any Yjs
+    frame back through the relay. Including them in ``room-state.peerCount`` would make a joining
+    editor wait forever for a reply that the authorization gate must drop.
+    """
+    count = 0
+    for peer in list(room):
+        if peer is exclude:
+            continue
+        role = await _live_collab_role(peer, canvas_id)
+        if role in ("owner", "editor"):
+            count += 1
+    return count
+
+
+async def _broadcast_collab_room_state(room: set[WebSocket], canvas_id: str) -> None:
+    """Refresh each peer's count after a sync-capable socket leaves or loses write access."""
+    for peer in list(room):
+        if peer not in room:
+            continue
+        try:
+            peer_count = await _sync_capable_peer_count(room, canvas_id, exclude=peer)
+            await peer.send_json({"type": "room-state", "peerCount": peer_count})
+        except Exception:  # noqa: BLE001 — dead peers are removed like ordinary fan-out failures
+            room.discard(peer)
+
+
 @app.websocket("/ws/collab/{canvas_id}")
 async def ws_collab(ws: WebSocket, canvas_id: str):
     # when auth is enabled, the collab channel is gated exactly like the HTTP canvas routes: a valid
@@ -513,6 +545,8 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
     room.add(ws)
     _collab_sessions[ws] = _CollabSession(uid, token)
     try:
+        peer_count = await _sync_capable_peer_count(room, canvas_id, exclude=ws)
+        await ws.send_json({"type": "room-state", "peerCount": peer_count})
         while True:
             msg = await ws.receive_json()
             if isinstance(msg, dict) and msg.get("clientId"):
@@ -526,6 +560,11 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
                 # A viewer may request/read Yjs sync and send presence, but its own updates must never
                 # be relayed — otherwise an editor peer could merge + autosave a laundered write.
                 if msg_type == "yjs" and role not in ("owner", "editor"):
+                    # The socket may have been counted as a responder before an editor→viewer
+                    # downgrade. Its correlated reply is still blocked, but refresh the room so the
+                    # waiting requester can hydrate when no legal responder remains.
+                    if msg.get("sync") is True:
+                        await _broadcast_collab_room_state(room, canvas_id)
                     continue
             for peer in list(room):
                 if peer is not ws:
@@ -550,6 +589,9 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
                     await peer.send_json({"type": "leave", "clientId": cid})
                 except Exception:  # noqa: BLE001
                     room.discard(peer)
+        # This is deliberately independent of clientId: a peer can disappear before announcing
+        # presence, and a waiting joiner must still learn that no peer remains to answer ysync.
+        await _broadcast_collab_room_state(room, canvas_id)
         if not room:
             _collab_rooms.pop(canvas_id, None)
 

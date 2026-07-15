@@ -109,7 +109,9 @@ def test_workspace_explicit_viewer_is_read_only_in_list_put_and_collab(monkeypat
             owner_ws_headers = {"cookie": owner_headers["Cookie"]}
             viewer_ws_headers = {"cookie": viewer_headers["Cookie"]}
             with client.websocket_connect(f"/ws/collab/{canvas_id}", headers=owner_ws_headers) as owner_ws:
+                assert owner_ws.receive_json() == {"type": "room-state", "peerCount": 0}
                 with client.websocket_connect(f"/ws/collab/{canvas_id}", headers=viewer_ws_headers) as viewer_ws:
+                    assert viewer_ws.receive_json() == {"type": "room-state", "peerCount": 1}
                     viewer_ws.send_json({"clientId": "viewer", "type": "yjs", "update": "AAAA"})
                     viewer_ws.send_json({"clientId": "viewer", "type": "presence", "name": "Viewer"})
                     # Presence remains visible, but the preceding Yjs write is dropped by the same
