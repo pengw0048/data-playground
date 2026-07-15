@@ -54,11 +54,13 @@ need neither external credentials nor a private service.
 | Tier | When | Required evidence |
 | --- | --- | --- |
 | PR smoke | Normal CI | `@ux-smoke` Playwright tests cover explicit canvas targeting, preview invalidation, sample/export scope, destructive disclosure, keyboard navigation, and serious/critical axe findings. |
-| Full matrix | Daily schedule, manual dispatch, release candidate, and a PR that changes the matrix | Full Playwright suite on the full fixture profile, including the documented minimum viewport. The full-only browser specs search the 120-entry catalog, render declared relationship-dense data, open synchronized temporal/multimodal streams, and inject slow, unavailable, permission-denied, stale-reference, partial-failure, and recovery states. Report, traces, test results, fixture manifest, workspace, and test DB are retained as an artifact. |
+| Full matrix | Daily schedule, manual dispatch, and release candidate | Full Playwright suite on the full fixture profile, including the documented minimum viewport. The full-only browser specs search the 120-entry catalog, render declared relationship-dense data, open synchronized temporal/multimodal streams, and inject slow, unavailable, permission-denied, stale-reference, partial-failure, and recovery states. Report, traces, test results, fixture manifest, workspace, and test DB are retained as an artifact. |
 | Release candidate | Tag-triggered release workflow | The full matrix plus the P0/P1 golden-workflow issue gate must pass before publishing release assets. |
 
-The release workflow runs `.github/workflows/ux-acceptance.yml`; its result is required release evidence.
-The [changelog](../CHANGELOG.md) also records this requirement for release readers.
+The full matrix does not run on pull requests or after merging to `main`; the tagged smoke in required
+browser CI is the PR gate. The release workflow calls `.github/workflows/ux-acceptance.yml`, and its
+result is required release evidence. See [CI and release gates](CI.md) for the trigger policy. The
+[changelog](../CHANGELOG.md) also records this requirement for release readers.
 
 ## Severity and sign-off
 

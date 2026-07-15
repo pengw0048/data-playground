@@ -1,12 +1,11 @@
 name: CI
 
-# Auto-runs on push to main + on PRs — the repo is PUBLIC, so GitHub Actions minutes are free/unlimited.
-# (Also manually triggerable via workflow_dispatch.) The per-job timeout caps below stay as hygiene so a
-# hung run can't spin to the 6h default. You can still run the suites locally during dev
+# Required pull-request validation plus an explicit manual entry point. `main` is protected and only
+# accepts up-to-date pull requests, so rerunning the same suite after merge would duplicate evidence.
+# The per-job timeout caps below stay as hygiene so a hung run can't spin to the 6h default. Run the
+# same suites locally during development
 # (`cd kernel && uv run pytest -q`; `cd web && npm run e2e`).
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 

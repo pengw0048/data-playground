@@ -1,15 +1,8 @@
 name: UX acceptance
 
-# The full matrix is intentionally separate from the PR smoke: it exercises large deterministic
-# fixtures and retains diagnostic evidence without making every small UI change wait for it.
+# The full matrix is intentionally separate from the required PR smoke: it exercises large
+# deterministic fixtures on a schedule, on demand, and as a release prerequisite.
 on:
-  pull_request:
-    paths:
-      - '.github/workflows/ux-acceptance.yml'
-      - 'scripts/build_ux_fixtures.py'
-      - 'web/e2e/**'
-      - 'web/playwright.config.ts'
-      - 'docs/UX_ACCEPTANCE.md'
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
@@ -61,9 +54,6 @@ jobs:
 
   golden-workflow-blockers:
     name: P0/P1 golden-workflow issue gate
-    # Matrix-changing PRs must prove the full fixture suite, but existing release blockers must not
-    # deadlock the PR that installs or repairs this gate. Enforce issue state on release/manual runs.
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
