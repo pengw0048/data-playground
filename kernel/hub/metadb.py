@@ -5765,6 +5765,7 @@ def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
         _catalog_upsert_in_session(
             s, normalized, name, payload, parents=parents, pipeline=pipeline)
         sync_local_result_owner(s, "catalog_entry", normalized, normalized, payload)
+        _materialize_folder(s, payload.get("folder") or "")  # a registered dataset's folder is first-class
 
 
 def catalog_publish_entries(entries: list[tuple[str, str, dict, list[str] | None, str | None]]) -> None:
@@ -5825,6 +5826,7 @@ def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: 
         r.folder, r.owner, r.description, r.doc = folder, owner, description, json.dumps(doc, default=str)
         if name:
             r.name = name
+        _materialize_folder(s, folder)  # curating into a folder makes it a first-class entity (#155)
         if logical is not None:
             logical.governance_doc = json.dumps(
                 _catalog_governance(doc), default=str, sort_keys=True)
@@ -6309,6 +6311,18 @@ def _ensure_folder_rows(s, paths) -> None:
             s.flush()
         except IntegrityError:
             sp.rollback()  # another writer inserted this path between the check and our insert
+
+
+def _materialize_folder(s, raw: str) -> None:
+    """Back a dataset's assigned folder STRING with first-class folder entities (its full ancestry), so
+    registering/curating into a path makes it a real folder — not a merely-implicit derived namespace
+    (#155). A malformed legacy string is left as a derived-only folder rather than failing the write."""
+    if not raw:
+        return
+    try:
+        _ensure_folder_rows(s, _folder_ancestors(_normalize_folder_path(raw)))
+    except ValueError:
+        pass
 
 
 def catalog_folders_list() -> list[dict]:

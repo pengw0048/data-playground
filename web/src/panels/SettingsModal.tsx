@@ -411,6 +411,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                         </SelectContent>
                       </Select>
                       <div className="mt-1 text-[10.5px] text-muted-foreground">The object-store credential used to browse and write here. Manage credentials in the Credentials pane.</div>
+                      <div className="mt-1 text-[10.5px] text-amber-700 dark:text-amber-300">In an authenticated workspace that started with no object store, external file access is fixed at kernel start — a newly added object-store destination takes effect only after a <strong>kernel restart</strong>.</div>
                     </div>
                   )}
                 </Section>}

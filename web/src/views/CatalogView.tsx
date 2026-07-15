@@ -467,6 +467,24 @@ function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revis
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const request = useRef(0)
+  // expansion (a set of open paths) lives here so a rename/remount keeps it; remap prefixes on rename,
+  // drop the subtree on delete.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const toggleExpand = (p: string) => setExpanded((s) => {
+    const n = new Set(s)
+    if (n.has(p)) n.delete(p)
+    else n.add(p)
+    return n
+  })
+  const renamed = (oldPath: string, newPath: string) => {
+    setExpanded((s) => new Set([...s].map((p) =>
+      p === oldPath ? newPath : p.startsWith(oldPath + '/') ? newPath + p.slice(oldPath.length) : p)))
+    onRenamed(oldPath, newPath)
+  }
+  const deleted = (path: string) => {
+    setExpanded((s) => new Set([...s].filter((p) => p !== path && !p.startsWith(path + '/'))))
+    onDeleted(path)
+  }
   const loadRoot = useCallback(async () => {
     const s = ++request.current
     setLoading(true); setError(null)
@@ -513,17 +531,19 @@ function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revis
         </div>
       )}
       {root?.map((f) => <FolderBranch key={f.path} node={f} depth={0} selected={selected} onSelect={onSelect}
-        onRenamed={onRenamed} onDeleted={onDeleted} mutable={mutable} revision={revision} />)}
+        onRenamed={renamed} onDeleted={deleted} mutable={mutable} revision={revision}
+        expanded={expanded} onToggleExpand={toggleExpand} />)}
       {root?.length === 0 && !loading && !error && <div className="px-2 py-1 text-[11px] text-muted-foreground">No folders yet</div>}
     </div>
   )
 }
 
-function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, mutable, revision }:
-  { node: FolderNode; depth: number; selected: string; onSelect: (f: string) => void; mutable: boolean; revision: number }
+function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, mutable, revision, expanded, onToggleExpand }:
+  { node: FolderNode; depth: number; selected: string; onSelect: (f: string) => void; mutable: boolean; revision: number
+    expanded: Set<string>; onToggleExpand: (path: string) => void }
   & Pick<FolderActions, 'onRenamed' | 'onDeleted'>) {
   const pushToast = useStore((s) => s.pushToast)
-  const [open, setOpen] = useState(false)
+  const open = expanded.has(node.path)
   const [kids, setKids] = useState<FolderNode[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -535,7 +555,7 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
     finally { setLoading(false) }
   }
   const expand = () => {
-    const next = !open; setOpen(next)
+    const next = !open; onToggleExpand(node.path)
     if (next && kids === null && !loading) void loadKids()
   }
   // a catalog change (create/rename/delete/register) can alter this branch's children — refetch its
@@ -592,7 +612,8 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
         </div>
       )}
       {open && kids?.map((k) => <FolderBranch key={k.path} node={k} depth={depth + 1} selected={selected} onSelect={onSelect}
-        onRenamed={onRenamed} onDeleted={onDeleted} mutable={mutable} revision={revision} />)}
+        onRenamed={onRenamed} onDeleted={onDeleted} mutable={mutable} revision={revision}
+        expanded={expanded} onToggleExpand={onToggleExpand} />)}
     </div>
   )
 }

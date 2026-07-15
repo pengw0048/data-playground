@@ -77,18 +77,20 @@ def test_empty_folder_appears_in_browse_tree():
         _wipe(["archive"], [])
 
 
-def test_rename_cascades_over_the_union_without_a_folder_entity(tmp_path):
-    """The #160 regression guard: register writes NO folder entity, yet rename must still cascade."""
+def test_register_materializes_folder_and_rename_cascades(tmp_path):
+    """#155: registering into 'x/y' MATERIALIZES first-class folder entities (its full ancestry), not
+    just an implicit derived string; rename then cascades over both the entities and the entry folder."""
     t = _register(tmp_path, "unionds", "x/y")
     uri = t["uri"]
     try:
-        # register did not create any folder entity — rename has to match the entry string
-        assert not any(f["path"] in ("x", "x/y") for f in metadb.catalog_folders_list())
+        paths = {f["path"] for f in metadb.catalog_folders_list()}
+        assert {"x", "x/y"} <= paths, "register materializes the assigned folder + its ancestor"
 
         r = client.put("/api/catalog/folders/rename", json={"oldPath": "x", "newPath": "z"})
         assert r.status_code == 200, r.text
         assert _raw_folder(uri) == ("z/y", "z/y"), "both the indexed column and the doc JSON move"
         assert client.get(f"/api/catalog/tables/{t['id']}").json()["folder"] == "z/y"
+        assert {"z", "z/y"} <= {f["path"] for f in metadb.catalog_folders_list()}  # entities moved too
     finally:
         _wipe(["x", "z"], [uri])
 

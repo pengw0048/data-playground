@@ -56,7 +56,12 @@ class InMemoryCatalog:
     cross-instance); there is no in-memory table map to go stale."""
 
     name = "in-memory"
-    folders_mutable = True  # this provider's browse() reads the same metadb folder CRUD writes to
+    # CONTRACT: folder create/rename/delete write the local metadb, which is authoritative only because
+    # THIS provider's browse() reads it. A provider that owns an EXTERNAL namespace (e.g. subclasses to
+    # override browse()) MUST set `folders_mutable = False` (or override the folder methods to hit its
+    # own store) — otherwise the routes would report local-only writes as success. The routes refuse
+    # (501) when this is False, before touching local state.
+    folders_mutable = True
 
     def __init__(self, data_dir: str, resolve_adapter):
         self.data_dir = data_dir

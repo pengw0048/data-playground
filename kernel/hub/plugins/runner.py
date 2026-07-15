@@ -450,8 +450,19 @@ class LocalRunner:
         nm = g.node_map(graph)
         rows_seen = 0
         # Bind the write destination's object-store credential BEFORE the run scope opens, so the scope
-        # cursor snapshots that secret (DuckDB freezes a cursor's secret view at transaction start).
-        run_object_store_cfg = self._run_object_store_cfg(plan, nm)
+        # cursor snapshots that secret (DuckDB freezes a cursor's secret view at transaction start). A
+        # broken/ambiguous destination credential raises here — terminalize as a failed run instead of
+        # letting it escape _execute, kill the worker thread, and strand every node in 'running'.
+        try:
+            run_object_store_cfg = self._run_object_store_cfg(plan, nm)
+        except Exception as e:  # noqa: BLE001 — any resolution error is a clean run failure, not a strand
+            status.status, status.error = "failed", str(e)
+            self._emit(graph, status)
+            with self._lock:
+                self._cancel.pop(run_id, None)
+                self._scopes.pop(run_id, None)
+            self._complete(graph, target, status)
+            return
         # Run on our OWN DuckDB cursor (db.run_scope), NOT the process-global lock: a long run no
         # longer serializes every other user's preview/sample/run, and a failure here can't wedge them.
         with db.object_store_binding(run_object_store_cfg), db.run_scope() as scope:

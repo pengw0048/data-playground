@@ -258,3 +258,94 @@ def test_delete_in_use_cred_returns_409_and_kind_change_rejected():
     finally:
         metadb.set_setting("defaultObjectStoreCredId", "", scope="global", scope_id="")
         _delete_all_creds()
+
+
+def test_two_destinations_write_to_their_own_object_store(monkeypatch):
+    # #156 acceptance (real object I/O, not a mock): a write bound to a destination's credential lands
+    # in THAT destination's object store. Two destinations point at two separate moto endpoints; each
+    # real httpfs COPY must land on (and read back from) its own endpoint — proving the per-destination
+    # cred cfg genuinely drives the write, not a shared/global identity.
+    import pytest
+    pytest.importorskip("flask")
+    boto3 = pytest.importorskip("boto3")
+    from moto.server import ThreadedMotoServer
+
+    from hub import db
+    from hub.secrets import resolve_object_store
+
+    monkeypatch.setenv("DP_TEST_AK", "test-key")
+    monkeypatch.setenv("DP_TEST_SK", "test-secret")
+    srv_a, srv_b = ThreadedMotoServer(port=0), ThreadedMotoServer(port=0)
+    srv_a.start(); srv_b.start()
+    try:
+        (ha, pa), (hb, pb) = srv_a.get_host_and_port(), srv_b.get_host_and_port()
+
+        def s3(host, port):
+            return boto3.client("s3", endpoint_url=f"http://{host}:{port}",
+                                aws_access_key_id="k", aws_secret_access_key="s", region_name="us-east-1")
+        s3(ha, pa).create_bucket(Bucket="bkt")
+        s3(hb, pb).create_bucket(Bucket="bkt")
+
+        def cred(host, port):
+            return client.post("/api/creds", json={"name": f"{host}:{port}", "kind": "object_store", "fields": {
+                "accessKeyId": "env:DP_TEST_AK", "secretAccessKey": "env:DP_TEST_SK",
+                "region": "us-east-1", "endpoint": f"http://{host}:{port}"}}).json()["id"]
+        ca, cb = cred(ha, pa), cred(hb, pb)
+
+        # write via each destination's cred and read it back — bound one endpoint at a time (a run holds
+        # one object-store identity), exactly as the runner binds a destination cred before its scope
+        def write_and_read(cred_id: str, value: str) -> str:
+            cfg = resolve_object_store(metadb.cred_object_store_config(cred_id))
+            with db.lock():
+                db.ensure_object_store(cfg)
+                db.conn().execute(f"COPY (SELECT '{value}' AS v) TO 's3://bkt/out.parquet' (FORMAT PARQUET)")
+                return db.conn().execute("SELECT v FROM read_parquet('s3://bkt/out.parquet')").fetchone()[0]
+
+        assert write_and_read(ca, "A") == "A"
+        assert write_and_read(cb, "B") == "B"
+        # each object landed on its OWN endpoint (distinct per-destination routing), not one shared store
+        assert s3(ha, pa).get_object(Bucket="bkt", Key="out.parquet")["Body"].read()  # exists on A
+        assert s3(hb, pb).get_object(Bucket="bkt", Key="out.parquet")["Body"].read()  # exists on B
+    finally:
+        srv_a.stop(); srv_b.stop()
+        _delete_all_creds()
+        # this test binds the SHARED base connection to a moto endpoint; restore pristine state so a
+        # later test neither inherits the dead-endpoint secret nor re-pays first-time extension loads.
+        with contextlib.suppress(Exception), db.lock():
+            db._base_conn().execute("DROP SECRET IF EXISTS dp_s3")
+            db._base_conn().execute("DROP SECRET IF EXISTS dp_gcs")
+        db._obj_store_secret_config = None
+        db._obj_store_loaded = db._obj_store_aws_loaded = False
+
+
+def test_broken_destination_credential_fails_the_run_not_strands_it(monkeypatch, tmp_path):
+    # #161 re-review: a missing/wrong-kind destination credential raises during pre-scope resolution.
+    # That must terminalize the run as FAILED (and clean up), not escape _execute, kill the worker, and
+    # leave every node stranded in 'running'.
+    from hub.models import CompilePlan, Graph, PerNodeStatus, PlanStep, RunStatus
+    from hub.plugins.runner import LocalRunner, _CancelToken
+
+    runner = LocalRunner(lambda _uri: object(), {}, object(), str(tmp_path))
+    rid = "brk"
+    runner.runs[rid] = RunStatus(run_id=rid, status="queued",
+                                 per_node=[PerNodeStatus(node_id="write", status="queued", label="write")])
+    runner._cancel[rid] = _CancelToken()
+
+    def _raise(_plan, _nm):
+        raise metadb.CredResolutionError("object-store credential 'gone' not found")
+    monkeypatch.setattr(runner, "_run_object_store_cfg", _raise)
+    completed: list[str] = []
+    monkeypatch.setattr(runner, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_complete", lambda *a, **k: completed.append(runner.runs[rid].status))
+
+    graph = Graph.model_validate({"id": "brk", "version": 1, "edges": [], "nodes": [
+        {"id": "write", "type": "write", "position": {"x": 0, "y": 0},
+         "data": {"config": {"destId": "s3dest", "filename": "o.parquet"}}}]})
+    plan = CompilePlan(target_node_id="write", steps=[PlanStep(node_id="write", kind="write", label="write")])
+
+    runner._execute(rid, plan, graph, "write")  # must not raise out
+
+    assert runner.runs[rid].status == "failed"
+    assert "gone" in (runner.runs[rid].error or "")
+    assert rid not in runner._cancel        # cleaned up, not stranded
+    assert completed == ["failed"]           # terminalized through the normal completion path
