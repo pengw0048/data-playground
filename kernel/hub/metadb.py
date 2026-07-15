@@ -7275,20 +7275,33 @@ def cred_object_store_config(cred_id: str | None = None) -> dict:
 
 
 def cred_agent_api_key_ref(cred_id: str | None = None) -> str:
-    """The agent apiKey reference. An EXPLICIT (non-empty) ``cred_id`` — or a configured ``agentCredId``
-    — that is missing/wrong-kind RAISES CredResolutionError; only when neither is set does it fall back
-    to the legacy ``agentApiKey``. Returns a reference string, never a resolved value."""
-    if cred_id:
-        c = cred_get(cred_id)
+    """The agent apiKey reference. An EXPLICIT ``cred_id`` — or a configured ``agentCredId``
+    — that is missing, wrong-kind, or has no key RAISES CredResolutionError; only when neither is set
+    does it fall back to the legacy ``agentApiKey``. Returns a reference string, never a resolved value.
+
+    An empty selected Cred is not the same as no selection: returning ``""`` here would let the Agent
+    silently continue under an ambient provider identity.
+    """
+    if cred_id is not None:
+        explicit_id = str(cred_id).strip()
+        if not explicit_id:
+            raise CredResolutionError("selected agent credential id is empty")
+        c = cred_get(explicit_id)
         if not c or c.get("kind") != "agent":
-            raise CredResolutionError(f"agent credential '{cred_id}' not found")
-        return str(c["fields"].get("apiKey") or "")
+            raise CredResolutionError("selected agent credential is missing or has the wrong kind")
+        ref = c["fields"].get("apiKey")
+        if not ref:
+            raise CredResolutionError("selected agent credential has no API key reference")
+        return str(ref)
     default_id = get_setting("agentCredId", "global")
     if default_id:
         c = cred_get(default_id)
         if not c or c.get("kind") != "agent":
-            raise CredResolutionError(f"default agent credential '{default_id}' is missing or not an agent cred")
-        return str(c["fields"].get("apiKey") or "")
+            raise CredResolutionError("selected agent credential is missing or has the wrong kind")
+        ref = c["fields"].get("apiKey")
+        if not ref:
+            raise CredResolutionError("selected agent credential has no API key reference")
+        return str(ref)
     return get_setting("agentApiKey", "global") or ""
 
 

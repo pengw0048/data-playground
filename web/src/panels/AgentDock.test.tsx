@@ -128,11 +128,13 @@ describe('AgentDock — AgentDataPolicy preflight disclosure', () => {
   it('still shows the configure affordance when the agent is unavailable', async () => {
     mocks.agentStatus.mockResolvedValue({
       available: false,
-      reason: 'set ANTHROPIC_API_KEY',
+      errorCode: 'agent_credential_unavailable',
+      reason: 'The configured Agent credential is unavailable. Update it or clear the selection in Settings.',
       model: 'anthropic/claude-opus-4-8',
     })
     render(<AgentDock />)
     expect(await screen.findByTestId('agent-configure')).toBeInTheDocument()
+    expect(screen.getByText(/configured Agent credential is unavailable/)).toBeInTheDocument()
     expect(screen.queryByTestId('agent-egress-disclosure')).toBeNull()
     fireEvent.click(screen.getByTestId('agent-configure'))
   })
