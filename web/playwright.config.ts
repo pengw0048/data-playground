@@ -5,6 +5,7 @@ import { MIN_VIEWPORT } from './support/min-viewport'
 // `npm run build` must run first (the kernel serves web/dist). The webServer block boots the
 // kernel on a test port and waits for /api/health before the specs run.
 const PORT = process.env.DP_E2E_PORT ?? '8899'
+const fixtureProfile = process.env.DP_E2E_FIXTURE_PROFILE ?? 'smoke'
 
 const chromiumLaunch = process.env.DP_E2E_CHROME
   ? { launchOptions: { executablePath: process.env.DP_E2E_CHROME } }
@@ -48,7 +49,7 @@ export default defineConfig({
   ],
   webServer: {
     // fresh metadata DB per run (the metadata DB persists canvases; tests need a clean slate)
-    command: `cd ../kernel && rm -f e2e-test.db && DP_DATABASE_URL=sqlite:///e2e-test.db uv run dataplay --workspace "$PWD" --port ${PORT} --no-open`,
+    command: `cd ../kernel && WORKSPACE=../web/.e2e-workspace && rm -f e2e-test.db* && rm -rf "$WORKSPACE" && uv run python ../scripts/build_ux_fixtures.py --profile ${fixtureProfile} --output "$WORKSPACE/data" && DP_DATABASE_URL=sqlite:///e2e-test.db uv run dataplay --workspace "$WORKSPACE" --port ${PORT} --no-open`,
     url: `http://127.0.0.1:${PORT}/api/health`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

@@ -67,7 +67,7 @@ async function tabUntil(page: Page, target: Locator, max = 50) {
   return target.evaluate((el) => el === document.activeElement || el.contains(document.activeElement))
 }
 
-test.describe('accessibility gate', () => {
+test.describe('accessibility gate @ux-smoke', () => {
   // Run serially — parallel e2e workers hammering the single kernel can leave the error-toast
   // run hanging past 15s even though canvas.spec's identical path passes in the same job.
   test.describe.configure({ mode: 'serial' })

@@ -15,6 +15,7 @@ web/test-results/
 web/playwright-report/
 web/blob-report/
 web/.last-run.json
+web/.e2e-workspace/
 
 # generated / runtime (regenerate with `make seed`)
 kernel/data/*.parquet
