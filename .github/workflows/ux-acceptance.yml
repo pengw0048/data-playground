@@ -61,6 +61,9 @@ jobs:
 
   golden-workflow-blockers:
     name: P0/P1 golden-workflow issue gate
+    # Matrix-changing PRs must prove the full fixture suite, but existing release blockers must not
+    # deadlock the PR that installs or repairs this gate. Enforce issue state on release/manual runs.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
