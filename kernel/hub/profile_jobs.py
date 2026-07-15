@@ -1,45 +1,41 @@
-"""Cancellable durable jobs for whole-dataset column profiles.
+"""Process-isolated jobs for whole-dataset column profiles.
 
-Small sample profiles stay on the interactive preview path. Whole-dataset profiles can scan an entire
-graph, so this runner deliberately uses the same queued/running/terminal status contract as normal
-runs. Coverage is complete, while distinct counts remain approximate by design.
+Sample profiles stay on the interactive in-process path. A whole-dataset profile can execute Python,
+plugins, adapters, and native code, so its canvas kernel owns a one-shot OS child and does not publish a
+terminal status until that child has exited and been reaped. The process supervisor, workload environment,
+and managed-source lease protocol are shared with normal isolated runs.
 """
 
 from __future__ import annotations
 
-import logging
-import threading
-import time
 import uuid
 
-from hub.executors.profile import profile_node
 from hub.models import Graph, PerNodeStatus, RunStatus
+from hub.subprocess_runner import SubprocessRunner, _SpawnSetupError
 
 
-_MAX_PROFILE_JOBS = 100
-
-
-class ProfileJobRunner:
-    """A small job owner for full profiles; status persistence is injected by :mod:`hub.deps`."""
+class ProfileProcessRunner(SubprocessRunner):
+    """Supervise each full profile in a killable one-shot ``hub.subrun`` child."""
 
     name = "local-profile"
-    cancel_acknowledges_stop = True
 
-    def __init__(self, resolve_adapter, registry, *, node_builders=None, node_specs=None, storage=None):
-        self.resolve_adapter = resolve_adapter
-        self.registry = registry
-        self.node_builders = node_builders if node_builders is not None else {}
-        self.node_specs = node_specs if node_specs is not None else {}
-        self.storage = storage
-        self.on_status = None
-        self.runs: dict[str, RunStatus] = {}
-        self._cancel: dict[str, threading.Event] = {}
-        self._scopes: dict[str, object] = {}
-        self._lock = threading.Lock()
+    def __init__(self, workspace: str, data_dir: str, *, storage=None,
+                 deadline_s: float | None = None):
+        super().__init__(workspace, data_dir, storage=storage, deadline_s=deadline_s)
+        self._profile_identities: dict[str, dict[str, object]] = {}
 
-    def run(self, graph: Graph, node_id: str, *, plan_digest: str, run_id: str | None = None,
+    def run(self, graph: Graph, node_id: str, *, plan_digest: str,
+            profile_attempt_order: int, run_id: str | None = None,
             request_id: str | None = None) -> RunStatus:
+        if type(profile_attempt_order) is not int or profile_attempt_order <= 0:
+            raise ValueError("profile attempt order must be a positive integer")
         run_id = run_id or f"profile_{uuid.uuid4().hex[:10]}"
+        identity = {
+            "target_node_id": node_id,
+            "plan_digest": plan_digest,
+            "profile_attempt_order": profile_attempt_order,
+            "request_id": request_id,
+        }
         status = RunStatus(
             run_id=run_id,
             status="queued",
@@ -48,119 +44,126 @@ class ProfileJobRunner:
             placement="local",
             per_node=[PerNodeStatus(node_id=node_id, status="queued", label="Full profile")],
             plan_digest=plan_digest,
+            profile_attempt_order=profile_attempt_order,
             request_id=request_id,
         )
         with self._lock:
-            self.runs[run_id] = status
-            self._cancel[run_id] = threading.Event()
-            self._evict()
-        self._emit(graph, status)
-        threading.Thread(target=self._execute, args=(run_id, graph, node_id), daemon=True,
-                         name=f"profile-{run_id}").start()
-        return status
-
-    def status(self, run_id: str) -> RunStatus:
-        with self._lock:
-            return self.runs[run_id]
-
-    def cancel(self, run_id: str) -> RunStatus:
-        with self._lock:
-            status = self.runs[run_id]
-            if status.status in ("done", "failed", "cancelled"):
-                return status
-            self._cancel[run_id].set()
-            scope = self._scopes.get(run_id)
-        # DuckDB work is scoped to the worker thread. Interrupt that exact scope rather than the
-        # process-global cursor, matching normal run cancellation and avoiding cross-job collateral.
-        if scope is not None:
-            try:
-                scope.interrupt()
-            except Exception:  # noqa: BLE001 - the worker will still observe its cancellation token
-                logging.getLogger("hub").debug("profile cancellation interrupt failed", exc_info=True)
-        return status
-
-    def _execute(self, run_id: str, graph: Graph, node_id: str) -> None:
-        started = time.monotonic()
-        with self._lock:
-            status = self.runs.get(run_id)
-            cancelled = bool(self._cancel.get(run_id) and self._cancel[run_id].is_set())
-        if status is None:
-            return
-        if cancelled:
-            self._terminal(graph, run_id, "cancelled", started)
-            return
-
-        status.status = "running"
-        status.per_node[0].status = "running"
-        self._emit(graph, status)
-
-        def remember_scope(scope) -> None:
-            with self._lock:
-                self._scopes[run_id] = scope
-                cancelled_now = bool(self._cancel.get(run_id) and self._cancel[run_id].is_set())
-            if cancelled_now:
-                scope.interrupt()
+            existing = self.runs.get(run_id)
+            if existing is not None:
+                existing_identity = self._profile_identities.get(run_id)
+                if existing_identity == identity:
+                    return existing
+                raise ValueError(
+                    f"profile run id is already bound to a different identity: {run_id}")
+            reserved_identity = self._profile_identities.get(run_id)
+            if reserved_identity is not None or run_id in self._procs:
+                # A concurrent dispatch has reserved the identity but has not yet installed a status.
+                # It is not safe to launch another child or pretend that the first dispatch succeeded.
+                if reserved_identity == identity:
+                    raise ValueError(f"profile run id dispatch is still in progress: {run_id}")
+                raise ValueError(
+                    f"profile run id is already bound to a different identity: {run_id}")
+            self._profile_identities[run_id] = identity
 
         try:
-            result = profile_node(
-                graph, node_id, self.resolve_adapter, self.registry,
-                self.node_builders, self.node_specs, full=True, storage=self.storage,
-                scope_callback=remember_scope,
-            )
-        except Exception as exc:  # noqa: BLE001 - job workers must always reach a visible terminal state
+            source_leases = self._claim_source_leases(graph, node_id, run_id)
             with self._lock:
-                cancelled = bool(self._cancel.get(run_id) and self._cancel[run_id].is_set())
-            if cancelled:
-                # DuckDB reports its cursor interrupt as an exception. The accepted cancel intent is
-                # the authoritative terminal cause; do not present a user-requested stop as a failure.
-                self._terminal(graph, run_id, "cancelled", started)
+                self._source_leases[run_id] = source_leases
+            return self._spawn(status, {
+                "jobKind": "profile",
+                "runId": run_id,
+                "managedSourceAttempts": source_leases["attempts"],
+                "managedLocalSources": source_leases["local_sources"],
+            }, graph, node_id)
+        except Exception as exc:
+            # Once Popen succeeds without reap proof, the base supervisor retains the exact child, job
+            # directory, and source ownership for retry/cancel/operator reconciliation.
+            if isinstance(exc, _SpawnSetupError) and not exc.reaped:
+                raise
+            self._release_source_leases(run_id)
+            with self._lock:
+                self._profile_identities.pop(run_id, None)
+            raise
+
+    def _profile_identity(self, run_id: str, status: RunStatus) -> RunStatus:
+        identity = self._profile_identities.get(run_id)
+        if identity is None:
+            status.status = "failed"
+            status.error = "profile supervisor lost the parent job identity"
+            status.profile = None
+            status.output_uri = status.output_table = None
+            return status
+        status.run_id = run_id
+        status.job_type = "profile"
+        status.target_node_id = str(identity["target_node_id"])
+        status.plan_digest = str(identity["plan_digest"])
+        status.profile_attempt_order = int(identity["profile_attempt_order"])
+        request_id = identity["request_id"]
+        status.request_id = str(request_id) if request_id is not None else None
+        status.placement = "local"
+        status.output_uri = status.output_table = None
+        return status
+
+    def _sanitize_child_status(self, run_id: str, observed: RunStatus) -> RunStatus:
+        """Replace every control-plane identity supplied by the untrusted child."""
+        observed = self._profile_identity(run_id, observed)
+        node_id = observed.target_node_id or ""
+        if observed.status == "done":
+            profile = observed.profile
+            if (profile is None or profile.sampled or profile.error or profile.not_previewable
+                    or profile.row_count < 0):
+                observed.status = "failed"
+                observed.error = "profile child returned an invalid full-profile result"
+                observed.profile = None
             else:
-                self._terminal(graph, run_id, "failed", started,
-                               error=f"{type(exc).__name__}: {exc}")
-            return
-        with self._lock:
-            cancelled = bool(self._cancel.get(run_id) and self._cancel[run_id].is_set())
-        if cancelled:
-            self._terminal(graph, run_id, "cancelled", started)
-        elif result.error or result.not_previewable:
-            self._terminal(graph, run_id, "failed", started, error=result.reason or "profile failed")
+                observed.error = None
+                observed.progress = 1.0
+                observed.rows_processed = profile.row_count
+                observed.total_rows = profile.row_count
         else:
-            self._terminal(graph, run_id, "done", started, profile=result)
+            # Partial/failed child documents never get to smuggle a result into durable state.
+            observed.profile = None
+            observed.rows_processed = 0
+            observed.total_rows = None
+            observed.progress = None
+            if observed.status in ("queued", "running", "cancelled"):
+                observed.error = None
+        observed.per_node = [PerNodeStatus(
+            node_id=node_id,
+            status=observed.status,
+            label="Full profile",
+            rows=observed.total_rows,
+            ms=observed.ms,
+            error=observed.error if observed.status == "failed" else None,
+        )]
+        return observed
 
-    def _terminal(self, graph: Graph, run_id: str, state: str, started: float, *, error: str | None = None,
-                  profile=None) -> None:
-        with self._lock:
-            status = self.runs.get(run_id)
-            if status is None:
-                return
-            status.status = state
-            status.ms = max(0, int((time.monotonic() - started) * 1000))
-            status.progress = 1.0 if state == "done" else None
-            status.error = error
-            status.profile = profile
-            status.rows_processed = profile.row_count if profile is not None else 0
-            status.total_rows = profile.row_count if profile is not None else None
-            status.per_node[0].status = state
-            status.per_node[0].rows = status.total_rows
-            status.per_node[0].ms = status.ms
-            if error:
-                status.per_node[0].error = error
-            self._scopes.pop(run_id, None)
-        self._emit(graph, status)
-
-    def _emit(self, graph: Graph, status: RunStatus) -> None:
-        callback = self.on_status
-        if callback is None:
-            return
-        try:
-            callback(graph, status)
-        except Exception:  # noqa: BLE001 - a persistence outage must not strand this worker thread
-            logging.getLogger("hub").exception("profile job status persistence failed")
+    def _finalize_reaped_status(self, run_id: str, status: RunStatus, *,
+                                deadline_hit: bool, returncode: int | None) -> RunStatus:
+        """Make cancellation/deadline authoritative only after ``wait``/``kill`` reaped the child."""
+        status = self._profile_identity(run_id, status)
+        if run_id in self._cancelled:
+            status.status = "cancelled"
+            status.error = None
+            status.profile = None
+        elif deadline_hit:
+            status.status = "failed"
+            status.error = (
+                f"full profile exceeded the wall-clock deadline of {self.deadline_s:.0f}s — killed")
+            status.profile = None
+        elif status.status == "cancelled":
+            # Cancellation is control-plane intent, never a status the workload may mint for itself.
+            status.status = "failed"
+            status.error = "profile process reported cancellation without a parent request"
+            status.profile = None
+        elif status.status == "done" and returncode != 0:
+            status.status = "failed"
+            status.error = status.error or f"profile process exited (code {returncode})"
+            status.profile = None
+        return self._sanitize_child_status(run_id, status)
 
     def _evict(self) -> None:
-        terminal = [rid for rid, st in self.runs.items() if st.status in ("done", "failed", "cancelled")]
-        while len(self.runs) > _MAX_PROFILE_JOBS and terminal:
-            victim = terminal.pop(0)
-            self.runs.pop(victim, None)
-            self._cancel.pop(victim, None)
-            self._scopes.pop(victim, None)
+        super()._evict()
+        for run_id in tuple(self._profile_identities):
+            if run_id not in self.runs:
+                self._profile_identities.pop(run_id, None)

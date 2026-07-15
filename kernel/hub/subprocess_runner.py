@@ -617,6 +617,20 @@ class SubprocessRunner:
             self._cancel_files.pop(victim, None)
             self._sink_contracts.pop(victim, None)
 
+    def _sanitize_child_status(self, run_id: str, observed: RunStatus) -> RunStatus:
+        """Apply backend-specific identity fences to an untrusted child status document.
+
+        Ordinary subprocess runs already get their parent run id overridden in :meth:`_read` and need
+        no additional changes. Specialized one-shot workloads can override this hook without copying
+        the process supervision and reap-before-terminal state machine.
+        """
+        return observed
+
+    def _finalize_reaped_status(self, run_id: str, status: RunStatus, *,
+                                deadline_hit: bool, returncode: int | None) -> RunStatus:
+        """Apply backend-specific terminal rules after the child is observably reaped."""
+        return status
+
     def _read(self, run_id: str, status_file: str) -> RunStatus | None:
         """Merge progress, but hold a child terminal status for parent-side finalization."""
         try:
@@ -634,6 +648,7 @@ class SubprocessRunner:
             logging.getLogger("hub").exception(
                 "ignored malformed subprocess status document")
             return None
+        observed = self._sanitize_child_status(run_id, observed)
         if observed.status in ("done", "failed", "cancelled"):
             return observed
         # Child progress is untrusted and parent-owned result/sink paths are provisional until reap,
@@ -708,6 +723,8 @@ class SubprocessRunner:
                 if reaped:
                     status.status = "cancelled" if cancelled else "failed"
                     status.error = None if status.status == "cancelled" else "execution supervisor failed"
+                    status = self._finalize_reaped_status(
+                        run_id, status, deadline_hit=False, returncode=proc.returncode)
                     self._complete(graph, target, status)
                     self._emit(graph, status)
                 else:
@@ -822,6 +839,8 @@ class SubprocessRunner:
             st.status = "failed"
             st.error = "managed source lease was lost during execution"
             st.output_uri = st.output_table = None
+        st = self._finalize_reaped_status(
+            run_id, st, deadline_hit=deadline_hit, returncode=proc.returncode)
         owned_sinks = self._object_sinks.get(run_id, {})
         sink_contracts = self._sink_contracts.get(run_id, {})
         managed_sink_uris = {item["uri"] for item in owned_sinks.values()}

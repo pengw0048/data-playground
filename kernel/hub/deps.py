@@ -376,10 +376,9 @@ class Deps:
         self.runner.result_put = _result_put
         # Whole-dataset profiles are inspection jobs, not materialized graph runs, but they share
         # the same durable RunState status/cancel/recovery contract.
-        from hub.profile_jobs import ProfileJobRunner
-        self.profile_runner = ProfileJobRunner(
-            self.resolve_adapter, self.registry, node_builders=self.node_builders,
-            node_specs=self.node_specs, storage=self.storage)
+        from hub.profile_jobs import ProfileProcessRunner
+        self.profile_runner = ProfileProcessRunner(
+            workspace, data_dir, storage=self.storage)
         self.profile_runner.on_status = _persist_run_state
         from hub.subprocess_runner import SubprocessRunner
         # a second, real backend: run jobs in an isolated OS process (Settings → Execution). Selected

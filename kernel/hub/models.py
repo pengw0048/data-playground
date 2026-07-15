@@ -386,6 +386,9 @@ class RunStatus(Wire):
     # SHA-256 of the client's graph-affecting identity, so durable status never duplicates the raw graph.
     profile: ProfileResult | None = None
     plan_digest: PlanDigest | None = None
+    # Monotonic, DB-authoritative submission order for retries of one profile identity. The parent
+    # control plane stamps it onto every observable status; one-shot workers cannot choose it.
+    profile_attempt_order: int | None = Field(default=None, ge=1)
     # HTTP/WebSocket request id that started this run (OPS-01). Optional so legacy/plugin backends
     # that omit it still deserialize; durable copy also lives on run_states / run_records.
     request_id: str | None = None
