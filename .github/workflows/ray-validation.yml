@@ -1,6 +1,53 @@
 name: Ray validation
 
 on:
+  pull_request:
+    paths:
+      # Image and dependency contract shared by both Ray acceptance suites.
+      - ".dockerignore"
+      - "docker/ray/**"
+      - "kernel/hatch_build.py"
+      - "kernel/pyproject.toml"
+      - "kernel/uv.lock"
+      - "examples/plugins/dp_ray/**"
+      - "kernel/hub/ray_compat.py"
+      # Execution, storage, destination, and plugin contracts exercised by dp_ray.
+      - "kernel/hub/backends.py"
+      - "kernel/hub/compiler.py"
+      - "kernel/hub/db.py"
+      - "kernel/hub/deps.py"
+      - "kernel/hub/destinations.py"
+      - "kernel/hub/graph.py"
+      - "kernel/hub/handoff.py"
+      - "kernel/hub/ir.py"
+      - "kernel/hub/job_artifacts.py"
+      - "kernel/hub/metadb.py"
+      - "kernel/hub/models.py"
+      - "kernel/hub/nodespecs.py"
+      - "kernel/hub/paths.py"
+      - "kernel/hub/placement.py"
+      - "kernel/hub/sandbox.py"
+      - "kernel/hub/secrets.py"
+      - "kernel/hub/settings.py"
+      - "kernel/hub/sinks.py"
+      - "kernel/hub/sqlanalyze.py"
+      - "kernel/hub/sqlpolicy.py"
+      - "kernel/hub/storage.py"
+      - "kernel/hub/workload_*.py"
+      - "kernel/hub/executors/engine.py"
+      - "kernel/hub/plugins/adapters.py"
+      - "kernel/hub/plugins/catalog.py"
+      - "kernel/hub/plugins/capabilities.py"
+      - "kernel/hub/plugins/default_catalog.py"
+      - "kernel/hub/plugins/processors.py"
+      - "kernel/hub/plugins/runner.py"
+      # Differential harness and the KubeRay validation fixtures it represents.
+      - ".github/workflows/ray-validation.yml"
+      - "docker-compose.ray.yml"
+      - "kernel/hub/ray_gpu_contract_check.py"
+      - "kernel/hub/ray_multinode_check.py"
+      - "deploy/kuberay/validate.sh"
+      - "deploy/kuberay/*.yaml"
   workflow_dispatch:
   workflow_call:
   schedule:

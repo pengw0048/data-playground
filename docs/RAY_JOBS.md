@@ -15,9 +15,10 @@ deployment is production-ready. The remaining scale, isolation, health, and resi
 
 ## Real-service acceptance gate
 
-The restart contract has a separate acceptance workflow so it does not make pull-request feedback or
-the Ray data differential slower. It runs weekly, on demand, and before publishing a release. See
-[CI and release gates](CI.md). Run it locally with:
+The restart contract has a separate acceptance workflow so unrelated pull requests and the Ray data
+differential do not pay for it. It runs when a pull request changes an owned Jobs lifecycle path,
+weekly, on demand, and before publishing a release. See [CI and release gates](CI.md). Run it locally
+with:
 
 ```bash
 scripts/ray-jobs-acceptance.sh

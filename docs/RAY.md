@@ -4,7 +4,8 @@
 closed: large Parquet inputs and simple Parquet overwrite outputs stay off the driver, and every
 remaining compatibility collect has an explicit byte ceiling. The multi-node differential in
 [`ray-validation.yml`](../.github/workflows/ray-validation.yml) verifies that contract on Ray and
-MinIO on a weekly schedule, on demand, and as a required version-release gate.
+MinIO when a pull request changes its owned execution paths, on a weekly schedule, on demand, and as a
+required version-release gate.
 
 The Compose and KubeRay files in this repository are validation harnesses, not deployment manifests.
 A green differential does not certify an operator's IAM, capacity, KubeRay configuration, or incident
@@ -160,9 +161,10 @@ before dispatch until distributed schema enforcement is implemented.
 
 ## What the validation gate proves
 
-This real-cluster matrix is intentionally not a pull-request or post-merge check. Required PR unit and
-contract tests provide fast feedback; the complete differential runs on schedule, on demand, and before
-publishing a release. See [CI and release gates](CI.md).
+This real-cluster matrix is a path-gated pull-request check, not an unconditional PR or post-merge
+check. Required PR unit and contract tests provide fast feedback for every change; the complete
+differential additionally runs when its owned execution contract changes, on schedule, on demand, and
+before publishing a release. See [CI and release gates](CI.md).
 
 The automated Compose gate starts a Ray head, two worker containers, a separate driver node, and MinIO.
 Before that CPU-only topology starts, a logical-resource Ray check (no NVIDIA runtime) proves typed
