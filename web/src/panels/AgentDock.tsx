@@ -178,7 +178,7 @@ function runTerminal(bg: { nodes: { id: string; type: string }[]; edges: { sourc
   const sink = [...bg.nodes].reverse().find((n) => !sources.has(n.id))
   if (!sink) return
   const store = useStore.getState()
-  if (['write', 'opaque', 'loop'].includes(sink.type)) store.requestRun(sink.id)
+  if (sink.type === 'write') store.requestRun(sink.id)
   else store.runPreview(sink.id)
 }
 

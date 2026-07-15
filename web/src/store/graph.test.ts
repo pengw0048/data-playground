@@ -117,6 +117,19 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.nodes).toHaveLength(0)  // back to the empty baseline
   })
 
+  it('loads unsupported historical shapes verbatim instead of silently migrating them', () => {
+    const legacy = {
+      id: 'legacy', version: 1, nodes: [{
+        id: 'old', type: 'notebook', position: { x: 0, y: 0 },
+        data: { title: 'old', status: 'draft', muted: true, config: {} },
+      }], edges: [],
+    }
+    useStore.getState().loadDoc(legacy as any, 'owner')
+    const node = useStore.getState().doc.nodes[0]
+    expect(node.type).toBe('notebook')
+    expect((node.data as any).muted).toBe(true)
+  })
+
   it('binds a preview to its canvas and plan identity, then blocks a stale response', async () => {
     let finish!: (result: ReturnType<typeof previewResult>) => void
     apiMocks.preview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))

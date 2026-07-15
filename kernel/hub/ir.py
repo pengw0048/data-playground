@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from hub import graph as g
 from hub.models import CompilePlan, Graph, GraphNode
 
-# transform/notebook modes a per-row / per-batch engine runs faithfully (the reduce-y `aggregate` and
+# transform modes a per-row / per-batch engine runs faithfully (the reduce-y `aggregate` and
 # escape-hatch `callable` modes need a full custom pass, so they are NOT clean).
 CLEAN_TRANSFORM_MODES = {"map", "map_batches", "filter", "flat_map", "flat_map_generator"}
 # ops a simple map-style engine (e.g. Ray Data) can run end-to-end
@@ -78,7 +78,7 @@ def parse_sort_keys(by: str) -> list[tuple[str, bool]] | None:
         out.append((m.group(1), (m.group(2) or "asc").lower() == "desc"))
     return out
 
-# canvas node type → IR op. `transform`/`notebook` resolve to their MODE (a clean transform mode, or
+# canvas node type → IR op. `transform` resolves to its MODE (a clean transform mode, or
 # `transform:<mode>` when not clean); anything not listed (incl. plugin kinds) → `opaque:<type>`.
 _NODE_OP = {
     "source": "read", "filter": "filter_sql", "select": "project_sql", "sql": "sql", "join": "join",
@@ -86,7 +86,6 @@ _NODE_OP = {
     "aggregate": "aggregate", "sort": "sort", "dedup": "dedup", "sample": "sample", "write": "write",
     "window": "window",
     "metric": "metric", "chart": "chart", "vector-search": "vector_search", "section": "section",
-    "opaque": "opaque", "loop": "loop", "variable": "variable",
 }
 
 
@@ -139,12 +138,12 @@ def resolve_config(node: GraphNode) -> dict:
     is read + key-normalized, so the IR AND the DuckDB engine (executors/engine.py `_lower`) consume the
     same thing and can't diverge (the class of bug that produced the earlier plan_is_clean mismatch).
     Type-keyed (independent of bypass/disabled — those are op-level, handled by `_op_and_config`). Only
-    KEY canonicalization + `uri||table` resolution + `options` nesting + structural defaults (`how`) live
+    KEY canonicalization + source options nesting + structural defaults (`how`) live
     here; VALUE-level normalization (`.strip()`, engine-context defaults like the preview sample size)
     stays in the consumer, so this never changes what the engine computes."""
     t = node.type
     cfg = _cfg(node)
-    if t in ("transform", "notebook"):
+    if t == "transform":
         c: dict = {"mode": cfg.get("mode", "map"), "onError": cfg.get("onError", "raise")}
         if cfg.get("batchFormat") in ("pandas", "arrow"):  # map_batches representation (else row-dicts)
             c["batchFormat"] = cfg["batchFormat"]
@@ -166,7 +165,7 @@ def resolve_config(node: GraphNode) -> dict:
         opts = {k: str(cfg[k]).strip().lower() if k == "header" else str(cfg[k]).strip()
                 for k in ("delimiter", "header") if str(cfg.get(k, "")).strip()}
         opts = {k: v for k, v in opts.items() if k != "header" or v in ("yes", "no")}  # header must be yes/no
-        c = {"uri": cfg.get("uri") or cfg.get("table")}
+        c = {"uri": cfg.get("uri")}
         if opts:
             c["options"] = opts
         return c
@@ -204,7 +203,7 @@ def resolve_config(node: GraphNode) -> dict:
                 "format": cfg.get("format", "parquet"), "writeMode": cfg.get("writeMode", "overwrite"),
                 "destId": cfg.get("destId"), "destPath": cfg.get("destPath", ""),
                 "partitionBy": cfg.get("partitionBy", "")}
-    return dict(cfg)  # metric/chart/vector-search/section/opaque/loop/variable — carry cfg verbatim
+    return dict(cfg)  # metric/chart/vector-search/section and plugin configs stay verbatim
 
 
 def _op_and_config(node: GraphNode, node_ir: dict | None = None) -> tuple[str, dict]:
@@ -213,7 +212,7 @@ def _op_and_config(node: GraphNode, node_ir: dict | None = None) -> tuple[str, d
     if _flag(node, "bypassed"):
         return "passthrough", {}
     t = node.type
-    if t in ("transform", "notebook"):
+    if t == "transform":
         cfg = resolve_config(node)
         mode = cfg.get("mode", "map")
         return (mode if mode in CLEAN_TRANSFORM_MODES else f"transform:{mode}"), cfg

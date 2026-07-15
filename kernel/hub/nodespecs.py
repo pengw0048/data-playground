@@ -82,9 +82,8 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              inputs=[_in()], outputs=[_out()], can_bypass=True,
              params=[ParamSpec(name="select", type="string", label="columns / expressions")],
              blurb="project / rename / derive columns"),
-    # The single Python-code compute node (the old `notebook` kind folded in here; both ran the
-    # SAME per-batch operator). `scope` labels whether it's exploring a sample or producing a
-    # dataset — execution is identical, the tag just guides the mental model.
+    # The single Python-code compute node. `scope` labels whether it's exploring a sample or producing
+    # a dataset — execution is identical, the tag just guides the mental model.
     NodeSpec(kind="transform", title="transform", category="compute", tag="code",
              inputs=[_in(("dataset", "sample", "selection"))], outputs=[_out()], can_bypass=True,
              params=[ParamSpec(name="source", type="select", options=["adhoc", "library"], default="adhoc"),
@@ -200,6 +199,4 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              params=[ParamSpec(name="script", type="code", lang="python",
                                default="# driver script — call contained nodes by alias\nemit(inputs['in'])")],
              blurb="composite node: a driver script over contained nodes (loops / branches)"),
-    # NOTE: the old control-flow nodes (branch/loop/variable/opaque) were removed; branch was
-    # redundant with two filters, and real control flow now lives in `section` above.
 ]

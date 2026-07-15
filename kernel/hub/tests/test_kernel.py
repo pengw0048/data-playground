@@ -3644,9 +3644,16 @@ def test_upload_lands_bytes_in_object_store(tmp_path):
         metadb.set_setting("objectStore", {}, "global")
 
 
-def _section(nid, script, subnodes, params=None, max_runs=200):
-    return N(nid, "section", {"script": script, "subnodes": subnodes,
-                              "params": params or {}, "maxRuns": max_runs})
+def _section(nid, script, params=None, max_runs=200, outputs=None):
+    config = {"script": script, "params": params or {}, "maxRuns": max_runs}
+    if outputs:
+        config["outputs"] = outputs
+    return N(nid, "section", config)
+
+
+def _section_child(nid, parent_id, alias, kind, config=None):
+    return {"id": nid, "type": kind, "parentId": parent_id, "position": {"x": 0, "y": 0},
+            "data": {"title": alias, "config": config or {}}}
 
 
 def _seq_parquet(tmp_path, n=1000):
@@ -3665,8 +3672,8 @@ def test_section_for_each_over_a_list(tmp_path):
               "emit(concat(parts))\n")
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": p}),
-        _section("sec", script, [{"alias": "f", "type": "filter", "config": {}}],
-                 {"preds": ["v >= 0 AND v < 100", "v >= 900"]}),  # 100 + 100 rows, disjoint
+        _section("sec", script, {"preds": ["v >= 0 AND v < 100", "v >= 900"]}),
+        _section_child("sec-filter", "sec", "f", "filter"),  # 100 + 100 rows, disjoint
         N("wr", "write", {"name": "sec_foreach"}),
     ], "edges": [E("src", "sec"), E("sec", "wr")]}
     st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
@@ -3686,10 +3693,9 @@ def test_section_iterate_until_condition(tmp_path):
               "emit(state)\n")
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": p}),
-        _section("sec", script, [
-            {"alias": "shrink", "type": "filter", "config": {}},
-            {"alias": "cnt", "type": "metric", "config": {"agg": "count"}},
-        ], {"max_iters": 10, "target": 300}),
+        _section("sec", script, {"max_iters": 10, "target": 300}),
+        _section_child("sec-shrink", "sec", "shrink", "filter"),
+        _section_child("sec-count", "sec", "cnt", "metric", {"agg": "count"}),
         N("wr", "write", {"name": "sec_iter"}),
     ], "edges": [E("src", "sec"), E("sec", "wr")]}
     st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
@@ -3707,7 +3713,8 @@ def test_section_multi_output_routes_by_port(tmp_path):
               "emit('high', run(f, data=inputs['in'], predicate='v >= 900'))\n")  # 100 rows
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": p}),
-        _section("sec", script, [{"alias": "f", "type": "filter", "config": {}}]),
+        _section("sec", script, outputs=["low", "high"]),
+        _section_child("sec-filter", "sec", "f", "filter"),
         N("wl", "write", {"name": "sec_low"}),
         N("wh", "write", {"name": "sec_high"}),
     ], "edges": [E("src", "sec"), E("sec", "wl", sh="low"), E("sec", "wh", sh="high")]}
@@ -6957,13 +6964,13 @@ def test_written_outputs_reregister_on_restart(tmp_path):
 
 def test_section_runs_its_parentid_children(tmp_path):
     # visual containment: a canvas node whose parentId is the section is a callable child — its
-    # alias is its title, so the driver calls run("keep", …). No form-declared subnodes needed.
+    # alias is its title, so the driver calls run("keep", …).
     p = _seq_parquet(tmp_path)  # v = 0..999
     child = {"id": "child1", "type": "filter", "parentId": "sec", "position": {"x": 0, "y": 0},
              "data": {"title": "keep", "config": {"predicate": "v < 300"}}}
     sec = {"id": "sec", "type": "section", "position": {"x": 0, "y": 0},
            "data": {"title": "sec", "config": {"script": "emit(run('keep', data=inputs['in']))\n",
-                                               "subnodes": [], "params": {}, "maxRuns": 50}}}
+                                               "params": {}, "maxRuns": 50}}}
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": p}), sec, child, N("wr", "write", {"name": "sec_parent"}),
     ], "edges": [E("src", "sec"), E("sec", "wr")]}
@@ -6981,10 +6988,10 @@ def test_section_nests_multiple_levels_by_parentid(tmp_path):
             "data": {"title": "keep", "config": {"predicate": "v < 300"}}}
     inner = {"id": "inner", "type": "section", "parentId": "outer", "position": {"x": 0, "y": 0},
              "data": {"title": "inner", "config": {"script": "emit(run('keep', data=inputs['in']))\n",
-                                                   "subnodes": [], "params": {}, "maxRuns": 50}}}
+                                                   "params": {}, "maxRuns": 50}}}
     outer = {"id": "outer", "type": "section", "position": {"x": 0, "y": 0},
              "data": {"title": "outer", "config": {"script": "emit(run('inner', data=inputs['in']))\n",
-                                                   "subnodes": [], "params": {}, "maxRuns": 50}}}
+                                                   "params": {}, "maxRuns": 50}}}
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": p}), outer, inner, keep, N("wr", "write", {"name": "sec_nested"}),
     ], "edges": [E("src", "outer"), E("outer", "wr")]}
@@ -7005,7 +7012,7 @@ def test_plan_hash_includes_section_children():
         return Graph(**{"id": "c", "version": 1, "nodes": [
             N("src", "source", {"uri": _uri("events")}),
             {"id": "sec", "type": "section", "position": {"x": 0, "y": 0},
-             "data": {"config": {"script": "emit(run('keep', data=inputs['in']))\n", "subnodes": [], "maxRuns": 10}}},
+             "data": {"config": {"script": "emit(run('keep', data=inputs['in']))\n", "maxRuns": 10}}},
             {"id": "k", "type": "filter", "parentId": "sec", "position": {"x": 0, "y": 0},
              "data": {"title": "keep", "config": {"predicate": pred}}},
             N("wr", "write", {"name": "o"}),
@@ -9274,11 +9281,16 @@ def test_ir_unify_regressions(tmp_path):
     with db.run_scope(), _pt.raises(NotPreviewable):
         eng(g2).relation("t")
 
-    # (3) a plugin ir hook that RAISES degrades to opaque — never bricks compile/estimate/run
+    # (3) a plugin ir hook that RAISES degrades to an IR opaque:<plugin-kind> step — never bricks
+    # compile/estimate/run. The plugin's config remains an opaque payload; literal graph kind `opaque`
+    # is unrelated and has no special execution semantics.
     def boom(node):
         raise ValueError("bad plugin hook")
     node_ir = {"myplugin": boom}
-    assert irmod._op_and_config(GraphNode(id="m", type="myplugin", data={"config": {}}), node_ir)[0] == "opaque:myplugin"
+    plugin_config = {"providerMetadata": {"revision": 7}, "customFlag": True}
+    op, config = irmod._op_and_config(
+        GraphNode(id="m", type="myplugin", data={"config": plugin_config}), node_ir)
+    assert op == "opaque:myplugin" and config == plugin_config
     g3 = G([src, {"id": "m", "type": "myplugin", "position": {"x": 0, "y": 0}, "data": {"config": {}}}],
            [{"id": "e", "source": "src", "target": "m", "data": {"wire": "dataset"}}])
     assert not irmod.lower_to_ir(g3, "m", d.node_specs, node_ir).is_clean()  # opaque → not clean, no raise
@@ -9313,6 +9325,16 @@ def test_unknown_node_kind_fails_closed():
         be.relation("x")
 
 
+def test_obsolete_source_table_alias_does_not_execute():
+    graph = {"id": "old-source", "version": 1, "nodes": [
+        N("source", "source", {"table": "events"}),
+    ], "edges": []}
+    preview = client.post("/api/run/preview", json={"graph": graph, "nodeId": "source", "k": 5})
+    assert preview.status_code == 200
+    assert preview.json()["notPreviewable"] is True
+    assert preview.json()["reason"] == "no dataset selected"
+
+
 def test_resolve_config_is_the_shared_builtin_resolver():
     # hub.ir.resolve_config is the SINGLE resolver both the IR and the DuckDB engine (executors/engine.py
     # _lower) read built-in config through — canonicalizing keys so they can't diverge. Lock the contract.
@@ -9324,9 +9346,10 @@ def test_resolve_config_is_the_shared_builtin_resolver():
 
     assert resolve_config(N("select", {"select": "a, b"})) == {"expr": "a, b"}            # select|expr → expr
     assert resolve_config(N("aggregate", {"group": "k", "aggs": "sum(x)"})) == {"groupBy": "k", "aggs": "sum(x)"}
-    assert resolve_config(N("source", {"table": "t", "delimiter": ";", "header": "No"})) == \
-        {"uri": "t", "options": {"delimiter": ";", "header": "no"}}                        # uri|table → uri; opts nested + normalized
-    assert resolve_config(N("source", {"uri": "/p.parquet"})) == {"uri": "/p.parquet"}     # no options key when unset
+    assert resolve_config(N("source", {"uri": "t", "tableId": "display-t", "delimiter": ";", "header": "No"})) == \
+        {"uri": "t", "options": {"delimiter": ";", "header": "no"}}                        # tableId is display identity, not an executable ref
+    assert resolve_config(N("source", {"table": "old-only"})) == {"uri": None}                # obsolete table alias is not executed
+    assert resolve_config(N("source", {"uri": "/p.parquet"})) == {"uri": "/p.parquet"}      # no options key when unset
     assert resolve_config(N("sample", {})) == {"n": None, "seed": 42}                       # n unset → engine supplies sample_k
     assert resolve_config(N("write", {"filename": "x.csv", "format": "csv", "writeMode": "append",
                                       "destId": "archive", "destPath": "daily/2026", "partitionBy": ""})) == \
@@ -13281,7 +13304,7 @@ def test_ray_backend_run_unit_live(tmp_path):
 def test_section_not_previewable():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
-        _section("sec", "emit(inputs['in'])", []),
+        _section("sec", "emit(inputs['in'])"),
     ], "edges": [E("src", "sec")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "sec", "k": 5}).json()
     assert r["notPreviewable"] is True
@@ -13292,8 +13315,27 @@ def test_section_maxruns_is_bounded():
     script = "while True:\n    run(f, data=inputs['in'], predicate='amount > 0')\n"
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
-        _section("sec", script, [{"alias": "f", "type": "filter", "config": {}}], max_runs=3),
+        _section("sec", script, max_runs=3),
+        _section_child("sec-filter", "sec", "f", "filter"),
         N("wr", "write", {"name": "sec_runaway"}),
     ], "edges": [E("src", "sec"), E("sec", "wr")]}
     st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
     assert st["status"] == "failed" and "maxRuns" in (st.get("error") or "")
+
+
+def test_inline_section_subnodes_are_not_executed():
+    # An old inline body remains an ordinary unknown config field; it must not be silently revived as
+    # executable nodes. Current section ownership is exclusively the canvas's parentId containment.
+    graph = {"id": "old-inline-section", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        N("sec", "section", {
+            "script": "emit(run('old-filter', data=inputs['in']))",
+            "subnodes": [{"alias": "old-filter", "type": "filter", "config": {}}],
+        }),
+        N("wr", "write", {"name": "must_not_publish"}),
+    ], "edges": [E("src", "sec"), E("sec", "wr")]}
+    status = _poll(client.post("/api/run", json={
+        "graph": graph, "targetNodeId": "wr", "confirmed": True,
+    }).json()["runId"])
+    assert status["status"] == "failed"
+    assert "section calls unknown node 'old-filter'" in (status.get("error") or "")

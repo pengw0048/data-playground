@@ -48,13 +48,7 @@ export const kindAccent: Record<string, string> = {
   'vector-search': '#7a6fce',
   write: '#64748b',
   metric: '#c39a4b',
-  notebook: '#4f8ba8',
   note: '#eab308',  // annotation — sticky-note amber
-  // control-flow: graphite, not data-colored
-  branch: '#566173',
-  loop: '#566173',
-  variable: '#566173',
-  opaque: '#566173',
 }
 
 // Wire types — each has a distinct port shape + neutral tint (design — wire types).

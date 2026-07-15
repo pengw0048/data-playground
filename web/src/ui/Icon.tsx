@@ -5,7 +5,7 @@ import type { CSSProperties } from 'react'
 export type IconName =
   | 'eye' | 'play' | 'clock' | 'code' | 'more' | 'refresh' | 'stop' | 'plus' | 'close'
   | 'chevronDown' | 'chevronRight' | 'chevronLeft' | 'lineage' | 'power' | 'mute' | 'rename'
-  | 'duplicate' | 'export' | 'import' | 'trash' | 'search' | 'sparkle' | 'grid' | 'branch' | 'loop'
+  | 'duplicate' | 'export' | 'import' | 'trash' | 'search' | 'sparkle' | 'grid'
   | 'fx' | 'sample' | 'arrow' | 'external' | 'check' | 'db' | 'sigma' | 'sql' | 'note'
   | 'minus' | 'link' | 'settings' | 'undo' | 'redo' | 'sun' | 'moon' | 'users' | 'maximize' | 'minimize'
 
@@ -40,8 +40,6 @@ const P: Record<IconName, JSX.Element> = {
   search: <><circle cx="7" cy="7" r="4" /><path d="M10 10l3.5 3.5" /></>,
   sparkle: <path d="M8 2.5l1.4 3.6L13 7.5l-3.6 1.4L8 12.5 6.6 8.9 3 7.5l3.6-1.4z" />,
   grid: <><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1" /><rect x="9" y="2.5" width="4.5" height="4.5" rx="1" /><rect x="2.5" y="9" width="4.5" height="4.5" rx="1" /><rect x="9" y="9" width="4.5" height="4.5" rx="1" /></>,
-  branch: <><circle cx="4" cy="8" r="1.6" /><circle cx="12" cy="4" r="1.6" /><circle cx="12" cy="12" r="1.6" /><path d="M5.5 7.3 10.6 4.6M5.5 8.7l5.1 2.7" /></>,
-  loop: <><path d="M4 8a4 4 0 0 1 4-4h1.5" /><path d="M12 8a4 4 0 0 1-4 4H6.5" /><path d="M9 2.5 10.5 4 9 5.5M7 10.5 5.5 12 7 13.5" /></>,
   fx: <path d="M5 12.5c0-6 1-9 3.5-9M3.5 7.5h5" />,
   sample: <><rect x="2.5" y="2.5" width="11" height="11" rx="2" /><path d="M2.5 6.5h11M6.5 6.5v7" opacity=".5" /></>,
   arrow: <path d="M3 8h9M9 5l3 3-3 3" />,

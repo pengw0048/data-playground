@@ -1049,7 +1049,7 @@ def test_primary_writer_run_must_publish_before_secondary_owners(storage):
     metadb.put_result(f"late-cache-{uuid.uuid4().hex}", {"uri": uri})
 
 
-def test_nested_visual_and_legacy_section_sources_are_durable_owner_candidates(storage):
+def test_nested_section_sources_are_durable_owner_candidates(storage):
     uris = [_ready_result(storage, f"run-{uuid.uuid4().hex}") for _ in range(2)]
     doc = {
         "nodes": [
@@ -1065,17 +1065,16 @@ def test_nested_visual_and_legacy_section_sources_are_durable_owner_candidates(s
                 "data": {"config": {"uri": uris[0]}},
             },
             {
-                "id": "legacy-section",
+                "id": "nested-section",
                 "type": "section",
-                "data": {"config": {"subnodes": [{
-                    "alias": "nested",
-                    "type": "section",
-                    "config": {"subnodes": [{
-                        "alias": "source",
-                        "type": "source",
-                        "config": {"uri": uris[1]},
-                    }]},
-                }]}},
+                "parentId": "visual-section",
+                "data": {"config": {}},
+            },
+            {
+                "id": "nested-source",
+                "type": "source",
+                "parentId": "nested-section",
+                "data": {"config": {"uri": uris[1]}},
             },
         ],
     }
@@ -1099,17 +1098,22 @@ def test_section_runtime_cannot_override_lifecycle_owner_fields(
         position=Position(x=0, y=0),
         data={"config": {
             "script": f"run(child, {protected_field}='replacement')",
-            "subnodes": [{
-                "alias": "child",
-                "type": subnode_type,
-                "config": ({"uri": "/stable/source.parquet"}
-                           if subnode_type == "source"
-                           else {"script": "emit(inputs['in'])", "subnodes": []}),
-            }],
         }},
     )
+    child = GraphNode(
+        id="child",
+        type=subnode_type,
+        parent_id="outer",
+        position=Position(x=0, y=0),
+        data={
+            "title": "child",
+            "config": ({"uri": "/stable/source.parquet"}
+                       if subnode_type == "source"
+                       else {"script": "emit(inputs['in'])"}),
+        },
+    )
     engine = types.SimpleNamespace(
-        graph=Graph(id="section-owner", version=1, nodes=[section], edges=[]),
+        graph=Graph(id="section-owner", version=1, nodes=[section, child], edges=[]),
         resolve_adapter=None,
         registry=None,
         node_builders={},

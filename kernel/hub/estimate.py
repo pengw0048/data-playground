@@ -28,7 +28,7 @@ from hub.models import Graph
 # streaming ops (scan/filter/select/map/sample/limit/write) need ~O(1) and don't.
 _BLOCKING = {"sort", "dedup", "aggregate", "join", "sql", "vector-search", "window", "pivot"}
 # code ops: output cardinality can't be known without running them.
-_CODE = {"transform", "notebook", "opaque", "section", "loop"}
+_CODE = {"transform", "section"}
 
 # a coarse per-column byte width by (display) type — for turning a row count into a working-set size.
 _TYPE_W = {

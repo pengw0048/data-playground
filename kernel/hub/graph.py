@@ -39,75 +39,49 @@ def node_map(graph: Graph) -> dict[str, GraphNode]:
 
 
 _MAX_EXECUTION_SOURCE_NODES = 10_000
-_MAX_LEGACY_SECTION_DEPTH = 64
 
 
 def _execution_source_configs(graph: Graph, roots: list[GraphNode]) -> list[dict]:
     """Source configs a selected execution cone can actually reach, including section bodies.
 
-    A visual section executes its ``parent_id`` children rather than ordinary graph edges. Older
-    canvases store the same callable nodes under ``config.subnodes``. Keep that precedence identical
-    to ``section._collect_subnodes`` and bound the iterative walk so malformed nested documents cannot
-    turn source ownership/fingerprinting into unbounded recursion.
+    A section executes its ``parent_id`` children rather than ordinary graph edges. Bound the
+    iterative walk so malformed containment cannot turn source ownership/fingerprinting into an
+    unbounded traversal.
     """
     children: dict[str, list[GraphNode]] = {}
     for node in graph.nodes:
         if node.parent_id:
             children.setdefault(node.parent_id, []).append(node)
 
-    queue: list[tuple[str, object, int]] = [("visual", node, 0) for node in roots]
-    seen_visual: set[str] = set()
-    seen_legacy: set[int] = set()
+    queue = list(roots)
+    seen: set[str] = set()
     configs: list[dict] = []
     cursor = 0
     while cursor < len(queue):
         if cursor >= _MAX_EXECUTION_SOURCE_NODES:
             raise RuntimeError("section source traversal exceeds the supported node limit")
-        kind, raw, depth = queue[cursor]
+        node = queue[cursor]
         cursor += 1
-        if depth > _MAX_LEGACY_SECTION_DEPTH:
-            raise RuntimeError("legacy section nesting exceeds the supported depth")
-
-        if kind == "visual":
-            node = raw
-            if not isinstance(node, GraphNode) or node.id in seen_visual:
-                continue
-            seen_visual.add(node.id)
-            node_type = node.type
-            data = node.data if isinstance(node.data, dict) else {}
-            config = data.get("config") if isinstance(data.get("config"), dict) else {}
-            direct_children = children.get(node.id, [])
-        else:
-            spec = raw
-            if not isinstance(spec, dict) or id(spec) in seen_legacy:
-                continue
-            seen_legacy.add(id(spec))
-            node_type = spec.get("type")
-            config = spec.get("config") if isinstance(spec.get("config"), dict) else {}
-            direct_children = []
-
-        if node_type == "source":
+        if not isinstance(node, GraphNode) or node.id in seen:
+            continue
+        seen.add(node.id)
+        data = node.data if isinstance(node.data, dict) else {}
+        config = data.get("config") if isinstance(data.get("config"), dict) else {}
+        if node.type == "source":
             configs.append(config)
-        if node_type != "section":
-            continue
-        if direct_children:  # visual containment wins; legacy subnodes are fallback-only
-            queue.extend(("visual", child, depth) for child in direct_children)
-            continue
-        subnodes = config.get("subnodes") or []
-        if not isinstance(subnodes, list):
-            raise RuntimeError("legacy section subnodes must be a list")
-        queue.extend(("legacy", child, depth + 1) for child in subnodes)
+        if node.type == "section":
+            queue.extend(children.get(node.id, []))
     return configs
 
 
 def resolve_source_refs(graph: Graph, resolve) -> None:
     """Rewrite every executable source binding IN PLACE through the catalog resolver.
 
-    This includes visual and legacy section children. Without that shared traversal the engine could
-    execute an unresolved legacy token while ownership guards protected a different (or no) URI.
+    This includes section-contained children. Without that shared traversal the engine could execute
+    an unresolved token while ownership guards protected a different (or no) URI.
     """
     for cfg in _execution_source_configs(graph, list(graph.nodes)):
-        value = cfg.get("uri") or cfg.get("table")
+        value = cfg.get("uri")
         if value:
             cfg["uri"] = resolve(value)
 
@@ -163,7 +137,7 @@ def all_upstream_source_uris(graph: Graph, node_id: str) -> list[str]:
     uris: list[str] = []
     seen: set[str] = set()
     for config in _execution_source_configs(graph, upstream_chain(graph, node_id)):
-        uri = config.get("uri") or config.get("table")
+        uri = config.get("uri")
         if uri and uri not in seen:
             seen.add(uri)
             uris.append(uri)
@@ -189,7 +163,7 @@ def all_upstream_publication_uris(graph: Graph, node_id: str) -> list[str]:
             config = node.data.get("config")
             if not isinstance(config, dict):
                 continue
-            uri = config.get("uri") or config.get("table")
+            uri = config.get("uri")
             configured = (uri,) if uri else ()
         for uri in configured:
             if uri and uri not in seen:
@@ -205,7 +179,7 @@ def execution_source_uris(graph: Graph, target_node_id: str | None) -> list[str]
     uris: list[str] = []
     seen: set[str] = set()
     for config in _execution_source_configs(graph, list(graph.nodes)):
-        uri = config.get("uri") or config.get("table")
+        uri = config.get("uri")
         if uri and uri not in seen:
             seen.add(uri)
             uris.append(uri)
@@ -236,16 +210,9 @@ def nearest_source(graph: Graph, chain: list[GraphNode]) -> GraphNode | None:
     return None
 
 
-# Node types the engine executes natively even though they carry no NodeSpec (legacy / intrinsic).
-# Any type outside node_specs ∪ node_builders ∪ these is unknown — a missing plugin or a typo — and
-# must fail closed rather than silently pass its input through (which would omit the intended work
-# yet report success). See executors/engine.py's catch-all and routers/runs._reject_unknown_kinds.
-INTRINSIC_KINDS = frozenset({"notebook", "loop", "variable", "opaque"})
-
-
 def unknown_kinds(graph: Graph, known) -> list[tuple[str, str]]:
-    """[(node_id, type), ...] for nodes whose type is neither a registered kind nor an intrinsic one."""
-    allow = set(known) | INTRINSIC_KINDS
+    """[(node_id, type), ...] for nodes whose type is not currently registered."""
+    allow = set(known)
     return [(n.id, n.type) for n in graph.nodes if n.type not in allow]
 
 
@@ -261,8 +228,8 @@ def _ports(node: GraphNode, spec, side: str) -> list[tuple[str, str, bool]]:
         declared = cfg.get("outputs") if isinstance(cfg, dict) else None
         if isinstance(declared, list) and declared:
             return [(str(port), "dataset", False) for port in declared]
-    if spec is None:  # intrinsic legacy kinds have one implicit dataset input/output
-        return [("out" if side == "source" else "in", "dataset", False)]
+    if spec is None:  # unknown kinds are reported by the unknown-kind gate, never given implicit ports
+        return []
     if side == "source":
         ports = spec.outputs
     else:
@@ -293,7 +260,7 @@ def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None
 
     ``None`` handles select a conventional default port (``out``/``in`` when present, otherwise the
     first declared port). An explicit handle must exist. Unknown kinds are left to the existing
-    unknown-kind gate; intrinsic legacy kinds use their implicit single ``in``/``out`` dataset ports.
+    unknown-kind gate; registered plugin kinds use the ports from their required NodeSpec.
     """
     errors: list[str] = []
     nodes: dict[str, GraphNode] = {}
@@ -328,7 +295,7 @@ def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None
             continue
 
         source_spec = node_specs.get(source.type)
-        if source_spec is not None or source.type in INTRINSIC_KINDS:
+        if source_spec is not None:
             output = _port(source, source_spec, edge.source_handle, "source")
             if output is None:
                 if edge.source_handle is None:
@@ -339,7 +306,7 @@ def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None
                     )
 
         target_spec = node_specs.get(target.type)
-        if target_spec is None and target.type not in INTRINSIC_KINDS:
+        if target_spec is None:
             continue
         input_port = _port(target, target_spec, edge.target_handle, "target")
         if input_port is None:
@@ -375,8 +342,7 @@ def type_errors(graph: Graph, node_specs: dict) -> list[str]:
         if not src or not tgt:
             continue
         sspec, tspec = node_specs.get(src.type), node_specs.get(tgt.type)
-        if ((sspec is None and src.type not in INTRINSIC_KINDS)
-                or (tspec is None and tgt.type not in INTRINSIC_KINDS)):
+        if sspec is None or tspec is None:
             continue
         out = _port(src, sspec, e.source_handle, "source")
         inp = _port(tgt, tspec, e.target_handle, "target")
