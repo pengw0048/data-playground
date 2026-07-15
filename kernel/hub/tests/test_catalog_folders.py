@@ -170,11 +170,17 @@ def test_rename_into_descendant_is_rejected(tmp_path):
         _wipe(["a"], [uri])
 
 
-def test_folder_mutation_501_when_provider_unsupported(monkeypatch):
-    # #161 review #4: a catalog provider that doesn't own the local folder store must not have a
-    # local-only mutation reported as success.
+def test_external_provider_subclass_refuses_local_folder_mutation(monkeypatch, tmp_path):
+    # #161 review #4: a read-only external provider (subclasses InMemoryCatalog to own a REMOTE
+    # namespace) sets folders_mutable=False so it inherits none of the local-metadb folder writes; the
+    # routes must refuse (501), never report a local-only write against a store its browse() ignores.
     from hub.deps import get_deps
-    monkeypatch.setattr(get_deps().catalog, "folders_mutable", False, raising=False)
+    from hub.plugins.catalog import InMemoryCatalog
+
+    class ReadOnlyExternal(InMemoryCatalog):
+        folders_mutable = False
+
+    monkeypatch.setattr(get_deps(), "catalog", ReadOnlyExternal(str(tmp_path), lambda _uri: object()))
     assert client.post("/api/catalog/folders", json={"path": "x"}).status_code == 501
     assert client.put("/api/catalog/folders/rename", json={"oldPath": "x", "newPath": "y"}).status_code == 501
     assert client.post("/api/catalog/folders/delete", json={"path": "x"}).status_code == 501
