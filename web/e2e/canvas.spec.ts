@@ -234,7 +234,9 @@ test.describe('Data Playground canvas', () => {
     const input = page.locator('.react-flow__node input')
     await expect(input).toBeVisible()
     await input.fill('my query')
-    await input.press('Enter')
+    // Blur is also a valid commit and may remove the input immediately after fill. Page-level Enter
+    // commits when it is still focused and is harmless when blur already committed the title.
+    await page.keyboard.press('Enter')
     await expect(page.locator('.react-flow__node').getByText('my query', { exact: true })).toBeVisible()
   })
 
