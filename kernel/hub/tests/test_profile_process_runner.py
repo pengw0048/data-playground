@@ -658,6 +658,15 @@ def test_managed_source_parent_lease_spans_real_child_reap_without_child_reacqui
             storage.commit_result(uri, producer_run)
             runner = ProfileProcessRunner(
                 str(workspace), str(tmp_path / "data"), storage=storage, deadline_s=10)
+            terminal_lease_states = []
+
+            def observe_terminal(_graph, status):
+                if status.status in ("done", "failed", "cancelled"):
+                    with runner._lock:
+                        terminal_lease_states.append(
+                            status.run_id in runner._source_leases)
+
+            runner.on_status = observe_terminal
             started = runner.run(
                 _graph(uri),
                 "source",
@@ -687,6 +696,7 @@ def test_managed_source_parent_lease_spans_real_child_reap_without_child_reacqui
             assert final.status == "done"
             assert final.profile is not None and final.profile.row_count == 4
             assert processes[0].returncode == 0
+            assert terminal_lease_states and not any(terminal_lease_states)
             assert not metadb.local_result_read_active(
                 uri, storage.namespace_id, acquired[0].reader_id)
             storage.abort_result(uri, producer_run)
