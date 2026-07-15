@@ -49,7 +49,10 @@ class APIErrorResponse(BaseModel):
     detail: Any = Field(description="Human-readable detail; clients must not parse this value.")
     code: APIErrorCode = Field(description="Stable machine-readable error code.")
     retryable: bool = Field(
-        description="Whether retrying later without changing the request may succeed."
+        description=(
+            "Whether the server knows that retrying the same request is safe under this operation's "
+            "semantics."
+        )
     )
 
 
@@ -79,11 +82,14 @@ _STATUS_DEFAULTS: dict[int, tuple[APIErrorCode, bool]] = {
     413: (APIErrorCode.PAYLOAD_TOO_LARGE, False),
     422: (APIErrorCode.VALIDATION_ERROR, False),
     429: (APIErrorCode.RATE_LIMITED, True),
-    500: (APIErrorCode.INTERNAL_ERROR, True),
+    # A generic 5xx has an unknown commit outcome. A POST may have committed its side effect before
+    # response serialization or an upstream acknowledgement failed, so status alone can never make
+    # the same request safe to repeat. Known pre-effect failures opt in with ``APIError`` instead.
+    500: (APIErrorCode.INTERNAL_ERROR, False),
     501: (APIErrorCode.NOT_IMPLEMENTED, False),
-    502: (APIErrorCode.UPSTREAM_FAILURE, True),
-    503: (APIErrorCode.SERVICE_UNAVAILABLE, True),
-    504: (APIErrorCode.UPSTREAM_TIMEOUT, True),
+    502: (APIErrorCode.UPSTREAM_FAILURE, False),
+    503: (APIErrorCode.SERVICE_UNAVAILABLE, False),
+    504: (APIErrorCode.UPSTREAM_TIMEOUT, False),
 }
 
 
@@ -110,7 +116,7 @@ def classify_http_error(exc: HTTPException) -> tuple[APIErrorCode, bool]:
     if isinstance(exc, APIError):
         return exc.code, exc.retryable
     default = (
-        (APIErrorCode.INTERNAL_ERROR, True)
+        (APIErrorCode.INTERNAL_ERROR, False)
         if exc.status_code >= 500
         else (APIErrorCode.INVALID_REQUEST, False)
     )

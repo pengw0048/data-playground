@@ -38,7 +38,7 @@
             "title": "Detail"
           },
           "retryable": {
-            "description": "Whether retrying later without changing the request may succeed.",
+            "description": "Whether the server knows that retrying the same request is safe under this operation's semantics.",
             "title": "Retryable",
             "type": "boolean"
           }

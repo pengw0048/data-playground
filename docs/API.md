@@ -37,8 +37,10 @@ adds two machine fields. Unhandled failures use the redacted detail `internal se
 
 - `detail` is human-readable and may change. Clients must not parse it.
 - `code` is the stable machine-readable classification. Its allowed values are pinned in OpenAPI.
-- `retryable` says whether the same request may succeed later without being changed. It is not a retry
-  instruction: clients must still apply bounded backoff and respect `Retry-After` when present.
+- `retryable: true` means the server knows that repeating the same request is safe under that
+  operation's semantics. Clients must still use bounded backoff and respect `Retry-After` when present.
+  Generic and unhandled 5xx responses are `false`: the server may not know whether a non-idempotent
+  operation committed before the failure. A known pre-effect failure opts in explicitly.
 
 Specific routes use specific codes such as `canvas_not_found`, `invalid_graph`, and
 `upstream_agent_failure`. Other existing `HTTPException` sites receive a stable status-level code such

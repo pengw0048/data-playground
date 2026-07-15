@@ -315,7 +315,9 @@ async def _stable_api_internal_error(request: Request, _exc: Exception):
             status_code=500,
             detail="internal server error",
             code=APIErrorCode.INTERNAL_ERROR,
-            retryable=True,
+            # The route may have committed before response construction failed. Unknown commit
+            # outcomes must never invite an automatic repeat of a non-idempotent request.
+            retryable=False,
         )
     return PlainTextResponse("Internal Server Error", status_code=500)
 

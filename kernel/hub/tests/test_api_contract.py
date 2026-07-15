@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from hub.contracts.openapi import check_snapshot, render_openapi
+from hub.api_errors import APIError, APIErrorCode, classify_http_error
 from hub.main import app
 
 
@@ -117,9 +118,22 @@ def test_unhandled_api_failure_is_stable_and_redacted():
 
     response = TestClient(probe, raise_server_exceptions=False).get("/api/failure")
 
-    _assert_error(response, status=500, code="internal_error", retryable=True)
+    _assert_error(response, status=500, code="internal_error", retryable=False)
     assert response.json()["detail"] == "internal server error"
     assert "private failure detail" not in response.text
+
+
+def test_generic_5xx_never_claims_retry_safety_without_an_explicit_contract():
+    assert classify_http_error(HTTPException(503, "temporarily unavailable")) == (
+        APIErrorCode.SERVICE_UNAVAILABLE,
+        False,
+    )
+    assert classify_http_error(APIError(
+        503,
+        "admission is temporarily unavailable",
+        code=APIErrorCode.SERVICE_UNAVAILABLE,
+        retryable=True,
+    )) == (APIErrorCode.SERVICE_UNAVAILABLE, True)
 
 
 def test_committed_openapi_snapshot_matches_the_app():
