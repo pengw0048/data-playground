@@ -34,9 +34,25 @@ async function goToFilesShell(page: Page) {
 }
 
 async function openCanvasWithSource(page: Page) {
+  // Full-profile workflows create named canvases before this spec. Start fresh so the visibility
+  // assertions exercise one source node rather than inheriting their graph.
+  await page.goto('/')
+  await expect(page.getByTestId('toolbar')).toBeVisible()
+  const previous = await page.evaluate(() => location.hash)
+  await page.getByTestId('file-menu').click()
+  await page.getByText('New file').click()
+  await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
+  await expect(page.locator('.react-flow__node')).toHaveCount(0)
+  await page.getByTestId('app-menu').click()
+  await page.getByText('Back to files').click()
+  await expect(page.getByTestId('rail-files')).toBeVisible()
+
   await page.getByTestId('rail-tables').click()
   await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
-  await page.getByText('events', { exact: true }).click()
+  // The full UX fixture replaces the small smoke catalog, so search instead of relying on its order.
+  const starterTable = process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events'
+  await page.getByTestId('catalog-search').fill(starterTable)
+  await page.getByRole('button', { name: `Open table ${starterTable}`, exact: true }).click()
   await page.getByTestId('detail-use').click()
   await expect(page.getByTestId('toolbar')).toBeVisible()
   await expect(page.locator('.react-flow__node')).toHaveCount(1)
@@ -96,7 +112,7 @@ test.describe('minimum viewport support', () => {
     await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
     const dataPanel = page.getByTestId('panel-data')
     await expectFullyInViewport(page, dataPanel, 'data panel')
-    // Seeded events preview paints a row-count label once the kernel returns.
+    // The seeded source preview paints a row-count label once the kernel returns.
     await expect(dataPanel.getByText(/^rows /)).toBeVisible({ timeout: 15_000 })
     await dataPanel.getByTitle('Close').click()
     await expect(dataPanel).toHaveCount(0)
