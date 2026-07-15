@@ -172,7 +172,7 @@ class Boto3ManagedObjectProvider:
         import boto3
         from hub import metadb
         from hub.secrets import resolve_object_store
-        cfg = resolve_object_store(metadb.get_setting("objectStore", "global", default={}) or {})
+        cfg = resolve_object_store(metadb.cred_object_store_config(None))
         kwargs = {
             "region_name": cfg.get("region") or os.environ.get("AWS_REGION") or "us-east-1",
         }

@@ -250,6 +250,16 @@ class CatalogEntry(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, index=True)
 
 
+class CatalogFolder(Base):
+    """A first-class browse folder. Additive to the `folder` path string on CatalogEntry (which the
+    external CatalogProvider namespace mapping still owns): a folder entity lets an EMPTY folder exist
+    and be renamed/deleted, while rename/delete operate over the UNION of these paths and the distinct
+    entry `folder` strings — so a folder created by simply registering a dataset is editable too."""
+    __tablename__ = "catalog_folders"
+    path: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class CatalogTag(Base):
     """One (dataset uri → tag) membership. A join table (not a JSON blob on the entry) so a tag filter
     / a tag facet is an indexed query, and two instances tagging concurrently can't clobber each other."""
@@ -558,6 +568,20 @@ class Setting(Base):
     key: Mapped[str] = mapped_column(String)
     value: Mapped[str] = mapped_column(Text)  # JSON-encoded
     __table_args__ = (UniqueConstraint("scope", "scope_id", "key", name="uq_setting"),)
+
+
+class CredEntity(Base):
+    """A named credential — a first-class entity a destination or the agent references by id.
+
+    ``fields`` stores only secret REFERENCES (``env:VAR`` / ``file:/path``), never raw secret bytes.
+    ``kind`` is 'object_store' (fields = the objectStore subkeys) or 'agent' (fields = {apiKey: ref}).
+    """
+    __tablename__ = "creds"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    name: Mapped[str] = mapped_column(String)
+    kind: Mapped[str] = mapped_column(String)  # 'object_store' | 'agent'
+    fields_json: Mapped[str] = mapped_column(Text, default="{}")  # JSON dict of secret references
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class AgentEgressEvent(Base):
@@ -5738,9 +5762,11 @@ def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
     with session() as s:
         normalized = str(uri).rstrip("/")
         payload = dict(doc)
+        payload["folder"] = catalog_folder_normalize(payload.get("folder") or "")
         _catalog_upsert_in_session(
             s, normalized, name, payload, parents=parents, pipeline=pipeline)
         sync_local_result_owner(s, "catalog_entry", normalized, normalized, payload)
+        _materialize_folder(s, payload.get("folder") or "")  # a registered dataset's folder is first-class
 
 
 def catalog_publish_entries(entries: list[tuple[str, str, dict, list[str] | None, str | None]]) -> None:
@@ -5750,6 +5776,7 @@ def catalog_publish_entries(entries: list[tuple[str, str, dict, list[str] | None
         for uri, name, doc, parents, pipeline in entries:
             normalized = str(uri).rstrip("/")
             payload = dict(doc)
+            payload["folder"] = catalog_folder_normalize(payload.get("folder") or "")
             _catalog_upsert_in_session(
                 s, normalized, name, payload,
                 parents=parents, pipeline=pipeline)
@@ -5786,6 +5813,7 @@ def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: 
     friendly `name` rename) — both the indexed columns AND the mirrored fields inside the stored doc,
     so a re-read is consistent without re-probing the dataset. Unknown or inactive managed targets
     fail closed."""
+    folder = catalog_folder_normalize(folder)
     with session() as s:
         target = _lock_catalog_mutation_targets(s, [uri])[0]
         if not target["known"]:
@@ -5801,6 +5829,7 @@ def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: 
         r.folder, r.owner, r.description, r.doc = folder, owner, description, json.dumps(doc, default=str)
         if name:
             r.name = name
+        _materialize_folder(s, folder)  # curating into a folder makes it a first-class entity (#155)
         if logical is not None:
             logical.governance_doc = json.dumps(
                 _catalog_governance(doc), default=str, sort_keys=True)
@@ -6237,6 +6266,187 @@ def catalog_facets(q: str | None = None, folder: str | None = None, tags: list[s
     return {"folders": folders, "tags": tag_counts, "owners": owners}
 
 
+def catalog_folder_normalize(path: str) -> str:
+    """A folder path with surrounding slashes stripped and each segment validated. Rejects empty
+    segments and `.`/`..` so a path can't escape its namespace. '' means the tree root."""
+    p = (path or "").strip().strip("/")
+    if not p:
+        return ""
+    segs = [seg.strip() for seg in p.split("/")]
+    if any(not seg or seg in (".", "..") for seg in segs):
+        raise ValueError(f"invalid folder path: '{path}'")
+    return "/".join(segs)
+
+
+def _folder_ancestors(path: str) -> list[str]:
+    """Every prefix of `path` including itself, e.g. 'x/y/z' -> ['x', 'x/y', 'x/y/z']."""
+    segs = path.split("/")
+    return ["/".join(segs[: i + 1]) for i in range(len(segs))]
+
+
+def _folder_exists(s, path: str) -> bool:
+    """True when `path` is a known folder — a folder entity at/under it OR any entry filed at/under it."""
+    like = _like_escape(path) + "/%"
+    if s.get(CatalogFolder, path) is not None:
+        return True
+    if s.scalar(select(CatalogFolder.path).where(
+            CatalogFolder.path.like(like, escape="\\")).limit(1)) is not None:
+        return True
+    return s.scalar(select(CatalogEntry.uri).where(or_(
+        CatalogEntry.folder == path,
+        CatalogEntry.folder.like(like, escape="\\"))).limit(1)) is not None
+
+
+def _ensure_folder_rows(s, paths) -> None:
+    """Insert a CatalogFolder row for every path not already present. Conflict-safe: a concurrent
+    creator that wins the check-then-insert race just leaves the row present (no duplicate-PK 500)."""
+    from sqlalchemy.exc import IntegrityError
+    want = list(dict.fromkeys(p for p in paths if p))
+    if not want:
+        return
+    have = {p for (p,) in s.execute(select(CatalogFolder.path).where(CatalogFolder.path.in_(want)))}
+    for p in want:
+        if p in have:
+            continue
+        sp = s.begin_nested()
+        try:
+            s.add(CatalogFolder(path=p))
+            s.flush()
+        except IntegrityError:
+            sp.rollback()  # another writer inserted this path between the check and our insert
+
+
+def _materialize_folder(s, raw: str) -> None:
+    """Back a dataset's assigned folder STRING with first-class folder entities (its full ancestry), so
+    registering/curating into a path makes it a real folder — not a merely-implicit derived namespace
+    (#155). A malformed legacy string is left as a derived-only folder rather than failing the write."""
+    if not raw:
+        return
+    try:
+        _ensure_folder_rows(s, _folder_ancestors(catalog_folder_normalize(raw)))
+    except ValueError:
+        pass
+
+
+def catalog_folders_list() -> list[dict]:
+    """Every folder entity, as {path, created_at}. Empty folders live only here (entry-derived folders
+    are additionally discovered from CatalogEntry.folder), so this powers the folder-name autocomplete."""
+    with session() as s:
+        return [{"path": r.path, "created_at": r.created_at}
+                for r in s.scalars(select(CatalogFolder).order_by(CatalogFolder.path))]
+
+
+class FolderExistsError(ValueError):
+    """The folder already exists, or a concurrent create won the race — the route maps this to 409."""
+
+
+def catalog_folder_create(path: str) -> str:
+    """Create an empty folder (+ its ancestor entity rows). Raises FolderExistsError if the folder
+    already exists (as an entity or via any entry) OR a concurrent create wins the race, so the loser
+    gets a stable conflict rather than a false success. Returns the normalized path."""
+    from sqlalchemy.exc import IntegrityError
+    path = catalog_folder_normalize(path)
+    if not path:
+        raise ValueError("folder path cannot be empty")
+    with session() as s:
+        if _folder_exists(s, path):
+            raise FolderExistsError(f"folder '{path}' already exists")
+        _ensure_folder_rows(s, _folder_ancestors(path)[:-1])  # parents tolerantly
+        sp = s.begin_nested()
+        try:
+            s.add(CatalogFolder(path=path))  # the target itself: a race here is a real conflict
+            s.flush()
+        except IntegrityError:
+            sp.rollback()
+            raise FolderExistsError(f"folder '{path}' already exists")
+    return path
+
+
+def _rewrite_entry_folders(s, old: str, new: str) -> None:
+    """Repoint every entry under `old` (== old or old/…) to `new`, updating both the indexed `folder`
+    column and the mirrored `folder` inside the stored doc JSON."""
+    like = _like_escape(old) + "/%"
+    rows = list(s.scalars(select(CatalogEntry).where(or_(
+        CatalogEntry.folder == old, CatalogEntry.folder.like(like, escape="\\")))))
+    for r in rows:
+        target = new + (r.folder or "")[len(old):]
+        r.folder = target
+        try:
+            doc = json.loads(r.doc)
+        except (ValueError, TypeError):
+            doc = {}
+        doc["folder"] = target
+        r.doc = json.dumps(doc, default=str)
+
+
+def catalog_folder_rename(old: str, new: str) -> None:
+    """Rename a folder, cascading to every dataset and subfolder under it. Operates over the UNION of
+    folder entities and entry `folder` strings, so a folder that exists only because a dataset was
+    registered into it is renameable too. Raises ValueError if `old` is unknown or `new` already exists."""
+    old = catalog_folder_normalize(old)
+    new = catalog_folder_normalize(new)
+    if not old or not new:
+        raise ValueError("folder path cannot be empty")
+    with session() as s:
+        if not _folder_exists(s, old):
+            raise ValueError(f"folder '{old}' not found")
+        if new == old:
+            return
+        if new.startswith(old + "/"):  # a folder can't become its own descendant (self-nesting)
+            raise ValueError("cannot move a folder into itself")
+        if _folder_exists(s, new):
+            raise ValueError(f"folder '{new}' already exists")
+        like = _like_escape(old) + "/%"
+        moved_entities = list(s.scalars(select(CatalogFolder).where(or_(
+            CatalogFolder.path == old, CatalogFolder.path.like(like, escape="\\")))))
+        targets = [new + row.path[len(old):] for row in moved_entities]
+        for row in moved_entities:
+            s.delete(row)
+        s.flush()
+        _rewrite_entry_folders(s, old, new)
+        _ensure_folder_rows(s, list(targets) + _folder_ancestors(new))
+
+
+def catalog_folder_delete(path: str) -> None:
+    """Delete a folder, moving everything under it UP one level to the folder's parent while PRESERVING
+    descendant structure (deleting 'research' turns 'research/vision/raw' into 'vision/raw', not a flat
+    dump), then removing the deleted node. Nothing is lost — datasets and subfolders are re-homed, not
+    deleted. Operates over the UNION of folder entities and entry `folder` strings; raises ValueError
+    if the folder is unknown."""
+    path = catalog_folder_normalize(path)
+    if not path:
+        raise ValueError("folder path cannot be empty")
+    parent = path.rsplit("/", 1)[0] if "/" in path else ""
+
+    def _reparent(folder: str) -> str:
+        if folder == path:
+            return parent
+        rel = folder[len(path) + 1:]  # strip the deleted "path/" prefix, keep the rest
+        return f"{parent}/{rel}" if parent else rel
+
+    with session() as s:
+        if not _folder_exists(s, path):
+            raise ValueError(f"folder '{path}' not found")
+        like = _like_escape(path) + "/%"
+        for r in s.scalars(select(CatalogEntry).where(or_(
+                CatalogEntry.folder == path, CatalogEntry.folder.like(like, escape="\\")))):
+            r.folder = _reparent(r.folder)
+            try:
+                doc = json.loads(r.doc)
+            except (ValueError, TypeError):
+                doc = {}
+            doc["folder"] = r.folder
+            r.doc = json.dumps(doc, default=str)
+        # descendant folder entities move up one level; only the deleted node itself is removed
+        moved = list(s.scalars(select(CatalogFolder).where(CatalogFolder.path.like(like, escape="\\"))))
+        targets = [_reparent(row.path) for row in moved]
+        for row in s.scalars(select(CatalogFolder).where(or_(
+                CatalogFolder.path == path, CatalogFolder.path.like(like, escape="\\")))):
+            s.delete(row)
+        s.flush()
+        _ensure_folder_rows(s, targets)
+
+
 def catalog_tree(prefix: str = "", table_limit: int = 100
                  ) -> tuple[list[tuple[str, str, int]], list[dict], int]:
     """One level of the browse tree at `prefix`: (child_folders, direct_tables, direct_total).
@@ -6250,8 +6460,11 @@ def catalog_tree(prefix: str = "", table_limit: int = 100
         folder_counts = s.execute(
             select(CatalogEntry.folder, func.count()).where(CatalogEntry.folder != "")
             .group_by(CatalogEntry.folder)).all()
+        # merge in folder ENTITY paths (count 0) so an empty folder — created directly or emptied by a
+        # move/delete — still appears in the tree alongside the entry-derived folders
+        entity_paths = [(pth, 0) for (pth,) in s.execute(select(CatalogFolder.path)).all()]
         children: dict[str, int] = {}
-        for folder, cnt in folder_counts:
+        for folder, cnt in list(folder_counts) + entity_paths:
             f = (folder or "").strip("/")
             if p:
                 if f != p and not f.startswith(p + "/"):
@@ -6751,7 +6964,8 @@ def get_kernel(canvas_id: str) -> dict | None:
         if r is None:
             return None
         return {"canvas_id": r.canvas_id, "kernel_id": r.kernel_id, "endpoint": r.endpoint,
-                "token": r.token, "state": r.state, "stale": _kernel_stale(r)}
+                "token": r.token, "state": r.state, "stale": _kernel_stale(r),
+                "started_at": r.started_at}
 
 
 def active_runs(canvas_id: str) -> list[dict]:
@@ -6945,6 +7159,137 @@ def set_setting(key: str, value, scope: str = "global", scope_id: str = "") -> N
             row.value = json.dumps(value)
         else:
             s.add(Setting(scope=scope, scope_id=scope_id, key=key, value=json.dumps(value)))
+
+
+CRED_KINDS = ("object_store", "agent")
+
+
+def _cred_row(c: CredEntity) -> dict:
+    return {"id": c.id, "name": c.name, "kind": c.kind,
+            "fields": json.loads(c.fields_json or "{}"),
+            "createdAt": c.created_at.isoformat() if c.created_at else None}
+
+
+def creds_list() -> list[dict]:
+    with session() as s:
+        return [_cred_row(c) for c in s.scalars(select(CredEntity).order_by(CredEntity.created_at))]
+
+
+def cred_get(cred_id: str | None) -> dict | None:
+    if not cred_id:
+        return None
+    with session() as s:
+        c = s.get(CredEntity, cred_id)
+        return _cred_row(c) if c else None
+
+
+CRED_FIELD_ALLOWLIST: dict[str, tuple[str, ...]] = {
+    "object_store": ("accessKeyId", "secretAccessKey", "sessionToken", "region", "endpoint"),
+    "agent": ("apiKey",),
+}
+
+
+def _validate_cred_fields(kind: str, fields: dict | None) -> dict:
+    """Normalize cred fields to a per-kind ALLOWLIST of references only, DROPPING any unknown key so a
+    raw secret can't be smuggled into an unvalidated/unredacted field and round-tripped. Raises
+    ValueError on an unknown kind or a raw secret in a known secret field."""
+    from hub.secrets import validate_secret_setting_value
+    if kind not in CRED_KINDS:
+        raise ValueError(f"unknown credential kind {kind!r}; must be one of {list(CRED_KINDS)}")
+    allowed = CRED_FIELD_ALLOWLIST[kind]
+    fields = dict(fields or {})
+    extra = [k for k in fields if k not in allowed]
+    if extra:  # reject, not silently drop — a stray key is a client bug, and dropping hides it
+        raise ValueError(f"unknown credential field(s) {extra}; allowed for {kind}: {list(allowed)}")
+    if kind == "object_store":
+        return validate_secret_setting_value("objectStore", fields)
+    ref = validate_secret_setting_value("agentApiKey", fields.get("apiKey"))
+    return {"apiKey": ref} if ref else {}
+
+
+def cred_upsert(cred_id: str | None, name: str, kind: str, fields: dict | None) -> dict:
+    """Create or update a credential. Rejects raw secret bytes — fields must be env:/file: references."""
+    fields = _validate_cred_fields(kind, fields)
+    with session() as s:
+        c = s.get(CredEntity, cred_id) if cred_id else None
+        if c is None:
+            c = CredEntity(id=cred_id or _uid(), name=name, kind=kind, fields_json=json.dumps(fields))
+            s.add(c)
+        else:
+            if c.kind != kind:  # a kind change would silently repoint every binding at a wrong identity
+                raise ValueError("cannot change a credential's kind")
+            c.name, c.fields_json = name, json.dumps(fields)
+        s.flush()
+        return _cred_row(c)
+
+
+def cred_references(cred_id: str) -> list[str]:
+    """Human-readable places a cred id is bound (default/agent/destinations), so deletion can refuse to
+    strand a live reference (which would otherwise fail open to another identity)."""
+    refs: list[str] = []
+    if get_setting("defaultObjectStoreCredId", "global") == cred_id:
+        refs.append("the default object store")
+    if get_setting("agentCredId", "global") == cred_id:
+        refs.append("the agent")
+    for d in get_setting("destinations", "global", default=[]) or []:
+        if isinstance(d, dict) and (d.get("credId") or d.get("cred_id")) == cred_id:
+            refs.append(f"destination '{d.get('name') or d.get('id')}'")
+    return refs
+
+
+def cred_delete(cred_id: str) -> None:
+    """Delete a credential. Refuses (ValueError) if it is still bound anywhere — detach it first, so a
+    dangling explicit reference can't silently resolve to a different account."""
+    refs = cred_references(cred_id)
+    if refs:
+        raise ValueError(f"credential is in use by {', '.join(refs)} — detach it first")
+    with session() as s:
+        c = s.get(CredEntity, cred_id)
+        if c is not None:
+            s.delete(c)
+
+
+class CredResolutionError(RuntimeError):
+    """An explicit (or configured-default) credential reference did not resolve to a cred of the right
+    kind. Resolution RAISES rather than silently falling back to ambient/legacy — using a different
+    identity for a configured reference is worse than a loud failure."""
+
+
+def cred_object_store_config(cred_id: str | None = None) -> dict:
+    """Unresolved object-store fields. An EXPLICIT (non-empty) ``cred_id`` — or a configured
+    ``defaultObjectStoreCredId`` — that is missing/wrong-kind RAISES CredResolutionError (never silently
+    uses ambient or the legacy ``objectStore`` identity). Only when NO default is configured does it
+    fall back to the legacy setting (the pre-cred behaviour)."""
+    if cred_id:
+        c = cred_get(cred_id)
+        if not c or c.get("kind") != "object_store":
+            raise CredResolutionError(f"object-store credential '{cred_id}' not found")
+        return dict(c["fields"])
+    default_id = get_setting("defaultObjectStoreCredId", "global")
+    if default_id:
+        c = cred_get(default_id)
+        if not c or c.get("kind") != "object_store":
+            raise CredResolutionError(f"default object-store credential '{default_id}' is missing or not an object store")
+        return dict(c["fields"])
+    return dict(get_setting("objectStore", "global", default={}) or {})
+
+
+def cred_agent_api_key_ref(cred_id: str | None = None) -> str:
+    """The agent apiKey reference. An EXPLICIT (non-empty) ``cred_id`` — or a configured ``agentCredId``
+    — that is missing/wrong-kind RAISES CredResolutionError; only when neither is set does it fall back
+    to the legacy ``agentApiKey``. Returns a reference string, never a resolved value."""
+    if cred_id:
+        c = cred_get(cred_id)
+        if not c or c.get("kind") != "agent":
+            raise CredResolutionError(f"agent credential '{cred_id}' not found")
+        return str(c["fields"].get("apiKey") or "")
+    default_id = get_setting("agentCredId", "global")
+    if default_id:
+        c = cred_get(default_id)
+        if not c or c.get("kind") != "agent":
+            raise CredResolutionError(f"default agent credential '{default_id}' is missing or not an agent cred")
+        return str(c["fields"].get("apiKey") or "")
+    return get_setting("agentApiKey", "global") or ""
 
 
 def record_agent_egress_event(event: dict) -> None:

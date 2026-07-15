@@ -23,6 +23,9 @@ export function CatalogView() {
   const rememberTables = useStore((s) => s.rememberTables)
   const uploadDataset = useStore((s) => s.uploadDataset)
   const pushToast = useStore((s) => s.pushToast)
+  // folder create/rename/delete only mean something when the active catalog provider owns the local
+  // folder store; a read-only/external provider omits this capability and we hide the affordances.
+  const foldersMutable = useStore((s) => s.kernelInfo?.capabilities?.includes('catalog.folder_mutation') ?? false)
   const fileRef = useRef<HTMLInputElement>(null)
 
   // query state
@@ -50,11 +53,18 @@ export function CatalogView() {
   const [registerOpen, setRegisterOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [catalogRevision, setCatalogRevision] = useState(0)
+  const [folderPaths, setFolderPaths] = useState<string[]>([])  // folder ENTITIES (incl. empty) for autocomplete
   const seq = useRef(0)
   const loadingMore = useRef(false)
 
   // debounce the search box into the query
   useEffect(() => { const t = setTimeout(() => setQ(rawQ.trim()), 250); return () => clearTimeout(t) }, [rawQ])
+
+  // folder entities (empty folders live only here) reload with every catalog change; best-effort
+  const reloadFolderList = useCallback(async () => {
+    try { setFolderPaths((await api.catalogFolders()).map((f) => f.path)) } catch { /* autocomplete only */ }
+  }, [])
+  useEffect(() => { void reloadFolderList() }, [reloadFolderList, catalogRevision])
 
   const params = useMemo<CatalogQueryParams>(
     () => ({ q: q || undefined, folder: folder || undefined, tags, owner: owner || undefined, hasColumns, sort, order, limit: PAGE }),
@@ -133,6 +143,18 @@ export function CatalogView() {
     setCatalogRevision((v) => v + 1)
     pushToast(`Registered “${t.name}”`, 'success')
     void loadFirst()
+  }
+  // folder-tree mutations: reload the tree (via the key bump) + the row list, and keep the selected
+  // folder filter pointing at where its datasets went so a rename/delete can't strand the view
+  const onFolderCreated = () => { setCatalogRevision((v) => v + 1) }
+  const onFolderRenamed = (oldPath: string, newPath: string) => {
+    setFolder((cur) => cur === oldPath ? newPath : cur.startsWith(`${oldPath}/`) ? newPath + cur.slice(oldPath.length) : cur)
+    setCatalogRevision((v) => v + 1); void loadFirst()
+  }
+  const onFolderDeleted = (path: string) => {
+    const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
+    setFolder((cur) => cur === path || cur.startsWith(`${path}/`) ? parent : cur)
+    setCatalogRevision((v) => v + 1); void loadFirst()
   }
   const toggleSelect = (id: string) => setSelectedIds((cur) => {
     const next = new Set(cur)
@@ -247,7 +269,8 @@ export function CatalogView() {
       {/* body: folder tree | list | facets */}
       <div className="flex min-h-0 flex-1 border-t border-border">
         <div className="w-[220px] flex-[0_0_220px] overflow-y-auto border-r border-border p-2">
-          <FolderTree key={catalogRevision} selected={folder} onSelect={setFolder} />
+          <FolderTree revision={catalogRevision} mutable={foldersMutable} selected={folder} onSelect={setFolder}
+            onCreated={onFolderCreated} onRenamed={onFolderRenamed} onDeleted={onFolderDeleted} />
         </div>
 
         <div className="flex min-w-0 flex-1 flex-col">
@@ -325,9 +348,10 @@ export function CatalogView() {
         }} />}
       {registerOpen && <RegisterModal onClose={() => setRegisterOpen(false)} onRegistered={onRegistered} />}
 
-      {/* known folder paths → autocomplete for every folder input (register modal + detail drawer) */}
+      {/* known folder paths → autocomplete for every folder input (register modal + detail drawer):
+          the union of entry-derived facet folders and the folder ENTITIES (which include empty ones) */}
       <datalist id="dp-folder-options">
-        {facets.folders.map((f) => <option key={f.value} value={f.value} />)}
+        {[...new Set([...facets.folders.map((f) => f.value), ...folderPaths])].map((v) => <option key={v} value={v} />)}
       </datalist>
     </div>
   )
@@ -428,11 +452,39 @@ function TableRow({ t, selected, selectionActive, onToggleSelect, onOpen, onUse,
 }
 
 // ---- folder tree (lazy) -----------------------------------------------------
-function FolderTree({ selected, onSelect }: { selected: string; onSelect: (f: string) => void }) {
+// Folders are first-class: create an empty one up front, or rename/delete an existing one (cascading
+// to its datasets + subfolders). Mutations bubble up so the parent can refresh + keep the filter valid.
+interface FolderActions {
+  onCreated: () => void
+  onRenamed: (oldPath: string, newPath: string) => void
+  onDeleted: (path: string) => void
+}
+
+function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revision, mutable }:
+  { selected: string; onSelect: (f: string) => void; revision: number; mutable: boolean } & FolderActions) {
+  const pushToast = useStore((s) => s.pushToast)
   const [root, setRoot] = useState<FolderNode[] | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const request = useRef(0)
+  // expansion (a set of open paths) lives here so a rename/remount keeps it; remap prefixes on rename,
+  // drop the subtree on delete.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const toggleExpand = (p: string) => setExpanded((s) => {
+    const n = new Set(s)
+    if (n.has(p)) n.delete(p)
+    else n.add(p)
+    return n
+  })
+  const renamed = (oldPath: string, newPath: string) => {
+    setExpanded((s) => new Set([...s].map((p) =>
+      p === oldPath ? newPath : p.startsWith(oldPath + '/') ? newPath + p.slice(oldPath.length) : p)))
+    onRenamed(oldPath, newPath)
+  }
+  const deleted = (path: string) => {
+    setExpanded((s) => new Set([...s].filter((p) => p !== path && !p.startsWith(path + '/'))))
+    onDeleted(path)
+  }
   const loadRoot = useCallback(async () => {
     const s = ++request.current
     setLoading(true); setError(null)
@@ -445,16 +497,32 @@ function FolderTree({ selected, onSelect }: { selected: string; onSelect: (f: st
       if (s === request.current) setLoading(false)
     }
   }, [])
+  // reload the root level when the catalog changes WITHOUT remounting the tree, so expanded branches
+  // keep their open state across a register/create/rename/delete (they reconcile by path key).
   useEffect(() => {
     void loadRoot()
     return () => { request.current += 1 }
-  }, [loadRoot])
+  }, [loadRoot, revision])
+  const create = async () => {
+    const path = window.prompt('New folder path (e.g. prod/images):', '')?.trim()
+    if (!path) return
+    try { await api.createFolder(path); onCreated(); pushToast(`Created folder “${path}”`, 'success') }
+    catch (e) { pushToast(errorMessage(e), 'error') }
+  }
   return (
     <div className="flex flex-col gap-px text-[12.5px]">
-      <button onClick={() => onSelect('')}
-        className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-left hover:bg-accent ${!selected ? 'bg-accent font-semibold text-accent-foreground' : 'text-muted-foreground'}`}>
-        <Icon name="db" size={13} /> All tables
-      </button>
+      <div className="mb-0.5 flex items-center gap-1">
+        <button onClick={() => onSelect('')}
+          className={`flex flex-1 items-center gap-1.5 rounded-md px-2 py-1 text-left hover:bg-accent ${!selected ? 'bg-accent font-semibold text-accent-foreground' : 'text-muted-foreground'}`}>
+          <Icon name="db" size={13} /> All tables
+        </button>
+        {mutable && (
+          <button onClick={() => void create()} data-testid="folder-new" aria-label="New folder" title="New folder"
+            className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground">
+            <Icon name="plus" size={13} />
+          </button>
+        )}
+      </div>
       {loading && root === null && <div className="px-2 py-1 text-[11px] text-muted-foreground">Loading…</div>}
       {error && (
         <div role="alert" className="mx-1 flex flex-col gap-1 rounded-md border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
@@ -462,31 +530,60 @@ function FolderTree({ selected, onSelect }: { selected: string; onSelect: (f: st
           <button onClick={() => void loadRoot()} data-testid="folder-tree-retry" className="self-start font-semibold underline">Retry</button>
         </div>
       )}
-      {root?.map((f) => <FolderBranch key={f.path} node={f} depth={0} selected={selected} onSelect={onSelect} />)}
+      {root?.map((f) => <FolderBranch key={f.path} node={f} depth={0} selected={selected} onSelect={onSelect}
+        onRenamed={renamed} onDeleted={deleted} mutable={mutable} revision={revision}
+        expanded={expanded} onToggleExpand={toggleExpand} />)}
       {root?.length === 0 && !loading && !error && <div className="px-2 py-1 text-[11px] text-muted-foreground">No folders yet</div>}
     </div>
   )
 }
 
-function FolderBranch({ node, depth, selected, onSelect }: { node: FolderNode; depth: number; selected: string; onSelect: (f: string) => void }) {
-  const [open, setOpen] = useState(false)
+function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, mutable, revision, expanded, onToggleExpand }:
+  { node: FolderNode; depth: number; selected: string; onSelect: (f: string) => void; mutable: boolean; revision: number
+    expanded: Set<string>; onToggleExpand: (path: string) => void }
+  & Pick<FolderActions, 'onRenamed' | 'onDeleted'>) {
+  const pushToast = useStore((s) => s.pushToast)
+  const open = expanded.has(node.path)
   const [kids, setKids] = useState<FolderNode[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const loadedRevision = useRef<number | null>(null)
   const isSel = selected === node.path
   const loadKids = async () => {
+    const loadRevision = revision
     setLoading(true); setError(null)
-    try { setKids((await api.catalogTree(node.path)).folders) }
+    try {
+      setKids((await api.catalogTree(node.path)).folders)
+      loadedRevision.current = loadRevision
+    }
     catch (e) { setError(errorMessage(e)) }
     finally { setLoading(false) }
   }
-  const expand = () => {
-    const next = !open; setOpen(next)
-    if (next && kids === null && !loading) void loadKids()
+  const expand = () => onToggleExpand(node.path)
+  // Expansion is path-owned by FolderTree. Hydrate a rename-remounted branch whose new path stays open,
+  // and refresh a branch that changed while collapsed before showing its cached children again.
+  useEffect(() => {
+    if (open && (kids === null || loadedRevision.current !== revision)) void loadKids()
+  }, [open, node.path, revision])  // eslint-disable-line react-hooks/exhaustive-deps
+  const rename = async () => {
+    const next = window.prompt(`Rename folder “${node.path}” to:`, node.path)?.trim()
+    if (!next || next === node.path) return
+    try { await api.renameFolder(node.path, next); onRenamed(node.path, next); pushToast('Folder renamed', 'success') }
+    catch (e) { pushToast(errorMessage(e), 'error') }
+  }
+  const remove = async () => {
+    const parent = node.path.includes('/') ? node.path.slice(0, node.path.lastIndexOf('/')) : ''
+    const where = parent ? `“${parent}”` : 'the top level'
+    const n = node.tableCount
+    // honest: delete is non-destructive — the whole subtree (datasets AND subfolders) moves up one level
+    if (!window.confirm(
+      `Delete folder “${node.path}”? Its ${n} dataset${n === 1 ? '' : 's'} and any subfolders move up to ${where}. Nothing is deleted.`)) return
+    try { await api.deleteFolder(node.path); onDeleted(node.path); pushToast('Folder deleted', 'success') }
+    catch (e) { pushToast(errorMessage(e), 'error') }
   }
   return (
     <div>
-      <div className={`flex items-center rounded-md hover:bg-accent ${isSel ? 'bg-accent' : ''}`} style={{ paddingLeft: depth * 12 }}>
+      <div className={`group/branch flex items-center rounded-md hover:bg-accent ${isSel ? 'bg-accent' : ''}`} style={{ paddingLeft: depth * 12 }}>
         <button onClick={expand} aria-label={`${open ? 'Collapse' : 'Expand'} folder ${node.path}`} className="grid h-6 w-5 place-items-center text-muted-foreground">
           <Icon name={open ? 'chevronDown' : 'chevronRight'} size={12} />
         </button>
@@ -495,6 +592,16 @@ function FolderBranch({ node, depth, selected, onSelect }: { node: FolderNode; d
           <span className="truncate">📁 {node.name}</span>
           <span className="text-[10px] tabular-nums opacity-60">{node.tableCount.toLocaleString()}</span>
         </button>
+        {mutable && (<>
+          <button onClick={() => void rename()} data-testid={`folder-rename-${node.path}`} aria-label={`Rename folder ${node.path}`} title="Rename"
+            className="grid h-6 w-5 shrink-0 place-items-center text-muted-foreground opacity-0 hover:text-foreground group-hover/branch:opacity-100 focus:opacity-100">
+            <Icon name="rename" size={11} />
+          </button>
+          <button onClick={() => void remove()} data-testid={`folder-delete-${node.path}`} aria-label={`Delete folder ${node.path}`} title="Delete"
+            className="mr-0.5 grid h-6 w-5 shrink-0 place-items-center text-muted-foreground opacity-0 hover:text-destructive group-hover/branch:opacity-100 focus:opacity-100">
+            <Icon name="trash" size={11} />
+          </button>
+        </>)}
       </div>
       {open && loading && kids === null && <div className="py-0.5 pr-1 text-[10.5px] text-muted-foreground" style={{ paddingLeft: (depth + 1) * 12 + 8 }}>Loading…</div>}
       {open && error && (
@@ -503,7 +610,9 @@ function FolderBranch({ node, depth, selected, onSelect }: { node: FolderNode; d
           <button onClick={() => void loadKids()} data-testid={`folder-branch-retry-${node.path}`} className="shrink-0 font-semibold underline">Retry</button>
         </div>
       )}
-      {open && kids?.map((k) => <FolderBranch key={k.path} node={k} depth={depth + 1} selected={selected} onSelect={onSelect} />)}
+      {open && kids?.map((k) => <FolderBranch key={k.path} node={k} depth={depth + 1} selected={selected} onSelect={onSelect}
+        onRenamed={onRenamed} onDeleted={onDeleted} mutable={mutable} revision={revision}
+        expanded={expanded} onToggleExpand={onToggleExpand} />)}
     </div>
   )
 }

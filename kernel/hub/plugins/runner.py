@@ -341,8 +341,30 @@ class LocalRunner:
             self._cancel[run_id] = _CancelToken(cancel_check)
             self._evict()
         self._emit(graph, status)  # persist 'queued' before the worker starts (pollable on any instance)
-        threading.Thread(target=self._execute, args=(run_id, plan, graph, target_node_id), daemon=True).start()
+        threading.Thread(target=self._execute_guarded, args=(run_id, plan, graph, target_node_id), daemon=True).start()
         return status
+
+    def _execute_guarded(self, run_id: str, plan: CompilePlan, graph: Graph, target: str | None) -> None:
+        """Worker-thread backstop. The daemon thread has no other terminalization, so any escape from
+        `_execute` (run-scope/engine setup failing before the body's own boundary, or an unforeseen bug)
+        fails the run cleanly instead of stranding every node in 'running'."""
+        try:
+            self._execute(run_id, plan, graph, target)
+        except Exception as e:  # noqa: BLE001
+            status = self.runs.get(run_id)
+            with self._lock:
+                self._cancel.pop(run_id, None)
+                self._scopes.pop(run_id, None)
+            if status is None or status.status in ("done", "failed", "cancelled"):
+                return
+            status.status, status.error = "failed", f"{type(e).__name__}: {e}"
+            for p in status.per_node:
+                if p.status not in ("done", "failed", "cancelled"):
+                    p.status = "failed"
+            with contextlib.suppress(Exception):
+                self._emit(graph, status)
+            with contextlib.suppress(Exception):
+                self._complete(graph, target, status)
 
     def _emit(self, graph: Graph, status: RunStatus, *, strict: bool = False) -> None:
         """Fire the on_status hook (DB-backed live status); never let persistence break a run."""
@@ -390,6 +412,37 @@ class LocalRunner:
         read_leases = contextlib.ExitStack()
         read_guards = []
         cache_pin = None
+        read_leases_released = False
+        cache_pin_released = False
+
+        def release_read_leases() -> None:
+            nonlocal read_leases_released
+            if read_leases_released:
+                return
+            read_leases_released = True
+            try:
+                read_leases.close()
+            except Exception:  # noqa: BLE001 — lease expiry is the safe fallback
+                logging.getLogger("hub").exception(
+                    "managed read lease cleanup failed after local run")
+
+        def release_cache_pin() -> None:
+            nonlocal cache_pin_released
+            if cache_pin_released:
+                return
+            cache_pin_released = True
+            if cache_pin is not None:
+                try:
+                    cache_pin.close()
+                except Exception:  # retain its process fence on metadata uncertainty
+                    logging.getLogger("hub").exception(
+                        "managed result cache reader release failed")
+
+        def release_guards() -> None:
+            """Release all ownership exactly once when execution fails before run_scope opens."""
+            release_read_leases()
+            release_cache_pin()
+
         try:
             # Fingerprinting for the plan hash is already a real source read. Acquire every exact source
             # guard before it, then retain the guards through the final lazy scan and publication fence.
@@ -427,11 +480,7 @@ class LocalRunner:
                                  node_builders=self.node_builders, node_specs=self.node_specs,
                                  pushdown=True, output_node=target)
         except Exception as exc:  # source ownership/fingerprint failure precedes the main execution scope
-            with contextlib.suppress(Exception):
-                read_leases.close()
-            if cache_pin is not None:
-                with contextlib.suppress(Exception):
-                    cache_pin.close()
+            release_guards()
             status.status = "cancelled" if cancel.is_set() else "failed"
             status.error = None if cancel.is_set() else f"{type(exc).__name__}: {exc}"
             for item in status.per_node:
@@ -449,9 +498,37 @@ class LocalRunner:
         provisional_result: RunStatus | None = None
         nm = g.node_map(graph)
         rows_seen = 0
+        # Bind the write destination's object-store credential BEFORE the run scope opens, so the scope
+        # cursor snapshots that secret (DuckDB freezes a cursor's secret view at transaction start). A
+        # broken/ambiguous destination credential raises here — terminalize as a failed run instead of
+        # letting it escape _execute, kill the worker thread, and strand every node in 'running'.
+        try:
+            run_object_store_cfg = self._run_object_store_cfg(plan, nm)
+        except Exception as e:  # noqa: BLE001 — any resolution error is a clean run failure, not a strand
+            release_guards()
+            status.status, status.error = "failed", str(e)
+            self._emit(graph, status)
+            with self._lock:
+                self._cancel.pop(run_id, None)
+                self._scopes.pop(run_id, None)
+            self._complete(graph, target, status)
+            return
         # Run on our OWN DuckDB cursor (db.run_scope), NOT the process-global lock: a long run no
         # longer serializes every other user's preview/sample/run, and a failure here can't wedge them.
-        with db.run_scope() as scope:
+        run_context = contextlib.ExitStack()
+        try:
+            run_context.enter_context(db.object_store_binding(run_object_store_cfg))
+            scope = run_context.enter_context(db.run_scope())
+        except Exception:
+            # ``run_scope`` can fail before yielding, so the body/finally below never runs. Reset the
+            # object-store binding and release every ownership guard before the thread backstop emits
+            # the terminal failure.
+            try:
+                run_context.close()
+            finally:
+                release_guards()
+            raise
+        with run_context:
             with self._lock:
                 self._scopes[run_id] = scope  # cancel() interrupts this scope's cursor
             try:
@@ -688,11 +765,7 @@ class LocalRunner:
                         if p.status == "running":
                             p.status = "failed"
             finally:
-                try:
-                    read_leases.close()
-                except Exception:  # noqa: BLE001 — lease expiry is the safe fallback
-                    logging.getLogger("hub").exception(
-                        "managed read lease cleanup failed after local run")
+                release_read_leases()
                 # scope exit (below) rolls back + drops this run's views on its own cursor
                 for pth in engine.spill_files:  # GC temp parquet spilled this run (outputs already committed)
                     try:
@@ -708,12 +781,7 @@ class LocalRunner:
                     self._scopes.pop(run_id, None)
                 if not terminal_persisted:
                     self._complete(graph, target, status)
-                if cache_pin is not None:
-                    try:
-                        cache_pin.close()
-                    except Exception:  # retain its process fence on metadata uncertainty
-                        logging.getLogger("hub").exception(
-                            "managed result cache reader release failed")
+                release_cache_pin()
                 with self._lock:
                     owned_local = self._owned_result_uris.get(run_id)
                 if terminal_persisted and owned_local is not None:
@@ -902,13 +970,49 @@ class LocalRunner:
                 parts.append("type-changed " + str([f"{c['name']}:{c['from']}→{c['to']}" for c in changed]))
             raise RuntimeError(f"schema contract on '{title}' violated — {'; '.join(parts)}")
 
+    def _run_object_store_cfg(self, plan: CompilePlan, nm: dict) -> dict | None:
+        """The single object-store credential this run's write sink(s) use, or None when no sink targets
+        an object store. A run executes on ONE cursor whose secret is frozen at scope start, so it can
+        carry only ONE object-store identity: if sinks target object stores with DIFFERENT credentials
+        we reject the run here rather than silently binding the first (which would write to the wrong
+        account). An object-store sink with ambient/instance-role creds resolves to {} — still bound
+        (env), never skipped as if it were a local sink (None)."""
+        from hub import destinations
+        from hub.sinks import SinkSpec
+        cfgs: list[dict] = []
+        for step in plan.steps:
+            if step.kind != "write":
+                continue
+            node = nm.get(step.node_id)
+            if node is None:
+                continue
+            data = node.data if isinstance(node.data, dict) else {}
+            spec = SinkSpec.from_config(data.get("config", {}), data.get("title"))
+            cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
+            if cfg is not None:  # None = not an object store; {} = object store with ambient creds
+                cfgs.append(cfg)
+        if not cfgs:
+            return None
+        if any(c != cfgs[0] for c in cfgs[1:]):
+            raise RuntimeError(
+                "this run writes to object-store destinations with different credentials; a run uses a "
+                "single object-store identity — split them into separate runs")
+        return cfgs[0]
+
     def _commit_write(self, node, graph: Graph, engine: BuildEngine, status: RunStatus,
                       cached: dict | None, cancel: _CancelToken, pre_publish=None) -> int:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+        from hub import destinations
         from hub.sinks import SinkCommit, SinkSpec, commit_sink, preflight_sink
         spec = SinkSpec.from_config(cfg, node.data.get("title") if isinstance(node.data, dict) else None)
         if cancel.is_set():
             raise RuntimeError("run cancelled before output commit")
+        # Bind this destination's credential at the object-store open (the scope cursor already
+        # snapshotted it via the run-level binding; this makes the per-write credential explicit).
+        os_cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
+        if os_cfg is not None:
+            with db.lock():
+                db.ensure_object_store(os_cfg)
         # content-addressed skip: an identical overwrite plan already wrote this, so re-running is a
         # no-op. append is NOT idempotent (it must add a part every run), so it never uses the cache.
         if spec.mode != "append" and cached and cached.get("table") and cached.get("uri") and self._output_exists(cached["uri"]):

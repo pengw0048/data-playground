@@ -18,7 +18,7 @@ from pydantic.alias_generators import to_camel
 from sqlalchemy import select as _sa_select
 
 from hub import auth, auth_admission, metadb
-from hub.models import RunStatus
+from hub.models import CredUpsert, RunStatus
 from hub.security import RequestIdentity, current_identity, current_user
 
 router = APIRouter()
@@ -481,12 +481,28 @@ def canvas_active_runs(canvas_id: str, uid: str = Depends(current_user)) -> list
 
 @router.get("/canvas/{canvas_id}/kernel")
 def canvas_kernel(canvas_id: str, uid: str = Depends(current_user)) -> dict:
-    """The per-canvas execution kernel's state (Jupyter-style), or {exists:false} if none is running.
-    Token/endpoint are internal — only state + staleness are surfaced."""
+    """The per-canvas execution kernel's live state (Jupyter-style), or {exists:false} if none is
+    running. Token/endpoint are internal — only lease state + the kernel's own /status are surfaced.
+    Read-only: this NEVER spawns a kernel, and the /status proxy fast-fails so a dead kernel can't
+    stall the request."""
     if metadb.canvas_role(canvas_id, uid) is None:
-        raise HTTPException(404, "not found")
+        # unknown/inaccessible canvas → "no kernel" (kernel liveness is not sensitive, and a 404 here
+        # would log a browser console error while a just-created canvas is not yet persisted). The
+        # mutating restart endpoint below stays role-gated.
+        return {"exists": False}
     k = metadb.get_kernel(canvas_id)
-    return {"exists": False} if k is None else {"exists": True, "state": k["state"], "stale": k["stale"]}
+    if k is None:
+        return {"exists": False}
+    out: dict = {"exists": True, "state": k["state"], "stale": k["stale"]}
+    if k.get("endpoint") and k.get("token") and not k["stale"]:
+        from hub import kernel_backend
+        try:
+            out.update(kernel_backend._get(k["endpoint"], "/status", k["token"],
+                                            timeout=2.0, connect_retries=0))
+            out["reachable"] = True
+        except Exception:  # noqa: BLE001 — a live lease whose HTTP status can't be reached is NOT healthy;
+            out["reachable"] = False  # surface it so the badge shows degraded, not warm/green
+    return out
 
 
 @router.post("/canvas/{canvas_id}/kernel/restart")
@@ -570,4 +586,65 @@ def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
     emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
                resource_type="setting", resource_id=body.key,
                attrs={"scope": body.scope, "sensitive": "true" if is_secret else "false"})
+    return {"ok": True}
+
+
+# Credentials (issue #156) — a Cred entity is admin-only instance-wide config, like global settings.
+# Fields are secret REFERENCES (env:/file:), never raw bytes; cred_upsert rejects a raw secret. A
+# defense-in-depth redaction still masks any residual plaintext before a cred leaves an API response.
+
+
+def _redact_cred(cred: dict) -> dict:
+    from hub.secrets import redact_global_setting, redact_secret_for_display
+    fields = cred.get("fields") or {}
+    if cred.get("kind") == "object_store":
+        fields = redact_global_setting("objectStore", dict(fields), plugin_secrets=set())
+    else:
+        fields = {"apiKey": redact_secret_for_display(fields.get("apiKey"))} if fields.get("apiKey") else {}
+    return {**cred, "fields": fields}
+
+
+@router.get("/creds")
+def list_creds(uid: str = Depends(current_user)) -> list[dict]:
+    _require_admin(uid)
+    return [_redact_cred(c) for c in metadb.creds_list()]
+
+
+@router.post("/creds")
+def create_cred(body: CredUpsert, uid: str = Depends(current_user)) -> dict:
+    return _upsert_cred(None, body, uid)
+
+
+@router.put("/creds/{cred_id}")
+def update_cred(cred_id: str, body: CredUpsert, uid: str = Depends(current_user)) -> dict:
+    return _upsert_cred(cred_id, body, uid)
+
+
+def _upsert_cred(cred_id: str | None, body: CredUpsert, uid: str) -> dict:
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
+    try:
+        _require_admin(uid)
+    except HTTPException:
+        emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.DENIED, principal_id=uid,
+                   resource_type="cred", resource_id=cred_id or "new")
+        raise
+    try:
+        cred = metadb.cred_upsert(cred_id, body.name, body.kind, body.fields)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="cred", resource_id=cred["id"], attrs={"sensitive": "true"})
+    return _redact_cred(cred)
+
+
+@router.delete("/creds/{cred_id}")
+def delete_cred(cred_id: str, uid: str = Depends(current_user)) -> dict:
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
+    _require_admin(uid)
+    try:
+        metadb.cred_delete(cred_id)
+    except ValueError as exc:  # still bound → 409, don't strand a reference that would fail open
+        raise HTTPException(409, str(exc)) from exc
+    emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
+               resource_type="cred", resource_id=cred_id)
     return {"ok": True}

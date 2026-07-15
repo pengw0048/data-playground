@@ -3365,7 +3365,7 @@ def test_object_store_destination_browse_binds_untrusted_prefix(monkeypatch):
             return Result()
 
     con = Connection()
-    monkeypatch.setattr(db, "ensure_object_store", lambda: None)
+    monkeypatch.setattr(db, "ensure_object_store", lambda *a, **k: None)
     monkeypatch.setattr(db, "lock", nullcontext)
     monkeypatch.setattr(db, "conn", lambda: con)
 
@@ -7682,10 +7682,13 @@ def test_sql_fs_sandbox_confines_reads_in_auth_mode(monkeypatch, tmp_path):
 
     import duckdb
 
-    from hub import db
+    from hub import db, metadb
     monkeypatch.setenv("DP_AUTH_SECRET", "x" * 40)          # auth on
     monkeypatch.setenv("DP_DATASET_ROOTS", str(tmp_path))   # allowed root
     monkeypatch.delenv("DP_STORAGE_URL", raising=False)     # no object store → the FS sandbox must apply
+    # "no object store" means ALL sources empty: env (above), default cred, and any s3/gs destination
+    metadb.set_setting("destinations", [], scope="global", scope_id="")
+    metadb.set_setting("defaultObjectStoreCredId", "", scope="global", scope_id="")
     inside = tmp_path / "ok.csv"
     inside.write_text("a\n1\n")
     outside_dir = tempfile.mkdtemp()                        # a dir NOT under any allowed root

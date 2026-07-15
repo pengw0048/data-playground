@@ -7,11 +7,13 @@ const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), facets: vi.fn(), catalogTree: vi.fn(), searchCatalog: vi.fn(),
   registerFile: vi.fn(), registerDataset: vi.fn(), lineage: vi.fn(), sample: vi.fn(), table: vi.fn(),
   setTableMetadata: vi.fn(), unregisterTable: vi.fn(), unregisterTables: vi.fn(),
+  catalogFolders: vi.fn(), createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 
 const store = vi.hoisted(() => ({
   addToCanvas: vi.fn(), rememberTables: vi.fn(), uploadDataset: vi.fn(), pushToast: vi.fn(),
+  kernelInfo: { capabilities: ['catalog.folder_mutation'] },  // folder mutation UI is capability-gated
 }))
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
 
@@ -50,6 +52,10 @@ describe('CatalogView request and mutation truth', () => {
     mocks.table.mockResolvedValue(TABLE)
     mocks.setTableMetadata.mockResolvedValue(TABLE)
     mocks.unregisterTable.mockResolvedValue({ ok: true })
+    mocks.catalogFolders.mockResolvedValue([])
+    mocks.createFolder.mockResolvedValue({ path: 'archive' })
+    mocks.renameFolder.mockResolvedValue({ ok: true })
+    mocks.deleteFolder.mockResolvedValue({ ok: true })
     store.uploadDataset.mockResolvedValue(null)
   })
   afterEach(() => cleanup())
@@ -137,6 +143,10 @@ describe('CatalogView selection, register modal, and rename', () => {
     mocks.setTableMetadata.mockResolvedValue(TABLE)
     mocks.unregisterTables.mockResolvedValue({ deleted: ['t1', 't2'], missing: [] })
     mocks.registerDataset.mockResolvedValue(TABLE)
+    mocks.catalogFolders.mockResolvedValue([])
+    mocks.createFolder.mockResolvedValue({ path: 'archive' })
+    mocks.renameFolder.mockResolvedValue({ ok: true })
+    mocks.deleteFolder.mockResolvedValue({ ok: true })
     store.uploadDataset.mockResolvedValue(null)
   })
   afterEach(() => cleanup())
@@ -167,5 +177,55 @@ describe('CatalogView selection, register modal, and rename', () => {
     fireEvent.click(screen.getByTestId('detail-save'))
     await waitFor(() => expect(mocks.setTableMetadata).toHaveBeenCalledWith('t1',
       expect.objectContaining({ name: 'daily orders' })))
+  })
+
+  it('creates an empty folder from the tree', async () => {
+    vi.spyOn(window, 'prompt').mockReturnValue('archive')
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByTestId('folder-new'))
+    await waitFor(() => expect(mocks.createFolder).toHaveBeenCalledWith('archive'))
+  })
+
+  it('renames a folder from the tree and moves the selected filter with it', async () => {
+    mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [{ name: 'sales', path: 'sales', tableCount: 1 }], tables: [] })
+    vi.spyOn(window, 'prompt').mockReturnValue('revenue')
+    render(<CatalogView />)
+    // select the folder first, then rename it — the filter must follow the rename, not strand
+    fireEvent.click(await screen.findByText('📁 sales'))
+    fireEvent.click(screen.getByTestId('folder-rename-sales'))
+    await waitFor(() => expect(mocks.renameFolder).toHaveBeenCalledWith('sales', 'revenue'))
+    expect(await screen.findByText('📁 revenue')).toBeInTheDocument()
+  })
+
+  it('rehydrates an expanded branch after rename remounts it under the new path', async () => {
+    let renamed = false
+    mocks.catalogTree.mockImplementation(async (prefix: string) => {
+      if (!prefix) {
+        const path = renamed ? 'revenue' : 'sales'
+        return { prefix: '', folders: [{ name: path, path, tableCount: 1 }], tables: [] }
+      }
+      const path = `${prefix}/daily`
+      return { prefix, folders: [{ name: 'daily', path, tableCount: 1 }], tables: [] }
+    })
+    mocks.renameFolder.mockImplementation(async () => { renamed = true; return { ok: true } })
+    vi.spyOn(window, 'prompt').mockReturnValue('revenue')
+    render(<CatalogView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand folder sales' }))
+    expect(await screen.findByTestId('folder-rename-sales/daily')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('folder-rename-sales'))
+
+    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledWith('revenue'))
+    expect(await screen.findByRole('button', { name: 'Collapse folder revenue' })).toBeInTheDocument()
+    expect(await screen.findByTestId('folder-rename-revenue/daily')).toBeInTheDocument()
+  })
+
+  it('deletes a folder from the tree after confirming where its datasets go', async () => {
+    mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [{ name: 'sales', path: 'sales', tableCount: 1 }], tables: [] })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByTestId('folder-delete-sales'))
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('the top level'))
+    await waitFor(() => expect(mocks.deleteFolder).toHaveBeenCalledWith('sales'))
   })
 })

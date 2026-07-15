@@ -28,6 +28,7 @@ from hub.settings import settings
 from hub.storage import ManagedSourceReadError, source_read_scope
 from hub.models import (
     CatalogBrowse,
+    CatalogFolder,
     CatalogMetadata,
     CatalogQuery,
     CatalogTable,
@@ -192,6 +193,80 @@ def catalog_tree(prefix: str = "") -> CatalogBrowse:
     return get_deps().catalog.browse(prefix)
 
 
+class FolderCreateRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    path: str
+
+
+class FolderRenameRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    old_path: str
+    new_path: str
+
+
+class FolderDeleteRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    path: str
+
+
+def _folder_provider():
+    """The active catalog provider IF it supports folder mutation, else None → the caller 501s. Folder
+    listing + mutation go through the provider (not metadb directly), so a provider that owns an
+    external namespace is never mutated as a silent local-only side effect."""
+    cat = get_deps().catalog
+    return cat if getattr(cat, "folders_mutable", False) else None
+
+
+@router.get("/catalog/folders", response_model=list[CatalogFolder])
+def list_folders() -> list[CatalogFolder]:
+    """Every folder entity — including EMPTY ones. Powers the folder-name autocomplete (unioned with the
+    entry-derived folder facets on the client). Empty when the provider owns no local folder store."""
+    cat = _folder_provider()
+    return [CatalogFolder(path=f["path"]) for f in (cat.list_folders() if cat else [])]
+
+
+def _require_folder_provider():
+    cat = _folder_provider()
+    if cat is None:
+        raise HTTPException(501, "this catalog provider does not support folder mutation")
+    return cat
+
+
+@router.post("/catalog/folders", response_model=CatalogFolder)
+def create_folder(req: FolderCreateRequest) -> CatalogFolder:
+    """Create an EMPTY folder (fill it later). 409 if it already exists, 400 if the path is invalid."""
+    cat = _require_folder_provider()
+    try:
+        return CatalogFolder(path=cat.create_folder(req.path))
+    except metadb.FolderExistsError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.put("/catalog/folders/rename")
+def rename_folder(req: FolderRenameRequest) -> dict:
+    """Rename a folder, cascading to every dataset and subfolder under it. Works whether the folder is a
+    created entity or exists only because a dataset was registered into it. 400 on unknown/collision."""
+    cat = _require_folder_provider()
+    try:
+        cat.rename_folder(req.old_path, req.new_path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@router.post("/catalog/folders/delete")
+def delete_folder(req: FolderDeleteRequest) -> dict:
+    """Delete a folder, moving its datasets + subfolders up to the parent (structure preserved). 400 if unknown."""
+    cat = _require_folder_provider()
+    try:
+        cat.delete_folder(req.path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
 @router.get("/catalog/search", response_model=list[CatalogTable])
 def catalog_search(
     q: str = Query(...),
@@ -234,13 +309,16 @@ def set_table_metadata(table_id: str, req: CatalogMetadata) -> CatalogTable:
     sent = req.model_fields_set
     # absent field → None (provider preserves); explicit null → "" (provider clears). name is
     # rename-only: a blank name is ignored (a dataset always keeps a name), never cleared.
-    return cat.set_metadata(
-        table.uri,
-        folder=(req.folder or "") if "folder" in sent else None,
-        tags=req.tags if "tags" in sent else None,
-        owner=(req.owner or "") if "owner" in sent else None,
-        description=(req.description or "") if "description" in sent else None,
-        name=req.name if "name" in sent else None)
+    try:
+        return cat.set_metadata(
+            table.uri,
+            folder=(req.folder or "") if "folder" in sent else None,
+            tags=req.tags if "tags" in sent else None,
+            owner=(req.owner or "") if "owner" in sent else None,
+            description=(req.description or "") if "description" in sent else None,
+            name=req.name if "name" in sent else None)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.get("/catalog/lineage", response_model=LineageResult)

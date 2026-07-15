@@ -40,6 +40,24 @@ class Wire(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Credentials (first-class Cred entity — references only, never raw secret bytes)
+# --------------------------------------------------------------------------- #
+class Cred(Wire):
+    id: str
+    name: str
+    kind: str  # 'object_store' | 'agent'
+    fields: dict = {}
+    created_at: str | None = None
+
+
+class CredUpsert(Wire):
+    id: str | None = None
+    name: str
+    kind: str
+    fields: dict = {}
+
+
+# --------------------------------------------------------------------------- #
 # Schema / catalog
 # --------------------------------------------------------------------------- #
 class ColumnSchema(Wire):
@@ -221,6 +239,12 @@ class CatalogBrowse(Wire):
     tables: list[CatalogTable] = []
     total_tables: int = 0
     truncated: bool = False
+
+
+class CatalogFolder(Wire):
+    """A first-class browse folder. Additive to the per-dataset `folder` path string: it lets an EMPTY
+    folder exist and be renamed/deleted, so a folder can be created up front and filled later."""
+    path: str
 
 
 class CatalogMetadata(Wire):

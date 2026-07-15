@@ -30,7 +30,7 @@ def _object_store_configured() -> bool:
     unconfigured/mistyped s3:// source can't hang the plan on a credential-less LIST to a real endpoint."""
     try:
         from hub import metadb
-        return bool(metadb.get_setting("objectStore", "global", default={}))
+        return bool(metadb.cred_object_store_config(None))
     except Exception:  # noqa: BLE001
         return False
 
@@ -71,7 +71,7 @@ def _cold_objects(uri: str, cap: int) -> int:
         return 0
     from hub import metadb
     from hub.secrets import resolve_object_store
-    cfg = resolve_object_store(metadb.get_setting("objectStore", "global", default={}) or {})
+    cfg = resolve_object_store(metadb.cred_object_store_config(None))
     kw: dict = {}
     if cfg.get("endpoint"):
         kw["endpoint_url"] = cfg["endpoint"]

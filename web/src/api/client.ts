@@ -1,6 +1,7 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
-  CatalogBrowse, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
+  CanvasKernelStatus,
+  CatalogBrowse, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PluginInfo, ProcessorDescriptor, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
@@ -168,6 +169,14 @@ export const api = {
     req<Facets>(`/catalog/facets${catalogQuery(params)}`),
   catalogTree: (prefix = '') =>
     req<CatalogBrowse>(`/catalog/tree${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`),
+  // folder entities (incl. empty ones) — used for the folder-name autocomplete + tree editing
+  catalogFolders: () => req<CatalogFolder[]>('/catalog/folders'),
+  createFolder: (path: string) =>
+    req<CatalogFolder>('/catalog/folders', { method: 'POST', body: JSON.stringify({ path }) }),
+  renameFolder: (oldPath: string, newPath: string) =>
+    req<{ ok: boolean }>('/catalog/folders/rename', { method: 'PUT', body: JSON.stringify({ oldPath, newPath }) }),
+  deleteFolder: (path: string) =>
+    req<{ ok: boolean }>('/catalog/folders/delete', { method: 'POST', body: JSON.stringify({ path }) }),
   searchCatalog: (params: CatalogQueryParams, mode: 'lexical' | 'semantic' | 'hybrid' = 'hybrid') =>
     req<CatalogTable[]>(`/catalog/search${catalogSearchQuery(params, mode)}`),
   table: (id: string) => req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}`),
@@ -235,7 +244,7 @@ export const api = {
 
   runStatus: (runId: string) => req<RunStatus>(`/run/${runId}`),
   activeRuns: (canvasId: string) => req<RunStatus[]>(`/canvas/${encodeURIComponent(canvasId)}/active-runs`),
-  kernelState: (canvasId: string) => req<{ exists: boolean; state?: string; stale?: boolean }>(`/canvas/${encodeURIComponent(canvasId)}/kernel`),
+  kernelState: (canvasId: string) => req<CanvasKernelStatus>(`/canvas/${encodeURIComponent(canvasId)}/kernel`),
   restartKernel: (canvasId: string) => req<{ ok: boolean; restarted: boolean }>(`/canvas/${encodeURIComponent(canvasId)}/kernel/restart`, { method: 'POST' }),
   cancelRun: (runId: string) => req<RunStatus>(`/run/${runId}/cancel`, { method: 'POST' }),
 
@@ -254,6 +263,14 @@ export const api = {
 
   // loaded plugin packs (name/version/error + any declared [[config]] schema & current values)
   plugins: () => req<PluginInfo[]>('/plugins'),
+
+  // credentials (first-class Cred entity — refs only; admin-only)
+  listCreds: () => req<Cred[]>('/creds'),
+  createCred: (body: { name: string; kind: CredKind; fields: Record<string, string> }) =>
+    req<Cred>('/creds', { method: 'POST', body: JSON.stringify(body) }),
+  updateCred: (id: string, body: { name: string; kind: CredKind; fields: Record<string, string> }) =>
+    req<Cred>(`/creds/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  deleteCred: (id: string) => req<{ ok: boolean }>(`/creds/${id}`, { method: 'DELETE' }),
 
   // destinations (save/open "places" — local + pluggable object stores)
   destinations: () => req<{ destinations: DestinationPreset[]; backends: string[] }>('/destinations'),
@@ -290,7 +307,9 @@ export const api = {
     req<{ ok: boolean }>(`/canvas/${canvasId}/share/${userId}`, { method: 'DELETE' }),
 }
 
-export interface DestinationPreset { id: string; name: string; backend: string; root: string }
+export type CredKind = 'object_store' | 'agent'
+export interface Cred { id: string; name: string; kind: CredKind; fields: Record<string, string>; createdAt?: string | null }
+export interface DestinationPreset { id: string; name: string; backend: string; root: string; credId?: string | null }
 export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export interface PerNodeStat { node_id: string; status: string; rows?: number | null; ms?: number | null; label?: string | null }

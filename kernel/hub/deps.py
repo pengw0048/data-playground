@@ -602,7 +602,8 @@ class Deps:
             adapters=[a.name for a in self.adapters],
             runners=[r.name for r in self.runners],
             processors=[p.id for p in self.registry.list()],
-            capabilities=[c.id for c in self.capabilities],
+            capabilities=[c.id for c in self.capabilities]
+            + (["catalog.folder_mutation"] if getattr(self.catalog, "folders_mutable", False) else []),
             capability_views=[CapabilityView(id=c.id, label=getattr(c, "label", c.id), viewer=getattr(c, "viewer"))
                               for c in self.capabilities if isinstance(getattr(c, "viewer", None), dict)],
             backends=self._backends(),

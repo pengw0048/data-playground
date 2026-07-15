@@ -18,6 +18,7 @@ Temp view names are unique across process lifetimes so names and derived spill f
 
 from __future__ import annotations
 
+import contextvars
 import itertools
 import os
 import tempfile
@@ -29,6 +30,12 @@ from typing import Iterator
 import duckdb
 
 _lock = threading.RLock()  # serializes access to the shared BASE connection (not per-run cursors)
+
+# The resolved object-store config this run/request should use (a destination's credential), carried
+# from the write/browse caller down to the object-store open. Set before a run scope opens so the
+# scope cursor snapshots the right secret (DuckDB freezes a cursor's secret view at transaction start).
+_bound_object_store_cfg: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "dp_object_store_cfg", default=None)
 _conn: duckdb.DuckDBPyConnection | None = None
 _view_seq = itertools.count(1)
 _view_namespace = uuid.uuid4().hex[:12]
@@ -157,10 +164,17 @@ def _maybe_sandbox_fs(c: duckdb.DuckDBPyConnection) -> None:
             return
         from hub import metadb
         from hub.plugins.adapters import is_object_uri
-        # an object store may be configured EITHER via the DB setting OR the DP_STORAGE_URL env var
-        # (creds then from the AWS chain) — both need external access on, or httpfs/s3 fails closed (P0-STOR-01)
+        # an object store may be configured via the default cred / legacy DB setting, the DP_STORAGE_URL
+        # env var, OR a per-destination object-store credential — ALL need external access on, or
+        # httpfs/s3 fails closed (P0-STOR-01). A destination-only S3 install must not stay sandboxed.
         storage_url = (os.environ.get("DP_STORAGE_URL") or "").strip()
-        if metadb.get_setting("objectStore", "global", default={}) or is_object_uri(storage_url):
+        try:
+            has_default_object_store = bool(metadb.cred_object_store_config(None))
+        except metadb.CredResolutionError:
+            has_default_object_store = True  # configured-but-broken default still means an object store is intended
+        dests = metadb.get_setting("destinations", "global", default=[]) or []
+        has_object_store_dest = any(isinstance(d, dict) and d.get("backend") in ("s3", "gs") for d in dests)
+        if has_default_object_store or is_object_uri(storage_url) or has_object_store_dest:
             import logging
             logging.getLogger("hub").warning(
                 "FS sandbox DISABLED: an object store is configured, so DuckDB runs with external access "
@@ -338,18 +352,43 @@ def _publish_object_store(cfg: dict) -> None:
         _obj_store_secret_config = fingerprint
 
 
-def ensure_object_store() -> None:
+@contextmanager
+def object_store_binding(cfg: dict | None) -> Iterator[None]:
+    """Bind the resolved object-store credentials this run/request should use, so a later
+    ``ensure_object_store()`` (with no explicit cfg) and the pre-scope prime both adopt it. Reset on
+    exit — the binding is per-context, never a stale process-global secret."""
+    token = _bound_object_store_cfg.set(cfg)
+    try:
+        yield
+    finally:
+        _bound_object_store_cfg.reset(token)
+
+
+def _default_object_store_cfg() -> dict:
+    """The resolved default object-store credentials: the default cred, else the legacy global setting."""
+    from hub import metadb
+    from hub.secrets import resolve_object_store
+    return resolve_object_store(metadb.cred_object_store_config(None))
+
+
+def ensure_object_store(cfg: dict | None = None) -> None:
     """Publish httpfs + credentials on the base connection for object-store consumers.
+
+    ``cfg`` is a resolved object-store config (a destination's credential). With no cfg, adopt the
+    context binding if one is set (a write/browse in progress), else the default cred / legacy setting
+    — so a default cred configured only via the Credentials pane still reaches generic reads.
 
     A run scope owns a long rollback-only transaction.  Creating its secret there would make two
     concurrent runs conflict on the shared catalog even though both use the same credentials.  The
     base connection instead performs one short, serialized autocommit publication per config; scoped
-    cursors consume that committed secret without writing the catalog themselves. Secret subkeys in
-    the ``objectStore`` setting are references; material values are resolved here only.
+    cursors consume that committed secret without writing the catalog themselves. Secret subkeys are
+    references; material values are resolved before they reach here.
     """
-    from hub import metadb
-    from hub.secrets import resolve_object_store
-    _publish_object_store(resolve_object_store(metadb.get_setting("objectStore", "global", default={}) or {}))
+    if cfg is None:
+        cfg = _bound_object_store_cfg.get()
+    if cfg is None:
+        cfg = _default_object_store_cfg()
+    _publish_object_store(cfg or {})
 
 
 def _prime_object_store_before_scope() -> None:
@@ -360,6 +399,12 @@ def _prime_object_store_before_scope() -> None:
     a later real object operation still calls ``ensure_object_store`` and surfaces any setup error.
     """
     try:
+        # A write/browse bound its destination credential for this context — prime THAT before the
+        # cursor snapshots its secret, so the run's object-store writes use the destination's cred.
+        bound = _bound_object_store_cfg.get()
+        if bound is not None:
+            _publish_object_store(bound)
+            return
         scheme = (os.environ.get("DP_STORAGE_URL") or "").split(":", 1)[0].lower()
         # A process that has never published a secret cannot have a stale cursor snapshot. This fast
         # path keeps purely local previews free of metadata/provider work.
@@ -368,7 +413,7 @@ def _prime_object_store_before_scope() -> None:
             return
         from hub import metadb
         from hub.secrets import resolve_object_store
-        cfg = metadb.get_setting("objectStore", "global", default={}) or {}
+        cfg = metadb.cred_object_store_config(None)  # default cred, else legacy objectStore setting
         if not cfg and scheme in ("s3", "s3a", "s3n", "gs", "gcs"):
             # Only a one-shot workload (subrun / Ray driver) with no hub settings DB reconstructs its
             # config from the allowlisted data-plane environment; a hub with an empty setting keeps its

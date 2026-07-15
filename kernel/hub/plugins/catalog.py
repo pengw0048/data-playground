@@ -56,6 +56,12 @@ class InMemoryCatalog:
     cross-instance); there is no in-memory table map to go stale."""
 
     name = "in-memory"
+    # CONTRACT: folder create/rename/delete write the local metadb, which is authoritative only because
+    # THIS provider's browse() reads it. A provider that owns an EXTERNAL namespace (e.g. subclasses to
+    # override browse()) MUST set `folders_mutable = False` (or override the folder methods to hit its
+    # own store) — otherwise the routes would report local-only writes as success. The routes refuse
+    # (501) when this is False, before touching local state.
+    folders_mutable = True
 
     def __init__(self, data_dir: str, resolve_adapter):
         self.data_dir = data_dir
@@ -129,7 +135,6 @@ class InMemoryCatalog:
         if version is None:
             sig = "|".join(f"{c.name}:{c.type}" for c in columns) + f"|rows={count}|fp={fp}"
             version = "v" + _h.sha256(sig.encode()).hexdigest()[:10]
-        folder = (folder or "").strip("/")
         tags = [str(t).strip() for t in (tags or []) if str(t).strip()]
         with self._lock:
             prior = metadb.catalog_get(uri)  # by uri (PK)
@@ -147,6 +152,7 @@ class InMemoryCatalog:
                 tags = tags or list(prior.get("tags") or [])
                 owner = owner if owner is not None else prior.get("owner")
                 description = description if description is not None else prior.get("description")
+            folder = metadb.catalog_folder_normalize(folder or "")
             self._warn_schema_drift(prior, name, columns, version)
             table = CatalogTable(
                 id=tid, name=name, uri=uri, row_count=count, version=version,
@@ -483,6 +489,23 @@ class InMemoryCatalog:
         t = self.get_table(uri)
         self._embed_one(t)  # description/tags changed → refresh the semantic vector
         return t
+
+    # -- folder namespace mutation ---------------------------------------------------------------- #
+    # This provider's browse() reads the same metadb these write, so folder create/rename/delete are
+    # authoritative here. An external provider that owns its own namespace must override these (or set
+    # folders_mutable=False) — the routes call the provider, not metadb, so local state is never a
+    # silent side effect for a provider that doesn't support folder mutation.
+    def list_folders(self) -> list[dict]:
+        return metadb.catalog_folders_list()
+
+    def create_folder(self, path: str) -> str:
+        return metadb.catalog_folder_create(path)
+
+    def rename_folder(self, old: str, new: str) -> None:
+        metadb.catalog_folder_rename(old, new)
+
+    def delete_folder(self, path: str) -> None:
+        metadb.catalog_folder_delete(path)
 
     def resolve_ref(self, ref: str) -> str:
         """Resolve a source reference to a uri: a real path / scheme'd uri passes through; a bare
