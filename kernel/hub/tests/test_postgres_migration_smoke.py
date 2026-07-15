@@ -62,13 +62,19 @@ def test_postgres_cli_migration_and_service_startup_contract(tmp_path):
         admin = session.get(metadb.User, metadb.DEFAULT_USER_ID)
         assert admin is not None and admin.is_admin and admin.password_hash
 
+    service_env = base_env.copy()
+    service_env.pop("DP_AUTH_PASSWORD", None)
+    ready_service = subprocess.run(
+        [sys.executable, "-c", "from hub import metadb; metadb.init_db()"],
+        env=service_env, text=True, capture_output=True, timeout=30,
+    )
+    assert ready_service.returncode == 0, ready_service.stderr
+
     with metadb.engine().connect() as connection:
         command.downgrade(metadb._alembic_cfg(connection), "-1")
     behind = metadb._current_schema_heads()
     assert behind == ()
 
-    service_env = base_env.copy()
-    service_env.pop("DP_AUTH_PASSWORD", None)
     service = subprocess.run(
         [sys.executable, "-c", "from hub import metadb; metadb.init_db()"],
         env=service_env, text=True, capture_output=True, timeout=30,
