@@ -29,6 +29,42 @@ from hub.models import Graph
 from hub.settings import settings
 
 
+AGENT_CREDENTIAL_ERROR_CODE = "agent_credential_unavailable"
+AGENT_CREDENTIAL_ERROR_REASON = (
+    "The configured Agent credential is unavailable. Update it or clear the selection in Settings."
+)
+
+
+class AgentCredentialError(RuntimeError):
+    """Safe public failure for any explicitly configured Agent credential that cannot be used."""
+
+    code = AGENT_CREDENTIAL_ERROR_CODE
+
+    def __init__(self) -> None:
+        super().__init__(AGENT_CREDENTIAL_ERROR_REASON)
+
+
+def _agent_semantic_config() -> tuple[str, str | None]:
+    """Non-secret Agent model/endpoint settings used in both success and error responses."""
+    from hub import metadb
+    return (
+        metadb.get_setting("agentModel", "global") or settings.agent_model,
+        metadb.get_setting("agentBaseUrl", "global") or settings.agent_base_url,
+    )
+
+
+def _agent_provider(model: str) -> str:
+    provider = model.split("/", 1)[0].split(":", 1)[0].lower()
+    return {"gemini": "google"}.get(provider, provider)
+
+
+def _agent_model_name(model: str) -> str:
+    for separator in ("/", ":"):
+        if separator in model:
+            return model.split(separator, 1)[1]
+    return model
+
+
 def _agent_config() -> tuple[str, str | None, str | None]:
     """Resolve (model, api_key, base_url): global DB settings (set in the UI) override env/defaults.
 
@@ -38,22 +74,47 @@ def _agent_config() -> tuple[str, str | None, str | None]:
     """
     from hub import metadb
     from hub.secrets import SecretResolveError, resolve_secret_value
-    model = metadb.get_setting("agentModel", "global") or settings.agent_model
-    stored_key = metadb.cred_agent_api_key_ref()
+    model, base_url = _agent_semantic_config()
     try:
-        api_key = resolve_secret_value(stored_key) if stored_key else None
-    except SecretResolveError:
-        # A broken reference (unset env var / missing file) must degrade to unavailable, not 500 the
-        # polled agent status endpoint.
-        api_key = None
-    api_key = api_key or settings.agent_api_key
-    base_url = metadb.get_setting("agentBaseUrl", "global") or settings.agent_base_url
+        stored_key = metadb.cred_agent_api_key_ref()
+        api_key = resolve_secret_value(stored_key, allow_plaintext=False) if stored_key else None
+        if stored_key and (not isinstance(api_key, str) or not api_key):
+            raise SecretResolveError("configured Agent credential resolved to an empty value")
+    except (metadb.CredResolutionError, SecretResolveError) as exc:
+        # Never expose a Cred id, env variable, file path, or resolver error to status/execution APIs.
+        # Most importantly, do not reinterpret an explicit failure as permission to use an ambient key.
+        raise AgentCredentialError() from exc
+    if not stored_key:
+        api_key = settings.agent_api_key or None
+    if api_key and not base_url and _agent_provider(model) not in _AGENT_API_KEY_PROVIDERS:
+        # A configured key with no supported provider binding would otherwise be silently ignored by
+        # infer_model(), which could continue under a different ambient identity.
+        raise AgentCredentialError()
     return model, api_key, base_url
+
+
+def agent_credential_error_status() -> dict:
+    """The one non-secret wire contract for credential failures across status and execution."""
+    model, base_url = _agent_semantic_config()
+    policy = load_agent_data_policy(model=model, base_url=base_url)
+    disclosure = policy.disclosure()
+    return {
+        "available": False,
+        "errorCode": AGENT_CREDENTIAL_ERROR_CODE,
+        "reason": AGENT_CREDENTIAL_ERROR_REASON,
+        "model": model,
+        "provider": policy.provider,
+        "policy": disclosure,
+        "disclosure": disclosure,
+    }
 
 
 def agent_status() -> dict:
     """Whether the LLM agent is usable, why not if not, and the active data-egress disclosure."""
-    model, api_key, base_url = _agent_config()
+    try:
+        model, api_key, base_url = _agent_config()
+    except AgentCredentialError:
+        return agent_credential_error_status()
     policy = load_agent_data_policy(model=model, base_url=base_url)
     disclosure = policy.disclosure()
     try:
@@ -251,35 +312,48 @@ except ImportError:  # pydantic_ai not installed — agent_status() reports it; 
     _agent = None
 
 
-# litellm 'provider/model' -> pydantic-ai 'provider:model' (native inference); keys map best-effort.
-_KEY_ENV = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "gemini": "GEMINI_API_KEY",
-            "google": "GOOGLE_API_KEY", "groq": "GROQ_API_KEY", "mistral": "MISTRAL_API_KEY",
-            "cohere": "CO_API_KEY", "xai": "XAI_API_KEY", "openrouter": "OPENROUTER_API_KEY"}
+# Native providers whose Pydantic AI constructors accept one explicit API key. Unsupported provider
+# shapes fail closed instead of ignoring a selected Cred and letting provider inference use ambient env.
+_AGENT_API_KEY_PROVIDERS = frozenset({
+    "openai", "openai-chat", "openai-responses", "anthropic", "google", "groq",
+    "mistral", "cohere",
+})
 
 
 def _build_model(model: str, api_key: str | None, base_url: str | None):
     """Build a Pydantic AI model from the (litellm-style) config — in-process, no proxy."""
-    name = model.split("/", 1)[1] if "/" in model else model
+    name = _agent_model_name(model)
     if base_url:  # any OpenAI-compatible endpoint (local Ollama, a gateway, …)
         from pydantic_ai.models.openai import OpenAIChatModel
         from pydantic_ai.providers.openai import OpenAIProvider
         return OpenAIChatModel(name, provider=OpenAIProvider(base_url=base_url, api_key=api_key or "not-needed"))
-    if api_key:  # a UI-set key for a native provider: hand it to the provider via its standard env var
-        import os
-        env = _KEY_ENV.get(model.split("/", 1)[0].split(":", 1)[0].lower())
-        if env and not os.environ.get(env):
-            os.environ[env] = api_key
     from pydantic_ai.models import infer_model
-    return infer_model(model.replace("/", ":", 1))
+    inferred_name = f"{_agent_provider(model)}:{name}"
+    if not api_key:
+        return infer_model(inferred_name)
+    if _agent_provider(model) not in _AGENT_API_KEY_PROVIDERS:
+        raise AgentCredentialError()
+
+    def configured_provider(provider_name: str):
+        from pydantic_ai.providers import infer_provider_class
+        try:
+            return infer_provider_class(provider_name)(api_key=api_key)
+        except (ImportError, TypeError, ValueError) as exc:
+            raise AgentCredentialError() from exc
+
+    # Pass the selected material directly to the provider. Process environment is never mutated, so
+    # concurrent requests, credential rotation, and deletion cannot observe or retain an old identity.
+    return infer_model(inferred_name, provider_factory=configured_provider)
 
 
 def run_agent(outcome: str, graph: dict, deps, model=None, policy=None) -> dict:
     """Run the tool-use loop; return {graph, transcript, summary}. `model`/`policy` injected in tests."""
+    config = _agent_config()
     if _agent is None:
         raise RuntimeError("agent extra not installed: from a clone, run `uv pip install -e 'kernel[agent]'`")
     from pydantic_ai.usage import UsageLimits
 
-    cfg_model, _, cfg_base = _agent_config()
+    cfg_model, _, cfg_base = config
     effective_policy = policy if policy is not None else load_agent_data_policy(
         model=cfg_model, base_url=cfg_base)
 
@@ -290,7 +364,7 @@ def run_agent(outcome: str, graph: dict, deps, model=None, policy=None) -> dict:
     }
     existing_ids = {n["id"] for n in wg["nodes"]}
     ctx = _Ctx(kdeps=deps, wg=wg, seq=[0], transcript=[], policy=effective_policy)
-    m = model if model is not None else _build_model(*_agent_config())
+    m = model if model is not None else _build_model(*config)
 
     prompt = (f"{outcome}\n\n(The canvas currently has {len(wg['nodes'])} node(s) and "
               f"{len(wg['edges'])} edge(s).) Respond to this — answer or advise in text, or build/"

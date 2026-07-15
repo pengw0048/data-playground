@@ -121,7 +121,10 @@ export interface AgentBackendNode { id: string; type: string; position: { x: num
 export interface AgentBackendEdge { id: string; source: string; target: string; sourceHandle?: string | null; targetHandle?: string | null; data?: { wire: string } }
 export interface AgentResult {
   available: boolean
+  errorCode?: string
   reason?: string
+  model?: string
+  provider?: string
   summary?: string
   transcript?: { tool: string; input: Record<string, unknown>; result: Record<string, unknown> }[]
   graph?: { nodes: AgentBackendNode[]; edges: AgentBackendEdge[] }
@@ -140,6 +143,7 @@ export interface AgentDataDisclosure {
 
 export interface AgentStatus {
   available: boolean
+  errorCode?: string
   reason: string
   model?: string
   provider?: string

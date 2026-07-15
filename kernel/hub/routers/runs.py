@@ -14,7 +14,7 @@ from pydantic.alias_generators import to_camel
 
 from hub import auth, compiler, destinations, metadb, placement
 from hub import graph as graph_mod
-from hub.agent import agent_status, run_agent
+from hub.agent import AgentCredentialError, agent_credential_error_status, agent_status, run_agent
 from hub.deps import get_deps
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
@@ -270,9 +270,13 @@ def agent_act(req: AgentRequest, uid: str = Depends(current_user)) -> dict:
     _require_graph_read_access(req.graph, uid)
     st = agent_status()
     if not st["available"]:
-        return {"available": False, "reason": st["reason"]}
+        return st
     try:
         out = run_agent(req.outcome, req.graph, get_deps())
+    except AgentCredentialError:
+        # The Cred may be deleted/rotated after the preflight status read. Preserve the same stable,
+        # non-secret contract instead of turning the race into a 502 with resolver details.
+        return agent_credential_error_status()
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"agent error: {type(e).__name__}: {e}")
     return {"available": True, **out}

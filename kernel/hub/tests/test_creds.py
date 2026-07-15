@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 from fastapi.testclient import TestClient
@@ -88,14 +90,251 @@ def test_agent_config_resolves_key_via_referenced_cred(monkeypatch):
     # The agent reads its key from the referenced agent cred's reference, resolved in-process.
     from hub import agent
     monkeypatch.setenv("DP_FIXTURE_AGENT_CRED", "resolved-agent-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "different-ambient-provider-key")
+    monkeypatch.setattr(settings, "agent_api_key", "different-ambient-settings-key")
     try:
         cid = client.post("/api/creds", json={
             "name": "agent", "kind": "agent", "fields": {"apiKey": "env:DP_FIXTURE_AGENT_CRED"}}).json()["id"]
         metadb.set_setting("agentCredId", cid, "global")
         assert agent._agent_config()[1] == "resolved-agent-key"
+        status = agent.agent_status()
+        assert status["available"] is True and "errorCode" not in status
+        assert "resolved-agent-key" not in json.dumps(status)
     finally:
         metadb.set_setting("agentCredId", "", "global")
         _delete_all_creds()
+
+
+@pytest.mark.parametrize("failure", ["empty", "broken_ref", "missing", "wrong_kind", "deleted"])
+def test_explicit_agent_credential_failures_never_use_ambient_identity(
+        failure, monkeypatch):
+    """Every explicit-selection failure has one stable, non-secret contract on config/status/execute."""
+    from hub import agent
+    import hub.routers.runs as runs
+
+    ambient_settings = "ambient-settings-material-must-not-appear"
+    ambient_provider = "ambient-provider-material-must-not-appear"
+    broken_ref = "env:DP_AGENT_EXPLICIT_REFERENCE_MUST_NOT_APPEAR"
+    created_ids: list[str] = []
+    metadb.set_setting("agentModel", "anthropic/credential-test", "global")
+    metadb.set_setting("agentBaseUrl", "", "global")
+    metadb.set_setting("agentApiKey", "", "global")
+    metadb.set_setting("agentCredId", "", "global")
+    monkeypatch.setattr(settings, "agent_api_key", ambient_settings)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ambient_provider)
+    monkeypatch.delenv("DP_AGENT_EXPLICIT_REFERENCE_MUST_NOT_APPEAR", raising=False)
+    try:
+        if failure == "empty":
+            selected = client.post("/api/creds", json={
+                "name": "empty-agent", "kind": "agent", "fields": {},
+            }).json()["id"]
+            created_ids.append(selected)
+        elif failure == "broken_ref":
+            selected = client.post("/api/creds", json={
+                "name": "broken-agent", "kind": "agent",
+                "fields": {"apiKey": broken_ref},
+            }).json()["id"]
+            created_ids.append(selected)
+        elif failure == "wrong_kind":
+            selected = client.post("/api/creds", json={
+                "name": "not-an-agent", "kind": "object_store", "fields": {},
+            }).json()["id"]
+            created_ids.append(selected)
+        elif failure == "deleted":
+            selected = client.post("/api/creds", json={
+                "name": "deleted-agent", "kind": "agent",
+                "fields": {"apiKey": "env:ANTHROPIC_API_KEY"},
+            }).json()["id"]
+            assert client.delete(f"/api/creds/{selected}").status_code == 200
+        else:
+            selected = "missing-agent-credential"
+        metadb.set_setting("agentCredId", selected, "global")
+
+        with pytest.raises(agent.AgentCredentialError) as exc_info:
+            agent._agent_config()
+        assert exc_info.value.code == agent.AGENT_CREDENTIAL_ERROR_CODE
+        assert str(exc_info.value) == agent.AGENT_CREDENTIAL_ERROR_REASON
+
+        monkeypatch.setattr(
+            runs, "run_agent",
+            lambda *_args, **_kwargs: pytest.fail("invalid explicit Cred reached Agent execution"),
+        )
+        status_response = client.get("/api/agent")
+        action_response = client.post("/api/agent", json={
+            "outcome": "inspect", "graph": {"nodes": [], "edges": []},
+        })
+        assert status_response.status_code == action_response.status_code == 200
+        status, action = status_response.json(), action_response.json()
+        for payload in (status, action):
+            assert payload["available"] is False
+            assert payload["errorCode"] == agent.AGENT_CREDENTIAL_ERROR_CODE
+            assert payload["reason"] == agent.AGENT_CREDENTIAL_ERROR_REASON
+            serialized = json.dumps(payload)
+            for forbidden in (ambient_settings, ambient_provider, broken_ref, selected):
+                assert forbidden not in serialized
+    finally:
+        metadb.set_setting("agentCredId", "", "global")
+        metadb.set_setting("agentApiKey", "", "global")
+        metadb.set_setting("agentModel", "", "global")
+        metadb.set_setting("agentBaseUrl", "", "global")
+        for cred_id in created_ids:
+            client.delete(f"/api/creds/{cred_id}")
+
+
+def test_no_agent_credential_selection_retains_ambient_default(monkeypatch):
+    from hub import agent
+
+    ambient = "ambient-default-agent-key"
+    metadb.set_setting("agentCredId", "", "global")
+    metadb.set_setting("agentApiKey", "", "global")
+    metadb.set_setting("agentModel", "anthropic/ambient-test", "global")
+    metadb.set_setting("agentBaseUrl", "", "global")
+    monkeypatch.setattr(settings, "agent_api_key", ambient)
+    try:
+        # An explicitly supplied empty selection is invalid, while the persisted empty default below
+        # means that no Cred has been selected and therefore retains the ambient/default behaviour.
+        with pytest.raises(metadb.CredResolutionError):
+            metadb.cred_agent_api_key_ref("")
+        assert agent._agent_config() == ("anthropic/ambient-test", ambient, None)
+        status = agent.agent_status()
+        assert status["available"] is True and "errorCode" not in status
+        assert ambient not in json.dumps(status)
+    finally:
+        metadb.set_setting("agentModel", "", "global")
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "xai"])
+def test_selected_key_for_provider_without_locked_support_fails_closed(provider, monkeypatch):
+    """Status must not claim availability when the locked agent extra cannot bind a selected key."""
+    from hub import agent
+    import hub.routers.runs as runs
+
+    selected_material = "selected-unsupported-provider-material"
+    monkeypatch.setenv("DP_AGENT_UNSUPPORTED_PROVIDER_KEY", selected_material)
+    cid = client.post("/api/creds", json={
+        "name": f"{provider}-agent", "kind": "agent",
+        "fields": {"apiKey": "env:DP_AGENT_UNSUPPORTED_PROVIDER_KEY"},
+    }).json()["id"]
+    metadb.set_setting("agentCredId", cid, "global")
+    metadb.set_setting("agentModel", f"{provider}/credential-test", "global")
+    metadb.set_setting("agentBaseUrl", "", "global")
+    try:
+        with pytest.raises(agent.AgentCredentialError):
+            agent._agent_config()
+        monkeypatch.setattr(
+            runs, "run_agent",
+            lambda *_args, **_kwargs: pytest.fail("unsupported provider reached Agent execution"),
+        )
+        for response in (
+            client.get("/api/agent"),
+            client.post("/api/agent", json={
+                "outcome": "inspect", "graph": {"nodes": [], "edges": []},
+            }),
+        ):
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["available"] is False
+            assert payload["errorCode"] == agent.AGENT_CREDENTIAL_ERROR_CODE
+            assert payload["reason"] == agent.AGENT_CREDENTIAL_ERROR_REASON
+            serialized = json.dumps(payload)
+            assert selected_material not in serialized
+            assert cid not in serialized
+    finally:
+        metadb.set_setting("agentCredId", "", "global")
+        metadb.set_setting("agentModel", "", "global")
+        metadb.set_setting("agentBaseUrl", "", "global")
+        client.delete(f"/api/creds/{cid}")
+
+
+def test_agent_credential_rotation_and_deletion_do_not_cache_material(
+        monkeypatch):
+    """Each resolution is fresh and model construction never leaves the selected key in process env."""
+    from pydantic_ai import models as pydantic_models, providers as pydantic_providers
+    from hub import agent
+
+    selected_v1 = "selected-agent-key-v1"
+    selected_v2 = "selected-agent-key-v2"
+    ambient_provider = "ambient-provider-key"
+    ambient_default = "ambient-default-key"
+    inferred_names: list[str] = []
+    observed: list[tuple[str, str | None, str | None]] = []
+
+    def fake_provider_class(provider_name: str):
+        class Provider:
+            def __init__(self, *, api_key: str | None = None):
+                observed.append((
+                    provider_name, api_key, os.environ.get("ANTHROPIC_API_KEY")))
+        return Provider
+
+    def fake_infer_model(name: str, provider_factory):
+        inferred_names.append(name)
+        provider_factory(name.split(":", 1)[0])
+        return object()
+
+    monkeypatch.setattr(pydantic_models, "infer_model", fake_infer_model)
+    monkeypatch.setattr(pydantic_providers, "infer_provider_class", fake_provider_class)
+    monkeypatch.setenv("DP_AGENT_ROTATION_V1", selected_v1)
+    monkeypatch.setenv("DP_AGENT_ROTATION_V2", selected_v2)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ambient_provider)
+    monkeypatch.setattr(settings, "agent_api_key", ambient_default)
+    metadb.set_setting("agentModel", "anthropic/rotation-test", "global")
+    metadb.set_setting("agentBaseUrl", "", "global")
+    metadb.set_setting("agentApiKey", "", "global")
+    cid = client.post("/api/creds", json={
+        "name": "rotating-agent", "kind": "agent",
+        "fields": {"apiKey": "env:DP_AGENT_ROTATION_V1"},
+    }).json()["id"]
+    metadb.set_setting("agentCredId", cid, "global")
+    try:
+        config_v1 = agent._agent_config()
+        assert config_v1[1] == selected_v1
+        agent._build_model(*config_v1)
+        assert inferred_names[-1] == "anthropic:rotation-test"
+        assert observed[-1] == ("anthropic", selected_v1, ambient_provider)
+        assert os.environ["ANTHROPIC_API_KEY"] == ambient_provider
+
+        updated = client.put(f"/api/creds/{cid}", json={
+            "name": "rotating-agent", "kind": "agent",
+            "fields": {"apiKey": "env:DP_AGENT_ROTATION_V2"},
+        })
+        assert updated.status_code == 200
+        config_v2 = agent._agent_config()
+        assert config_v2[1] == selected_v2
+        agent._build_model(*config_v2)
+        assert observed[-1] == ("anthropic", selected_v2, ambient_provider)
+        assert os.environ["ANTHROPIC_API_KEY"] == ambient_provider
+
+        metadb.set_setting("agentCredId", "", "global")
+        assert client.delete(f"/api/creds/{cid}").status_code == 200
+        default_config = agent._agent_config()
+        assert default_config[1] == ambient_default
+        agent._build_model(*default_config)
+        assert observed[-1] == ("anthropic", ambient_default, ambient_provider)
+        assert os.environ["ANTHROPIC_API_KEY"] == ambient_provider
+        assert all(key != selected_v1 for _provider, key, _ambient in observed[1:])
+    finally:
+        metadb.set_setting("agentCredId", "", "global")
+        metadb.set_setting("agentModel", "", "global")
+        metadb.set_setting("agentBaseUrl", "", "global")
+        client.delete(f"/api/creds/{cid}")
+
+
+def test_agent_execution_race_uses_normalized_credential_error(monkeypatch):
+    from hub import agent
+    import hub.routers.runs as runs
+
+    monkeypatch.setattr(runs, "agent_status", lambda: {"available": True, "reason": ""})
+
+    def rotated_after_status(*_args, **_kwargs):
+        raise agent.AgentCredentialError()
+
+    monkeypatch.setattr(runs, "run_agent", rotated_after_status)
+    response = client.post("/api/agent", json={
+        "outcome": "inspect", "graph": {"nodes": [], "edges": []},
+    })
+    assert response.status_code == 200
+    assert response.json()["errorCode"] == agent.AGENT_CREDENTIAL_ERROR_CODE
+    assert response.json()["reason"] == agent.AGENT_CREDENTIAL_ERROR_REASON
 
 
 def test_cred_crud_round_trip():
