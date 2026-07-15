@@ -8,7 +8,8 @@ record per finished run:
     {canvas_id, run_id, status, rows, ms, error, output_table, placement,
      per_node: [{node_id, label, status, rows, ms}, ...]}
 
-A sink that raises is caught by the core and logged, never failing the run.
+A sink that raises is caught by the core and logged, never failing the run. Delivery is best-effort
+through a finite asynchronous queue, so a slow filesystem cannot delay run completion.
 
 Config (dataplay.toml [[config]] → Settings → Plugins, or the DP_RUN_LOG env var): `path`, the log
 file. Default: `run-telemetry.jsonl` in the process working directory.

@@ -120,14 +120,15 @@ class Registry:
     def add_telemetry_sink(self, sink) -> None:
         """Register a callback invoked once per FINISHED run with a normalized telemetry record (a dict:
         canvas_id/run_id/request_id/status/rows/ms/error/output_table/placement/per_node). Core ships no
-        exporter — an OTel/StatsD/log sink is a plugin. A sink that raises or times out is logged and
-        swallowed, never failing a run. See also add_metric_sink / add_audit_sink (OPS-01 contracts)."""
+        exporter — an OTel/StatsD/log sink is a plugin. Delivery uses a finite per-sink queue; callback
+        failures and overload are logged and never fail a run. See add_metric_sink / add_audit_sink."""
         if callable(sink):
-            self.deps.telemetry_sinks.append(sink)
+            from hub.observability import register_sink_delivery
+            self.deps.telemetry_sinks.append(register_sink_delivery(sink, kind="telemetry"))
 
     def add_metric_sink(self, sink) -> None:
         """Register a MetricEvent consumer (OPS-01). See docs/OBSERVABILITY.md. Isolation matches
-        add_telemetry_sink — a broken/slow sink never fails a request or run."""
+        add_telemetry_sink — delivery never waits on plugin I/O in a request or run path."""
         from hub.observability import add_metric_sink
         add_metric_sink(sink)
 
@@ -223,7 +224,7 @@ def _persist_run(deps, graph, target, status) -> None:
 def _emit_telemetry(deps, graph, target, status, per_node, *, request_id=None) -> None:
     """Fan a finished run's normalized telemetry record out to registered sinks (reg.add_telemetry_sink).
     Core ships NO exporter — an OTel/StatsD/etc. sink is a plugin. A broken or slow sink never breaks a run."""
-    from hub.observability import fanout_sinks  # same timeout isolation as metric/audit sinks
+    from hub.observability import fanout_sinks
 
     sinks = getattr(deps, "telemetry_sinks", None)
     if not sinks:
@@ -330,7 +331,8 @@ class Deps:
         self.builtin_kinds = {s.kind for s in BUILTIN_NODE_SPECS}
         self.node_builders: dict[str, object] = {}
         self.node_ir: dict[str, object] = {}  # kind -> ir(node) hook: an engine-neutral emit path (§ IR unify B)
-        self.telemetry_sinks: list = []  # reg.add_telemetry_sink — finished-run records fan out here (OTel = plugin)
+        # Registered delivery handles for reg.add_telemetry_sink callbacks (OTel/exporters stay plugins).
+        self.telemetry_sinks: list = []
         self.managed_object_provider = None
         self.plugins: list[dict] = []
         self._manifests: dict[str, dict] = {}

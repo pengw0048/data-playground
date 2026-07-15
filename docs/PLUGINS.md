@@ -172,9 +172,10 @@ Built-in `local` / `s3` / `gs` go through the same registry.
 `reg.add_telemetry_sink(fn)` exports finished-run telemetry. `fn(record: dict)` is called once per
 finished run with `canvas_id`, `run_id`, `request_id`, `status`, `rows`, `ms`, `error`, `output_table`,
 `placement`, and `per_node` (`[{node_id, label, status, rows, ms}]`). Core ships no exporter. A sink that
-raises or times out is caught and logged, never failing the run. It stays as a compatibility seam
-alongside the typed `MetricEvent` / `AuditEvent` sinks below — see [`OBSERVABILITY.md`](OBSERVABILITY.md)
-and `dp_run_log`.
+raises is caught and logged, never failing the run. Delivery is best-effort and asynchronous through a
+finite per-sink queue; overload drops the newest event with a rate-limited warning. It stays alongside
+the typed `MetricEvent` / `AuditEvent` sinks below — see [`OBSERVABILITY.md`](OBSERVABILITY.md) and
+`dp_run_log`.
 
 `reg.add_metric_sink(fn)` exports ops metrics (OPS-01). `fn(MetricEvent)` receives low-cardinality
 counters, histograms, and gauges. `reg.add_audit_sink(fn)` exports the security/ops audit trail

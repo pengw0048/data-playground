@@ -354,7 +354,11 @@ def main() -> None:
         # advertise the address the hub reaches us at (Service DNS in a pod), not the bind host.
         metadb.mark_kernel_ready(canvas, kid, f"{args.advertise_host or args.host}:{args.port}")
         threading.Thread(target=_heartbeat_loop, daemon=True).start()
-        yield
+        try:
+            yield
+        finally:
+            from hub.observability import drain_sinks
+            drain_sinks()
 
     app = FastAPI(lifespan=lifespan)
 

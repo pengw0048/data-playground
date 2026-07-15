@@ -16,9 +16,18 @@ Schema version for typed models in [`kernel/hub/observability.py`](../kernel/hub
    not labels.
 2. **Redaction.** Audit `attrs` never carry passwords, tokens, API keys, credential URIs, or raw row /
    column sample values. Failed validation rejects the event (logged) rather than emitting a leak.
-3. **Failure isolation.** A sink that raises or exceeds a short timeout is logged and swallowed. Run
-   status, row counts, and stored outputs are identical with or without sinks.
+3. **Failure isolation.** Each registered sink owns one daemon worker and a 256-event queue. Callers
+   only enqueue; they never wait for plugin I/O. A callback that raises stays usable for later events,
+   while a permanently wedged callback can consume only its own worker. Core allows at most 32 sink
+   workers process-wide.
 4. **Offline-first.** Registering zero sinks is valid; nothing is exported until a plugin attaches.
+
+When a queue is full, the newest event is dropped. Core logs the sink kind, queue capacity, and
+cumulative drop count on the first drop and then at powers of two, keeping overload visible without a
+log storm. Delivery is intentionally best-effort: queues are in memory and are not replayed after a
+crash. Graceful shutdown drains healthy sinks within one shared one-second deadline and then returns;
+a wedged daemon worker cannot hold process shutdown open. Registrations and workers are process-scoped,
+not tied to one FastAPI lifespan, so an embedded app can stop and start again without re-registering.
 
 ## Trace / request ID propagation
 
@@ -91,7 +100,7 @@ Redaction rules: never include raw row values, plaintext secrets, or credential-
 
 | Seam | Registrar | Payload | Notes |
 | --- | --- | --- | --- |
-| Finished-run telemetry (legacy) | `Registry.add_telemetry_sink(fn)` | `dict` with `canvas_id`, `target_node_id`, `run_id`, `status`, `rows`, `ms`, `error`, `output_table`, `placement`, `per_node`, and **`request_id`** | Unchanged compatibility callback. Reference consumer: [`examples/plugins/dp_run_log`](../examples/plugins/dp_run_log/). |
+| Finished-run telemetry (legacy) | `Registry.add_telemetry_sink(fn)` | `dict` with `canvas_id`, `target_node_id`, `run_id`, `status`, `rows`, `ms`, `error`, `output_table`, `placement`, `per_node`, and **`request_id`** | Best-effort asynchronous callback. Reference consumer: [`examples/plugins/dp_run_log`](../examples/plugins/dp_run_log/). |
 | Metrics | `Registry.add_metric_sink(fn)` / `hub.observability.add_metric_sink` | `MetricEvent` | In-memory sink for tests: `InMemoryObservabilitySink`. |
 | Audit | `Registry.add_audit_sink(fn)` / `hub.observability.add_audit_sink` | `AuditEvent` | Same isolation guarantees. |
 
@@ -109,16 +118,18 @@ A plugin may implement only the legacy sink, only the new sinks, or both.
 ## In-memory test sink
 
 ```python
-from hub.observability import InMemoryObservabilitySink, clear_sinks
+from hub.observability import InMemoryObservabilitySink, clear_sinks, drain_sinks
 
 clear_sinks()
 sink = InMemoryObservabilitySink().register()
 # … exercise HTTP / runs …
+assert drain_sinks(timeout=1)
 assert sink.metrics and sink.audits
 ```
 
 Contract tests cover event shape validity, redaction, bounded label cardinality, request-ID
-propagation to a fake `ExecutionBackend`, and fault isolation (raising + blocking sinks).
+propagation to a fake `ExecutionBackend`, queue/worker bounds, overload logging, deterministic
+shutdown, and fault isolation (raising + permanently blocked sinks).
 
 ## Out of scope (follow-ups)
 
