@@ -269,10 +269,11 @@ make e2e-install  # one-time browser install
 make e2e
 ```
 
-Required PR CI also owns the PostgreSQL migration contract and researcher-workflow browser smoke.
-Environment-heavy UX, artifact, and Ray acceptance run on schedule, on demand, and before a versioned
-release; they are not repeated after merging to protected `main`. See [CI and release gates](docs/CI.md)
-and [CONTRIBUTING.md](.github/CONTRIBUTING.md) for the exact contracts and clean-environment commands.
+Required PR CI also owns the PostgreSQL migration contract and researcher-workflow browser smoke. The
+same lean CI and security gates validate the integrated `main` tree. Environment-heavy UX, artifact,
+and Ray acceptance use separate scheduled, on-demand, and release policies; they do not run
+unconditionally after every merge. See [CI and release gates](docs/CI.md) and
+[CONTRIBUTING.md](.github/CONTRIBUTING.md) for the exact contracts and clean-environment commands.
 
 ## Contributing
 

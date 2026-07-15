@@ -2,11 +2,13 @@ name: CodeQL
 
 # Static analysis for Python (kernel/) and JavaScript/TypeScript (web/).
 # Results upload to the repository Security → Code scanning tab.
-# Heavy enough that a weekly schedule + workflow_dispatch accompany PR runs;
-# the job itself has a timeout cap. Findings already on main should be filed
-# as follow-up issues rather than suppressed here without comment.
+# Runs on proposed changes and the integrated default branch; a weekly schedule and
+# workflow_dispatch also catch analyzer/environment drift. The job itself has a timeout cap.
+# Findings already on main should be filed as follow-up issues rather than suppressed here.
 on:
   pull_request:
+  push:
+    branches: [main]
   schedule:
     # Mondays 04:27 UTC — offset from Ray validation (05:17) and image-scan.
     - cron: "27 4 * * 1"

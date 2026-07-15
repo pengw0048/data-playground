@@ -18,11 +18,11 @@ def _workflow(name: str) -> dict:
     return parsed
 
 
-def test_required_ci_runs_before_merge_but_not_again_on_main() -> None:
+def test_lean_validation_runs_on_pull_requests_and_main() -> None:
     for name in ("ci.yml", "codeql.yml", "secret-scan.yml"):
         events = _workflow(name)["on"]
         assert "pull_request" in events
-        assert "push" not in events
+        assert events["push"]["branches"] == ["main"]
 
 
 def test_required_e2e_does_not_run_the_smoke_suite_twice() -> None:

@@ -1,12 +1,14 @@
 name: CI
 
-# Required pull-request validation plus an explicit manual entry point. `main` is protected and only
-# accepts up-to-date pull requests, so rerunning the same suite after merge would duplicate evidence.
+# Required pull-request validation plus a lean integration run on `main`. Pull requests are not
+# required to be rebased onto the latest default branch, so the push run proves the combined tree.
 # The per-job timeout caps below stay as hygiene so a hung run can't spin to the 6h default. Run the
 # same suites locally during development
 # (`cd kernel && uv run pytest -q`; `cd web && npm run e2e`).
 on:
   pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 # Least-privilege default for the functional CI suite. Adding this block is the
