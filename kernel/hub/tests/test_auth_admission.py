@@ -664,7 +664,11 @@ def test_auth_request_bodies_are_strict_and_bound_password_bytes(monkeypatch):
     long_multibyte_user_id = "é" * (workspace.MAX_AUTH_USER_ID_BYTES // 2 + 1)
     long_profile = "p" * (workspace.MAX_AUTH_USER_PROFILE_FIELD_BYTES + 1)
     long_multibyte_profile = "é" * (workspace.MAX_AUTH_USER_PROFILE_FIELD_BYTES // 2 + 1)
-    safe_error = {"detail": "invalid authentication request body"}
+    safe_error = {
+        "detail": "invalid authentication request body",
+        "code": "validation_error",
+        "retryable": False,
+    }
 
     class UserIdEncodeMustNotRun(str):
         def encode(self, *_args, **_kwargs):

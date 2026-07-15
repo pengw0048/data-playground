@@ -18,6 +18,7 @@ from pydantic.alias_generators import to_camel
 from sqlalchemy import select as _sa_select
 
 from hub import auth, auth_admission, metadb
+from hub.api_errors import APIError, APIErrorCode
 from hub.models import CredUpsert, RunStatus
 from hub.security import RequestIdentity, current_identity, current_user
 
@@ -345,7 +346,12 @@ def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
 @router.get("/canvas/{canvas_id}")
 def get_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
     if metadb.canvas_role(canvas_id, uid) is None:  # owner, shared, or workspace-visible
-        raise HTTPException(404, f"canvas '{canvas_id}' not found")
+        raise APIError(
+            404,
+            f"canvas '{canvas_id}' not found",
+            code=APIErrorCode.CANVAS_NOT_FOUND,
+            retryable=False,
+        )
     with metadb.session() as s:
         return json.loads(s.get(metadb.Canvas, canvas_id).doc)
 

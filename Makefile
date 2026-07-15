@@ -1,4 +1,4 @@
-.PHONY: setup run dev-kernel dev-web build test lint e2e e2e-install seed clean
+.PHONY: setup run dev-kernel dev-web build test lint openapi check-openapi e2e e2e-install seed clean
 
 # One-time setup: kernel deps + sample data + web deps.
 # web/dist is gitignored so a fresh clone lacks it; the kernel wheel force-includes ../web/dist, so
@@ -30,6 +30,14 @@ test:
 lint:
 	cd kernel && uv run ruff check --config pyproject.toml . ../examples/plugins
 	cd kernel && uv run basedpyright
+
+# Reviewable HTTP wire contract. `openapi` intentionally rewrites the snapshot; CI uses the
+# read-only check so accidental route/DTO drift fails with a unified diff.
+openapi:
+	cd kernel && uv run python -m hub.contracts.openapi --write
+
+check-openapi:
+	cd kernel && uv run python -m hub.contracts.openapi --check
 
 # One-time: download the Playwright browser used by the E2E suite.
 e2e-install:

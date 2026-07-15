@@ -28,6 +28,8 @@ jobs:
         run: mkdir -p web/dist
       - name: Install kernel (dev extra)
         run: cd kernel && uv sync --extra dev
+      - name: Check committed OpenAPI contract
+        run: cd kernel && uv run python -m hub.contracts.openapi --check
       - name: Run tests
         # Dump every thread if one test stalls for a minute. The job-level cap prevents runaway spend;
         # this makes an intermittent deadlock actionable instead of ending with only "operation canceled".

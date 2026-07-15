@@ -79,7 +79,11 @@ def test_chunked_body_without_content_length_is_limited(monkeypatch):
     )
 
     assert status == 413
-    assert body == {"detail": "request body exceeds the 5-byte limit (raise DP_MAX_BODY_BYTES)"}
+    assert body == {
+        "detail": "request body exceeds the 5-byte limit (raise DP_MAX_BODY_BYTES)",
+        "code": "payload_too_large",
+        "retryable": False,
+    }
     assert receive_calls == 2
     assert app_body == b"abc"
 
@@ -95,7 +99,9 @@ def test_chunked_limit_remains_413_through_fastapi_body_parsing(monkeypatch):
 
     assert response.status_code == 413
     assert response.json() == {
-        "detail": "request body exceeds the 5-byte limit (raise DP_MAX_BODY_BYTES)"
+        "detail": "request body exceeds the 5-byte limit (raise DP_MAX_BODY_BYTES)",
+        "code": "payload_too_large",
+        "retryable": False,
     }
 
 
@@ -192,7 +198,11 @@ def test_declared_oversize_is_rejected_before_reading_body(monkeypatch):
     )
 
     assert status == 413
-    assert body == {"detail": "request body exceeds the 5-byte limit (raise DP_MAX_BODY_BYTES)"}
+    assert body == {
+        "detail": "request body exceeds the 5-byte limit (raise DP_MAX_BODY_BYTES)",
+        "code": "payload_too_large",
+        "retryable": False,
+    }
     assert receive_calls == 0
     assert app_body == b""
 
@@ -223,7 +233,9 @@ def test_catalog_upload_uses_its_independent_streaming_limit(monkeypatch):
         )
         assert response.status_code == 413
         assert response.json() == {
-            "detail": "upload exceeds the 5-byte limit (raise DP_MAX_UPLOAD_BYTES)"
+            "detail": "upload exceeds the 5-byte limit (raise DP_MAX_UPLOAD_BYTES)",
+            "code": "payload_too_large",
+            "retryable": False,
         }
     finally:
         if landed_uri is not None:
