@@ -349,3 +349,31 @@ def test_broken_destination_credential_fails_the_run_not_strands_it(monkeypatch,
     assert "gone" in (runner.runs[rid].error or "")
     assert rid not in runner._cancel        # cleaned up, not stranded
     assert completed == ["failed"]           # terminalized through the normal completion path
+
+
+def test_worker_thread_backstop_terminalizes_escape_past_the_run_body(monkeypatch, tmp_path):
+    # #161 re-review: a failure that escapes _execute (e.g. run-scope/engine setup, before the body's
+    # own boundary) must still fail the run via the worker-thread backstop, not kill the daemon thread
+    # silently and strand every node in 'running'.
+    from hub.models import PerNodeStatus, RunStatus
+    from hub.plugins.runner import LocalRunner, _CancelToken
+
+    runner = LocalRunner(lambda _uri: object(), {}, object(), str(tmp_path))
+    rid = "esc"
+    runner.runs[rid] = RunStatus(run_id=rid, status="running",
+                                 per_node=[PerNodeStatus(node_id="n", status="running", label="n")])
+    runner._cancel[rid] = _CancelToken()
+    completed: list[str] = []
+    monkeypatch.setattr(runner, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_complete", lambda *a, **k: completed.append(runner.runs[rid].status))
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("run scope setup exploded")
+    monkeypatch.setattr(runner, "_execute", _boom)
+
+    runner._execute_guarded(rid, object(), object(), "n")  # must not raise out
+
+    assert runner.runs[rid].status == "failed"
+    assert "exploded" in (runner.runs[rid].error or "")
+    assert rid not in runner._cancel
+    assert completed == ["failed"]

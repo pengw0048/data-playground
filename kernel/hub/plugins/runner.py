@@ -341,8 +341,30 @@ class LocalRunner:
             self._cancel[run_id] = _CancelToken(cancel_check)
             self._evict()
         self._emit(graph, status)  # persist 'queued' before the worker starts (pollable on any instance)
-        threading.Thread(target=self._execute, args=(run_id, plan, graph, target_node_id), daemon=True).start()
+        threading.Thread(target=self._execute_guarded, args=(run_id, plan, graph, target_node_id), daemon=True).start()
         return status
+
+    def _execute_guarded(self, run_id: str, plan: CompilePlan, graph: Graph, target: str | None) -> None:
+        """Worker-thread backstop. The daemon thread has no other terminalization, so any escape from
+        `_execute` (run-scope/engine setup failing before the body's own boundary, or an unforeseen bug)
+        fails the run cleanly instead of stranding every node in 'running'."""
+        try:
+            self._execute(run_id, plan, graph, target)
+        except Exception as e:  # noqa: BLE001
+            status = self.runs.get(run_id)
+            with self._lock:
+                self._cancel.pop(run_id, None)
+                self._scopes.pop(run_id, None)
+            if status is None or status.status in ("done", "failed", "cancelled"):
+                return
+            status.status, status.error = "failed", f"{type(e).__name__}: {e}"
+            for p in status.per_node:
+                if p.status not in ("done", "failed", "cancelled"):
+                    p.status = "failed"
+            with contextlib.suppress(Exception):
+                self._emit(graph, status)
+            with contextlib.suppress(Exception):
+                self._complete(graph, target, status)
 
     def _emit(self, graph: Graph, status: RunStatus, *, strict: bool = False) -> None:
         """Fire the on_status hook (DB-backed live status); never let persistence break a run."""
