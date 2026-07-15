@@ -489,6 +489,25 @@ async def _close_revoked_collab_peer(ws: WebSocket, room: set[WebSocket]) -> Non
         pass
 
 
+async def _sync_capable_peer_count(
+    room: set[WebSocket], canvas_id: str, *, exclude: WebSocket | None = None,
+) -> int:
+    """Count peers that can legally answer a Yjs sync request.
+
+    Viewers receive document updates and may request a sync themselves, but cannot send any Yjs
+    frame back through the relay. Including them in ``room-state.peerCount`` would make a joining
+    editor wait forever for a reply that the authorization gate must drop.
+    """
+    count = 0
+    for peer in list(room):
+        if peer is exclude:
+            continue
+        role = await _live_collab_role(peer, canvas_id)
+        if role in ("owner", "editor"):
+            count += 1
+    return count
+
+
 @app.websocket("/ws/collab/{canvas_id}")
 async def ws_collab(ws: WebSocket, canvas_id: str):
     # when auth is enabled, the collab channel is gated exactly like the HTTP canvas routes: a valid
@@ -511,10 +530,10 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
             return
     await ws.accept()
     room = _collab_rooms.setdefault(canvas_id, set())
-    peer_count = len(room)
     room.add(ws)
     _collab_sessions[ws] = _CollabSession(uid, token)
     try:
+        peer_count = await _sync_capable_peer_count(room, canvas_id, exclude=ws)
         await ws.send_json({"type": "room-state", "peerCount": peer_count})
         while True:
             msg = await ws.receive_json()
@@ -556,8 +575,11 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
         # This is deliberately independent of clientId: a peer can disappear before announcing
         # presence, and a waiting joiner must still learn that no peer remains to answer ysync.
         for peer in list(room):
+            if peer not in room:
+                continue
             try:
-                await peer.send_json({"type": "room-state", "peerCount": len(room) - 1})
+                peer_count = await _sync_capable_peer_count(room, canvas_id, exclude=peer)
+                await peer.send_json({"type": "room-state", "peerCount": peer_count})
             except Exception:  # noqa: BLE001
                 room.discard(peer)
         if not room:

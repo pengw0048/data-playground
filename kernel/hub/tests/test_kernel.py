@@ -5141,6 +5141,53 @@ def test_collab_relay_gates_viewer_doc_updates(monkeypatch, live_collab_url):
         metadb.delete_canvas_cascade(cid)
 
 
+def test_collab_room_state_excludes_viewer_only_sync_peers(monkeypatch, live_collab_url):
+    # A viewer receives ysync requests but cannot return a Yjs frame, so an editor joining a
+    # viewer-only room must hydrate immediately instead of waiting for an impossible reply.
+    import asyncio
+    import websockets
+    from hub import auth, metadb
+
+    monkeypatch.setenv("DP_AUTH_SECRET", "s3cr3t")
+    cid = "cvs_viewer_first_sync"
+    _provision_private_collab_canvas(cid, "owner_u", "editor_u", "viewer_u")
+    metadb.share_canvas(cid, "editor_u", "editor")
+    metadb.share_canvas(cid, "viewer_u", "viewer")
+    viewer_cookie = f"dp_session={auth.sign('viewer_u')}"
+    editor_cookie = f"dp_session={auth.sign('editor_u')}"
+
+    async def scenario() -> None:
+        ws_url = live_collab_url.replace("http://", "ws://") + f"/ws/collab/{cid}"
+        async with websockets.connect(
+            ws_url, additional_headers={"Cookie": viewer_cookie}, proxy=None,
+        ) as viewer:
+            assert await _collab_recv(viewer) == {"type": "room-state", "peerCount": 0}
+            async with websockets.connect(
+                ws_url, additional_headers={"Cookie": editor_cookie}, proxy=None,
+            ) as editor:
+                assert await _collab_recv(editor) == {"type": "room-state", "peerCount": 0}
+                await _collab_send(editor, {
+                    "clientId": "E", "type": "ysync", "requestId": "editor-sync", "sv": "state",
+                })
+                assert await _collab_recv(viewer) == {
+                    "clientId": "E", "type": "ysync", "requestId": "editor-sync", "sv": "state",
+                }
+                # A viewer cannot use a correlated reply to launder a document write through editor.
+                await _collab_send(viewer, {
+                    "clientId": "V", "type": "yjs", "update": "BLOCKED", "sync": True,
+                    "replyTo": "editor-sync", "targetId": "E",
+                })
+                await _collab_send(viewer, {"clientId": "V", "type": "presence", "name": "Val"})
+                assert await _collab_recv(editor) == {
+                    "clientId": "V", "type": "presence", "name": "Val",
+                }
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        metadb.delete_canvas_cascade(cid)
+
+
 def test_collab_rechecks_editor_downgrade_on_the_same_socket(monkeypatch, live_collab_url):
     # Downgrading a connected editor must take effect without reconnecting: its next Yjs update is
     # dropped, while viewer-safe presence and incoming document updates keep working on that socket.
@@ -5219,7 +5266,10 @@ def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_
                         for watcher in (owner_a, owner_b, removed_reader):
                             leave = await _collab_recv(watcher)
                             assert leave == {"type": "leave", "clientId": "RW"}
-                            assert await _collab_recv(watcher) == {"type": "room-state", "peerCount": 2}
+                            expected_peers = 2 if watcher is removed_reader else 1
+                            assert await _collab_recv(watcher) == {
+                                "type": "room-state", "peerCount": expected_peers,
+                            }
 
                         await _collab_send(owner_b, {"clientId": "OB", "type": "yjs", "update": "AFTER_REMOVAL"})
                         # Closing the revoked reader emits a peer-count update concurrently with
@@ -5277,7 +5327,7 @@ def test_collab_logout_revokes_sender_and_recipient(monkeypatch, live_collab_url
                     expected_leave = {"type": "leave", "clientId": "revoked-writer"}
                     assert await _collab_recv(owner) == expected_leave
                     assert await _collab_recv(reader) == expected_leave
-                    assert await _collab_recv(owner) == {"type": "room-state", "peerCount": 1}
+                    assert await _collab_recv(owner) == {"type": "room-state", "peerCount": 0}
                     assert await _collab_recv(reader) == {"type": "room-state", "peerCount": 1}
 
                     await _collab_send(owner, {
