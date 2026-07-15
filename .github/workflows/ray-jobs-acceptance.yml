@@ -48,6 +48,8 @@ on:
       - "kernel/hub/ray_jobs_acceptance.py"
       - "kernel/hub/ray_jobs_acceptance_entrypoint.py"
       - "kernel/hub/routers/runs.py"
+      - "kernel/hub/run_controller.py"
+      - "kernel/hub/planner.py"
       - "kernel/hub/estimate.py"
       - "kernel/hub/executors/schema.py"
       - "kernel/hub/cli.py"

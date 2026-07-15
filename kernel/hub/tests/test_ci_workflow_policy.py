@@ -1,6 +1,6 @@
 """Regression tests for the repository's fast-PR / heavy-release workflow boundary."""
 
-from fnmatch import fnmatchcase
+import re
 from pathlib import Path
 
 import yaml
@@ -63,6 +63,8 @@ _RAY_JOBS_PATHS = _RAY_SHARED_PATHS | {
     "kernel/hub/ray_jobs_acceptance.py",
     "kernel/hub/ray_jobs_acceptance_entrypoint.py",
     "kernel/hub/routers/runs.py",
+    "kernel/hub/run_controller.py",
+    "kernel/hub/planner.py",
     "kernel/hub/estimate.py",
     "kernel/hub/executors/schema.py",
     "kernel/hub/cli.py",
@@ -85,7 +87,27 @@ def _pull_request_paths(name: str) -> set[str]:
 
 
 def _is_owned(path: str, patterns: set[str]) -> bool:
-    return any(fnmatchcase(path, pattern) for pattern in patterns)
+    def _matches(pattern: str) -> bool:
+        # GitHub path globs treat `*` as one path segment and `**` as recursive. Python's fnmatch
+        # lets `*` cross `/`, so using it here would make the policy test broader than Actions.
+        parts: list[str] = []
+        index = 0
+        while index < len(pattern):
+            if pattern.startswith("**", index):
+                parts.append(".*")
+                index += 2
+            elif pattern[index] == "*":
+                parts.append("[^/]*")
+                index += 1
+            elif pattern[index] == "?":
+                parts.append("[^/]")
+                index += 1
+            else:
+                parts.append(re.escape(pattern[index]))
+                index += 1
+        return re.fullmatch("".join(parts), path) is not None
+
+    return any(_matches(pattern) for pattern in patterns)
 
 
 def test_lean_validation_runs_on_pull_requests_and_main() -> None:
@@ -146,8 +168,11 @@ def test_ray_path_ownership_routes_representative_changes() -> None:
 
     assert _is_owned("kernel/hub/ray_jobs_acceptance.py", jobs)
     assert not _is_owned("kernel/hub/ray_jobs_acceptance.py", ray)
+    assert _is_owned("kernel/hub/run_controller.py", jobs)
+    assert _is_owned("kernel/hub/planner.py", jobs)
     assert _is_owned("kernel/hub/migrations/versions/revision.py", jobs)
     assert not _is_owned("kernel/hub/migrations/versions/revision.py", ray)
+    assert not _is_owned("deploy/kuberay/overlays/prod.yaml", ray)
 
     for docs_only in ("README.md", "docs/CI.md", "docs/RAY.md"):
         assert not _is_owned(docs_only, ray)
