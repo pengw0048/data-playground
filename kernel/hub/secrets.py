@@ -19,11 +19,8 @@ import re
 from collections.abc import Callable
 from typing import Any
 
-# Object-store setting subkeys that hold credentials (sessionToken included: consumed by handoff).
+# Object-store Cred fields that hold credentials (sessionToken included: consumed by handoff).
 OBJECT_STORE_SECRET_SUBKEYS = ("accessKeyId", "secretAccessKey", "sessionToken")
-
-# Top-level setting keys that are secret references (scalar string values).
-SCALAR_SECRET_KEYS = frozenset({"agentApiKey"})
 
 Resolver = Callable[[str], str]
 
@@ -153,9 +150,9 @@ def resolve_secret(ref: str) -> str:
 def resolve_secret_value(value: Any, *, allow_plaintext: bool = True) -> Any:
     """Resolve ``value`` when it is a secret reference; otherwise return it unchanged.
 
-    ``allow_plaintext`` keeps a literal string usable for in-process test fixtures that write
-    through ``metadb.set_setting`` directly. The settings API and migration reject / strip
-    plaintext for reference-backed keys; callers that need a hard fail pass ``allow_plaintext=False``.
+    ``allow_plaintext`` keeps literal values usable for the ephemeral workload environment bridge.
+    Cred fields and plugin secret settings validate references before persistence; callers that need
+    a hard fail at resolution time pass ``allow_plaintext=False``.
     """
     if value in (None, ""):
         return value
@@ -168,7 +165,7 @@ def resolve_secret_value(value: Any, *, allow_plaintext: bool = True) -> Any:
 
 
 def resolve_object_store(cfg: dict | None) -> dict:
-    """Return a copy of an ``objectStore`` setting with secret subkeys resolved."""
+    """Return a copy of object-store Cred fields with secret references resolved."""
     if not cfg:
         return {}
     out = dict(cfg)
@@ -176,11 +173,6 @@ def resolve_object_store(cfg: dict | None) -> dict:
         if key in out and out[key] not in (None, ""):
             out[key] = resolve_secret_value(out[key])
     return out
-
-
-def is_plaintext_secret(value: Any) -> bool:
-    """True when ``value`` is a non-empty string that is not a secret reference."""
-    return isinstance(value, str) and value != "" and not is_secret_ref(value)
 
 
 def is_registered_secret_ref(value: Any) -> bool:
@@ -193,7 +185,7 @@ def is_registered_secret_ref(value: Any) -> bool:
     return scheme in list_schemes()
 
 
-# Echoed in place of a secret-backed setting that still holds legacy plaintext, so GET never leaks it.
+# Echoed in place of a malformed plaintext value so an API response never leaks it.
 _REDACTED_DISPLAY = "__redacted__"
 
 
@@ -204,16 +196,6 @@ def redact_secret_for_display(value: Any) -> Any:
     if is_secret_ref(value):
         return value
     return _REDACTED_DISPLAY
-
-
-def redact_global_setting(key: str, value: Any, *, plugin_secrets: set[str]) -> Any:
-    """Mask residual plaintext in a reference-backed global setting before it leaves an API response."""
-    if key in SCALAR_SECRET_KEYS or key in plugin_secrets:
-        return redact_secret_for_display(value)
-    if key == "objectStore" and isinstance(value, dict):
-        return {k: (redact_secret_for_display(v) if k in OBJECT_STORE_SECRET_SUBKEYS else v)
-                for k, v in value.items()}
-    return value
 
 
 def plugin_secret_setting_keys() -> set[str]:
@@ -230,66 +212,18 @@ def plugin_secret_setting_keys() -> set[str]:
     return out
 
 
-def is_reference_backed_key(key: str, *, plugin_secrets: set[str] | None = None) -> bool:
-    """Whether ``key`` (or an objectStore secret subkey) must store a reference, not plaintext."""
-    if key in SCALAR_SECRET_KEYS:
-        return True
-    if key == "objectStore":
-        return True
-    secrets = plugin_secrets if plugin_secrets is not None else plugin_secret_setting_keys()
-    return key in secrets
+def validate_secret_reference(value: Any, *, field: str) -> str:
+    """Validate one Cred field or plugin secret setting before persistence.
 
-
-def validate_secret_setting_value(key: str, value: Any, *,
-                                  plugin_secrets: set[str] | None = None) -> Any:
-    """Validate a PUT body for a reference-backed setting.
-
-    Accepts empty / None (clear), a well-formed reference, or — for ``objectStore`` — a dict whose
-    secret subkeys are each empty or a reference. Rejects raw secrets.
+    Empty values clear the field. Non-empty values must use a registered SecretResolver scheme;
+    resolved credential bytes are never accepted by supported persistence APIs.
     """
-    secrets = plugin_secrets if plugin_secrets is not None else plugin_secret_setting_keys()
-    if key == "objectStore":
-        if value in (None, "", {}):
-            return value if value is not None else {}
-        if not isinstance(value, dict):
-            raise ValueError("objectStore must be an object")
-        out = dict(value)
-        for sub in OBJECT_STORE_SECRET_SUBKEYS:
-            v = out.get(sub)
-            if v in (None, ""):
-                continue
-            if not isinstance(v, str) or not is_registered_secret_ref(v):
-                raise ValueError(
-                    f"objectStore.{sub} must be a secret reference "
-                    f"(env:VAR or file:/path), not a raw credential")
-        return out
-    if key in SCALAR_SECRET_KEYS or key in secrets:
-        if value in (None, ""):
-            return value if value is not None else ""
-        if not isinstance(value, str) or not is_registered_secret_ref(value):
-            raise ValueError(
-                f"{key} must be a secret reference (env:VAR or file:/path), not a raw credential")
-        return value
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str) or not is_registered_secret_ref(value):
+        raise ValueError(
+            f"{field} must be a secret reference (env:VAR or file:/path), not a raw credential")
     return value
-
-
-def scan_settings_rows_for_plaintext(rows: list[tuple[str, Any]]) -> list[str]:
-    """Return human-readable descriptions of settings that still hold plaintext secrets.
-
-    ``rows`` is a list of ``(key, decoded_value)`` for global settings. Used by the destructive
-    migration and by tests.
-    """
-    secrets = plugin_secret_setting_keys()
-    problems: list[str] = []
-    for key, value in rows:
-        if key in SCALAR_SECRET_KEYS or key in secrets:
-            if is_plaintext_secret(value):
-                problems.append(key)
-        elif key == "objectStore" and isinstance(value, dict):
-            for sub in OBJECT_STORE_SECRET_SUBKEYS:
-                if is_plaintext_secret(value.get(sub)):
-                    problems.append(f"objectStore.{sub}")
-    return problems
 
 
 # Install builtins at import so the first resolve works without an explicit ensure call.

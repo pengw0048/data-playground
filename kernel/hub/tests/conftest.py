@@ -2,6 +2,9 @@
 # Runs at import (before hub.settings is imported), so settings picks it up.
 import os
 import tempfile
+import uuid
+
+import pytest
 
 # FORCE a throwaway metadata DB (override, not setdefault) so pytest NEVER writes a real/exported
 # DP_DATABASE_URL — a dev running the suite with their prod/dev DB exported would otherwise have the
@@ -28,3 +31,57 @@ seed_if_empty(settings.data_dir)
 if os.environ.get("DP_TEST_DATABASE_URL") and not settings.database_url.startswith("sqlite"):
     from hub import metadb  # noqa: E402
     metadb.migrate_db()
+
+
+@pytest.fixture
+def object_store_cred(monkeypatch):
+    """Bind canonical object-store Cred fixtures without persisting material secret values."""
+    from hub import metadb
+    from hub.secrets import OBJECT_STORE_SECRET_SUBKEYS, is_secret_ref
+    from hub.settings import settings
+
+    states: dict[str, dict] = {}
+
+    def current_state() -> dict:
+        url = settings.database_url
+        state = states.get(url)
+        if state is None:
+            state = {
+                "previous": metadb.get_setting(
+                    "defaultObjectStoreCredId", "global", default="") or "",
+                "created": [],
+            }
+            states[url] = state
+        return state
+
+    def bind(fields: dict | None) -> str:
+        state = current_state()
+        if fields is None:
+            metadb.set_setting("defaultObjectStoreCredId", "", "global")
+            return ""
+        normalized = dict(fields)
+        if "useSsl" in normalized:
+            raise ValueError("Cred fixtures infer TLS from endpoint; useSsl is not a Cred field")
+        for field in OBJECT_STORE_SECRET_SUBKEYS:
+            value = normalized.get(field)
+            if value in (None, "") or is_secret_ref(value):
+                continue
+            env_key = f"DP_TEST_OBJECT_STORE_{uuid.uuid4().hex.upper()}_{field.upper()}"
+            monkeypatch.setenv(env_key, str(value))
+            normalized[field] = f"env:{env_key}"
+        cred_id = f"test-object-store-{uuid.uuid4().hex}"
+        metadb.cred_upsert(
+            cred_id, "Test object store", "object_store", normalized,
+        )
+        state["created"].append(cred_id)
+        metadb.set_setting("defaultObjectStoreCredId", cred_id, "global")
+        return cred_id
+
+    try:
+        yield bind
+    finally:
+        state = states.get(settings.database_url)
+        if state is not None:
+            metadb.set_setting("defaultObjectStoreCredId", state["previous"], "global")
+            for cred_id in state["created"]:
+                metadb.cred_delete(cred_id)

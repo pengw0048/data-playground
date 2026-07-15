@@ -12,7 +12,8 @@ import pytest
 
 from hub.workload_env import (build_workload_credential_env, build_workload_env,
                               build_workload_semantic_env, data_plane_object_store_config,
-                              initialize_ephemeral_metadata, prepare_workload_graph)
+                              EPHEMERAL_OBJECT_STORE_CRED_ID, initialize_ephemeral_metadata,
+                              prepare_workload_graph)
 
 
 _CONTROL_SECRETS = {
@@ -180,28 +181,50 @@ def test_only_global_control_plane_marks_unhandled_backend_jobs(tmp_path, monkey
 
 def test_ephemeral_worker_seeds_only_allowlisted_object_store_execution_config(tmp_path, monkeypatch):
     from hub import metadb
+    from hub.settings import settings
 
+    original_url = settings.database_url
+    original_engine, original_session = metadb._engine, metadb._Session
     monkeypatch.setenv("DP_DATABASE_URL", "sqlite:///original-test.db")
     monkeypatch.setenv("DP_S3_ENDPOINT", "http://minio:9000")
     monkeypatch.setenv("DP_S3_KEY", "data-key")
     monkeypatch.setenv("DP_S3_SECRET", "data-secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "data-session")
     monkeypatch.setenv("DP_AUTH_SECRET", "must-not-cross")
-    seeded: list[tuple[str, dict, str]] = []
+    creds: list[tuple[str, str, str, dict]] = []
+    seeded_settings: list[tuple[str, str, str]] = []
     monkeypatch.setattr(metadb, "init_db", lambda: None)
-    monkeypatch.setattr(metadb, "set_setting", lambda key, value, scope: seeded.append((key, value, scope)))
+    monkeypatch.setattr(
+        metadb,
+        "cred_upsert",
+        lambda cred_id, name, kind, fields: (
+            creds.append((cred_id, name, kind, fields)) or {"id": cred_id}
+        ),
+    )
+    monkeypatch.setattr(
+        metadb, "set_setting",
+        lambda key, value, scope: seeded_settings.append((key, value, scope)),
+    )
 
-    url = initialize_ephemeral_metadata(str(tmp_path))
+    try:
+        url = initialize_ephemeral_metadata(str(tmp_path))
+    finally:
+        settings.database_url = original_url
+        metadb._engine, metadb._Session = original_engine, original_session
 
     assert url.endswith("/workload-metadata.db")
-    assert seeded == [("objectStore", {
+    assert creds == [(EPHEMERAL_OBJECT_STORE_CRED_ID, "Ephemeral workload object store", "object_store", {
         "accessKeyId": "env:DP_S3_KEY",
         "secretAccessKey": "env:DP_S3_SECRET",
+        "sessionToken": "env:AWS_SESSION_TOKEN",
         "endpoint": "http://minio:9000",
-        "useSsl": False,
         "region": "us-east-1",
-    }, "global")]
-    assert "data-key" not in repr(seeded) and "data-secret" not in repr(seeded)
-    assert "must-not-cross" not in repr(seeded)
+    })]
+    assert seeded_settings == [(
+        "defaultObjectStoreCredId", EPHEMERAL_OBJECT_STORE_CRED_ID, "global")]
+    persisted = repr((creds, seeded_settings))
+    assert "data-key" not in persisted and "data-secret" not in persisted
+    assert "data-session" not in persisted and "must-not-cross" not in persisted
 
 
 def test_job_artifact_module_does_not_freeze_metadata_settings_before_worker_bootstrap():
@@ -244,13 +267,16 @@ def test_data_plane_object_store_config_uses_only_allowlisted_worker_identity():
     }
 
 
-def test_object_store_env_fallback_is_gated_to_ephemeral_workloads(monkeypatch):
-    # A hub with an empty objectStore setting must keep its ambient credential chain; only a one-shot
-    # workload (subrun / Ray driver) may reconstruct config from the DP_S3_* data-plane environment.
+def test_object_store_env_fallback_is_gated_to_ephemeral_workloads(
+        monkeypatch, object_store_cred):
+    # A hub with an empty default Cred keeps its ambient credential chain; only a one-shot workload
+    # (subrun / Ray driver) may reconstruct explicit config from its data-plane environment. Binding an
+    # empty synthetic Cred must not disable that fallback.
     from hub import metadb, workload_env
     from hub.plugins import adapters
 
-    monkeypatch.setattr(metadb, "get_setting", lambda *a, **k: {})
+    object_store_cred({})
+    assert metadb.cred_object_store_config(None) == {}
     calls: list[str] = []
     monkeypatch.setattr(
         workload_env, "data_plane_object_store_config",

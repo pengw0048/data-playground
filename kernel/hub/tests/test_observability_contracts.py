@@ -99,7 +99,7 @@ def test_settings_change_audit_reaches_sinks():
     shape put_setting emits (scope + sensitive) must stay guard-safe and emittable."""
     sink = InMemoryObservabilitySink().register()
     event = emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.SUCCESS, principal_id="admin",
-                       resource_type="setting", resource_id="agentApiKey",
+                       resource_type="setting", resource_id="plugin.example.token",
                        attrs={"scope": "global", "sensitive": "true"})
     assert event is not None  # not rejected at construction (a 'secret'-named attr would be)
     assert drain_sinks()

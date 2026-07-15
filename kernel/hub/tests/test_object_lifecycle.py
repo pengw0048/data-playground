@@ -2207,7 +2207,8 @@ def test_overlapping_app_lifespans_share_background_reapers_until_last_exit():
 
 
 @pytest.mark.parametrize("versioning_enabled", [False, True], ids=["unversioned", "versioned"])
-def test_moto_exact_root_marker_is_inventoried_and_exactly_reaped(versioning_enabled):
+def test_moto_exact_root_marker_is_inventoried_and_exactly_reaped(
+        versioning_enabled, object_store_cred):
     pytest.importorskip("moto")
     pytest.importorskip("flask")
     boto3 = pytest.importorskip("boto3")
@@ -2216,7 +2217,6 @@ def test_moto_exact_root_marker_is_inventoried_and_exactly_reaped(versioning_ena
 
     server = ThreadedMotoServer(port=0)
     server.start()
-    previous_store = metadb.get_setting("objectStore", "global", default={}) or {}
     handle = None
     try:
         host, port = server.get_host_and_port()
@@ -2230,10 +2230,10 @@ def test_moto_exact_root_marker_is_inventoried_and_exactly_reaped(versioning_ena
         if versioning_enabled:
             client.put_bucket_versioning(
                 Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
-        metadb.set_setting("objectStore", {
+        object_store_cred({
             "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
-            "secretAccessKey": "s", "useSsl": False,
-        }, "global")
+            "secretAccessKey": "s",
+        })
 
         token = uuid.uuid4().hex
         logical = f"s3://{bucket}/results/{token}.parquet"
@@ -2300,11 +2300,12 @@ def test_moto_exact_root_marker_is_inventoried_and_exactly_reaped(versioning_ena
             with contextlib.suppress(Exception):
                 metadb.catalog_delete_entry(handle["uri"])
             metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
-        metadb.set_setting("objectStore", previous_store, "global")
+        object_store_cred(None)
         server.stop()
 
 
-def test_moto_versioned_s3_history_read_and_exact_sibling_safe_gc(monkeypatch):
+def test_moto_versioned_s3_history_read_and_exact_sibling_safe_gc(
+        monkeypatch, object_store_cred):
     pytest.importorskip("moto")
     pytest.importorskip("flask")
     boto3 = pytest.importorskip("boto3")
@@ -2332,10 +2333,10 @@ def test_moto_versioned_s3_history_read_and_exact_sibling_safe_gc(monkeypatch):
         client.create_bucket(Bucket="lifecycle-versioned")
         client.put_bucket_versioning(
             Bucket="lifecycle-versioned", VersioningConfiguration={"Status": "Enabled"})
-        metadb.set_setting("objectStore", {
+        object_store_cred({
             "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
-            "secretAccessKey": "s", "useSsl": False,
-        }, "global")
+            "secretAccessKey": "s",
+        })
 
         logical = f"s3://lifecycle-versioned/results/{uuid.uuid4().hex}.parquet"
 
@@ -2439,11 +2440,12 @@ def test_moto_versioned_s3_history_read_and_exact_sibling_safe_gc(monkeypatch):
         metadb.put_result(cache_key, {"uri": None})
         if second is not None:
             metadb.quarantine_object_attempt(second["uri"], "test cleanup")
-        metadb.set_setting("objectStore", {}, "global")
+        object_store_cred(None)
         server.stop()
 
 
-def test_moto_terminal_manifest_cleans_leftover_multipart_or_schedules_exact_gc(monkeypatch):
+def test_moto_terminal_manifest_cleans_leftover_multipart_or_schedules_exact_gc(
+        monkeypatch, object_store_cred):
     pytest.importorskip("moto")
     pytest.importorskip("flask")
     boto3 = pytest.importorskip("boto3")
@@ -2464,10 +2466,10 @@ def test_moto_terminal_manifest_cleans_leftover_multipart_or_schedules_exact_gc(
             "s3", endpoint_url=endpoint, aws_access_key_id="k", aws_secret_access_key="s",
             region_name="us-east-1")
         client.create_bucket(Bucket="lifecycle-multipart-terminal")
-        metadb.set_setting("objectStore", {
+        object_store_cred({
             "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
-            "secretAccessKey": "s", "useSsl": False,
-        }, "global")
+            "secretAccessKey": "s",
+        })
 
         def land_with_leftover_upload(handle, value):
             prefix = urlsplit(handle["uri"]).path.lstrip("/").rstrip("/")
@@ -2555,13 +2557,13 @@ def test_moto_terminal_manifest_cleans_leftover_multipart_or_schedules_exact_gc(
             with contextlib.suppress(Exception):
                 metadb.catalog_delete_entry(published["uri"])
             metadb.quarantine_object_attempt(published["uri"], "test cleanup")
-        metadb.set_setting("objectStore", {}, "global")
+        object_store_cred(None)
         server.stop()
 
 
 @pytest.mark.parametrize("backend", ["local-subprocess", "local-pool"])
 def test_moto_subprocess_backends_publish_parent_owned_object_full_result(
-        tmp_path, monkeypatch, backend):
+        tmp_path, monkeypatch, backend, object_store_cred):
     pytest.importorskip("moto")
     pytest.importorskip("flask")
     boto3 = pytest.importorskip("boto3")
@@ -2595,10 +2597,10 @@ def test_moto_subprocess_backends_publish_parent_owned_object_full_result(
         settings.database_url = isolated_url
         metadb._engine = metadb._Session = None
         metadb.init_db()
-        metadb.set_setting("objectStore", {
+        object_store_cred({
             "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
-            "secretAccessKey": "s", "useSsl": False,
-        }, "global")
+            "secretAccessKey": "s",
+        })
         monkeypatch.setenv("DP_STORAGE_URL", "s3://subprocess-full-result/results")
         monkeypatch.setenv("DP_S3_ENDPOINT", endpoint)
         monkeypatch.setenv("DP_S3_KEY", "k")
@@ -2663,7 +2665,7 @@ def test_moto_subprocess_backends_publish_parent_owned_object_full_result(
 
 @pytest.mark.parametrize("backend", ["local-subprocess", "local-pool"])
 def test_moto_subprocess_backends_publish_parent_owned_managed_sink(
-        tmp_path, monkeypatch, backend):
+        tmp_path, monkeypatch, backend, object_store_cred):
     pytest.importorskip("moto")
     pytest.importorskip("flask")
     boto3 = pytest.importorskip("boto3")
@@ -2698,10 +2700,10 @@ def test_moto_subprocess_backends_publish_parent_owned_managed_sink(
         settings.database_url = isolated_url
         metadb._engine = metadb._Session = None
         metadb.init_db()
-        metadb.set_setting("objectStore", {
+        object_store_cred({
             "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
-            "secretAccessKey": "s", "useSsl": False,
-        }, "global")
+            "secretAccessKey": "s",
+        })
         monkeypatch.setenv("DP_STORAGE_URL", "s3://subprocess-managed-sink/results")
         monkeypatch.setenv("DP_S3_ENDPOINT", endpoint)
         monkeypatch.setenv("DP_S3_KEY", "k")

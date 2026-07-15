@@ -62,13 +62,21 @@ def _configure_control_plane() -> None:
     from hub import metadb
 
     metadb.init_db()
-    metadb.set_setting("objectStore", {
+    fields = {
         "endpoint": os.environ["DP_S3_ENDPOINT"],
-        "accessKeyId": os.environ["DP_S3_KEY"],
-        "secretAccessKey": os.environ["DP_S3_SECRET"],
+        "accessKeyId": "env:DP_S3_KEY",
+        "secretAccessKey": "env:DP_S3_SECRET",
         "region": os.environ.get("AWS_REGION", "us-east-1"),
-        "useSsl": False,
-    }, "global")
+    }
+    if os.environ.get("AWS_SESSION_TOKEN"):
+        fields["sessionToken"] = "env:AWS_SESSION_TOKEN"
+    cred = metadb.cred_upsert(
+        "ray-jobs-acceptance-object-store",
+        "Ray Jobs acceptance object store",
+        "object_store",
+        fields,
+    )
+    metadb.set_setting("defaultObjectStoreCredId", cred["id"], "global")
 
 
 def _load_dp_ray():

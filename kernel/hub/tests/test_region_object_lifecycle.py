@@ -633,7 +633,8 @@ def test_subprocess_region_gets_logical_target_and_returns_parent_attested_attem
         backend._object_results.clear()
 
 
-def test_moto_subprocess_region_end_to_end_publishes_after_child_reap(tmp_path, monkeypatch):
+def test_moto_subprocess_region_end_to_end_publishes_after_child_reap(
+        tmp_path, monkeypatch, object_store_cred):
     pytest.importorskip("moto")
     pytest.importorskip("flask")
     boto3 = pytest.importorskip("boto3")
@@ -654,10 +655,10 @@ def test_moto_subprocess_region_end_to_end_publishes_after_child_reap(tmp_path, 
         client.create_bucket(Bucket="subprocess-region-lifecycle")
         client.put_bucket_versioning(
             Bucket="subprocess-region-lifecycle", VersioningConfiguration={"Status": "Enabled"})
-        metadb.set_setting("objectStore", {
+        object_store_cred({
             "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
-            "secretAccessKey": "s", "useSsl": False,
-        }, "global")
+            "secretAccessKey": "s",
+        })
         monkeypatch.setenv(
             "DP_STORAGE_URL", "s3://subprocess-region-lifecycle/results")
         monkeypatch.setenv("DP_S3_ENDPOINT", endpoint)
@@ -717,7 +718,7 @@ def test_moto_subprocess_region_end_to_end_publishes_after_child_reap(tmp_path, 
             _close(result)
         if runner is not None:
             runner._terminate_all()
-        metadb.set_setting("objectStore", {}, "global")
+        object_store_cred(None)
         server.stop()
 
 

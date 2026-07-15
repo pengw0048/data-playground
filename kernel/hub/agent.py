@@ -69,8 +69,7 @@ def _agent_config() -> tuple[str, str | None, str | None]:
     """Resolve (model, api_key, base_url): global DB settings (set in the UI) override env/defaults.
 
     The agent's API key is stored as a secret reference (``env:…`` / ``file:…``) on the referenced
-    ``agent`` cred (or the legacy ``agentApiKey`` setting); the material value is resolved here and
-    never written back into settings.
+    ``agent`` Cred; the material value is resolved here and never written back into metadata.
     """
     from hub import metadb
     from hub.secrets import SecretResolveError, resolve_secret_value

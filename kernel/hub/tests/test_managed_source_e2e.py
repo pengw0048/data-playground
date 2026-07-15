@@ -33,11 +33,18 @@ def _assert_disposable_child_metadata(job_dir, endpoint: str) -> None:
     with sqlite3.connect(child_db) as connection:
         assert connection.execute("SELECT count(*) FROM object_attempts").fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM catalog_entries").fetchone() == (0,)
-        row = connection.execute(
+        assert connection.execute(
             "SELECT value FROM settings WHERE scope = 'global' AND key = 'objectStore'"
+        ).fetchone() is None
+        row = connection.execute(
+            "SELECT value FROM settings WHERE scope = 'global' "
+            "AND key = 'defaultObjectStoreCredId'"
         ).fetchone()
-    assert row is not None
-    object_store = json.loads(row[0])
+        creds = connection.execute("SELECT id, kind, fields_json FROM creds").fetchall()
+    assert row is not None and len(creds) == 1
+    default_id = json.loads(row[0])
+    assert creds[0][0] == default_id and creds[0][1] == "object_store"
+    object_store = json.loads(creds[0][2])
     assert object_store["endpoint"] == endpoint
     assert object_store["accessKeyId"] == "env:DP_S3_KEY"
     assert object_store["secretAccessKey"] == "env:DP_S3_SECRET"
@@ -46,7 +53,7 @@ def _assert_disposable_child_metadata(job_dir, endpoint: str) -> None:
 
 @pytest.mark.parametrize("backend", ["local-subprocess", "local-pool"])
 def test_moto_isolated_backends_read_parent_published_managed_source(
-        tmp_path, monkeypatch, backend):
+        tmp_path, monkeypatch, backend, object_store_cred):
     pytest.importorskip("moto")
     pytest.importorskip("flask")
     boto3 = pytest.importorskip("boto3")
@@ -85,10 +92,10 @@ def test_moto_isolated_backends_read_parent_published_managed_source(
         settings.database_url = f"sqlite:///{parent_db}"
         metadb._engine = metadb._Session = None
         metadb.init_db()
-        metadb.set_setting("objectStore", {
+        object_store_cred({
             "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
-            "secretAccessKey": "s", "useSsl": False,
-        }, "global")
+            "secretAccessKey": "s",
+        })
         monkeypatch.setenv("DP_S3_ENDPOINT", endpoint)
         monkeypatch.setenv("DP_S3_KEY", "k")
         monkeypatch.setenv("DP_S3_SECRET", "s")

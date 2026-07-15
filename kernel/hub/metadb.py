@@ -653,7 +653,8 @@ class CredEntity(Base):
     """A named credential — a first-class entity a destination or the agent references by id.
 
     ``fields`` stores only secret REFERENCES (``env:VAR`` / ``file:/path``), never raw secret bytes.
-    ``kind`` is 'object_store' (fields = the objectStore subkeys) or 'agent' (fields = {apiKey: ref}).
+    ``kind`` is 'object_store' (connection fields plus SecretRefs) or 'agent'
+    (fields = {apiKey: ref}).
     """
     __tablename__ = "creds"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
@@ -7932,10 +7933,12 @@ CRED_FIELD_ALLOWLIST: dict[str, tuple[str, ...]] = {
 
 
 def _validate_cred_fields(kind: str, fields: dict | None) -> dict:
-    """Normalize cred fields to a per-kind ALLOWLIST of references only, DROPPING any unknown key so a
-    raw secret can't be smuggled into an unvalidated/unredacted field and round-tripped. Raises
-    ValueError on an unknown kind or a raw secret in a known secret field."""
-    from hub.secrets import validate_secret_setting_value
+    """Normalize Cred fields to a per-kind allowlist and validate every secret field as a SecretRef.
+
+    Unknown fields are rejected so a raw secret cannot be smuggled into an unvalidated or unredacted
+    field and round-tripped.
+    """
+    from hub.secrets import OBJECT_STORE_SECRET_SUBKEYS, validate_secret_reference
     if kind not in CRED_KINDS:
         raise ValueError(f"unknown credential kind {kind!r}; must be one of {list(CRED_KINDS)}")
     allowed = CRED_FIELD_ALLOWLIST[kind]
@@ -7943,10 +7946,16 @@ def _validate_cred_fields(kind: str, fields: dict | None) -> dict:
     extra = [k for k in fields if k not in allowed]
     if extra:  # reject, not silently drop — a stray key is a client bug, and dropping hides it
         raise ValueError(f"unknown credential field(s) {extra}; allowed for {kind}: {list(allowed)}")
-    if kind == "object_store":
-        return validate_secret_setting_value("objectStore", fields)
-    ref = validate_secret_setting_value("agentApiKey", fields.get("apiKey"))
-    return {"apiKey": ref} if ref else {}
+    secret_fields = OBJECT_STORE_SECRET_SUBKEYS if kind == "object_store" else ("apiKey",)
+    for field in secret_fields:
+        if field not in fields:
+            continue
+        ref = validate_secret_reference(fields[field], field=f"{kind}.{field}")
+        if ref:
+            fields[field] = ref
+        else:
+            fields.pop(field)
+    return fields
 
 
 def cred_upsert(cred_id: str | None, name: str, kind: str, fields: dict | None) -> dict:
@@ -8000,8 +8009,8 @@ class CredResolutionError(RuntimeError):
 def cred_object_store_config(cred_id: str | None = None) -> dict:
     """Unresolved object-store fields. An EXPLICIT (non-empty) ``cred_id`` — or a configured
     ``defaultObjectStoreCredId`` — that is missing/wrong-kind RAISES CredResolutionError (never silently
-    uses ambient or the legacy ``objectStore`` identity). Only when NO default is configured does it
-    fall back to the legacy setting (the pre-cred behaviour)."""
+    uses ambient identity). When no default is configured, return an empty config so SDK consumers use
+    their deliberate ambient credential chain."""
     if cred_id:
         c = cred_get(cred_id)
         if not c or c.get("kind") != "object_store":
@@ -8013,13 +8022,14 @@ def cred_object_store_config(cred_id: str | None = None) -> dict:
         if not c or c.get("kind") != "object_store":
             raise CredResolutionError(f"default object-store credential '{default_id}' is missing or not an object store")
         return dict(c["fields"])
-    return dict(get_setting("objectStore", "global", default={}) or {})
+    return {}
 
 
 def cred_agent_api_key_ref(cred_id: str | None = None) -> str:
     """The agent apiKey reference. An EXPLICIT ``cred_id`` — or a configured ``agentCredId``
-    — that is missing, wrong-kind, or has no key RAISES CredResolutionError; only when neither is set
-    does it fall back to the legacy ``agentApiKey``. Returns a reference string, never a resolved value.
+    — that is missing, wrong-kind, or has no key RAISES CredResolutionError. When neither is set, return
+    an empty string so the configured provider may use its process environment. Returns a reference
+    string, never a resolved value.
 
     An empty selected Cred is not the same as no selection: returning ``""`` here would let the Agent
     silently continue under an ambient provider identity.
@@ -8044,7 +8054,7 @@ def cred_agent_api_key_ref(cred_id: str | None = None) -> str:
         if not ref:
             raise CredResolutionError("selected agent credential has no API key reference")
         return str(ref)
-    return get_setting("agentApiKey", "global") or ""
+    return ""
 
 
 def record_agent_egress_event(event: dict) -> None:
