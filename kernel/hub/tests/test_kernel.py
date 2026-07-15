@@ -4282,6 +4282,112 @@ def test_collab_room_state_elects_one_seed_and_re_elects_after_disconnect(live_c
     asyncio.run(scenario())
 
 
+def test_collab_seed_lease_rotates_after_partial_handshake(monkeypatch, live_collab_url):
+    # A seed that sends its snapshot but never acknowledges readiness still blocks the room. Lease the
+    # complete handshake, rotate in connection order, and make the timed-out peer sync from the winner.
+    import asyncio
+    import websockets
+    from hub import main as hub_main
+
+    monkeypatch.setattr(hub_main, "_COLLAB_SEED_READY_TIMEOUT_SECONDS", 0.08)
+
+    async def scenario() -> None:
+        url = live_collab_url.replace("http://", "ws://") + "/ws/collab/partial-seed-timeout"
+        async with websockets.connect(url, proxy=None) as first:
+            first_plan = await _collab_recv(first)
+            assert first_plan["mode"] == "seed"
+            await _collab_send(first, {
+                "type": "yjs", "seed": True, "requestId": first_plan["requestId"],
+                "update": "partial-state",
+            })
+
+            async with websockets.connect(url, proxy=None) as replacement:
+                assert (await _collab_recv(replacement))["mode"] == "wait"
+                assert await _collab_recv(first) == {
+                    "type": "server", "event": "room-state", "mode": "wait",
+                }
+                replacement_plan = await _collab_recv(replacement)
+                assert replacement_plan["mode"] == "seed"
+                assert replacement_plan["requestId"] != first_plan["requestId"]
+
+                await _collab_send(replacement, {
+                    "type": "yjs", "seed": True, "requestId": replacement_plan["requestId"],
+                    "update": "authoritative-state",
+                })
+                await _collab_send(replacement, {
+                    "type": "sync-ready", "requestId": replacement_plan["requestId"],
+                })
+                assert (await _collab_recv(replacement))["mode"] == "ready"
+
+                sync_plan = await _collab_recv(first)
+                assert sync_plan["mode"] == "sync"
+                await _collab_send(first, {
+                    "type": "ysync", "requestId": sync_plan["requestId"], "sv": "partial-vector",
+                })
+                assert (await _collab_recv(replacement))["requestId"] == sync_plan["requestId"]
+                await _collab_send(replacement, {
+                    "type": "yjs", "sync": True, "replyTo": sync_plan["requestId"],
+                    "update": "authoritative-state",
+                })
+                assert (await _collab_recv(first))["replyTo"] == sync_plan["requestId"]
+                await _collab_send(first, {
+                    "type": "sync-ready", "requestId": sync_plan["requestId"],
+                })
+                assert (await _collab_recv(first))["mode"] == "ready"
+
+    asyncio.run(scenario())
+
+
+def test_collab_all_silent_seed_candidates_become_unavailable_then_retry(monkeypatch, live_collab_url):
+    # Every connected writer gets one bounded seed lease. Exhaustion is explicit unavailable (never
+    # ready), followed by a fresh bounded election pass so open silent sockets cannot cause a permanent wait.
+    import asyncio
+    import websockets
+    from hub import main as hub_main
+
+    monkeypatch.setattr(hub_main, "_COLLAB_SEED_READY_TIMEOUT_SECONDS", 0.04)
+    monkeypatch.setattr(hub_main, "_COLLAB_UNAVAILABLE_RETRY_SECONDS", 0.06)
+
+    async def scenario() -> None:
+        url = live_collab_url.replace("http://", "ws://") + "/ws/collab/all-silent-seeds"
+        async with websockets.connect(url, proxy=None) as first:
+            first_plan = await _collab_recv(first)
+            assert first_plan["mode"] == "seed"
+            async with websockets.connect(url, proxy=None) as second:
+                assert (await _collab_recv(second))["mode"] == "wait"
+
+                assert (await _collab_recv(first))["mode"] == "wait"
+                second_plan = await _collab_recv(second)
+                assert second_plan["mode"] == "seed"
+                assert second_plan["requestId"] != first_plan["requestId"]
+
+                assert await _collab_recv(first) == {
+                    "type": "server", "event": "room-state", "mode": "unavailable",
+                }
+                assert await _collab_recv(second) == {
+                    "type": "server", "event": "room-state", "mode": "unavailable",
+                }
+
+                retry_plan = await _collab_recv(first)
+                assert retry_plan["mode"] == "seed"
+                assert retry_plan["requestId"] not in {
+                    first_plan["requestId"], second_plan["requestId"],
+                }
+                assert (await _collab_recv(second))["mode"] == "wait"
+
+                await _collab_send(first, {
+                    "type": "yjs", "seed": True, "requestId": retry_plan["requestId"],
+                    "update": "recovered-state",
+                })
+                await _collab_send(first, {
+                    "type": "sync-ready", "requestId": retry_plan["requestId"],
+                })
+                assert (await _collab_recv(first))["mode"] == "ready"
+                await _collab_sync(first, second, update="recovered-state")
+
+    asyncio.run(scenario())
+
+
 def test_collab_plans_are_isolated_between_rooms(live_collab_url):
     # Replanning one canvas must not invalidate an in-flight seed request in another canvas.
     import asyncio
@@ -4395,6 +4501,60 @@ def test_collab_two_simultaneous_joiners_can_only_sync_from_the_ready_authority(
                         assert await _collab_recv(joiner) == {
                             "type": "server", "event": "room-state", "mode": "ready",
                         }
+
+    asyncio.run(scenario())
+
+
+def test_collab_sync_request_and_ready_ack_have_bounded_deadlines(monkeypatch, live_collab_url):
+    # Bound the whole directed-sync handshake, not just the authority's response: a joiner that never
+    # requests or never acknowledges a forwarded reply enters unavailable/backoff and can safely retry.
+    import asyncio
+    import websockets
+    from hub import main as hub_main
+
+    monkeypatch.setattr(hub_main, "_COLLAB_SYNC_REQUEST_TIMEOUT_SECONDS", 0.04)
+    monkeypatch.setattr(hub_main, "_COLLAB_SYNC_READY_TIMEOUT_SECONDS", 0.04)
+    monkeypatch.setattr(hub_main, "_COLLAB_UNAVAILABLE_RETRY_SECONDS", 0.05)
+
+    async def scenario() -> None:
+        url = live_collab_url.replace("http://", "ws://") + "/ws/collab/sync-phase-deadlines"
+        async with websockets.connect(url, proxy=None) as authority:
+            await _collab_seed(authority, update="authoritative-state")
+            async with websockets.connect(url, proxy=None) as joiner:
+                silent_request = await _collab_recv(joiner)
+                assert silent_request["mode"] == "sync"
+                assert (await _collab_recv(joiner))["mode"] == "unavailable"
+
+                silent_ready = await _collab_recv(joiner)
+                assert silent_ready["mode"] == "sync"
+                assert silent_ready["requestId"] != silent_request["requestId"]
+                await _collab_send(joiner, {
+                    "type": "ysync", "requestId": silent_ready["requestId"], "sv": "joiner-vector",
+                })
+                assert (await _collab_recv(authority))["requestId"] == silent_ready["requestId"]
+                await _collab_send(authority, {
+                    "type": "yjs", "sync": True, "replyTo": silent_ready["requestId"],
+                    "update": "authoritative-state",
+                })
+                assert (await _collab_recv(joiner))["replyTo"] == silent_ready["requestId"]
+                assert (await _collab_recv(joiner))["mode"] == "unavailable"
+
+                recovered = await _collab_recv(joiner)
+                assert recovered["mode"] == "sync"
+                assert recovered["requestId"] != silent_ready["requestId"]
+                await _collab_send(joiner, {
+                    "type": "ysync", "requestId": recovered["requestId"], "sv": "joiner-vector",
+                })
+                assert (await _collab_recv(authority))["requestId"] == recovered["requestId"]
+                await _collab_send(authority, {
+                    "type": "yjs", "sync": True, "replyTo": recovered["requestId"],
+                    "update": "authoritative-state",
+                })
+                assert (await _collab_recv(joiner))["replyTo"] == recovered["requestId"]
+                await _collab_send(joiner, {
+                    "type": "sync-ready", "requestId": recovered["requestId"],
+                })
+                assert (await _collab_recv(joiner))["mode"] == "ready"
 
     asyncio.run(scenario())
 

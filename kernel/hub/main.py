@@ -526,17 +526,32 @@ class _CollabSyncPlan:
     request_sent: bool = False
     response_forwarded: bool = False
     timed_out: bool = False
+    timeout_phase: str | None = None  # request | response | ready
     timer_task: asyncio.Task[None] | None = None
 
 
 _collab_plans: dict[WebSocket, _CollabSyncPlan] = {}
+
+
+@dataclass
+class _CollabSeedElection:
+    """Room-level memory for one bounded pass through the current seed candidates."""
+
+    attempted: set[WebSocket] = field(default_factory=set)
+    retry_task: asyncio.Task[None] | None = None
+
+
+_collab_seed_elections: dict[str, _CollabSeedElection] = {}
 _COLLAB_CLIENT_MESSAGES = frozenset(("presence", "yjs", "ysync", "sync-ready"))
 _COLLAB_SERVER_ONLY_MESSAGES = frozenset((
     "server", "room-state", "leave", "external-edit", "ownership", "authority", "sync-plan",
     "protocol-error",
 ))
+_COLLAB_SEED_READY_TIMEOUT_SECONDS = 5.0
+_COLLAB_SYNC_REQUEST_TIMEOUT_SECONDS = 5.0
 _COLLAB_SYNC_RESPONSE_TIMEOUT_SECONDS = 5.0
-_COLLAB_SYNC_RETRY_SECONDS = 5.0
+_COLLAB_SYNC_READY_TIMEOUT_SECONDS = 5.0
+_COLLAB_UNAVAILABLE_RETRY_SECONDS = 5.0
 
 
 def _retain_collab_room_lock(canvas_id: str) -> asyncio.Lock:
@@ -617,8 +632,35 @@ def _cancel_collab_plan_timer(plan: _CollabSyncPlan) -> None:
         task.cancel()
 
 
+def _cancel_collab_seed_retry(election: _CollabSeedElection) -> None:
+    task, election.retry_task = election.retry_task, None
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+
+
+def _clear_collab_seed_election(canvas_id: str) -> None:
+    election = _collab_seed_elections.pop(canvas_id, None)
+    if election is not None:
+        _cancel_collab_seed_retry(election)
+
+
+def _ensure_collab_plan_deadline(
+    canvas_id: str, peer: WebSocket, plan: _CollabSyncPlan,
+) -> None:
+    if plan.timer_task is not None:
+        return
+    if plan.mode == "seed":
+        _schedule_collab_seed_deadline(canvas_id, peer, plan)
+    elif plan.mode == "sync":
+        phase = "request" if not plan.request_sent else "response" if not plan.response_forwarded else "ready"
+        _schedule_collab_sync_phase_deadline(canvas_id, peer, plan, phase)
+
+
 async def _replan_collab_room_locked(room: set[WebSocket], canvas_id: str) -> None:
     """Recompute deterministic bootstrap ownership. Caller holds this canvas's room lock."""
+    if not room:
+        _clear_collab_seed_election(canvas_id)
+        return
     while room:
         roles: dict[WebSocket, str] = {}
         for peer in _ordered_collab_peers(room):
@@ -629,6 +671,7 @@ async def _replan_collab_room_locked(room: set[WebSocket], canvas_id: str) -> No
                 roles[peer] = role
 
         if not room:
+            _clear_collab_seed_election(canvas_id)
             return
         ready_writers = [
             peer for peer in _ordered_collab_peers(room)
@@ -636,12 +679,21 @@ async def _replan_collab_room_locked(room: set[WebSocket], canvas_id: str) -> No
         ]
         unsynced = [peer for peer in _ordered_collab_peers(room) if peer not in _collab_synced]
         desired: dict[WebSocket, _CollabSyncPlan] = {}
+        seed_exhausted = False
         if ready_writers:
+            _clear_collab_seed_election(canvas_id)
             for peer in unsynced:
                 previous = _collab_plans.get(peer)
                 attempted = set(previous.attempted_responders) if previous is not None else set()
                 if previous is not None and previous.mode == "sync" and previous.timed_out:
-                    if previous.responder is not None:
+                    if previous.timeout_phase in ("request", "ready"):
+                        # The authority did not fail in these phases. Fence the current authority set
+                        # only to preserve the joiner's unavailable/backoff window; a newly ready writer
+                        # may still trigger an immediate retry, and the scheduled retry clears the fence.
+                        attempted.update(ready_writers)
+                        desired[peer] = _new_collab_plan("unavailable", attempted=attempted)
+                        continue
+                    if previous.responder is not None:  # response timeout: rotate the silent authority
                         attempted.add(previous.responder)
                 elif (
                     previous is not None and previous.mode == "sync"
@@ -659,9 +711,31 @@ async def _replan_collab_room_locked(room: set[WebSocket], canvas_id: str) -> No
         else:
             writers = [peer for peer in unsynced if roles.get(peer) in ("owner", "editor")]
             if writers:
-                seed = writers[0]
-                previous = _collab_plans.get(seed)
-                desired[seed] = previous if previous is not None and previous.mode == "seed" else _new_collab_plan("seed")
+                election = _collab_seed_elections.setdefault(canvas_id, _CollabSeedElection())
+                election.attempted.intersection_update(writers)
+                active_seed: WebSocket | None = None
+                for peer in writers:
+                    previous = _collab_plans.get(peer)
+                    if previous is None or previous.mode != "seed":
+                        continue
+                    if previous.timed_out:
+                        election.attempted.add(peer)
+                    else:
+                        active_seed = peer
+                        desired[peer] = previous
+                    break
+
+                if active_seed is None:
+                    candidates = [peer for peer in writers if peer not in election.attempted]
+                    if candidates:
+                        _cancel_collab_seed_retry(election)
+                        desired[candidates[0]] = _new_collab_plan("seed")
+                    else:
+                        seed_exhausted = True
+                        if election.retry_task is None:
+                            _schedule_collab_seed_retry(canvas_id, election)
+            else:
+                _clear_collab_seed_election(canvas_id)
 
         for peer in list(_collab_plans):
             if _collab_canvas.get(peer) == canvas_id and peer not in desired:
@@ -678,13 +752,18 @@ async def _replan_collab_room_locked(room: set[WebSocket], canvas_id: str) -> No
 
         send_failed = False
         for peer in _ordered_collab_peers(room):
+            plan = _collab_plans.get(peer)
             if peer in _collab_synced:
                 state = ("ready", None)
-            elif (plan := _collab_plans.get(peer)) is not None:
+            elif plan is not None:
                 state = (plan.mode, plan.request_id if plan.mode != "unavailable" else None)
+            elif seed_exhausted:
+                state = ("unavailable", None)
             else:
                 state = ("wait", None)
             if _collab_last_state.get(peer) == state:
+                if plan is not None:
+                    _ensure_collab_plan_deadline(canvas_id, peer, plan)
                 continue
             payload: dict[str, str] = {"type": "server", "event": "room-state", "mode": state[0]}
             if state[1] is not None:
@@ -692,6 +771,8 @@ async def _replan_collab_room_locked(room: set[WebSocket], canvas_id: str) -> No
             try:
                 await peer.send_json(payload)
                 _collab_last_state[peer] = state
+                if plan is not None:
+                    _ensure_collab_plan_deadline(canvas_id, peer, plan)
             except Exception:  # noqa: BLE001 — a dead authority changes every waiter's plan
                 room.discard(peer)
                 send_failed = True
@@ -699,23 +780,58 @@ async def _replan_collab_room_locked(room: set[WebSocket], canvas_id: str) -> No
             return
 
 
-def _schedule_collab_sync_deadline(
-    canvas_id: str, joiner: WebSocket, plan: _CollabSyncPlan,
+def _schedule_collab_seed_deadline(
+    canvas_id: str, seed: WebSocket, plan: _CollabSyncPlan,
 ) -> None:
-    """Rotate away from an open-but-silent responder; a deadline never grants readiness itself."""
+    """Lease the complete seed handshake; expiry rotates candidates but can never grant readiness."""
     lock = _retain_collab_room_lock(canvas_id)
 
     async def expire() -> None:
-        await asyncio.sleep(_COLLAB_SYNC_RESPONSE_TIMEOUT_SECONDS)
+        await asyncio.sleep(_COLLAB_SEED_READY_TIMEOUT_SECONDS)
         async with lock:
             room = _collab_rooms.get(canvas_id)
-            current = _collab_plans.get(joiner)
+            current = _collab_plans.get(seed)
             if (
-                room is not None and joiner in room and current is plan and plan.mode == "sync"
-                and plan.request_sent and not plan.response_forwarded
+                room is not None and seed in room and current is plan and plan.mode == "seed"
+                and seed not in _collab_synced
             ):
                 plan.timer_task = None
                 plan.timed_out = True
+                _collab_last_state.pop(seed, None)
+                await _replan_collab_room_locked(room, canvas_id)
+
+    plan.timer_task = asyncio.create_task(expire())
+    plan.timer_task.add_done_callback(lambda _task: _release_collab_room_lock(canvas_id, lock))
+
+
+def _schedule_collab_sync_phase_deadline(
+    canvas_id: str, joiner: WebSocket, plan: _CollabSyncPlan, phase: str,
+) -> None:
+    """Bound every sync phase; expiry only replans and can never grant readiness itself."""
+    delay = {
+        "request": _COLLAB_SYNC_REQUEST_TIMEOUT_SECONDS,
+        "response": _COLLAB_SYNC_RESPONSE_TIMEOUT_SECONDS,
+        "ready": _COLLAB_SYNC_READY_TIMEOUT_SECONDS,
+    }[phase]
+    lock = _retain_collab_room_lock(canvas_id)
+
+    async def expire() -> None:
+        await asyncio.sleep(delay)
+        async with lock:
+            room = _collab_rooms.get(canvas_id)
+            current = _collab_plans.get(joiner)
+            phase_still_pending = (
+                (phase == "request" and not plan.request_sent)
+                or (phase == "response" and plan.request_sent and not plan.response_forwarded)
+                or (phase == "ready" and plan.response_forwarded)
+            )
+            if (
+                room is not None and joiner in room and current is plan and plan.mode == "sync"
+                and joiner not in _collab_synced and phase_still_pending
+            ):
+                plan.timer_task = None
+                plan.timed_out = True
+                plan.timeout_phase = phase
                 _collab_last_state.pop(joiner, None)
                 await _replan_collab_room_locked(room, canvas_id)
 
@@ -730,7 +846,7 @@ def _schedule_collab_unavailable_retry(
     lock = _retain_collab_room_lock(canvas_id)
 
     async def retry() -> None:
-        await asyncio.sleep(_COLLAB_SYNC_RETRY_SECONDS)
+        await asyncio.sleep(_COLLAB_UNAVAILABLE_RETRY_SECONDS)
         async with lock:
             room = _collab_rooms.get(canvas_id)
             if room is not None and joiner in room and _collab_plans.get(joiner) is plan:
@@ -741,6 +857,25 @@ def _schedule_collab_unavailable_retry(
 
     plan.timer_task = asyncio.create_task(retry())
     plan.timer_task.add_done_callback(lambda _task: _release_collab_room_lock(canvas_id, lock))
+
+
+def _schedule_collab_seed_retry(canvas_id: str, election: _CollabSeedElection) -> None:
+    """Expose seed exhaustion, then begin a fresh bounded pass through connected writers."""
+    lock = _retain_collab_room_lock(canvas_id)
+
+    async def retry() -> None:
+        await asyncio.sleep(_COLLAB_UNAVAILABLE_RETRY_SECONDS)
+        async with lock:
+            room = _collab_rooms.get(canvas_id)
+            if room is not None and room and _collab_seed_elections.get(canvas_id) is election:
+                election.retry_task = None
+                election.attempted.clear()
+                for peer in room:
+                    _collab_last_state.pop(peer, None)
+                await _replan_collab_room_locked(room, canvas_id)
+
+    election.retry_task = asyncio.create_task(retry())
+    election.retry_task.add_done_callback(lambda _task: _release_collab_room_lock(canvas_id, lock))
 
 
 async def _send_collab_protocol_error(ws: WebSocket, code: str, canvas_id: str) -> None:
@@ -873,7 +1008,8 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
                                             "type": "ysync", "requestId": request_id, "sv": state_vector,
                                         })
                                         plan.request_sent = True
-                                        _schedule_collab_sync_deadline(canvas_id, ws, plan)
+                                        _cancel_collab_plan_timer(plan)
+                                        _schedule_collab_sync_phase_deadline(canvas_id, ws, plan, "response")
                                     except Exception:  # noqa: BLE001 — re-elect without a timer
                                         room.discard(responder)
                                         await _replan_collab_room_locked(room, canvas_id)
@@ -906,6 +1042,7 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
                                     (joiner, plan) for joiner, plan in _collab_plans.items()
                                     if _collab_canvas.get(joiner) == canvas_id and plan.mode == "sync"
                                     and plan.responder is ws and plan.request_id == reply_to
+                                    and not plan.response_forwarded
                                 ), None)
                             if not should_break and (role not in ("owner", "editor") or ws not in _collab_synced):
                                 await _replan_collab_room_locked(room, canvas_id)
@@ -917,6 +1054,7 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
                                     })
                                     plan.response_forwarded = True
                                     _cancel_collab_plan_timer(plan)
+                                    _schedule_collab_sync_phase_deadline(canvas_id, joiner, plan, "ready")
                                 except Exception:  # noqa: BLE001
                                     room.discard(joiner)
                                     await _replan_collab_room_locked(room, canvas_id)
