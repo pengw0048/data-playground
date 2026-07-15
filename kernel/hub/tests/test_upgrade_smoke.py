@@ -16,7 +16,7 @@ import sys
 
 import pytest
 from alembic import command
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
 
 from hub import metadb
 from hub.settings import settings
@@ -31,6 +31,7 @@ FIXTURE_CANVAS_NAME = "upgrade-smoke-canvas"
 FIXTURE_RUN_ID = "rr_upgrade_smoke"
 FIXTURE_CATALOG_URI = "file:///tmp/upgrade-smoke-events.parquet"
 FIXTURE_CATALOG_NAME = "upgrade_smoke_events"
+FIXTURE_CATALOG_FOLDER = "upgrade/smoke"
 
 
 def _reset_engine() -> None:
@@ -87,6 +88,7 @@ def _seed_fixture_rows() -> None:
         "name": FIXTURE_CATALOG_NAME,
         "uri": FIXTURE_CATALOG_URI,
         "format": "parquet",
+        "folder": FIXTURE_CATALOG_FOLDER,
         "columns": [{"name": "id", "type": "int64"}],
     })
     dialect = metadb.engine().dialect.name
@@ -120,11 +122,12 @@ def _seed_fixture_rows() -> None:
         })
         connection.execute(text(
             "INSERT INTO catalog_entries (uri, name, doc, folder) "
-            "VALUES (:uri, :name, :doc, '')"
+            "VALUES (:uri, :name, :doc, :folder)"
         ), {
             "uri": FIXTURE_CATALOG_URI,
             "name": FIXTURE_CATALOG_NAME,
             "doc": catalog_doc,
+            "folder": FIXTURE_CATALOG_FOLDER,
         })
 
 
@@ -144,6 +147,10 @@ def _assert_fixtures_intact() -> None:
         catalog = session.get(metadb.CatalogEntry, FIXTURE_CATALOG_URI)
         assert catalog is not None, "catalog_entries fixture missing after migrate"
         assert catalog.name == FIXTURE_CATALOG_NAME
+        assert catalog.folder == FIXTURE_CATALOG_FOLDER
+        folders = set(session.scalars(
+            select(metadb.CatalogFolder.path).order_by(metadb.CatalogFolder.path)))
+        assert {"upgrade", FIXTURE_CATALOG_FOLDER} <= folders
 
 
 def _run_upgrade_smoke(tmp_path, *, postgres: bool) -> None:
