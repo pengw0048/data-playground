@@ -271,9 +271,10 @@ make e2e
 ```
 
 Required PR CI also owns the PostgreSQL migration contract and researcher-workflow browser smoke. The
-same lean CI and security gates validate the integrated `main` tree. Environment-heavy UX, artifact,
-and Ray acceptance use separate scheduled, on-demand, and release policies; they do not run
-unconditionally after every merge. See [CI and release gates](docs/CI.md) and
+same lean CI and security gates validate the integrated `main` tree. Ray and Ray Jobs acceptance also
+run on PRs that change their explicitly owned execution or lifecycle paths; full UX, artifacts, and all
+heavy gates run on their scheduled, on-demand, or release policies. None run unconditionally after
+every merge. See [CI and release gates](docs/CI.md) and
 [CONTRIBUTING.md](.github/CONTRIBUTING.md) for the exact contracts and clean-environment commands.
 
 ## Contributing
