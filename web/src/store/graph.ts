@@ -157,34 +157,6 @@ export interface PreviewState {
   offset?: number
 }
 
-// The API receives exactly these graph-affecting fields for a preview. Positions and transient UI status
-// do not invalidate it; title does because metric output and section-child aliases execute from it.
-// Keeping this identity in the store makes stale data impossible to present as current.
-export function previewPlanIdentity(doc: CanvasDoc, nodeId: string): string {
-  return JSON.stringify({
-    canvasId: doc.id,
-    nodeId,
-    requirements: doc.requirements ?? [],
-    nodes: doc.nodes.map((node) => ({
-      id: node.id,
-      type: node.type,
-      parentId: node.parentId ?? null,
-      title: node.data.title,
-      config: node.data.config,
-      bypassed: node.data.bypassed,
-      disabled: node.data.disabled,
-    })),
-    edges: doc.edges.map((edge) => ({
-      id: edge.id,
-      source: edge.source,
-      target: edge.target,
-      sourceHandle: edge.sourceHandle ?? null,
-      targetHandle: edge.targetHandle ?? null,
-      wire: edge.data?.wire ?? 'dataset',
-    })),
-  })
-}
-
 function canonicalIdentityValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalIdentityValue)
   if (value && typeof value === 'object') {
@@ -200,10 +172,12 @@ function compareIdentityText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0
 }
 
-// Whole-dataset profile identity follows the server's target-scoped execution cone. Unlike previews,
-// an unrelated branch edit must not detach a long-running scan. Section nodes execute their complete
-// parentId-contained subtree, so those descendants are part of the cone even without ordinary edges.
-export function profilePlanIdentity(doc: CanvasDoc, nodeId: string): string {
+// Preview and profile requests execute the same target-scoped graph cone on the server. Keep one
+// canonical document identity for every client-side consumer: unrelated branches, array ordering,
+// positions, edge ids, selection, and transient node status are presentation-only; requirements,
+// executable node data, wiring, and section containment affect execution. Titles are included because
+// metric output and section-child aliases execute from them.
+function targetExecutionPlanIdentity(doc: CanvasDoc, nodeId: string): string {
   const executableNodes = doc.nodes.filter((node) => node.type !== 'note' && node.type !== 'code')
   const byId = new Map(executableNodes.map((node) => [node.id, node]))
   const incoming = new Map<string, string[]>()
@@ -269,6 +243,14 @@ export function profilePlanIdentity(doc: CanvasDoc, nodeId: string): string {
     nodes,
     edges,
   }))
+}
+
+export function previewPlanIdentity(doc: CanvasDoc, nodeId: string): string {
+  return targetExecutionPlanIdentity(doc, nodeId)
+}
+
+export function profilePlanIdentity(doc: CanvasDoc, nodeId: string): string {
+  return targetExecutionPlanIdentity(doc, nodeId)
 }
 
 export function previewIsCurrent(preview: PreviewState, doc: CanvasDoc, nodeId: string): boolean {
