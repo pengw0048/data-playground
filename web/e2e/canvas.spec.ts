@@ -500,9 +500,11 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('Relationships', { exact: true })).toBeVisible({ timeout: 10_000 })
     const entities = page.locator('.react-flow__node')
     await expect(entities.filter({ hasText: 'events' }).first().getByText('user_id')).toBeVisible({ timeout: 10_000 })
-    // "show all" widens to the whole catalog — a large-fixture table appears as an entity too.
+    // "show all" widens to the whole catalog. Assert against the selected fixture profile so the
+    // normal PR smoke keeps its starter-data contract while the full matrix proves the large catalog.
     await page.getByTestId('er-clear-focus').click()
-    await expect(entities.filter({ hasText: 'catalog_000' }).first()).toBeVisible({ timeout: 10_000 })
+    const expandedTable = process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'images'
+    await expect(entities.filter({ hasText: expandedTable }).first()).toBeVisible({ timeout: 10_000 })
   })
 
   test('a failing run surfaces an error toast (not a silent failure)', async ({ page }) => {
