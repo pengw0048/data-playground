@@ -308,6 +308,7 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('toast').filter({ hasText: 'permission' })).toContainText('permission')
     await expect.poll(() => page.evaluate(() => location.hash)).toBe(current)
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await expect(page.getByRole('heading', { name: 'Import pipeline' })).toBeVisible()
   })
 
   test('settings modal edits and saves the agent config', async ({ page }) => {
@@ -711,6 +712,31 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByRole('button', { name: 'Previous page' })).toBeEnabled()
     await page.locator('.dp-panel table tbody tr').first().click()
     await expect(page.getByRole('button', { name: /^Row / })).toBeVisible() // detail back-button
+  })
+
+  test('editing a graph blocks rows from the previous preview until it is refreshed', async ({ page }) => {
+    await fresh(page)
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to files').click()
+    await page.getByTestId('rail-tables').click()
+    await openCatalogTable(page, 'events')
+    await page.getByTestId('detail-use').click()
+    await page.route('**/api/run/preview', (route) => route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        columns: [{ name: 'event', type: 'VARCHAR', capabilities: [] }],
+        rows: [{ event: 'purchase' }], rowCount: 1, hasMore: false, truncated: false,
+      }),
+    }))
+
+    const inspector = page.getByTestId('inspector')
+    await inspector.getByRole('button', { name: 'View data' }).click()
+    await expect(page.getByText('purchase', { exact: true })).toBeVisible()
+    await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('another-events.parquet')
+
+    await expect(page.getByRole('status')).toContainText('Preview out of date')
+    await expect(page.getByRole('button', { name: 'Refresh preview' })).toBeVisible()
+    await expect(page.getByText('purchase', { exact: true })).toHaveCount(0)
   })
 
   test('a write node picks an output destination via the save dialog', async ({ page }) => {
