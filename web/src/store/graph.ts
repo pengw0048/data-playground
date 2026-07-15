@@ -19,6 +19,12 @@ import { crdtUndo, crdtUndoActive, collabApply } from '../collab/undo'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 
+export type CanvasPersistence = 'remote' | 'local-draft'
+
+export type CanvasCreationResult =
+  | { ok: true; canvasId: string; persistence: CanvasPersistence }
+  | { ok: false }
+
 const LS_KEY = 'dp-canvas'       // offline cache of the open doc
 const USER_KEY = 'dp-user'       // last-selected user id
 const OPEN_KEY = (uid: string) => `dp-open-${uid}`  // last-opened file per user
@@ -237,7 +243,9 @@ interface Store {
   save: () => Promise<void>
   loadDoc: (doc: CanvasDoc, role?: CanvasRole | null) => void
   applyExternalEdit: (canvasId?: string) => void
-  applyAgentGraph: (graph: { nodes: AgentBackendNode[]; edges: AgentBackendEdge[] }) => void
+  // `targetCanvasId` binds a destructive replacement to the canvas the caller created. Imports use
+  // it so a late response can never replace whichever canvas became active in the meantime.
+  applyAgentGraph: (graph: { nodes: AgentBackendNode[]; edges: AgentBackendEdge[] }, targetCanvasId?: string) => boolean
 
   // -- app shell (Figma-style views) --
   view: DpView
@@ -269,8 +277,8 @@ interface Store {
   refreshFiles: () => Promise<boolean>  // true only when this user's authoritative list was refreshed
   refreshUsers: () => Promise<void>
   openFile: (id: string) => Promise<boolean>
-  newFile: () => Promise<void>
-  newFromExample: (key: string) => Promise<void>
+  newFile: () => Promise<CanvasCreationResult>
+  newFromExample: (key: string) => Promise<CanvasCreationResult>
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
   deleteFile: (id: string) => Promise<void>
@@ -342,9 +350,15 @@ export const useStore = create<Store>((set, get) => ({
   doc: emptyDoc(),
   canvasRole: null,
   view: 'canvas',
-  setView: (view) => set({ view }),
+  setView: (view) => {
+    if (get().view !== view) _fileNavigationGeneration += 1
+    set({ view })
+  },
   erFocusUri: null,
-  openRelationships: (uri) => set({ erFocusUri: uri, view: 'relationships' }),
+  openRelationships: (uri) => {
+    if (get().view !== 'relationships') _fileNavigationGeneration += 1
+    set({ erFocusUri: uri, view: 'relationships' })
+  },
   addToCanvas: (kind, config, title) => {
     if (!roleCanEdit(get().canvasRole)) {
       get().pushToast('This canvas is view-only', 'info')
@@ -959,13 +973,15 @@ export const useStore = create<Store>((set, get) => ({
     const generation = ++_fileNavigationGeneration
     const userId = get().currentUser?.id ?? null
     const doc = emptyDoc()
+    let persistence: CanvasPersistence = 'remote'
     try {
-      await api.createCanvas(doc)
-      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+      const created = await api.createCanvas(doc)
+      if (!created.ok) return { ok: false }
+      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
       rememberRole(userId, doc.id, 'owner') // create response confirms ownership
       await get().refreshFiles()
     } catch (e) {
-      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
       if (e instanceof KernelError) {
         if (e.status === 401) {
           rememberRole(userId, get().doc.id, null)
@@ -978,16 +994,18 @@ export const useStore = create<Store>((set, get) => ({
           set({ kernelUp: true })
           get().pushToast(`Could not create canvas: ${e.message}`, 'error')
         }
-        return
+        return { ok: false }
       }
       // A transport failure is the one case where local-first creation is truthful: this is a new,
       // collision-resistant local draft and a later PUT can create it as the current user's canvas.
+      persistence = 'local-draft'
     }
-    if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+    if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
     get().loadDoc(doc, 'owner')
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
     set({ view: 'canvas' })
+    return { ok: true, canvasId: doc.id, persistence }
   },
 
   newFromExample: async (key) => {
@@ -995,14 +1013,16 @@ export const useStore = create<Store>((set, get) => ({
     const userId = get().currentUser?.id ?? null
     const id = `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
     const doc = exampleDoc(key, id)  // a runnable starter on the seeded data; falls back to a blank file
-    if (!doc) { await get().newFile(); return }
+    if (!doc) return get().newFile()
+    let persistence: CanvasPersistence = 'remote'
     try {
-      await api.createCanvas(doc)
-      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+      const created = await api.createCanvas(doc)
+      if (!created.ok) return { ok: false }
+      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
       rememberRole(userId, doc.id, 'owner') // create response confirms ownership
       await get().refreshFiles()
     } catch (e) {
-      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
       if (e instanceof KernelError) {
         if (e.status === 401) {
           rememberRole(userId, get().doc.id, null)
@@ -1015,15 +1035,17 @@ export const useStore = create<Store>((set, get) => ({
           set({ kernelUp: true })
           get().pushToast(`Could not create canvas: ${e.message}`, 'error')
         }
-        return
+        return { ok: false }
       }
       // Transport failure: keep the runnable example as an offline local-first draft.
+      persistence = 'local-draft'
     }
-    if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return
+    if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
     get().loadDoc(doc, 'owner')
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
     set({ view: 'canvas' })
+    return { ok: true, canvasId: doc.id, persistence }
   },
 
   renameFile: (name) => {
@@ -1160,8 +1182,9 @@ export const useStore = create<Store>((set, get) => ({
 
   // Apply a graph the LLM agent built (extends the canvas). Undoable; preserves UI state of nodes
   // whose ids already exist, and marks touched nodes stale so the user can preview/run them.
-  applyAgentGraph: (bg) => {
-    if (!roleCanEdit(get().canvasRole)) return
+  applyAgentGraph: (bg, targetCanvasId) => {
+    if (!roleCanEdit(get().canvasRole)) return false
+    if (targetCanvasId && (get().doc.id !== targetCanvasId || get().view !== 'canvas')) return false
     get().commit()
     set((s) => {
       const existing = new Map(s.doc.nodes.map((n) => [n.id, n]))
@@ -1173,6 +1196,7 @@ export const useStore = create<Store>((set, get) => ({
       const edges: CanvasEdge[] = bg.edges.map((e) => ({ id: e.id, source: e.source, target: e.target, sourceHandle: e.sourceHandle ?? null, targetHandle: e.targetHandle ?? null, data: { wire: (e.data?.wire ?? 'dataset') as WireType } }))
       return { doc: { ...s.doc, nodes, edges } }
     })
+    return true
   },
 }))
 

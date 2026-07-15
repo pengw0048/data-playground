@@ -31,8 +31,11 @@ export function ImportPipelineModal({ onClose }: { onClose: () => void }) {
     try {
       const res = await api.importPipeline(text)
       if (res.graph && res.graph.nodes.length) {
-        await newFile()  // import into a fresh canvas — applyAgentGraph replaces nodes/edges
-        applyAgentGraph(res.graph)
+        const created = await newFile()
+        if (!created.ok) return
+        // applyAgentGraph replaces nodes/edges, so bind it to the canvas just created. A completed
+        // creation must not let a late import replace a canvas the researcher navigated to instead.
+        if (!applyAgentGraph(res.graph, created.canvasId)) return
         pushToast(`Imported ${res.graph.nodes.length} nodes`, 'success')
         onClose()
       } else {
