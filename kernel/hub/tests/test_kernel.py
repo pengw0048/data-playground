@@ -4262,18 +4262,18 @@ def test_collab_handshake_relays_sync_through_reconnect(live_collab_url):
             assert await _collab_recv(a) == {"type": "room-state", "peerCount": 0}
             async with websockets.connect(url, proxy=None) as b:
                 assert await _collab_recv(b) == {"type": "room-state", "peerCount": 1}
-                await _collab_send(b, {"clientId": "B", "type": "ysync", "sv": "b-state"})
-                assert await _collab_recv(a) == {"clientId": "B", "type": "ysync", "sv": "b-state"}
-                await _collab_send(a, {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True})
-                assert await _collab_recv(b) == {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True}
+                await _collab_send(b, {"clientId": "B", "type": "ysync", "requestId": "b-sync", "sv": "b-state"})
+                assert await _collab_recv(a) == {"clientId": "B", "type": "ysync", "requestId": "b-sync", "sv": "b-state"}
+                await _collab_send(a, {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True, "replyTo": "b-sync", "targetId": "B"})
+                assert await _collab_recv(b) == {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True, "replyTo": "b-sync", "targetId": "B"}
             assert await _collab_recv(a) == {"type": "leave", "clientId": "B"}
             assert await _collab_recv(a) == {"type": "room-state", "peerCount": 0}
             async with websockets.connect(url, proxy=None) as b_reconnected:
                 assert await _collab_recv(b_reconnected) == {"type": "room-state", "peerCount": 1}
-                await _collab_send(b_reconnected, {"clientId": "B2", "type": "ysync", "sv": "b2-state"})
-                assert await _collab_recv(a) == {"clientId": "B2", "type": "ysync", "sv": "b2-state"}
-                await _collab_send(a, {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True})
-                assert await _collab_recv(b_reconnected) == {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True}
+                await _collab_send(b_reconnected, {"clientId": "B2", "type": "ysync", "requestId": "b2-sync", "sv": "b2-state"})
+                assert await _collab_recv(a) == {"clientId": "B2", "type": "ysync", "requestId": "b2-sync", "sv": "b2-state"}
+                await _collab_send(a, {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True, "replyTo": "b2-sync", "targetId": "B2"})
+                assert await _collab_recv(b_reconnected) == {"clientId": "A", "type": "yjs", "update": "A-state", "sync": True, "replyTo": "b2-sync", "targetId": "B2"}
 
     asyncio.run(scenario())
 
@@ -4295,10 +4295,10 @@ def test_collab_room_state_unblocks_joiner_when_unannounced_peer_vanishes(live_c
                 await _collab_send(joiner, {"clientId": "J", "type": "yjs", "update": "J-edit"})
                 async with websockets.connect(url, proxy=None) as later:
                     assert await _collab_recv(later) == {"type": "room-state", "peerCount": 1}
-                    await _collab_send(later, {"clientId": "L", "type": "ysync", "sv": "later-state"})
-                    assert await _collab_recv(joiner) == {"clientId": "L", "type": "ysync", "sv": "later-state"}
-                    await _collab_send(joiner, {"clientId": "J", "type": "yjs", "update": "J-edit", "sync": True})
-                    assert await _collab_recv(later) == {"clientId": "J", "type": "yjs", "update": "J-edit", "sync": True}
+                    await _collab_send(later, {"clientId": "L", "type": "ysync", "requestId": "later-sync", "sv": "later-state"})
+                    assert await _collab_recv(joiner) == {"clientId": "L", "type": "ysync", "requestId": "later-sync", "sv": "later-state"}
+                    await _collab_send(joiner, {"clientId": "J", "type": "yjs", "update": "J-edit", "sync": True, "replyTo": "later-sync", "targetId": "L"})
+                    assert await _collab_recv(later) == {"clientId": "J", "type": "yjs", "update": "J-edit", "sync": True, "replyTo": "later-sync", "targetId": "L"}
 
     asyncio.run(scenario())
 
