@@ -425,7 +425,7 @@ def test_canvas_delete_waits_for_preallocated_sink_cleanup(open_mode):
         with metadb.session() as session:
             session.get(metadb.RunState, run_id).status = "allocating"
 
-    with pytest.raises(metadb.ActiveBackendJobsError, match="active external run"):
+    with pytest.raises(metadb.ActiveBackendJobsError, match="active run"):
         metadb.delete_canvas_cascade(canvas_id)
     with metadb.session() as session:
         assert session.get(metadb.Canvas, canvas_id) is not None

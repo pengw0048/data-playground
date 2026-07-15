@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  PluginInfo, ProcessorDescriptor, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunStatus, SampleResult,
+  PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -213,8 +213,8 @@ export const api = {
 
   preview: (doc: CanvasDoc, nodeId: string, k = 50, offset = 0) =>
     req<SampleResult>('/run/preview', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, k, offset }) }),
-  profile: (doc: CanvasDoc, nodeId: string, full = false) =>
-    req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, full }) }),
+  profile: (doc: CanvasDoc, nodeId: string) =>
+    req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
 
   // per-node output columns (metadata only) → editor column suggestions; null = untyped port
   schema: (doc: CanvasDoc) =>
@@ -247,11 +247,23 @@ export const api = {
   estimate: (doc: CanvasDoc, targetNodeId?: string) =>
     req<RunEstimate>('/run/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
 
+  profileEstimate: (doc: CanvasDoc, nodeId: string) =>
+    req<ProfileEstimate>('/run/profile-estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
+
+  profileIdentity: (doc: CanvasDoc, nodeId: string) =>
+    req<ProfileIdentity>('/run/profile-identity', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
+
   run: (doc: CanvasDoc, targetNodeId?: string, confirmed = false) =>
     req<RunStatus>('/run', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed }) }),
 
+  fullProfile: (doc: CanvasDoc, nodeId: string, planDigest: string, submissionId: string, confirmed = false) =>
+    req<RunStatus>('/run/profile-job', {
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, planDigest, submissionId, confirmed }),
+    }),
+
   runStatus: (runId: string) => req<RunStatus>(`/run/${runId}`),
   activeRuns: (canvasId: string) => req<RunStatus[]>(`/canvas/${encodeURIComponent(canvasId)}/active-runs`),
+  profileJobs: (canvasId: string) => req<RunStatus[]>(`/canvas/${encodeURIComponent(canvasId)}/profile-jobs`),
   kernelState: (canvasId: string) => req<CanvasKernelStatus>(`/canvas/${encodeURIComponent(canvasId)}/kernel`),
   restartKernel: (canvasId: string) => req<{ ok: boolean; restarted: boolean }>(`/canvas/${encodeURIComponent(canvasId)}/kernel/restart`, { method: 'POST' }),
   cancelRun: (runId: string) => req<RunStatus>(`/run/${runId}/cancel`, { method: 'POST' }),

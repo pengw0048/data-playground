@@ -46,6 +46,14 @@ def test_status_payload_memory_limit_may_be_none():
     assert out["activeRuns"] == 0 and out["inflight"] == 0
 
 
+def test_status_payload_counts_async_profile_jobs_as_active_work():
+    out = kernel._status_payload(
+        RelationCache(), "4GB", 0, {}, threading.Lock(), time.monotonic(),
+        {"profile": _St("running")}, threading.Lock(),
+    )
+    assert out["activeRuns"] == 1
+
+
 def test_runs_snapshot_is_lock_safe_under_concurrent_mutation():
     lock = threading.Lock()
     runs = {f"r{i}": _St("running") for i in range(200)}

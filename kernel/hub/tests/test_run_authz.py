@@ -85,15 +85,19 @@ _GRAPH_READ_ENDPOINTS = [
     ("plan", "/api/graph/plan"),
     ("join-analysis", "/api/graph/join-analysis"),
     ("run-estimate", "/api/run/estimate"),
+    ("profile-estimate", "/api/run/profile-estimate"),
+    ("profile-identity", "/api/run/profile-identity"),
 ]
 
 
 def _graph_read_body(case: str, canvas_id: str) -> dict:
     graph = _analysis_graph(canvas_id)
     if case == "preview":
-        return {"graph": graph, "nodeId": "join", "k": 2}
+        return {"graph": graph, "nodeId": "left", "k": 2}
     if case == "profile":
-        return {"graph": graph, "nodeId": "join", "full": False}
+        return {"graph": graph, "nodeId": "left", "full": False}
+    if case in ("profile-estimate", "profile-identity"):
+        return {"graph": graph, "nodeId": "left"}
     return {"graph": graph, "targetNodeId": "join"}
 
 
@@ -232,6 +236,10 @@ def test_graph_reads_allow_every_canvas_read_role(authed, monkeypatch, uid, case
         assert "suggestions" in payload
     elif case == "run-estimate":
         assert payload["placement"] == "local"
+    elif case == "profile-estimate":
+        assert len(payload["planDigest"]) == 64
+    elif case == "profile-identity":
+        assert len(payload["planDigest"]) == 64
 
 
 def test_agent_graph_is_authorized_before_provider_or_data_access(authed, monkeypatch):
@@ -286,6 +294,100 @@ def test_run_submit_requires_canvas_write_role(authed, uid, expected):
     _share_editor_and_viewer()
     response = _start_run(_hdr(uid), "authz_canvas")
     assert response.status_code == expected, response.text
+
+
+def test_profile_job_submit_and_recovery_use_read_vs_mutate_roles(authed, monkeypatch):
+    from hub.models import RunEstimate, RunStatus
+    from hub.routers import runs as run_routes
+
+    _share_editor_and_viewer()
+    deps = get_deps()
+    graph = _graph("authz_canvas")
+    digest = "a" * 64
+    dispatched: list[str] = []
+
+    class Owner:
+        def profile_job(self, _graph_doc, node_id, plan_digest, *, run_id, admission_token,
+                        request_id=None):
+            won, queued = metadb.consume_profile_run_preallocation(
+                run_id, admission_token, canvas_id="authz_canvas",
+                kernel_id="authz-profile-kernel", target_node_id=node_id,
+                plan_digest=plan_digest,
+            )
+            assert won
+            dispatched.append(run_id)
+            return RunStatus(**queued)
+
+    monkeypatch.setattr(deps, "kernel_backend", lambda: Owner())
+    monkeypatch.setattr(run_routes, "_profile_job_estimate", lambda *_args: RunEstimate(
+        rows=10, bytes=100, placement="local", needs_confirm=False,
+    ))
+    monkeypatch.setattr(run_routes, "_profile_plan_digest", lambda *_args: digest)
+
+    def submit(uid: str, submission_id: str):
+        return client.post("/api/run/profile-job", json={
+            "graph": graph, "nodeId": "s", "planDigest": digest,
+            "submissionId": submission_id,
+        }, headers=_hdr(uid))
+
+    run_id: str | None = None
+    try:
+        viewer = submit("authz_viewer", "00000000-0000-4000-8000-000000000031")
+        stranger = submit("authz_b", "00000000-0000-4000-8000-000000000032")
+        editor = submit("authz_editor", "00000000-0000-4000-8000-000000000033")
+
+        assert viewer.status_code == 403
+        assert stranger.status_code == 404
+        assert editor.status_code == 200, editor.text
+        run_id = editor.json()["runId"]
+        assert dispatched == [run_id]
+        latest = client.get("/api/canvas/authz_canvas/profile-jobs", headers=_hdr("authz_viewer"))
+        hidden = client.get("/api/canvas/authz_canvas/profile-jobs", headers=_hdr("authz_b"))
+        assert latest.status_code == 200
+        assert any(item["runId"] == run_id for item in latest.json())
+        assert hidden.status_code == 404
+    finally:
+        if run_id is not None:
+            status = metadb.get_run_state(run_id)
+            if status is not None:
+                status.update({"status": "cancelled", "progress": None})
+                metadb.save_run_state(
+                    run_id, status, canvas_id="authz_canvas", kernel_id="authz-profile-kernel",
+                )
+            deps.run_index.pop(run_id, None)
+            deps.run_owner.pop(run_id, None)
+
+
+def test_viewer_profile_identity_rejects_third_party_adapter_before_fingerprint(
+        authed, monkeypatch):
+    _share_editor_and_viewer()
+    fingerprint_calls: list[str] = []
+
+    class ThirdPartyAdapter:
+        name = "third-party-identity"
+
+        def fingerprint(self, uri: str) -> str:
+            fingerprint_calls.append(uri)
+            raise AssertionError("shared-mode recovery must not execute third-party fingerprint code")
+
+    monkeypatch.setattr(get_deps(), "resolve_adapter", lambda _uri: ThirdPartyAdapter())
+    graph = {
+        "id": "authz_canvas", "version": 1,
+        "nodes": [{
+            "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+            "data": {"config": {"uri": "third-party://recovery-source"}},
+        }],
+        "edges": [],
+    }
+
+    response = client.post(
+        "/api/run/profile-identity", json={"graph": graph, "nodeId": "source"},
+        headers=_hdr("authz_viewer"),
+    )
+
+    assert response.status_code == 403
+    assert "third-party dataset adapter" in response.json()["detail"]
+    assert fingerprint_calls == []
 
 
 def test_run_read_and_cancel_use_different_role_policies(authed):
@@ -573,7 +675,7 @@ def test_mcp_graph_reads_use_the_authorized_saved_document(authed, monkeypatch):
     assert saved.status_code == 200, saved.text
 
     viewer_preview = _mcp_tool("authz_viewer", "preview_node",
-                               {"canvasId": "authz_canvas", "nodeId": "join", "limit": 2})
+                               {"canvasId": "authz_canvas", "nodeId": "left", "limit": 2})
     viewer_validate = _mcp_tool("authz_viewer", "validate_canvas", {"canvasId": "authz_canvas"})
     assert viewer_preview.get("isError") is not True
     assert viewer_preview["structuredContent"]["rows"]
@@ -581,5 +683,5 @@ def test_mcp_graph_reads_use_the_authorized_saved_document(authed, monkeypatch):
 
     for canvas_id in ("authz_canvas", "authz_invented"):
         denied = _mcp_tool("authz_b", "preview_node",
-                           {"canvasId": canvas_id, "nodeId": "join", "limit": 1})
+                           {"canvasId": canvas_id, "nodeId": "left", "limit": 1})
         assert denied["isError"] is True and "not found" in denied["content"][0]["text"]

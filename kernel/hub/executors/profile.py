@@ -11,6 +11,7 @@ can say so. This also profiles nodes a sampled profile refuses (aggregate/sql th
 
 from __future__ import annotations
 
+import contextlib
 import os
 import uuid
 
@@ -107,7 +108,8 @@ def _full_stats(engine: BuildEngine, node_id: str) -> ProfileResult:
 
 def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                  node_builders=None, node_specs=None, cache=None, full: bool = False,
-                 storage=None) -> ProfileResult:
+                 storage=None, scope_callback=None, *, process_isolated: bool = False,
+                 source_leases_preclaimed: bool = False) -> ProfileResult:
     if not g.is_acyclic(graph):
         return ProfileResult(error=True, reason="graph has a cycle — control flow must be encapsulated")
     if node_specs:
@@ -116,7 +118,9 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
             return ProfileResult(error=True, reason="incompatible connection: " + "; ".join(errs[:3]))
 
     from hub import auth
-    if auth.auth_enabled() and any(n.type in _CODE_CELL_KINDS for n in g.upstream_chain(graph, node_id)):
+    if (auth.auth_enabled()
+            and any(n.type in _CODE_CELL_KINDS for n in g.upstream_chain(graph, node_id))
+            and not (full and process_isolated)):
         return ProfileResult(not_previewable=True, reason=(
             "profiling a Python cell is disabled in multi-user mode — the in-process timeout can't kill "
             "a runaway cell; run it (runs execute in a killable, deadline-bounded child)"))
@@ -133,11 +137,17 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
 
         def work() -> ProfileResult:
             from hub.storage import source_read_scope
-            with source_read_scope(
-                    storage, g.all_upstream_source_uris(graph, node_id),
-                    owner=f"profile:{uuid.uuid4().hex}"):
+            # A one-shot subrun has already validated the exact parent attestation and inherited local
+            # locks. Its disposable metadata DB cannot reacquire the parent's object lease; the parent
+            # supervisor retains and checks that lease through child reap instead.
+            source_scope = (contextlib.nullcontext() if source_leases_preclaimed else source_read_scope(
+                storage, g.all_upstream_source_uris(graph, node_id),
+                owner=f"profile:{uuid.uuid4().hex}"))
+            with source_scope:
                 with db.run_scope() as scope:
                     holder["scope"] = scope
+                    if scope_callback is not None:
+                        scope_callback(scope)
                     return _full_stats(eng, node_id)
 
         def on_timeout() -> None:
@@ -145,6 +155,12 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
             (sc.interrupt() if sc is not None else db.interrupt())
 
         try:
+            if source_leases_preclaimed and not process_isolated:
+                raise RuntimeError("preclaimed profile sources require process isolation")
+            if process_isolated:
+                # The canvas kernel owns the deadline and TERM/KILL/reap sequence. Running directly in
+                # this child thread avoids the unkillable nested daemon used by the interactive timeout.
+                return work()
             return run_with_timeout(work, PROFILE_FULL_BUDGET_S, on_timeout=on_timeout)
         except ManagedSourceReadError as e:
             return ProfileResult(error=True, reason=str(e))

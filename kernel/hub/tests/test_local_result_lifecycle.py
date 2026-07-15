@@ -649,11 +649,14 @@ def test_warm_preview_reacquires_local_source_guard_on_cache_hit(storage, monkey
             fingerprints += 1
             return "stable-local-source"
 
-        def scan(self, source_uri, **_kwargs):
+        def preview_scan(self, source_uri, **_kwargs):
             nonlocal scans
             assert source_uri == uri and active()
             scans += 1
             return db.conn().sql("SELECT 1 AS value")
+
+        def scan(self, _source_uri, **_kwargs):
+            raise AssertionError("interactive preview must use the bounded adapter capability")
 
     graph = Graph.model_validate({
         "id": f"warm-{uuid.uuid4().hex}",

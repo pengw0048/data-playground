@@ -19,6 +19,7 @@ import os
 import secrets
 import threading
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -134,10 +135,65 @@ class RunState(Base):
     auth_canvas_id: Mapped[str | None] = mapped_column(String, nullable=True)  # the real canvas it was authorized against (None = ad-hoc)
     # HTTP/WebSocket request id that started the run (OPS-01). Mirrored from RunStatus.request_id.
     request_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # Fixed-size profile identity fields. Reopen reads the independent ProfileJobLatest projection below;
+    # RunState remains globally bounded detail and must never be used to reconstruct latest-wins state.
+    job_type: Mapped[str] = mapped_column(String, default="run", server_default="run")
+    target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    profile_attempt_order: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=True)
     preallocation_token: Mapped[str | None] = mapped_column(String, nullable=True)
     preallocation_expires_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    __table_args__ = (
+        UniqueConstraint(
+            "canvas_id", "profile_attempt_order", name="uq_run_state_canvas_profile_attempt"),
+        CheckConstraint(
+            "profile_attempt_order IS NULL OR profile_attempt_order >= 1",
+            name="ck_run_state_profile_attempt_positive"),
+    )
+
+
+class ProfileJobLatest(Base):
+    """Canvas-scoped latest retry for one node/plan, independent of global RunState retention.
+
+    The projection owns a copy of the latest status document so pruning detailed RunState rows can never
+    resurrect an older retry or erase reopen recovery. One bounded row exists per retained plan identity.
+    """
+    __tablename__ = "profile_job_latest"
+    canvas_id: Mapped[str] = mapped_column(String, primary_key=True)
+    target_node_id: Mapped[str] = mapped_column(String, primary_key=True)
+    plan_digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String)
+    doc: Mapped[str] = mapped_column(Text)
+    attempt_order: Mapped[int] = mapped_column(BigInteger)
+    submitted_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now)
+    __table_args__ = (
+        Index("ix_profile_job_latest_canvas_attempt", "canvas_id", "attempt_order"),
+        UniqueConstraint(
+            "canvas_id", "attempt_order", name="uq_profile_latest_canvas_attempt"),
+        CheckConstraint("attempt_order >= 1", name="ck_profile_latest_attempt_positive"),
+    )
+
+
+class ProfileJobRetention(Base):
+    """Per-canvas cutoff for profile identities evicted from the bounded latest projection."""
+    __tablename__ = "profile_job_retention"
+    canvas_id: Mapped[str] = mapped_column(String, primary_key=True)
+    next_attempt_order: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
+    cutoff_attempt_order: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now)
+    __table_args__ = (
+        CheckConstraint("next_attempt_order >= 1", name="ck_profile_next_attempt_positive"),
+        CheckConstraint(
+            "cutoff_attempt_order IS NULL OR cutoff_attempt_order >= 1",
+            name="ck_profile_cutoff_attempt_positive"),
+    )
 
 
 class RunBackendJob(Base):
@@ -189,7 +245,16 @@ class RunTerminalFence(Base):
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)
     auth_canvas_id: Mapped[str | None] = mapped_column(String, nullable=True)
     canvas_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    job_type: Mapped[str] = mapped_column(String, default="run", server_default="run")
+    target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    profile_attempt_order: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (
+        CheckConstraint(
+            "profile_attempt_order IS NULL OR profile_attempt_order >= 1",
+            name="ck_terminal_fence_profile_attempt_positive"),
+    )
 
 
 class ActiveBackendJobsError(RuntimeError):
@@ -198,6 +263,19 @@ class ActiveBackendJobsError(RuntimeError):
 
 class TerminalRunIdError(RuntimeError):
     """A completed logical run id cannot be rebound after its retained detail is pruned."""
+
+
+class ProfileSubmissionConflict(RuntimeError):
+    """A submission id is already permanently bound to a different profile identity."""
+
+
+@dataclass(frozen=True)
+class ProfileRunReservation:
+    run_id: str
+    admission_token: str | None
+    attempt_order: int
+    status: dict
+    should_dispatch: bool
 
 
 class SchemaContract(Base):
@@ -1228,7 +1306,9 @@ def _backfill_terminal_fence_identity(s, state: RunState) -> None:
         raise RuntimeError("terminal run fence does not match its bound run state")
     if fence.canvas_id != state.canvas_id:
         raise RuntimeError("terminal run fence canvas identity does not match its bound run state")
-    for field in ("created_by", "auth_canvas_id"):
+    for field in (
+            "created_by", "auth_canvas_id", "job_type", "target_node_id",
+            "plan_digest", "profile_attempt_order"):
         expected = getattr(state, field)
         current = getattr(fence, field)
         if current is not None and current != expected:
@@ -1325,6 +1405,383 @@ def preallocate_run_owner(
     return token
 
 
+def _lock_profile_retention(s, canvas_id: str) -> ProfileJobRetention:
+    """Create then lock the per-canvas profile sequence/watermark row."""
+    canvas_id = str(canvas_id)
+    now = _now()
+    values = {"canvas_id": canvas_id, "next_attempt_order": 1, "updated_at": now}
+    dialect = s.get_bind().dialect.name
+    if dialect in ("postgresql", "sqlite"):
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        s.execute(dialect_insert(ProfileJobRetention).values(
+            **values,
+        ).on_conflict_do_nothing(index_elements=[ProfileJobRetention.canvas_id]))
+    elif s.get(ProfileJobRetention, canvas_id) is None:  # pragma: no cover - fallback dialect
+        s.add(ProfileJobRetention(**values))
+    s.flush()
+    retention = s.get(
+        ProfileJobRetention, canvas_id, with_for_update=True, populate_existing=True,
+    )
+    if retention is None:  # pragma: no cover - defensive database contract check
+        raise RuntimeError("profile retention state reservation failed")
+    return retention
+
+
+def profile_submission_run_id(uid: str, canvas_id: str, submission_id: str) -> str:
+    """Derive the permanent logical run id for one user submission intent."""
+    canonical = "\x00".join(("profile-submission-v1", str(uid), str(canvas_id),
+                              str(submission_id).lower()))
+    return f"profile_{hashlib.sha256(canonical.encode()).hexdigest()[:48]}"
+
+
+def _profile_binding_matches(
+        identity, *, uid: str, auth_canvas_id: str | None, canvas_id: str,
+        target_node_id: str, plan_digest: str) -> bool:
+    return bool(
+        identity.created_by == uid
+        and identity.auth_canvas_id == auth_canvas_id
+        and identity.canvas_id == canvas_id
+        and identity.job_type == "profile"
+        and identity.target_node_id == target_node_id
+        and identity.plan_digest == plan_digest
+        and isinstance(identity.profile_attempt_order, int)
+        and identity.profile_attempt_order >= 1
+    )
+
+
+def _profile_status_doc(state: RunState) -> dict:
+    try:
+        parsed = json.loads(state.doc)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("profile submission has an invalid durable status") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("profile submission has an invalid durable status")
+    return parsed
+
+
+def _terminalize_unadmitted_profile(
+        s, state: RunState, *, reason: str) -> dict:
+    """Permanently fail a reservation that never entered the latest-job projection."""
+    if (state.job_type != "profile" or state.kernel_id is not None
+            or state.preallocation_token is None
+            or state.target_node_id is None or state.plan_digest is None
+            or state.profile_attempt_order is None):
+        raise RuntimeError("only an exact unadmitted profile reservation can be terminalized")
+    failed = {
+        "run_id": state.run_id,
+        "status": "failed",
+        "job_type": "profile",
+        "target_node_id": state.target_node_id,
+        "plan_digest": state.plan_digest,
+        "profile_attempt_order": int(state.profile_attempt_order),
+        "request_id": state.request_id,
+        "placement": "local",
+        "per_node": [{
+            "node_id": state.target_node_id,
+            "status": "failed",
+            "label": "Full profile",
+            "error": reason,
+        }],
+        "error": reason,
+    }
+    _abandon_run_preallocation_attempts(s, state.run_id)
+    _replace_attempt_ref(s, "run_state", state.run_id, None)
+    state.status = "failed"
+    state.doc = json.dumps(failed, default=str)
+    state.preallocation_token = None
+    state.preallocation_expires_at = None
+    _record_terminal_fence(s, state.run_id, "failed")
+    return failed
+
+
+def _profile_reservation_from_bound_identity(
+        s, *, run_id: str, uid: str, auth_canvas_id: str | None,
+        canvas_id: str, target_node_id: str, plan_digest: str,
+        terminalize_expired: bool) -> ProfileRunReservation | None:
+    state = s.get(RunState, run_id, with_for_update=True)
+    if state is not None:
+        if not _profile_binding_matches(
+                state, uid=uid, auth_canvas_id=auth_canvas_id, canvas_id=canvas_id,
+                target_node_id=target_node_id, plan_digest=plan_digest):
+            raise ProfileSubmissionConflict(
+                "profile submission id is already bound to a different identity")
+        attempt_order = int(state.profile_attempt_order)
+        if state.preallocation_token is not None:
+            if (terminalize_expired and not _run_preallocation_active(
+                    state.preallocation_expires_at, _db_now(s))):
+                failed = _terminalize_unadmitted_profile(
+                    s, state, reason="profile submission expired before kernel admission")
+                return ProfileRunReservation(
+                    run_id, None, attempt_order, failed, False)
+            return ProfileRunReservation(
+                run_id, state.preallocation_token, attempt_order,
+                _profile_status_doc(state), True)
+        if state.kernel_id is None and state.status not in _TERMINAL_RUN:
+            raise RuntimeError("profile submission lost both admission and terminal ownership")
+        return ProfileRunReservation(
+            run_id, None, attempt_order, _profile_status_doc(state), False)
+
+    fence = s.get(RunTerminalFence, run_id, with_for_update=True)
+    if fence is None:
+        return None
+    if not _profile_binding_matches(
+            fence, uid=uid, auth_canvas_id=auth_canvas_id, canvas_id=canvas_id,
+            target_node_id=target_node_id, plan_digest=plan_digest):
+        raise ProfileSubmissionConflict(
+            "profile submission id is already bound to a different identity")
+    attempt_order = int(fence.profile_attempt_order)
+    latest = s.get(
+        ProfileJobLatest, (canvas_id, target_node_id, plan_digest),
+        with_for_update=True,
+    )
+    if latest is None or latest.run_id != run_id or latest.attempt_order != attempt_order:
+        error = (
+            "Full profile failed (terminal details were pruned)"
+            if fence.status == "failed" else None
+        )
+        pruned = {
+            "run_id": run_id,
+            "status": fence.status,
+            "job_type": "profile",
+            "target_node_id": target_node_id,
+            "plan_digest": plan_digest,
+            "profile_attempt_order": attempt_order,
+            "placement": "local",
+            "per_node": [{
+                "node_id": target_node_id,
+                "status": fence.status,
+                "label": "Full profile",
+                "error": error,
+            }],
+            "progress": 1.0 if fence.status == "done" else None,
+            "error": error,
+        }
+        return ProfileRunReservation(run_id, None, attempt_order, pruned, False)
+    try:
+        parsed = json.loads(latest.doc)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("profile submission has an invalid retained status") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("profile submission has an invalid retained status")
+    return ProfileRunReservation(run_id, None, attempt_order, parsed, False)
+
+
+def lookup_profile_submission(
+        submission_id: str, uid: str, auth_canvas_id: str | None,
+        operational_canvas_id: str, target_node_id: str,
+        plan_digest: str) -> ProfileRunReservation | None:
+    """Adopt an existing submission before consulting mutable source state."""
+    uid, operational_canvas_id = str(uid), str(operational_canvas_id)
+    auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
+    run_id = profile_submission_run_id(uid, operational_canvas_id, submission_id)
+    with session() as s:
+        _lock_authorized_run_canvas(s, operational_canvas_id)
+        return _profile_reservation_from_bound_identity(
+            s, run_id=run_id, uid=uid, auth_canvas_id=auth_canvas_id,
+            canvas_id=operational_canvas_id, target_node_id=str(target_node_id),
+            plan_digest=str(plan_digest), terminalize_expired=True,
+        )
+
+
+def preallocate_or_adopt_profile_run_owner(
+        submission_id: str, uid: str, auth_canvas_id: str | None,
+        operational_canvas_id: str, target_node_id: str, plan_digest: str,
+        request_id: str | None = None,
+        ttl_seconds: float = RUN_PREALLOCATION_TTL_SECONDS) -> ProfileRunReservation:
+    """Reserve once or return the exact durable state bound to this submission id."""
+    uid, operational_canvas_id = str(uid), str(operational_canvas_id or "")
+    auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
+    target_node_id, plan_digest = str(target_node_id or ""), str(plan_digest or "")
+    if not operational_canvas_id:
+        raise ValueError("profile run requires an operational canvas id")
+    if auth_canvas_id is not None and operational_canvas_id != auth_canvas_id:
+        raise RuntimeError("authorized run canvas and operational canvas must match")
+    if not target_node_id or not _valid_plan_digest(plan_digest):
+        raise ValueError("profile preallocation requires a target node and plan digest")
+    run_id = profile_submission_run_id(uid, operational_canvas_id, submission_id)
+    token = secrets.token_urlsafe(32)
+    with session() as s:
+        _lock_authorized_run_canvas(s, operational_canvas_id)
+        if s.get_bind().dialect.name == "sqlite":
+            # SQLite ignores SELECT ... FOR UPDATE. Take its single writer lock on the already-locked
+            # canvas before observing RunState, preserving Canvas -> RunState ordering while making two
+            # fresh same-submission requests converge instead of racing into duplicate INSERTs.
+            s.execute(update(Canvas).where(
+                Canvas.id == operational_canvas_id,
+            ).values(updated_at=Canvas.updated_at))
+        existing = _profile_reservation_from_bound_identity(
+            s, run_id=run_id, uid=uid, auth_canvas_id=auth_canvas_id,
+            canvas_id=operational_canvas_id, target_node_id=target_node_id,
+            plan_digest=plan_digest, terminalize_expired=True,
+        )
+        if existing is not None:
+            return existing
+
+        # Existing status publication locks RunState before ProfileJobRetention. Never acquire the
+        # retention row on adoption: reversing that order could deadlock a replay against terminal
+        # publication on Postgres. The canvas row serializes all same-canvas fresh allocations, so once
+        # absence is observed under that lock it is safe to allocate the next sequence value.
+        retention = _lock_profile_retention(s, operational_canvas_id)
+        attempt_order = int(retention.next_attempt_order)
+        retention.next_attempt_order = attempt_order + 1
+        retention.updated_at = _now()
+        status_doc = {
+            "run_id": run_id,
+            "status": "queued",
+            "job_type": "profile",
+            "target_node_id": target_node_id,
+            "plan_digest": plan_digest,
+            "profile_attempt_order": attempt_order,
+            "request_id": request_id,
+        }
+        s.add(RunState(
+            run_id=run_id, canvas_id=operational_canvas_id, status="queued",
+            doc=json.dumps(status_doc), created_by=uid, auth_canvas_id=auth_canvas_id,
+            request_id=request_id, job_type="profile", target_node_id=target_node_id,
+            plan_digest=plan_digest, profile_attempt_order=attempt_order,
+            preallocation_token=token,
+            preallocation_expires_at=_run_preallocation_deadline(s, ttl_seconds),
+        ))
+        return ProfileRunReservation(
+            run_id, token, attempt_order, status_doc, True)
+
+
+def preallocate_profile_run_owner(
+        run_id: str, uid: str, auth_canvas_id: str | None, operational_canvas_id: str,
+        target_node_id: str, plan_digest: str, request_id: str | None = None,
+        ttl_seconds: float = RUN_PREALLOCATION_TTL_SECONDS) -> tuple[str, int]:
+    """Mint a durable profile identity and DB-monotonic attempt order before kernel allocation.
+
+    The returned opaque token is the one capability a kernel may consume to bind itself and start the
+    worker. No kernel, subprocess, plugin, or source-side effect is allowed before this transaction.
+    """
+    run_id, uid = str(run_id), str(uid)
+    auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
+    operational_canvas_id = str(operational_canvas_id or "")
+    target_node_id, plan_digest = str(target_node_id or ""), str(plan_digest or "")
+    if not operational_canvas_id:
+        raise ValueError("profile run requires an operational canvas id")
+    if auth_canvas_id is not None and operational_canvas_id != auth_canvas_id:
+        raise RuntimeError("authorized run canvas and operational canvas must match")
+    if not target_node_id or not _valid_plan_digest(plan_digest):
+        raise ValueError("profile preallocation requires a target node and plan digest")
+
+    token = secrets.token_urlsafe(32)
+    with session() as s:
+        # Full profiles are canvas-scoped durable jobs even in open mode. Holding the real canvas row
+        # closes delete/recreate races before the RunState and profile sequence are allocated.
+        _lock_authorized_run_canvas(s, operational_canvas_id)
+        state = s.get(RunState, run_id, with_for_update=True)
+        if state is not None:
+            raise RuntimeError(f"run '{run_id}' is already allocated")
+        fenced = _terminal_fence_status(s, run_id)
+        if fenced is not None:
+            raise TerminalRunIdError(f"run '{run_id}' is already terminal ({fenced})")
+
+        retention = _lock_profile_retention(s, operational_canvas_id)
+        attempt_order = int(retention.next_attempt_order)
+        retention.next_attempt_order = attempt_order + 1
+        retention.updated_at = _now()
+        status_doc = {
+            "run_id": run_id,
+            "status": "queued",
+            "job_type": "profile",
+            "target_node_id": target_node_id,
+            "plan_digest": plan_digest,
+            "profile_attempt_order": attempt_order,
+            "request_id": request_id,
+        }
+        s.add(RunState(
+            run_id=run_id, canvas_id=operational_canvas_id, status="queued",
+            doc=json.dumps(status_doc), created_by=uid, auth_canvas_id=auth_canvas_id,
+            request_id=request_id, job_type="profile", target_node_id=target_node_id,
+            plan_digest=plan_digest, profile_attempt_order=attempt_order,
+            preallocation_token=token,
+            preallocation_expires_at=_run_preallocation_deadline(s, ttl_seconds),
+        ))
+    return token, attempt_order
+
+
+def consume_profile_run_preallocation(
+        run_id: str, token: str, *, canvas_id: str, kernel_id: str,
+        target_node_id: str, plan_digest: str) -> tuple[bool, dict]:
+    """Atomically bind one profile preallocation to its kernel before child dispatch.
+
+    Returns ``(True, queued_status)`` for the one token-consuming admission. A response-lost replay on
+    the same authenticated kernel and exact durable identity returns ``(False, current_status)`` and
+    therefore cannot launch a second worker; the one-time token is no longer consulted after consumption.
+    Any identity mismatch, expired initial token, or cross-kernel replay fails closed.
+    """
+    run_id, canvas_id, kernel_id = str(run_id), str(canvas_id), str(kernel_id)
+    target_node_id, plan_digest = str(target_node_id), str(plan_digest)
+    with session() as s:
+        state = _lock_existing_run_identity(s, run_id)
+        if (state is None or state.job_type != "profile"
+                or state.canvas_id != canvas_id
+                or state.target_node_id != target_node_id
+                or state.plan_digest != plan_digest
+                or state.profile_attempt_order is None):
+            raise RuntimeError("profile admission identity does not match its preallocation")
+
+        now = _db_now(s)
+        if state.preallocation_token is None:
+            if state.kernel_id != kernel_id:
+                raise RuntimeError("profile run is already bound to a different kernel")
+            try:
+                current = json.loads(state.doc)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("profile run has an invalid durable status") from exc
+            if not isinstance(current, dict):
+                raise RuntimeError("profile run has an invalid durable status")
+            return False, current
+
+        if (not secrets.compare_digest(state.preallocation_token, str(token))
+                or not _run_preallocation_active(state.preallocation_expires_at, now)):
+            raise RuntimeError("profile run preallocation is invalid or expired")
+
+        state.kernel_id = kernel_id
+        state.preallocation_token = None
+        state.preallocation_expires_at = None
+        try:
+            queued = json.loads(state.doc)
+        except (TypeError, ValueError) as exc:  # pragma: no cover - written by this module
+            raise RuntimeError("profile run has an invalid queued status") from exc
+        payload = json.dumps(queued, default=str)
+        _upsert_profile_latest(
+            s, canvas_id=canvas_id, target_node_id=target_node_id,
+            plan_digest=plan_digest, run_id=run_id, payload=payload,
+            attempt_order=int(state.profile_attempt_order),
+            submitted_at=state.created_at or _now(),
+        )
+        return True, queued
+
+
+def admitted_profile_run_status(
+        run_id: str, uid: str, auth_canvas_id: str | None, *, canvas_id: str,
+        target_node_id: str, plan_digest: str, attempt_order: int) -> dict | None:
+    """Return the durable status only after the exact profile preallocation was consumed."""
+    with session() as s:
+        state = s.get(RunState, str(run_id))
+        if (state is None or state.created_by != str(uid)
+                or state.auth_canvas_id != (
+                    str(auth_canvas_id) if auth_canvas_id is not None else None)
+                or state.canvas_id != str(canvas_id)
+                or state.job_type != "profile"
+                or state.target_node_id != str(target_node_id)
+                or state.plan_digest != str(plan_digest)
+                or state.profile_attempt_order != int(attempt_order)
+                or state.preallocation_token is not None or state.kernel_id is None):
+            return None
+        try:
+            parsed = json.loads(state.doc)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+
 def renew_run_preallocation(
         run_id: str, token: str,
         ttl_seconds: float = RUN_PREALLOCATION_TTL_SECONDS) -> bool:
@@ -1387,6 +1844,70 @@ def discard_run_preallocation(
         _record_terminal_fence(s, run_id, "failed")
         s.delete(state)
         return True
+
+
+def settle_profile_submission_failure(
+        run_id: str, token: str, uid: str, auth_canvas_id: str | None, *,
+        canvas_id: str, target_node_id: str, plan_digest: str,
+        attempt_order: int,
+        reason: str = "execution kernel rejected profile submission before admission",
+        ) -> tuple[str, dict | None]:
+    """Atomically classify a failed kernel command as discarded or already admitted.
+
+    The canvas lock serializes this transaction with deletion and the RunState lock waits for any
+    concurrent kernel token-consume commit. Therefore callers never make a racy read-then-settle
+    decision: the exact token still present becomes a durable unadmitted failure, while a
+    consumed/kernel-bound identity returns its durable status for response-loss adoption.
+    """
+    run_id, uid, canvas_id = str(run_id), str(uid), str(canvas_id)
+    auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
+    target_node_id, plan_digest = str(target_node_id), str(plan_digest)
+    attempt_order = int(attempt_order)
+    with session() as s:
+        _lock_authorized_run_canvas(s, canvas_id)
+        state = _lock_existing_run_identity(s, run_id)
+        if state is None:
+            fence = s.get(RunTerminalFence, run_id, with_for_update=True)
+            if (fence is None or not _profile_binding_matches(
+                    fence, uid=uid, auth_canvas_id=auth_canvas_id,
+                    canvas_id=canvas_id, target_node_id=target_node_id,
+                    plan_digest=plan_digest)
+                    or fence.profile_attempt_order != attempt_order):
+                return "identity_mismatch", None
+            latest = s.get(
+                ProfileJobLatest, (canvas_id, target_node_id, plan_digest),
+                with_for_update=True,
+            )
+            if (latest is not None and latest.run_id == run_id
+                    and latest.attempt_order == attempt_order):
+                try:
+                    parsed = json.loads(latest.doc)
+                except (TypeError, ValueError):
+                    return "identity_mismatch", None
+                return ("admitted", parsed) if isinstance(parsed, dict) else (
+                    "identity_mismatch", None)
+            return ("discarded", None) if fence.status == "failed" else (
+                "identity_mismatch", None)
+
+        if (state.created_by != uid or state.auth_canvas_id != auth_canvas_id
+                or state.canvas_id != canvas_id or state.job_type != "profile"
+                or state.target_node_id != target_node_id
+                or state.plan_digest != plan_digest
+                or state.profile_attempt_order != attempt_order):
+            return "identity_mismatch", None
+        if state.preallocation_token is not None:
+            if not secrets.compare_digest(state.preallocation_token, str(token)):
+                return "identity_mismatch", None
+            failed = _terminalize_unadmitted_profile(s, state, reason=str(reason))
+            return "discarded", failed
+        if state.kernel_id is None:
+            return "identity_mismatch", None
+        try:
+            parsed = json.loads(state.doc)
+        except (TypeError, ValueError):
+            return "identity_mismatch", None
+        return ("admitted", parsed) if isinstance(parsed, dict) else (
+            "identity_mismatch", None)
 
 
 def finish_run_preallocation(run_id: str, token: str, status_doc: dict) -> bool:
@@ -1591,13 +2112,17 @@ def delete_canvas_cascade(canvas_id: str) -> None:
                         RunBackendJob.run_id.is_not(None),
                         RunState.status.in_(("queued", "running")),
                     ),
+                    and_(
+                        RunState.job_type == "profile",
+                        RunState.status.in_(("queued", "running")),
+                    ),
                 ),
             )
             .order_by(RunState.run_id).limit(1)
         )
         if active:
             raise ActiveBackendJobsError(
-                f"canvas '{canvas_id}' has active external run '{active}'; "
+                f"canvas '{canvas_id}' has active run '{active}'; "
                 "cancel it and wait for terminal status"
             )
         shares = list(s.scalars(select(CanvasShare).where(
@@ -1616,6 +2141,12 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             (RunTerminalFence.canvas_id == canvas_id)
             | (RunTerminalFence.auth_canvas_id == canvas_id)
         ).order_by(RunTerminalFence.run_id).with_for_update()))
+        profile_retention = s.get(ProfileJobRetention, canvas_id, with_for_update=True)
+        profile_latest = list(s.scalars(select(ProfileJobLatest).where(
+            ProfileJobLatest.canvas_id == canvas_id
+        ).order_by(
+            ProfileJobLatest.target_node_id, ProfileJobLatest.plan_digest,
+        ).with_for_update()))
         local_owners: list[tuple[str, str]] = [("canvas", canvas_id)]
         for sh in shares:
             s.delete(sh)
@@ -1626,6 +2157,10 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         for v in versions:
             local_owners.append(("canvas_version", v.id))
             s.delete(v)
+        for latest in profile_latest:
+            s.delete(latest)
+        if profile_retention is not None:
+            s.delete(profile_retention)
         # also drop this canvas's run_states — else auth_canvas_id/canvas_id dangle into a reusable id
         # namespace and a later canvas re-created under the same id could re-grant its old runs (P0-AUTH-02)
         for rs in run_states:
@@ -1689,6 +2224,7 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
 
 _RUN_STATE_MAX = 2000  # cap on TERMINAL run_states — live (queued/running) rows are never pruned
 _TERMINAL_RUN = ("done", "failed", "cancelled")
+_PROFILE_LATEST_MAX = 100  # per canvas; each row retains one latest status document for reopen
 
 
 class RunStatePublicationRejected(RuntimeError):
@@ -1726,15 +2262,90 @@ def _record_terminal_fence(s, run_id: str, status: str) -> None:
     if current is None:
         identity = s.execute(select(
             RunState.created_by, RunState.auth_canvas_id, RunState.canvas_id,
+            RunState.job_type, RunState.target_node_id, RunState.plan_digest,
+            RunState.profile_attempt_order,
         ).where(RunState.run_id == str(run_id))).one_or_none()
-        created_by, auth_canvas_id, canvas_id = (
-            identity if identity is not None else (None, None, None)
+        (created_by, auth_canvas_id, canvas_id, job_type, target_node_id,
+         plan_digest, profile_attempt_order) = (
+            identity if identity is not None
+            else (None, None, None, "run", None, None, None)
         )
         s.add(RunTerminalFence(
             run_id=str(run_id), status=status, created_by=created_by,
             auth_canvas_id=auth_canvas_id, canvas_id=canvas_id,
+            job_type=job_type, target_node_id=target_node_id,
+            plan_digest=plan_digest, profile_attempt_order=profile_attempt_order,
         ))
         s.flush()
+
+
+def _valid_plan_digest(value: object) -> bool:
+    return (
+        isinstance(value, str) and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _upsert_profile_latest(
+        s, *, canvas_id: str, target_node_id: str, plan_digest: str,
+        run_id: str, payload: str, attempt_order: int,
+        submitted_at: datetime.datetime) -> None:
+    """Atomically advance one canvas/node/plan pointer and retain its latest status document.
+
+    A status update for the current run refreshes the document. A newer submission replaces the pointer;
+    a late update from an older run is ignored. The projection is pruned independently per canvas and is
+    deliberately unaffected by global RunState detail retention.
+    """
+    canvas_id, target_node_id = str(canvas_id), str(target_node_id)
+    plan_digest, run_id = str(plan_digest), str(run_id)
+    attempt_order = int(attempt_order)
+    if attempt_order < 1:
+        raise ValueError("profile attempt order must be positive")
+    now = _now()
+    # This one row is the canvas-scoped mutex and DB sequence. It also retains the eviction watermark
+    # that prevents an absent identity from being resurrected by delayed status from an older attempt.
+    retention = _lock_profile_retention(s, canvas_id)
+    current = s.get(
+        ProfileJobLatest, (canvas_id, target_node_id, plan_digest),
+        with_for_update=True, populate_existing=True,
+    )
+    if current is None:
+        if (retention.cutoff_attempt_order is not None
+                and attempt_order <= retention.cutoff_attempt_order):
+            return
+        s.add(ProfileJobLatest(
+            canvas_id=canvas_id, target_node_id=target_node_id,
+            plan_digest=plan_digest, run_id=run_id, doc=payload,
+            attempt_order=attempt_order,
+            submitted_at=submitted_at, updated_at=now,
+        ))
+    elif current.run_id == run_id:
+        if current.attempt_order != attempt_order:
+            raise RuntimeError("profile run changed its durable attempt order")
+        current.doc = payload
+        current.updated_at = now
+    elif attempt_order > current.attempt_order:
+        current.run_id = run_id
+        current.doc = payload
+        current.attempt_order = attempt_order
+        current.submitted_at = submitted_at
+        current.updated_at = now
+    else:
+        return
+    s.flush()
+    stale = list(s.scalars(select(ProfileJobLatest).where(
+        ProfileJobLatest.canvas_id == canvas_id,
+    ).order_by(
+        ProfileJobLatest.attempt_order.desc(),
+    ).offset(_PROFILE_LATEST_MAX).with_for_update()))
+    if stale:
+        evicted_order = max(row.attempt_order for row in stale)
+        if (retention.cutoff_attempt_order is None
+                or evicted_order > retention.cutoff_attempt_order):
+            retention.cutoff_attempt_order = evicted_order
+            retention.updated_at = now
+    for row in stale:
+        s.delete(row)
 
 
 def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
@@ -1749,6 +2360,18 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
     durable per-canvas history remains separate."""
     status = dict(status)
     st = str(status.get("status", "running"))
+    job_type = str(status.get("job_type", status.get("jobType", "run")))
+    target_node_id = status.get("target_node_id", status.get("targetNodeId"))
+    plan_digest = status.get("plan_digest", status.get("planDigest"))
+    profile_attempt_order = status.get(
+        "profile_attempt_order", status.get("profileAttemptOrder"))
+    if job_type == "profile" and (
+            not target_node_id or not _valid_plan_digest(plan_digest)
+            or not isinstance(profile_attempt_order, int)
+            or isinstance(profile_attempt_order, bool) or profile_attempt_order < 1):
+        raise ValueError(
+            "profile status requires a target node, lowercase SHA-256 plan digest, "
+            "and positive attempt order")
     if st != "done" and _local_result_candidate(_result_doc_uri(status)) is not None:
         for key in ("uri", "outputUri", "output_uri", "outputTable", "output_table"):
             status.pop(key, None)
@@ -1787,10 +2410,36 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
         request_id = status.get("request_id") or status.get("requestId")
         fenced = _terminal_fence_status(s, run_id)
         if fenced is not None and (r is None or st != fenced):
+            if job_type == "profile" or (r is not None and r.job_type == "profile"):
+                raise RunStatePublicationRejected(
+                    "profile terminal publication lost its permanent terminal fence race")
             return
+        if r is not None and (job_type == "profile" or r.job_type == "profile"):
+            if (job_type != "profile" or r.job_type != "profile"
+                    or r.target_node_id != str(target_node_id)
+                    or r.plan_digest != str(plan_digest)
+                    or r.profile_attempt_order != profile_attempt_order):
+                raise RunStatePublicationRejected(
+                    "profile status does not match its preallocated identity")
+            if canvas_id is None or str(canvas_id) != r.canvas_id:
+                raise RunStatePublicationRejected(
+                    "profile status was published for a different canvas")
+            if r.preallocation_token is not None or r.kernel_id is None:
+                raise RunStatePublicationRejected(
+                    "profile status was published before kernel admission")
+            if kernel_id != r.kernel_id:
+                raise RunStatePublicationRejected(
+                    "profile status was published by a different kernel")
         if r is None:
-            s.add(RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload,
-                           kernel_id=kernel_id, request_id=request_id))
+            if job_type == "profile":
+                raise RunStatePublicationRejected(
+                    "profile status has no preallocated run identity")
+            r = RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload,
+                         kernel_id=kernel_id, request_id=request_id,
+                         job_type=job_type, target_node_id=target_node_id,
+                         plan_digest=plan_digest,
+                         profile_attempt_order=profile_attempt_order)
+            s.add(r)
         else:
             # Make terminal monotonicity an UPDATE predicate, not a prior ORM read. A transaction can load
             # queued, pause while another supervisor atomically publishes done, then otherwise flush its
@@ -1802,15 +2451,49 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                 values["kernel_id"] = func.coalesce(RunState.kernel_id, kernel_id)
             if request_id:
                 values["request_id"] = func.coalesce(RunState.request_id, request_id)
+            if job_type == "profile":
+                # ``bind_run_owner`` may have pre-created a generic queued identity. The first profile
+                # status promotes that placeholder once; later writes preserve the same node/plan key.
+                values["job_type"] = "profile"
+                if target_node_id is not None:
+                    values["target_node_id"] = func.coalesce(
+                        RunState.target_node_id, str(target_node_id))
+                if plan_digest is not None:
+                    values["plan_digest"] = func.coalesce(
+                        RunState.plan_digest, plan_digest)
+                if profile_attempt_order is not None:
+                    values["profile_attempt_order"] = func.coalesce(
+                        RunState.profile_attempt_order, profile_attempt_order)
             updated = s.execute(update(RunState).where(
                 RunState.run_id == run_id,
                 or_(RunState.status.not_in(_TERMINAL_RUN), RunState.status == st),
+                or_(plan_digest is None,
+                    RunState.plan_digest.is_(None),
+                    RunState.plan_digest == plan_digest),
+                or_(target_node_id is None,
+                    RunState.target_node_id.is_(None),
+                    RunState.target_node_id == str(target_node_id)),
+                or_(profile_attempt_order is None,
+                    RunState.profile_attempt_order.is_(None),
+                    RunState.profile_attempt_order == profile_attempt_order),
             ).values(**values))
             if not updated.rowcount:
                 return
         s.flush()
         if st in _TERMINAL_RUN:
             _record_terminal_fence(s, run_id, st)
+        profile_canvas_id = r.canvas_id if job_type == "profile" else (canvas_id or r.canvas_id)
+        if job_type == "profile" and profile_canvas_id is not None:
+            _upsert_profile_latest(
+                s,
+                canvas_id=str(profile_canvas_id),
+                target_node_id=str(target_node_id),
+                plan_digest=str(plan_digest),
+                run_id=str(run_id),
+                payload=payload,
+                attempt_order=int(profile_attempt_order),
+                submitted_at=r.created_at or _now(),
+            )
         stale = []
         if st in _TERMINAL_RUN:
             # Re-evaluate age after every candidate lock; delete only rows included in the one
@@ -7025,6 +7708,30 @@ def active_runs(canvas_id: str) -> list[dict]:
     return out
 
 
+def latest_profile_jobs(canvas_id: str, limit: int = 100) -> list[dict]:
+    """Latest durable profile retry for each ``(node, plan)`` identity on a canvas.
+
+    This reads only the canvas-scoped latest projection. It never reconstructs pointers from globally
+    pruned RunState detail, so an older late-finishing retry cannot reappear after the newer row is evicted.
+    """
+    bounded = min(_PROFILE_LATEST_MAX, max(1, int(limit)))
+    with session() as s:
+        rows = s.execute(select(ProfileJobLatest.doc).where(
+            ProfileJobLatest.canvas_id == str(canvas_id),
+        ).order_by(
+            ProfileJobLatest.attempt_order.desc(),
+        ).limit(bounded)).all()
+    out: list[dict] = []
+    for (doc,) in rows:
+        try:
+            parsed = json.loads(doc)
+        except Exception:  # noqa: BLE001 - retain a bounded best-effort recovery surface
+            continue
+        if isinstance(parsed, dict):
+            out.append(parsed)
+    return out
+
+
 def kernel_for_run(run_id: str) -> dict | None:
     """The kernel that OWNS a run (endpoint + token) — for routing cancel to it. None if the run's owning
     kernel no longer holds the canvas lease (fenced / replaced / gone): routing /cancel to whatever kernel
@@ -7097,6 +7804,12 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
             if s.get(RunBackendJob, r.run_id, with_for_update=True) is not None:
                 continue
             preallocation_expired = r.preallocation_token is not None
+            admitted_profile = (
+                not preallocation_expired and r.kernel_id is not None
+                and r.job_type == "profile" and r.canvas_id is not None
+                and r.target_node_id is not None and r.plan_digest is not None
+                and r.profile_attempt_order is not None
+            )
             if preallocation_expired:
                 _abandon_run_preallocation_attempts(s, r.run_id)
                 r.preallocation_token = None
@@ -7115,8 +7828,25 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
                 if preallocation_expired else
                 "interrupted — the run's kernel is gone (hub restarted with no live kernel)"
             )
+            if admitted_profile:
+                # Reopen reads ProfileJobLatest rather than globally bounded RunState detail. Advance
+                # both views in this transaction so a dead kernel cannot leave the durable projection
+                # queued forever after its owner row has become terminal.
+                d.update({
+                    "job_type": "profile",
+                    "target_node_id": str(r.target_node_id),
+                    "plan_digest": str(r.plan_digest),
+                    "profile_attempt_order": int(r.profile_attempt_order or 0),
+                })
             r.status = "failed"
             r.doc = json.dumps(d, default=str)
+            if admitted_profile:
+                _upsert_profile_latest(
+                    s, canvas_id=str(r.canvas_id), target_node_id=str(r.target_node_id),
+                    plan_digest=str(r.plan_digest), run_id=r.run_id, payload=r.doc,
+                    attempt_order=int(r.profile_attempt_order or 0),
+                    submitted_at=r.created_at or _now(),
+                )
             _replace_attempt_ref(s, "run_state", r.run_id, None)
             _record_terminal_fence(s, r.run_id, "failed")
             reaped_run_ids.append(r.run_id)

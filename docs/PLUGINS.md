@@ -105,7 +105,13 @@ None` emits an engine-neutral IR op (for example a clean `map` with inlined `cod
 
 `reg.add_adapter(adapter)` claims a URI scheme. Implement `DatasetAdapter` in
 `kernel/hub/backends.py`: `name`, `matches`, `scan`, `schema`, `count`, `fingerprint`, `write`, and
-optional `nearest`.
+optional `nearest`. Interactive sampling is a separate `DatasetPreviewAdapter` capability: add
+`preview_scan` only when the adapter can enforce the supplied row limit at the source. Full-run-only
+adapters remain valid and the UI will direct users to a durable run instead of silently scanning them.
+An adapter may also expose `metadata_count(uri)` only when it is an exact, bounded metadata lookup: it
+must not scan rows or perform an unbounded namespace listing. Preflight and recovery also call
+`fingerprint(uri)`; keep it bounded and metadata-only, and return the best available revision token rather
+than promising a content hash. Missing capabilities or uncertain metadata are handled as unknown cost.
 
 `reg.add_runner(runner)` adds an execution backend. Implement `ExecutionBackend`: `name`, `can_run`,
 `estimate`, `run`, `status`, `cancel`.

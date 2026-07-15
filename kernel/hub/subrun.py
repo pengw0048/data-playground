@@ -159,6 +159,77 @@ def _validate_local_source_locks(job: dict, storage) -> None:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
 
 
+def _run_profile_job(job: dict, deps, graph, status_file: str, external_cancel) -> int:
+    """Execute one full profile directly on the one-shot child's main thread.
+
+    The durable parent owns identity, deadline, cancellation, and source leases. This child only emits
+    workload progress/result documents; the parent treats them as untrusted and publishes no terminal
+    status until this process has exited and been reaped.
+    """
+    from hub.executors.profile import profile_node
+    from hub.models import PerNodeStatus, RunStatus
+
+    node_id = job.get("target")
+    if not isinstance(node_id, str) or not node_id:
+        raise RuntimeError("profile job target is missing")
+
+    started = time.monotonic()
+
+    def write(state: str, *, result=None, error: str | None = None) -> None:
+        elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+        rows = result.row_count if result is not None and state == "done" else 0
+        status = RunStatus(
+            run_id="child",
+            status=state,
+            job_type="profile",
+            target_node_id=node_id,
+            rows_processed=rows,
+            total_rows=rows if state == "done" else None,
+            ms=elapsed_ms,
+            placement="local",
+            per_node=[PerNodeStatus(
+                node_id=node_id,
+                status=state,
+                rows=rows if state == "done" else None,
+                ms=elapsed_ms,
+                label="Full profile",
+                error=error if state == "failed" else None,
+            )],
+            progress=1.0 if state == "done" else None,
+            error=error,
+            profile=result if state == "done" else None,
+        )
+        _atomic_write(status_file, status.model_dump())
+
+    if external_cancel and external_cancel():
+        write("cancelled")
+        return 1
+    write("running")
+    result = profile_node(
+        graph,
+        node_id,
+        deps.resolve_adapter,
+        deps.registry,
+        deps.node_builders,
+        deps.node_specs,
+        full=True,
+        storage=deps.storage,
+        process_isolated=True,
+        source_leases_preclaimed=True,
+    )
+    if external_cancel and external_cancel():
+        write("cancelled")
+        return 1
+    if result.error or result.not_previewable:
+        write("failed", error=result.reason or "full profile failed")
+        return 1
+    if result.sampled:
+        write("failed", error="profile worker returned a sampled result for a full profile")
+        return 1
+    write("done", result=result)
+    return 0
+
+
 def main() -> int:
     job = json.load(open(sys.argv[1]))
     status_file = job["statusFile"]
@@ -245,6 +316,11 @@ def main() -> int:
             sandbox.set_allowed(mods)
         else:
             sandbox.set_allowed(set())
+        job_kind = job.get("jobKind", "run")
+        if job_kind == "profile":
+            return _run_profile_job(job, deps, graph, status_file, external_cancel)
+        if job_kind != "run":
+            raise RuntimeError(f"unsupported subprocess job kind: {job_kind}")
         # region-materialize mode (RunController C3): run this sub-graph in THIS worker process and
         # write the target node's relation to a given uri — how a placed region executes on its worker.
         mat_uri = job.get("materializeUri")

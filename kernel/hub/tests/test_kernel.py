@@ -101,6 +101,21 @@ def _poll(run_id, tries=150):
     return st
 
 
+def _full_result(graph: dict, target_node_id: str, k: int = 100) -> tuple[dict, dict]:
+    """Run an exact, durable non-write target and reopen its materialized result."""
+    started = client.post(
+        "/api/run",
+        json={"graph": graph, "targetNodeId": target_node_id, "confirmed": True},
+    )
+    assert started.status_code == 200, started.text
+    status = _poll(started.json()["runId"])
+    assert status["status"] == "done", status.get("error")
+    assert status.get("outputUri")
+    sampled = client.post("/api/data/sample", json={"uri": status["outputUri"], "k": k})
+    assert sampled.status_code == 200, sampled.text
+    return status, sampled.json()
+
+
 def test_kernel_info():
     info = client.get("/api/kernel").json()
     assert info["backend"] == "duckdb+polars+arrow"
@@ -134,7 +149,7 @@ def test_sample():
     assert len(r["rows"]) == 5 and r["rowCount"] == 500 and r["truncated"] is True
 
 
-def test_preview_pipeline_derives_and_sorts():
+def test_sort_requires_a_full_run_and_preserves_exact_order():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("images")}),
         N("flt", "filter", {"predicate": "is_valid = true"}),
@@ -142,9 +157,10 @@ def test_preview_pipeline_derives_and_sorts():
         N("srt", "sort", {"by": "area DESC"}),
     ], "edges": [E("src", "flt"), E("flt", "sel"), E("sel", "srt")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "srt", "k": 10}).json()
-    assert not r["notPreviewable"]
-    assert "area" in [c["name"] for c in r["columns"]]
-    areas = [row["area"] for row in r["rows"]]
+    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    _, result = _full_result(g, "srt", 10)
+    assert "area" in [c["name"] for c in result["columns"]]
+    areas = [row["area"] for row in result["rows"]]
     assert areas == sorted(areas, reverse=True)
 
 
@@ -163,6 +179,55 @@ def test_profile_returns_column_stats():
     assert area["distinct"] is not None
     assert area["mean"] is not None                          # numeric → has a mean
     assert area["min"] is not None and area["max"] is not None
+
+
+def test_full_profile_uses_cancellable_job_lifecycle():
+    from hub import metadb
+
+    canvas_id = "profile-kernel-lifecycle"
+    with metadb.session() as session:
+        if session.get(metadb.Canvas, canvas_id) is None:
+            session.add(metadb.Canvas(
+                id=canvas_id, owner_id="local", name="Profile kernel lifecycle",
+                version=1, doc="{}",
+            ))
+    g = {"id": canvas_id, "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("images")}),
+        N("sel", "select", {"select": "id, width, height, width*height AS area"}),
+    ], "edges": [E("src", "sel")]}
+    # The old synchronous full-mode escape hatch explicitly refuses instead of silently scanning.
+    legacy = client.post("/api/run/profile", json={"graph": g, "nodeId": "sel", "full": True})
+    assert legacy.status_code == 200 and legacy.json()["error"] is True
+    assert "cancellable jobs" in legacy.json()["reason"]
+
+    preflight = client.post("/api/run/profile-estimate", json={
+        "graph": g, "nodeId": "sel",
+    })
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["needsConfirm"] is True
+    plan_digest = preflight.json()["planDigest"]
+    submit = client.post("/api/run/profile-job", json={
+        "graph": g, "nodeId": "sel", "planDigest": plan_digest,
+        "submissionId": "00000000-0000-4000-8000-000000000014",
+        "confirmed": True,
+    }, headers={"X-Request-Id": "req_profile_kernel_01"})
+    assert submit.status_code == 200, submit.text
+    started = submit.json()
+    assert started["jobType"] == "profile"
+    assert started["planDigest"] == plan_digest
+    assert started["requestId"] == "req_profile_kernel_01"
+
+    deadline = time.monotonic() + 5
+    status = started
+    while status["status"] not in ("done", "failed", "cancelled"):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+        response = client.get(f"/api/run/{started['runId']}")
+        assert response.status_code == 200, response.text
+        status = response.json()
+    assert status["status"] == "done", status
+    assert status["profile"]["sampled"] is False
+    assert status["profile"]["rowCount"] > 0
 
 
 def test_profile_over_transform_upstream_of_faithful_op_is_honest():
@@ -214,15 +279,18 @@ def test_warm_relation_cache_hit_crosses_run_scopes_without_rerunning_scan():
     from hub.models import Graph
     from hub.relation_cache import RelationCache
 
-    calls = {"scan": 0}
+    calls = {"preview": 0}
 
     class Adapter:
         def fingerprint(self, _uri):
             return "stable"
 
-        def scan(self, _uri, **_kwargs):
-            calls["scan"] += 1
+        def preview_scan(self, _uri, **_kwargs):
+            calls["preview"] += 1
             return db.conn().from_arrow(pa.table({"value": [1, 2, 3]}))
+
+        def scan(self, _uri, **_kwargs):
+            raise AssertionError("interactive cache fill must use the bounded preview capability")
 
     adapter = Adapter()
     graph = Graph(**{"id": "warm-cross-scope", "version": 1, "nodes": [
@@ -236,7 +304,7 @@ def test_warm_relation_cache_hit_crosses_run_scopes_without_rerunning_scan():
 
     assert not first.error and not second.error
     assert first.rows == second.rows
-    assert calls["scan"] == 1, "the second run_scope must hit Arrow cache, not rebuild the source"
+    assert calls["preview"] == 1, "the second run_scope must hit Arrow cache, not rebuild the source"
 
 
 def test_relation_cache_no_deadlock_and_eviction_safe():
@@ -305,8 +373,8 @@ def test_transform_arrow_batches():
 
 
 def test_join_and_sql():
-    # a row-preserving sql over a join previews faithfully (a GROUP BY / global aggregate would refuse
-    # the sample — see test_sql_groupby_preview_refuses_the_sample).
+    # A row-preserving SQL node is bounded-previewable on its own, but an upstream join requires a full
+    # pass; the exact durable result remains inspectable.
     g = {"id": "c", "version": 1, "nodes": [
         N("a", "source", {"uri": _uri("events")}),
         N("b", "source", {"uri": _uri("events")}),
@@ -314,7 +382,9 @@ def test_join_and_sql():
         N("q", "sql", {"sql": "SELECT user_id, amount FROM input WHERE amount > 0"}),
     ], "edges": [E("a", "j", None, "a"), E("b", "j", None, "b"), E("j", "q")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 5}).json()
-    assert not r["notPreviewable"] and not r.get("error") and len(r["rows"]) > 0
+    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    _, result = _full_result(g, "q", 5)
+    assert result["rows"]
 
 
 def test_union_stacks_inputs_row_wise():
@@ -425,9 +495,9 @@ def test_sql_groupby_preview_refuses_the_sample():
     assert not r2["notPreviewable"] and not r2.get("error")
 
 
-def test_sql_join_and_window_preview_faithfully(tmp_path):
-    # a JOIN / window in a sql node must run over FULL inputs in preview (like the join/window nodes),
-    # not two truncated 2000-row prefixes — else it silently returns wrong results with has_more=false.
+def test_sql_join_and_window_require_a_full_pass(tmp_path):
+    # JOIN / window / global ordering in SQL cannot be exact over bounded prefixes. Interactive preview
+    # refuses them instead of silently rebuilding an unbounded relation; the durable run stays exact.
     import duckdb
     from hub.executors.engine import sql_needs_full_input
     assert sql_needs_full_input("SELECT * FROM input a JOIN input2 b USING(id)")
@@ -465,8 +535,9 @@ def test_sql_join_and_window_preview_faithfully(tmp_path):
         N("q", "sql", {"sql": "SELECT a.id FROM input a JOIN input2 b USING (id)"}),
     ], "edges": [E("l", "q"), E("r", "q")]}
     res = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 50}).json()
-    assert not res["notPreviewable"] and not res.get("error"), res.get("reason")
-    assert res["rowCount"] > 0, "sql join previewed two prefixes → 0 matches (the lie); must run full inputs"
+    assert res["notPreviewable"] and "full pass" in (res["reason"] or "")
+    _, result = _full_result(g, "q", 50)
+    assert result["rowCount"] > 0, "the durable SQL join must see matching rows beyond preview prefixes"
 
 
 def test_sql_query_scope_cte_and_aggregate_message_reflects_groupby():
@@ -516,10 +587,9 @@ def test_tight_memory_limit_caps_threads(monkeypatch, tmp_path):
     assert int(cn.execute("SELECT current_setting('threads')").fetchone()[0]) == cores
 
 
-def test_preview_is_faithful_for_join_and_sort(tmp_path):
-    # preview used to truncate each source to its first 2000 rows and THEN join/sort — so a join of
-    # two non-overlapping prefixes showed 0 matches, and a sort showed the top of an arbitrary prefix.
-    # It now runs these over the full inputs (bounded by the preview limit), so the sample is faithful.
+def test_join_and_sort_preview_refuse_instead_of_scanning_full_inputs(tmp_path):
+    # Truncated-prefix join/sort results lie, but constructing full inputs inside preview is unbounded.
+    # Preview refuses both; durable runs still produce the exact matches and global order.
     import duckdb
     left, right = str(tmp_path / "left.parquet"), str(tmp_path / "right.parquet")
     # matching keys live only in rows past the 2000-row preview window of at least one side
@@ -530,12 +600,16 @@ def test_preview_is_faithful_for_join_and_sort(tmp_path):
         N("j", "join", {"on": "id", "how": "inner"}),
     ], "edges": [E("l", "j", None, "a"), E("r", "j", None, "b")]}
     rj = client.post("/api/run/preview", json={"graph": gj, "nodeId": "j", "k": 50}).json()
-    assert not rj["notPreviewable"] and rj["rowCount"] > 0  # real matches (2500..2999), not the old 0
+    assert rj["notPreviewable"] and "full pass" in (rj["reason"] or "")
+    _, joined = _full_result(gj, "j", 50)
+    assert joined["rowCount"] > 0
     gs = {"id": "c2", "version": 1, "nodes": [
         N("l", "source", {"uri": left}), N("s", "sort", {"by": "lval DESC"}),
     ], "edges": [E("l", "s")]}
     rs = client.post("/api/run/preview", json={"graph": gs, "nodeId": "s", "k": 5}).json()
-    assert rs["rows"][0]["lval"] == 29990  # the TRUE global max (id=2999), not a 2000-row-prefix max
+    assert rs["notPreviewable"] and "full pass" in (rs["reason"] or "")
+    _, sorted_result = _full_result(gs, "s", 5)
+    assert sorted_result["rows"][0]["lval"] == 29990
 
 
 def test_join_on_expression_with_differing_keys(tmp_path):
@@ -551,10 +625,11 @@ def test_join_on_expression_with_differing_keys(tmp_path):
         N("j", "join", {"how": "inner", "condition": "a.id = b.uid"}),
     ], "edges": [E("l", "j", None, "a"), E("r", "j", None, "b")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "j", "k": 50}).json()
-    assert not r["notPreviewable"], r.get("reason")
-    cols = [c["name"] for c in r["columns"]]
+    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    _, result = _full_result(g, "j", 50)
+    cols = [c["name"] for c in result["columns"]]
     assert cols == ["id", "name", "uid", "name_2"]  # right-side 'name' renamed → no ambiguity
-    assert r["rowCount"] == 3  # ids 2,3,4 overlap
+    assert result["rowCount"] == 3  # ids 2,3,4 overlap
 
 
 def test_dedup_and_metric():
@@ -1122,7 +1197,7 @@ def test_aggregate_keeps_group_key():
     assert "n" in [c["name"] for c in out["columns"]]
 
 
-def test_metric_preview_is_true_value(tmp_path):
+def test_metric_requires_a_full_run_for_its_true_value(tmp_path):
     import duckdb
     p = str(tmp_path / "big5k.parquet")
     duckdb.connect(":memory:").execute(f"COPY (SELECT 1 AS v FROM range(0,5000)) TO '{p}' (FORMAT PARQUET)")
@@ -1131,8 +1206,9 @@ def test_metric_preview_is_true_value(tmp_path):
         N("m", "metric", {"agg": "count"}),
     ], "edges": [E("src", "m")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "m", "k": 5}).json()
-    assert not r["notPreviewable"] and not r.get("error")
-    assert r["rows"][0]["value"] == 5000.0  # TRUE count over 5000 rows, not the 2000 preview sample
+    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    _, result = _full_result(g, "m", 5)
+    assert result["rows"][0]["value"] == 5000.0
 
 
 def test_join_duplicate_columns_preserved():
@@ -1142,9 +1218,11 @@ def test_join_duplicate_columns_preserved():
         N("j", "join", {"how": "inner"}),  # no key → cross join; both have 'id'
     ], "edges": [E("a", "j", None, "a"), E("b", "j", None, "b")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "j", "k": 3}).json()
-    names = [c["name"] for c in r["columns"]]
+    assert r["notPreviewable"]
+    _, result = _full_result(g, "j", 3)
+    names = [c["name"] for c in result["columns"]]
     assert "id" in names and "id_2" in names           # both id columns kept, de-duped
-    assert all(len(row) == len(names) for row in r["rows"])  # no column dropped
+    assert all(len(row) == len(names) for row in result["rows"])  # no column dropped
 
 
 def test_join_using_dedups_nonkey_clashes_and_survives_full_run():
@@ -1157,7 +1235,10 @@ def test_join_using_dedups_nonkey_clashes_and_survives_full_run():
         N("j", "join", {"on": "user_id", "how": "inner"}),
         N("s", "select", {"select": "user_id, amount, amount_2"}),  # downstream ref that would break on a dup
     ], "edges": [E("a", "j", None, "a"), E("b", "j", None, "b"), E("j", "s")]}
-    names = [c["name"] for c in client.post("/api/run/preview", json={"graph": g, "nodeId": "j", "k": 3}).json()["columns"]]
+    preview = client.post("/api/run/preview", json={"graph": g, "nodeId": "j", "k": 3}).json()
+    assert preview["notPreviewable"]
+    _, joined = _full_result(g, "j", 3)
+    names = [c["name"] for c in joined["columns"]]
     assert "user_id" in names and names.count("user_id") == 1   # key coalesced once
     assert "amount" in names and "amount_2" in names            # non-key clash de-duped, not ambiguous
     # the FULL run (where the ambiguity used to surface) completes, and the downstream select resolves
@@ -1177,8 +1258,9 @@ def test_full_using_join_coalesces_key_for_right_only_rows(tmp_path):
         N("j", "join", {"on": "id", "how": "full"}),
     ], "edges": [E("l", "j", None, "a"), E("r", "j", None, "b")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "j", "k": 50}).json()
-    assert not r["notPreviewable"] and not r.get("error"), r.get("reason")
-    ids = sorted(row["id"] for row in r["rows"] if row.get("id") is not None)
+    assert r["notPreviewable"]
+    _, result = _full_result(g, "j", 50)
+    ids = sorted(row["id"] for row in result["rows"] if row.get("id") is not None)
     assert ids == [1, 2, 3], f"right-only key (3) must be coalesced, not NULL — got {ids}"
 
 
@@ -1221,9 +1303,9 @@ def test_decimal_serialized_as_number():
     assert all(isinstance(a, (int, float)) for a in amounts)  # small decimals stay numeric
 
 
-def test_sample_node_previews_a_real_sample_not_the_head(tmp_path):
-    # the sample node used to reservoir-sample the source-capped 2000-row PREFIX, so its "random sample"
-    # in preview only ever contained rows 0..1999. It must sample the FULL input.
+def test_sample_node_requires_a_full_run_instead_of_sampling_a_preview_prefix(tmp_path):
+    # A reservoir sample must inspect the whole source. Preview refuses that unbounded scan; the durable
+    # run executes the real sample rather than sampling only the source prefix.
     import duckdb
     p = str(tmp_path / "big.parquet")
     duckdb.connect().execute(f"COPY (SELECT i AS id FROM range(0,10000) t(i)) TO '{p}' (FORMAT PARQUET)")
@@ -1232,8 +1314,9 @@ def test_sample_node_previews_a_real_sample_not_the_head(tmp_path):
         N("sm", "sample", {"n": 200, "seed": 1}),
     ], "edges": [E("s", "sm")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "sm", "k": 200}).json()
-    assert not r.get("error") and not r.get("notPreviewable"), r.get("reason")
-    ids = [row["id"] for row in r["rows"]]
+    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    _, result = _full_result(g, "sm", 200)
+    ids = [row["id"] for row in result["rows"]]
     assert max(ids) >= 2000, f"reservoir sample must reach past the first 2000 rows — got max {max(ids)}"
 
 
@@ -1252,8 +1335,9 @@ def test_ident_escapes_embedded_quotes_not_strips(tmp_path):
         N("m", "metric", {"agg": "max", "column": 'wei"rd'}),
     ], "edges": [E("s", "m")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "m", "k": 5}).json()
-    assert not r.get("error") and not r.get("notPreviewable"), r.get("reason")
-    assert r["rows"][0]["value"] == 5
+    assert r["notPreviewable"]
+    _, result = _full_result(g, "m", 5)
+    assert result["rows"][0]["value"] == 5
 
 
 def test_high_precision_decimal_previews_exactly():
@@ -1613,9 +1697,17 @@ def test_write_mode_append_builds_a_readable_directory_dataset():
     n, out = st1["totalRows"], st1["outputUri"]
     assert n and out and not out.endswith(".parquet")  # a directory, not a single file
     append_run()  # a second part
-    pv = client.post("/api/run/preview", json={"graph": {"id": "c", "version": 1,
-        "nodes": [N("s", "source", {"uri": out})], "edges": []}, "nodeId": "s", "k": 100000}).json()
-    assert pv["rowCount"] >= 2 * n and pv["rowCount"] % n == 0  # each append added a full part, read back together
+    read_graph = {"id": "c", "version": 1,
+                  "nodes": [N("s", "source", {"uri": out})], "edges": []}
+    preview = client.post("/api/run/preview", json={
+        "graph": read_graph, "nodeId": "s", "k": 100000,
+    }).json()
+    assert preview["notPreviewable"], "directory enumeration belongs in a cancellable durable run"
+    readback = _poll(client.post("/api/run", json={
+        "graph": read_graph, "targetNodeId": "s", "confirmed": True,
+    }).json()["runId"])
+    assert readback["status"] == "done", readback.get("error")
+    assert readback["totalRows"] >= 2 * n and readback["totalRows"] % n == 0
 
 
 def test_write_formats_round_trip(tmp_path):
@@ -3210,8 +3302,8 @@ def test_lance_scan_streams_with_pushdown(tmp_path):
 
 
 def test_vector_search_lance_ann_and_external_query(tmp_path):
-    # vector-search uses Lance's native nearest (its index if present) when the input is a bare Lance
-    # source, and can query by an arbitrary external vector — not only an existing row.
+    # vector-search uses Lance's native nearest (its index if present) on a durable full run and can query
+    # by an arbitrary external vector. Preview refuses because Lance may flat-scan when no index exists.
     pytest.importorskip("lance")
     import lance
     import pyarrow as pa
@@ -3222,13 +3314,14 @@ def test_vector_search_lance_ann_and_external_query(tmp_path):
     g = {"id": "cv", "version": 1, "nodes": [N("s", "source", {"uri": p}),
          N("vs", "vector-search", {"column": "embedding", "queryRow": 0, "k": 3})], "edges": [E("s", "vs")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "vs", "k": 10}).json()
-    assert not r["notPreviewable"], r.get("reason")
-    assert "_score" in [c["name"] for c in r["columns"]] and r["rows"][0]["id"] == 0
+    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    _, result = _full_result(g, "vs", 10)
+    assert "_score" in [c["name"] for c in result["columns"]] and result["rows"][0]["id"] == 0
     # an external query vector [0,1,0,0] → row 2 is nearest (no such row was the query)
     g2 = {"id": "cv2", "version": 1, "nodes": [N("s", "source", {"uri": p}),
           N("vs", "vector-search", {"column": "embedding", "queryVector": "[0,1,0,0]", "k": 2})], "edges": [E("s", "vs")]}
-    r2 = client.post("/api/run/preview", json={"graph": g2, "nodeId": "vs", "k": 10}).json()
-    assert r2["rows"][0]["id"] == 2
+    _, result2 = _full_result(g2, "vs", 10)
+    assert result2["rows"][0]["id"] == 2
 
 
 def test_object_store_s3_roundtrip_and_browse(tmp_path):
@@ -5097,10 +5190,27 @@ def test_adapter_and_catalog_conform_to_formal_protocols():
     # the two seams that were duck-typed are now runtime_checkable Protocols, and the BUILT-INS conform —
     # i.e. the built-in adapters + catalog are the first implementations through the seam, not a privileged
     # core path. A plugin has a typed target instead of reverse-engineering call sites.
-    from hub.backends import CatalogProvider, DatasetAdapter
+    from hub.backends import CatalogProvider, DatasetAdapter, DatasetPreviewAdapter
     from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
+
+    class FullRunOnlyAdapter:
+        """A valid third-party adapter must not be forced to claim bounded preview support."""
+
+        name = "full-run-only"
+
+        def matches(self, _uri): return True
+        def scan(self, _uri, columns=None, predicate=None, limit=None, options=None): return None
+        def schema(self, _uri): return []
+        def count(self, _uri): return None
+        def fingerprint(self, _uri): return "full-run-only"
+        def write(self, uri, _rel, mode="overwrite"): return {"uri": uri, "rows": 0}
+
     assert isinstance(DuckDBAdapter(), DatasetAdapter)
     assert isinstance(LanceAdapter(), DatasetAdapter)
+    assert isinstance(DuckDBAdapter(), DatasetPreviewAdapter)
+    assert isinstance(LanceAdapter(), DatasetPreviewAdapter)
+    assert isinstance(FullRunOnlyAdapter(), DatasetAdapter)
+    assert not isinstance(FullRunOnlyAdapter(), DatasetPreviewAdapter)
     assert isinstance(get_deps().catalog, CatalogProvider)  # the built-in InMemoryCatalog IS the reference
 
 
@@ -5271,19 +5381,28 @@ def test_hf_datasets_adapter_reference_plugin(monkeypatch):
     import importlib.util
     from pathlib import Path
     from hub import db
-    from hub.backends import DatasetAdapter
+    from hub.backends import DatasetAdapter, DatasetPreviewAdapter
 
     fake = ds_mod.Dataset.from_dict({"id": [1, 2, 3], "txt": ["a", "b", "c"]})
-    monkeypatch.setattr(ds_mod, "load_dataset", lambda name, config=None, split=None: fake)
+    loads: list[tuple[str, str | None, str | None]] = []
+
+    def load_dataset(name, config=None, split=None):
+        loads.append((name, config, split))
+        return fake
+
+    monkeypatch.setattr(ds_mod, "load_dataset", load_dataset)
     src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_hf_datasets" / "__init__.py"
     spec = importlib.util.spec_from_file_location("dp_hf_ref", src)
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
 
     a = mod.HfDatasetsAdapter()
     assert isinstance(a, DatasetAdapter)
+    assert not isinstance(a, DatasetPreviewAdapter)
     assert a.matches("hf://x:train") and not a.matches("/tmp/x.parquet")
     assert mod._parse("hf://glue@mrpc:validation") == ("glue", "mrpc", "validation")
     assert mod._parse("hf://stanfordnlp/imdb") == ("stanfordnlp/imdb", None, "train")  # id keeps its '/'
+    assert a.fingerprint("hf://x") == a.fingerprint("hf://x")
+    assert loads == [], "the URI-only fingerprint must not load the remote dataset during preflight"
     assert {c.name for c in a.schema("hf://x")} == {"id", "txt"}   # schema/count manage their own base_guard
     assert a.count("hf://x") == 3
     with db.base_guard():
@@ -5301,12 +5420,18 @@ def test_iceberg_adapter_reference_plugin(monkeypatch):
     import pyarrow as pa
     import pyiceberg.catalog as pc
     from hub import db
-    from hub.backends import DatasetAdapter
+    from hub.backends import DatasetAdapter, DatasetPreviewAdapter
 
     tbl = pa.table({"id": [1, 2], "v": ["a", "b"]})
     scan = type("S", (), {"to_arrow": lambda self: tbl})()
     table = type("T", (), {"scan": lambda self, **kw: scan})()
-    monkeypatch.setattr(pc, "load_catalog", lambda name=None, **kw: type("C", (), {"load_table": lambda self, i: table})())
+    loads: list[str | None] = []
+
+    def load_catalog(name=None, **_kwargs):
+        loads.append(name)
+        return type("C", (), {"load_table": lambda self, i: table})()
+
+    monkeypatch.setattr(pc, "load_catalog", load_catalog)
 
     src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_iceberg" / "__init__.py"
     spec = importlib.util.spec_from_file_location("dp_iceberg_ref", src)
@@ -5314,8 +5439,11 @@ def test_iceberg_adapter_reference_plugin(monkeypatch):
 
     a = mod.IcebergAdapter()
     assert isinstance(a, DatasetAdapter)
+    assert not isinstance(a, DatasetPreviewAdapter)
     assert a.matches("iceberg://prod/sales.orders") and not a.matches("/tmp/x.parquet")
     assert mod._parse("iceberg://prod/sales.orders") == ("prod", "sales.orders")  # first '/' splits catalog
+    assert a.fingerprint("iceberg://prod/db.t") == a.fingerprint("iceberg://prod/db.t")
+    assert loads == [], "the URI-only fingerprint must not load the table during preflight"
     assert {c.name for c in a.schema("iceberg://prod/db.t")} == {"id", "v"}
     assert a.count("iceberg://prod/db.t") == 2
     with db.base_guard():
@@ -7879,8 +8007,8 @@ def test_window_fill_unnest_nodes(tmp_path):
     with db.run_scope():
         assert "window" in eng(gb).relation("w").to_arrow_table().column_names
 
-    # PREVIEW FAITHFULNESS: a window aggregate (sum OVER ()) previewed on a sampled input must reflect the
-    # FULL input, not the sample — build a source bigger than the preview sample and check the total.
+    # A window aggregate cannot be exact on a bounded prefix, and preview must not rebuild an unbounded
+    # input. The interactive engine refuses it; full execution above remains exact.
     pbig = str(tmp_path / "big.parquet")
     duckdb.connect().execute(f"COPY (SELECT i AS x FROM range(1,101) t(i)) TO '{pbig}' (FORMAT PARQUET)")
     gwin = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": pbig}),
@@ -7888,8 +8016,9 @@ def test_window_fill_unnest_nodes(tmp_path):
     with db.run_scope():
         prev = BuildEngine(gwin, d.resolve_adapter, d.registry, sample_k=10, full=False,
                            node_specs=d.node_specs, node_builders=d.node_builders)
-        totals = set(prev.relation("w").to_arrow_table().column("total").to_pylist())
-        assert totals == {5050}  # sum(1..100), NOT sum of a 10-row sample — faithful despite sample_k=10
+        from hub.executors.engine import NotPreviewable
+        with pytest.raises(NotPreviewable, match="full pass"):
+            prev.relation("w")
 
 
 def test_pivot_unpivot_nodes(tmp_path):
@@ -8076,16 +8205,17 @@ def test_row_width_accounts_for_vector_and_list_columns():
     assert wide >= 1024 * 8 and wide > _row_width([{"name": "id", "type": "int"}]) * 100
 
 
-def test_source_count_is_memoized_by_fingerprint():
-    # count() on a CSV/JSON source is a full parse; memoize it by the adapter's fingerprint so an edit
-    # storm doesn't re-scan. A changed fingerprint recounts; a transient failure is NOT cached.
+def test_source_metadata_count_is_memoized_by_fingerprint():
+    # An adapter's explicit metadata-only row count is memoized by fingerprint. A changed fingerprint
+    # recounts; a transient metadata failure is NOT cached. Ordinary count() is never used here because
+    # it may full-scan a source during interactive preflight.
     from hub import estimate
     estimate._COUNT_CACHE.clear()
     calls = {"n": 0}
     fp = {"v": "fp1"}
     class Stub:
         def fingerprint(self, uri): return fp["v"]
-        def count(self, uri): calls["n"] += 1; return 123
+        def metadata_count(self, uri): calls["n"] += 1; return 123
     resolve = lambda uri: Stub()  # noqa: E731
     assert estimate._counted(resolve, "s3://x/a.csv") == 123
     assert estimate._counted(resolve, "s3://x/a.csv") == 123
@@ -8097,7 +8227,7 @@ def test_source_count_is_memoized_by_fingerprint():
     fail = {"boom": True}
     class Flaky:
         def fingerprint(self, uri): return "fpf"
-        def count(self, uri):
+        def metadata_count(self, uri):
             if fail["boom"]: raise RuntimeError("io")
             return 7
     assert estimate._counted(lambda uri: Flaky(), "x.csv") is None
@@ -8682,24 +8812,33 @@ def test_catalog_missing_flag_and_unregister(tmp_path):
 
 def test_chart_node_produces_series():
     # F37 (charting): the chart node builds an (x, y) series — grouped agg(y) by x (bar/line), or
-    # raw x,y points (scatter). Runs out-of-core server-side; the panel renders the SVG.
+    # raw x,y points (scatter). Grouped charts require a durable full run; raw points stay bounded-previewable.
     ev = _uri("events")
 
-    def chart(cfg):
-        g = {"id": "c", "version": 1, "nodes": [
+    def chart_graph(cfg):
+        return {"id": "c", "version": 1, "nodes": [
             N("s", "source", {"uri": ev}),
             {"id": "ch", "type": "chart", "position": {"x": 0, "y": 0}, "data": {"config": cfg}}],
             "edges": [E("s", "ch")]}
+
+    def chart(cfg):
+        g = chart_graph(cfg)
         return client.post("/api/run/preview", json={"graph": g, "nodeId": "ch", "k": 50}).json()
     bar = chart({"chartType": "bar", "x": "event", "agg": "count"})
-    assert not bar.get("notPreviewable") and {c["name"] for c in bar["columns"]} == {"x", "y"}
-    assert {r["x"] for r in bar["rows"]} == {"view", "click", "purchase", "signup"}  # one point per distinct event
+    assert bar.get("notPreviewable") and "full pass" in (bar.get("reason") or "")
+    _, grouped = _full_result(chart_graph({"chartType": "bar", "x": "event", "agg": "count"}), "ch", 50)
+    assert {c["name"] for c in grouped["columns"]} == {"x", "y"}
+    assert {r["x"] for r in grouped["rows"]} == {"view", "click", "purchase", "signup"}
     scatter = chart({"chartType": "scatter", "x": "user_id", "y": "amount", "agg": "none"})
     assert {c["name"] for c in scatter["columns"]} == {"x", "y"} and scatter["rows"]
     assert chart({"chartType": "bar", "agg": "count"}).get("notPreviewable")       # no X → honest refusal
     assert chart({"chartType": "bar", "x": "event", "agg": "sum"}).get("notPreviewable")  # sum needs a Y (not silent count)
     minmax = chart({"chartType": "bar", "x": "event", "y": "event", "agg": "max"})  # max of a TEXT column
-    assert not minmax.get("error"), minmax  # TRY_CAST → NULL y (dropped), not a raw ConversionException
+    assert minmax.get("notPreviewable")
+    _, minmax_result = _full_result(
+        chart_graph({"chartType": "bar", "x": "event", "y": "event", "agg": "max"}), "ch", 50,
+    )
+    assert not minmax_result.get("error")  # TRY_CAST → NULL y, not a raw ConversionException
 
 
 def test_source_node_accepts_catalog_name():

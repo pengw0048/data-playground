@@ -127,7 +127,10 @@ def _probed_list_len(resolve_adapter, uri: str, col: str) -> int | None:
     if key in _LISTLEN_CACHE:
         return _LISTLEN_CACHE[key]
     try:
-        rel = adapter.scan(uri, columns=[col], limit=1024)
+        preview_scan = getattr(adapter, "preview_scan", None)
+        if not callable(preview_scan):
+            return None
+        rel = preview_scan(uri, columns=[col], limit=1024)
         v = rel.aggregate(f'avg(length("{col.replace(chr(34), chr(34) * 2)}"))').fetchone()[0]
         n = int(round(v)) if v is not None else None
     except Exception:  # noqa: BLE001 — uncountable / not a list here → fall back
@@ -144,24 +147,24 @@ _COUNT_CACHE_MAX = 256
 
 
 def _counted(resolve_adapter, uri: str) -> int | None:
-    """adapter.count(uri), memoized by the adapter's fingerprint (size+mtime for a local file), so a
-    CSV/JSON source — whose count is a full parse — isn't re-scanned on every keystroke-triggered
-    estimate. Only real counts are cached (a transient failure retries); a changed file gets a new
-    fingerprint and recounts. Object-store uris can't be stat'd, so their count is keyed by the uri and
-    effectively cached for the process — acceptable for a hint (re-scanning an object every edit is worse)."""
+    """Read an exact metadata-only count when the adapter explicitly provides that capability.
+
+    Preflight must never call the ordinary `count`, which may parse/scan an entire CSV, JSON, remote
+    table, or plugin source before the user has admitted a cancellable full job.
+    """
     try:
         adapter = resolve_adapter(uri)
-        fp = adapter.fingerprint(uri)
-    except Exception:  # noqa: BLE001 — no adapter / can't fingerprint → count uncached (best-effort)
-        try:
-            return resolve_adapter(uri).count(uri)
-        except Exception:  # noqa: BLE001
+        metadata_count = getattr(adapter, "metadata_count", None)
+        if not callable(metadata_count):
             return None
+        fp = adapter.fingerprint(uri)
+    except Exception:  # noqa: BLE001 — unknown metadata is safer than a fallback scan
+        return None
     key = (uri, fp)
     if key in _COUNT_CACHE:
         return _COUNT_CACHE[key]
     try:
-        n = adapter.count(uri)
+        n = metadata_count(uri)
     except Exception:  # noqa: BLE001 — uncountable source → unknown, not a fabricated number
         return None
     if n is not None:
@@ -273,6 +276,21 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
                 out[nid] = _sized(rows, first.confidence if (first and base is not None and base <= k) else "bounded", w)
             else:
                 out[nid] = first or _sized(None, "unknown", w)
+            continue
+
+        if t == "union":
+            # A UNION ALL consumes every input row, so using only the first branch understates both the
+            # scan and the output. UNION DISTINCT can only reduce that sum, making the same value a safe
+            # upper bound. If any branch is unknown, a partial sum is not a complete admission signal.
+            if not ins or any(item.rows is None or item.confidence == "unknown" for item in ins):
+                out[nid] = _sized(None, "unknown", w)
+            else:
+                rows = sum(int(item.rows) for item in ins if item.rows is not None)
+                mode = str(resolve_config(node).get("mode") or "all").lower()
+                exact = (len(ins) == 1 or mode == "all") and all(
+                    item.confidence == "exact" for item in ins
+                )
+                out[nid] = _sized(rows, "exact" if exact else "bounded", w)
             continue
 
         if t in ("filter", "dedup", "assert"):  # row-reducing but unbounded → keep input as an UPPER bound

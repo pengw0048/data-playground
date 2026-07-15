@@ -3,10 +3,12 @@
 Read any dataset on the HF Hub as a Data Playground source: point a `source` node at
 `hf://<dataset_id>[@<config>][:<split>]` (e.g. `hf://stanfordnlp/imdb:test`, `hf://glue@mrpc:train`;
 split defaults to `train`). The dataset is loaded via the `datasets` library, handed to DuckDB as an
-Arrow table, and flows through the graph like any other dataset — preview, filter, transform, join, etc.
+Arrow table, and flows through durable full runs like any other dataset.
 
-It demonstrates the `DatasetAdapter` seam (`reg.add_adapter`): `matches` claims the `hf://` scheme, `scan`
-returns a LAZY DuckDB relation (with column/limit pushdown), `schema`/`count`/`fingerprint` round it out.
+It demonstrates the `DatasetAdapter` seam (`reg.add_adapter`): `matches` claims the `hf://` scheme and
+`schema`/`count`/`fingerprint` round out the full-run adapter. This compact example loads a whole split
+before applying DuckDB LIMIT, so it omits the optional interactive-preview capability; production
+adapters should implement `preview_scan` only when they can enforce the limit at the remote source.
 It's read-only (`write` raises) — HF datasets are sources. `datasets` is imported lazily (like the built-in
 Lance adapter), so the plugin loads fine without it installed and only errors with a clear message when a
 `hf://` uri is actually used.

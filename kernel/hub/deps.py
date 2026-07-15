@@ -374,6 +374,13 @@ class Deps:
         self.runner.result_get = _result_get  # DB-backed content-addressed result reuse (cross-run/restart)
         self.runner.result_acquire = _result_acquire
         self.runner.result_put = _result_put
+        # Whole-dataset profiles are inspection jobs, not materialized graph runs, but they share
+        # the same durable RunState status/cancel/recovery contract.
+        from hub.profile_jobs import ProfileProcessRunner
+        self.profile_runner = ProfileProcessRunner(
+            workspace, data_dir, storage=self.storage)
+        self.profile_runner.on_complete = _on_complete
+        self.profile_runner.on_status = _persist_run_state
         from hub.subprocess_runner import SubprocessRunner
         # a second, real backend: run jobs in an isolated OS process (Settings → Execution). Selected
         # by name via pick_runner; pod/Ray runners install as plugins over the same protocol.

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
+from pydantic import UUID4, BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 from pydantic.alias_generators import to_camel
 
 # dataset/selection/sample/sql-view are the data wires; metric/value are leaf/value wires
@@ -16,6 +16,10 @@ from pydantic.alias_generators import to_camel
 WireType = Literal["dataset", "selection", "sample", "sql-view", "metric", "value"]
 NodeStatus = Literal["draft", "latest", "stale", "queued", "running", "failed"]
 Placement = Literal["local", "distributed"]
+PlanDigest = Annotated[
+    str,
+    Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"),
+]
 ProcessorMode = Literal[
     "map",
     "map_batches",
@@ -335,6 +339,16 @@ class RunEstimate(Wire):
     breakdown: str | None = None
 
 
+class ProfileEstimate(RunEstimate):
+    """Whole-profile preflight plus the server-minted identity required by submission."""
+    plan_digest: PlanDigest
+
+
+class ProfileIdentity(Wire):
+    """Current server identity for recovery without re-running the size estimate."""
+    plan_digest: PlanDigest
+
+
 class PerNodeStatus(Wire):
     node_id: str
     status: str  # per-step run state: queued | running | done | failed (not a NodeStatus)
@@ -363,6 +377,10 @@ class RunBackendRef(Wire):
 class RunStatus(Wire):
     run_id: str
     status: Literal["queued", "running", "done", "failed", "cancelled"]
+    # ``run`` materializes a graph result; ``profile`` is a whole-dataset inspection job.
+    # Both share one durable status/cancel/recovery lifecycle, but consumers must not mistake a
+    # profile completion for a newly materialized node result.
+    job_type: Literal["run", "profile"] = "run"
     target_node_id: str | None = None   # the run's sink — lets a reattaching client re-bind the run to its node
     rows_processed: int = 0
     total_rows: int | None = None
@@ -374,6 +392,14 @@ class RunStatus(Wire):
     error: str | None = None
     output_uri: str | None = None
     output_table: str | None = None
+    # A profile result is present only on a successful full-profile job. ``plan_digest`` is the fixed-size
+    # SHA-256 of the server-authoritative execution/source identity, so durable status never duplicates
+    # the raw graph while still fencing results to the exact data revision that was profiled.
+    profile: ProfileResult | None = None
+    plan_digest: PlanDigest | None = None
+    # Monotonic per-canvas submission order allocated by the metadata DB. Recovery uses it instead of
+    # host clocks or random run ids; the parent stamps it on statuses and workers cannot choose it.
+    profile_attempt_order: int | None = Field(default=None, ge=1)
     # HTTP/WebSocket request id that started this run (OPS-01). Optional so legacy/plugin backends
     # that omit it still deserialize; durable copy also lives on run_states / run_records.
     request_id: str | None = None
@@ -543,6 +569,32 @@ class PreviewRequest(Wire):
     k: int | None = None  # None → fall back to settings.preview_k (DP_PREVIEW_K); an explicit int wins
     offset: int = 0
     full: bool = False    # profile only: stats over the WHOLE dataset (a full pass), not the sample
+
+
+class ProfileEstimateRequest(Wire):
+    """Estimate a whole-dataset profile before the user chooses whether to submit it."""
+    graph: Graph
+    node_id: str
+
+
+class ProfileIdentityRequest(Wire):
+    """Compute the current server identity for one node without starting work."""
+    graph: Graph
+    node_id: str
+
+
+class ProfileJobRequest(Wire):
+    """Submit a whole-dataset profile through the durable job lifecycle.
+
+    ``plan_digest`` is minted by the server preflight and checked again at submission. The fixed wire
+    value is persisted so a late result cannot be presented for a newer graph or source revision without
+    duplicating the submitted graph in durable status rows.
+    """
+    graph: Graph
+    node_id: str
+    plan_digest: PlanDigest
+    submission_id: UUID4
+    confirmed: bool = False
 
 
 class EstimateRequest(Wire):

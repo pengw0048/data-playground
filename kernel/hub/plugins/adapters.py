@@ -19,13 +19,17 @@ from collections.abc import Callable
 
 import duckdb
 
-from hub import db
+from hub import db, paths
 from hub.models import ColumnSchema
 from hub.plugins.capabilities import tag_columns
 from hub.sqlpolicy import identifier, identifier_list, quote_identifier
 
 Relation = duckdb.DuckDBPyRelation
 CancelCheck = Callable[[], bool]
+
+
+class BoundedPreviewUnsupported(RuntimeError):
+    """The adapter cannot prove that this URI can be read within the interactive preview budget."""
 
 
 def _raise_if_cancelled(cancelled: CancelCheck | None) -> None:
@@ -146,7 +150,7 @@ def _read_ipc(con: "duckdb.DuckDBPyConnection", source, filesystem=None) -> "Rel
     return con.from_arrow(pds.dataset(source, format="ipc", filesystem=filesystem))
 
 
-def _stream_ipc(rel: "Relation", sink) -> None:
+def _stream_ipc(rel: "Relation", sink) -> int:
     """Write a DuckDB relation to an Arrow-IPC file `sink` (a local path or an open output stream) by
     STREAMING RecordBatches — never draining the whole relation into one in-RAM Arrow table (out-of-core
     WRITE). `sink` as a stream is used for the object-store temp-key upload. The batch size is BYTE-budgeted
@@ -157,9 +161,31 @@ def _stream_ipc(rel: "Relation", sink) -> None:
     width = max(8, _row_width(relation_columns(rel)))  # bytes/row; relation_columns is schema-only (no scan)
     batch_rows = max(1024, min(_ARROW_BATCH_MAX_ROWS, _ARROW_BATCH_TARGET_BYTES // width))
     reader = rel.to_arrow_reader(batch_rows)
+    rows = 0
     with ipc.new_file(sink, reader.schema) as w:
         for batch in reader:
             w.write_batch(batch)
+            rows += batch.num_rows
+    return rows
+
+
+def _copy_relation(rel: "Relation", path: str, options: str) -> int:
+    """COPY a possibly one-shot relation once and return DuckDB's emitted row count.
+
+    Counting first and writing second drains Arrow RecordBatchReader-backed relations (for example a
+    Lance nearest-neighbour result), producing an empty artifact after reporting a non-zero count.
+    DuckDB's COPY result carries the count from the same execution that wrote the bytes.
+    """
+    view = db.unique_view("write")
+    rel.create_view(view)
+    escaped = path.replace("'", "''")
+    try:
+        row = db.conn().execute(
+            f"COPY {quote_identifier(view)} TO '{escaped}' ({options})"
+        ).fetchone()
+        return int(row[0] if row else 0)
+    finally:
+        db.conn().execute(f"DROP VIEW IF EXISTS {quote_identifier(view)}")
 
 
 def _csv_kwargs(options: dict | None) -> dict:
@@ -185,15 +211,23 @@ def relation_columns(rel: Relation) -> list[ColumnSchema]:
 
 
 def _fingerprint_path(p: str) -> str:
+    checked = paths.checked_local_path(p)
+    if checked is None:
+        return "unknown"
+    p = checked
     try:
+        # `p` is the realpath returned after root containment and shared-mode glob rejection.
+        # codeql[py/path-injection]
         if os.path.isdir(p):
-            parts = []
-            for root, _, files in os.walk(p):
-                for f in sorted(files):
-                    fp = os.path.join(root, f)
-                    st = os.stat(fp)
-                    parts.append(f"{fp}:{st.st_size}:{st.st_mtime_ns}")
-            return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+            # Best-available, bounded directory identity: the directory inode/mtime usually changes for
+            # immediate membership updates, but does not identify arbitrary descendant contents. Never
+            # recursively enumerate a dataset during profile preflight/recovery; strong versioned source
+            # identity remains #226.
+            # codeql[py/path-injection]
+            st = os.stat(p)
+            observed = f"dir:{p}:{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
+            return hashlib.sha256(observed.encode()).hexdigest()[:16]
+        # codeql[py/path-injection]
         st = os.stat(p)
         return hashlib.sha256(f"{p}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:16]
     except OSError:
@@ -228,7 +262,8 @@ class DuckDBAdapter:
         if uri.startswith("mem://") or is_object_uri(uri):
             return True
         p = uri.lower()
-        if os.path.isdir(uri):
+        local = paths.checked_local_path(uri)
+        if local is not None and os.path.isdir(local):
             return True
         return p.endswith(self._EXTS)
 
@@ -236,6 +271,26 @@ class DuckDBAdapter:
              predicate: str | None = None, limit: int | None = None,
              options: dict | None = None) -> Relation:
         con = db.conn()
+        normalized = _read_uri(uri)
+        if (is_object_uri(normalized)
+                and normalized.lower().endswith((".arrow", ".feather", ".ipc"))
+                and limit is not None):
+            if int(limit) != 0:
+                raise BoundedPreviewUnsupported(
+                    "remote Arrow/Feather/IPC has no bounded row reader — needs a full pass"
+                )
+            # Schema-only callers need the IPC footer, not any record batch. Avoid the eager full-object
+            # feather.read_table path used by an actual durable run.
+            import pyarrow as pa
+            import pyarrow.ipc as ipc
+            fs, path = object_fs(normalized)
+            with fs.open_input_file(path) as stream:
+                schema = ipc.open_file(stream).schema
+            rel = con.from_arrow(pa.Table.from_batches([], schema=schema))
+            if columns:
+                selected = [identifier(c, rel.columns, label="projection column") for c in columns]
+                rel = rel.project(", ".join(quote_identifier(c) for c in selected))
+            return rel
         rel = self._read(con, uri, options)
         if columns:
             selected = [identifier(c, rel.columns, label="projection column") for c in columns]
@@ -245,6 +300,44 @@ class DuckDBAdapter:
         if limit is not None:
             rel = rel.limit(int(limit))
         return rel
+
+    def preview_scan(self, uri: str, columns: list[str] | None = None,
+                     limit: int = 2000, options: dict | None = None) -> Relation:
+        """A hard-bounded source read for interactive preview.
+
+        Directory/prefix/glob datasets can require enumerating an arbitrary number of files before a row
+        limit applies. Arrow IPC can place the entire file in one record batch, so even its local lazy
+        reader has no strict row-level source bound. Refuse these shapes instead of pretending an outer
+        LIMIT bounds namespace or batch work; durable full runs retain the ordinary scan path.
+        """
+        normalized = _read_uri(uri)
+        low = normalized.lower()
+        if glob.has_magic(normalized):
+            raise BoundedPreviewUnsupported(
+                "glob sources have no bounded namespace preview — needs a full pass"
+            )
+        if low.endswith((".arrow", ".feather", ".ipc")):
+            raise BoundedPreviewUnsupported(
+                "Arrow/Feather/IPC record batches have no strict bounded preview — needs a full pass"
+            )
+        local: str | None = None
+        if is_object_uri(normalized):
+            if not low.endswith((".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson")):
+                raise BoundedPreviewUnsupported(
+                    "object-store prefixes have no bounded namespace preview — needs a full pass"
+                )
+        else:
+            local = paths.checked_local_path(normalized)
+            # `local` is the checked realpath; the read below also consumes this exact spelling.
+            # codeql[py/path-injection]
+            if local is not None and os.path.isdir(local):
+                raise BoundedPreviewUnsupported(
+                    "directory datasets have no bounded namespace preview — needs a full pass"
+                )
+        # The read must consume the exact canonical path that crossed the containment check. Reusing the
+        # original file URI/symlink here would split check from use; remote URIs keep their normalized form.
+        return self.scan(local if local is not None else normalized,
+                         columns=columns, limit=int(limit), options=options)
 
     def _read(self, con: duckdb.DuckDBPyConnection, uri: str, options: dict | None = None) -> Relation:
         uri = _read_uri(uri)
@@ -280,7 +373,8 @@ class DuckDBAdapter:
             # injected. (union_by_name alone disables hive detection, so it must be explicit when wanted.)
             return con.read_parquet(uri.rstrip("/") + "/**/*.parquet", union_by_name=True,
                                     hive_partitioning=self._is_hive_dir(uri, obj=True))
-        p = uri
+        local = paths.checked_local_path(uri)
+        p = local if local is not None else uri
         low = p.lower()
         if os.path.isdir(p):
             return self._read_dir(con, p)
@@ -383,6 +477,29 @@ class DuckDBAdapter:
         except Exception:  # noqa: BLE001
             return None
 
+    def metadata_count(self, uri: str) -> int | None:
+        """Exact count from one local Parquet footer; arbitrary directories stay unknown.
+
+        Recursively listing a partitioned dataset and opening every footer is data-page-free but still
+        unbounded admission work (millions of objects/partitions are possible). A future bounded summary
+        metadata capability can opt such datasets back in explicitly.
+        """
+        normalized = _read_uri(uri)
+        if is_object_uri(normalized) or normalized.startswith("mem://"):
+            return None
+        local = paths.checked_local_path(normalized)
+        if local is None:
+            return None
+        try:
+            import pyarrow.parquet as pq
+            # `local` is the checked realpath; shared-mode glob patterns have already failed closed.
+            # codeql[py/path-injection]
+            if os.path.isfile(local) and local.lower().endswith((".parquet", ".pq")):
+                return int(pq.ParquetFile(local).metadata.num_rows)
+        except Exception:  # noqa: BLE001 - metadata uncertainty means unknown, never a fallback scan
+            return None
+        return None
+
     def fingerprint(self, uri: str) -> str:
         uri = _read_uri(uri)
         if uri.startswith("mem://"):
@@ -398,11 +515,10 @@ class DuckDBAdapter:
             db.ensure_object_store()  # load httpfs + credentials
         target = uri if obj else path_of(uri)  # object stores keep the full s3://… uri
         low = target.lower()
-        rows = int(rel.aggregate("count(*)").fetchone()[0])
         _raise_if_cancelled(cancelled)
         pcols = identifier_list(partition_by, rel.columns, label="partitionBy column")
         if pcols:
-            return self._write_partitioned(target, rel, pcols, mode, low, obj, rows, cancelled)
+            return self._write_partitioned(target, rel, pcols, mode, low, obj, cancelled)
         if mode == "append":
             # append = a DIRECTORY / prefix of part files (out-of-core; the reader reads them all back via
             # _read_dir). Only for row formats that have a directory-scan reader — parquet/csv/tsv/json;
@@ -427,7 +543,7 @@ class DuckDBAdapter:
                 _raise_if_cancelled(cancelled)  # enter the object append commit phase before moving/publishing
                 self._migrate_singlefile_into_dir(target, base, ext, obj)  # overwrite→append: fold prior file in
                 part = base.rstrip("/") + "/" + part_name
-                self._write_part(rel, part, ext)
+                rows = self._write_part(rel, part, ext)
             else:
                 import contextlib
                 # stage the part as a SIBLING of base (NOT inside it) so a concurrent compaction's rmtree of
@@ -439,7 +555,7 @@ class DuckDBAdapter:
                 # glob / destination browse (same `.tmp-*`-not-`.parquet` discipline as overwrite/partitioned).
                 staging = base + f".parttmp-{uuid.uuid4().hex[:10]}"
                 try:
-                    self._write_part(rel, staging, ext)
+                    rows = self._write_part(rel, staging, ext)
                 except BaseException:
                     with contextlib.suppress(OSError):
                         os.remove(staging)
@@ -475,10 +591,10 @@ class DuckDBAdapter:
         try:
             _raise_if_cancelled(cancelled)
             if low.endswith((".csv", ".tsv")):
-                rel.write_csv(wtarget)
+                rows = _copy_relation(rel, wtarget, "FORMAT CSV")
             elif low.endswith((".json", ".ndjson")):
                 # DuckDB writes JSON out-of-core via COPY; ARRAY true emits a top-level [] read_json reads back
-                rel.query("_w", f"COPY _w TO '{wtarget.replace(chr(39), chr(39) * 2)}' (FORMAT JSON, ARRAY true)")
+                rows = _copy_relation(rel, wtarget, "FORMAT JSON, ARRAY true")
             elif low.endswith((".arrow", ".feather", ".ipc")):
                 # Arrow-IPC has no DuckDB writer; go through pyarrow, STREAMING RecordBatches (not
                 # to_arrow_table, which materializes the whole result in RAM → OOM on a big write). On an
@@ -492,7 +608,7 @@ class DuckDBAdapter:
                     tmp = f"{p}.tmp-{uuid.uuid4().hex[:8]}"
                     try:
                         with fs.open_output_stream(tmp) as f:
-                            _stream_ipc(rel, f)
+                            rows = _stream_ipc(rel, f)
                         _raise_if_cancelled(cancelled)
                         fs.move(tmp, p)  # server-side copy+delete; the destination is replaced only now
                     except BaseException:
@@ -501,9 +617,9 @@ class DuckDBAdapter:
                             fs.delete_file(tmp)
                         raise
                 else:
-                    _stream_ipc(rel, wtarget)
+                    rows = _stream_ipc(rel, wtarget)
             else:
-                rel.write_parquet(wtarget)
+                rows = _copy_relation(rel, wtarget, "FORMAT PARQUET")
             if not obj:
                 _raise_if_cancelled(cancelled)
                 os.replace(wtarget, target)
@@ -516,7 +632,7 @@ class DuckDBAdapter:
         return {"uri": uri, "rows": rows}
 
     def _write_partitioned(self, target: str, rel: Relation, pcols: list, mode: str, low: str,
-                           obj: bool, rows: int, cancelled: CancelCheck | None = None) -> dict:
+                           obj: bool, cancelled: CancelCheck | None = None) -> dict:
         """A Hive-partitioned parquet DIRECTORY (dir=val/… layout), read back partition-pruned (the read
         path passes hive_partitioning=True). Parquet + overwrite only. Local publication uses a recoverable
         old/new directory swap: the previous version is parked before the staged version is published, and
@@ -535,9 +651,11 @@ class DuckDBAdapter:
         base = os.path.splitext(target)[0]  # a DIRECTORY (Hive layout), not a single file
         cols_sql = ", ".join(quote_identifier(c) for c in pcols)
 
-        def _copy(dst: str) -> None:
-            rel.query("_w", f"COPY _w TO '{dst.replace(chr(39), chr(39) * 2)}' "
-                            f"(FORMAT PARQUET, PARTITION_BY ({cols_sql}), OVERWRITE_OR_IGNORE)")
+        def _copy(dst: str) -> int:
+            return _copy_relation(
+                rel, dst,
+                f"FORMAT PARQUET, PARTITION_BY ({cols_sql}), OVERWRITE_OR_IGNORE",
+            )
         if obj:
             # Replacing a Hive prefix spans many independent objects. Delete-then-write loses the old
             # version on failure; writing in place mixes old and new partitions when the partition set
@@ -552,7 +670,7 @@ class DuckDBAdapter:
         old = base + f".partition-old-{token}"
         parked = False
         try:
-            _copy(tmp)                                    # fully write and validate the staged version first
+            rows = _copy(tmp)                             # fully write and validate the staged version first
             with self._base_lock(base):
                 _raise_if_cancelled(cancelled)             # fence before parking the visible prior version
                 if os.path.lexists(base):
@@ -581,15 +699,14 @@ class DuckDBAdapter:
 
     # -- append part-directory helpers (transactional; row formats only) ---------------------------- #
     @staticmethod
-    def _write_part(rel: Relation, path: str, ext: str) -> None:
+    def _write_part(rel: Relation, path: str, ext: str) -> int:
         """Write ONE append part (parquet/csv/json — the row formats _read_dir can scan back)."""
         el = ext.lower()
         if el in (".csv", ".tsv"):
-            rel.write_csv(path)
+            return _copy_relation(rel, path, "FORMAT CSV")
         elif el in (".json", ".ndjson"):  # out-of-core COPY, ARRAY true → a top-level [] read_json reads back
-            rel.query("_w", f"COPY _w TO '{path.replace(chr(39), chr(39) * 2)}' (FORMAT JSON, ARRAY true)")
-        else:
-            rel.write_parquet(path)
+            return _copy_relation(rel, path, "FORMAT JSON, ARRAY true")
+        return _copy_relation(rel, path, "FORMAT PARQUET")
 
     _PART_EXTS = (".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson")
 
@@ -661,7 +778,9 @@ class LanceAdapter:
             import lance  # lazy — only if the optional `lance` extra is installed
         except ModuleNotFoundError as e:  # a clear remediation, not a raw "No module named 'lance'"
             raise ModuleNotFoundError("Lance support is not installed — run: uv pip install -e 'kernel[lance]'") from e
-        return lance.dataset(_read_uri(uri))
+        normalized = _read_uri(uri)
+        local = paths.checked_local_path(normalized)
+        return lance.dataset(local if local is not None else normalized)
 
     def scan(self, uri: str, columns: list[str] | None = None,
              predicate: str | None = None, limit: int | None = None,
@@ -693,6 +812,15 @@ class LanceAdapter:
                 rel = rel.project(", ".join(quote_identifier(c) for c in selected))
             return rel.limit(int(limit)) if limit is not None else rel
         reader = ds.scanner(columns=selected, limit=limit).to_reader()
+        return db.conn().from_arrow(reader)
+
+    def preview_scan(self, uri: str, columns: list[str] | None = None,
+                     limit: int = 2000, options: dict | None = None) -> Relation:
+        """Use Lance's scanner row limit directly; preview never takes the full-scan filter fallback."""
+        ds = self._dataset(uri)
+        selected = ([identifier(c, ds.schema.names, label="projection column") for c in columns]
+                    if columns else None)
+        reader = ds.scanner(columns=selected, limit=int(limit)).to_reader()
         return db.conn().from_arrow(reader)
 
     def nearest(self, uri: str, column: str, query, k: int = 10) -> Relation:
@@ -736,13 +864,26 @@ class LanceAdapter:
             # turned a typo — or an unimplemented merge/update/delete — into a stray append: a correctness
             # landmine). Lance mutation modes (merge_insert/update/delete) are a future capability.
             raise NotImplementedError(f"Lance write mode '{mode}' is not supported — use overwrite or append")
-        rows = int(rel.aggregate("count(*)").fetchone()[0])
         _raise_if_cancelled(cancelled)
-        # stream RecordBatches into Lance (bounded memory) instead of materializing the whole table.
-        # to_arrow_reader — NOT rel.record_batch, which does not exist on DuckDBPyRelation (it resolves as
-        # a column lookup → AttributeError, so the old code broke EVERY Lance write on DuckDB 1.5.x).
-        reader = rel.to_arrow_reader(1 << 16)
-        _raise_if_cancelled(cancelled)
+        # Count while Lance consumes the one stream. A separate aggregate first drains a DuckDB relation
+        # backed by a one-shot Arrow reader and silently publishes an empty dataset on the second pass.
+        import pyarrow as pa
+
+        source = rel.to_arrow_reader(1 << 16)
+        rows = 0
+
+        def counted_batches():
+            nonlocal rows
+            while True:
+                _raise_if_cancelled(cancelled)
+                try:
+                    batch = source.read_next_batch()
+                except StopIteration:
+                    return
+                rows += batch.num_rows
+                yield batch
+
+        reader = pa.RecordBatchReader.from_batches(source.schema, counted_batches())
         lance.write_dataset(reader, path_of(uri), mode=mode)
         return {"uri": uri, "rows": rows}
 

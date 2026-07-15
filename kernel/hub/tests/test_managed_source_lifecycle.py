@@ -194,14 +194,14 @@ def test_data_sample_holds_lease_through_blocked_adapter_and_response(monkeypatc
     errors: list[BaseException] = []
 
     class Adapter:
-        def scan(self, uri, *_args, **_kwargs):
+        def preview_scan(self, uri, *_args, **_kwargs):
             assert uri == published["uri"] and _read_leases(uri)
             entered.set()
             assert release.wait(timeout=5)
             return db.conn().sql("SELECT 1 AS value")
 
         @staticmethod
-        def count(_uri):
+        def metadata_count(_uri):
             return 1
 
     monkeypatch.setattr(catalog_routes, "get_deps", lambda: types.SimpleNamespace(

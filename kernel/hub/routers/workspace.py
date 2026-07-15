@@ -504,6 +504,19 @@ def canvas_active_runs(canvas_id: str, uid: str = Depends(current_user)) -> list
     return [RunStatus(**d) for d in metadb.active_runs(canvas_id)]
 
 
+@router.get("/canvas/{canvas_id}/profile-jobs", response_model=list[RunStatus])
+def canvas_profile_jobs(canvas_id: str, uid: str = Depends(current_user)) -> list[RunStatus]:
+    """Latest durable profile attempt for each node/plan identity, including terminal attempts.
+
+    Unlike ``active-runs``, this bounded recovery surface lets a profile that finished while the canvas
+    was closed reappear on reopen. The client still verifies the fixed plan digest against its current
+    graph identity before presenting the result.
+    """
+    if metadb.canvas_role(canvas_id, uid) is None:
+        raise HTTPException(404, "not found")
+    return [RunStatus(**doc) for doc in metadb.latest_profile_jobs(canvas_id)]
+
+
 @router.get("/canvas/{canvas_id}/kernel")
 def canvas_kernel(canvas_id: str, uid: str = Depends(current_user)) -> dict:
     """The per-canvas execution kernel's live state (Jupyter-style), or {exists:false} if none is
