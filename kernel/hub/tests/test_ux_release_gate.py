@@ -13,16 +13,19 @@ def _load_gate():
     return module
 
 
-def test_release_gate_blocks_open_p1_ux_defects_but_not_its_tracking_issue():
+def test_release_gate_blocks_open_p0_and_p1_ux_defects_but_not_tracking_or_prs():
     gate = _load_gate()
     issues = [
         {"number": 174, "title": "tracking", "labels": [{"name": "P1"}, {"name": "ux"}]},
+        {"number": 160, "title": "data loss", "labels": [{"name": "P0"}, {"name": "ux"}]},
         {"number": 164, "title": "stale preview", "labels": [{"name": "P1"}, {"name": "ux"}]},
         {"number": 173, "title": "responsive", "labels": [{"name": "P2"}, {"name": "ux"}]},
         {"number": 123, "title": "unrelated P1", "labels": [{"name": "P1"}, {"name": "api"}]},
+        {"number": 999, "title": "labeled PR", "labels": [{"name": "P1"}, {"name": "ux"}],
+         "pull_request": {"url": "https://api.github.test/pulls/999"}},
     ]
 
-    assert [issue["number"] for issue in gate.blockers(issues)] == [164]
+    assert [issue["number"] for issue in gate.blockers(issues)] == [160, 164]
 
 
 def test_fixture_builder_is_deterministic_and_full_profile_has_the_catalog_matrix(tmp_path):
