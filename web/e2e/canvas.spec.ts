@@ -36,6 +36,15 @@ async function fresh(page: Page) {
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
 }
 
+// The catalog is paginated by usage. Search before selecting a starter dataset so every test stays
+// deterministic when the full acceptance fixture adds more than 100 tables ahead of the starter data.
+async function openCatalogTable(page: Page, name: string) {
+  await page.getByTestId('catalog-search').fill(name)
+  const table = page.getByRole('button', { name: `Open table ${name}`, exact: true })
+  await expect(table).toBeVisible({ timeout: 15_000 })
+  await table.click()
+}
+
 // Prove the app's collab socket has joined THIS canvas before driving an out-of-band edit. The
 // autosave label only proves the HTTP canvas exists; it says nothing about websocket readiness. A
 // short-lived peer waits for the app's presence frame, which the server can relay only after the app
@@ -296,7 +305,7 @@ test.describe('Data Playground canvas', () => {
     await page.getByPlaceholder(/my_table_or_uri/).fill('{"source":"x"}')
     await page.getByRole('button', { name: 'Import', exact: true }).click()
 
-    await expect(page.getByTestId('toast')).toContainText('permission')
+    await expect(page.getByTestId('toast').filter({ hasText: 'permission' })).toContainText('permission')
     await expect.poll(() => page.evaluate(() => location.hash)).toBe(current)
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
     await expect(page.getByRole('heading', { name: 'Import pipeline' })).toBeVisible()
@@ -468,7 +477,8 @@ test.describe('Data Playground canvas', () => {
     // rail → Tables (shows the seeded catalog) and Transforms
     await page.getByTestId('rail-tables').click()
     await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
-    await expect(page.getByText('images', { exact: true })).toBeVisible()
+    await page.getByTestId('catalog-search').fill('images')
+    await expect(page.getByRole('button', { name: 'Open table images', exact: true })).toBeVisible()
     await page.getByTestId('rail-transforms').click()
     await expect(page.getByRole('heading', { name: 'Transforms' })).toBeVisible()
     // back to recents → New file returns to the canvas editor
@@ -484,16 +494,15 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('rail-tables').click()
     await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
     // search keeps this robust to list order, then open the dataset's drawer → View relationship graph
-    await page.getByTestId('catalog-search').fill('events')
-    await page.getByText('events', { exact: true }).click()
+    await openCatalogTable(page, 'events')
     await page.getByTestId('detail-relationships').click()
     // the graph mounts focused on that table (its columns are visible on the entity)
     await expect(page.getByText('Relationships', { exact: true })).toBeVisible({ timeout: 10_000 })
     const entities = page.locator('.react-flow__node')
     await expect(entities.filter({ hasText: 'events' }).first().getByText('user_id')).toBeVisible({ timeout: 10_000 })
-    // "show all" widens to the whole catalog — other seeded datasets appear as entities too
+    // "show all" widens to the whole catalog — a large-fixture table appears as an entity too.
     await page.getByTestId('er-clear-focus').click()
-    await expect(entities.filter({ hasText: 'images' }).first()).toBeVisible({ timeout: 10_000 })
+    await expect(entities.filter({ hasText: 'catalog_000' }).first()).toBeVisible({ timeout: 10_000 })
   })
 
   test('a failing run surfaces an error toast (not a silent failure)', async ({ page }) => {
@@ -691,7 +700,7 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to files').click()
     await page.getByTestId('rail-tables').click()
-    await page.getByText('events', { exact: true }).click()   // opens the dataset detail drawer
+    await openCatalogTable(page, 'events')                     // opens the dataset detail drawer
     await page.getByTestId('detail-use').click()               // "Use" drops a source onto the canvas
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect(page.locator('.react-flow__node')).toHaveCount(1) // the events source landed
@@ -710,7 +719,7 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to files').click()
     await page.getByTestId('rail-tables').click()
-    await page.getByText('events', { exact: true }).click()
+    await openCatalogTable(page, 'events')
     await page.getByTestId('detail-use').click()
     await page.route('**/api/run/preview', (route) => route.fulfill({
       contentType: 'application/json',
@@ -761,7 +770,7 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
     await expect(page.getByTestId('register-dataset')).toBeVisible() // register lives here, not only in Settings
     // clicking a dataset row opens its detail drawer; "Use" drops a source onto the canvas
-    await page.getByText('images', { exact: true }).click()
+    await openCatalogTable(page, 'images')
     await page.getByTestId('detail-use').click()
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect(page.locator('.react-flow__node')).toHaveCount(1)

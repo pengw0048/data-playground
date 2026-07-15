@@ -3,6 +3,13 @@ name: UX acceptance
 # The full matrix is intentionally separate from the PR smoke: it exercises large deterministic
 # fixtures and retains diagnostic evidence without making every small UI change wait for it.
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/ux-acceptance.yml'
+      - 'scripts/build_ux_fixtures.py'
+      - 'web/e2e/**'
+      - 'web/playwright.config.ts'
+      - 'docs/UX_ACCEPTANCE.md'
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
