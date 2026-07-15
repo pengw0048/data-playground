@@ -22,6 +22,12 @@ Install the Ray extra, load [`examples/plugins/dp_ray`](../examples/plugins/dp_r
 resolved requirements contain `labels.engine=ray`. Set `DP_RAY_REMOTE=1` when Ray workers do not share
 the kernel's filesystem; remote placement then requires a configured object-storage tier.
 
+With no Ray Jobs address, the local `Popen` driver uses the same workload process-scope contract as
+ordinary isolated runs. On POSIX, the direct child owns a new process group; cancellation and
+`DP_RUN_DEADLINE_S` send TERM followed by a bounded KILL, and terminal status waits for the group fence
+and direct-child reap. On non-POSIX platforms, both paths can stop only the direct child and therefore
+cannot guarantee that descendants stop. This limitation does not change the durable Ray Jobs contract.
+
 The hub cannot inspect cluster resources without connecting a driver, so operators declare admission
 capacity with `DP_RAY_NUM_CPUS`, `DP_RAY_MEM`, `DP_RAY_GPUS`, `DP_RAY_GPU_TYPE`, and optional labels
 such as `DP_RAY_LABELS=pool=a100,zone=use1`. Each non-engine label value must also exist as a Ray

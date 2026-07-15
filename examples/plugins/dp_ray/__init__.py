@@ -21,7 +21,7 @@ while preserving small compatibility workloads.
 EXECUTION MODEL — an isolated subprocess driver. Running Ray inline in the kernel process deadlocks: the
 source read / sink write go through a DuckDB base connection, and a materialization on the hub's
 pre-existing connection wedges once `ray.init()` has run in the same process. So `run()` spawns a fresh
-subprocess (`_driver.py`) whose OWN process holds its DuckDB + Ray (`ray.init` before any DuckDB). The hub
+subprocess (`_driver.py`) whose owned process group holds its DuckDB + Ray (`ray.init` before any DuckDB). The hub
 resolves logical destinations before dispatch and owns catalog registration after the driver returns;
 the driver receives physical sink URIs and never reads that control-plane state. This is the same
 process-isolation boundary the built-in SubprocessRunner uses. With no `DP_RAY_JOBS_ADDRESS`, development
@@ -81,6 +81,7 @@ from hub.job_artifacts import (RAY_JOB_CONTRACT_VERSION, RAY_JOB_RESULT_FIELDS, 
 from hub.models import (CatalogPublicationReceipt, PerNodeStatus, ResourceSpec, RunBackendRef,
                         RunStatus, WorkerInfo)
 from hub.placement import node_requires, satisfies
+from hub.process_scope import OwnedProcessScope, owned_process_popen_kwargs
 from hub.sqlpolicy import (
     FragmentKind,
     SQLPolicyError,
@@ -1039,12 +1040,12 @@ class RayRunner:
         self.runs: dict[str, RunStatus] = {}
         self._cancel: dict[str, threading.Event] = {}
         self._cancel_ack: set[str] = set()
-        # A driver whose OS process cannot yet be reaped must remain non-terminal.  Keep every
+        # A driver whose OS process group cannot yet be fenced must remain non-terminal. Keep every
         # publication fence and the credential-bearing work directory owned until a background
-        # reconciler can prove the process stopped.
+        # reconciler can fence the group and reap its direct child.
         self._unreaped_drivers: dict[str, dict] = {}
         self._finalizing_drivers: set[str] = set()
-        self._driver_procs: dict[str, object] = {}
+        self._driver_scopes: dict[str, OwnedProcessScope] = {}
         self._driver_workdirs: dict[str, str] = {}
         self._retained_workdirs: dict[str, str] = {}
         self._settled: dict[str, threading.Event] = {}
@@ -1076,13 +1077,13 @@ class RayRunner:
         import shutil
 
         with self._lock:
-            drivers = list(self._driver_procs.items())
-            for run_id, _proc in drivers:
+            drivers = list(self._driver_scopes.items())
+            for run_id, _scope in drivers:
                 event = self._cancel.get(run_id)
                 if event is not None:
                     event.set()
-        for run_id, proc in drivers:
-            if not self._try_reap_driver(proc):
+        for run_id, scope in drivers:
+            if not self._try_reap_driver(scope):
                 continue  # retain workdir and managed ownership; never guess writer termination
             with self._lock:
                 state = self._unreaped_drivers.pop(run_id, None)
@@ -1099,7 +1100,7 @@ class RayRunner:
                             state["result"] = json.load(stream)
                     except Exception:  # noqa: BLE001 — malformed receipt stays private
                         state["result"] = None
-                state["returncode"] = proc.returncode
+                state["returncode"] = scope.process.returncode
                 try:
                     self._finish_supervision(state)
                 except Exception:  # noqa: BLE001 — interpreter shutdown remains best-effort
@@ -4349,7 +4350,7 @@ class RayRunner:
         work = tempfile.mkdtemp(prefix="dp_ray_")
         with self._lock:
             self._driver_workdirs[run_id] = work
-        result, returncode, proc = None, "not-started", None
+        result, returncode, scope = None, "not-started", None
         driver_reaped = True  # no Popen means there is no writer to fence
         supervisor_error = None
         read_leases = contextlib.ExitStack()
@@ -4367,10 +4368,11 @@ class RayRunner:
             for uri in source_uris:
                 read_guards.append(read_leases.enter_context(managed_read_lease(
                     uri, owner=f"ray:{run_id}", ttl_seconds=ttl)))
-            result, returncode, proc, driver_reaped, supervisor_error = self._supervise_in_work(
+            result, returncode, scope, driver_reaped, supervisor_error = self._supervise_in_work(
                 run_id, graph, target, status, work,
                 materialize_uri=materialize_uri, requires=requires,
                 sink_targets=sink_targets, sink_attempts=sink_attempts,
+                deadline_s=deadline,
             )
         except Exception as exc:  # noqa: BLE001 — provider/process detail belongs only in server logs
             logging.getLogger(__name__).exception("Ray supervisor setup failed")
@@ -4380,7 +4382,7 @@ class RayRunner:
 
         state = {
             "run_id": run_id, "graph": graph, "target": target, "status": status,
-            "work": work, "proc": proc, "result": result, "returncode": returncode,
+            "work": work, "scope": scope, "result": result, "returncode": returncode,
             "supervisor_error": supervisor_error, "read_leases": read_leases,
             "read_guards": read_guards, "materialize_uri": materialize_uri,
             "sink_targets": sink_targets, "sink_attempts": sink_attempts,
@@ -4405,7 +4407,10 @@ class RayRunner:
 
     def _supervise_in_work(self, run_id, graph, target, status, work, materialize_uri=None,
                            requires=None, sink_targets=None,
-                           sink_attempts=None) -> tuple[dict | None, int | str, object | None, bool, str | None]:
+                           sink_attempts=None, deadline_s: float = 3600.0,
+                           ) -> tuple[
+                               dict | None, int | str, OwnedProcessScope | None, bool, str | None
+                           ]:
         """Parent side: spawn the isolated Ray driver, poll its status file, mirror the result. Touches
         NO DuckDB (only subprocess + files + the DB-backed on_status/on_complete hooks) → never deadlocks.
         `materialize_uri` set = region mode (write target → that uri); else whole-graph mode (write node).
@@ -4430,6 +4435,7 @@ class RayRunner:
         driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_driver.py")
         result = None
         proc = None
+        scope = None
         driver_log = None
         supervisor_error = None
         reaped = True
@@ -4444,20 +4450,26 @@ class RayRunner:
             # uv/venv markers and put the venv's bin on PATH so Ray runs workers with THIS interpreter
             # (which has ray); run from the work dir so uv/Ray don't pick up the repo's pyproject.
             child_env = _ray_child_env()
-            proc = subprocess.Popen([sys.executable, driver, job_file], cwd=work,
-                                    stdout=driver_log, stderr=driver_log,
-                                    start_new_session=True, env=child_env)
+            proc = subprocess.Popen(
+                [sys.executable, driver, job_file],
+                **owned_process_popen_kwargs({
+                    "cwd": work, "stdout": driver_log, "stderr": driver_log, "env": child_env,
+                }),
+            )
+            scope = OwnedProcessScope(proc, owns_process_group=os.name == "posix")
             with self._lock:
-                self._driver_procs[run_id] = proc
+                self._driver_scopes[run_id] = scope
             reaped = False
+            started_at = time.monotonic()
             while proc.poll() is None:
                 if cancel.is_set():
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=5)
+                    scope.request_stop()
+                    break
+                if deadline_s > 0 and time.monotonic() - started_at > deadline_s:
+                    supervisor_error = (
+                        f"Ray run exceeded the wall-clock deadline of {deadline_s:g}s"
+                    )
+                    scope.request_stop()
                     break
                 # surface the driver's INTERIM progress (it rewrites the status file as it computes/writes)
                 # into the parent RunStatus, so a placed region's progress advances mid-run — not just at
@@ -4482,8 +4494,8 @@ class RayRunner:
         finally:
             # A parent-side error must not leave the credential-bearing child running while its work
             # directory is erased. Terminate first, then close the inherited log descriptor.
-            if proc is not None:
-                reaped = self._try_reap_driver(proc)
+            if scope is not None:
+                reaped = self._try_reap_driver(scope)
             if driver_log is not None:
                 driver_log.close()
         if reaped and os.path.exists(status_file):
@@ -4495,29 +4507,16 @@ class RayRunner:
                 supervisor_error = "Ray execution supervisor failed"
                 result = None
         return (result, proc.returncode if proc is not None else "not-started",
-                proc, reaped, supervisor_error)
+                scope, reaped, supervisor_error)
 
     @staticmethod
-    def _try_reap_driver(proc) -> bool:
-        """Best-effort fence for one local driver; true only after wait/poll proves exit."""
+    def _try_reap_driver(scope: OwnedProcessScope) -> bool:
+        """Best-effort group fence; true only after the direct driver is reaped."""
         try:
-            if proc.poll() is not None:
-                proc.wait(timeout=0)
-                return True
-        except Exception:  # noqa: BLE001 — continue to terminate/kill proof
-            logging.getLogger(__name__).exception("Ray driver poll/wait failed")
-        try:
-            proc.terminate()
-            proc.wait(timeout=10)
-            return True
-        except Exception:  # noqa: BLE001 — force-reap below
-            try:
-                proc.kill()
-                proc.wait(timeout=5)
-                return True
-            except Exception:  # noqa: BLE001 — alive/unknown remains non-terminal
-                logging.getLogger(__name__).exception("Ray driver could not be force-reaped")
-                return False
+            return scope.fence()
+        except Exception:  # noqa: BLE001 — alive/unknown remains non-terminal
+            logging.getLogger(__name__).exception("Ray driver scope could not be fenced and reaped")
+            return False
 
     def _reconcile_unreaped_driver(self, run_id: str) -> None:
         """Retain ownership and retry until the local driver is observably stopped."""
@@ -4526,7 +4525,7 @@ class RayRunner:
                 state = self._unreaped_drivers.get(run_id)
             if state is None:
                 return
-            if self._try_reap_driver(state["proc"]):
+            if self._try_reap_driver(state["scope"]):
                 break
             time.sleep(1.0)
         with self._lock:
@@ -4544,7 +4543,7 @@ class RayRunner:
                     "Ray driver returned an invalid status document after reconciliation")
                 state["result"] = None
                 state["supervisor_error"] = "Ray execution supervisor failed"
-        state["returncode"] = state["proc"].returncode
+        state["returncode"] = state["scope"].process.returncode
         self._finish_supervision(state)
 
     def _finish_supervision(self, state: dict) -> None:
@@ -4563,7 +4562,7 @@ class RayRunner:
             publication_blocked = True
             status.status, status.error = "failed", "Ray managed source lease was lost"
 
-        # job.json contains graph code/source URIs and may contain credentials.  Only a reaped driver
+        # job.json contains graph code/source URIs and may contain credentials. Only a fenced driver scope
         # reaches this method, so deleting the directory cannot race a live writer.
         try:
             shutil.rmtree(state["work"])
@@ -4574,17 +4573,23 @@ class RayRunner:
 
         if cleanup_succeeded and not publication_blocked:
             try:
+                cancel_requested = bool(
+                    self._cancel.get(run_id) and self._cancel[run_id].is_set())
                 kwargs = {
-                    "cancel_requested": bool(
-                        self._cancel.get(run_id) and self._cancel[run_id].is_set()),
+                    "cancel_requested": cancel_requested,
                 }
                 if state["sink_targets"] is not None or state["sink_attempts"] is not None:
                     kwargs.update(
                         expected_targets=state["sink_targets"],
                         expected_attempts=state["sink_attempts"],
                     )
-                self._settle_popen_result(
-                    graph, status, state["result"], state["returncode"], **kwargs)
+                if state.get("supervisor_error") and not cancel_requested:
+                    status.status = "failed"
+                    status.error = state["supervisor_error"]
+                    status.output_uri = status.output_table = None
+                else:
+                    self._settle_popen_result(
+                        graph, status, state["result"], state["returncode"], **kwargs)
             except Exception:  # noqa: BLE001 — continue through terminal bookkeeping
                 logging.getLogger(__name__).exception("Ray result settlement failed")
                 status.status, status.error = "failed", "Ray result settlement failed"
@@ -4612,7 +4617,7 @@ class RayRunner:
             self._cancel.pop(run_id, None)
             self._unreaped_drivers.pop(run_id, None)
             self._finalizing_drivers.discard(run_id)
-            self._driver_procs.pop(run_id, None)
+            self._driver_scopes.pop(run_id, None)
             work = self._driver_workdirs.pop(run_id, None)
             if cleanup_succeeded:
                 self._retained_workdirs.pop(run_id, None)
@@ -4640,7 +4645,7 @@ class RayRunner:
             status.output_uri = status.output_table = None
             return
         # A clean done receipt wins a late cancellation because its data commit point has already
-        # crossed.  Without that receipt, a reaped driver's cancellation request wins over a crash or
+        # crossed. Without that receipt, a fenced driver's cancellation request wins over a crash or
         # incomplete interim document.
         if cancel_requested and not (
                 result and result.get("status") == "done" and returncode == 0):

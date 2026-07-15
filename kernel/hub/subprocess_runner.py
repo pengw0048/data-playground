@@ -25,6 +25,7 @@ import uuid
 
 from hub.models import CompilePlan, Graph, PerNodeStatus, Placement, RunEstimate, RunStatus
 from hub.plugins.runner import _CONFIRM_ROWS, _MAX_RUNS, _persist_local_result_done
+from hub.process_scope import OwnedProcessScope, owned_process_popen_kwargs
 
 _CANCEL_GRACE_S = 2.0  # cooperative child cancel first; then SIGTERM/SIGKILL for runaway native/Python code
 
@@ -81,6 +82,7 @@ class SubprocessRunner:
         self.on_status = None    # optional (graph, status) hook — Deps wires it to DB-backed live status
         self.runs: dict[str, RunStatus] = {}
         self._procs: dict[str, subprocess.Popen] = {}
+        self._process_scopes: dict[str, OwnedProcessScope] = {}
         self._cancel_files: dict[str, str] = {}
         self._cancelled: set[str] = set()
         self._object_results: dict[str, dict] = {}
@@ -99,21 +101,34 @@ class SubprocessRunner:
         atexit.register(self._terminate_all)  # don't orphan running children when the kernel exits
 
     def _spawn_process(self, run_id: str, command: list[str], **kwargs) -> subprocess.Popen:
-        """Backend hook for process-containment variants; ordinary runs keep direct-child semantics."""
-        _ = run_id
-        return subprocess.Popen(command, **kwargs)
+        """Spawn and retain exact ownership before returning the child to setup code."""
+        grouped = os.name == "posix"
+        proc = subprocess.Popen(command, **owned_process_popen_kwargs(kwargs))
+        scope = OwnedProcessScope(proc, owns_process_group=grouped)
+        with self._lock:
+            self._process_scopes[run_id] = scope
+        return proc
 
     def _signal_process(self, run_id: str, proc: subprocess.Popen, *, force: bool) -> None:
-        """Signal the owned writer. Specialized runners may target a process group/cgroup instead."""
-        _ = run_id
-        if force:
-            proc.kill()
-        else:
-            proc.terminate()
+        """Signal only the scope still owned by this exact run and Popen."""
+        with self._lock:
+            scope = self._process_scopes.get(run_id)
+        if scope is not None and scope.process is proc:
+            scope.request_stop(force=force)
 
     def _finalize_process_scope(self, run_id: str, proc: subprocess.Popen) -> None:
-        """Prove specialized descendant containment is empty after the direct child is reaped."""
-        _ = run_id, proc
+        """Fence descendants, reap the child, then release this exact process scope."""
+        with self._lock:
+            scope = self._process_scopes.get(run_id)
+        if scope is None or scope.process is not proc:
+            if proc.poll() is None:
+                raise RuntimeError("live subprocess has no owned process scope")
+            return
+        if not scope.fence():
+            raise RuntimeError("subprocess could not be reaped after SIGKILL")
+        with self._lock:
+            if self._process_scopes.get(run_id) is scope:
+                self._process_scopes.pop(run_id, None)
 
     def _terminate_all(self) -> None:
         """Fence, reap, then discard parent-owned writers during an orderly interpreter shutdown.
@@ -131,13 +146,6 @@ class SubprocessRunner:
             except Exception:  # noqa: BLE001
                 pass
         for run_id, proc in procs:
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._signal_process(run_id, proc, force=True)
-                proc.wait()
-            except Exception:  # noqa: BLE001
-                continue
             try:
                 self._finalize_process_scope(run_id, proc)
             except Exception:  # noqa: BLE001 - process exit will release the remaining OS scope
@@ -589,27 +597,16 @@ class SubprocessRunner:
             # parent-owned attempt; setup failure alone is not writer terminal proof.
             reaped = False
             try:
-                if proc.poll() is None:
-                    self._signal_process(run_id, proc, force=False)
-                proc.wait(timeout=2)
                 self._finalize_process_scope(run_id, proc)
                 reaped = True
-            except subprocess.TimeoutExpired:
-                try:
-                    self._signal_process(run_id, proc, force=True)
-                    proc.wait()
-                    self._finalize_process_scope(run_id, proc)
-                    reaped = True
-                except Exception:  # noqa: BLE001
-                    logging.getLogger("hub").exception(
-                        "post-Popen setup failure could not force-reap child")
             except Exception:  # noqa: BLE001
                 logging.getLogger("hub").exception(
-                    "post-Popen setup failure could not reap child")
+                    "post-Popen setup failure could not fence and reap child")
             if reaped:
                 with self._lock:
                     self.runs.pop(run_id, None)
                     self._procs.pop(run_id, None)
+                    self._process_scopes.pop(run_id, None)
                     self._cancel_files.pop(run_id, None)
                 shutil.rmtree(job_dir, ignore_errors=True)
             else:
@@ -649,6 +646,7 @@ class SubprocessRunner:
             self.runs.pop(victim, None)
             self._cancelled.discard(victim)
             self._procs.pop(victim, None)
+            self._process_scopes.pop(victim, None)
             self._cancel_files.pop(victim, None)
             self._sink_contracts.pop(victim, None)
 
@@ -723,23 +721,11 @@ class SubprocessRunner:
             reaped = False
             try:
                 try:
-                    if proc.poll() is None:
-                        self._signal_process(run_id, proc, force=False)
-                    proc.wait(timeout=2)
                     self._finalize_process_scope(run_id, proc)
                     reaped = True
-                except subprocess.TimeoutExpired:
-                    try:
-                        self._signal_process(run_id, proc, force=True)
-                        proc.wait()
-                        self._finalize_process_scope(run_id, proc)
-                        reaped = True
-                    except Exception:  # noqa: BLE001
-                        logging.getLogger("hub").exception(
-                            "subprocess supervisor could not force-reap child")
                 except Exception:  # noqa: BLE001 — continue into ownership cleanup
                     logging.getLogger("hub").exception(
-                        "subprocess supervisor could not reap child cleanly")
+                        "subprocess supervisor could not fence and reap child")
                 if reaped:
                     owned_result = self._object_results.get(run_id)
                     if owned_result is not None:
@@ -782,6 +768,7 @@ class SubprocessRunner:
                     shutil.rmtree(job_dir, ignore_errors=True)
                     with self._lock:
                         self._procs.pop(run_id, None)
+                        self._process_scopes.pop(run_id, None)
                         self._cancel_files.pop(run_id, None)
                         self._object_results.pop(run_id, None)
                         self._local_results.pop(run_id, None)
@@ -855,12 +842,13 @@ class SubprocessRunner:
                 terminal = self._read(run_id, status_file)
                 break
             time.sleep(0.15)
-        try:
-            proc.wait(timeout=2 if run_id in self._cancelled else 5)
-        except subprocess.TimeoutExpired:
-            # SIGTERM ignored (e.g. a C-level DuckDB loop) → force-reap so _watch can't hang.
-            self._signal_process(run_id, proc, force=True)
-            proc.wait()
+        stop_requested = source_lease_lost or deadline_hit or run_id in self._cancelled
+        if terminal is not None and not stop_requested and proc.poll() is None:
+            try:
+                # A valid terminal receipt may precede ordinary interpreter cleanup very slightly.
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._signal_process(run_id, proc, force=False)
         self._finalize_process_scope(run_id, proc)
         terminal = self._read(run_id, status_file) or terminal
         try:
@@ -914,7 +902,7 @@ class SubprocessRunner:
                     st.error = "parent managed-sink publication failed"
                     st.output_uri = st.output_table = None
             else:
-                # wait()/kill() above is writer terminal proof; only now may failed/cancelled attempts enter GC.
+                # The process-scope fence above is writer terminal proof; only now may attempts enter GC.
                 self._discard_object_sinks(owned_sinks)
                 st.output_uri = st.output_table = None
                 if cancelled:
@@ -1121,6 +1109,7 @@ class SubprocessRunner:
         shutil.rmtree(job_dir, ignore_errors=True)
         with self._lock:
             self._procs.pop(run_id, None)
+            self._process_scopes.pop(run_id, None)
             self._cancel_files.pop(run_id, None)
             self._object_results.pop(run_id, None)
             self._local_results.pop(run_id, None)
@@ -1137,7 +1126,8 @@ class SubprocessRunner:
             return False
         with self._lock:
             proc = self._procs.get(run_id)
-        return proc is None or proc.poll() is not None
+            scope = self._process_scopes.get(run_id)
+        return proc is None and scope is None
 
     def cancel(self, run_id: str) -> RunStatus:
         with self._lock:
@@ -1151,7 +1141,6 @@ class SubprocessRunner:
                 pass
             except OSError:
                 pass  # watcher still hard-kills after the bounded grace period
-        # _watch publishes `cancelled` only after wait()/kill() has reaped the child. Until then the status
-        # remains non-terminal, making terminal status a real stop acknowledgement rather than an optimistic
-        # label while the process could still commit an output.
+        # _watch publishes `cancelled` only after the process group is fenced and its direct child reaped.
+        # Until then status remains non-terminal, so it cannot acknowledge stop while a descendant may write.
         return self.runs[run_id]

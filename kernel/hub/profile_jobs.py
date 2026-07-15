@@ -10,57 +10,12 @@ from __future__ import annotations
 
 import logging
 import os
-import signal
-import subprocess
 import threading
-import time
 import uuid
 from collections.abc import Callable
 
 from hub.models import Graph, PerNodeStatus, RunStatus
 from hub.subprocess_runner import SubprocessRunner, _SpawnSetupError
-
-
-def _posix_group_has_live_members(pgid: int) -> bool | None:
-    """Inspect a POSIX group, excluding zombies; ``None`` means the platform probe failed."""
-    if os.name != "posix" or not hasattr(os, "posix_spawn"):
-        return None
-    read_fd, write_fd = os.pipe()
-    try:
-        actions = [
-            (os.POSIX_SPAWN_DUP2, write_fd, 1),
-            (os.POSIX_SPAWN_CLOSE, read_fd),
-            (os.POSIX_SPAWN_CLOSE, write_fd),
-        ]
-        probe_pid = os.posix_spawn(
-            "/bin/ps", ["ps", "-axo", "pgid=,stat="], os.environ,
-            file_actions=actions,
-        )
-    except Exception:  # noqa: BLE001 - cleanup falls back to signal-delivery proof
-        os.close(read_fd)
-        os.close(write_fd)
-        return None
-    os.close(write_fd)
-    try:
-        chunks = []
-        while True:
-            chunk = os.read(read_fd, 64 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        _, wait_status = os.waitpid(probe_pid, 0)
-        if wait_status != 0:
-            return None
-        for line in b"".join(chunks).decode(errors="replace").splitlines():
-            fields = line.split()
-            if len(fields) >= 2 and fields[0].isdigit() and int(fields[0]) == pgid:
-                if not fields[1].upper().startswith(("Z", "X")):
-                    return True
-        return False
-    except Exception:  # noqa: BLE001
-        return None
-    finally:
-        os.close(read_fd)
 
 
 class ProfileProcessRunner(SubprocessRunner):
@@ -79,7 +34,6 @@ class ProfileProcessRunner(SubprocessRunner):
         self._terminal_publication_done: set[str] = set()
         self._terminal_publication_rejected: set[str] = set()
         self._completion_done: set[str] = set()
-        self._profile_process_groups: dict[str, subprocess.Popen] = {}
 
     def run(self, graph: Graph, node_id: str, *, plan_digest: str,
             profile_attempt_order: int, run_id: str | None = None,
@@ -304,86 +258,6 @@ class ProfileProcessRunner(SubprocessRunner):
         except ValueError:
             configured = 30.0
         return max(0.1, min(60.0, configured))
-
-    def _spawn_process(
-            self, run_id: str, command: list[str], **kwargs) -> subprocess.Popen:
-        if os.name != "posix":
-            return super()._spawn_process(run_id, command, **kwargs)
-        kwargs["start_new_session"] = True
-        proc = super()._spawn_process(run_id, command, **kwargs)
-        with self._lock:
-            self._profile_process_groups[run_id] = proc
-        return proc
-
-    def _owns_process_group(self, run_id: str, proc: subprocess.Popen) -> bool:
-        with self._lock:
-            return self._profile_process_groups.get(run_id) is proc
-
-    def _signal_process(
-            self, run_id: str, proc: subprocess.Popen, *, force: bool) -> None:
-        if os.name != "posix":
-            super()._signal_process(run_id, proc, force=force)
-            return
-        # The PGID equals the session-leading child's PID. Never signal after this exact Popen's scope
-        # ownership has been cleared: a delayed killpg could otherwise hit a reused numeric PGID.
-        if not self._owns_process_group(run_id, proc):
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-
-    def _finalize_process_scope(self, run_id: str, proc: subprocess.Popen) -> None:
-        if os.name != "posix":
-            super()._finalize_process_scope(run_id, proc)
-            return
-        if not self._owns_process_group(run_id, proc):
-            return
-        pgid = proc.pid
-        self._signal_process(run_id, proc, force=False)
-        deadline = time.monotonic() + 0.5
-        unknown = False
-        live: bool | None = True
-        while time.monotonic() < deadline:
-            live = _posix_group_has_live_members(pgid)
-            if live is False:
-                break
-            unknown = unknown or live is None
-            time.sleep(0.02)
-        else:
-            live = True
-        if live is not False:
-            self._signal_process(run_id, proc, force=True)
-            deadline = time.monotonic() + 1.0
-            while time.monotonic() < deadline:
-                live = _posix_group_has_live_members(pgid)
-                if live is False:
-                    break
-                if live is None:
-                    unknown = True
-                    # SIGKILL is synchronous process-group stop authority; an unavailable ``ps`` probe
-                    # cannot distinguish reparented zombies, which execute no further side effects.
-                    time.sleep(0.1)
-                    live = False
-                    break
-                time.sleep(0.02)
-            if live is not False:
-                raise RuntimeError("profile process group still has live members after SIGKILL")
-        if unknown:
-            logging.getLogger("hub").debug(
-                "profile process-group liveness probe was unavailable after signal delivery")
-        with self._lock:
-            if self._profile_process_groups.get(run_id) is proc:
-                self._profile_process_groups.pop(run_id, None)
-
-    def cancel_acknowledged(self, run_id: str) -> bool:
-        with self._lock:
-            status = self.runs.get(run_id)
-            return bool(
-                status is not None and status.status == "cancelled"
-                and run_id not in self._procs
-                and run_id not in self._profile_process_groups
-            )
 
     def _profile_identity(self, run_id: str, status: RunStatus) -> RunStatus:
         identity = self._profile_identities.get(run_id)
