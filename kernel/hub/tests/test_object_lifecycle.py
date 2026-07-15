@@ -2375,11 +2375,11 @@ def test_moto_versioned_s3_history_read_and_exact_sibling_safe_gc(monkeypatch):
         metadb.put_result(cache_key, {"uri": second["uri"], "rows": 1})
         assert _state(first["uri"]) == "published", "run history must keep the old version readable"
         class _HistoryAdapter:
-            def scan(self, _uri, _columns=None, limit=None):
+            def preview_scan(self, _uri, _columns=None, limit=None):
                 rel = db.conn().from_arrow(pa.table({"value": [1]}))
                 return rel.limit(limit) if limit is not None else rel
 
-            def count(self, _uri):
+            def metadata_count(self, _uri):
                 return 1
 
         deps = get_deps()

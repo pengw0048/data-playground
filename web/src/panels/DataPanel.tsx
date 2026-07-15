@@ -17,6 +17,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const doc = useStore((s) => s.doc)
   const node = doc.nodes.find((n) => n.id === nodeId)
   const run = useStore((s) => s.runs[nodeId])
+  const done = run?.status?.status === 'done' ? run.status : undefined
   const pushToast = useStore((s) => s.pushToast)
   const [tab, setTab] = useState('rows')
   const [resultMode, setResultMode] = useState<'sample' | 'full'>('sample')
@@ -28,6 +29,11 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeId])
   useEffect(() => setResultMode('sample'), [nodeId])
+  useEffect(() => {
+    // A node that cannot produce a bounded preview should reveal the exact artifact as soon as its
+    // durable run finishes. A later explicit click on Sample remains sticky until the artifact changes.
+    if (preview?.result?.notPreviewable && done?.outputUri) setResultMode('full')
+  }, [nodeId, done?.outputUri, preview?.result?.notPreviewable])
   const page = (o: number) => { setDetail(null); runPreview(nodeId, o) }
 
   if (!preview) return <Skeleton />
@@ -36,25 +42,41 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   if (preview.error) return <ErrorState reason={preview.error} onRetry={() => runPreview(nodeId, offset)} />
   const res = preview.result!
   if (res.error) return <ErrorState reason={res.reason ?? 'preview failed'} onRetry={() => runPreview(nodeId, offset)} />
-  const done = run?.status?.status === 'done' ? run.status : undefined
+  const isMetric = node?.type === 'metric'
+  const isChart = node?.type === 'chart'
+  const artifactPresentation: ArtifactPresentation | undefined = isChart
+    ? {
+        kind: 'chart',
+        type: String(node?.data.config.chartType ?? 'bar'),
+        xLabel: String(node?.data.config.x ?? 'x'),
+        yLabel: String(node?.data.config.agg && node?.data.config.agg !== 'none'
+          ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})`
+          : (node?.data.config.y ?? 'y')),
+      }
+    : isMetric ? { kind: 'metric' } : undefined
+  const resultModeToggle = done?.outputUri
+    ? <ResultModeToggle mode={resultMode} onChange={setResultMode} />
+    : undefined
   if (res.notPreviewable) {
     // P0-UX-01: a sample can't preview this node (an aggregate/sort), but a full run MATERIALIZES the
     // result to a durable artifact — so if this node's last run is done and produced one, show the exact
     // Full result (restorable after a restart via the persisted run status) instead of a dead end.
-    if (done?.outputUri) return <FullResult uri={done.outputUri} total={done.totalRows ?? null} />
-    return <NotPreviewable reason={res.reason ?? 'needs a full pass'} onRun={() => requestRun(nodeId)} />
+    if (done?.outputUri && resultMode === 'full') {
+      return <FullResult uri={done.outputUri} total={done.totalRows ?? null}
+        modeToggle={resultModeToggle} presentation={artifactPresentation} />
+    }
+    return <NotPreviewable reason={res.reason ?? 'needs a full pass'}
+      onRun={() => requestRun(nodeId)} modeToggle={resultModeToggle} />
   }
   if (done?.outputUri && resultMode === 'full') {
     return <FullResult uri={done.outputUri} total={done.totalRows ?? null}
-      modeToggle={<ResultModeToggle mode="full" onChange={setResultMode} />} />
+      modeToggle={resultModeToggle} presentation={artifactPresentation} />
   }
 
   const columns = res.columns
   const caps = capabilitiesFor(columns as ColumnSchema[])
   // gate the scalar/chart views on the NODE TYPE, not a column-name heuristic — otherwise any
   // 2-column dataset that happens to have columns named 'metric'+'value' was hijacked (F42).
-  const isMetric = node?.type === 'metric'
-  const isChart = node?.type === 'chart'
   const special = isMetric || isChart
   const tabs = [{ id: 'rows', label: 'Rows' }, ...caps.map((c) => ({ id: c.id, label: c.label })), { id: 'stats', label: 'Stats' }]
   // a refresh may drop the capability whose tab was selected — fall back to Rows
@@ -83,7 +105,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
           </button>
         )}
         {done?.outputUri && detail == null && (
-          <ResultModeToggle mode="sample" onChange={setResultMode} />
+          resultModeToggle
         )}
         <span className="flex-1" />
         {!special && detail == null && activeTab !== 'stats' && (
@@ -182,8 +204,8 @@ const fmtNum = (n: number) => n.toLocaleString(undefined, { maximumFractionDigit
 // cancellable job: every row is covered, while distinct remains approximate.
 function StatsView({ nodeId }: { nodeId: string }) {
   const doc = useStore((s) => s.doc)
-  const requestRun = useStore((s) => s.requestRun)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
+  const currentUserId = useStore((s) => s.currentUser?.id)
   const profileJob = useStore((s) => s.profileJobs[nodeId])
   const prepareFullProfile = useStore((s) => s.prepareFullProfile)
   const startFullProfile = useStore((s) => s.startFullProfile)
@@ -198,44 +220,65 @@ function StatsView({ nodeId }: { nodeId: string }) {
   }
   useEffect(() => { if (!full) loadSample() }, [nodeId, full])  // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => setFull(false), [nodeId])
-  const job = profileJob && profileJobIsCurrent(profileJob, doc, nodeId) ? profileJob : undefined
+  const job = currentUserId && profileJob?.principalId === currentUserId
+      && profileJobIsCurrent(profileJob, doc, nodeId)
+    ? profileJob
+    : undefined
   const selectMode = (v: boolean) => {
     setFull(v)
   }
   const toggle = (
     <div className="flex items-center gap-1 rounded-md border border-border p-0.5 text-[10px]">
       {([['sample', false], ['full dataset', true]] as const).map(([label, v]) => (
-        <button key={label} onClick={() => selectMode(v)} disabled={v && !canEdit}
-          title={v && !canEdit ? 'Editors can start full-dataset profile jobs' : undefined}
-          className={`rounded px-1.5 py-0.5 disabled:cursor-not-allowed disabled:opacity-50 ${full === v ? 'bg-muted font-semibold text-foreground' : 'text-muted-foreground'}`}>
+        <button key={label} onClick={() => selectMode(v)}
+          title={v && !canEdit ? 'View full-dataset profile results' : undefined}
+          className={`rounded px-1.5 py-0.5 ${full === v ? 'bg-muted font-semibold text-foreground' : 'text-muted-foreground'}`}>
           {label}
         </button>
       ))}
     </div>
   )
   if (full) {
-    if (!canEdit) return <FullProfilePrompt toggle={toggle} onEstimate={() => {}} disabled />
     if (!job || job.phase === 'cancelled') {
-      return <FullProfilePrompt toggle={toggle} onEstimate={() => prepareFullProfile(nodeId)} />
+      return <FullProfilePrompt toggle={toggle}
+        onEstimate={() => prepareFullProfile(nodeId)} disabled={!canEdit} />
     }
     if (job.phase === 'preflight') {
-      return <FullProfilePreflight job={job} toggle={toggle} onStart={() => startFullProfile(nodeId)} />
+      return canEdit
+        ? <FullProfilePreflight job={job} toggle={toggle} onStart={() => startFullProfile(nodeId)} />
+        : <FullProfilePrompt toggle={toggle} onEstimate={() => {}} disabled />
+    }
+    if (job.phase === 'verifying') {
+      const activeRun = job.status?.status === 'queued' || job.status?.status === 'running'
+      return <FullProfileProgress job={job} toggle={toggle}
+        onCancel={canEdit && job.canCancel === true && activeRun ? () => cancelFullProfile(nodeId) : undefined} />
     }
     if (job.phase === 'estimating' || job.phase === 'queued' || job.phase === 'running' || job.phase === 'cancelling') {
-      return <FullProfileProgress job={job} toggle={toggle} onCancel={() => cancelFullProfile(nodeId)} />
+      return <FullProfileProgress job={job} toggle={toggle}
+        onCancel={canEdit ? () => cancelFullProfile(nodeId) : undefined} />
     }
     if (job.phase === 'failed') {
-      return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState reason={job.error ?? 'full profile failed'} onRetry={() => prepareFullProfile(nodeId)} /></div>
+      const activeRun = job.status && (job.status.status === 'queued' || job.status.status === 'running')
+      const retry = job.submissionUnresolved
+        ? () => startFullProfile(nodeId)
+        : () => prepareFullProfile(nodeId)
+      return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState
+        title={job.identityVerified === false ? 'Full profile not verified' : 'Full profile failed'}
+        reason={job.error ?? 'full profile failed'}
+        onRetry={canEdit ? retry : undefined}
+        onCancel={canEdit && activeRun ? () => cancelFullProfile(nodeId) : undefined} /></div>
     }
-    const res = job.status?.profile
-    if (!res) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState reason="full profile completed without statistics" onRetry={() => prepareFullProfile(nodeId)} /></div>
+    const res = job.identityVerified === false ? undefined : job.status?.profile
+    if (!res) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState title="Full profile failed" reason="full profile completed without statistics" onRetry={canEdit ? () => prepareFullProfile(nodeId) : undefined} /></div>
     return <ProfileTable res={res} toggle={toggle} />
   }
   if (st.loading) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><Skeleton /></div>
-  if (st.err) return <ErrorState reason={st.err} onRetry={loadSample} />
+  if (st.err) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState reason={st.err} onRetry={loadSample} /></div>
   const res = st.res!
-  if (res.error) return <ErrorState reason={res.reason ?? 'profile failed'} onRetry={loadSample} />
-  if (res.notPreviewable) return <NotPreviewable reason={res.reason ?? 'needs a full pass'} onRun={() => requestRun(nodeId)} />
+  if (res.error) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState reason={res.reason ?? 'profile failed'} onRetry={loadSample} /></div>
+  if (res.notPreviewable) return <NotPreviewable
+    reason={`${res.reason ?? 'Sample statistics need a full pass.'} Switch to full dataset to estimate a whole-dataset profile.`}
+    modeToggle={toggle} />
   return <ProfileTable res={res} toggle={toggle} />
 }
 
@@ -245,7 +288,9 @@ function FullProfilePrompt({ toggle, onEstimate, disabled = false }: {
   return (
     <div className="px-5 py-6 text-center">
       <div className="mb-1 text-[12px] font-semibold text-foreground">Whole-dataset profile</div>
-      <p className="mb-3 text-[11px] text-muted-foreground">Estimate the scan first. Starting it is a separate choice.</p>
+      <p className="mb-3 text-[11px] text-muted-foreground">
+        {disabled ? 'Editors can estimate and start full-dataset profile jobs.' : 'Estimate the scan first. Starting it is a separate choice.'}
+      </p>
       <div className="flex items-center justify-center gap-2">
         <button onClick={onEstimate} disabled={disabled}
           className="rounded-md bg-primary px-2.5 py-1 text-[11px] font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50">
@@ -258,9 +303,14 @@ function FullProfilePrompt({ toggle, onEstimate, disabled = false }: {
 }
 
 function profileEstimateLabel(estimate?: { rows: number | null; bytes?: number | null }): string {
-  if (estimate?.rows != null) return `Estimated ${estimate.rows.toLocaleString()} rows`
-  if (estimate?.bytes != null) return `Estimated ${estimate.bytes.toLocaleString()} bytes`
-  return 'Size estimate unavailable'
+  const rows = estimate?.rows == null ? 'rows unknown' : `${estimate.rows.toLocaleString()} rows`
+  if (estimate?.bytes == null) return `Estimated ${rows} · size unknown`
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
+  const unit = estimate.bytes > 0
+    ? Math.min(Math.floor(Math.log(estimate.bytes) / Math.log(1024)), units.length - 1)
+    : 0
+  const bytes = (estimate.bytes / 1024 ** unit).toLocaleString(undefined, { maximumFractionDigits: 1 })
+  return `Estimated ${rows} · ${bytes} ${units[unit]}`
 }
 
 function FullProfilePreflight({ job, toggle, onStart }: {
@@ -288,21 +338,29 @@ function FullProfilePreflight({ job, toggle, onStart }: {
 }
 
 function FullProfileProgress({ job, toggle, onCancel }: {
-  job: { phase: string; estimate?: { rows: number | null; bytes?: number | null } }; toggle: ReactNode; onCancel: () => void
+  job: { phase: string; estimate?: { rows: number | null; bytes?: number | null }; error?: string }; toggle: ReactNode; onCancel?: () => void
 }) {
   const estimate = profileEstimateLabel(job.estimate)
   const label = job.phase === 'estimating' ? 'Estimating full profile…'
     : job.phase === 'queued' ? 'Full profile queued…'
-      : job.phase === 'cancelling' ? 'Cancelling full profile…' : 'Full profile running…'
+      : job.phase === 'cancelling' ? 'Cancelling full profile…'
+        : job.phase === 'verifying' ? 'Verifying recovered full profile…' : 'Full profile running…'
   return (
     <div className="px-5 py-6 text-center">
       <div className="mb-1 text-[12px] font-semibold text-foreground">{label}</div>
-      <p className="mb-3 text-[11px] text-muted-foreground">{estimate} · whole-dataset scan; distinct counts are approximate</p>
+      <p className="mb-3 text-[11px] text-muted-foreground">
+        {job.phase === 'verifying'
+          ? 'Statistics remain hidden until verification completes.'
+          : `${estimate} · whole-dataset scan; distinct counts are approximate`}
+      </p>
+      {job.error && <p role="status" className="mx-auto mb-3 max-w-[380px] text-[11px] text-destructive">{job.error}</p>}
       <div className="flex items-center justify-center gap-2">
-        <button onClick={onCancel} disabled={job.phase === 'cancelling' || job.phase === 'estimating'}
-          className="rounded-md border border-border px-2.5 py-1 text-[11px] font-semibold text-foreground disabled:cursor-not-allowed disabled:opacity-50">
-          Cancel
-        </button>
+        {onCancel && (
+          <button onClick={onCancel} disabled={job.phase === 'cancelling' || job.phase === 'estimating'}
+            className="rounded-md border border-border px-2.5 py-1 text-[11px] font-semibold text-foreground disabled:cursor-not-allowed disabled:opacity-50">
+            Cancel
+          </button>
+        )}
         {toggle}
       </div>
     </div>
@@ -552,23 +610,35 @@ function Skeleton() {
   )
 }
 
-function ErrorState({ reason, onRetry }: { reason: string; onRetry: () => void }) {
+function ErrorState({ title = 'Preview failed', reason, onRetry, onCancel }: {
+  title?: string; reason: string; onRetry?: () => void; onCancel?: () => void
+}) {
   return (
     <div className="dp-dark px-5 py-6 text-center text-muted-foreground">
       <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-destructive/10 text-destructive">
         <Icon name="close" size={18} />
       </div>
-      <div className="text-[13px] font-semibold text-destructive">Preview failed</div>
+      <div className="text-[13px] font-semibold text-destructive">{title}</div>
       <div className="dp-mono mx-auto mt-2 max-w-[380px] whitespace-pre-wrap rounded-lg border border-destructive/20 bg-destructive/10 p-2.5 text-left text-[11px] leading-normal text-muted-foreground">{reason}</div>
-      <Button variant="outline" size="sm" onClick={onRetry} className="mt-3.5">Retry</Button>
+      {(onRetry || onCancel) && <div className="mt-3.5 flex items-center justify-center gap-2">
+        {onCancel && <Button variant="outline" size="sm" onClick={onCancel}>Cancel run</Button>}
+        {onRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}
+      </div>}
     </div>
   )
 }
 
 // P0-UX-01: page the DURABLE artifact a full run materialized for a not-sample-previewable target
 // (an aggregate/sort). Read back over the normal sample-by-uri API, so it's restorable after a restart.
-export function FullResult({ uri, total, modeToggle }: {
-  uri: string; total: number | null; modeToggle?: React.ReactNode
+type ArtifactPresentation =
+  | { kind: 'chart'; type: string; xLabel: string; yLabel: string }
+  | { kind: 'metric' }
+
+export function FullResult({ uri, total, modeToggle, presentation }: {
+  uri: string
+  total: number | null
+  modeToggle?: React.ReactNode
+  presentation?: ArtifactPresentation
 }) {
   const [data, setData] = useState<import('../types/api').SampleResult | null>(null)
   const [err, setErr] = useState<(Error & { status?: number }) | null>(null)
@@ -587,13 +657,21 @@ export function FullResult({ uri, total, modeToggle }: {
   }, [uri, offset, retry])
   if (err) return <ArtifactUnavailable error={err} modeToggle={modeToggle}
     onRetry={() => setRetry((n) => n + 1)} />
-  if (!data) return <Skeleton />
+  if (!data) return <div className="dp-dark text-foreground">
+    <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
+      <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">Full result</span>
+      {modeToggle}
+    </div>
+    <Skeleton />
+  </div>
   const cols = (data.columns ?? []) as ColumnSchema[]
   const rows = data.rows ?? []
   // A write run's total is rows written by that attempt; an append artifact can already contain more.
   // Prefer the count measured from the artifact being viewed, using run history only as a fallback.
   const reportedTotal = data.rowCount ?? total ?? null
-  const more = !!data.hasMore || (reportedTotal != null && reportedTotal > offset + rows.length)
+  const more = !!data.hasMore
+  const viewLimitReached = !!data.truncated && !more
+    && reportedTotal != null && reportedTotal > offset + rows.length
   const page = (next: number) => { setData(null); setDetail(null); setOffset(Math.max(0, next)) }
   return (
     <div className="dp-dark text-foreground">
@@ -604,6 +682,12 @@ export function FullResult({ uri, total, modeToggle }: {
           rows {rows.length ? offset + 1 : 0}–{offset + rows.length}
           {reportedTotal != null ? ` of ${reportedTotal.toLocaleString()}` : ''}
         </span>
+        {viewLimitReached && (
+          <span className="rounded bg-amber-100 px-1.5 py-px text-[10px] font-semibold text-amber-800 dark:bg-amber-500/15 dark:text-amber-300"
+            title="This interactive view reached its server read limit. Export actions still include only the current page.">
+            Interactive view limit reached
+          </span>
+        )}
         {detail != null && (
           <button onClick={() => setDetail(null)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-semibold text-primary">
             <Icon name="chevronLeft" size={12} /> Row {offset + detail + 1}
@@ -617,12 +701,17 @@ export function FullResult({ uri, total, modeToggle }: {
           </span>
         )}
         {detail == null && rows.length > 0 && (
-          <ExportCluster columns={cols} rows={rows} name="result" truncated={more} pushToast={pushToast} />
+          <ExportCluster columns={cols} rows={rows} name="result" truncated={!!data.truncated} pushToast={pushToast} />
         )}
       </div>
-      {detail != null && rows[detail]
-        ? <RowDetail columns={cols} row={rows[detail]} />
-        : <RowsTable columns={cols} rows={rows} onRowClick={setDetail} />}
+      {presentation?.kind === 'chart'
+        ? <ChartView rows={rows} type={presentation.type}
+          xLabel={presentation.xLabel} yLabel={presentation.yLabel} />
+        : presentation?.kind === 'metric'
+          ? <MetricValue rows={rows} />
+          : detail != null && rows[detail]
+            ? <RowDetail columns={cols} row={rows[detail]} />
+            : <RowsTable columns={cols} rows={rows} onRowClick={setDetail} />}
     </div>
   )
 }
@@ -653,15 +742,20 @@ function ArtifactUnavailable({ error, onRetry, modeToggle }: {
   )
 }
 
-function NotPreviewable({ reason, onRun }: { reason: string; onRun: () => void }) {
+function NotPreviewable({ reason, onRun, modeToggle }: {
+  reason: string
+  onRun?: () => void
+  modeToggle?: ReactNode
+}) {
   return (
     <div className="px-5 py-7 text-center text-muted-foreground">
+      {modeToggle && <div className="mb-3 flex justify-center">{modeToggle}</div>}
       <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
         <Icon name="power" size={18} />
       </div>
       <div className="text-[13px] font-semibold text-foreground">Not sample-previewable</div>
       <div className="mx-auto mt-[5px] max-w-[320px] text-[11.5px] leading-normal">{reason}</div>
-      <Button variant="outline" size="sm" onClick={onRun} className="mt-3.5">Run a full pass →</Button>
+      {onRun && <Button variant="outline" size="sm" onClick={onRun} className="mt-3.5">Run a full pass →</Button>}
     </div>
   )
 }

@@ -8,12 +8,14 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+import types
 
 import duckdb
 import pytest
 
-from hub.models import Graph
+from hub.models import Graph, RunStatus
 from hub.profile_jobs import ProfileProcessRunner
 
 
@@ -42,7 +44,7 @@ def _isolated_metadata(path):
     metadb._engine = metadb._Session = None
     metadb.init_db()
     try:
-        yield
+        yield metadb
     finally:
         if metadb._engine is not None:
             metadb._engine.dispose()
@@ -78,6 +80,15 @@ def _wait_for_supervisor_cleanup(runner: ProfileProcessRunner, run_id: str) -> N
     raise AssertionError(f"profile supervisor retained a reaped child: {run_id}")
 
 
+def _wait_until(predicate, message: str, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError(message)
+
+
 def _fake_subrun(monkeypatch, source: str):
     """Replace only the one-shot command while retaining a real OS Popen/process."""
     real_popen = subprocess.Popen
@@ -104,6 +115,26 @@ def _runner(tmp_path, *, deadline_s: float = 10.0) -> ProfileProcessRunner:
         str(tmp_path / "data"),
         deadline_s=deadline_s,
     )
+
+
+def _admit_profile(metadb, graph: Graph, run_id: str, plan_digest: str) -> int:
+    with metadb.session() as db:
+        if db.get(metadb.User, "profile-owner") is None:
+            db.add(metadb.User(id="profile-owner", name="Profile owner"))
+        if db.get(metadb.Canvas, graph.id) is None:
+            db.add(metadb.Canvas(
+                id=graph.id, owner_id="profile-owner", name="Profile process",
+                version=1, doc="{}",
+            ))
+    token, attempt_order = metadb.preallocate_profile_run_owner(
+        run_id, "profile-owner", graph.id, graph.id, "source", plan_digest,
+    )
+    won, _status = metadb.consume_profile_run_preallocation(
+        run_id, token, canvas_id=graph.id, kernel_id="profile-kernel",
+        target_node_id="source", plan_digest=plan_digest,
+    )
+    assert won
+    return attempt_order
 
 
 def test_full_profile_roundtrips_through_real_subrun_and_reaps(tmp_path):
@@ -135,6 +166,450 @@ def test_full_profile_roundtrips_through_real_subrun_and_reaps(tmp_path):
     assert final.request_id == "request-real-child"
     _wait_for_supervisor_cleanup(runner, started.run_id)
     assert started.run_id not in runner._procs
+
+
+def test_live_profile_heartbeats_prevent_false_stall_without_fake_progress(
+        tmp_path, monkeypatch):
+    script = """
+import json, os, sys, time
+job = json.load(open(sys.argv[1]))
+payload = {"run_id": "child", "status": "running", "job_type": "profile",
+           "rows_processed": 0, "ms": 0, "placement": "local", "per_node": [],
+           "progress": None}
+tmp = job["statusFile"] + ".tmp"
+json.dump(payload, open(tmp, "w")); os.replace(tmp, job["statusFile"])
+while not os.path.exists(job["cancelFile"]): time.sleep(0.01)
+"""
+    _processes, _environments = _fake_subrun(monkeypatch, script)
+    monkeypatch.setenv("DP_PROFILE_HEARTBEAT_S", "0.05")
+    monkeypatch.setattr("hub.subprocess_runner._CANCEL_GRACE_S", 0.01)
+
+    with _isolated_metadata(tmp_path / "profile-heartbeat.db") as metadb:
+        graph = _graph()
+        run_id = "profile-heartbeat"
+        digest = _digest("heartbeat")
+        attempt_order = _admit_profile(metadb, graph, run_id, digest)
+        runner = _runner(tmp_path)
+        running_publications = 0
+        transient_failed = False
+
+        def persist(observed_graph, status):
+            nonlocal running_publications, transient_failed
+            if status.status == "running":
+                running_publications += 1
+                if running_publications == 2 and not transient_failed:
+                    transient_failed = True
+                    raise OSError("transient heartbeat metadata outage")
+            metadb.save_run_state(
+                status.run_id, status.model_dump(), canvas_id=observed_graph.id,
+                kernel_id="profile-kernel",
+            )
+
+        runner.on_status = persist
+        started = runner.run(
+            graph, "source", plan_digest=digest,
+            profile_attempt_order=attempt_order, run_id=run_id,
+        )
+        _wait_until(
+            lambda: running_publications >= 4,
+            "unchanged running profile did not publish durable heartbeats",
+        )
+        time.sleep(0.12)
+
+        durable = metadb.get_run_state(run_id)
+        assert durable is not None and durable["status"] == "running"
+        assert durable["progress"] is None
+        assert metadb.run_stalled(run_id, 0.18) is False
+        assert transient_failed is True
+
+        runner.cancel(started.run_id)
+        assert _wait(runner, started.run_id).status == "cancelled"
+
+    _wait_for_supervisor_cleanup(runner, started.run_id)
+
+
+def test_full_profile_fails_closed_without_posix_group_containment(tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    monkeypatch.setattr("hub.profile_jobs.os.name", "nt")
+
+    with pytest.raises(RuntimeError, match="POSIX process-group containment"):
+        runner.run(
+            _graph(), "source", plan_digest=_digest("non-posix"),
+            profile_attempt_order=1, run_id="profile-non-posix",
+        )
+
+    assert runner.runs == {}
+    assert runner._procs == {}
+
+
+def test_reaped_terminal_retries_transient_db_publication_to_projection(
+        tmp_path, monkeypatch):
+    script = """
+import json, os, sys
+job = json.load(open(sys.argv[1]))
+payload = {
+    "run_id": "child", "status": "done", "job_type": "profile",
+    "rows_processed": 2, "total_rows": 2, "ms": 1, "placement": "local",
+    "per_node": [], "progress": 1.0,
+    "profile": {"columns": [], "row_count": 2, "sampled": False,
+                "not_previewable": False, "error": False}
+}
+tmp = job["statusFile"] + ".tmp"
+json.dump(payload, open(tmp, "w")); os.replace(tmp, job["statusFile"])
+"""
+    _processes, _environments = _fake_subrun(monkeypatch, script)
+    with _isolated_metadata(tmp_path / "terminal-retry.db") as metadb:
+        graph = _graph()
+        run_id = "profile-terminal-retry"
+        plan_digest = _digest("terminal-retry")
+        attempt_order = _admit_profile(metadb, graph, run_id, plan_digest)
+        runner = _runner(tmp_path)
+        runner.publication_retry_wait = lambda _delay: None
+        persisted = threading.Event()
+        completed = threading.Event()
+        terminal_calls = 0
+
+        def save_status(observed_graph, status):
+            nonlocal terminal_calls
+            if status.status in ("done", "failed", "cancelled"):
+                terminal_calls += 1
+                if terminal_calls == 1:
+                    raise OSError("transient terminal metadata failure")
+            metadb.save_run_state(
+                status.run_id, status.model_dump(), canvas_id=observed_graph.id,
+                kernel_id="profile-kernel",
+            )
+            if status.status in ("done", "failed", "cancelled"):
+                persisted.set()
+
+        runner.on_status = save_status
+        runner.on_complete = lambda *_args: completed.set()
+        started = runner.run(
+            graph, "source", plan_digest=plan_digest,
+            profile_attempt_order=attempt_order, run_id=run_id,
+        )
+        final = _wait(runner, started.run_id)
+        assert persisted.wait(timeout=5)
+        assert completed.wait(timeout=5)
+
+        assert final.status == "done"
+        assert terminal_calls >= 2
+        assert metadb.get_run_state(run_id)["status"] == "done"
+        recovered = metadb.latest_profile_jobs(graph.id)[0]
+        assert recovered["run_id"] == run_id and recovered["status"] == "done"
+        assert recovered["profile_attempt_order"] == attempt_order
+
+
+def test_definitive_terminal_rejection_is_not_retried_or_completed(
+        tmp_path, monkeypatch):
+    from hub.metadb import RunStatePublicationRejected
+
+    runner = _runner(tmp_path)
+    runner.publication_retry_wait = lambda _delay: pytest.fail(
+        "definitive rejection must not retry")
+    publication_calls = 0
+    completion_calls = 0
+
+    def reject(_graph, _status):
+        nonlocal publication_calls
+        publication_calls += 1
+        raise RunStatePublicationRejected("owner fence rejected terminal")
+
+    def complete(*_args):
+        nonlocal completion_calls
+        completion_calls += 1
+
+    runner.on_complete = complete
+    status = runner.retain_terminal_failure(
+        _graph(),
+        RunStatus(
+            run_id="profile-rejected", status="failed", job_type="profile",
+            target_node_id="source", plan_digest=_digest("rejected"),
+            profile_attempt_order=1, placement="local", per_node=[],
+            error="pre-spawn failure",
+        ),
+        reject,
+    )
+    _wait_until(
+        lambda: status.run_id not in runner._terminal_persistence_pending,
+        "definitively rejected terminal remained pending",
+    )
+    runner._emit(_graph(), status)
+    time.sleep(0.02)
+
+    assert publication_calls == 1
+    assert completion_calls == 0
+
+
+def test_pending_terminal_survives_bounded_eviction_until_publication(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr("hub.subprocess_runner._MAX_RUNS", 2)
+    runner = _runner(tmp_path)
+    publication_entered = threading.Event()
+    publication_release = threading.Event()
+
+    def blocked_publication(_graph, _status):
+        publication_entered.set()
+        assert publication_release.wait(timeout=5)
+
+    terminal = RunStatus(
+        run_id="profile-pending-eviction", status="failed", job_type="profile",
+        target_node_id="source", plan_digest=_digest("pending-eviction"),
+        profile_attempt_order=1, placement="local", per_node=[], error="failed",
+    )
+    retained = runner.retain_terminal_failure(_graph(), terminal, blocked_publication)
+    assert publication_entered.wait(timeout=5)
+    with runner._lock:
+        for index in range(4):
+            run_id = f"live-{index}"
+            runner.runs[run_id] = RunStatus(
+                run_id=run_id, status="running", placement="local", per_node=[])
+        runner._evict()
+        assert runner.runs[retained.run_id].model_dump() == retained.model_dump()
+        assert retained.run_id in runner._profile_identities
+        assert retained.run_id in runner._terminal_persistence_pending
+
+    publication_release.set()
+    _wait_until(
+        lambda: retained.run_id not in runner._terminal_persistence_pending,
+        "published terminal remained pending",
+    )
+    _wait_until(
+        lambda: retained.run_id not in runner.runs,
+        "published terminal did not resume bounded eviction",
+    )
+
+
+@pytest.mark.parametrize("mode", ["done", "failed", "cancelled"])
+def test_profile_terminals_enter_existing_history_once(tmp_path, monkeypatch, mode):
+    from sqlalchemy import func, select
+
+    from hub import metadb
+    from hub.deps import _persist_run
+
+    if mode == "done":
+        script = """
+import json, os, sys
+job = json.load(open(sys.argv[1]))
+payload = {
+    "run_id": "child", "status": "done", "job_type": "profile",
+    "rows_processed": 3, "total_rows": 3, "ms": 1, "placement": "local",
+    "per_node": [], "progress": 1.0,
+    "profile": {"columns": [], "row_count": 3, "sampled": False,
+                "not_previewable": False, "error": False}
+}
+tmp = job["statusFile"] + ".tmp"
+json.dump(payload, open(tmp, "w")); os.replace(tmp, job["statusFile"])
+"""
+    elif mode == "failed":
+        script = "import sys; sys.exit(9)"
+    else:
+        script = "import time; time.sleep(10)"
+        monkeypatch.setattr("hub.subprocess_runner._CANCEL_GRACE_S", 0.01)
+    _processes, _environments = _fake_subrun(monkeypatch, script)
+
+    with _isolated_metadata(tmp_path / f"history-{mode}.db"):
+        graph = _graph()
+        run_id = f"profile-history-{mode}"
+        plan_digest = _digest(f"history-{mode}")
+        attempt_order = _admit_profile(metadb, graph, run_id, plan_digest)
+        runner = _runner(tmp_path)
+        telemetry = []
+        deps = types.SimpleNamespace(telemetry_sinks=[telemetry.append])
+        runner.on_status = lambda observed_graph, status: metadb.save_run_state(
+            status.run_id, status.model_dump(), canvas_id=observed_graph.id,
+            kernel_id="profile-kernel",
+        )
+        runner.on_complete = lambda g, target, status: _persist_run(
+            deps, g, target, status)
+        started = runner.run(
+            graph, "source", plan_digest=plan_digest,
+            profile_attempt_order=attempt_order, run_id=run_id,
+        )
+        if mode == "cancelled":
+            runner.cancel(started.run_id)
+        final = _wait(runner, started.run_id)
+        _wait_until(
+            lambda: started.run_id in runner._completion_done,
+            "profile completion did not reach history",
+        )
+
+        with metadb.session() as session:
+            records = session.scalar(select(func.count()).select_from(
+                metadb.RunRecord).where(
+                    metadb.RunRecord.canvas_id == graph.id,
+                    metadb.RunRecord.run_id == run_id,
+                ))
+            record = session.scalar(select(metadb.RunRecord).where(
+                metadb.RunRecord.canvas_id == graph.id,
+                metadb.RunRecord.run_id == run_id,
+            ))
+        assert records == 1
+        assert record is not None and record.status == mode
+        assert len(telemetry) == 1 and telemetry[0]["status"] == mode
+        assert final.status == mode
+
+
+def test_profile_history_retry_is_idempotent_after_commit_unknown(tmp_path, monkeypatch):
+    from sqlalchemy import func, select
+
+    from hub import metadb
+    from hub.deps import _persist_run
+
+    with _isolated_metadata(tmp_path / "history-retry.db"):
+        graph = _graph()
+        run_id = "profile-history-retry"
+        plan_digest = _digest("history-retry")
+        attempt_order = _admit_profile(metadb, graph, run_id, plan_digest)
+        runner = _runner(tmp_path)
+        runner.publication_retry_wait = lambda _delay: None
+        telemetry = []
+        deps = types.SimpleNamespace(telemetry_sinks=[telemetry.append])
+        real_record_run = metadb.record_run
+        history_calls = 0
+
+        def commit_unknown(**kwargs):
+            nonlocal history_calls
+            history_calls += 1
+            result = real_record_run(**kwargs)
+            if history_calls == 1:
+                raise OSError("history commit acknowledgement lost")
+            return result
+
+        monkeypatch.setattr(metadb, "record_run", commit_unknown)
+        runner.on_complete = lambda g, target, status: _persist_run(
+            deps, g, target, status)
+        status = RunStatus(
+            run_id=run_id, status="failed", job_type="profile",
+            target_node_id="source", plan_digest=plan_digest,
+            profile_attempt_order=attempt_order, placement="local", per_node=[],
+            error="pre-spawn failure",
+        )
+        runner.retain_terminal_failure(
+            graph, status,
+            lambda observed_graph, observed: metadb.save_run_state(
+                observed.run_id, observed.model_dump(), canvas_id=observed_graph.id,
+                kernel_id="profile-kernel",
+            ),
+        )
+        _wait_until(
+            lambda: run_id in runner._completion_done,
+            "profile history retry did not complete",
+        )
+
+        with metadb.session() as session:
+            records = session.scalar(select(func.count()).select_from(
+                metadb.RunRecord).where(
+                    metadb.RunRecord.canvas_id == graph.id,
+                    metadb.RunRecord.run_id == run_id,
+                ))
+        assert history_calls == 2
+        assert records == 1
+        assert len(telemetry) == 1 and telemetry[0]["run_id"] == run_id
+
+
+def test_supervisor_exception_retries_failed_terminal_publication(
+        tmp_path, monkeypatch):
+    script = "import time; time.sleep(10)"
+    processes, _environments = _fake_subrun(monkeypatch, script)
+    with _isolated_metadata(tmp_path / "supervisor-terminal-retry.db") as metadb:
+        graph = _graph()
+        run_id = "profile-supervisor-terminal-retry"
+        plan_digest = _digest("supervisor-terminal-retry")
+        attempt_order = _admit_profile(metadb, graph, run_id, plan_digest)
+        runner = _runner(tmp_path)
+        runner.publication_retry_wait = lambda _delay: None
+        persisted = threading.Event()
+        terminal_calls = 0
+
+        def crash_supervisor(*_args, **_kwargs):
+            raise RuntimeError("simulated profile supervisor fault")
+
+        monkeypatch.setattr(runner, "_watch_inner", crash_supervisor)
+
+        def save_status(observed_graph, status):
+            nonlocal terminal_calls
+            if status.status in ("done", "failed", "cancelled"):
+                terminal_calls += 1
+                if terminal_calls == 1:
+                    raise OSError("transient supervisor terminal metadata failure")
+            metadb.save_run_state(
+                status.run_id, status.model_dump(), canvas_id=observed_graph.id,
+                kernel_id="profile-kernel",
+            )
+            if status.status in ("done", "failed", "cancelled"):
+                persisted.set()
+
+        runner.on_status = save_status
+        started = runner.run(
+            graph, "source", plan_digest=plan_digest,
+            profile_attempt_order=attempt_order, run_id=run_id,
+        )
+        final = _wait(runner, started.run_id)
+        assert persisted.wait(timeout=5)
+
+        assert final.status == "failed"
+        assert final.error == "execution supervisor failed"
+        assert terminal_calls >= 2
+        assert processes[0].returncode is not None
+        assert metadb.get_run_state(run_id)["status"] == "failed"
+        assert metadb.latest_profile_jobs(graph.id)[0]["status"] == "failed"
+
+
+def test_late_profile_terminal_rejected_after_dead_kernel_fence(
+        tmp_path):
+    from sqlalchemy import func, select
+
+    from hub import metadb
+
+    with _isolated_metadata(tmp_path / "late-terminal-fence.db"):
+        graph = _graph()
+        run_id = "profile-late-after-reaper"
+        plan_digest = _digest("late-after-reaper")
+        attempt_order = _admit_profile(metadb, graph, run_id, plan_digest)
+        metadb.save_run_state(
+            run_id,
+            RunStatus(
+                run_id=run_id, status="running", job_type="profile",
+                target_node_id="source", plan_digest=plan_digest,
+                profile_attempt_order=attempt_order, placement="local", per_node=[],
+            ).model_dump(),
+            canvas_id=graph.id, kernel_id="profile-kernel",
+        )
+        assert metadb.reap_orphaned_runs(only_kernel_runs=True) == 1
+        assert metadb.get_run_state(run_id)["status"] == "failed"
+
+        runner = _runner(tmp_path)
+        completion_calls = 0
+
+        def complete(*_args):
+            nonlocal completion_calls
+            completion_calls += 1
+
+        runner.on_status = lambda observed_graph, status: metadb.save_run_state(
+            status.run_id, status.model_dump(), canvas_id=observed_graph.id,
+            kernel_id="profile-kernel",
+        )
+        runner.on_complete = complete
+        late_done = RunStatus(
+            run_id=run_id, status="done", job_type="profile",
+            target_node_id="source", plan_digest=plan_digest,
+            profile_attempt_order=attempt_order, placement="local", per_node=[],
+        )
+        runner._complete(graph, "source", late_done)
+        runner._emit(graph, late_done)
+        _wait_until(
+            lambda: run_id in runner._terminal_publication_rejected,
+            "late terminal did not observe the permanent fence rejection",
+        )
+
+        assert completion_calls == 0
+        assert metadb.get_run_state(run_id)["status"] == "failed"
+        assert metadb.latest_profile_jobs(graph.id)[0]["status"] == "failed"
+        with metadb.session() as session:
+            history = session.scalar(select(func.count()).select_from(
+                metadb.RunRecord).where(metadb.RunRecord.run_id == run_id))
+        assert history == 0
 
 
 def test_managed_source_parent_lease_spans_real_child_reap_without_child_reacquire(
@@ -336,6 +811,81 @@ while True:
     terminal_codes = [code for state, code in terminal_observations
                       if state in ("done", "failed", "cancelled")]
     assert terminal_codes and all(code is not None for code in terminal_codes)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group containment")
+def test_cancel_stops_and_reaps_profile_grandchild_side_effects(tmp_path, monkeypatch):
+    marker = tmp_path / "profile-grandchild-cancel-side-effect"
+    grandchild = f"""
+import os, time
+while True:
+    with open({str(marker)!r}, "a") as output:
+        output.write("x"); output.flush(); os.fsync(output.fileno())
+    time.sleep(0.01)
+"""
+    script = f"""
+import json, os, subprocess, sys, time
+job = json.load(open(sys.argv[1]))
+subprocess.Popen([sys.executable, "-c", {grandchild!r}])
+payload = {{"run_id": "child", "status": "running", "job_type": "profile",
+           "rows_processed": 0, "ms": 0, "placement": "local", "per_node": []}}
+tmp = job["statusFile"] + ".tmp"
+json.dump(payload, open(tmp, "w")); os.replace(tmp, job["statusFile"])
+while True: time.sleep(1)
+"""
+    processes, _environments = _fake_subrun(monkeypatch, script)
+    monkeypatch.setattr("hub.subprocess_runner._CANCEL_GRACE_S", 0.01)
+    runner = _runner(tmp_path)
+    started = runner.run(
+        _graph(), "source", plan_digest=_digest("grandchild-cancel"),
+        profile_attempt_order=1, run_id="profile-grandchild-cancel",
+    )
+    _wait_for(marker)
+
+    runner.cancel(started.run_id)
+    final = _wait(runner, started.run_id)
+    side_effect_size = marker.stat().st_size
+    time.sleep(0.2)
+
+    assert final.status == "cancelled"
+    assert runner.cancel_acknowledged(started.run_id)
+    assert processes[0].returncode is not None
+    assert marker.stat().st_size == side_effect_size
+    assert started.run_id not in runner._profile_process_groups
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group containment")
+def test_direct_child_exit_tears_down_lingering_profile_descendants(tmp_path, monkeypatch):
+    marker = tmp_path / "profile-grandchild-orphan-side-effect"
+    grandchild = f"""
+import os, time
+while True:
+    with open({str(marker)!r}, "a") as output:
+        output.write("x"); output.flush(); os.fsync(output.fileno())
+    time.sleep(0.01)
+"""
+    script = f"""
+import subprocess, sys, time
+subprocess.Popen([sys.executable, "-c", {grandchild!r}])
+time.sleep(0.1)
+"""
+    processes, _environments = _fake_subrun(monkeypatch, script)
+    runner = _runner(tmp_path)
+    started = runner.run(
+        _graph(), "source", plan_digest=_digest("grandchild-orphan"),
+        profile_attempt_order=1, run_id="profile-grandchild-orphan",
+    )
+    _wait_for(marker)
+
+    final = _wait(runner, started.run_id)
+    side_effect_size = marker.stat().st_size
+    time.sleep(0.2)
+
+    assert final.status == "failed"
+    assert "without a valid terminal status" in (final.error or "")
+    assert processes[0].returncode == 0
+    assert marker.stat().st_size == side_effect_size
+    assert started.run_id not in runner._profile_process_groups
 
 
 def test_child_cannot_self_report_parent_cancellation(tmp_path, monkeypatch):

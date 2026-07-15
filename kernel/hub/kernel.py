@@ -42,6 +42,7 @@ class PreviewBody(BaseModel):
 
 class ProfileJobBody(BaseModel):
     run_id: str
+    admission_token: str = Field(min_length=20, max_length=200)
     graph: dict
     node_id: str
     plan_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
@@ -123,6 +124,91 @@ def _cancel_owned_run(run_runner, profile_runner, run_id: str, persisted: dict |
     return run_runner.cancel(run_id)
 
 
+def _cancel_with_profile_admission(
+        run_runner, profile_runner, run_id: str, persisted: dict | None,
+        profile_admission_lock, refresh_persisted=None):
+    """Serialize a profile cancel with its consume->process-registration critical section."""
+    is_profile = (persisted or {}).get(
+        "job_type", (persisted or {}).get("jobType")) == "profile"
+    if is_profile:
+        with profile_admission_lock:
+            current = refresh_persisted() if refresh_persisted is not None else persisted
+            return _cancel_owned_run(run_runner, profile_runner, run_id, current)
+    return _cancel_owned_run(run_runner, profile_runner, run_id, persisted)
+
+
+def _start_admitted_profile(
+        *, profile_runner, graph, node_id: str, plan_digest: str, run_id: str,
+        request_id: str | None, profile_attempt_order: int, persist_failure) -> object:
+    """Register/spawn an admitted profile or terminalize a proven pre-spawn failure.
+
+    The caller holds the kernel's profile admission mutex. If a subprocess runner retains a possibly
+    live child after a post-Popen setup error, ``status`` remains available and is returned unchanged;
+    only a failure with no retained worker ownership is safe to publish as terminal.
+    """
+    from hub.models import PerNodeStatus, RunStatus
+
+    try:
+        return profile_runner.run(
+            graph, node_id, plan_digest=plan_digest,
+            profile_attempt_order=profile_attempt_order, run_id=run_id,
+            request_id=request_id,
+        )
+    except Exception as exc:
+        try:
+            return profile_runner.status(run_id)
+        except KeyError:
+            if getattr(exc, "reaped", True) is False:
+                raise RuntimeError(
+                    "profile supervisor lost ownership of a possibly live child") from exc
+            failed = RunStatus(
+                run_id=run_id, status="failed", job_type="profile",
+                target_node_id=node_id, plan_digest=plan_digest,
+                profile_attempt_order=profile_attempt_order, request_id=request_id,
+                per_node=[PerNodeStatus(
+                    node_id=node_id, status="failed", label="Full profile",
+                    error=f"{type(exc).__name__}: {exc}",
+                )],
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            retain_failure = getattr(profile_runner, "retain_terminal_failure", None)
+            if callable(retain_failure):
+                return retain_failure(graph, failed, persist_failure)
+            persist_failure(graph, failed)
+            return failed
+
+
+def _dispatch_profile_job(
+        *, body: ProfileJobBody, kernel_canvas: str, kernel_id: str,
+        profile_runner, profile_admission_lock, metadata) -> object:
+    """Validate the kernel's canvas, consume admission, then register exactly one profile child."""
+    from hub.models import Graph, RunStatus
+
+    graph = Graph(**body.graph)
+    if graph.id != kernel_canvas:
+        raise RuntimeError("profile graph does not match the kernel canvas")
+    with profile_admission_lock:
+        won, durable = metadata.consume_profile_run_preallocation(
+            body.run_id, body.admission_token, canvas_id=kernel_canvas, kernel_id=kernel_id,
+            target_node_id=body.node_id, plan_digest=body.plan_digest,
+        )
+        if not won:
+            return RunStatus(**durable)
+        profile_attempt_order = durable.get(
+            "profile_attempt_order", durable.get("profileAttemptOrder"))
+        if not isinstance(profile_attempt_order, int) or profile_attempt_order < 1:
+            raise RuntimeError("profile admission is missing its attempt order")
+        return _start_admitted_profile(
+            profile_runner=profile_runner, graph=graph, node_id=body.node_id,
+            plan_digest=body.plan_digest, run_id=body.run_id,
+            request_id=body.request_id,
+            profile_attempt_order=profile_attempt_order,
+            persist_failure=lambda _graph, st: metadata.save_run_state(
+                st.run_id, st.model_dump(), canvas_id=kernel_canvas,
+                kernel_id=kernel_id),
+        )
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="hub.kernel")
     p.add_argument("--canvas", required=True)
@@ -180,6 +266,10 @@ def main() -> None:
     profile_runner = deps.profile_runner
     profile_runner.on_status = lambda g, st: metadb.save_run_state(
         st.run_id, st.model_dump(), canvas_id=getattr(g, "id", None), kernel_id=kid)
+    # Serialize the narrow consume->runner-registration window with profile cancellation. Once consume
+    # commits, a cross-hub cancel waits until either the process is registered (and can be killed) or a
+    # proven pre-spawn failure is durable; accepted cancel intent is never answered from stale queued state.
+    _profile_admission_lock = threading.Lock()
 
     last_activity = [time.monotonic()]
     # In-process preview/sample-profile requests do not show up in either runner, so count them explicitly.
@@ -305,19 +395,21 @@ def main() -> None:
     def profile_job(body: ProfileJobBody, x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)
         last_activity[0] = time.monotonic()
-        graph = Graph(**body.graph)
-        _ensure_deps(graph)
-        return profile_runner.run(
-            graph, body.node_id, plan_digest=body.plan_digest, run_id=body.run_id,
-            request_id=body.request_id,
-        ).model_dump()
+        status = _dispatch_profile_job(
+            body=body, kernel_canvas=canvas, kernel_id=kid,
+            profile_runner=profile_runner,
+            profile_admission_lock=_profile_admission_lock, metadata=metadb,
+        )
+        return status.model_dump()
 
     @app.post("/cancel")
     def cancel(body: dict, x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)
         run_id = str(body["run_id"])
-        return _cancel_owned_run(
-            run_runner, profile_runner, run_id, metadb.get_run_state(run_id),
+        persisted = metadb.get_run_state(run_id)
+        return _cancel_with_profile_admission(
+            run_runner, profile_runner, run_id, persisted,
+            _profile_admission_lock, lambda: metadb.get_run_state(run_id),
         ).model_dump()
 
     @app.get("/status")

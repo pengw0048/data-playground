@@ -18,7 +18,7 @@ import pyarrow as pa
 from hub import db, graph as g, sandbox
 from hub.ir import resolve_config  # single source of built-in node config resolution (shared with the IR)
 from hub.models import PREVIEWABLE_MODES, ColumnSchema, Graph, GraphNode
-from hub.plugins.adapters import display_type
+from hub.plugins.adapters import BoundedPreviewUnsupported, display_type
 from hub.plugins.capabilities import tag_columns
 # The faithful-preview SQL gates parse with DuckDB's OWN parser (hub.sqlanalyze) rather than regex, so
 # detection matches execution exactly — handling quoting / string literals / a column named `input2` /
@@ -435,22 +435,6 @@ class BuildEngine:
         # route each incoming edge by its source port (multi-output nodes build {port -> Relation})
         return [self.relation(e.source, e.source_handle) for e in g.incoming(self.graph, node.id)]
 
-    def _faithful_inputs(self, node: GraphNode) -> list[Relation]:
-        """Build this node's inputs UNSAMPLED even during preview, so an op that must see all rows
-        (join / sort / vector-search) is FAITHFUL — the op's own LIMIT then makes it an efficient
-        top-N, bounded by the preview budget. A truncated-prefix version of these ops lies (a join of
-        two independent 2000-row prefixes finds few real matches; a sort/vector-search shows the top
-        of an arbitrary prefix, not the true top-K). Refuse honestly (P8) if a Python transform is
-        upstream — a 'full' eval would spill every row inside a preview."""
-        if self.full:
-            return self._inputs(node)
-        chain = g.upstream_chain(self.graph, node.id)
-        if any(n.type in ("transform", "notebook", "opaque", "loop") for n in chain):
-            raise NotPreviewable(node, f"{node.type} over a transformed input — needs a full pass")
-        full = BuildEngine(self.graph, self.resolve_adapter, self.registry, sample_k=None, full=True,
-                              node_builders=self.node_builders, node_specs=self.node_specs)
-        return [full.relation(e.source, e.source_handle) for e in g.incoming(self.graph, node.id)]
-
     def _view(self, rel: Relation, base: str = "v") -> str:
         # process-globally-unique name so concurrent engines never clobber each other's views
         name = db.unique_view(base)
@@ -534,11 +518,27 @@ class BuildEngine:
                 cols, pred = self._source_pushdown(node)  # prune at the source for adapters that can
                 if cols:
                     extra["columns"] = cols
-                if pred:
+                # An ordinary filter may have to scan every row to find `sample_k` matches. Without an
+                # adapter-declared index bound, preview caps the source first and filters that prefix.
+                if pred and self.full:
                     extra["predicate"] = pred
-            rel = self.resolve_adapter(uri).scan(uri, **extra)
-            if self.sample_k and not self.full:
+            adapter = self.resolve_adapter(uri)
+            if self.sample_k is not None and not self.full:
+                preview_scan = getattr(adapter, "preview_scan", None)
+                if not callable(preview_scan):
+                    raise NotPreviewable(
+                        node, f"source adapter '{getattr(adapter, 'name', type(adapter).__name__)}' "
+                        "does not guarantee a bounded preview — needs a full pass",
+                    )
+                try:
+                    rel = preview_scan(uri, limit=self.sample_k, **extra)
+                except BoundedPreviewUnsupported as exc:
+                    raise NotPreviewable(node, str(exc)) from exc
+                # Keep a relation-level cap as defence in depth; the source-level capability is the
+                # actual hard-bound contract and may not be replaced by this outer LIMIT.
                 rel = rel.limit(self.sample_k)
+            else:
+                rel = adapter.scan(uri, **extra)
             return rel
 
         inputs = self._inputs(node)
@@ -567,10 +567,11 @@ class BuildEngine:
             n = cfg.get("n")
             n = max(0, int(n if n is not None else (self.sample_k or 1000)))
             seed = int(cfg.get("seed", 42))
-            # a reservoir sample must draw from the FULL input — over the source-capped 2000-row preview
-            # prefix it would just be a sample of the first 2000 rows, not a real sample of the dataset.
-            # Build the input unsampled (like join/sort/window); the reservoir size bounds the work.
-            src = parent if self.full else self._faithful_inputs(node)[0]
+            # A faithful reservoir sample must inspect the full input. Its result cardinality is bounded,
+            # but its source scan is not, so only a durable full run may execute it.
+            if not self.full:
+                raise NotPreviewable(node, "reservoir sampling needs a full pass")
+            src = parent
             v = self._view(src, "s")
             return db.conn().sql(f"SELECT * FROM {v} USING SAMPLE {n} ROWS (reservoir, {seed})")
 
@@ -606,10 +607,11 @@ class BuildEngine:
             if not by:
                 return parent
             validate_fragment(FragmentKind.ORDER_BY, by, con=db.conn())
-            # the true top-N is over ALL rows, not a 2000-row prefix — sort the full input in preview
-            # too (the preview limit turns it into an efficient top-N)
-            src = parent if self.full else self._faithful_inputs(node)[0]
-            return src.order(by)
+            # The true top-N requires an unbounded input scan unless the source exposes a dedicated
+            # index-backed contract. The generic relation path has no such proof.
+            if not self.full:
+                raise NotPreviewable(node, "sort needs a full pass")
+            return parent.order(by)
 
         if t == "dedup":
             on = (cfg.get("on") or "").strip()
@@ -637,11 +639,11 @@ class BuildEngine:
             col = validate_identifier_alias(
                 (cfg.get("as") or "").strip() or "window", label="window output column"
             )
-            # a window fn ranks/aggregates ACROSS rows, so a sample would lie (rank within the sample, a
-            # partial SUM) — compute over the full input in preview too, like sort (the preview LIMIT then
-            # just truncates the display).
-            src = parent if self.full else self._faithful_inputs(node)[0]
-            v = self._view(src, "w")
+            # A window ranks/aggregates across the complete relation. Running it over a bounded prefix
+            # would lie; rebuilding its input unbounded inside preview would violate the preview budget.
+            if not self.full:
+                raise NotPreviewable(node, "window needs a full pass")
+            v = self._view(parent, "w")
             return db.conn().sql(
                 f"SELECT *, {expr} OVER ({over}) AS {quote_identifier(col)} FROM {quote_identifier(v)}"
             )
@@ -664,10 +666,11 @@ class BuildEngine:
                 agg = {"mean": "avg", "min": "min", "max": "max"}.get(method)
                 return f"COALESCE({q}, {agg}({q}) OVER ())" if agg else q
 
-            # mean/min/max impute from a WHOLE-COLUMN aggregate → a sample would compute the wrong fill
-            # value; run over the full input in preview (constant/zero are per-row, so stay on `parent`).
-            faithful = method in ("mean", "min", "max") and not self.full
-            v = self._view(self._faithful_inputs(node)[0] if faithful else parent, "fl")
+            # mean/min/max impute from a whole-column aggregate. Constant/zero stay previewable because
+            # they are row-local; aggregate-derived values require a durable full pass.
+            if method in ("mean", "min", "max") and not self.full:
+                raise NotPreviewable(node, f"fill {method} needs a full pass")
+            v = self._view(parent, "fl")
             repl = ", ".join(f"{_fill(c)} AS {quote_identifier(c)}" for c in cols)
             return db.conn().sql(f"SELECT * REPLACE ({repl}) FROM {quote_identifier(v)}")
 
@@ -748,27 +751,24 @@ class BuildEngine:
             # complete (the aggregate node already refuses a sample for exactly this reason) — refuse it.
             if not self.full and sql_reduces_rows(q):
                 raise NotPreviewable(node, "this SQL aggregates/reduces rows — a sample would mislead; run a full pass")
-            # a JOIN / window (OVER) / QUALIFY over two truncated 2000-row prefixes lies just like the
-            # dedicated join/window nodes do — build the CTE inputs UNSAMPLED (full) so the query is
-            # faithful; the preview LIMIT at the target then truncates the DISPLAY. Refuses honestly via
-            # _faithful_inputs if a Python transform is upstream.
-            sql_inputs = inputs
+            # JOIN / window / QUALIFY / statement ORDER BY require complete inputs. A generic SQL
+            # relation has no bounded, index-backed proof, so preview must hand this to a durable run.
             if not self.full and sql_needs_full_input(q):
-                sql_inputs = self._faithful_inputs(node)
+                raise NotPreviewable(node, "this SQL needs a full pass")
             # Expose inputs as query-scoped CTEs named input/input2/... backed by UNIQUE views,
             # so two sql nodes in one graph never clobber a shared literal 'input' view.
-            wrapped = bind_input_ctes(validated, [self._view(rel) for rel in sql_inputs])
+            wrapped = bind_input_ctes(validated, [self._view(rel) for rel in inputs])
             return db.conn().sql(wrapped)
 
         if t == "join":
             if len(inputs) < 2:
                 return parent
-            # joining two independently-truncated prefixes finds few/no real matches — join the FULL
-            # inputs even in preview (bounded by the preview limit + budget). The join SQL (projection +
-            # clause + naming) is the shared join_sql used by the distributed backend too, so they agree.
-            ins = inputs if self.full else self._faithful_inputs(node)
-            a, b = self._view(ins[0], "ja"), self._view(ins[1], "jb")
-            return db.conn().sql(join_sql(list(ins[0].columns), list(ins[1].columns), a, b,
+            # Joining bounded prefixes is misleading, while rebuilding both sources unbounded inside a
+            # preview is unsafe. The durable run path executes the exact join.
+            if not self.full:
+                raise NotPreviewable(node, "join needs a full pass")
+            a, b = self._view(inputs[0], "ja"), self._view(inputs[1], "jb")
+            return db.conn().sql(join_sql(list(inputs[0].columns), list(inputs[1].columns), a, b,
                                           cfg.get("on"), cfg.get("condition"), cfg.get("how"),
                                           con=db.conn()))
 
@@ -794,22 +794,11 @@ class BuildEngine:
         if t == "metric":
             agg = cfg.get("agg", "count")
             col = cfg.get("column")
-            # honest (P8): a metric reduces over ALL rows, so compute over the FULL input even in
-            # preview — never a truncated sample value. (Relational upstream is cheap out-of-core.)
-            base = parent
+            # A metric reduces over every row. Even an out-of-core relational scan is unbounded work and
+            # therefore belongs to the durable run lifecycle, never an interactive preview request.
             if not self.full:
-                # computing the true value means a full pass over the upstream. That is cheap for
-                # relational ops (DuckDB), but a Python transform upstream would spill EVERY row
-                # inside a "preview" — refuse honestly in that case (P8) rather than run away.
-                chain = g.upstream_chain(self.graph, node.id)
-                if any(n.type in ("transform", "notebook", "opaque", "loop") for n in chain):
-                    raise NotPreviewable(node, "metric over a transformed input — needs a full pass")
-                inc = g.incoming(self.graph, node.id)
-                if inc:
-                    full = BuildEngine(self.graph, self.resolve_adapter, self.registry,
-                                          sample_k=None, full=True, node_builders=self.node_builders,
-                                          node_specs=self.node_specs)
-                    base = full.relation(inc[0].source, inc[0].source_handle)
+                raise NotPreviewable(node, "metric needs a full pass")
+            base = parent
             if col:
                 col = identifier(col, base.columns, label="metric column")
             expr = "count(*)" if agg == "count" or not col else f"{_agg_name(agg)}({quote_identifier(col)})"
@@ -828,18 +817,9 @@ class BuildEngine:
                 raise NotPreviewable(node, "pick a Y column (or an aggregation) to chart")
             if agg not in ("none", "count") and not y:  # sum/mean/min/max need a Y (don't silently count)
                 raise NotPreviewable(node, f"pick a Y column to {agg}")
-            base = parent
             if agg != "none" and not self.full:
-                # a grouped chart aggregates over ALL rows — compute over the full input even in
-                # preview (honest, like metric); refuse if a Python transform is upstream.
-                chain = g.upstream_chain(self.graph, node.id)
-                if any(n.type in ("transform", "notebook", "opaque", "loop") for n in chain):
-                    raise NotPreviewable(node, "chart over a transformed input — needs a full pass")
-                inc = g.incoming(self.graph, node.id)
-                if inc:
-                    full = BuildEngine(self.graph, self.resolve_adapter, self.registry, sample_k=None,
-                                          full=True, node_builders=self.node_builders, node_specs=self.node_specs)
-                    base = full.relation(inc[0].source, inc[0].source_handle)
+                raise NotPreviewable(node, "grouped chart needs a full pass")
+            base = parent
             x = identifier(x, base.columns, label="chart X column")
             if y:
                 y = identifier(y, base.columns, label="chart Y column")
@@ -1006,9 +986,12 @@ class BuildEngine:
         k = int(cfg.get("k", 10))
         if not inputs:
             raise NotPreviewable(node, "vector-search needs a dataset input")
-        # the true nearest-K are over ALL rows (and the query row itself must come from the full set),
-        # not a 2000-row prefix — score the full input in preview too
-        src = inputs[0] if self.full else self._faithful_inputs(node)[0]
+        # The true nearest-K are over all rows. `nearest()` may fall back to a flat scan when an adapter
+        # has no usable index, and the generic adapter protocol cannot prove otherwise, so preview fails
+        # closed instead of silently issuing an unbounded search.
+        if not self.full:
+            raise NotPreviewable(node, "vector-search needs a full pass")
+        src = inputs[0]
         col = identifier(col, src.columns, label="vector column")
         base = self._view(src, "vs")
         con = db.conn()

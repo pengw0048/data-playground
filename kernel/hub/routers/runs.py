@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -29,7 +30,10 @@ from hub.models import (
     EstimateRequest,
     JoinAnalysis,
     PreviewRequest,
+    ProfileEstimate,
     ProfileEstimateRequest,
+    ProfileIdentity,
+    ProfileIdentityRequest,
     ProfileJobRequest,
     ProfileResult,
     RunEstimate,
@@ -166,43 +170,145 @@ def _profile_job_estimate(graph, node_id: str, deps) -> RunEstimate:
 
     The normal local runner intentionally lets an entirely unknown job fail fast. A profile is different:
     it will scan whatever relation the node resolves to, so unknown cost requires explicit confirmation.
-    Known-small means at least one measured cost signal exists and neither known signal is over its gate.
+    Known-small requires every execution-cone size to be known and all known row/byte signals to remain
+    under their gates. Partial known values still drive large-cost admission internally, but are not
+    presented on the wire as if they described the complete scan.
     """
     plan = compiler.compile_plan(graph, node_id, deps.registry, deps.node_specs, deps.node_ir)
-    rows, byts, _ = _cone_size(graph, node_id, deps)
+    rows, byts, sizes = _metadata_only_cone_size(graph, node_id, deps)
     backend = deps.kernel_backend() or deps.runner
     estimate = backend.estimate(plan, rows, byts)
-    unknown = rows is None and byts is None
+    # A tiny/known terminal output does not make the whole scan known. In particular, metric/aggregate
+    # output can be one row while its source has no metadata count. Any unknown node in the executable
+    # cone conservatively keeps admission behind confirmation.
+    rows_complete = bool(sizes) and all(
+        size.rows is not None and size.confidence != "unknown" for size in sizes.values()
+    )
+    bytes_complete = byts is not None
+    unknown = not rows_complete or not bytes_complete
     breakdown = estimate.breakdown or "size unknown"
+    if unknown and "some cone sizes unknown" not in breakdown:
+        breakdown = f"{breakdown} · some cone sizes unknown"
     if "whole-dataset profile" not in breakdown:
         breakdown = f"{breakdown} · whole-dataset profile"
-    return estimate.model_copy(update={
+    updates = {
         "needs_confirm": bool(estimate.needs_confirm or unknown),
         "breakdown": breakdown,
-    })
+        # Partial known values still enter the backend's admission gate, but the response only exposes a
+        # signal that describes the complete cone. In particular, unknown width must not erase an exact
+        # metadata row count, nor may the estimator's internal default width become an asserted byte size.
+        "rows": rows if rows_complete else None,
+        "bytes": byts if bytes_complete else None,
+    }
+    return estimate.model_copy(update=updates)
 
 
-@router.post("/run/profile-estimate", response_model=RunEstimate)
+def _profile_plan_digest(graph, node_id: str, deps) -> str:
+    import uuid
+    from hub.profile_identity import profile_plan_digest
+    from hub.storage import source_read_scope
+
+    with source_read_scope(
+            deps.storage, graph_mod.execution_source_uris(graph, node_id),
+            owner=f"profile-identity:{uuid.uuid4().hex}"):
+        return profile_plan_digest(graph, node_id, deps.resolve_adapter)
+
+
+@router.post("/run/profile-estimate", response_model=ProfileEstimate)
 def estimate_full_profile(req: ProfileEstimateRequest,
-                          uid: str = Depends(current_user)) -> RunEstimate:
+                          uid: str = Depends(current_user)) -> ProfileEstimate:
     """Preflight a whole-dataset profile without starting any work."""
+    import uuid
+    from hub.storage import source_read_scope
+
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     _reject_invalid(req.graph, deps, req.node_id)
-    return _profile_job_estimate(req.graph, req.node_id, deps)
+    _require_full_profile_containment(req.graph, req.node_id, deps)
+    # Pin one managed-source generation across both observations. Their internal scopes remain useful
+    # in direct-call paths, while this outer lease prevents size and digest from describing two different
+    # generations if retention races the endpoint between those calls.
+    with source_read_scope(
+            deps.storage, graph_mod.execution_source_uris(req.graph, req.node_id),
+            owner=f"profile-preflight:{uuid.uuid4().hex}"):
+        estimate = _profile_job_estimate(req.graph, req.node_id, deps)
+        digest = _profile_plan_digest(req.graph, req.node_id, deps)
+    return ProfileEstimate(**estimate.model_dump(), plan_digest=digest)
+
+
+@router.post("/run/profile-identity", response_model=ProfileIdentity)
+def current_profile_identity(req: ProfileIdentityRequest,
+                             uid: str = Depends(current_user)) -> ProfileIdentity:
+    """Mint the current profile identity for stale-safe canvas reopen recovery."""
+    _require_graph_read_access(req.graph, uid)
+    deps = get_deps()
+    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
+    _reject_invalid(req.graph, deps, req.node_id)
+    _require_full_profile_containment(req.graph, req.node_id, deps)
+    return ProfileIdentity(plan_digest=_profile_plan_digest(req.graph, req.node_id, deps))
+
+
+def _require_full_profile_containment(graph, node_id: str, deps) -> None:
+    """Fail closed where the local profile supervisor cannot contain arbitrary workload code."""
+    if os.name != "posix":
+        raise HTTPException(
+            501, "full profiles require POSIX process-group containment on this backend")
+    if not auth.auth_enabled():
+        return
+    from hub.executors.preview import _CODE_CELL_KINDS
+
+    cone = graph_mod.upstream_chain(graph, node_id)
+    code_nodes = [node for node in cone if node.type in _CODE_CELL_KINDS]
+    plugin_nodes = [node for node in cone if node.type not in deps.builtin_kinds]
+    if code_nodes:
+        raise HTTPException(
+            403,
+            "full profiling Python/control-flow cells are disabled in multi-user mode "
+            "until a stronger workload-containment backend is configured",
+        )
+    if plugin_nodes:
+        raise HTTPException(
+            403,
+            "full profiling custom plugin nodes is unsupported in multi-user mode because "
+            "shared deployments require stronger workload containment",
+        )
+    # A built-in source node can still dispatch arbitrary Python/native plugin code through its resolved
+    # DatasetAdapter. Only the exact core implementations are trusted under process-group containment;
+    # subclasses may override scan/fingerprint and therefore remain third-party execution hooks.
+    from hub.ir import resolve_config
+    from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
+
+    core_adapter_types = {DuckDBAdapter, LanceAdapter}
+    for source in (node for node in cone if node.type == "source"):
+        uri = str(resolve_config(source).get("uri") or "")
+        if not uri:
+            continue
+        adapter = deps.resolve_adapter(uri)
+        if type(adapter) not in core_adapter_types:
+            raise HTTPException(
+                403,
+                "full profiling a third-party dataset adapter is unsupported in multi-user mode because "
+                "shared deployments require stronger workload containment",
+            )
 
 
 @router.post("/run/profile-job", response_model=RunStatus)
 def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -> RunStatus:
     """Queue a whole-dataset profile with durable ownership, cancellation, and recovery semantics."""
+    import uuid
+
     from hub.observability import (
         AuditAction, AuditOutcome, emit_audit, error_class, get_request_id,
     )
+    from hub.storage import source_read_scope
+
     request_id = get_request_id()
-    status = None
+    status: RunStatus | None = None
+    run_id: str | None = None
+    owner = None
+    auth_canvas: str | None = None
     try:
-        auth_canvas = None
         if auth.auth_enabled():
             cid, role = _require_graph_read_access(req.graph, uid)
             assert cid is not None and role is not None
@@ -210,33 +316,176 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
                 raise HTTPException(403, f"canvas '{cid}' requires owner or editor to start a full profile")
             auth_canvas = cid
         deps = get_deps()
-        graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
-        _reject_invalid(req.graph, deps, req.node_id)
-        estimate = _profile_job_estimate(req.graph, req.node_id, deps)
-        if estimate.needs_confirm and not req.confirmed:
-            raise HTTPException(409, "full profile needs confirmation (large or unknown whole-dataset scan)")
+        operational_canvas = str(getattr(req.graph, "id", None) or "canvas")
+        submission_id = str(req.submission_id)
+        try:
+            existing = metadb.lookup_profile_submission(
+                submission_id, uid, auth_canvas, operational_canvas,
+                req.node_id, req.plan_digest,
+            )
+        except metadb.ProfileSubmissionConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+
         owner = deps.kernel_backend()
-        if owner is None:
-            raise HTTPException(503, "canvas execution kernel is unavailable")
-        status = owner.profile_job(
-            req.graph, req.node_id, req.plan_digest, request_id=request_id,
-        )
-        deps.run_index[status.run_id] = owner
+        if existing is not None and not existing.should_dispatch:
+            # A consumed or terminal submission is adopted from its immutable durable binding before
+            # consulting mutable source state. Response-loss replay therefore survives source updates.
+            run_id = existing.run_id
+            status = RunStatus(**existing.status)
+        else:
+            graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
+            _reject_invalid(req.graph, deps, req.node_id)
+            _require_full_profile_containment(req.graph, req.node_id, deps)
+
+            # Keep managed inputs pinned from identity minting until the kernel-side process runner has
+            # synchronously claimed its own exact-generation leases. This closes the fingerprint->dispatch
+            # retirement gap while still letting the child own the long-lived execution leases.
+            with source_read_scope(
+                    deps.storage, graph_mod.execution_source_uris(req.graph, req.node_id),
+                    owner=f"profile-submit:{uuid.uuid4().hex}"):
+                authoritative_digest = _profile_plan_digest(req.graph, req.node_id, deps)
+                if req.plan_digest != authoritative_digest:
+                    if existing is None or not existing.should_dispatch:
+                        raise HTTPException(
+                            409, "profile preflight is stale; estimate the current graph again")
+                    assert existing.admission_token is not None
+                    outcome, settled = metadb.settle_profile_submission_failure(
+                        existing.run_id, existing.admission_token, uid, auth_canvas,
+                        canvas_id=operational_canvas, target_node_id=req.node_id,
+                        plan_digest=req.plan_digest,
+                        attempt_order=existing.attempt_order,
+                        reason="profile source changed before kernel admission",
+                    )
+                    if outcome not in ("discarded", "admitted") or settled is None:
+                        raise RuntimeError(
+                            "stale profile submission identity changed during reconciliation")
+                    run_id = existing.run_id
+                    status = RunStatus(**settled)
+                else:
+                    estimate = _profile_job_estimate(req.graph, req.node_id, deps)
+                    if estimate.needs_confirm and not req.confirmed:
+                        raise HTTPException(
+                            409, "full profile needs confirmation (large or unknown whole-dataset scan)")
+                    if owner is None:
+                        raise HTTPException(503, "canvas execution kernel is unavailable")
+
+                    try:
+                        reservation = metadb.preallocate_or_adopt_profile_run_owner(
+                            submission_id, uid, auth_canvas, operational_canvas,
+                            req.node_id, authoritative_digest, request_id=request_id,
+                        )
+                    except metadb.ProfileSubmissionConflict as exc:
+                        raise HTTPException(409, str(exc)) from exc
+                    run_id = reservation.run_id
+                    if not reservation.should_dispatch:
+                        status = RunStatus(**reservation.status)
+                    else:
+                        preallocation_token = reservation.admission_token
+                        attempt_order = reservation.attempt_order
+                        assert preallocation_token is not None
+                        keepalive_stop = threading.Event()
+
+                        def _renew_preallocation() -> None:
+                            interval = max(1.0, metadb.RUN_PREALLOCATION_TTL_SECONDS / 3)
+                            while not keepalive_stop.wait(interval):
+                                try:
+                                    if not metadb.renew_run_preallocation(
+                                            run_id, preallocation_token):
+                                        return
+                                except Exception:
+                                    logging.getLogger("hub").exception(
+                                        "profile preallocation lease renewal failed")
+
+                        keepalive = threading.Thread(
+                            target=_renew_preallocation, daemon=True,
+                            name=f"profile-preallocation-{run_id}",
+                        )
+
+                        def _settle_submission_failure() -> tuple[str, dict | None]:
+                            last_error: Exception | None = None
+                            for retry in range(3):
+                                try:
+                                    return metadb.settle_profile_submission_failure(
+                                        run_id, preallocation_token, uid, auth_canvas,
+                                        canvas_id=operational_canvas,
+                                        target_node_id=req.node_id,
+                                        plan_digest=authoritative_digest,
+                                        attempt_order=attempt_order,
+                                    )
+                                except Exception as exc:  # bounded metadata outage reconciliation
+                                    last_error = exc
+                                    if retry < 2:
+                                        time.sleep(0.05 * (retry + 1))
+                            raise RuntimeError(
+                                "could not reconcile profile submission after kernel command failure"
+                            ) from last_error
+
+                        returned: RunStatus | None = None
+                        try:
+                            try:
+                                keepalive.start()
+                            except Exception:
+                                outcome, admitted = _settle_submission_failure()
+                                if outcome not in ("discarded", "admitted") or admitted is None:
+                                    raise RuntimeError(
+                                        "profile preallocation changed before submission started")
+                                status = RunStatus(**admitted)
+                            else:
+                                try:
+                                    returned = owner.profile_job(
+                                        req.graph, req.node_id, authoritative_digest,
+                                        run_id=run_id, admission_token=preallocation_token,
+                                        request_id=request_id,
+                                    )
+                                    if (returned.run_id != run_id
+                                            or returned.job_type != "profile"
+                                            or returned.target_node_id != req.node_id
+                                            or returned.plan_digest != authoritative_digest
+                                            or returned.profile_attempt_order != attempt_order):
+                                        raise RuntimeError(
+                                            "execution kernel did not preserve its prebound profile identity")
+                                except Exception:
+                                    # Wait for a racing consume commit, then adopt it; otherwise retain
+                                    # one stable failed logical submission without launching a new run.
+                                    outcome, admitted = _settle_submission_failure()
+                                    if outcome not in ("discarded", "admitted") or admitted is None:
+                                        raise RuntimeError(
+                                            "profile submission identity changed during reconciliation")
+                                else:
+                                    admitted = metadb.admitted_profile_run_status(
+                                        run_id, uid, auth_canvas,
+                                        canvas_id=operational_canvas,
+                                        target_node_id=req.node_id,
+                                        plan_digest=authoritative_digest,
+                                        attempt_order=attempt_order,
+                                    )
+                                    if admitted is None:
+                                        outcome, admitted = _settle_submission_failure()
+                                        if outcome != "admitted" or admitted is None:
+                                            raise RuntimeError(
+                                                "execution kernel did not consume profile admission")
+                                    # A proven no-child failure is retained while exact terminal DB
+                                    # publication retries; return it immediately without losing identity.
+                                    if (returned is not None
+                                            and returned.status in ("done", "failed", "cancelled")
+                                            and admitted.get("status") in ("queued", "running")):
+                                        admitted = returned.model_dump()
+                                status = RunStatus(**admitted)
+                        finally:
+                            keepalive_stop.set()
+                            if keepalive.ident is not None:
+                                keepalive.join(timeout=1.0)
+
+        assert run_id is not None and status is not None
+        if owner is not None:
+            deps.run_index[status.run_id] = owner
         deps.run_owner[status.run_id] = uid
-        if auth.auth_enabled():
-            metadb.bind_run_owner(
-                status.run_id, uid, auth_canvas, request_id=request_id,
-            )
-        elif request_id:
-            metadb.bind_run_request_id(
-                status.run_id, request_id, canvas_id=getattr(req.graph, "id", None),
-            )
         while len(deps.run_index) > _RUN_INDEX_MAX:
             deps.run_index.pop(next(iter(deps.run_index)))
         while len(deps.run_owner) > _RUN_INDEX_MAX:
             deps.run_owner.pop(next(iter(deps.run_owner)))
     except Exception as exc:
-        run_id = getattr(status, "run_id", None)
+        run_id = run_id or getattr(status, "run_id", None)
         emit_audit(
             AuditAction.JOB_SUBMIT, AuditOutcome.FAILURE,
             principal_id=uid, resource_type="run", resource_id=run_id,
@@ -440,6 +689,32 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
     rows = [s.rows for s in sizes.values() if s.rows is not None]
     byts = [s.bytes for s in sizes.values() if s.bytes is not None]
     return (max(rows) if rows else None), (max(byts) if byts else None), sizes
+
+
+def _metadata_only_cone_size(
+        req_graph, target_node_id, deps) -> "tuple[int | None, int | None, dict]":
+    """Admission-safe sizing that never asks a third-party adapter to build a relation.
+
+    ``schema_for_graph`` uses ``scan(limit=0)`` to let DuckDB infer relational schemas. That is cheap for
+    the core adapters but is not a portable metadata contract: an eager warehouse/HF adapter may load its
+    whole table before applying the outer limit. Whole-dataset profile preflight must therefore use only
+    explicit metadata capabilities from ``estimate_sizes``. ``metadata_count`` can establish row bounds,
+    but core has no bounded metadata-schema SPI yet. The estimator's schema-less 64-byte fallback is useful
+    for ordinary placement hints, not authoritative enough for profile admission, so bytes stay unknown and
+    the profile admission policy conservatively requires confirmation.
+    """
+    from hub.estimate import estimate_sizes
+    try:
+        sizes = estimate_sizes(
+            req_graph, deps.resolve_adapter, target=target_node_id, schemas=None,
+            storage=deps.storage,
+        )
+    except ManagedSourceReadError as e:
+        raise HTTPException(400, str(e))
+    except Exception:  # noqa: BLE001 — metadata uncertainty is an explicit unknown admission cost
+        return None, None, {}
+    rows = [size.rows for size in sizes.values() if size.rows is not None]
+    return (max(rows) if rows else None), None, sizes
 
 
 def _route_by_capability(deps, chosen, graph, target_node_id: str | None = None):

@@ -22,7 +22,9 @@ from pydantic.alias_generators import to_camel
 from hub import db, graph as g, metadb
 from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
-from hub.plugins.adapters import is_object_uri, path_of, relation_columns
+from hub.plugins.adapters import (
+    BoundedPreviewUnsupported, is_object_uri, path_of, relation_columns,
+)
 from hub.plugins.importer import ImporterNotConfigured
 from hub.settings import settings
 from hub.storage import ManagedSourceReadError, source_read_scope
@@ -63,6 +65,11 @@ def _catalog_query(q, folder, tags, owner, has_columns, sort, order, limit, offs
         limit=max(1, min(int(limit), 500)), offset=max(0, int(offset)))
 
 router = APIRouter()
+
+# `preview_scan` currently accepts a source row limit, not an offset. Pagination therefore reads a
+# bounded prefix; keep that prefix under a fixed server-owned budget regardless of caller-controlled
+# `offset`/`k`. A larger browse belongs in a durable run, not an interactive request.
+DATA_SAMPLE_PREVIEW_ROW_BUDGET = 2_000
 
 @router.get("/kernel", response_model=KernelInfo)
 def kernel_info() -> KernelInfo:
@@ -588,6 +595,23 @@ def data_sample(req: SampleRequest) -> SampleResult:
         raise HTTPException(400, "k must be >= 0")
     if req.offset < 0:
         raise HTTPException(400, "offset must be >= 0")
+    if req.offset >= DATA_SAMPLE_PREVIEW_ROW_BUDGET:
+        raise HTTPException(
+            400,
+            f"sample offset is outside the {DATA_SAMPLE_PREVIEW_ROW_BUDGET}-row interactive window; "
+            "use a durable run for a larger range",
+        )
+    if req.k > DATA_SAMPLE_PREVIEW_ROW_BUDGET:
+        raise HTTPException(
+            400,
+            f"sample page size exceeds the {DATA_SAMPLE_PREVIEW_ROW_BUDGET}-row interactive work budget",
+        )
+    # A final page may straddle the budget boundary. Clamp its source prefix instead of reporting
+    # `has_more=true` on the preceding page and then rejecting the user's valid Next click.
+    preview_rows = min(
+        DATA_SAMPLE_PREVIEW_ROW_BUDGET,
+        req.offset + req.k + 1,  # one look-ahead row makes `has_more` exact within the window
+    )
     from hub import paths
     try:
         paths.ensure_local_uri_allowed(req.uri)  # multi-user: don't sample an arbitrary local file
@@ -604,16 +628,36 @@ def data_sample(req: SampleRequest) -> SampleResult:
                     raise HTTPException(410, "dataset artifact is missing or expired")
             adapter = deps.resolve_adapter(req.uri)
             with db.run_scope():  # own cursor — a big sample doesn't block other users' runs/previews
-                # Keep the adapter contract unchanged: request a bounded prefix, then page that lazy
-                # relation. Fetch one extra row so `has_more` is exact even when count() is unavailable.
-                rel = adapter.scan(req.uri, req.columns, limit=req.offset + req.k + 1)
+                preview_scan = getattr(adapter, "preview_scan", None)
+                if not callable(preview_scan):
+                    return SampleResult(
+                        not_previewable=True,
+                        reason=(f"source adapter '{getattr(adapter, 'name', type(adapter).__name__)}' "
+                                "does not guarantee a bounded preview — needs a full pass"),
+                    )
+                # Fetch one extra row so `has_more` remains exact without a full count. The adapter's
+                # explicit preview capability, not an outer LIMIT, owns the source-level work bound.
+                try:
+                    rel = preview_scan(
+                        req.uri, req.columns, limit=preview_rows,
+                    )
+                except BoundedPreviewUnsupported as exc:
+                    return SampleResult(not_previewable=True, reason=str(exc))
                 cols = relation_columns(rel)          # schema is metadata — no second scan needed
                 page = _table_to_rows(rel.limit(req.k + 1, req.offset).to_arrow_table())
                 rows = page[:req.k]
-                total = adapter.count(req.uri)
-            has_more = len(page) > req.k or (total is not None and total > req.offset + len(rows))
+                metadata_count = getattr(adapter, "metadata_count", None)
+                try:
+                    total = metadata_count(req.uri) if callable(metadata_count) else None
+                except Exception:  # metadata uncertainty stays unknown; never fall back to a full scan
+                    total = None
+            page_end = req.offset + len(rows)
+            budgeted_total = min(total, DATA_SAMPLE_PREVIEW_ROW_BUDGET) if total is not None else None
+            has_more = len(page) > req.k or (
+                budgeted_total is not None and budgeted_total > page_end
+            )
             result = SampleResult(columns=cols, rows=rows, row_count=total, has_more=has_more,
-                                  truncated=(total is None or total > req.offset + len(rows)))
+                                  truncated=(total is None or total > page_end))
         with contextlib.suppress(Exception):
             metadb.catalog_bump_usage(req.uri)  # someone looked at this data → popularity signal (best-effort)
         return result

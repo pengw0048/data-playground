@@ -177,6 +177,14 @@ export interface RunEstimate {
   breakdown?: string | null
 }
 
+export interface ProfileEstimate extends RunEstimate {
+  planDigest: string
+}
+
+export interface ProfileIdentity {
+  planDigest: string
+}
+
 export type RunState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
 
 export interface PerNodeStatus {
@@ -205,6 +213,7 @@ export interface RunStatus {
   outputTable?: string | null
   profile?: ProfileResult | null
   planDigest?: string | null
+  profileAttemptOrder?: number | null
 }
 
 export interface PlanStep {

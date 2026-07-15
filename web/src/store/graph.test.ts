@@ -4,7 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
   listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
-  estimate: vi.fn(), profileEstimate: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
+  estimate: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   activeRuns: vi.fn(), profileJobs: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
@@ -23,6 +23,8 @@ vi.mock('../api/client', () => ({
               ? apiMocks.estimate
               : property === 'profileEstimate'
                 ? apiMocks.profileEstimate
+              : property === 'profileIdentity'
+                ? apiMocks.profileIdentity
               : property === 'fullProfile'
                 ? apiMocks.fullProfile
                 : property === 'runStatus'
@@ -39,7 +41,7 @@ vi.mock('../api/client', () => ({
   setApiUser: vi.fn(),
 }))
 
-import { useStore } from './graph'
+import { previewPlanIdentity, profilePlanIdentity, useStore } from './graph'
 import { KernelError } from '../api/client'
 
 const storage = new Map<string, string>()
@@ -72,10 +74,16 @@ describe('graph store — core authority ops', () => {
     apiMocks.deleteCanvas.mockReset().mockResolvedValue({ ok: true })
     apiMocks.preview.mockReset()
     apiMocks.estimate.mockReset().mockResolvedValue({ rows: 10, bytes: 100, placement: 'local', needsConfirm: false })
-    apiMocks.profileEstimate.mockReset().mockResolvedValue({ rows: 10, bytes: 100, placement: 'local', needsConfirm: false })
+    apiMocks.profileEstimate.mockReset().mockResolvedValue({
+      rows: 10, bytes: 100, placement: 'local', needsConfirm: false, planDigest: 'a'.repeat(64),
+    })
+    apiMocks.profileIdentity.mockReset().mockResolvedValue({ planDigest: 'a'.repeat(64) })
     apiMocks.fullProfile.mockReset()
     apiMocks.runStatus.mockReset()
-    apiMocks.cancelRun.mockReset().mockResolvedValue({})
+    apiMocks.cancelRun.mockReset().mockImplementation(async (runId: string) => ({
+      runId, status: 'cancelled', jobType: 'run',
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    }))
     apiMocks.activeRuns.mockReset().mockResolvedValue([])
     apiMocks.profileJobs.mockReset().mockResolvedValue([])
     useStore.setState({ currentUser: { id: 'alice', name: 'Alice' } })
@@ -134,6 +142,98 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().previews.filter?.result?.rows).toEqual([{ value: 'view' }])
   })
 
+  it('scopes profile identity to the deterministic upstream execution cone', () => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events.parquet', options: { batchSize: 10, columns: ['event'] } }
+    const target = NODE('target', 'filter')
+    target.data.config = { predicate: 'event = view' }
+    const otherSource = NODE('other-source')
+    otherSource.data.config = { uri: 'other.parquet' }
+    const otherTarget = NODE('other-target', 'filter')
+    otherTarget.data.config = { predicate: 'score > 0' }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: ['pyarrow==20', 'numpy==2'],
+      nodes: [otherTarget, source, target, otherSource],
+      edges: [
+        { id: 'other-edge', source: 'other-source', target: 'other-target', data: { wire: 'dataset' as const } },
+        { id: 'target-edge', source: 'source', target: 'target', data: { wire: 'dataset' as const } },
+      ],
+    }
+    const identity = profilePlanIdentity(doc, 'target')
+
+    const reordered = structuredClone(doc)
+    reordered.nodes.reverse()
+    reordered.edges.reverse()
+    reordered.requirements.reverse()
+    expect(profilePlanIdentity(reordered, 'target')).toBe(identity)
+
+    const unrelated = structuredClone(doc)
+    unrelated.nodes.find((node) => node.id === 'other-source')!.data.config.uri = 'other-v2.parquet'
+    unrelated.edges.find((edge) => edge.id === 'other-edge')!.targetHandle = 'replacement-input'
+    expect(profilePlanIdentity(unrelated, 'target')).toBe(identity)
+    expect(previewPlanIdentity(unrelated, 'target')).not.toBe(previewPlanIdentity(doc, 'target'))
+
+    const visualOnly = structuredClone(doc)
+    visualOnly.version = 99
+    visualOnly.nodes.find((node) => node.id === 'source')!.position = { x: 900, y: 400 }
+    visualOnly.nodes.find((node) => node.id === 'target')!.data.status = 'running'
+    visualOnly.edges.find((edge) => edge.id === 'target-edge')!.id = 'layout-only-edge-id'
+    expect(profilePlanIdentity(visualOnly, 'target')).toBe(identity)
+
+    const upstreamEdit = structuredClone(doc)
+    upstreamEdit.nodes.find((node) => node.id === 'source')!.data.config.uri = 'events-v2.parquet'
+    expect(profilePlanIdentity(upstreamEdit, 'target')).not.toBe(identity)
+
+    const targetEdit = structuredClone(doc)
+    targetEdit.nodes.find((node) => node.id === 'target')!.data.config.predicate = 'event = purchase'
+    expect(profilePlanIdentity(targetEdit, 'target')).not.toBe(identity)
+
+    const executionEdgeEdit = structuredClone(doc)
+    executionEdgeEdit.edges.find((edge) => edge.id === 'target-edge')!.sourceHandle = 'filtered'
+    expect(profilePlanIdentity(executionEdgeEdit, 'target')).not.toBe(identity)
+  })
+
+  it('keeps an in-flight profile attached across an unrelated branch edit', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events.parquet' }
+    const target = NODE('target', 'filter')
+    target.data.config = { predicate: 'event = view' }
+    const otherSource = NODE('other-source')
+    otherSource.data.config = { uri: 'other.parquet' }
+    const otherTarget = NODE('other-target', 'filter')
+    otherTarget.data.config = { predicate: 'score > 0' }
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [],
+        nodes: [source, target, otherSource, otherTarget],
+        edges: [
+          { id: 'source-target', source: 'source', target: 'target', data: { wire: 'dataset' } },
+          { id: 'other-branch', source: 'other-source', target: 'other-target', data: { wire: 'dataset' } },
+        ],
+      },
+    })
+    await useStore.getState().prepareFullProfile('target')
+    const requestGeneration = useStore.getState().profileJobs.target.requestGeneration
+    let finish!: (status: any) => void
+    apiMocks.fullProfile.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+
+    const pending = useStore.getState().startFullProfile('target')
+    useStore.getState().updateConfig('other-target', { predicate: 'score > 10' })
+    finish({
+      runId: 'profile-unrelated-edit', status: 'running', jobType: 'profile', targetNodeId: 'target',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 1, ms: 10, placement: 'local', perNode: [],
+    })
+    await pending
+
+    expect(useStore.getState().profileJobs.target).toMatchObject({
+      requestGeneration, phase: 'running',
+      status: { runId: 'profile-unrelated-edit', status: 'running' },
+    })
+    expect(apiMocks.cancelRun).not.toHaveBeenCalledWith('profile-unrelated-edit')
+  })
+
   it('cancels a full-profile response that arrives for an old graph revision', async () => {
     let resolveJob!: (status: any) => void
     let submitted!: () => void
@@ -151,6 +251,7 @@ describe('graph store — core authority ops', () => {
     await submittedJob
     useStore.getState().updateConfig('source', { uri: 'new-events.parquet' })
     resolveJob({ runId: 'profile-old', status: 'queued', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 0, ms: 0, placement: 'local', perNode: [] })
     await pending
 
@@ -158,11 +259,57 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().profileJobs.source?.status).toBeUndefined()
   })
 
+  it('cancels a profile when a metric title changes while submission is in flight', async () => {
+    let finish!: (status: any) => void
+    apiMocks.fullProfile.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    const metric = NODE('metric', 'metric')
+    metric.data.title = 'Revenue'
+    useStore.setState({
+      doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [metric], edges: [] },
+    })
+    await useStore.getState().prepareFullProfile('metric')
+    const pending = useStore.getState().startFullProfile('metric')
+    useStore.getState().updateData('metric', { title: 'Average revenue' })
+    finish({
+      runId: 'profile-old-metric-title', status: 'queued', jobType: 'profile', targetNodeId: 'metric',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    })
+    await pending
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith('profile-old-metric-title')
+    expect(useStore.getState().profileJobs.metric?.status).toBeUndefined()
+  })
+
+  it('cancels a section profile when a nested descendant alias title changes in flight', async () => {
+    let finish!: (status: any) => void
+    apiMocks.fullProfile.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    const section = NODE('section', 'section')
+    const nested = { ...NODE('nested', 'section'), parentId: 'section' }
+    const child = { ...NODE('child', 'filter'), parentId: 'nested' }
+    child.data.title = 'Clean rows'
+    useStore.setState({
+      doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [section, nested, child], edges: [] },
+    })
+    await useStore.getState().prepareFullProfile('section')
+    const pending = useStore.getState().startFullProfile('section')
+    useStore.getState().updateData('child', { title: 'Keep valid rows' })
+    finish({
+      runId: 'profile-old-section-alias', status: 'queued', jobType: 'profile', targetNodeId: 'section',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    })
+    await pending
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith('profile-old-section-alias')
+    expect(useStore.getState().profileJobs.section?.status).toBeUndefined()
+  })
+
   it('keeps a whole-dataset profile behind visible preflight and an explicit start', async () => {
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     useStore.setState({ doc })
     apiMocks.profileEstimate.mockResolvedValueOnce({
-      rows: null, bytes: null, placement: 'local', needsConfirm: true,
+      rows: null, bytes: null, placement: 'local', needsConfirm: true, planDigest: 'a'.repeat(64),
     })
 
     await useStore.getState().prepareFullProfile('source')
@@ -174,16 +321,661 @@ describe('graph store — core authority ops', () => {
 
     apiMocks.fullProfile.mockResolvedValueOnce({
       runId: 'profile-confirmed', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
     })
     await useStore.getState().startFullProfile('source')
 
     expect(apiMocks.fullProfile).toHaveBeenCalledWith(
-      doc, 'source', useStore.getState().profileJobs.source.planDigest, true,
+      doc, 'source', useStore.getState().profileJobs.source.planDigest, expect.any(String), true,
     )
   })
 
-  it('recovers a profile that finished while closed but ignores a stale plan on reopen', async () => {
+  it('reuses one submission id across bounded ambiguous submission retries', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    apiMocks.fullProfile
+      .mockRejectedValueOnce(new Error('network response lost'))
+      .mockRejectedValueOnce(new KernelError(503, 'hub restarting'))
+      .mockResolvedValueOnce({
+        runId: 'profile-adopted', status: 'done', jobType: 'profile', targetNodeId: 'source',
+        planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+        rowsProcessed: 10, ms: 10, placement: 'local', perNode: [],
+        profile: { columns: [], rowCount: 10, sampled: false },
+      })
+
+    await useStore.getState().startFullProfile('source')
+
+    expect(apiMocks.fullProfile).toHaveBeenCalledTimes(3)
+    const submissionIds = apiMocks.fullProfile.mock.calls.map((call) => call[3])
+    expect(new Set(submissionIds).size).toBe(1)
+    expect(submissionIds[0]).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      submissionId: submissionIds[0], submissionUnresolved: false,
+      identityVerified: true, phase: 'done',
+    })
+  })
+
+  it('does not retry a non-ambiguous profile submission rejection', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    apiMocks.fullProfile.mockRejectedValueOnce(new KernelError(409, 'stale plan'))
+
+    await useStore.getState().startFullProfile('source')
+
+    expect(apiMocks.fullProfile).toHaveBeenCalledTimes(1)
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'failed', submissionUnresolved: false, error: 'stale plan',
+    })
+  })
+
+  it('keeps an ambiguous submission id for an explicit reconciliation retry', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    apiMocks.fullProfile.mockRejectedValue(new Error('connection reset'))
+
+    await useStore.getState().startFullProfile('source')
+
+    expect(apiMocks.fullProfile).toHaveBeenCalledTimes(3)
+    const submissionId = useStore.getState().profileJobs.source.submissionId
+    expect(useStore.getState().profileJobs.source.submissionUnresolved).toBe(true)
+    apiMocks.fullProfile.mockReset().mockResolvedValueOnce({
+      runId: 'profile-reconciled-later', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 10, ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 10, sampled: false },
+    })
+
+    await useStore.getState().startFullProfile('source')
+
+    expect(apiMocks.fullProfile).toHaveBeenCalledWith(doc, 'source', 'a'.repeat(64), submissionId, true)
+    expect(useStore.getState().profileJobs.source.status?.runId).toBe('profile-reconciled-later')
+  })
+
+  it('records cancel intent while submission is pending and cancels immediately after adoption', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    let finishSubmission!: (status: any) => void
+    apiMocks.fullProfile.mockImplementationOnce(() => new Promise((resolve) => { finishSubmission = resolve }))
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+
+    const submission = useStore.getState().startFullProfile('source')
+    await vi.waitFor(() => expect(apiMocks.fullProfile).toHaveBeenCalledTimes(1))
+    await useStore.getState().cancelFullProfile('source')
+    expect(useStore.getState().profileJobs.source).toMatchObject({ phase: 'cancelling', cancelRequested: true })
+    expect(apiMocks.cancelRun).not.toHaveBeenCalled()
+
+    finishSubmission({
+      runId: 'profile-cancel-after-adopt', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    })
+    await submission
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith('profile-cancel-after-adopt')
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'cancelled', cancelRequested: true, identityVerified: false,
+      status: { runId: 'profile-cancel-after-adopt', status: 'cancelled' },
+    })
+  })
+
+  it('reconciles a lost post-adoption cancellation response while the ordinary poll is hung', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    let finishSubmission!: (status: any) => void
+    apiMocks.fullProfile.mockImplementationOnce(() => new Promise((resolve) => { finishSubmission = resolve }))
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+    apiMocks.cancelRun.mockRejectedValueOnce(new Error('cancel response lost'))
+
+    const submission = useStore.getState().startFullProfile('source')
+    await vi.waitFor(() => expect(apiMocks.fullProfile).toHaveBeenCalledTimes(1))
+    await useStore.getState().cancelFullProfile('source')
+    finishSubmission({
+      runId: 'profile-cancel-response-lost', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    })
+    await submission
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledTimes(2)
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'cancelled', cancelRequested: true, identityVerified: false,
+      status: { runId: 'profile-cancel-response-lost', status: 'cancelled' },
+    })
+    expect(useStore.getState().profileJobs.source.error).toBeUndefined()
+  })
+
+  it('rejects an async profile writeback after its submission id is superseded', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    let finishSubmission!: (status: any) => void
+    apiMocks.fullProfile.mockImplementationOnce(() => new Promise((resolve) => { finishSubmission = resolve }))
+    const submission = useStore.getState().startFullProfile('source')
+    await vi.waitFor(() => expect(apiMocks.fullProfile).toHaveBeenCalledTimes(1))
+    useStore.setState((state) => ({ profileJobs: { ...state.profileJobs, source: {
+      ...state.profileJobs.source!, submissionId: 'newer-explicit-submission', status: undefined,
+    } } }))
+
+    finishSubmission({
+      runId: 'superseded-submission-run', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    })
+    await submission
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith('superseded-submission-run')
+    expect(useStore.getState().profileJobs.source).toMatchObject({ submissionId: 'newer-explicit-submission' })
+    expect(useStore.getState().profileJobs.source.status).toBeUndefined()
+  })
+
+  it('reconciles and cancels an orphaned submission after the graph and preflight are superseded', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    let finishOrphan!: (status: any) => void
+    apiMocks.fullProfile
+      .mockRejectedValueOnce(new Error('response lost 1'))
+      .mockRejectedValueOnce(new Error('response lost 2'))
+      .mockRejectedValueOnce(new Error('response lost 3'))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishOrphan = resolve }))
+
+    const firstSubmission = useStore.getState().startFullProfile('source')
+    await vi.waitFor(() => expect(apiMocks.fullProfile).toHaveBeenCalledTimes(1))
+    useStore.getState().updateConfig('source', { uri: 'new-source.parquet' })
+    await firstSubmission
+    await vi.waitFor(() => expect(apiMocks.fullProfile).toHaveBeenCalledTimes(4))
+    const oldSubmissionId = apiMocks.fullProfile.mock.calls[0][3]
+    expect(apiMocks.fullProfile.mock.calls.slice(0, 4).every((call) => call[3] === oldSubmissionId)).toBe(true)
+
+    // The user can move on to the new graph. Orphan reconciliation owns the old captured doc/key and
+    // must not write through this newer preflight when its response finally arrives.
+    await useStore.getState().prepareFullProfile('source')
+    const newGeneration = useStore.getState().profileJobs.source.requestGeneration
+    expect(useStore.getState().profileJobs.source.phase).toBe('preflight')
+    finishOrphan({
+      runId: 'old-orphaned-scan', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    })
+
+    await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledWith('old-orphaned-scan'))
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      requestGeneration: newGeneration, phase: 'preflight',
+    })
+    expect(useStore.getState().profileJobs.source.status).toBeUndefined()
+  })
+
+  it('stops orphan reconciliation before retrying under a different user', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    let rejectOrphan!: (error: Error) => void
+    apiMocks.fullProfile
+      .mockRejectedValueOnce(new Error('response lost 1'))
+      .mockRejectedValueOnce(new Error('response lost 2'))
+      .mockRejectedValueOnce(new Error('response lost 3'))
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOrphan = reject }))
+
+    const submission = useStore.getState().startFullProfile('source')
+    await vi.waitFor(() => expect(apiMocks.fullProfile).toHaveBeenCalledTimes(1))
+    useStore.getState().updateConfig('source', { uri: 'new-source.parquet' })
+    await submission
+    await vi.waitFor(() => expect(apiMocks.fullProfile).toHaveBeenCalledTimes(4))
+    useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } })
+    rejectOrphan(new Error('old-user request lost'))
+
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(apiMocks.fullProfile).toHaveBeenCalledTimes(4)
+    expect(apiMocks.cancelRun).not.toHaveBeenCalled()
+  })
+
+  it('clears preflight and fails closed before submission when user identity disappears', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    useStore.setState({ currentUser: null })
+    useStore.setState({ canvasRole: 'owner' })
+
+    await useStore.getState().startFullProfile('source')
+
+    expect(apiMocks.fullProfile).not.toHaveBeenCalled()
+    expect(useStore.getState().profileJobs.source).toBeUndefined()
+  })
+
+  it('keeps detached cancellation supervised after a 200 running response and deduplicates the run', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const planDigest = 'a'.repeat(64)
+    const running = {
+      runId: 'removed-node-profile', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 1, ms: 10,
+      placement: 'local', perNode: [],
+    }
+    const installActiveJob = () => useStore.setState({
+      doc: { ...doc, nodes: [NODE('source')] },
+      profileJobs: { source: {
+        canvasId: doc.id, nodeId: 'source', principalId: 'alice', canCancel: true,
+        planIdentity: JSON.stringify({}), planDigest,
+        requestGeneration: 1, phase: 'running', identityVerified: true,
+        status: running,
+      } },
+    } as any)
+    let finishFirstCancel!: (status: any) => void
+    apiMocks.cancelRun.mockImplementationOnce(() => new Promise((resolve) => { finishFirstCancel = resolve }))
+    apiMocks.runStatus.mockResolvedValueOnce({ ...running, status: 'cancelled' })
+    installActiveJob()
+
+    useStore.getState().removeNode('source')
+    // A second local detachment of the same exact run joins the existing supervisor.
+    installActiveJob()
+    useStore.getState().removeNode('source')
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith('removed-node-profile')
+    expect(apiMocks.cancelRun).toHaveBeenCalledTimes(1)
+    expect(useStore.getState().profileJobs.source).toBeUndefined()
+    expect(useStore.getState().doc.nodes).toHaveLength(0)
+
+    // HTTP 200 is not an acknowledgement while the exact run is still active.
+    finishFirstCancel(running)
+    await vi.waitFor(() => expect(apiMocks.runStatus).toHaveBeenCalledWith('removed-node-profile'))
+    expect(apiMocks.cancelRun).toHaveBeenCalledTimes(1)
+
+    // An exact terminal observation releases tracking, so a later detachment starts a new supervisor.
+    installActiveJob()
+    useStore.getState().removeNode('source')
+    await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledTimes(2))
+  })
+
+  it('stops a detached cancellation supervisor before replaying a run id under another user', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const planDigest = 'a'.repeat(64)
+    const running = {
+      runId: 'alice-detached-profile', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 1, ms: 10,
+      placement: 'local', perNode: [],
+    }
+    useStore.setState({
+      doc,
+      profileJobs: { source: {
+        canvasId: doc.id, nodeId: 'source', principalId: 'alice', canCancel: true,
+        planIdentity: JSON.stringify({}), planDigest,
+        requestGeneration: 1, phase: 'running', identityVerified: true, status: running,
+      } },
+    } as any)
+    let finishCancel!: (status: any) => void
+    apiMocks.cancelRun.mockImplementationOnce(() => new Promise((resolve) => { finishCancel = resolve }))
+
+    useStore.getState().removeNode('source')
+    await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledWith(running.runId))
+    useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } })
+    finishCancel(running)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledTimes(1)
+    expect(apiMocks.runStatus).not.toHaveBeenCalledWith(running.runId)
+  })
+
+  it('permanently stops detached cancellation after a non-retryable authorization rejection', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const planDigest = 'a'.repeat(64)
+    const running = {
+      runId: 'detached-profile-role-revoked', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 1, ms: 10,
+      placement: 'local', perNode: [],
+    }
+    useStore.setState({
+      doc,
+      profileJobs: { source: {
+        canvasId: doc.id, nodeId: 'source', principalId: 'alice', canCancel: true,
+        planIdentity: JSON.stringify({}), planDigest,
+        requestGeneration: 1, phase: 'running', identityVerified: true, status: running,
+      } },
+    } as any)
+    apiMocks.cancelRun.mockRejectedValueOnce(new KernelError(403, 'role changed to viewer'))
+
+    useStore.getState().removeNode('source')
+    await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledWith(running.runId))
+    await new Promise((resolve) => setTimeout(resolve, 150))
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledTimes(1)
+    expect(apiMocks.runStatus).not.toHaveBeenCalledWith(running.runId)
+  })
+
+  it('fails closed and cancels a malformed first profile response', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    apiMocks.fullProfile.mockResolvedValueOnce({
+      runId: 'profile-malformed', status: 'running', jobType: 'profile', targetNodeId: 'other-node',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    })
+
+    await useStore.getState().startFullProfile('source')
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith('profile-malformed')
+    expect(useStore.getState().profileJobs.source?.phase).toBe('failed')
+    expect(useStore.getState().profileJobs.source?.error).toMatch(/invalid durable identity/i)
+  })
+
+  it('does not cancel an unrelated ordinary run returned by a malformed profile submission', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    apiMocks.fullProfile.mockResolvedValueOnce({
+      runId: 'ordinary-run-not-ours', status: 'running', jobType: 'run', targetNodeId: 'source',
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    })
+
+    await useStore.getState().startFullProfile('source')
+
+    expect(apiMocks.cancelRun).not.toHaveBeenCalledWith('ordinary-run-not-ours')
+    expect(useStore.getState().profileJobs.source?.phase).toBe('failed')
+  })
+
+  it('lets a terminal poll beat a rejected cancellation response for the same attempt', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    const running = {
+      runId: 'profile-cancel-race', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }
+    apiMocks.fullProfile.mockResolvedValueOnce(running)
+    let finishPoll!: (status: any) => void
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise((resolve) => { finishPoll = resolve }))
+    let rejectCancel!: (error: Error) => void
+    apiMocks.cancelRun.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectCancel = reject }))
+
+    await useStore.getState().startFullProfile('source')
+    await vi.waitFor(() => expect(apiMocks.runStatus).toHaveBeenCalledWith(running.runId))
+    const cancellation = useStore.getState().cancelFullProfile('source')
+    await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledWith(running.runId))
+    finishPoll({
+      ...running, status: 'done', rowsProcessed: 10,
+      profile: { columns: [], rowCount: 10, sampled: false },
+    })
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source?.phase).toBe('done'))
+    rejectCancel(new Error('cancel response lost'))
+    await cancellation
+
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'done', status: { status: 'done', runId: running.runId },
+    })
+    expect(useStore.getState().profileJobs.source.error).toBeUndefined()
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(apiMocks.cancelRun).toHaveBeenCalledTimes(1)
+  })
+
+  it('starts another cancel round after active cancel and status responses', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    const running = {
+      runId: 'profile-cancel-active-200', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }
+    apiMocks.fullProfile.mockResolvedValueOnce(running)
+    let finishOrdinaryStatus!: (status: any) => void
+    let finishSupervisorStatus!: (status: any) => void
+    apiMocks.runStatus
+      .mockImplementationOnce(() => new Promise((resolve) => { finishOrdinaryStatus = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishSupervisorStatus = resolve }))
+      .mockImplementation(() => new Promise(() => {}))
+    apiMocks.cancelRun.mockReset()
+      .mockResolvedValueOnce(running)
+      .mockResolvedValueOnce({ ...running, rowsProcessed: 2, ms: 20 })
+      .mockResolvedValueOnce({ ...running, status: 'cancelled' })
+
+    await useStore.getState().startFullProfile('source')
+    await useStore.getState().cancelFullProfile('source')
+
+    await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(apiMocks.runStatus).toHaveBeenCalledTimes(2))
+    finishOrdinaryStatus({ ...running, rowsProcessed: 2, ms: 20 })
+    finishSupervisorStatus({ ...running, rowsProcessed: 3, ms: 30 })
+    await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledTimes(3))
+    expect(apiMocks.cancelRun).toHaveBeenNthCalledWith(1, running.runId)
+    expect(apiMocks.cancelRun).toHaveBeenNthCalledWith(2, running.runId)
+    expect(apiMocks.cancelRun).toHaveBeenNthCalledWith(3, running.runId)
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'cancelled', status: { runId: running.runId, status: 'cancelled' },
+    }))
+    await Promise.resolve()
+    expect(apiMocks.cancelRun).toHaveBeenCalledTimes(3)
+  })
+
+  it('reissues explicit cancellation after a transient rejection until an exact terminal response', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    const running = {
+      runId: 'profile-cancel-transient-error', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }
+    apiMocks.fullProfile.mockResolvedValueOnce(running)
+    apiMocks.runStatus.mockImplementation(() => new Promise(() => {}))
+    apiMocks.cancelRun.mockReset()
+      .mockRejectedValueOnce(new Error('connection reset'))
+      .mockResolvedValueOnce({ ...running, status: 'cancelled' })
+
+    await useStore.getState().startFullProfile('source')
+    await useStore.getState().cancelFullProfile('source')
+
+    await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledTimes(2))
+    expect(apiMocks.cancelRun).toHaveBeenNthCalledWith(1, running.runId)
+    expect(apiMocks.cancelRun).toHaveBeenNthCalledWith(2, running.runId)
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'cancelled', status: { runId: running.runId, status: 'cancelled' },
+    }))
+    await Promise.resolve()
+    expect(apiMocks.cancelRun).toHaveBeenCalledTimes(2)
+  })
+
+  it('starts another cancel round after a transient supervisor status error', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    const running = {
+      runId: 'profile-cancel-status-transient', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }
+    apiMocks.fullProfile.mockResolvedValueOnce(running)
+    apiMocks.runStatus
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockRejectedValueOnce(new Error('status connection reset'))
+    apiMocks.cancelRun.mockReset()
+      .mockResolvedValueOnce(running)
+      .mockResolvedValueOnce({ ...running, rowsProcessed: 2, ms: 20 })
+      .mockResolvedValueOnce({ ...running, status: 'cancelled' })
+
+    await useStore.getState().startFullProfile('source')
+    await useStore.getState().cancelFullProfile('source')
+
+    await vi.waitFor(() => expect(apiMocks.runStatus).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledTimes(3))
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'cancelled', status: { runId: running.runId, status: 'cancelled' },
+    }))
+    expect(apiMocks.cancelRun).toHaveBeenNthCalledWith(3, running.runId)
+  })
+
+  it('keeps a concurrent done terminal ahead of a delayed supervisor cancellation terminal', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    const running = {
+      runId: 'profile-cancel-terminal-race', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }
+    const done = {
+      ...running, status: 'done', rowsProcessed: 10,
+      profile: { columns: [], rowCount: 10, sampled: false },
+    }
+    apiMocks.fullProfile.mockResolvedValueOnce(running)
+    let finishPoll!: (status: any) => void
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise((resolve) => { finishPoll = resolve }))
+    let finishRetry!: (status: any) => void
+    apiMocks.cancelRun.mockReset()
+      .mockResolvedValueOnce(running)
+      .mockImplementationOnce(() => new Promise((resolve) => { finishRetry = resolve }))
+
+    await useStore.getState().startFullProfile('source')
+    await useStore.getState().cancelFullProfile('source')
+    await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledTimes(2))
+
+    finishPoll(done)
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'done', status: { runId: running.runId, status: 'done' },
+    }))
+    finishRetry({ ...running, status: 'cancelled' })
+    await Promise.resolve()
+
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'done', status: { runId: running.runId, status: 'done', profile: { rowCount: 10 } },
+    })
+    expect(apiMocks.cancelRun).toHaveBeenCalledTimes(2)
+  })
+
+  it('sanitizes an unverified terminal reconciled by the tracked cancellation supervisor', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    const running = {
+      runId: 'profile-cancel-unverified', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    }
+    apiMocks.fullProfile.mockResolvedValueOnce(running)
+    apiMocks.runStatus.mockImplementation(() => new Promise(() => {}))
+    apiMocks.cancelRun.mockReset()
+      .mockResolvedValueOnce(running)
+      .mockResolvedValueOnce({
+        ...running, status: 'cancelled', rowsProcessed: 999, totalRows: 999,
+        profile: { columns: [], rowCount: 999, sampled: false },
+        outputUri: '/must/not/leak.parquet',
+      })
+
+    await useStore.getState().startFullProfile('source')
+    useStore.setState((state) => ({ profileJobs: { ...state.profileJobs, source: {
+      ...state.profileJobs.source!, identityVerified: false,
+    } } }))
+    await useStore.getState().cancelFullProfile('source')
+
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'cancelled', identityVerified: false,
+      status: { runId: running.runId, status: 'cancelled', rowsProcessed: 0, ms: 0, perNode: [] },
+    }))
+    expect(useStore.getState().profileJobs.source.status?.profile).toBeUndefined()
+    expect(useStore.getState().profileJobs.source.status?.outputUri).toBeUndefined()
+  })
+
+  it('reconciles a compact cancellation terminal through the durable exact-attempt projection', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    const running = {
+      runId: 'profile-cancel-compact-terminal', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }
+    const cancelled = { ...running, status: 'cancelled' }
+    apiMocks.fullProfile.mockResolvedValueOnce(running)
+    apiMocks.runStatus.mockImplementation(() => new Promise(() => {}))
+    apiMocks.cancelRun.mockReset().mockResolvedValueOnce({
+      runId: running.runId, status: 'cancelled', jobType: 'run',
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    })
+    apiMocks.profileJobs.mockResolvedValueOnce([cancelled])
+
+    await useStore.getState().startFullProfile('source')
+    await useStore.getState().cancelFullProfile('source')
+
+    expect(apiMocks.profileJobs).toHaveBeenCalledWith(doc.id)
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'cancelled', identityVerified: true,
+      status: {
+        runId: running.runId, status: 'cancelled', jobType: 'profile',
+        planDigest: running.planDigest, profileAttemptOrder: 1,
+      },
+    })
+    expect(apiMocks.cancelRun).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not retry explicit cancellation after a non-retryable authorization rejection', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    const running = {
+      runId: 'profile-cancel-role-revoked', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }
+    apiMocks.fullProfile.mockResolvedValueOnce(running)
+    apiMocks.runStatus.mockImplementation(() => new Promise(() => {}))
+    apiMocks.cancelRun.mockReset().mockRejectedValueOnce(new KernelError(403, 'role revoked'))
+
+    await useStore.getState().startFullProfile('source')
+    await useStore.getState().cancelFullProfile('source')
+
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(apiMocks.cancelRun).toHaveBeenCalledTimes(1)
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith(running.runId)
+  })
+
+  it('keeps monitoring a nonterminal run when cancellation transport fails', async () => {
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    useStore.setState({ doc })
+    await useStore.getState().prepareFullProfile('source')
+    const running = {
+      runId: 'profile-cancel-unknown', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }
+    apiMocks.fullProfile.mockResolvedValueOnce(running)
+    let finishPoll!: (status: any) => void
+    let finishSupervisorStatus!: (status: any) => void
+    apiMocks.runStatus
+      .mockImplementationOnce(() => new Promise((resolve) => { finishPoll = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishSupervisorStatus = resolve }))
+    apiMocks.cancelRun.mockReset()
+      .mockRejectedValueOnce(new Error('connection reset'))
+      .mockRejectedValueOnce(new Error('connection reset again'))
+
+    await useStore.getState().startFullProfile('source')
+    const cancellation = useStore.getState().cancelFullProfile('source')
+    await cancellation
+
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'cancelling', cancelRequested: true,
+      status: { runId: running.runId, status: 'running' },
+    })
+    expect(useStore.getState().profileJobs.source.error).toMatch(/could not be confirmed/i)
+
+    await vi.waitFor(() => expect(apiMocks.runStatus).toHaveBeenCalledTimes(2))
+    finishPoll({ ...running, rowsProcessed: 2, ms: 20 })
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source.status?.rowsProcessed).toBe(2))
+    expect(useStore.getState().profileJobs.source.phase).toBe('cancelling')
+    expect(useStore.getState().profileJobs.source.error).toMatch(/could not be confirmed/i)
+
+    finishSupervisorStatus({ ...running, status: 'cancelled', rowsProcessed: 2, ms: 20 })
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'cancelled', status: { runId: running.runId, status: 'cancelled' },
+    }))
+  })
+
+  it('recovers a current result, then ignores a stale terminal-only response after reopen', async () => {
     const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     // Capture the real digest without coupling this regression to identity serialization details.
     useStore.setState({ doc: current })
@@ -192,7 +984,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ profileJobs: {} })
     apiMocks.profileJobs.mockResolvedValueOnce([{
       runId: 'finished-away', status: 'done', jobType: 'profile', targetNodeId: 'source',
-      planDigest, rowsProcessed: 4, totalRows: 4, ms: 10, placement: 'local', perNode: [],
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 4, totalRows: 4, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 4, sampled: false },
     }])
     apiMocks.activeRuns.mockRejectedValueOnce(new Error('transient active-run lookup failure'))
@@ -203,12 +995,264 @@ describe('graph store — core authority ops', () => {
 
     apiMocks.profileJobs.mockResolvedValueOnce([{
       runId: 'stale-plan', status: 'done', jobType: 'profile', targetNodeId: 'source',
-      planDigest: '0'.repeat(64), rowsProcessed: 4, totalRows: 4, ms: 10, placement: 'local', perNode: [],
+      planDigest: '0'.repeat(64), profileAttemptOrder: 2, rowsProcessed: 4, totalRows: 4, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 4, sampled: false },
     }])
     useStore.getState().loadDoc(current, 'owner')
     await vi.waitFor(() => expect(apiMocks.profileJobs).toHaveBeenCalledTimes(2))
-    expect(useStore.getState().profileJobs.source).toBeUndefined()
+    await vi.waitFor(() => expect(apiMocks.profileIdentity).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toBeUndefined())
+    expect(apiMocks.cancelRun).not.toHaveBeenCalledWith('stale-plan')
+  })
+
+  it.each([
+    ['stale terminal first', 'done', true],
+    ['stale terminal last', 'done', false],
+    ['stale active first', 'running', true],
+    ['stale active last', 'running', false],
+  ] as const)(
+    'selects the current server digest across async recovery order: %s',
+    async (_label, staleStatus, staleFirst) => {
+      const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+      const currentAttempt = {
+        runId: 'current-plan-order-1', status: 'done', jobType: 'profile', targetNodeId: 'source',
+        planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+        rowsProcessed: 4, totalRows: 4, ms: 10, placement: 'local', perNode: [],
+        profile: { columns: [], rowCount: 4, sampled: false },
+      }
+      const staleAttempt = {
+        runId: `stale-plan-order-2-${staleStatus}-${staleFirst ? 'first' : 'last'}`,
+        status: staleStatus, jobType: 'profile', targetNodeId: 'source',
+        planDigest: 'b'.repeat(64), profileAttemptOrder: 2,
+        rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      }
+      apiMocks.profileJobs.mockResolvedValueOnce(
+        staleFirst ? [staleAttempt, currentAttempt] : [currentAttempt, staleAttempt],
+      )
+
+      useStore.getState().loadDoc(current, 'owner')
+
+      await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+        phase: 'done', identityVerified: true, planDigest: currentAttempt.planDigest,
+        status: { runId: currentAttempt.runId, profileAttemptOrder: 1 },
+      }))
+      expect(useStore.getState().profileJobs.source.status?.profile).toMatchObject({ rowCount: 4 })
+      if (staleStatus === 'running') {
+        await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledWith(staleAttempt.runId))
+      } else {
+        expect(apiMocks.cancelRun).not.toHaveBeenCalledWith(staleAttempt.runId)
+      }
+      expect(apiMocks.cancelRun).not.toHaveBeenCalledWith(currentAttempt.runId)
+    },
+  )
+
+  it('ignores a stale active recovery for viewers without issuing cancellation mutations', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const stale = {
+      runId: 'viewer-stale-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'b'.repeat(64), profileAttemptOrder: 2,
+      rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }
+    apiMocks.profileJobs.mockResolvedValueOnce([stale])
+
+    useStore.getState().loadDoc(current, 'viewer')
+
+    await vi.waitFor(() => expect(apiMocks.profileIdentity).toHaveBeenCalled())
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toBeUndefined())
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(apiMocks.cancelRun).not.toHaveBeenCalledWith(stale.runId)
+  })
+
+  it('recovers and read-only polls a current active profile for viewers', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const active = {
+      runId: 'viewer-current-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 2,
+      rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }
+    apiMocks.profileJobs.mockResolvedValueOnce([active])
+    apiMocks.runStatus.mockResolvedValueOnce({ ...active, status: 'cancelled' })
+
+    useStore.getState().loadDoc(current, 'viewer')
+
+    await vi.waitFor(() => expect(apiMocks.runStatus).toHaveBeenCalledWith(active.runId))
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      principalId: 'alice', canCancel: false, phase: 'cancelled',
+      status: { runId: active.runId, status: 'cancelled' },
+    }))
+    expect(apiMocks.cancelRun).not.toHaveBeenCalledWith(active.runId)
+  })
+
+  it('describes provisional viewer recovery without promising cancellation', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const active = {
+      runId: 'viewer-verifying-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 2,
+      rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+    }
+    apiMocks.profileJobs.mockResolvedValueOnce([active])
+    let finishIdentity!: (identity: { planDigest: string }) => void
+    apiMocks.profileIdentity.mockImplementationOnce(() => new Promise((resolve) => { finishIdentity = resolve }))
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+
+    useStore.getState().loadDoc(current, 'viewer')
+
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'verifying', identityVerified: false, canCancel: false,
+      status: { runId: active.runId },
+    }))
+    expect(useStore.getState().profileJobs.source.error).toBeUndefined()
+    expect(apiMocks.cancelRun).not.toHaveBeenCalledWith(active.runId)
+
+    finishIdentity({ planDigest: active.planDigest })
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'running', identityVerified: true, canCancel: false,
+      status: { runId: active.runId },
+    }))
+  })
+
+  it.each([
+    ['owner', true],
+    ['viewer', false],
+  ] as const)('keeps a recovered terminal result in non-error verification for %s', async (role, canCancel) => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const terminal = {
+      runId: `terminal-verifying-${role}`, status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 2,
+      rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 10, sampled: false },
+    }
+    apiMocks.profileJobs.mockResolvedValueOnce([terminal])
+    let finishIdentity!: (identity: { planDigest: string }) => void
+    apiMocks.profileIdentity.mockImplementationOnce(() => new Promise((resolve) => { finishIdentity = resolve }))
+
+    useStore.getState().loadDoc(current, role)
+
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'verifying', identityVerified: false, canCancel,
+      status: { runId: terminal.runId, status: 'done' },
+    }))
+    expect(useStore.getState().profileJobs.source.status?.profile).toBeUndefined()
+    expect(useStore.getState().profileJobs.source.error).toBeUndefined()
+    expect(apiMocks.cancelRun).not.toHaveBeenCalledWith(terminal.runId)
+
+    finishIdentity({ planDigest: terminal.planDigest })
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'done', identityVerified: true, canCancel,
+      status: { runId: terminal.runId, profile: { rowCount: 10 } },
+    }))
+  })
+
+  it('clears principal-bound profile state immediately and rejects late recovery after identity switch', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    let finishRecovery!: (statuses: any[]) => void
+    apiMocks.profileJobs.mockImplementationOnce(() => new Promise((resolve) => { finishRecovery = resolve }))
+    useStore.getState().loadDoc(current, 'owner')
+    const done = {
+      runId: 'alice-complete-profile', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 10, sampled: false },
+    }
+    useStore.setState({
+      profileJobs: { source: {
+        canvasId: current.id, nodeId: 'source', principalId: 'alice', canCancel: true,
+        planIdentity: JSON.stringify({}), planDigest: done.planDigest,
+        requestGeneration: 1, phase: 'done', identityVerified: true, status: done,
+      } },
+    } as any)
+
+    useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } })
+    expect(useStore.getState().profileJobs).toEqual({})
+    finishRecovery([done])
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(useStore.getState().profileJobs).toEqual({})
+    expect(apiMocks.cancelRun).not.toHaveBeenCalledWith(done.runId)
+  })
+
+  it('keeps a recovered active run cancellable while identity retry is pending, then verifies it', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const recovered = {
+      runId: 'identity-retry-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 2,
+      rowsProcessed: 2, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 2, sampled: false },
+      outputUri: '/unverified/result.parquet', outputTable: 'unverified',
+    }
+    apiMocks.activeRuns.mockResolvedValueOnce([recovered])
+    let finishIdentity!: (identity: { planDigest: string }) => void
+    apiMocks.profileIdentity
+      .mockRejectedValueOnce(new Error('identity service warming'))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishIdentity = resolve }))
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+
+    useStore.getState().loadDoc(current, 'owner')
+
+    await vi.waitFor(() => expect(apiMocks.profileIdentity).toHaveBeenCalledTimes(2))
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'verifying', identityVerified: false,
+      status: { runId: recovered.runId, profileAttemptOrder: 2 },
+    })
+    expect(useStore.getState().profileJobs.source.status?.profile).toBeUndefined()
+    expect(useStore.getState().profileJobs.source.status?.outputUri).toBeUndefined()
+    expect(useStore.getState().profileJobs.source.status).toMatchObject({
+      rowsProcessed: 0, ms: 0, perNode: [],
+    })
+    expect(useStore.getState().profileJobs.source.status?.totalRows).toBeUndefined()
+    expect(useStore.getState().profileJobs.source.error).toBeUndefined()
+
+    finishIdentity({ planDigest: 'a'.repeat(64) })
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'running', identityVerified: true,
+      status: { runId: recovered.runId, profile: { rowCount: 2 } },
+    }))
+  })
+
+  it('fails closed after persistent identity failure while retaining exact cancellation identity', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const recovered = {
+      runId: 'identity-failed-active', status: 'queued', jobType: 'profile', targetNodeId: 'source',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 4,
+      rowsProcessed: 0, totalRows: 10, ms: 0, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 999, sampled: false },
+      outputUri: '/must/not/leak.parquet', outputTable: 'must_not_leak',
+    }
+    apiMocks.activeRuns.mockResolvedValueOnce([recovered])
+    apiMocks.profileIdentity.mockRejectedValue(new Error('identity unavailable'))
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+    apiMocks.cancelRun.mockRejectedValueOnce(new Error('cancel response lost'))
+
+    useStore.getState().loadDoc(current, 'owner')
+
+    await vi.waitFor(() => expect(apiMocks.profileIdentity).toHaveBeenCalledTimes(3))
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source?.error).toMatch(/could not verify/i))
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'failed', identityVerified: false,
+      status: {
+        runId: recovered.runId, status: 'queued', targetNodeId: 'source',
+        planDigest: recovered.planDigest, profileAttemptOrder: 4,
+      },
+    })
+    expect(useStore.getState().profileJobs.source.status?.profile).toBeUndefined()
+    expect(useStore.getState().profileJobs.source.status?.outputUri).toBeUndefined()
+    expect(useStore.getState().profileJobs.source.status).toMatchObject({
+      rowsProcessed: 0, ms: 0, perNode: [],
+    })
+    expect(useStore.getState().profileJobs.source.status?.totalRows).toBeUndefined()
+    expect(useStore.getState().profileJobs.source.status?.error).toBeUndefined()
+
+    await useStore.getState().cancelFullProfile('source')
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith(recovered.runId)
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'cancelled', identityVerified: false,
+      status: { runId: recovered.runId, status: 'cancelled' },
+    })
+    expect(useStore.getState().profileJobs.source.status).toMatchObject({
+      status: 'cancelled', rowsProcessed: 0, ms: 0, perNode: [],
+    })
+    expect(useStore.getState().profileJobs.source.status?.profile).toBeUndefined()
   })
 
   it('falls back to active profile recovery when the latest-profile request fails', async () => {
@@ -220,7 +1264,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.profileJobs.mockRejectedValueOnce(new Error('transient latest-profile lookup failure'))
     apiMocks.activeRuns.mockResolvedValueOnce([{
       runId: 'active-fallback', status: 'running', jobType: 'profile', targetNodeId: 'source',
-      planDigest, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }])
     let finishStatus!: (status: any) => void
     apiMocks.runStatus.mockImplementationOnce(() => new Promise((resolve) => { finishStatus = resolve }))
@@ -233,9 +1277,89 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().profileJobs.source?.phase).toBe('running')
     finishStatus({
       runId: 'active-fallback', status: 'cancelled', jobType: 'profile', targetNodeId: 'source',
-      planDigest, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     })
     await vi.waitFor(() => expect(useStore.getState().profileJobs.source?.phase).toBe('cancelled'))
+  })
+
+  it('does not let a delayed queued poll response regress a running profile', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const planDigest = 'a'.repeat(64)
+    const base = {
+      runId: 'poll-monotonic', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 2, rowsProcessed: 1, totalRows: 10,
+      ms: 10, placement: 'local', perNode: [],
+    }
+    apiMocks.profileJobs.mockRejectedValueOnce(new Error('projection unavailable'))
+    apiMocks.activeRuns.mockResolvedValueOnce([{ ...base, status: 'running' }])
+    apiMocks.runStatus
+      .mockResolvedValueOnce({ ...base, status: 'queued', rowsProcessed: 0 })
+      .mockResolvedValueOnce({ ...base, status: 'cancelled' })
+
+    useStore.getState().loadDoc(current, 'owner')
+    await vi.waitFor(() => expect(apiMocks.runStatus).toHaveBeenCalledTimes(1))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(useStore.getState().profileJobs.source?.phase).toBe('running')
+    await vi.waitFor(
+      () => expect(useStore.getState().profileJobs.source?.phase).toBe('cancelled'),
+      { timeout: 1000 },
+    )
+  })
+
+  it('fails closed when a profile poll returns a different durable identity', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const planDigest = 'a'.repeat(64)
+    apiMocks.profileJobs.mockRejectedValueOnce(new Error('projection unavailable'))
+    apiMocks.activeRuns.mockResolvedValueOnce([{
+      runId: 'poll-identity', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 3, rowsProcessed: 1, totalRows: 10,
+      ms: 10, placement: 'local', perNode: [],
+    }])
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: 'poll-identity', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest: '0'.repeat(64), profileAttemptOrder: 3, rowsProcessed: 10, totalRows: 10,
+      ms: 20, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 10, sampled: false },
+    })
+
+    useStore.getState().loadDoc(current, 'owner')
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source?.phase).toBe('failed'))
+    expect(useStore.getState().profileJobs.source?.status?.status).toBe('running')
+    expect(useStore.getState().profileJobs.source?.error).toMatch(/identity changed/i)
+    expect(apiMocks.profileJobs).toHaveBeenCalledTimes(1)
+  })
+
+  it('recovers full profile detail from the durable projection after RunState pruning', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const planDigest = 'a'.repeat(64)
+    const running = {
+      runId: 'profile-pruned-detail', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 7, rowsProcessed: 3, totalRows: 10,
+      ms: 10, placement: 'local', perNode: [],
+    }
+    const projected = {
+      ...running, status: 'done', rowsProcessed: 10, ms: 30,
+      profile: { columns: [], rowCount: 10, sampled: false },
+    }
+    apiMocks.activeRuns.mockResolvedValueOnce([running])
+    apiMocks.profileJobs
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([projected])
+    // Detail retention has evicted the RunState, so the run endpoint can return only its compact fence.
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: running.runId, status: 'done', jobType: 'run', rowsProcessed: 0,
+      ms: 0, placement: 'local', perNode: [], error: 'terminal_details_pruned',
+    })
+
+    useStore.getState().loadDoc(current, 'owner')
+
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source?.phase).toBe('done'))
+    expect(useStore.getState().profileJobs.source?.status).toMatchObject({
+      runId: running.runId, jobType: 'profile', profileAttemptOrder: 7,
+      profile: { rowCount: 10, sampled: false },
+    })
+    expect(apiMocks.profileJobs).toHaveBeenCalledTimes(2)
   })
 
   it('recovers an authoritative profile while active-runs remains pending', async () => {
@@ -248,7 +1372,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.activeRuns.mockImplementationOnce(() => new Promise((resolve) => { finishActive = resolve }))
     apiMocks.profileJobs.mockResolvedValueOnce([{
       runId: 'projection-first', status: 'done', jobType: 'profile', targetNodeId: 'source',
-      planDigest, rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },
     }])
 
@@ -258,6 +1382,80 @@ describe('graph store — core authority ops', () => {
       useStore.getState().profileJobs.source?.status?.runId,
     ).toBe('projection-first'))
     finishActive([])
+  })
+
+  it('does not let an empty projection suppress a delayed active profile', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const planDigest = 'a'.repeat(64)
+    let finishActive!: (statuses: any[]) => void
+    apiMocks.activeRuns.mockImplementationOnce(() => new Promise((resolve) => { finishActive = resolve }))
+    apiMocks.profileJobs.mockResolvedValueOnce([])
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+
+    useStore.getState().loadDoc(current, 'owner')
+    await vi.waitFor(() => expect(apiMocks.profileJobs).toHaveBeenCalled())
+    finishActive([{
+      runId: 'active-after-empty', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 3, rowsProcessed: 1, totalRows: 10,
+      ms: 10, placement: 'local', perNode: [],
+    }])
+
+    await vi.waitFor(() => expect(
+      useStore.getState().profileJobs.source?.status?.runId,
+    ).toBe('active-after-empty'))
+  })
+
+  it('lets a newer active retry supersede an older projection for the same plan', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const planDigest = 'a'.repeat(64)
+    let finishActive!: (statuses: any[]) => void
+    apiMocks.activeRuns.mockImplementationOnce(() => new Promise((resolve) => { finishActive = resolve }))
+    apiMocks.profileJobs.mockResolvedValueOnce([{
+      runId: 'old-projection', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 4, rowsProcessed: 10, totalRows: 10,
+      ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 10, sampled: false },
+    }])
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+
+    useStore.getState().loadDoc(current, 'owner')
+    await vi.waitFor(() => expect(
+      useStore.getState().profileJobs.source?.status?.runId,
+    ).toBe('old-projection'))
+    finishActive([{
+      runId: 'new-active-retry', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 5, rowsProcessed: 1, totalRows: 10,
+      ms: 10, placement: 'local', perNode: [],
+    }])
+
+    await vi.waitFor(() => expect(
+      useStore.getState().profileJobs.source?.status?.runId,
+    ).toBe('new-active-retry'))
+  })
+
+  it('never regresses the same recovered attempt from running to queued', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const planDigest = 'a'.repeat(64)
+    let finishProjection!: (statuses: any[]) => void
+    apiMocks.profileJobs.mockImplementationOnce(() => new Promise((resolve) => { finishProjection = resolve }))
+    apiMocks.activeRuns.mockResolvedValueOnce([{
+      runId: 'same-attempt', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 6, rowsProcessed: 1, totalRows: 10,
+      ms: 10, placement: 'local', perNode: [],
+    }])
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+
+    useStore.getState().loadDoc(current, 'owner')
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source?.phase).toBe('running'))
+    finishProjection([{
+      runId: 'same-attempt', status: 'queued', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 6, rowsProcessed: 0,
+      ms: 0, placement: 'local', perNode: [],
+    }])
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(useStore.getState().profileJobs.source?.phase).toBe('running')
   })
 
   it('uses active profile provisionally while projection is pending, then yields to projection', async () => {
@@ -270,7 +1468,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.profileJobs.mockImplementationOnce(() => new Promise((resolve) => { finishProjection = resolve }))
     apiMocks.activeRuns.mockResolvedValueOnce([{
       runId: 'provisional-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
-      planDigest, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }])
     let finishStatus!: (status: any) => void
     apiMocks.runStatus.mockImplementationOnce(() => new Promise((resolve) => { finishStatus = resolve }))
@@ -282,7 +1480,7 @@ describe('graph store — core authority ops', () => {
     ).toBe('provisional-active'))
     finishProjection([{
       runId: 'authoritative-terminal', status: 'done', jobType: 'profile', targetNodeId: 'source',
-      planDigest, rowsProcessed: 10, totalRows: 10, ms: 20, placement: 'local', perNode: [],
+      planDigest, profileAttemptOrder: 2, rowsProcessed: 10, totalRows: 10, ms: 20, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },
     }])
     await vi.waitFor(() => expect(
@@ -290,7 +1488,7 @@ describe('graph store — core authority ops', () => {
     ).toBe('authoritative-terminal'))
     finishStatus({
       runId: 'provisional-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
-      planDigest, rowsProcessed: 2, totalRows: 10, ms: 20, placement: 'local', perNode: [],
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 2, totalRows: 10, ms: 20, placement: 'local', perNode: [],
     })
     await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledWith('provisional-active'))
     expect(useStore.getState().profileJobs.source?.status?.runId).toBe('authoritative-terminal')
@@ -312,7 +1510,7 @@ describe('graph store — core authority ops', () => {
     useStore.getState().loadDoc(current, 'owner')
     finishNew([{
       runId: 'newer-reattach', status: 'done', jobType: 'profile', targetNodeId: 'source',
-      planDigest, rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      planDigest, profileAttemptOrder: 2, rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },
     }])
     await vi.waitFor(() => expect(
@@ -320,12 +1518,46 @@ describe('graph store — core authority ops', () => {
     ).toBe('newer-reattach'))
     finishOld([{
       runId: 'older-reattach', status: 'done', jobType: 'profile', targetNodeId: 'source',
-      planDigest, rowsProcessed: 5, totalRows: 5, ms: 10, placement: 'local', perNode: [],
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 5, totalRows: 5, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 5, sampled: false },
     }])
     await Promise.resolve()
     await Promise.resolve()
     expect(useStore.getState().profileJobs.source?.status?.runId).toBe('newer-reattach')
+  })
+
+  it('does not let delayed recovery replace a profile the user started after reopen', async () => {
+    const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
+    const planDigest = 'a'.repeat(64)
+    let finishRecovery!: (statuses: any[]) => void
+    let finishSubmission!: (status: any) => void
+    apiMocks.profileJobs.mockImplementationOnce(() => new Promise((resolve) => { finishRecovery = resolve }))
+    apiMocks.fullProfile.mockImplementationOnce(() => new Promise((resolve) => { finishSubmission = resolve }))
+
+    useStore.getState().loadDoc(current, 'owner')
+    await useStore.getState().prepareFullProfile('source')
+    const submission = useStore.getState().startFullProfile('source')
+    finishRecovery([{
+      runId: 'old-recovered-profile', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 5, totalRows: 5,
+      ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 5, sampled: false },
+    }])
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(useStore.getState().profileJobs.source?.phase).toBe('queued')
+    expect(useStore.getState().profileJobs.source?.status).toBeUndefined()
+
+    finishSubmission({
+      runId: 'new-user-profile', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      planDigest, profileAttemptOrder: 2, rowsProcessed: 10, totalRows: 10,
+      ms: 20, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 10, sampled: false },
+    })
+    await submission
+
+    expect(useStore.getState().profileJobs.source?.status?.runId).toBe('new-user-profile')
+    expect(apiMocks.cancelRun).not.toHaveBeenCalledWith('new-user-profile')
   })
 
   it('blocks a preview response when the graph topology changes', async () => {

@@ -1,11 +1,11 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, it, expect, vi } from 'vitest'
 import { fmtMs, DurationTrend, PerNodeBreakdown } from './RunHistoryModal'
 import type { PerNodeStat, RunRecordDto } from '../api/client'
 import { RunHistoryModal } from './RunHistoryModal'
 import { DataPanel, FullResult } from './DataPanel'
-import { previewPlanIdentity, useStore } from '../store/graph'
+import { previewPlanIdentity, profilePlanIdentity, useStore } from '../store/graph'
 
 const apiMock = vi.hoisted(() => ({
   listRuns: vi.fn(),
@@ -23,15 +23,20 @@ beforeEach(() => {
   apiMock.sample.mockReset()
   apiMock.profile.mockReset().mockResolvedValue({ columns: [], rowCount: 10, sampled: true })
   apiMock.profileEstimate.mockReset().mockResolvedValue({
-    rows: null, bytes: null, placement: 'local', needsConfirm: true,
+    rows: null, bytes: null, placement: 'local', needsConfirm: true, planDigest: 'a'.repeat(64),
   })
   apiMock.fullProfile.mockReset().mockResolvedValue({
     runId: 'profile-ui', status: 'done', jobType: 'profile', targetNodeId: 'target',
+    planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
     rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     profile: { columns: [], rowCount: 10, sampled: false },
   })
-  apiMock.cancelRun.mockReset().mockResolvedValue({})
+  apiMock.cancelRun.mockReset().mockImplementation(async (runId: string) => ({
+    runId, status: 'cancelled', jobType: 'run',
+    rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+  }))
   useStore.setState({
+    currentUser: { id: 'alice', name: 'Alice' },
     doc: { id: 'history-canvas', name: 'History', version: 1, nodes: [], edges: [], requirements: [] },
     previews: {}, runs: {},
   } as any)
@@ -115,6 +120,32 @@ describe('durable full results', () => {
     expect(apiMock.sample).toHaveBeenLastCalledWith('/outputs/result.parquet', 50, undefined, 50)
   })
 
+  it('stops at the read budget while preserving truncated export labeling', async () => {
+    apiMock.sample.mockImplementation(async (
+      _uri: string, _k: number, _columns: unknown, offset: number,
+    ) => ({
+      ...sample(offset, 50, offset < 1950),
+      rowCount: 100_000,
+      truncated: true,
+    }))
+    const user = userEvent.setup()
+
+    render(<FullResult uri="/outputs/budget-terminal.parquet" total={100_000} />)
+
+    await screen.findByText('rows 1–50 of 100,000')
+    expect(screen.queryByText('Interactive view limit reached')).not.toBeInTheDocument()
+    for (let offset = 50; offset <= 1950; offset += 50) {
+      await user.click(screen.getByRole('button', { name: 'Next page' }))
+      await screen.findByText(`rows ${offset + 1}–${offset + 50} of 100,000`)
+    }
+    expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled()
+    expect(screen.getByText('Interactive view limit reached')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'CSV' })).toHaveAttribute(
+      'title',
+      expect.stringContaining('previewed sample only'),
+    )
+  })
+
   it('labels a missing or expired artifact explicitly', async () => {
     apiMock.sample.mockRejectedValue(new Error('404: no such file'))
     render(<FullResult uri="/outputs/missing.parquet" total={105} />)
@@ -175,6 +206,76 @@ describe('durable full results', () => {
     expect(screen.getByText('rows 1–50')).toBeInTheDocument()
   })
 
+  it('renders an exact grouped-chart artifact as a chart without starting another scan', async () => {
+    apiMock.sample.mockResolvedValue({
+      columns: [
+        { name: 'x', type: 'VARCHAR', capabilities: [] },
+        { name: 'y', type: 'BIGINT', capabilities: [] },
+      ],
+      rows: [{ x: 'walk', y: 4 }, { x: 'pick', y: 7 }],
+      rowCount: 2, hasMore: false, truncated: false,
+    })
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'chart', position: { x: 0, y: 0 },
+      data: { title: 'Tasks', status: 'latest', config: { chartType: 'bar', x: 'task', y: 'count', agg: 'sum' }, history: [] },
+    }] }
+    useStore.setState({
+      doc, canvasRole: 'owner', profileJobs: {},
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, notPreviewable: true,
+        reason: 'grouped charts require a full pass',
+      }) },
+      runs: { target: { phase: 'done', status: {
+        runId: 'chart-exact-run', status: 'done', targetNodeId: 'target',
+        rowsProcessed: 2, totalRows: 2, ms: 10, placement: 'local', perNode: [],
+        outputUri: '/outputs/grouped-chart.parquet',
+      } } },
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(await screen.findByRole('img', { name: 'bar chart' })).toBeInTheDocument()
+    expect(screen.getByText('sum(count) vs task · 2 points')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Sample' })).toBeInTheDocument()
+    expect(apiMock.sample).toHaveBeenCalledWith('/outputs/grouped-chart.parquet', 50, undefined, 0)
+    expect(apiMock.fullProfile).not.toHaveBeenCalled()
+  })
+
+  it('renders an exact metric artifact as a scalar without starting another scan', async () => {
+    apiMock.sample.mockResolvedValue({
+      columns: [
+        { name: 'metric', type: 'VARCHAR', capabilities: [] },
+        { name: 'value', type: 'BIGINT', capabilities: [] },
+      ],
+      rows: [{ metric: 'successful grasps', value: 1234 }],
+      rowCount: 1, hasMore: false, truncated: false,
+    })
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'metric', position: { x: 0, y: 0 },
+      data: { title: 'Successes', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc, canvasRole: 'owner', profileJobs: {},
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, notPreviewable: true,
+        reason: 'this metric requires a full pass',
+      }) },
+      runs: { target: { phase: 'done', status: {
+        runId: 'metric-exact-run', status: 'done', targetNodeId: 'target',
+        rowsProcessed: 1, totalRows: 1, ms: 10, placement: 'local', perNode: [],
+        outputUri: '/outputs/metric.parquet',
+      } } },
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(await screen.findByText('1,234')).toBeInTheDocument()
+    expect(screen.getByText('successful grasps · over the full dataset')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Sample' })).toBeInTheDocument()
+    expect(apiMock.sample).toHaveBeenCalledWith('/outputs/metric.parquet', 50, undefined, 0)
+    expect(apiMock.fullProfile).not.toHaveBeenCalled()
+  })
+
   it('blocks stale rows and offers a refresh for the current graph', () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'filter', position: { x: 0, y: 0 },
@@ -198,6 +299,12 @@ describe('durable full results', () => {
   })
 
   it('shows profile preflight before an explicit confirmed start', async () => {
+    apiMock.profileEstimate.mockResolvedValueOnce({
+      rows: 10, bytes: 5 * 1024 ** 3, placement: 'local', needsConfirm: true,
+      planDigest: 'a'.repeat(64),
+    })
+    let finishProfile!: (status: any) => void
+    apiMock.fullProfile.mockImplementationOnce(() => new Promise((resolve) => { finishProfile = resolve }))
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'source', position: { x: 0, y: 0 },
       data: { title: 'target', status: 'latest', config: {}, history: [] },
@@ -219,13 +326,240 @@ describe('durable full results', () => {
 
     await user.click(screen.getByRole('button', { name: 'Estimate full profile' }))
     expect(await screen.findByText('Profile preflight')).toBeInTheDocument()
+    expect(screen.getByText(/Estimated 10 rows · 5 GiB · Large or unknown scan/i)).toBeInTheDocument()
     expect(screen.getByText(/distinct counts are approximate/i)).toBeInTheDocument()
     expect(apiMock.fullProfile).not.toHaveBeenCalled()
 
     await user.click(screen.getByRole('button', { name: 'Start whole-dataset profile' }))
     await waitFor(() => expect(apiMock.fullProfile).toHaveBeenCalledWith(
-      doc, 'target', expect.any(String), true,
+      doc, 'target', expect.any(String), expect.any(String), true,
     ))
+    expect(screen.getByText('Full profile queued…')).toBeInTheDocument()
+    expect(screen.getByText(/Estimated 10 rows · 5 GiB · whole-dataset scan/i)).toBeInTheDocument()
+
+    finishProfile({
+      runId: 'profile-ui', status: 'done', jobType: 'profile', targetNodeId: 'target',
+      planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+      rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 10, sampled: false },
+    })
+    expect(await screen.findByText('whole dataset · 10 rows · distinct is an estimate')).toBeInTheDocument()
+  })
+
+  it('lets viewers read recovered full profiles without mutation controls', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    const planIdentity = profilePlanIdentity(doc, 'target')
+    const planDigest = 'a'.repeat(64)
+    const done = {
+      runId: 'profile-viewer', status: 'done', jobType: 'profile', targetNodeId: 'target',
+      planDigest, profileAttemptOrder: 1, rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 10, sampled: false },
+    }
+    useStore.setState({
+      doc,
+      canvasRole: 'viewer',
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+      profileJobs: { target: {
+        canvasId: doc.id, nodeId: 'target', principalId: 'alice', canCancel: false,
+        planIdentity, planDigest,
+        requestGeneration: 1, phase: 'done', status: done,
+      } },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    await user.click(screen.getByRole('button', { name: 'full dataset' }))
+    expect(screen.getByText('whole dataset · 10 rows · distinct is an estimate')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Estimate full profile' })).not.toBeInTheDocument()
+    expect(apiMock.profileEstimate).not.toHaveBeenCalled()
+    expect(apiMock.fullProfile).not.toHaveBeenCalled()
+
+    act(() => useStore.setState((state) => ({ profileJobs: { ...state.profileJobs, target: {
+      ...state.profileJobs.target!, phase: 'verifying', identityVerified: false,
+      status: { ...done, status: 'running', profile: undefined },
+    } } })))
+    expect(screen.getByText('Verifying recovered full profile…')).toBeInTheDocument()
+    expect(screen.getByText('Statistics remain hidden until verification completes.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
+    expect(apiMock.cancelRun).not.toHaveBeenCalled()
+  })
+
+  it('hides unverified recovered statistics but keeps the exact active run cancellable for editors', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    const planDigest = 'a'.repeat(64)
+    useStore.setState({
+      doc,
+      canvasRole: 'owner',
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+      profileJobs: { target: {
+        canvasId: doc.id, nodeId: 'target', principalId: 'alice', canCancel: true,
+        planIdentity: profilePlanIdentity(doc, 'target'), planDigest,
+        requestGeneration: 1, phase: 'verifying', identityVerified: false,
+        status: {
+          runId: 'profile-unverified-active', status: 'running', jobType: 'profile', targetNodeId: 'target',
+          planDigest, profileAttemptOrder: 2, rowsProcessed: 5, ms: 10,
+          placement: 'local', perNode: [],
+          profile: { columns: [], rowCount: 999, sampled: false },
+          outputUri: '/unverified/result.parquet',
+        },
+      } },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    await user.click(screen.getByRole('button', { name: 'full dataset' }))
+
+    expect(screen.getByText('Verifying recovered full profile…')).toBeInTheDocument()
+    expect(screen.getByText('Statistics remain hidden until verification completes.')).toBeInTheDocument()
+    expect(screen.queryByText('Full profile not verified')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/whole dataset · 999 rows/i)).not.toBeInTheDocument()
+    apiMock.cancelRun.mockResolvedValueOnce({
+      runId: 'profile-unverified-active', status: 'cancelled', jobType: 'profile', targetNodeId: 'target',
+      planDigest, profileAttemptOrder: 2, rowsProcessed: 5, ms: 10,
+      placement: 'local', perNode: [],
+    })
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(apiMock.cancelRun).toHaveBeenCalledWith('profile-unverified-active')
+  })
+
+  it.each([
+    ['owner', true],
+    ['viewer', false],
+  ] as const)('shows terminal recovery verification as progress without mutations for %s', async (role, canCancel) => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    const planDigest = 'a'.repeat(64)
+    useStore.setState({
+      doc,
+      canvasRole: role,
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+      profileJobs: { target: {
+        canvasId: doc.id, nodeId: 'target', principalId: 'alice', canCancel,
+        planIdentity: profilePlanIdentity(doc, 'target'), planDigest,
+        requestGeneration: 1, phase: 'verifying', identityVerified: false,
+        status: {
+          runId: `profile-terminal-verifying-${role}`, status: 'done', jobType: 'profile', targetNodeId: 'target',
+          planDigest, profileAttemptOrder: 2, rowsProcessed: 10, ms: 10,
+          placement: 'local', perNode: [],
+        },
+      } },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    await user.click(screen.getByRole('button', { name: 'full dataset' }))
+
+    expect(screen.getByText('Verifying recovered full profile…')).toBeInTheDocument()
+    expect(screen.getByText('Statistics remain hidden until verification completes.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Full profile not verified')).not.toBeInTheDocument()
+    expect(apiMock.cancelRun).not.toHaveBeenCalled()
+  })
+
+  it('keeps whole-dataset mode reachable when sample statistics are not previewable', async () => {
+    apiMock.profile.mockResolvedValueOnce({
+      columns: [], rowCount: 0, sampled: true, notPreviewable: true,
+      reason: 'sort statistics require a full pass',
+    })
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'sort', position: { x: 0, y: 0 },
+      data: { title: 'Sorted rows', status: 'latest', config: { by: 'score' }, history: [] },
+    }] }
+    useStore.setState({
+      doc, canvasRole: 'owner', profileJobs: {},
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    expect(await screen.findByText('Not sample-previewable')).toBeInTheDocument()
+    expect(screen.getByText(/switch to full dataset to estimate/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /run a full pass/i })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'full dataset' }))
+    await user.click(screen.getByRole('button', { name: 'Estimate full profile' }))
+    await waitFor(() => expect(apiMock.profileEstimate).toHaveBeenCalledWith(doc, 'target'))
+  })
+
+  it('hides Alice full-profile statistics synchronously when identity changes to Bob', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    const planDigest = 'a'.repeat(64)
+    useStore.setState({
+      doc, canvasRole: 'owner',
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+      profileJobs: { target: {
+        canvasId: doc.id, nodeId: 'target', principalId: 'alice', canCancel: true,
+        planIdentity: profilePlanIdentity(doc, 'target'), planDigest,
+        requestGeneration: 1, phase: 'done', identityVerified: true,
+        status: {
+          runId: 'alice-visible-profile', status: 'done', jobType: 'profile', targetNodeId: 'target',
+          planDigest, profileAttemptOrder: 1, rowsProcessed: 10, totalRows: 10,
+          ms: 10, placement: 'local', perNode: [],
+          profile: { columns: [], rowCount: 10, sampled: false },
+        },
+      } },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    await user.click(screen.getByRole('button', { name: 'full dataset' }))
+    expect(screen.getByText('whole dataset · 10 rows · distinct is an estimate')).toBeInTheDocument()
+
+    act(() => useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } }))
+
+    expect(screen.queryByText('whole dataset · 10 rows · distinct is an estimate')).not.toBeInTheDocument()
+    expect(screen.getByText('Whole-dataset profile')).toBeInTheDocument()
+  })
+
+  it('labels a failed whole-dataset job separately from sample preview failures', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    const planIdentity = profilePlanIdentity(doc, 'target')
+    const planDigest = 'a'.repeat(64)
+    useStore.setState({
+      doc,
+      canvasRole: 'owner',
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+      profileJobs: { target: {
+        canvasId: doc.id, nodeId: 'target', principalId: 'alice', canCancel: true,
+        planIdentity, planDigest,
+        requestGeneration: 1, phase: 'failed', error: 'adapter timed out',
+        status: {
+          runId: 'profile-failed', status: 'failed', jobType: 'profile', targetNodeId: 'target',
+          planDigest, profileAttemptOrder: 1, rowsProcessed: 0, ms: 10,
+          placement: 'local', perNode: [], error: 'adapter timed out',
+        },
+      } },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    await user.click(screen.getByRole('button', { name: 'full dataset' }))
+
+    expect(screen.getByText('Full profile failed')).toBeInTheDocument()
+    expect(screen.queryByText('Preview failed')).not.toBeInTheDocument()
+    expect(screen.getByText('adapter timed out')).toBeInTheDocument()
   })
 })
 

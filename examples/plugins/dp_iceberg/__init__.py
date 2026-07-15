@@ -6,9 +6,11 @@ catalog named in the uri is resolved by pyiceberg from its usual config (`~/.pyi
 `PYICEBERG_CATALOG__*` env vars), so credentials/warehouse live in your pyiceberg config, not here.
 
 It demonstrates the `DatasetAdapter` seam (`reg.add_adapter`) for a warehouse-style source: `matches`
-claims `iceberg://`, `scan` returns a lazy DuckDB relation (column/limit applied in DuckDB — a fuller
-version would push `row_filter`/`selected_fields` into pyiceberg's scan), `schema`/`count`/`fingerprint`
-round it out, `write` raises (read-only). `pyiceberg` is imported lazily, so the plugin loads without it.
+claims `iceberg://`, while `schema`/`count`/`fingerprint` round out the read-only full-run adapter. This
+compact example materializes PyIceberg's complete Arrow result before applying DuckDB LIMIT, so it
+omits the optional interactive-preview capability; a production adapter should implement source-level
+scan limits.
+`pyiceberg` is imported lazily, so the plugin loads without it.
 
 Install: `uv pip install -e 'kernel[iceberg]'`. Verify against your own Iceberg catalog/warehouse —
 the shipped test exercises the adapter's logic against a stand-in, not a live catalog.

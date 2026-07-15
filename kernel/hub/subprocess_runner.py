@@ -94,6 +94,23 @@ class SubprocessRunner:
             self.deadline_s = 3600.0
         atexit.register(self._terminate_all)  # don't orphan running children when the kernel exits
 
+    def _spawn_process(self, run_id: str, command: list[str], **kwargs) -> subprocess.Popen:
+        """Backend hook for process-containment variants; ordinary runs keep direct-child semantics."""
+        _ = run_id
+        return subprocess.Popen(command, **kwargs)
+
+    def _signal_process(self, run_id: str, proc: subprocess.Popen, *, force: bool) -> None:
+        """Signal the owned writer. Specialized runners may target a process group/cgroup instead."""
+        _ = run_id
+        if force:
+            proc.kill()
+        else:
+            proc.terminate()
+
+    def _finalize_process_scope(self, run_id: str, proc: subprocess.Popen) -> None:
+        """Prove specialized descendant containment is empty after the direct child is reaped."""
+        _ = run_id, proc
+
     def _terminate_all(self) -> None:
         """Fence, reap, then discard parent-owned writers during an orderly interpreter shutdown.
 
@@ -103,19 +120,25 @@ class SubprocessRunner:
         with self._lock:
             procs = list(self._procs.items())
             self._cancelled.update(run_id for run_id, _proc in procs)
-        for _run_id, proc in procs:
+        for run_id, proc in procs:
             try:
                 if proc.poll() is None:
-                    proc.terminate()
+                    self._signal_process(run_id, proc, force=False)
             except Exception:  # noqa: BLE001
                 pass
         for run_id, proc in procs:
             try:
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                self._signal_process(run_id, proc, force=True)
                 proc.wait()
             except Exception:  # noqa: BLE001
+                continue
+            try:
+                self._finalize_process_scope(run_id, proc)
+            except Exception:  # noqa: BLE001 - process exit will release the remaining OS scope
+                logging.getLogger("hub").exception(
+                    "subprocess shutdown could not finalize its process scope")
                 continue
             owned = self._object_results.get(run_id)
             if owned is not None:
@@ -533,8 +556,8 @@ class SubprocessRunner:
                 inherited_fds.append(int(result_lock_fd))
             if inherited_fds:
                 popen_kwargs["pass_fds"] = tuple(sorted(set(inherited_fds)))
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "hub.subrun", job_file], **popen_kwargs)
+            proc = self._spawn_process(
+                run_id, [sys.executable, "-m", "hub.subrun", job_file], **popen_kwargs)
         except Exception:
             shutil.rmtree(job_dir, ignore_errors=True)
             raise
@@ -557,13 +580,15 @@ class SubprocessRunner:
             reaped = False
             try:
                 if proc.poll() is None:
-                    proc.terminate()
+                    self._signal_process(run_id, proc, force=False)
                 proc.wait(timeout=2)
+                self._finalize_process_scope(run_id, proc)
                 reaped = True
             except subprocess.TimeoutExpired:
                 try:
-                    proc.kill()
+                    self._signal_process(run_id, proc, force=True)
                     proc.wait()
+                    self._finalize_process_scope(run_id, proc)
                     reaped = True
                 except Exception:  # noqa: BLE001
                     logging.getLogger("hub").exception(
@@ -626,6 +651,10 @@ class SubprocessRunner:
         """
         return observed
 
+    def _heartbeat_interval_s(self) -> float | None:
+        """Optional unchanged-status publication interval; ordinary subprocess runs stay event-driven."""
+        return None
+
     def _finalize_reaped_status(self, run_id: str, status: RunStatus, *,
                                 deadline_hit: bool, returncode: int | None) -> RunStatus:
         """Apply backend-specific terminal rules after the child is observably reaped."""
@@ -685,13 +714,15 @@ class SubprocessRunner:
             try:
                 try:
                     if proc.poll() is None:
-                        proc.terminate()
+                        self._signal_process(run_id, proc, force=False)
                     proc.wait(timeout=2)
+                    self._finalize_process_scope(run_id, proc)
                     reaped = True
                 except subprocess.TimeoutExpired:
                     try:
-                        proc.kill()
+                        self._signal_process(run_id, proc, force=True)
                         proc.wait()
+                        self._finalize_process_scope(run_id, proc)
                         reaped = True
                     except Exception:  # noqa: BLE001
                         logging.getLogger("hub").exception(
@@ -753,6 +784,7 @@ class SubprocessRunner:
         deadline_hit = False
         cancel_seen_at = None
         last = None
+        last_emit_at = 0.0
         terminal = None
         source_lease_lost = False
         while True:
@@ -762,7 +794,7 @@ class SubprocessRunner:
                 source_lease_lost = True
                 if proc.poll() is None:
                     try:
-                        proc.terminate()
+                        self._signal_process(run_id, proc, force=False)
                     except OSError:
                         pass
                 time.sleep(0.1)
@@ -776,9 +808,18 @@ class SubprocessRunner:
             cur = self.runs.get(run_id)
             if cur is not None:
                 dump = cur.model_dump()
-                if dump != last:
+                now = time.monotonic()
+                heartbeat_s = self._heartbeat_interval_s()
+                heartbeat_due = bool(
+                    heartbeat_s is not None
+                    and now - last_emit_at >= heartbeat_s
+                    and proc.poll() is None
+                    and self._procs.get(run_id) is proc
+                )
+                if dump != last or heartbeat_due:
                     self._emit(graph, cur)
                     last = dump
+                    last_emit_at = now
             if proc.poll() is not None:      # child exited — do a final read then stop
                 time.sleep(0.1)
                 terminal = self._read(run_id, status_file)
@@ -790,7 +831,7 @@ class SubprocessRunner:
                     # A runaway Python/native operation may ignore it; terminate only after the grace window.
                     if proc.poll() is None:
                         try:
-                            proc.terminate()
+                            self._signal_process(run_id, proc, force=False)
                         except OSError:
                             pass  # exited between poll and signal
                     time.sleep(0.1)
@@ -799,7 +840,7 @@ class SubprocessRunner:
             if self.deadline_s and self.deadline_s > 0 and time.monotonic() - start > self.deadline_s:
                 deadline_hit = True           # runaway — hard-kill the child and fail the run
                 if proc.poll() is None:
-                    proc.terminate()
+                    self._signal_process(run_id, proc, force=False)
                 time.sleep(0.1)
                 terminal = self._read(run_id, status_file)
                 break
@@ -807,8 +848,10 @@ class SubprocessRunner:
         try:
             proc.wait(timeout=2 if run_id in self._cancelled else 5)
         except subprocess.TimeoutExpired:
-            proc.kill()  # SIGTERM ignored (e.g. a C-level DuckDB loop) → force-reap so _watch can't hang
+            # SIGTERM ignored (e.g. a C-level DuckDB loop) → force-reap so _watch can't hang.
+            self._signal_process(run_id, proc, force=True)
             proc.wait()
+        self._finalize_process_scope(run_id, proc)
         terminal = self._read(run_id, status_file) or terminal
         try:
             self._check_source_leases(run_id)

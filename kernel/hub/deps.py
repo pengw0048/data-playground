@@ -379,6 +379,7 @@ class Deps:
         from hub.profile_jobs import ProfileProcessRunner
         self.profile_runner = ProfileProcessRunner(
             workspace, data_dir, storage=self.storage)
+        self.profile_runner.on_complete = _on_complete
         self.profile_runner.on_status = _persist_run_state
         from hub.subprocess_runner import SubprocessRunner
         # a second, real backend: run jobs in an isolated OS process (Settings → Execution). Selected

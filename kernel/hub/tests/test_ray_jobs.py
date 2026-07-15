@@ -658,8 +658,11 @@ def test_ray_jobs_submit_is_deterministic_and_excludes_metadata_secrets(jobs_con
     first = runner.run(plan, graph, "write", "distributed", run_id=run_id)
     ref = first.backend_ref
     assert ref is not None
-    assert ref.attempt_id == module._job_attempt_id(store.read(ref.job_uri))
     _wait_submitted(client, ref.submission_id)
+    # ``run`` durably binds the job and hands materialization/submission to an asynchronous supervisor.
+    # Observing the submit is the synchronization barrier: the supervisor must write the job artifact
+    # before constructing the submit request, while an immediate read after ``run`` races that handoff.
+    assert ref.attempt_id == module._job_attempt_id(store.read(ref.job_uri))
     assert len(client.submit_calls) == 1
     submit = client.submit_calls[0]
     entrypoint_args = shlex.split(submit["entrypoint"])[-4:]

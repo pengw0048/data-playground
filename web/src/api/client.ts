@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  PluginInfo, ProcessorDescriptor, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunStatus, SampleResult,
+  PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -248,13 +248,18 @@ export const api = {
     req<RunEstimate>('/run/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
 
   profileEstimate: (doc: CanvasDoc, nodeId: string) =>
-    req<RunEstimate>('/run/profile-estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
+    req<ProfileEstimate>('/run/profile-estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
+
+  profileIdentity: (doc: CanvasDoc, nodeId: string) =>
+    req<ProfileIdentity>('/run/profile-identity', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
 
   run: (doc: CanvasDoc, targetNodeId?: string, confirmed = false) =>
     req<RunStatus>('/run', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed }) }),
 
-  fullProfile: (doc: CanvasDoc, nodeId: string, planDigest: string, confirmed = false) =>
-    req<RunStatus>('/run/profile-job', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, planDigest, confirmed }) }),
+  fullProfile: (doc: CanvasDoc, nodeId: string, planDigest: string, submissionId: string, confirmed = false) =>
+    req<RunStatus>('/run/profile-job', {
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, planDigest, submissionId, confirmed }),
+    }),
 
   runStatus: (runId: string) => req<RunStatus>(`/run/${runId}`),
   activeRuns: (canvasId: string) => req<RunStatus[]>(`/canvas/${encodeURIComponent(canvasId)}/active-runs`),

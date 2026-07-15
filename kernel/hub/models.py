@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
+from pydantic import UUID4, BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 from pydantic.alias_generators import to_camel
 
 # dataset/selection/sample/sql-view are the data wires; metric/value are leaf/value wires
@@ -339,6 +339,16 @@ class RunEstimate(Wire):
     breakdown: str | None = None
 
 
+class ProfileEstimate(RunEstimate):
+    """Whole-profile preflight plus the server-minted identity required by submission."""
+    plan_digest: PlanDigest
+
+
+class ProfileIdentity(Wire):
+    """Current server identity for recovery without re-running the size estimate."""
+    plan_digest: PlanDigest
+
+
 class PerNodeStatus(Wire):
     node_id: str
     status: str  # per-step run state: queued | running | done | failed (not a NodeStatus)
@@ -383,11 +393,12 @@ class RunStatus(Wire):
     output_uri: str | None = None
     output_table: str | None = None
     # A profile result is present only on a successful full-profile job. ``plan_digest`` is the fixed-size
-    # SHA-256 of the client's graph-affecting identity, so durable status never duplicates the raw graph.
+    # SHA-256 of the server-authoritative execution/source identity, so durable status never duplicates
+    # the raw graph while still fencing results to the exact data revision that was profiled.
     profile: ProfileResult | None = None
     plan_digest: PlanDigest | None = None
-    # Monotonic, DB-authoritative submission order for retries of one profile identity. The parent
-    # control plane stamps it onto every observable status; one-shot workers cannot choose it.
+    # Monotonic per-canvas submission order allocated by the metadata DB. Recovery uses it instead of
+    # host clocks or random run ids; the parent stamps it on statuses and workers cannot choose it.
     profile_attempt_order: int | None = Field(default=None, ge=1)
     # HTTP/WebSocket request id that started this run (OPS-01). Optional so legacy/plugin backends
     # that omit it still deserialize; durable copy also lives on run_states / run_records.
@@ -566,16 +577,23 @@ class ProfileEstimateRequest(Wire):
     node_id: str
 
 
+class ProfileIdentityRequest(Wire):
+    """Compute the current server identity for one node without starting work."""
+    graph: Graph
+    node_id: str
+
+
 class ProfileJobRequest(Wire):
     """Submit a whole-dataset profile through the durable job lifecycle.
 
-    ``plan_digest`` is the lowercase SHA-256 of the client-side graph identity. The fixed wire value is
-    persisted with the job so a late result cannot be presented for a newer canvas revision without
-    amplifying the full graph identity across durable status rows.
+    ``plan_digest`` is minted by the server preflight and checked again at submission. The fixed wire
+    value is persisted so a late result cannot be presented for a newer graph or source revision without
+    duplicating the submitted graph in durable status rows.
     """
     graph: Graph
     node_id: str
     plan_digest: PlanDigest
+    submission_id: UUID4
     confirmed: bool = False
 
 

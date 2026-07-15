@@ -154,11 +154,22 @@ class DatasetAdapter(Protocol):
     (Iceberg, Delta, a REST source, …). Register a plugin adapter via `reg.add_adapter(a)`; it is
     inserted FIRST, so it claims a URI before the built-ins. The built-in DuckDBAdapter (parquet/csv/
     json/arrow/dir/object-store) and LanceAdapter both conform — i.e. the built-ins are just the first
-    adapters through this same seam. `scan` MUST be LAZY (return a relation; the runner materializes at
-    the end). An adapter may optionally accept a `cancelled` callable in `write`; LocalRunner feature-
+    adapters through this same seam. `scan` is the full-run path and MUST be lazy where the source permits
+    it. Interactive preview is a separate, optional `DatasetPreviewAdapter` capability. Its
+    `preview_scan` MUST enforce `limit` at the source and must never eagerly materialize or scan the full
+    input. An adapter that cannot prove that bound omits the capability; an adapter that supports only
+    some URIs may reject those it cannot bound. The UI will offer a durable full run instead. Merely
+    accepting a `limit` argument on `scan` is not proof of bounded work. An adapter may optionally accept
+    a `cancelled` callable in `write`; LocalRunner feature-
     detects it, and the adapter should call it immediately before any externally visible publish point.
     Adapters without that optional argument retain the legacy pre-call-only cancellation behavior. An
-    optional `nearest(uri, column, query, k)` adds native ANN (LanceAdapter has it)."""
+    optional `nearest(uri, column, query, k)` adds native ANN (LanceAdapter has it). An optional
+    `metadata_count(uri)` may return an exact count only from a bounded metadata lookup; it MUST NOT scan
+    rows or enumerate an unbounded partition/directory namespace. Interactive/preflight callers do not use
+    the potentially full-scanning `count(uri)` fallback. `fingerprint(uri)` is also a preflight / recovery
+    capability: it MUST be bounded and metadata-only and MUST NOT scan or materialize source rows. It may
+    return the adapter's best available revision identity (including URI-only when that is all the source
+    exposes); callers must not assume it is a content hash or a versioned snapshot id."""
     name: str
 
     def matches(self, uri: str) -> bool: ...
@@ -168,6 +179,19 @@ class DatasetAdapter(Protocol):
     def count(self, uri: str) -> "int | None": ...
     def fingerprint(self, uri: str) -> str: ...
     def write(self, uri: str, rel: Relation, mode: str = "overwrite") -> dict: ...
+
+
+@runtime_checkable
+class DatasetPreviewAdapter(Protocol):
+    """Optional source-bounded interactive preview capability for a `DatasetAdapter`.
+
+    Structural conformance to the base adapter contract deliberately does not require this method: a
+    full-run-only third-party source remains a valid adapter and fails closed only when preview is asked
+    for. Implementations may raise their adapter-specific bounded-preview exception for unsupported URIs.
+    """
+
+    def preview_scan(self, uri: str, columns: "list[str] | None" = None,
+                     limit: int = 2000, options: "dict | None" = None) -> Relation: ...
 
 
 @runtime_checkable
