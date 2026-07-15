@@ -171,8 +171,10 @@ export const api = {
   tablesPage: (params: CatalogQueryParams = {}) => catalogPage(params),
   facets: (params: CatalogQueryParams = {}) =>
     req<Facets>(`/catalog/facets${catalogQuery(params)}`),
-  catalogTree: (prefix = '') =>
-    req<CatalogBrowse>(`/catalog/tree${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`),
+  catalogTree: (prefix = '', options?: { signal?: AbortSignal }) =>
+    req<CatalogBrowse>(`/catalog/tree${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`, {
+      signal: options?.signal,
+    }),
   // folder entities (incl. empty ones) — used for the folder-name autocomplete + tree editing
   catalogFolders: () => req<CatalogFolder[]>('/catalog/folders'),
   createFolder: (path: string) =>

@@ -507,6 +507,68 @@ test.describe('Data Playground canvas', () => {
     await expect(entities.filter({ hasText: expandedTable }).first()).toBeVisible({ timeout: 10_000 })
   })
 
+  test('catalog folder A→B→A navigation ignores a late child response and preserves focus', async ({ page }) => {
+    for (const path of ['race-a', 'race-b']) {
+      const created = await page.request.post('/api/catalog/folders', {
+        data: { path }, headers: { 'X-DP-User': 'local' },
+      })
+      expect(created.ok()).toBeTruthy()
+    }
+
+    let aCalls = 0
+    let releaseFirstA!: () => void
+    const firstAHeld = new Promise<void>((resolve) => { releaseFirstA = resolve })
+    let markFirstAStarted!: () => void
+    const firstAStarted = new Promise<void>((resolve) => { markFirstAStarted = resolve })
+    let markFirstADone!: () => void
+    const firstADone = new Promise<void>((resolve) => { markFirstADone = resolve })
+    await page.route('**/api/catalog/tree*', async (route) => {
+      const prefix = new URL(route.request().url()).searchParams.get('prefix') ?? ''
+      if (prefix !== 'race-a' && prefix !== 'race-b') return route.continue()
+      if (prefix === 'race-b') {
+        return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+          prefix, folders: [{ name: 'b-current', path: 'race-b/b-current', tableCount: 0 }], tables: [],
+        }) })
+      }
+      aCalls += 1
+      if (aCalls > 1) {
+        return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+          prefix, folders: [{ name: 'a-current', path: 'race-a/a-current', tableCount: 0 }], tables: [],
+        }) })
+      }
+      markFirstAStarted()
+      await firstAHeld
+      try {
+        await route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+          prefix, folders: [{ name: 'a-stale', path: 'race-a/a-stale', tableCount: 0 }], tables: [],
+        }) })
+      } catch { /* collapse aborted this generation before its deliberately late response */ }
+      markFirstADone()
+    })
+
+    await page.goto('/#/tables')
+    await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
+    await page.getByRole('button', { name: 'Expand folder race-a' }).click()
+    await firstAStarted
+    const firstABranch = page.getByRole('button', { name: 'Collapse folder race-a' }).locator('xpath=../..')
+    await expect(firstABranch.getByText('Loading…', { exact: true })).toBeVisible()
+
+    await page.getByRole('button', { name: 'Collapse folder race-a' }).click()
+    await page.getByRole('button', { name: 'Expand folder race-b' }).click()
+    await expect(page.getByText('📁 b-current', { exact: true })).toBeVisible()
+    await page.getByText('📁 race-b', { exact: true }).click()
+    await page.getByRole('button', { name: 'Expand folder race-a' }).click()
+    await expect(page.getByText('📁 a-current', { exact: true })).toBeVisible()
+
+    releaseFirstA()
+    await firstADone
+    await expect(page.getByText('📁 a-stale', { exact: true })).toHaveCount(0)
+    await expect(page.getByText('📁 a-current', { exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Collapse folder race-a' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Collapse folder race-b' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Remove filter 📁 race-b' })).toBeVisible()
+  })
+
   test('a failing run surfaces an error toast (not a silent failure)', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Sources & sinks', 'source') // auto-selected → editable in the inspector

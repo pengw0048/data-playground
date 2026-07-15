@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
 import type { CatalogTable } from '../types/api'
@@ -39,6 +39,16 @@ const TABLE_2: CatalogTable = {
   columns: [{ name: 'customer_id', type: 'int', capabilities: ['key'] }],
 }
 const FACETS = { folders: [{ value: 'sales', count: 1 }], tags: [], owners: [] }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+
+const folder = (path: string) => ({ name: path.split('/').pop()!, path, tableCount: 0 })
+const tree = (prefix: string, paths: string[]) => ({ prefix, folders: paths.map(folder), tables: [] })
 
 describe('CatalogView request and mutation truth', () => {
   beforeEach(() => {
@@ -215,7 +225,7 @@ describe('CatalogView selection, register modal, and rename', () => {
     expect(await screen.findByTestId('folder-rename-sales/daily')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('folder-rename-sales'))
 
-    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledWith('revenue'))
+    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledWith('revenue', expect.anything()))
     expect(await screen.findByRole('button', { name: 'Collapse folder revenue' })).toBeInTheDocument()
     expect(await screen.findByTestId('folder-rename-revenue/daily')).toBeInTheDocument()
   })
@@ -227,5 +237,245 @@ describe('CatalogView selection, register modal, and rename', () => {
     fireEvent.click(await screen.findByTestId('folder-delete-sales'))
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining('the top level'))
     await waitFor(() => expect(mocks.deleteFolder).toHaveBeenCalledWith('sales'))
+  })
+})
+
+describe('CatalogView folder child request identity', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    vi.clearAllMocks()
+    store.kernelInfo = { capabilities: ['catalog.folder_mutation'] }
+    mocks.tablesPage.mockResolvedValue({ items: [], total: 0, hasMore: false })
+    mocks.facets.mockResolvedValue({ folders: [], tags: [], owners: [] })
+    mocks.searchCatalog.mockResolvedValue([])
+    mocks.catalogFolders.mockResolvedValue([])
+    mocks.createFolder.mockResolvedValue({ path: 'created' })
+    mocks.renameFolder.mockResolvedValue({ ok: true })
+    mocks.deleteFolder.mockResolvedValue({ ok: true })
+    store.uploadDataset.mockResolvedValue(null)
+  })
+  afterEach(() => cleanup())
+
+  it('keeps reversed A and B responses bound to their own expanded branches', async () => {
+    const a = deferred<ReturnType<typeof tree>>()
+    const b = deferred<ReturnType<typeof tree>>()
+    mocks.catalogTree.mockImplementation((prefix: string) => {
+      if (!prefix) return Promise.resolve(tree('', ['A', 'B']))
+      return prefix === 'A' ? a.promise : b.promise
+    })
+    render(<CatalogView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Expand folder B' }))
+    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledWith('A', expect.anything()))
+    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledWith('B', expect.anything()))
+
+    await act(async () => { b.resolve(tree('B', ['B/b-current'])); await b.promise })
+    expect(await screen.findByText('📁 b-current')).toBeInTheDocument()
+    await act(async () => { a.resolve(tree('A', ['A/a-current'])); await a.promise })
+
+    expect(await screen.findByText('📁 a-current')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Collapse folder A' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Collapse folder B' })).toBeInTheDocument()
+  })
+
+  it('makes A→B→A re-expansion supersede the first A generation without losing focus', async () => {
+    const firstA = deferred<ReturnType<typeof tree>>()
+    const secondA = deferred<ReturnType<typeof tree>>()
+    let aCalls = 0
+    let firstSignal: AbortSignal | undefined
+    mocks.catalogTree.mockImplementation((prefix: string, options?: { signal?: AbortSignal }) => {
+      if (!prefix) return Promise.resolve(tree('', ['A', 'B']))
+      if (prefix === 'B') return Promise.resolve(tree('B', ['B/b-current']))
+      aCalls += 1
+      if (aCalls === 1) {
+        firstSignal = options?.signal
+        return firstA.promise
+      }
+      return secondA.promise
+    })
+    render(<CatalogView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
+    await waitFor(() => expect(firstSignal).toBeDefined())
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse folder A' }))
+    expect(firstSignal?.aborted).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Expand folder B' }))
+    expect(await screen.findByText('📁 b-current')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('📁 B'))
+    fireEvent.click(screen.getByRole('button', { name: 'Expand folder A' }))
+    await waitFor(() => expect(aCalls).toBe(2))
+
+    await act(async () => { secondA.resolve(tree('A', ['A/a-current'])); await secondA.promise })
+    expect(await screen.findByText('📁 a-current')).toBeInTheDocument()
+    await act(async () => { firstA.resolve(tree('A', ['A/a-stale'])); await firstA.promise })
+
+    expect(screen.queryByText('📁 a-stale')).toBeNull()
+    expect(screen.getByText('📁 a-current')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Remove filter 📁 B' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Collapse folder A' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Collapse folder B' })).toBeInTheDocument()
+  })
+
+  it('does not let an aborted error clear the newer loading state or replace its retry error', async () => {
+    const first = deferred<ReturnType<typeof tree>>()
+    const second = deferred<ReturnType<typeof tree>>()
+    let calls = 0
+    mocks.catalogTree.mockImplementation((prefix: string) => {
+      if (!prefix) return Promise.resolve(tree('', ['A']))
+      calls += 1
+      if (calls === 1) return first.promise
+      if (calls === 2) return second.promise
+      return Promise.resolve(tree('A', ['A/recovered']))
+    })
+    render(<CatalogView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
+    expect(await screen.findByText('Loading…')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse folder A' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Expand folder A' }))
+    await waitFor(() => expect(calls).toBe(2))
+
+    await act(async () => { first.reject(new Error('stale failure')); await first.promise.catch(() => {}) })
+    expect(screen.getByText('Loading…')).toBeInTheDocument()
+    expect(screen.queryByText(/stale failure/)).toBeNull()
+    await act(async () => { second.reject(new Error('latest failure')); await second.promise.catch(() => {}) })
+
+    expect(await screen.findByText(/Couldn't load: latest failure/)).toBeInTheDocument()
+    expect(screen.queryByText('Loading…')).toBeNull()
+    fireEvent.click(screen.getByTestId('folder-branch-retry-A'))
+    expect(await screen.findByText('📁 recovered')).toBeInTheDocument()
+    expect(screen.queryByText(/latest failure/)).toBeNull()
+  })
+
+  it('binds background revision refreshes and loaded children to the latest revision', async () => {
+    const revisionOne = deferred<ReturnType<typeof tree>>()
+    const revisionTwo = deferred<ReturnType<typeof tree>>()
+    const revisionSignals: AbortSignal[] = []
+    let branchCalls = 0
+    mocks.catalogTree.mockImplementation((prefix: string, options?: { signal?: AbortSignal }) => {
+      if (!prefix) return Promise.resolve(tree('', ['A']))
+      branchCalls += 1
+      if (branchCalls === 1) return Promise.resolve(tree('A', ['A/initial']))
+      if (options?.signal) revisionSignals.push(options.signal)
+      return branchCalls === 2 ? revisionOne.promise : revisionTwo.promise
+    })
+    vi.spyOn(window, 'prompt').mockReturnValue('created')
+    render(<CatalogView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
+    expect(await screen.findByText('📁 initial')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('folder-new'))
+    await waitFor(() => expect(branchCalls).toBe(2))
+    expect(screen.getByText('Refreshing…')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('folder-new'))
+    await waitFor(() => expect(branchCalls).toBe(3))
+    expect(revisionSignals[0].aborted).toBe(true)
+
+    await act(async () => { revisionTwo.resolve(tree('A', ['A/revision-two'])); await revisionTwo.promise })
+    expect(await screen.findByText('📁 revision-two')).toBeInTheDocument()
+    await act(async () => { revisionOne.resolve(tree('A', ['A/revision-one-stale'])); await revisionOne.promise })
+
+    expect(screen.queryByText('📁 revision-one-stale')).toBeNull()
+    expect(screen.getByText('📁 revision-two')).toBeInTheDocument()
+    expect(screen.queryByText('Refreshing…')).toBeNull()
+  })
+
+  it('invalidates branch children when the catalog provider snapshot changes', async () => {
+    const oldProvider = deferred<ReturnType<typeof tree>>()
+    let branchCalls = 0
+    let oldSignal: AbortSignal | undefined
+    mocks.catalogTree.mockImplementation((prefix: string, options?: { signal?: AbortSignal }) => {
+      if (!prefix) return Promise.resolve(tree('', ['A']))
+      branchCalls += 1
+      if (branchCalls === 1) {
+        oldSignal = options?.signal
+        return oldProvider.promise
+      }
+      return Promise.resolve(tree('A', ['A/new-provider']))
+    })
+    const view = render(<CatalogView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
+    await waitFor(() => expect(oldSignal).toBeDefined())
+    store.kernelInfo = { capabilities: ['catalog.folder_mutation'] }
+    view.rerender(<CatalogView />)
+
+    await waitFor(() => expect(oldSignal?.aborted).toBe(true))
+    expect(await screen.findByText('📁 new-provider')).toBeInTheDocument()
+    await act(async () => { oldProvider.resolve(tree('A', ['A/old-provider'])); await oldProvider.promise })
+    expect(screen.queryByText('📁 old-provider')).toBeNull()
+    expect(screen.getByText('📁 new-provider')).toBeInTheDocument()
+  })
+
+  it('aborts an old-path request after rename and hydrates the remapped expanded branch', async () => {
+    const oldPath = deferred<ReturnType<typeof tree>>()
+    let renamed = false
+    let oldSignal: AbortSignal | undefined
+    mocks.catalogTree.mockImplementation((prefix: string, options?: { signal?: AbortSignal }) => {
+      if (!prefix) return Promise.resolve(tree('', [renamed ? 'B' : 'A']))
+      if (prefix === 'A') {
+        oldSignal = options?.signal
+        return oldPath.promise
+      }
+      return Promise.resolve(tree('B', ['B/current']))
+    })
+    mocks.renameFolder.mockImplementation(async () => { renamed = true; return { ok: true } })
+    vi.spyOn(window, 'prompt').mockReturnValue('B')
+    render(<CatalogView />)
+
+    fireEvent.click(await screen.findByText('📁 A'))
+    fireEvent.click(screen.getByRole('button', { name: 'Expand folder A' }))
+    await waitFor(() => expect(oldSignal).toBeDefined())
+    fireEvent.click(screen.getByTestId('folder-rename-A'))
+
+    await waitFor(() => expect(oldSignal?.aborted).toBe(true))
+    expect(await screen.findByText('📁 current')).toBeInTheDocument()
+    await act(async () => { oldPath.resolve(tree('A', ['A/stale'])); await oldPath.promise })
+    expect(screen.queryByText('📁 stale')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Collapse folder B' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Remove filter 📁 B' })).toBeInTheDocument()
+  })
+
+  it('aborts a branch request after delete and ignores its late result', async () => {
+    const pending = deferred<ReturnType<typeof tree>>()
+    let deleted = false
+    let signal: AbortSignal | undefined
+    mocks.catalogTree.mockImplementation((prefix: string, options?: { signal?: AbortSignal }) => {
+      if (!prefix) return Promise.resolve(tree('', deleted ? [] : ['A']))
+      signal = options?.signal
+      return pending.promise
+    })
+    mocks.deleteFolder.mockImplementation(async () => { deleted = true; return { ok: true } })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<CatalogView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
+    await waitFor(() => expect(signal).toBeDefined())
+    fireEvent.click(screen.getByTestId('folder-delete-A'))
+
+    await waitFor(() => expect(signal?.aborted).toBe(true))
+    expect(await screen.findByText('No folders yet')).toBeInTheDocument()
+    await act(async () => { pending.resolve(tree('A', ['A/stale'])); await pending.promise })
+    expect(screen.queryByText('📁 stale')).toBeNull()
+  })
+
+  it('aborts a branch request when navigation unmounts the catalog view', async () => {
+    const pending = deferred<ReturnType<typeof tree>>()
+    let signal: AbortSignal | undefined
+    mocks.catalogTree.mockImplementation((prefix: string, options?: { signal?: AbortSignal }) => {
+      if (!prefix) return Promise.resolve(tree('', ['A']))
+      signal = options?.signal
+      return pending.promise
+    })
+    const view = render(<CatalogView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
+    await waitFor(() => expect(signal).toBeDefined())
+    view.unmount()
+
+    expect(signal?.aborted).toBe(true)
+    await act(async () => { pending.resolve(tree('A', ['A/stale'])); await pending.promise })
+    expect(store.pushToast).not.toHaveBeenCalled()
   })
 })
