@@ -195,12 +195,10 @@ jobs:
         run: cd kernel && uv sync --extra dev
       - name: Install Playwright browser
         run: cd web && npx playwright install --with-deps chromium
-      # The tagged subset is the fast researcher-workflow gate. Run it first so a broken canvas target,
-      # stale result, misleading preview export, keyboard path, or axe regression fails with a focused log.
-      - name: Run UX golden-workflow smoke
-        run: cd web && npm run e2e -- --project=chromium --grep @ux-smoke
-      - name: Run remaining E2E
-        run: cd web && npm run e2e -- --grep-invert=@ux-smoke
+      # The Playwright project DAG runs the tagged researcher smoke first, the remaining Chromium
+      # suite second, and the minimum-viewport project last, without executing smoke fixtures twice.
+      - name: Run E2E (UX smoke first)
+        run: cd web && npm run e2e
       - name: Upload report on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

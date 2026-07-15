@@ -25,6 +25,17 @@ def test_required_ci_runs_before_merge_but_not_again_on_main() -> None:
         assert "push" not in events
 
 
+def test_required_e2e_does_not_run_the_smoke_suite_twice() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    commands = [step.get("run", "") for step in jobs["e2e"]["steps"]]
+    assert commands.count("cd web && npm run e2e") == 1
+    config = (_ROOT / "web" / "playwright.config.ts").read_text(encoding="utf-8")
+    assert "name: 'chromium-ux-smoke'" in config
+    assert "grep: /@ux-smoke/" in config
+    assert "dependencies: ['chromium-ux-smoke']" in config
+    assert "grepInvert: /@ux-smoke/" in config
+
+
 def test_heavy_acceptance_is_manual_scheduled_or_release_callable() -> None:
     expected_events = {
         "release-artifacts.yml": {"workflow_dispatch", "workflow_call"},
