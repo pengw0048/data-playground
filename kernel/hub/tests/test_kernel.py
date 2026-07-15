@@ -45,11 +45,13 @@ def test_observability_livez_readyz_version(monkeypatch):
     r = client.get("/api/readyz")
     assert r.status_code == 503
     assert r.json()["checks"]["schema"] is False
+    assert r.json()["code"] == "service_unavailable" and r.json()["retryable"] is True
     monkeypatch.setattr(metadb, "ping", lambda: False)
     monkeypatch.setattr(metadb, "schema_at_head", lambda: pytest.fail("schema check followed a DB timeout"))
     r = client.get("/api/readyz")
     assert r.status_code == 503
     assert r.json()["checks"] == {"db": False, "schema": False, "engine": True}
+    assert r.json()["detail"] == "service is not ready"
     assert object_store_primes == []
 
 

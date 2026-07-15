@@ -30,14 +30,21 @@ import time
 from dataclasses import dataclass
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from hub import auth, metadb
+from hub.api_errors import (
+    API_ERROR_RESPONSES,
+    APIErrorCode,
+    api_error_response,
+    classify_http_error,
+)
 from hub.routers import catalog, runs, workspace
 from hub.routers.runs import _status_or_lost
 from hub.security import current_user
@@ -78,9 +85,12 @@ class RequestBodyLimitMiddleware:
         self.app = app
 
     @staticmethod
-    def _response(limit: int) -> JSONResponse:
+    def _response(limit: int, path: str) -> JSONResponse:
+        content = {"detail": f"request body exceeds the {limit}-byte limit (raise DP_MAX_BODY_BYTES)"}
+        if path == "/api" or path.startswith("/api/"):
+            content.update(code=APIErrorCode.PAYLOAD_TOO_LARGE, retryable=False)
         return JSONResponse(
-            {"detail": f"request body exceeds the {limit}-byte limit (raise DP_MAX_BODY_BYTES)"},
+            content,
             status_code=413,
         )
 
@@ -102,7 +112,7 @@ class RequestBodyLimitMiddleware:
             except ValueError:
                 declared_over_limit = False
             if declared_over_limit:
-                await self._response(limit)(scope, receive, send)
+                await self._response(limit, scope.get("path") or "")(scope, receive, send)
                 return
 
         received = 0
@@ -140,7 +150,7 @@ class RequestBodyLimitMiddleware:
                 raise _RequestBodyTooLarge(limit)
             # A route may translate body-read exceptions (for example JSON-RPC parse errors). Discard
             # that response and keep the transport-level size contract authoritative.
-            await self._response(limit)(scope, receive, send)
+            await self._response(limit, scope.get("path") or "")(scope, receive, send)
 
 
 class RequestIdMiddleware:
@@ -282,13 +292,55 @@ app = FastAPI(title="Data Playground kernel", version="0.1.0", lifespan=_lifespa
 _SENSITIVE_AUTH_BODY_PATHS = frozenset(("/api/auth/login", "/api/auth/password", "/api/users"))
 
 
+@app.exception_handler(StarletteHTTPException)
+async def _stable_api_http_error(request: Request, exc: StarletteHTTPException):
+    """Add machine fields to API errors while preserving FastAPI's existing ``detail`` value."""
+    if request.url.path == "/api" or request.url.path.startswith("/api/"):
+        code, retryable = classify_http_error(exc)
+        return api_error_response(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            code=code,
+            retryable=retryable,
+            headers=exc.headers,
+        )
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def _stable_api_internal_error(request: Request, _exc: Exception):
+    """Give production callers a stable 500 body; ServerErrorMiddleware still re-raises for logs."""
+    if request.url.path == "/api" or request.url.path.startswith("/api/"):
+        return api_error_response(
+            status_code=500,
+            detail="internal server error",
+            code=APIErrorCode.INTERNAL_ERROR,
+            # The route may have committed before response construction failed. Unknown commit
+            # outcomes must never invite an automatic repeat of a non-idempotent request.
+            retryable=False,
+        )
+    return PlainTextResponse("Internal Server Error", status_code=500)
+
+
 @app.exception_handler(RequestValidationError)
 async def _safe_auth_validation_error(request: Request, exc: RequestValidationError):
     # FastAPI's default validation response includes rejected input. Never echo a password, and never
     # ask the JSON encoder to serialize an unpaired surrogate from an attacker-controlled auth body.
     # Other routes retain FastAPI's useful field-level diagnostics.
     if request.url.path in _SENSITIVE_AUTH_BODY_PATHS:
-        return JSONResponse({"detail": "invalid authentication request body"}, status_code=422)
+        return api_error_response(
+            status_code=422,
+            detail="invalid authentication request body",
+            code=APIErrorCode.VALIDATION_ERROR,
+            retryable=False,
+        )
+    if request.url.path == "/api" or request.url.path.startswith("/api/"):
+        return api_error_response(
+            status_code=422,
+            detail=exc.errors(),
+            code=APIErrorCode.VALIDATION_ERROR,
+            retryable=False,
+        )
     return await request_validation_exception_handler(request, exc)
 
 
@@ -314,11 +366,11 @@ app.add_middleware(TrustedProxyHeadersMiddleware)
 # workspace PUBLIC router (auth status/login/logout + the login roster) is reachable pre-login. This
 # keeps auth the SECURE DEFAULT — a route is gated unless it is explicitly put on the public router —
 # instead of an opt-in-per-route model that once left /run, /data, /catalog, POST /users wide open.
-app.include_router(workspace.public_router, prefix="/api")
+app.include_router(workspace.public_router, prefix="/api", responses=API_ERROR_RESPONSES)
 _GATE = [Depends(current_user)]
-app.include_router(catalog.router, prefix="/api", dependencies=_GATE)
-app.include_router(runs.router, prefix="/api", dependencies=_GATE)
-app.include_router(workspace.router, prefix="/api", dependencies=_GATE)
+app.include_router(catalog.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
+app.include_router(runs.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
+app.include_router(workspace.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
 
 # Fail before opening the metadata DB when the hub has a missing/known-weak signing secret, or when
 # shared mode lacks Secure cookies / an explicit TLS or trusted-proxy declaration. A spawned kernel
@@ -651,15 +703,15 @@ def mcp_http_delete():
     return {"ok": True}  # stateless server — no session id to terminate
 
 
-@app.get("/api/health")     # back-compat alias for /api/livez
-@app.get("/api/livez")
+@app.get("/api/health", responses=API_ERROR_RESPONSES)     # back-compat alias for /api/livez
+@app.get("/api/livez", responses=API_ERROR_RESPONSES)
 def livez() -> dict:
     from hub.observability import MetricName, emit_metric
     emit_metric(MetricName.KERNEL_HEALTH, 1.0, labels={"probe": "livez", "ready": "true"})
     return {"ok": True}     # the process is up and serving — a pure liveness signal (no dep checks)
 
 
-@app.get("/api/readyz")
+@app.get("/api/readyz", responses=API_ERROR_RESPONSES)
 def readyz():
     # readiness = can this instance actually serve? Real dep checks (not a static ok): the metadata DB
     # answers, is still at this build's exact schema head, and the DuckDB engine is responsive (not
@@ -678,10 +730,17 @@ def readyz():
     ready = all(checks.values())
     emit_metric(MetricName.KERNEL_HEALTH, 1.0 if ready else 0.0,
                 labels={"probe": "readyz", "ready": "true" if ready else "false"})
-    return JSONResponse({"ready": ready, "checks": checks}, status_code=200 if ready else 503)
+    body = {"ready": ready, "checks": checks}
+    if not ready:
+        body.update(
+            detail="service is not ready",
+            code=APIErrorCode.SERVICE_UNAVAILABLE,
+            retryable=True,
+        )
+    return JSONResponse(body, status_code=200 if ready else 503)
 
 
-@app.get("/api/version")
+@app.get("/api/version", responses=API_ERROR_RESPONSES)
 def version() -> dict:
     # deployment identity for operability — package version + sha + the pluggable-backend choices +
     # core lib versions. SECRETS ARE REDACTED: the DB is reported as its dialect only (never the

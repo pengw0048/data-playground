@@ -15,6 +15,7 @@ from pydantic.alias_generators import to_camel
 from hub import auth, compiler, destinations, metadb, placement
 from hub import graph as graph_mod
 from hub.agent import AgentCredentialError, agent_credential_error_status, agent_status, run_agent
+from hub.api_errors import APIError, APIErrorCode
 from hub.deps import get_deps
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
@@ -55,7 +56,12 @@ def _require_graph_read_access(graph, uid: str) -> tuple[str | None, str | None]
     cid = str(cid or "")
     role = metadb.canvas_role(cid, uid) if cid else None
     if role is None:
-        raise HTTPException(404, f"canvas '{cid}' not found")
+        raise APIError(
+            404,
+            f"canvas '{cid}' not found",
+            code=APIErrorCode.CANVAS_NOT_FOUND,
+            retryable=False,
+        )
     return cid, role
 
 
@@ -94,7 +100,12 @@ def _reject_invalid(graph, deps, target_node_id: str | None = None) -> None:
     """400 on any graph that compile would reject."""
     invalid = _invalid_graph(graph, deps, target_node_id)
     if invalid:
-        raise HTTPException(400, invalid[0])
+        raise APIError(
+            400,
+            invalid[0],
+            code=APIErrorCode.INVALID_GRAPH,
+            retryable=False,
+        )
 
 
 @router.post("/graph/compile", response_model=CompilePlan)
@@ -278,7 +289,12 @@ def agent_act(req: AgentRequest, uid: str = Depends(current_user)) -> dict:
         # non-secret contract instead of turning the race into a 502 with resolver details.
         return agent_credential_error_status()
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"agent error: {type(e).__name__}: {e}")
+        raise APIError(
+            502,
+            f"agent error: {type(e).__name__}: {e}",
+            code=APIErrorCode.UPSTREAM_AGENT_FAILURE,
+            retryable=True,
+        )
     return {"available": True, **out}
 
 
