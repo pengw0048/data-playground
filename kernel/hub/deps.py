@@ -94,7 +94,7 @@ class Registry:
         that calls this during ``register(reg)`` — core never imports a vendor client.
         """
         from hub.secrets import register_resolver
-        register_resolver(scheme, resolver, replace=True)
+        register_resolver(scheme, resolver)
 
     def add_node(self, spec: NodeSpec, build: "NodeBuilder | None" = None, ir=None) -> None:
         # `build` is the node's build callable — see hub.backends.NodeBuilder for its exact

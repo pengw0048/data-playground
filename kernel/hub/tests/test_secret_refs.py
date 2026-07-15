@@ -16,6 +16,7 @@ from hub.secrets import (
     SecretResolveError,
     is_secret_ref,
     list_schemes,
+    parse_secret_ref,
     register_resolver,
     resolve_object_store,
     resolve_secret,
@@ -176,25 +177,68 @@ def test_ephemeral_metadata_stores_refs_not_fixture_secret(monkeypatch, tmp_path
     assert store["secretAccessKey"] == "env:DP_S3_SECRET"
 
 
-def test_pluggable_secret_resolver_scheme():
-    # AC5: a fake scheme registers and is used without core changes.
-    def _fake(name: str) -> str:
+def test_pluggable_secret_resolver_supports_uri_scheme(tmp_path):
+    # AC5: an out-of-tree-style, hyphenated scheme works through the public registry seam.
+    from hub.deps import Deps, Registry
+
+    def _aws_sm(name: str) -> str:
         return f"resolved-{name}"
 
-    register_resolver("fake", _fake, replace=True)
+    reg = Registry(Deps(str(tmp_path / "workspace"), str(tmp_path / "data")))
+    reg.add_secret_resolver("aws-sm", _aws_sm)
     try:
-        assert "fake" in list_schemes()
-        assert resolve_secret("fake:widget") == "resolved-widget"
-        assert is_secret_ref("fake:widget")
-        from hub.deps import Deps, Registry
-        import tempfile
-        with tempfile.TemporaryDirectory() as d:
-            reg = Registry(Deps(d, d))
-            reg.add_secret_resolver("fake2", lambda n: f"via-reg-{n}")
-            assert resolve_secret("fake2:x") == "via-reg-x"
-            unregister_resolver("fake2")
+        assert "aws-sm" in list_schemes()
+        assert parse_secret_ref("AWS-SM:widget") == ("aws-sm", "widget")
+        assert resolve_secret("AWS-SM:widget") == "resolved-widget"
+        assert is_secret_ref("aws-sm:widget")
+        assert is_secret_ref("vault+oidc.v2:item")
+
+        # Re-registering the identical callable is idempotent; another plugin cannot shadow it.
+        reg.add_secret_resolver("AWS-SM", _aws_sm)
+        with pytest.raises(ValueError, match="already registered"):
+            reg.add_secret_resolver("aws-sm", lambda name: f"shadowed-{name}")
+        assert resolve_secret("aws-sm:widget") == "resolved-widget"
     finally:
-        unregister_resolver("fake")
+        unregister_resolver("AWS-SM")
+
+
+@pytest.mark.parametrize(
+    ("scheme", "reference"),
+    [
+        ("", ":item"),
+        ("1vault", "1vault:item"),
+        ("_vault", "_vault:item"),
+        ("vault_name", "vault_name:item"),
+        ("vault/name", "vault/name:item"),
+        (" vault", " vault:item"),
+        ("vault ", "vault :item"),
+        ("väult", "väult:item"),
+        ("-vault", "-vault:item"),
+        (".vault", ".vault:item"),
+        ("vault\n", "vault\n:item"),
+    ],
+)
+def test_secret_scheme_rejects_malformed_names_consistently(scheme, reference):
+    def _resolver(name: str) -> str:
+        return name
+
+    with pytest.raises(ValueError, match="invalid secret-reference scheme"):
+        register_resolver(scheme, _resolver)
+    assert not is_secret_ref(reference)
+    with pytest.raises(SecretResolveError, match="not a secret reference"):
+        parse_secret_ref(reference)
+
+
+def test_secret_scheme_rejects_empty_reference_and_builtin_conflict(tmp_path):
+    from hub.deps import Deps, Registry
+
+    assert not is_secret_ref("aws-sm:")
+    with pytest.raises(SecretResolveError, match="not a secret reference"):
+        parse_secret_ref("aws-sm:")
+
+    reg = Registry(Deps(str(tmp_path / "workspace"), str(tmp_path / "data")))
+    with pytest.raises(ValueError, match="'env' is already registered"):
+        reg.add_secret_resolver("ENV", lambda name: name)
 
 
 def test_put_settings_rejects_plaintext_for_reference_backed_keys():
