@@ -513,10 +513,18 @@ _collab_outboxes: dict[WebSocket, asyncio.Queue[dict[str, object]]] = {}
 _collab_sender_tasks: dict[WebSocket, asyncio.Task[None]] = {}
 
 
-@dataclass(frozen=True)
+def _collab_now() -> float:
+    """Monotonic collaboration clock, isolated so authorization bounds are deterministic in tests."""
+    return time.monotonic()
+
+
+@dataclass
 class _CollabSession:
     user_id: str | None
     token: str | None  # the exact admission token; None only for a trusted open-mode socket
+    role: str = "editor"
+    role_revalidated_at: float = 0.0
+    revalidation_task: asyncio.Task[str | None] | None = field(default=None, repr=False)
 
 
 _collab_sessions: dict[WebSocket, _CollabSession] = {}
@@ -559,6 +567,7 @@ _COLLAB_SYNC_RESPONSE_TIMEOUT_SECONDS = 5.0
 _COLLAB_SYNC_READY_TIMEOUT_SECONDS = 5.0
 _COLLAB_UNAVAILABLE_RETRY_SECONDS = 5.0
 _COLLAB_SEND_TIMEOUT_SECONDS = 1.0
+_COLLAB_ROLE_REVALIDATION_INTERVAL_SECONDS = 5.0
 _COLLAB_ROLE_RECHECK_TIMEOUT_SECONDS = 1.0
 _COLLAB_OUTBOX_CAPACITY = 256
 
@@ -589,11 +598,11 @@ def _release_collab_room_lock(canvas_id: str, lock: asyncio.Lock) -> None:
 
 
 async def _live_collab_role(ws: WebSocket, canvas_id: str) -> str | None:
-    """Current role for a connected socket, re-read at the document-message boundary.
+    """Read the current session and role for a connected socket from the authorization store.
 
     Authenticated sessions and collaboration permissions are mutable while a socket is open. Reverify
     the exact token captured at admission, then read the current canvas role. The metadata DB is shared
-    across web instances; running both lookups off-loop makes revocation visible without blocking peers.
+    across web instances; running both lookups off-loop keeps revalidation from blocking peers.
     """
     session = _collab_sessions.get(ws)
     if session is None:
@@ -623,6 +632,40 @@ async def _bounded_live_collab_role(ws: WebSocket, canvas_id: str) -> str | None
             "collab access revalidation timed out canvas=%s", canvas_id,
         )
         return None
+
+
+async def _current_collab_role(ws: WebSocket, canvas_id: str) -> str | None:
+    """Return admitted authorization while fresh, then share one fail-closed revalidation.
+
+    The five-second monotonic interval bounds revocation and role-downgrade visibility for active
+    sockets without multiplying metadata reads by frame rate and fanout recipients. Concurrent frames
+    share ``revalidation_task``, so each connection performs at most one store lookup per interval.
+    """
+    session = _collab_sessions.get(ws)
+    if session is None:
+        return None
+    if session.token is None:  # trusted open mode has no mutable session or per-user role store
+        return session.role
+    if _collab_now() - session.role_revalidated_at < _COLLAB_ROLE_REVALIDATION_INTERVAL_SECONDS:
+        return session.role
+
+    task = session.revalidation_task
+    if task is None:
+        async def revalidate() -> str | None:
+            try:
+                role = await _bounded_live_collab_role(ws, canvas_id)
+                if role is not None and _collab_sessions.get(ws) is session:
+                    session.role = role
+                    session.role_revalidated_at = _collab_now()
+                return role
+            finally:
+                if session.revalidation_task is asyncio.current_task():
+                    session.revalidation_task = None
+
+        task = asyncio.create_task(revalidate())
+        session.revalidation_task = task
+    # A cancelled frame must not cancel the shared lookup needed by another sender/recipient path.
+    return await asyncio.shield(task)
 
 
 def _ordered_collab_peers(room: set[WebSocket]) -> list[WebSocket]:
@@ -1018,8 +1061,8 @@ async def _terminate_collab_peer(
 async def _refresh_collab_sender_role(
     ws: WebSocket, canvas_id: str, lock: asyncio.Lock,
 ) -> str | None:
-    """Reauthorize every inbound frame, including viewer-safe presence, outside the room lock."""
-    role = await _bounded_live_collab_role(ws, canvas_id)
+    """Apply the sender's admitted or periodically revalidated role outside the room lock."""
+    role = await _current_collab_role(ws, canvas_id)
     sender_task: asyncio.Task[None] | None = None
     revoked = False
     async with lock:
@@ -1060,7 +1103,7 @@ async def _fanout_collab(
     *,
     baseline_required: bool = False,
 ) -> None:
-    """Reauthorize recipients independently, then append sanitized frames under the room lock."""
+    """Check cached recipient authorization, then append sanitized frames under the room lock."""
     async with lock:
         room = _collab_rooms.get(canvas_id)
         if room is None:
@@ -1070,7 +1113,7 @@ async def _fanout_collab(
         return
 
     async def recheck(peer: WebSocket) -> tuple[WebSocket, str | None]:
-        return peer, await _bounded_live_collab_role(peer, canvas_id)
+        return peer, await _current_collab_role(peer, canvas_id)
 
     checks = [asyncio.create_task(recheck(peer)) for peer in recipients]
     removals: list[asyncio.Task[None]] = []
@@ -1141,7 +1184,9 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
             outbox: asyncio.Queue[dict[str, object]] = asyncio.Queue(
                 maxsize=_COLLAB_OUTBOX_CAPACITY,
             )
-            _collab_sessions[ws] = _CollabSession(uid, token)
+            _collab_sessions[ws] = _CollabSession(
+                uid, token, admission_role, _collab_now(),
+            )
             _collab_canvas[ws] = canvas_id
             _collab_roles[ws] = admission_role
             _collab_outboxes[ws] = outbox
@@ -1217,7 +1262,7 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
                     )
                 if responder is None:
                     continue
-                responder_role = await _bounded_live_collab_role(responder, canvas_id)
+                responder_role = await _current_collab_role(responder, canvas_id)
                 removed_responder: tuple[WebSocket, asyncio.Task[None] | None, int] | None = None
                 async with lock:
                     room = _collab_rooms.get(canvas_id)
@@ -1310,7 +1355,7 @@ async def ws_collab(ws: WebSocket, canvas_id: str):
                         continue
 
                     joiner, plan = target
-                    joiner_role = await _bounded_live_collab_role(joiner, canvas_id)
+                    joiner_role = await _current_collab_role(joiner, canvas_id)
                     removed_joiner: tuple[WebSocket, asyncio.Task[None] | None, int] | None = None
                     async with lock:
                         room = _collab_rooms.get(canvas_id)
