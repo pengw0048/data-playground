@@ -11,6 +11,11 @@ import time
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
+from alembic.autogenerate import compare_metadata
+from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from sqlalchemy import inspect
 
 from hub import metadb
 from hub.settings import settings
@@ -29,6 +34,88 @@ def _isolated_metadata(url: str):
             metadb._engine.dispose()
         settings.database_url = original_url
         metadb._engine, metadb._Session = original_engine, original_session
+
+
+def _normalized_default(value) -> str | None:
+    if value is None:
+        return None
+    value = getattr(value, "arg", value)
+    rendered = str(value).strip()
+    if len(rendered) >= 2 and rendered[0] == rendered[-1] == "'":
+        rendered = rendered[1:-1].replace("''", "'")
+    normalized = rendered.lower()
+    return "now()" if normalized == "current_timestamp" else normalized
+
+
+def test_migration_graph_is_one_pre_1_0_baseline():
+    scripts = ScriptDirectory.from_config(metadb._alembic_cfg())
+    revisions = list(scripts.walk_revisions())
+
+    assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0001_schema_baseline", None),
+    ]
+    assert scripts.get_heads() == ["0001_schema_baseline"]
+    assert metadb.expected_schema_head() == "0001_schema_baseline"
+
+
+def test_fresh_sqlite_baseline_matches_runtime_metadata(tmp_path):
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'baseline.db'}"):
+        metadb.migrate_db()
+        with metadb.engine().connect() as connection:
+            context = MigrationContext.configure(
+                connection,
+                opts={"compare_type": True, "target_metadata": metadb.Base.metadata},
+            )
+            assert compare_metadata(context, metadb.Base.metadata) == []
+
+            installation = connection.execute(sa.text(
+                "SELECT id, owner_token, storage_namespace FROM installation_identity"
+            )).one()
+            assert installation.id == 1
+            assert len(installation.owner_token) == 32
+            assert installation.storage_namespace
+            local_registry = connection.execute(sa.text(
+                "SELECT id, owner_token FROM local_result_registry"
+            )).one()
+            assert local_registry.id == 1
+            assert len(local_registry.owner_token) == 32
+
+            inspector = inspect(connection)
+            for table in metadb.Base.metadata.sorted_tables:
+                actual_columns = {
+                    column["name"]: column
+                    for column in inspector.get_columns(table.name)
+                }
+                for column in table.columns:
+                    assert _normalized_default(actual_columns[column.name]["default"]) == (
+                        _normalized_default(column.server_default)
+                    ), f"server default drift for {table.name}.{column.name}"
+
+                expected_checks = {
+                    (constraint.name, str(constraint.sqltext))
+                    for constraint in table.constraints
+                    if isinstance(constraint, sa.CheckConstraint)
+                }
+                actual_checks = {
+                    (constraint["name"], constraint["sqltext"])
+                    for constraint in inspector.get_check_constraints(table.name)
+                }
+                assert actual_checks == expected_checks, (
+                    f"check constraint drift for {table.name}"
+                )
+
+                expected_uniques = {
+                    (constraint.name, tuple(column.name for column in constraint.columns))
+                    for constraint in table.constraints
+                    if isinstance(constraint, sa.UniqueConstraint)
+                }
+                actual_uniques = {
+                    (constraint["name"], tuple(constraint["column_names"]))
+                    for constraint in inspector.get_unique_constraints(table.name)
+                }
+                assert actual_uniques == expected_uniques, (
+                    f"unique constraint drift for {table.name}"
+                )
 
 
 def test_concurrent_fresh_sqlite_startup_is_serialized_across_48_processes(tmp_path):

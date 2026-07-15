@@ -10,7 +10,7 @@ import types
 import uuid
 
 import pytest
-from sqlalchemy import event, inspect, select, text
+from sqlalchemy import event, select
 
 from hub import metadb
 from hub.plugins.runner import _persist_local_result_done
@@ -1322,44 +1322,6 @@ def test_namespace_marker_initialization_closes_scandir_duplicate_fds(tmp_path, 
     for fd in duplicated:
         with pytest.raises(OSError):
             os.fstat(fd)
-
-
-def test_migration_0021_has_exact_schema_constraints(tmp_path, monkeypatch):
-    import sqlalchemy as sa
-    from alembic import command
-    from hub.settings import settings
-
-    url = f"sqlite:///{tmp_path / 'migration-0021.db'}"
-    monkeypatch.setattr(settings, "database_url", url)
-    cfg = metadb._alembic_cfg()
-    command.upgrade(cfg, "0020_object_attempt_lifecycle")
-    command.upgrade(cfg, "0021_local_result_artifacts")
-    engine = sa.create_engine(url)
-    inspector = inspect(engine)
-    assert {item["name"] for item in inspector.get_unique_constraints(
-        "local_result_artifacts")} >= {"uq_local_result_artifact_namespace_lock"}
-    assert {item["name"] for item in inspector.get_check_constraints(
-        "local_result_artifacts")} >= {
-            "ck_local_result_artifact_state",
-            "ck_local_result_artifact_writer_pair",
-            "ck_local_result_artifact_lock_pair",
-            "ck_local_result_artifact_delete_state",
-            "ck_local_result_artifact_ready_commit",
-        }
-    with pytest.raises(sa.exc.IntegrityError):
-        with engine.begin() as connection:
-            connection.execute(text("""
-                INSERT INTO local_result_artifacts
-                    (uri, namespace_id, storage_root, lock_name, lock_protected, state,
-                     writer_run_id, created_at)
-                VALUES
-                    ('/tmp/.dp-results/__result_bad_00000000000000000000000000000000.parquet',
-                     'namespace', '/tmp/.dp-results', 'bad.lock', false, 'writing',
-                     'unpaired-writer', CURRENT_TIMESTAMP)
-            """))
-    command.downgrade(cfg, "0020_object_attempt_lifecycle")
-    assert "local_result_artifacts" not in inspect(engine).get_table_names()
-    engine.dispose()
 
 
 def test_postgres_canvas_delete_wins_terminal_publication_without_resurrection(

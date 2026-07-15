@@ -908,7 +908,7 @@ def _run_read_access(run_id: str, uid: str | None) -> bool:
     """Whether `uid` may observe this run.
 
     Open mode is one trusted user. In auth mode, the creator or any current collaborator on the REAL
-    canvas may read status/output. A legacy ad-hoc run remains private to its creator, and a later
+    canvas may read status/output. An ad-hoc run remains private to its creator, and a later
     canvas that reuses the graph id cannot claim it. A compact terminal fence preserves the same policy
     after bounded RunState detail is pruned.
     """
@@ -921,7 +921,7 @@ def _run_read_access(run_id: str, uid: str | None) -> bool:
         if creator == uid:
             return True
         return bool(auth_canvas and metadb.canvas_role(auth_canvas, uid) is not None)
-    # a legacy run persisted before the creator column existed → best-effort canvas grant
+    # Missing creator identity falls back to the operational canvas grant.
     cid = metadb.run_canvas_id(run_id)
     if cid:
         return metadb.canvas_role(cid, uid) is not None
