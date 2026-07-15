@@ -348,52 +348,49 @@ def test_facets_advertise_semantic_availability():
         cat._embedder = None
 
 
-def test_old_protocol_provider_still_works_via_compat():
-    """A provider written against the PRE-scale protocol (only list_tables/get_table) keeps working
-    behind the new discovery surface: reg.set_catalog wraps it in CatalogCompat."""
-    from hub.models import CatalogTable
-    from hub.plugins.catalog import CatalogCompat
-
-    class OldProvider:
-        name = "old"
-
-        def __init__(self):
-            self._tables = [
-                CatalogTable(id="tbl_x", name="x", uri="mem://old/x", folder="f1", tags=["t1"],
-                             owner="ann", columns=[], keys=[]),
-                CatalogTable(id="tbl_y", name="y", uri="mem://old/y", folder="f1/sub", tags=[],
-                             owner=None, columns=[], keys=[]),
-                CatalogTable(id="tbl_z", name="z", uri="mem://old/z", folder="", tags=["t1"],
-                             owner="ann", columns=[], keys=[]),
-            ]
-
-        def list_tables(self, q=None):
-            return [t for t in self._tables if not q or q in t.name]
-
+def test_incomplete_catalog_provider_fails_during_registration():
+    class IncompleteProvider:
         def get_table(self, id_or_name):
-            for t in self._tables:
-                if id_or_name in (t.id, t.name, t.uri):
-                    return t
             raise KeyError(id_or_name)
 
+    original = object()
+
     class _FakeDeps:
-        catalog = None
+        catalog = original
+
     from hub.deps import Registry
     reg = Registry.__new__(Registry)
     reg.deps = _FakeDeps()
-    reg.set_catalog(OldProvider())
-    cat = reg.deps.catalog
-    assert isinstance(cat, CatalogCompat)
-    page = cat.list_page(CatalogQuery(folder="f1", limit=10))
-    assert {t.name for t in page.items} == {"x", "y"} and page.total == 2
-    f = cat.facets(CatalogQuery())
-    assert {v.value for v in f.owners} == {"ann"} and {v.value for v in f.tags} == {"t1"}
-    tree = cat.browse("")
-    assert {fo.name for fo in tree.folders} == {"f1"} and {t.name for t in tree.tables} == {"z"}
-    assert [t.name for t in cat.search("x")] == ["x"]
-    assert {t.name for t in cat.search("", query=CatalogQuery(folder="f1", owner="ann"))} == {"x"}
-    assert cat.search_modes() == ["lexical"]
-    assert cat.get_table("tbl_y").name == "y"  # passthrough still works
+    with pytest.raises(TypeError) as error:
+        reg.set_catalog(IncompleteProvider())
+    message = str(error.value)
+    assert message.startswith("catalog provider does not satisfy CatalogProvider; missing methods: ")
+    assert all(name in message for name in ("browse", "facets", "list_page", "search"))
+    assert "list_tables" not in message
+    assert reg.deps.catalog is original
+
+
+def test_search_pushes_structured_query_into_provider(monkeypatch):
+    catalog = get_deps().catalog
+    real_search = catalog.search
+    calls = []
+
+    def search(q, mode="hybrid", limit=50, *, query=None):
+        calls.append((q, mode, limit, query))
+        return real_search(q, mode=mode, limit=limit, query=query)
+
+    monkeypatch.setattr(catalog, "search", search)
+    response = client.get("/api/catalog/search", params={
+        "q": "orders", "mode": "lexical", "limit": 17, "folder": "team/finance",
+        "tags": "gold,curated", "owner": "ann", "hasColumns": "order_id",
+    })
+    assert response.status_code == 200
+    q, mode, limit, query = calls.pop()
+    assert (q, mode, limit) == ("orders", "lexical", 17)
+    assert query == CatalogQuery(
+        q="orders", folder="team/finance", tags=["gold", "curated"], owner="ann",
+        has_columns=["order_id"], limit=17,
+    )
 
 
 def test_semantic_plugin_registers_embedder():

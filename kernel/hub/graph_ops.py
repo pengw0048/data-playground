@@ -20,6 +20,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from hub.models import CatalogQuery
+
 
 class GraphOpError(ValueError):
     """A bad edit the caller asked for (unknown kind, missing node, port already wired). Not a bug —
@@ -143,7 +145,7 @@ def catalog_tables(deps) -> list[dict]:
     """The catalog's datasets with columns (name + type), measured row count, and primary-key
     candidate column(s) — everything needed to pick a `source` uri and the keys to join on."""
     out = []
-    for t in deps.catalog.list_tables(None):
+    for t in deps.catalog.list_page(CatalogQuery(limit=5000)).items:
         out.append({
             "name": t.name, "uri": t.uri, "id": t.id, "rowCount": t.row_count,
             "columns": [{"name": c.name, "type": c.type} for c in t.columns],

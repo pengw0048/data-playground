@@ -36,6 +36,7 @@ import time
 from typing import Any, Callable
 
 from hub import graph_ops
+from hub.models import CatalogQuery
 
 SERVER_NAME = "data-playground"
 SERVER_VERSION = "0.1.0"
@@ -491,7 +492,7 @@ class Playground:
     # -- resources (read-only context the client can pull) ---------------- #
     def list_resources(self) -> list[dict]:
         res: list[dict] = []
-        for t in self.deps.catalog.list_tables(None):
+        for t in self.deps.catalog.list_page(CatalogQuery(limit=5000)).items:
             res.append({"uri": f"dataplay://dataset/{t.id}", "name": t.name,
                         "description": f"dataset ({t.row_count if t.row_count is not None else '?'} rows) — {t.uri}",
                         "mimeType": "application/json"})

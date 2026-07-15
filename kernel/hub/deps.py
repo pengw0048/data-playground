@@ -15,7 +15,7 @@ import logging
 import os
 import sys
 
-from hub.backends import NodeBuilder
+from hub.backends import CatalogProvider, NodeBuilder
 from hub.models import BackendInfo, CapabilityView, KernelInfo, ResourceSpec, WorkerInfo
 from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec
 from hub.plugins.adapters import DuckDBAdapter, default_adapters
@@ -155,11 +155,18 @@ class Registry:
         self.deps.registry.register(proc)
 
     def set_catalog(self, catalog) -> None:
-        # a provider written against the pre-scale protocol (no list_page/facets/browse/search) still
-        # works behind the new discovery routes: wrap it in the compat shim (see CatalogCompat)
-        if not hasattr(catalog, "list_page"):
-            from hub.plugins.catalog import CatalogCompat
-            catalog = CatalogCompat(catalog)
+        if not isinstance(catalog, CatalogProvider):
+            # CatalogProvider is the single source of truth. Derive the diagnostic from its public
+            # protocol methods instead of maintaining a second contract list that could drift.
+            missing = sorted(
+                name
+                for name, member in CatalogProvider.__dict__.items()
+                if not name.startswith("_")
+                and callable(member)
+                and not callable(getattr(catalog, name, None))
+            )
+            detail = f"; missing methods: {', '.join(missing)}" if missing else ""
+            raise TypeError(f"catalog provider does not satisfy CatalogProvider{detail}")
         self.deps.catalog = catalog
 
     def set_managed_object_provider(self, provider) -> None:

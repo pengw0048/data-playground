@@ -131,15 +131,17 @@ renders generically (`grid` for media, `json` for pretty-printed cells), surface
 
 `reg.set_catalog(catalog)` replaces the dataset catalog provider. The protocol in `backends.py` is
 the source of truth: bounded discovery via `list_page(CatalogQuery)`, `facets`, `browse(prefix)`,
-`search(q, mode)`, `search_modes`, plus `list_tables`, `get_table`, `lineage(uri, depth, max_nodes)`,
+`search(q, mode, limit, query=CatalogQuery)`, `search_modes`, plus `get_table`,
+`lineage(uri, depth, max_nodes)`,
 `relationships`, `resolve_ref`, and write-back / curation (`register`, `register_output`,
 `set_metadata`, `unregister`, `set_declared_key`, `add_relationship`, `remove_relationship`).
-`get_table` must raise `KeyError` on a miss. A provider written against the pre-scale protocol (no
-`list_page` / `facets` / `browse` / `search`) still works — `reg.set_catalog` wraps it in
-`CatalogCompat`, which synthesizes those from bounded `list_tables()` calls. A read-only external
-catalog can subclass `InMemoryCatalog` and override only the reads (`dp_sql_catalog` also overrides
-`list_page` / `facets` / `browse` / `search` so SQL rows appear while browsing). A catalog that fully
-replaces the built-in without subclassing will not automatically receive run-completion
+Every discovery implementation must push its filters and finite window into the backing store;
+`search` must apply the supplied structured query before ranking. `get_table` must raise `KeyError` on
+a miss. `reg.set_catalog` validates the complete protocol during registration and rejects an incomplete
+provider with the missing method names. A read-only external catalog can subclass `InMemoryCatalog` and
+override the reads (`dp_sql_catalog` overrides `get_table`, `list_page`, `facets`, `browse`, and `search`
+so SQL rows appear on every read surface). A catalog that fully replaces the built-in without
+subclassing will not automatically receive run-completion
 `register_output` write-backs (runners keep the catalog they were built with), so either subclass
 `InMemoryCatalog` or forward `register_output` to your store.
 

@@ -291,8 +291,7 @@ def catalog_search(
     embedder is installed, so search always works offline."""
     bounded = max(1, min(int(limit), 200))
     query = _catalog_query(q, folder, tags, owner, has_columns, "name", "asc", bounded, 0, uris=uris)
-    from hub.plugins.catalog import search_with_query
-    return search_with_query(get_deps().catalog, query, mode, bounded)
+    return get_deps().catalog.search(query.q or "", mode=mode, limit=bounded, query=query)
 
 
 @router.get("/catalog/tables/{table_id}", response_model=CatalogTable)
