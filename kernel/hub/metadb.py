@@ -5780,6 +5780,7 @@ def catalog_publish_entries(entries: list[tuple[str, str, dict, list[str] | None
             _catalog_upsert_in_session(
                 s, normalized, name, payload,
                 parents=parents, pipeline=pipeline)
+            _materialize_folder(s, payload.get("folder") or "")
             local_owners.append((normalized, payload))
         for normalized, payload in local_owners:
             sync_local_result_owner(
@@ -6362,14 +6363,39 @@ def catalog_folder_create(path: str) -> str:
     return path
 
 
-def _rewrite_entry_folders(s, old: str, new: str) -> None:
-    """Repoint every entry under `old` (== old or old/…) to `new`, updating both the indexed `folder`
-    column and the mirrored `folder` inside the stored doc JSON."""
-    like = _like_escape(old) + "/%"
-    rows = list(s.scalars(select(CatalogEntry).where(or_(
-        CatalogEntry.folder == old, CatalogEntry.folder.like(like, escape="\\")))))
-    for r in rows:
-        target = new + (r.folder or "")[len(old):]
+def _lock_folder_entries(s, path: str) -> list[tuple[CatalogEntry, CatalogLogicalDataset | None]]:
+    """Lock every entry in a folder subtree using the catalog governance lock order.
+
+    The initial snapshot discovers managed logical IDs without taking entry locks. The shared mutation
+    helper then locks logical datasets before their current entries, matching metadata writes and
+    managed publication. A changed snapshot fails closed instead of moving a newly published generation
+    according to stale folder state.
+    """
+    like = _like_escape(path) + "/%"
+    snapshots = list(s.execute(select(CatalogEntry.uri, CatalogEntry.folder).where(or_(
+        CatalogEntry.folder == path, CatalogEntry.folder.like(like, escape="\\"),
+    )).order_by(CatalogEntry.uri)))
+    if not snapshots:
+        return []
+    targets = _lock_catalog_mutation_targets(s, [uri for uri, _folder in snapshots])
+    locked: list[tuple[CatalogEntry, CatalogLogicalDataset | None]] = []
+    for (uri, folder), target in zip(snapshots, targets, strict=True):
+        entry = target.get("entry")
+        logical = target.get("logical")
+        if (not target.get("known") or entry is None
+                or entry.uri != uri or entry.folder != folder
+                or (logical is not None and entry.logical_id != logical.logical_id)):
+            raise RuntimeError("catalog folder contents changed concurrently")
+        locked.append((entry, logical))
+    return locked
+
+
+def _rewrite_entry_folders(
+        rows: list[tuple[CatalogEntry, CatalogLogicalDataset | None]], rewrite) -> list[str]:
+    """Rewrite locked entry folders and their durable managed-governance projection together."""
+    targets: list[str] = []
+    for r, logical in rows:
+        target = rewrite(r.folder or "")
         r.folder = target
         try:
             doc = json.loads(r.doc)
@@ -6377,6 +6403,23 @@ def _rewrite_entry_folders(s, old: str, new: str) -> None:
             doc = {}
         doc["folder"] = target
         r.doc = json.dumps(doc, default=str)
+        if logical is not None:
+            try:
+                governance = json.loads(logical.governance_doc or "{}")
+            except (TypeError, ValueError):
+                governance = _catalog_governance(doc)
+            if not isinstance(governance, dict):
+                governance = _catalog_governance(doc)
+            governance["folder"] = target
+            logical.governance_doc = json.dumps(governance, default=str, sort_keys=True)
+            logical.metadata_version += 1
+        targets.append(target)
+    return targets
+
+
+def _materialize_folder_paths(s, paths) -> None:
+    for path in dict.fromkeys(paths):
+        _materialize_folder(s, path)
 
 
 def catalog_folder_rename(old: str, new: str) -> None:
@@ -6396,15 +6439,18 @@ def catalog_folder_rename(old: str, new: str) -> None:
             raise ValueError("cannot move a folder into itself")
         if _folder_exists(s, new):
             raise ValueError(f"folder '{new}' already exists")
+        entries = _lock_folder_entries(s, old)
         like = _like_escape(old) + "/%"
         moved_entities = list(s.scalars(select(CatalogFolder).where(or_(
-            CatalogFolder.path == old, CatalogFolder.path.like(like, escape="\\")))))
+            CatalogFolder.path == old, CatalogFolder.path.like(like, escape="\\")))
+            .order_by(CatalogFolder.path).with_for_update()))
         targets = [new + row.path[len(old):] for row in moved_entities]
         for row in moved_entities:
             s.delete(row)
         s.flush()
-        _rewrite_entry_folders(s, old, new)
-        _ensure_folder_rows(s, list(targets) + _folder_ancestors(new))
+        targets.extend(_rewrite_entry_folders(
+            entries, lambda folder: new + folder[len(old):]))
+        _materialize_folder_paths(s, targets + [new])
 
 
 def catalog_folder_delete(path: str) -> None:
@@ -6427,24 +6473,21 @@ def catalog_folder_delete(path: str) -> None:
     with session() as s:
         if not _folder_exists(s, path):
             raise ValueError(f"folder '{path}' not found")
+        entries = _lock_folder_entries(s, path)
         like = _like_escape(path) + "/%"
-        for r in s.scalars(select(CatalogEntry).where(or_(
-                CatalogEntry.folder == path, CatalogEntry.folder.like(like, escape="\\")))):
-            r.folder = _reparent(r.folder)
-            try:
-                doc = json.loads(r.doc)
-            except (ValueError, TypeError):
-                doc = {}
-            doc["folder"] = r.folder
-            r.doc = json.dumps(doc, default=str)
+        entry_targets = _rewrite_entry_folders(entries, _reparent)
         # descendant folder entities move up one level; only the deleted node itself is removed
-        moved = list(s.scalars(select(CatalogFolder).where(CatalogFolder.path.like(like, escape="\\"))))
+        moved = list(s.scalars(select(CatalogFolder).where(
+            CatalogFolder.path.like(like, escape="\\"))
+            .order_by(CatalogFolder.path).with_for_update()))
         targets = [_reparent(row.path) for row in moved]
-        for row in s.scalars(select(CatalogFolder).where(or_(
-                CatalogFolder.path == path, CatalogFolder.path.like(like, escape="\\")))):
+        deleted = list(s.scalars(select(CatalogFolder).where(or_(
+            CatalogFolder.path == path, CatalogFolder.path.like(like, escape="\\")))
+            .order_by(CatalogFolder.path).with_for_update()))
+        for row in deleted:
             s.delete(row)
         s.flush()
-        _ensure_folder_rows(s, targets)
+        _materialize_folder_paths(s, targets + entry_targets)
 
 
 def catalog_tree(prefix: str = "", table_limit: int = 100
