@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../store/graph'
 import { api } from '../api/client'
 import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { VirtualList } from '../ui/VirtualList'
 import { FileDialog } from '../ui/FileDialog'
-import type { CatalogQueryParams, CatalogTable, Facets, FolderNode, LineageResult, SampleResult } from '../types/api'
+import type { CatalogQueryParams, CatalogTable, Facets, FolderNode, KernelInfo, LineageResult, SampleResult } from '../types/api'
 
 // The Tables catalog — built to browse thousands of datasets. Nothing is loaded up front: a left
 // FOLDER TREE (lazy), a center VIRTUALIZED list fed by a server-side filtered/sorted/paginated query
@@ -25,7 +25,8 @@ export function CatalogView() {
   const pushToast = useStore((s) => s.pushToast)
   // folder create/rename/delete only mean something when the active catalog provider owns the local
   // folder store; a read-only/external provider omits this capability and we hide the affordances.
-  const foldersMutable = useStore((s) => s.kernelInfo?.capabilities?.includes('catalog.folder_mutation') ?? false)
+  const catalogSource = useStore((s) => s.kernelInfo)
+  const foldersMutable = catalogSource?.capabilities?.includes('catalog.folder_mutation') ?? false
   const fileRef = useRef<HTMLInputElement>(null)
 
   // query state
@@ -269,7 +270,7 @@ export function CatalogView() {
       {/* body: folder tree | list | facets */}
       <div className="flex min-h-0 flex-1 border-t border-border">
         <div className="w-[220px] flex-[0_0_220px] overflow-y-auto border-r border-border p-2">
-          <FolderTree revision={catalogRevision} mutable={foldersMutable} selected={folder} onSelect={setFolder}
+          <FolderTree revision={catalogRevision} sourceIdentity={catalogSource} mutable={foldersMutable} selected={folder} onSelect={setFolder}
             onCreated={onFolderCreated} onRenamed={onFolderRenamed} onDeleted={onFolderDeleted} />
         </div>
 
@@ -460,8 +461,8 @@ interface FolderActions {
   onDeleted: (path: string) => void
 }
 
-function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revision, mutable }:
-  { selected: string; onSelect: (f: string) => void; revision: number; mutable: boolean } & FolderActions) {
+function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revision, sourceIdentity, mutable }:
+  { selected: string; onSelect: (f: string) => void; revision: number; sourceIdentity: KernelInfo | null; mutable: boolean } & FolderActions) {
   const pushToast = useStore((s) => s.pushToast)
   const [root, setRoot] = useState<FolderNode[] | null>(null)
   const [loading, setLoading] = useState(true)
@@ -496,7 +497,7 @@ function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revis
     } finally {
       if (s === request.current) setLoading(false)
     }
-  }, [])
+  }, [sourceIdentity])
   // reload the root level when the catalog changes WITHOUT remounting the tree, so expanded branches
   // keep their open state across a register/create/rename/delete (they reconcile by path key).
   useEffect(() => {
@@ -532,43 +533,128 @@ function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revis
       )}
       {root?.map((f) => <FolderBranch key={f.path} node={f} depth={0} selected={selected} onSelect={onSelect}
         onRenamed={renamed} onDeleted={deleted} mutable={mutable} revision={revision}
-        expanded={expanded} onToggleExpand={toggleExpand} />)}
+        sourceIdentity={sourceIdentity} expanded={expanded} onToggleExpand={toggleExpand} />)}
       {root?.length === 0 && !loading && !error && <div className="px-2 py-1 text-[11px] text-muted-foreground">No folders yet</div>}
     </div>
   )
 }
 
-function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, mutable, revision, expanded, onToggleExpand }:
+function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, mutable, revision, sourceIdentity, expanded, onToggleExpand }:
   { node: FolderNode; depth: number; selected: string; onSelect: (f: string) => void; mutable: boolean; revision: number
-    expanded: Set<string>; onToggleExpand: (path: string) => void }
+    sourceIdentity: KernelInfo | null; expanded: Set<string>; onToggleExpand: (path: string) => void }
   & Pick<FolderActions, 'onRenamed' | 'onDeleted'>) {
   const pushToast = useStore((s) => s.pushToast)
   const open = expanded.has(node.path)
   const [kids, setKids] = useState<FolderNode[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const loadedRevision = useRef<number | null>(null)
+  const loaded = useRef<{ path: string; revision: number; sourceIdentity: KernelInfo | null } | null>(null)
+  const requestGeneration = useRef(0)
+  const activeRequest = useRef<{
+    path: string; revision: number; sourceIdentity: KernelInfo | null; generation: number; controller: AbortController
+  } | null>(null)
+  const mounted = useRef(false)
+  const currentIdentity = useRef<{
+    path: string; revision: number; sourceIdentity: KernelInfo | null; open: boolean
+  } | null>(null)
   const isSel = selected === node.path
-  const loadKids = async () => {
-    const loadRevision = revision
+
+  const invalidateChildRequest = useCallback(() => {
+    requestGeneration.current += 1
+    activeRequest.current?.controller.abort()
+    activeRequest.current = null
+  }, [])
+
+  // Request authority belongs to the committed branch identity. Never publish render-phase props to
+  // this ref: concurrent React may abandon that render after this branch has run, and an in-flight
+  // response must still be judged against the identity users actually see. Layout cleanup fences and
+  // aborts the previous committed identity before a replacement identity can become authoritative.
+  useLayoutEffect(() => {
+    mounted.current = true
+    currentIdentity.current = { path: node.path, revision, sourceIdentity, open }
+    return () => {
+      currentIdentity.current = null
+      mounted.current = false
+      invalidateChildRequest()
+    }
+  }, [invalidateChildRequest, node.path, open, revision, sourceIdentity])
+
+  const loadKids = useCallback(async () => {
+    invalidateChildRequest()
+    const request = {
+      path: node.path,
+      revision,
+      sourceIdentity,
+      generation: requestGeneration.current,
+      controller: new AbortController(),
+    }
+    activeRequest.current = request
+    const isCurrent = () => {
+      const identity = currentIdentity.current
+      return mounted.current
+        && activeRequest.current === request
+        && request.generation === requestGeneration.current
+        && !request.controller.signal.aborted
+        && identity !== null
+        && identity.path === request.path
+        && identity.revision === request.revision
+        && identity.sourceIdentity === request.sourceIdentity
+        && identity.open
+    }
     setLoading(true); setError(null)
     try {
-      setKids((await api.catalogTree(node.path)).folders)
-      loadedRevision.current = loadRevision
+      const browse = await api.catalogTree(request.path, { signal: request.controller.signal })
+      if (!isCurrent()) return
+      if (browse.prefix !== request.path) {
+        throw new Error(`Catalog returned folder “${browse.prefix}” for “${request.path}”`)
+      }
+      // Commit children and their identity together. A stale response can update neither half.
+      loaded.current = {
+        path: request.path, revision: request.revision, sourceIdentity: request.sourceIdentity,
+      }
+      setKids(browse.folders)
     }
-    catch (e) { setError(errorMessage(e)) }
-    finally { setLoading(false) }
+    catch (e) {
+      if (isCurrent()) setError(errorMessage(e))
+    }
+    finally {
+      if (isCurrent()) {
+        activeRequest.current = null
+        setLoading(false)
+      }
+    }
+  }, [invalidateChildRequest, node.path, revision, sourceIdentity])
+
+  const expand = () => {
+    // Collapse revokes this generation in the event handler, before React schedules/commits the new
+    // closed identity. The layout cleanup below remains the authoritative fence for every other change.
+    if (open) invalidateChildRequest()
+    onToggleExpand(node.path)
   }
-  const expand = () => onToggleExpand(node.path)
   // Expansion is path-owned by FolderTree. Hydrate a rename-remounted branch whose new path stays open,
   // and refresh a branch that changed while collapsed before showing its cached children again.
   useEffect(() => {
-    if (open && (kids === null || loadedRevision.current !== revision)) void loadKids()
-  }, [open, node.path, revision])  // eslint-disable-line react-hooks/exhaustive-deps
+    if (!open) {
+      invalidateChildRequest()
+      setLoading(false)
+      setError(null)
+      return
+    }
+    if (loaded.current?.path !== node.path
+      || loaded.current.revision !== revision
+      || loaded.current.sourceIdentity !== sourceIdentity) void loadKids()
+    return invalidateChildRequest
+  }, [invalidateChildRequest, loadKids, node.path, open, revision, sourceIdentity])
+
   const rename = async () => {
     const next = window.prompt(`Rename folder “${node.path}” to:`, node.path)?.trim()
     if (!next || next === node.path) return
-    try { await api.renameFolder(node.path, next); onRenamed(node.path, next); pushToast('Folder renamed', 'success') }
+    try {
+      await api.renameFolder(node.path, next)
+      invalidateChildRequest()
+      onRenamed(node.path, next)
+      pushToast('Folder renamed', 'success')
+    }
     catch (e) { pushToast(errorMessage(e), 'error') }
   }
   const remove = async () => {
@@ -578,9 +664,15 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
     // honest: delete is non-destructive — the whole subtree (datasets AND subfolders) moves up one level
     if (!window.confirm(
       `Delete folder “${node.path}”? Its ${n} dataset${n === 1 ? '' : 's'} and any subfolders move up to ${where}. Nothing is deleted.`)) return
-    try { await api.deleteFolder(node.path); onDeleted(node.path); pushToast('Folder deleted', 'success') }
+    try {
+      await api.deleteFolder(node.path)
+      invalidateChildRequest()
+      onDeleted(node.path)
+      pushToast('Folder deleted', 'success')
+    }
     catch (e) { pushToast(errorMessage(e), 'error') }
   }
+  const visibleKids = loaded.current?.path === node.path && loaded.current.sourceIdentity === sourceIdentity ? kids : null
   return (
     <div>
       <div className={`group/branch flex items-center rounded-md hover:bg-accent ${isSel ? 'bg-accent' : ''}`} style={{ paddingLeft: depth * 12 }}>
@@ -603,16 +695,17 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
           </button>
         </>)}
       </div>
-      {open && loading && kids === null && <div className="py-0.5 pr-1 text-[10.5px] text-muted-foreground" style={{ paddingLeft: (depth + 1) * 12 + 8 }}>Loading…</div>}
+      {open && loading && visibleKids === null && <div className="py-0.5 pr-1 text-[10.5px] text-muted-foreground" style={{ paddingLeft: (depth + 1) * 12 + 8 }}>Loading…</div>}
+      {open && loading && visibleKids !== null && <div role="status" className="py-0.5 pr-1 text-[10.5px] text-muted-foreground" style={{ paddingLeft: (depth + 1) * 12 + 8 }}>Refreshing…</div>}
       {open && error && (
         <div role="alert" className="flex items-center gap-1 py-0.5 pr-1 text-[10.5px] text-destructive" style={{ paddingLeft: (depth + 1) * 12 + 8 }}>
-          <span className="truncate">Couldn't load: {error}{kids ? ' (stale)' : ''}</span>
+          <span className="truncate">Couldn't load: {error}{visibleKids ? ' (stale)' : ''}</span>
           <button onClick={() => void loadKids()} data-testid={`folder-branch-retry-${node.path}`} className="shrink-0 font-semibold underline">Retry</button>
         </div>
       )}
-      {open && kids?.map((k) => <FolderBranch key={k.path} node={k} depth={depth + 1} selected={selected} onSelect={onSelect}
+      {open && visibleKids?.map((k) => <FolderBranch key={k.path} node={k} depth={depth + 1} selected={selected} onSelect={onSelect}
         onRenamed={onRenamed} onDeleted={onDeleted} mutable={mutable} revision={revision}
-        expanded={expanded} onToggleExpand={onToggleExpand} />)}
+        sourceIdentity={sourceIdentity} expanded={expanded} onToggleExpand={onToggleExpand} />)}
     </div>
   )
 }
