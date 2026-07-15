@@ -2830,6 +2830,33 @@ def test_canvas_crud_is_per_user():
     assert client.get("/api/canvas/cv1").status_code == 404
 
 
+def test_canvas_create_reports_new_insert_without_claiming_an_existing_id():
+    canvas_id = "cv-create-evidence"
+    client.delete(f"/api/canvas/{canvas_id}")
+    original = {"id": canvas_id, "name": "Original", "version": 1, "nodes": [], "edges": []}
+
+    created = client.post("/api/canvas", json=original)
+    assert created.status_code == 200
+    assert created.json() == {"ok": True, "id": canvas_id, "created": True}
+
+    # Retrying the same client-generated ID is not evidence of ownership and must not mutate the row.
+    collision = client.post("/api/canvas", json={**original, "name": "Replacement"})
+    assert collision.status_code == 200
+    assert collision.json() == {"ok": True, "id": canvas_id, "created": False}
+    assert client.get(f"/api/canvas/{canvas_id}").json()["name"] == "Original"
+
+    # The same evidence contract holds across users: a collision neither transfers ownership nor grants access.
+    other = client.post("/api/users", json={"name": "Canvas collision user"}).json()["id"]
+    foreign_collision = client.post(
+        "/api/canvas", json={**original, "name": "Foreign replacement"},
+        headers={"X-DP-User": other},
+    )
+    assert foreign_collision.json() == {"ok": True, "id": canvas_id, "created": False}
+    assert client.get(f"/api/canvas/{canvas_id}", headers={"X-DP-User": other}).status_code == 404
+    assert client.get(f"/api/canvas/{canvas_id}").json()["name"] == "Original"
+    client.delete(f"/api/canvas/{canvas_id}")
+
+
 def test_canvas_version_history_and_restore():
     # every save keeps a (throttled) snapshot; a bad edit is recoverable by restoring an earlier one.
     a = {"id": "cvh", "name": "V", "version": 1, "nodes": [{"id": "n1", "type": "source",

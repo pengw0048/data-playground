@@ -284,9 +284,9 @@ export const api = {
   // per-user canvases (multi-file)
   listCanvases: () => req<CanvasFile[]>('/canvas'),
   getCanvas: (id: string) => req<CanvasDoc>(`/canvas/${id}`),
-  createCanvas: (doc: CanvasDoc, options?: { signal?: AbortSignal }) =>
-    req<{ ok: boolean; id: string }>('/canvas', {
-      method: 'POST', body: JSON.stringify(doc), signal: options?.signal,
+  createCanvas: (doc: CanvasDoc) =>
+    req<{ ok: boolean; id: string; created: boolean }>('/canvas', {
+      method: 'POST', body: JSON.stringify(doc),
     }),
   saveCanvas: (doc: CanvasDoc, keepalive = false) =>  // keepalive: let the PUT survive a tab-close flush
     req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc), keepalive }),

@@ -361,6 +361,57 @@ test.describe('Data Playground canvas', () => {
     await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/files')
   })
 
+  test('an import destination ID collision never activates or deletes the existing canvas', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+    const current = await page.evaluate(() => location.hash)
+    await page.route('**/api/pipelines/import', (route) => route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        config: '{}', params: {}, inputColumns: [], outputColumns: [], stages: [], driverSteps: [],
+        graph: {
+          nodes: [{ id: 'must-not-apply', type: 'source', position: { x: 80, y: 80 }, data: { title: 'Must not apply', config: {} } }],
+          edges: [],
+        },
+      }),
+    }))
+
+    let collidedId = ''
+    let destinationDeletes = 0
+    await page.route('**/api/canvas/*', async (route) => {
+      if (route.request().method() === 'DELETE') destinationDeletes += 1
+      await route.continue()
+    })
+    await page.route('**/api/canvas', async (route) => {
+      if (route.request().method() !== 'POST') return route.continue()
+      const destination = route.request().postDataJSON() as { id: string }
+      collidedId = destination.id
+      const seed = await page.request.post('/api/canvas', {
+        data: { ...destination, name: 'Existing collision canvas' },
+      })
+      expect(seed.ok()).toBe(true)
+      expect((await seed.json()).created).toBe(true)
+      const response = await route.fetch() // the browser's request now receives created:false
+      await route.fulfill({ response })
+    })
+
+    await page.getByTestId('app-menu').click()
+    await page.getByTestId('import-pipeline').click()
+    await page.getByPlaceholder(/my_table_or_uri/).fill('{"source":"x"}')
+    await page.getByRole('button', { name: 'Import', exact: true }).click()
+
+    await expect.poll(() => collidedId).not.toBe('')
+    await expect(page.getByRole('heading', { name: 'Import pipeline' })).toBeVisible()
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe(current)
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await expect(page.getByText('Must not apply', { exact: true })).toHaveCount(0)
+    expect(destinationDeletes).toBe(0)
+    const retained = await page.request.get(`/api/canvas/${collidedId}`)
+    expect(retained.ok()).toBe(true)
+    expect((await retained.json()).name).toBe('Existing collision canvas')
+    await page.request.delete(`/api/canvas/${collidedId}`)
+  })
+
   test('Cancel during destination creation cleans up a committed remote draft and preserves the canvas', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Shape', 'filter')
@@ -416,6 +467,64 @@ test.describe('Data Playground canvas', () => {
     await expect.poll(() => page.evaluate(() => location.hash)).toBe(current)
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
     await expect(page.getByText('Must not apply', { exact: true })).toHaveCount(0)
+  })
+
+  test('Cancel retains a recoverable remote draft when the create response is lost', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+    const current = await page.evaluate(() => location.hash)
+    await page.route('**/api/pipelines/import', (route) => route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        config: '{}', params: {}, inputColumns: [], outputColumns: [], stages: [], driverSteps: [],
+        graph: {
+          nodes: [{ id: 'must-not-apply', type: 'source', position: { x: 80, y: 80 }, data: { title: 'Must not apply', config: {} } }],
+          edges: [],
+        },
+      }),
+    }))
+
+    let createdId = ''
+    let destinationDeletes = 0
+    await page.route('**/api/canvas/*', async (route) => {
+      if (route.request().method() === 'DELETE') destinationDeletes += 1
+      await route.continue()
+    })
+    let releaseLostResponse!: () => void
+    const responseHeld = new Promise<void>((resolve) => { releaseLostResponse = resolve })
+    let markCanvasCommitted!: () => void
+    const canvasCommitted = new Promise<void>((resolve) => { markCanvasCommitted = resolve })
+    let markCreateRouteDone!: () => void
+    const createRouteDone = new Promise<void>((resolve) => { markCreateRouteDone = resolve })
+    await page.route('**/api/canvas', async (route) => {
+      if (route.request().method() !== 'POST') return route.continue()
+      createdId = (route.request().postDataJSON() as { id: string }).id
+      await route.fetch() // the insert committed, but its success response will never reach the browser
+      markCanvasCommitted()
+      await responseHeld
+      try { await route.abort('failed') } finally { markCreateRouteDone() }
+    })
+
+    await page.getByTestId('app-menu').click()
+    await page.getByTestId('import-pipeline').click()
+    await page.getByPlaceholder(/my_table_or_uri/).fill('{"source":"x"}')
+    await page.getByRole('button', { name: 'Import', exact: true }).click()
+    await canvasCommitted
+
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Import pipeline' })).toBeHidden()
+    releaseLostResponse()
+    await createRouteDone
+
+    await expect.poll(() => destinationDeletes).toBe(0)
+    const retained = await page.request.get(`/api/canvas/${createdId}`)
+    expect(retained.ok()).toBe(true)
+    expect((await retained.json()).nodes).toEqual([])
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe(current)
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await expect(page.getByText('Must not apply', { exact: true })).toHaveCount(0)
+    await expect(page.getByTestId('toast').filter({ hasText: 'Imported pipeline' })).toHaveCount(0)
+    await page.request.delete(`/api/canvas/${createdId}`)
   })
 
   test('settings modal edits and saves the agent config', async ({ page }) => {

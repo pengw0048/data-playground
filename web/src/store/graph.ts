@@ -1054,16 +1054,18 @@ export const useStore = create<Store>((set, get) => ({
       && generation === _fileNavigationGeneration
       && (get().currentUser?.id ?? null) === userId
     const cleanUpCancelledRemoteDraft = async () => {
-      // Canvas IDs are client-generated, so DELETE is safe even when an aborted POST never committed.
-      // If this best-effort cleanup fails, the server keeps an empty, recoverable draft. The import
-      // graph is never applied to it and it becomes visible on the next ordinary file-list refresh.
+      // Called only after the create response proves this request inserted doc.id. If this best-effort
+      // cleanup fails, the server keeps an empty, recoverable draft; the import graph is never applied.
       try { await api.deleteCanvas(doc.id) } catch { /* retain the empty remote draft */ }
     }
     let persistence: CanvasPersistence = 'remote'
     if (signal?.aborted) return { ok: false }
     try {
-      const created = await api.createCanvas(doc, { signal })
-      if (!created.ok) return { ok: false }
+      // Do not abort this POST: once the server may have committed, an AbortError cannot tell us whether
+      // this request owns doc.id. Wait for explicit insert evidence; a lost response leaves the empty
+      // draft recoverable rather than risking a speculative DELETE of a pre-existing canvas.
+      const created = await api.createCanvas(doc)
+      if (!created.ok || !created.created || created.id !== doc.id) return { ok: false }
       if (!isCurrent()) {
         if (signal) await cleanUpCancelledRemoteDraft()
         return { ok: false }
@@ -1075,7 +1077,8 @@ export const useStore = create<Store>((set, get) => ({
       if (!signal) await get().refreshFiles()
     } catch (e) {
       if (!isCurrent() || (e as Error)?.name === 'AbortError') {
-        if (signal) await cleanUpCancelledRemoteDraft()
+        // The create outcome is unknown: retain a possible empty draft. Without a positive response we
+        // cannot distinguish our committed insert from a collision with somebody else's canvas.
         return { ok: false }
       }
       if (e instanceof KernelError) {
@@ -1097,7 +1100,6 @@ export const useStore = create<Store>((set, get) => ({
       persistence = 'local-draft'
     }
     if (!isCurrent()) {
-      if (signal && persistence === 'remote') await cleanUpCancelledRemoteDraft()
       return { ok: false }
     }
     get().loadDoc(doc, 'owner')
@@ -1117,7 +1119,7 @@ export const useStore = create<Store>((set, get) => ({
     let persistence: CanvasPersistence = 'remote'
     try {
       const created = await api.createCanvas(doc)
-      if (!created.ok) return { ok: false }
+      if (!created.ok || !created.created || created.id !== doc.id) return { ok: false }
       if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
       rememberRole(userId, doc.id, 'owner') // create response confirms ownership
       await get().refreshFiles()

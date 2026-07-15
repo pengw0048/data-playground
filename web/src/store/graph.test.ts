@@ -50,7 +50,9 @@ describe('graph store — core authority ops', () => {
     localStorage.clear()
     apiMocks.listCanvases.mockReset().mockResolvedValue([])
     apiMocks.getCanvas.mockReset()
-    apiMocks.createCanvas.mockReset().mockResolvedValue({ ok: true })
+    apiMocks.createCanvas.mockReset().mockImplementation(async (doc: { id: string }) => (
+      { ok: true, id: doc.id, created: true }
+    ))
     apiMocks.deleteCanvas.mockReset().mockResolvedValue({ ok: true })
     apiMocks.preview.mockReset()
     useStore.setState({ currentUser: { id: 'alice', name: 'Alice' } })
@@ -372,21 +374,22 @@ describe('graph store — core authority ops', () => {
   })
 
   it('cancels a pending canvas creation when the researcher navigates away', async () => {
-    let finishCreate!: (value: { ok: boolean }) => void
+    let finishCreate!: (value: { ok: boolean; id: string; created: boolean }) => void
     apiMocks.createCanvas.mockImplementationOnce(() => new Promise((resolve) => { finishCreate = resolve }))
     const before = useStore.getState().doc
 
     const creating = useStore.getState().newFile()
+    const pendingDoc = apiMocks.createCanvas.mock.calls[0][0] as { id: string }
     useStore.getState().setView('files')
-    finishCreate({ ok: true })
+    finishCreate({ ok: true, id: pendingDoc.id, created: true })
 
     expect(await creating).toEqual({ ok: false })
     expect(useStore.getState().doc).toBe(before)
     expect(useStore.getState().view).toBe('files')
   })
 
-  it('aborts a cancellable creation, cleans up a late remote canvas, and never activates it', async () => {
-    let finishCreate!: (value: { ok: boolean; id: string }) => void
+  it('waits for confirmed insertion, cleans up a cancelled remote canvas, and never activates it', async () => {
+    let finishCreate!: (value: { ok: boolean; id: string; created: boolean }) => void
     apiMocks.createCanvas.mockImplementationOnce(() => new Promise((resolve) => { finishCreate = resolve }))
     const controller = new AbortController()
     const before = useStore.getState().doc
@@ -394,9 +397,9 @@ describe('graph store — core authority ops', () => {
 
     const creating = useStore.getState().newFile({ signal: controller.signal })
     const pendingDoc = apiMocks.createCanvas.mock.calls[0][0] as { id: string }
-    expect(apiMocks.createCanvas.mock.calls[0][1]).toEqual({ signal: controller.signal })
+    expect(apiMocks.createCanvas.mock.calls[0]).toHaveLength(1)
     controller.abort()
-    finishCreate({ ok: true, id: pendingDoc.id }) // server committed despite the client abort
+    finishCreate({ ok: true, id: pendingDoc.id, created: true })
 
     expect(await creating).toEqual({ ok: false })
     expect(apiMocks.deleteCanvas).toHaveBeenCalledWith(pendingDoc.id)
@@ -406,7 +409,7 @@ describe('graph store — core authority ops', () => {
   })
 
   it('retains a failed-cleanup remote draft without navigating or reporting import success', async () => {
-    let finishCreate!: (value: { ok: boolean; id: string }) => void
+    let finishCreate!: (value: { ok: boolean; id: string; created: boolean }) => void
     apiMocks.createCanvas.mockImplementationOnce(() => new Promise((resolve) => { finishCreate = resolve }))
     apiMocks.deleteCanvas.mockRejectedValueOnce(new TypeError('cleanup offline'))
     const controller = new AbortController()
@@ -416,10 +419,46 @@ describe('graph store — core authority ops', () => {
     const creating = useStore.getState().newFile({ signal: controller.signal })
     const pendingDoc = apiMocks.createCanvas.mock.calls[0][0] as { id: string }
     controller.abort()
-    finishCreate({ ok: true, id: pendingDoc.id })
+    finishCreate({ ok: true, id: pendingDoc.id, created: true })
 
     expect(await creating).toEqual({ ok: false })
     expect(apiMocks.deleteCanvas).toHaveBeenCalledWith(pendingDoc.id)
+    expect(useStore.getState().doc).toBe(before)
+    expect(useStore.getState().view).toBe(beforeView)
+    expect(useStore.getState().toasts).toEqual([])
+  })
+
+  it('never deletes or activates an existing canvas ID returned by create', async () => {
+    apiMocks.createCanvas.mockImplementationOnce(async (doc: { id: string }) => (
+      { ok: true, id: doc.id, created: false }
+    ))
+    const controller = new AbortController()
+    const before = useStore.getState().doc
+    const beforeView = useStore.getState().view
+
+    expect(await useStore.getState().newFile({ signal: controller.signal })).toEqual({ ok: false })
+
+    expect(apiMocks.deleteCanvas).not.toHaveBeenCalled()
+    expect(useStore.getState().doc).toBe(before)
+    expect(useStore.getState().view).toBe(beforeView)
+    expect(useStore.getState().toasts).toEqual([])
+  })
+
+  it('retains a possible remote draft when cancellation makes the create outcome unknown', async () => {
+    let loseResponse!: (error: Error) => void
+    apiMocks.createCanvas.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      loseResponse = reject
+    }))
+    const controller = new AbortController()
+    const before = useStore.getState().doc
+    const beforeView = useStore.getState().view
+
+    const creating = useStore.getState().newFile({ signal: controller.signal })
+    controller.abort()
+    loseResponse(new TypeError('response lost after commit'))
+
+    expect(await creating).toEqual({ ok: false })
+    expect(apiMocks.deleteCanvas).not.toHaveBeenCalled()
     expect(useStore.getState().doc).toBe(before)
     expect(useStore.getState().view).toBe(beforeView)
     expect(useStore.getState().toasts).toEqual([])
