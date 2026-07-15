@@ -332,14 +332,33 @@ def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
         # honor the client's id so the canvas exists under it immediately (no orphan row, and
         # sharing/opening works without waiting for the first autosave to PUT it).
         cid = doc.get("id") or metadb._uid()
-        if s.get(metadb.Canvas, cid, with_for_update=True) is None:
-            s.add(metadb.Canvas(id=cid, owner_id=uid, name=doc.get("name") or "untitled",
-                                version=doc.get("version", 1), doc=json.dumps(doc)))
+        values = {
+            "id": cid,
+            "owner_id": uid,
+            "name": doc.get("name") or "untitled",
+            "version": doc.get("version", 1),
+            "doc": json.dumps(doc),
+        }
+        dialect = s.get_bind().dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
+            raise RuntimeError(f"unsupported metadata database dialect: {dialect}")
+        # The insert itself is the ownership decision. A prior read plus INSERT would race another
+        # creator, while RETURNING proves this transaction inserted the row. Clients may only clean up
+        # a cancelled import after receiving this positive evidence; an existing ID is never theirs.
+        inserted_id = s.scalar(dialect_insert(metadb.Canvas).values(**values)
+                               .on_conflict_do_nothing(index_elements=[metadb.Canvas.id])
+                               .returning(metadb.Canvas.id))
+        created = inserted_id is not None
+        if created:
             # Materialize the durable owner row before the local-result registry lock.  Autoflush is
             # deliberately disabled inside that lock so every ownership path has one global order.
             s.flush()
             metadb.sync_local_result_owner(s, "canvas", cid, doc)
-        return {"ok": True, "id": cid}
+        return {"ok": True, "id": cid, "created": created}
 
 
 @router.get("/canvas/{canvas_id}")
