@@ -5222,8 +5222,12 @@ def test_collab_rechecks_removed_sender_and_recipient_sockets(monkeypatch, live_
                             assert await _collab_recv(watcher) == {"type": "room-state", "peerCount": 2}
 
                         await _collab_send(owner_b, {"clientId": "OB", "type": "yjs", "update": "AFTER_REMOVAL"})
-                        got = await _collab_recv(owner_a)
-                        assert got["type"] == "yjs" and got["update"] == "AFTER_REMOVAL"
+                        # Closing the revoked reader emits a peer-count update concurrently with
+                        # owner_b's relay frame, so either frame may arrive first at owner_a.
+                        got = [await _collab_recv(owner_a), await _collab_recv(owner_a)]
+                        assert {msg["type"] for msg in got} == {"room-state", "yjs"}
+                        assert {msg["peerCount"] for msg in got if msg["type"] == "room-state"} == {1}
+                        assert {msg["update"] for msg in got if msg["type"] == "yjs"} == {"AFTER_REMOVAL"}
                         with pytest.raises(ConnectionClosed) as reader_closed:
                             await _collab_recv(removed_reader)
                         assert reader_closed.value.rcvd and reader_closed.value.rcvd.code == 1008
