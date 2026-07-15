@@ -16,6 +16,9 @@ export default defineConfig({
   timeout: 30_000,
   expect: { timeout: 8_000 },
   retries: process.env.CI ? 1 : 0,
+  // The full fixture profile mutates one shared local kernel/catalog. Keep that certification matrix
+  // serial so route-level failure injection and catalog writes cannot bleed across workers.
+  workers: fixtureProfile === 'full' ? 1 : undefined,
   reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
