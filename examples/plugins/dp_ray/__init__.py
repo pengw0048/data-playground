@@ -1127,8 +1127,8 @@ class RayRunner:
     def estimate(self, plan, rows, byts=None):
         return self.base.estimate(plan, rows, byts)  # reuse the hub-side confirm gate verbatim
 
-    def _refresh_recovery_blocked_terminal(self, status: RunStatus) -> bool:
-        """Converge a stale local recovery diagnostic behind the authoritative terminal fence."""
+    def _refresh_durable_terminal(self, status: RunStatus) -> bool:
+        """Converge stale local status behind the authoritative terminal fence."""
         from hub import metadb
 
         run_id = status.run_id
@@ -1151,7 +1151,9 @@ class RayRunner:
         with self._lock:
             self._recovery_blocked.discard(run_id)
             self._settled.setdefault(run_id, threading.Event()).set()
-        self._prune_terminal_runs()
+            supervising = run_id in self._supervising
+        if not supervising:
+            self._prune_terminal_runs()
         return True
 
     def status(self, run_id: str) -> RunStatus:
@@ -1161,25 +1163,30 @@ class RayRunner:
         if st is None:
             raise KeyError(run_id)
         if run_id in self._recovery_blocked:
-            self._refresh_recovery_blocked_terminal(st)
+            self._refresh_durable_terminal(st)
         ref = getattr(st, "backend_ref", None)
         if (st.status in ("queued", "running") and ref and ref.backend == _JOBS_BACKEND
                 and run_id not in self._recovery_blocked):
-            self._ensure_jobs_supervisor(run_id)
+            # Terminal publication commits the canonical SQL status before the winning supervisor copies
+            # it into this process-local object. Read that fence before deciding the run still needs a
+            # supervisor so a status poll cannot expose stale live state or restart settled work.
+            self._refresh_durable_terminal(st)
+            if st.status in ("queued", "running"):
+                self._ensure_jobs_supervisor(run_id)
         return st
 
     def cancel(self, run_id: str) -> RunStatus:
         st = self.runs.get(run_id)
         if st and run_id in self._recovery_blocked:
-            self._refresh_recovery_blocked_terminal(st)
+            self._refresh_durable_terminal(st)
         ref = getattr(st, "backend_ref", None) if st else None
         if st and run_id in self._recovery_blocked and st.status in ("queued", "running"):
             from hub import metadb
 
             if not metadb.request_backend_cancel(run_id):
-                self._refresh_recovery_blocked_terminal(st)
+                self._refresh_durable_terminal(st)
                 return self.runs.get(run_id, st)
-            if self._refresh_recovery_blocked_terminal(st):
+            if self._refresh_durable_terminal(st):
                 return st
             if run_id in self._cancel:
                 self._cancel[run_id].set()
@@ -1187,12 +1194,12 @@ class RayRunner:
             if suffix not in (st.error or ""):
                 st.error = f"{st.error}; {suffix}" if st.error else suffix
                 metadb.save_run_state(run_id, st.model_dump())
-            self._refresh_recovery_blocked_terminal(st)
+            self._refresh_durable_terminal(st)
             return st
         if st and ref and ref.backend == _JOBS_BACKEND and st.status in ("queued", "running"):
             from hub import metadb
             if not metadb.request_backend_cancel(run_id):
-                self._refresh_recovery_blocked_terminal(st)
+                self._refresh_durable_terminal(st)
                 return self.runs.get(run_id, st)
             ev = self._cancel.get(run_id)
             if ev:
@@ -1205,13 +1212,13 @@ class RayRunner:
                 acknowledged = settled.wait(self._jobs_cancel_timeout_s + self._jobs_poll_s * 2)
                 current = self.runs.get(run_id, st)
                 if not acknowledged and current.status in ("queued", "running"):
-                    if self._refresh_recovery_blocked_terminal(current):
+                    if self._refresh_durable_terminal(current):
                         return current
                     # Do not make the synchronous API response depend on the supervisor winning a polling
                     # boundary race. The supervisor persists the same diagnostic and keeps reattaching.
                     current.error = self._cancel_timeout_error()
                     metadb.save_run_state(current.run_id, current.model_dump())
-                    self._refresh_recovery_blocked_terminal(current)
+                    self._refresh_durable_terminal(current)
                 return current
             return self.runs.get(run_id, st)
         if st and st.status in ("queued", "running"):

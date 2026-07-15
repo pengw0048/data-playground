@@ -3493,7 +3493,7 @@ def test_early_result_never_beats_running_and_corruption_waits_for_stopped(jobs_
 
 @pytest.mark.parametrize("remote_status", ["SUCCEEDED", "STOPPED"])
 def test_terminal_remote_result_corruption_uses_durable_quarantine(
-        jobs_config, remote_status):
+        jobs_config, remote_status, monkeypatch):
     module, deps, original, client, store = _runner(jobs_config)
     graph = _graph()
     plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
@@ -3540,17 +3540,35 @@ def test_terminal_remote_result_corruption_uses_durable_quarantine(
     client.get_job_status = transient_get_status
     client.list_jobs = transient_list_jobs
 
+    publication_visible = threading.Event()
+    release_publication = threading.Event()
+    original_finish_publication = metadb.finish_backend_publication
+
+    def finish_publication_then_pause(run_id, attempt_id, owner, result):
+        published = original_finish_publication(run_id, attempt_id, owner, result)
+        if published and run_id == status.run_id:
+            publication_visible.set()
+            assert release_publication.wait(2), "test did not release terminal publication"
+        return published
+
+    monkeypatch.setattr(metadb, "finish_backend_publication", finish_publication_then_pause)
+
     recovered = module.RayRunner(
         deps, jobs_client_factory=client, artifact_store=store, recover=True
     )
-    # Poll SQL directly: calling runner.status() would itself restart a missing supervisor and hide a
-    # liveness regression in the supervisor's normal retry tail.
-    deadline = time.monotonic() + 2
-    while metadb.backend_job(status.run_id)["publication_state"] != "published" \
-            and time.monotonic() < deadline:
-        time.sleep(0.01)
+    assert publication_visible.wait(2), "terminal publication did not reach the test handoff"
     assert metadb.backend_job(status.run_id)["publication_state"] == "published"
-    final = recovered.status(status.run_id)
+    ensure_calls: list[str] = []
+    monkeypatch.setattr(
+        recovered, "_ensure_jobs_supervisor",
+        lambda run_id: ensure_calls.append(run_id) or False,
+    )
+    try:
+        final = recovered.status(status.run_id)
+        assert ensure_calls == []
+        assert status.run_id in recovered._cancel
+    finally:
+        release_publication.set()
 
     assert final.status == "failed"
     assert final.error == "Ray Jobs artifact rejected (code=artifact_contract_invalid)"
