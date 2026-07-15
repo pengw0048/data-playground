@@ -45,22 +45,28 @@ kept here rather than silenced in CI (per [#148](https://github.com/pengw0048/da
 
 ## Scope — what is and isn't a security boundary
 
-Data Playground is a local-first tool. Read this before deciding whether a behavior is a
-vulnerability:
+Data Playground's canonical profiles and trust assumptions are in
+[Supported deployments and trust model](../docs/SUPPORT.md). The primary profiles are a local
+workstation and a shared service operated by a trusted team; mutually distrusting tenants are not
+supported.
 
-- **The code "sandbox" is not a security boundary.** A canvas's transform / section code runs as the
-  **same OS user on the same filesystem** as the kernel. `DP_DATASET_ROOTS` + DuckDB's native sandbox
-  confine *file* access to allowed roots (uniformly, including raw `sql`), but arbitrary Python is
-  arbitrary Python. Running an untrusted canvas is equivalent to running untrusted code on your
-  machine — this is by design, not a bug. Real multi-tenant isolation needs OS-level sandboxing
-  (containers, per-user accounts, or a pod-per-canvas `ExecutionBackend`). See the "Execution
-  isolation — and its limits" section of the README.
-- **In scope:** authentication / authorization bypass (unauthorized canvas access across users when
-  `DP_AUTH_SECRET` is set), leakage of secrets (the LLM key, object-store credentials) to the
-  browser or logs, a path-traversal escape from `DP_DATASET_ROOTS`, or a cross-site / cross-origin
-  hole in the API or the collaboration WebSocket.
-- **Out of scope:** a transform executing code you put on a canvas; anything requiring an attacker to
-  already have write access to a shared canvas or the workspace filesystem.
+- **Arbitrary code is trusted.** Transform and section code runs with the kernel or worker's process
+  permissions. Installed plugins and their `register()` hooks do too. `DP_DATASET_ROOTS` and SQL policy
+  constrain the declarative paths they govern, but a subprocess, container, or PodSpawner does not turn
+  arbitrary Python into a tenant boundary by itself.
+- **Ordinary application controls remain in scope.** Please report authentication or authorization
+  bypass, session-forgery or revocation failures, cross-site/cross-origin or collaboration-WebSocket
+  holes, traversal outside `DP_DATASET_ROOTS` through a supported declarative data path, unsafe SQL
+  policy bypass, plaintext-secret persistence or disclosure, selected-credential fallback to the wrong
+  identity, or redaction failures in browser/API/log surfaces.
+- **Trusted-code behavior is not a vulnerability by itself.** A user who may edit and run arbitrary
+  Python, an installed plugin, an execution worker, or a workspace administrator is trusted with the
+  workspace data and process capabilities. Likewise, the absence of mutually hostile tenant isolation
+  is an explicit unsupported profile, not an undisclosed sandbox escape.
+
+If a report crosses these categories—for example, read-only access becomes code execution, or an
+unauthenticated request reaches a trusted-code capability—please report it privately so we can assess
+the actual boundary crossing.
 
 ## Supported versions
 

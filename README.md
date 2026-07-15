@@ -153,19 +153,22 @@ claude mcp add --transport http dataplay http://127.0.0.1:8471/mcp
 > client backed by a hosted model as data egress; use a provider and policy appropriate for the data,
 > or keep those integrations disabled.
 
-## Project status and security boundary
+## Project status and support boundary
+
+The canonical deployment and trust model is in [docs/SUPPORT.md](docs/SUPPORT.md). In short:
 
 | Deployment profile | Status |
 | --- | --- |
 | **Local, single user or fully trusted collaborators** | Primary path; runs offline with SQLite and local storage |
-| **Trusted-team shared service** | Auth, Postgres, object storage, shared run state, and PodSpawner building blocks exist; operators still own TLS, secrets, IAM, backups, network policy, quotas, and topology validation |
-| **Ray execution** | `dp_ray` is a tested reference backend for the exact shapes in [docs/RAY.md](docs/RAY.md). On current `main`, it does not have a restart-durable Ray job lifecycle, and the Compose/KubeRay files are validation harnesses rather than production manifests |
+| **Trusted-team shared service** | Supported application profile with shared-mode auth/transport checks, Postgres, durable storage, and documented topology; operators still own TLS, secrets, IAM, backups, network policy, quotas, and deployment validation |
+| **Ray execution** | `dp_ray` is tested for the exact shapes in [docs/RAY.md](docs/RAY.md). Whole-graph Ray Jobs persists its binding, reattaches after a hub restart, and publishes terminal state/history with idempotently keyed catalog effects; the multi-region parent remains process-local, and Compose/KubeRay files are validation harnesses rather than production manifests |
 | **Mutually distrusting tenants** | Not supported |
 
-Python transforms, section scripts, installed plugins, and per-canvas dependencies execute as the
-kernel's OS user. `DP_DATASET_ROOTS` constrains supported file access, and user SQL has a fail-closed
-policy, but neither turns arbitrary Python into a security boundary. A kernel also holds the data and
-metadata credentials needed to execute its canvas.
+Operators, administrators, installed plugins, per-canvas dependencies, execution workers, and anyone
+allowed to run arbitrary Python or section code are trusted within a workspace. That code executes with
+the kernel or worker's process permissions. `DP_DATASET_ROOTS` constrains supported file access, and user
+SQL has a fail-closed policy, but neither turns arbitrary Python into a security boundary. A kernel also
+holds the data and metadata credentials needed to execute its canvas.
 
 Canvas sharing is not dataset isolation: the catalog and data engine are workspace-wide. Agent and
 object-store credentials are first-class Cred entities; plugin `[[config]]` fields marked `secret` remain
@@ -199,8 +202,8 @@ Leave the Agent selection or object-store Cred fields blank to use the configure
 or ambient SDK / instance-role chain. Metadata backups contain Cred connection metadata and references,
 not resolved credential values.
 
-Run only trusted canvases and plugins. See the [security policy](.github/SECURITY.md) for the exact
-boundary and private vulnerability-reporting path.
+Run only trusted canvases and plugins. See the [support boundary](docs/SUPPORT.md) for the exact trust
+model and the [security policy](.github/SECURITY.md) for private vulnerability reporting.
 
 ### Docker reference setup
 
@@ -255,11 +258,12 @@ Unset mode keeps today's localhost defaults. The Compose reference sets `shared`
 | [HTTP API contract](docs/API.md) | OpenAPI snapshot, drift check, and stable error envelope |
 | [Plugins](docs/PLUGINS.md) | Add nodes or connect another data, catalog, destination, or execution system |
 | [MCP](docs/MCP.md) | Connect an external agent over HTTP or stdio |
+| [Supported deployments and trust model](docs/SUPPORT.md) | Supported profiles, trusted components, application guarantees, and operator responsibilities |
 | [Ray](docs/RAY.md) | Exact distributed support matrix, validation evidence, and production gates |
 | [CI and release gates](docs/CI.md) | Fast PR checks, scheduled acceptance, and the release-blocking contract |
 | [Kubernetes reference](deploy/README.md) | Validate and adapt the per-canvas Pod substrate |
 | [Contributing](.github/CONTRIBUTING.md) | Development loop, tests, and plugin contribution guidelines |
-| [Security policy](.github/SECURITY.md) | Trust boundary and private vulnerability reporting |
+| [Security policy](.github/SECURITY.md) | Vulnerability scope and private reporting |
 
 The workbench is desktop-first (minimum **1280×720**, Chromium tested in CI, keyboard + mouse). See
 [browser and viewport support](docs/BROWSER_SUPPORT.md) for the full statement.

@@ -5,10 +5,17 @@ importer. Register a node and it shows up on the canvas typed, wired, and previe
 frontend change. This guide builds from the shipped example in
 [`examples/plugins/dp_example/`](../examples/plugins/dp_example/).
 
+Plugins are trusted code, not a sandbox boundary. Plugin modules and registration hooks execute in every
+trusted Data Playground process that loads the plugin registry, including the hub and per-canvas kernels;
+execution drivers may load them too. Node, adapter, backend, or worker code can access the process
+capabilities available to it. Install packages only from parties trusted with the workspace, and read the
+canonical [supported deployments and trust model](SUPPORT.md) before exposing a plugin to a shared
+service.
+
 ## The shape of a plugin
 
-A plugin is a Python package with a `register(reg)` function. The kernel calls it once at startup and
-passes a `Registry`:
+A plugin is a Python package with a `register(reg)` function. Each process that loads the plugin calls
+the hook with its process-local `Registry`; do not assume one global invocation across the deployment:
 
 ```python
 # examples/plugins/dp_example/__init__.py
@@ -59,8 +66,9 @@ on a preview sample or at full scale.
 - `ctx.polars(rel, fn)` — `fn(polars.DataFrame) -> polars.DataFrame`
 - `ctx.resource(key, factory)` — a warm handle built once by `factory()` and reused across batches and
   runs on the same per-canvas kernel. Namespace `key` (for example `f"{pack}:{model}"`). Thread-safe.
-  For trusted plugin nodes, not the sandboxed `transform` cell. Give the object `close()` / `__exit__`
-  and the kernel releases it on graceful shutdown. See `dp_warm_resource`.
+  For plugin nodes with an explicit resource lifecycle, not transform cells; neither is a security
+  sandbox. Give the object `close()` / `__exit__` and the kernel releases it on graceful shutdown. See
+  `dp_warm_resource`.
 
 Prefer `ctx.sql` when it suffices — it stays in the engine and spills to disk.
 
@@ -118,7 +126,8 @@ than promising a content hash. Missing capabilities or uncertain metadata are ha
 default Cred must also implement `supports_selected_destination_credentials() -> True`. Core treats a
 missing or false capability as ambient-identity-only and rejects the run before dispatch; never claim
 the capability unless the backend uses the selected Cred rather than silently falling back to ambient
-credentials.
+credentials. A remote backend also owns truthful cancellation, deadlines, resource limits, worker trust,
+and operational documentation for the shapes it claims.
 
 `reg.add_capability(cap)` declares a column capability. Optional `detect(col) -> bool` tags matching
 columns via `tag_columns`. Optional `viewer = {"kind": …}` adds a declarative viewer tab the SPA
@@ -243,6 +252,11 @@ path to your class (`pkg.module:Class`):
 The example has a test that loads it via drop-in discovery and runs its node
 (`test_example_plugin_loads_and_runs` in `kernel/hub/tests/test_kernel.py`). `GET /api/plugins` lists
 loaded packs (with any load error). `GET /api/nodes` shows the schema the SPA renders.
+
+An out-of-tree package should run the same contract tests against its declared core API range and add
+provider-independent fakes for failure, cancellation, credential-selection, and bounded-work behavior.
+Live integration tests then validate the intended provider or cluster; they do not replace deterministic
+contract tests.
 
 ## Reference plugins
 
