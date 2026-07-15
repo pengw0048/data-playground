@@ -182,7 +182,7 @@ class RunController:
             if n is None or n.type != "source":
                 continue
             cfg = n.data.get("config", {}) if isinstance(n.data, dict) else {}
-            ref = str(cfg.get("uri") or cfg.get("table") or "").strip()
+            ref = str(cfg.get("uri") or "").strip()
             if not ref:
                 continue
             try:

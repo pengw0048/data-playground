@@ -4139,54 +4139,23 @@ def _local_result_candidate(value) -> str | None:
 
 
 def _canvas_local_result_candidates(value) -> set[str]:
-    """Extract bounded executable source bindings, including legacy nested section bodies."""
+    """Extract local-result URIs from the canvas's canonical node list."""
     if not isinstance(value, dict):
         raise ValueError("canvas document must be an object")
     nodes = value.get("nodes", [])
     if not isinstance(nodes, list) or len(nodes) > 5000:
         raise ValueError("canvas document has an invalid or oversized node list")
-    children: dict[str, list[dict]] = {}
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-        parent = node.get("parentId") or node.get("parent_id")
-        if parent:
-            children.setdefault(str(parent), []).append(node)
     candidates: set[str] = set()
-    queue: list[tuple[dict, int, bool]] = [
-        (node, 0, True) for node in nodes if isinstance(node, dict)]
-    seen: set[int] = set()
-    cursor = 0
-    while cursor < len(queue):
-        if cursor >= 10_000:
-            raise ValueError("canvas section source traversal exceeds the supported node limit")
-        node, depth, visual = queue[cursor]
-        cursor += 1
-        if depth > 64:
-            raise ValueError("canvas legacy section nesting exceeds the supported depth")
-        if id(node) in seen:
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("type") != "source":
             continue
-        seen.add(id(node))
-        data = node.get("data") if visual else None
-        config = ((data.get("config") if isinstance(data, dict) else None)
-                  if visual else node.get("config"))
+        data = node.get("data")
+        config = data.get("config") if isinstance(data, dict) else None
         if not isinstance(config, dict):
-            config = {}
-        if node.get("type") == "source":
-            candidate = _local_result_candidate(config.get("uri") or config.get("table"))
-            if candidate is not None:
-                candidates.add(candidate)
-        if node.get("type") != "section":
             continue
-        direct = children.get(str(node.get("id")), []) if visual else []
-        if direct:  # identical precedence to section._collect_subnodes
-            queue.extend((child, depth, True) for child in direct)
-            continue
-        subnodes = config.get("subnodes") or []
-        if not isinstance(subnodes, list):
-            raise ValueError("canvas legacy section subnodes must be a list")
-        queue.extend((child, depth + 1, False)
-                     for child in subnodes if isinstance(child, dict))
+        candidate = _local_result_candidate(config.get("uri"))
+        if candidate is not None:
+            candidates.add(candidate)
     return candidates
 
 

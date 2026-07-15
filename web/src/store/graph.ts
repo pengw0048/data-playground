@@ -763,28 +763,6 @@ function emptyDoc(): CanvasDoc {
   return { id: `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`, name: 'untitled', version: 1, nodes: [], edges: [] }
 }
 
-// Fold legacy documents into the current node model on load:
-//  - the old `notebook` kind is now just a `transform` scoped to a sample (they ran identically).
-//  - the old `muted` flag was purely visual (never affected execution); drop it so it doesn't get
-//    mistaken for the new `disabled` semantics.
-function migrateDoc(doc: CanvasDoc): CanvasDoc {
-  let changed = false
-  const nodes = doc.nodes.map((n) => {
-    let node = n
-    if (n.type === 'notebook') {
-      changed = true
-      node = { ...node, type: 'transform', data: { ...node.data, config: { source: 'adhoc', scope: 'sample', ...node.data.config } } }
-    }
-    if ((node.data as { muted?: boolean }).muted !== undefined) {
-      changed = true
-      const { muted: _drop, ...rest } = node.data as NodeData & { muted?: boolean }
-      node = { ...node, data: rest }
-    }
-    return node
-  })
-  return changed ? { ...doc, nodes } : doc
-}
-
 // true if the node, or anything feeding it, has an unmet required param — so running the pipeline
 // through it would fail. Keeps rerun-all consistent with the disabled ▶ on the cards.
 function hasInvalidUpstream(doc: CanvasDoc, id: string): boolean {
@@ -1820,7 +1798,7 @@ export const useStore = create<Store>((set, get) => ({
           const doc = JSON.parse(saved) as CanvasDoc
           if (doc?.nodes) {
             const role = cachedRole(get().currentUser?.id, doc.id)
-            set({ doc: migrateDoc(doc), canvasRole: role, agentOpen: false })
+            set({ doc, canvasRole: role, agentOpen: false })
           }
         }
       } catch { /* ignore corrupt state */ }
@@ -2107,7 +2085,7 @@ export const useStore = create<Store>((set, get) => ({
 
   loadDoc: (doc, role = get().canvasRole) => {
     _cfgEdit = { id: '', t: 0 }
-    const d = migrateDoc(doc)
+    const d = doc
     set({
       doc: d,
       canvasRole: role,

@@ -24,7 +24,7 @@ PREVIEW_BUDGET_S = 8.0
 # execute in a killable, deadline-bounded child instead. `section` runs a user driver script via exec
 # (section.run_section), so it belongs here too. (vector-search is pure SQL/Lance — interruptible — so
 # it is NOT here.)
-_CODE_CELL_KINDS = ("transform", "notebook", "opaque", "loop", "section")
+_CODE_CELL_KINDS = ("transform", "section")
 
 
 def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,

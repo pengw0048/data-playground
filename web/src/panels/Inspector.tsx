@@ -27,7 +27,7 @@ const BUILTIN_KINDS = new Set([
 // Kinds whose OUTPUT columns need running code, so they can carry a user schema contract — mirrors the
 // kernel's _UNTYPED set (minus 'section', which has its own port editor). Plugin kinds execute too, so
 // any non-built-in kind is contract-capable as well. Relational/io/annotation nodes are always typed.
-const CONTRACT_KINDS = new Set(['transform', 'notebook', 'vector-search', 'loop', 'opaque'])
+const CONTRACT_KINDS = new Set(['transform', 'vector-search'])
 export const canDeclareSchemaKind = (kind: string) => CONTRACT_KINDS.has(kind) || !BUILTIN_KINDS.has(kind)
 
 // Figma-style right property panel: shows the SELECTED node's properties (params reused from the

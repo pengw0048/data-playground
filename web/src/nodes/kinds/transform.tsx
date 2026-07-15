@@ -14,9 +14,9 @@ const DEFAULT_CODE = `def fn(row):
     # edit me — runs per row
     return row`
 
-// The single Python-code compute node (the old `notebook` folded in here). `scope` just labels
-// whether you're exploring a sample or producing a dataset — execution is identical. Code is
-// edited in the one fullscreen editor (mode / on_error / Promote live there too).
+// The single Python-code compute node. `scope` labels whether you're exploring a sample or producing
+// a dataset — execution is identical. Code is edited in the one fullscreen editor (mode / on_error /
+// Promote live there too).
 function Transform({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
   const openFullscreen = useStore((s) => s.openCodeFullscreen)

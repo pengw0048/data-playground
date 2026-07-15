@@ -61,7 +61,7 @@ def _grain_for(graph: Graph, node, grains: dict[str, GrainInfo], catalog) -> Gra
     parent = grains.get(ps[0], _UNKNOWN) if ps else _UNKNOWN
 
     if t == "source":
-        return _source_grain(cfg.get("uri") or cfg.get("table"), catalog)
+        return _source_grain(cfg.get("uri"), catalog)
     if t in ("filter", "sort", "sample", "vector-search", "write"):
         return parent  # row-preserving (or row-subsetting) — the key stays unique
     if t == "select":

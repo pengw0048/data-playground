@@ -5,8 +5,8 @@ calls the nodes it contains, by alias, with ordinary control flow (for/while/if)
 head-pod-script model as a first-class canvas node. Not sample-previewable (full pass only).
 See docs/meta-programming.zh.md.
 
-Trust model: the driver script runs with the SAME soft sandbox as the `transform`/`notebook`
-nodes — the kernel executes user-authored Python by design, so this is a footgun guard, not a
+Trust model: the driver script runs with the SAME soft sandbox as the `transform` node — the
+kernel executes user-authored Python by design, so this is a footgun guard, not a
 security boundary. `maxRuns` caps run() calls (a bounded loop), but a script that never calls
 run() (e.g. `while True: pass`) is not time-bounded and, like any node, holds the shared DuckDB
 lock for the run; true isolation of untrusted code needs OS-level sandboxing (out of scope for
@@ -14,7 +14,6 @@ this internal tool).
 
 Wire format (node.data.config):
   script:   str                    # Python; API: inputs, params, run, value, concat, emit
-  subnodes: [{alias, type, config}]# the nodes this section contains (script calls them by alias)
   params:   dict                   # scalars the script reads (prompts, thresholds, max_iters, …)
   outputs:  [str]                  # declared output port names (default ["out"]); emit()ed by name
   maxRuns:  int                    # cap on run() calls (default 200)
@@ -54,23 +53,19 @@ def _materialize(engine, rel):
     return db.conn().read_parquet(path)
 
 
-def _collect_subnodes(engine, node) -> dict:
+def _collect_children(engine, node) -> dict:
     """The callable nodes of a section, as {alias -> {type, config}}.
 
-    Preferred model (visual containment): the canvas nodes whose parent_id is this section — the
-    alias is each node's title, so the driver calls run("clean rows", …). Falls back to the legacy
-    form-declared config.subnodes when the section has no contained canvas nodes (back-compat)."""
+    The canvas nodes whose parent_id is this section are its body. The alias is each node's title,
+    so the driver calls run("clean rows", …)."""
     kids = [n for n in engine.graph.nodes if getattr(n, "parent_id", None) == node.id]
-    if kids:
-        out: dict = {}
-        for k in kids:
-            data = k.data if isinstance(k.data, dict) else {}
-            alias = str(data.get("title") or k.id).strip()
-            # keep the node id so run() can carry this kid's own contained subtree (nested sections)
-            out[alias] = {"alias": alias, "type": k.type, "config": data.get("config", {}) or {}, "id": k.id}
-        return out
-    cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-    return {s["alias"]: s for s in (cfg.get("subnodes") or []) if s.get("alias")}
+    out: dict = {}
+    for k in kids:
+        data = k.data if isinstance(k.data, dict) else {}
+        alias = str(data.get("title") or k.id).strip()
+        # keep the node id so run() can carry this kid's own contained subtree (nested sections)
+        out[alias] = {"alias": alias, "type": k.type, "config": data.get("config", {}) or {}, "id": k.id}
+    return out
 
 
 def _descendants(graph, root_id: str) -> list:
@@ -101,7 +96,7 @@ def run_section(engine, node, inputs):
 
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
     script = (cfg.get("script") or "").strip()
-    subnodes = _collect_subnodes(engine, node)
+    children = _collect_children(engine, node)
     params = cfg.get("params") or {}
     max_runs = int(cfg.get("maxRuns", 200))
     if not script:
@@ -115,12 +110,12 @@ def run_section(engine, node, inputs):
         if calls["n"] > max_runs:
             raise SectionError(f"section exceeded maxRuns={max_runs} (bounded for safety)")
         alias = ref.alias if isinstance(ref, _Ref) else str(ref)
-        spec = subnodes.get(alias)
+        spec = children.get(alias)
         if not spec:
             raise SectionError(f"section calls unknown node '{alias}'")
         data = kw.pop("data", None)  # a handle to bind as this node's input
-        protected = ({"uri", "table"} if spec.get("type") == "source" else
-                     {"subnodes", "script"} if spec.get("type") == "section" else set())
+        protected = ({"uri"} if spec.get("type") == "source" else
+                     {"script"} if spec.get("type") == "section" else set())
         overridden = protected & set(kw)
         if overridden:
             fields = ", ".join(sorted(overridden))
@@ -180,7 +175,7 @@ def run_section(engine, node, inputs):
         "params": params,
         "run": run, "value": value, "concat": concat, "emit": emit,
     })
-    for alias in subnodes:
+    for alias in children:
         if alias.isidentifier():  # bare alias object: run(caption, …); other titles use run("my title", …)
             ns[alias] = _Ref(alias)
 

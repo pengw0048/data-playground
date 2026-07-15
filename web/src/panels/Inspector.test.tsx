@@ -10,7 +10,7 @@ const cols: ColumnSchema[] = [
 
 describe('canDeclareSchemaKind — which kinds can carry a schema contract', () => {
   it('is true for code ops + any plugin kind', () => {
-    for (const k of ['transform', 'notebook', 'vector-search', 'loop', 'opaque', 'my_plugin_node']) {
+    for (const k of ['transform', 'vector-search', 'my_plugin_node']) {
       expect(canDeclareSchemaKind(k)).toBe(true)
     }
   })

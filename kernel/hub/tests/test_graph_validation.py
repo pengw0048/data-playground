@@ -38,8 +38,6 @@ def _graph(nodes: list[GraphNode], edges: list[GraphEdge]) -> Graph:
             [_edge("e", "s", "f", source_handle="bogus")]), "unknown source handle 'bogus'"),
     (_graph([_node("s", "source"), _node("j", "join")],
             [_edge("e", "s", "j", target_handle="bogus")]), "unknown target handle 'bogus'"),
-    (_graph([_node("s", "notebook"), _node("f", "filter")],
-            [_edge("e", "s", "f", source_handle="bogus")]), "unknown source handle 'bogus'"),
 ])
 def test_structural_errors_reject_ambiguous_graphs(graph: Graph, message: str):
     assert any(message in error for error in graph_mod.structural_errors(graph, SPECS))
@@ -79,10 +77,19 @@ def test_structural_errors_reject_unknown_requested_target():
     assert graph_mod.structural_errors(graph, SPECS, "missing") == ["target node 'missing' does not exist"]
 
 
-def test_intrinsic_legacy_ports_are_structurally_and_wire_type_validated():
-    graph = _graph([_node("n", "notebook"), _node("v", "variable")], [_edge("e", "n", "v")])
-    assert graph_mod.structural_errors(graph, SPECS) == []
-    assert graph_mod.type_errors(graph, SPECS) == []
+@pytest.mark.parametrize("kind", ["notebook", "loop", "variable", "opaque"])
+def test_obsolete_literal_node_kinds_are_unknown(kind: str):
+    graph = _graph([_node("old", kind)], [])
+    assert graph_mod.unknown_kinds(graph, SPECS) == [("old", kind)]
+
+    payload = graph.model_dump(by_alias=True)
+    compiled = client.post("/api/graph/compile", json={"graph": payload, "targetNodeId": "old"})
+    assert compiled.status_code == 200
+    assert f"unknown node kind '{kind}'" in compiled.json()["error"]
+
+    preview = client.post("/api/run/preview", json={"graph": payload, "nodeId": "old", "k": 5})
+    assert preview.status_code == 400
+    assert f"unknown node kind '{kind}'" in preview.text
 
 
 def _wire(node_id: str, kind: str) -> dict:

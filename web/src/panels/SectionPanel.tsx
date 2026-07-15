@@ -1,15 +1,11 @@
 import { Suspense, lazy, useState } from 'react'
 import { roleCanEdit, useStore } from '../store/graph'
-import { allSpecs } from '../nodes/registry'
 import { color } from '../theme/tokens'
-import { Icon } from '../ui/Icon'
 
 const CodeEditor = lazy(() => import('../ui/CodeEditor').then((m) => ({ default: m.CodeEditor })))
 
-interface SubNode { alias: string; type: string; config: Record<string, unknown> }
-
-// Editor for a `section` node: the driver script + the nodes it contains (alias/type/config) +
-// params + a maxRuns bound. The script calls the sub-nodes by alias: run(alias, data=…, **cfg).
+// Editor for a `section` node: the driver script + its parentId-contained canvas nodes + params and a
+// maxRuns bound. The script calls contained nodes by title: run(alias, data=…, **cfg).
 export function SectionPanel({ nodeId }: { nodeId: string }) {
   const nodes = useStore((s) => s.doc.nodes) // stable ref; filter in-body (a filtering selector returns a new array each render → infinite loop)
   const node = nodes.find((n) => n.id === nodeId)
@@ -18,12 +14,7 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   if (!node) return null
   const cfg = node.data.config
-  const subnodes = (Array.isArray(cfg.subnodes) ? cfg.subnodes : []) as SubNode[]
   const outputs = (Array.isArray(cfg.outputs) && cfg.outputs.length ? cfg.outputs : ['out']) as string[]
-  const kinds = allSpecs().map((s) => s.kind).filter((k) => k !== 'section' && k !== 'note')
-
-  const setSubs = (next: SubNode[]) => updateConfig(nodeId, { subnodes: next })
-  const patchSub = (i: number, patch: Partial<SubNode>) => setSubs(subnodes.map((s, j) => (j === i ? { ...s, ...patch } : s)))
   // outputs: the section's output ports. `emit(rel)` fills "out"; `emit("name", rel)` a named port.
   const setOutputs = (v: string) => {
     const ports = [...new Set(v.split(',').map((s) => s.trim()).filter(Boolean))]  // de-dup: unique handles
@@ -48,8 +39,8 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
         </Suspense>
       </Field>
 
-      {children.length > 0 ? (
-        <Field label="contained nodes (on the canvas)">
+      <Field label="contained nodes (on the canvas)">
+        {children.length > 0 ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             <div style={{ fontSize: 11, color: color.text3, lineHeight: 1.5 }}>
               Drop nodes onto the section frame to contain them. The script calls each by its title:
@@ -62,33 +53,12 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
               </div>
             ))}
           </div>
-        </Field>
-      ) : (
-      <Field label="contained nodes (inline — used when nothing is on the canvas)">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {subnodes.map((s, i) => (
-            <div key={i} style={{ border: `1px solid ${color.border}`, borderRadius: 8, padding: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                <input value={s.alias} placeholder="alias" onChange={(e) => patchSub(i, { alias: e.target.value })}
-                  style={{ width: 120, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', outline: 'none' }} />
-                <select value={s.type} onChange={(e) => patchSub(i, { type: e.target.value })}
-                  style={{ flex: 1, fontSize: 12, border: `1px solid ${color.border}`, borderRadius: 6, padding: '5px 8px', background: 'hsl(var(--card))' }}>
-                  {kinds.map((k) => <option key={k} value={k}>{k}</option>)}
-                </select>
-                <button onClick={() => setSubs(subnodes.filter((_, j) => j !== i))} title="remove"
-                  style={{ border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer' }}><Icon name="close" size={13} /></button>
-              </div>
-              <JsonField label="config" value={s.config ?? {}} onChange={(v) => patchSub(i, { config: v as Record<string, unknown> })} />
-            </div>
-          ))}
-          <button
-            onClick={() => setSubs([...subnodes, { alias: `n${subnodes.length + 1}`, type: kinds[0] ?? 'filter', config: {} }])}
-            style={{ alignSelf: 'flex-start', display: 'inline-flex', alignItems: 'center', gap: 5, border: `1px solid ${color.border}`, borderRadius: 7, background: 'hsl(var(--card))', color: color.text2, fontSize: 12, padding: '6px 10px' }}>
-            <Icon name="plus" size={12} /> <span>add node</span>
-          </button>
-        </div>
+        ) : (
+          <div style={{ fontSize: 11, color: color.text3, lineHeight: 1.5 }}>
+            Drop nodes onto the section frame to make them callable from the driver script.
+          </div>
+        )}
       </Field>
-      )}
 
       <Field label="output ports (comma-separated)">
         <input defaultValue={outputs.join(', ')} onChange={(e) => setOutputs(e.target.value)} placeholder="out"

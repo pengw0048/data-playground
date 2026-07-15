@@ -1139,7 +1139,7 @@ class LocalRunner:
         for n in g.upstream_chain(graph, nm_node):
             if n.type == "source":
                 cfg = n.data.get("config", {}) if isinstance(n.data, dict) else {}
-                return cfg.get("uri") or cfg.get("table")
+                return cfg.get("uri")
         return None
 
     def status(self, run_id: str) -> RunStatus:

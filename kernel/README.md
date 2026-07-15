@@ -30,7 +30,7 @@ relation; preview runs the SAME build with a bounded source sample (faithful —
 | vector-search | cosine similarity top-K (Lance ANN when available) |
 | write | streaming sink → Parquet/CSV/Lance, registered in the catalog |
 
-Not sample-previewable: `aggregate`, `write`, `opaque`, `loop` → "needs a full pass".
+Not sample-previewable: `aggregate`, `write`, `section` → "needs a full pass".
 
 ## Layout
 

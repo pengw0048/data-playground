@@ -43,8 +43,8 @@ from hub.sqlpolicy import (
 Relation = duckdb.DuckDBPyRelation
 
 # Node kinds whose result cannot be faithfully computed on a truncated sample (P8).
-NOT_PREVIEWABLE_KINDS = {"aggregate", "write", "opaque", "loop", "section"}
-_TRANSFORM_KINDS = {"transform", "notebook"}
+NOT_PREVIEWABLE_KINDS = {"aggregate", "write", "section"}
+_TRANSFORM_KINDS = {"transform"}
 
 
 
@@ -87,7 +87,7 @@ def _disabled(node: GraphNode) -> bool:
 
 # code-op kinds whose OUTPUT columns can't be resolved without running them → untyped ports, UNLESS
 # the node carries a user-declared schema contract (config.outputSchema). See executors/schema.
-_CODE_KINDS = {"transform", "notebook", "section", "vector-search", "loop", "opaque"}
+_CODE_KINDS = {"transform", "section", "vector-search"}
 
 _DUCK_TYPE = {
     "int": "BIGINT", "integer": "BIGINT", "bigint": "BIGINT", "long": "BIGINT",
@@ -840,17 +840,10 @@ class BuildEngine:
         if t == "vector-search":
             return self._vector_search(node, inputs)
 
-        if t in ("write", "opaque", "loop"):
+        if t == "write":
             if self.full and parent is not None:
                 return parent  # runner performs the real work / commit; here we pass through
-            raise NotPreviewable(node, {
-                "write": "commit is all-or-nothing — needs a full pass",
-                "opaque": "opaque op — needs a full pass",
-                "loop": "each loop pass runs real work — needs a full pass",
-            }[t])
-
-        if t == "variable":  # a named passthrough handle — carries its single input through unchanged
-            return parent if parent is not None else _empty()
+            raise NotPreviewable(node, "commit is all-or-nothing — needs a full pass")
         # any other kind reaching here is unhandled — a missing plugin or a typo. Fail closed (P0-DATA-02):
         # never silently pass the input through, which would omit the intended work yet report success.
         if t not in self.node_specs and t not in self.node_builders:

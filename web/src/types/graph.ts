@@ -19,13 +19,12 @@ export interface PortSpec {
 export interface NodeConfig {
   // source
   uri?: string
-  table?: string
   tableId?: string
   // sample
   n?: number
   seed?: number
   method?: string
-  // filter / branch
+  // filter
   predicate?: string
   // transform (two forms)
   source?: TransformSource
@@ -55,9 +54,6 @@ export interface NodeConfig {
   // write
   name?: string
   writeMode?: 'append' | 'overwrite'
-  // loop
-  maxIters?: number
-  budgetUsd?: number
   // generic
   [k: string]: unknown
 }

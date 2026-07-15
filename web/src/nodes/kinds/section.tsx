@@ -103,7 +103,7 @@ register(
     canBypass: false,
     blurb: 'driver script over contained nodes (loops / branches)',
     defaultData: () => ({ title: 'section', status: 'draft', meta: 'driver script',
-      config: { script: DEFAULT_SCRIPT, subnodes: [], params: {}, maxRuns: 200, outputs: ['out'] } }),
+      config: { script: DEFAULT_SCRIPT, params: {}, maxRuns: 200, outputs: ['out'] } }),
   },
   Section,
 )

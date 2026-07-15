@@ -64,7 +64,7 @@ def plan_hash(graph: Graph, target: str | None, resolve_adapter) -> str:
         flags = f"b{int(bool(data.get('bypassed')))}d{int(bool(data.get('disabled')))}t{data.get('title', '')}"
         parts.append(f"{prefix}{n.id}:{n.type}:{flags}:{json.dumps(cfg, sort_keys=True, default=str)}")
         if n.type == "source":
-            uri = cfg.get("uri") or cfg.get("table")
+            uri = cfg.get("uri")
             if uri:
                 try:
                     parts.append(f"{prefix}fp:{resolve_adapter(uri).fingerprint(uri)}")
@@ -100,7 +100,7 @@ def plan_cacheable(graph: Graph, target: str | None, node_builders) -> bool:
         if cfg.get("cacheable") is False:
             return False
         if n.type == "source":
-            uri = str(cfg.get("uri") or cfg.get("table") or "")
+            uri = str(cfg.get("uri") or "")
             if uri.startswith("mem://") or is_object_uri(uri):
                 return False
         if n.type == "write" and cfg.get("writeMode") == "append":

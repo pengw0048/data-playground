@@ -578,14 +578,22 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText(name, { exact: true })).toBeVisible() // new member appears in the roster
   })
 
-  test('a section node opens its editor and adds a contained node', async ({ page }) => {
+  test('a section editor uses canvas containment instead of inline nodes', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Compute', 'section')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
     await page.getByText('Edit script →').click()
     await expect(page.getByText('driver script (Python)')).toBeVisible()
-    await page.getByText('add node').click()
-    await expect(page.getByPlaceholder('alias')).toBeVisible() // a contained-node row appeared
+    await expect(page.getByText('contained nodes (on the canvas)')).toBeVisible()
+    await expect(page.getByText(/Drop nodes onto the section frame/)).toBeVisible()
+    await expect(page.getByRole('button', { name: 'add node' })).toHaveCount(0)
+    await expect(page.getByTestId('autosave')).toHaveText(/saved/, { timeout: 8_000 })
+
+    await page.reload()
+    const section = page.locator('.react-flow__node').filter({ hasText: 'SECTION' })
+    await expect(section).toBeVisible()
+    await section.getByText('Edit script →').click()
+    await expect(page.getByText(/Drop nodes onto the section frame/)).toBeVisible()
   })
 
   test('a section can declare multiple output ports (multi-output)', async ({ page }) => {

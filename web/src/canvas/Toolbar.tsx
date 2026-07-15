@@ -9,7 +9,7 @@ import { Popover } from '../ui/Popover'
 import { cn } from '@/lib/utils'
 
 const CATEGORY_ICON: Record<Category, IconName> = {
-  io: 'db', shape: 'sample', compute: 'fx', query: 'sql', inspect: 'note', control: 'branch',
+  io: 'db', shape: 'sample', compute: 'fx', query: 'sql', inspect: 'note', control: 'code',
 }
 const CATEGORY_LABEL: Record<Category, string> = {
   io: 'Sources & sinks', shape: 'Shape', compute: 'Compute', query: 'Query', inspect: 'Inspect', control: 'Control flow',

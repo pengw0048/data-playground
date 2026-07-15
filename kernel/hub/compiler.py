@@ -15,8 +15,7 @@ from hub.models import CompilePlan, GraphNode, PlanStep
 _STEP_KIND = {
     "source": "read", "sample": "sample", "filter": "filter", "select": "select",
     "sort": "op", "dedup": "op", "sql": "sql", "join": "join", "aggregate": "reduce",
-    "transform": "op", "notebook": "op", "metric": "reduce", "write": "write",
-    "opaque": "opaque", "loop": "loop", "variable": "op",
+    "transform": "op", "metric": "reduce", "write": "write",
     "vector-search": "query", "assert": "assert",
     "window": "op", "fill": "op", "unnest": "op",
 }
@@ -39,7 +38,7 @@ def compile_plan(graph, target_node_id: str | None = None, registry=None, node_s
     for node in chain:
         kind = _STEP_KIND.get(node.type, "op")
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-        mode = cfg.get("mode", "map") if node.type in ("transform", "notebook") else node.type
+        mode = cfg.get("mode", "map") if node.type == "transform" else node.type
         # the authoritative engine-neutral IR op (incl. a plugin node's emit hook via node_ir) — a
         # backend's can_run gates the clean subset on THIS, so it's identical to what the IR lowers
         op = _op_and_config(node, node_ir)[0]
