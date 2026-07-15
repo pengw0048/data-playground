@@ -41,8 +41,8 @@ folders. `get` and `resolve` are indexed lookups. Lineage expands breadth-first 
 
 Key endpoints under `/api`:
 
-- `GET /catalog/tables?q&folder&tags&owner&hasColumns&uris&sort&order&limit&offset` — page body plus
-  `X-Total-Count` / `X-Has-More`
+- `GET /catalog/tables?q&folder&tags&owner&hasColumns&uris&sort&order&limit&offset` —
+  `{items, total, offset, limit, hasMore}` page body
 - `GET /catalog/facets?<same filters>` — folder / tag / owner values and counts, plus
   `semanticAvailable`
 - `GET /catalog/tree?prefix=` — one level of the folder tree (`totalTables` / `truncated` when

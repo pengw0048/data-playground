@@ -3,7 +3,7 @@ import { MIN_VIEWPORT } from './support/min-viewport'
 
 // End-to-end tests drive the REAL app: the kernel (FastAPI + engine) serving the built SPA.
 // `npm run build` must run first (the kernel serves web/dist). The webServer block boots the
-// kernel on a test port and waits for /api/health before the specs run.
+// kernel on a test port and waits for /api/livez before the specs run.
 const PORT = process.env.DP_E2E_PORT ?? '8899'
 const fixtureProfile = process.env.DP_E2E_FIXTURE_PROFILE ?? 'smoke'
 
@@ -67,7 +67,7 @@ export default defineConfig({
   webServer: {
     // fresh metadata DB per run (the metadata DB persists canvases; tests need a clean slate)
     command: `cd ../kernel && WORKSPACE=../web/.e2e-workspace && rm -f e2e-test.db* && rm -rf "$WORKSPACE" && uv run python ../scripts/build_ux_fixtures.py --profile ${fixtureProfile} --output "$WORKSPACE/data" && DP_DATABASE_URL=sqlite:///e2e-test.db uv run dataplay --workspace "$WORKSPACE" --port ${PORT} --no-open`,
-    url: `http://127.0.0.1:${PORT}/api/health`,
+    url: `http://127.0.0.1:${PORT}/api/livez`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
   },

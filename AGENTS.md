@@ -28,5 +28,5 @@ Standard commands live in the root `Makefile`, `web/package.json`, and `kernel/p
 - **Build ordering:** `web/dist` is gitignored, so a fresh clone lacks it. The kernel wheel force-includes `../web/dist`, so `web/dist` must exist before `uv sync` (a `hatch_build.py` hook creates an empty one, and `make setup` does `mkdir -p web/dist` first). `make run` rebuilds `web/dist` for real before serving.
 - **No linters are configured** in either component. The static gates are `tsc` (web) and `pytest` with `error::DeprecationWarning:hub.*` treated as errors (kernel). There is no ruff/black/eslint.
 - **First run auto-seeds** sample data (`events.parquet`, `movies.csv`, `images.parquet`) and creates a default canvas; the DB migrates on startup via Alembic.
-- **`dataplay` tries to auto-open a browser** on startup. In a headless VM this prints harmless `dbus`/`gpu`/`gcm` Chrome errors to the log — the server itself is fine (check `GET /api/health` → `{"ok":true}`).
+- **`dataplay` tries to auto-open a browser** on startup. In a headless VM this prints harmless `dbus`/`gpu`/`gcm` Chrome errors to the log — the server itself is fine (check `GET /api/livez` → `{"ok":true}`).
 - E2E (`npm run e2e`) boots its own `dataplay` instance on `:8899` with a throwaway SQLite DB, so it does not collide with a `make run` server on `:8471`.

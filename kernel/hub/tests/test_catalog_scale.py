@@ -59,44 +59,50 @@ def scale_catalog():
         metadb.catalog_delete_prefix(_SCALE)
 
 
-def test_pagination_headers_and_windowing(scale_catalog):
+def test_pagination_body_and_windowing(scale_catalog):
     n = scale_catalog
     r = client.get("/api/catalog/tables", params={"folder": "team0", "limit": 25, "offset": 0, "sort": "name"})
     assert r.status_code == 200
-    items = r.json()
+    page = r.json()
+    items = page["items"]
     assert len(items) == 25, "the page is bounded by limit, not the catalog size"
-    total = int(r.headers["X-Total-Count"])
-    assert total == n // 5, "team0 holds exactly a fifth of the seeded tables"
-    assert r.headers["X-Has-More"] == "1"
+    assert page == {
+        "items": items,
+        "total": n // 5,
+        "offset": 0,
+        "limit": 25,
+        "hasMore": True,
+    }
+    assert "X-Total-Count" not in r.headers and "X-Has-More" not in r.headers
     # a deterministic second page has no overlap with the first (stable sort + offset)
     r2 = client.get("/api/catalog/tables", params={"folder": "team0", "limit": 25, "offset": 25, "sort": "name"})
     first = {t["uri"] for t in items}
-    second = {t["uri"] for t in r2.json()}
+    second = {t["uri"] for t in r2.json()["items"]}
     assert first.isdisjoint(second)
 
 
 def test_sort_by_rows_and_usage(scale_catalog):
     r = client.get("/api/catalog/tables", params={"folder": "team1", "sort": "rows", "order": "desc", "limit": 5})
-    rows = [t["rowCount"] for t in r.json()]
+    rows = [t["rowCount"] for t in r.json()["items"]]
     assert rows == sorted(rows, reverse=True) and rows[0] > rows[-1]
 
 
 def test_folder_subtree_filter(scale_catalog):
     # a folder filter matches the folder AND its subtree
-    total_top = int(client.get("/api/catalog/tables", params={"folder": "team2", "limit": 1}).headers["X-Total-Count"])
-    total_sub = int(client.get("/api/catalog/tables", params={"folder": "team2/ds2", "limit": 1}).headers["X-Total-Count"])
+    total_top = client.get("/api/catalog/tables", params={"folder": "team2", "limit": 1}).json()["total"]
+    total_sub = client.get("/api/catalog/tables", params={"folder": "team2/ds2", "limit": 1}).json()["total"]
     assert total_top > total_sub > 0
 
 
 def test_tag_and_owner_and_column_filters(scale_catalog):
     # tags AND together; pii is a strict subset of the seeded set
-    pii = int(client.get("/api/catalog/tables", params={"tags": "pii", "limit": 1}).headers["X-Total-Count"])
-    pii_gold = int(client.get("/api/catalog/tables", params={"tags": "pii,gold", "limit": 1}).headers["X-Total-Count"])
+    pii = client.get("/api/catalog/tables", params={"tags": "pii", "limit": 1}).json()["total"]
+    pii_gold = client.get("/api/catalog/tables", params={"tags": "pii,gold", "limit": 1}).json()["total"]
     assert 0 < pii_gold <= pii
     # every pii table has the email column, so has-column agrees
-    has_email = int(client.get("/api/catalog/tables", params={"hasColumns": "email", "limit": 1}).headers["X-Total-Count"])
+    has_email = client.get("/api/catalog/tables", params={"hasColumns": "email", "limit": 1}).json()["total"]
     assert has_email == pii
-    owned = int(client.get("/api/catalog/tables", params={"owner": "alice", "limit": 1}).headers["X-Total-Count"])
+    owned = client.get("/api/catalog/tables", params={"owner": "alice", "limit": 1}).json()["total"]
     assert owned > 0
 
 
@@ -135,7 +141,9 @@ def test_set_metadata_roundtrip(scale_catalog):
     body = r.json()
     assert body["folder"] == "curated/featured" and "blessed" in body["tags"] and body["owner"] == "erin"
     # it's now findable by the new folder + tag, and gone from its old team folder
-    assert int(client.get("/api/catalog/tables", params={"folder": "curated", "tags": "blessed"}).headers["X-Total-Count"]) == 1
+    assert client.get(
+        "/api/catalog/tables", params={"folder": "curated", "tags": "blessed"}
+    ).json()["total"] == 1
     assert client.get("/api/catalog/search", params={"q": "hand-picked"}).json()[0]["name"] == "scale_00042"
 
 
@@ -166,7 +174,7 @@ def test_register_with_folder_and_tags(tmp_path):
     t = r.json()
     assert t["folder"] == "sandbox/demo" and set(t["tags"]) == {"temp", "demo"} and t["owner"] == "zoe"
     try:
-        assert int(client.get("/api/catalog/tables", params={"folder": "sandbox"}).headers["X-Total-Count"]) >= 1
+        assert client.get("/api/catalog/tables", params={"folder": "sandbox"}).json()["total"] >= 1
     finally:
         client.delete(f"/api/catalog/tables/{t['id']}")
 
@@ -263,16 +271,17 @@ def test_default_catalog_is_loaded_as_a_plugin():
 def test_search_multi_token_and_tags(scale_catalog):
     # every whitespace token must match SOMEWHERE — "team0 gold" means folder team0 AND tag gold,
     # even though the words never appear adjacent in any single field
-    both = int(client.get("/api/catalog/tables", params={"q": "team0 gold", "limit": 1}).headers["X-Total-Count"])
-    gold_in_team0 = int(client.get("/api/catalog/tables",
-                                   params={"folder": "team0", "tags": "gold", "limit": 1}).headers["X-Total-Count"])
+    both = client.get("/api/catalog/tables", params={"q": "team0 gold", "limit": 1}).json()["total"]
+    gold_in_team0 = client.get(
+        "/api/catalog/tables", params={"folder": "team0", "tags": "gold", "limit": 1}
+    ).json()["total"]
     assert both == gold_in_team0 > 0
     # a tag term matches through plain q too (the documented search contract)
-    by_q = int(client.get("/api/catalog/tables", params={"q": "pii", "limit": 1}).headers["X-Total-Count"])
-    by_tag = int(client.get("/api/catalog/tables", params={"tags": "pii", "limit": 1}).headers["X-Total-Count"])
+    by_q = client.get("/api/catalog/tables", params={"q": "pii", "limit": 1}).json()["total"]
+    by_tag = client.get("/api/catalog/tables", params={"tags": "pii", "limit": 1}).json()["total"]
     assert by_q >= by_tag > 0
     # LIKE metacharacters in q are literal, not wildcards
-    assert int(client.get("/api/catalog/tables", params={"q": "%", "limit": 1}).headers["X-Total-Count"]) == 0
+    assert client.get("/api/catalog/tables", params={"q": "%", "limit": 1}).json()["total"] == 0
 
 
 def test_set_metadata_partial_and_clear(scale_catalog):

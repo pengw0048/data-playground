@@ -392,7 +392,7 @@ def route_class(path: str) -> str:
         return "api.settings"
     if path.startswith("/api/data"):
         return "api.data"
-    if path in ("/api/livez", "/api/health"):
+    if path == "/api/livez":
         return "api.livez"
     if path == "/api/readyz":
         return "api.readyz"
