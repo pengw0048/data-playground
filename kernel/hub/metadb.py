@@ -2346,6 +2346,26 @@ def renew_backend_submission(run_id: str, attempt_id: str, owner: str,
         return bool(updated.rowcount)
 
 
+def release_backend_submission_before_dispatch(
+        run_id: str, attempt_id: str, owner: str) -> bool:
+    """Release a submit CAS only when local pre-dispatch authorization proved no request was sent."""
+    with session() as s:
+        updated = s.execute(
+            update(RunBackendJob).where(
+                RunBackendJob.run_id == run_id,
+                RunBackendJob.attempt_id == attempt_id,
+                RunBackendJob.publication_state == "pending",
+                RunBackendJob.submission_state == "submitting",
+                RunBackendJob.submission_owner == owner,
+            ).values(
+                submission_state="queued",
+                submission_owner=None,
+                submission_lease_until=None,
+            )
+        )
+        return bool(updated.rowcount)
+
+
 def note_backend_submission_observed(run_id: str, attempt_id: str) -> bool:
     """Persist a visible remote winner and invalidate any pre-effects terminal candidate."""
     with session() as s:

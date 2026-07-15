@@ -155,6 +155,12 @@ def _find(workspace: str, dest_id: str) -> dict | None:
     return next((d for d in presets(workspace) if d.get("id") == dest_id), None)
 
 
+def get_destination(workspace: str, dest_id: str) -> dict | None:
+    """Return a detached destination record for trusted execution-contract construction."""
+    found = _find(workspace, dest_id)
+    return dict(found) if found is not None else None
+
+
 def browse(workspace: str, dest_id: str, path: str) -> dict:
     d = _find(workspace, dest_id)
     if not d:

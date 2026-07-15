@@ -948,6 +948,25 @@ def _ray_jobs_env(job: dict) -> dict[str, str]:
     return child
 
 
+def _reauthorized_sink_context(bindings: dict | None, step_id: str, target_uri: str):
+    """Bind the exact frozen destination identity for parent-side object lifecycle/publication."""
+    from hub.plugins.adapters import is_object_uri
+
+    bindings = bindings or {}
+    if not is_object_uri(target_uri):
+        if step_id in bindings:
+            raise RuntimeError(
+                f"local sink '{step_id}' received an object-store credential binding")
+        return contextlib.nullcontext()
+    binding = bindings.get(step_id)
+    if not isinstance(binding, dict):
+        raise RuntimeError(
+            f"object sink '{step_id}' has no frozen destination credential binding")
+    from hub.workload_credentials import reauthorize_binding
+    _references, material = reauthorize_binding(binding)
+    return db.object_store_binding(material)
+
+
 def _ray_opts(requires: dict | None) -> dict:
     """Map the region's resolved resource need (the planner's `requires`) to per-Ray-task placement
     options, so a Ray cluster schedules the region's map tasks onto a worker that has the resource:
@@ -1498,7 +1517,7 @@ class RayRunner:
         return RunBackendRef.model_validate(ref)
 
     @staticmethod
-    def _validated_sink_contracts(job: dict) -> dict[str, dict[str, str]]:
+    def _validated_sink_contracts(job: dict) -> dict[str, dict]:
         contracts = job.get("sink_contracts")
         raw_targets = job.get("sink_targets")
         targets = {} if raw_targets is None else raw_targets
@@ -1510,15 +1529,22 @@ class RayRunner:
             raise ArtifactContractError(
                 "Ray Jobs supports at most one write sink until atomic batch publication is available"
             )
-        validated: dict[str, dict[str, str]] = {}
-        fields = {"name", "logical_uri", "physical_uri", "writer"}
+        validated: dict[str, dict] = {}
+        fields = {"name", "logical_uri", "physical_uri", "writer", "credential"}
         for step_id, contract in contracts.items():
             if not isinstance(step_id, str) or not step_id or not isinstance(contract, dict):
                 raise ArtifactContractError("Ray job contains an invalid sink contract")
             if set(contract) != fields or any(
                     not isinstance(contract.get(key), str) or not contract[key]
-                    for key in fields):
+                    for key in fields - {"credential"}):
                 raise ArtifactContractError(f"Ray job sink contract '{step_id}' is incomplete")
+            try:
+                from hub.workload_credentials import validate_bindings
+                credential = validate_bindings({step_id: contract["credential"]})[step_id]
+            except Exception as exc:
+                raise ArtifactContractError(
+                    f"Ray job sink contract '{step_id}' has an invalid credential binding"
+                ) from exc
             logical_uri = contract["logical_uri"]
             physical_uri = contract["physical_uri"]
             writer = contract["writer"]
@@ -1534,7 +1560,7 @@ class RayRunner:
                 raise ArtifactContractError(
                     f"Ray job sink contract '{step_id}' has no managed physical attempt"
                 )
-            validated[step_id] = contract
+            validated[step_id] = {**contract, "credential": credential}
         return validated
 
     @staticmethod
@@ -2470,9 +2496,27 @@ class RayRunner:
                 targets[step.id] = uri
         return targets
 
+    def _resolve_sink_credentials(
+            self, ir, targets: dict[str, str]) -> tuple[dict[str, dict], dict[str, dict]]:
+        """Freeze each object sink's selected identity and resolve material before writer allocation."""
+        from hub.workload_credentials import authorize_destination
+
+        bindings: dict[str, dict] = {}
+        material: dict[str, dict] = {}
+        for step in ir.steps:
+            if step.op != "write":
+                continue
+            spec = SinkSpec.from_config(step.config, step.config.get("title"))
+            credential = authorize_destination(
+                self.deps.workspace, spec.destination_id, targets[step.id])
+            if credential is not None:
+                bindings[step.id], material[step.id] = credential
+        return bindings, material
+
     def _claim_sink_attempts(
             self, ir, targets: dict[str, str], run_id: str, *,
-            require_live_preallocation: bool = False) -> dict[str, str]:
+            require_live_preallocation: bool = False,
+            credential_material: dict[str, dict] | None = None) -> dict[str, str]:
         """Precompute and register worker-direct sink attempts in the hub control plane.
 
         The isolated driver intentionally has a private metadata DB, so it must receive the exact physical
@@ -2505,23 +2549,33 @@ class RayRunner:
         attempts: dict[str, str] = {}
         try:
             for step, target_uri, spec in managed_steps:
-                attempt_uri = _allocate_handoff_uri(
-                    target_uri, run_id, "sink", scope=step.id,
-                    catalog_key_base=f"tbl_{spec.name}",
-                    require_live_preallocation=require_live_preallocation)
+                from hub.plugins.adapters import is_object_uri
+                material = (credential_material or {}).get(step.id)
+                if is_object_uri(target_uri) and material is None:
+                    raise RuntimeError(
+                        f"managed object sink '{step.id}' has no authorized credential")
+                with db.object_store_binding(material):
+                    attempt_uri = _allocate_handoff_uri(
+                        target_uri, run_id, "sink", scope=step.id,
+                        catalog_key_base=f"tbl_{spec.name}",
+                        require_live_preallocation=require_live_preallocation)
                 attempts[step.id] = attempt_uri
             return attempts
         except Exception:
-            for attempt_uri in attempts.values():
-                discard_attempt(attempt_uri)
+            for step_id, attempt_uri in attempts.items():
+                with db.object_store_binding(
+                        (credential_material or {}).get(step_id)):
+                    discard_attempt(attempt_uri)
             raise
 
     def _freeze_jobs_sink_contracts(
             self, ir, targets: dict[str, str], run_id: str,
-            sink_attempts: dict[str, str] | None = None) -> dict[str, dict[str, str]]:
+            sink_attempts: dict[str, str] | None = None,
+            credential_bindings: dict[str, dict] | None = None) -> dict[str, dict]:
         """Freeze allocated writer identities before a durable Jobs attempt is bound."""
         sink_attempts = sink_attempts or {}
-        contracts: dict[str, dict[str, str]] = {}
+        credential_bindings = credential_bindings or {}
+        contracts: dict[str, dict] = {}
         for step in ir.steps:
             if step.op != "write":
                 continue
@@ -2538,11 +2592,17 @@ class RayRunner:
                 raise RuntimeError(
                     f"Ray Jobs direct sink '{step.id}' has no allocated object attempt"
                 )
+            credential = credential_bindings.get(step.id)
+            if not isinstance(credential, dict):
+                raise RuntimeError(
+                    f"Ray Jobs direct sink '{step.id}' has no destination credential binding"
+                )
             contracts[step.id] = {
                 "name": spec.name,
                 "logical_uri": logical_uri,
                 "physical_uri": sink_attempts[step.id],
                 "writer": "worker-direct-parquet",
+                "credential": credential,
             }
         if set(sink_attempts) != set(contracts):
             raise RuntimeError("Ray Jobs sink allocation set does not match its frozen writer set")
@@ -2664,11 +2724,15 @@ class RayRunner:
                 # would violate an explicit Ray placement request and hide a deployment error.
                 self._jobs_contract()
                 sink_targets = self._resolve_sink_targets(ir)
+                sink_credential_bindings, sink_credential_material = (
+                    self._resolve_sink_credentials(ir, sink_targets))
                 self._validate_jobs_io(ir, sink_targets=sink_targets)
                 self._validate_jobs_catalog_publication(sink_targets)
                 source_attempts = self._jobs_source_attempts(graph, target_node_id)
             else:
                 sink_targets = self._resolve_sink_targets(ir)
+                sink_credential_bindings, sink_credential_material = (
+                    self._resolve_sink_credentials(ir, sink_targets))
         except Exception as exc:  # noqa: BLE001 — resolve/adapter uncertainty ⇒ local or explicit failure
             if self.jobs_address:
                 raise
@@ -2688,13 +2752,14 @@ class RayRunner:
                            target_node_id=target_node_id)
         if self.jobs_address:
             sink_attempts = self._claim_sink_attempts(
-                ir, sink_targets, run_id, require_live_preallocation=True
+                ir, sink_targets, run_id, require_live_preallocation=True,
+                credential_material=sink_credential_material,
             )
             # The router's leased run preallocation owns allocation-to-bind rollback. It can atomically
             # prove that no backend row exists and terminalize every attempt for this run; doing that here
             # with a check-then-cleanup would race another hub binding the same logical run.
             sink_contracts = self._freeze_jobs_sink_contracts(
-                ir, sink_targets, run_id, sink_attempts
+                ir, sink_targets, run_id, sink_attempts, sink_credential_bindings
             )
             return self._start_jobs(
                 status, graph, target_node_id, sink_targets=sink_targets,
@@ -2707,7 +2772,9 @@ class RayRunner:
             self._cancel_ack.discard(run_id)
         self._emit(graph, status)
         try:
-            sink_attempts = self._claim_sink_attempts(ir, sink_targets, run_id)
+            sink_attempts = self._claim_sink_attempts(
+                ir, sink_targets, run_id,
+                credential_material=sink_credential_material)
         except Exception as exc:  # noqa: BLE001 — never dispatch an object write the hub cannot track
             logging.getLogger(__name__).exception("Ray sink control-plane setup failed")
             status.status = "failed"
@@ -2731,7 +2798,9 @@ class RayRunner:
         # deadlocks against the shared DuckDB connection — see the module docstring.)
         threading.Thread(target=self._supervise, args=(run_id, graph, target_node_id, status),
                          kwargs={"requires": requires.model_dump(), "sink_targets": sink_targets,
-                                 "sink_attempts": sink_attempts},
+                                 "sink_attempts": sink_attempts,
+                                 "sink_credential_bindings": sink_credential_bindings,
+                                 "sink_credential_material": sink_credential_material},
                          daemon=True).start()
         return status
 
@@ -2779,7 +2848,8 @@ class RayRunner:
                 pass
 
     def _register_outputs(self, graph, result, job: dict | None = None, *,
-                          expected_targets=None, expected_attempts=None) -> None:
+                          expected_targets=None, expected_attempts=None,
+                          credential_bindings=None) -> None:
         """Publish driver-written outputs through the hub-owned catalog/control plane."""
         from hub.plugins.adapters import is_object_uri
         from hub.plugins.catalog import (
@@ -2796,6 +2866,12 @@ class RayRunner:
                 "Ray Jobs requires the DurableCatalogPublisher capability: "
                 "register_output_idempotent(...) and record_usage_idempotent(idempotency_key, parents)"
             )
+        if job is not None:
+            credential_bindings = {
+                step_id: contract["credential"]
+                for step_id, contract in self._validated_sink_contracts(job).items()
+            }
+        credential_bindings = credential_bindings or {}
         nodes = {node.id: node for node in graph.nodes}
         outputs = result.get("outputs") or []
         if expected_targets is not None:
@@ -2820,8 +2896,10 @@ class RayRunner:
                 raise RuntimeError(f"ray driver returned an unexpected name for sink '{step_id}'")
             if expected_targets is not None and expected_uri is None:
                 target_uri = expected_targets.get(step_id)
-                published_uri = expected_sink_uri(
-                    spec, target_uri, self.resolve_adapter(target_uri))
+                with _reauthorized_sink_context(
+                        credential_bindings, step_id, target_uri):
+                    published_uri = expected_sink_uri(
+                        spec, target_uri, self.resolve_adapter(target_uri))
                 if uri != published_uri:
                     raise RuntimeError(
                         f"ray driver returned an unexpected physical URI for sink '{step_id}'")
@@ -2833,42 +2911,44 @@ class RayRunner:
             parents = list(dict.fromkeys(g.all_upstream_publication_uris(graph, step_id)))
             run_parents.extend(parents)
             managed_attempt = bool(logical_uri and is_object_uri(uri) and is_attempt_uri(uri))
-            if managed_attempt:
-                publish = core_managed_publisher(self.catalog)
-                if publish is None:
-                    raise RuntimeError("managed object output has no core publisher")
-                try:
-                    receipt = publish(
-                        name=name, uri=uri, version=None, parents=parents, pipeline="canvas")
-                except Exception as exc:
-                    logging.getLogger(__name__).exception(
-                        "Ray managed sink publication failed for step %s", step_id)
-                    raise RuntimeError(
-                        f"Ray could not atomically publish managed sink '{step_id}'"
-                    ) from exc
-                if not isinstance(receipt, dict) or receipt.get("uri") != uri:
-                    raise RuntimeError(
-                        f"core publisher returned an invalid receipt for sink '{step_id}'")
-            elif register_once is not None:
-                idempotency_key = f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}"
-                raw_receipt = register_once(
-                    idempotency_key=idempotency_key,
-                    name=name, uri=uri, version=None, parents=parents, pipeline="canvas",
-                )
-                try:
-                    receipt = CatalogPublicationReceipt.model_validate(raw_receipt)
-                except Exception as e:  # noqa: BLE001 — a durable receipt is the publication boundary
-                    raise RuntimeError(
-                        "durable catalog publisher returned no valid output receipt"
-                    ) from e
-                if receipt.idempotency_key != idempotency_key or receipt.uri != uri:
-                    raise RuntimeError(
-                        "durable catalog publisher returned a receipt for a different output effect"
+            with _reauthorized_sink_context(
+                    credential_bindings, step_id, logical_uri or uri):
+                if managed_attempt:
+                    publish = core_managed_publisher(self.catalog)
+                    if publish is None:
+                        raise RuntimeError("managed object output has no core publisher")
+                    try:
+                        receipt = publish(
+                            name=name, uri=uri, version=None, parents=parents, pipeline="canvas")
+                    except Exception as exc:
+                        logging.getLogger(__name__).exception(
+                            "Ray managed sink publication failed for step %s", step_id)
+                        raise RuntimeError(
+                            f"Ray could not atomically publish managed sink '{step_id}'"
+                        ) from exc
+                    if not isinstance(receipt, dict) or receipt.get("uri") != uri:
+                        raise RuntimeError(
+                            f"core publisher returned an invalid receipt for sink '{step_id}'")
+                elif register_once is not None:
+                    idempotency_key = f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}"
+                    raw_receipt = register_once(
+                        idempotency_key=idempotency_key,
+                        name=name, uri=uri, version=None, parents=parents, pipeline="canvas",
                     )
-            else:
-                publish_unmanaged_output_attested(
-                    self.catalog, name=name, uri=uri, version=None,
-                    parents=parents, pipeline="canvas")
+                    try:
+                        receipt = CatalogPublicationReceipt.model_validate(raw_receipt)
+                    except Exception as e:  # noqa: BLE001 — a durable receipt is the publication boundary
+                        raise RuntimeError(
+                            "durable catalog publisher returned no valid output receipt"
+                        ) from e
+                    if receipt.idempotency_key != idempotency_key or receipt.uri != uri:
+                        raise RuntimeError(
+                            "durable catalog publisher returned a receipt for a different output effect"
+                        )
+                else:
+                    publish_unmanaged_output_attested(
+                        self.catalog, name=name, uri=uri, version=None,
+                        parents=parents, pipeline="canvas")
         if usage_once and (result.get("outputs") or []):
             usage_once(
                 idempotency_key=f"{_JOBS_BACKEND}:{job['attempt_id']}",
@@ -3004,6 +3084,8 @@ class RayRunner:
 
     def _ensure_job_submitted(self, client, job: dict) -> str:
         from hub import metadb
+        from hub.workload_credentials import (DESTINATION_CREDENTIAL_REFERENCE_ENV,
+                                              reference_capability)
 
         submission_id = job["submission_id"]
         existing = self._find_job(client, submission_id)
@@ -3022,7 +3104,25 @@ class RayRunner:
             return "SUBMITTING"
         if claim != "claimed":
             raise RuntimeError(f"Ray Jobs submission claim is {claim}")
-        child_env = _ray_jobs_env(job)
+        try:
+            child_env = _ray_jobs_env(job)
+            credential_bindings = {
+                step_id: contract["credential"]
+                for step_id, contract in self._validated_sink_contracts(job).items()
+            }
+            if credential_bindings:
+                # Runtime_env receives only the exact identity and SecretRefs. The trusted remote driver
+                # resolves them against cluster-side secret mounts/provider configuration.
+                child_env[DESTINATION_CREDENTIAL_REFERENCE_ENV] = reference_capability(
+                    credential_bindings)
+            else:
+                child_env.pop(DESTINATION_CREDENTIAL_REFERENCE_ENV, None)
+        except Exception:
+            # No external request exists yet, so this CAS may be safely released. Once submit_job starts,
+            # ambiguity is handled by the existing lease/reconciliation fence and is never released here.
+            metadb.release_backend_submission_before_dispatch(
+                job["run_id"], job["attempt_id"], owner)
+            raise
         child_env.pop("DP_DATABASE_URL", None)  # defense in depth: workload profile already excludes it
         entrypoint = " ".join((
             job["entrypoint"], shlex.quote(job["job_uri"]), shlex.quote(job["attempt_id"]),
@@ -3194,6 +3294,10 @@ class RayRunner:
         if planner is None:
             raise RuntimeError("Ray Jobs managed outputs require the core catalog planner")
         nodes = {node.id: node for node in graph.nodes}
+        credential_bindings = {
+            step_id: contract["credential"]
+            for step_id, contract in self._validated_sink_contracts(job).items()
+        }
         plans: list[dict] = []
         run_parents: list[str] = []
         for output in outputs:
@@ -3206,12 +3310,14 @@ class RayRunner:
                 raise RuntimeError(f"Ray driver returned an unexpected name for sink '{step_id}'")
             parents = list(dict.fromkeys(g.all_upstream_publication_uris(graph, step_id)))
             run_parents.extend(parents)
-            plans.append(planner(
-                run_id=job["run_id"], step_id=step_id,
-                idempotency_key=f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}",
-                name=output["name"], uri=output["uri"], version=None,
-                parents=parents, pipeline="canvas",
-            ))
+            with _reauthorized_sink_context(
+                    credential_bindings, step_id, output["logical_uri"]):
+                plans.append(planner(
+                    run_id=job["run_id"], step_id=step_id,
+                    idempotency_key=f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}",
+                    name=output["name"], uri=output["uri"], version=None,
+                    parents=parents, pipeline="canvas",
+                ))
         usage = None
         if plans:
             usage = metadb.catalog_prepare_usage_publication(
@@ -4326,7 +4432,8 @@ class RayRunner:
                 self._ensure_jobs_supervisor(run_id)
 
     def _supervise(self, run_id, graph, target, status, materialize_uri=None, requires=None,
-                   sink_targets=None, sink_attempts=None) -> None:
+                   sink_targets=None, sink_attempts=None, sink_credential_bindings=None,
+                   sink_credential_material=None) -> None:
         """Run one local Ray driver in an isolated temporary directory and always erase it."""
         import tempfile
 
@@ -4355,6 +4462,8 @@ class RayRunner:
                 run_id, graph, target, status, work,
                 materialize_uri=materialize_uri, requires=requires,
                 sink_targets=sink_targets, sink_attempts=sink_attempts,
+                sink_credential_bindings=sink_credential_bindings,
+                sink_credential_material=sink_credential_material,
             )
         except Exception as exc:  # noqa: BLE001 — provider/process detail belongs only in server logs
             logging.getLogger(__name__).exception("Ray supervisor setup failed")
@@ -4368,6 +4477,7 @@ class RayRunner:
             "supervisor_error": supervisor_error, "read_leases": read_leases,
             "read_guards": read_guards, "materialize_uri": materialize_uri,
             "sink_targets": sink_targets, "sink_attempts": sink_attempts,
+            "sink_credential_bindings": sink_credential_bindings,
         }
         if not driver_reaped:
             status.status = "running"
@@ -4389,7 +4499,9 @@ class RayRunner:
 
     def _supervise_in_work(self, run_id, graph, target, status, work, materialize_uri=None,
                            requires=None, sink_targets=None,
-                           sink_attempts=None) -> tuple[dict | None, int | str, object | None, bool, str | None]:
+                           sink_attempts=None, sink_credential_bindings=None,
+                           sink_credential_material=None,
+                           ) -> tuple[dict | None, int | str, object | None, bool, str | None]:
         """Parent side: spawn the isolated Ray driver, poll its status file, mirror the result. Touches
         NO DuckDB (only subprocess + files + the DB-backed on_status/on_complete hooks) → never deadlocks.
         `materialize_uri` set = region mode (write target → that uri); else whole-graph mode (write node).
@@ -4398,6 +4510,7 @@ class RayRunner:
         exact parent-claimed physical URI for worker-direct sinks. Region mode omits both."""
         import json
         import subprocess
+        from hub.workload_credentials import create_fd_capability
 
         cancel = self._cancel[run_id]
         status.status = "running"
@@ -4409,8 +4522,20 @@ class RayRunner:
         if sink_targets is not None:  # whole-graph run only; region materialization has no write sink
             job["sink_targets"] = sink_targets
             job["sink_attempts"] = sink_attempts or {}
-        with open(job_file, "w") as f:
-            json.dump(job, f)
+            job["sink_credential_bindings"] = sink_credential_bindings or {}
+        credential_fd = None
+        try:
+            credential_fd, capability = create_fd_capability(
+                run_id, job.get("sink_credential_bindings") or {},
+                sink_credential_material or {})
+            if capability is not None:
+                job["sink_credential_capability"] = capability
+            with open(job_file, "w") as f:
+                json.dump(job, f)
+        except Exception:
+            if credential_fd is not None:
+                os.close(credential_fd)
+            raise
         driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_driver.py")
         result = None
         proc = None
@@ -4428,9 +4553,17 @@ class RayRunner:
             # uv/venv markers and put the venv's bin on PATH so Ray runs workers with THIS interpreter
             # (which has ray); run from the work dir so uv/Ray don't pick up the repo's pyproject.
             child_env = _ray_child_env()
-            proc = subprocess.Popen([sys.executable, driver, job_file], cwd=work,
-                                    stdout=driver_log, stderr=driver_log,
-                                    start_new_session=True, env=child_env)
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, driver, job_file], cwd=work,
+                    stdout=driver_log, stderr=driver_log,
+                    start_new_session=True, env=child_env,
+                    pass_fds=(() if credential_fd is None else (credential_fd,)),
+                )
+            finally:
+                if credential_fd is not None:
+                    os.close(credential_fd)
+                    credential_fd = None
             with self._lock:
                 self._driver_procs[run_id] = proc
             reaped = False
@@ -4459,6 +4592,8 @@ class RayRunner:
                     pass
                 time.sleep(0.2)
         except Exception as exc:  # noqa: BLE001 — keep user-visible status non-terminal until reap proof
+            if credential_fd is not None:
+                os.close(credential_fd)
             logging.getLogger(__name__).exception("Ray driver supervision failed")
             supervisor_error = self._stable_exception(
                 "Ray driver control failed", exc, "driver_control_failed"
@@ -4566,6 +4701,7 @@ class RayRunner:
                     kwargs.update(
                         expected_targets=state["sink_targets"],
                         expected_attempts=state["sink_attempts"],
+                        credential_bindings=state["sink_credential_bindings"],
                     )
                 self._settle_popen_result(
                     graph, status, state["result"], state["returncode"], **kwargs)
@@ -4614,6 +4750,7 @@ class RayRunner:
 
     def _settle_popen_result(self, graph, status, result, returncode, *,
                              expected_targets=None, expected_attempts=None,
+                             credential_bindings=None,
                              cancel_requested: bool = False) -> None:
         """Apply a local driver result only after its sensitive work directory was erased."""
         # Only a TERMINAL status file is authoritative. A hard kill can leave the last interim
@@ -4649,6 +4786,7 @@ class RayRunner:
                     self._register_outputs(
                         graph, result, expected_targets=expected_targets,
                         expected_attempts=expected_attempts,
+                        credential_bindings=credential_bindings,
                     )
             except Exception as exc:  # noqa: BLE001 — local parity: catalog commit failure fails the run
                 logging.getLogger(__name__).exception("Ray output publication failed")
@@ -4672,7 +4810,7 @@ class RayRunner:
 
     def _run_ir_sync(self, ir, graph, target, ray_opts=None, progress=None, sink_targets=None,
                      attempt_id: str | None = None, sink_attempts=None,
-                     sink_contracts=None) -> dict:
+                     sink_contracts=None, sink_credentials=None) -> dict:
         """Child side (in the driver subprocess, Ray already init'd): execute the clean IR synchronously
         and return a result dict for the parent. Reuses _build/_commit; the fresh-process DuckDB is safe
         because Ray was init'd before it was created. Sink targets are physical URIs resolved by the hub;
@@ -4680,6 +4818,16 @@ class RayRunner:
         outputs: list[dict[str, str]] = []
         attempt_id = attempt_id or f"driver_{uuid.uuid4().hex}"
         try:
+            from hub.plugins.adapters import is_object_uri
+            expected_credential_steps = {
+                step.id for step in ir.steps
+                if step.op == "write" and is_object_uri(
+                    ((sink_contracts or {}).get(step.id) or {}).get("logical_uri")
+                    or (sink_targets or {}).get(step.id) or "")
+            }
+            if set(sink_credentials or {}) != expected_credential_steps:
+                raise RuntimeError(
+                    "destination credential capability does not match the Ray object sinks")
             datasets: dict[str, object] = {}
             rows, out_uri, out_table = 0, None, None
             for step in ir.steps:
@@ -4698,6 +4846,7 @@ class RayRunner:
                             else (sink_attempts or {}).get(step.id)
                         ),
                         writer=frozen.get("writer") if isinstance(frozen, dict) else None,
+                        credential_cfg=(sink_credentials or {}).get(step.id),
                     )
                     outputs.append({"step_id": step.id, "name": out_table, "uri": out_uri,
                                     "logical_uri": target_uri})
@@ -4989,7 +5138,8 @@ class RayRunner:
                 attempt_id: str | None = None,
                 ray_opts: dict | None = None,
                 attempt_uri: str | None = None,
-                writer: str | None = None) -> tuple[int, str, str]:
+                writer: str | None = None,
+                credential_cfg: dict | None = None) -> tuple[int, str, str]:
         cfg = step.config
         spec = SinkSpec.from_config(cfg, cfg.get("title"))
         ds = datasets[step.inputs[0][0]]
@@ -5001,24 +5151,35 @@ class RayRunner:
             writer == "worker-direct-parquet" if writer is not None
             else _worker_direct_parquet_sink(spec, target_uri, adapter)
         )
-        if worker_direct:
-            actual_uri = attempt_uri or _attempt_handoff_uri(target_uri, attempt_id, scope=step.id)
-            from hub.plugins.adapters import is_object_uri
-            if is_object_uri(target_uri) and attempt_uri is None:
-                raise RuntimeError("object sink attempt was not preclaimed by the hub before dispatch")
-            rows, actual_uri = _write_worker_direct_parquet(
-                ds, actual_uri, attempt_id=attempt_id, ray_opts=ray_opts
-            )
-            return rows, actual_uri, spec.name
-        tbl = _collect_arrow(ds, purpose=(
-            f"{spec.mode} {spec.extension} sink"
-            + (f" partitioned by {spec.partition_by}" if spec.partition_by else "")
-        ))
-        with db.base_guard():
-            rel = db.conn().from_arrow(tbl)
-            committed = commit_sink(spec, rel, self.deps.workspace, self.base.storage,
-                                    self.resolve_adapter, target_uri=target_uri)
-        return committed.rows, committed.uri, committed.name
+        from hub.plugins.adapters import is_object_uri
+        object_target = is_object_uri(target_uri)
+        if object_target and credential_cfg is None:
+            raise RuntimeError("object sink has no authorized destination credential")
+        if not object_target and credential_cfg is not None:
+            raise RuntimeError("local sink received an object-store destination credential")
+        with db.object_store_binding(credential_cfg):
+            if object_target:
+                with db.lock():
+                    db.ensure_object_store(credential_cfg)
+            if worker_direct:
+                actual_uri = attempt_uri or _attempt_handoff_uri(
+                    target_uri, attempt_id, scope=step.id)
+                if object_target and attempt_uri is None:
+                    raise RuntimeError("object sink attempt was not preclaimed by the hub before dispatch")
+                rows, actual_uri = _write_worker_direct_parquet(
+                    ds, actual_uri, attempt_id=attempt_id, ray_opts=ray_opts
+                )
+                return rows, actual_uri, spec.name
+            tbl = _collect_arrow(ds, purpose=(
+                f"{spec.mode} {spec.extension} sink"
+                + (f" partitioned by {spec.partition_by}" if spec.partition_by else "")
+            ))
+            with db.base_guard():
+                rel = db.conn().from_arrow(tbl)
+                committed = commit_sink(
+                    spec, rel, self.deps.workspace, self.base.storage,
+                    self.resolve_adapter, target_uri=target_uri)
+            return committed.rows, committed.uri, committed.name
 
 
 def _collect_arrow(dataset, *, purpose: str = "Ray result"):

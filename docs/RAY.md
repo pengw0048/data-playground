@@ -246,8 +246,10 @@ certification. The backend still needs the following before it should own produc
 
 1. Make the multi-region parent orchestration durable, then exercise head/worker/driver loss during an
    active Jobs run with bounded retry and recovery assertions.
-2. Replace broad data-plane credentials with attempt/dataset-scoped identities and enforce per-run
-   namespace, network, pod-security, and quota boundaries on the target cluster.
+2. Replace the remaining broad source/artifact data-plane identity with attempt/dataset-scoped
+   capabilities and enforce per-run namespace, network, pod-security, and quota boundaries on the target
+   cluster. Destination writes already freeze the selected Cred ID and fail closed across isolated local
+   and Jobs execution, but that does not scope source reads, job artifacts, or a cluster's ambient role.
 3. Discover live cluster capacity and health, enforce admission/backpressure, and reject an explicit
    Ray placement when its requirements cannot be honored.
 4. Pin and verify the supported Ray/runtime image contract across the submitting process and every

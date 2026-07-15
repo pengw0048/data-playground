@@ -246,15 +246,17 @@ class SubprocessRunner:
                            breakdown=f"{size} · {rowstr} · {len(plan.steps)} steps · isolated process")
 
     def _claim_sink_contracts(self, plan: CompilePlan, graph: Graph, run_id: str
-                              ) -> tuple[dict[str, str], dict[str, dict], dict[str, dict]]:
+                              ) -> tuple[dict[str, str], dict[str, dict], dict[str, dict], dict[str, dict]]:
         """Resolve every sink on the parent and allocate the one supported managed sink before dispatch."""
         from hub.plugins.adapters import is_object_uri
         from hub.plugins.runner import _is_core_managed_sink
         from hub.sinks import SinkSpec, expected_sink_uri, preflight_sink
+        from hub.workload_credentials import authorize_destination
 
         nodes = {node.id: node for node in graph.nodes}
         targets: dict[str, str] = {}
         contracts: dict[str, dict] = {}
+        credential_material: dict[str, dict] = {}
         managed = []
         from hub import graph as graph_mod
 
@@ -284,10 +286,15 @@ class SubprocessRunner:
                 adapter = self.resolve_adapter(target_uri)
             targets[step.node_id] = target_uri
             parents = graph_mod.all_upstream_publication_uris(graph, step.node_id)
+            credential = authorize_destination(
+                self.workspace, spec.destination_id, target_uri)
+            binding = None
+            if credential is not None:
+                binding, credential_material[step.node_id] = credential
             contracts[step.node_id] = {
                 "logical_uri": target_uri,
                 "published_uri": expected_sink_uri(spec, target_uri, adapter),
-                "name": spec.name, "parents": parents,
+                "name": spec.name, "parents": parents, "credential": binding,
             }
             if adapter is not None and _is_core_managed_sink(spec, target_uri, adapter):
                 managed.append((step.node_id, target_uri, spec, parents))
@@ -310,19 +317,25 @@ class SubprocessRunner:
         try:
             from hub.handoff import allocate_attempt, physical_attempt_uri
             for step_id, logical_uri, spec, parents in managed:
-                handle = allocate_attempt(
-                    logical_uri=logical_uri, kind="sink", run_id=run_id,
-                    allocation_key=f"subprocess-sink:{run_id}:{step_id}:{logical_uri}",
-                    catalog_key_base=f"tbl_{spec.name}",
-                    uri_factory=lambda namespace, generation, attempt_id,
-                    logical_uri=logical_uri: physical_attempt_uri(
-                        logical_uri, namespace, generation, attempt_id),
-                )
+                from hub import db
+                sink_material = credential_material.get(step_id)
+                if sink_material is None:
+                    raise RuntimeError(
+                        f"managed object sink '{step_id}' has no authorized credential")
+                with db.object_store_binding(sink_material):
+                    handle = allocate_attempt(
+                        logical_uri=logical_uri, kind="sink", run_id=run_id,
+                        allocation_key=f"subprocess-sink:{run_id}:{step_id}:{logical_uri}",
+                        catalog_key_base=f"tbl_{spec.name}",
+                        uri_factory=lambda namespace, generation, attempt_id,
+                        logical_uri=logical_uri: physical_attempt_uri(
+                            logical_uri, namespace, generation, attempt_id),
+                    )
                 attempts[step_id] = {
                     "uri": handle["uri"], "logical_uri": logical_uri, "name": spec.name,
-                    "parents": parents,
+                    "parents": parents, "credential": contracts[step_id]["credential"],
                 }
-            return targets, attempts, contracts
+            return targets, attempts, contracts, credential_material
         except Exception:
             self._discard_object_sinks(attempts)
             raise
@@ -332,8 +345,16 @@ class SubprocessRunner:
         if not sinks:
             return
         for item in sinks.values():
-            _safe_abandon_attempt(
-                item["uri"], context="parent managed-sink")
+            try:
+                from hub import db
+                from hub.workload_credentials import reauthorize_binding
+                _references, material = reauthorize_binding(item.get("credential"))
+                with db.object_store_binding(material):
+                    _safe_abandon_attempt(
+                        item["uri"], context="parent managed-sink")
+            except Exception:  # an unavailable identity cannot authorize destructive object cleanup
+                logging.getLogger("hub").warning(
+                    "parent managed-sink cleanup deferred: destination credential unavailable")
 
     def _publish_object_sinks(self, sinks: dict[str, dict], status: RunStatus) -> None:
         if not sinks:
@@ -347,13 +368,17 @@ class SubprocessRunner:
         from hub.handoff import prepare_attempt_commit
         from hub.plugins.catalog import core_managed_publisher
 
-        prepare_attempt_commit(item["uri"])
-        publish = core_managed_publisher(self.catalog)
-        if publish is None:
-            raise RuntimeError("managed object output has no core publisher")
-        receipt = publish(
-            name=item["name"], uri=item["uri"], version=None,
-            parents=item["parents"], pipeline="canvas")
+        from hub import db
+        from hub.workload_credentials import reauthorize_binding
+        _references, material = reauthorize_binding(item.get("credential"))
+        with db.object_store_binding(material):
+            prepare_attempt_commit(item["uri"])
+            publish = core_managed_publisher(self.catalog)
+            if publish is None:
+                raise RuntimeError("managed object output has no core publisher")
+            receipt = publish(
+                name=item["name"], uri=item["uri"], version=None,
+                parents=item["parents"], pipeline="canvas")
         if not isinstance(receipt, dict) or receipt.get("uri") != item["uri"]:
             raise RuntimeError(
                 f"core publisher returned an invalid receipt for sink '{step_id}'")
@@ -373,7 +398,7 @@ class SubprocessRunner:
                 self._source_leases[run_id] = source_leases
             job_extra["managedSourceAttempts"] = source_leases["attempts"]
             job_extra["managedLocalSources"] = source_leases["local_sources"]
-            sink_targets, object_sinks, sink_contracts = self._claim_sink_contracts(
+            sink_targets, object_sinks, sink_contracts, credential_material = self._claim_sink_contracts(
                 plan, graph, run_id)
             if object_sinks:
                 self._object_sinks[run_id] = object_sinks
@@ -382,6 +407,11 @@ class SubprocessRunner:
             job_extra["sinkTargets"] = sink_targets
             job_extra["sinkAttempts"] = {
                 step_id: item["uri"] for step_id, item in object_sinks.items()}
+            job_extra["sinkCredentialBindings"] = {
+                step_id: contract["credential"]
+                for step_id, contract in sink_contracts.items()
+                if contract["credential"] is not None
+            }
 
             target = next((node for node in graph.nodes if node.id == target_node_id), None)
             if target is not None and target.type not in ("write", "assert"):
@@ -414,7 +444,9 @@ class SubprocessRunner:
                         f"__result_{run_id}", ".parquet")
                     from hub.plugins.adapters import is_object_uri
                     if not is_object_uri(logical_uri):
-                        return self._spawn(status, job_extra, graph, target_node_id)
+                        return self._spawn(
+                            status, job_extra, graph, target_node_id,
+                            credential_material=credential_material)
                     if self.resolve_adapter is None:
                         raise RuntimeError(
                             "object-backed subprocess results require a parent adapter resolver")
@@ -437,7 +469,9 @@ class SubprocessRunner:
                         "run_state_owner": True,
                     }
                     job_extra["forcedResultUri"] = handle["uri"]
-            return self._spawn(status, job_extra, graph, target_node_id)
+            return self._spawn(
+                status, job_extra, graph, target_node_id,
+                credential_material=credential_material)
         except Exception as exc:
             if isinstance(exc, _SpawnSetupError) and not exc.reaped:
                 raise
@@ -505,16 +539,24 @@ class SubprocessRunner:
             self._release_source_leases(run_id)
             raise
 
-    def _spawn(self, status: RunStatus, job_extra: dict, graph: Graph, target: str | None) -> RunStatus:
+    def _spawn(self, status: RunStatus, job_extra: dict, graph: Graph, target: str | None, *,
+               credential_material: dict[str, dict] | None = None) -> RunStatus:
         from hub.workload_env import prepare_workload_graph
+        from hub.workload_credentials import create_fd_capability
 
         run_id = status.run_id
         job_dir = tempfile.mkdtemp(prefix="dp-run-")
         status_file = os.path.join(job_dir, "status.json")
         cancel_file = os.path.join(job_dir, "cancel.requested")
         job_file = os.path.join(job_dir, "job.json")
+        credential_fd = None
         try:
             prepared_graph = prepare_workload_graph(graph)
+            bindings = job_extra.get("sinkCredentialBindings") or {}
+            credential_fd, capability = create_fd_capability(
+                run_id, bindings, credential_material or {})
+            if capability is not None:
+                job_extra = {**job_extra, "sinkCredentialCapability": capability}
             with open(job_file, "w") as f:
                 json.dump({"workspace": self.workspace, "dataDir": self.data_dir,
                            "graph": prepared_graph,
@@ -531,11 +573,20 @@ class SubprocessRunner:
             result_lock_fd = job_extra.get("resultLockFd")
             if result_lock_fd is not None:
                 inherited_fds.append(int(result_lock_fd))
+            if credential_fd is not None:
+                inherited_fds.append(credential_fd)
             if inherited_fds:
                 popen_kwargs["pass_fds"] = tuple(sorted(set(inherited_fds)))
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "hub.subrun", job_file], **popen_kwargs)
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "hub.subrun", job_file], **popen_kwargs)
+            finally:
+                if credential_fd is not None:
+                    os.close(credential_fd)
+                    credential_fd = None
         except Exception:
+            if credential_fd is not None:
+                os.close(credential_fd)
             shutil.rmtree(job_dir, ignore_errors=True)
             raise
         try:

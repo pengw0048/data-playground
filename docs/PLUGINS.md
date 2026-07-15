@@ -159,6 +159,13 @@ it. Default is `NullImporter` (501). Core auto-lays out an imported graph left u
 `target_uri(root, path, filename)`. A user adds a preset (backend + root) in Settings → Destinations.
 Built-in `local` / `s3` / `gs` go through the same registry.
 
+Destination resolution and credential authorization are separate contracts. A backend returns the
+logical URI; it must not embed resolved material in that URI or graph config. An execution backend that
+crosses a process/cluster boundary must freeze the selected Cred identity before dispatch and use
+`hub.workload_credentials` to carry either the one-use local FD capability or the durable SecretRef-only
+capability. Missing/wrong-kind/revoked bindings fail closed. Do not look up a destination from a worker's
+private metadata DB or fall back to its default credential after a binding was selected.
+
 `reg.add_telemetry_sink(fn)` exports finished-run telemetry. `fn(record: dict)` is called once per
 finished run with `canvas_id`, `run_id`, `request_id`, `status`, `rows`, `ms`, `error`, `output_table`,
 `placement`, and `per_node` (`[{node_id, label, status, rows, ms}]`). Core ships no exporter. A sink that

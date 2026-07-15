@@ -364,6 +364,12 @@ def object_store_binding(cfg: dict | None) -> Iterator[None]:
         _bound_object_store_cfg.reset(token)
 
 
+def bound_object_store_config() -> dict | None:
+    """Return the current run/request binding, preserving ``{}`` as explicit ambient identity."""
+    cfg = _bound_object_store_cfg.get()
+    return None if cfg is None else dict(cfg)
+
+
 def _default_object_store_cfg() -> dict:
     """The resolved default object-store credentials: the default cred, else the legacy global setting."""
     from hub import metadb

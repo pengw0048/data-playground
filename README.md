@@ -157,7 +157,7 @@ claude mcp add --transport http dataplay http://127.0.0.1:8471/mcp
 | --- | --- |
 | **Local, single user or fully trusted collaborators** | Primary path; runs offline with SQLite and local storage |
 | **Trusted-team shared service** | Auth, Postgres, object storage, shared run state, and PodSpawner building blocks exist; operators still own TLS, secrets, IAM, backups, network policy, quotas, and topology validation |
-| **Ray execution** | `dp_ray` is a tested reference backend for the exact shapes in [docs/RAY.md](docs/RAY.md). On current `main`, it does not have a restart-durable Ray job lifecycle, and the Compose/KubeRay files are validation harnesses rather than production manifests |
+| **Ray execution** | `dp_ray` is a tested reference backend for the exact shapes in [docs/RAY.md](docs/RAY.md), including the optional restart-durable [Ray Jobs lifecycle](docs/RAY_JOBS.md). The Compose/KubeRay files remain validation harnesses rather than production manifests |
 | **Mutually distrusting tenants** | Not supported |
 
 Python transforms, section scripts, installed plugins, and per-canvas dependencies execute as the
@@ -172,6 +172,14 @@ the secret itself. The hub resolves references only in the process that needs th
 object-store client, plugin registration). A pluggable `SecretResolver` seam (`hub.secrets` /
 `reg.add_secret_resolver`) lets a future plugin add schemes such as Vault without importing a vendor
 client into core.
+
+For an object-store write, the hub freezes the selected destination Cred ID before dispatch. Isolated
+local/Ray subprocesses receive resolved write material through a one-use inherited descriptor; durable
+Ray Jobs persist only the Cred ID and send SecretRefs at submission, resolving them in the trusted remote
+driver. A missing, deleted, wrong-kind, or unresolved selected Cred fails closed instead of using a worker
+default. Updating SecretRefs on the same Cred ID is rotation; rebinding a destination to another Cred ID
+does not change an existing run. This write identity is narrower than the backend's broader source,
+artifact, and control identities; see [the Ray production gates](docs/RAY.md#what-remains-before-production-ownership).
 
 After upgrading, run `dataplay migrate`: any legacy plaintext secret values are **deleted** (not
 converted). Re-enter each affected setting as a reference. Example:

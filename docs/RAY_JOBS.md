@@ -84,15 +84,16 @@ produces an attempt ID; the complete envelope produces a second SHA-256 binding.
 environment excludes known secrets, but the hub cannot prove that arbitrary plugin configuration is
 secret-free; artifact and metadata-store access controls remain mandatory.
 
-Durable Jobs currently supports contract version 3 only. That version freezes each sink's writer mode,
-logical URI, and physical attempt URI before submission. Earlier experimental versions were never
+Durable Jobs currently supports contract version 4 only. That version freezes each sink's writer mode,
+logical URI, physical attempt URI, and exact non-secret destination credential identity before
+submission. Earlier experimental versions were never
 released and are intentionally not replayed: an unsupported version is quarantined and stopped rather
 than submitted under semantics that cannot satisfy the current ownership contract.
 
 A release must bump the contract version for any incompatible envelope or result change. The current
 implementation has no mixed-version decoder, so that release requires draining active Jobs runs before
 upgrading the hubs and Ray image. Rolling hub replacement is supported only when no metadata migration is
-required, every process uses the same exact Alembic head, every replacement keeps the v3 reader, and the
+required, every process uses the same exact Alembic head, every replacement keeps the v4 reader, and the
 image asserted by each active run's `code_ref` remains available. For any schema or contract change,
 stop new submissions, drain active Jobs, stop all metadata writers, run the one-shot migration, and then
 upgrade the hubs and Ray image.
@@ -113,9 +114,11 @@ storage boundary:
 - the control plane may read results, while overwrite/delete is denied after creation;
 - bucket administrators remain trusted, and retention/lifecycle rules must outlive maximum recovery time.
 
-Prefer distinct hub and Ray service identities. The current workload allowlist can pass `AWS_*`,
-`DP_S3_*`, or Google credential references for compatibility; those remain broad capabilities, so a
-deployment that forwards one shared credential has not achieved tenant isolation.
+Prefer distinct hub and Ray service identities. The current workload allowlist can still pass `AWS_*`,
+`DP_S3_*`, or Google material for source and job-artifact compatibility; those remain broad capabilities,
+so a deployment that forwards one shared identity has not achieved tenant isolation. A selected
+destination write does not use that broad identity as a fallback: its frozen Cred binding must resolve
+independently, or the write fails before dispatch.
 
 ## Frozen semantics and credential rotation
 
@@ -123,10 +126,35 @@ Settings that change execution meaning—plugin selection, memory/shuffle/runtim
 workspace/data paths, and Ray labels—are frozen in the envelope and participate in the attempt hash.
 Reattachment and replay use that snapshot even if the replacement hub's environment changed.
 
-Credential values and credential-file/profile selectors are excluded from the semantic snapshot. Each
-launch uses the operator's current allowlisted data credentials, so key rotation does not create a new
-logical attempt. Hub metadata identity (`DP_DATABASE_URL`), auth signing material, and provider/control
-API keys are never sent to the driver.
+Each object sink freezes one of three write identities in the hash-bound envelope:
+
+- `cred`: the exact selected/default Cred ID;
+- `legacy`: the SHA-256 of the legacy SecretRef configuration, for installations not yet using Cred
+  entities;
+- `ambient`: an explicit authorization to use the workload's ambient chain when no Cred or legacy
+  configuration was selected.
+
+The binding contains no resolved material and never changes when a destination is later rebound. A
+replacement supervisor reauthorizes the same Cred ID before every new submit/replay. Updating SecretRefs
+on that same entity is rotation and supplies the next submission; deletion, wrong kind, incomplete keys,
+unavailable refs, or a changed legacy reference set fails closed. A running remote job keeps the
+capability already delivered at dispatch; deletion is not retroactive revocation. Restoring or recreating
+the same Cred ID is the explicit recovery path for a pre-dispatch failure.
+
+The hub first resolves the binding locally to prove availability, then sends only the binding plus
+SecretRefs in `DP_DESTINATION_CREDENTIAL_REFS`. The verified remote driver resolves those refs against
+cluster-side secret mounts/provider configuration before importing workload/plugin code. The destination
+capability never adds raw material to the graph, durable job/result envelopes, SQL job copy, submission
+metadata, runtime-env payload, logs, errors, or telemetry. The local Popen driver uses an anonymous
+one-use FD instead; its job file contains only the FD number and binding digest. Hub metadata identity
+(`DP_DATABASE_URL`), auth signing material, and provider/control API keys are never sent to the driver.
+The existing broader source/artifact environment may independently contain the same value when an
+operator deliberately reuses one credential for both roles; eliminating that overlap requires the scoped
+source/artifact identity gate below.
+
+This contract scopes the **destination write** only. Source reads, job/result artifact access, and the Ray
+service identity still use the deployment's broader data-plane/runtime configuration and remain a
+production-readiness gate tracked in [`RAY.md`](RAY.md#what-remains-before-production-ownership).
 
 ## Durable state machine
 
@@ -147,7 +175,11 @@ API keys are never sent to the driver.
    DB-clock lease and a CAS that requires `cancel_requested=false`; an expired-owner reclaim moves
    directly to the new owner in that same CAS, and recovery must query Ray again before attempting it.
    A timeout/disconnect never releases the claim after one immediate missing check because the HTTP
-   request may still be accepted later. Official Jobs API requests carry a finite connect/read timeout,
+   request may still be accepted later. Before calling Ray, the winning owner reauthorizes the frozen
+   destination Cred ID and builds the SecretRef-only capability. A known local authorization failure
+   releases the pre-dispatch SQL claim because no external request exists; a request that has entered
+   `submit_job` retains the normal ambiguity fence. Official Jobs API requests carry a finite
+   connect/read timeout,
    and lease renewal stops after a bounded continuous ownership window; a wedged caller therefore cannot
    exclude a replacement supervisor forever.
 4. A result cannot beat an explicit `PENDING`/`RUNNING` Jobs status. Readable result corruption while the
@@ -186,7 +218,7 @@ API keys are never sent to the driver.
    the exact attempt becomes eligible for the normal supersession/GC policy while the compact run-ID fence
    still prevents resurrection. Telemetry is best-effort only after that terminal barrier.
 
-Jobs v3 managed outputs currently require the built-in DB-backed catalog. A graph with a write sink rejects
+Jobs v4 managed outputs currently require the built-in DB-backed catalog. A graph with a write sink rejects
 an external catalog before object allocation or Ray submission, even if that provider implements the older
 `DurableCatalogPublisher` capability. That interface can acknowledge an at-least-once write, but it cannot freeze a pre-probed plan,
 participate in the core object-attempt barrier, or replay exact output/lineage/usage receipts without
@@ -199,7 +231,7 @@ parent for the run. Parent aliases are resolved to stable logical or exact-URI i
 write-ahead barrier: a generation replacement receives the usage on its logical dataset, while an
 unregister becomes an idempotent no-op and never resurrects the dataset. Two real runs therefore increment
 popularity twice, while a crash/retry does not increment it again; permanent lineage-edge existence is not
-a run-usage event. The current Jobs v3
+a run-usage event. The current Jobs v4
 backend admits at most one write sink and rejects a multi-sink graph before allocation. The catalog
 publisher primitive can represent multiple outputs, but it does not provide a cross-dataset transaction,
 so the reference Jobs backend will not expose that shape until atomic batch publication exists.
@@ -279,8 +311,8 @@ authentication boundary. Do not expose port 8265 directly to end users.
 - Durable Jobs covers whole-graph execution only. Region data publication uses manifest v2, but the
   multi-region parent is not restart-durable.
 - Object-store reads and whole-graph file sinks remain driver-funneled in several paths.
-- Live capacity/health discovery, admission backpressure, scoped per-attempt identity, active-job fault
-  injection, HA/upgrade runbooks, and production observability remain open readiness gates.
+- Live capacity/health discovery, admission backpressure, scoped source/artifact identity, active-job
+  fault injection, HA/upgrade runbooks, and production observability remain open readiness gates.
 - Operators must configure finite metadata-database connection and statement timeouts. The bounded owner
   window prevents application keepalives from renewing forever, but it cannot interrupt a database driver
   call that the deployment itself permits to block indefinitely.

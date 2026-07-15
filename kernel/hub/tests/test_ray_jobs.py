@@ -683,6 +683,94 @@ def test_ray_jobs_submit_is_deterministic_and_excludes_metadata_secrets(jobs_con
     assert metadb.catalog_get(final.output_uri) is not None
 
 
+def test_ray_jobs_recovery_reauthorizes_frozen_cred_id_with_rotated_refs(
+        jobs_config, monkeypatch):
+    from hub.workload_credentials import DESTINATION_CREDENTIAL_REFERENCE_ENV
+
+    monkeypatch.setenv("DP_RAY_DEST_KEY_V1", "ray-access-v1")
+    monkeypatch.setenv("DP_RAY_DEST_SECRET_V1", "ray-secret-v1")
+    monkeypatch.setenv("DP_RAY_DEST_KEY_V2", "ray-access-v2")
+    monkeypatch.setenv("DP_RAY_DEST_SECRET_V2", "ray-secret-v2")
+    cred = metadb.cred_upsert(None, "Ray destination", "object_store", {
+        "accessKeyId": "env:DP_RAY_DEST_KEY_V1",
+        "secretAccessKey": "env:DP_RAY_DEST_SECRET_V1",
+        "region": "us-east-1",
+    })
+    metadb.set_setting("destinations", [{
+        "id": "ray-selected", "name": "Ray selected", "backend": "s3",
+        "root": "s3://shared/selected", "credId": cred["id"],
+    }], "global")
+    try:
+        _module, deps, runner, client, _store = _runner(jobs_config)
+        runner._ensure_jobs_supervisor = lambda *_args, **_kwargs: None
+        graph = _graph()
+        graph.nodes[-1].data["config"]["destId"] = "ray-selected"
+        plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+        status = runner.run(
+            plan, graph, "write", "distributed",
+            run_id=f"run_jobs_cred_rotation_{uuid.uuid4().hex}",
+        )
+        job = _materialize_bound_job(runner, status)
+        binding = job["sink_contracts"]["write"]["credential"]
+        assert binding["credential_id"] == cred["id"]
+        serialized_job = json.dumps(job)
+        assert "ray-secret-v1" not in serialized_job
+        assert "env:DP_RAY_DEST_SECRET_V1" not in serialized_job
+
+        # A replacement supervisor uses the immutable Cred ID, but resolves the current refs on the same
+        # entity. Rebinding to another ID would not affect this envelope.
+        metadb.cred_upsert(cred["id"], "Ray destination", "object_store", {
+            "accessKeyId": "env:DP_RAY_DEST_KEY_V2",
+            "secretAccessKey": "env:DP_RAY_DEST_SECRET_V2",
+            "region": "us-east-2",
+        })
+        assert runner._ensure_job_submitted(client, job) == "PENDING"
+        env = client.submit_calls[0]["runtime_env"]["env_vars"]
+        capability = env[DESTINATION_CREDENTIAL_REFERENCE_ENV]
+        assert "env:DP_RAY_DEST_SECRET_V2" in capability
+        assert "ray-secret-v2" not in json.dumps(client.submit_calls[0])
+        assert "ray-secret-v2" not in (
+            metadb.backend_job_artifact_payload(status.run_id) or b"").decode()
+    finally:
+        metadb.set_setting("destinations", [], "global")
+        metadb.cred_delete(cred["id"])
+
+
+def test_ray_jobs_deleted_frozen_cred_fails_before_submit_and_releases_claim(
+        jobs_config, monkeypatch):
+    from hub.workload_credentials import DestinationCredentialError
+
+    monkeypatch.setenv("DP_RAY_DELETE_KEY", "deleted-access")
+    monkeypatch.setenv("DP_RAY_DELETE_SECRET", "deleted-secret")
+    cred = metadb.cred_upsert(None, "Delete before submit", "object_store", {
+        "accessKeyId": "env:DP_RAY_DELETE_KEY",
+        "secretAccessKey": "env:DP_RAY_DELETE_SECRET",
+    })
+    metadb.set_setting("destinations", [{
+        "id": "ray-delete", "name": "Ray delete", "backend": "s3",
+        "root": "s3://shared/deleted", "credId": cred["id"],
+    }], "global")
+    _module, deps, runner, client, _store = _runner(jobs_config)
+    runner._ensure_jobs_supervisor = lambda *_args, **_kwargs: None
+    graph = _graph()
+    graph.nodes[-1].data["config"]["destId"] = "ray-delete"
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    status = runner.run(
+        plan, graph, "write", "distributed",
+        run_id=f"run_jobs_cred_deleted_{uuid.uuid4().hex}",
+    )
+    job = _materialize_bound_job(runner, status)
+    metadb.set_setting("destinations", [], "global")
+    metadb.cred_delete(cred["id"])
+
+    with pytest.raises(DestinationCredentialError):
+        runner._ensure_job_submitted(client, job)
+    assert client.submit_calls == []
+    binding = metadb.backend_job(status.run_id)
+    assert binding and binding["submission_state"] == "queued"
+    assert "deleted-secret" not in json.dumps(job)
+
+
 def test_ray_jobs_worker_direct_sink_publishes_attempt_uri(jobs_config):
     module, deps, runner, client, store = _runner(jobs_config)
     graph = _graph()
@@ -946,7 +1034,12 @@ def test_driver_dispatch_uses_frozen_sink_writer_and_physical_uri(jobs_config):
             "name": "frozen", "logical_uri": "s3://shared/frozen.parquet",
             "physical_uri": "s3://shared/frozen.attempt-run-write.parquet",
             "writer": "worker-direct-parquet",
+            "credential": {
+                "version": 1, "scope": "destination-write", "mode": "ambient",
+                "destination_id": None,
+            },
         }},
+        sink_credentials={"write": {}},
     )
 
     assert result["status"] == "done"
@@ -2793,7 +2886,7 @@ def test_malformed_backend_result_blocks_only_its_own_recovery_row(jobs_config, 
     _retire_inert_test_run(recovered.status(good.run_id))
 
 
-def test_ray_jobs_multi_sink_usage_is_one_event_per_run(jobs_config):
+def test_ray_jobs_usage_is_one_event_per_run(jobs_config):
     catalog = CountingCatalog()
     _module, _deps, runner, _client, _store = _runner(jobs_config, catalog=catalog)
     left_source = "s3://shared/left-parent.parquet"
@@ -2821,17 +2914,30 @@ def test_ray_jobs_multi_sink_usage_is_one_event_per_run(jobs_config):
             {"id": "b", "source": "join", "target": "write-b", "data": {"wire": "dataset"}},
         ],
     })
+    logical_uri = "s3://shared/a.parquet"
+    credential = {
+        "version": 1, "scope": "destination-write", "mode": "ambient",
+        "destination_id": None,
+    }
+    job = {
+        "attempt_id": "attempt-one-output",
+        "sink_targets": {"write-a": logical_uri},
+        "sink_contracts": {"write-a": {
+            "name": "a", "logical_uri": logical_uri,
+            "physical_uri": "s3://shared/a.attempt-one-output",
+            "writer": "worker-direct-parquet", "credential": credential,
+        }},
+    }
     result = {"outputs": [
-        {"step_id": "write-a", "name": "a", "uri": "s3://shared/a.parquet"},
-        {"step_id": "write-b", "name": "b", "uri": "s3://shared/b.parquet"},
+        {"step_id": "write-a", "name": "a", "uri": logical_uri},
     ]}
 
-    runner._register_outputs(graph, result, {"attempt_id": "attempt-multi"})
-    runner._register_outputs(graph, result, {"attempt_id": "attempt-multi"})
+    runner._register_outputs(graph, result, job)
+    runner._register_outputs(graph, result, job)
 
-    assert len(catalog.calls) == 2, "each output remains independently idempotent"
+    assert len(catalog.calls) == 1, "the output remains independently idempotent"
     assert len(catalog.usage_calls) == 1
-    assert catalog.usage_calls[0]["idempotency_key"] == "ray-jobs:attempt-multi"
+    assert catalog.usage_calls[0]["idempotency_key"] == "ray-jobs:attempt-one-output"
     assert set(catalog.usage_calls[0]["parents"]) == {left_source, right_source}
     assert all(set(call["parents"]) == {left_source, right_source} for call in catalog.calls)
 

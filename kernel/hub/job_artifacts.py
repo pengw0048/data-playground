@@ -22,7 +22,7 @@ JSON_ARTIFACT_MAX_BYTES = 64 * 1024**2
 # than placing a tens-of-megabytes value in one metadata row.
 JOB_SQL_ENVELOPE_MAX_BYTES = 8 * 1024**2
 
-RAY_JOB_CONTRACT_VERSION = 3
+RAY_JOB_CONTRACT_VERSION = 4
 RAY_JOB_CANONICAL_FIELDS = (
     "contract_version", "run_id", "graph", "target", "source_attempts", "sink_targets",
     "sink_contracts", "materialize_uri", "requires", "code_ref", "cluster_ref",

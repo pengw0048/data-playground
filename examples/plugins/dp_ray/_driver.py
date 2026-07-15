@@ -38,7 +38,8 @@ def _progress_writer(status_file: str):
     return emit
 
 
-def _run_job(runner, ir, graph, target, ray_opts, progress, job: dict):
+def _run_job(runner, ir, graph, target, ray_opts, progress, job: dict,
+             sink_credentials: dict[str, dict]):
     """Dispatch one verified job while preserving each control plane's sink binding."""
     materialize_uri = job.get("materialize_uri")
     if materialize_uri:
@@ -55,6 +56,7 @@ def _run_job(runner, ir, graph, target, ray_opts, progress, job: dict):
         job.get("attempt_id"),
         sink_attempts=job.get("sink_attempts"),
         sink_contracts=job.get("sink_contracts"),
+        sink_credentials=sink_credentials,
     )
 
 
@@ -102,6 +104,34 @@ def main() -> None:
     result = {"status": "failed", "error": "ray driver did not run", "rows": 0}
     metadata_dir = None
     try:
+        from hub.workload_credentials import (
+            DESTINATION_CREDENTIAL_REFERENCE_ENV,
+            read_fd_capability,
+            resolve_reference_capability,
+            validate_bindings,
+        )
+        if jobs_mode:
+            sink_contracts = job.get("sink_contracts")
+            if (not isinstance(sink_contracts, dict)
+                    or any(not isinstance(contract, dict)
+                           or "credential" not in contract
+                           for contract in sink_contracts.values())):
+                raise RuntimeError("Ray job destination credential contract is malformed")
+            sink_bindings = validate_bindings({
+                step_id: contract.get("credential")
+                for step_id, contract in sink_contracts.items()
+            })
+            sink_credentials = resolve_reference_capability(
+                os.environ.pop(DESTINATION_CREDENTIAL_REFERENCE_ENV, None),
+                sink_bindings,
+            )
+        else:
+            sink_bindings = validate_bindings(
+                job.get("sink_credential_bindings") or {})
+            sink_credentials = read_fd_capability(
+                job.get("sink_credential_capability"), job["attempt_id"],
+                sink_bindings,
+            )
         os.environ.setdefault("RAY_DATA_DISABLE_PROGRESS_BARS", "1")
         # THE macOS/uv fix: if the kernel was launched via `uv run`, Ray (RAY_ENABLE_UV_RUN_RUNTIME_ENV,
         # default on) re-launches its WORKERS through uv too — which builds a fresh, ray-less .venv, so a
@@ -165,7 +195,8 @@ def main() -> None:
             f"lowered; {'_run_ir_materialize' if job.get('materialize_uri') else '_run_ir_sync'}; "
             f"ray_opts={ray_opts}"
         )
-        result = _run_job(runner, ir, graph, target, ray_opts, prog, job)
+        result = _run_job(
+            runner, ir, graph, target, ray_opts, prog, job, sink_credentials)
         _log(f"run done: {result.get('status')}")
     except Exception as e:  # noqa: BLE001 — always leave the parent a status to read
         result = {"status": "failed", "error": f"{type(e).__name__}: {e}", "rows": 0}

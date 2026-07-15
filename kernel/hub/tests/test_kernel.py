@@ -9151,7 +9151,7 @@ def test_ray_ir_carries_transform_output_schema_for_empty_results():
 
 
 @pytest.fixture
-def ray_catalog_object_store():
+def ray_catalog_object_store(monkeypatch):
     """A real versioned S3-compatible provider for Ray catalog publication tests."""
     pytest.importorskip("moto")
     pytest.importorskip("flask")
@@ -9172,9 +9172,12 @@ def ray_catalog_object_store():
         client.create_bucket(Bucket="ray-catalog-lifecycle")
         client.put_bucket_versioning(
             Bucket="ray-catalog-lifecycle", VersioningConfiguration={"Status": "Enabled"})
+        monkeypatch.setenv("DP_TEST_RAY_CATALOG_KEY", "k")
+        monkeypatch.setenv("DP_TEST_RAY_CATALOG_SECRET", "s")
         metadb.set_setting("objectStore", {
-            "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
-            "secretAccessKey": "s", "useSsl": False,
+            "endpoint": endpoint, "region": "us-east-1",
+            "accessKeyId": "env:DP_TEST_RAY_CATALOG_KEY",
+            "secretAccessKey": "env:DP_TEST_RAY_CATALOG_SECRET", "useSsl": False,
         }, "global")
         yield client
     finally:
@@ -9228,13 +9231,17 @@ def test_ray_sink_attempt_retention_runs_only_after_catalog_publication(
             pq.write_table(table, stream)
         handoff.write_manifest(uri, run_id=run_id, rows=1, schema=table.schema)
 
+    from hub.workload_credentials import authorize_destination
+    credential, _material = authorize_destination(str(workspace), None, logical)
+    assert credential is not None
+    credentials = {"w": credential}
     runner._register_outputs(graph, {"outputs": [
         {"step_id": "w", "name": "out", "uri": first, "logical_uri": logical},
-    ]})
+    ]}, credential_bindings=credentials)
     stable_id = metadb.catalog_get(first)["id"]
     runner._register_outputs(graph, {"outputs": [
         {"step_id": "w", "name": "out", "uri": second, "logical_uri": logical},
-    ]})
+    ]}, credential_bindings=credentials)
     assert metadb.catalog_get(first)["uri"] == second
     with metadb.session() as session:
         assert session.get(metadb.CatalogEntry, first) is None
@@ -9252,7 +9259,7 @@ def test_ray_sink_attempt_retention_runs_only_after_catalog_publication(
     with pytest.raises(RuntimeError, match="atomically publish"):
         runner._register_outputs(graph, {"outputs": [
             {"step_id": "w", "name": "out", "uri": failed, "logical_uri": logical},
-        ]})
+        ]}, credential_bindings=credentials)
     with metadb.session() as session:
         assert session.get(metadb.ObjectAttempt, failed).state == "abandoned"
         assert session.get(metadb.ObjectAttempt, second).state == "published"
@@ -9305,6 +9312,10 @@ def test_ray_sink_swallowed_catalog_persist_failure_does_not_publish(
         pq.write_table(table, stream)
     handoff.write_manifest(
         attempt, run_id="persist-failure", rows=1, schema=table.schema)
+    from hub.workload_credentials import authorize_destination
+    credential, _material = authorize_destination(
+        str(workspace), None, "s3://ray-catalog-lifecycle/outputs/out.parquet")
+    assert credential is not None
 
     monkeypatch.setattr(
         metadb, "catalog_upsert_entry",
@@ -9315,7 +9326,7 @@ def test_ray_sink_swallowed_catalog_persist_failure_does_not_publish(
         runner._register_outputs(graph, {"outputs": [{
             "step_id": "w", "name": "out", "uri": attempt,
             "logical_uri": "s3://ray-catalog-lifecycle/outputs/out.parquet",
-        }]})
+        }]}, credential_bindings={"w": credential})
     assert "SECRET_SENTINEL" not in str(raised.value)
     assert metadb.catalog_get(attempt) is None
     with metadb.session() as session:
@@ -10387,6 +10398,7 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
         graph, missing_status,
         {"status": "done", "rows": 0, "outputs": []}, 0,
         expected_targets=expected_targets, expected_attempts=expected_attempts,
+        credential_bindings={},
     )
     assert missing_status.status == "failed"
     assert missing_status.error == (
@@ -10415,10 +10427,12 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
     runner._settle_popen_result(
         graph, status, result, 0,
         expected_targets=expected_targets, expected_attempts=expected_attempts,
+        credential_bindings={},
     )
 
     assert registered == [(graph, result, {
         "expected_targets": expected_targets, "expected_attempts": expected_attempts,
+        "credential_bindings": {},
     })]
     assert status.status == "done" and status.progress == 1.0
     assert status.output_uri == result["output_uri"] and status.output_table == "second"

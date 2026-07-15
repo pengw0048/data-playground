@@ -182,6 +182,10 @@ class LocalRunner:
         # None means a normal in-process runner. An empty dict is an authoritative "no write sinks" contract.
         self.forced_sink_targets: dict[str, str] | None = None
         self.forced_sink_attempts: dict[str, str] = {}
+        # The trusted parent resolves each object sink's exact authorized identity. An isolated child
+        # receives only resolved, attempt-scoped material and must never consult its disposable metadata
+        # DB or silently fall back to a different default/ambient credential.
+        self.forced_sink_credentials: dict[str, dict] | None = None
         # A metadata-isolated child cannot validate a parent-owned managed source against its disposable
         # database. Its parent holds the renewable read leases and passes only the exact physical URIs it
         # attested before dispatch. None means this is a normal in-process runner; an empty set is an
@@ -978,8 +982,13 @@ class LocalRunner:
         account). An object-store sink with ambient/instance-role creds resolves to {} — still bound
         (env), never skipped as if it were a local sink (None)."""
         from hub import destinations
+        from hub.plugins.adapters import is_object_uri
         from hub.sinks import SinkSpec
         cfgs: list[dict] = []
+        object_steps: set[str] = set()
+        parent_contract = self.forced_sink_targets is not None
+        if parent_contract and self.forced_sink_credentials is None:
+            raise RuntimeError("parent destination credential contract is missing")
         for step in plan.steps:
             if step.kind != "write":
                 continue
@@ -988,9 +997,24 @@ class LocalRunner:
                 continue
             data = node.data if isinstance(node.data, dict) else {}
             spec = SinkSpec.from_config(data.get("config", {}), data.get("title"))
-            cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
+            if parent_contract:
+                target = self.forced_sink_targets.get(step.node_id)
+                if not isinstance(target, str) or not target:
+                    raise RuntimeError(f"parent supplied an invalid target for sink '{step.node_id}'")
+                if is_object_uri(target):
+                    object_steps.add(step.node_id)
+                    cfg = self.forced_sink_credentials.get(step.node_id)
+                    if not isinstance(cfg, dict):
+                        raise RuntimeError(
+                            f"parent did not authorize an object-store identity for sink '{step.node_id}'")
+                else:
+                    cfg = None
+            else:
+                cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
             if cfg is not None:  # None = not an object store; {} = object store with ambient creds
                 cfgs.append(cfg)
+        if parent_contract and set(self.forced_sink_credentials) != object_steps:
+            raise RuntimeError("parent destination credential contract does not match its object sinks")
         if not cfgs:
             return None
         if any(c != cfgs[0] for c in cfgs[1:]):
@@ -1003,13 +1027,37 @@ class LocalRunner:
                       cached: dict | None, cancel: _CancelToken, pre_publish=None) -> int:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         from hub import destinations
+        from hub.plugins.adapters import is_object_uri
         from hub.sinks import SinkCommit, SinkSpec, commit_sink, preflight_sink
         spec = SinkSpec.from_config(cfg, node.data.get("title") if isinstance(node.data, dict) else None)
         if cancel.is_set():
             raise RuntimeError("run cancelled before output commit")
+        parent_contract = self.forced_sink_targets is not None
+        if parent_contract and node.id not in self.forced_sink_targets:
+            raise RuntimeError(f"parent did not authorize sink '{node.id}'")
+        forced_target = self.forced_sink_targets.get(node.id) if parent_contract else None
+        if parent_contract and (not isinstance(forced_target, str) or not forced_target):
+            raise RuntimeError(f"parent supplied an invalid target for sink '{node.id}'")
+        logical_uri = preflight_sink(
+            spec, self.workspace, self.storage, self.resolve_adapter,
+            target_uri=forced_target)
         # Bind this destination's credential at the object-store open (the scope cursor already
         # snapshotted it via the run-level binding; this makes the per-write credential explicit).
-        os_cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
+        if parent_contract:
+            if self.forced_sink_credentials is None:
+                raise RuntimeError("parent destination credential contract is missing")
+            if is_object_uri(logical_uri):
+                os_cfg = self.forced_sink_credentials.get(node.id)
+                if not isinstance(os_cfg, dict):
+                    raise RuntimeError(
+                        f"parent did not authorize an object-store identity for sink '{node.id}'")
+            else:
+                if node.id in self.forced_sink_credentials:
+                    raise RuntimeError(
+                        f"parent supplied an object-store identity for local sink '{node.id}'")
+                os_cfg = None
+        else:
+            os_cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
         if os_cfg is not None:
             with db.lock():
                 db.ensure_object_store(os_cfg)
@@ -1025,15 +1073,6 @@ class LocalRunner:
         # route by the wired output PORT (source_handle) — a write off a multi-output node must
         # persist that port's data, not the default/first one. Mirrors BuildEngine._inputs.
         parent_rel = engine.relation(inc[0].source, inc[0].source_handle)
-        parent_contract = self.forced_sink_targets is not None
-        if parent_contract and node.id not in self.forced_sink_targets:
-            raise RuntimeError(f"parent did not authorize sink '{node.id}'")
-        forced_target = self.forced_sink_targets.get(node.id) if parent_contract else None
-        if parent_contract and (not isinstance(forced_target, str) or not forced_target):
-            raise RuntimeError(f"parent supplied an invalid target for sink '{node.id}'")
-        logical_uri = preflight_sink(
-            spec, self.workspace, self.storage, self.resolve_adapter,
-            target_uri=forced_target)
         logical_adapter = self.resolve_adapter(logical_uri)
         managed_parquet = _is_core_managed_sink(spec, logical_uri, logical_adapter)
         parent_assigned_attempt = self.forced_sink_attempts.get(node.id)

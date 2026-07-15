@@ -15,6 +15,15 @@ from sqlalchemy import func, select, text
 from hub import handoff, metadb
 
 
+def _ambient_destination_credential() -> dict:
+    return {
+        "version": 1,
+        "scope": "destination-write",
+        "mode": "ambient",
+        "destination_id": None,
+    }
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _schema():
     metadb.init_db()
@@ -2579,10 +2588,16 @@ def test_moto_subprocess_backends_publish_parent_owned_managed_sink(
         settings.database_url = isolated_url
         metadb._engine = metadb._Session = None
         metadb.init_db()
-        metadb.set_setting("objectStore", {
-            "endpoint": endpoint, "region": "us-east-1", "accessKeyId": "k",
-            "secretAccessKey": "s", "useSsl": False,
-        }, "global")
+        selected_cred = metadb.cred_upsert(None, "selected subprocess identity", "object_store", {
+            "accessKeyId": "env:DP_S3_KEY",
+            "secretAccessKey": "env:DP_S3_SECRET", "region": "us-east-1",
+            "endpoint": endpoint,
+        })
+        metadb.set_setting("destinations", [{
+            "id": "isolated-s3", "name": "Isolated S3", "backend": "s3",
+            "root": "s3://subprocess-managed-sink/results",
+            "credId": selected_cred["id"],
+        }], "global")
         monkeypatch.setenv("DP_STORAGE_URL", "s3://subprocess-managed-sink/results")
         monkeypatch.setenv("DP_S3_ENDPOINT", endpoint)
         monkeypatch.setenv("DP_S3_KEY", "k")
@@ -2634,7 +2649,7 @@ def test_moto_subprocess_backends_publish_parent_owned_managed_sink(
                 {"id": "source", "type": "source", "position": {"x": 0, "y": 0},
                  "data": {"config": {"uri": str(source)}}},
                 {"id": "write", "type": "write", "position": {"x": 200, "y": 0},
-                 "data": {"config": {"filename": "daily.parquet",
+                 "data": {"config": {"destId": "isolated-s3", "filename": "daily.parquet",
                                        "writeMode": "overwrite"}}},
             ],
             "edges": [{"id": "source-write", "source": "source", "target": "write",
@@ -2682,6 +2697,153 @@ def test_moto_subprocess_backends_publish_parent_owned_managed_sink(
         server.stop()
 
 
+def test_concurrent_subprocess_runs_use_distinct_destination_credentials(
+        tmp_path, monkeypatch):
+    pytest.importorskip("moto")
+    pytest.importorskip("flask")
+    boto3 = pytest.importorskip("boto3")
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    from moto.server import ThreadedMotoServer
+
+    from hub import compiler
+    from hub.deps import Deps
+    from hub.models import Graph
+    from hub.settings import settings
+
+    original_engine, original_session = metadb._engine, metadb._Session
+    original_url = settings.database_url
+    servers = [ThreadedMotoServer(port=0), ThreadedMotoServer(port=0)]
+    for server in servers:
+        server.start()
+    runner = None
+    try:
+        endpoints = [
+            f"http://{server.get_host_and_port()[0]}:{server.get_host_and_port()[1]}"
+            for server in servers
+        ]
+        buckets = ["isolated-destination-a", "isolated-destination-b"]
+        clients = {}
+        for index, (endpoint, bucket) in enumerate(zip(endpoints, buckets, strict=True)):
+            client = boto3.client(
+                "s3", endpoint_url=endpoint,
+                aws_access_key_id=f"key-{index}", aws_secret_access_key=f"secret-{index}",
+                region_name="us-east-1")
+            client.create_bucket(Bucket=bucket)
+            client.put_bucket_versioning(
+                Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+            clients[bucket] = client
+            monkeypatch.setenv(f"DP_DEST_KEY_{index}", f"key-{index}")
+            monkeypatch.setenv(f"DP_DEST_SECRET_{index}", f"secret-{index}")
+
+        if metadb._engine is not None:
+            metadb._engine.dispose()
+        settings.database_url = f"sqlite:///{tmp_path / 'multi-destination.db'}"
+        metadb._engine = metadb._Session = None
+        metadb.init_db()
+        destinations = []
+        for index, (endpoint, bucket) in enumerate(zip(endpoints, buckets, strict=True)):
+            cred = metadb.cred_upsert(None, f"destination {index}", "object_store", {
+                "accessKeyId": f"env:DP_DEST_KEY_{index}",
+                "secretAccessKey": f"env:DP_DEST_SECRET_{index}",
+                "region": "us-east-1", "endpoint": endpoint,
+            })
+            destinations.append({
+                "id": f"destination-{index}", "name": f"Destination {index}",
+                "backend": "s3", "root": f"s3://{bucket}/results",
+                "credId": cred["id"],
+            })
+        metadb.set_setting("destinations", destinations, "global")
+
+        # The child allowlist intentionally sees only this WRONG fallback endpoint. Destination B can
+        # succeed only if the parent-to-child FD capability overrides ambient/default identity.
+        monkeypatch.setenv("DP_STORAGE_URL", "s3://fallback-only/results")
+        monkeypatch.setenv("DP_S3_ENDPOINT", endpoints[0])
+        monkeypatch.setenv("DP_S3_KEY", "fallback-key")
+        monkeypatch.setenv("DP_S3_SECRET", "fallback-secret")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+
+        workspace, data_dir = tmp_path / "workspace", tmp_path / "data"
+        workspace.mkdir()
+        data_dir.mkdir()
+        source = tmp_path / "source.parquet"
+        pq.write_table(pa.table({"value": [1, 2, 3]}), source)
+        deps = Deps(str(workspace), str(data_dir))
+
+        class ParquetProbe:
+            @staticmethod
+            def _metadata(uri):
+                parsed = urlsplit(uri)
+                key = parsed.path.lstrip("/").rstrip("/") + "/part-00000.parquet"
+                body = clients[parsed.netloc].get_object(
+                    Bucket=parsed.netloc, Key=key)["Body"].read()
+                return pq.ParquetFile(pa.BufferReader(body)).metadata
+
+            def schema(self, uri):
+                from hub.models import ColumnSchema
+                metadata = self._metadata(uri)
+                return [ColumnSchema(
+                    name=metadata.schema.column(i).name,
+                    type=str(metadata.schema.column(i).physical_type),
+                ) for i in range(metadata.num_columns)]
+
+            def count(self, uri):
+                return self._metadata(uri).num_rows
+
+            @staticmethod
+            def fingerprint(uri):
+                return f"multi-destination:{uri}"
+
+        monkeypatch.setattr(deps.catalog, "resolve", lambda _uri: ParquetProbe())
+        monkeypatch.setattr(deps.catalog, "_object_stat_sig", lambda _uri: "")
+        runner = next(
+            candidate for candidate in deps.runners
+            if candidate.name == "local-subprocess")
+
+        statuses = []
+        for index in range(2):
+            graph = Graph.model_validate({
+                "id": f"isolated-destination-{index}", "version": 1,
+                "nodes": [
+                    {"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                     "data": {"config": {"uri": str(source)}}},
+                    {"id": "write", "type": "write", "position": {"x": 200, "y": 0},
+                     "data": {"config": {
+                         "destId": f"destination-{index}",
+                         "filename": f"output-{index}.parquet",
+                     }}},
+                ],
+                "edges": [{"id": "source-write", "source": "source", "target": "write"}],
+            })
+            plan = compiler.compile_plan(
+                graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+            statuses.append(runner.run(plan, graph, "write", "local"))
+
+        deadline = time.monotonic() + 30
+        while any(runner.status(status.run_id).status not in (
+                "done", "failed", "cancelled") for status in statuses):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        finals = [runner.status(status.run_id) for status in statuses]
+        assert [final.status for final in finals] == ["done", "done"], [
+            final.error for final in finals]
+        for index, final in enumerate(finals):
+            assert urlsplit(final.output_uri).netloc == buckets[index]
+            key = urlsplit(final.output_uri).path.lstrip("/").rstrip("/") \
+                + "/part-00000.parquet"
+            assert clients[buckets[index]].head_object(
+                Bucket=buckets[index], Key=key)["ContentLength"] > 0
+    finally:
+        if runner is not None:
+            runner._terminate_all()
+        if metadb._engine is not None:
+            metadb._engine.dispose()
+        settings.database_url = original_url
+        metadb._engine, metadb._Session = original_engine, original_session
+        for server in servers:
+            server.stop()
+
+
 def test_subprocess_parent_attests_and_prepares_managed_sink_before_publish(
         tmp_path, monkeypatch):
     from hub.models import RunStatus
@@ -2703,6 +2865,7 @@ def test_subprocess_parent_attests_and_prepares_managed_sink_before_publish(
     sinks = {"write": {
         "uri": attempt_uri, "logical_uri": "s3://managed/results/daily.parquet",
         "name": "daily", "parents": ["s3://managed/source.parquet"],
+        "credential": _ambient_destination_credential(),
     }}
     runner._publish_object_sinks(sinks, RunStatus(
         run_id="run", status="done", per_node=[],
@@ -2852,7 +3015,8 @@ def test_subprocess_parent_contract_uses_shared_published_sink_uri(tmp_path, cas
     runner = SubprocessRunner(
         str(tmp_path), str(tmp_path), catalog=Catalog(), storage=Storage(),
         resolve_adapter=lambda _uri: DuckDBAdapter())
-    targets, attempts, contracts = runner._claim_sink_contracts(plan, graph, "run")
+    targets, attempts, contracts, _credential_material = runner._claim_sink_contracts(
+        plan, graph, "run")
     assert targets == {"write": target} and attempts == {}
     assert contracts["write"]["logical_uri"] == target
     assert contracts["write"]["published_uri"] == expected
@@ -3048,6 +3212,7 @@ def test_subprocess_parent_discards_managed_sink_only_after_child_reaped(
     runner._object_sinks[handle["run_id"]] = {"write": {
         "uri": handle["uri"], "logical_uri": handle["logical_uri"],
         "name": "daily", "parents": [],
+        "credential": _ambient_destination_credential(),
     }}
     if cancelled:
         runner._cancelled.add(handle["run_id"])
@@ -3311,7 +3476,8 @@ def test_subprocess_parent_registers_unmanaged_sink_with_source_lineage_across_r
     ])
     runner = SubprocessRunner(
         str(tmp_path), str(tmp_path), catalog=Catalog(), storage=LocalStorage())
-    _targets, _attempts, contracts = runner._claim_sink_contracts(plan, graph, "run")
+    _targets, _attempts, contracts, _credential_material = runner._claim_sink_contracts(
+        plan, graph, "run")
     assert set(expected_parents) == {source_a, source_b}
     assert graph_mod.execution_source_uris(graph, "write") == [region_ref]
     assert contracts["write"]["parents"] == expected_parents
@@ -3380,6 +3546,7 @@ def test_isolated_child_adapter_disagreement_never_writes_assigned_sink(tmp_path
     runner.forced_sink_attempts = {
         "write": "s3://managed/results/out.attempt-parent",
     }
+    runner.forced_sink_credentials = {"write": {}}
     with pytest.raises(RuntimeError, match="parent and child disagree"):
         runner._commit_write(
             next(node for node in graph.nodes if node.id == "write"), graph, Engine(),
@@ -3419,6 +3586,7 @@ def test_subprocess_managed_sink_cleanup_outage_does_not_block_terminalization(
     runner._object_sinks["run"] = {"write": {
         "uri": attempt_uri, "logical_uri": "s3://managed/results/daily.parquet",
         "name": "daily", "parents": [],
+        "credential": _ambient_destination_credential(),
     }}
     monkeypatch.setattr(
         runner, "_publish_object_sinks",

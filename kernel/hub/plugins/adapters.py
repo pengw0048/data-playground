@@ -91,12 +91,15 @@ def object_fs(uri: str):
     a clear message. A custom GCS endpoint (emulator) IS forwarded."""
     import pyarrow.fs as pafs
 
-    from hub import metadb
     from hub.secrets import resolve_object_store
     scheme, _, rest = uri.partition("://")
     scheme = scheme.lower()
-    cfg = metadb.cred_object_store_config(None)  # default cred → legacy objectStore (unified resolver)
-    if not cfg:
+    cfg = db.bound_object_store_config()
+    explicitly_bound = cfg is not None
+    if not explicitly_bound:
+        from hub import metadb
+        cfg = metadb.cred_object_store_config(None)  # default cred → legacy objectStore
+    if not cfg and not explicitly_bound:
         # Only a one-shot workload (subrun / Ray driver) with no hub settings DB falls back to the
         # allowlisted data-plane environment; a hub keeps its ambient credential chain.
         from hub.workload_env import data_plane_object_store_config, is_ephemeral_workload

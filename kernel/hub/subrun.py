@@ -191,6 +191,13 @@ def main() -> int:
         deps.runner.result_get = None
         deps.runner.result_acquire = None
         deps.runner.result_put = None
+        from hub.workload_credentials import (read_fd_capability,
+                                              validate_bindings)
+        sink_credential_bindings = validate_bindings(
+            job.get("sinkCredentialBindings") or {})
+        sink_credential_material = read_fd_capability(
+            job.get("sinkCredentialCapability"), job["runId"],
+            sink_credential_bindings)
         deps.runner.forced_result_uri = job.get("forcedResultUri")
         identity = job.get("resultNamespaceIdentity")
         if identity is not None:
@@ -228,6 +235,8 @@ def main() -> int:
         deps.runner.forced_sink_targets = (
             dict(job.get("sinkTargets") or {}) if "sinkTargets" in job else None)
         deps.runner.forced_sink_attempts = dict(job.get("sinkAttempts") or {})
+        deps.runner.forced_sink_credentials = (
+            sink_credential_material if "sinkTargets" in job else None)
         graph = Graph(**job["graph"])
         # The disposable child DB cannot prove lifecycle ownership. Accept managed source attempts only
         # when the durable parent attested the exact physical URI and is holding its renewable read lease.

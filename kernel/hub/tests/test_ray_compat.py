@@ -146,10 +146,14 @@ def test_ray_driver_preserves_popen_sink_attempt_binding():
             "sink_targets": {"write": "s3://bucket/output.parquet"},
             "sink_attempts": sink_attempts,
         },
+        {"write": {}},
     )
 
     assert result == {"status": "done"}
-    assert calls[0][1] == {"sink_attempts": sink_attempts, "sink_contracts": None}
+    assert calls[0][1] == {
+        "sink_attempts": sink_attempts, "sink_contracts": None,
+        "sink_credentials": {"write": {}},
+    }
 
 
 def _assert_restricted_pod(pod: dict, container_name: str) -> None:
