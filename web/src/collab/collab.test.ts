@@ -12,13 +12,20 @@ class MockWebSocket {
 
   readyState = MockWebSocket.CONNECTING
   sent: string[] = []
+  failNextSend = false
   onopen: ((event: Event) => void) | null = null
   onmessage: ((event: MessageEvent) => void) | null = null
   onclose: ((event: CloseEvent) => void) | null = null
 
   constructor(_url: string) { MockWebSocket.instances.push(this) }
 
-  send(data: string): void { this.sent.push(data) }
+  send(data: string): void {
+    if (this.failNextSend) {
+      this.failNextSend = false
+      throw new Error('simulated websocket send failure')
+    }
+    this.sent.push(data)
+  }
   close(code = 1000): void {
     this.readyState = MockWebSocket.CLOSED
     this.onclose?.({ code } as CloseEvent)
@@ -122,6 +129,28 @@ describe('collaboration relay handshake', () => {
     expect(frames.filter((frame) => frame.type === 'yjs')).toEqual([])
     expect(frames.filter((frame) => frame.type === 'sync-ready')).toEqual([])
     expect(useStore.getState().toasts.at(-1)?.msg).toContain('available synchronized peer')
+  })
+
+  it('reconnects promptly when a directed sync request cannot enter the socket queue', () => {
+    connectCollab('canvas')
+    const first = MockWebSocket.instances[0]
+    first.open()
+    first.failNextSend = true
+
+    first.receive({ type: 'server', event: 'room-state', mode: 'sync', requestId: 'failed-request' })
+
+    expect(first.readyState).toBe(MockWebSocket.CLOSED)
+    expect(first.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.type === 'ysync')).toEqual([])
+    vi.advanceTimersByTime(1499)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    vi.advanceTimersByTime(1)
+
+    const second = MockWebSocket.instances[1]
+    second.open()
+    second.receive({ type: 'server', event: 'room-state', mode: 'sync', requestId: 'retry-request' })
+    expect(second.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.type === 'ysync')).toEqual([
+      expect.objectContaining({ requestId: 'retry-request', sv: expect.any(String) }),
+    ])
   })
 
   it('stops without reconnecting when the relay reports a protocol violation', () => {

@@ -31,9 +31,15 @@ function send(msg: Record<string, unknown>): void {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ...msg, clientId }))
 }
 
-function requestYSync(requestId: string): void {
+function requestYSync(requestId: string): boolean {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false
+  try {
+    send({ type: 'ysync', requestId, sv: encodeYStateVector() })
+  } catch {
+    return false
+  }
   latestYSyncRequestId = requestId
-  send({ type: 'ysync', requestId, sv: encodeYStateVector() })
+  return true
 }
 
 function resetHandshake(): void {
@@ -131,7 +137,18 @@ function openSocket(canvasId: string): void {
         }
         if (msg.mode === 'sync' && typeof msg.requestId === 'string') {
           if (completedYSyncRequestId !== msg.requestId && latestYSyncRequestId !== msg.requestId) {
-            requestYSync(msg.requestId)
+            if (!requestYSync(msg.requestId)) {
+              // A request that never entered the socket queue must not consume the relay's five-second
+              // lease. Closing starts a fresh authenticated plan through the normal reconnect path.
+              try { sock.close() } catch {
+                if (ws === sock) {
+                  ws = null
+                  stopYSync()
+                  resetHandshake()
+                  scheduleReconnect(canvasId)
+                }
+              }
+            }
           }
           return
         }
