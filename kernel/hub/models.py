@@ -363,6 +363,10 @@ class RunBackendRef(Wire):
 class RunStatus(Wire):
     run_id: str
     status: Literal["queued", "running", "done", "failed", "cancelled"]
+    # ``run`` materializes a graph result; ``profile`` is an exact full-dataset inspection job.
+    # Both share one durable status/cancel/recovery lifecycle, but consumers must not mistake a
+    # profile completion for a newly materialized node result.
+    job_type: Literal["run", "profile"] = "run"
     target_node_id: str | None = None   # the run's sink — lets a reattaching client re-bind the run to its node
     rows_processed: int = 0
     total_rows: int | None = None
@@ -374,6 +378,10 @@ class RunStatus(Wire):
     error: str | None = None
     output_uri: str | None = None
     output_table: str | None = None
+    # A profile result is present only on a successful full-profile job. The client also echoes the
+    # graph-affecting identity it submitted, so it can refuse results after a graph revision changed.
+    profile: ProfileResult | None = None
+    plan_identity: str | None = None
     # HTTP/WebSocket request id that started this run (OPS-01). Optional so legacy/plugin backends
     # that omit it still deserialize; durable copy also lives on run_states / run_records.
     request_id: str | None = None
@@ -543,6 +551,17 @@ class PreviewRequest(Wire):
     k: int | None = None  # None → fall back to settings.preview_k (DP_PREVIEW_K); an explicit int wins
     offset: int = 0
     full: bool = False    # profile only: stats over the WHOLE dataset (a full pass), not the sample
+
+
+class ProfileJobRequest(Wire):
+    """Submit an exact full-dataset profile through the durable job lifecycle.
+
+    ``plan_identity`` is an opaque client-side graph identity. It is persisted with the job and only
+    used to ensure a late result cannot be presented for a newer canvas revision.
+    """
+    graph: Graph
+    node_id: str
+    plan_identity: str
 
 
 class EstimateRequest(Wire):

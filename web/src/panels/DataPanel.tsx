@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { previewIsCurrent, useStore } from '../store/graph'
+import { useEffect, useState, type ReactNode } from 'react'
+import { previewIsCurrent, profileJobIsCurrent, roleCanEdit, useStore } from '../store/graph'
 import { capabilitiesFor } from '../nodes/registry'
 import { api } from '../api/client'
 import { Icon } from '../ui/Icon'
@@ -178,35 +178,106 @@ function ResultModeToggle({ mode, onChange }: {
 
 const fmtNum = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 3 })
 
-// Per-column stats over the previewed sample (null%/distinct/min/max/mean). Fetched lazily on tab
-// open (remounts → refetches), and honest: labeled "sample", and it inherits preview's P8 refusal.
+// Per-column stats over the previewed sample (null%/distinct/min/max/mean). Exact full-dataset stats
+// are deliberately a cancellable job: the UI never turns a tab click into an unbounded synchronous scan.
 function StatsView({ nodeId }: { nodeId: string }) {
   const doc = useStore((s) => s.doc)
   const requestRun = useStore((s) => s.requestRun)
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
+  const profileJob = useStore((s) => s.profileJobs[nodeId])
+  const startFullProfile = useStore((s) => s.startFullProfile)
+  const cancelFullProfile = useStore((s) => s.cancelFullProfile)
   const [full, setFull] = useState(false)
   const [st, setSt] = useState<{ loading: boolean; res?: ProfileResult; err?: string }>({ loading: true })
-  const load = (asFull = full) => {
+  const loadSample = () => {
     setSt({ loading: true })
-    api.profile(doc, nodeId, asFull)
+    api.profile(doc, nodeId)
       .then((res) => setSt({ loading: false, res }))
       .catch((e) => setSt({ loading: false, err: e?.message ?? String(e) }))
   }
-  useEffect(() => load(full), [nodeId, full])  // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (!full) loadSample() }, [nodeId, full])  // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => setFull(false), [nodeId])
+  const job = profileJob && profileJobIsCurrent(profileJob, doc, nodeId) ? profileJob : undefined
+  const selectMode = (v: boolean) => {
+    setFull(v)
+    if (v && canEdit && (!job || job.phase === 'failed' || job.phase === 'cancelled')) void startFullProfile(nodeId)
+  }
   const toggle = (
     <div className="flex items-center gap-1 rounded-md border border-border p-0.5 text-[10px]">
       {([['sample', false], ['full dataset', true]] as const).map(([label, v]) => (
-        <button key={label} onClick={() => setFull(v)}
-          className={`rounded px-1.5 py-0.5 ${full === v ? 'bg-muted font-semibold text-foreground' : 'text-muted-foreground'}`}>
+        <button key={label} onClick={() => selectMode(v)} disabled={v && !canEdit}
+          title={v && !canEdit ? 'Editors can start full-dataset profile jobs' : undefined}
+          className={`rounded px-1.5 py-0.5 disabled:cursor-not-allowed disabled:opacity-50 ${full === v ? 'bg-muted font-semibold text-foreground' : 'text-muted-foreground'}`}>
           {label}
         </button>
       ))}
     </div>
   )
+  if (full) {
+    if (!canEdit) return <FullProfilePrompt toggle={toggle} onStart={() => {}} disabled />
+    if (!job || job.phase === 'cancelled') {
+      return <FullProfilePrompt toggle={toggle} onStart={() => startFullProfile(nodeId)} />
+    }
+    if (job.phase === 'estimating' || job.phase === 'queued' || job.phase === 'running' || job.phase === 'cancelling') {
+      return <FullProfileProgress job={job} toggle={toggle} onCancel={() => cancelFullProfile(nodeId)} />
+    }
+    if (job.phase === 'failed') {
+      return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState reason={job.error ?? 'full profile failed'} onRetry={() => startFullProfile(nodeId)} /></div>
+    }
+    const res = job.status?.profile
+    if (!res) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState reason="full profile completed without statistics" onRetry={() => startFullProfile(nodeId)} /></div>
+    return <ProfileTable res={res} toggle={toggle} />
+  }
   if (st.loading) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><Skeleton /></div>
-  if (st.err) return <ErrorState reason={st.err} onRetry={load} />
+  if (st.err) return <ErrorState reason={st.err} onRetry={loadSample} />
   const res = st.res!
-  if (res.error) return <ErrorState reason={res.reason ?? 'profile failed'} onRetry={load} />
+  if (res.error) return <ErrorState reason={res.reason ?? 'profile failed'} onRetry={loadSample} />
   if (res.notPreviewable) return <NotPreviewable reason={res.reason ?? 'needs a full pass'} onRun={() => requestRun(nodeId)} />
+  return <ProfileTable res={res} toggle={toggle} />
+}
+
+function FullProfilePrompt({ toggle, onStart, disabled = false }: {
+  toggle: ReactNode; onStart: () => void; disabled?: boolean
+}) {
+  return (
+    <div className="px-5 py-6 text-center">
+      <div className="mb-1 text-[12px] font-semibold text-foreground">Exact full-dataset profile</div>
+      <p className="mb-3 text-[11px] text-muted-foreground">This is a full pass. It runs as a cancellable job and reports progress here.</p>
+      <div className="flex items-center justify-center gap-2">
+        <button onClick={onStart} disabled={disabled}
+          className="rounded-md bg-primary px-2.5 py-1 text-[11px] font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50">
+          Start full profile
+        </button>
+        {toggle}
+      </div>
+    </div>
+  )
+}
+
+function FullProfileProgress({ job, toggle, onCancel }: {
+  job: { phase: string; estimate?: { rows: number | null; bytes?: number | null } }; toggle: ReactNode; onCancel: () => void
+}) {
+  const estimate = job.estimate?.rows == null ? 'size estimate unavailable'
+    : `estimated ${job.estimate.rows.toLocaleString()} rows`
+  const label = job.phase === 'estimating' ? 'Estimating full profile…'
+    : job.phase === 'queued' ? 'Full profile queued…'
+      : job.phase === 'cancelling' ? 'Cancelling full profile…' : 'Full profile running…'
+  return (
+    <div className="px-5 py-6 text-center">
+      <div className="mb-1 text-[12px] font-semibold text-foreground">{label}</div>
+      <p className="mb-3 text-[11px] text-muted-foreground">{estimate} · exact statistics are computed over the whole dataset</p>
+      <div className="flex items-center justify-center gap-2">
+        <button onClick={onCancel} disabled={job.phase === 'cancelling' || job.phase === 'estimating'}
+          className="rounded-md border border-border px-2.5 py-1 text-[11px] font-semibold text-foreground disabled:cursor-not-allowed disabled:opacity-50">
+          Cancel
+        </button>
+        {toggle}
+      </div>
+    </div>
+  )
+}
+
+function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }) {
   const pct = (n: number) => (res.rowCount ? Math.round((n / res.rowCount) * 100) : 0)
   return (
     <div className="max-h-[360px] overflow-auto">

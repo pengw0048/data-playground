@@ -213,8 +213,8 @@ export const api = {
 
   preview: (doc: CanvasDoc, nodeId: string, k = 50, offset = 0) =>
     req<SampleResult>('/run/preview', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, k, offset }) }),
-  profile: (doc: CanvasDoc, nodeId: string, full = false) =>
-    req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, full }) }),
+  profile: (doc: CanvasDoc, nodeId: string) =>
+    req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
 
   // per-node output columns (metadata only) → editor column suggestions; null = untyped port
   schema: (doc: CanvasDoc) =>
@@ -249,6 +249,9 @@ export const api = {
 
   run: (doc: CanvasDoc, targetNodeId?: string, confirmed = false) =>
     req<RunStatus>('/run', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed }) }),
+
+  fullProfile: (doc: CanvasDoc, nodeId: string, planIdentity: string) =>
+    req<RunStatus>('/run/profile-job', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, planIdentity }) }),
 
   runStatus: (runId: string) => req<RunStatus>(`/run/${runId}`),
   activeRuns: (canvasId: string) => req<RunStatus[]>(`/canvas/${encodeURIComponent(canvasId)}/active-runs`),

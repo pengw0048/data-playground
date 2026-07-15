@@ -107,7 +107,7 @@ def _full_stats(engine: BuildEngine, node_id: str) -> ProfileResult:
 
 def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                  node_builders=None, node_specs=None, cache=None, full: bool = False,
-                 storage=None) -> ProfileResult:
+                 storage=None, scope_callback=None) -> ProfileResult:
     if not g.is_acyclic(graph):
         return ProfileResult(error=True, reason="graph has a cycle — control flow must be encapsulated")
     if node_specs:
@@ -135,9 +135,11 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
             from hub.storage import source_read_scope
             with source_read_scope(
                     storage, g.all_upstream_source_uris(graph, node_id),
-                    owner=f"profile:{uuid.uuid4().hex}"):
+                owner=f"profile:{uuid.uuid4().hex}"):
                 with db.run_scope() as scope:
                     holder["scope"] = scope
+                    if scope_callback is not None:
+                        scope_callback(scope)
                     return _full_stats(eng, node_id)
 
         def on_timeout() -> None:

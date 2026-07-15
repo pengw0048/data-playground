@@ -29,6 +29,7 @@ from hub.models import (
     EstimateRequest,
     JoinAnalysis,
     PreviewRequest,
+    ProfileJobRequest,
     ProfileResult,
     RunEstimate,
     RunRequest,
@@ -139,19 +140,49 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
 
 @router.post("/run/profile", response_model=ProfileResult)
 def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> ProfileResult:
-    """Per-column stats (null/distinct/min/max/mean) over a node's output — the previewed sample, or the
-    WHOLE dataset (a full pass) when `full` is set."""
+    """Bounded, interactive column statistics over a preview sample.
+
+    Exact profiles scan the full relation and therefore go through ``/run/profile-job`` instead of
+    silently occupying this synchronous preview route.
+    """
     _require_graph_read_access(req.graph, uid)
+    if req.full:
+        return ProfileResult(error=True, reason="full profiles run as cancellable jobs; use /run/profile-job")
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.node_id)
     if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
         try:
-            return ProfileResult(**kb.profile(req.graph, req.node_id, full=req.full))  # on the canvas's warm kernel
+            return ProfileResult(**kb.profile(req.graph, req.node_id, full=False))  # bounded sample on the warm kernel
         except Exception as e:  # noqa: BLE001 — kernel unreachable → a clean error, not a raw 500
             return ProfileResult(error=True, reason=f"kernel unavailable: {type(e).__name__}: {e}")
     return profile_node(req.graph, req.node_id, deps.resolve_adapter, deps.registry,
-                        deps.node_builders, deps.node_specs, full=req.full, storage=deps.storage)
+                        deps.node_builders, deps.node_specs, full=False, storage=deps.storage)
+
+
+@router.post("/run/profile-job", response_model=RunStatus)
+def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -> RunStatus:
+    """Queue an exact full-dataset profile with normal run status, cancellation, and recovery semantics."""
+    auth_canvas = None
+    if auth.auth_enabled():
+        cid, role = _require_graph_read_access(req.graph, uid)
+        assert cid is not None and role is not None
+        if role not in _RUN_MUTATE_ROLES:
+            raise HTTPException(403, f"canvas '{cid}' requires owner or editor to start a full profile")
+        auth_canvas = cid
+    deps = get_deps()
+    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
+    _reject_invalid(req.graph, deps, req.node_id)
+    status = deps.profile_runner.run(req.graph, req.node_id, plan_identity=req.plan_identity)
+    deps.run_index[status.run_id] = deps.profile_runner
+    deps.run_owner[status.run_id] = uid
+    if auth.auth_enabled():
+        metadb.bind_run_owner(status.run_id, uid, auth_canvas)
+    while len(deps.run_index) > _RUN_INDEX_MAX:
+        deps.run_index.pop(next(iter(deps.run_index)))
+    while len(deps.run_owner) > _RUN_INDEX_MAX:
+        deps.run_owner.pop(next(iter(deps.run_owner)))
+    return status
 
 
 @router.post("/graph/schema")

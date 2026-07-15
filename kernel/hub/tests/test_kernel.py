@@ -165,6 +165,37 @@ def test_profile_returns_column_stats():
     assert area["min"] is not None and area["max"] is not None
 
 
+def test_full_profile_uses_cancellable_job_lifecycle():
+    g = {"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("images")}),
+        N("sel", "select", {"select": "id, width, height, width*height AS area"}),
+    ], "edges": [E("src", "sel")]}
+    # The old synchronous full-mode escape hatch explicitly refuses instead of silently scanning.
+    legacy = client.post("/api/run/profile", json={"graph": g, "nodeId": "sel", "full": True})
+    assert legacy.status_code == 200 and legacy.json()["error"] is True
+    assert "cancellable jobs" in legacy.json()["reason"]
+
+    submit = client.post("/api/run/profile-job", json={
+        "graph": g, "nodeId": "sel", "planIdentity": "revision-1",
+    })
+    assert submit.status_code == 200, submit.text
+    started = submit.json()
+    assert started["jobType"] == "profile"
+    assert started["planIdentity"] == "revision-1"
+
+    deadline = time.monotonic() + 5
+    status = started
+    while status["status"] not in ("done", "failed", "cancelled"):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+        response = client.get(f"/api/run/{started['runId']}")
+        assert response.status_code == 200, response.text
+        status = response.json()
+    assert status["status"] == "done", status
+    assert status["profile"]["sampled"] is False
+    assert status["profile"]["rowCount"] > 0
+
+
 def test_profile_over_transform_upstream_of_faithful_op_is_honest():
     # a sort over a transformed input can't be previewed on a sample → profile must refuse honestly,
     # not fabricate stats from a truncated prefix

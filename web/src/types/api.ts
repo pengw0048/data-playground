@@ -191,6 +191,7 @@ export interface PerNodeStatus {
 export interface RunStatus {
   runId: string
   status: RunState
+  jobType?: 'run' | 'profile'
   targetNodeId?: string | null
   rowsProcessed: number
   totalRows?: number | null
@@ -202,6 +203,8 @@ export interface RunStatus {
   error?: string | null
   outputUri?: string | null
   outputTable?: string | null
+  profile?: ProfileResult | null
+  planIdentity?: string | null
 }
 
 export interface PlanStep {

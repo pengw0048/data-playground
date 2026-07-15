@@ -4,6 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
   listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
+  estimate: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
   api: new Proxy({}, {
@@ -17,6 +18,14 @@ vi.mock('../api/client', () => ({
             ? apiMocks.deleteCanvas
           : property === 'preview'
             ? apiMocks.preview
+            : property === 'estimate'
+              ? apiMocks.estimate
+              : property === 'fullProfile'
+                ? apiMocks.fullProfile
+                : property === 'runStatus'
+                  ? apiMocks.runStatus
+                  : property === 'cancelRun'
+                    ? apiMocks.cancelRun
           : async () => ({}),
   }),
   KernelError: class KernelError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status } },
@@ -55,10 +64,15 @@ describe('graph store — core authority ops', () => {
     ))
     apiMocks.deleteCanvas.mockReset().mockResolvedValue({ ok: true })
     apiMocks.preview.mockReset()
+    apiMocks.estimate.mockReset().mockResolvedValue({ rows: 10, bytes: 100, placement: 'local', needsConfirm: false })
+    apiMocks.fullProfile.mockReset()
+    apiMocks.runStatus.mockReset()
+    apiMocks.cancelRun.mockReset().mockResolvedValue({})
     useStore.setState({ currentUser: { id: 'alice', name: 'Alice' } })
     useStore.setState({
       doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] },
       canvasRole: 'owner', past: [], future: [], toasts: [], agentOpen: false, accessDenied: false, kernelUp: false,
+      profileJobs: {},
     })
   })
 
@@ -108,6 +122,29 @@ describe('graph store — core authority ops', () => {
     apiMocks.preview.mockResolvedValueOnce(previewResult('view'))
     await useStore.getState().runPreview('filter')
     expect(useStore.getState().previews.filter?.result?.rows).toEqual([{ value: 'view' }])
+  })
+
+  it('cancels a full-profile response that arrives for an old graph revision', async () => {
+    let resolveJob!: (status: any) => void
+    let submitted!: () => void
+    const submittedJob = new Promise<void>((resolve) => { submitted = resolve })
+    apiMocks.fullProfile.mockImplementationOnce(() => {
+      submitted()
+      return new Promise((resolve) => { resolveJob = resolve })
+    })
+    useStore.setState({
+      doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] },
+    })
+
+    const pending = useStore.getState().startFullProfile('source')
+    await submittedJob
+    useStore.getState().updateConfig('source', { uri: 'new-events.parquet' })
+    resolveJob({ runId: 'profile-old', status: 'queued', jobType: 'profile', targetNodeId: 'source',
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [] })
+    await pending
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith('profile-old')
+    expect(useStore.getState().profileJobs.source?.status).toBeUndefined()
   })
 
   it('blocks a preview response when the graph topology changes', async () => {
