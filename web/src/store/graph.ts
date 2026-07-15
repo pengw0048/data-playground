@@ -57,6 +57,7 @@ let _cfgEdit = { id: '', t: 0 } // coalesces param-edit undo checkpoints
 let _extEditTimer: ReturnType<typeof setTimeout> | null = null // debounces external-edit refetches
 let _fileNavigationGeneration = 0 // latest file-open/new navigation wins across async requests
 let _fileListGeneration = 0       // stale same-user list responses cannot overwrite a newer refresh
+let _previewRequestGeneration = 0 // every preview captures its own generation; latest request for a node wins
 
 /** A canvas position near `base` that doesn't overlap any existing node (so added nodes never stack). */
 export function freePosition(nodes: CanvasNode[], base: { x: number; y: number }): { x: number; y: number } {
@@ -143,7 +144,56 @@ function mergeIntoCatalog(set: (fn: (s: Store) => Partial<Store>) => void, table
   })
 }
 
-interface PreviewState { loading?: boolean; result?: SampleResult; error?: string; offset?: number }
+export interface PreviewState {
+  canvasId: string
+  nodeId: string
+  planIdentity: string
+  requestGeneration: number
+  loading?: boolean
+  result?: SampleResult
+  error?: string
+  offset?: number
+}
+
+// The API receives exactly these graph-affecting fields for a preview. Positions, titles, and UI-only
+// node status deliberately do not invalidate a preview; a config, topology, requirement, or canvas
+// change does. Keeping this identity in the store makes stale data impossible to present as current.
+export function previewPlanIdentity(doc: CanvasDoc, nodeId: string): string {
+  return JSON.stringify({
+    canvasId: doc.id,
+    nodeId,
+    requirements: doc.requirements ?? [],
+    nodes: doc.nodes.map((node) => ({
+      id: node.id,
+      type: node.type,
+      parentId: node.parentId ?? null,
+      config: node.data.config,
+      bypassed: node.data.bypassed,
+      disabled: node.data.disabled,
+    })),
+    edges: doc.edges.map((edge) => ({
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      sourceHandle: edge.sourceHandle ?? null,
+      targetHandle: edge.targetHandle ?? null,
+      wire: edge.data?.wire ?? 'dataset',
+    })),
+  })
+}
+
+export function previewIsCurrent(preview: PreviewState, doc: CanvasDoc, nodeId: string): boolean {
+  return preview.canvasId === doc.id
+    && preview.nodeId === nodeId
+    && doc.nodes.some((node) => node.id === nodeId)
+    && preview.planIdentity === previewPlanIdentity(doc, nodeId)
+}
+
+// Schema hints and editor completions must follow the same reuse rule as the data panel. Otherwise
+// a preview made for an earlier graph could leak stale columns into the graph now being edited.
+export function currentPreviews(doc: CanvasDoc, previews: Record<string, PreviewState>): Record<string, PreviewState> {
+  return Object.fromEntries(Object.entries(previews).filter(([nodeId, preview]) => previewIsCurrent(preview, doc, nodeId)))
+}
 interface RunState {
   estimate?: RunEstimate
   status?: RunStatus
@@ -690,17 +740,43 @@ export const useStore = create<Store>((set, get) => ({
   runPreview: async (id: string, offset = 0) => {
     // offset lives in the preview state (single source of truth) so an external Refresh (which
     // re-fetches page 0) and the panel's page controls never disagree.
-    set((s) => ({ previews: { ...s.previews, [id]: { loading: true, offset } }, openPanels: { [id]: 'data' } }))
+    const doc = get().doc
+    const node = doc.nodes.find((candidate) => candidate.id === id)
+    if (!node) return
+    const planIdentity = previewPlanIdentity(doc, id)
+    const requestGeneration = ++_previewRequestGeneration
+    const isCurrent = () => {
+      const state = get()
+      const preview = state.previews[id]
+      return preview?.requestGeneration === requestGeneration
+        && previewIsCurrent(preview, state.doc, id)
+    }
+    set((s) => ({
+      previews: {
+        ...s.previews,
+        [id]: { canvasId: doc.id, nodeId: id, planIdentity, requestGeneration, loading: true, offset },
+      },
+      openPanels: { [id]: 'data' },
+    }))
     try {
       // A preview is a bounded peek (a page of rows), NOT a full materialized run — we deliberately
       // do NOT flip status to 'latest' (that green state means a real run). Paginated via `offset`.
       // A chart renders its whole series at once, so fetch up to the backend's grouped cap (2000)
       // instead of a 50-row page (which silently truncated bar/scatter to the first 50 points).
-      const k = get().doc.nodes.find((n) => n.id === id)?.type === 'chart' ? 2000 : 50
-      const result = await api.preview(get().doc, id, k, offset)
-      set((s) => ({ previews: { ...s.previews, [id]: { result, offset } } }))
+      const k = node.type === 'chart' ? 2000 : 50
+      const result = await api.preview(doc, id, k, offset)
+      if (!isCurrent()) return
+      set((s) => ({
+        previews: { ...s.previews, [id]: { canvasId: doc.id, nodeId: id, planIdentity, requestGeneration, result, offset } },
+      }))
     } catch (e) {
-      set((s) => ({ previews: { ...s.previews, [id]: { error: (e as Error).message, offset } } }))
+      if (!isCurrent()) return
+      set((s) => ({
+        previews: {
+          ...s.previews,
+          [id]: { canvasId: doc.id, nodeId: id, planIdentity, requestGeneration, error: (e as Error).message, offset },
+        },
+      }))
     }
   },
 

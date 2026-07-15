@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useStore } from '../store/graph'
+import { previewIsCurrent, useStore } from '../store/graph'
 import { capabilitiesFor } from '../nodes/registry'
 import { api } from '../api/client'
 import { Icon } from '../ui/Icon'
@@ -14,7 +14,8 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const preview = useStore((s) => s.previews[nodeId])
   const runPreview = useStore((s) => s.runPreview)
   const requestRun = useStore((s) => s.requestRun)
-  const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
+  const doc = useStore((s) => s.doc)
+  const node = doc.nodes.find((n) => n.id === nodeId)
   const run = useStore((s) => s.runs[nodeId])
   const pushToast = useStore((s) => s.pushToast)
   const [tab, setTab] = useState('rows')
@@ -29,7 +30,9 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   useEffect(() => setResultMode('sample'), [nodeId])
   const page = (o: number) => { setDetail(null); runPreview(nodeId, o) }
 
-  if (!preview || preview.loading) return <Skeleton />
+  if (!preview) return <Skeleton />
+  if (!previewIsCurrent(preview, doc, nodeId)) return <StalePreview onRefresh={() => runPreview(nodeId)} />
+  if (preview.loading) return <Skeleton />
   if (preview.error) return <ErrorState reason={preview.error} onRetry={() => runPreview(nodeId, offset)} />
   const res = preview.result!
   if (res.error) return <ErrorState reason={res.reason ?? 'preview failed'} onRetry={() => runPreview(nodeId, offset)} />
@@ -132,6 +135,16 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
           return Tab ? <Tab columns={columns as ColumnSchema[]} rows={res.rows} /> : null
         })()
       )}
+    </div>
+  )
+}
+
+function StalePreview({ onRefresh }: { onRefresh: () => void }) {
+  return (
+    <div role="status" className="flex flex-col items-start gap-2 px-4 py-5 text-[12px] text-muted-foreground">
+      <span className="font-medium text-foreground">Preview out of date</span>
+      <span>The graph changed after these rows were fetched. Refresh to inspect the current result.</span>
+      <Button size="sm" onClick={onRefresh}><Icon name="refresh" size={13} /> Refresh preview</Button>
     </div>
   )
 }

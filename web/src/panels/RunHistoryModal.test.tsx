@@ -5,7 +5,7 @@ import { fmtMs, DurationTrend, PerNodeBreakdown } from './RunHistoryModal'
 import type { PerNodeStat, RunRecordDto } from '../api/client'
 import { RunHistoryModal } from './RunHistoryModal'
 import { DataPanel, FullResult } from './DataPanel'
-import { useStore } from '../store/graph'
+import { previewPlanIdentity, useStore } from '../store/graph'
 
 const apiMock = vi.hoisted(() => ({
   listRuns: vi.fn(),
@@ -117,12 +117,13 @@ describe('durable full results', () => {
 
   it('offers sample/full switching for previewable nodes after a full run', async () => {
     apiMock.sample.mockResolvedValue(sample(0, 50, true))
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
     useStore.setState({
-      doc: { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
-        id: 'target', type: 'source', position: { x: 0, y: 0 },
-        data: { title: 'target', status: 'latest', config: {}, history: [] },
-      }] },
-      previews: { target: { offset: 0, result: sample(0, 50, true) } },
+      doc,
+      previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
       runs: { target: { phase: 'done', status: { runId: 'run-real', status: 'done',
         targetNodeId: 'target', rowsProcessed: 105, totalRows: 105, ms: 10, placement: 'local',
         perNode: [], outputUri: '/outputs/result.parquet' } } },
@@ -137,12 +138,13 @@ describe('durable full results', () => {
 
   it('keeps the Sample escape hatch when loading Full fails temporarily', async () => {
     apiMock.sample.mockRejectedValue(Object.assign(new Error('service unavailable'), { status: 503 }))
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
     useStore.setState({
-      doc: { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
-        id: 'target', type: 'source', position: { x: 0, y: 0 },
-        data: { title: 'target', status: 'latest', config: {}, history: [] },
-      }] },
-      previews: { target: { offset: 0, result: sample(0, 50, true) } },
+      doc,
+      previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
       runs: { target: { phase: 'done', status: { runId: 'run-real', status: 'done',
         targetNodeId: 'target', rowsProcessed: 105, totalRows: 105, ms: 10, placement: 'local',
         perNode: [], outputUri: '/outputs/result.parquet' } } },
@@ -158,4 +160,30 @@ describe('durable full results', () => {
     expect(screen.queryByText('Couldn’t load full result')).not.toBeInTheDocument()
     expect(screen.getByText('rows 1–50')).toBeInTheDocument()
   })
+
+  it('blocks stale rows and offers a refresh for the current graph', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'filter', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'stale', config: { predicate: 'event = view' }, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: {
+        target: {
+          canvasId: doc.id, nodeId: 'target', planIdentity: 'a-previous-plan', requestGeneration: 1,
+          offset: 0,
+          result: { columns: [{ name: 'event', type: 'VARCHAR', capabilities: [] }], rows: [{ event: 'purchase' }], rowCount: 1, hasMore: false, truncated: false },
+        },
+      },
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+    expect(screen.getByRole('status')).toHaveTextContent('Preview out of date')
+    expect(screen.getByRole('button', { name: 'Refresh preview' })).toBeInTheDocument()
+    expect(screen.queryByText('purchase')).not.toBeInTheDocument()
+  })
 })
+
+function boundPreview(doc: any, nodeId: string, result: any) {
+  return { canvasId: doc.id, nodeId, planIdentity: previewPlanIdentity(doc, nodeId), requestGeneration: 1, offset: 0, result }
+}

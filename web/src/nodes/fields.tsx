@@ -3,7 +3,7 @@
 // text. Everything still round-trips to the same SQL string the kernel already understands, and a
 // free-text fallback stays available for anything the builder can't express.
 import { useState } from 'react'
-import { useStore } from '../store/graph'
+import { currentPreviews, useStore } from '../store/graph'
 import { inputColumns, schemaWarnings } from './schema'
 import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
@@ -21,8 +21,8 @@ export function useInputColumns(nodeId: string): ColumnSchema[] {
   const schemas = useStore((s) => s.schemas)
   const previews = useStore((s) => s.previews)
   const catalog = useStore((s) => s.catalog)
-  const nodes = useStore.getState().doc.nodes
-  return inputColumns({ nodes, edges } as never, schemas, previews, catalog, nodeId)
+  const doc = useStore.getState().doc
+  return inputColumns({ nodes: doc.nodes, edges } as never, schemas, currentPreviews(doc, previews), catalog, nodeId)
 }
 
 /** Soft, non-blocking warnings for a node whose config references a column not in its (known) input —
@@ -35,8 +35,8 @@ export function useSchemaWarnings(nodeId: string): string[] {
   const catalog = useStore((s) => s.catalog)
   const config = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId)?.data.config)
   void config
-  const nodes = useStore.getState().doc.nodes
-  return schemaWarnings({ nodes, edges } as never, schemas, previews, catalog, nodeId)
+  const doc = useStore.getState().doc
+  return schemaWarnings({ nodes: doc.nodes, edges } as never, schemas, currentPreviews(doc, previews), catalog, nodeId)
 }
 
 let _dl = 0
