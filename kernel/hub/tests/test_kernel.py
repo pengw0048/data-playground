@@ -150,6 +150,46 @@ def test_sample():
     assert len(r["rows"]) == 5 and r["rowCount"] == 500 and r["truncated"] is True
 
 
+def test_hardlinked_local_source_is_readable_across_interactive_and_full_paths(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source = tmp_path / "hardlinked-source.parquet"
+    alias = tmp_path / "hardlinked-snapshot.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), source)
+    os.link(source, alias)
+    assert source.stat().st_nlink == alias.stat().st_nlink == 2
+
+    graph = {
+        "id": "hardlinked-local-source",
+        "version": 1,
+        "nodes": [N("src", "source", {"uri": str(alias)})],
+        "edges": [],
+    }
+    preview = client.post(
+        "/api/run/preview", json={"graph": graph, "nodeId": "src", "k": 10})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["rows"] == [{"value": 1}, {"value": 2}, {"value": 3}]
+
+    profile = client.post("/api/run/profile", json={"graph": graph, "nodeId": "src"})
+    assert profile.status_code == 200, profile.text
+    assert profile.json()["rowCount"] == 3
+
+    schema = client.post(
+        "/api/graph/schema", json={"graph": graph, "targetNodeId": "src"})
+    assert schema.status_code == 200, schema.text
+    assert [column["name"] for column in schema.json()["src"]] == ["value"]
+
+    estimate = client.post(
+        "/api/run/estimate", json={"graph": graph, "targetNodeId": "src"})
+    assert estimate.status_code == 200, estimate.text
+    assert estimate.json()["rows"] == 3
+
+    status, result = _full_result(graph, "src", 10)
+    assert status["totalRows"] == 3
+    assert result["rows"] == [{"value": 1}, {"value": 2}, {"value": 3}]
+
+
 def test_sort_requires_a_full_run_and_preserves_exact_order():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("images")}),
