@@ -996,6 +996,9 @@ class SubprocessRunner:
                 st.status = "failed"
                 st.error = "parent catalog registration failed"
                 st.output_uri = st.output_table = None
+        # The child has been reaped and all parent-side output publication is complete. Release
+        # managed inputs before any terminal callback or in-memory status can become observable.
+        self._release_source_leases(run_id)
         # Finalize before publishing the terminal status. Otherwise a caller can observe `done` and query
         # the catalog while parent-side output registration is still in flight.
         # Persist run history here (the child disables its own on_complete to avoid a daemon-thread
@@ -1113,7 +1116,6 @@ class SubprocessRunner:
             self._local_results.pop(run_id, None)
             self._object_sinks.pop(run_id, None)
             self._sink_contracts.pop(run_id, None)
-        self._release_source_leases(run_id)
 
     def status(self, run_id: str) -> RunStatus:
         return self.runs[run_id]
