@@ -151,8 +151,6 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
     silently occupying this synchronous preview route.
     """
     _require_graph_read_access(req.graph, uid)
-    if req.full:
-        return ProfileResult(error=True, reason="full profiles run as cancellable jobs; use /run/profile-job")
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.node_id)

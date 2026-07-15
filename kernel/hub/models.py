@@ -564,11 +564,12 @@ class CompileRequest(Wire):
 
 
 class PreviewRequest(Wire):
+    model_config = ConfigDict(extra="forbid")
+
     graph: Graph
     node_id: str
     k: int | None = None  # None → fall back to settings.preview_k (DP_PREVIEW_K); an explicit int wins
     offset: int = 0
-    full: bool = False    # profile only: stats over the WHOLE dataset (a full pass), not the sample
 
 
 class ProfileEstimateRequest(Wire):

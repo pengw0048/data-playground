@@ -1521,7 +1521,6 @@ def mcp_http_delete():
     return {"ok": True}  # stateless server — no session id to terminate
 
 
-@app.get("/api/health", responses=API_ERROR_RESPONSES)     # back-compat alias for /api/livez
 @app.get("/api/livez", responses=API_ERROR_RESPONSES)
 def livez() -> dict:
     from hub.observability import MetricName, emit_metric

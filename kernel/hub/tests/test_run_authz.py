@@ -95,7 +95,7 @@ def _graph_read_body(case: str, canvas_id: str) -> dict:
     if case == "preview":
         return {"graph": graph, "nodeId": "left", "k": 2}
     if case == "profile":
-        return {"graph": graph, "nodeId": "left", "full": False}
+        return {"graph": graph, "nodeId": "left"}
     if case in ("profile-estimate", "profile-identity"):
         return {"graph": graph, "nodeId": "left"}
     return {"graph": graph, "targetNodeId": "join"}

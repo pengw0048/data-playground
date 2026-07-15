@@ -252,6 +252,41 @@
         "title": "CatalogMetadata",
         "type": "object"
       },
+      "CatalogPage": {
+        "description": "One window of a filtered catalog: the page's items plus the totals a UI needs to paginate\n(total match count, whether more follow) — so the client shows '1–50 of 4,213' and loads the\nnext page on demand instead of holding every table in memory.",
+        "properties": {
+          "hasMore": {
+            "default": false,
+            "title": "Hasmore",
+            "type": "boolean"
+          },
+          "items": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/CatalogTable"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "limit": {
+            "default": 50,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "title": "CatalogPage",
+        "type": "object"
+      },
       "CatalogTable": {
         "properties": {
           "columns": {
@@ -1575,12 +1610,8 @@
         "type": "object"
       },
       "PreviewRequest": {
+        "additionalProperties": false,
         "properties": {
-          "full": {
-            "default": false,
-            "title": "Full",
-            "type": "boolean"
-          },
           "graph": {
             "$ref": "#/components/schemas/Graph"
           },
@@ -5780,7 +5811,7 @@
     },
     "/api/catalog/tables": {
       "get": {
-        "description": "A filtered, sorted, paginated page of the catalog. Backward-compatible on the wire: the body is\nstill a bare `list[CatalogTable]` (so existing callers keep working), while the TOTAL match count +\nwhether more follow ride along in `X-Total-Count` / `X-Has-More` headers for a paginating UI. This\nis what lets the Tables view browse thousands of datasets without ever loading them all.",
+        "description": "A filtered, sorted, paginated catalog page with its window and total in the response body.",
         "operationId": "list_tables_api_catalog_tables_get",
         "parameters": [
           {
@@ -5960,11 +5991,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/CatalogTable"
-                  },
-                  "title": "Response List Tables Api Catalog Tables Get",
-                  "type": "array"
+                  "$ref": "#/components/schemas/CatalogPage"
                 }
               }
             },
@@ -7657,46 +7684,6 @@
           }
         },
         "summary": "Graph Schema"
-      }
-    },
-    "/api/health": {
-      "get": {
-        "operationId": "livez_api_health_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Livez Api Health Get",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/APIErrorResponse"
-                }
-              }
-            },
-            "description": "Request validation failed."
-          },
-          "default": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/APIErrorResponse"
-                }
-              }
-            },
-            "description": "API error with a stable code and retry classification."
-          }
-        },
-        "summary": "Livez"
       }
     },
     "/api/kernel": {

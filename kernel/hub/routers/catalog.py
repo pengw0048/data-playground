@@ -32,6 +32,7 @@ from hub.models import (
     CatalogBrowse,
     CatalogFolder,
     CatalogMetadata,
+    CatalogPage,
     CatalogQuery,
     CatalogTable,
     ColumnSchema,
@@ -147,9 +148,8 @@ def get_schema(name: str) -> dict:
     return {**c, "versions": metadb.schema_contract_versions(name)}
 
 
-@router.get("/catalog/tables", response_model=list[CatalogTable])
+@router.get("/catalog/tables", response_model=CatalogPage)
 def list_tables(
-    response: Response,
     q: str | None = None,
     folder: str | None = None,
     tags: str | None = None,          # comma-separated; ALL must match
@@ -160,17 +160,10 @@ def list_tables(
     order: str = "asc",               # asc | desc
     limit: int = 50,
     offset: int = 0,
-) -> list[CatalogTable]:
-    """A filtered, sorted, paginated page of the catalog. Backward-compatible on the wire: the body is
-    still a bare `list[CatalogTable]` (so existing callers keep working), while the TOTAL match count +
-    whether more follow ride along in `X-Total-Count` / `X-Has-More` headers for a paginating UI. This
-    is what lets the Tables view browse thousands of datasets without ever loading them all."""
+) -> CatalogPage:
+    """A filtered, sorted, paginated catalog page with its window and total in the response body."""
     query = _catalog_query(q, folder, tags, owner, has_columns, sort, order, limit, offset, uris=uris)
-    page = get_deps().catalog.list_page(query)
-    response.headers["X-Total-Count"] = str(page.total)
-    response.headers["X-Has-More"] = "1" if page.has_more else "0"
-    response.headers["Access-Control-Expose-Headers"] = "X-Total-Count, X-Has-More"
-    return page.items
+    return get_deps().catalog.list_page(query)
 
 
 @router.get("/catalog/facets", response_model=Facets)

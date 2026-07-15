@@ -19,8 +19,8 @@ async function openCatalogTable(page: Page, name: string) {
 async function namedTable(request: APIRequestContext, name: string) {
   const response = await request.get(`/api/catalog/tables?q=${encodeURIComponent(name)}`)
   expect(response.ok(), `catalog query for ${name}`).toBeTruthy()
-  const tables = await response.json()
-  const table = tables.find((candidate: { name: string }) => candidate.name === name)
+  const page = await response.json()
+  const table = page.items.find((candidate: { name: string }) => candidate.name === name)
   expect(table, `fixture table ${name}`).toBeTruthy()
   return table as { id: string; name: string; uri: string }
 }

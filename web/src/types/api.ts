@@ -82,7 +82,13 @@ export interface CatalogQueryParams {
   offset?: number
 }
 
-export interface CatalogPage { items: CatalogTable[]; total: number; hasMore: boolean }
+export interface CatalogPage {
+  items: CatalogTable[]
+  total: number
+  offset: number
+  limit: number
+  hasMore: boolean
+}
 export interface FacetValue { value: string; count: number }
 export interface Facets { folders: FacetValue[]; tags: FacetValue[]; owners: FacetValue[]; semanticAvailable?: boolean }
 export interface FolderNode { name: string; path: string; tableCount: number }

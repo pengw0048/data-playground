@@ -92,23 +92,6 @@ function catalogSearchQuery(p: CatalogQueryParams, mode: 'lexical' | 'semantic' 
   return `${query || '?'}${query ? '&' : ''}mode=${encodeURIComponent(mode)}`
 }
 
-// One page of the catalog: the item list (bare JSON body, backward-compatible) plus the TOTAL match
-// count + hasMore, which ride in X-Total-Count / X-Has-More headers so paging never loads everything.
-async function catalogPage(params: CatalogQueryParams): Promise<CatalogPage> {
-  const headers: Record<string, string> = {}
-  if (_userId) headers['X-DP-User'] = _userId
-  const res = await fetch(`${BASE}/catalog/tables${catalogQuery(params)}`, { headers })
-  if (!res.ok) {
-    let detail = res.statusText
-    try { detail = (await res.json()).detail ?? detail } catch { /* noop */ }
-    throw new KernelError(res.status, typeof detail === 'string' ? detail : JSON.stringify(detail))
-  }
-  const items = (await res.json()) as CatalogTable[]
-  const total = Number(res.headers.get('X-Total-Count') ?? items.length)
-  const hasMore = res.headers.get('X-Has-More') === '1'
-  return { items, total: Number.isFinite(total) ? total : items.length, hasMore }
-}
-
 export interface BackendPort { id: string; label?: string; wire: string; accepts?: string[] }
 export interface BackendParam { name: string; type: string; default?: unknown; options?: string[]; label?: string; lang?: string; required?: boolean; showWhen?: { param: string; in: string[] } }
 export interface BackendNodeSpec {
@@ -153,7 +136,6 @@ export interface AgentStatus {
 
 export const api = {
   kernel: () => req<KernelInfo>('/kernel'),
-  health: () => req<{ ok: boolean }>('/health'),
   nodes: () => req<BackendNodeSpec[]>('/nodes'),
   registerFile: (uri: string, name?: string) =>
     req<CatalogTable>('/catalog/register', { method: 'POST', body: JSON.stringify({ uri, name }) }),
@@ -164,11 +146,9 @@ export const api = {
   uploadFile: (file: File) =>
     req<CatalogTable>('/catalog/upload', { method: 'POST', body: file, headers: { 'X-Upload-Filename': encodeURIComponent(file.name) } }),
 
-  // a bare (bounded) list — kept for callers that just want "some tables"; browsing uses tablesPage
-  tables: (q?: string) => req<CatalogTable[]>(`/catalog/tables${q ? `?q=${encodeURIComponent(q)}` : ''}`),
-  // one filtered/sorted page + the total match count + whether more follow (from response headers), so
-  // a UI can browse thousands of tables without ever loading them all
-  tablesPage: (params: CatalogQueryParams = {}) => catalogPage(params),
+  // One filtered/sorted page with its bounded window and total in the response body.
+  tablesPage: (params: CatalogQueryParams = {}) =>
+    req<CatalogPage>(`/catalog/tables${catalogQuery(params)}`),
   facets: (params: CatalogQueryParams = {}) =>
     req<Facets>(`/catalog/facets${catalogQuery(params)}`),
   catalogTree: (prefix = '', options?: { signal?: AbortSignal }) =>
