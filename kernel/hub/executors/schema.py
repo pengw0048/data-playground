@@ -86,3 +86,53 @@ def schema_for_graph(graph: Graph, resolve_adapter, registry,
                 except Exception:  # noqa: BLE001 — unwired / bad config → treat as unknown
                     out[n.id] = None
     return out
+
+
+def schema_for_graph_ports(graph: Graph, resolve_adapter, registry,
+                           node_builders=None, node_specs=None, storage=None) -> dict[str, dict[str, list | None]]:
+    """Per-*port* metadata schemas for the public graph-inspection endpoint.
+
+    ``schema_for_graph`` remains node-keyed because placement and join analysis operate on
+    single-output relations.  Inspection is different: collapsing named outputs would silently
+    attribute one port's columns to another.  Each declared port therefore gets an explicit
+    entry, including ``None`` when metadata cannot honestly establish its schema.
+    """
+    if not g.is_acyclic(graph):
+        return {}
+    untyped = _UNTYPED | set(node_builders or {})
+
+    def blocks(c) -> bool:
+        return (c.type in untyped and declared_schema(c) is None) or _disabled(c)
+
+    engine = BuildEngine(graph, resolve_adapter, registry, sample_k=None, full=True,
+                         node_builders=node_builders, node_specs=node_specs, schema_only=True)
+    out: dict[str, dict[str, list | None]] = {}
+    from hub.storage import source_read_scope
+    with source_read_scope(
+            storage, g.execution_source_uris(graph, None),
+            owner=f"schema:{uuid.uuid4().hex}"):
+        with db.run_scope():
+            for n in graph.nodes:
+                try:
+                    ports = (g.effective_output_ports_for_node(n, node_specs[n.type])
+                             if node_specs else [g.EffectiveOutputPort("out", None, "dataset")])
+                except (KeyError, ValueError):
+                    out[n.id] = {}
+                    continue
+                values: dict[str, list | None] = {}
+                chain = g.upstream_chain(graph, n.id)
+                for port in ports:
+                    if n.type in untyped and declared_schema(n) is not None and not _disabled(n) and not _bypassed(n):
+                        # A node-wide declaration describes exactly one effective output.  Do not
+                        # project it onto sibling named ports.
+                        values[port.id] = [_norm_col(c) for c in declared_schema(n)] if len(ports) == 1 else None
+                    elif any(blocks(c) for c in chain):
+                        values[port.id] = None
+                    else:
+                        try:
+                            rel = engine.relation(n.id, port.id)
+                            values[port.id] = [c.model_dump(by_alias=True) for c in relation_columns(rel)]
+                        except Exception:  # noqa: BLE001 — unwired / bad config is unknown, never guessed
+                            values[port.id] = None
+                out[n.id] = values
+    return out

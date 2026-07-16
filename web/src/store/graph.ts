@@ -263,14 +263,13 @@ export function previewIsCurrent(preview: PreviewState, doc: CanvasDoc, nodeId: 
     && preview.planIdentity === previewPlanIdentity(doc, nodeId, portId)
 }
 
-// Schema hints and editor completions must follow the same reuse rule as the data panel. Otherwise
-// a preview made for an earlier graph could leak stale columns into the graph now being edited.
+// Schema hints and editor completions must follow the same reuse rule as the data panel. The
+// consumer of this map additionally matches its source handle, so a current preview for one named
+// output cannot supply columns for a sibling port.
 export function currentPreviews(doc: CanvasDoc, previews: Record<string, PreviewState>): Record<string, PreviewState> {
   return Object.fromEntries(Object.entries(previews).filter(([nodeId, preview]) => {
     const node = doc.nodes.find((candidate) => candidate.id === nodeId)
-    // Until schemas become port-addressed, a selected multi-output preview is valid for Data only.
-    // Do not let its columns masquerade as one node-wide schema for every source handle.
-    return !!node && nodeOutputs(node).length <= 1 && previewIsCurrent(preview, doc, nodeId)
+    return !!node && previewIsCurrent(preview, doc, nodeId)
   }))
 }
 interface RunState {
@@ -635,7 +634,7 @@ interface Store {
   catalog: CatalogTable[]
   processors: ProcessorDescriptor[]
   specsVersion: number
-  schemas: SchemaMap               // per-node output columns (typed ports); null entry = untyped
+  schemas: SchemaMap               // per-node, per-output-port columns; null port entry = untyped
   sizes: Record<string, { rows: number | null; confidence: string }>  // per-node size estimate (card hint)
 
   selectedId: string | null        // primary selection (drives panels)

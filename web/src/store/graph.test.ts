@@ -233,7 +233,9 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().previews.section).toMatchObject({
       portId: 'out', result: previewResult('refreshed out'),
     })
-    expect(currentPreviews(doc, useStore.getState().previews)).toEqual({})
+    expect(currentPreviews(doc, useStore.getState().previews).section).toMatchObject({
+      portId: 'out', result: previewResult('refreshed out'),
+    })
   })
 
   it('sends multi-output full runs to the backend capability boundary from every entry point', async () => {

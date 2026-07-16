@@ -40,7 +40,7 @@ describe('Inspector — effective named outputs', () => {
           data: { title: type, status: 'draft', history: [], config: outputs ? { outputs } : {} },
         }],
       },
-      runs: {}, schemas: { node: null },
+      runs: {}, schemas: { node: { out: null } },
     } as any)
   }
 

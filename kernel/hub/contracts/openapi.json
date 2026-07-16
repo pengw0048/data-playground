@@ -8500,7 +8500,7 @@
     },
     "/api/graph/schema": {
       "post": {
-        "description": "Per-node output columns (metadata-only) for editor column suggestions — see executors/schema.",
+        "description": "Per-node, per-output-port metadata columns for editor inspection and suggestions.",
         "operationId": "graph_schema_api_graph_schema_post",
         "parameters": [
           {

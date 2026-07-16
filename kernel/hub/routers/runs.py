@@ -26,7 +26,7 @@ from hub.backends import BackendStatusUnavailable, backend_supports_named_multi_
 from hub.deps import get_deps
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
-from hub.executors.schema import schema_for_graph
+from hub.executors.schema import schema_for_graph, schema_for_graph_ports
 from hub.run_outputs import (
     UnsupportedRunOutputs, expected_run_outputs, preflight_run_output_target,
     require_single_run_output,
@@ -662,14 +662,14 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
 
 @router.post("/graph/schema")
 def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
-    """Per-node output columns (metadata-only) for editor column suggestions — see executors/schema."""
+    """Per-node, per-output-port metadata columns for editor inspection and suggestions."""
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.target_node_id)
     try:
-        return schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
-                                deps.node_builders, deps.node_specs, storage=deps.storage)
+        return schema_for_graph_ports(req.graph, deps.resolve_adapter, deps.registry,
+                                      deps.node_builders, deps.node_specs, storage=deps.storage)
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))
 

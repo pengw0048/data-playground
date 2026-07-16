@@ -4,16 +4,19 @@
 import type { CanvasDoc, CanvasNode, ColumnSchema } from '../types/graph'
 import type { CatalogTable, SampleResult } from '../types/api'
 
-export type SchemaMap = Record<string, ColumnSchema[] | null>
-export type PreviewMap = Record<string, { result?: SampleResult; loading?: boolean; error?: string }>
+/** Metadata schemas by node and named output port. ``null`` means that port is untyped. */
+export type SchemaMap = Record<string, Record<string, ColumnSchema[] | null>>
+export type PreviewMap = Record<string, { portId?: string; result?: SampleResult; loading?: boolean; error?: string }>
 
 /** OUTPUT columns of a node: server schema (typed) → last observed preview → source catalog. */
 export function nodeColumns(
-  doc: CanvasDoc, schemas: SchemaMap, previews: PreviewMap, catalog: CatalogTable[], id: string,
+  doc: CanvasDoc, schemas: SchemaMap, previews: PreviewMap, catalog: CatalogTable[], id: string, portId?: string | null,
 ): ColumnSchema[] {
-  const s = schemas[id]
+  const nodeSchemas = schemas[id]
+  const s = nodeSchemas?.[portId ?? 'out']
   if (s && s.length) return s
-  const pv = previews[id]?.result?.columns
+  const preview = previews[id]
+  const pv = (preview?.portId ?? 'out') === (portId ?? 'out') ? preview?.result?.columns : undefined
   if (pv && pv.length) return pv as ColumnSchema[]
   const n = doc.nodes.find((x) => x.id === id)
   if (n?.type === 'source' && n.data.config.uri) {
@@ -27,11 +30,11 @@ export function nodeColumns(
 export function inputColumns(
   doc: CanvasDoc, schemas: SchemaMap, previews: PreviewMap, catalog: CatalogTable[], id: string,
 ): ColumnSchema[] {
-  const sources = doc.edges.filter((e) => e.target === id).map((e) => e.source)
+  const sources = doc.edges.filter((e) => e.target === id)
   const out: ColumnSchema[] = []
   const seen = new Set<string>()
-  for (const src of sources) {
-    for (const c of nodeColumns(doc, schemas, previews, catalog, src)) {
+  for (const edge of sources) {
+    for (const c of nodeColumns(doc, schemas, previews, catalog, edge.source, edge.sourceHandle)) {
       if (!seen.has(c.name)) { seen.add(c.name); out.push(c) }
     }
   }
@@ -135,12 +138,13 @@ function referencedColumns(node: CanvasNode): string[] {
 function knownInputColumnSet(
   doc: CanvasDoc, schemas: SchemaMap, previews: PreviewMap, catalog: CatalogTable[], id: string,
 ): Set<string> | null {
-  const srcs = doc.edges.filter((e) => e.target === id).map((e) => e.source)
+  const srcs = doc.edges.filter((e) => e.target === id)
   if (!srcs.length) return null
   const set = new Set<string>()
-  for (const src of srcs) {
-    if (schemas[src] === null) return null                 // untyped code op upstream → unknown
-    const cols = nodeColumns(doc, schemas, previews, catalog, src)
+  for (const edge of srcs) {
+    const schema = schemas[edge.source]?.[edge.sourceHandle ?? 'out']
+    if (schema === null) return null                       // untyped upstream port → unknown
+    const cols = nodeColumns(doc, schemas, previews, catalog, edge.source, edge.sourceHandle)
     if (!cols.length) return null                          // unresolved / typed-but-empty → treat as unknown
     for (const c of cols) set.add(c.name.toLowerCase())
   }

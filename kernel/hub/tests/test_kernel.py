@@ -203,7 +203,7 @@ def test_hardlinked_local_source_is_readable_across_interactive_and_full_paths(t
     schema = client.post(
         "/api/graph/schema", json={"graph": graph, "targetNodeId": "src"})
     assert schema.status_code == 200, schema.text
-    assert [column["name"] for column in schema.json()["src"]] == ["value"]
+    assert [column["name"] for column in schema.json()["src"]["out"]] == ["value"]
 
     estimate = client.post(
         "/api/run/estimate", json={"graph": graph, "targetNodeId": "src"})
@@ -9007,6 +9007,12 @@ def test_assert_named_ports_are_independently_previewable_and_profiled():
     assert violation_profile.status_code == pass_profile.status_code == 200
     assert violation_profile.json()["rowCount"] == 5
     assert pass_profile.json()["rowCount"] > violation_profile.json()["rowCount"]
+
+    schema = client.post("/api/graph/schema", json={"graph": graph})
+    assert schema.status_code == 200, schema.text
+    assert set(schema.json()["a"]) == {"out", "pass"}
+    assert [column["name"] for column in schema.json()["a"]["out"]] == ["id", "user_id", "event", "amount"]
+    assert schema.json()["a"]["pass"] == schema.json()["a"]["out"]
 
 
 def test_assert_node_is_a_transparent_gate_before_a_write(tmp_path):
