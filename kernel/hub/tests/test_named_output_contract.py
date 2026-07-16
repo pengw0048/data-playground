@@ -79,8 +79,10 @@ def test_named_multi_output_backend_capability_is_explicit_and_fails_closed(tmp_
         lambda _uri: None, {}, object(), str(tmp_path), node_specs=SPECS)
     assert backend_supports_named_multi_output_runs(local)
 
-    local.forced_result_uri = str(tmp_path / "forced.parquet")
-    assert not backend_supports_named_multi_output_runs(local)
+    local.forced_results = [{
+        "nodeId": "branches", "portId": "left", "uri": str(tmp_path / "forced.parquet"),
+    }]
+    assert backend_supports_named_multi_output_runs(local)
     assert not backend_supports_named_multi_output_runs(SimpleNamespace(name="legacy"))
 
     class BrokenProbe:

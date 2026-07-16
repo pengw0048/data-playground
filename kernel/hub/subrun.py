@@ -234,14 +234,6 @@ def main() -> int:
     job = json.load(open(sys.argv[1]))
     status_file = job["statusFile"]
     cancel_file = job.get("cancelFile")
-    result_lock_fd = job.get("resultLockFd")
-    if result_lock_fd is not None:
-        if fcntl is None:
-            raise RuntimeError("inherited local-result locks are unavailable on this platform")
-        result_lock_fd = int(result_lock_fd)
-        if not stat.S_ISREG(os.fstat(result_lock_fd).st_mode):
-            raise RuntimeError("inherited local-result lock is not a regular file")
-        fcntl.flock(result_lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     try:
         # The worker needs catalog tables for normal Deps composition, not the hub's users/settings/run
         # state. Build a private disposable DB before importing settings instead of forwarding the hub
@@ -262,37 +254,51 @@ def main() -> int:
         deps.runner.result_get = None
         deps.runner.result_acquire = None
         deps.runner.result_put = None
-        deps.runner.forced_result_uri = job.get("forcedResultUri")
+        forced_results = job.get("forcedResults")
+        if forced_results is None:
+            deps.runner.forced_results = None
+        elif not isinstance(forced_results, list):
+            raise RuntimeError("isolated forced result contract is missing or malformed")
+        else:
+            deps.runner.forced_results = forced_results
         identity = job.get("resultNamespaceIdentity")
-        if identity is not None:
-            if (not isinstance(identity, list) or len(identity) != 2
-                    or not all(isinstance(part, int) for part in identity)):
-                raise RuntimeError("local result namespace identity is malformed")
-            deps.runner.forced_result_namespace_identity = tuple(identity)
-        managed_local = getattr(deps.storage, "is_managed_result_uri", None)
-        forced_local = bool(
-            deps.runner.forced_result_uri and callable(managed_local)
-            and managed_local(deps.runner.forced_result_uri))
-        if forced_local and identity is None:
-            raise RuntimeError("local result namespace identity is missing")
-        if forced_local and job.get("resultNamespaceId") != deps.storage.namespace_id:
+        if forced_results is None:
+            identity = None
+        elif (not forced_results or not isinstance(identity, list) or len(identity) != 2
+              or not all(isinstance(part, int) for part in identity)):
+            raise RuntimeError("local result namespace identity is malformed")
+        elif job.get("resultNamespaceId") != deps.storage.namespace_id:
             raise RuntimeError("local result filesystem namespace is invalid")
-        if forced_local and getattr(deps.storage, "lock_supported", False) \
-                and result_lock_fd is None:
-            raise RuntimeError("local result writer lock was not inherited")
-        if result_lock_fd is not None and not forced_local:
-            raise RuntimeError("local result writer lock has no matching result contract")
-        if result_lock_fd is not None:
-            _artifact_name, lock_name = deps.storage._result_names(
-                deps.runner.forced_result_uri)
+        else:
+            deps.runner.forced_result_namespace_identity = tuple(identity)
+        seen_forced: set[tuple[str, str]] = set()
+        for result in forced_results or []:
+            if not isinstance(result, dict):
+                raise RuntimeError("isolated forced result contract is malformed")
+            node_id, port_id, uri = result.get("nodeId"), result.get("portId"), result.get("uri")
+            if (not isinstance(node_id, str) or not isinstance(port_id, str)
+                    or not isinstance(uri, str) or not deps.storage.is_managed_result_uri(uri)
+                    or (node_id, port_id) in seen_forced):
+                raise RuntimeError("isolated forced result contract is malformed")
+            seen_forced.add((node_id, port_id))
+            fd = result.get("lockFd")
+            if getattr(deps.storage, "lock_supported", False) and fd is None:
+                raise RuntimeError("local result writer lock was not inherited")
+            if fd is None:
+                continue
+            if fcntl is None:
+                raise RuntimeError("inherited local-result locks are unavailable on this platform")
+            fd = int(fd)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise RuntimeError("inherited local-result lock is not a regular file")
+            _artifact_name, lock_name = deps.storage._result_names(uri)
             expected_lock = os.stat(
                 lock_name, dir_fd=deps.storage._result_lock_dir_fd, follow_symlinks=False)
-            actual_lock = os.fstat(result_lock_fd)
-            if ((actual_lock.st_dev, actual_lock.st_ino)
-                    != (expected_lock.st_dev, expected_lock.st_ino)
-                    or deps.storage._read_lock_token(result_lock_fd)
-                    != job.get("resultLockToken")):
+            actual_lock = os.fstat(fd)
+            if ((actual_lock.st_dev, actual_lock.st_ino) != (expected_lock.st_dev, expected_lock.st_ino)
+                    or deps.storage._read_lock_token(fd) != result.get("lockToken")):
                 raise RuntimeError("inherited local-result lock does not match its exact URI")
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         # Every write target was resolved by the real parent control plane. For managed object sinks the
         # child also receives one exact physical attempt and is write-only: allocation, inventory commit,
         # and catalog publication remain in the parent's durable metadata database.
