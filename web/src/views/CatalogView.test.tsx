@@ -6,6 +6,7 @@ import type { CatalogTable } from '../types/api'
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), facets: vi.fn(), catalogTree: vi.fn(), searchCatalog: vi.fn(),
   registerFile: vi.fn(), registerDataset: vi.fn(), lineage: vi.fn(), sample: vi.fn(), table: vi.fn(),
+  datasetRevisions: vi.fn(), datasetRevision: vi.fn(),
   setTableMetadata: vi.fn(), saveTableEdit: vi.fn(), unregisterTable: vi.fn(), unregisterTables: vi.fn(),
   catalogFolders: vi.fn(), createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
 }))
@@ -62,6 +63,7 @@ describe('CatalogView request and mutation truth', () => {
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [], tables: [] })
     mocks.searchCatalog.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ rootUri: TABLE.uri, nodes: [], edges: [] })
+    mocks.datasetRevisions.mockRejectedValue(Object.assign(new Error('history absent'), { status: 501 }))
     mocks.sample.mockResolvedValue({
       columns: TABLE.columns, rows: [{ order_id: 1 }], rowCount: 2,
       hasMore: true, truncated: true, completeness: 'page',
@@ -254,6 +256,7 @@ describe('CatalogView selection, register modal, and rename', () => {
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [], tables: [] })
     mocks.searchCatalog.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ rootUri: TABLE.uri, nodes: [], edges: [] })
+    mocks.datasetRevisions.mockRejectedValue(Object.assign(new Error('history absent'), { status: 501 }))
     mocks.saveTableEdit.mockResolvedValue(TABLE)
     mocks.unregisterTables.mockResolvedValue({ deleted: ['t1', 't2'], missing: [] })
     mocks.registerDataset.mockResolvedValue(TABLE)
@@ -390,6 +393,7 @@ describe('CatalogView folder child request identity', () => {
     mocks.tablesPage.mockResolvedValue({ items: [], total: 0, hasMore: false })
     mocks.facets.mockResolvedValue({ folders: [], tags: [], owners: [] })
     mocks.searchCatalog.mockResolvedValue([])
+    mocks.datasetRevisions.mockRejectedValue(Object.assign(new Error('history absent'), { status: 501 }))
     mocks.catalogFolders.mockResolvedValue([])
     mocks.createFolder.mockResolvedValue({ path: 'created' })
     mocks.renameFolder.mockResolvedValue({ ok: true })
