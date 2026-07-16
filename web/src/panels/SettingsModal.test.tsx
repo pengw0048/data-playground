@@ -10,6 +10,20 @@ const PACK = {
   config_values: { url: 'existing' },   // non-secret current value (secret never sent)
   config_set: ['url'],
 }
+const SCHEMA_PACK = {
+  name: 'dp_schema', source: 'drop-in', version: '0.1.0',
+  config: [
+    { key: 'enabled', type: 'bool', label: 'Enabled', default: true },
+    { key: 'count', type: 'int', label: 'Count', default: 1 },
+    { key: 'ratio', type: 'float', label: 'Ratio', default: 0.5 },
+    { key: 'label', type: 'string', label: 'Label', default: 'default label' },
+    { key: 'mode', type: 'select', label: 'Mode', default: 'fast', options: ['fast', 'balanced'] },
+  ],
+}
+const SEMANTIC_CATALOG_PACK = {
+  name: 'dp-semantic-catalog', source: 'drop-in', version: '0.1.0',
+  config: [{ key: 'enabled', type: 'bool', label: 'Enable semantic search', default: true }],
+}
 const getSettings = vi.fn()
 const plugins = vi.fn()
 const putSettingsBatch = vi.fn()
@@ -81,6 +95,98 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.change(tok, { target: { value: '' } })
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
     expect(putSettingsBatch).not.toHaveBeenCalled()
+  })
+
+  it('shows a declared default without an override and saves typed plugin values', async () => {
+    getSettings.mockResolvedValue({
+      global: {
+        'plugin.dp_schema.count': 1,
+        'plugin.dp_schema.ratio': 0.5,
+        'plugin.dp_schema.label': 'old label',
+        'plugin.dp_schema.mode': 'fast',
+      }, user: {}, revision: { global: 2, user: 4 },
+    })
+    plugins.mockResolvedValue([SCHEMA_PACK])
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
+
+    // No stored `enabled` value still displays the manifest's true default and does not dirty the form.
+    expect(screen.getByLabelText('Enabled')).toHaveTextContent('true')
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+
+    fireEvent.click(screen.getByLabelText('Enabled'))
+    fireEvent.click(await screen.findByRole('option', { name: 'false' }))
+    fireEvent.change(screen.getByLabelText('Count'), { target: { value: '42' } })
+    fireEvent.change(screen.getByLabelText('Ratio'), { target: { value: '1.25' } })
+    fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'new label' } })
+    fireEvent.click(screen.getByLabelText('Mode'))
+    fireEvent.click(await screen.findByRole('option', { name: 'balanced' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
+      { global: 2, user: 4 },
+      [
+        { scope: 'global', key: 'plugin.dp_schema.enabled', value: false },
+        { scope: 'global', key: 'plugin.dp_schema.count', value: 42 },
+        { scope: 'global', key: 'plugin.dp_schema.ratio', value: 1.25 },
+        { scope: 'global', key: 'plugin.dp_schema.label', value: 'new label' },
+        { scope: 'global', key: 'plugin.dp_schema.mode', value: 'balanced' },
+      ],
+    ))
+  })
+
+  it('keeps the bundled semantic-catalog enabled default effective without creating an override', async () => {
+    getSettings.mockResolvedValue({ global: {}, user: {}, revision: { global: 2, user: 4 } })
+    plugins.mockResolvedValue([SEMANTIC_CATALOG_PACK])
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
+
+    expect(screen.getByLabelText('Enable semantic search')).toHaveTextContent('true')
+    expect(screen.getByText('Using environment/default.')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+  })
+
+  it('uses null only to remove a non-secret plugin override and falls back to the declared default', async () => {
+    getSettings.mockResolvedValue({
+      global: { 'plugin.dp_schema.enabled': false }, user: {}, revision: { global: 2, user: 4 },
+    })
+    plugins.mockResolvedValue([SCHEMA_PACK])
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Use environment/default' }))
+    expect(screen.queryByRole('button', { name: 'Use environment/default' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
+      { global: 2, user: 4 },
+      [{ scope: 'global', key: 'plugin.dp_schema.enabled', value: null }],
+    ))
+  })
+
+  it('does not save an incomplete numeric plugin override', async () => {
+    plugins.mockResolvedValue([SCHEMA_PACK])
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
+    fireEvent.change(screen.getByLabelText('Count'), { target: { value: '' } })
+
+    expect(await screen.findByText('Enter a finite integer.')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+  })
+
+  it('keeps a typed plugin edit visible when the revisioned save conflicts', async () => {
+    getSettings.mockResolvedValue({
+      global: { 'plugin.dp_schema.count': 1 }, user: {}, revision: { global: 2, user: 4 },
+    })
+    plugins.mockResolvedValue([SCHEMA_PACK])
+    putSettingsBatch.mockRejectedValueOnce(new Error('HTTP 409: settings changed'))
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
+    fireEvent.change(screen.getByLabelText('Count'), { target: { value: '42' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('HTTP 409: settings changed')
+    expect(screen.getByLabelText('Count')).toHaveValue(42)
   })
 
   it('opens clean and sends only fields the user changed', async () => {
