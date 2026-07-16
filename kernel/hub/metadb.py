@@ -8015,7 +8015,8 @@ def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
 
 
 def catalog_publish_managed_local_file(
-        logical_uri: str, artifact_uri: str, name: str, doc: dict) -> dict:
+        logical_uri: str, artifact_uri: str, name: str, doc: dict, *,
+        parents: list[str] | None = None, lineage: dict | None = None) -> dict:
     """Atomically publish one already-validated local artifact as a new immutable revision.
 
     The catalog retains only the current physical projection; the revision ledger owns every physical
@@ -8030,13 +8031,38 @@ def catalog_publish_managed_local_file(
     payload = CatalogTable.model_validate(doc).model_dump(by_alias=True)
     if payload.get("uri") != artifact_uri or payload.get("name") != str(name):
         raise ValueError("managed local publication table does not match its artifact")
+    parent_tokens = catalog_lineage_parent_tokens(parents)
+    canonical_lineage = _catalog_lineage_canonical(lineage, len(parent_tokens))
     with session() as s:
+        # Take the lineage reservation before the managed output projection. This matches the
+        # composite-publication ordering used by the other catalog writers and keeps both effects
+        # in this transaction: a lineage failure must roll back the new head and revision receipt.
+        _catalog_sqlite_write_fence(s)
+        lineage_publication_key = None
+        lineage_applied = False
+        parent_snapshots: list[_CatalogLineageParentSnapshot] = []
+        destination_version = _catalog_lineage_version(
+            payload.get("version"), field="destination version")
+        if canonical_lineage is not None:
+            lineage_publication_key, lineage_applied = _catalog_reserve_lineage_publication(
+                s,
+                destination_uri=artifact_uri,
+                destination_version=destination_version,
+                parent_tokens=parent_tokens,
+                lineage=canonical_lineage,
+            )
+            parent_snapshots = [
+                _catalog_lineage_parent_snapshot(s, token)
+                for token in parent_tokens
+            ]
         logical_id, catalog_key = _catalog_managed_namespace_identity(logical_uri, f"tbl_{name}")
         _lock_catalog_namespace_tokens(s, [logical_uri, logical_id, catalog_key])
         receipt = _managed_local_file_publication_receipt_in_session(
             s, logical_uri, artifact_uri, str(name))
         if receipt is not None:
             return receipt
+        if canonical_lineage is not None and not lineage_applied:
+            raise RuntimeError("managed local publication lineage reservation has no receipt")
         _assert_managed_catalog_namespace_available(
             s, logical_uri=logical_uri, logical_id=logical_id, catalog_key=catalog_key)
         reserved_id, _epoch, publish_seq = _reserve_catalog_publication(
@@ -8086,6 +8112,36 @@ def catalog_publish_managed_local_file(
         _materialize_folder(s, folder)
         # The revision ledger, rather than the replaceable head projection, retains every artifact.
         sync_local_result_owner(s, "managed_file_revision", revision_id, artifact_uri)
+        if canonical_lineage is not None:
+            destination_snapshot = _catalog_lineage_parent_snapshot(s, artifact_uri)
+            target_snapshots = [destination_snapshot, *parent_snapshots]
+            targets = _lock_catalog_mutation_targets(
+                s, [artifact_uri, *parent_tokens],
+                exact_current_attempts={artifact_uri})
+            destination = targets[0]
+            if (target_snapshots[0].logical_id is None
+                    and target_snapshots[0].entry_uri is None):
+                raise RuntimeError("lineage destination is not the exact current catalog output")
+            if (not destination["known"]
+                    or destination["current_uri"] != artifact_uri):
+                raise RuntimeError("lineage destination is not the exact current catalog output")
+            observed_version = _catalog_entry_version(destination["entry"])
+            if observed_version != destination_version:
+                raise RuntimeError("lineage destination version is not exact")
+            locked_logicals = {
+                target["logical"].logical_id: target["logical"]
+                for target in targets if target.get("logical") is not None
+            }
+            locked_entries = {
+                target["entry"].uri: target["entry"]
+                for target in targets if target.get("entry") is not None
+            }
+            _catalog_validate_lineage_parent_logicals(target_snapshots, locked_logicals)
+            _catalog_validate_lineage_parent_entries(target_snapshots, locked_entries)
+            _catalog_apply_lineage_in_session(
+                s, destination["catalog_key"], artifact_uri, observed_version,
+                target_snapshots[1:], locked_logicals, locked_entries,
+                canonical_lineage, lineage_publication_key)
         return {
             "dataset_id": logical.logical_id,
             "revision_id": revision_id,

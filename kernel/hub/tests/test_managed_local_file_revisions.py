@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import select
 
 from hub import metadb
+from hub.models import LineagePublication
 from hub.plugins.adapters import DuckDBAdapter, ManagedLocalFileRevisionAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.routers import catalog as catalog_routes
@@ -65,6 +66,17 @@ def _publish(storage, catalog, logical_uri: str, value: int) -> tuple[str, dict]
     return artifact, published
 
 
+def _lineage(key: str) -> LineagePublication:
+    return LineagePublication(idempotency_key=key, provenance="manual")
+
+
+def _register_source(catalog, tmp_path) -> str:
+    source_uri = str(tmp_path / "source.parquet")
+    pq.write_table(pa.table({"source": [1]}), source_uri)
+    catalog._add(name="source", uri=source_uri, strict_probe=True)
+    return source_uri
+
+
 def test_local_managed_revision_history_and_exact_open_survive_head_replacement(
         local_catalog, tmp_path, monkeypatch):
     storage, catalog = local_catalog
@@ -114,21 +126,31 @@ def test_failed_local_publication_never_advances_the_catalog_head(
     storage, catalog = local_catalog
     logical_uri = str(tmp_path / "published" / "managed.parquet")
     first_uri, first = _publish(storage, catalog, logical_uri, 1)
+    source_uri = _register_source(catalog, tmp_path)
     run_id = f"managed-local-failure-{uuid.uuid4().hex}"
     unpublished = storage.begin_result("failed-publication", run_id)
     pq.write_table(pa.table({"value": [2]}), unpublished)
     storage.commit_result(unpublished, run_id)
-    def fail_publication(*_args, **_kwargs):
-        raise RuntimeError("publish failed")
+    def fail_lineage(*_args, **_kwargs):
+        raise RuntimeError("lineage failed")
 
-    monkeypatch.setattr(metadb, "catalog_publish_managed_local_file", fail_publication)
-    with pytest.raises(RuntimeError, match="publish failed"):
-        try:
-            catalog.publish_managed_local_file_output(
-                name="managed_local", logical_uri=logical_uri, artifact_uri=unpublished)
-        except Exception:
-            storage.abort_result(unpublished, run_id)
-            raise
+    monkeypatch.setattr(metadb, "_catalog_apply_lineage_in_session", fail_lineage)
+    with pytest.raises(RuntimeError, match="lineage failed"):
+        catalog.publish_managed_local_file_output(
+            name="managed_local", logical_uri=logical_uri, artifact_uri=unpublished,
+            parents=[source_uri], lineage=_lineage("managed-local-lineage-failure"))
+
+    with metadb.session() as session:
+        logical = session.scalar(select(metadb.CatalogLogicalDataset).where(
+            metadb.CatalogLogicalDataset.logical_uri == logical_uri))
+        assert logical is not None and logical.current_uri == first_uri
+        assert session.scalar(select(metadb.ManagedLocalFileRevision).where(
+            metadb.ManagedLocalFileRevision.artifact_uri == unpublished)) is None
+        assert session.scalar(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.uri == unpublished)) is None
+        assert session.scalar(select(metadb.CatalogLineageFact)) is None
+    storage.abort_result(unpublished, run_id)
+    assert not pathlib.Path(unpublished).exists()
 
     adapter = ManagedLocalFileRevisionAdapter()
     resolved = adapter.resolve_revision(first_uri)
@@ -141,6 +163,8 @@ def test_committed_publication_response_loss_recovers_exact_receipt(
         local_catalog, tmp_path, monkeypatch):
     storage, catalog = local_catalog
     logical_uri = str(tmp_path / "published" / "managed.parquet")
+    source_uri = _register_source(catalog, tmp_path)
+    lineage = _lineage("managed-local-response-loss")
     run_id = f"managed-local-response-loss-{uuid.uuid4().hex}"
     artifact = storage.begin_result("response-loss", run_id)
     pq.write_table(pa.table({"value": [7]}), artifact)
@@ -154,8 +178,17 @@ def test_committed_publication_response_loss_recovers_exact_receipt(
 
     monkeypatch.setattr(metadb, "catalog_publish_managed_local_file", commit_then_lose_response)
     published = catalog.publish_managed_local_file_output(
-        name="managed_local", logical_uri=logical_uri, artifact_uri=artifact)
+        name="managed_local", logical_uri=logical_uri, artifact_uri=artifact,
+        parents=[source_uri], lineage=lineage)
+    monkeypatch.setattr(metadb, "catalog_publish_managed_local_file", publish)
+    replayed = catalog.publish_managed_local_file_output(
+        name="managed_local", logical_uri=logical_uri, artifact_uri=artifact,
+        parents=[source_uri], lineage=lineage)
     assert storage.release_result(artifact, run_id) is True
     assert published["table"].uri == artifact
+    assert replayed["revision_id"] == published["revision_id"]
     assert ManagedLocalFileRevisionAdapter().open_revision(
         artifact, published["revision_id"]).fetchall() == [(7,)]
+    with metadb.session() as session:
+        assert session.scalar(select(metadb.CatalogLineageFact)) is not None
+        assert len(list(session.scalars(select(metadb.CatalogLineageFact)))) == 1
