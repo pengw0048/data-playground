@@ -308,8 +308,13 @@ def catalog_search(
 
 
 @router.get("/catalog/tables/{table_id}", response_model=CatalogTable)
-def get_table(table_id: str) -> CatalogTable:
+def get_table(table_id: str, registration: bool = False) -> CatalogTable:
     try:
+        if registration:
+            binding = metadb.catalog_revision_binding(table_id)
+            if binding is None:
+                raise KeyError(table_id)
+            return get_deps().catalog.get_table(binding["uri"])
         return get_deps().catalog.get_table(table_id)
     except KeyError:
         raise HTTPException(404, f"table '{table_id}' not found")

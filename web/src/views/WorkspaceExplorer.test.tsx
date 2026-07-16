@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), table: vi.fn(),
+  workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), tableByRegistration: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   workspaceResourceId: null as string | null,
@@ -29,7 +29,7 @@ describe('WorkspaceExplorer', () => {
     store.workspaceResourceId = null
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'complete' })
     mocks.workspaceResource.mockResolvedValue({ resource: DATASET, ancestors: [ROOT, FOLDER] })
-    mocks.table.mockResolvedValue({ id: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
+    mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
   })
   afterEach(() => cleanup())
 
@@ -72,7 +72,7 @@ describe('WorkspaceExplorer', () => {
   it('does not misreport a transient detail failure as a detached dataset', async () => {
     store.workspaceResourceId = DATASET.id
     mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
-    mocks.table.mockRejectedValueOnce(Object.assign(new Error('service unavailable'), { status: 503 }))
+    mocks.tableByRegistration.mockRejectedValueOnce(Object.assign(new Error('service unavailable'), { status: 503 }))
     render(<WorkspaceExplorer />)
 
     expect(await screen.findByRole('alert')).toHaveTextContent('service unavailable')
@@ -84,7 +84,7 @@ describe('WorkspaceExplorer', () => {
   it('shows a dataset detached when it disappears between resolve and detail fetch', async () => {
     store.workspaceResourceId = DATASET.id
     mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
-    mocks.table.mockRejectedValueOnce(Object.assign(new Error('not found'), { status: 404 }))
+    mocks.tableByRegistration.mockRejectedValueOnce(Object.assign(new Error('not found'), { status: 404 }))
     render(<WorkspaceExplorer />)
 
     expect(await screen.findByRole('dialog', { name: 'observations' })).toHaveTextContent('detached')

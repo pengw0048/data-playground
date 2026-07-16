@@ -459,6 +459,7 @@ def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> d
     version = doc.get("version", 1)
     with metadb.session() as s:
         c = s.get(metadb.Canvas, canvas_id, with_for_update=True)
+        previous_name = c.name if c is not None else None
         if c and role not in ("owner", "editor"):
             raise HTTPException(403, "you don't have edit access to this canvas")
         if not c:
@@ -471,6 +472,10 @@ def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> d
         metadb.sync_local_result_owner(s, "canvas", canvas_id, doc)
         metadb._workspace_ensure_root_placement_in_session(
             s, target_kind="canvas", target_id=canvas_id, name=c.name)
+        if previous_name is not None:
+            metadb._workspace_follow_target_name_in_session(
+                s, target_kind="canvas", target_id=canvas_id,
+                previous_name=previous_name, name=c.name)
     # keep a throttled snapshot history so a bad edit is recoverable (autosave fires ~every 400ms; the
     # snapshotter dedups + rate-limits so it doesn't store every keystroke)
     metadb.snapshot_canvas(canvas_id, doc_json, version, author_id=uid)

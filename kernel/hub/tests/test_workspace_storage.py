@@ -205,6 +205,11 @@ def test_workspace_api_mixes_keyset_pages_resolves_ancestors_and_never_writes_ca
         dataset_placement["id"], expected_version=dataset_placement["version"],
         container_id=folder["id"], name=f"workspace-{token}-dataset", ordinal=0)
 
+    with TestClient(app) as client:
+        detail = client.get(f"/api/catalog/tables/{dataset_id}", params={"registration": True})
+        assert detail.status_code == 200
+        assert detail.json()["name"] == "Original dataset"
+
     statements: list[str] = []
 
     def record(_connection, _cursor, statement, _parameters, _context, _executemany):
@@ -292,12 +297,53 @@ def test_normal_local_lifecycles_materialize_root_workspace_resources():
                 (f"canvas:{canvas_id}", "Lifecycle canvas"),
                 (f"dataset:{dataset_id}", "Lifecycle dataset"),
             }
+            renamed = client.put(f"/api/canvas/{canvas_id}", json={
+                "id": canvas_id, "name": "Renamed lifecycle canvas", "version": 2,
+                "nodes": [], "edges": [],
+            })
+            assert renamed.status_code == 200
+            metadb.catalog_set_metadata(
+                uri, "", None, None, [], name="Renamed lifecycle dataset")
+            renamed_page = client.get(
+                f"/api/workspace/containers/{metadb.LOCAL_WORKSPACE_ROOT_ID}",
+                params={"limit": 100})
+            assert renamed_page.status_code == 200
+            assert {(item["id"], item["name"]) for item in renamed_page.json()["items"]} >= {
+                (f"canvas:{canvas_id}", "Renamed lifecycle canvas"),
+                (f"dataset:{dataset_id}", "Renamed lifecycle dataset"),
+            }
     finally:
         metadb.delete_canvas_cascade(canvas_id)
         metadb.catalog_delete_entry(uri)
         with metadb.session() as session:
             session.execute(delete(metadb.WorkspacePlacement).where(
                 metadb.WorkspacePlacement.target_id.in_([canvas_id, dataset_id])))
+
+
+def test_bulk_seed_materializes_workspace_placements():
+    token = uuid.uuid4().hex
+    uri = f"file:///workspace-bulk-seed-{token}.parquet"
+    dataset_id = ""
+    try:
+        assert metadb.catalog_bulk_seed([{
+            "uri": uri, "name": "Bulk seed dataset",
+            "doc": {"id": f"tbl_{token}", "name": "Bulk seed dataset", "uri": uri,
+                    "version": "v1", "columns": []},
+        }]) == 1
+        dataset_id = metadb.workspace_builtin_dataset_identity(uri)
+        with metadb.session() as session:
+            placement = session.scalar(select(metadb.WorkspacePlacement).where(
+                metadb.WorkspacePlacement.target_kind == "dataset",
+                metadb.WorkspacePlacement.target_id == dataset_id,
+            ))
+            assert placement is not None
+            assert placement.container_id == metadb.LOCAL_WORKSPACE_ROOT_ID
+            assert placement.name == "Bulk seed dataset"
+    finally:
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspacePlacement).where(
+                metadb.WorkspacePlacement.target_id == dataset_id))
+            session.execute(delete(metadb.CatalogEntry).where(metadb.CatalogEntry.uri == uri))
 
 
 def test_migration_backfills_existing_local_resources_without_moving_placements():

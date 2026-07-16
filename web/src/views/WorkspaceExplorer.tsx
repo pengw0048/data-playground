@@ -84,7 +84,7 @@ export function WorkspaceExplorer() {
         await load(identity(container))
         if (cancelled || resolved.resource.kind !== 'dataset') return
         if (resolved.resource.detached) { setSelectedDetached(resolved.resource); return }
-        try { setSelectedTable(await api.table(identity(resolved.resource))) }
+        try { setSelectedTable(await api.tableByRegistration(identity(resolved.resource))) }
         catch (caught) {
           if (cancelled) return
           const status = typeof caught === 'object' && caught !== null

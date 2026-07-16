@@ -209,6 +209,8 @@ export const api = {
   searchCatalog: (params: CatalogQueryParams, mode: 'lexical' | 'semantic' | 'hybrid' = 'hybrid') =>
     req<CatalogTable[]>(`/catalog/search${catalogSearchQuery(params, mode)}`),
   table: (id: string) => req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}`),
+  tableByRegistration: (id: string) =>
+    req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}?registration=true`),
   setTableMetadata: (id: string, meta: CatalogMetadata) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),
   saveTableEdit: (id: string, edit: CatalogEdit) =>
