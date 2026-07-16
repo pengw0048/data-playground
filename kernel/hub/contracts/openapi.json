@@ -3041,6 +3041,7 @@
         "type": "object"
       },
       "SettingBody": {
+        "additionalProperties": false,
         "properties": {
           "key": {
             "title": "Key",
@@ -3048,6 +3049,10 @@
           },
           "scope": {
             "default": "global",
+            "enum": [
+              "global",
+              "user"
+            ],
             "title": "Scope",
             "type": "string"
           },
@@ -3059,6 +3064,122 @@
           "key"
         ],
         "title": "SettingBody",
+        "type": "object"
+      },
+      "SettingsBatchBody": {
+        "additionalProperties": false,
+        "properties": {
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/SettingBody"
+            },
+            "maxItems": 128,
+            "title": "Changes",
+            "type": "array"
+          },
+          "expectedRevision": {
+            "$ref": "#/components/schemas/SettingsRevision"
+          }
+        },
+        "required": [
+          "expectedRevision",
+          "changes"
+        ],
+        "title": "SettingsBatchBody",
+        "type": "object"
+      },
+      "SettingsBatchConflict": {
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/APIErrorCode",
+            "description": "Stable machine-readable error code."
+          },
+          "detail": {
+            "description": "Human-readable detail; clients must not parse this value.",
+            "title": "Detail"
+          },
+          "retryable": {
+            "description": "Whether the server knows that retrying the same request is safe under this operation's semantics.",
+            "title": "Retryable",
+            "type": "boolean"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/SettingsRevision"
+          }
+        },
+        "required": [
+          "detail",
+          "code",
+          "retryable",
+          "revision"
+        ],
+        "title": "SettingsBatchConflict",
+        "type": "object"
+      },
+      "SettingsBatchResult": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/SettingsRevision"
+          }
+        },
+        "required": [
+          "revision"
+        ],
+        "title": "SettingsBatchResult",
+        "type": "object"
+      },
+      "SettingsRevision": {
+        "additionalProperties": false,
+        "properties": {
+          "global": {
+            "exclusiveMaximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Global",
+            "type": "integer"
+          },
+          "user": {
+            "exclusiveMaximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "User",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "global",
+          "user"
+        ],
+        "title": "SettingsRevision",
+        "type": "object"
+      },
+      "SettingsSnapshot": {
+        "additionalProperties": false,
+        "properties": {
+          "global": {
+            "additionalProperties": true,
+            "title": "Global",
+            "type": "object"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/SettingsRevision"
+          },
+          "user": {
+            "additionalProperties": true,
+            "title": "User",
+            "type": "object"
+          }
+        },
+        "required": [
+          "global",
+          "user",
+          "revision"
+        ],
+        "title": "SettingsSnapshot",
         "type": "object"
       },
       "UnregisterManyRequest": {
@@ -10275,9 +10396,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Get Settings Api Settings Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/SettingsSnapshot"
                 }
               }
             },
@@ -10387,6 +10506,98 @@
           }
         },
         "summary": "Put Setting"
+      }
+    },
+    "/api/settings/batch": {
+      "put": {
+        "operationId": "put_settings_batch_api_settings_batch_put",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingsBatchBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsBatchResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsBatchConflict"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Put Settings Batch"
       }
     },
     "/api/users": {

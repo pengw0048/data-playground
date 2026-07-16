@@ -133,6 +133,7 @@ jobs:
           hub/tests/test_backend_sink_cleanup.py
           hub/tests/test_backend_source_pins.py
           hub/tests/test_catalog_folders.py
+          hub/tests/test_settings_batches.py
           hub/tests/test_run_identity.py
           hub/tests/test_object_lifecycle.py
       - name: Verify durable Ray Jobs lifecycle on PostgreSQL

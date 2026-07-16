@@ -588,12 +588,42 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("name", "version"),
     )
     op.create_table(
+        "setting_revisions",
+        sa.Column("scope", sa.String(), nullable=False),
+        sa.Column("scope_id", sa.String(), nullable=False),
+        sa.Column("revision", sa.BigInteger(), server_default="0", nullable=False),
+        sa.CheckConstraint(
+            "scope IN ('global', 'user')", name="ck_setting_revision_scope"
+        ),
+        sa.CheckConstraint(
+            "(scope = 'global' AND scope_id = '') OR "
+            "(scope = 'user' AND scope_id <> '')",
+            name="ck_setting_revision_identity",
+        ),
+        sa.PrimaryKeyConstraint("scope", "scope_id"),
+    )
+    op.bulk_insert(
+        sa.table(
+            "setting_revisions",
+            sa.column("scope", sa.String()),
+            sa.column("scope_id", sa.String()),
+            sa.column("revision", sa.BigInteger()),
+        ),
+        [{"scope": "global", "scope_id": "", "revision": 0}],
+    )
+    op.create_table(
         "settings",
         sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
         sa.Column("scope", sa.String(), nullable=False),
         sa.Column("scope_id", sa.String(), nullable=False),
         sa.Column("key", sa.String(), nullable=False),
         sa.Column("value", sa.Text(), nullable=False),
+        sa.CheckConstraint("scope IN ('global', 'user')", name="ck_setting_scope"),
+        sa.CheckConstraint(
+            "(scope = 'global' AND scope_id = '') OR "
+            "(scope = 'user' AND scope_id <> '')",
+            name="ck_setting_identity",
+        ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("scope", "scope_id", "key", name="uq_setting"),
     )
@@ -841,6 +871,7 @@ def downgrade() -> None:
     op.drop_table("canvases")
     op.drop_table("users")
     op.drop_table("settings")
+    op.drop_table("setting_revisions")
     op.drop_table("schema_contracts")
     op.drop_table("run_terminal_fences")
     op.drop_index(op.f("ix_run_states_status"), table_name="run_states")
