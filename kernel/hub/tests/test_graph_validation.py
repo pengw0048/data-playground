@@ -9,7 +9,7 @@ from hub import graph as graph_mod
 from hub.executors.engine import BuildEngine, NotPreviewable
 from hub.main import app
 from hub.models import Graph, GraphEdge, GraphNode
-from hub.nodespecs import BUILTIN_NODE_SPECS
+from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec, ParamSpec, PortSpec
 
 SPECS = {spec.kind: spec for spec in BUILTIN_NODE_SPECS}
 client = TestClient(app)
@@ -51,6 +51,39 @@ def test_default_handles_are_normalized_before_single_input_fan_in_check():
     )
     errors = graph_mod.structural_errors(graph, SPECS)
     assert errors == ["input 'in' on node 'f' has multiple incoming edges ('ea' and 'eb')"]
+
+
+@pytest.mark.parametrize(("config", "message"), [
+    ({"count": "12abc"}, "complete safe integer"),
+    ({"count": True}, "complete safe integer"),
+    ({"count": 2**53}, "complete safe integer"),
+    ({"count": 1, "ratio": "1.2"}, "finite number"),
+    ({"count": 1, "ratio": float("nan")}, "finite number"),
+    ({"count": 1, "ratio": float("inf")}, "finite number"),
+    ({"count": 1, "ratio": 10**400}, "finite number"),
+])
+def test_numeric_plugin_parameters_require_declared_json_number_types(config: dict, message: str):
+    spec = NodeSpec(
+        kind="numeric-plugin", title="numeric plugin", category="compute",
+        outputs=[PortSpec(id="out")],
+        params=[ParamSpec(name="count", type="int", required=True),
+                ParamSpec(name="ratio", type="float", default=0.5)],
+    )
+    graph = _graph([_node("numeric", spec.kind, config)], [])
+    assert any(message in error for error in graph_mod.parameter_errors(graph, {spec.kind: spec}))
+
+
+@pytest.mark.parametrize("config", [
+    {"count": 0}, {"count": -7, "ratio": 1}, {"count": 42, "ratio": -1.25e2},
+])
+def test_numeric_plugin_parameters_accept_zero_signs_and_finite_exponents(config: dict):
+    spec = NodeSpec(
+        kind="numeric-plugin", title="numeric plugin", category="compute",
+        outputs=[PortSpec(id="out")],
+        params=[ParamSpec(name="count", type="int", required=True),
+                ParamSpec(name="ratio", type="float", default=0.5)],
+    )
+    assert graph_mod.parameter_errors(_graph([_node("numeric", spec.kind, config)], []), {spec.kind: spec}) == []
 
 
 def test_multi_inputs_and_dynamic_section_outputs_preserve_valid_contracts():
