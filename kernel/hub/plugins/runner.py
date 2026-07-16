@@ -455,7 +455,12 @@ class LocalRunner:
         _ = attempt_id
         status = RunStatus(run_id=run_id, status="queued", placement=placement, per_node=per_node,
                            target_node_id=output_target, request_id=request_id)
-        initialize_run_outputs(status, graph, output_target, self.node_specs)
+        from hub.sampling import explicit_sample_provenance
+        initialize_run_outputs(
+            status, graph, output_target, self.node_specs,
+            explicit_sample_provenance(graph, output_target, self.resolve_adapter, returned_rows=0)
+            if output_target is not None else None,
+        )
         with self._lock:
             self.runs[run_id] = status
             self._published_statuses[run_id] = RunStatus.model_validate(status.model_dump())

@@ -11,7 +11,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import type { ColumnSchema, PortSpec } from '../types/graph'
-import type { ProfileResult, RunOutput, RunState, SampleResult } from '../types/api'
+import type { ProfileResult, RunOutput, RunState, SampleProvenance, SampleResult } from '../types/api'
 
 const PAGE = 50
 const CHART_DISPLAY_LIMIT = 2_000
@@ -187,7 +187,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
             {activeTab === 'rows' && res.rows.length > 0 && (
               <ExportCluster columns={columns as ColumnSchema[]} rows={res.rows}
                 name={String(node?.data.title || node?.id || 'data')} offset={offset}
-                scope="preview" pushToast={pushToast} />
+                scope="preview" sampleProvenance={res.sampleProvenance} pushToast={pushToast} />
             )}
           </>
         )}
@@ -627,7 +627,8 @@ function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }
   const pct = (n: number) => (res.rowCount ? Math.round((n / res.rowCount) * 100) : 0)
   const wholeDataset = res.completeness === 'complete'
   const previewSample = res.completeness === 'sample'
-  const scopeLabel = wholeDataset ? 'Whole dataset' : previewSample ? 'Preview sample' : 'Profile scope unknown'
+  const completeSample = wholeDataset && !!res.sampleProvenance
+  const scopeLabel = completeSample ? 'Complete sampled result' : wholeDataset ? 'Whole dataset' : previewSample ? 'Preview sample' : 'Profile scope unknown'
   const rowVerb = wholeDataset ? 'scanned' : previewSample ? 'inspected' : 'reported'
   return (
     <div className="max-h-[360px] overflow-auto">
@@ -638,12 +639,15 @@ function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }
             {' · '}{res.rowCount.toLocaleString()} rows {rowVerb}
           </div>
           <div>
-            {wholeDataset
+            {completeSample
+              ? 'All rows of this sampled result were scanned; approximate distinct counts are marked ≈.'
+              : wholeDataset
               ? 'All rows were scanned; approximate distinct counts are marked ≈.'
               : previewSample
                 ? 'All metrics describe this preview sample only; approximate counts are marked ≈.'
                 : 'The kernel did not report whether these statistics cover a sample or the whole dataset.'}
           </div>
+          {res.sampleProvenance && <SampleProvenanceSummary provenance={res.sampleProvenance} />}
         </div>
         {toggle}
       </div>
@@ -671,6 +675,19 @@ function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }
           ))}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+export function SampleProvenanceSummary({ provenance }: { provenance: SampleProvenance }) {
+  const counts = `requested ${provenance.requestedRows.toLocaleString()} · scanned ${provenance.scannedRows?.toLocaleString() ?? 'unknown'} · returned ${provenance.returnedRows.toLocaleString()} · total ${provenance.totalRows?.toLocaleString() ?? 'unknown'}`
+  return (
+    <div className="max-w-[290px] text-right text-[9.5px] leading-snug text-muted-foreground">
+      <div>{provenance.strategy === 'reservoir' ? 'Deterministic reservoir sample' : 'Bounded preview prefix'}{provenance.seed != null ? ` · seed ${provenance.seed}` : ''}</div>
+      <div>{counts}</div>
+      <div className="break-all">input {provenance.datasetIdentity ?? 'unknown'}</div>
+      {provenance.datasetRevision && <div title={provenance.datasetRevision}>revision {provenance.datasetRevision}</div>}
+      {provenance.limitations.map((limitation) => <div key={limitation}>{limitation}</div>)}
     </div>
   )
 }
@@ -720,9 +737,10 @@ function _download(name: string, text: string, mime: string): void {
   URL.revokeObjectURL(url)
 }
 
-function ExportCluster({ columns, rows, name, offset, scope, pushToast }: {
+function ExportCluster({ columns, rows, name, offset, scope, sampleProvenance, pushToast }: {
   columns: ColumnSchema[]; rows: Record<string, unknown>[]; name: string; offset: number
   scope: 'preview' | 'full-result' | 'published-dataset'
+  sampleProvenance?: SampleProvenance | null
   pushToast: (m: string, k?: 'error' | 'info' | 'success') => void
 }) {
   const start = rows.length ? offset + 1 : 0
@@ -744,6 +762,9 @@ function ExportCluster({ columns, rows, name, offset, scope, pushToast }: {
       _download(`${fileBase}.csv`, rowsToCsv(columns, rows), 'text/csv')
     } else {
       _download(`${fileBase}.json`, JSON.stringify(rows, null, 2), 'application/json')
+    }
+    if (scope === 'preview' && sampleProvenance) {
+      _download(`${fileBase}.provenance.json`, JSON.stringify({ sampleProvenance }, null, 2), 'application/json')
     }
     pushToast(`Exported ${scopeLabel} (${range}) as ${format}.${scope === 'preview' ? ' This is not the full result.' : ''}`, 'success')
   }

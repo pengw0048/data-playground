@@ -1592,6 +1592,41 @@ def test_sample_node_preview_is_deterministic_and_provenance_bearing(tmp_path):
     assert bypassed_result["rowLimit"] == 2_000
 
 
+def test_profiles_keep_sample_provenance_without_marking_full_sources_sampled(tmp_path):
+    import duckdb
+    from hub.deps import get_deps
+    from hub.executors.profile import profile_node
+    from hub.models import Graph
+
+    path = str(tmp_path / "profile-sample.parquet")
+    duckdb.connect().execute(
+        f"COPY (SELECT i AS id FROM range(0,5000) t(i)) TO '{path}' (FORMAT PARQUET)")
+    deps = get_deps()
+    sampled_graph = Graph(**{"id": "profile-sample", "version": 1, "nodes": [
+        N("source", "source", {"uri": path}),
+        N("sample", "sample", {"n": 120, "seed": 9}),
+    ], "edges": [E("source", "sample")]})
+
+    sampled = profile_node(sampled_graph, "sample", deps.resolve_adapter, deps.registry,
+                           deps.node_builders, deps.node_specs)
+    assert sampled.sampled and sampled.sample_provenance is not None
+    assert sampled.sample_provenance.strategy == "reservoir"
+    assert sampled.sample_provenance.seed == 9
+    assert sampled.sample_provenance.total_rows == 5000
+
+    full_sampled = profile_node(sampled_graph, "sample", deps.resolve_adapter, deps.registry,
+                                deps.node_builders, deps.node_specs, full=True)
+    assert not full_sampled.sampled and full_sampled.sample_provenance is not None
+    assert full_sampled.sample_provenance.strategy == "reservoir"
+
+    source_graph = Graph(**{"id": "profile-source", "version": 1, "nodes": [
+        N("source", "source", {"uri": path}),
+    ], "edges": []})
+    full_source = profile_node(source_graph, "source", deps.resolve_adapter, deps.registry,
+                               deps.node_builders, deps.node_specs, full=True)
+    assert not full_source.sampled and full_source.sample_provenance is None
+
+
 def test_sample_seed_and_size_survive_canvas_save_reload():
     canvas_id = "sample-provenance-save-reload"
     graph = {"id": canvas_id, "name": "sample provenance", "version": 1, "nodes": [

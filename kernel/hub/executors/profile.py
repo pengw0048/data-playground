@@ -20,8 +20,11 @@ import pyarrow.compute as pc
 
 from hub import db, graph as g
 from hub.executors.engine import BuildEngine, NotPreviewable, _dedupe_names
-from hub.executors.preview import _CODE_CELL_KINDS, PREVIEW_BUDGET_S, PREVIEW_SCAN
+from hub.executors.preview import (
+    _CODE_CELL_KINDS, PREVIEW_BUDGET_S, PREVIEW_SCAN, _reservoir_preview_allowed,
+)
 from hub.models import ColumnProfile, Graph, ProfileResult
+from hub.sampling import explicit_sample_provenance, provenance_for_graph
 from hub.storage import ManagedSourceReadError
 from hub.plugins.adapters import display_type
 from hub.sandbox import run_with_timeout
@@ -157,7 +160,10 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                     holder["scope"] = scope
                     if scope_callback is not None:
                         scope_callback(scope)
-                    return _full_stats(eng, node_id, selected_port)
+                    result = _full_stats(eng, node_id, selected_port)
+                    provenance = explicit_sample_provenance(
+                        graph, node_id, resolve_adapter, returned_rows=result.row_count)
+                    return result.model_copy(update={"sample_provenance": provenance})
 
         def on_timeout() -> None:
             sc = holder.get("scope")
@@ -178,9 +184,10 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
         except Exception as e:  # noqa: BLE001
             return ProfileResult(error=True, reason=f"{type(e).__name__}: {e}")
 
+    reservoir_preview = _reservoir_preview_allowed(graph, node_id, resolve_adapter)
     engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
                          node_builders=node_builders, node_specs=node_specs,
-                         warm=cache, warm_scope="preview")
+                         warm=cache, warm_scope="preview", reservoir_preview=reservoir_preview)
     holder: dict = {}
 
     def work() -> ProfileResult:
@@ -198,8 +205,18 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                 cols = [ColumnProfile(name=f.name, type=display_type(str(f.type)),
                                       **_stat(tbl.column(f.name), n, f.type))
                         for f in tbl.schema]
+                provenance = (explicit_sample_provenance(
+                    graph, node_id, resolve_adapter, returned_rows=n)
+                    if reservoir_preview else provenance_for_graph(
+                        graph, node_id, resolve_adapter, strategy="prefix", seed=None,
+                        requested_rows=PROFILE_ROWS, scanned_rows=None, returned_rows=n,
+                        total_rows=None,
+                        limitations=[
+                            f"Each source was bounded to at most {PREVIEW_SCAN} rows; this profile describes that prefix only.",
+                        ],
+                    ))
                 return ProfileResult(columns=cols, row_count=n, sampled=True,
-                                     completeness="sample")
+                                     completeness="sample", sample_provenance=provenance)
 
     def on_timeout() -> None:
         sc = holder.get("scope")

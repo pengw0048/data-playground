@@ -650,6 +650,9 @@ class ProfileResult(Wire):
         default="unknown",
         description="complete=whole dataset, sample=bounded rows, unknown=no statistics are available.",
     )
+    # Present only when the profile was measured from a bounded preview or an explicit Sample node.
+    # A complete profile over an unsampled graph must not acquire sample evidence by implication.
+    sample_provenance: SampleProvenance | None = None
     not_previewable: bool = False
     error: bool = False
     reason: str | None = None
@@ -666,6 +669,8 @@ class ProfileResult(Wire):
                 raise ValueError("an unavailable profile cannot carry statistics")
             if not self.reason or not self.reason.strip():
                 raise ValueError("an unavailable profile requires a non-empty reason")
+            if self.sample_provenance is not None:
+                raise ValueError("an unavailable profile cannot carry sample provenance")
             return self
         if self.completeness == "unknown":
             raise ValueError("a successful profile must declare complete or sample completeness")
@@ -777,6 +782,8 @@ class RunOutput(Wire):
     )
     rows: int | None = Field(default=None, ge=0)
     error: str | None = Field(default=None, max_length=4096)
+    # Evidence travels with the durable output snapshot so result history survives restart.
+    sample_provenance: SampleProvenance | None = None
 
     @model_validator(mode="after")
     def _publication_shape(self) -> "RunOutput":
@@ -894,6 +901,9 @@ class RunHistoryRecord(Wire):
     ms: int | None = Field(default=None, ge=0)
     error: str | None = None
     outputs: list[RunOutput] = Field(default_factory=list, max_length=64)
+    # Full-profile jobs have no materialized outputs. Keep their measured profile as a separate,
+    # bounded history payload instead of abusing result-output fields.
+    profile: ProfileResult | None = None
     per_node: list[PerNodeStatus] | None = None
     created_at: str | None = None
 
@@ -915,7 +925,13 @@ class RunHistoryRecord(Wire):
         if self.job_type == "profile":
             if self.outputs or self.rows is not None:
                 raise ValueError("profile history stores result rows only in the profile status")
+            if self.status == "done" and self.profile is None:
+                raise ValueError("successful profile history requires a profile result")
+            if self.status != "done" and self.profile is not None:
+                raise ValueError("unsuccessful profile history cannot carry a profile result")
         else:
+            if self.profile is not None:
+                raise ValueError("run history cannot carry a profile result")
             if self.outputs and self.target_node_id is None:
                 raise ValueError("run-history outputs require a targetNodeId")
             if self.target_node_id is not None and any(

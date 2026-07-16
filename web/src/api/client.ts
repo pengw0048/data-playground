@@ -368,7 +368,7 @@ export interface DestinationPreset { id: string; name: string; backend: string; 
 export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export type PerNodeStat = PerNodeStatus
-export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputs: RunOutput[]; perNode?: PerNodeStat[] | null; createdAt?: string | null }
+export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputs: RunOutput[]; profile?: ProfileResult | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
 export interface SchemaFieldCompatibilityDto { kind: 'unchanged' | 'renamed' | 'added' | 'removed' | 'changed'; status: 'compatible' | 'breaking' | 'unknown'; reason: string; fieldId?: string | null; oldName?: string | null; newName?: string | null }
 export interface SchemaCompatibilityDto { status: 'compatible' | 'breaking' | 'unknown'; fields: SchemaFieldCompatibilityDto[] }

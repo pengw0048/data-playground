@@ -6,6 +6,7 @@ import hashlib
 import json
 
 from hub import graph as graph_ops
+from hub.ir import resolve_config
 from hub.models import Graph, SampleProvenance
 from hub.plan_key import plan_hash
 
@@ -73,4 +74,53 @@ def provenance_for_dataset(
         returned_rows=returned_rows, total_rows=total_rows, dataset_identity=uri,
         dataset_revision=revision, identity=hashlib.sha256(canonical.encode()).hexdigest(),
         limitations=limitations,
+    )
+
+
+def explicit_sample_provenance(
+        graph: Graph, target_node_id: str, resolve_adapter, *, returned_rows: int,
+) -> SampleProvenance | None:
+    """Return evidence for the effective explicit Sample node in a full execution cone.
+
+    This is deliberately separate from bounded preview provenance: callers use it only after a full
+    profile or run actually evaluated the graph. Bypassed/disabled sample nodes do not make a result
+    sampled. Exact input totals are reported only for a direct source -> Sample shape, where adapter
+    metadata proves the count without another scan.
+    """
+    chain = graph_ops.upstream_chain(graph, target_node_id)
+    samples = [node for node in chain if node.type == "sample"
+               and not (isinstance(node.data, dict)
+                        and (node.data.get("bypassed") or node.data.get("disabled")))]
+    if not samples:
+        return None
+    sample = samples[-1]
+    config = resolve_config(sample)
+    raw_n = config.get("n")
+    requested_rows = max(0, int(raw_n if raw_n is not None else 1000))
+    seed = int(config.get("seed", 42))
+    total_rows: int | None = None
+    # The Sample node's direct predecessor is the only topology whose metadata count is its exact
+    # sampling population. A filter/join may change that population, so unknown is more honest.
+    parents = graph_ops.parents(graph, sample.id)
+    if len(parents) == 1:
+        parent = next((node for node in graph.nodes if node.id == parents[0]), None)
+        if parent is not None and parent.type == "source":
+            parent_config = parent.data.get("config", {}) if isinstance(parent.data, dict) else {}
+            uri = parent_config.get("uri") if isinstance(parent_config, dict) else None
+            try:
+                count = getattr(resolve_adapter(uri), "metadata_count", None) if uri else None
+                value = count(uri) if callable(count) else None
+                total_rows = int(value) if value is not None else None
+            except Exception:  # provenance is evidence, never a reason to fail a completed result
+                pass
+    return provenance_for_graph(
+        graph, target_node_id, resolve_adapter, strategy="reservoir", seed=seed,
+        requested_rows=requested_rows, scanned_rows=total_rows, returned_rows=returned_rows,
+        total_rows=total_rows,
+        limitations=[
+            ("A reservoir sample scanned the complete input."
+             if total_rows is not None else
+             "A reservoir sample scanned its complete input; total population size is unknown."),
+            "Membership is deterministic for this input revision and seed.",
+        ],
     )

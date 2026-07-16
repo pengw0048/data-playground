@@ -468,7 +468,12 @@ class SubprocessRunner:
             placement: Placement, run_id: str | None = None,
             request_id: str | None = None, attempt_id: str | None = None) -> RunStatus:
         output_target = preflight_run_output_target(plan, target_node_id)
-        expected_outputs = (expected_run_outputs(graph, output_target, self.node_specs)
+        from hub.sampling import explicit_sample_provenance
+        provenance = (explicit_sample_provenance(
+            graph, output_target, self.resolve_adapter, returned_rows=0)
+            if output_target is not None and self.resolve_adapter is not None else None)
+        expected_outputs = ([output.model_copy(update={"sample_provenance": provenance})
+                             for output in expected_run_outputs(graph, output_target, self.node_specs)]
                             if output_target is not None else [])
         from hub.backends import require_destination_credential_support
         require_destination_credential_support(self, plan, graph, self.workspace)
