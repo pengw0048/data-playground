@@ -245,6 +245,43 @@ describe('SettingsModal — plugin config form', () => {
     expect(onClose).toHaveBeenCalledOnce()
   })
 
+  it.each([
+    ['Destinations', 'Destination name', 'draft destination'],
+    ['Credentials', 'Credential name', 'draft credential'],
+  ])('protects an unsaved %s draft on dismissal', async (pane, label, draft) => {
+    const onClose = vi.fn()
+    render(<SettingsModal onClose={onClose} />)
+    fireEvent.click(await screen.findByRole('button', { name: pane }))
+    const input = screen.getByLabelText(label)
+    input.focus()
+    fireEvent.change(input, { target: { value: draft } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+
+    expect(await screen.findByTestId('settings-discard-confirmation')).toBeVisible()
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Keep editing' }))
+    await waitFor(() => expect(input).toHaveFocus())
+    expect(input).toHaveValue(draft)
+  })
+
+  it('protects an unsaved member draft on dismissal', async () => {
+    const onClose = vi.fn()
+    render(<SettingsModal onClose={onClose} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Members' }))
+    const input = screen.getByPlaceholderText('Name')
+    input.focus()
+    fireEvent.change(input, { target: { value: 'draft member' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+
+    expect(await screen.findByTestId('settings-discard-confirmation')).toBeVisible()
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Keep editing' }))
+    await waitFor(() => expect(input).toHaveFocus())
+    expect(input).toHaveValue('draft member')
+  })
+
   it('uses the native beforeunload contract only while Settings is dirty', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')

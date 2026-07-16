@@ -247,7 +247,17 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     [baseline, canGlobal, g, pcfg, plugins, u],
   )
   const invalidPluginEdit = useMemo(() => hasInvalidPluginEdit(pcfg, plugins), [pcfg, plugins])
-  const dirty = changes.length > 0 || invalidPluginEdit
+  const destinationDraftDirty = dest.name !== '' || dest.root !== '' || dest.backend !== 'local' || dest.credId !== NO_CRED
+  const originalCred = credForm.id ? creds.find((credential) => credential.id === credForm.id) : null
+  const credentialDraftDirty = credForm.id
+    ? Boolean(originalCred && (
+      credForm.name !== originalCred.name
+      || credForm.kind !== originalCred.kind
+      || !sameJson(credForm.fields, originalCred.fields)
+    ))
+    : credForm.name !== '' || credForm.kind !== 'object_store' || Object.values(credForm.fields).some((value) => value !== '')
+  const memberDraftDirty = newUser.name !== '' || newUser.password !== ''
+  const dirty = changes.length > 0 || invalidPluginEdit || destinationDraftDirty || credentialDraftDirty || memberDraftDirty
 
   useEffect(() => {
     if (!dirty) return
@@ -345,8 +355,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <span className="flex items-center text-muted-foreground"><Icon name="settings" size={15} /></span>
           <DialogTitle className="text-[15px] font-bold">Settings</DialogTitle>
           <span className="flex-1" />
-          <span role="status" aria-live="polite" className={cn('text-[11.5px]', changes.length ? 'text-amber-700 dark:text-amber-300' : 'text-green-600')}>
-            {changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'}` : savedMsg}
+          <span role="status" aria-live="polite" className={cn('text-[11.5px]', dirty ? 'text-amber-700 dark:text-amber-300' : 'text-green-600')}>
+            {changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'}` : dirty ? 'Unsaved draft' : savedMsg}
           </span>
           <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || invalidPluginEdit || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
         </div>
