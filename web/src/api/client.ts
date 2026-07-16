@@ -128,6 +128,14 @@ export interface BackendNodeSpec {
 
 export interface AgentBackendNode { id: string; type: string; position: { x: number; y: number }; data: { title?: string; config?: Record<string, unknown> } }
 export interface AgentBackendEdge { id: string; source: string; target: string; sourceHandle?: string | null; targetHandle?: string | null; data?: { wire: string } }
+export type SettingScope = 'global' | 'user'
+export interface SettingsRevision { global: number; user: number }
+export interface SettingsSnapshot {
+  global: Record<string, unknown>
+  user: Record<string, unknown>
+  revision: SettingsRevision
+}
+export interface SettingChange { scope: SettingScope; key: string; value: unknown }
 export interface AgentResult {
   available: boolean
   errorCode?: string
@@ -296,9 +304,11 @@ export const api = {
   users: () => req<DpUser[]>('/users'),
   createUser: (name: string, password?: string) =>
     req<DpUser>('/users', { method: 'POST', body: JSON.stringify({ name, password }) }),
-  getSettings: () => req<{ global: Record<string, unknown>; user: Record<string, unknown> }>('/settings'),
-  putSetting: (scope: 'global' | 'user', key: string, value: unknown) =>
-    req<{ ok: boolean }>('/settings', { method: 'PUT', body: JSON.stringify({ scope, key, value }) }),
+  getSettings: () => req<SettingsSnapshot>('/settings'),
+  putSettingsBatch: (expectedRevision: SettingsRevision, changes: SettingChange[]) =>
+    req<{ ok: boolean; revision: SettingsRevision }>('/settings/batch', {
+      method: 'PUT', body: JSON.stringify({ expectedRevision, changes }),
+    }),
 
   // loaded plugin packs (name/version/error + any declared [[config]] schema & current values)
   plugins: () => req<PluginInfo[]>('/plugins'),

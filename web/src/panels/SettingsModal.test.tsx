@@ -12,7 +12,7 @@ const PACK = {
 }
 const getSettings = vi.fn()
 const plugins = vi.fn()
-const putSetting = vi.fn()
+const putSettingsBatch = vi.fn()
 const listCreds = vi.fn()
 const createCred = vi.fn()
 const updateCred = vi.fn()
@@ -21,7 +21,7 @@ vi.mock('../api/client', () => ({
   api: {
     getSettings: () => getSettings(),
     plugins: () => plugins(),
-    putSetting: (...a: unknown[]) => putSetting(...a),
+    putSettingsBatch: (...a: unknown[]) => putSettingsBatch(...a),
     listCreds: () => listCreds(),
     createCred: (...a: unknown[]) => createCred(...a),
     updateCred: (...a: unknown[]) => updateCred(...a),
@@ -43,9 +43,11 @@ import { SettingsModal } from './SettingsModal'
 describe('SettingsModal — plugin config form', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    getSettings.mockReset().mockResolvedValue({ global: {}, user: {} })
+    getSettings.mockReset().mockResolvedValue({
+      global: { 'plugin.dp_x.url': 'existing' }, user: {}, revision: { global: 2, user: 4 },
+    })
     plugins.mockReset().mockResolvedValue([PACK])
-    putSetting.mockReset().mockResolvedValue({ ok: true })
+    putSettingsBatch.mockReset().mockResolvedValue({ ok: true, revision: { global: 3, user: 5 } })
     listCreds.mockReset().mockResolvedValue([])
     createCred.mockReset().mockImplementation(async (b) => ({ id: 'new-cred', ...b }))
     updateCred.mockReset().mockImplementation(async (id, b) => ({ id, ...b }))
@@ -66,24 +68,47 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.change(tok, { target: { value: 'env:DP_X_TOK' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
-    await waitFor(() => expect(putSetting).toHaveBeenCalledWith('global', 'plugin.dp_x.url', 'new-url'))
-    expect(putSetting).toHaveBeenCalledWith('global', 'plugin.dp_x.tok', 'env:DP_X_TOK')  // namespaced per pack
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
+      { global: 2, user: 4 },
+      [
+        { scope: 'global', key: 'plugin.dp_x.url', value: 'new-url' },
+        { scope: 'global', key: 'plugin.dp_x.tok', value: 'env:DP_X_TOK' },
+      ],
+    ))
 
     // clearing the secret must NOT write a blank (that would wipe the stored reference) — it's skipped
-    putSetting.mockClear()
+    putSettingsBatch.mockClear()
     fireEvent.change(tok, { target: { value: '' } })
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(putSettingsBatch).not.toHaveBeenCalled()
+  })
+
+  it('opens clean and sends only fields the user changed', async () => {
+    render(<SettingsModal onClose={vi.fn()} />)
+    const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+
+    fireEvent.change(model, { target: { value: 'openai/gpt-5' } })
+    expect(await screen.findByText('1 unsaved change')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
-    await waitFor(() => expect(putSetting).toHaveBeenCalledWith('global', 'plugin.dp_x.url', 'new-url'))
-    expect(putSetting).not.toHaveBeenCalledWith('global', 'plugin.dp_x.tok', expect.anything())
+
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
+      { global: 2, user: 4 },
+      [{ scope: 'global', key: 'agentModel', value: 'openai/gpt-5' }],
+    ))
+    expect(await screen.findByText('Saved')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
   })
 
   it('surfaces a save failure instead of a false "Saved" (UX-01)', async () => {
-    putSetting.mockRejectedValueOnce(new Error('save failed'))  // first write rejects
+    putSettingsBatch.mockRejectedValueOnce(new Error('save failed'))
     render(<SettingsModal onClose={vi.fn()} />)
-    await screen.findByPlaceholderText('anthropic/claude-opus-4-8')  // wait for load (agent pane is default)
+    const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+    fireEvent.change(model, { target: { value: 'edited-model' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
-    await waitFor(() => expect(state.pushToast).toHaveBeenCalledWith('Could not save global setting "agentModel": save failed', 'error'))
-    expect(screen.getByRole('alert')).toHaveTextContent('No update was confirmed. Your edits remain here.')
+    await waitFor(() => expect(state.pushToast).toHaveBeenCalledWith('Settings were not saved: save failed', 'error'))
+    expect(screen.getByRole('alert')).toHaveTextContent('The save was not confirmed. Settings are never partially committed; your edits remain here.')
+    expect(screen.getByDisplayValue('edited-model')).toBeVisible()
     expect(screen.queryByText('Saved')).toBeNull()  // no false success
   })
 
@@ -104,7 +129,7 @@ describe('SettingsModal — plugin config form', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Retry loading' }))
     expect(await screen.findByPlaceholderText('anthropic/claude-opus-4-8')).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
   })
 
   it('treats a plugin metadata failure as a blocking load failure for admins', async () => {
@@ -130,30 +155,81 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.queryByPlaceholderText('Name')).toBeNull()
     expect(plugins).not.toHaveBeenCalled()
 
+    fireEvent.click(screen.getByLabelText('Runner'))
+    fireEvent.click(await screen.findByRole('option', { name: 'local-out-of-core' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
-    await waitFor(() => expect(putSetting).toHaveBeenCalledWith('user', 'backend', ''))
-    expect(putSetting).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
+      { global: 2, user: 4 },
+      [{ scope: 'user', key: 'backend', value: 'local-out-of-core' }],
+    ))
   })
 
-  it('reports a partial sequential save, keeps edits, and retries without claiming success', async () => {
-    putSetting.mockImplementation(async () => {
-      if (putSetting.mock.calls.length === 2) throw new Error('HTTP 500: write failed')
-      return { ok: true }
-    })
+  it('keeps every edit when the atomic save fails and retries without claiming success', async () => {
+    putSettingsBatch.mockRejectedValueOnce(new Error('HTTP 500: write failed'))
     render(<SettingsModal onClose={vi.fn()} />)
     const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+    const baseUrl = screen.getByPlaceholderText('http://localhost:11434 (optional)')
     fireEvent.change(model, { target: { value: 'edited-model' } })
+    fireEvent.change(baseUrl, { target: { value: 'http://edited.example' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent('Could not save global setting "agentBaseUrl": HTTP 500: write failed')
-    expect(alert).toHaveTextContent('1 of 7 updates completed before the failure. Server settings may be partially updated; your edits remain here.')
+    expect(alert).toHaveTextContent('Settings were not saved: HTTP 500: write failed')
+    expect(alert).toHaveTextContent('The save was not confirmed. Settings are never partially committed; your edits remain here.')
     expect(screen.getByDisplayValue('edited-model')).toBeVisible()
+    expect(screen.getByDisplayValue('http://edited.example')).toBeVisible()
     expect(screen.queryByText('Saved')).toBeNull()
 
-    putSetting.mockResolvedValue({ ok: true })
     fireEvent.click(screen.getByRole('button', { name: 'Retry save' }))
     expect(await screen.findByText('Saved')).toBeVisible()
+  })
+
+  it('advances only the revision for the scope confirmed by each save', async () => {
+    putSettingsBatch
+      .mockResolvedValueOnce({ ok: true, revision: { global: 3, user: 99 } })
+      .mockResolvedValueOnce({ ok: true, revision: { global: 3, user: 5 } })
+    render(<SettingsModal onClose={vi.fn()} />)
+
+    fireEvent.change(await screen.findByPlaceholderText('anthropic/claude-opus-4-8'), {
+      target: { value: 'edited-model' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenNthCalledWith(
+      1,
+      { global: 2, user: 4 },
+      [{ scope: 'global', key: 'agentModel', value: 'edited-model' }],
+    ))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Execution' }))
+    fireEvent.click(screen.getByLabelText('Runner'))
+    fireEvent.click(await screen.findByRole('option', { name: 'local-out-of-core' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenNthCalledWith(
+      2,
+      { global: 3, user: 4 },
+      [{ scope: 'user', key: 'backend', value: 'local-out-of-core' }],
+    ))
+  })
+
+  it('commits mixed global and user edits in one batch', async () => {
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.change(await screen.findByPlaceholderText('anthropic/claude-opus-4-8'), {
+      target: { value: 'edited-model' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Execution' }))
+    fireEvent.click(screen.getByLabelText('Runner'))
+    fireEvent.click(await screen.findByRole('option', { name: 'local-out-of-core' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
+      { global: 2, user: 4 },
+      [
+        { scope: 'global', key: 'agentModel', value: 'edited-model' },
+        { scope: 'user', key: 'backend', value: 'local-out-of-core' },
+      ],
+    ))
   })
 
   it('creates an object-store credential from the Credentials pane (references only)', async () => {
@@ -190,26 +266,32 @@ describe('SettingsModal — plugin config form', () => {
   })
 
   it('saves the selected agent + default object-store credential references', async () => {
-    getSettings.mockResolvedValue({ global: { agentCredId: 'a1', defaultObjectStoreCredId: 'o1' }, user: {} })
+    getSettings.mockResolvedValue({
+      global: { agentCredId: 'a1', defaultObjectStoreCredId: 'o1' },
+      user: {}, revision: { global: 2, user: 4 },
+    })
     listCreds.mockResolvedValue([
       { id: 'a1', name: 'Agent key', kind: 'agent', fields: {} },
       { id: 'o1', name: 'Store', kind: 'object_store', fields: {} },
     ])
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+    fireEvent.click(screen.getByLabelText('Agent credential'))
+    fireEvent.click(await screen.findByRole('option', { name: /None/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     // creds are referenced by id in settings; the raw agentApiKey/objectStore keys are gone
-    await waitFor(() => expect(putSetting).toHaveBeenCalledWith('global', 'agentCredId', 'a1'))
-    expect(putSetting).toHaveBeenCalledWith('global', 'defaultObjectStoreCredId', 'o1')
-    expect(putSetting).not.toHaveBeenCalledWith('global', 'agentApiKey', expect.anything())
-    expect(putSetting).not.toHaveBeenCalledWith('global', 'objectStore', expect.anything())
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
+      { global: 2, user: 4 },
+      [{ scope: 'global', key: 'agentCredId', value: '' }],
+    ))
   })
 
   it('tags an object-store destination with a credential and shows it', async () => {
     getSettings.mockResolvedValue({
       global: { destinations: [{ id: 'd1', name: 'Exports', backend: 's3', root: 's3://b/p', credId: 'c1' }] },
       user: {},
+      revision: { global: 2, user: 4 },
     })
     listCreds.mockResolvedValue([{ id: 'c1', name: 'Prod S3', kind: 'object_store', fields: {} }])
     render(<SettingsModal onClose={vi.fn()} />)
