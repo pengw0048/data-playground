@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -150,6 +150,39 @@ describe('AgentDock — AgentDataPolicy preflight disclosure', () => {
     ))
     expect(mocks.agentAct).toHaveBeenCalledTimes(1)
     expect(input).toHaveValue('')
+  })
+
+  it('ignores a late Agent response after switching canvases', async () => {
+    let finishRequest!: (result: {
+      available: boolean
+      graph: { nodes: never[]; edges: never[] }
+      transcript: { tool: string; input: { kind: string }; result: Record<string, never> }[]
+      summary: string
+    }) => void
+    mocks.agentAct.mockImplementationOnce(() => new Promise((resolve) => { finishRequest = resolve }))
+    render(<AgentDock />)
+
+    const input = await screen.findByPlaceholderText('Describe this request…')
+    fireEvent.change(input, { target: { value: 'build on canvas one' } })
+    fireEvent.click(screen.getByTestId('agent-submit'))
+    await waitFor(() => expect(mocks.agentAct).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'canvas-1' }),
+      'build on canvas one',
+    ))
+
+    mocks.state.doc = { id: 'canvas-2', version: 1, nodes: [], edges: [] }
+    await act(async () => {
+      finishRequest({
+        available: true,
+        graph: { nodes: [], edges: [] },
+        transcript: [{ tool: 'add_node', input: { kind: 'source' }, result: {} }],
+        summary: 'Updated the canvas.',
+      })
+    })
+
+    expect(mocks.applyAgentGraph).not.toHaveBeenCalled()
+    expect(mocks.pushAgent).toHaveBeenCalledTimes(1)
+    expect(mocks.pushAgent).toHaveBeenCalledWith({ role: 'user', text: 'build on canvas one' })
   })
 
   it('still shows the configure affordance when the agent is unavailable', async () => {

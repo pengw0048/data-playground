@@ -54,12 +54,14 @@ export function AgentDock() {
     if (!roleCanEdit(useStore.getState().canvasRole)) return
     const intent = text.trim()
     if (!intent || busy || !ready) return
+    const requestDoc = useStore.getState().doc
+    const requestCanvasId = requestDoc.id
     push({ role: 'user', text: intent })
     setText('')
     setBusy(true)
     try {
-      const { doc } = useStore.getState()
-      const res = await api.agentAct(doc, intent)
+      const res = await api.agentAct(requestDoc, intent)
+      if (useStore.getState().doc.id !== requestCanvasId) return
       if (res.available && res.graph) {
         const tx = res.transcript ?? []
         // the model chose to build iff it made a successful mutating tool call this turn; a pure
@@ -67,8 +69,7 @@ export function AgentDock() {
         const mutated = tx.some((t) => ['add_node', 'connect', 'set_config'].includes(t.tool) && !t.result?.error)
         const built = tx.filter((t) => t.tool === 'add_node' && !t.result?.error).map((t) => String(t.input.kind))
         push({ role: 'agent', text: res.summary || (mutated ? 'Updated the canvas.' : 'Done.'), plan: built.length ? built : undefined })
-        if (mutated) {
-          useStore.getState().applyAgentGraph(res.graph)
+        if (mutated && useStore.getState().applyAgentGraph(res.graph, requestCanvasId)) {
           runTerminal(res.graph)
         }
       } else {
@@ -76,6 +77,7 @@ export function AgentDock() {
         push({ role: 'agent', text: `Agent unavailable — ${res.reason ?? 'no model configured'}. Set a model in Settings.` })
       }
     } catch (e) {
+      if (useStore.getState().doc.id !== requestCanvasId) return
       push({ role: 'agent', text: `Agent error: ${(e as Error).message}` })
     } finally {
       setBusy(false)
