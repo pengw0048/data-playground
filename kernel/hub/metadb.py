@@ -723,6 +723,24 @@ class CatalogLogicalDataset(Base):
     )
 
 
+class ManagedLocalFileRevision(Base):
+    """One retained, core-owned local-file revision behind a logical catalog target."""
+    __tablename__ = "managed_local_file_revisions"
+    revision_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    logical_id: Mapped[str] = mapped_column(
+        String, ForeignKey("catalog_logical_datasets.logical_id"), nullable=False)
+    artifact_uri: Mapped[str] = mapped_column(
+        Text, ForeignKey("local_result_artifacts.uri"), nullable=False, unique=True)
+    publish_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    table_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    committed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now)
+    __table_args__ = (
+        UniqueConstraint("logical_id", "publish_seq", name="uq_managed_local_file_revision_sequence"),
+        Index("ix_managed_local_file_revisions_history", "logical_id", "publish_seq"),
+    )
+
+
 class SettingRevision(Base):
     """One optimistic-concurrency counter per independently editable settings scope."""
     __tablename__ = "setting_revisions"
@@ -4897,7 +4915,8 @@ _INSTALLATION_ID = 1
 _OBJECT_ATTEMPT_KINDS = ("region", "sink")
 _LOCAL_RESULT_REGISTRY_ID = 1
 _LOCAL_RESULT_OWNER_KINDS = {
-    "canvas", "canvas_version", "catalog_entry", "result_cache", "run_record", "run_state",
+    "canvas", "canvas_version", "catalog_entry", "managed_file_revision", "result_cache",
+    "run_record", "run_state",
 }
 _LOCAL_RESULT_EPHEMERAL_OWNER_KIND = "read_lease"
 _LOCAL_RESULT_DIR = ".dp-results"
@@ -4966,7 +4985,7 @@ def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
                 candidate = _local_result_candidate(uri)
                 if candidate is not None:
                     candidates.add(candidate)
-    elif owner_kind == "catalog_entry":
+    elif owner_kind in ("catalog_entry", "managed_file_revision"):
         for value in values:
             candidate = _local_result_candidate(value)
             if candidate is not None:
@@ -5044,8 +5063,8 @@ def sync_local_result_owner(s, owner_kind: str, owner_key: str, *values) -> None
         if artifact.state != "ready":
             raise RuntimeError("managed local result is not ready for durable publication")
         if artifact.writer_run_id is not None or artifact.writer_token is not None:
-            if (owner_kind != "run_state"
-                    or str(owner_key) != artifact.writer_run_id):
+            if (owner_kind not in ("run_state", "managed_file_revision")
+                    or (owner_kind == "run_state" and str(owner_key) != artifact.writer_run_id)):
                 # Only the exact writer's RunState transaction may establish the primary ref and clear
                 # its writer pair. Secondary owners cannot pin a guessed/provisional URI before that.
                 raise RuntimeError(
@@ -7995,6 +8014,126 @@ def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
         return True
 
 
+def catalog_publish_managed_local_file(
+        logical_uri: str, artifact_uri: str, name: str, doc: dict) -> dict:
+    """Atomically publish one already-validated local artifact as a new immutable revision.
+
+    The catalog retains only the current physical projection; the revision ledger owns every physical
+    artifact so old exact reads remain valid until an explicit retention policy exists.
+    """
+    from hub.models import CatalogTable
+
+    logical_uri = str(logical_uri).rstrip("/")
+    artifact_uri = _local_result_candidate(artifact_uri) or ""
+    if not logical_uri or not artifact_uri:
+        raise ValueError("managed local publication requires logical and exact artifact URIs")
+    payload = CatalogTable.model_validate(doc).model_dump(by_alias=True)
+    if payload.get("uri") != artifact_uri or payload.get("name") != str(name):
+        raise ValueError("managed local publication table does not match its artifact")
+    with session() as s:
+        logical_id, catalog_key = _catalog_managed_namespace_identity(logical_uri, f"tbl_{name}")
+        _lock_catalog_namespace_tokens(s, [logical_uri, logical_id, catalog_key])
+        receipt = _managed_local_file_publication_receipt_in_session(
+            s, logical_uri, artifact_uri, str(name))
+        if receipt is not None:
+            return receipt
+        _assert_managed_catalog_namespace_available(
+            s, logical_uri=logical_uri, logical_id=logical_id, catalog_key=catalog_key)
+        reserved_id, _epoch, publish_seq = _reserve_catalog_publication(
+            s, logical_uri, f"tbl_{name}")
+        logical = s.get(CatalogLogicalDataset, reserved_id, with_for_update=True)
+        if logical is None:  # pragma: no cover - reservation is checked above
+            raise RuntimeError("managed local publication identity is missing")
+        old_uri = logical.current_uri
+        old = s.get(CatalogEntry, old_uri, with_for_update=True) if old_uri else None
+        current = s.get(CatalogEntry, artifact_uri, with_for_update=True)
+        if current is not None:
+            raise RuntimeError("managed local artifact is already cataloged")
+        if old is not None:
+            # Keep the browse ID and curation stable while replacing only the physical head.
+            payload["id"] = old.tbl_id or payload["id"]
+            for field in ("folder", "owner", "description"):
+                if not payload.get(field) and field in json.loads(old.doc):
+                    payload[field] = json.loads(old.doc).get(field)
+            if not payload.get("tags"):
+                payload["tags"] = [tag.tag for tag in s.scalars(select(CatalogTag).where(
+                    CatalogTag.uri == old.uri).order_by(CatalogTag.tag))]
+            _delete_catalog_children(s, [old.uri])
+            s.delete(old)
+            # ``logical_id`` is unique on the current catalog projection. Flush the retired head before
+            # adding its replacement so SQLite and PostgreSQL observe the same one-head invariant.
+            s.flush()
+        tbl_id, folder, owner, description, rows, tags, cols = _doc_org(payload)
+        entry = CatalogEntry(
+            uri=artifact_uri, name=str(name), doc=json.dumps(payload, default=str),
+            tbl_id=tbl_id, folder=folder, owner=owner, description=description,
+            row_count=rows, logical_id=logical.logical_id, usage=logical.usage,
+        )
+        s.add(entry)
+        _sync_children(s, artifact_uri, tags, cols)
+        revision_id = uuid.uuid4().hex
+        committed_at = _db_now(s)
+        s.add(ManagedLocalFileRevision(
+            revision_id=revision_id, logical_id=logical.logical_id,
+            artifact_uri=artifact_uri, publish_seq=publish_seq,
+            table_doc=json.dumps(payload, default=str),
+            committed_at=committed_at,
+        ))
+        logical.current_uri = artifact_uri
+        logical.current_publish_seq = publish_seq
+        logical.state = "active"
+        logical.governance_doc = json.dumps(_catalog_governance(payload), default=str, sort_keys=True)
+        _materialize_folder(s, folder)
+        # The revision ledger, rather than the replaceable head projection, retains every artifact.
+        sync_local_result_owner(s, "managed_file_revision", revision_id, artifact_uri)
+        return {
+            "dataset_id": logical.logical_id,
+            "revision_id": revision_id,
+            "committed_at": committed_at,
+            "table": payload,
+        }
+
+
+def _managed_local_file_publication_receipt_in_session(
+        s, logical_uri: str, artifact_uri: str, name: str) -> dict | None:
+    revision = s.scalars(select(ManagedLocalFileRevision).where(
+        ManagedLocalFileRevision.artifact_uri == artifact_uri).limit(1)).first()
+    if revision is None:
+        return None
+    logical = s.get(CatalogLogicalDataset, revision.logical_id)
+    ref = s.get(LocalResultReference, {
+        "uri": artifact_uri,
+        "owner_kind": "managed_file_revision",
+        "owner_key": revision.revision_id,
+    })
+    try:
+        from hub.models import CatalogTable
+        table = CatalogTable.model_validate(json.loads(revision.table_doc))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("managed local publication receipt is invalid") from exc
+    if (logical is None or logical.logical_uri != logical_uri or ref is None
+            or table.uri != artifact_uri or table.name != name):
+        raise RuntimeError("managed local publication receipt does not match its request")
+    return {
+        "dataset_id": logical.logical_id,
+        "revision_id": revision.revision_id,
+        "committed_at": revision.committed_at,
+        "table": table.model_dump(by_alias=True),
+    }
+
+
+def catalog_managed_local_file_publication_receipt(
+        logical_uri: str, artifact_uri: str, name: str) -> dict | None:
+    """Recover one exact committed local revision after an unknown transaction response."""
+    logical_uri = str(logical_uri).rstrip("/")
+    artifact_uri = _local_result_candidate(artifact_uri) or ""
+    if not logical_uri or not artifact_uri:
+        raise ValueError("managed local publication requires logical and exact artifact URIs")
+    with session() as s:
+        return _managed_local_file_publication_receipt_in_session(
+            s, logical_uri, artifact_uri, str(name))
+
+
 def catalog_managed_publication_receipt(uri: str) -> dict | None:
     """Core-only durable receipt; execution backends never inspect lifecycle tables themselves."""
     with session() as s:
@@ -9038,6 +9177,13 @@ def catalog_revision_binding(dataset_id: str) -> dict | None:
     exact-revision reference cannot be rebound merely because a path or name was reused.
     """
     with session() as s:
+        managed = s.get(CatalogLogicalDataset, str(dataset_id))
+        if managed is not None and managed.current_uri and s.scalar(select(
+                ManagedLocalFileRevision.revision_id).where(
+                    ManagedLocalFileRevision.logical_id == managed.logical_id,
+                    ManagedLocalFileRevision.artifact_uri == managed.current_uri,
+                ).limit(1)) is not None:
+            return {"dataset_id": managed.logical_id, "uri": managed.current_uri}
         entry = s.scalars(select(CatalogEntry).where(
             CatalogEntry.registration_id == str(dataset_id)).limit(1)).first()
         if entry is None:
@@ -9051,7 +9197,99 @@ def catalog_revision_binding_for_uri(uri: str) -> dict | None:
         entry = s.get(CatalogEntry, str(uri).rstrip("/"))
         if entry is None:
             return None
+        if entry.logical_id and s.scalar(select(ManagedLocalFileRevision.revision_id).where(
+                ManagedLocalFileRevision.logical_id == entry.logical_id,
+                ManagedLocalFileRevision.artifact_uri == entry.uri,
+        ).limit(1)) is not None:
+            return {"dataset_id": entry.logical_id, "uri": entry.uri}
         return {"dataset_id": entry.registration_id, "uri": entry.uri}
+
+
+def managed_local_file_revision_history(
+        uri: str, *, limit: int, cursor: str | None = None) -> tuple[list[dict], str | None]:
+    """Return a bounded newest-first page for the managed local dataset owning ``uri``."""
+    bounded = max(1, min(int(limit), 100))
+    with session() as s:
+        entry = s.get(CatalogEntry, str(uri).rstrip("/"))
+        if entry is None or not entry.logical_id:
+            raise KeyError(uri)
+        logical_id = entry.logical_id
+        if cursor is not None:
+            cursor_row = s.get(ManagedLocalFileRevision, str(cursor))
+            if cursor_row is None or cursor_row.logical_id != logical_id:
+                raise KeyError(cursor)
+            rows = list(s.scalars(select(ManagedLocalFileRevision).where(
+                ManagedLocalFileRevision.logical_id == logical_id,
+                ManagedLocalFileRevision.publish_seq < cursor_row.publish_seq,
+            ).order_by(ManagedLocalFileRevision.publish_seq.desc()).limit(bounded + 1)))
+        else:
+            rows = list(s.scalars(select(ManagedLocalFileRevision).where(
+                ManagedLocalFileRevision.logical_id == logical_id,
+            ).order_by(ManagedLocalFileRevision.publish_seq.desc()).limit(bounded + 1)))
+        items = rows[:bounded]
+        return ([{"revision_id": row.revision_id, "committed_at": row.committed_at}
+                 for row in items], items[-1].revision_id if len(rows) > bounded else None)
+
+
+def managed_local_file_revision_resolve(
+        uri: str, *, as_of: datetime.datetime | None = None) -> dict:
+    """Resolve the local head or latest retained revision at ``as_of`` without a path fallback."""
+    with session() as s:
+        entry = s.get(CatalogEntry, str(uri).rstrip("/"))
+        if entry is None or not entry.logical_id:
+            raise KeyError(uri)
+        query = select(ManagedLocalFileRevision).where(
+            ManagedLocalFileRevision.logical_id == entry.logical_id)
+        if as_of is not None:
+            query = query.where(ManagedLocalFileRevision.committed_at <= as_of)
+        row = s.scalars(query.order_by(ManagedLocalFileRevision.publish_seq.desc()).limit(1)).first()
+        if row is None:
+            raise KeyError(uri)
+        return {"revision_id": row.revision_id, "committed_at": row.committed_at,
+                "artifact_uri": row.artifact_uri}
+
+
+def managed_local_file_revision_open(uri: str, revision_id: str) -> str:
+    """Return only the exact retained physical artifact for an opaque local revision ID."""
+    with session() as s:
+        entry = s.get(CatalogEntry, str(uri).rstrip("/"))
+        if entry is None or not entry.logical_id:
+            raise KeyError(uri)
+        row = s.get(ManagedLocalFileRevision, str(revision_id))
+        if row is None or row.logical_id != entry.logical_id:
+            raise KeyError(revision_id)
+        artifact = s.get(LocalResultArtifact, row.artifact_uri)
+        if artifact is None or artifact.state != "ready":
+            raise KeyError(revision_id)
+        return row.artifact_uri
+
+
+def managed_local_file_revision_detail(uri: str, revision_id: str) -> dict:
+    """Return persisted facts for one exact retained local revision and its immediate parent."""
+    from hub.models import CatalogTable
+
+    with session() as s:
+        entry = s.get(CatalogEntry, str(uri).rstrip("/"))
+        if entry is None or not entry.logical_id:
+            raise KeyError(uri)
+        row = s.get(ManagedLocalFileRevision, str(revision_id))
+        if row is None or row.logical_id != entry.logical_id:
+            raise KeyError(revision_id)
+        artifact = s.get(LocalResultArtifact, row.artifact_uri)
+        if artifact is None or artifact.state != "ready":
+            raise KeyError(revision_id)
+        parent = s.scalars(select(ManagedLocalFileRevision).where(
+            ManagedLocalFileRevision.logical_id == row.logical_id,
+            ManagedLocalFileRevision.publish_seq < row.publish_seq,
+        ).order_by(ManagedLocalFileRevision.publish_seq.desc()).limit(1)).first()
+        table = CatalogTable.model_validate(json.loads(row.table_doc))
+        return {
+            "revision_id": row.revision_id,
+            "committed_at": row.committed_at,
+            "parent_revision_id": parent.revision_id if parent is not None else None,
+            "artifact_uri": row.artifact_uri,
+            "table": table,
+        }
 
 
 def catalog_get_many(uris: list[str]) -> dict[str, dict]:

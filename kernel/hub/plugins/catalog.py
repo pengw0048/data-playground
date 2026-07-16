@@ -579,6 +579,36 @@ class InMemoryCatalog:
             raise RuntimeError("core managed publication did not return a durable receipt")
         return {**receipt, "table": table}
 
+    def publish_managed_local_file_output(
+            self, *, name: str, logical_uri: str, artifact_uri: str,
+            parents: list[str] | None = None, pipeline: str | None = None,
+            lineage: LineagePublication | None = None) -> dict:
+        """Publish a default-local immutable artifact and advance its logical catalog head."""
+        table = self._add(
+            name=name, uri=artifact_uri, strict_probe=True,
+            _persist_table=False, _embed_table=False,
+        )
+        try:
+            published = metadb.catalog_publish_managed_local_file(
+                logical_uri, artifact_uri, name, table.model_dump(by_alias=True))
+        except Exception:
+            published = metadb.catalog_managed_local_file_publication_receipt(
+                logical_uri, artifact_uri, name)
+            if published is None:
+                raise
+        canonical = CatalogTable.model_validate(published["table"])
+        if parents and lineage is not None:
+            self.record_lineage(
+                name=canonical.name, uri=canonical.uri, version=canonical.version,
+                parents=parents, lineage=lineage)
+        for parent in parents or []:
+            try:
+                metadb.catalog_bump_usage(parent)
+            except Exception:  # noqa: BLE001 — popularity is optional after durable publication
+                log.warning("catalog usage bump failed after local revision publication", exc_info=True)
+        self._embed_one(canonical)
+        return {**published, "table": canonical}
+
     def register_output_idempotent(
         self, idempotency_key: str, **kwargs
     ) -> CatalogPublicationReceipt:
@@ -896,6 +926,11 @@ class InMemoryCatalog:
 def core_managed_publisher(catalog):
     """Return the core lifecycle publisher only; a lookalike custom method cannot claim this authority."""
     return catalog.publish_managed_output if type(catalog) is InMemoryCatalog else None
+
+
+def core_managed_local_file_publisher(catalog):
+    """Return the local revision publisher only for the built-in transactional catalog."""
+    return catalog.publish_managed_local_file_output if type(catalog) is InMemoryCatalog else None
 
 
 def core_managed_publication_planner(catalog):

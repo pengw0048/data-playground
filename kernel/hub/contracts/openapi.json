@@ -787,8 +787,11 @@
             "type": "string"
           },
           "retentionOwner": {
-            "const": "provider",
             "default": "provider",
+            "enum": [
+              "provider",
+              "core"
+            ],
             "title": "Retentionowner",
             "type": "string"
           },
@@ -855,8 +858,11 @@
             "title": "Produceroperation"
           },
           "retentionOwner": {
-            "const": "provider",
             "default": "provider",
+            "enum": [
+              "provider",
+              "core"
+            ],
             "title": "Retentionowner",
             "type": "string"
           },
@@ -968,8 +974,11 @@
             "type": "string"
           },
           "retentionOwner": {
-            "const": "provider",
             "default": "provider",
+            "enum": [
+              "provider",
+              "core"
+            ],
             "title": "Retentionowner",
             "type": "string"
           },
