@@ -188,6 +188,53 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.getByPlaceholderText('anthropic/claude-opus-4-8')).toHaveValue('staged-model')
   })
 
+  it('preserves unrelated edits made while a failed plugin secret clear is pending', async () => {
+    let rejectClear: ((reason: unknown) => void) | undefined
+    getSettings.mockResolvedValueOnce({
+      global: { agentModel: 'server-model', 'plugin.dp_x.url': 'existing', 'plugin.dp_x.tok': 'env:DP_X_TOKEN' },
+      user: {}, revision: { global: 2, user: 4 },
+    }).mockResolvedValueOnce({
+      global: { agentModel: 'server-model', 'plugin.dp_x.url': 'server-url', 'plugin.dp_x.tok': 'env:DP_X_TOKEN' },
+      user: {}, revision: { global: 3, user: 4 },
+    })
+    putSettingsBatch.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectClear = reject }))
+    render(<SettingsModal onClose={vi.fn()} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Clear…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Clear stored reference' }))
+    expect(screen.getByLabelText('Token')).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Agent' }))
+    fireEvent.change(screen.getByPlaceholderText('anthropic/claude-opus-4-8'), { target: { value: 'during-clear' } })
+
+    rejectClear?.(new Error('service unavailable'))
+    await waitFor(() => expect(getSettings).toHaveBeenCalledTimes(2))
+    expect(screen.getByPlaceholderText('anthropic/claude-opus-4-8')).toHaveValue('during-clear')
+    fireEvent.click(screen.getByRole('button', { name: 'Plugins' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('The stored reference is still set; choose Clear again to retry.')
+  })
+
+  it('distinguishes an unrelated revision conflict from a changed secret reference', async () => {
+    getSettings.mockResolvedValueOnce({
+      global: { 'plugin.dp_x.url': 'existing', 'plugin.dp_x.tok': 'env:DP_X_TOKEN' },
+      user: {}, revision: { global: 2, user: 4 },
+    }).mockResolvedValueOnce({
+      global: { 'plugin.dp_x.url': 'server-url', 'plugin.dp_x.tok': 'env:DP_X_TOKEN' },
+      user: {}, revision: { global: 3, user: 4 },
+    })
+    putSettingsBatch.mockRejectedValueOnce(new KernelError(409, 'settings revision is stale'))
+    render(<SettingsModal onClose={vi.fn()} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Clear…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Clear stored reference' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Settings changed on the server before Token could be cleared.')
+    expect(alert).not.toHaveTextContent('Token changed on the server')
+    expect(screen.getByLabelText('Token')).toHaveValue('env:DP_X_TOKEN')
+  })
+
   it('does not overwrite a concurrently changed plugin secret reference', async () => {
     getSettings.mockResolvedValueOnce({
       global: { 'plugin.dp_x.url': 'existing', 'plugin.dp_x.tok': 'env:DP_X_TOKEN' },

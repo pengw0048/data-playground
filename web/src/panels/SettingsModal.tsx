@@ -280,6 +280,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     () => stagedSettings(baseline, g, u, pcfg, plugins, canGlobal),
     [baseline, canGlobal, g, pcfg, plugins, u],
   )
+  const changesRef = useRef(changes)
+  changesRef.current = changes
   const invalidPluginEdit = useMemo(() => hasInvalidPluginEdit(pcfg, plugins), [pcfg, plugins])
   const destinationDraftDirty = dest.name !== '' || dest.root !== '' || dest.backend !== 'local' || dest.credId !== NO_CRED
   const originalCred = credForm.id ? creds.find((credential) => credential.id === credForm.id) : null
@@ -519,9 +521,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   }
   const clearPluginSecret = async (target: PluginSecretTarget) => {
     const key = pluginSettingKey(target.pack, target.field.key)
-    if (!baseline || pluginSecretClearingKey) return
-    const staged = changes
+    if (!baseline || saving || pluginSecretClearingKey) return
     const expectedRevision = baseline.revision
+    const expectedValue = baseline.global[key]
     setPluginSecretTarget(null)
     setPluginSecretClearingKey(key)
     setPluginSecretNotices((current) => {
@@ -542,7 +544,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     } catch (error) {
       try {
         const latest = await api.getSettings()
-        applySnapshotPreservingChanges(latest, staged)
+        applySnapshotPreservingChanges(latest, changesRef.current)
         const latestValue = latest.global[key]
         if (latestValue == null || latestValue === '') {
           finishPluginSecretClear(
@@ -552,8 +554,11 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           )
         } else {
           const conflict = error instanceof KernelError && error.status === 409
-          const message = conflict
+          const targetChanged = !sameJson(expectedValue, latestValue)
+          const message = conflict && targetChanged
             ? `${target.field.label} changed on the server and was not cleared. Review the current state, then choose Clear again.`
+            : conflict
+              ? `Settings changed on the server before ${target.field.label} could be cleared. The stored reference is still set; choose Clear again to retry.`
             : `Could not clear ${target.field.label}: ${errorMessage(error)}. The stored reference is still set; choose Clear again to retry.`
           setPluginSecretNotice(key, { kind: 'error', message })
           pushToast(message, 'error')
@@ -586,7 +591,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <span role="status" aria-live="polite" className={cn('text-[11.5px]', dirty ? 'text-amber-700 dark:text-amber-300' : 'text-green-600')}>
             {changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'}` : dirty ? 'Unsaved draft' : savedMsg}
           </span>
-          <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || invalidPluginEdit || Boolean(conflict) || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
+          <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || Boolean(pluginSecretClearingKey) || invalidPluginEdit || Boolean(conflict) || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
         </div>
         <DialogDescription className="sr-only">Application and workspace settings: the agent model, execution backend, and output destinations.</DialogDescription>
 
@@ -890,6 +895,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                             ) : (
                               <Input
                                 type={f.type === 'int' || f.type === 'float' ? 'number' : 'text'}
+                                disabled={f.secret && clearing}
                                 value={f.secret
                                   ? String(pcfg[p.name]?.[f.key] ?? storedRef ?? '')
                                   : String(pval(p.name, f))}
@@ -910,7 +916,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                                 {isSet ? <Button
                                   variant="link"
                                   className="h-auto p-0 text-[10.5px]"
-                                  disabled={clearing || Boolean(pluginSecretClearingKey) || Boolean(stagedSecret)}
+                                  disabled={saving || clearing || Boolean(pluginSecretClearingKey) || Boolean(stagedSecret)}
                                   onClick={() => setPluginSecretTarget({ pack: p.name, field: f })}
                                 >{clearing ? 'Clearing…' : 'Clear…'}</Button> : <span>Using environment/default.</span>}
                                 <span>{isSet ? 'Clearing applies immediately; it does not wait for Save.' : 'No stored reference.'}</span>
