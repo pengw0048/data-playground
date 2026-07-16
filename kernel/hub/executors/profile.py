@@ -37,6 +37,36 @@ except ValueError:
     PROFILE_FULL_BUDGET_S = 3600.0
 
 
+def _reservoir_profile_allowed(graph: Graph, node_id: str, resolve_adapter) -> bool:
+    """Allow a local reservoir pass when one Sample dominates every path to the profile target."""
+    if _reservoir_preview_allowed(graph, node_id, resolve_adapter):
+        return True
+    chain = g.upstream_chain(graph, node_id)
+    samples = [node for node in chain if node.type == "sample"
+               and not (isinstance(node.data, dict)
+                        and (node.data.get("bypassed") or node.data.get("disabled")))]
+    if len(samples) != 1:
+        return False
+    sample = samples[0]
+    if not _reservoir_preview_allowed(graph, sample.id, resolve_adapter):
+        return False
+
+    # Every reverse path from the target must encounter the Sample before reaching a source. This
+    # keeps a join or side branch from losing its preview cap when only one input was sampled.
+    pending = [node_id]
+    seen: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current == sample.id or current in seen:
+            continue
+        seen.add(current)
+        parents = g.parents(graph, current)
+        if not parents:
+            return False
+        pending.extend(parents)
+    return True
+
+
 def _stat(arr: pa.ChunkedArray, n: int, t: pa.DataType) -> dict:
     """null/distinct/min/max/mean for one column, guarding types that don't support each op."""
     non_null = pc.count(arr).as_py()  # counts only valid (non-null) by default
@@ -184,7 +214,7 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
         except Exception as e:  # noqa: BLE001
             return ProfileResult(error=True, reason=f"{type(e).__name__}: {e}")
 
-    reservoir_preview = _reservoir_preview_allowed(graph, node_id, resolve_adapter)
+    reservoir_preview = _reservoir_profile_allowed(graph, node_id, resolve_adapter)
     engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
                          node_builders=node_builders, node_specs=node_specs,
                          warm=cache, warm_scope="preview", reservoir_preview=reservoir_preview)

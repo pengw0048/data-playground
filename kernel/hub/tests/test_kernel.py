@@ -1595,7 +1595,7 @@ def test_sample_node_preview_is_deterministic_and_provenance_bearing(tmp_path):
 def test_profiles_keep_sample_provenance_without_marking_full_sources_sampled(tmp_path):
     import duckdb
     from hub.deps import get_deps
-    from hub.executors.profile import profile_node
+    from hub.executors.profile import _reservoir_profile_allowed, profile_node
     from hub.models import Graph
 
     path = str(tmp_path / "profile-sample.parquet")
@@ -1605,7 +1605,8 @@ def test_profiles_keep_sample_provenance_without_marking_full_sources_sampled(tm
     sampled_graph = Graph(**{"id": "profile-sample", "version": 1, "nodes": [
         N("source", "source", {"uri": path}),
         N("sample", "sample", {"n": 120, "seed": 9}),
-    ], "edges": [E("source", "sample")]})
+        N("filter", "filter", {"predicate": "id >= 0"}),
+    ], "edges": [E("source", "sample"), E("sample", "filter")]})
 
     sampled = profile_node(sampled_graph, "sample", deps.resolve_adapter, deps.registry,
                            deps.node_builders, deps.node_specs)
@@ -1613,6 +1614,24 @@ def test_profiles_keep_sample_provenance_without_marking_full_sources_sampled(tm
     assert sampled.sample_provenance.strategy == "reservoir"
     assert sampled.sample_provenance.seed == 9
     assert sampled.sample_provenance.total_rows == 5000
+
+    downstream = profile_node(sampled_graph, "filter", deps.resolve_adapter, deps.registry,
+                              deps.node_builders, deps.node_specs)
+    assert downstream.sampled and downstream.sample_provenance is not None
+    assert downstream.sample_provenance.strategy == "reservoir"
+    assert downstream.sample_provenance.seed == 9
+    assert downstream.sample_provenance.total_rows == 5000
+
+    side_branch = Graph(**{"id": "profile-sample-side-branch", "version": 1, "nodes": [
+        *sampled_graph.nodes,
+        N("side", "source", {"uri": path}),
+        N("join", "join", {"on": "id", "how": "inner"}),
+    ], "edges": [
+        *sampled_graph.edges,
+        E("filter", "join", None, "a"),
+        E("side", "join", None, "b"),
+    ]})
+    assert not _reservoir_profile_allowed(side_branch, "join", deps.resolve_adapter)
 
     full_sampled = profile_node(sampled_graph, "sample", deps.resolve_adapter, deps.registry,
                                 deps.node_builders, deps.node_specs, full=True)
