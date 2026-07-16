@@ -49,6 +49,33 @@ need neither external credentials nor a private service.
 - A reproducible view has durable navigation state, and all core actions have a keyboard path.
 - Supported desktop viewports preserve access to essential controls without silently hiding them.
 
+## Result scope and export contract
+
+Every data view names the scope it can prove:
+
+- **Preview sample** is computed with a bounded prefix from each upstream source. A join, unnest, or
+  other transform can reorder, remove, or create output rows, so the result is not described as the
+  first N rows of the final dataset. Paging or exporting it never implies that the full dataset was
+  scanned.
+- **Dataset preview**, **published-dataset page**, and **full-result page** are distinct interactive
+  scopes. Their CSV/JSON actions say `Export this page`, and filenames include both the scope and row
+  range. A write output reports rows written by that mutation, never that number as the table total.
+- **Full result** is a committed non-catalog run artifact. Its interactive pages and native export are
+  resolved by run, node, and port identity rather than accepting a client-provided storage URI.
+  `Export full result` preflights access and streams the original single-file artifact without leaving
+  the application; it does not synchronously convert a large result or silently download the first
+  file of a multi-file artifact.
+- Interactive artifact reads stop at 2,000 rows. The response and UI distinguish a complete result,
+  an ordinary page, an unknown total, and the interactive cap. A grouped chart may draw at most 2,000
+  groups, but its durable artifact and downstream dataset retain every group.
+- Page navigation distinguishes a proven end from an unknown next page. When an adapter cannot prove
+  either state, the UI names that uncertainty and lets the user try the next bounded offset.
+- Preview-profile metrics are exact only within the preview sample. Whole-dataset profiles scan every
+  row for count, null, min, max, and mean; distinct counts are estimates and display `≈` inline.
+
+These labels are product semantics, not decoration. A release fails this contract if a filename,
+toast, chart, profile cell, or disabled paging control makes a smaller scope look complete.
+
 ## Gate tiers and evidence
 
 | Tier | When | Required evidence |

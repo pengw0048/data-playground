@@ -24,6 +24,15 @@ from hub.models import (
 Relation = duckdb.DuckDBPyRelation
 
 
+class BackendStatusUnavailable(RuntimeError):
+    """A backend's status control plane is temporarily unreachable.
+
+    Backends must use this narrow signal (or an ``OSError``) only for availability failures. Integrity,
+    configuration-drift, and programming errors must retain their own exception type so callers never
+    mistake stale durable state for a fresh successful observation.
+    """
+
+
 def stop_acknowledged(backend, status: RunStatus) -> bool:
     """Whether a terminal-looking backend status proves execution can no longer publish.
 
@@ -88,7 +97,9 @@ class ExecutionBackend(Protocol):
         """
         ...
 
-    def status(self, run_id: str) -> RunStatus: ...
+    def status(self, run_id: str) -> RunStatus:
+        """Return current status; raise KeyError when unknown or BackendStatusUnavailable when offline."""
+        ...
 
     def cancel(self, run_id: str) -> RunStatus: ...
 

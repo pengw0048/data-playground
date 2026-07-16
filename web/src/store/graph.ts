@@ -1315,8 +1315,8 @@ export const useStore = create<Store>((set, get) => ({
     try {
       // A preview is a bounded peek (a page of rows), NOT a full materialized run — we deliberately
       // do NOT flip status to 'latest' (that green state means a real run). Paginated via `offset`.
-      // A chart renders its whole series at once, so fetch up to the backend's grouped cap (2000)
-      // instead of a 50-row page (which silently truncated bar/scatter to the first 50 points).
+      // A chart renders its visible series at once, so request the explicit 2,000-point presentation
+      // budget instead of a 50-row page. Durable run artifacts retain every group.
       const k = node.type === 'chart' ? 2000 : 50
       const result = await api.preview(doc, id, k, offset, portId)
       if (!isCurrent()) return

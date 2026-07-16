@@ -49,6 +49,13 @@ Key endpoints under `/api`:
   direct tables are truncated)
 - `GET /catalog/search?q&mode=lexical|semantic|hybrid&limit`
 - `GET /catalog/lineage?uri&depth&maxNodes` and `GET /catalog/edges?limit&offset`
+- `POST /data/sample` — bounded dataset rows plus explicit `completeness`, `rowLimit`,
+  `limitReason`, and `limitScope` metadata. `limitScope=result-window` identifies the 2,000-row
+  interactive artifact window; graph previews use `each-source` instead because their source budget
+  is not a promise about which output rows a transform produces. Neither path falls back to an
+  unbounded count or scan just to fill in an unknown total. `hasMore` is tri-state: `true` and `false`
+  are proven within that interactive scope, while `null` means the adapter cannot establish whether a
+  next page exists without doing unbounded work.
 - `PUT /catalog/tables/{id}/metadata` — set folder, tags, owner, description; only present fields
   change; explicit `null` clears owner or description
 - `DELETE /catalog/tables/{id}` — unregister and drop its lineage edges, key, and relationships

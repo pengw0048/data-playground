@@ -113,7 +113,7 @@ test.describe('minimum viewport support', () => {
     const dataPanel = page.getByTestId('panel-data')
     await expectFullyInViewport(page, dataPanel, 'data panel')
     // The seeded source preview paints a row-count label once the kernel returns.
-    await expect(dataPanel.getByText(/^rows /)).toBeVisible({ timeout: 15_000 })
+    await expect(dataPanel.getByText(/^rows \d+–\d+$/)).toBeVisible({ timeout: 15_000 })
     await dataPanel.getByTitle('Close').click()
     await expect(dataPanel).toHaveCount(0)
 

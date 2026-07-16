@@ -95,7 +95,9 @@ test.describe('full researcher acceptance matrix', () => {
     await inspector.getByRole('button', { name: 'View data' }).click()
     await expect(page.getByText('partial failure: one partition is unavailable')).toBeVisible()
     await page.getByRole('button', { name: 'Retry' }).click()
-    await expect(page.getByText(/^rows /)).toBeVisible({ timeout: 15_000 })
+    await expect(page.getByTestId('panel-data').getByText(/^rows \d+–\d+$/)).toBeVisible({
+      timeout: 15_000,
+    })
 
     // The same full workflow also executes ux-golden-workflows.spec.ts, which mutates a graph after
     // preview and asserts the stale-reference state before allowing refresh.

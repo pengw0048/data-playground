@@ -18,6 +18,10 @@ from pydantic.alias_generators import to_camel
 WireType = Literal["dataset", "selection", "sample", "sql-view", "metric", "value"]
 NodeStatus = Literal["draft", "latest", "stale", "queued", "running", "failed"]
 Placement = Literal["local", "distributed"]
+DataCompleteness = Literal["complete", "page", "sample", "capped", "unknown"]
+DataLimitReason = Literal["preview-scan", "interactive-row-budget"]
+DataLimitScope = Literal["each-source", "result-window"]
+ProfileCompleteness = Literal["complete", "sample", "unknown"]
 PlanDigest = Annotated[
     str,
     Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"),
@@ -267,36 +271,186 @@ class CatalogMetadata(Wire):
 # Data preview
 # --------------------------------------------------------------------------- #
 class SampleResult(Wire):
-    columns: list[ColumnSchema] = []
-    rows: list[dict[str, Any]] = []
-    row_count: int | None = None
-    has_more: bool = False     # another page exists after this one (for paginated previews)
-    truncated: bool = False
+    """One page of rows plus an explicit statement of what that page represents.
+
+    ``row_count`` is an exact total when present, never the number of rows in this response. A limit
+    applies either to EACH upstream source scan or to the browsable RESULT window; it is deliberately
+    separate from the caller-selected page size. This prevents a bounded multi-source preview from
+    being described as the first N output rows.
+    """
+
+    columns: list[ColumnSchema] = Field(default_factory=list)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    row_count: int | None = Field(
+        default=None, ge=0,
+        description="Exact total rows in the dataset/result when known; not this page's row count.",
+    )
+    has_more: bool | None = Field(
+        default=None,
+        description=(
+            "Whether another page exists within the current interactive scope: true/false is "
+            "proven by lookahead, exact metadata, or a result-window boundary; null is unknown. "
+            "It never asserts whether more rows exist in the full dataset beyond that scope."
+        ),
+    )
+    truncated: bool = Field(
+        default=False,
+        description=(
+            "Whether this response is not a proven complete dataset/result. Every successful "
+            "non-complete response is truncated; unavailable responses are not."
+        ),
+    )
+    completeness: DataCompleteness = Field(
+        default="unknown",
+        description=(
+            "complete=all rows; page=one page of a known/continuable result; sample=derived from "
+            "bounded source scans; capped=result window ended at a server limit; unknown=no proof."
+        ),
+    )
+    row_limit: int | None = Field(
+        default=None, ge=1,
+        description="Server row limit whose meaning is defined by limitScope; never the page size.",
+    )
+    limit_reason: DataLimitReason | None = Field(
+        default=None,
+        description="Why rowLimit applies. Present only together with rowLimit and limitScope.",
+    )
+    limit_scope: DataLimitScope | None = Field(
+        default=None,
+        description=(
+            "each-source means every upstream source scan is independently bounded; "
+            "result-window means result pagination cannot continue beyond rowLimit."
+        ),
+    )
     preview_ref: str | None = None
     not_previewable: bool = False
     error: bool = False        # a real failure (bad code / bad query), distinct from P8 not_previewable
     reason: str | None = None
     wire: WireType = "dataset"
 
+    @model_validator(mode="after")
+    def _truthful_scope(self) -> "SampleResult":
+        limit_parts = (self.row_limit, self.limit_reason, self.limit_scope)
+        if any(part is not None for part in limit_parts) and not all(
+                part is not None for part in limit_parts):
+            raise ValueError("rowLimit, limitReason, and limitScope must be provided together")
+        if self.error and self.not_previewable:
+            raise ValueError("a sample result cannot be both an error and not previewable")
+        unavailable = self.error or self.not_previewable
+        if unavailable:
+            if self.completeness != "unknown":
+                raise ValueError("an unavailable sample must have unknown completeness")
+            if self.rows or self.row_count is not None or self.has_more is not None:
+                raise ValueError("an unavailable sample cannot carry rows, rowCount, or hasMore")
+            if self.truncated:
+                raise ValueError("an unavailable sample cannot be truncated")
+            if self.row_limit is not None:
+                raise ValueError("an unavailable sample cannot carry an active row limit")
+            if not self.reason or not self.reason.strip():
+                raise ValueError("an unavailable sample requires a non-empty reason")
+            return self
+        if self.limit_reason == "preview-scan" and self.limit_scope != "each-source":
+            raise ValueError("preview-scan limits must use limitScope=each-source")
+        if self.limit_reason == "interactive-row-budget" and self.limit_scope != "result-window":
+            raise ValueError("interactive-row-budget limits must use limitScope=result-window")
+        if self.row_count is not None and self.row_count < len(self.rows):
+            raise ValueError("rowCount cannot be smaller than the returned page")
+        if self.has_more is True and not self.truncated:
+            raise ValueError("hasMore requires truncated=true")
+        if self.completeness == "complete":
+            if self.row_count is None or self.row_count != len(self.rows):
+                raise ValueError("complete data requires rowCount to equal the returned row count")
+            if self.has_more is not False or self.truncated:
+                raise ValueError("complete data cannot be truncated or have another page")
+            if self.row_limit is not None:
+                raise ValueError("complete data cannot carry an active row limit")
+        if self.completeness == "sample":
+            if not self.truncated:
+                raise ValueError("sample data requires truncated=true")
+            if (self.row_limit is None or self.limit_reason != "preview-scan"
+                    or self.limit_scope != "each-source"):
+                raise ValueError("sample data requires an each-source preview-scan limit")
+        if self.completeness == "capped":
+            if not self.truncated:
+                raise ValueError("capped data requires truncated=true")
+            if self.row_limit is None:
+                raise ValueError("capped data requires rowLimit, limitReason, and limitScope")
+            if self.has_more is not False:
+                raise ValueError("capped data requires hasMore=false at the interactive boundary")
+            if (self.limit_reason != "interactive-row-budget"
+                    or self.limit_scope != "result-window"):
+                raise ValueError("capped data requires a result-window interactive-row-budget limit")
+        if self.completeness != "complete" and not self.truncated:
+            raise ValueError("successful non-complete data requires truncated=true")
+        return self
+
 
 class ColumnProfile(Wire):
     name: str
     type: str
-    non_null: int = 0
-    nulls: int = 0
-    distinct: int | None = None    # exact over the sample; None for nested/uncomparable types
+    non_null: int = Field(default=0, ge=0)
+    nulls: int = Field(default=0, ge=0)
+    distinct: int | None = Field(
+        default=None, ge=0,
+        description="Measured distinct count, or null when the column type cannot be compared.",
+    )
+    distinct_is_approximate: bool = Field(
+        default=False,
+        description="Whether distinct was estimated (for example, whole-dataset HLL) rather than exact.",
+    )
     min: str | None = None         # stringified (numeric / temporal / text); None if not applicable
     max: str | None = None
     mean: float | None = None      # numeric columns only
 
+    @model_validator(mode="after")
+    def _distinct_shape(self) -> "ColumnProfile":
+        if self.distinct is None and self.distinct_is_approximate:
+            raise ValueError("distinctIsApproximate requires a distinct value")
+        return self
+
 
 class ProfileResult(Wire):
-    columns: list[ColumnProfile] = []
-    row_count: int = 0             # rows actually profiled (the bounded sample, NOT the full total)
-    sampled: bool = True           # stats are over the previewed sample, not the whole dataset
+    """Column statistics with an explicit, non-inferred measurement scope."""
+
+    columns: list[ColumnProfile] = Field(default_factory=list)
+    row_count: int = Field(
+        default=0, ge=0,
+        description="Rows actually profiled; a full dataset total only when completeness=complete.",
+    )
+    sampled: bool = Field(
+        default=True,
+        description="Whether statistics were computed from a bounded sample instead of all rows.",
+    )
+    completeness: ProfileCompleteness = Field(
+        default="unknown",
+        description="complete=whole dataset, sample=bounded rows, unknown=no statistics are available.",
+    )
     not_previewable: bool = False
     error: bool = False
     reason: str | None = None
+
+    @model_validator(mode="after")
+    def _truthful_scope(self) -> "ProfileResult":
+        if self.error and self.not_previewable:
+            raise ValueError("a profile result cannot be both an error and not previewable")
+        unavailable = self.error or self.not_previewable
+        if unavailable:
+            if self.completeness != "unknown":
+                raise ValueError("an unavailable profile must have unknown completeness")
+            if self.columns or self.row_count:
+                raise ValueError("an unavailable profile cannot carry statistics")
+            if not self.reason or not self.reason.strip():
+                raise ValueError("an unavailable profile requires a non-empty reason")
+            return self
+        if self.completeness == "unknown":
+            raise ValueError("a successful profile must declare complete or sample completeness")
+        if self.completeness == "complete" and self.sampled:
+            raise ValueError("a complete profile cannot be marked sampled")
+        if self.completeness == "sample" and not self.sampled:
+            raise ValueError("a sample profile must be marked sampled")
+        if any(column.non_null + column.nulls != self.row_count for column in self.columns):
+            raise ValueError("each profile column's nonNull + nulls must equal rowCount")
+        return self
 
 
 # --------------------------------------------------------------------------- #

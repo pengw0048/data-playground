@@ -26,6 +26,7 @@ function result(value: string): SampleResult {
   return {
     columns: [{ name: 'value', type: 'string', capabilities: [] }],
     rows: [{ value }], rowCount: 1, truncated: true, hasMore: false,
+    completeness: 'sample', rowLimit: 2_000, limitReason: 'preview-scan',
   }
 }
 
@@ -96,7 +97,7 @@ describe('node sample export freshness', () => {
     expect(await blobs[0].text()).not.toContain('stale')
   })
 
-  it('reuses a current cached result across presentation-only movement, status, edge-id, and selection edits', async () => {
+  it('fetches a fresh export sample across presentation-only movement, status, edge-id, and selection edits', async () => {
     const previewDoc = pipeline()
     const currentDoc = structuredClone(previewDoc)
     currentDoc.nodes[0].position = { x: 800, y: 400 }
@@ -107,11 +108,13 @@ describe('node sample export freshness', () => {
       previews: { target: boundPreview(previewDoc, 'target', 'current') },
       selectedId: 'source', selectedIds: ['source'],
     })
+    apiMocks.preview.mockResolvedValueOnce(result('fresh current'))
 
     await exportNode('target')
 
-    expect(apiMocks.preview).not.toHaveBeenCalled()
-    expect(downloads).toEqual(['target.json', 'target.csv'])
+    expect(apiMocks.preview).toHaveBeenCalledWith(currentDoc, 'target', 500, 0, undefined)
+    expect(downloads).toEqual(['target-preview-sample.json', 'target-preview-sample.csv'])
+    expect(await blobs[0].text()).toContain('fresh current')
   })
 
   it('exports the visible named output with port-bound identity and filenames', async () => {
@@ -122,12 +125,13 @@ describe('node sample export freshness', () => {
       doc,
       previews: { target: boundPreview(doc, 'target', 'visible right', 'right') },
     })
+    apiMocks.preview.mockResolvedValueOnce(result('fresh visible right'))
 
     await exportNode('target')
 
-    expect(apiMocks.preview).not.toHaveBeenCalled()
-    expect(downloads).toEqual(['target-right.json', 'target-right.csv'])
-    expect(await blobs[0].text()).toContain('visible right')
+    expect(apiMocks.preview).toHaveBeenCalledWith(doc, 'target', 500, 0, 'right')
+    expect(downloads).toEqual(['target-right-preview-sample.json', 'target-right-preview-sample.csv'])
+    expect(await blobs[0].text()).toContain('fresh visible right')
   })
 
   it('requires a visible named output before exporting a multi-output node', async () => {
@@ -141,6 +145,19 @@ describe('node sample export freshness', () => {
     expect(apiMocks.preview).not.toHaveBeenCalled()
     expect(downloads).toEqual([])
     expect(useStore.getState().toasts.at(-1)?.msg).toMatch(/choose an output in data/i)
+  })
+
+  it('does not create a fake data file when the node cannot produce a truthful preview sample', async () => {
+    apiMocks.preview.mockResolvedValueOnce({
+      columns: [], rows: [], rowCount: null, hasMore: false, truncated: false,
+      completeness: 'unknown', rowLimit: null, limitReason: null,
+      notPreviewable: true, error: false, reason: 'needs a full pass', wire: 'dataset',
+    })
+
+    await exportNode('target')
+
+    expect(downloads).toEqual([])
+    expect(useStore.getState().toasts.at(-1)?.msg).toMatch(/committed full result/i)
   })
 
   it('drops a refreshed export when the graph changes before its response arrives', async () => {
@@ -183,6 +200,6 @@ describe('node sample export freshness', () => {
     finishThird(result('newest'))
     await third
     expect(downloads).toHaveLength(4)
-    expect(useStore.getState().toasts.filter((toast) => /Exported target/.test(toast.msg))).toHaveLength(2)
+    expect(useStore.getState().toasts.filter((toast) => /Exported preview sample/.test(toast.msg))).toHaveLength(2)
   })
 })

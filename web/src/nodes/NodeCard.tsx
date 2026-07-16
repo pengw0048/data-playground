@@ -344,7 +344,7 @@ function MoreMenu({ id, kind, canEdit, disabled, bypassed }: { id: string; kind:
         {canEdit && item('duplicate', 'Duplicate', () => duplicate(id))}
         {canEdit && canBypass && item('power', bypassed ? 'Un-bypass' : 'Bypass (pass data through)', () => bypass(id))}
         {canEdit && item('mute', disabled ? 'Enable' : 'Disable (+ downstream)', () => disable(id))}
-        {item('export', 'Export data', () => exportNode(id))}
+        {item('export', 'Export preview sample (JSON + CSV)', () => exportNode(id))}
         {item('lineage', 'Lineage', () => openPanel(id, 'lineage'))}
         {canEdit && <DropdownMenuSeparator />}
         {canEdit && item('trash', 'Delete', () => removeNode(id), true)}

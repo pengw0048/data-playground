@@ -640,6 +640,35 @@ def test_viewer_can_read_completed_output_history_mcp_and_websocket(authed):
     assert history.status_code == 200
     assert any(row["status"] == "done" and row["targetNodeId"] == "s" for row in history.json())
 
+    export_params = {"nodeId": owner_output["nodeId"], "portId": owner_output["portId"]}
+    viewer_export = client.get(
+        f"/api/run/{run_id}/export", params=export_params, headers=_hdr("authz_viewer"),
+    )
+    assert viewer_export.status_code == 200
+    assert viewer_export.headers["x-data-scope"] == "full-result"
+    assert client.head(
+        f"/api/run/{run_id}/export", params=export_params, headers=_hdr("authz_viewer"),
+    ).status_code == 200
+    stranger_export = client.get(
+        f"/api/run/{run_id}/export",
+        params={**export_params, "userId": "authz_viewer"}, headers=_hdr("authz_b"),
+    )
+    assert stranger_export.status_code == 404
+    assert client.head(
+        f"/api/run/{run_id}/export",
+        params={**export_params, "userId": "authz_viewer"}, headers=_hdr("authz_b"),
+    ).status_code == 404
+    sample_body = {**export_params, "k": 2, "offset": 0}
+    viewer_sample = client.post(
+        f"/api/run/{run_id}/sample", json=sample_body, headers=_hdr("authz_viewer"),
+    )
+    assert viewer_sample.status_code == 200
+    assert viewer_sample.json()["rows"]
+    stranger_sample = client.post(
+        f"/api/run/{run_id}/sample", json=sample_body, headers=_hdr("authz_b"),
+    )
+    assert stranger_sample.status_code == 404
+
     mcp_status = _mcp_tool("authz_viewer", "run_status", {"runId": run_id})
     assert mcp_status.get("isError") is not True
     assert mcp_status["structuredContent"]["outputs"] == owner_status["outputs"]

@@ -61,7 +61,8 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                   </div>
                   {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
                   {r.outputs.length > 0 && (
-                    <HistoryOutputs runId={r.id} outputs={r.outputs} openKey={resultOpen}
+                    <HistoryOutputs historyId={r.id} runId={r.runId ?? undefined}
+                      outputs={r.outputs} openKey={resultOpen}
                       onToggle={(key) => setResultOpen(resultOpen === key ? null : key)} />
                   )}
                 </div>
@@ -78,18 +79,20 @@ function historyOutputKey(runId: string, output: RunOutput): string {
   return JSON.stringify([runId, output.nodeId, output.portId])
 }
 
-function HistoryOutputs({ runId, outputs, openKey, onToggle }: {
-  runId: string
+function HistoryOutputs({ historyId, runId, outputs, openKey, onToggle }: {
+  historyId: string
+  runId?: string
   outputs: RunOutput[]
   openKey: string | null
   onToggle: (key: string) => void
 }) {
   return (
-    <div aria-label={`Outputs for run ${runId}`} className="border-t border-border bg-muted/20">
+    <div aria-label={`Outputs for run ${historyId}`} className="border-t border-border bg-muted/20">
       {outputs.map((output) => {
-        const key = historyOutputKey(runId, output)
+        const key = historyOutputKey(historyId, output)
         const readable = output.outcome === 'committed' && !!output.uri
         const label = output.portLabel || output.portId
+        const publishedDataset = output.publicationKind === 'catalog'
         return (
           <div key={`${output.nodeId}:${output.portId}`} className="border-b border-border/60 last:border-b-0">
             <div className="flex items-center gap-2 px-4 py-2 text-[11px]">
@@ -100,18 +103,30 @@ function HistoryOutputs({ runId, outputs, openKey, onToggle }: {
                 title={output.table || output.uri || undefined}>
                 {output.table ? `→ ${output.table}` : output.uri ? `→ ${output.uri}` : output.publicationKind}
               </span>
-              {output.rows != null && <span className="shrink-0 text-muted-foreground">{output.rows.toLocaleString()} rows</span>}
+              {output.rows != null && (
+                <span className="shrink-0 text-muted-foreground">
+                  {output.rows.toLocaleString()} rows{output.publicationKind === 'catalog' ? ' written' : ''}
+                </span>
+              )}
               {readable && (
                 <Button variant="ghost" size="sm" className="h-6 px-2 text-[10.5px]"
                   onClick={() => onToggle(key)}>
-                  {openKey === key ? 'Hide result' : outputs.length === 1 ? 'Open full result' : `Open ${label}`}
+                  {openKey === key
+                    ? publishedDataset ? 'Hide dataset' : 'Hide result'
+                    : outputs.length === 1
+                      ? publishedDataset ? 'Open published dataset' : 'Open full result'
+                      : `Open ${label}`}
                 </Button>
               )}
             </div>
             {output.error && <div className="dp-mono px-4 pb-2 text-[10.5px] text-destructive">{output.error}</div>}
             {openKey === key && readable && (
               <div className="border-t border-border">
-                <FullResult uri={output.uri!} total={output.rows ?? null} />
+                <FullResult uri={output.uri!}
+                  total={output.publicationKind === 'result' ? output.rows ?? null : null}
+                  runId={runId} nodeId={output.nodeId} portId={output.portId}
+                  publicationKind={output.publicationKind}
+                  name={`${output.nodeId}-${label}`} />
               </div>
             )}
           </div>

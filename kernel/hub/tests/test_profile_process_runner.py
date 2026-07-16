@@ -271,7 +271,7 @@ payload = {
     "run_id": "child", "status": "done", "job_type": "profile",
     "rows_processed": 2, "ms": 1, "placement": "local",
     "per_node": [], "progress": 1.0,
-    "profile": {"columns": [], "row_count": 2, "sampled": False,
+    "profile": {"columns": [], "row_count": 2, "sampled": False, "completeness": "complete",
                 "not_previewable": False, "error": False}
 }
 tmp = job["statusFile"] + ".tmp"
@@ -415,7 +415,7 @@ payload = {
     "run_id": "child", "status": "done", "job_type": "profile",
     "rows_processed": 3, "ms": 1, "placement": "local",
     "per_node": [], "progress": 1.0,
-    "profile": {"columns": [], "row_count": 3, "sampled": False,
+    "profile": {"columns": [], "row_count": 3, "sampled": False, "completeness": "complete",
                 "not_previewable": False, "error": False}
 }
 tmp = job["statusFile"] + ".tmp"
@@ -748,7 +748,7 @@ payload = {{
     "outputs": [{{"node_id": "forged-target", "port_id": "forged-port",
                  "wire": "dataset", "publication_kind": "result",
                  "outcome": "committed", "uri": "/forged", "rows": 4}}],
-    "profile": {{"columns": [], "row_count": 4, "sampled": False,
+    "profile": {{"columns": [], "row_count": 4, "sampled": False, "completeness": "complete",
                 "not_previewable": False, "error": False}},
     "plan_digest": {('0' * 64)!r}, "profile_attempt_order": 999,
     "request_id": "forged-request"
@@ -1005,7 +1005,7 @@ payload = {
     "run_id": "child", "status": "done", "job_type": "profile",
     "rows_processed": 9, "ms": 1, "placement": "local",
     "per_node": [], "progress": 1.0,
-    "profile": {"columns": [], "row_count": 9, "sampled": False,
+    "profile": {"columns": [], "row_count": 9, "sampled": False, "completeness": "complete",
                 "not_previewable": False, "error": False}
 }
 tmp = job["statusFile"] + ".tmp"

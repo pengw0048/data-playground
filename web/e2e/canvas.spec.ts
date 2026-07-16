@@ -997,11 +997,12 @@ test.describe('Data Playground canvas', () => {
     // preview via the Inspector's View data (always visible for the selected node — no hover needed)
     await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
     // the data viewer shows rows, then Next paginates, then clicking a row opens its detail
-    await expect(page.getByText(/^rows /)).toBeVisible({ timeout: 15_000 })
-    await page.getByRole('button', { name: 'Next page' }).click()
-    await expect(page.getByRole('button', { name: 'Previous page' })).toBeEnabled()
-    await page.locator('.dp-panel table tbody tr').first().click()
-    await expect(page.getByRole('button', { name: /^Row / })).toBeVisible() // detail back-button
+    const panel = page.getByTestId('panel-data')
+    await expect(panel.getByText(/^rows \d+–\d+$/)).toBeVisible({ timeout: 15_000 })
+    await panel.getByRole('button', { name: 'Next page' }).click()
+    await expect(panel.getByRole('button', { name: 'Previous page' })).toBeEnabled()
+    await panel.locator('table tbody tr').first().click()
+    await expect(panel.getByRole('button', { name: /^Row / })).toBeVisible() // detail back-button
   })
 
   test('editing a graph blocks rows from the previous preview until it is refreshed', async ({ page }) => {

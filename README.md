@@ -64,7 +64,7 @@ it into a second pipeline definition.
 | Area | Current capability |
 | --- | --- |
 | **Build** | Typed ports and validated connections on a React Flow canvas; autosave, versions, undo/redo, sections, sharing, and Yjs live collaboration |
-| **Inspect** | Bounded real-row previews, schemas, profiles, media cells, charts, row export, and per-node errors; operations that cannot be sampled truthfully request a full pass |
+| **Inspect** | Bounded real-row previews, schemas, profiles, media cells, charts, scope-labeled page/sample exports, native full-result streaming, and per-node errors; operations that cannot be sampled truthfully request a full pass |
 | **Transform** | Relational filtering, projection, joins, unions, pivots, aggregates, sorting, deduplication, windows, null filling, unnesting, SQL, and Python transforms fed from Arrow batches in row, pandas, or PyArrow modes |
 | **Validate** | Schema-aware column warnings, row-level assertions that expose violating rows, and named/versioned schema contracts that can fail a run on drift |
 | **Discover** | Server-paginated catalog browse, folders, facets, lexical search, optional semantic search, keys, join suggestions, relationships, and bounded lineage |

@@ -58,7 +58,11 @@ describe('CatalogView request and mutation truth', () => {
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [], tables: [] })
     mocks.searchCatalog.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ nodes: [], edges: [] })
-    mocks.sample.mockResolvedValue({ columns: TABLE.columns, rows: [{ order_id: 1 }], truncated: false, notPreviewable: false, wire: 'dataset' })
+    mocks.sample.mockResolvedValue({
+      columns: TABLE.columns, rows: [{ order_id: 1 }], rowCount: 2,
+      hasMore: true, truncated: true, completeness: 'page',
+      notPreviewable: false, wire: 'dataset',
+    })
     mocks.table.mockResolvedValue(TABLE)
     mocks.setTableMetadata.mockResolvedValue(TABLE)
     mocks.unregisterTable.mockResolvedValue({ ok: true })
@@ -111,7 +115,11 @@ describe('CatalogView request and mutation truth', () => {
       .mockResolvedValueOnce({ nodes: [], edges: [] })
     mocks.sample
       .mockRejectedValueOnce(new Error('Failed to fetch'))
-      .mockResolvedValueOnce({ columns: TABLE.columns, rows: [{ order_id: 1 }], truncated: false, notPreviewable: false, wire: 'dataset' })
+      .mockResolvedValueOnce({
+        columns: TABLE.columns, rows: [{ order_id: 1 }], rowCount: 2,
+        hasMore: true, truncated: true, completeness: 'page',
+        notPreviewable: false, wire: 'dataset',
+      })
     mocks.setTableMetadata
       .mockRejectedValueOnce(new Error('HTTP 409: concurrent edit'))
       .mockResolvedValueOnce({ ...TABLE, folder: 'curated/sales' })
@@ -127,6 +135,7 @@ describe('CatalogView request and mutation truth', () => {
     expect(await screen.findByText(/Couldn't load preview: Failed to fetch/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('detail-preview-retry'))
     expect(await screen.findByRole('cell', { name: '1' })).toBeInTheDocument()
+    expect(screen.getByText('Dataset preview · showing 1 of 2 rows')).toBeInTheDocument()
 
     const folder = screen.getByTestId('detail-folder') as HTMLInputElement
     fireEvent.change(folder, { target: { value: 'curated/sales' } })
@@ -139,6 +148,50 @@ describe('CatalogView request and mutation truth', () => {
     await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(2))
     fireEvent.click(screen.getByTestId('detail-unregister'))
     await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(3))
+  })
+
+  it('renders every row counted by the catalog preview scope label', async () => {
+    const rows = Array.from({ length: 50 }, (_, order_id) => ({ order_id }))
+    mocks.sample.mockResolvedValue({
+      columns: TABLE.columns, rows, rowCount: 50,
+      hasMore: false, truncated: false, completeness: 'complete',
+      notPreviewable: false, wire: 'dataset',
+    })
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByText('orders'))
+    fireEvent.click(screen.getByTestId('detail-preview'))
+
+    expect(await screen.findByText('Complete dataset · 50 rows')).toBeInTheDocument()
+    expect(screen.getAllByRole('cell')).toHaveLength(50)
+  })
+
+  it('does not infer an empty dataset from an empty bounded preview batch', async () => {
+    mocks.sample.mockResolvedValue({
+      columns: TABLE.columns, rows: [], rowCount: null,
+      hasMore: null, truncated: true, completeness: 'unknown',
+      notPreviewable: false, wire: 'dataset',
+    })
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByText('orders'))
+    fireEvent.click(screen.getByTestId('detail-preview'))
+
+    expect(await screen.findByText('No rows returned by this preview; dataset size is unknown.')).toBeInTheDocument()
+    expect(screen.queryByText('No rows in this dataset')).not.toBeInTheDocument()
+  })
+
+  it('keeps a known nonzero dataset distinct from an empty preview batch', async () => {
+    mocks.sample.mockResolvedValue({
+      columns: TABLE.columns, rows: [], rowCount: 120,
+      hasMore: true, truncated: true, completeness: 'page',
+      notPreviewable: false, wire: 'dataset',
+    })
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByText('orders'))
+    fireEvent.click(screen.getByTestId('detail-preview'))
+
+    expect(await screen.findByText(
+      'No rows returned by this preview; the dataset contains 120 rows.',
+    )).toBeInTheDocument()
   })
 })
 

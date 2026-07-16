@@ -66,7 +66,7 @@ import uuid
 from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 from hub import db, graph as g
-from hub.backends import DurableCatalogPublisher
+from hub.backends import BackendStatusUnavailable, DurableCatalogPublisher
 from hub.handoff import (allocate_attempt, attempt_has_commit_record, attempt_has_contents,
                          discard_attempt, has_attempt_path_component, is_attempt_uri,
                          lookup_attempt, read_manifest, validate_shards, write_manifest)
@@ -160,7 +160,7 @@ class JobsConfigurationDrift(RuntimeError):
     """The current operator configuration points at a different durable execution namespace."""
 
 
-class JobsConfigurationUnavailable(RuntimeError):
+class JobsConfigurationUnavailable(BackendStatusUnavailable):
     """A replacement process lacks the local production contract needed to reattach safely."""
 
 
@@ -3042,7 +3042,7 @@ class RayRunner:
             try:
                 return self._listed_job_status(client.list_jobs(), submission_id)
             except Exception as list_error:  # noqa: BLE001
-                raise RuntimeError(
+                raise BackendStatusUnavailable(
                     "Ray Jobs discovery unavailable "
                     f"(code=job_discovery_unavailable,status_type={type(status_error).__name__},"
                     f"list_type={type(list_error).__name__})"

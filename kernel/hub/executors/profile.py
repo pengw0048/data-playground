@@ -97,6 +97,7 @@ def _full_stats(
         prof: dict = {"non_null": nn, "nulls": n - nn}
         if d.get(f"c{i}_d") is not None:
             prof["distinct"] = int(d[f"c{i}_d"])
+            prof["distinct_is_approximate"] = True
         if has_mm:
             lo, hi = d.get(f"c{i}_mn"), d.get(f"c{i}_mx")
             prof["min"] = None if lo is None else str(lo)
@@ -104,7 +105,7 @@ def _full_stats(
         if numeric and d.get(f"c{i}_av") is not None:
             prof["mean"] = float(d[f"c{i}_av"])
         cols.append(ColumnProfile(name=name, type=display_type(str(t)), **prof))
-    return ProfileResult(columns=cols, row_count=n, sampled=False)
+    return ProfileResult(columns=cols, row_count=n, sampled=False, completeness="complete")
 
 
 def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
@@ -197,7 +198,8 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                 cols = [ColumnProfile(name=f.name, type=display_type(str(f.type)),
                                       **_stat(tbl.column(f.name), n, f.type))
                         for f in tbl.schema]
-                return ProfileResult(columns=cols, row_count=n, sampled=True)
+                return ProfileResult(columns=cols, row_count=n, sampled=True,
+                                     completeness="sample")
 
     def on_timeout() -> None:
         sc = holder.get("scope")

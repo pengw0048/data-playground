@@ -644,12 +644,46 @@ def data_sample(req: SampleRequest) -> SampleResult:
                 except Exception:  # metadata uncertainty stays unknown; never fall back to a full scan
                     total = None
             page_end = req.offset + len(rows)
-            budgeted_total = min(total, DATA_SAMPLE_PREVIEW_ROW_BUDGET) if total is not None else None
-            has_more = len(page) > req.k or (
-                budgeted_total is not None and budgeted_total > page_end
+            # ``preview_scan(limit=...)`` guarantees an upper work bound, not EOF semantics. A
+            # third-party adapter may legitimately return fewer rows than requested while more data
+            # exists (remote pagination, sparse partitions, transient batch boundaries). Only the
+            # adapter's explicit bounded metadata capability can establish an exact total.
+            exact_total = total
+            budgeted_total = (min(exact_total, DATA_SAMPLE_PREVIEW_ROW_BUDGET)
+                              if exact_total is not None else None)
+            budget_capped = page_end >= DATA_SAMPLE_PREVIEW_ROW_BUDGET and (
+                exact_total is None or exact_total > page_end
             )
-            result = SampleResult(columns=cols, rows=rows, row_count=total, has_more=has_more,
-                                  truncated=(total is None or total > page_end))
+            if len(page) > req.k:
+                has_more: bool | None = True
+            elif budget_capped:
+                # Pagination is deliberately closed at this result-window boundary even when the
+                # source's exact total is larger or unknown.
+                has_more = False
+            elif budgeted_total is not None:
+                has_more = budgeted_total > page_end
+            else:
+                # A short bounded adapter batch is not an EOF signal.
+                has_more = None
+            if budget_capped:
+                completeness = "capped"
+            elif exact_total is None:
+                completeness = "page" if has_more is True or req.offset > 0 else "unknown"
+            elif req.offset == 0 and page_end >= exact_total:
+                completeness = "complete"
+            else:
+                completeness = "page"
+            result = SampleResult(columns=cols, rows=rows, row_count=exact_total, has_more=has_more,
+                                  # Every page after offset zero omits the rows before it, including
+                                  # the final page of a dataset with an exact total.
+                                  truncated=(req.offset > 0 or exact_total is None
+                                             or exact_total > page_end),
+                                  completeness=completeness,
+                                  row_limit=(DATA_SAMPLE_PREVIEW_ROW_BUDGET
+                                             if budget_capped else None),
+                                  limit_reason=("interactive-row-budget"
+                                                if budget_capped else None),
+                                  limit_scope=("result-window" if budget_capped else None))
         with contextlib.suppress(Exception):
             metadb.catalog_bump_usage(req.uri)  # someone looked at this data → popularity signal (best-effort)
         return result

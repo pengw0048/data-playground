@@ -132,8 +132,12 @@ export interface SampleResult {
   columns: ColumnSchema[]
   rows: Record<string, unknown>[]
   rowCount?: number | null
-  hasMore?: boolean
+  hasMore?: boolean | null
   truncated: boolean
+  completeness: 'complete' | 'page' | 'sample' | 'capped' | 'unknown'
+  rowLimit?: number | null
+  limitReason?: 'preview-scan' | 'interactive-row-budget' | null
+  limitScope?: 'each-source' | 'result-window' | null
   previewRef?: string | null
   notPreviewable: boolean
   error?: boolean
@@ -147,6 +151,7 @@ export interface ColumnProfile {
   nonNull: number
   nulls: number
   distinct?: number | null
+  distinctIsApproximate: boolean
   min?: string | null
   max?: string | null
   mean?: number | null
@@ -156,6 +161,7 @@ export interface ProfileResult {
   columns: ColumnProfile[]
   rowCount: number
   sampled: boolean
+  completeness: 'complete' | 'sample' | 'unknown'
   notPreviewable: boolean
   error?: boolean
   reason?: string | null
