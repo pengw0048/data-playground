@@ -168,7 +168,7 @@ class RunController:
             return [{"id": "r_all", "outputNode": target, "backend": "default", "worker": None,
                      "nodeIds": [n.id for n in cone], "tier": None,
                      "rows": rows, "confidence": conf,
-                     "requires": _req_str(greq) if unsat else "", "unsatisfied": unsat,
+                     "requires": _req_str(greq), "unsatisfied": unsat,
                      "available": avail if unsat else "",
                      "preflight": self._source_warnings(graph, [n.id for n in cone])}]
         out: list[dict] = []

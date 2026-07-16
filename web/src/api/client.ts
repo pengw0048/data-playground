@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunOutput, RunStatus, SampleResult,
+  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunOutput, RunStatus, SampleResult,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -123,7 +123,7 @@ export interface BackendParam { name: string; type: string; default?: unknown; o
 export interface BackendNodeSpec {
   kind: string; title: string; category: string; tag?: string
   inputs: BackendPort[]; outputs: BackendPort[]; params: BackendParam[]
-  canBypass: boolean; previewable: boolean; blurb: string
+  canBypass: boolean; previewable: boolean; requires?: ResourceSpec | null; blurb: string
 }
 
 export interface AgentBackendNode { id: string; type: string; position: { x: number; y: number }; data: { title?: string; config?: Record<string, unknown> } }

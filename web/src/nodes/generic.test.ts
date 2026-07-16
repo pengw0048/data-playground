@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { portMulti } from './registry'
+import { getSpec, portMulti } from './registry'
 import { registerGenericNodes } from './generic'
 
 describe('generic node registration', () => {
@@ -12,5 +12,18 @@ describe('generic node registration', () => {
     }])
 
     expect(portMulti('plugin-multi-input-contract', 'items')).toBe(true)
+  })
+
+  it('preserves plugin previewability and declared resource requirements', () => {
+    registerGenericNodes([{
+      kind: 'plugin-requires-preview-contract', title: 'Plugin full pass', category: 'compute',
+      inputs: [{ id: 'in', wire: 'dataset' }], outputs: [{ id: 'out', wire: 'dataset' }], params: [],
+      canBypass: false, previewable: false, requires: { gpu: 1, labels: { engine: 'plugin-gpu' } }, blurb: '',
+    }])
+
+    expect(getSpec('plugin-requires-preview-contract')).toMatchObject({
+      previewable: false,
+      requires: { gpu: 1, labels: { engine: 'plugin-gpu' } },
+    })
   })
 })

@@ -5,6 +5,7 @@ import type { ComponentType } from 'react'
 import type { WireType, Category } from '../theme/tokens'
 import type { CanvasNode, NodeData, PortSpec } from '../types/graph'
 import type { ColumnSchema } from '../types/graph'
+import type { ResourceSpec } from '../types/api'
 
 export interface NodeSpec {
   kind: string
@@ -14,6 +15,8 @@ export interface NodeSpec {
   inputs: PortSpec[]
   outputs: PortSpec[]
   canBypass: boolean
+  previewable?: boolean
+  requires?: ResourceSpec | null
   defaultData: () => NodeData
   blurb: string
   // Optional: dynamically resolve output wire types (e.g. a source's out depends on nothing,
