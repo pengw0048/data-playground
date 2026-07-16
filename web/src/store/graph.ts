@@ -1394,7 +1394,7 @@ export const useStore = create<Store>((set, get) => ({
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'running' } } }))
     get().updateData(id, { status: 'running' })
     try {
-      const status = await api.run(get().doc, id, confirmed)
+      const status = await api.run(get().doc, id, confirmed, globalThis.crypto.randomUUID())
       set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), status, phase: 'running' } } }))
       pollRun(get, set, id, status.runId)
     } catch (e) {

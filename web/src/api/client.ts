@@ -282,8 +282,21 @@ export const api = {
   profileIdentity: (doc: CanvasDoc, nodeId: string) =>
     req<ProfileIdentity>('/run/profile-identity', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
 
-  run: (doc: CanvasDoc, targetNodeId?: string, confirmed = false) =>
-    req<RunStatus>('/run', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed }) }),
+  run: async (doc: CanvasDoc, targetNodeId: string | undefined, confirmed: boolean, submissionId: string) => {
+    // Keep the same client-owned id across a lost HTTP response: the hub adopts the one immutable
+    // admission instead of starting another full pass against a moved source head.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await req<RunStatus>('/run', {
+          method: 'POST',
+          body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed, submissionId }),
+        })
+      } catch (error) {
+        if (error instanceof KernelError || attempt >= 2) throw error
+        await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)))
+      }
+    }
+  },
 
   fullProfile: (doc: CanvasDoc, nodeId: string, planDigest: string, submissionId: string, confirmed = false) =>
     req<RunStatus>('/run/profile-job', {

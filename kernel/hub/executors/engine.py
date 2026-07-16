@@ -599,6 +599,18 @@ class BuildEngine:
                 if pred and self.full:
                     extra["predicate"] = pred
             adapter = self.resolve_adapter(uri)
+            # Full-run admission may bind a source to one provider-native revision.  This is an
+            # internal execution capability, never a client-configurable source option: opening the
+            # exact revision is deliberately preferred to scanning the mutable provider head.
+            revision_id = cfg.get("_input_revision_id")
+            if revision_id is not None:
+                open_revision = getattr(adapter, "open_revision", None)
+                if not callable(open_revision):
+                    raise NotPreviewable(node, "persisted input revision is unavailable")
+                try:
+                    return open_revision(uri, str(revision_id))
+                except Exception as exc:  # provider retention/removal must never fall back to head
+                    raise NotPreviewable(node, "persisted input revision is unavailable") from exc
             if self.sample_k is not None and not self.full and not self.reservoir_preview:
                 preview_scan = getattr(adapter, "preview_scan", None)
                 if not callable(preview_scan):

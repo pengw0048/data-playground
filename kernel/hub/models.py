@@ -960,6 +960,7 @@ class RunHistoryRecord(Wire):
     rows: int | None = Field(default=None, ge=0)
     ms: int | None = Field(default=None, ge=0)
     error: str | None = None
+    input_manifest: list[dict[str, str]] | None = None
     outputs: list[RunOutput] = Field(default_factory=list, max_length=64)
     # Full-profile jobs have no materialized outputs. Keep their measured profile as a separate,
     # bounded history payload instead of abusing result-output fields.
@@ -1235,3 +1236,6 @@ class RunRequest(Wire):
     graph: Graph
     target_node_id: str | None = None
     confirmed: bool = False
+    # A browser retains this UUID across a response-loss retry.  The hub derives the durable run
+    # identity from it rather than treating a repeated POST as another dispatch.
+    submission_id: UUID4 | None = None

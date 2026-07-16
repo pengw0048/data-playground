@@ -3034,6 +3034,23 @@
             "title": "Id",
             "type": "string"
           },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
           "jobType": {
             "enum": [
               "run",
@@ -3336,6 +3353,18 @@
           },
           "graph": {
             "$ref": "#/components/schemas/Graph"
+          },
+          "submissionId": {
+            "anyOf": [
+              {
+                "format": "uuid4",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Submissionid"
           },
           "targetNodeId": {
             "anyOf": [
