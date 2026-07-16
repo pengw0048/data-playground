@@ -56,3 +56,30 @@ def test_released_posix_scope_never_signals_a_reused_group(monkeypatch):
     assert scope.request_stop() is False
     assert scope.request_stop(force=True) is False
     assert signals == released_signals
+
+
+def test_posix_scope_refuses_killpg_after_leader_pid_reuse(monkeypatch):
+    """``Popen.poll()`` reaps the leader; a recycled PID must not be killpg'd."""
+    proc = _DirectProcess(running=False)
+    proc.pid = 424242
+    starttimes = {424242: 100}
+    signals = []
+
+    monkeypatch.setattr(
+        "hub.process_scope._proc_starttime",
+        lambda pid: starttimes.get(pid),
+    )
+
+    def killpg(pgid, sig):
+        signals.append((pgid, sig))
+
+    monkeypatch.setattr("hub.process_scope.os.killpg", killpg)
+    scope = OwnedProcessScope(proc, owns_process_group=True)
+    assert scope._starttime == 100
+
+    # Another session leader recycled the numeric PID after our child was reaped.
+    starttimes[424242] = 999
+    assert scope.request_stop() is True
+    assert signals == []
+    assert scope.fence(term_grace_s=0, kill_wait_s=0)
+    assert signals == []
