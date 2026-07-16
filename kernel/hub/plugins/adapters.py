@@ -10,12 +10,12 @@ carries its schema so wires are schema-aware.
 
 from __future__ import annotations
 
+import datetime
 import glob
 import hashlib
 import os
 import threading
 import uuid
-import datetime
 from collections.abc import Callable
 
 import duckdb
@@ -781,14 +781,14 @@ class LanceAdapter:
     def matches(self, uri: str) -> bool:
         return _read_uri(uri).lower().rstrip("/").endswith(".lance")
 
-    def _dataset(self, uri: str):
+    def _dataset(self, uri: str, **kwargs):
         try:
             import lance  # lazy — only if the optional `lance` extra is installed
         except ModuleNotFoundError as e:  # a clear remediation, not a raw "No module named 'lance'"
             raise ModuleNotFoundError("Lance support is not installed — run: uv pip install -e 'kernel[lance]'") from e
         normalized = _read_uri(uri)
         local = paths.checked_local_path(normalized)
-        return lance.dataset(local if local is not None else normalized)
+        return lance.dataset(local if local is not None else normalized, **kwargs)
 
     def scan(self, uri: str, columns: list[str] | None = None,
              predicate: str | None = None, limit: int | None = None,
@@ -894,8 +894,7 @@ class LanceAdapter:
             if as_of is None:
                 dataset = self._dataset(uri)
             else:
-                import lance
-                dataset = lance.dataset(path_of(uri), asof=as_of)
+                dataset = self._dataset(uri, asof=as_of)
             return {"revision_id": self._revision_id(dataset.version), "committed_at": None}
         except RevisionUnavailable:
             raise
@@ -904,8 +903,7 @@ class LanceAdapter:
 
     def open_revision(self, uri: str, revision_id: str) -> Relation:
         try:
-            import lance
-            dataset = lance.dataset(path_of(uri), version=int(self._revision_id(revision_id)))
+            dataset = self._dataset(uri, version=int(self._revision_id(revision_id)))
             dataset.schema  # Lance can defer a missing-version error until the first metadata access.
         except RevisionUnavailable:
             raise

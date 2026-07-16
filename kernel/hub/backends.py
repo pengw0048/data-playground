@@ -10,6 +10,7 @@ becomes a matter of *which backend*, not a core rewrite.
 
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 

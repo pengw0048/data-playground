@@ -369,7 +369,8 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionR
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     try:
-        _revision_adapter(binding["uri"]).open_revision(binding["uri"], revision_id)
+        with db.base_guard():
+            _revision_adapter(binding["uri"]).open_revision(binding["uri"], revision_id)
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
