@@ -743,14 +743,22 @@ def test_kernel_backend_preserves_none_execution_target_for_full_graph(monkeypat
     ])
     submitted = []
     monkeypatch.setattr(backend, "_ensure_kernel", lambda _canvas: ("endpoint", "token"))
+    monkeypatch.setattr(
+        "hub.kernel_backend.metadb.local_run_input_admission",
+        lambda run_id: {
+            "run_id": run_id, "canvas_id": "run-all", "target_node_id": None,
+            "manifest": [],
+        },
+    )
 
     def post(_endpoint, _path, _token, body):
         submitted.append(body)
         return {"runId": body["run_id"], "status": "failed", "outputs": []}
 
     monkeypatch.setattr("hub.kernel_backend._post", post)
-    backend.run(plan, graph, None, "local", run_id="kernel-run-all")
+    backend.run(plan, graph, None, "local", run_id="kernel-run-all", input_manifest=[])
     assert submitted[0]["target"] is None
+    assert submitted[0]["input_manifest"] == []
 
 
 def test_kernel_backend_rejects_ambiguous_run_all_before_kernel_claim(monkeypatch):

@@ -466,7 +466,8 @@ class SubprocessRunner:
 
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
             placement: Placement, run_id: str | None = None,
-            request_id: str | None = None, attempt_id: str | None = None) -> RunStatus:
+            request_id: str | None = None, attempt_id: str | None = None,
+            input_manifest: list[dict[str, str]] | None = None) -> RunStatus:
         output_target = preflight_run_output_target(plan, target_node_id)
         from hub.sampling import explicit_sample_provenance
         provenance = (explicit_sample_provenance(
@@ -484,6 +485,25 @@ class SubprocessRunner:
                            target_node_id=output_target, request_id=request_id,
                            outputs=expected_outputs)
         job_extra: dict = {"runId": run_id}
+        from hub.local_run_inputs import LocalRunInputError, source_nodes, validate_manifest_graph
+        private_revisions = any(
+            isinstance(node.data, dict)
+            and isinstance(node.data.get("config"), dict)
+            and node.data["config"].get("_input_revision_id") is not None
+            for node in source_nodes(graph, target_node_id)
+        )
+        if input_manifest is None:
+            if private_revisions:
+                raise LocalRunInputError("isolated run is missing its admitted input manifest")
+        else:
+            manifest = validate_manifest_graph(
+                graph, target_node_id, input_manifest, require_bound_revisions=True)
+            job_extra["inputManifest"] = manifest
+            job_extra["inputManifestIdentity"] = {
+                "runId": run_id,
+                "canvasId": str(graph.id),
+                "targetNodeId": target_node_id,
+            }
         try:
             source_leases = self._claim_source_leases(graph, target_node_id, run_id)
             with self._lock:

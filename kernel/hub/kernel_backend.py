@@ -159,8 +159,12 @@ class KernelBackend:
     # -- ExecutionBackend -------------------------------------------------- #
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None, placement,
             run_id: str | None = None, request_id: str | None = None,
-            attempt_id: str | None = None) -> RunStatus:
+            attempt_id: str | None = None,
+            input_manifest: list[dict[str, str]] | None = None) -> RunStatus:
         from hub.backends import require_destination_credential_support
+        from hub.local_run_inputs import (
+            LocalRunInputError, validate_manifest, validate_manifest_graph,
+        )
         from hub.run_outputs import preflight_run_output_target, require_single_run_output
         execution_target = target_node_id
         output_target = preflight_run_output_target(plan, execution_target)
@@ -172,12 +176,28 @@ class KernelBackend:
         require_destination_credential_support(
             self, plan, graph, getattr(self.base, "workspace", ""))
         canvas_id = getattr(graph, "id", None) or "canvas"
-        run_id = run_id or f"run_{os.urandom(5).hex()}"  # hub-authoritative id, threaded into the kernel
+        if not run_id:
+            raise RuntimeError("kernel runs require a persisted local input admission")
+        admission = metadb.local_run_input_admission(run_id)
+        if (admission is None or admission["canvas_id"] != canvas_id
+                or admission["target_node_id"] != target_node_id):
+            raise RuntimeError("kernel run does not match its persisted local input admission")
+        try:
+            manifest = validate_manifest(input_manifest)
+            persisted = validate_manifest(admission["manifest"])
+            if manifest != persisted:
+                raise LocalRunInputError(
+                    "kernel transport manifest does not match its persisted admission")
+            manifest = validate_manifest_graph(
+                graph, target_node_id, manifest, require_bound_revisions=True)
+        except LocalRunInputError as exc:
+            raise RuntimeError("kernel run has an invalid admitted input manifest") from exc
         endpoint, token = self._ensure_kernel(canvas_id)
         # ``None`` is semantically meaningful: execute the complete topological graph. Never replace it
         # with the sole public output target, which would drop an independent branch.
         body = {"run_id": run_id, "graph": graph.model_dump(), "target": execution_target,
-                "placement": placement, "request_id": request_id, "attempt_id": attempt_id}
+                "placement": placement, "request_id": request_id, "attempt_id": attempt_id,
+                "input_manifest": manifest}
         status = RunStatus(**_post(endpoint, "/run", token, body))
         if request_id and not status.request_id:
             status.request_id = request_id

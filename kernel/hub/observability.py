@@ -640,12 +640,13 @@ def _bucket_placement(placement: str | None) -> str:
 
 def invoke_backend_run(backend, plan, graph, target_node_id, placement, *,
                        run_id: str | None = None, request_id: str | None = None,
-                       attempt_id: str | None = None):
+                       attempt_id: str | None = None,
+                       input_manifest: list[dict[str, str]] | None = None):
     """Call ``backend.run`` forwarding optional correlation kwargs when the backend accepts them.
 
     The ``ExecutionBackend`` Protocol keeps the four positional parameters; optional ``run_id``,
-    ``request_id``, and ``attempt_id`` are feature-detected (same pattern as existing LocalRunner
-    ``run_id`` / ``cancel_check`` kwargs).
+    ``request_id``, ``attempt_id``, and the admitted local ``input_manifest`` are feature-detected
+    (same pattern as existing LocalRunner ``run_id`` / ``cancel_check`` kwargs).
     """
     import inspect
 
@@ -660,6 +661,8 @@ def invoke_backend_run(backend, plan, graph, target_node_id, placement, *,
         kwargs["request_id"] = request_id
     if attempt_id is not None and "attempt_id" in params:
         kwargs["attempt_id"] = attempt_id
+    if input_manifest is not None and "input_manifest" in params:
+        kwargs["input_manifest"] = input_manifest
     status = backend.run(plan, graph, target_node_id, placement, **kwargs)
     if request_id and getattr(status, "request_id", None) in (None, ""):
         try:
