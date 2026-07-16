@@ -51,6 +51,8 @@ type SaveFailure = {
 
 type ActionNotice = { kind: 'success' | 'error'; message: string }
 
+type PluginSecretTarget = { pack: string; field: PluginConfigField }
+
 type ConflictRecovery = {
   submitted: SettingChange[]
   serverChanged: SettingChange[]
@@ -193,6 +195,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [kernelNotice, setKernelNotice] = useState<ActionNotice | null>(null)
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [pcfg, setPcfg] = useState<PluginEdits>({})  // pack → edited { key: value }, null = use environment/default
+  const [pluginSecretTarget, setPluginSecretTarget] = useState<PluginSecretTarget | null>(null)
+  const [pluginSecretClearingKey, setPluginSecretClearingKey] = useState<string | null>(null)
+  const [pluginSecretNotices, setPluginSecretNotices] = useState<Record<string, ActionNotice>>({})
   const [active, setActive] = useState('agent')
   const [confirmDiscard, setConfirmDiscard] = useState(false)
   const lastEditingControl = useRef<HTMLElement | null>(null)
@@ -275,6 +280,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     () => stagedSettings(baseline, g, u, pcfg, plugins, canGlobal),
     [baseline, canGlobal, g, pcfg, plugins, u],
   )
+  const changesRef = useRef(changes)
+  changesRef.current = changes
   const invalidPluginEdit = useMemo(() => hasInvalidPluginEdit(pcfg, plugins), [pcfg, plugins])
   const destinationDraftDirty = dest.name !== '' || dest.root !== '' || dest.backend !== 'local' || dest.credId !== NO_CRED
   const originalCred = credForm.id ? creds.find((credential) => credential.id === credForm.id) : null
@@ -464,6 +471,107 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       pushToast(message, 'error')
     } finally { setKernelRestarting(false) }
   }
+  const pluginSettingKey = (pack: string, field: string) => `plugin.${pack}.${field}`
+  const setPluginSecretNotice = (key: string, notice: ActionNotice) =>
+    setPluginSecretNotices((current) => ({ ...current, [key]: notice }))
+  const applySnapshotPreservingChanges = (snapshot: SettingsSnapshot, staged: SettingChange[]) => {
+    const nextGlobal = editableGlobal(snapshot)
+    const nextUser = { ...snapshot.user }
+    for (const change of staged) {
+      if (change.scope === 'user') {
+        nextUser[change.key] = change.value
+        continue
+      }
+      // Plugin drafts already live in pcfg. Keep the refreshed value in g as their truthful baseline.
+      if (change.key.startsWith('plugin.')) continue
+      nextGlobal[change.key] = change.value
+      if (change.key === 'agentDataPolicy' && change.value && typeof change.value === 'object') {
+        const policy = change.value as { level?: unknown; endpointIsLocal?: unknown }
+        nextGlobal.agentDataPolicyLevel = String(policy.level || 'metadata-only')
+        nextGlobal.agentDataPolicyEndpointIsLocal = Boolean(policy.endpointIsLocal)
+      }
+    }
+    setG(nextGlobal)
+    setU(nextUser)
+    setBaseline(snapshot)
+  }
+  const finishPluginSecretClear = (
+    target: PluginSecretTarget,
+    revision: SettingsSnapshot['revision'],
+    message: string,
+  ) => {
+    const key = pluginSettingKey(target.pack, target.field.key)
+    setG((current) => ({ ...current, [key]: '' }))
+    setBaseline((current) => current ? {
+      ...current,
+      global: { ...current.global, [key]: '' },
+      revision: { ...revision },
+    } : current)
+    setPcfg((current) => {
+      const fields = current[target.pack]
+      if (!fields || !hasOwn(fields, target.field.key)) return current
+      const nextFields = { ...fields }
+      delete nextFields[target.field.key]
+      const next = { ...current }
+      if (Object.keys(nextFields).length) next[target.pack] = nextFields
+      else delete next[target.pack]
+      return next
+    })
+    setPluginSecretNotice(key, { kind: 'success', message })
+  }
+  const clearPluginSecret = async (target: PluginSecretTarget) => {
+    const key = pluginSettingKey(target.pack, target.field.key)
+    if (!baseline || saving || pluginSecretClearingKey) return
+    const expectedRevision = baseline.revision
+    const expectedValue = baseline.global[key]
+    setPluginSecretTarget(null)
+    setPluginSecretClearingKey(key)
+    setPluginSecretNotices((current) => {
+      const next = { ...current }
+      delete next[key]
+      return next
+    })
+    try {
+      const result = await api.putSettingsBatch(expectedRevision, [
+        { scope: 'global', key, value: '' },
+      ])
+      finishPluginSecretClear(
+        target,
+        result.revision,
+        `${target.field.label} now uses its environment/default value. This applied immediately; staged Settings are unchanged.`,
+      )
+      pushToast(`Cleared ${target.field.label} stored reference`, 'success')
+    } catch (error) {
+      try {
+        const latest = await api.getSettings()
+        applySnapshotPreservingChanges(latest, changesRef.current)
+        const latestValue = latest.global[key]
+        if (latestValue == null || latestValue === '') {
+          finishPluginSecretClear(
+            target,
+            latest.revision,
+            `${target.field.label} was already cleared. It now uses its environment/default value; staged Settings are unchanged.`,
+          )
+        } else {
+          const conflict = error instanceof KernelError && error.status === 409
+          const targetChanged = !sameJson(expectedValue, latestValue)
+          const message = conflict && targetChanged
+            ? `${target.field.label} changed on the server and was not cleared. Review the current state, then choose Clear again.`
+            : conflict
+              ? `Settings changed on the server before ${target.field.label} could be cleared. The stored reference is still set; choose Clear again to retry.`
+            : `Could not clear ${target.field.label}: ${errorMessage(error)}. The stored reference is still set; choose Clear again to retry.`
+          setPluginSecretNotice(key, { kind: 'error', message })
+          pushToast(message, 'error')
+        }
+      } catch (refreshError) {
+        const message = `Could not confirm whether ${target.field.label} was cleared: ${errorMessage(refreshError)}. Reload Settings before retrying.`
+        setPluginSecretNotice(key, { kind: 'error', message })
+        pushToast(message, 'error')
+      }
+    } finally {
+      setPluginSecretClearingKey(null)
+    }
+  }
   const go = (id: string) => setActive(id)  // master-detail: the nav switches the visible pane
   const runners = kernelInfo?.runners ?? ['local-out-of-core']
 
@@ -483,7 +591,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <span role="status" aria-live="polite" className={cn('text-[11.5px]', dirty ? 'text-amber-700 dark:text-amber-300' : 'text-green-600')}>
             {changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'}` : dirty ? 'Unsaved draft' : savedMsg}
           </span>
-          <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || invalidPluginEdit || Boolean(conflict) || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
+          <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || Boolean(pluginSecretClearingKey) || invalidPluginEdit || Boolean(conflict) || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
         </div>
         <DialogDescription className="sr-only">Application and workspace settings: the agent model, execution backend, and output destinations.</DialogDescription>
 
@@ -761,8 +869,14 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                         <Icon name="settings" size={12} /> {p.name}
                       </div>
                       {p.config!.map((f) => {
-                        const storedRef = g[`plugin.${p.name}.${f.key}`]
+                        const settingKey = pluginSettingKey(p.name, f.key)
+                        const storedRef = g[settingKey]
                         const isSet = storedRef != null && storedRef !== ''
+                        const stagedSecret = f.secret && pcfg[p.name] && hasOwn(pcfg[p.name], f.key)
+                          ? String(pcfg[p.name][f.key] ?? '').trim()
+                          : ''
+                        const clearing = pluginSecretClearingKey === settingKey
+                        const secretNotice = pluginSecretNotices[settingKey]
                         const ph = f.placeholder ?? (f.secret
                           ? (isSet ? String(storedRef ?? 'env:VAR or file:/path') : 'env:VAR or file:/path')
                           : (f.default != null ? String(f.default) : ''))
@@ -781,6 +895,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                             ) : (
                               <Input
                                 type={f.type === 'int' || f.type === 'float' ? 'number' : 'text'}
+                                disabled={f.secret && clearing}
                                 value={f.secret
                                   ? String(pcfg[p.name]?.[f.key] ?? storedRef ?? '')
                                   : String(pval(p.name, f))}
@@ -795,7 +910,22 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                                 : <Button variant="link" className="h-auto p-0 text-[10.5px]" onClick={() => setPval(p.name, f.key, null)}>Use environment/default</Button>}
                             </div>}
                             {!f.secret && pcfg[p.name] && hasOwn(pcfg[p.name], f.key) && !canonicalPluginValue(f, rawPval(p.name, f.key)).valid && <div className="mt-1 text-[10.5px] text-destructive">Enter a finite {f.type === 'int' ? 'integer' : 'number'}.</div>}
-                            {f.secret && <div className="mt-1 text-[10.5px] text-muted-foreground">Secret reference only (`env:VAR` / `file:/path`). Blank on save leaves the stored reference unchanged.</div>}
+                            {f.secret && <>
+                              <div className="mt-1 text-[10.5px] text-muted-foreground">Secret reference only (`env:VAR` / `file:/path`). Blank on Save leaves the stored reference unchanged.</div>
+                              <div className="mt-1 flex items-center gap-2 text-[10.5px] text-muted-foreground">
+                                {isSet ? <Button
+                                  variant="link"
+                                  className="h-auto p-0 text-[10.5px]"
+                                  disabled={saving || clearing || Boolean(pluginSecretClearingKey) || Boolean(stagedSecret)}
+                                  onClick={() => setPluginSecretTarget({ pack: p.name, field: f })}
+                                >{clearing ? 'Clearing…' : 'Clear…'}</Button> : <span>Using environment/default.</span>}
+                                <span>{isSet ? 'Clearing applies immediately; it does not wait for Save.' : 'No stored reference.'}</span>
+                              </div>
+                              {stagedSecret && isSet && <div className="mt-1 text-[10.5px] text-muted-foreground">Blank the staged replacement before clearing the stored reference.</div>}
+                              {secretNotice && <div role={secretNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-1 text-[10.5px]', secretNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>
+                                {secretNotice.message}
+                              </div>}
+                            </>}
                             {f.help && <div className="mt-1 text-[10.5px] text-muted-foreground">{f.help}</div>}
                           </Field>
                         )
@@ -848,6 +978,18 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <div className="flex justify-end gap-2">
             <Button variant="outline" onClick={keepEditing}>Keep editing</Button>
             <Button variant="destructive" onClick={onClose}>Discard</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={Boolean(pluginSecretTarget)} onOpenChange={(open) => { if (!open) setPluginSecretTarget(null) }}>
+        <DialogContent className="max-w-[410px]">
+          <DialogTitle>Clear stored plugin secret reference?</DialogTitle>
+          <DialogDescription>
+            {pluginSecretTarget && <>This immediately removes only the stored <strong>{pluginSecretTarget.field.label}</strong> reference for <strong>{pluginSecretTarget.pack}</strong>. It does not save or discard other staged Settings. The field will use its environment/default value.</>}
+          </DialogDescription>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setPluginSecretTarget(null)}>Cancel</Button>
+            <Button variant="destructive" onClick={() => { if (pluginSecretTarget) void clearPluginSecret(pluginSecretTarget) }}>Clear stored reference</Button>
           </div>
         </DialogContent>
       </Dialog>
