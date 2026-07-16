@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import sqlite3
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
+from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
@@ -52,11 +54,101 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0003_repair_historical_metadata", "0002_managed_file_revs"),
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0002_managed_file_revs"]
-    assert metadb.expected_schema_head() == "0002_managed_file_revs"
+    assert scripts.get_heads() == ["0003_repair_historical_metadata"]
+    assert metadb.expected_schema_head() == "0003_repair_historical_metadata"
+
+
+def test_committed_migration_revisions_are_immutable():
+    versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
+    expected_hashes = {
+        "0001_schema_baseline.py": "f8a793dd0af47e189939f1ce41ec39ae336009bf353e8ac8147fd961386c1e96",
+        "0002_managed_local_file_revisions.py": (
+            "c69ae2c9e2b6311261b694ecdd057008d5d6ffccd7e88bd3cbadfe04af7095f5"
+        ),
+        "0003_repair_historical_metadata.py": (
+            "66165953789dbc0d2c46c8c8a5f5605c0e9c62b0393235062c8929500aca5b54"
+        ),
+    }
+    revision_paths = {path.name: path for path in versions_path.glob("*.py")}
+
+    assert revision_paths.keys() == expected_hashes.keys(), (
+        "record every new forward migration in the immutable revision checksum guard"
+    )
+    for name, expected_hash in expected_hashes.items():
+        assert hashlib.sha256(revision_paths[name].read_bytes()).hexdigest() == expected_hash, (
+            "committed migration revisions are immutable; add a forward migration instead"
+        )
+
+
+def test_historical_baseline_upgrade_repairs_workspace_metadata_without_data_loss(tmp_path):
+    """Exercise the exact old schema shape instead of fixing committed revision 0001 in place."""
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'historical.db'}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0001_schema_baseline")
+
+        # These are exactly the post-baseline additions that stranded databases created at 09339e9
+        # without. Keep this fixture explicit so the regression exercises a real historical shape.
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text("DROP TABLE workspace_placements"))
+            connection.execute(sa.text("DROP TABLE workspace_containers"))
+            connection.execute(sa.text("ALTER TABLE run_records DROP COLUMN profile"))
+            connection.execute(sa.text("""
+                INSERT INTO canvases (id, owner_id, name, version, doc, visibility, created_at, updated_at)
+                VALUES ('historical-canvas', 'local', 'Historical', 7, '{\"nodes\":[]}', 'private',
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """))
+            connection.execute(sa.text("""
+                INSERT INTO run_records (id, canvas_id, status, outputs, created_at)
+                VALUES ('historical-run', 'historical-canvas', 'ok', '[]', CURRENT_TIMESTAMP)
+            """))
+            connection.execute(sa.text("""
+                INSERT INTO catalog_entries (uri, registration_id, name, doc, updated_at)
+                VALUES ('file:///historical.parquet', 'historical-catalog-entry-00000001',
+                        'Historical catalog entry', '{}', CURRENT_TIMESTAMP)
+            """))
+            connection.execute(sa.text("""
+                INSERT INTO settings (scope, scope_id, key, value)
+                VALUES ('global', '', 'historical.setting', :value)
+            """), {"value": '{"preserved":true}'})
+
+        assert metadb._current_schema_heads() == ("0001_schema_baseline",)
+        assert metadb.migrate_db() == metadb.expected_schema_head()
+        metadb.init_db()  # A repaired local database must restart at head cleanly.
+
+        with metadb.engine().connect() as connection:
+            inspector = inspect(connection)
+            assert {"workspace_containers", "workspace_placements"} <= set(inspector.get_table_names())
+            assert "profile" in {column["name"] for column in inspector.get_columns("run_records")}
+            assert {index["name"] for index in inspector.get_indexes("workspace_containers")} >= {
+                "ix_workspace_containers_parent_id"
+            }
+            assert {index["name"] for index in inspector.get_indexes("workspace_placements")} >= {
+                "ix_workspace_placements_container_id"
+            }
+            assert connection.execute(sa.text("""
+                SELECT id, name FROM workspace_containers WHERE id = 'workspace-local-root'
+            """)).one() == ("workspace-local-root", "Workspace")
+            assert connection.execute(sa.text("SELECT count(*) FROM workspace_containers")).scalar_one() == 1
+            assert connection.execute(sa.text("SELECT version, doc FROM canvases WHERE id = 'historical-canvas'")) \
+                .one() == (7, '{"nodes":[]}')
+            assert connection.execute(sa.text("SELECT status, outputs FROM run_records WHERE id = 'historical-run'")) \
+                .one() == ("ok", "[]")
+            assert connection.execute(sa.text("SELECT name FROM catalog_entries WHERE uri = 'file:///historical.parquet'")) \
+                .scalar_one() == "Historical catalog entry"
+            assert connection.execute(sa.text("SELECT value FROM settings WHERE key = 'historical.setting'")) \
+                .scalar_one() == '{"preserved":true}'
+
+            context = MigrationContext.configure(
+                connection,
+                opts={"compare_type": True, "target_metadata": metadb.Base.metadata},
+            )
+            assert compare_metadata(context, metadb.Base.metadata) == []
+
+        assert metadb.migrate_db() == metadb.expected_schema_head()
 
 
 def test_fresh_sqlite_baseline_matches_runtime_metadata(tmp_path):
