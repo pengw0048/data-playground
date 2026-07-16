@@ -10,6 +10,10 @@ subsystems live in [Catalog](CATALOG.md), [Plugins](PLUGINS.md), [Ray](RAY.md), 
 [MCP](MCP.md), and [browser support](BROWSER_SUPPORT.md). The canonical deployment and trust boundary is
 [Supported deployments and trust model](SUPPORT.md).
 
+The long-range product and architecture plan for exact dataset revisions, transactional writes,
+sparse enrichment, durable background work, a unified workspace, and heterogeneous temporal data is
+[Versioned data and durable execution](VERSIONED_DATA_AND_DURABLE_EXECUTION.md).
+
 ## Product scope
 
 The primary path is a local workstation: one process, embedded metadata and storage, and no required

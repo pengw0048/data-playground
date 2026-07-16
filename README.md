@@ -255,6 +255,7 @@ Unset mode keeps today's localhost defaults. The Compose reference sets `shared`
 | [5-minute tour](docs/TUTORIAL.md) | Build and run a first pipeline on the seeded data |
 | [Browser and viewport support](docs/BROWSER_SUPPORT.md) | Desktop-first scope, minimum viewport, tested browsers, and input model |
 | [Catalog](docs/CATALOG.md) | Browse, search, curate, and integrate catalog and lineage data |
+| [Versioned data and durable execution](docs/VERSIONED_DATA_AND_DURABLE_EXECUTION.md) | Long-range product and architecture plan for revisions, writes, sparse enrichment, background jobs, and heterogeneous research data |
 | [HTTP API contract](docs/API.md) | OpenAPI snapshot, drift check, and stable error envelope |
 | [Plugins](docs/PLUGINS.md) | Add nodes or connect another data, catalog, destination, or execution system |
 | [MCP](docs/MCP.md) | Connect an external agent over HTTP or stdio |
