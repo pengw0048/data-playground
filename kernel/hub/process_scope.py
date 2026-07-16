@@ -27,6 +27,30 @@ def owned_process_popen_kwargs(kwargs: dict[str, Any] | None = None) -> dict[str
     return result
 
 
+def _proc_starttime(pid: int) -> int | None:
+    """Linux process-start fingerprint used to refuse killpg after PID reuse.
+
+    ``Popen.poll()`` reaps the direct child. Once that PID is free, a later
+    ``killpg(pid, ...)`` can hit an unrelated new session leader. The kernel
+    starttime field distinguishes "our former leader" from a recycled PID.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+    # stat: pid (comm) state ... starttime is field 22. ``comm`` may contain spaces
+    # and parentheses, so split only after the final ')'.
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return None
+    fields = data[rparen + 1:].split()
+    try:
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
 class OwnedProcessScope:
     """Exact ownership of one Popen and, on POSIX, the session it leads."""
 
@@ -36,6 +60,7 @@ class OwnedProcessScope:
         # Popen always has a PID.  The no-PID case keeps lightweight test doubles on
         # the documented direct-child fallback without inventing a numeric PGID.
         self._pgid = pid if owns_process_group and isinstance(pid, int) and pid > 0 else None
+        self._starttime = _proc_starttime(self._pgid) if self._pgid is not None else None
         self._owned = True
         self._term_sent_at: float | None = None
         self._lock = threading.Lock()
@@ -51,6 +76,8 @@ class OwnedProcessScope:
             return False
         if self._pgid is None:
             return self.process.poll() is None
+        if not self._group_signal_target_locked():
+            return False
         try:
             os.killpg(self._pgid, 0)
         except ProcessLookupError:
@@ -59,8 +86,22 @@ class OwnedProcessScope:
             return True
         return True
 
+    def _group_signal_target_locked(self) -> bool:
+        """True when killpg on ``_pgid`` still refers to this scope's process group."""
+        if self._pgid is None:
+            return False
+        if self._starttime is None:
+            return True
+        current = _proc_starttime(self._pgid)
+        if current is not None and current != self._starttime:
+            # The leader PID was recycled into an unrelated process/session.
+            return False
+        return True
+
     def _signal_locked(self, *, force: bool) -> None:
         if self._pgid is not None:
+            if not self._group_signal_target_locked():
+                return
             try:
                 os.killpg(self._pgid, signal.SIGKILL if force else signal.SIGTERM)
             except ProcessLookupError:
@@ -120,4 +161,5 @@ class OwnedProcessScope:
         with self._lock:
             self._owned = False
             self._pgid = None
+            self._starttime = None
         return True
