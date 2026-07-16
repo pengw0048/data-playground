@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import threading
 import uuid
 
 import pytest
@@ -78,6 +80,9 @@ def test_root_and_container_paths_are_stable_and_local(workspace_scope):
 
     with pytest.raises(metadb.WorkspaceVersionConflict, match="version"):
         metadb.workspace_update_container(left["id"], expected_version=left["version"], ordinal=4)
+    with pytest.raises(ValueError, match="own descendant"):
+        metadb.workspace_update_container(
+            right["id"], expected_version=right["version"], parent_id=left["id"])
 
 
 def test_delete_recreate_and_placement_moves_preserve_independent_targets(workspace_scope):
@@ -124,13 +129,81 @@ def test_delete_recreate_and_placement_moves_preserve_independent_targets(worksp
         metadb.workspace_update_placement(
             canvas_placement["id"], expected_version=canvas_placement["version"], ordinal=10)
 
+    with pytest.raises(metadb.WorkspaceVersionConflict, match="version"):
+        metadb.workspace_delete_placement(
+            canvas_placement["id"], expected_version=canvas_placement["version"])
+    metadb.workspace_delete_placement(moved["id"], expected_version=moved["version"])
+    replacement_placement = metadb.workspace_create_placement(
+        destination["id"], target_kind="canvas", target_id=workspace_scope["canvas_id"],
+        name=f"workspace-{token}-canvas",
+    )
+    assert replacement_placement["id"] != canvas_placement["id"]
+
+    metadb.delete_canvas_cascade(workspace_scope["canvas_id"])
+    with metadb.session() as session:
+        detached = session.get(metadb.WorkspacePlacement, replacement_placement["id"])
+        assert detached is not None and detached.target_id == workspace_scope["canvas_id"]
+    metadb.workspace_delete_placement(
+        replacement_placement["id"], expected_version=replacement_placement["version"])
+
 
 def test_dataset_recreate_gets_a_new_workspace_target_identity(workspace_scope):
     uri = workspace_scope["uri"]
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     original = metadb.workspace_builtin_dataset_identity(uri)
+    container = metadb.workspace_create_container(
+        metadb.local_workspace_root()["id"], f"workspace-{token}-dataset-lifecycle")
+    placement = metadb.workspace_create_placement(
+        container["id"], target_kind="dataset", target_id=original,
+        name=f"workspace-{token}-dataset-lifecycle")
     metadb.catalog_delete_entry(uri)
+    with metadb.session() as session:
+        detached = session.get(metadb.WorkspacePlacement, placement["id"])
+        assert detached is not None and detached.target_id == original
     metadb.catalog_upsert_entry(uri, "Replacement dataset", {
         "id": f"tbl_recreated_{uuid.uuid4().hex}", "name": "Replacement dataset", "uri": uri,
         "version": "v2",
     })
     assert metadb.workspace_builtin_dataset_identity(uri) != original
+    metadb.workspace_delete_placement(placement["id"], expected_version=placement["version"])
+
+
+def test_concurrent_container_cas_has_one_winner(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    container = metadb.workspace_create_container(
+        metadb.local_workspace_root()["id"], f"workspace-{token}-concurrent-cas")
+    start = threading.Barrier(3)
+    results = []
+
+    def update_ordinal(ordinal):
+        start.wait(timeout=5)
+        try:
+            results.append(metadb.workspace_update_container(
+                container["id"], expected_version=container["version"], ordinal=ordinal))
+        except Exception as exc:  # noqa: BLE001 - assert the public conflict type below
+            results.append(exc)
+
+    threads = [threading.Thread(target=update_ordinal, args=(ordinal,)) for ordinal in (1, 2)]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    winners = [result for result in results if isinstance(result, dict)]
+    conflicts = [result for result in results if isinstance(result, metadb.WorkspaceVersionConflict)]
+    assert len(winners) == len(conflicts) == 1
+    assert winners[0]["version"] == container["version"] + 1
+
+
+def test_sqlite_workspace_write_reserves_writer_before_hierarchy_reads(workspace_scope):
+    if not metadb._is_sqlite_database():
+        pytest.skip("SQLite writer-reservation regression")
+    database = metadb._database_url().database
+    assert database
+
+    with metadb._workspace_write_session():
+        with sqlite3.connect(database, timeout=0) as competing:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                competing.execute("BEGIN IMMEDIATE")

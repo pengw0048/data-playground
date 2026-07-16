@@ -2185,10 +2185,39 @@ def _workspace_container_locked(s, container_id: str) -> WorkspaceContainer:
     return row
 
 
+def _workspace_placement_locked(s, placement_id: str) -> WorkspacePlacement:
+    row = s.get(WorkspacePlacement, placement_id, with_for_update=True)
+    if row is None:
+        raise KeyError(f"workspace placement '{placement_id}' not found")
+    return row
+
+
+def _workspace_version_conflict(kind: str, identity: str, expected_version: int) -> None:
+    raise WorkspaceVersionConflict(
+        f"workspace {kind} '{identity}' changed from expected version {expected_version}")
+
+
+@contextlib.contextmanager
+def _workspace_write_session():
+    """Serialize Workspace writes before reading cross-row hierarchy invariants."""
+    with session() as s:
+        if _is_sqlite_database():
+            # SQLite ignores SELECT FOR UPDATE.  Acquire its one writer slot before validating a move
+            # so opposite concurrent moves cannot both validate and create a container cycle.
+            s.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        else:
+            # The persisted root is the local authority's narrow write mutex.  Lock it first so two
+            # cross-parent edits cannot deadlock or validate opposite moves against stale hierarchies.
+            root = s.get(WorkspaceContainer, LOCAL_WORKSPACE_ROOT_ID, with_for_update=True)
+            if root is None or not root.is_root:
+                raise RuntimeError("local Workspace root is missing from the metadata baseline")
+        yield s
+
+
 def workspace_create_container(parent_id: str, name: str, *, ordinal: int = 0) -> dict:
     """Create one local overlay container beneath a stable parent identity."""
     name, ordinal = _workspace_name(name), _workspace_ordinal(ordinal)
-    with session() as s:
+    with _workspace_write_session() as s:
         _workspace_container_locked(s, parent_id)
         if s.scalar(select(WorkspaceContainer.id).where(
                 WorkspaceContainer.parent_id == parent_id, WorkspaceContainer.name == name)) is not None:
@@ -2214,13 +2243,12 @@ def _workspace_parent_is_descendant(s, candidate_parent_id: str, container_id: s
 def workspace_update_container(container_id: str, *, expected_version: int, name: str | None = None,
                                parent_id: str | None = None, ordinal: int | None = None) -> dict:
     """CAS-update a container's display/navigation fields without changing its opaque identity."""
-    with session() as s:
+    with _workspace_write_session() as s:
         row = _workspace_container_locked(s, container_id)
         if row.is_root:
             raise ValueError("the local Workspace root cannot be edited")
         if row.version != expected_version:
-            raise WorkspaceVersionConflict(
-                f"workspace container '{container_id}' is at version {row.version}")
+            _workspace_version_conflict("container", container_id, expected_version)
         target_parent = parent_id if parent_id is not None else row.parent_id
         if target_parent is None:
             raise ValueError("an overlay container requires a parent")
@@ -2235,28 +2263,41 @@ def workspace_update_container(container_id: str, *, expected_version: int, name
         ))
         if sibling is not None:
             raise WorkspaceNameConflict(f"workspace container '{target_name}' already exists under its parent")
-        row.parent_id, row.name, row.ordinal = target_parent, target_name, target_ordinal
-        row.version += 1
-        s.flush()
+        changed = s.execute(update(WorkspaceContainer).where(
+            WorkspaceContainer.id == container_id,
+            WorkspaceContainer.version == expected_version,
+        ).values(
+            parent_id=target_parent,
+            name=target_name,
+            ordinal=target_ordinal,
+            version=WorkspaceContainer.version + 1,
+        ).execution_options(synchronize_session=False))
+        if changed.rowcount != 1:
+            _workspace_version_conflict("container", container_id, expected_version)
+        s.refresh(row)
         return _workspace_container_doc(row)
 
 
 def workspace_delete_container(container_id: str, *, expected_version: int) -> None:
     """Delete an empty overlay container; callers must explicitly move its children first."""
-    with session() as s:
+    with _workspace_write_session() as s:
         row = _workspace_container_locked(s, container_id)
         if row.is_root:
             raise ValueError("the local Workspace root cannot be deleted")
         if row.version != expected_version:
-            raise WorkspaceVersionConflict(
-                f"workspace container '{container_id}' is at version {row.version}")
+            _workspace_version_conflict("container", container_id, expected_version)
         if s.scalar(select(WorkspaceContainer.id).where(
                 WorkspaceContainer.parent_id == container_id).limit(1)) is not None:
             raise ValueError("cannot delete a workspace container with child containers")
         if s.scalar(select(WorkspacePlacement.id).where(
                 WorkspacePlacement.container_id == container_id).limit(1)) is not None:
             raise ValueError("cannot delete a workspace container with placements")
-        s.delete(row)
+        removed = s.execute(delete(WorkspaceContainer).where(
+            WorkspaceContainer.id == container_id,
+            WorkspaceContainer.version == expected_version,
+        ).execution_options(synchronize_session=False))
+        if removed.rowcount != 1:
+            _workspace_version_conflict("container", container_id, expected_version)
 
 
 def workspace_builtin_dataset_identity(uri: str) -> str:
@@ -2274,13 +2315,13 @@ def workspace_create_placement(container_id: str, *, target_kind: str, target_id
     if target_kind not in {"canvas", "dataset"}:
         raise ValueError("workspace placement target kind must be 'canvas' or 'dataset'")
     name, ordinal = _workspace_name(name), _workspace_ordinal(ordinal)
-    with session() as s:
+    with _workspace_write_session() as s:
         _workspace_container_locked(s, container_id)
         if target_kind == "canvas":
-            if s.get(Canvas, target_id) is None:
+            if s.get(Canvas, target_id, with_for_update=True) is None:
                 raise KeyError(f"canvas '{target_id}' not found")
         elif s.scalar(select(CatalogEntry.uri).where(
-                CatalogEntry.registration_id == target_id).limit(1)) is None:
+                CatalogEntry.registration_id == target_id).limit(1).with_for_update()) is None:
             raise KeyError(f"registered dataset identity '{target_id}' not found")
         if s.scalar(select(WorkspacePlacement.id).where(
                 WorkspacePlacement.target_kind == target_kind,
@@ -2297,23 +2338,42 @@ def workspace_update_placement(placement_id: str, *, expected_version: int,
                                container_id: str | None = None, name: str | None = None,
                                ordinal: int | None = None) -> dict:
     """CAS-update only a placement's local presentation; target identity is intentionally immutable."""
-    with session() as s:
-        row = s.get(WorkspacePlacement, placement_id, with_for_update=True)
-        if row is None:
-            raise KeyError(f"workspace placement '{placement_id}' not found")
+    with _workspace_write_session() as s:
+        row = _workspace_placement_locked(s, placement_id)
         if row.version != expected_version:
-            raise WorkspaceVersionConflict(
-                f"workspace placement '{placement_id}' is at version {row.version}")
+            _workspace_version_conflict("placement", placement_id, expected_version)
+        target_container = container_id if container_id is not None else row.container_id
         if container_id is not None:
-            _workspace_container_locked(s, container_id)
-            row.container_id = container_id
-        if name is not None:
-            row.name = _workspace_name(name)
-        if ordinal is not None:
-            row.ordinal = _workspace_ordinal(ordinal)
-        row.version += 1
-        s.flush()
+            _workspace_container_locked(s, target_container)
+        target_name = _workspace_name(name) if name is not None else row.name
+        target_ordinal = _workspace_ordinal(ordinal) if ordinal is not None else row.ordinal
+        changed = s.execute(update(WorkspacePlacement).where(
+            WorkspacePlacement.id == placement_id,
+            WorkspacePlacement.version == expected_version,
+        ).values(
+            container_id=target_container,
+            name=target_name,
+            ordinal=target_ordinal,
+            version=WorkspacePlacement.version + 1,
+        ).execution_options(synchronize_session=False))
+        if changed.rowcount != 1:
+            _workspace_version_conflict("placement", placement_id, expected_version)
+        s.refresh(row)
         return _workspace_placement_doc(row)
+
+
+def workspace_delete_placement(placement_id: str, *, expected_version: int) -> None:
+    """CAS-delete a canonical placement without deleting or rewriting its target."""
+    with _workspace_write_session() as s:
+        row = _workspace_placement_locked(s, placement_id)
+        if row.version != expected_version:
+            _workspace_version_conflict("placement", placement_id, expected_version)
+        removed = s.execute(delete(WorkspacePlacement).where(
+            WorkspacePlacement.id == placement_id,
+            WorkspacePlacement.version == expected_version,
+        ).execution_options(synchronize_session=False))
+        if removed.rowcount != 1:
+            _workspace_version_conflict("placement", placement_id, expected_version)
 
 
 _RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (older history is pruned)
