@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunStatus, SampleResult,
+  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunOutput, RunStatus, SampleResult,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -191,10 +191,10 @@ export const api = {
   compile: (doc: CanvasDoc, targetNodeId?: string) =>
     req<CompilePlan>('/graph/compile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
 
-  preview: (doc: CanvasDoc, nodeId: string, k = 50, offset = 0) =>
-    req<SampleResult>('/run/preview', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, k, offset }) }),
-  profile: (doc: CanvasDoc, nodeId: string) =>
-    req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
+  preview: (doc: CanvasDoc, nodeId: string, k = 50, offset = 0, portId?: string) =>
+    req<SampleResult>('/run/preview', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, k, offset }) }),
+  profile: (doc: CanvasDoc, nodeId: string, portId?: string) =>
+    req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId }) }),
 
   // per-node output columns (metadata only) → editor column suggestions; null = untyped port
   schema: (doc: CanvasDoc) =>
@@ -314,8 +314,8 @@ export interface Cred { id: string; name: string; kind: CredKind; fields: Record
 export interface DestinationPreset { id: string; name: string; backend: string; root: string; credId?: string | null }
 export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
-export interface PerNodeStat { node_id: string; status: string; rows?: number | null; ms?: number | null; label?: string | null }
-export interface RunRecordDto { id: string; runId?: string | null; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputTable?: string | null; outputUri?: string | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
+export type PerNodeStat = PerNodeStatus
+export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputs: RunOutput[]; perNode?: PerNodeStat[] | null; createdAt?: string | null }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
 export interface CanvasVersionDto { id: string; version: number; label?: string | null; authorId?: string | null; createdAt?: string | null }
 export type CanvasRole = 'owner' | 'editor' | 'viewer'

@@ -20,7 +20,7 @@ from sqlalchemy import select
 from hub import metadb
 from hub.compiler import compile_plan
 from hub.deps import Deps
-from hub.models import CatalogPublicationReceipt, Graph, GraphNode, ResourceSpec, RunStatus
+from hub.models import CatalogPublicationReceipt, Graph, GraphNode, ResourceSpec, RunOutput, RunStatus
 
 _RAY_JOBS_BACKEND = "ray-jobs"
 
@@ -438,10 +438,16 @@ def _workload_metadata(status) -> dict[str, str]:
 
 def _retire_inert_test_run(status) -> None:
     """Keep disabled-supervisor fixtures from leaking active SQL rows into later recovery tests."""
+    from hub.models import RunStatus
+    from hub.run_outputs import settle_uncommitted_outputs
+
     run_id = status.run_id if hasattr(status, "run_id") else status["run_id"]
     doc = status.model_dump() if hasattr(status, "model_dump") else dict(status)
-    doc.update(run_id=run_id, status="failed", error="test fixture retired without a live supervisor")
-    metadb.save_run_state(run_id, doc)
+    candidate = RunStatus.model_validate({**doc, "run_id": run_id})
+    candidate.status = "failed"
+    candidate.error = "test fixture retired without a live supervisor"
+    settle_uncommitted_outputs(candidate, "failed", candidate.error)
+    metadb.save_run_state(run_id, candidate.model_dump())
 
 
 def _scrub_leaked_ray_jobs() -> None:
@@ -511,25 +517,16 @@ def _wait_control_calls_stable(client: FakeJobsClient, expected: tuple[int, int,
     raise AssertionError(f"control calls did not stabilize at {expected}: last={current}")
 
 
-def _publish_test_backend_done(status) -> None:
+def _publish_test_backend_done(runner, graph: Graph, status) -> None:
+    """Publish a supported single-write Jobs result through the production publication seam."""
     ref = status.backend_ref
     assert ref is not None
     payload = metadb.backend_job_artifact_payload(status.run_id)
     assert payload is not None
     job = json.loads(payload)
-    assert job["sink_contracts"] == {} and job["materialize_uri"] is None
-    owner = f"test-terminal-{uuid.uuid4().hex}"
-    assert metadb.claim_backend_publication(
-        status.run_id, ref.attempt_id, owner, 30
-    ) == "claimed"
-    terminal = status.model_copy(deep=True)
-    terminal.status, terminal.progress, terminal.error = "done", 1.0, None
-    terminal.rows_processed = terminal.total_rows = 0
-    terminal.output_uri = terminal.output_table = None
-    for node in terminal.per_node:
-        node.status = "done"
-        node.error = None
-    validated_result = {
+    assert set(job["sink_contracts"]) == {"write"}
+    contract = job["sink_contracts"]["write"]
+    runner._publish_job_result(job, graph, "write", status, {
         "contract_version": job["contract_version"],
         "attempt_id": ref.attempt_id,
         "submission_id": ref.submission_id,
@@ -537,17 +534,15 @@ def _publish_test_backend_done(status) -> None:
         "status": "done",
         "rows": 0,
         "error": None,
-        "output_uri": None,
-        "output_table": None,
-        "outputs": [],
-    }
-    assert metadb.begin_backend_publication_effects(
-        status.run_id, ref.attempt_id, owner, terminal.model_dump(),
-        validated_result, {}, [], None,
-    ) == "started"
-    assert metadb.finish_backend_publication(
-        status.run_id, ref.attempt_id, owner, terminal.model_dump()
-    ) is True
+        "output_uri": contract["physical_uri"],
+        "output_table": contract["name"],
+        "outputs": [{
+            "step_id": "write",
+            "name": contract["name"],
+            "uri": contract["physical_uri"],
+            "logical_uri": contract["logical_uri"],
+        }],
+    })
 
 
 def _stage_raw_test_backend_failure(
@@ -649,6 +644,14 @@ def _complete(store: MemoryArtifacts, client: FakeJobsClient, status, rows=3,
     client.set_status(ref.submission_id, "SUCCEEDED")
 
 
+def _committed_output(status):
+    from hub.run_outputs import sole_output
+
+    output = sole_output(status, committed=True)
+    assert output is not None
+    return output
+
+
 def test_ray_jobs_submit_is_deterministic_and_excludes_metadata_secrets(jobs_config):
     module, deps, runner, client, store = _runner(jobs_config)
     graph = _graph()
@@ -683,7 +686,7 @@ def test_ray_jobs_submit_is_deterministic_and_excludes_metadata_secrets(jobs_con
     _complete(store, client, first)
     final = _wait(runner, run_id)
     assert final.status == "done" and final.total_rows == 3
-    assert metadb.catalog_get(final.output_uri) is not None
+    assert metadb.catalog_get(_committed_output(final).uri) is not None
 
 
 def test_ray_jobs_worker_direct_sink_publishes_attempt_uri(jobs_config):
@@ -718,7 +721,7 @@ def test_ray_jobs_worker_direct_sink_publishes_attempt_uri(jobs_config):
 
     _complete(store, client, status, output_uri=physical_uri)
     final = _wait(runner, status.run_id)
-    assert final.status == "done" and final.output_uri == physical_uri
+    assert final.status == "done" and _committed_output(final).uri == physical_uri
     assert metadb.catalog_get(physical_uri)["uri"] == physical_uri
 
 
@@ -806,6 +809,40 @@ def test_ray_jobs_rejects_multiple_sinks_before_object_attempt_allocation(
     assert allocation_calls == []
 
 
+def test_ray_jobs_rejects_non_write_before_attempt_binding_or_submission(
+        jobs_config, monkeypatch):
+    module, deps, runner, client, store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "map", deps.registry, deps.node_specs, deps.node_ir)
+    run_id = f"run_jobs_non_write_{uuid.uuid4().hex}"
+    allocation_calls: list[dict] = []
+    start_calls: list[str] = []
+
+    monkeypatch.setattr(
+        module, "allocate_attempt",
+        lambda **kwargs: allocation_calls.append(kwargs) or {"uri": "unexpected"},
+    )
+    monkeypatch.setattr(
+        runner, "_start_jobs",
+        lambda *_args, **_kwargs: start_calls.append("start") or None,
+    )
+    # The output-shape gate owns this decision even when the graph also has a generic Ray
+    # incompatibility; Jobs must not use that reason to fall back into local execution.
+    monkeypatch.setattr(runner, "_ray_unsupported_reason", lambda _ir: "synthetic incompatibility")
+
+    failed = runner.run(plan, graph, "map", "distributed", run_id=run_id)
+
+    assert failed.status == "failed"
+    assert "whole-graph non-write results are owned by the local backend" in (failed.error or "")
+    assert allocation_calls == [] and start_calls == []
+    assert client.submit_calls == [] and store.values == {}
+    assert metadb.backend_job(run_id) is None
+    with metadb.session() as session:
+        assert list(session.scalars(select(metadb.ObjectAttempt).where(
+            metadb.ObjectAttempt.run_id == run_id
+        ))) == []
+
+
 def test_ray_jobs_prebind_failure_atomically_discards_allocated_attempt(
         jobs_config):
     _module, deps, runner, _client, _store = _runner(jobs_config)
@@ -889,8 +926,13 @@ def test_ray_jobs_postbind_failure_retains_attempt_for_recovery(
     assert metadb.claim_backend_publication(
         run_id, binding["attempt_id"], "test-retire", 10
     ) == "claimed"
-    terminal = metadb.get_run_state(run_id)
-    terminal.update(status="failed", error="test fixture retired")
+    from hub.models import RunStatus
+    from hub.run_outputs import settle_uncommitted_outputs
+    terminal_status = RunStatus.model_validate(metadb.get_run_state(run_id))
+    terminal_status.status = "failed"
+    terminal_status.error = "test fixture retired"
+    settle_uncommitted_outputs(terminal_status, "failed", terminal_status.error)
+    terminal = terminal_status.model_dump()
     assert metadb.begin_backend_publication_effects(
         run_id, binding["attempt_id"], "test-retire", terminal,
         None, {}, catalog_effects=[], usage_effect=None,
@@ -1014,7 +1056,8 @@ def test_failed_jobs_result_keeps_private_partial_output_evidence(jobs_config):
         attempt.terminal_proof_at = metadb._now()
     client.set_status(ref.submission_id, "SUCCEEDED")
     final = _wait(runner, status.run_id)
-    assert final.status == "failed" and final.output_uri is None and final.output_table is None
+    assert final.status == "failed"
+    assert all(output.uri is None and output.table is None for output in final.outputs)
     assert final.error == "Ray execution failed (RemoteExecutionError; code=ray_execution_failed)"
     assert store.read(ref.result_uri)["outputs"] == [{
         "step_id": "write", "name": "jobs_out", "uri": physical_uri,
@@ -1057,13 +1100,13 @@ def test_negative_effect_stage_requires_exact_sinks_and_durable_derive_authority
         "status": terminal, "rows": 0, "outputs": [],
         "error": "RemoteJobFailed: private remote details" if terminal == "failed" else None,
     })
-    candidate.output_uri = "s3://private/remote-output"
-    with pytest.raises(ValueError, match="cannot expose output identity"):
+    tampered_candidate = candidate.model_dump()
+    tampered_candidate["outputs"][0]["uri"] = "s3://private/remote-output"
+    with pytest.raises(ValueError, match="cannot expose a URI or table identity"):
         metadb.begin_backend_publication_effects(
-            status.run_id, ref.attempt_id, owner, candidate.model_dump(),
+            status.run_id, ref.attempt_id, owner, tampered_candidate,
             None, {"write": sink_uri}, catalog_effects=[], usage_effect=None,
         )
-    candidate.output_uri = None
     with pytest.raises(RuntimeError, match="exactly cover all active bound sinks"):
         metadb.begin_backend_publication_effects(
             status.run_id, ref.attempt_id, owner, candidate.model_dump(),
@@ -1228,10 +1271,10 @@ def test_ray_jobs_cancel_timeout_never_claims_a_live_job_is_cancelled(jobs_confi
 def test_cancel_converges_when_publication_wins_before_cancel_cas(jobs_config, monkeypatch):
     _module, deps, runner, client, _store = _runner(jobs_config)
     graph = _graph()
-    plan = compile_plan(graph, "map", deps.registry, deps.node_specs, deps.node_ir)
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
     runner._ensure_jobs_supervisor = lambda _run_id: None
     status = runner.run(
-        plan, graph, "map", "distributed",
+        plan, graph, "write", "distributed",
         run_id=f"run_jobs_cancel_cas_lost_{uuid.uuid4().hex}",
     )
     original_request = metadb.request_backend_cancel
@@ -1239,7 +1282,7 @@ def test_cancel_converges_when_publication_wins_before_cancel_cas(jobs_config, m
 
     def _publish_then_request(run_id: str) -> bool:
         assert run_id == status.run_id
-        _publish_test_backend_done(status)
+        _publish_test_backend_done(runner, graph, status)
         outcomes.append(original_request(run_id))
         return outcomes[-1]
 
@@ -1259,10 +1302,10 @@ def test_cancel_converges_when_publication_wins_before_cancel_cas(jobs_config, m
 def test_cancel_converges_when_publication_wins_during_local_wait(jobs_config):
     _module, deps, runner, client, _store = _runner(jobs_config)
     graph = _graph()
-    plan = compile_plan(graph, "map", deps.registry, deps.node_specs, deps.node_ir)
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
     runner._ensure_jobs_supervisor = lambda _run_id: None
     status = runner.run(
-        plan, graph, "map", "distributed",
+        plan, graph, "write", "distributed",
         run_id=f"run_jobs_cancel_wait_race_{uuid.uuid4().hex}",
     )
 
@@ -1273,7 +1316,7 @@ def test_cancel_converges_when_publication_wins_during_local_wait(jobs_config):
 
         def wait(self, _timeout=None):
             self.wait_called = True
-            _publish_test_backend_done(status)
+            _publish_test_backend_done(runner, graph, status)
             return False  # another supervisor published; this process never signalled its local event
 
         def set(self):
@@ -1616,6 +1659,8 @@ def test_remote_observation_invalidates_pre_effects_publisher_but_not_effects_wi
     ) == "claimed"
     terminal = effects.model_copy(deep=True)
     terminal.status, terminal.error = "failed", "terminal winner"
+    from hub.run_outputs import settle_uncommitted_outputs
+    settle_uncommitted_outputs(terminal, "failed", terminal.error)
     assert metadb.begin_backend_publication_effects(
         effects.run_id, effects_ref.attempt_id, "effects-winner",
         terminal.model_dump(), None, None, [], None,
@@ -2343,7 +2388,7 @@ def test_ray_jobs_restart_reattaches_and_catalog_publication_has_one_winner(jobs
     final = _wait(recovered_a, run_id)
     assert final.status == "done"
     assert _wait(recovered_b, run_id).status == "done"
-    assert metadb.catalog_get(final.output_uri) is not None
+    assert metadb.catalog_get(_committed_output(final).uri) is not None
     with metadb.session() as session:
         events = list(session.scalars(select(metadb.CatalogPublicationEvent).where(
             metadb.CatalogPublicationEvent.event_key
@@ -2378,7 +2423,8 @@ def test_same_state_control_recovery_clears_durable_error_without_write_churn(jo
     # Freeze the next Jobs poll so the test observes the persisted error before the same RUNNING state
     # succeeds again. Recovery must clear that stale DB/UI error even though the visible label is unchanged.
     with client.lock:
-        runner._persist_jobs_live_error(status, "Ray control temporarily unavailable")
+        runner._persist_jobs_live_error(
+            runner.runs[status.run_id], "Ray control temporarily unavailable")
         assert metadb.get_run_state(status.run_id)["error"] == "Ray control temporarily unavailable"
 
     deadline = time.monotonic() + 2
@@ -2495,10 +2541,10 @@ def test_malformed_recovery_row_is_durably_visible_without_replay(
 def test_recovery_blocked_cancel_refreshes_terminal_before_writing_intent(jobs_config):
     module, deps, original, client, store = _runner(jobs_config)
     graph = _graph()
-    plan = compile_plan(graph, "map", deps.registry, deps.node_specs, deps.node_ir)
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
     original._ensure_jobs_supervisor = lambda _run_id: None
     status = original.run(
-        plan, graph, "map", "distributed",
+        plan, graph, "write", "distributed",
         run_id=f"recovery-blocked-terminal-{uuid.uuid4().hex}",
     )
     with metadb.session() as session:
@@ -2511,7 +2557,7 @@ def test_recovery_blocked_cancel_refreshes_terminal_before_writing_intent(jobs_c
     assert status.run_id in recovered._recovery_blocked
     assert metadb.backend_job(status.run_id)["cancel_requested"] is False
 
-    _publish_test_backend_done(status)
+    _publish_test_backend_done(original, graph, status)
     final = recovered.cancel(status.run_id)
 
     assert final.status == "done" and final.error is None
@@ -2525,10 +2571,10 @@ def test_recovery_blocked_cancel_converges_when_publication_wins_cancel_cas(
         jobs_config, monkeypatch):
     module, deps, original, client, store = _runner(jobs_config)
     graph = _graph()
-    plan = compile_plan(graph, "map", deps.registry, deps.node_specs, deps.node_ir)
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
     original._ensure_jobs_supervisor = lambda _run_id: None
     status = original.run(
-        plan, graph, "map", "distributed",
+        plan, graph, "write", "distributed",
         run_id=f"recovery-blocked-cancel-cas-{uuid.uuid4().hex}",
     )
     with metadb.session() as session:
@@ -2544,7 +2590,7 @@ def test_recovery_blocked_cancel_converges_when_publication_wins_cancel_cas(
 
     def _publish_then_request(run_id: str) -> bool:
         assert run_id == status.run_id
-        _publish_test_backend_done(status)
+        _publish_test_backend_done(original, graph, status)
         outcomes.append(original_request(run_id))
         return outcomes[-1]
 
@@ -2599,7 +2645,7 @@ def test_staged_effects_recover_from_sql_after_artifacts_and_catalog_change(
     final = _wait(recovered, status.run_id)
 
     assert final.status == "done"
-    assert metadb.catalog_get(final.output_uri) is not None
+    assert metadb.catalog_get(_committed_output(final).uri) is not None
     assert (len(client.status_calls), len(client.submit_calls), len(client.stop_calls)) == control_calls
 
 
@@ -2657,10 +2703,10 @@ def test_recovery_blocked_cancel_converges_when_publication_wins_after_cancel_ca
         jobs_config, monkeypatch):
     module, deps, original, client, store = _runner(jobs_config)
     graph = _graph()
-    plan = compile_plan(graph, "map", deps.registry, deps.node_specs, deps.node_ir)
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
     original._ensure_jobs_supervisor = lambda _run_id: None
     status = original.run(
-        plan, graph, "map", "distributed",
+        plan, graph, "write", "distributed",
         run_id=f"recovery-blocked-after-cancel-cas-{uuid.uuid4().hex}",
     )
     with metadb.session() as session:
@@ -2677,7 +2723,7 @@ def test_recovery_blocked_cancel_converges_when_publication_wins_after_cancel_ca
     def _request_then_publish(run_id: str) -> bool:
         assert run_id == status.run_id
         outcomes.append(original_request(run_id))
-        _publish_test_backend_done(status)
+        _publish_test_backend_done(original, graph, status)
         return outcomes[-1]
 
     monkeypatch.setattr(metadb, "request_backend_cancel", _request_then_publish)
@@ -2701,10 +2747,10 @@ def test_postgres_recovery_blocked_caller_converges_after_terminal_publication(
 
     module, deps, original, client, store = _runner(jobs_config)
     graph = _graph()
-    plan = compile_plan(graph, "map", deps.registry, deps.node_specs, deps.node_ir)
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
     original._ensure_jobs_supervisor = lambda _run_id: None
     status = original.run(
-        plan, graph, "map", "distributed",
+        plan, graph, "write", "distributed",
         run_id=f"pg-recovery-blocked-terminal-{uuid.uuid4().hex}",
     )
     with metadb.session() as session:
@@ -2741,7 +2787,7 @@ def test_postgres_recovery_blocked_caller_converges_after_terminal_publication(
     caller.start()
     try:
         assert marked.wait(timeout=5), "recovery marker did not commit before the barrier"
-        _publish_test_backend_done(status)
+        _publish_test_backend_done(original, graph, status)
         assert metadb.terminal_run_status(status.run_id) == "done"
         assert metadb.get_run_state(status.run_id)["status"] == "done"
     finally:
@@ -2991,7 +3037,9 @@ def test_sql_bound_envelope_recovers_crash_before_artifact_materialization(jobs_
 
     status = original.run(plan, graph, "write", "distributed", run_id=run_id)
     assert status.status == "queued"
-    assert original.runs[run_id] is status and deps.run_index[run_id] is original
+    assert original.runs[run_id].run_id == status.run_id
+    assert original.runs[run_id] is not status
+    assert deps.run_index[run_id] is original
 
     binding = metadb.backend_job(run_id)
     payload = metadb.backend_job_artifact_payload(run_id)
@@ -3049,6 +3097,48 @@ def test_status_retries_supervisor_after_thread_start_failure(jobs_config, monke
     assert _wait(runner, status.run_id).status == "done"
 
 
+def test_ray_public_status_waits_for_a_coherent_detached_snapshot(jobs_config):
+    _module, _deps, runner, _client, _store = _runner(jobs_config)
+    runner.on_status = None
+    graph = _graph()
+    live = RunStatus(
+        run_id=f"ray_snapshot_{uuid.uuid4().hex}",
+        status="running",
+        placement="distributed",
+        target_node_id="map",
+        outputs=[RunOutput(
+            node_id="map", port_id="out", wire="dataset",
+            publication_kind="result", outcome="pending",
+        )],
+    )
+    with runner._lock:
+        runner.runs[live.run_id] = live
+        runner._published_statuses[live.run_id] = live.model_copy(deep=True)
+
+    live.outputs = [RunOutput(
+        node_id="map", port_id="out", wire="dataset",
+        publication_kind="result", outcome="committed",
+        uri="s3://shared/result.parquet", rows=7,
+    )]
+    live.status = "done"
+    before = runner.status(live.run_id)
+    assert before.status == "running"
+    assert before.outputs[0].outcome == "pending" and before.total_rows is None
+
+    live.total_rows = 7
+    runner._emit(graph, live)
+    visible = runner.status(live.run_id)
+    assert visible.status == "done"
+    assert visible.outputs[0].outcome == "committed"
+    assert visible.outputs[0].uri == "s3://shared/result.parquet"
+    assert visible.outputs[0].rows == visible.total_rows == 7
+
+    visible.error = "caller mutation"
+    cancelled = runner.cancel(live.run_id)
+    assert cancelled is not None and cancelled.error is None
+    assert cancelled is not visible and cancelled is not runner.runs[live.run_id]
+
+
 def test_bound_sql_artifact_recovers_before_first_submit(jobs_config):
     module, deps, original, client, store = _runner(jobs_config)
     graph = _graph()
@@ -3088,7 +3178,8 @@ def test_ray_jobs_terminal_artifact_wins_before_missing_job_replay(jobs_config):
 
     assert _wait(recovered, status.run_id).status == "done"
     final = recovered.status(status.run_id)
-    assert client.submit_calls == [] and metadb.catalog_get(final.output_uri) is not None
+    assert client.submit_calls == []
+    assert metadb.catalog_get(_committed_output(final).uri) is not None
 
 
 def test_cancel_preserves_trusted_success_after_submitted_metadata_disappears(jobs_config):
@@ -3455,8 +3546,11 @@ def test_canvas_delete_is_blocked_while_external_job_is_active(jobs_config):
 
     with pytest.raises(metadb.ActiveBackendJobsError, match="cancel it"):
         metadb.delete_canvas_cascade(graph.id)
-    metadb.save_run_state(status.run_id, status.model_copy(update={"status": "failed"}).model_dump(),
-                          canvas_id=graph.id)
+    failed = status.model_copy(deep=True)
+    failed.status = "failed"
+    from hub.run_outputs import settle_uncommitted_outputs
+    settle_uncommitted_outputs(failed, "failed", "test fixture retired")
+    metadb.save_run_state(status.run_id, failed.model_dump(), canvas_id=graph.id)
     metadb.delete_canvas_cascade(graph.id)
 
 
@@ -3786,13 +3880,12 @@ def test_backend_publication_atomically_updates_state_and_history(jobs_config, m
     _preallocate_backend_test_run(run_id)
     metadb.bind_backend_job(run_id, ref, status_doc, canvas_id=graph.id)
     assert metadb.claim_backend_publication(run_id, "attempt", "owner", 10) == "claimed"
-    result = _stage_raw_test_backend_failure(
-        run_id, ref, "owner", status_doc, total_rows=7)
+    result = _stage_raw_test_backend_failure(run_id, ref, "owner", status_doc)
     assert metadb.finish_backend_publication(run_id, "attempt", "owner", result) is True
     assert metadb.backend_job(run_id)["publication_state"] == "published"
     assert metadb.get_run_state(run_id)["status"] == "failed"
     history = metadb.list_runs(graph.id)
-    assert len(history) == 1 and history[0]["runId"] == run_id and history[0]["rows"] == 7
+    assert len(history) == 1 and history[0]["runId"] == run_id and history[0]["rows"] is None
 
     rollback_id = f"atomic_rollback_{uuid.uuid4().hex}"
     rollback_ref = {**ref, "submission_id": f"submission-{uuid.uuid4().hex}"}
@@ -3801,7 +3894,6 @@ def test_backend_publication_atomically_updates_state_and_history(jobs_config, m
     assert metadb.claim_backend_publication(rollback_id, "attempt", "owner", 10) == "claimed"
     rollback_result = _stage_raw_test_backend_failure(
         rollback_id, rollback_ref, "owner", {**status_doc, "run_id": rollback_id},
-        total_rows=7,
     )
     monkeypatch.setattr(metadb, "_upsert_run_record", lambda *_args, **_kwargs: (_ for _ in ()).throw(
         RuntimeError("history write failed")
@@ -3834,8 +3926,7 @@ def test_backend_publication_prunes_terminal_state_and_binding_but_keeps_history
         _preallocate_backend_test_run(run_id)
         metadb.bind_backend_job(run_id, ref, status_doc, canvas_id=graph.id)
         assert metadb.claim_backend_publication(run_id, ref["attempt_id"], "owner", 10) == "claimed"
-        result = _stage_raw_test_backend_failure(
-            run_id, ref, "owner", status_doc, total_rows=index + 1)
+        result = _stage_raw_test_backend_failure(run_id, ref, "owner", status_doc)
         assert metadb.finish_backend_publication(
             run_id, ref["attempt_id"], "owner", result,
         ) is True
@@ -3871,8 +3962,7 @@ def test_terminal_fence_survives_ad_hoc_pruning_without_run_history(jobs_config,
     _preallocate_backend_test_run(run_id)
     metadb.bind_backend_job(run_id, ref, status)
     assert metadb.claim_backend_publication(run_id, "attempt", "owner", 10) == "claimed"
-    result = _stage_raw_test_backend_failure(
-        run_id, ref, "owner", status, total_rows=1)
+    result = _stage_raw_test_backend_failure(run_id, ref, "owner", status)
     assert metadb.finish_backend_publication(
         run_id, "attempt", "owner", result,
     ) is True
@@ -3901,28 +3991,112 @@ def test_stale_supervisor_converges_after_terminal_detail_is_pruned(jobs_config,
         plan, graph, "write", "distributed",
         run_id=f"stale_terminal_{uuid.uuid4().hex}",
     )
+    owner = runner.runs[status.run_id]
+    assert owner == status and owner is not status
     ref = status.backend_ref
     assert ref is not None
     job = _materialize_bound_job(runner, status)
     monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 0)
     runner._publish_job_result(
-        job, None, status.target_node_id, status,
+        job, None, owner.target_node_id, owner,
         {"status": "failed", "error": "canonical failure", "rows": 0, "outputs": []},
         artifact_error=True,
     )
     assert metadb.backend_job(status.run_id) is None
 
     runner._publish_job_result(
-        job, graph, "write", status,
+        job, graph, "write", owner,
         {"status": "done", "rows": 1, "outputs": []},
     )
-    assert status.status == "failed"
+    assert owner.status == "failed"
 
-    status.status = "queued"  # emulate another stale loop that had not observed publication
+    owner.status = "queued"  # emulate another stale loop that had not observed publication
     runner._supervising.add(status.run_id)
     runner._supervise_jobs(status.run_id)
-    assert status.status == "failed"
+    assert owner.status == "failed"
+    assert runner.status(status.run_id).status == "failed"
     assert status.run_id not in runner._supervising
+
+
+@pytest.mark.parametrize("accessor", ["status", "cancel"])
+def test_durable_terminal_refresh_preserves_the_snapshot_being_returned(
+        jobs_config, monkeypatch, accessor):
+    _module, _deps, runner, _client, _store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", runner.deps.registry,
+                        runner.deps.node_specs, runner.deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(
+        plan, graph, "write", "distributed",
+        run_id=f"terminal_refresh_retention_{accessor}_{uuid.uuid4().hex}",
+    )
+    owner = runner.runs[status.run_id]
+    job = _materialize_bound_job(runner, status)
+    runner._publish_job_result(
+        job, None, owner.target_node_id, owner,
+        {"status": "failed", "error": "canonical failure", "rows": 0, "outputs": []},
+        artifact_error=True,
+    )
+    canonical = runner._status_snapshot(status.run_id)
+
+    # Emulate a stale process-local owner after another publisher committed the durable terminal.
+    # The retention pass must not evict the detached snapshot that this API call is about to return.
+    owner.status = "queued"
+    runner._publish_status_snapshot(owner)
+    monkeypatch.setattr("hub.plugins.runner._MAX_RUNS", 0)
+    settled = runner._settled[status.run_id]
+    assert not settled.is_set()
+    original_publish = runner._publish_status_snapshot
+    terminal_barriers = []
+
+    def observed_publish(current, **kwargs):
+        if kwargs.get("settle_event") is not None:
+            assert kwargs["settle_event"] is settled
+            assert not settled.is_set()
+            terminal_barriers.append(current.status)
+        return original_publish(current, **kwargs)
+
+    monkeypatch.setattr(runner, "_publish_status_snapshot", observed_publish)
+
+    observed = getattr(runner, accessor)(status.run_id)
+
+    assert observed is not None and observed.model_dump() == canonical.model_dump()
+    assert terminal_barriers == ["failed"] and settled.is_set()
+    assert status.run_id in runner.runs
+    assert runner._published_statuses[status.run_id] is not observed
+
+
+def test_terminal_reattach_preserves_the_snapshot_being_returned(
+        jobs_config, monkeypatch):
+    _module, _deps, runner, _client, _store = _runner(jobs_config)
+    graph = _graph()
+    plan = compile_plan(graph, "write", runner.deps.registry,
+                        runner.deps.node_specs, runner.deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+    status = runner.run(
+        plan, graph, "write", "distributed",
+        run_id=f"terminal_reattach_retention_{uuid.uuid4().hex}",
+    )
+    owner = runner.runs[status.run_id]
+    job = _materialize_bound_job(runner, status)
+    runner._publish_job_result(
+        job, None, owner.target_node_id, owner,
+        {"status": "failed", "error": "canonical failure", "rows": 0, "outputs": []},
+        artifact_error=True,
+    )
+    canonical = runner._status_snapshot(status.run_id)
+    with runner._lock:
+        runner.runs.clear()
+        runner._published_statuses.clear()
+        runner._cancel.clear()
+        runner._settled.clear()
+    monkeypatch.setattr("hub.plugins.runner._MAX_RUNS", 0)
+
+    observed = runner.status(status.run_id)
+
+    assert observed.model_dump() == canonical.model_dump()
+    assert status.run_id in runner.runs
+    assert runner._published_statuses[status.run_id] is not observed
 
 
 def test_fast_terminal_run_can_bind_owner_while_detail_still_exists(jobs_config):
@@ -4024,15 +4198,19 @@ def test_managed_catalog_persist_failure_cannot_publish_terminal_done(
     monkeypatch.setattr(
         metadb, "catalog_apply_managed_publication", _swallowed_before_this_fix)
     _complete(store, client, status)
+    binding = _wait_publication_state(
+        status.run_id, "effects_started", timeout=10, runner=runner)
     deadline = time.monotonic() + 5
-    while "waiting for staged effects" not in (runner.status(status.run_id).error or "") \
+    visible = runner.status(status.run_id)
+    while "waiting for staged effects" not in (visible.error or "") \
             and time.monotonic() < deadline:
         time.sleep(0.01)
+        visible = runner.status(status.run_id)
 
     job = store.read(status.backend_ref.job_uri)
     output_uri = job["sink_contracts"]["write"]["physical_uri"]
-    assert runner.status(status.run_id).status in ("queued", "running")
-    binding = metadb.backend_job(status.run_id)
+    assert visible.status in ("queued", "running")
+    assert "waiting for staged effects" in (visible.error or "")
     assert binding["publication_state"] == "effects_started"
     with metadb.session() as session:
         publication_owner = session.get(
@@ -4108,4 +4286,5 @@ def test_ray_jobs_live_submission_round_trip(tmp_path):
     final = _wait(runner, status.run_id, timeout=120)
 
     assert final.status == "done", final.error
-    assert final.total_rows == 3 and final.output_uri and final.output_uri.startswith("s3://dpray/")
+    assert final.total_rows == 3
+    assert str(_committed_output(final).uri).startswith("s3://dpray/")

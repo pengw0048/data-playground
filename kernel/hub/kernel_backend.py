@@ -161,28 +161,52 @@ class KernelBackend:
             run_id: str | None = None, request_id: str | None = None,
             attempt_id: str | None = None) -> RunStatus:
         from hub.backends import require_destination_credential_support
+        from hub.run_outputs import preflight_run_output_target, require_single_run_output
+        execution_target = target_node_id
+        output_target = preflight_run_output_target(plan, execution_target)
+        # This seam is callable without the HTTP router. Fail before credential resolution, kernel
+        # lease claims, process spawn, or remote submission so unsupported multi-output work leaves no
+        # control-plane or storage side effects.
+        if output_target is not None:
+            require_single_run_output(graph, output_target, self.base.node_specs)
         require_destination_credential_support(
             self, plan, graph, getattr(self.base, "workspace", ""))
         canvas_id = getattr(graph, "id", None) or "canvas"
         run_id = run_id or f"run_{os.urandom(5).hex()}"  # hub-authoritative id, threaded into the kernel
         endpoint, token = self._ensure_kernel(canvas_id)
-        body = {"run_id": run_id, "graph": graph.model_dump(), "target": target_node_id,
+        # ``None`` is semantically meaningful: execute the complete topological graph. Never replace it
+        # with the sole public output target, which would drop an independent branch.
+        body = {"run_id": run_id, "graph": graph.model_dump(), "target": execution_target,
                 "placement": placement, "request_id": request_id, "attempt_id": attempt_id}
         status = RunStatus(**_post(endpoint, "/run", token, body))
         if request_id and not status.request_id:
             status.request_id = request_id
         return status
 
-    def preview(self, graph: Graph, node_id: str, k: int, offset: int) -> dict:
+    def preview(
+            self, graph: Graph, node_id: str, k: int, offset: int,
+            port_id: str | None = None) -> dict:
         """Run a sample preview on the canvas's warm kernel (so it shares the kernel's engine + cache)."""
+        from hub.graph import require_output_port
+        selected = require_output_port(graph, node_id, self.base.node_specs, port_id)
         endpoint, token = self._ensure_kernel(getattr(graph, "id", None) or "canvas")
         return _post(endpoint, "/preview", token,
-                     {"graph": graph.model_dump(), "node_id": node_id, "k": k, "offset": offset})
+                     {"graph": graph.model_dump(), "node_id": node_id, "port_id": selected.id,
+                      "k": k, "offset": offset})
 
-    def profile(self, graph: Graph, node_id: str, full: bool = False) -> dict:
+    def profile(
+            self, graph: Graph, node_id: str, full: bool = False,
+            port_id: str | None = None) -> dict:
+        from hub.graph import require_output_port
+        from hub.run_outputs import require_single_run_output
+        if full:
+            selected = require_single_run_output(graph, node_id, self.base.node_specs)
+        else:
+            selected = require_output_port(graph, node_id, self.base.node_specs, port_id)
         endpoint, token = self._ensure_kernel(getattr(graph, "id", None) or "canvas")
         return _post(endpoint, "/profile", token,
-                     {"graph": graph.model_dump(), "node_id": node_id, "full": full})
+                     {"graph": graph.model_dump(), "node_id": node_id,
+                      "port_id": selected.port_id if full else selected.id, "full": full})
 
     def profile_job(self, graph: Graph, node_id: str, plan_digest: str,
                     run_id: str, admission_token: str,
@@ -192,6 +216,8 @@ class KernelBackend:
         The kernel stamps its fenced ``kernel_id`` onto the shared RunState. Any stateless hub can
         therefore route cancellation back to the exact process and DuckDB scope that owns the scan.
         """
+        from hub.run_outputs import require_single_run_output
+        require_single_run_output(graph, node_id, self.base.node_specs)
         canvas_id = getattr(graph, "id", None) or "canvas"
         endpoint, token = self._ensure_kernel(canvas_id)
         return RunStatus(**_post(endpoint, "/profile-job", token, {

@@ -795,12 +795,15 @@ class LocalStorage:
             self, uri: str, run_id: str, expected_doc: dict) -> bool:
         """Bind a terminal RunState read-back receipt to this exact filesystem namespace."""
         from hub import metadb
+        from hub.run_outputs import sole_committed_document_output
 
         canonical_uri = uri[len("file://"):] if uri.startswith("file://") else uri
         self._result_names(canonical_uri)
-        raw_expected = next((expected_doc.get(key) for key in (
-            "uri", "outputUri", "output_uri") if expected_doc.get(key)), None)
-        expected_uri = str(raw_expected).rstrip("/") if raw_expected else None
+        output = sole_committed_document_output({
+            "outputs": expected_doc.get("outputs")
+            if isinstance(expected_doc, dict) else None,
+        })
+        expected_uri = str(output.uri).rstrip("/") if output is not None else None
         if expected_uri and expected_uri.startswith("file://"):
             expected_uri = expected_uri[len("file://"):]
         if expected_uri != canonical_uri:

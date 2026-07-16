@@ -97,15 +97,20 @@ class RunRecord(Base):
     # backends that do not propagate a request id.
     request_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    job_type: Mapped[str] = mapped_column(String, nullable=False, default="run", server_default="run")
     status: Mapped[str] = mapped_column(String)
     rows: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    output_table: Mapped[str | None] = mapped_column(String, nullable=True)
-    output_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Declaration-ordered RunOutput snapshots.  The pre-1.0 baseline stores the collection directly;
+    # there are no singular compatibility columns or migration shims.
+    outputs: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default="[]")
     per_node: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON: durable per-node breakdown
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    __table_args__ = (UniqueConstraint("canvas_id", "run_id", name="uq_run_record_canvas_run"),)
+    __table_args__ = (
+        UniqueConstraint("canvas_id", "run_id", name="uq_run_record_canvas_run"),
+        CheckConstraint("job_type IN ('run', 'profile')", name="ck_run_record_job_type"),
+    )
 
 
 class CanvasVersion(Base):
@@ -393,13 +398,13 @@ class CatalogPublicationEvent(Base):
 
 
 class ResultCache(Base):
-    """Content-addressed result index: a run plan's content hash → where its output landed (uri /
-    table / rows / fmt, as JSON). Persisted + shared so a completed run's output is REUSED across
+    """Content-addressed result index: a run plan's content hash → its canonical sole committed
+    ``RunOutput`` collection. Persisted + shared so a completed run's output is REUSED across
     kernel restarts AND across stateless web instances — the old in-process dict was per-process and
     lost on restart. Not authoritative data: a miss just recomputes, so it's safe to prune (newest N)."""
     __tablename__ = "result_cache"
     key: Mapped[str] = mapped_column(String, primary_key=True)
-    doc: Mapped[str] = mapped_column(Text)  # {uri, table, rows, fmt}
+    doc: Mapped[str] = mapped_column(Text)  # {"outputs": [one committed RunOutput]}
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -2026,19 +2031,40 @@ def list_canvases_for(uid: str) -> list[dict]:
 
 
 _RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (older history is pruned)
+_RUN_RECORD_OUTPUTS_MAX_BYTES = 1_048_576
 
 
-def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None, status: str,
+def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
+                       job_type: str, status: str,
                        rows: int | None = None, ms: int | None = None, error: str | None = None,
-                       output_table: str | None = None, per_node: list[dict] | None = None,
-                       run_id: str | None = None, output_uri: str | None = None,
+                       outputs: list[dict] | None = None, per_node: list[dict] | None = None,
+                       run_id: str | None = None,
                        request_id: str | None = None) -> bool:
     """Session-scoped history upsert shared by normal completion and backend publication."""
     if not canvas_id:
         return False
-    if status != "done" and _local_result_candidate(output_uri) is not None:
-        output_uri = None
-        output_table = None
+    from hub.models import RunHistoryRecord
+    # One model owns the complete public history invariant before any row/ref/local-owner mutation.
+    history = RunHistoryRecord.model_validate({
+        "id": "validation",
+        "run_id": run_id,
+        "request_id": request_id,
+        "job_type": job_type,
+        "status": status,
+        "target_node_id": target_node_id,
+        "rows": rows,
+        "ms": ms,
+        "error": error,
+        "outputs": outputs if outputs is not None else [],
+        "per_node": per_node,
+    })
+    output_docs = [output.model_dump() for output in history.outputs]
+    output_payload = json.dumps(output_docs, separators=(",", ":"), default=str)
+    if len(output_payload.encode("utf-8")) > _RUN_RECORD_OUTPUTS_MAX_BYTES:
+        raise ValueError(
+            f"run history outputs exceed {_RUN_RECORD_OUTPUTS_MAX_BYTES} encoded bytes")
+    committed = [output for output in history.outputs if output.outcome == "committed"]
+    output_uri = str(committed[0].uri).rstrip("/") if len(committed) == 1 else None
     if s.get(Canvas, canvas_id, with_for_update=True) is None:
         return False
     rec = (s.scalar(select(RunRecord).where(
@@ -2051,10 +2077,13 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None, 
     rid = rec.id
     if request_id and not rec.request_id:
         rec.request_id = request_id
-    rec.target_node_id, rec.status = target_node_id, status
-    rec.rows, rec.ms, rec.error = rows, ms, error
-    rec.output_table, rec.output_uri = output_table, output_uri
-    rec.per_node = json.dumps(per_node, default=str) if per_node else None
+    rec.target_node_id, rec.job_type, rec.status = (
+        history.target_node_id, history.job_type, history.status)
+    rec.rows, rec.ms, rec.error = history.rows, history.ms, history.error
+    rec.outputs = output_payload
+    rec.per_node = (json.dumps(
+        [item.model_dump() for item in history.per_node], default=str)
+        if history.per_node else None)
     s.flush()
     stale = list(s.scalars(select(RunRecord).where(
         RunRecord.canvas_id == canvas_id, RunRecord.id != rid
@@ -2066,16 +2095,16 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None, 
         s.delete(obj)
     if stale:
         _lock_local_result_registry(s)
-    sync_local_result_owner(s, "run_record", rid, output_uri)
+    sync_local_result_owner(s, "run_record", rid, {"outputs": output_docs})
     for obj in stale:
         _drop_local_result_owner_locked(s, "run_record", obj.id)
     return True
 
 
-def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
+def record_run(canvas_id: str | None, target_node_id: str | None, job_type: str, status: str,
                rows: int | None = None, ms: int | None = None, error: str | None = None,
-               output_table: str | None = None, per_node: list[dict] | None = None,
-               run_id: str | None = None, output_uri: str | None = None,
+               outputs: list[dict] | None = None, per_node: list[dict] | None = None,
+               run_id: str | None = None,
                request_id: str | None = None) -> bool:
     """Persist a finished run under its canvas. No-op (returns False) without a real canvas — an ad-hoc
     API run or an internal region sub-run (graph id '_region'). Returns True when a row was written.
@@ -2084,14 +2113,12 @@ def record_run(canvas_id: str | None, target_node_id: str | None, status: str,
     `request_id` (OPS-01) is the HTTP/WebSocket id that started the run."""
     if not canvas_id:
         return False
-    if status != "done" and _local_result_candidate(output_uri) is not None:
-        output_uri = None
-        output_table = None
     with session() as s:
         return _upsert_run_record(
-            s, canvas_id=canvas_id, target_node_id=target_node_id, status=status,
-            rows=rows, ms=ms, error=error, output_table=output_table, per_node=per_node,
-            run_id=run_id, output_uri=output_uri, request_id=request_id,
+            s, canvas_id=canvas_id, target_node_id=target_node_id,
+            job_type=job_type, status=status,
+            rows=rows, ms=ms, error=error, outputs=outputs, per_node=per_node,
+            run_id=run_id, request_id=request_id,
         )
 
 
@@ -2216,9 +2243,9 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
         rows = s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id)
                          .order_by(RunRecord.created_at.desc()).limit(limit)).all()
         return [{"id": r.id, "runId": r.run_id, "requestId": r.request_id, "status": r.status,
-                 "targetNodeId": r.target_node_id, "rows": r.rows,
-                 "ms": r.ms, "error": r.error, "outputTable": r.output_table,
-                 "outputUri": r.output_uri,
+                 "targetNodeId": r.target_node_id, "jobType": r.job_type, "rows": r.rows,
+                 "ms": r.ms, "error": r.error,
+                 "outputs": json.loads(r.outputs),
                  "perNode": json.loads(r.per_node) if r.per_node else None,
                  "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
 
@@ -2359,7 +2386,11 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
     the reaper and in-flight status lookups are unaffected. An evicted old run retains an authorized,
     synthetic terminal status through its compact identity fence, while detailed status fields are gone;
     durable per-canvas history remains separate."""
-    status = dict(status)
+    from hub.models import RunStatus
+    # Revalidate mutable in-memory models at the durable boundary.  This is where terminal pending
+    # ports, stale singular fields, and inconsistent scalar row projections would otherwise become
+    # restart-visible state even though response-model validation catches them later.
+    status = RunStatus.model_validate(status).model_dump()
     st = str(status.get("status", "running"))
     job_type = str(status.get("job_type", status.get("jobType", "run")))
     target_node_id = status.get("target_node_id", status.get("targetNodeId"))
@@ -2373,9 +2404,6 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
         raise ValueError(
             "profile status requires a target node, lowercase SHA-256 plan digest, "
             "and positive attempt order")
-    if st != "done" and _local_result_candidate(_result_doc_uri(status)) is not None:
-        for key in ("uri", "outputUri", "output_uri", "outputTable", "output_table"):
-            status.pop(key, None)
     with session() as s:
         stale_candidate_ids: list[str] = []
         locked: dict[str, RunState] = {}
@@ -3282,6 +3310,7 @@ def _validated_backend_publication_effects(
         JOB_SQL_ENVELOPE_MAX_BYTES, RAY_JOB_CONTRACT_VERSION, RAY_JOB_RESULT_FIELDS,
     )
     from hub.models import RunStatus
+    from hub.run_outputs import sole_output
 
     run_id, attempt_id = str(run_id), str(attempt_id)
     if not isinstance(terminal_status, dict) or set(terminal_status) != set(RunStatus.model_fields):
@@ -3295,9 +3324,11 @@ def _validated_backend_publication_effects(
             or candidate.backend_ref.attempt_id != attempt_id
             or not candidate.backend_ref.durable):
         raise ValueError("backend publication terminal_status has no exact durable attempt")
-    if candidate.status != "done" and (
-            candidate.output_uri is not None or candidate.output_table is not None):
-        raise ValueError("negative backend publication cannot expose output identity")
+    public_output = sole_output(candidate, committed=True)
+    if candidate.status == "done" and public_output is None:
+        raise ValueError("successful backend publication requires one committed RunOutput")
+    if candidate.status != "done" and public_output is not None:
+        raise ValueError("negative backend publication cannot expose a committed output")
 
     if (not isinstance(sink_attempts, dict)
             or any(not isinstance(step_id, str) or not step_id
@@ -3318,9 +3349,11 @@ def _validated_backend_publication_effects(
                 or validated_result.get("attempt_id") != attempt_id
                 or validated_result.get("submission_id") != candidate.backend_ref.submission_id):
             raise ValueError("backend publication validated_result has an invalid attempt contract")
+        assert public_output is not None
         if (validated_result.get("rows") != candidate.total_rows
-                or validated_result.get("output_uri") != candidate.output_uri
-                or validated_result.get("output_table") != candidate.output_table):
+                or validated_result.get("rows") != public_output.rows
+                or validated_result.get("output_uri") != public_output.uri
+                or validated_result.get("output_table") != public_output.table):
             raise ValueError("backend publication result and terminal_status disagree")
         outputs = validated_result.get("outputs")
         if not isinstance(outputs, list):
@@ -3861,9 +3894,10 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
         _release_backend_source_pins(s, source_pins)
         _upsert_run_record(
             s, canvas_id=state.canvas_id, target_node_id=published.get("target_node_id"),
-            status=terminal, rows=published.get("total_rows"), ms=published.get("ms"),
-            error=published.get("error"), output_table=published.get("output_table"),
-            per_node=per_node, run_id=run_id, output_uri=output_uri,
+            job_type="run", status=terminal,
+            rows=published.get("total_rows"), ms=published.get("ms"),
+            error=published.get("error"), outputs=published.get("outputs") or [],
+            per_node=per_node, run_id=run_id,
         )
         if pruned:
             _lock_local_result_registry(s)
@@ -4163,12 +4197,12 @@ def _canvas_local_result_candidates(value) -> set[str]:
 def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
     """Owner-aware exact extraction avoids scanning arbitrary caller-controlled JSON strings."""
     candidates: set[str] = set()
-    if owner_kind in ("run_state", "result_cache"):
+    if owner_kind in ("run_state", "run_record", "result_cache"):
         for value in values:
             candidate = _local_result_candidate(_result_doc_uri(value))
             if candidate is not None:
                 candidates.add(candidate)
-    elif owner_kind in ("run_record", "catalog_entry"):
+    elif owner_kind == "catalog_entry":
         for value in values:
             candidate = _local_result_candidate(value)
             if candidate is not None:
@@ -4673,7 +4707,7 @@ def validate_managed_object_uri(uri: str, *, attempt: bool = False) -> str:
 
 
 def get_result(key: str) -> dict | None:
-    """The stored result pointer ({uri, table, rows, fmt}) for a plan's content hash, or None."""
+    """The canonical ``{"outputs": [...]}`` cache document for a plan hash, or ``None``."""
     with session() as s:
         r = s.get(ResultCache, key)
         return json.loads(r.doc) if r else None
@@ -5845,14 +5879,24 @@ def _result_doc_uri(raw: str | dict | None) -> str | None:
         doc = raw if isinstance(raw, dict) else json.loads(raw or "{}")
     except (TypeError, ValueError):
         return None
-    uri = (doc.get("uri") or doc.get("outputUri") or doc.get("output_uri")) \
-        if isinstance(doc, dict) else None
-    return str(uri).rstrip("/") if uri else None
+    from hub.run_outputs import sole_committed_document_output
+    # Run state/history documents contain the canonical collection alongside status metadata, while
+    # result-cache documents are exactly {"outputs": [...]}.  Extract only that collection here; the
+    # cache write/read boundaries separately enforce their exact document shape.
+    output = sole_committed_document_output({"outputs": doc.get("outputs")})
+    return str(output.uri).rstrip("/") if output is not None else None
 
 
 def put_result(key: str, doc: dict) -> list[str]:
     """Atomically replace a cache row and its durable object/local artifact reference."""
-    payload = json.dumps(doc, default=str)
+    from hub.run_outputs import sole_committed_document_output
+    output = sole_committed_document_output(doc)
+    if set(doc) != {"outputs"} or output is None or output.rows is None:
+        raise ValueError(
+            "result cache requires exactly one committed RunOutput with a known row count")
+    payload = json.dumps(doc, separators=(",", ":"), default=str)
+    if len(payload.encode("utf-8")) > 65_536:
+        raise ValueError("result cache output document exceeds 65536 encoded bytes")
     new_uri = _result_doc_uri(doc)
     retired: list[str] = []
     with session() as s:
@@ -7788,12 +7832,7 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
                 d = json.loads(r.doc)
             except Exception:  # noqa: BLE001
                 d = {"run_id": r.run_id}
-            # A child may have reported a provisional binding before its durable parent reaped and
-            # committed it. Interrupted runs never publish that binding as a failed RunState owner.
-            for key in ("uri", "outputUri", "output_uri", "outputTable", "output_table"):
-                d.pop(key, None)
-            d["status"] = "failed"
-            d["error"] = (
+            interrupted_error = (
                 "interrupted before durable backend binding"
                 if preallocation_expired else
                 "interrupted — the run's kernel is gone (hub restarted with no live kernel)"
@@ -7808,6 +7847,35 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
                     "plan_digest": str(r.plan_digest),
                     "profile_attempt_order": int(r.profile_attempt_order or 0),
                 })
+            # A child may have reported a provisional binding before its durable parent reaped and
+            # committed it. Interrupted runs settle every expected port without publishing an identity.
+            try:
+                from hub.models import RunStatus
+                from hub.run_outputs import discard_unpublished_outputs
+                # Validate the live document before making it terminal: a valid queued/running status is
+                # expected to contain pending ports, which terminal model validation correctly rejects.
+                interrupted = RunStatus.model_validate(d)
+                interrupted.status = "failed"
+                interrupted.error = interrupted_error
+                interrupted.profile = None
+                interrupted.total_rows = None
+                if interrupted.job_type == "profile":
+                    interrupted.outputs = []
+                else:
+                    discard_unpublished_outputs(interrupted, "failed", interrupted_error)
+                d = RunStatus.model_validate(interrupted.model_dump()).model_dump()
+            except (TypeError, ValueError):
+                d = RunStatus(
+                    run_id=r.run_id,
+                    status="failed",
+                    job_type="profile" if admitted_profile else "run",
+                    target_node_id=str(r.target_node_id) if r.target_node_id is not None else None,
+                    error=interrupted_error,
+                    plan_digest=str(r.plan_digest) if admitted_profile else None,
+                    profile_attempt_order=(
+                        int(r.profile_attempt_order or 0) if admitted_profile else None),
+                    outputs=[],
+                ).model_dump()
             r.status = "failed"
             r.doc = json.dumps(d, default=str)
             if admitted_profile:

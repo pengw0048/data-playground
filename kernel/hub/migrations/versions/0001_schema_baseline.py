@@ -781,12 +781,12 @@ def upgrade() -> None:
         sa.Column("run_id", sa.String(), nullable=True),
         sa.Column("request_id", sa.String(), nullable=True),
         sa.Column("target_node_id", sa.String(), nullable=True),
+        sa.Column("job_type", sa.String(), server_default="run", nullable=False),
         sa.Column("status", sa.String(), nullable=False),
         sa.Column("rows", sa.Integer(), nullable=True),
         sa.Column("ms", sa.Integer(), nullable=True),
         sa.Column("error", sa.Text(), nullable=True),
-        sa.Column("output_table", sa.String(), nullable=True),
-        sa.Column("output_uri", sa.Text(), nullable=True),
+        sa.Column("outputs", sa.Text(), server_default="[]", nullable=False),
         sa.Column("per_node", sa.Text(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(
@@ -794,6 +794,9 @@ def upgrade() -> None:
             ["canvases.id"],
         ),
         sa.PrimaryKeyConstraint("id"),
+        sa.CheckConstraint(
+            "job_type IN ('run', 'profile')", name="ck_run_record_job_type"
+        ),
         sa.UniqueConstraint("canvas_id", "run_id", name="uq_run_record_canvas_run"),
     )
     op.create_index(

@@ -5,6 +5,8 @@ The top-level canvas graph must be acyclic (control flow is encapsulated).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from hub.models import Graph, GraphEdge, GraphNode, Position
 
 
@@ -39,6 +41,87 @@ def node_map(graph: Graph) -> dict[str, GraphNode]:
 
 
 _MAX_EXECUTION_SOURCE_NODES = 10_000
+MAX_EFFECTIVE_OUTPUT_PORTS = 64
+
+
+@dataclass(frozen=True)
+class EffectiveOutputPort:
+    """The declaration-order identity used by execution, inspection, and durable run history."""
+
+    id: str
+    label: str | None
+    wire: str
+
+
+def effective_output_ports_for_node(
+        node: GraphNode, spec) -> list[EffectiveOutputPort]:
+    """Validate one already-resolved node/spec pair without another graph scan."""
+    cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+    has_dynamic_outputs = (
+        node.type == "section" and isinstance(cfg, dict) and "outputs" in cfg)
+    declared = cfg.get("outputs") if has_dynamic_outputs else None
+    if has_dynamic_outputs:
+        if not isinstance(declared, list):
+            raise ValueError(f"node '{node.id}' output declaration must be a list")
+        ports: list[EffectiveOutputPort] = []
+        for port in declared:
+            if not isinstance(port, str):
+                raise ValueError(f"node '{node.id}' output port ids must be strings")
+            if port != port.strip():
+                raise ValueError(f"node '{node.id}' output port '{port}' contains surrounding whitespace")
+            if not port:
+                raise ValueError(f"node '{node.id}' declares an empty output port id")
+            if len(port) > 128:
+                raise ValueError(f"node '{node.id}' output port '{port[:32]}…' exceeds 128 characters")
+            ports.append(EffectiveOutputPort(id=port, label=port, wire="dataset"))
+    else:
+        ports = []
+        for port in spec.outputs:
+            port_id = str(port.id)
+            label = port.label
+            if not port_id or port_id != port_id.strip() or len(port_id) > 128:
+                raise ValueError(f"node '{node.id}' declares an invalid output port id")
+            if label is not None and len(label) > 256:
+                raise ValueError(f"node '{node.id}' output port '{port_id}' label exceeds 256 characters")
+            ports.append(EffectiveOutputPort(id=port_id, label=label, wire=str(port.wire)))
+    if not ports:
+        raise ValueError(f"node '{node.id}' must declare at least one output port")
+    if len(ports) > MAX_EFFECTIVE_OUTPUT_PORTS:
+        raise ValueError(
+            f"node '{node.id}' declares {len(ports)} output ports; "
+            f"the supported maximum is {MAX_EFFECTIVE_OUTPUT_PORTS}")
+    ids = [port.id for port in ports]
+    duplicate = next((port_id for index, port_id in enumerate(ids)
+                      if port_id in ids[:index]), None)
+    if duplicate is not None:
+        raise ValueError(f"node '{node.id}' declares duplicate output port '{duplicate}'")
+    return ports
+
+
+def effective_output_ports(
+        graph: Graph, node_id: str, node_specs: dict) -> list[EffectiveOutputPort]:
+    """Resolve one bounded, declaration-ordered output set; never use runtime dict ordering."""
+    node = node_map(graph).get(node_id)
+    if node is None:
+        raise ValueError(f"target node '{node_id}' does not exist")
+    spec = node_specs.get(node.type)
+    if spec is None:
+        raise ValueError(f"node '{node_id}' has unknown kind '{node.type}'")
+    return effective_output_ports_for_node(node, spec)
+
+
+def require_output_port(
+        graph: Graph, node_id: str, node_specs: dict, port_id: str | None) -> EffectiveOutputPort:
+    """Select one relation port without guessing for a multi-output node."""
+    ports = effective_output_ports(graph, node_id, node_specs)
+    if port_id is None:
+        if len(ports) != 1:
+            raise ValueError(f"node '{node_id}' requires an explicit output port")
+        return ports[0]
+    found = next((port for port in ports if port.id == port_id), None)
+    if found is None:
+        raise KeyError(f"node '{node_id}' has no output port '{port_id}'")
+    return found
 
 
 def _execution_source_configs(graph: Graph, roots: list[GraphNode]) -> list[dict]:
@@ -216,39 +299,55 @@ def unknown_kinds(graph: Graph, known) -> list[tuple[str, str]]:
     return [(n.id, n.type) for n in graph.nodes if n.type not in allow]
 
 
+def validation_error(
+        graph: Graph, node_specs: dict, known_kinds=(),
+        target_node_id: str | None = None) -> tuple[str, bool] | None:
+    """One authoritative, side-effect-free graph validity decision for every ingress.
+
+    Returns ``(message, acyclic)`` so compile can keep its error-plan response while execution,
+    importers, and graph-building tools enforce exactly the same structural contract.
+    """
+    unknown = unknown_kinds(graph, set(node_specs) | set(known_kinds))
+    if unknown:
+        node_id, kind = unknown[0]
+        return (
+            f"unknown node kind '{kind}' (node '{node_id}') — "
+            "install its plugin or remove the node",
+            True,
+        )
+    structural = structural_errors(graph, node_specs, target_node_id)
+    if structural:
+        return "invalid graph: " + "; ".join(structural[:5]), True
+    incompatible = type_errors(graph, node_specs)
+    if incompatible:
+        return "incompatible connection: " + "; ".join(incompatible[:5]), True
+    if not is_acyclic(graph):
+        return "graph has a cycle — control flow must be encapsulated (§5.7)", False
+    return None
+
+
 def _ports(node: GraphNode, spec, side: str) -> list[tuple[str, str, bool]]:
     """Return effective ``(id, wire, multi)`` ports for structural validation.
 
-    Outputs may be declared per node via ``config.outputs`` (sections use this for named emits).
-    Inputs are always defined by the NodeSpec. Keeping this resolution here makes structural and
-    wire-type validation agree on the exact port an edge addresses.
+    Outputs use the same validated resolver as execution and durable history. Inputs remain static
+    NodeSpec declarations. Invalid output declarations return no selectable port; the structural pass
+    reports the resolver's precise validation error separately.
     """
-    if side == "source":
-        cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-        declared = cfg.get("outputs") if isinstance(cfg, dict) else None
-        if isinstance(declared, list) and declared:
-            return [(str(port), "dataset", False) for port in declared]
     if spec is None:  # unknown kinds are reported by the unknown-kind gate, never given implicit ports
         return []
     if side == "source":
-        ports = spec.outputs
-    else:
-        ports = spec.inputs
-    return [(p.id, p.wire, bool(getattr(p, "multi", False))) for p in ports]
+        try:
+            return [(port.id, port.wire, False)
+                    for port in effective_output_ports_for_node(node, spec)]
+        except ValueError:
+            return []
+    return [(p.id, p.wire, bool(getattr(p, "multi", False))) for p in spec.inputs]
 
 
 def _port(node: GraphNode, spec, handle: str | None, side: str) -> tuple[str, str, bool] | None:
     ports = _ports(node, spec, side)
     if handle is not None:
-        found = next((p for p in ports if p[0] == handle), None)
-        # A legacy section without config.outputs has an intentionally dynamic output namespace. New
-        # UI-created sections declare outputs, which are validated strictly above; preserve old saved
-        # canvases that already wire a named emit but predate that declaration.
-        if found is None and side == "source" and node.type == "section":
-            cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-            if not isinstance(cfg.get("outputs") if isinstance(cfg, dict) else None, list):
-                return handle, "dataset", False
-        return found
+        return next((p for p in ports if p[0] == handle), None)
     if not ports:
         return None
     default_id = "out" if side == "source" else "in"
@@ -258,8 +357,8 @@ def _port(node: GraphNode, spec, handle: str | None, side: str) -> tuple[str, st
 def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None = None) -> list[str]:
     """Return deterministic errors for graph structure that must never be guessed by an executor.
 
-    ``None`` handles select a conventional default port (``out``/``in`` when present, otherwise the
-    first declared port). An explicit handle must exist. Unknown kinds are left to the existing
+    A missing target handle selects its conventional primary input; a missing source handle is valid
+    only for a single-output node. An explicit handle must exist. Unknown kinds are left to the
     unknown-kind gate; registered plugin kinds use the ports from their required NodeSpec.
     """
     errors: list[str] = []
@@ -272,6 +371,16 @@ def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None
                 duplicate_nodes.add(node.id)
         else:
             nodes[node.id] = node
+
+    effective_outputs: dict[str, list[EffectiveOutputPort]] = {}
+    for node in nodes.values():
+        if node.type not in node_specs:
+            continue
+        try:
+            effective_outputs[node.id] = effective_output_ports_for_node(
+                node, node_specs[node.type])
+        except ValueError as exc:
+            errors.append(str(exc))
 
     seen_edges: set[str] = set()
     duplicate_edges: set[str] = set()
@@ -296,6 +405,10 @@ def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None
 
         source_spec = node_specs.get(source.type)
         if source_spec is not None:
+            if edge.source_handle is None and len(effective_outputs.get(source.id, [])) > 1:
+                errors.append(
+                    f"edge '{edge.id}' must identify a source handle on multi-output node "
+                    f"'{source.id}'")
             output = _port(source, source_spec, edge.source_handle, "source")
             if output is None:
                 if edge.source_handle is None:

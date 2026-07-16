@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -102,6 +103,21 @@ def _poll(run_id, tries=150):
     return st
 
 
+def _sole_output(status, *, outcome: str | None = None):
+    outputs = status.get("outputs") if isinstance(status, dict) else status.outputs
+    assert len(outputs) == 1, outputs
+    output = outputs[0]
+    actual = output.get("outcome") if isinstance(output, dict) else output.outcome
+    if outcome is not None:
+        assert actual == outcome
+    return output
+
+
+def _output_field(status, name: str, *, outcome: str | None = None):
+    output = _sole_output(status, outcome=outcome)
+    return output.get(name) if isinstance(output, dict) else getattr(output, name)
+
+
 def _full_result(graph: dict, target_node_id: str, k: int = 100) -> tuple[dict, dict]:
     """Run an exact, durable non-write target and reopen its materialized result."""
     started = client.post(
@@ -111,8 +127,9 @@ def _full_result(graph: dict, target_node_id: str, k: int = 100) -> tuple[dict, 
     assert started.status_code == 200, started.text
     status = _poll(started.json()["runId"])
     assert status["status"] == "done", status.get("error")
-    assert status.get("outputUri")
-    sampled = client.post("/api/data/sample", json={"uri": status["outputUri"], "k": k})
+    uri = _output_field(status, "uri", outcome="committed")
+    assert uri
+    sampled = client.post("/api/data/sample", json={"uri": uri, "k": k})
     assert sampled.status_code == 200, sampled.text
     return status, sampled.json()
 
@@ -391,7 +408,7 @@ def test_full_run_of_a_non_write_target_materializes_an_inspectable_result():
     ], "edges": [E("src", "agg")]}
     st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "agg", "confirmed": True}).json()["runId"])
     assert st["status"] == "done"
-    uri = st["outputUri"]
+    uri = _output_field(st, "uri", outcome="committed")
     assert uri, "a non-write target's full result must be materialized to a durable artifact"
     # the artifact holds the EXACT grouped rows (the aggregate a sample can't preview), inspectable via
     # the normal sample-by-uri API — the same way the UI pages a Full result
@@ -400,7 +417,8 @@ def test_full_run_of_a_non_write_target_materializes_an_inspectable_result():
     assert out["rowCount"] == st["totalRows"] and out["rowCount"] > 0
     # durability: re-fetching the run status (served from run_states, i.e. after a restart / on another
     # instance) still carries the artifact uri, so the Full result is restorable
-    assert client.get(f"/api/run/{st['runId']}").json()["outputUri"] == uri
+    assert _output_field(
+        client.get(f"/api/run/{st['runId']}").json(), "uri", outcome="committed") == uri
     # but the ephemeral result artifact must NOT be re-cataloged into the Tables view on restart
     from hub.deps import get_deps
     tables = get_deps().catalog.list_page(CatalogQuery(limit=5000)).items
@@ -697,7 +715,8 @@ def test_run_write_and_lineage():
     ], "edges": [E("src", "flt"), E("flt", "wr")]}
     r = client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()
     st = _poll(r["runId"])
-    assert st["status"] == "done" and st["outputTable"] == "images_valid"
+    assert st["status"] == "done"
+    assert _output_field(st, "table", outcome="committed") == "images_valid"
     assert st["totalRows"] and st["totalRows"] < 500  # filtered out invalids
     lin = client.get("/api/catalog/lineage", params={"uri": _uri("images")}).json()
     assert any(e["child"].endswith("images_valid.parquet") for e in lin["edges"])
@@ -883,10 +902,16 @@ def test_run_controller_evicts_terminal_runs_only():
     from hub.plugins.runner import _MAX_RUNS
     from hub.models import RunStatus
     rc = RunController(None, None, None)
-    rc.runs["live"] = RunStatus(run_id="live", status="running", placement="distributed")  # oldest, in-flight
-    for i in range(_MAX_RUNS + 5):
-        rc.runs[f"r{i}"] = RunStatus(run_id=f"r{i}", status="done", placement="distributed")
-    rc._evict()
+    with rc._lock:
+        rc.runs["live"] = RunStatus(
+            run_id="live", status="running", placement="distributed")
+        rc._published_statuses["live"] = rc.runs["live"].model_copy(deep=True)
+        for i in range(_MAX_RUNS + 5):
+            run_id = f"r{i}"
+            rc.runs[run_id] = RunStatus(
+                run_id=run_id, status="done", placement="distributed")
+            rc._published_statuses[run_id] = rc.runs[run_id].model_copy(deep=True)
+        rc._evict()
     assert len(rc.runs) <= _MAX_RUNS
     assert "live" in rc.runs  # the in-flight run is never dropped, even though it's the oldest key
 
@@ -1758,7 +1783,7 @@ def test_write_mode_append_builds_a_readable_directory_dataset():
 
     st1 = append_run()
     assert st1["status"] == "done", st1.get("error")
-    n, out = st1["totalRows"], st1["outputUri"]
+    n, out = st1["totalRows"], _output_field(st1, "uri", outcome="committed")
     assert n and out and not out.endswith(".parquet")  # a directory, not a single file
     append_run()  # a second part
     read_graph = {"id": "c", "version": 1,
@@ -3124,13 +3149,16 @@ def test_subprocess_runner_executes_in_isolation(tmp_path):
         r = client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()
         st = _poll(r["runId"], tries=400)
         assert st["status"] == "done", st.get("error")
-        assert st["outputTable"] == "subproc_out"
+        assert _output_field(st, "table", outcome="committed") == "subproc_out"
         assert (st["totalRows"] or st["rowsProcessed"]) == 40
         # the child wrote in its own (discarded) catalog — the parent must still register it live
         # The catalog endpoint is paginated; query the exact artifact so earlier suite outputs cannot
         # push this table off the first page and turn a registration assertion into an order-dependent
         # false failure.
-        tables = client.get("/api/catalog/tables", params={"uris": st["outputUri"]}).json()["items"]
+        tables = client.get(
+            "/api/catalog/tables",
+            params={"uris": _output_field(st, "uri", outcome="committed")},
+        ).json()["items"]
         assert any(t["name"] == "subproc_out" for t in tables)
     finally:
         metadb.set_setting("backend", "", "global")  # restore the default in-process runner
@@ -3168,7 +3196,7 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
     import json
     import threading
 
-    from hub.models import Graph, RunStatus
+    from hub.models import Graph, RunOutput, RunStatus
     from hub.subprocess_runner import SubprocessRunner
 
     registration_started = threading.Event()
@@ -3203,7 +3231,13 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
     runner = SubprocessRunner(
         str(tmp_path / "workspace"), str(tmp_path), catalog=BlockingCatalog())
     run_id = "run_catalog_gate"
-    runner.runs[run_id] = RunStatus(run_id=run_id, status="running", per_node=[])
+    runner.runs[run_id] = RunStatus(
+        run_id=run_id, status="running", target_node_id="write", per_node=[],
+        outputs=[RunOutput(
+            node_id="write", port_id="out", wire="dataset",
+            publication_kind="catalog", outcome="pending",
+        )],
+    )
     runner._sink_contracts[run_id] = {"write": {
         "logical_uri": str(tmp_path / "result.parquet"),
         "published_uri": str(tmp_path / "result.parquet"),
@@ -3213,14 +3247,22 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
     status_file.write_text(json.dumps(RunStatus(
         run_id="child",
         status="done",
+        target_node_id="write",
         per_node=[],
-        output_uri=str(tmp_path / "result.parquet"),
-        output_table="result",
+        outputs=[RunOutput(
+            node_id="write", port_id="out", wire="dataset",
+            publication_kind="catalog", outcome="committed",
+            uri=str(tmp_path / "result.parquet"), table="result",
+        )],
     ).model_dump()))
-    graph = Graph.model_validate({"id": "c", "version": 1, "nodes": [], "edges": []})
+    graph = Graph.model_validate({
+        "id": "c", "version": 1,
+        "nodes": [N("write", "write", {"name": "result"})], "edges": [],
+    })
+    runner._emit(graph, runner.runs[run_id])
 
     watcher = threading.Thread(target=runner._watch, args=(
-        run_id, FinishedProcess(), str(status_file), str(tmp_path), graph, None
+        run_id, FinishedProcess(), str(status_file), str(tmp_path), graph, "write"
     ))
     watcher.start()
     assert registration_started.wait(timeout=5)
@@ -3745,7 +3787,8 @@ def test_section_for_each_over_a_list(tmp_path):
         N("wr", "write", {"name": "sec_foreach"}),
     ], "edges": [E("src", "sec"), E("sec", "wr")]}
     st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
-    assert st["status"] == "done" and st["outputTable"] == "sec_foreach"
+    assert st["status"] == "done"
+    assert _output_field(st, "table", outcome="committed") == "sec_foreach"
     out = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_sec_foreach").uri, "k": 5}).json()
     assert out["rowCount"] == 200  # concat of the two per-predicate runs
 
@@ -3815,15 +3858,20 @@ def test_run_history_persisted_with_canvas(tmp_path):
         if runs:
             break
         time.sleep(0.05)
-    assert runs and runs[0]["status"] == "done" and runs[0]["outputTable"] == "hist_out"
-    assert runs[0]["runId"] == st["runId"] and runs[0]["outputUri"] == st["outputUri"]
+    assert runs and runs[0]["status"] == "done"
+    assert _output_field(runs[0], "table", outcome="committed") == "hist_out"
+    history_uri = _output_field(runs[0], "uri", outcome="committed")
+    status_uri = _output_field(st, "uri", outcome="committed")
+    assert runs[0]["runId"] == st["runId"] and history_uri == status_uri
     # The history row, not the runner's in-memory map, is sufficient to reopen the committed artifact.
     # This is the restart/reopen path used by Run history after a fresh browser/server process.
-    reopened = client.post("/api/data/sample", json={"uri": runs[0]["outputUri"], "k": 5, "offset": 0}).json()
+    reopened = client.post(
+        "/api/data/sample", json={"uri": history_uri, "k": 5, "offset": 0}).json()
     assert len(reopened["rows"]) == 5 and reopened["rowCount"] == st["totalRows"]
     api_runs = client.get("/api/canvas/hist_canvas/runs").json()
     api_record = next(r for r in api_runs if r["runId"] == st["runId"])
-    assert api_record["status"] == "done" and api_record["outputUri"] == st["outputUri"]
+    assert api_record["status"] == "done"
+    assert _output_field(api_record, "uri", outcome="committed") == status_uri
     # durable per-node breakdown (telemetry) travels with the run record, not just the transient RunState
     pn = runs[0]["perNode"]
     assert pn and all("node_id" in p and "status" in p for p in pn)
@@ -3846,7 +3894,9 @@ def test_non_write_full_result_reopens_from_durable_history(tmp_path):
     status = _poll(client.post("/api/run", json={
         "graph": graph, "targetNodeId": "agg", "confirmed": True,
     }).json()["runId"])
-    assert status["status"] == "done" and status["outputUri"] and status["outputTable"] is None
+    assert status["status"] == "done"
+    status_uri = _output_field(status, "uri", outcome="committed")
+    assert status_uri and _output_field(status, "table") is None
 
     records = []
     for _ in range(40):
@@ -3855,11 +3905,12 @@ def test_non_write_full_result_reopens_from_durable_history(tmp_path):
             break
         time.sleep(0.05)
     record = next(r for r in records if r["runId"] == status["runId"])
-    assert record["outputUri"] == status["outputUri"] and record["outputTable"] is None
+    assert _output_field(record, "uri", outcome="committed") == status_uri
+    assert _output_field(record, "table") is None
 
     # Reopen and page using only the durable history link, as the UI does after a restart.
     second = client.post("/api/data/sample", json={
-        "uri": record["outputUri"], "k": 50, "offset": 50,
+        "uri": _output_field(record, "uri", outcome="committed"), "k": 50, "offset": 50,
     }).json()
     assert len(second["rows"]) == 50 and second["rowCount"] == 105 and second["hasMore"] is True
 
@@ -3897,7 +3948,7 @@ def test_full_result_commit_failure_fails_the_run(tmp_path):
         time.sleep(0.01)
     assert status.status == "failed"
     assert "artifact commit failed" in (status.error or "")
-    assert status.output_uri is None
+    assert _output_field(status, "uri", outcome="failed") is None
 
 
 def test_headless_run_executes_a_saved_canvas(tmp_path, capsys):
@@ -4319,6 +4370,7 @@ def test_coordination_tables_pruned_to_cap(monkeypatch):
     from sqlalchemy import func, select as _select
 
     from hub import metadb
+    from hub.models import RunOutput
     monkeypatch.setattr(metadb, "_RUN_HISTORY_MAX", 3)
     monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 3)
 
@@ -4327,7 +4379,13 @@ def test_coordination_tables_pruned_to_cap(monkeypatch):
     with metadb.session() as s:
         s.add(metadb.Canvas(id=cid, owner_id=metadb.DEFAULT_USER_ID, name="t", version=1, doc="{}", visibility="private"))
     for i in range(7):
-        assert metadb.record_run(cid, None, "done", rows=i) is True
+        output = RunOutput(
+            node_id="n", port_id="out", wire="dataset", publication_kind="result",
+            outcome="committed", uri=f"/tmp/{cid}-{i}.parquet", rows=i,
+        )
+        assert metadb.record_run(
+            cid, "n", "run", "done", rows=i, outputs=[output.model_dump()]
+        ) is True
     with metadb.session() as s:
         surviving = sorted(r.rows for r in s.scalars(_select(metadb.RunRecord).where(metadb.RunRecord.canvas_id == cid)))
     # exactly the cap, and the NEWEST 3 (rows 4,5,6) survive — pins keep-newest, not merely the count
@@ -4357,7 +4415,7 @@ def test_telemetry_sink_seam_fires_once_per_finished_run(tmp_path):
     # sink that raises is swallowed (never fails the run) and the other sinks still fire.
     import hub.deps as dm
     from hub.deps import Deps, Registry
-    from hub.models import Graph, PerNodeStatus, RunStatus
+    from hub.models import Graph, PerNodeStatus, RunOutput, RunStatus
 
     ws = tmp_path / "ws"; ws.mkdir()
     d = Deps(str(ws), str(tmp_path / "data"))
@@ -4367,8 +4425,15 @@ def test_telemetry_sink_seam_fires_once_per_finished_run(tmp_path):
     assert len(d.telemetry_sinks) == 2
 
     g = Graph(**{"id": "no_such_canvas", "version": 1, "nodes": [], "edges": []})
-    st = RunStatus(run_id="r1", status="done", total_rows=5, ms=12, placement="local",
-                   per_node=[PerNodeStatus(node_id="n", status="done", rows=5, ms=12)])
+    st = RunStatus(
+        run_id="r1", status="done", target_node_id="n", total_rows=5, ms=12,
+        placement="local",
+        per_node=[PerNodeStatus(node_id="n", status="done", rows=5, ms=12)],
+        outputs=[RunOutput(
+            node_id="n", port_id="out", wire="dataset", publication_kind="result",
+            outcome="committed", uri="/tmp/r1.parquet", rows=5,
+        )],
+    )
     dm._persist_run(d, g, "n", st)  # no canvas → record_run no-ops, but the sink seam still fans out
     from hub.observability import drain_sinks
     assert drain_sinks()
@@ -4394,7 +4459,7 @@ def test_run_log_reference_plugin_appends_finished_runs(tmp_path, monkeypatch):
 
     import hub.deps as dm
     from hub.deps import Deps
-    from hub.models import Graph, PerNodeStatus, RunStatus
+    from hub.models import Graph, PerNodeStatus, RunOutput, RunStatus
 
     log = tmp_path / "runs.jsonl"
     monkeypatch.setenv("DP_RUN_LOG", str(log))  # the plugin reads path via reg.config (env fallback)
@@ -4406,8 +4471,20 @@ def test_run_log_reference_plugin_appends_finished_runs(tmp_path, monkeypatch):
 
     g = Graph(**{"id": "no_such_canvas", "version": 1, "nodes": [], "edges": []})
     for rid, status in [("r1", "done"), ("r2", "failed")]:
-        dm._persist_run(d, g, "n", RunStatus(run_id=rid, status=status, total_rows=3, ms=7, placement="local",
-                                             per_node=[PerNodeStatus(node_id="n", status=status, rows=3, ms=7)]))
+        output = RunOutput(
+            node_id="n", port_id="out", wire="dataset", publication_kind="result",
+            outcome="committed" if status == "done" else "failed",
+            uri=f"/tmp/{rid}.parquet" if status == "done" else None,
+            rows=3 if status == "done" else None,
+            error="failed" if status == "failed" else None,
+        )
+        dm._persist_run(d, g, "n", RunStatus(
+            run_id=rid, status=status, target_node_id="n",
+            total_rows=3 if status == "done" else None, ms=7, placement="local",
+            error="failed" if status == "failed" else None,
+            per_node=[PerNodeStatus(node_id="n", status=status, rows=3, ms=7)],
+            outputs=[output],
+        ))
 
     from hub.observability import drain_sinks
     assert drain_sinks()
@@ -5168,17 +5245,24 @@ def test_evict_never_drops_a_running_run():
     r = get_deps().runner
     with r._lock:
         saved = dict(r.runs)
+        saved_published = dict(r._published_statuses)
         try:
             r.runs.clear()
+            r._published_statuses.clear()
             r.runs["run_live"] = RunStatus(run_id="run_live", status="running")  # oldest + still running
+            r._published_statuses["run_live"] = r.runs["run_live"].model_copy(deep=True)
             for i in range(_MAX_RUNS + 5):
-                r.runs[f"run_done_{i}"] = RunStatus(run_id=f"run_done_{i}", status="done")
+                run_id = f"run_done_{i}"
+                r.runs[run_id] = RunStatus(run_id=run_id, status="done")
+                r._published_statuses[run_id] = r.runs[run_id].model_copy(deep=True)
             r._evict()
             assert "run_live" in r.runs          # the in-flight run survived
             assert len(r.runs) == _MAX_RUNS      # only terminal runs were dropped, down to the cap
         finally:
             r.runs.clear()
             r.runs.update(saved)
+            r._published_statuses.clear()
+            r._published_statuses.update(saved_published)
 
 
 def test_run_state_persists_and_survives_loss_of_memory():
@@ -5252,15 +5336,20 @@ def test_cancel_returns_full_terminal_detail_not_the_pruned_fence():
     metadb.save_run_state(
         "run_cancel_done",
         {"run_id": "run_cancel_done", "status": "done", "per_node": [],
-         "output_uri": "s3://cancel-detail/out.parquet", "output_table": "out",
-         "rows_processed": 42, "progress": 1.0},
+         "target_node_id": "out", "rows_processed": 42, "total_rows": 42,
+         "outputs": [{
+             "node_id": "out", "port_id": "out", "wire": "dataset",
+             "publication_kind": "catalog", "outcome": "committed",
+             "uri": "s3://cancel-detail/out.parquet", "table": "out", "rows": 42,
+         }],
+         "progress": 1.0},
         canvas_id="cv_cancel_done", kernel_id="k_none")  # no live kernel owns it
     get_deps().run_index.pop("run_cancel_done", None)     # this process doesn't own it
     assert metadb.terminal_run_status("run_cancel_done") == "done"  # a fence row exists alongside detail
     body = client.post("/api/run/run_cancel_done/cancel").json()
     assert body["status"] == "done"
-    assert body["outputUri"] == "s3://cancel-detail/out.parquet"
-    assert body["outputTable"] == "out"
+    assert _output_field(body, "uri", outcome="committed") == "s3://cancel-detail/out.parquet"
+    assert _output_field(body, "table") == "out"
     assert body.get("error") is None
 
 
@@ -5819,6 +5908,61 @@ def test_pipelines_import_reports_not_configured():
     r = client.post("/api/pipelines/import", json={"config": "x", "params": {}})
     assert r.status_code == 501
     assert "importer" in r.text.lower()
+
+
+@pytest.mark.parametrize("source_handle", [None, "missing"])
+def test_pipeline_import_rejects_invalid_multi_output_source_handles(source_handle):
+    from hub.models import Graph, PipelineImport
+
+    graph = Graph.model_validate({
+        "id": "imported-invalid", "version": 1,
+        "nodes": [
+            N("section", "section", {"outputs": ["left", "right"]}),
+            N("filter", "filter", {"predicate": "value > 0"}),
+        ],
+        "edges": [{
+            "id": "section-filter", "source": "section", "target": "filter",
+            "sourceHandle": source_handle, "data": {"wire": "dataset"},
+        }],
+    })
+    deps = get_deps()
+    previous = deps.importer
+    deps.importer = SimpleNamespace(import_pipeline=lambda config, _params: PipelineImport(
+        config=config, graph=graph))
+    try:
+        response = client.post("/api/pipelines/import", json={"config": "foreign"})
+    finally:
+        deps.importer = previous
+
+    assert response.status_code == 400
+    assert "source handle" in response.text.lower()
+
+
+def test_pipeline_import_accepts_an_exact_multi_output_source_handle():
+    from hub.models import Graph, PipelineImport
+
+    graph = Graph.model_validate({
+        "id": "imported-valid", "version": 1,
+        "nodes": [
+            N("section", "section", {"outputs": ["left", "right"]}),
+            N("filter", "filter", {"predicate": "value > 0"}),
+        ],
+        "edges": [{
+            "id": "section-filter", "source": "section", "target": "filter",
+            "sourceHandle": "right", "data": {"wire": "dataset"},
+        }],
+    })
+    deps = get_deps()
+    previous = deps.importer
+    deps.importer = SimpleNamespace(import_pipeline=lambda config, _params: PipelineImport(
+        config=config, graph=graph))
+    try:
+        response = client.post("/api/pipelines/import", json={"config": "foreign"})
+    finally:
+        deps.importer = previous
+
+    assert response.status_code == 200
+    assert response.json()["graph"]["edges"][0]["sourceHandle"] == "right"
 
 
 def test_datasets_place_destination_reference_plugin(tmp_path):
@@ -7342,6 +7486,7 @@ def test_completed_run_result_is_db_cached(tmp_path):
     # across a kernel restart / another stateless instance — not just the accepting process's dict.
     from hub import metadb
     from hub.models import Graph
+    from hub.run_outputs import sole_committed_document_output
     p = _seq_parquet(tmp_path)
     gd = {"id": "c", "version": 1, "nodes": [N("src", "source", {"uri": p}), N("wr", "write", {"name": "a2cache"})],
           "edges": [E("src", "wr")]}
@@ -7349,8 +7494,10 @@ def test_completed_run_result_is_db_cached(tmp_path):
     assert st["status"] == "done"
     phash = get_deps().runner._plan_hash(Graph(**gd), "wr")
     c = metadb.get_result(phash)
-    assert c and c.get("uri") and c.get("table")                 # persisted to the shared DB
-    assert get_deps().runner._cache_get(phash)["table"] == c["table"]  # a fresh instance reads the same pointer
+    cached_output = sole_committed_document_output(c)
+    assert cached_output and cached_output.uri and cached_output.table  # persisted to the shared DB
+    fresh_output = sole_committed_document_output(get_deps().runner._cache_get(phash))
+    assert fresh_output and fresh_output.table == cached_output.table  # a fresh instance reads the same pointer
 
 
 def test_plan_cacheable_opt_out():
@@ -8149,21 +8296,25 @@ def test_assert_node_surfaces_violations_and_gates_the_run():
     def graph(pred, sev="warn"):
         return Graph(**{"id": "c", "version": 1, "nodes": [
             N("s", "source", {"uri": ev}),
-            N("a", "assert", {"predicate": pred, "severity": sev})], "edges": [E("s", "a")]})
+            N("a", "assert", {"predicate": pred, "severity": sev}),
+            N("f", "filter", {"predicate": "TRUE"}),
+        ], "edges": [E("s", "a"), E("a", "f", "pass")]})
 
     # engine: assert relation = the VIOLATING rows (IS NOT TRUE catches false + null)
     with db.run_scope():
         eng = BuildEngine(graph("id >= 0"), d.resolve_adapter, d.registry, full=True,
                           node_specs=d.node_specs, node_builders=d.node_builders)
         total = int(eng.relation("s").aggregate("count(*) AS n").fetchone()[0])
-        assert int(eng.relation("a").aggregate("count(*) AS n").fetchone()[0]) == 0        # all satisfy → 0
+        assert int(eng.relation("a", "out").aggregate("count(*) AS n").fetchone()[0]) == 0  # all satisfy → 0
         eng2 = BuildEngine(graph("id < 0"), d.resolve_adapter, d.registry, full=True,
                            node_specs=d.node_specs, node_builders=d.node_builders)
-        assert int(eng2.relation("a").aggregate("count(*) AS n").fetchone()[0]) == total    # none satisfy → all
+        assert int(eng2.relation("a", "out").aggregate("count(*) AS n").fetchone()[0]) == total  # none satisfy → all
 
     def run(pred, sev):
         g = graph(pred, sev)
-        st = d.runner.run(compile_plan(g, "a", d.registry, d.node_specs), g, "a", "local")
+        # Direct full runs of the multi-output Assert are deliberately unsupported. Target a
+        # single-output downstream consumer so this remains a test of Assert's execution gate.
+        st = d.runner.run(compile_plan(g, "f", d.registry, d.node_specs), g, "f", "local")
         for _ in range(200):
             s = d.runner.status(st.run_id)
             if s.status in ("done", "failed", "cancelled"):
@@ -8180,11 +8331,38 @@ def test_assert_node_surfaces_violations_and_gates_the_run():
     with db.run_scope():
         eng3 = BuildEngine(graph(""), d.resolve_adapter, d.registry, full=True,
                            node_specs=d.node_specs, node_builders=d.node_builders)
-        assert int(eng3.relation("a").aggregate("count(*) AS n").fetchone()[0]) == 0
+        assert int(eng3.relation("a", "out").aggregate("count(*) AS n").fetchone()[0]) == 0
     assert run("", "error").status == "done"        # empty predicate + severity=error → must NOT fail the run
     # a predicate that can't evaluate (missing column): warn is non-blocking (run succeeds); error fails clean
     assert run("no_such_col > 0", "warn").status == "done"
     assert run("no_such_col > 0", "error").status == "failed"
+
+
+def test_assert_named_ports_are_independently_previewable_and_profiled():
+    graph = {"id": "assert-inspection-ports", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("events")}),
+        N("a", "assert", {"predicate": "id >= 5", "severity": "warn"}),
+    ], "edges": [E("s", "a")]}
+
+    violations = client.post(
+        "/api/run/preview",
+        json={"graph": graph, "nodeId": "a", "portId": "out", "k": 10},
+    )
+    passed = client.post(
+        "/api/run/preview",
+        json={"graph": graph, "nodeId": "a", "portId": "pass", "k": 10},
+    )
+    assert violations.status_code == passed.status_code == 200
+    assert [row["id"] for row in violations.json()["rows"]] == [0, 1, 2, 3, 4]
+    assert len(passed.json()["rows"]) == 10
+
+    violation_profile = client.post(
+        "/api/run/profile", json={"graph": graph, "nodeId": "a", "portId": "out"})
+    pass_profile = client.post(
+        "/api/run/profile", json={"graph": graph, "nodeId": "a", "portId": "pass"})
+    assert violation_profile.status_code == pass_profile.status_code == 200
+    assert violation_profile.json()["rowCount"] == 5
+    assert pass_profile.json()["rowCount"] > violation_profile.json()["rowCount"]
 
 
 def test_assert_node_is_a_transparent_gate_before_a_write(tmp_path):
@@ -8211,7 +8389,7 @@ def test_assert_node_is_a_transparent_gate_before_a_write(tmp_path):
         eng = BuildEngine(graph("id >= 5", "warn"), d.resolve_adapter, d.registry, full=True,
                           node_specs=d.node_specs, node_builders=d.node_builders)
         total = int(eng.relation("s").aggregate("count(*) AS n").fetchone()[0])
-        viol = int(eng.relation("a").aggregate("count(*) AS n").fetchone()[0])          # default = violations
+        viol = int(eng.relation("a", "out").aggregate("count(*) AS n").fetchone()[0])  # violations
         passed = int(eng.relation("a", "pass").aggregate("count(*) AS n").fetchone()[0])  # passthrough
         assert 0 < viol < total and passed == total  # 'pass' is EVERY row, not the 5 violations
 
@@ -8226,10 +8404,12 @@ def test_assert_node_is_a_transparent_gate_before_a_write(tmp_path):
         return s
 
     warned = run("id >= 5", "warn")   # warn → run succeeds and writes ALL rows (via 'pass'), not violations
-    assert warned.status == "done" and warned.total_rows == total and warned.output_uri
+    from hub.run_outputs import sole_output
+    assert warned.status == "done" and warned.total_rows == total
+    assert sole_output(warned, committed=True) is not None
     errored = run("id >= 5", "error")  # error → run fails at the assert, BEFORE the write commits
     assert errored.status == "failed" and "assert" in (errored.error or "").lower()
-    assert not errored.output_uri     # no sink side effect
+    assert all(output.uri is None for output in errored.outputs)  # no sink side effect
 
 
 def test_window_fill_unnest_nodes(tmp_path):
@@ -8547,14 +8727,21 @@ def test_latest_actuals_feeds_estimator_only_for_latest_nodes():
     # but only while the producing node is still 'latest' (an edited/'stale' node's old count would lie).
     from hub import metadb
     from hub.routers.runs import _actuals_for
-    from hub.models import Graph
+    from hub.models import Graph, RunOutput
     cid = "cv_actuals"
     with metadb.session() as s:
         if s.get(metadb.Canvas, cid) is None:
             s.add(metadb.Canvas(id=cid, owner_id="local", name="a", doc="{}"))
     # realistic: the per_node breakdown leaves a lazy relation's own rows null, so the target count comes
     # from RunRecord.rows (=total_rows) — latest_actuals must read that, not only per_node.
-    metadb.record_run(cid, "j", "done", rows=4321, per_node=[{"node_id": "j", "rows": None, "status": "done"}])
+    output = RunOutput(
+        node_id="j", port_id="out", wire="dataset", publication_kind="result",
+        outcome="committed", uri="/tmp/cv-actuals-j.parquet", rows=4321,
+    )
+    metadb.record_run(
+        cid, "j", "run", "done", rows=4321, outputs=[output.model_dump()],
+        per_node=[{"node_id": "j", "rows": None, "status": "done"}],
+    )
     assert metadb.latest_actuals(cid) == {"j": 4321}
     g_latest = Graph(id=cid, version=1, nodes=[N("j", "join", {})], edges=[])
     g_latest.nodes[0].data["status"] = "latest"
@@ -8887,7 +9074,7 @@ def test_parallel_regions_run_independent_regions_concurrently(monkeypatch):
     import threading as _th
     import time as _t
 
-    from hub.models import Graph, PerNodeStatus, ResourceSpec, RunStatus
+    from hub.models import Graph, PerNodeStatus, ResourceSpec, RunOutput, RunStatus
     from hub.planner import Region
     ctrl = get_deps().controller
     regs = [
@@ -8899,8 +9086,16 @@ def test_parallel_regions_run_independent_regions_concurrently(monkeypatch):
                requires=ResourceSpec(), cut_inputs=[("a", None, "f", None), ("b", None, "f", None)]),
     ]
     rid = "run_parallel_regions"
-    ctrl.runs[rid] = RunStatus(run_id=rid, status="queued", placement="distributed", target_node_id="f",
-                               per_node=[PerNodeStatus(node_id=n, status="queued", label=n) for n in ("a", "b", "f")])
+    expected_output = RunOutput(
+        node_id="f", port_id="out", wire="dataset",
+        publication_kind="result", outcome="pending",
+    )
+    ctrl.runs[rid] = RunStatus(
+        run_id=rid, status="queued", placement="distributed", target_node_id="f",
+        outputs=[expected_output],
+        per_node=[PerNodeStatus(node_id=n, status="queued", label=n)
+                  for n in ("a", "b", "f")],
+    )
     ctrl._cancel[rid] = _th.Event()
     inflight, peak, lock = [0], [0], _th.Lock()
 
@@ -8915,8 +9110,13 @@ def test_parallel_regions_run_independent_regions_concurrently(monkeypatch):
 
     monkeypatch.setattr(ctrl, "_materialize", fake_mat)
     monkeypatch.setattr(ctrl, "_run_final", lambda *a, **k: RunStatus(
-        run_id="x", status="done", placement="distributed", per_node=[], output_uri="/tmp/f",
-        output_table="f", rows_processed=1))
+        run_id="x", status="done", placement="distributed", target_node_id="f",
+        per_node=[], rows_processed=1, total_rows=1,
+        outputs=[RunOutput(
+            node_id="f", port_id="out", wire="dataset",
+            publication_kind="result", outcome="committed", uri="/tmp/f", rows=1,
+        )],
+    ))
     monkeypatch.setattr(ctrl, "on_status", None)
     monkeypatch.setattr(ctrl, "on_complete", None)
     monkeypatch.setenv("DP_REGION_CONCURRENCY", "4")
@@ -9938,23 +10138,25 @@ def test_ray_sink_contract_matches_local_without_a_live_cluster(tmp_path, monkey
     # Destination, nested path, format, partitionBy, and overwrite are identical to the local contract.
     local_partitioned = graph("local-test", "local_partitioned.parquet", partition_by="cat")
     local_status = wait_local(local_partitioned)
+    local_partitioned_uri = _output_field(local_status, "uri", outcome="committed")
     ray_partitioned = graph("ray-test", "ray_partitioned.parquet", partition_by="cat")
     ray_rows, ray_uri, _ = ray_commit(ray_partitioned, source_table)
     assert ray_rows == 3
-    assert local_status.output_uri == str(local_root / "daily/2026/local_partitioned")
+    assert local_partitioned_uri == str(local_root / "daily/2026/local_partitioned")
     assert ray_uri == str(ray_root / "daily/2026/ray_partitioned")
     scan = lambda uri: sorted(deps.resolve_adapter(uri).scan(uri).fetchall())  # noqa: E731
-    assert scan(local_status.output_uri) == scan(ray_uri)
+    assert scan(local_partitioned_uri) == scan(ray_uri)
 
     # With no filename extension, format chooses the same physical extension on both backends.
     local_csv = wait_local(graph("local-test", "local_csv", output_format="csv"))
+    local_csv_uri = _output_field(local_csv, "uri", outcome="committed")
     _, ray_csv_uri, _ = ray_commit(graph("ray-test", "ray_csv", output_format="csv"), source_table)
-    assert local_csv.output_uri.endswith("/local_csv.csv") and ray_csv_uri.endswith("/ray_csv.csv")
-    assert scan(local_csv.output_uri) == scan(ray_csv_uri)
+    assert local_csv_uri.endswith("/local_csv.csv") and ray_csv_uri.endswith("/ray_csv.csv")
+    assert scan(local_csv_uri) == scan(ray_csv_uri)
 
     # Append remains append (not an implicit overwrite) and returns the adapter's parts-directory URI.
     local_append = graph("local-test", "local_append.parquet", mode="append")
-    local_append_uri = wait_local(local_append).output_uri
+    local_append_uri = _output_field(wait_local(local_append), "uri", outcome="committed")
     wait_local(local_append)
     ray_append = graph("ray-test", "ray_append.parquet", mode="append")
     _, ray_append_uri, _ = ray_commit(ray_append, source_table)
@@ -9964,7 +10166,7 @@ def test_ray_sink_contract_matches_local_without_a_live_cluster(tmp_path, monkey
 
     # An empty Ray Dataset can expose zero blocks; commit reconstructs a zero-row table from its schema.
     local_empty = graph("local-test", "local_empty.parquet", empty=True)
-    local_empty_uri = wait_local(local_empty).output_uri
+    local_empty_uri = _output_field(wait_local(local_empty), "uri", outcome="committed")
     empty_table = mod._make_mapper({
         "mode": "filter", "code": "def fn(row):\n    return False", "onError": "raise",
     })(source_table)
@@ -11370,7 +11572,8 @@ def test_ray_clean_done_receipt_wins_late_cancel_and_nonzero_done_stays_private(
     from pathlib import Path
 
     from hub.deps import Deps
-    from hub.models import Graph, RunStatus
+    from hub.models import Graph, RunOutput, RunStatus
+    from hub.run_outputs import sole_output
 
     mod = _load_dp_ray()
     workspace, data = tmp_path / "workspace", tmp_path / "data"
@@ -11419,18 +11622,33 @@ def test_ray_clean_done_receipt_wins_late_cancel_and_nonzero_done_stays_private(
     )
     run_id = "ray-late-cancel"
     graph = Graph(id="ray-late-cancel", version=1, nodes=[], edges=[])
-    status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=[])
+    status = RunStatus(
+        run_id=run_id, status="queued", placement="distributed",
+        target_node_id="write", per_node=[],
+        outputs=[RunOutput(
+            node_id="write", port_id="out", wire="dataset",
+            publication_kind="catalog", outcome="pending",
+        )],
+    )
     runner.runs[run_id] = status
     runner._cancel[run_id] = threading.Event()
     runner._cancel[run_id].set()
 
     runner._supervise(run_id, graph, None, status)
 
-    assert status.status == "done" and status.output_uri == "/tmp/out.csv"
+    committed = sole_output(status, committed=True)
+    assert status.status == "done" and committed is not None
+    assert committed.uri == "/tmp/out.csv" and committed.table == "out"
     assert len(registered) == 1
     assert not runner.cancel_acknowledged(run_id)
 
-    failed = RunStatus(run_id="ray-done-nonzero", status="running")
+    failed = RunStatus(
+        run_id="ray-done-nonzero", status="running", target_node_id="write",
+        outputs=[RunOutput(
+            node_id="write", port_id="out", wire="dataset",
+            publication_kind="catalog", outcome="pending",
+        )],
+    )
     runner._settle_popen_result(
         graph, failed, {
             "status": "done", "rows": 1,
@@ -11439,7 +11657,9 @@ def test_ray_clean_done_receipt_wins_late_cancel_and_nonzero_done_stays_private(
     )
     assert failed.status == "failed"
     assert failed.error == "Ray driver exited unsuccessfully after writing a terminal receipt"
-    assert failed.output_uri is None and failed.output_table is None
+    failed_output = sole_output(failed)
+    assert failed_output is not None and failed_output.outcome == "failed"
+    assert failed_output.uri is None and failed_output.table is None
     assert len(registered) == 1
 
     # Local Popen driver errors surface verbatim (same host/trust boundary), unlike remote Jobs runs
@@ -11506,7 +11726,8 @@ def test_ray_reconcile_and_shutdown_have_one_terminal_finalizer(tmp_path, monkey
 def test_ray_popen_multi_sink_failure_keeps_partial_output_private_and_untouched(tmp_path, monkeypatch):
     from hub.deps import Deps
     from hub.ir import lower_to_ir
-    from hub.models import Graph, RunStatus
+    from hub.models import Graph, RunOutput, RunStatus
+    from hub.run_outputs import sole_output
 
     mod = _load_dp_ray()
     workspace = tmp_path / "workspace"
@@ -11557,7 +11778,11 @@ def test_ray_popen_multi_sink_failure_keeps_partial_output_private_and_untouched
         lambda _uri: pytest.fail("terminal settlement guessed ownership from a returned URI"),
     )
     status = RunStatus(
-        run_id="run", status="running", output_uri="stale-uri", output_table="stale-table"
+        run_id="run", status="running", target_node_id="second",
+        outputs=[RunOutput(
+            node_id="second", port_id="out", wire="dataset",
+            publication_kind="catalog", outcome="pending",
+        )],
     )
     runner._settle_popen_result(
         graph, status, result, 1,
@@ -11565,7 +11790,9 @@ def test_ray_popen_multi_sink_failure_keeps_partial_output_private_and_untouched
     )
 
     assert status.status == "failed"
-    assert status.output_uri is None and status.output_table is None
+    failed_output = sole_output(status)
+    assert failed_output is not None and failed_output.outcome == "failed"
+    assert failed_output.uri is None and failed_output.table is None
     assert catalog_calls == []
     assert first_output.read_text() == "x\n1\n"
     assert result["outputs"] == partial_outputs
@@ -11574,13 +11801,21 @@ def test_ray_popen_multi_sink_failure_keeps_partial_output_private_and_untouched
         result, status="cancelled", error=None,
         output_uri=str(first_output), output_table="first",
     )
-    cancelled_status = RunStatus(run_id="cancelled-run", status="running")
+    cancelled_status = RunStatus(
+        run_id="cancelled-run", status="running", target_node_id="second",
+        outputs=[RunOutput(
+            node_id="second", port_id="out", wire="dataset",
+            publication_kind="catalog", outcome="pending",
+        )],
+    )
     runner._settle_popen_result(
         graph, cancelled_status, cancelled, -15,
         expected_targets=sink_targets, expected_attempts={},
     )
     assert cancelled_status.status == "cancelled"
-    assert cancelled_status.output_uri is None and cancelled_status.output_table is None
+    cancelled_output = sole_output(cancelled_status)
+    assert cancelled_output is not None and cancelled_output.outcome == "cancelled"
+    assert cancelled_output.uri is None and cancelled_output.table is None
     assert catalog_calls == []
     assert first_output.read_text() == "x\n1\n"
     assert cancelled["outputs"] == result["outputs"]
@@ -11588,7 +11823,8 @@ def test_ray_popen_multi_sink_failure_keeps_partial_output_private_and_untouched
 
 def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tmp_path, monkeypatch):
     from hub.deps import Deps
-    from hub.models import Graph, RunStatus
+    from hub.models import Graph, RunOutput, RunStatus
+    from hub.run_outputs import sole_output
 
     mod = _load_dp_ray()
     workspace = tmp_path / "workspace"
@@ -11606,8 +11842,11 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
         lambda **_kwargs: pytest.fail("an incomplete expected sink set reached the catalog"),
     )
     missing_status = RunStatus(
-        run_id="missing", status="running",
-        output_uri="/tmp/stale.attempt-run", output_table="stale",
+        run_id="missing", status="running", target_node_id="second",
+        outputs=[RunOutput(
+            node_id="second", port_id="out", wire="dataset",
+            publication_kind="catalog", outcome="pending",
+        )],
     )
     runner._settle_popen_result(
         graph, missing_status,
@@ -11619,7 +11858,9 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
         "Catalog registration failed "
         "(code=catalog_registration_failed,type=RuntimeError)"
     )
-    assert missing_status.output_uri is None and missing_status.output_table is None
+    missing_output = sole_output(missing_status)
+    assert missing_output is not None and missing_output.outcome == "failed"
+    assert missing_output.uri is None and missing_output.table is None
 
     result = {
         "status": "done", "rows": 5,
@@ -11636,7 +11877,13 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
         runner, "_register_outputs",
         lambda got_graph, got_result, **kwargs: registered.append((got_graph, got_result, kwargs)),
     )
-    status = RunStatus(run_id="run", status="running")
+    status = RunStatus(
+        run_id="run", status="running", target_node_id="second",
+        outputs=[RunOutput(
+            node_id="second", port_id="out", wire="dataset",
+            publication_kind="catalog", outcome="pending",
+        )],
+    )
 
     runner._settle_popen_result(
         graph, status, result, 0,
@@ -11647,7 +11894,9 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
         "expected_targets": expected_targets, "expected_attempts": expected_attempts,
     })]
     assert status.status == "done" and status.progress == 1.0
-    assert status.output_uri == result["output_uri"] and status.output_table == "second"
+    output = sole_output(status, committed=True)
+    assert output is not None
+    assert output.uri == result["output_uri"] and output.table == "second"
     assert status.rows_processed == status.total_rows == 5
 
 
@@ -12357,7 +12606,8 @@ def test_ray_backend_live_differential(tmp_path):
 
     def rows(uri):
         return sorted(r[0] for r in deps.resolve_adapter(uri).scan(uri).project("x").fetchall())
-    assert rows(st_ray.output_uri) == rows(st_loc.output_uri) == [10, 12, 14, 16, 18, 20]
+    assert rows(_output_field(st_ray, "uri", outcome="committed")) == rows(
+        _output_field(st_loc, "uri", outcome="committed")) == [10, 12, 14, 16, 18, 20]
 
 
 def test_ray_opts_maps_region_requires_to_ray_task_placement():
@@ -12418,15 +12668,25 @@ def test_ray_whole_run_enforces_and_forwards_final_region_resources(tmp_path, mo
     source_uri = str(tmp_path / "input.parquet")
     duckdb.connect().execute(f"COPY (SELECT 1 AS x) TO '{source_uri}' (FORMAT PARQUET)")
 
-    def graph(pool):
-        return Graph(**{"id": "ray-final-placement", "version": 1, "nodes": [
+    def graph(pool, *, with_write=True):
+        nodes = [
             _ray_node("src", "source", {"uri": source_uri, "requires": {
                 "labels": {"engine": "ray", "pool": pool}}}),
-        ], "edges": []})
+        ]
+        edges = []
+        if with_write:
+            nodes.append(_ray_node(
+                "write", "write", {"filename": str(tmp_path / "ray-final.parquet")}
+            ))
+            edges.append(_ray_edge("src", "write"))
+        return Graph(**{
+            "id": "ray-final-placement", "version": 1,
+            "nodes": nodes, "edges": edges,
+        })
 
     rejected = graph("h100")
-    failed = rr.run(compile_plan(rejected, "src", rr.deps.registry, rr.node_specs),
-                    rejected, "src", "local")
+    failed = rr.run(compile_plan(rejected, "write", rr.deps.registry, rr.node_specs),
+                    rejected, "write", "local")
     assert failed.status == "failed" and "exceed advertised" in (failed.error or "")
     failed_whole = rr.run(compile_plan(rejected, None, rr.deps.registry, rr.node_specs),
                           rejected, None, "local")
@@ -12448,6 +12708,18 @@ def test_ray_whole_run_enforces_and_forwards_final_region_resources(tmp_path, mo
                     accepted, None, "local")
     assert queued.status == "queued"
     assert dispatched["kwargs"]["requires"]["labels"] == {"engine": "ray", "pool": "a100"}
+
+    # A whole graph with no selected target and no write has no public output identity. Even with a
+    # valid Ray pin it must fail before allocating an attempt or dispatching a driver thread.
+    dispatched.clear()
+    source_only = graph("a100", with_write=False)
+    no_output = rr.run(
+        compile_plan(source_only, None, rr.deps.registry, rr.node_specs),
+        source_only, None, "local",
+    )
+    assert no_output.status == "failed"
+    assert "no publishable output target" in (no_output.error or "")
+    assert dispatched == {}
 
     # A plugin NodeSpec default is a real placement pin even when node config has no requires override.
     from hub.models import ResourceSpec
@@ -12785,11 +13057,13 @@ def test_ray_region_reattaches_committed_attempt_and_refuses_partial_retry(tmp_p
     write_manifest(attempt, run_id=run_id, rows=1, schema="x: int64")
     rr._acknowledge_cancel(run_id)  # a prior owner reused this explicit ID; registration must clear it
     done = rr.run_unit(graph, "src", suggested, run_id=run_id)
-    assert done.status == "done" and done.output_uri == attempt and done.rows_processed == 1
+    assert done.status == "done" and done.rows_processed == 1
+    assert _output_field(done, "uri", outcome="committed") == attempt
     assert not rr.cancel_acknowledged(run_id)
     restarted = mod.RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
     reattached = restarted.run_unit(graph, "src", suggested, run_id=run_id)
-    assert reattached.status == "done" and reattached.output_uri == attempt
+    assert reattached.status == "done"
+    assert _output_field(reattached, "uri", outcome="committed") == attempt
 
     partial_id = "unit_partial"
     partial = mod._attempt_handoff_uri(suggested, partial_id)
@@ -12928,6 +13202,7 @@ def test_object_attempt_registry_reaps_superseded_and_fenced_failures(
     from moto.server import ThreadedMotoServer
 
     from hub import handoff, metadb
+    from hub.models import RunOutput
     from hub.plugins.adapters import object_fs
 
     server = ThreadedMotoServer(port=0)
@@ -13023,8 +13298,15 @@ def test_object_attempt_registry_reaps_superseded_and_fenced_failures(
             reserve(uri, region_logical, "region", run_id)
             land(uri, run_id)
             handoff.prepare_attempt_commit(uri)
-        assert metadb.put_result("object-gc-region-key", {"uri": region_old}) == []
-        assert metadb.put_result("object-gc-region-key", {"uri": region_new}) == [region_old]
+        def result_doc(uri: str) -> dict:
+            return {"outputs": [RunOutput(
+                node_id="src", port_id="out", wire="dataset",
+                publication_kind="result", outcome="committed", uri=uri, rows=1,
+            ).model_dump()]}
+
+        assert metadb.put_result("object-gc-region-key", result_doc(region_old)) == []
+        assert metadb.put_result(
+            "object-gc-region-key", result_doc(region_new)) == [region_old]
         cleanup.append(region_new)
         region_phase1 = handoff.reap_attempts(retention_seconds=3600, delete_grace_seconds=0)
         with metadb.session() as session:
@@ -13112,7 +13394,15 @@ def test_object_attempt_registry_reaps_superseded_and_fenced_failures(
     finally:
         try:
             metadb.catalog_delete_entry("s3://bkt/outputs/out.attempt-new")
-            metadb.put_result("object-gc-region-key", {"uri": None})
+            # Result-cache documents cannot use a tombstone shape. Remove the durable cache row and its
+            # exact object-attempt reference in one test cleanup transaction, as retention would.
+            with metadb.session() as session:
+                cache = session.get(
+                    metadb.ResultCache, "object-gc-region-key", with_for_update=True)
+                if cache is not None:
+                    metadb._replace_attempt_ref(
+                        session, "result_cache", "object-gc-region-key", None)
+                    session.delete(cache)
             reap_until_deleted("s3://bkt/outputs/out.attempt-new")
         except Exception:
             pass
@@ -13158,7 +13448,7 @@ def test_ray_region_worker_direct_write_and_progress(tmp_path):
     assert s.status == "done", s.error
     assert s.progress == 1.0                                   # the placed sub-run reported terminal progress
     assert saw_interim, "the placed sub-run's progress never surfaced an interim value to the parent"
-    d = s.output_uri
+    d = _output_field(s, "uri", outcome="committed")
     assert os.path.isdir(d), f"worker-direct write must produce a DIRECTORY of shards, got {d}"
     assert d != suggested and ".attempt-" in d
     manifest_path = os.path.join(d, "_DP_SUCCESS.json")
@@ -13182,9 +13472,11 @@ def test_ray_region_worker_direct_write_and_progress(tmp_path):
             break
         time.sleep(0.1)
     assert s2.status == "done", s2.error
-    assert s2.output_uri != d
-    assert os.path.isfile(os.path.join(s2.output_uri, "_DP_SUCCESS.json"))
-    again = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{s2.output_uri}/**/*.parquet')").fetchall())
+    retry_uri = _output_field(s2, "uri", outcome="committed")
+    assert retry_uri != d
+    assert os.path.isfile(os.path.join(retry_uri, "_DP_SUCCESS.json"))
+    again = sorted(r[0] for r in duckdb.connect().execute(
+        f"SELECT x FROM read_parquet('{retry_uri}/**/*.parquet')").fetchall())
     assert again == [2 * i for i in range(1, 21)]
     original = sorted(r[0] for r in duckdb.connect().execute(f"SELECT x FROM read_parquet('{d}/**/*.parquet')").fetchall())
     assert original == again, "publishing a retry mutated the previously committed attempt"
@@ -13235,7 +13527,8 @@ def test_ray_aggregate_live_differential(tmp_path):
                              node_specs=deps.node_specs, output_node="a").relation("a").to_arrow_table()
     con = duckdb.connect()
     con.register("oracle", oracle)
-    ray_src = f"read_parquet('{st.output_uri}/**/*.parquet', union_by_name=true)"  # reconcile per-shard drift
+    ray_uri = _output_field(st, "uri", outcome="committed")
+    ray_src = f"read_parquet('{ray_uri}/**/*.parquet', union_by_name=true)"  # reconcile per-shard drift
     q = "SELECT cat, n, nv, lo, hi, sm, av, sd FROM {src}"
     rmap = {(-1 if r[0] is None else r[0]): r for r in con.execute(q.format(src=ray_src)).fetchall()}
     dmap = {(-1 if r[0] is None else r[0]): r for r in con.execute(q.format(src="oracle")).fetchall()}
@@ -13295,7 +13588,8 @@ def test_ray_aggregate_float_nan_and_allnull_parity(tmp_path):
                              node_specs=deps.node_specs, output_node="a").relation("a").to_arrow_table()
     con = duckdb.connect()
     con.register("oracle", oracle)
-    ray_src = f"read_parquet('{st.output_uri}/**/*.parquet', union_by_name=true)"
+    ray_uri = _output_field(st, "uri", outcome="committed")
+    ray_src = f"read_parquet('{ray_uri}/**/*.parquet', union_by_name=true)"
     # cast the floats to VARCHAR so NaN ('nan') and signed zero ('-0.0'/'0.0') compare faithfully
     q = ("SELECT g, CAST(lo AS VARCHAR), CAST(hi AS VARCHAR), "
          "CAST(anlo AS VARCHAR), CAST(anhi AS VARCHAR) FROM {src}")
@@ -13348,7 +13642,8 @@ def test_ray_window_live_differential(tmp_path):
                              node_specs=deps.node_specs, output_node="w").relation("w").to_arrow_table()
     con = duckdb.connect()
     con.register("oracle", oracle)
-    ray_src = f"read_parquet('{st.output_uri}/**/*.parquet', union_by_name=true)"
+    ray_uri = _output_field(st, "uri", outcome="committed")
+    ray_src = f"read_parquet('{ray_uri}/**/*.parquet', union_by_name=true)"
     q = "SELECT v, cat, rn FROM {src} ORDER BY v"        # v is unique → deterministic total order
     ray_rows = con.execute(q.format(src=ray_src)).fetchall()
     duck_rows = con.execute(q.format(src="oracle")).fetchall()
@@ -13395,7 +13690,8 @@ def test_ray_dedup_live_differential(tmp_path):
                              node_specs=deps.node_specs, output_node="d").relation("d").to_arrow_table()
     con = duckdb.connect()
     con.register("oracle", oracle)
-    ray_src = f"read_parquet('{st.output_uri}/**/*.parquet', union_by_name=true)"
+    ray_uri = _output_field(st, "uri", outcome="committed")
+    ray_src = f"read_parquet('{ray_uri}/**/*.parquet', union_by_name=true)"
     q = "SELECT cat, v FROM {src} ORDER BY cat, v"
     ray_rows = con.execute(q.format(src=ray_src)).fetchall()
     duck_rows = con.execute(q.format(src="oracle")).fetchall()
@@ -13446,7 +13742,8 @@ def test_ray_join_live_differential(tmp_path):
             oracle = BuildEngine(g, deps.resolve_adapter, deps.registry, full=True,
                                  node_specs=deps.node_specs, output_node="j").relation("j").to_arrow_table()
         con.register("oracle", oracle)
-        ray_src = f"read_parquet('{st.output_uri}/**/*.parquet', union_by_name=true)"
+        ray_uri = _output_field(st, "uri", outcome="committed")
+        ray_src = f"read_parquet('{ray_uri}/**/*.parquet', union_by_name=true)"
         # (a) SCHEMA byte-identity: the output columns (incl. the coalesced key + the `_2`-suffixed right
         # `amount`) must match the single-node engine exactly, in the same order.
         ray_cols = [c[0] for c in con.execute(f"DESCRIBE SELECT * FROM {ray_src}").fetchall()]
@@ -13496,7 +13793,8 @@ def test_ray_sort_live_differential(tmp_path):
             time.sleep(0.1)
         st = rr.status(st.run_id)
         assert st.status == "done", f"{by}: {st.error}"
-        files = sorted(_glob.glob(os.path.join(st.output_uri, "**", "*.parquet"), recursive=True))
+        ray_uri = _output_field(st, "uri", outcome="committed")
+        files = sorted(_glob.glob(os.path.join(ray_uri, "**", "*.parquet"), recursive=True))
         ray_rows = _pq.read_table(files).to_pylist()      # physical file order (pyarrow preserves it)
         with db.run_scope():
             oracle = BuildEngine(g, deps.resolve_adapter, deps.registry, full=True,
@@ -13570,6 +13868,7 @@ def test_ray_cancel_is_acknowledged_only_after_driver_reap(tmp_path):
     rr = _load_dp_ray().RayRunner(Deps(str(tmp_path / "ws"), str(tmp_path / "data")))
     run_id = "unit_cancel_ack"
     rr.runs[run_id] = RunStatus(run_id=run_id, status="cancelled", placement="distributed", per_node=[])
+    rr._published_statuses[run_id] = rr.runs[run_id].model_copy(deep=True)
     assert not rr.cancel_acknowledged(run_id)
     assert not stop_acknowledged(rr, rr.status(run_id))
 
@@ -13592,6 +13891,7 @@ def test_ray_backend_run_unit_falls_back_locally_for_a_nonclean_region(tmp_path)
 
     from hub.deps import Deps
     from hub.models import Graph
+    from hub.run_outputs import sole_output
     p = str(tmp_path / "nums.parquet")
     duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES (1),(1),(2)) t(x)) TO '{p}' (FORMAT PARQUET)")
     (tmp_path / "ws").mkdir()
@@ -13605,17 +13905,21 @@ def test_ray_backend_run_unit_falls_back_locally_for_a_nonclean_region(tmp_path)
     st = rr.run_unit(gr, "a", out, run_id="unit_local_fallback")
     assert st.status == "done", st.error
     assert st.placement == "local"  # a non-clean region fell back to the local engine, not Ray
-    assert st.output_uri == _load_dp_ray()._attempt_handoff_uri(out, "unit_local_fallback")
+    output = sole_output(st, committed=True)
+    assert output is not None
+    assert output.uri == _load_dp_ray()._attempt_handoff_uri(out, "unit_local_fallback")
     assert not os.path.exists(out), "the fallback wrote the stable controller suggestion"
-    assert os.path.isfile(os.path.join(st.output_uri, "_DP_SUCCESS.json"))
+    assert os.path.isfile(os.path.join(output.uri, "_DP_SUCCESS.json"))
     assert duckdb.connect().execute(
-        f"SELECT count(*) FROM read_parquet('{st.output_uri}/**/*.parquet')").fetchone()[0] == 2
+        f"SELECT count(*) FROM read_parquet('{output.uri}/**/*.parquet')").fetchone()[0] == 2
 
     # Reattaching the same explicit attempt is read-only and returns the committed physical prefix.
-    manifest_mtime = os.path.getmtime(os.path.join(st.output_uri, "_DP_SUCCESS.json"))
+    manifest_mtime = os.path.getmtime(os.path.join(output.uri, "_DP_SUCCESS.json"))
     again = rr.run_unit(gr, "a", out, run_id="unit_local_fallback")
-    assert again.status == "done" and again.output_uri == st.output_uri
-    assert os.path.getmtime(os.path.join(st.output_uri, "_DP_SUCCESS.json")) == manifest_mtime
+    again_output = sole_output(again, committed=True)
+    assert again.status == "done" and again_output is not None
+    assert again_output.uri == output.uri
+    assert os.path.getmtime(os.path.join(output.uri, "_DP_SUCCESS.json")) == manifest_mtime
 
 
 @pytest.mark.skipif(not os.environ.get("DP_TEST_RAY_LIVE"), reason="live Ray run — opt-in (needs [ray] + a real executor). Enable: DP_TEST_RAY_LIVE=1.")
@@ -13628,6 +13932,7 @@ def test_ray_backend_run_unit_live(tmp_path):
 
     from hub.deps import Deps
     from hub.models import Graph
+    from hub.run_outputs import sole_output
 
     pytest.importorskip("ray")
     p = str(tmp_path / "nums.parquet")
@@ -13648,10 +13953,11 @@ def test_ray_backend_run_unit_live(tmp_path):
         time.sleep(0.1)
     st = rr.status(st.run_id)
     assert st.status == "done", st.error
-    assert st.output_uri != out and ".attempt-" in st.output_uri
-    assert os.path.isfile(os.path.join(st.output_uri, "_DP_SUCCESS.json"))
+    output = sole_output(st, committed=True)
+    assert output is not None and output.uri != out and ".attempt-" in output.uri
+    assert os.path.isfile(os.path.join(output.uri, "_DP_SUCCESS.json"))
     got = sorted(r[0] for r in duckdb.connect().execute(
-        f"SELECT x FROM read_parquet('{st.output_uri}/**/*.parquet')").fetchall())
+        f"SELECT x FROM read_parquet('{output.uri}/**/*.parquet')").fetchall())
     assert got == [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
 
 

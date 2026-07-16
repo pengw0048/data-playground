@@ -28,7 +28,9 @@ from hub import compiler, db
 from hub import graph as g
 from hub import planner
 from hub.executors.engine import BuildEngine
-from hub.models import (Graph, GraphEdge, GraphEdgeData, GraphNode, PerNodeStatus, Position, RunStatus)
+from hub.models import (
+    Graph, GraphEdge, GraphEdgeData, GraphNode, PerNodeStatus, Position, RunOutput, RunStatus)
+from hub.run_outputs import require_single_run_output, settle_uncommitted_outputs, sole_output
 from hub.storage import ManagedSourceReadError
 
 
@@ -59,11 +61,12 @@ def _reserve_region_internal_id(base: str, occupied: set[str]) -> str:
 
 
 class _RegionMaterialization(str):
-    """A region URI plus the temporary cache owner protecting it for the consuming run."""
+    """A region URI, its exact row count, and the temporary owner protecting it for one run."""
 
-    def __new__(cls, uri: str, cache_pin=None):
+    def __new__(cls, uri: str, cache_pin=None, *, rows: int | None = None):
         value = super().__new__(cls, uri)
         value.cache_pin = cache_pin
+        value.rows = rows
         return value
 
 
@@ -79,6 +82,9 @@ class RunController:
         self.on_status = None
         self.on_complete = None
         self.runs: dict[str, RunStatus] = {}
+        # Region orchestration owns and mutates ``runs``.  Pollers receive validated snapshots published
+        # only after a complete transition, so grouped status/output/count changes cannot tear.
+        self._published_statuses: dict[str, RunStatus] = {}
         self._cancel: dict[str, threading.Event] = {}  # user intent only
         self._stop: dict[str, threading.Event] = {}    # user cancel OR sibling-failure execution stop
         self._sub: dict[str, dict] = {}  # overall run_id -> {sub_run_id: backend} for ALL concurrent sub-runs
@@ -274,20 +280,29 @@ class RunController:
             return None
         if not self._safe_to_split(graph, target, regions):
             return None  # a shape the region machinery can't yet materialize correctly → run whole, in-process
+        # The logical target and every intermediate handoff are separate singular contracts in #263.
+        # Validate both before run identity, durable status, allocation, or worker threads are observable.
+        expected_output = (require_single_run_output(
+            graph, target, self.deps.node_specs) if target is not None else None)
+        for region in regions[:-1]:
+            require_single_run_output(
+                graph, region.output_node, self.deps.node_specs)
         run_id = f"run_{uuid.uuid4().hex[:10]}"
         nm = g.node_map(graph)
         per = [PerNodeStatus(node_id=nid, status="queued", label=nm[nid].type)
                for r in regions for nid in r.node_ids if nid in nm]
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=per,
-                           target_node_id=target, request_id=request_id)
+                           target_node_id=target, request_id=request_id,
+                           outputs=[expected_output] if expected_output is not None else [])
         with self._lock:
             self.runs[run_id] = status
+            self._published_statuses[run_id] = RunStatus.model_validate(status.model_dump())
             self._cancel[run_id] = threading.Event()
             self._stop[run_id] = threading.Event()
             self._evict()
         self._emit(graph, status)
         threading.Thread(target=self._orchestrate, args=(run_id, graph, target, regions, uid), daemon=True).start()
-        return status
+        return self.status(run_id)
 
     def _evict(self) -> None:
         """Bound retained distributed-run state (called under self._lock). The sibling in-process
@@ -297,10 +312,13 @@ class RunController:
         from hub.plugins.runner import _MAX_RUNS
         _terminal = {"done", "failed", "cancelled"}
         while len(self.runs) > _MAX_RUNS:
-            victim = next((rid for rid, st in self.runs.items() if st.status in _terminal), None)
+            victim = next((rid for rid in self.runs
+                           if (published := self._published_statuses.get(rid)) is not None
+                           and published.status in _terminal), None)
             if victim is None:
                 break  # everything retained is still in-flight — exceed the cap rather than drop a live run
             self.runs.pop(victim, None)
+            self._published_statuses.pop(victim, None)
             self._cancel.pop(victim, None)
             self._stop.pop(victim, None)
             self._sub.pop(victim, None)
@@ -410,7 +428,17 @@ class RunController:
                 pin.check()
             self._mark(status, region, "running")
             sub = self._run_final(run_id, graph, region, ref_uri, uid)
-            status.output_uri, status.output_table = sub.output_uri, sub.output_table
+            expected = sole_output(status)
+            observed = sole_output(sub)
+            if expected is None or observed is None or (
+                    expected.node_id, expected.port_id, expected.port_label,
+                    expected.wire, expected.publication_kind) != (
+                    observed.node_id, observed.port_id, observed.port_label,
+                    observed.wire, observed.publication_kind):
+                raise RuntimeError("final backend returned an unexpected output declaration")
+            if sub.status == "done" and observed.outcome != "committed":
+                raise RuntimeError("final backend completed without committing its expected output")
+            status.outputs = [observed.model_copy(deep=True)]
             status.rows_processed = sub.rows_processed
             if sub.status != "done":
                 status.status = sub.status
@@ -424,7 +452,9 @@ class RunController:
             self._mark(status, region, "done")
             status.progress = _step_progress(status)
             self._emit(graph, status)
-            status.total_rows = status.rows_processed  # set the count BEFORE 'done' (a poll reads terminal
+            committed_output = sole_output(status, committed=True)
+            status.total_rows = committed_output.rows if committed_output is not None else None
+            # Set the count BEFORE 'done' (a poll reads terminal
             status.progress = 1.0                      # status eagerly; the finally would set it too late)
             status.stalled = False
             status.ms = int((time.time() - started) * 1000)
@@ -449,7 +479,10 @@ class RunController:
                     if p.status != "done":
                         p.status = status.status
             status.ms = int((time.time() - started) * 1000)
-            status.total_rows = status.rows_processed
+            if status.status in ("failed", "cancelled"):
+                settle_uncommitted_outputs(status, status.status, status.error)
+            committed_output = sole_output(status, committed=True)
+            status.total_rows = committed_output.rows if committed_output is not None else None
             self._emit(graph, status)
             with self._lock:
                 self._cancel.pop(run_id, None)
@@ -485,9 +518,17 @@ class RunController:
     def _safe_to_split(self, graph: Graph, target: str, regions) -> bool:
         """Refuse to split (→ run the whole graph in-process, correct but unplaced) for shapes the
         single-port parquet handoff can't represent yet, rather than silently corrupt data:
-        - a cross-region cut off a NON-default output port (a multi-output node / section named port);
+        - any multi-output intermediate boundary, even when the cut names its conventional ``out`` port;
+        - a cross-region cut off a non-default output port;
         - an intermediate `write` (materializing it would drop its commit + catalog side-effect)."""
         nm = g.node_map(graph)
+        try:
+            if any(len(g.effective_output_ports(
+                    graph, region.output_node, self.deps.node_specs)) != 1
+                    for region in regions[:-1]):
+                return False
+        except ValueError:
+            return False
         if any(sh not in (None, "out") for r in regions for (_u, sh, _i, _t) in r.cut_inputs):
             return False
         return not any(nm[nid].type == "write" and nid != target for r in regions for nid in r.node_ids)
@@ -587,6 +628,43 @@ class RunController:
             except Exception:  # noqa: BLE001 — a stale cache hit is safe to ignore
                 logging.getLogger("hub").exception(
                     "region result-cache pin cleanup failed")
+
+    @staticmethod
+    def _known_result_rows(result: dict, *, context: str) -> int:
+        raw = result.get("rows") if isinstance(result, dict) else None
+        if raw is None or isinstance(raw, bool):
+            raise RuntimeError(f"{context} did not report an exact row count")
+        try:
+            rows = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"{context} reported an invalid row count") from exc
+        if rows < 0 or raw != rows:
+            raise RuntimeError(f"{context} reported an invalid row count")
+        return rows
+
+    @staticmethod
+    def _region_output_identity(output: RunOutput) -> tuple:
+        return (
+            output.node_id, output.port_id, output.port_label,
+            output.wire, output.publication_kind,
+        )
+
+    @classmethod
+    def _region_cache_document(
+            cls, expected: RunOutput, *, uri: str, rows: int) -> dict:
+        if expected.publication_kind != "result":
+            raise RuntimeError("an intermediate region cache must publish a result output")
+        output = RunOutput(
+            node_id=expected.node_id,
+            port_id=expected.port_id,
+            port_label=expected.port_label,
+            wire=expected.wire,
+            publication_kind="result",
+            outcome="committed",
+            uri=uri,
+            rows=rows,
+        )
+        return {"outputs": [output.model_dump()]}
 
     @contextlib.contextmanager
     def _region_source_lease_scope(self, graph: Graph, target: str, *,
@@ -705,17 +783,24 @@ class RunController:
         discard_attempt(uri)
 
     def _acquire_region_cache(self, cache_key: str, *, owner: str,
+                              expected_output: RunOutput,
                               logical_uri: str | None = None) -> _RegionMaterialization | None:
         """Atomically read and temporarily own one reusable region-cache generation."""
+        from hub.run_outputs import sole_committed_document_output
+
         # SQLite cannot enforce the cache-row FOR UPDATE lock used by PostgreSQL. A concurrent pointer
         # replacement can therefore retire the generation observed by one acquire before its follow-up
         # identity check. Release that stale pin and retry the atomic read; never consume it unowned.
         for _attempt in range(3):
             doc, pin = self.base._cache_acquire(
                 cache_key, owner, self._region_pin_ttl())
-            uri = doc.get("uri") if isinstance(doc, dict) else None
+            output = (sole_committed_document_output(doc)
+                      if isinstance(doc, dict) and set(doc) == {"outputs"} else None)
+            uri = output.uri if output is not None else None
             keep_pin = False
-            if not uri:
+            if (not uri or output.rows is None
+                    or self._region_output_identity(output)
+                    != self._region_output_identity(expected_output)):
                 self._close_region_pin(pin)
                 return None
             try:
@@ -728,7 +813,7 @@ class RunController:
                     continue
                 if pin is not None:
                     pin.check()
-                result = _RegionMaterialization(str(uri), pin)
+                result = _RegionMaterialization(str(uri), pin, rows=int(output.rows))
                 keep_pin = True
                 return result
             except Exception:  # noqa: BLE001 — retry a concurrently replaced/unattested pointer
@@ -742,7 +827,8 @@ class RunController:
         return None
 
     def _publish_region_attempt(self, *, cache_key: str, uri: str, logical_uri: str,
-                                table: str, run_id: str, cancel,
+                                region_id: str, expected_output: RunOutput, rows: int,
+                                run_id: str, cancel,
                                 expected_attempt_run_id: str) -> _RegionMaterialization:
         """Commit inventory, publish the cache owner, then pin the exact current generation."""
         try:
@@ -760,14 +846,16 @@ class RunController:
             raise RuntimeError("run cancelled before region publication")
         try:
             self.base._cache_put(
-                cache_key, {"uri": uri, "table": table, "rows": None})
+                cache_key, self._region_cache_document(
+                    expected_output, uri=uri, rows=rows))
         except Exception:  # noqa: BLE001 — commit outcome may be uncertain after a transport error
             logging.getLogger("hub").exception(
                 "region result-cache publication reported failure")
             # A transaction may have committed before its caller observed an error. Read-back plus a
             # result_reader ref is the durable receipt; never report failure while that owner exists.
             current = self._acquire_region_cache(
-                cache_key, owner=f"region:{run_id}:{table}", logical_uri=logical_uri)
+                cache_key, owner=f"region:{run_id}:{region_id}",
+                expected_output=expected_output, logical_uri=logical_uri)
             if current is not None:
                 if str(current) != uri:
                     self._abandon_region_attempt(uri)
@@ -775,7 +863,8 @@ class RunController:
             self._abandon_region_attempt(uri)
             raise RuntimeError("region object lifecycle publication failed") from None
         current = self._acquire_region_cache(
-            cache_key, owner=f"region:{run_id}:{table}", logical_uri=logical_uri)
+            cache_key, owner=f"region:{run_id}:{region_id}",
+            expected_output=expected_output, logical_uri=logical_uri)
         if current is None:
             self._abandon_region_attempt(uri)
             raise RuntimeError("region object lifecycle publication failed") from None
@@ -786,7 +875,7 @@ class RunController:
         return current
 
     def _move_tier(self, src_uri: str, dst_uri: str, dst_tier, cancel,
-                   run_id: str | None = None) -> None:
+                   run_id: str | None = None) -> int:
         """Copy a materialized region parquet across tiers (cheaper than recomputing). DuckDB streams it;
         httpfs handles an object-store endpoint on either side."""
         from hub.handoff import is_attempt_uri
@@ -809,6 +898,7 @@ class RunController:
                          if exact_attempt else dst_uri)
             result = self.base._adapter_write(
                 self.deps.resolve_adapter(write_uri), write_uri, rel, "overwrite", cancel)
+            rows = self._known_result_rows(result, context="region tier copy")
             if exact_attempt:
                 if cancel.is_set():
                     raise RuntimeError("run cancelled before region manifest publication")
@@ -817,11 +907,12 @@ class RunController:
                     schema = list(zip(rel.columns, (str(t) for t in rel.types)))
                     write_manifest(
                         dst_uri, run_id=run_id or f"region-copy-{uuid.uuid4().hex}",
-                        rows=int(result.get("rows") or 0), schema=schema)
+                        rows=rows, schema=schema)
                 except Exception:  # noqa: BLE001 — provider details stay in server logs
                     logging.getLogger("hub").exception(
                         "region object-attempt manifest write failed")
                     raise RuntimeError("region object lifecycle manifest failed") from None
+            return rows
 
     def _materialize(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str],
                      regions=None, uid: str | None = None) -> str:
@@ -846,6 +937,8 @@ class RunController:
         """Materialize while the wrapper retains every source fence from hash through publication."""
         from hub import tiers as tier_mod
 
+        expected_output = require_single_run_output(
+            subg, region.output_node, self.deps.node_specs)
         key = self.base._plan_hash(subg, region.output_node)
         picked = self._boundary_tier(region, regions or [])
         if picked is None:
@@ -861,6 +954,7 @@ class RunController:
         logical_uri = tier.uri(f"{region.id}_{key}.parquet")
         cached = self._acquire_region_cache(
             ckey, owner=f"region:{run_id}:{region.id}",
+            expected_output=expected_output,
             logical_uri=logical_uri if tier.is_object else None)
         if cached is not None:
             return cached  # reuse — pin survives until this run's final region has stopped
@@ -872,11 +966,15 @@ class RunController:
             other_logical = other.uri(f"{region.id}_{key}.parquet")
             alt = self._acquire_region_cache(
                 f"{key}@{other.name}", owner=f"region-copy:{run_id}:{region.id}",
+                expected_output=expected_output,
                 logical_uri=other_logical if other.is_object else None)
             if alt is None:
                 continue
             alt_pin = getattr(alt, "cache_pin", None)
             try:
+                source_rows = getattr(alt, "rows", None)
+                if source_rows is None:
+                    continue
                 if cancel.is_set():
                     raise RuntimeError("run cancelled before region tier copy")
                 if tier.is_object:
@@ -884,22 +982,31 @@ class RunController:
                         logical_uri=logical_uri, run_id=run_id,
                         region_id=region.id, cache_key=ckey)
                     try:
-                        self._move_tier(str(alt), dst, tier, cancel, run_id=run_id)
+                        copied_rows = self._move_tier(
+                            str(alt), dst, tier, cancel, run_id=run_id)
+                        if copied_rows != source_rows:
+                            raise RuntimeError(
+                                "region tier copy changed the exact row count")
                         if alt_pin is not None:
                             alt_pin.check()
                         return self._publish_region_attempt(
                             cache_key=ckey, uri=dst, logical_uri=logical_uri,
-                            table=region.id, run_id=run_id, cancel=cancel,
+                            region_id=region.id, expected_output=expected_output,
+                            rows=source_rows, run_id=run_id, cancel=cancel,
                             expected_attempt_run_id=run_id)
                     except Exception:
                         self._abandon_region_attempt(dst)  # copy is synchronous; writer has stopped
                         raise
-                self._move_tier(str(alt), logical_uri, tier, cancel, run_id=run_id)
+                copied_rows = self._move_tier(
+                    str(alt), logical_uri, tier, cancel, run_id=run_id)
+                if copied_rows != source_rows:
+                    raise RuntimeError("region tier copy changed the exact row count")
                 if alt_pin is not None:
                     alt_pin.check()
                 self.base._cache_put(
-                    ckey, {"uri": logical_uri, "table": region.id, "rows": None})
-                return logical_uri
+                    ckey, self._region_cache_document(
+                        expected_output, uri=logical_uri, rows=source_rows))
+                return _RegionMaterialization(logical_uri, rows=source_rows)
             finally:
                 self._close_region_pin(alt_pin)
         if tier.is_object:
@@ -931,7 +1038,8 @@ class RunController:
                         result = self.base._adapter_write(
                             self.deps.resolve_adapter(write_uri), write_uri,
                             rel, "overwrite", cancel)
-                        rows = int(result.get("rows") or 0)
+                        rows = self._known_result_rows(
+                            result, context="local region materialization")
                         schema = list(zip(rel.columns, (str(t) for t in rel.types)))
                         # The shard write is the point at which lazy source scans have completed. Fence
                         # every exact source generation before writing a commit manifest or cache pointer.
@@ -951,14 +1059,16 @@ class RunController:
                 if tier.is_object:
                     return self._publish_region_attempt(
                         cache_key=ckey, uri=result_uri, logical_uri=logical_uri,
-                        table=region.id, run_id=run_id, cancel=cancel,
+                        region_id=region.id, expected_output=expected_output,
+                        rows=rows, run_id=run_id, cancel=cancel,
                         expected_attempt_run_id=run_id)
                 if not self._region_output_exists(result_uri):
                     raise RuntimeError(
                         f"region {region.id} on {region.backend} returned an unreadable handoff")
                 self.base._cache_put(
-                    ckey, {"uri": result_uri, "table": region.id, "rows": None})
-                return result_uri
+                    ckey, self._region_cache_document(
+                        expected_output, uri=result_uri, rows=rows))
+                return _RegionMaterialization(result_uri, rows=rows)
             except Exception:
                 if tier.is_object and "result_uri" in locals():
                     self._abandon_region_attempt(result_uri)  # in-process writer has stopped
@@ -981,7 +1091,13 @@ class RunController:
                     f"region {region.id} on {region.backend} {s.status}: {s.error}")
             if source_guards:
                 self._check_region_source_leases(source_guards)
-        result_uri = s.output_uri or logical_uri
+        output = sole_output(s, committed=True)
+        if (output is None or output.rows is None
+                or self._region_output_identity(output)
+                != self._region_output_identity(expected_output)):
+            raise RuntimeError(
+                f"region {region.id} on {region.backend} returned no exact committed handoff")
+        result_uri = str(output.uri)
         if tier.is_object:
             try:
                 self._assert_region_attempt(
@@ -992,14 +1108,16 @@ class RunController:
                 raise RuntimeError("region object lifecycle attestation failed") from None
             return self._publish_region_attempt(
                 cache_key=ckey, uri=result_uri, logical_uri=logical_uri,
-                table=region.id, run_id=run_id, cancel=cancel,
+                region_id=region.id, expected_output=expected_output,
+                rows=output.rows, run_id=run_id, cancel=cancel,
                 expected_attempt_run_id=sub.run_id)
         if not self._region_output_exists(result_uri):
             raise RuntimeError(
                 f"region {region.id} on {region.backend} returned an unreadable handoff")
         self.base._cache_put(
-            ckey, {"uri": result_uri, "table": region.id, "rows": None})
-        return result_uri
+            ckey, self._region_cache_document(
+                expected_output, uri=result_uri, rows=output.rows))
+        return _RegionMaterialization(result_uri, rows=output.rows)
 
     def _run_final(self, run_id: str, graph: Graph, region, ref_uri: dict[str, str], uid: str | None = None) -> RunStatus:
         """Run the final (target) region over the reduced graph, waiting for it — on the base runner
@@ -1066,21 +1184,29 @@ class RunController:
                 p.status = state
 
     def _emit(self, graph: Graph, status: RunStatus) -> None:
+        snapshot = RunStatus.model_validate(status.model_dump())
         if self.on_status:
             try:
                 self.on_status(graph, status)
             except Exception:  # noqa: BLE001
                 pass
+        with self._lock:
+            if status.run_id in self.runs:
+                self._published_statuses[status.run_id] = snapshot
 
     def status(self, run_id: str) -> RunStatus:
-        return self.runs[run_id]
+        with self._lock:
+            return self._published_statuses[run_id].model_copy(deep=True)
 
     def cancel(self, run_id: str) -> RunStatus:
-        ev = self._cancel.get(run_id)
+        with self._lock:
+            ev = self._cancel.get(run_id)
         if ev:
             ev.set()
             self._signal_execution_stop(run_id)
         # _orchestrate publishes the terminal state only after all locally-owned sub-runs have acknowledged
         # cancellation. Until then the logical run remains non-terminal, so clients do not mistake a request
         # for completion while a region may still publish.
-        return self.runs.get(run_id)
+        with self._lock:
+            snapshot = self._published_statuses.get(run_id)
+            return snapshot.model_copy(deep=True) if snapshot is not None else None

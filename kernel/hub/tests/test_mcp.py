@@ -180,6 +180,47 @@ def test_connect_duplicate_single_input_is_iserror():
     assert res["isError"] is True and "already connected" in res["content"][0]["text"]
 
 
+def test_connect_rejects_an_explicit_empty_target_handle():
+    cid = data("create_canvas", {})["canvasId"]
+    source = data("add_node", {"canvasId": cid, "kind": "source"})["nodeId"]
+    target = data("add_node", {"canvasId": cid, "kind": "filter"})["nodeId"]
+
+    result = call("connect", {
+        "canvasId": cid, "sourceId": source, "targetId": target, "targetHandle": "",
+    })
+
+    assert result["isError"] is True
+    assert client.get(f"/api/canvas/{cid}").json()["edges"] == []
+
+
+def test_section_output_config_edit_preserves_only_exact_named_edges():
+    cid = data("create_canvas", {})["canvasId"]
+    section = data("add_node", {
+        "canvasId": cid, "kind": "section", "config": {"outputs": ["out"]},
+    })["nodeId"]
+    target = data("add_node", {"canvasId": cid, "kind": "filter"})["nodeId"]
+    data("connect", {"canvasId": cid, "sourceId": section, "targetId": target})
+
+    invalid = call("set_node_config", {
+        "canvasId": cid, "nodeId": section, "config": {"outputs": ["left", "left"]},
+    })
+    assert invalid["isError"] is True
+    unchanged = client.get(f"/api/canvas/{cid}").json()
+    assert unchanged["nodes"][0]["data"]["config"]["outputs"] == ["out"]
+    assert unchanged["edges"][0]["sourceHandle"] == "out"
+
+    data("set_node_config", {
+        "canvasId": cid, "nodeId": section, "config": {"outputs": ["out", "right"]},
+    })
+    retained = client.get(f"/api/canvas/{cid}").json()
+    assert retained["edges"][0]["sourceHandle"] == "out"
+
+    data("set_node_config", {
+        "canvasId": cid, "nodeId": section, "config": {"outputs": ["left", "right"]},
+    })
+    assert client.get(f"/api/canvas/{cid}").json()["edges"] == []
+
+
 def test_remove_node_drops_node_and_edges():
     cid = data("create_canvas", {})["canvasId"]
     s = data("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})["nodeId"]
@@ -423,15 +464,25 @@ def test_cancel_run_persists_durable_intent_when_plugin_is_unavailable():
 def test_run_envelope_flags_a_non_terminal_run_as_timed_out():
     # unit-level, race-free: the envelope marks a still-running status as recoverable, a terminal one not
     from hub.mcp import Playground
+    from hub.models import RunOutput, RunStatus
 
-    class _St:
-        def __init__(self, status):
-            self.run_id, self.status, self.total_rows, self.ms = "r", status, 3, 9
-            self.output_table = self.output_uri = self.error = None
+    output = RunOutput(
+        node_id="n", port_id="out", wire="dataset", publication_kind="result",
+        outcome="committed", uri="/tmp/result.parquet", rows=3,
+    )
+    done_status = RunStatus(
+        run_id="r", status="done", target_node_id="n", total_rows=3, ms=9,
+        outputs=[output],
+    )
+    running_status = RunStatus(
+        run_id="r", status="running", target_node_id="n", total_rows=None, ms=9,
+        outputs=[output.model_copy(update={"outcome": "pending", "uri": None, "rows": None})],
+    )
 
-    done = Playground._run_envelope(_St("done"), "n")
+    done = Playground._run_envelope(done_status, "n")
     assert done.get("timedOut") is not True and done["status"] == "done" and "hint" not in done
-    running = Playground._run_envelope(_St("running"), "n")
+    assert done["outputs"][0]["uri"] == "/tmp/result.parquet"
+    running = Playground._run_envelope(running_status, "n")
     assert running["timedOut"] is True and running["runId"] == "r" and running["hint"]
 
 

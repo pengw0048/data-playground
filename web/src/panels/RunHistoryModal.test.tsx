@@ -6,10 +6,12 @@ import type { PerNodeStat, RunRecordDto } from '../api/client'
 import { RunHistoryModal } from './RunHistoryModal'
 import { DataPanel, FullResult } from './DataPanel'
 import { previewPlanIdentity, profilePlanIdentity, useStore } from '../store/graph'
+import { register } from '../nodes/registry'
 
 const apiMock = vi.hoisted(() => ({
   listRuns: vi.fn(),
   sample: vi.fn(),
+  preview: vi.fn(),
   profile: vi.fn(),
   profileEstimate: vi.fn(),
   fullProfile: vi.fn(),
@@ -18,9 +20,19 @@ const apiMock = vi.hoisted(() => ({
 
 vi.mock('../api/client', () => ({ api: apiMock }))
 
+function registerAssertUiTestNode() {
+  register({
+    kind: 'assert-ui-test', title: 'assert', category: 'compute', inputs: [],
+    outputs: [{ id: 'pass', label: 'Passing', wire: 'dataset' }, { id: 'out', label: 'Violations', wire: 'dataset' }],
+    canBypass: false, blurb: '',
+    defaultData: () => ({ title: 'assert', status: 'draft', history: [], config: {} }),
+  }, () => null)
+}
+
 beforeEach(() => {
   apiMock.listRuns.mockReset()
   apiMock.sample.mockReset()
+  apiMock.preview.mockReset()
   apiMock.profile.mockReset().mockResolvedValue({ columns: [], rowCount: 10, sampled: true })
   apiMock.profileEstimate.mockReset().mockResolvedValue({
     rows: null, bytes: null, placement: 'local', needsConfirm: true, planDigest: 'a'.repeat(64),
@@ -60,8 +72,8 @@ describe('fmtMs — human-readable durations', () => {
 
 describe('DurationTrend — a native SVG bar per run', () => {
   const runs: RunRecordDto[] = [
-    { id: 'r2', status: 'failed', ms: 200 },
-    { id: 'r1', status: 'done', ms: 100 },
+    { id: 'r2', status: 'failed', ms: 200, outputs: [] },
+    { id: 'r1', status: 'done', ms: 100, outputs: [] },
   ]
   it('renders one rect per run and reports the max duration', () => {
     const { container } = render(<DurationTrend runs={runs} />)
@@ -73,8 +85,8 @@ describe('DurationTrend — a native SVG bar per run', () => {
 
 describe('PerNodeBreakdown — per-node horizontal bars', () => {
   const nodes: PerNodeStat[] = [
-    { node_id: 'src', label: 'source', status: 'done', ms: 10, rows: 5 },
-    { node_id: 'wr', label: 'write', status: 'done', ms: 90, rows: 5 },
+    { nodeId: 'src', label: 'source', status: 'done', ms: 10, rows: 5 },
+    { nodeId: 'wr', label: 'write', status: 'done', ms: 90, rows: 5 },
   ]
   it('lists every node with its duration', () => {
     render(<PerNodeBreakdown nodes={nodes} />)
@@ -86,6 +98,10 @@ describe('PerNodeBreakdown — per-node horizontal bars', () => {
 })
 
 describe('durable full results', () => {
+  const committedOutput = (uri: string, rows: number, portId = 'out') => ({
+    nodeId: 'target', portId, wire: 'dataset' as const, publicationKind: 'result' as const,
+    outcome: 'committed' as const, uri, rows,
+  })
   const sample = (offset: number, count: number, hasMore: boolean) => ({
     columns: [{ name: 'v', type: 'BIGINT', capabilities: [] }],
     rows: Array.from({ length: count }, (_, i) => ({ v: offset + i })),
@@ -96,7 +112,7 @@ describe('durable full results', () => {
 
   it('reopens a completed result from persisted run history', async () => {
     apiMock.listRuns.mockResolvedValue([{ id: 'history-row', runId: 'run-real', status: 'done',
-      targetNodeId: 'target', rows: 105, outputUri: '/outputs/result.parquet' }])
+      targetNodeId: 'target', rows: 105, outputs: [committedOutput('/outputs/result.parquet', 105)] }])
     apiMock.sample.mockResolvedValue(sample(0, 50, true))
     const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
@@ -104,6 +120,29 @@ describe('durable full results', () => {
     await user.click(await screen.findByRole('button', { name: 'Open full result' }))
     expect(await screen.findByText('rows 1–50 of 105')).toBeInTheDocument()
     expect(apiMock.sample).toHaveBeenCalledWith('/outputs/result.parquet', 50, undefined, 0)
+  })
+
+  it('shows every named history output and keeps a committed artifact inspectable after overall failure', async () => {
+    apiMock.listRuns.mockResolvedValue([{
+      id: 'partial-history', runId: 'partial-run', status: 'failed', targetNodeId: 'target', rows: null,
+      error: 'out failed', outputs: [
+        committedOutput('/outputs/pass.parquet', 7, 'pass'),
+        {
+          nodeId: 'target', portId: 'out', portLabel: 'Violations', wire: 'dataset',
+          publicationKind: 'result', outcome: 'failed', error: 'writer failed',
+        },
+      ],
+    }])
+    apiMock.sample.mockResolvedValue({ ...sample(0, 7, false), rows: [{ v: 'survived' }] })
+    const user = userEvent.setup()
+    render(<RunHistoryModal onClose={() => {}} />)
+
+    expect(await screen.findByLabelText('Outputs for run partial-history')).toBeInTheDocument()
+    expect(screen.getByText('pass')).toBeInTheDocument()
+    expect(screen.getByText('Violations')).toBeInTheDocument()
+    expect(screen.getByText('writer failed')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Open pass' }))
+    expect(await screen.findByText('survived')).toBeInTheDocument()
   })
 
   it('pages beyond the first 50 materialized rows', async () => {
@@ -171,7 +210,7 @@ describe('durable full results', () => {
       previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
       runs: { target: { phase: 'done', status: { runId: 'run-real', status: 'done',
         targetNodeId: 'target', rowsProcessed: 105, totalRows: 105, ms: 10, placement: 'local',
-        perNode: [], outputUri: '/outputs/result.parquet' } } },
+        perNode: [], outputs: [committedOutput('/outputs/result.parquet', 105)] } } },
     } as any)
     const user = userEvent.setup()
     render(<DataPanel nodeId="target" />)
@@ -192,7 +231,7 @@ describe('durable full results', () => {
       previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
       runs: { target: { phase: 'done', status: { runId: 'run-real', status: 'done',
         targetNodeId: 'target', rowsProcessed: 105, totalRows: 105, ms: 10, placement: 'local',
-        perNode: [], outputUri: '/outputs/result.parquet' } } },
+        perNode: [], outputs: [committedOutput('/outputs/result.parquet', 105)] } } },
     } as any)
     const user = userEvent.setup()
     render(<DataPanel nodeId="target" />)
@@ -204,6 +243,103 @@ describe('durable full results', () => {
     await user.click(sampleButton)
     expect(screen.queryByText('Couldn’t load full result')).not.toBeInTheDocument()
     expect(screen.getByText('rows 1–50')).toBeInTheDocument()
+  })
+
+  it('switches named output previews, sampled profiles, and full artifacts by the visible port tab', async () => {
+    registerAssertUiTestNode()
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'assert-ui-test', position: { x: 0, y: 0 },
+      data: { title: 'Quality gate', status: 'latest', config: {}, history: [] },
+    }] }
+    const passSample = { ...sample(0, 1, false), rows: [{ v: 'pass row' }] }
+    const violationSample = { ...sample(0, 1, false), rows: [{ v: 'violation row' }] }
+    apiMock.preview.mockResolvedValueOnce(passSample)
+    apiMock.sample.mockResolvedValueOnce(passSample)
+    useStore.setState({
+      doc, canvasRole: 'owner', profileJobs: {},
+      previews: { target: boundPreview(doc, 'target', violationSample, 'out') },
+      runs: { target: { phase: 'done', status: {
+        runId: 'named-output-run', status: 'done', targetNodeId: 'target', rowsProcessed: 2,
+        totalRows: null, ms: 10, placement: 'local', perNode: [],
+        outputs: [
+          committedOutput('/outputs/pass.parquet', 1, 'pass'),
+          committedOutput('/outputs/violations.parquet', 1, 'out'),
+        ],
+      } } },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.getByRole('button', { name: 'Violations' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByText('violation row')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Passing' }))
+    expect(await screen.findByText('pass row')).toBeInTheDocument()
+    expect(apiMock.preview).toHaveBeenLastCalledWith(doc, 'target', 50, 0, 'pass')
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    await waitFor(() => expect(apiMock.profile).toHaveBeenLastCalledWith(doc, 'target', 'pass'))
+    expect(screen.getByRole('button', { name: 'full dataset' })).toBeDisabled()
+    expect(screen.getByText(/Whole-dataset profiles are not available for multi-output nodes/i)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Rows' }))
+    await user.click(screen.getByRole('button', { name: 'Full result' }))
+    await waitFor(() => expect(apiMock.sample).toHaveBeenLastCalledWith('/outputs/pass.parquet', 50, undefined, 0))
+  })
+
+  it('does not carry a same-named port selection across a nodeId change', () => {
+    registerAssertUiTestNode()
+    const first = {
+      id: 'first', type: 'assert-ui-test', position: { x: 0, y: 0 },
+      data: { title: 'First gate', status: 'latest', config: {}, history: [] },
+    }
+    const second = {
+      id: 'second', type: 'assert-ui-test', position: { x: 0, y: 0 },
+      data: { title: 'Second gate', status: 'latest', config: {}, history: [] },
+    }
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [first, second] }
+    useStore.setState({
+      doc, runs: {},
+      previews: {
+        first: boundPreview(doc, 'first', {
+          columns: [{ name: 'v', type: 'BIGINT', capabilities: [] }], rows: [{ v: 'first pass' }], truncated: false,
+        }, 'pass'),
+        second: boundPreview(doc, 'second', {
+          columns: [{ name: 'v', type: 'BIGINT', capabilities: [] }], rows: [{ v: 'second violations' }], truncated: false,
+        }, 'out'),
+      },
+    } as any)
+
+    const { rerender } = render(<DataPanel nodeId="first" />)
+    expect(screen.getByRole('button', { name: 'Passing' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByText('first pass')).toBeInTheDocument()
+
+    rerender(<DataPanel nodeId="second" />)
+    expect(screen.getByRole('button', { name: 'Violations' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByText('second violations')).toBeInTheDocument()
+    expect(apiMock.preview).not.toHaveBeenCalled()
+  })
+
+  it('keeps each Section port explicitly not-previewable', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'section', position: { x: 0, y: 0 },
+      data: { title: 'Branches', status: 'stale', config: { outputs: ['left', 'right'] }, history: [] },
+    }] }
+    apiMock.preview.mockResolvedValueOnce({
+      columns: [], rows: [], truncated: false, notPreviewable: true, reason: 'right requires a full pass',
+    })
+    useStore.setState({
+      doc, runs: {},
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, notPreviewable: true, reason: 'left requires a full pass',
+      }, 'left') },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.getByText(/left requires a full pass/i)).toHaveTextContent(/Full runs for multi-output nodes are not available yet/i)
+    expect(screen.queryByRole('button', { name: /Run a full pass/i })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'right' }))
+    expect(await screen.findByText(/right requires a full pass/i)).toHaveTextContent(/Full runs for multi-output nodes are not available yet/i)
+    expect(apiMock.preview).toHaveBeenLastCalledWith(doc, 'target', 50, 0, 'right')
   })
 
   it('renders an exact grouped-chart artifact as a chart without starting another scan', async () => {
@@ -228,7 +364,7 @@ describe('durable full results', () => {
       runs: { target: { phase: 'done', status: {
         runId: 'chart-exact-run', status: 'done', targetNodeId: 'target',
         rowsProcessed: 2, totalRows: 2, ms: 10, placement: 'local', perNode: [],
-        outputUri: '/outputs/grouped-chart.parquet',
+        outputs: [committedOutput('/outputs/grouped-chart.parquet', 2)],
       } } },
     } as any)
 
@@ -263,7 +399,7 @@ describe('durable full results', () => {
       runs: { target: { phase: 'done', status: {
         runId: 'metric-exact-run', status: 'done', targetNodeId: 'target',
         rowsProcessed: 1, totalRows: 1, ms: 10, placement: 'local', perNode: [],
-        outputUri: '/outputs/metric.parquet',
+        outputs: [committedOutput('/outputs/metric.parquet', 1)],
       } } },
     } as any)
 
@@ -452,7 +588,7 @@ describe('durable full results', () => {
           planDigest, profileAttemptOrder: 2, rowsProcessed: 5, ms: 10,
           placement: 'local', perNode: [],
           profile: { columns: [], rowCount: 999, sampled: false },
-          outputUri: '/unverified/result.parquet',
+          outputs: [committedOutput('/unverified/result.parquet', 999)],
         },
       } },
     } as any)
@@ -607,6 +743,6 @@ describe('durable full results', () => {
   })
 })
 
-function boundPreview(doc: any, nodeId: string, result: any) {
-  return { canvasId: doc.id, nodeId, planIdentity: previewPlanIdentity(doc, nodeId), requestGeneration: 1, offset: 0, result }
+function boundPreview(doc: any, nodeId: string, result: any, portId?: string) {
+  return { canvasId: doc.id, nodeId, portId, planIdentity: previewPlanIdentity(doc, nodeId, portId), requestGeneration: 1, offset: 0, result }
 }

@@ -119,7 +119,7 @@ class Registry:
 
     def add_telemetry_sink(self, sink) -> None:
         """Register a callback invoked once per FINISHED run with a normalized telemetry record (a dict:
-        canvas_id/run_id/request_id/status/rows/ms/error/output_table/placement/per_node). Core ships no
+        canvas_id/run_id/request_id/job_type/status/rows/ms/error/outputs/placement/per_node). Core ships no
         exporter — an OTel/StatsD/log sink is a plugin. Delivery uses a finite per-sink queue; callback
         failures and overload are logged and never fail a run. See add_metric_sink / add_audit_sink."""
         if callable(sink):
@@ -207,25 +207,28 @@ def _persist_run(deps, graph, target, status) -> None:
     from hub.observability import (
         MetricName, MetricUnit, emit_metric, finished_run_metric_labels, get_request_id,
     )
+    # Region runners complete an internal implementation detail, not a logical user run.  Do not send
+    # their deliberately partial status through either the durable history contract or telemetry; the
+    # controller publishes the one complete logical run after all regions settle.
+    if getattr(graph, "id", None) == "_region":
+        return
     per_node = [p.model_dump() for p in (status.per_node or [])] or None
     request_id = getattr(status, "request_id", None) or get_request_id()
-    metadb.record_run(canvas_id=getattr(graph, "id", None), target_node_id=target, status=status.status,
+    persisted_target = status.target_node_id or target
+    metadb.record_run(canvas_id=getattr(graph, "id", None), target_node_id=persisted_target,
+                      job_type=status.job_type, status=status.status,
                       rows=status.total_rows, ms=status.ms, error=status.error,
-                      output_table=status.output_table, per_node=per_node,
-                      run_id=status.run_id, output_uri=status.output_uri, request_id=request_id)
-    # The RunController runs each region as an internal sub-graph with the sentinel id '_region' (see
-    # run_controller._subgraph); its base-runner completion must NOT leak to sinks as a phantom run — the
-    # controller fires the real, user-facing completion once for the whole logical run.
-    if getattr(graph, "id", None) != "_region":
-        _emit_telemetry(deps, graph, target, status, per_node, request_id=request_id)
-        labels = finished_run_metric_labels(status.status, status.placement)
-        emit_metric(MetricName.RUN_FINISHED, 1.0, labels=labels,
-                    request_id=request_id, run_id=status.run_id)
-        emit_metric(MetricName.RUN_STATE, 1.0, labels=labels,
-                    request_id=request_id, run_id=status.run_id)
-        if status.ms is not None:
-            emit_metric(MetricName.RUN_DURATION_MS, float(status.ms), unit=MetricUnit.MILLISECONDS,
-                        labels=labels, request_id=request_id, run_id=status.run_id)
+                      outputs=[output.model_dump() for output in status.outputs], per_node=per_node,
+                      run_id=status.run_id, request_id=request_id)
+    _emit_telemetry(deps, graph, persisted_target, status, per_node, request_id=request_id)
+    labels = finished_run_metric_labels(status.status, status.placement)
+    emit_metric(MetricName.RUN_FINISHED, 1.0, labels=labels,
+                request_id=request_id, run_id=status.run_id)
+    emit_metric(MetricName.RUN_STATE, 1.0, labels=labels,
+                request_id=request_id, run_id=status.run_id)
+    if status.ms is not None:
+        emit_metric(MetricName.RUN_DURATION_MS, float(status.ms), unit=MetricUnit.MILLISECONDS,
+                    labels=labels, request_id=request_id, run_id=status.run_id)
 
 
 def _emit_telemetry(deps, graph, target, status, per_node, *, request_id=None) -> None:
@@ -239,8 +242,10 @@ def _emit_telemetry(deps, graph, target, status, per_node, *, request_id=None) -
     rid = request_id if request_id is not None else getattr(status, "request_id", None)
     record = {"canvas_id": getattr(graph, "id", None), "target_node_id": target, "run_id": status.run_id,
               "request_id": rid,
+              "job_type": status.job_type,
               "status": status.status, "rows": status.total_rows, "ms": status.ms, "error": status.error,
-              "output_table": status.output_table, "placement": status.placement, "per_node": per_node}
+              "outputs": [output.model_dump() for output in status.outputs],
+              "placement": status.placement, "per_node": per_node}
     fanout_sinks(list(sinks), record, kind="telemetry")
 
 
@@ -269,8 +274,10 @@ def _result_acquire(key, owner, ttl_seconds):
 def _result_put(key, doc) -> None:
     from hub import metadb
     from hub.handoff import prepare_attempt_commit
-    if doc.get("uri"):
-        prepare_attempt_commit(doc["uri"])
+    from hub.run_outputs import sole_committed_document_output
+    output = sole_committed_document_output(doc)
+    if output is not None:
+        prepare_attempt_commit(str(output.uri))
     metadb.put_result(key, doc)
 
 
@@ -387,7 +394,7 @@ class Deps:
         # the same durable RunState status/cancel/recovery contract.
         from hub.profile_jobs import ProfileProcessRunner
         self.profile_runner = ProfileProcessRunner(
-            workspace, data_dir, storage=self.storage)
+            workspace, data_dir, storage=self.storage, node_specs=self.node_specs)
         self.profile_runner.on_complete = _on_complete
         self.profile_runner.on_status = _persist_run_state
         from hub.subprocess_runner import SubprocessRunner
@@ -395,7 +402,8 @@ class Deps:
         # by name via pick_runner; pod/Ray runners install as plugins over the same protocol.
         sub = SubprocessRunner(
             workspace, data_dir, catalog=self.catalog, storage=self.storage,
-            resolve_adapter=self.resolve_adapter, node_builders=self.node_builders)
+            resolve_adapter=self.resolve_adapter, node_builders=self.node_builders,
+            node_specs=self.node_specs)
         sub.on_complete = _on_complete  # record cancelled/crashed isolated runs the child couldn't
         sub.on_status = _persist_run_state
         sub.result_put = _result_put

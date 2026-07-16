@@ -1,5 +1,6 @@
 // Kernel API DTOs — camelCase on the wire, mirrors kernel/models.py.
 import type { ColumnSchema } from './graph'
+import type { WireType } from '../theme/tokens'
 
 export interface ResourceSpec {
   cpu?: number | null
@@ -202,10 +203,25 @@ export interface PerNodeStatus {
   error?: string | null   // set on the failed step — the error + a fix hint, attributed to its node
 }
 
+export type RunOutputOutcome = 'pending' | 'committed' | 'failed' | 'skipped' | 'cancelled'
+
+export interface RunOutput {
+  nodeId: string
+  portId: string
+  portLabel?: string | null
+  wire: WireType
+  publicationKind: 'result' | 'catalog'
+  outcome: RunOutputOutcome
+  uri?: string | null
+  table?: string | null
+  rows?: number | null
+  error?: string | null
+}
+
 export interface RunStatus {
   runId: string
   status: RunState
-  jobType?: 'run' | 'profile'
+  jobType: 'run' | 'profile'
   targetNodeId?: string | null
   rowsProcessed: number
   totalRows?: number | null
@@ -215,8 +231,7 @@ export interface RunStatus {
   progress?: number | null   // 0..1 fraction of steps complete
   stalled?: boolean          // running but no step has completed for a while (a soft "stuck?" hint)
   error?: string | null
-  outputUri?: string | null
-  outputTable?: string | null
+  outputs: RunOutput[]
   profile?: ProfileResult | null
   planDigest?: string | null
   profileAttemptOrder?: number | null

@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { FullResult } from './DataPanel'
+import type { RunOutput } from '../types/api'
 
 // Persisted run history + telemetry for the current canvas (survives restarts) — /canvas/{id}/runs.
 // Charts are native inline SVG (no external lib) so they work fully offline and theme-aware.
@@ -38,7 +39,6 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
             {runs?.map((r) => {
               const st = statusTok[r.status as keyof typeof statusTok] ?? statusTok.draft
               const hasNodes = !!r.perNode && r.perNode.length > 0
-              const hasResult = r.status === 'done' && !!r.outputUri
               const isOpen = open === r.id
               return (
                 <div key={r.id} className="border-b border-border">
@@ -49,25 +49,20 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                     <span className="w-3 text-center text-muted-foreground">{hasNodes ? (isOpen ? '▾' : '▸') : ''}</span>
                     <span className="w-3 text-center" style={{ color: st.color }}>{st.glyph}</span>
                     <Badge variant="secondary" className="w-[70px] justify-center">{r.status}</Badge>
+                    <Badge variant="outline" className="w-[54px] justify-center capitalize">{r.jobType}</Badge>
                     <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-foreground">
-                      {r.outputTable ? `→ ${r.outputTable}` : r.targetNodeId ?? '—'}
+                      {r.targetNodeId ?? '—'}
+                      {r.outputs.length > 0 && <span className="text-muted-foreground"> · {r.outputs.length} output{r.outputs.length === 1 ? '' : 's'}</span>}
                       {r.error && <span className="text-destructive"> · {r.error}</span>}
                     </span>
                     {r.rows != null && <span className="text-muted-foreground">{r.rows.toLocaleString()} rows</span>}
-                    {hasResult && (
-                      <Button variant="ghost" size="sm" className="h-6 px-2 text-[10.5px]"
-                        onClick={(e) => { e.stopPropagation(); setResultOpen(resultOpen === r.id ? null : r.id) }}>
-                        {resultOpen === r.id ? 'Hide result' : 'Open full result'}
-                      </Button>
-                    )}
                     {r.ms != null && <span className="w-16 text-right text-muted-foreground">{fmtMs(r.ms)}</span>}
                     <span className="w-32 text-right text-[11px] text-muted-foreground">{r.createdAt ? new Date(r.createdAt).toLocaleString() : ''}</span>
                   </div>
                   {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
-                  {resultOpen === r.id && r.outputUri && (
-                    <div className="border-t border-border">
-                      <FullResult uri={r.outputUri} total={r.rows ?? null} />
-                    </div>
+                  {r.outputs.length > 0 && (
+                    <HistoryOutputs runId={r.id} outputs={r.outputs} openKey={resultOpen}
+                      onToggle={(key) => setResultOpen(resultOpen === key ? null : key)} />
                   )}
                 </div>
               )
@@ -76,6 +71,53 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
         </div>
       </DialogContent>
     </Dialog>
+  )
+}
+
+function historyOutputKey(runId: string, output: RunOutput): string {
+  return JSON.stringify([runId, output.nodeId, output.portId])
+}
+
+function HistoryOutputs({ runId, outputs, openKey, onToggle }: {
+  runId: string
+  outputs: RunOutput[]
+  openKey: string | null
+  onToggle: (key: string) => void
+}) {
+  return (
+    <div aria-label={`Outputs for run ${runId}`} className="border-t border-border bg-muted/20">
+      {outputs.map((output) => {
+        const key = historyOutputKey(runId, output)
+        const readable = output.outcome === 'committed' && !!output.uri
+        const label = output.portLabel || output.portId
+        return (
+          <div key={`${output.nodeId}:${output.portId}`} className="border-b border-border/60 last:border-b-0">
+            <div className="flex items-center gap-2 px-4 py-2 text-[11px]">
+              <span className="dp-mono min-w-0 max-w-36 overflow-hidden text-ellipsis whitespace-nowrap font-semibold text-foreground"
+                title={`${output.nodeId}:${output.portId}`}>{label}</span>
+              <Badge variant="outline" className="h-5 px-1.5 text-[9px] uppercase">{output.outcome}</Badge>
+              <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-muted-foreground"
+                title={output.table || output.uri || undefined}>
+                {output.table ? `→ ${output.table}` : output.uri ? `→ ${output.uri}` : output.publicationKind}
+              </span>
+              {output.rows != null && <span className="shrink-0 text-muted-foreground">{output.rows.toLocaleString()} rows</span>}
+              {readable && (
+                <Button variant="ghost" size="sm" className="h-6 px-2 text-[10.5px]"
+                  onClick={() => onToggle(key)}>
+                  {openKey === key ? 'Hide result' : outputs.length === 1 ? 'Open full result' : `Open ${label}`}
+                </Button>
+              )}
+            </div>
+            {output.error && <div className="dp-mono px-4 pb-2 text-[10.5px] text-destructive">{output.error}</div>}
+            {openKey === key && readable && (
+              <div className="border-t border-border">
+                <FullResult uri={output.uri!} total={output.rows ?? null} />
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
   )
 }
 
@@ -130,9 +172,9 @@ export function PerNodeBreakdown({ nodes }: { nodes: PerNodeStat[] }) {
           const st = statusTok[n.status as keyof typeof statusTok] ?? statusTok.draft
           const pct = Math.max(2, Math.round(((n.ms ?? 0) / max) * 100))
           return (
-            <div key={n.node_id} className="flex items-center gap-2 text-[11.5px]">
-              <span className="w-28 shrink-0 overflow-hidden text-ellipsis whitespace-nowrap text-foreground" title={n.node_id}>
-                {n.label || n.node_id}
+            <div key={n.nodeId} className="flex items-center gap-2 text-[11.5px]">
+              <span className="w-28 shrink-0 overflow-hidden text-ellipsis whitespace-nowrap text-foreground" title={n.nodeId}>
+                {n.label || n.nodeId}
               </span>
               <div className="relative h-3.5 min-w-0 flex-1 rounded-sm bg-border/60">
                 <div className="absolute inset-y-0 left-0 rounded-sm" style={{ width: `${pct}%`, backgroundColor: st.color, opacity: 0.85 }} />

@@ -13,7 +13,9 @@ import pytest
 from sqlalchemy import func, select, text
 
 from hub import handoff, metadb
+from hub.models import RunOutput, RunStatus
 from hub.process_scope import OwnedProcessScope
+from hub.run_outputs import require_single_run_output, sole_committed_document_output, sole_output
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -61,6 +63,55 @@ def _commit(handle: dict, *, version_id: str | None = None) -> list[dict]:
     inventory = _inventory(handle, version_id=version_id)
     metadb.record_object_attempt_commit(handle["uri"], inventory)
     return inventory
+
+
+def _run_output(
+        uri: str | None = None, *, rows: int | None = None,
+        node_id: str = "source", table: str | None = None,
+        outcome: str = "committed", publication_kind: str | None = None) -> RunOutput:
+    kind = publication_kind or ("catalog" if table is not None else "result")
+    return RunOutput(
+        node_id=node_id, port_id="out", wire="dataset", publication_kind=kind,
+        outcome=outcome, uri=uri,
+        table=table if outcome == "committed" else None, rows=rows,
+    )
+
+
+def _cache_document(uri: str, rows: int = 1, *, node_id: str = "source") -> dict:
+    return {"outputs": [_run_output(uri, rows=rows, node_id=node_id).model_dump()]}
+
+
+def _cached_output(key: str) -> RunOutput:
+    document = metadb.get_result(key)
+    assert document is not None and set(document) == {"outputs"}
+    output = sole_committed_document_output(document)
+    assert output is not None and output.rows is not None
+    return output
+
+
+def _committed_output(status: RunStatus) -> RunOutput:
+    output = sole_output(status, committed=True)
+    assert output is not None
+    return output
+
+
+def _retire_result_cache(key: str) -> None:
+    """Simulate bounded cache-row pruning without publishing a legacy null-URI tombstone."""
+    with metadb.session() as session:
+        row = session.get(metadb.ResultCache, str(key), with_for_update=True)
+        if row is None:
+            return
+        metadb._replace_attempt_ref(session, "result_cache", str(key), None)
+        session.delete(row)
+
+
+def _run_state_document(
+        run_id: str, uri: str, *, rows: int = 1,
+        node_id: str = "source", table: str | None = None) -> dict:
+    return RunStatus(
+        run_id=run_id, status="done", target_node_id=node_id, total_rows=rows,
+        outputs=[_run_output(uri, rows=rows, node_id=node_id, table=table)],
+    ).model_dump()
 
 
 def _state(uri: str) -> str:
@@ -220,7 +271,7 @@ def test_postgres_cache_replacement_reader_pin_and_gc_are_atomic():
     _commit(old)
     _commit(new)
     cache_key = f"pg-cache-race-{token}"
-    metadb.put_result(cache_key, {"uri": old["uri"], "rows": 1})
+    metadb.put_result(cache_key, _cache_document(old["uri"]))
     barrier = threading.Barrier(2)
     acquired: list[tuple[dict | None, str | None]] = []
     errors: list[BaseException] = []
@@ -236,7 +287,7 @@ def test_postgres_cache_replacement_reader_pin_and_gc_are_atomic():
     def replace() -> None:
         try:
             barrier.wait(timeout=3)
-            metadb.put_result(cache_key, {"uri": new["uri"], "rows": 1})
+            metadb.put_result(cache_key, _cache_document(new["uri"]))
         except BaseException as exc:  # noqa: BLE001 - asserted below
             errors.append(exc)
 
@@ -249,19 +300,20 @@ def test_postgres_cache_replacement_reader_pin_and_gc_are_atomic():
     assert all(not thread.is_alive() for thread in threads)
     assert errors == [] and len(acquired) == 1
     doc, pin_id = acquired[0]
-    pinned_uri = doc["uri"]
+    pinned_output = sole_committed_document_output(doc)
+    assert pinned_output is not None
+    pinned_uri = pinned_output.uri
     assert pinned_uri in (old["uri"], new["uri"]) and pin_id
     actions = metadb.object_attempt_gc_batch(0, 0)
     assert pinned_uri not in {action["uri"] for action in actions}
     assert _state(pinned_uri) == "published"
 
     run_id = f"pg-cache-reader-{token}"
-    metadb.save_run_state(run_id, {
-        "run_id": run_id, "status": "done", "output_uri": pinned_uri})
+    metadb.save_run_state(run_id, _run_state_document(run_id, pinned_uri))
     metadb.release_result_cache_pin(pin_id)
     assert _state(pinned_uri) == "published"
     _retire_terminal_run_state(run_id)
-    metadb.put_result(cache_key, {"uri": None})
+    _retire_result_cache(cache_key)
     for handle in (old, new):
         metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
@@ -420,9 +472,9 @@ def test_postgres_result_pin_release_and_expiry_cleanup_share_lock_order():
         handles.append(handle)
         _commit(handle)
         cache_key = f"pg-pin-expiry-{token}"
-        metadb.put_result(cache_key, {"uri": handle["uri"]})
+        metadb.put_result(cache_key, _cache_document(handle["uri"]))
         _doc, pin_id = metadb.acquire_result_cache_pin(cache_key, f"expiry-{index}", 30)
-        metadb.put_result(cache_key, {"uri": None})
+        _retire_result_cache(cache_key)
         with metadb.session() as session:
             session.get(metadb.ObjectAttemptLease, pin_id).expires_at = \
                 metadb._db_now(session) - datetime.timedelta(seconds=1)
@@ -936,8 +988,8 @@ def test_attempt_refs_cover_cache_history_and_state_pruning(monkeypatch):
     _commit(handle)
     uri = handle["uri"]
     cache_a, cache_b = f"cache-{uuid.uuid4().hex}", f"cache-{uuid.uuid4().hex}"
-    metadb.put_result(cache_a, {"uri": uri, "rows": 1})
-    metadb.put_result(cache_b, {"uri": uri, "rows": 1})
+    metadb.put_result(cache_a, _cache_document(uri))
+    metadb.put_result(cache_b, _cache_document(uri))
 
     canvas_id = f"canvas-{uuid.uuid4().hex}"
     with metadb.session() as session:
@@ -946,8 +998,11 @@ def test_attempt_refs_cover_cache_history_and_state_pruning(monkeypatch):
     monkeypatch.setattr(metadb, "_RUN_HISTORY_MAX", 1)
     monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 1)
     run_id = f"run-{uuid.uuid4().hex}"
-    metadb.record_run(canvas_id, "n", "done", run_id=run_id, output_uri=uri)
-    metadb.save_run_state(run_id, {"run_id": run_id, "status": "done", "output_uri": uri})
+    history_output = _run_output(uri, rows=1, node_id="n").model_dump()
+    metadb.record_run(
+        canvas_id, "n", "run", "done", rows=1,
+        outputs=[history_output], run_id=run_id)
+    metadb.save_run_state(run_id, _run_state_document(run_id, uri, node_id="n"))
 
     with metadb.session() as session:
         refs = list(session.scalars(select(metadb.ObjectAttemptRef).where(
@@ -956,15 +1011,15 @@ def test_attempt_refs_cover_cache_history_and_state_pruning(monkeypatch):
             "result_cache", "result_cache", "run_record", "run_state"]
 
     # Pruning the owning SQL rows releases exactly their refs, but two cache owners still pin the data.
-    metadb.record_run(canvas_id, "n", "done", run_id=f"new-{run_id}")
+    metadb.record_run(canvas_id, None, "run", "done", run_id=f"new-{run_id}")
     metadb.save_run_state(
         f"new-{run_id}", {"run_id": f"new-{run_id}", "status": "done"})
     assert _state(uri) == "published"
-    metadb.put_result(cache_a, {"uri": None})
+    _retire_result_cache(cache_a)
     assert _state(uri) == "published", "one cache key cannot retire another key's artifact"
     with handoff.managed_read_lease(uri, owner="history-read"):
         assert _state(uri) == "published"
-    metadb.put_result(cache_b, {"uri": None})
+    _retire_result_cache(cache_b)
     assert _state(uri) == "superseded"
     metadb.quarantine_object_attempt(uri, "test cleanup")
 
@@ -1096,9 +1151,9 @@ def test_read_lease_wins_or_observes_explicit_gc_miss():
     reader_first = _handle()
     _commit(reader_first)
     key = f"lease-{uuid.uuid4().hex}"
-    metadb.put_result(key, {"uri": reader_first["uri"]})
+    metadb.put_result(key, _cache_document(reader_first["uri"]))
     lease = metadb.acquire_object_attempt_lease(reader_first["uri"], "read", "reader", 30)
-    metadb.put_result(key, {"uri": None})
+    _retire_result_cache(key)
     assert not any(item["uri"] == reader_first["uri"] for item in
                    metadb.object_attempt_gc_batch(0, 0))
     metadb.release_object_attempt_lease(lease)
@@ -1109,8 +1164,8 @@ def test_read_lease_wins_or_observes_explicit_gc_miss():
     gc_first = _handle()
     _commit(gc_first)
     key2 = f"lease-{uuid.uuid4().hex}"
-    metadb.put_result(key2, {"uri": gc_first["uri"]})
-    metadb.put_result(key2, {"uri": None})
+    metadb.put_result(key2, _cache_document(gc_first["uri"]))
+    _retire_result_cache(key2)
     next(item for item in metadb.object_attempt_gc_batch(0, 0) if item["uri"] == gc_first["uri"])
     with pytest.raises(FileNotFoundError, match="unavailable"):
         metadb.acquire_object_attempt_lease(gc_first["uri"], "read", "late-reader", 30)
@@ -1125,19 +1180,19 @@ def test_result_cache_pin_keeps_replaced_generation_published_until_run_owns_it(
     _commit(old)
     _commit(new)
     cache_key = f"cache-pin-{uuid.uuid4().hex}"
-    metadb.put_result(cache_key, {"uri": old["uri"], "rows": 1})
+    metadb.put_result(cache_key, _cache_document(old["uri"]))
     doc, pin_id = metadb.acquire_result_cache_pin(cache_key, "pin-reader", 30)
-    assert doc["uri"] == old["uri"] and pin_id
+    cached_output = sole_committed_document_output(doc)
+    assert cached_output is not None and cached_output.uri == old["uri"] and pin_id
 
-    metadb.put_result(cache_key, {"uri": new["uri"], "rows": 1})
+    metadb.put_result(cache_key, _cache_document(new["uri"]))
     assert _state(old["uri"]) == "published"
     with metadb.session() as session:
         assert session.get(metadb.ObjectAttemptRef, {
             "ref_type": "result_reader", "ref_key": pin_id}).attempt_uri == old["uri"]
 
     run_id = f"cache-pin-run-{uuid.uuid4().hex}"
-    metadb.save_run_state(run_id, {
-        "run_id": run_id, "status": "done", "output_uri": old["uri"]})
+    metadb.save_run_state(run_id, _run_state_document(run_id, old["uri"]))
     metadb.release_result_cache_pin(pin_id)
     assert _state(old["uri"]) == "published", "terminal RunState replaced the temporary owner"
     with metadb.session() as session:
@@ -1147,7 +1202,7 @@ def test_result_cache_pin_keeps_replaced_generation_published_until_run_owns_it(
 
     _retire_terminal_run_state(run_id)
     assert _state(old["uri"]) == "superseded"
-    metadb.put_result(cache_key, {"uri": None})
+    _retire_result_cache(cache_key)
     metadb.quarantine_object_attempt(old["uri"], "test cleanup")
     metadb.quarantine_object_attempt(new["uri"], "test cleanup")
 
@@ -1156,8 +1211,7 @@ def test_done_run_state_is_primary_owner_for_noncacheable_committed_region():
     handle = _handle(logical=f"s3://lifecycle-tests/{uuid.uuid4().hex}/noncacheable.parquet")
     _commit(handle)
     run_id = f"noncacheable-{uuid.uuid4().hex}"
-    metadb.save_run_state(run_id, {
-        "run_id": run_id, "status": "done", "output_uri": handle["uri"]},
+    metadb.save_run_state(run_id, _run_state_document(run_id, handle["uri"]),
         publish_region=True)
     assert _state(handle["uri"]) == "published"
     with metadb.session() as session:
@@ -1201,7 +1255,7 @@ def test_local_runner_terminal_persistence_failure_releases_cache_pin_before_ter
         deps.registry, deps.catalog, str(tmp_path), node_builders=deps.node_builders,
         node_specs=deps.node_specs)
     phash = runner._plan_hash(graph, "source")
-    metadb.put_result(phash, {"uri": handle["uri"], "rows": 1, "table": None})
+    metadb.put_result(phash, _cache_document(handle["uri"]))
     runner.result_acquire = metadb.acquire_result_cache_pin
     persistence_started = threading.Event()
     allow_failure = threading.Event()
@@ -1259,7 +1313,8 @@ def test_local_runner_terminal_persistence_failure_releases_cache_pin_before_ter
         assert time.monotonic() < deadline
         time.sleep(0.01)
     final = runner.status(started.run_id)
-    assert final.status == "failed" and final.output_uri is None
+    assert final.status == "failed"
+    assert final.outputs[0].outcome == "failed" and final.outputs[0].uri is None
     assert "full result publication failed" in (final.error or "")
     assert "terminal persistence unavailable" not in (final.error or "")
     assert "terminal persistence unavailable" in caplog.text
@@ -1268,7 +1323,7 @@ def test_local_runner_terminal_persistence_failure_releases_cache_pin_before_ter
             metadb.ObjectAttemptRef.ref_type == "result_reader",
             metadb.ObjectAttemptRef.attempt_uri == handle["uri"],
         )))
-    metadb.put_result(phash, {"uri": None})
+    _retire_result_cache(phash)
     metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
@@ -1304,7 +1359,7 @@ def test_local_runner_cancel_releases_cache_pin_before_terminal(
         deps.registry, deps.catalog, str(tmp_path), node_builders=deps.node_builders,
         node_specs=deps.node_specs)
     phash = runner._plan_hash(graph, "source")
-    metadb.put_result(phash, {"uri": handle["uri"], "rows": 1, "table": None})
+    metadb.put_result(phash, _cache_document(handle["uri"]))
     runner.result_acquire = metadb.acquire_result_cache_pin
     cache_acquired = threading.Event()
     allow_step = threading.Event()
@@ -1351,7 +1406,7 @@ def test_local_runner_cancel_releases_cache_pin_before_terminal(
             metadb.ObjectAttemptRef.ref_type == "result_reader",
             metadb.ObjectAttemptRef.attempt_uri == handle["uri"],
         )))
-    metadb.put_result(phash, {"uri": None})
+    _retire_result_cache(phash)
     metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
@@ -1359,9 +1414,9 @@ def test_long_reader_renews_beyond_initial_ttl_and_blocks_gc():
     handle = _handle()
     _commit(handle)
     key = f"renew-{uuid.uuid4().hex}"
-    metadb.put_result(key, {"uri": handle["uri"]})
+    metadb.put_result(key, _cache_document(handle["uri"]))
     with handoff.managed_read_lease(handle["uri"], owner="slow-reader", ttl_seconds=1) as guard:
-        metadb.put_result(key, {"uri": None})
+        _retire_result_cache(key)
         time.sleep(2.35)  # past the requested TTL and SQLite's one-second DB-clock resolution margin
         guard.check()
         assert not any(item["uri"] == handle["uri"] for item in
@@ -1417,7 +1472,7 @@ def test_unrelated_attempt_writes_do_not_take_installation_lock(monkeypatch):
 
     def publish(handle, key):
         try:
-            metadb.put_result(key, {"uri": handle["uri"]})
+            metadb.put_result(key, _cache_document(handle["uri"]))
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -1440,7 +1495,7 @@ def test_sqlite_cache_replacement_and_reader_pin_are_serialized():
     _commit(old)
     _commit(new)
     cache_key = f"sqlite-cache-race-{uuid.uuid4().hex}"
-    metadb.put_result(cache_key, {"uri": old["uri"], "rows": 1})
+    metadb.put_result(cache_key, _cache_document(old["uri"]))
     barrier = threading.Barrier(2)
     acquired: list[tuple[dict | None, str | None]] = []
     errors: list[BaseException] = []
@@ -1456,7 +1511,7 @@ def test_sqlite_cache_replacement_and_reader_pin_are_serialized():
     def replace() -> None:
         try:
             barrier.wait(timeout=3)
-            metadb.put_result(cache_key, {"uri": new["uri"], "rows": 1})
+            metadb.put_result(cache_key, _cache_document(new["uri"]))
         except BaseException as exc:  # noqa: BLE001 - asserted below
             errors.append(exc)
 
@@ -1468,10 +1523,12 @@ def test_sqlite_cache_replacement_and_reader_pin_are_serialized():
     assert all(not thread.is_alive() for thread in threads)
     assert errors == [] and len(acquired) == 1
     doc, pin_id = acquired[0]
-    assert doc["uri"] in (old["uri"], new["uri"]) and pin_id
-    assert _state(doc["uri"]) == "published"
+    acquired_output = sole_committed_document_output(doc)
+    assert acquired_output is not None
+    assert acquired_output.uri in (old["uri"], new["uri"]) and pin_id
+    assert _state(acquired_output.uri) == "published"
     metadb.release_result_cache_pin(pin_id)
-    metadb.put_result(cache_key, {"uri": None})
+    _retire_result_cache(cache_key)
     metadb.quarantine_object_attempt(old["uri"], "test cleanup")
     metadb.quarantine_object_attempt(new["uri"], "test cleanup")
 
@@ -1648,7 +1705,7 @@ def test_repeated_published_commit_validation_never_regresses_state():
     handle = _handle()
     inventory = _commit(handle)
     key = f"repeat-{uuid.uuid4().hex}"
-    metadb.put_result(key, {"uri": handle["uri"]})
+    metadb.put_result(key, _cache_document(handle["uri"]))
     metadb.record_object_attempt_commit(handle["uri"], inventory)
     assert _state(handle["uri"]) == "published"
     changed = [dict(item) for item in inventory]
@@ -1738,10 +1795,13 @@ def test_commit_crash_publish_lease_expires_and_secondary_pointers_fail_closed()
             id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name="commit crash",
             version=1, doc="{}"))
     with pytest.raises(RuntimeError, match="only a published"):
-        metadb.record_run(canvas_id, "n", "done", run_id="secondary", output_uri=uri)
+        metadb.record_run(
+            canvas_id, "n", "run", "done", rows=1,
+            outputs=[_run_output(uri, rows=1, node_id="n").model_dump()],
+            run_id="secondary")
     with pytest.raises(RuntimeError, match="only a published"):
-        metadb.save_run_state(
-            "secondary", {"run_id": "secondary", "status": "done", "output_uri": uri})
+        metadb.save_run_state("secondary", _run_state_document(
+            "secondary", uri, node_id="n"))
 
     with metadb.session() as session:
         row = session.get(metadb.ObjectAttempt, uri)
@@ -2071,15 +2131,18 @@ def test_isolated_clone_cannot_take_original_namespace_or_inherited_visibility(t
             allocation_key=f"clone-region-{uuid.uuid4().hex}")
         _commit(region)
         cache_key = f"clone-cache-{uuid.uuid4().hex}"
-        metadb.put_result(cache_key, {"uri": region["uri"], "rows": 1})
+        metadb.put_result(cache_key, _cache_document(region["uri"]))
         canvas_id = f"clone-canvas-{uuid.uuid4().hex}"
         with metadb.session() as session:
             session.add(metadb.Canvas(
                 id=canvas_id, owner_id=metadb.DEFAULT_USER_ID,
                 name="clone history", version=1, doc="{}"))
+        clone_run_id = f"clone-run-{uuid.uuid4().hex}"
         metadb.record_run(
-            canvas_id, "n", "done", run_id=f"clone-run-{uuid.uuid4().hex}",
-            output_uri=region["uri"])
+            canvas_id, "n", "run", "done", rows=1,
+            outputs=[_run_output(
+                region["uri"], rows=1, node_id="n").model_dump()],
+            run_id=clone_run_id)
         inherited_writing = _handle(
             logical="s3://clone-claim-bucket/root/writing.parquet",
             allocation_key=f"clone-writing-{uuid.uuid4().hex}")
@@ -2117,7 +2180,7 @@ def test_isolated_clone_cannot_take_original_namespace_or_inherited_visibility(t
             assert session.scalar(select(func.count()).select_from(
                 metadb.ObjectAttemptRef)) == 0
             record = session.scalar(select(metadb.RunRecord).where(
-                metadb.RunRecord.output_uri == region["uri"]))
+                metadb.RunRecord.run_id == clone_run_id))
             assert record is not None
         assert metadb.get_result(cache_key) is None
         assert metadb.catalog_get(sink["uri"]) is None
@@ -2132,7 +2195,7 @@ def test_isolated_clone_cannot_take_original_namespace_or_inherited_visibility(t
         handoff.ensure_storage_namespace_claim(claim_uri, namespace)
         assert metadb.object_attempt_owner_id() == owner
         assert metadb.catalog_get(sink["uri"])["uri"] == sink["uri"]
-        assert metadb.get_result(cache_key)["uri"] == region["uri"]
+        assert _cached_output(cache_key).uri == region["uri"]
         new_logical = f"s3://clone-claim-bucket/root/{uuid.uuid4().hex}.parquet"
         new_handle = handoff.allocate_attempt(
             logical_uri=new_logical, kind="region", run_id="original-still-active",
@@ -2361,20 +2424,24 @@ def test_moto_versioned_s3_history_read_and_exact_sibling_safe_gc(
         captured = metadb.object_attempt_inventory(first["uri"])
         assert sum(item["member_type"] == "object_version" for item in captured) >= 3
         assert any(item["member_type"] == "delete_marker" for item in captured)
-        metadb.put_result(cache_key, {"uri": first["uri"], "rows": 1})
+        metadb.put_result(cache_key, _cache_document(first["uri"]))
         with metadb.session() as session:
             session.add(metadb.Canvas(
                 id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name="moto history",
                 version=1, doc="{}"))
         run_id = f"moto-run-{uuid.uuid4().hex}"
-        metadb.record_run(canvas_id, "n", "done", run_id=run_id, output_uri=first["uri"])
+        metadb.record_run(
+            canvas_id, "n", "run", "done", rows=1,
+            outputs=[_run_output(
+                first["uri"], rows=1, node_id="n").model_dump()],
+            run_id=run_id)
         metadb.save_run_state(
-            run_id, {"run_id": run_id, "status": "done", "output_uri": first["uri"]},
+            run_id, _run_state_document(run_id, first["uri"], node_id="n"),
             canvas_id=canvas_id)
 
         second = _handle(logical=logical, allocation_key=f"moto-second-{uuid.uuid4().hex}")
         land(second, 2)
-        metadb.put_result(cache_key, {"uri": second["uri"], "rows": 1})
+        metadb.put_result(cache_key, _cache_document(second["uri"]))
         assert _state(first["uri"]) == "published", "run history must keep the old version readable"
         class _HistoryAdapter:
             def preview_scan(self, _uri, _columns=None, limit=None):
@@ -2437,7 +2504,7 @@ def test_moto_versioned_s3_history_read_and_exact_sibling_safe_gc(
             Bucket="lifecycle-versioned", Prefix=partial_key).get("Uploads", [])
         assert uploads == []
     finally:
-        metadb.put_result(cache_key, {"uri": None})
+        _retire_result_cache(cache_key)
         if second is not None:
             metadb.quarantine_object_attempt(second["uri"], "test cleanup")
         object_store_cred(None)
@@ -2635,24 +2702,31 @@ def test_moto_subprocess_backends_publish_parent_owned_object_full_result(
             time.sleep(0.05)
         final = runner.status(status.run_id)
         assert final.status == "done", final.error
-        assert final.output_uri and final.output_table is None
-        result_key = urlsplit(final.output_uri).path.lstrip("/").rstrip("/") \
+        assert len(final.outputs) == 1
+        output = final.outputs[0]
+        assert output.outcome == "committed" and output.uri and output.table is None
+        result_key = urlsplit(output.uri).path.lstrip("/").rstrip("/") \
             + "/part-00000.parquet"
         result_bytes = client.get_object(
             Bucket="subprocess-full-result", Key=result_key)["Body"].read()
         assert pq.read_table(pa.BufferReader(result_bytes)).num_rows == 3
         with metadb.session() as session:
-            attempt = session.get(metadb.ObjectAttempt, final.output_uri)
+            attempt = session.get(metadb.ObjectAttempt, output.uri)
             assert attempt is not None and attempt.state == "published"
             ref = session.get(metadb.ObjectAttemptRef, {
                 "ref_type": "run_state", "ref_key": final.run_id})
-            assert ref is not None and ref.attempt_uri == final.output_uri
+            assert ref is not None and ref.attempt_uri == output.uri
         phash = deps.runner._plan_hash(graph, "source")
-        assert metadb.get_result(phash)["uri"] == final.output_uri
+        cache_deadline = time.monotonic() + 2
+        while metadb.get_result(phash) is None and time.monotonic() < cache_deadline:
+            # The durable RunState is the terminal publication point; the reusable cache pointer is a
+            # best-effort secondary write performed immediately afterward.
+            time.sleep(0.01)
+        assert _cached_output(phash).uri == output.uri
 
         _retire_terminal_run_state(final.run_id)
-        metadb.put_result(phash, {"uri": None})
-        metadb.quarantine_object_attempt(final.output_uri, "test cleanup")
+        _retire_result_cache(phash)
+        metadb.quarantine_object_attempt(output.uri, "test cleanup")
     finally:
         if runner is not None:
             runner._terminate_all()
@@ -2770,8 +2844,10 @@ def test_moto_subprocess_backends_publish_parent_owned_managed_sink(
             time.sleep(0.05)
         final = runner.status(status.run_id)
         assert final.status == "done", final.error
-        assert final.output_uri and final.output_table == "daily"
-        published_uri = final.output_uri
+        assert len(final.outputs) == 1
+        output = final.outputs[0]
+        assert output.outcome == "committed" and output.uri and output.table == "daily"
+        published_uri = output.uri
         logical_uri = "s3://subprocess-managed-sink/results/daily.parquet"
         assert metadb.catalog_get(logical_uri)["uri"] == published_uri
         with metadb.session() as session:
@@ -2826,8 +2902,9 @@ def test_subprocess_parent_attests_and_prepares_managed_sink_before_publish(
         "name": "daily", "parents": ["s3://managed/source.parquet"],
     }}
     runner._publish_object_sinks(sinks, RunStatus(
-        run_id="run", status="done", per_node=[],
-        output_uri=attempt_uri, output_table="daily"))
+        run_id="run", status="done", per_node=[], target_node_id="write",
+        outputs=[_run_output(
+            attempt_uri, rows=1, node_id="write", table="daily")]))
     assert events == [
         ("prepare", attempt_uri),
         ("publish", {
@@ -2838,8 +2915,9 @@ def test_subprocess_parent_attests_and_prepares_managed_sink_before_publish(
 
     with pytest.raises(RuntimeError, match="unexpected output binding"):
         runner._publish_object_sinks(sinks, RunStatus(
-            run_id="run", status="done", per_node=[],
-            output_uri=attempt_uri, output_table="wrong"))
+            run_id="run", status="done", per_node=[], target_node_id="write",
+            outputs=[_run_output(
+                attempt_uri, rows=1, node_id="write", table="wrong")]))
     assert len(events) == 2
 
 
@@ -2849,6 +2927,7 @@ def test_subprocess_multi_sink_fails_before_allocation_or_dispatch(
     from hub.models import CompilePlan, Graph, PlanStep
     from hub.plugins import catalog as catalog_mod
     from hub.plugins.adapters import DuckDBAdapter
+    from hub.run_outputs import UnsupportedRunOutputs
     from hub.subprocess_runner import SubprocessRunner
     import hub.subprocess_runner as subprocess_runner
 
@@ -2889,7 +2968,8 @@ def test_subprocess_multi_sink_fails_before_allocation_or_dispatch(
         PlanStep(node_id="first", kind="write", label="first"),
         PlanStep(node_id="second", kind="write", label="second"),
     ])
-    with pytest.raises(RuntimeError, match="until atomic multi-sink publication"):
+    with pytest.raises(
+            UnsupportedRunOutputs, match="do not yet support multiple write outputs"):
         runner.run(plan, graph, "first", "local")
     assert calls == []
 
@@ -2973,7 +3053,12 @@ def test_subprocess_parent_contract_uses_shared_published_sink_uri(tmp_path, cas
     runner = SubprocessRunner(
         str(tmp_path), str(tmp_path), catalog=Catalog(), storage=Storage(),
         resolve_adapter=lambda _uri: DuckDBAdapter())
-    targets, attempts, contracts = runner._claim_sink_contracts(plan, graph, "run")
+    status = RunStatus(
+        run_id="run", status="queued", target_node_id="write",
+        outputs=[require_single_run_output(graph, "write", runner.node_specs)],
+    )
+    targets, attempts, contracts = runner._claim_sink_contracts(
+        plan, graph, "run", status)
     assert targets == {"write": target} and attempts == {}
     assert contracts["write"]["logical_uri"] == target
     assert contracts["write"]["published_uri"] == expected
@@ -3019,8 +3104,10 @@ def test_subprocess_done_status_with_nonzero_exit_never_publishes(
     job_dir.mkdir()
     status_file = job_dir / "status.json"
     status_file.write_text(json.dumps(RunStatus(
-        run_id="child", status="done", per_node=[],
-        output_uri=expected_uri, output_table="out",
+        run_id="child", status="done", per_node=[], target_node_id="write",
+        total_rows=1,
+        outputs=[_run_output(
+            expected_uri, rows=1, node_id="write", table="out")],
     ).model_dump()))
 
     class Catalog:
@@ -3044,7 +3131,10 @@ def test_subprocess_done_status_with_nonzero_exit_never_publishes(
             return 7
 
     runner = SubprocessRunner(str(tmp_path), str(tmp_path), catalog=Catalog())
-    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner.runs["run"] = RunStatus(
+        run_id="run", status="running", per_node=[], target_node_id="write",
+        outputs=[_run_output(
+            node_id="write", table="out", outcome="pending")])
     runner._sink_contracts["run"] = {"write": {
         "logical_uri": ("s3://managed/results/out.parquet" if managed else expected_uri),
         "published_uri": expected_uri, "name": "out", "parents": [],
@@ -3063,10 +3153,11 @@ def test_subprocess_done_status_with_nonzero_exit_never_publishes(
     runner._watch(
         "run", FinishedProcess(), str(status_file), str(job_dir),
         Graph.model_validate({"id": "nonzero", "version": 1,
-                              "nodes": [], "edges": []}), None)
+                              "nodes": [], "edges": []}), "write")
     final = runner.status("run")
     assert final.status == ("cancelled" if cancelled else "failed")
-    assert final.output_uri is None and final.output_table is None
+    assert final.outputs[0].outcome == final.status
+    assert final.outputs[0].uri is None and final.outputs[0].table is None
     assert calls == (["discard"] if managed else [])
 
 
@@ -3085,8 +3176,11 @@ def test_subprocess_parent_discards_object_result_only_after_child_reaped(
     job_dir = tmp_path / f"job-{child_status}-{cancelled}"
     job_dir.mkdir()
     status_file = job_dir / "status.json"
+    child_output = (_run_output(handle["uri"], rows=1)
+                    if child_status == "done" else _run_output(outcome="failed"))
     status_file.write_text(json.dumps(RunStatus(
-        run_id="child", status=child_status, per_node=[], output_uri=handle["uri"],
+        run_id="child", status=child_status, per_node=[], target_node_id="source",
+        total_rows=1 if child_status == "done" else None, outputs=[child_output],
     ).model_dump()))
     events: list[str] = []
 
@@ -3104,7 +3198,8 @@ def test_subprocess_parent_discards_object_result_only_after_child_reaped(
 
     runner = SubprocessRunner(str(tmp_path), str(tmp_path))
     runner.runs[handle["run_id"]] = RunStatus(
-        run_id=handle["run_id"], status="running", per_node=[])
+        run_id=handle["run_id"], status="running", per_node=[],
+        target_node_id="source", outputs=[_run_output(outcome="pending")])
     runner._object_results[handle["run_id"]] = {"uri": handle["uri"], "cache_key": None}
     process = FinishedProcess()
     runner._process_scopes[handle["run_id"]] = OwnedProcessScope(
@@ -3122,9 +3217,10 @@ def test_subprocess_parent_discards_object_result_only_after_child_reaped(
         runner._watch(
             handle["run_id"], process, str(status_file), str(job_dir),
             Graph.model_validate({"id": "subprocess-fail", "version": 1,
-                                  "nodes": [], "edges": []}), None)
+                                  "nodes": [], "edges": []}), "source")
         final = runner.status(handle["run_id"])
-        assert final.status == expected and final.output_uri is None
+        assert final.status == expected
+        assert final.outputs[0].outcome == expected and final.outputs[0].uri is None
         assert _state(handle["uri"]) == "abandoned"
     finally:
         handoff.discard_attempt = original_discard
@@ -3148,9 +3244,13 @@ def test_subprocess_parent_discards_managed_sink_only_after_child_reaped(
     job_dir = tmp_path / f"sink-job-{child_status}-{cancelled}"
     job_dir.mkdir()
     status_file = job_dir / "status.json"
+    child_output = (_run_output(
+        handle["uri"], rows=1, node_id="write", table="daily")
+        if child_status == "done" else _run_output(
+            node_id="write", table="daily", outcome="failed"))
     status_file.write_text(json.dumps(RunStatus(
-        run_id="child", status=child_status, per_node=[],
-        output_uri=handle["uri"], output_table="daily",
+        run_id="child", status=child_status, per_node=[], target_node_id="write",
+        total_rows=1 if child_status == "done" else None, outputs=[child_output],
     ).model_dump()))
     events: list[str] = []
 
@@ -3168,7 +3268,9 @@ def test_subprocess_parent_discards_managed_sink_only_after_child_reaped(
 
     runner = SubprocessRunner(str(tmp_path), str(tmp_path))
     runner.runs[handle["run_id"]] = RunStatus(
-        run_id=handle["run_id"], status="running", per_node=[])
+        run_id=handle["run_id"], status="running", per_node=[],
+        target_node_id="write", outputs=[_run_output(
+            node_id="write", table="daily", outcome="pending")])
     runner._object_sinks[handle["run_id"]] = {"write": {
         "uri": handle["uri"], "logical_uri": handle["logical_uri"],
         "name": "daily", "parents": [],
@@ -3189,10 +3291,11 @@ def test_subprocess_parent_discards_managed_sink_only_after_child_reaped(
         runner._watch(
             handle["run_id"], process, str(status_file), str(job_dir),
             Graph.model_validate({"id": "subprocess-sink", "version": 1,
-                                  "nodes": [], "edges": []}), None)
+                                  "nodes": [], "edges": []}), "write")
         final = runner.status(handle["run_id"])
         assert final.status == expected
-        assert final.output_uri is None and final.output_table is None
+        assert final.outputs[0].outcome == expected
+        assert final.outputs[0].uri is None and final.outputs[0].table is None
         assert _state(handle["uri"]) == "abandoned"
     finally:
         handoff.discard_attempt = original_discard
@@ -3209,8 +3312,9 @@ def test_subprocess_parent_catalog_failure_is_generic_and_clears_output(
     job_dir.mkdir()
     status_file = job_dir / "status.json"
     status_file.write_text(json.dumps(RunStatus(
-        run_id="child", status="done", per_node=[],
-        output_uri=str(tmp_path / "out.parquet"), output_table="out",
+        run_id="child", status="done", per_node=[], target_node_id="write",
+        total_rows=1, outputs=[_run_output(
+            str(tmp_path / "out.parquet"), rows=1, node_id="write", table="out")],
     ).model_dump()))
 
     class FinishedProcess:
@@ -3235,7 +3339,9 @@ def test_subprocess_parent_catalog_failure_is_generic_and_clears_output(
 
     caplog.set_level("ERROR", logger="hub")
     runner = SubprocessRunner(str(tmp_path), str(tmp_path), catalog=FailingCatalog())
-    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner.runs["run"] = RunStatus(
+        run_id="run", status="running", per_node=[], target_node_id="write",
+        outputs=[_run_output(node_id="write", table="out", outcome="pending")])
     runner._sink_contracts["run"] = {"write": {
         "logical_uri": str(tmp_path / "out.parquet"),
         "published_uri": str(tmp_path / "out.parquet"), "name": "out", "parents": [],
@@ -3243,11 +3349,12 @@ def test_subprocess_parent_catalog_failure_is_generic_and_clears_output(
     runner._watch(
         "run", FinishedProcess(), str(status_file), str(job_dir),
         Graph.model_validate({"id": "catalog-failure", "version": 1,
-                              "nodes": [], "edges": []}), None)
+                              "nodes": [], "edges": []}), "write")
     final = runner.status("run")
     assert final.status == "failed"
     assert final.error == "parent catalog registration failed"
-    assert final.output_uri is None and final.output_table is None
+    assert final.outputs[0].outcome == "failed"
+    assert final.outputs[0].uri is None and final.outputs[0].table is None
     assert "secret-provider-detail" not in final.error
     assert "secret-provider-detail" in caplog.text
 
@@ -3263,8 +3370,9 @@ def test_subprocess_builtin_catalog_strict_publish_rejects_same_uri_persist_fail
     job_dir.mkdir()
     status_file = job_dir / "status.json"
     status_file.write_text(json.dumps(RunStatus(
-        run_id="child", status="done", per_node=[],
-        output_uri=output_uri, output_table="durable-readback",
+        run_id="child", status="done", per_node=[], target_node_id="write",
+        total_rows=1, outputs=[_run_output(
+            output_uri, rows=1, node_id="write", table="durable-readback")],
     ).model_dump()))
 
     class Probe:
@@ -3294,7 +3402,10 @@ def test_subprocess_builtin_catalog_strict_publish_rejects_same_uri_persist_fail
     catalog = InMemoryCatalog(str(tmp_path / "catalog-data"), lambda _uri: Probe())
     prior = catalog.register_output(name="durable-readback", uri=output_uri, parents=[])
     runner = SubprocessRunner(str(tmp_path), str(tmp_path), catalog=catalog)
-    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner.runs["run"] = RunStatus(
+        run_id="run", status="running", per_node=[], target_node_id="write",
+        outputs=[_run_output(
+            node_id="write", table="durable-readback", outcome="pending")])
     runner._sink_contracts["run"] = {"write": {
         "logical_uri": output_uri, "published_uri": output_uri,
         "name": "durable-readback", "parents": [],
@@ -3308,11 +3419,12 @@ def test_subprocess_builtin_catalog_strict_publish_rejects_same_uri_persist_fail
     runner._watch(
         "run", FinishedProcess(), str(status_file), str(job_dir),
         Graph.model_validate({"id": "durable-readback", "version": 1,
-                              "nodes": [], "edges": []}), None)
+                              "nodes": [], "edges": []}), "write")
     final = runner.status("run")
     assert final.status == "failed"
     assert final.error == "parent catalog registration failed"
-    assert final.output_uri is None and final.output_table is None
+    assert final.outputs[0].outcome == "failed"
+    assert final.outputs[0].uri is None and final.outputs[0].table is None
     assert "secret-metadb-persist-detail" not in final.error
     assert "secret-metadb-persist-detail" in caplog.text
     assert catalog.get_table(output_uri).version == prior.version
@@ -3329,8 +3441,9 @@ def test_subprocess_unmanaged_uri_mismatch_never_calls_catalog(tmp_path):
     job_dir.mkdir()
     status_file = job_dir / "status.json"
     status_file.write_text(json.dumps(RunStatus(
-        run_id="child", status="done", per_node=[],
-        output_uri=returned_uri, output_table="expected",
+        run_id="child", status="done", per_node=[], target_node_id="write",
+        total_rows=1, outputs=[_run_output(
+            returned_uri, rows=1, node_id="write", table="expected")],
     ).model_dump()))
 
     class Catalog:
@@ -3356,7 +3469,10 @@ def test_subprocess_unmanaged_uri_mismatch_never_calls_catalog(tmp_path):
             return 0
 
     runner = SubprocessRunner(str(tmp_path), str(tmp_path), catalog=Catalog())
-    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner.runs["run"] = RunStatus(
+        run_id="run", status="running", per_node=[], target_node_id="write",
+        outputs=[_run_output(
+            node_id="write", table="expected", outcome="pending")])
     runner._sink_contracts["run"] = {"write": {
         "logical_uri": expected_uri, "published_uri": expected_uri,
         "name": "expected", "parents": [],
@@ -3364,11 +3480,12 @@ def test_subprocess_unmanaged_uri_mismatch_never_calls_catalog(tmp_path):
     runner._watch(
         "run", FinishedProcess(), str(status_file), str(job_dir),
         Graph.model_validate({"id": "uri-mismatch", "version": 1,
-                              "nodes": [], "edges": []}), None)
+                              "nodes": [], "edges": []}), "write")
     final = runner.status("run")
     assert final.status == "failed"
     assert final.error == "parent catalog registration failed"
-    assert final.output_uri is None and final.output_table is None
+    assert final.outputs[0].outcome == "failed"
+    assert final.outputs[0].uri is None and final.outputs[0].table is None
     assert calls == []
 
 
@@ -3438,18 +3555,27 @@ def test_subprocess_parent_registers_unmanaged_sink_with_source_lineage_across_r
     ])
     runner = SubprocessRunner(
         str(tmp_path), str(tmp_path), catalog=Catalog(), storage=LocalStorage())
-    _targets, _attempts, contracts = runner._claim_sink_contracts(plan, graph, "run")
+    claim_status = RunStatus(
+        run_id="run", status="queued", target_node_id="write",
+        outputs=[require_single_run_output(graph, "write", runner.node_specs)],
+    )
+    _targets, _attempts, contracts = runner._claim_sink_contracts(
+        plan, graph, "run", claim_status)
     assert set(expected_parents) == {source_a, source_b}
     assert graph_mod.execution_source_uris(graph, "write") == [region_ref]
     assert contracts["write"]["parents"] == expected_parents
     runner._sink_contracts["run"] = contracts
-    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner.runs["run"] = RunStatus(
+        run_id="run", status="running", per_node=[], target_node_id="write",
+        outputs=[_run_output(
+            node_id="write", table="derived", outcome="pending")])
     job_dir = tmp_path / "lineage-job"
     job_dir.mkdir()
     status_file = job_dir / "status.json"
     status_file.write_text(json.dumps(RunStatus(
-        run_id="child", status="done", per_node=[],
-        output_uri=str(tmp_path / "derived.csv"), output_table="derived",
+        run_id="child", status="done", per_node=[], target_node_id="write",
+        total_rows=1, outputs=[_run_output(
+            str(tmp_path / "derived.csv"), rows=1, node_id="write", table="derived")],
     ).model_dump()))
 
     class FinishedProcess:
@@ -3510,7 +3636,11 @@ def test_isolated_child_adapter_disagreement_never_writes_assigned_sink(tmp_path
     with pytest.raises(RuntimeError, match="parent and child disagree"):
         runner._commit_write(
             next(node for node in graph.nodes if node.id == "write"), graph, Engine(),
-            RunStatus(run_id="run", status="running", per_node=[]), None, _CancelToken())
+            RunStatus(
+                run_id="run", status="running", target_node_id="write", per_node=[],
+                outputs=[_run_output(
+                    node_id="write", outcome="pending", publication_kind="catalog")]),
+            None, _CancelToken())
     assert writes == []
 
 
@@ -3524,8 +3654,9 @@ def test_subprocess_managed_sink_cleanup_outage_does_not_block_terminalization(
     job_dir.mkdir()
     status_file = job_dir / "status.json"
     status_file.write_text(json.dumps(RunStatus(
-        run_id="child", status="done", per_node=[],
-        output_uri=attempt_uri, output_table="daily",
+        run_id="child", status="done", per_node=[], target_node_id="write",
+        total_rows=1, outputs=[_run_output(
+            attempt_uri, rows=1, node_id="write", table="daily")],
     ).model_dump()))
 
     class FinishedProcess:
@@ -3541,7 +3672,10 @@ def test_subprocess_managed_sink_cleanup_outage_does_not_block_terminalization(
 
     caplog.set_level("ERROR", logger="hub")
     runner = SubprocessRunner(str(tmp_path), str(tmp_path))
-    runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
+    runner.runs["run"] = RunStatus(
+        run_id="run", status="running", per_node=[], target_node_id="write",
+        outputs=[_run_output(
+            node_id="write", table="daily", outcome="pending")])
     runner._procs["run"] = FinishedProcess()
     runner._object_sinks["run"] = {"write": {
         "uri": attempt_uri, "logical_uri": "s3://managed/results/daily.parquet",
@@ -3557,11 +3691,12 @@ def test_subprocess_managed_sink_cleanup_outage_does_not_block_terminalization(
     runner._watch(
         "run", FinishedProcess(), str(status_file), str(job_dir),
         Graph.model_validate({"id": "cleanup-outage", "version": 1,
-                              "nodes": [], "edges": []}), None)
+                              "nodes": [], "edges": []}), "write")
     final = runner.status("run")
     assert final.status == "failed"
     assert final.error == "parent managed-sink publication failed"
-    assert final.output_uri is None and final.output_table is None
+    assert final.outputs[0].outcome == "failed"
+    assert final.outputs[0].uri is None and final.outputs[0].table is None
     assert "secret-publish-detail" not in final.error
     assert "secret-publish-detail" in caplog.text
     assert "metadata unavailable" in caplog.text
@@ -3578,7 +3713,8 @@ def test_subprocess_parent_persistence_failure_never_publishes_done(tmp_path, mo
     job_dir.mkdir()
     status_file = job_dir / "status.json"
     status_file.write_text(json.dumps(RunStatus(
-        run_id="child", status="done", per_node=[], output_uri=handle["uri"],
+        run_id="child", status="done", per_node=[], target_node_id="source",
+        total_rows=1, outputs=[_run_output(handle["uri"], rows=1)],
     ).model_dump()))
 
     class FinishedProcess:
@@ -3594,7 +3730,8 @@ def test_subprocess_parent_persistence_failure_never_publishes_done(tmp_path, mo
 
     runner = SubprocessRunner(str(tmp_path), str(tmp_path))
     runner.runs[handle["run_id"]] = RunStatus(
-        run_id=handle["run_id"], status="running", per_node=[])
+        run_id=handle["run_id"], status="running", per_node=[],
+        target_node_id="source", outputs=[_run_output(outcome="pending")])
     runner._object_results[handle["run_id"]] = {"uri": handle["uri"], "cache_key": None}
     runner.on_status = lambda _graph, status: (
         (_ for _ in ()).throw(RuntimeError("metadata unavailable"))
@@ -3603,9 +3740,10 @@ def test_subprocess_parent_persistence_failure_never_publishes_done(tmp_path, mo
     runner._watch(
         handle["run_id"], FinishedProcess(), str(status_file), str(job_dir),
         Graph.model_validate({"id": "persist-fail", "version": 1,
-                              "nodes": [], "edges": []}), None)
+                              "nodes": [], "edges": []}), "source")
     final = runner.status(handle["run_id"])
-    assert final.status == "failed" and final.output_uri is None
+    assert final.status == "failed"
+    assert final.outputs[0].outcome == "failed" and final.outputs[0].uri is None
     assert "publication failed" in (final.error or "")
     assert _state(handle["uri"]) == "abandoned"
     metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
@@ -3743,7 +3881,14 @@ def test_subprocess_run_unit_allocates_exact_object_attempt_before_spawn(
         return status
 
     monkeypatch.setattr(runner, "_spawn", spawn)
-    graph = Graph.model_validate({"id": "region", "version": 1, "nodes": [], "edges": []})
+    graph = Graph.model_validate({
+        "id": "region", "version": 1,
+        "nodes": [{
+            "id": "result", "type": "source", "position": {"x": 0, "y": 0},
+            "data": {"config": {"uri": str(tmp_path / "source.parquet")}},
+        }],
+        "edges": [],
+    })
     status = runner.run_unit(graph, "result", logical)
 
     assert spawned["job_extra"]["runId"] == status.run_id
@@ -3804,7 +3949,8 @@ def test_subprocess_region_attempt_is_returned_without_run_state_ownership(
     job_dir.mkdir()
     status_file = job_dir / "status.json"
     status_file.write_text(json.dumps(RunStatus(
-        run_id="child", status="done", per_node=[], output_uri=attempt,
+        run_id="child", status="done", target_node_id="result", total_rows=1,
+        per_node=[], outputs=[_run_output(attempt, rows=1, node_id="result")],
     ).model_dump()))
 
     class FinishedProcess:
@@ -3822,7 +3968,12 @@ def test_subprocess_region_attempt_is_returned_without_run_state_ownership(
     persisted = []
     monkeypatch.setattr(handoff, "prepare_attempt_commit", prepared.append)
     runner = SubprocessRunner(str(tmp_path), str(tmp_path))
-    runner.runs["unit"] = RunStatus(run_id="unit", status="running", per_node=[])
+    parent = RunStatus(
+        run_id="unit", status="running", target_node_id="result", per_node=[],
+        outputs=[_run_output(node_id="result", outcome="pending")])
+    runner.runs["unit"] = parent
+    runner._published_statuses["unit"] = parent.model_copy(deep=True)
+    runner._internal_runs.add("unit")
     runner._object_results["unit"] = {
         "uri": attempt, "cache_key": None, "run_state_owner": False,
     }
@@ -3833,9 +3984,11 @@ def test_subprocess_region_attempt_is_returned_without_run_state_ownership(
         "result")
 
     final = runner.status("unit")
-    assert final.status == "done" and final.output_uri == attempt
+    output = _committed_output(final)
+    assert final.status == "done" and final.target_node_id == "result"
+    assert output.uri == attempt and output.rows == 1
     assert prepared == [attempt]
-    assert persisted[-1].status == "done" and persisted[-1].output_uri is None
+    assert persisted == []
     assert "unit" not in runner._object_results and not job_dir.exists()
 
 
@@ -3925,11 +4078,13 @@ def test_local_cleanup_outages_do_not_replace_primary_failure_or_skip_finally(
                    "data": {"config": {"uri": "s3://local-cleanup/source.parquet"}}}],
         "edges": [],
     })
-    runner.runs["run"] = RunStatus(run_id="run", status="queued", per_node=[])
+    runner.runs["run"] = RunStatus(
+        run_id="run", status="queued", target_node_id="source", per_node=[],
+        outputs=[_run_output(node_id="source", outcome="pending")])
     runner._cancel["run"] = _CancelToken()
 
     def fail_result(_node_id, _engine, status, *_args):
-        status.output_uri = attempt
+        status.outputs = [_run_output(attempt, rows=1, node_id="source")]
         raise RuntimeError("primary data failure")
 
     runner._materialize_result = fail_result
@@ -4011,7 +4166,11 @@ def test_local_sink_prepublication_fence_blocks_catalog_and_abandons_attempt(
     with pytest.raises(RuntimeError, match="lease lost"):
         runner._commit_write(
             next(node for node in graph.nodes if node.id == "write"), graph, Engine(),
-            RunStatus(run_id="run", status="running", per_node=[]), None,
+            RunStatus(
+                run_id="run", status="running", target_node_id="write", per_node=[],
+                outputs=[_run_output(
+                    node_id="write", outcome="pending", publication_kind="catalog")]),
+            None,
             _CancelToken(), pre_publish=fence)
     assert published == []
     assert discarded == [attempt]
@@ -4067,15 +4226,17 @@ def test_local_successful_sink_publication_is_not_reversed_by_later_lease_renewa
     plan = CompilePlan(target_node_id="write", steps=[step])
     runner = LocalRunner(lambda _uri: Adapter(), {}, Catalog(), str(tmp_path))
     runner.runs["run"] = RunStatus(
-        run_id="run", status="queued",
+        run_id="run", status="queued", target_node_id="write",
+        outputs=[_run_output(
+            node_id="write", outcome="pending", publication_kind="catalog")],
         per_node=[PerNodeStatus(node_id="write", status="queued", label="write")])
     runner._cancel["run"] = _CancelToken()
     monkeypatch.setattr(handoff, "managed_read_lease", lambda *_args, **_kwargs: Lease())
 
     def commit(_node, _graph, _engine, status, _cached, _cancel, pre_publish=None):
         pre_publish(check_cancel=False)
-        status.output_uri = str(tmp_path / "out.csv")
-        status.output_table = "out"
+        status.outputs = [_run_output(
+            str(tmp_path / "out.csv"), rows=1, node_id="write", table="out")]
         return 1
 
     runner._commit_write = commit
@@ -4174,20 +4335,23 @@ def test_local_cancel_race_respects_sink_commit_point(
         assert discarded == [attempt]
     else:
         assert final.status == "done"
-        assert final.output_uri == logical and final.output_table == "out"
+        output = _committed_output(final)
+        assert output.uri == logical and output.table == "out" and output.rows == 1
         assert len(registered) == 1 and managed_published == [] and discarded == []
 
 
 def test_local_runner_rejects_multiple_writes_before_starting_worker(tmp_path):
     from hub.models import CompilePlan, Graph, PlanStep
     from hub.plugins.runner import LocalRunner
+    from hub.run_outputs import UnsupportedRunOutputs
 
     runner = LocalRunner(lambda _uri: object(), {}, object(), str(tmp_path))
     plan = CompilePlan(target_node_id="second", steps=[
         PlanStep(node_id="first", kind="write", label="first"),
         PlanStep(node_id="second", kind="write", label="second"),
     ])
-    with pytest.raises(RuntimeError, match="until atomic multi-sink publication"):
+    with pytest.raises(
+            UnsupportedRunOutputs, match="do not yet support multiple write outputs"):
         runner.run(
             plan, Graph.model_validate({"id": "multi", "version": 1,
                                         "nodes": [], "edges": []}), "second", "local")
@@ -4267,7 +4431,11 @@ def test_local_unmanaged_sink_registers_all_join_sources_across_region_cut(tmp_p
         lambda _uri: Adapter(), {}, Catalog(), str(tmp_path), storage=Storage())
     runner._commit_write(
         next(node for node in graph.nodes if node.id == "write"), graph, Engine(),
-        RunStatus(run_id="run", status="running", per_node=[]), None,
+        RunStatus(
+            run_id="run", status="running", target_node_id="write", per_node=[],
+            outputs=[_run_output(
+                node_id="write", outcome="pending", publication_kind="catalog")]),
+        None,
         _CancelToken(), pre_publish=lambda **_kwargs: None)
     assert set(expected) == {source_a, source_b}
     assert graph_mod.execution_source_uris(graph, "write") == [str(tmp_path / "region-ref.parquet")]

@@ -35,6 +35,7 @@ class RunBody(BaseModel):
 class PreviewBody(BaseModel):
     graph: dict
     node_id: str
+    port_id: str | None = Field(default=None, min_length=1, max_length=128)
     k: int = 50
     offset: int = 0
     full: bool = False   # profile only: whole-dataset stats (full pass) instead of the sample
@@ -382,7 +383,8 @@ def main() -> None:
         with _inflight_work():
             return preview_node(graph, body.node_id, body.k, deps.resolve_adapter,
                                 deps.registry, deps.node_builders, deps.node_specs, offset=body.offset,
-                                cache=warm, storage=deps.storage).model_dump()
+                                cache=warm, storage=deps.storage,
+                                port_id=body.port_id).model_dump()
 
     @app.post("/profile")
     def profile(body: PreviewBody, x_dp_kernel_token: str = Header(None)):
@@ -393,7 +395,7 @@ def main() -> None:
         with _inflight_work():
             return profile_node(graph, body.node_id, deps.resolve_adapter, deps.registry,
                                 deps.node_builders, deps.node_specs, cache=warm, full=body.full,
-                                storage=deps.storage).model_dump()
+                                storage=deps.storage, port_id=body.port_id).model_dump()
 
     @app.post("/profile-job")
     def profile_job(body: ProfileJobBody, x_dp_kernel_token: str = Header(None)):

@@ -23,9 +23,18 @@ import threading
 import time
 import uuid
 
-from hub.models import CompilePlan, Graph, PerNodeStatus, Placement, RunEstimate, RunStatus
+from hub.models import CompilePlan, Graph, PerNodeStatus, Placement, RunEstimate, RunOutput, RunStatus
 from hub.plugins.runner import _CONFIRM_ROWS, _MAX_RUNS, _persist_local_result_done
 from hub.process_scope import OwnedProcessScope, owned_process_popen_kwargs
+from hub.run_outputs import (
+    discard_unpublished_outputs,
+    outputs_cache_document,
+    preflight_output_table,
+    preflight_run_output_target,
+    require_single_run_output,
+    settle_uncommitted_outputs,
+    sole_output,
+)
 
 _CANCEL_GRACE_S = 2.0  # cooperative child cancel first; then SIGTERM/SIGKILL for runaway native/Python code
 
@@ -67,7 +76,7 @@ class SubprocessRunner:
         return False  # the ephemeral child has ambient data identity only; it cannot resolve hub Creds
 
     def __init__(self, workspace: str, data_dir: str, catalog=None, deadline_s: float | None = None,
-                 storage=None, resolve_adapter=None, node_builders=None):
+                 storage=None, resolve_adapter=None, node_builders=None, node_specs=None):
         self.workspace = workspace
         self.data_dir = data_dir
         self.catalog = catalog  # register outputs written by children into the parent's live catalog
@@ -77,15 +86,23 @@ class SubprocessRunner:
         self.storage = storage
         self.resolve_adapter = resolve_adapter
         self.node_builders = node_builders if node_builders is not None else {}
+        if node_specs is None:
+            from hub.nodespecs import BUILTIN_NODE_SPECS
+            node_specs = {spec.kind: spec for spec in BUILTIN_NODE_SPECS}
+        self.node_specs = node_specs
         self.result_put = None  # optional parent DB cache publication after RunState owns the result
         self.on_complete = None  # optional (graph, target, status) hook — Deps wires it to run-history
         self.on_status = None    # optional (graph, status) hook — Deps wires it to DB-backed live status
         self.runs: dict[str, RunStatus] = {}
+        # Execution and supervision retain their mutable owner in ``runs``.  Public status/cancel reads
+        # are served from independently validated snapshots published only at coherent _emit boundaries.
+        self._published_statuses: dict[str, RunStatus] = {}
         self._procs: dict[str, subprocess.Popen] = {}
         self._process_scopes: dict[str, OwnedProcessScope] = {}
         self._cancel_files: dict[str, str] = {}
         self._cancelled: set[str] = set()
         self._object_results: dict[str, dict] = {}
+        self._internal_runs: set[str] = set()
         self._local_results: dict[str, dict] = {}
         self._object_sinks: dict[str, dict[str, dict]] = {}
         self._sink_contracts: dict[str, dict[str, dict]] = {}
@@ -280,7 +297,7 @@ class SubprocessRunner:
         return RunEstimate(rows=rows, bytes=byts, placement="local", needs_confirm=needs,
                            breakdown=f"{size} · {rowstr} · {len(plan.steps)} steps · isolated process")
 
-    def _claim_sink_contracts(self, plan: CompilePlan, graph: Graph, run_id: str
+    def _claim_sink_contracts(self, plan: CompilePlan, graph: Graph, run_id: str, status: RunStatus
                               ) -> tuple[dict[str, str], dict[str, dict], dict[str, dict]]:
         """Resolve every sink on the parent and allocate the one supported managed sink before dispatch."""
         from hub.plugins.adapters import is_object_uri
@@ -302,6 +319,7 @@ class SubprocessRunner:
             cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
             title = node.data.get("title") if isinstance(node.data, dict) else None
             spec = SinkSpec.from_config(cfg, title)
+            preflight_output_table(status, spec.name)
             if self.resolve_adapter is None:
                 target_uri = spec.target_uri(self.workspace, self.storage)
                 if is_object_uri(target_uri) or spec.partition_by:
@@ -376,7 +394,8 @@ class SubprocessRunner:
         if len(sinks) != 1:
             raise RuntimeError("managed subprocess sink publication requires one exact sink")
         step_id, item = next(iter(sinks.items()))
-        if status.output_uri != item["uri"] or status.output_table != item["name"]:
+        output = sole_output(status, committed=True)
+        if output is None or output.uri != item["uri"] or output.table != item["name"]:
             raise RuntimeError(
                 f"child returned an unexpected output binding for managed sink '{step_id}'")
         from hub.handoff import prepare_attempt_commit
@@ -396,13 +415,17 @@ class SubprocessRunner:
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
             placement: Placement, run_id: str | None = None,
             request_id: str | None = None, attempt_id: str | None = None) -> RunStatus:
+        output_target = preflight_run_output_target(plan, target_node_id)
+        expected_output = (require_single_run_output(graph, output_target, self.node_specs)
+                           if output_target is not None else None)
         from hub.backends import require_destination_credential_support
         require_destination_credential_support(self, plan, graph, self.workspace)
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
         per = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         _ = attempt_id  # OPS-01 port parity; managed publication stamps attempts itself
         status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=per,
-                           target_node_id=target_node_id, request_id=request_id)
+                           target_node_id=output_target, request_id=request_id,
+                           outputs=[expected_output] if expected_output is not None else [])
         job_extra: dict = {"runId": run_id}
         try:
             source_leases = self._claim_source_leases(graph, target_node_id, run_id)
@@ -411,7 +434,7 @@ class SubprocessRunner:
             job_extra["managedSourceAttempts"] = source_leases["attempts"]
             job_extra["managedLocalSources"] = source_leases["local_sources"]
             sink_targets, object_sinks, sink_contracts = self._claim_sink_contracts(
-                plan, graph, run_id)
+                plan, graph, run_id, status)
             if object_sinks:
                 self._object_sinks[run_id] = object_sinks
             if sink_contracts:
@@ -420,7 +443,7 @@ class SubprocessRunner:
             job_extra["sinkAttempts"] = {
                 step_id: item["uri"] for step_id, item in object_sinks.items()}
 
-            target = next((node for node in graph.nodes if node.id == target_node_id), None)
+            target = next((node for node in graph.nodes if node.id == output_target), None)
             if target is not None and target.type not in ("write", "assert"):
                 begin_local = getattr(self.storage, "begin_result", None)
                 if callable(begin_local):
@@ -500,12 +523,15 @@ class SubprocessRunner:
         the seam a pod/Ray backend overrides to allocate a pod / submit a job. `requires` (the region's
         resource need) is accepted for signature parity but ignored: a subprocess is one local process,
         so there's no worker to place onto."""
+        expected_output = require_single_run_output(graph, output_node, self.node_specs)
         from hub import compiler
         from hub.backends import require_destination_credential_support
         plan = compiler.compile_plan(graph, output_node)
         require_destination_credential_support(self, plan, graph, self.workspace)
         run_id = f"unit_{uuid.uuid4().hex[:10]}"
-        status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=[])
+        status = RunStatus(
+            run_id=run_id, status="queued", placement="local", per_node=[],
+            target_node_id=output_node, outputs=[expected_output])
         materialize_uri = output_uri
         from hub.plugins.adapters import is_object_uri
         try:
@@ -550,6 +576,8 @@ class SubprocessRunner:
         from hub.workload_env import prepare_workload_graph
 
         run_id = status.run_id
+        if job_extra.get("materializeUri"):
+            self._internal_runs.add(run_id)
         job_dir = tempfile.mkdtemp(prefix="dp-run-")
         status_file = os.path.join(job_dir, "status.json")
         cancel_file = os.path.join(job_dir, "cancel.requested")
@@ -578,10 +606,13 @@ class SubprocessRunner:
                 run_id, [sys.executable, "-m", "hub.subrun", job_file], **popen_kwargs)
         except Exception:
             shutil.rmtree(job_dir, ignore_errors=True)
+            self._internal_runs.discard(run_id)
             raise
         try:
             with self._lock:
                 self.runs[run_id] = status
+                self._published_statuses[run_id] = RunStatus.model_validate(
+                    status.model_dump())
                 self._procs[run_id] = proc
                 self._cancel_files[run_id] = cancel_file
                 self._evict()
@@ -591,7 +622,7 @@ class SubprocessRunner:
                 args=(run_id, proc, status_file, job_dir, graph, target),
                 daemon=True,
             ).start()
-            return status
+            return self.status(run_id)
         except Exception as exc:
             # Once Popen succeeds the child may be writing. Reap it before the caller terminalizes the
             # parent-owned attempt; setup failure alone is not writer terminal proof.
@@ -605,9 +636,11 @@ class SubprocessRunner:
             if reaped:
                 with self._lock:
                     self.runs.pop(run_id, None)
+                    self._published_statuses.pop(run_id, None)
                     self._procs.pop(run_id, None)
                     self._process_scopes.pop(run_id, None)
                     self._cancel_files.pop(run_id, None)
+                    self._internal_runs.discard(run_id)
                 shutil.rmtree(job_dir, ignore_errors=True)
             else:
                 logging.getLogger("hub").error(
@@ -621,14 +654,27 @@ class SubprocessRunner:
             raise _SpawnSetupError(str(exc), reaped=reaped) from exc
 
     def _emit(self, graph: Graph, status: RunStatus, *, strict: bool = False) -> None:
-        if self.on_status:
+        snapshot = RunStatus.model_validate(status.model_dump())
+        internal = status.run_id in self._internal_runs
+        if not internal and self.on_status:
             try:
                 self.on_status(graph, status)
             except Exception:  # noqa: BLE001
                 if strict:
                     raise
+        self._publish_status_snapshot(status, snapshot=snapshot)
+
+    def _publish_status_snapshot(
+            self, status: RunStatus, *, snapshot: RunStatus | None = None) -> None:
+        """Atomically publish one validated observation without replacing the live owner."""
+        snapshot = snapshot or RunStatus.model_validate(status.model_dump())
+        with self._lock:
+            if status.run_id in self.runs:
+                self._published_statuses[status.run_id] = snapshot
 
     def _complete(self, graph: Graph, target: str | None, status: RunStatus) -> None:
+        if status.run_id in self._internal_runs:
+            return
         if self.on_complete:
             try:
                 self.on_complete(graph, target, status)
@@ -640,14 +686,18 @@ class SubprocessRunner:
         Evict only TERMINAL runs (oldest first); never drop a run whose child is still executing."""
         _terminal = {"done", "failed", "cancelled"}
         while len(self.runs) > _MAX_RUNS:
-            victim = next((rid for rid, st in self.runs.items() if st.status in _terminal), None)
+            victim = next((rid for rid in self.runs
+                           if (published := self._published_statuses.get(rid)) is not None
+                           and published.status in _terminal), None)
             if victim is None:
                 break  # all retained runs are still live — exceed the cap rather than drop one
             self.runs.pop(victim, None)
+            self._published_statuses.pop(victim, None)
             self._cancelled.discard(victim)
             self._procs.pop(victim, None)
             self._process_scopes.pop(victim, None)
             self._cancel_files.pop(victim, None)
+            self._internal_runs.discard(victim)
             self._sink_contracts.pop(victim, None)
 
     def _sanitize_child_status(self, run_id: str, observed: RunStatus) -> RunStatus:
@@ -657,6 +707,93 @@ class SubprocessRunner:
         no additional changes. Specialized one-shot workloads can override this hook without copying
         the process supervision and reap-before-terminal state machine.
         """
+        return observed
+
+    def _fence_child_outputs(self, run_id: str, observed: RunStatus) -> RunStatus:
+        """Bind an untrusted child receipt to the declaration snapshot owned by the parent."""
+        current = self.runs.get(run_id)
+        if current is None:
+            raise ValueError("subprocess status has no parent-owned run")
+        observed.target_node_id = current.target_node_id
+        observed.request_id = current.request_id
+        observed.job_type = current.job_type
+        observed.placement = current.placement
+        if current.job_type == "profile":
+            observed.outputs = []
+            return observed
+        if not current.outputs and current.target_node_id is None:
+            observed.outputs = []
+            return observed
+        expected = sole_output(current)
+        actual = sole_output(observed)
+        if expected is None:
+            raise ValueError("subprocess status does not contain the expected output")
+        if actual is None:
+            if observed.status == "done":
+                raise ValueError("a completed subprocess did not return its expected output")
+            outcome = (observed.status if observed.status in ("failed", "cancelled")
+                       else "pending")
+            observed.outputs = [RunOutput(
+                node_id=expected.node_id,
+                port_id=expected.port_id,
+                port_label=expected.port_label,
+                wire=expected.wire,
+                publication_kind=expected.publication_kind,
+                outcome=outcome,
+                error=observed.error if outcome != "pending" else None,
+            )]
+            if outcome == "pending":
+                observed.total_rows = None
+            return observed
+        expected_identity = (
+            expected.node_id, expected.port_id, expected.port_label,
+            expected.wire, expected.publication_kind,
+        )
+        actual_identity = (
+            actual.node_id, actual.port_id, actual.port_label,
+            actual.wire, actual.publication_kind,
+        )
+        if actual_identity != expected_identity:
+            raise ValueError("subprocess status output declaration does not match its parent")
+        if observed.status not in ("done", "failed", "cancelled"):
+            observed.outputs = [RunOutput(
+                node_id=expected.node_id,
+                port_id=expected.port_id,
+                port_label=expected.port_label,
+                wire=expected.wire,
+                publication_kind=expected.publication_kind,
+                outcome="pending",
+            )]
+            observed.total_rows = None
+            return observed
+        if observed.status in ("failed", "cancelled"):
+            # A child cannot publish a committed identity through a negative terminal receipt. The
+            # parent owns every publication decision after reaping and settles this declaration only.
+            observed.outputs = [RunOutput(
+                node_id=expected.node_id,
+                port_id=expected.port_id,
+                port_label=expected.port_label,
+                wire=expected.wire,
+                publication_kind=expected.publication_kind,
+                outcome=observed.status,
+                error=observed.error,
+            )]
+            observed.total_rows = None
+            return observed
+        if observed.status == "done" and actual.outcome != "committed":
+            raise ValueError("a completed subprocess did not commit its expected output")
+        observed.outputs = [RunOutput(
+            node_id=expected.node_id,
+            port_id=expected.port_id,
+            port_label=expected.port_label,
+            wire=expected.wire,
+            publication_kind=expected.publication_kind,
+            outcome=actual.outcome,
+            uri=actual.uri,
+            table=actual.table,
+            rows=actual.rows,
+            error=actual.error,
+        )]
         return observed
 
     def _heartbeat_interval_s(self) -> float | None:
@@ -685,12 +822,17 @@ class SubprocessRunner:
             logging.getLogger("hub").exception(
                 "ignored malformed subprocess status document")
             return None
-        observed = self._sanitize_child_status(run_id, observed)
+        try:
+            observed = self._fence_child_outputs(
+                run_id, self._sanitize_child_status(run_id, observed))
+        except Exception:  # noqa: BLE001 — output receipts are untrusted child input
+            logging.getLogger("hub").exception(
+                "ignored subprocess status with an invalid output receipt")
+            return None
         if observed.status in ("done", "failed", "cancelled"):
             return observed
         # Child progress is untrusted and parent-owned result/sink paths are provisional until reap,
         # exact receipt validation, and parent commit. Never mirror an intermediate output binding.
-        observed.output_uri = observed.output_table = None
         if run_id not in self._cancelled:
             self.runs[run_id] = observed
         return None
@@ -746,10 +888,12 @@ class SubprocessRunner:
                 current = self.runs.get(run_id)
                 status = (current.model_copy(deep=True) if current is not None else RunStatus(
                     run_id=run_id, status="running", placement="local", per_node=[]))
-                status.output_uri = status.output_table = None
                 if reaped:
                     status.status = "cancelled" if cancelled else "failed"
                     status.error = None if status.status == "cancelled" else "execution supervisor failed"
+                    if status.job_type == "run":
+                        discard_unpublished_outputs(
+                            status, status.status, status.error)
                     status = self._finalize_reaped_status(
                         run_id, status, deadline_hit=False, returncode=proc.returncode)
                     self._complete(graph, target, status)
@@ -758,6 +902,8 @@ class SubprocessRunner:
                     status.status = "running"
                     status.stalled = True
                     status.error = "execution supervisor is retrying writer reconciliation"
+                    if status.job_type == "run":
+                        discard_unpublished_outputs(status, "pending")
                     self._emit(graph, status)
                     self._schedule_watch_retry(
                         run_id, proc, status_file, job_dir, graph, target)
@@ -770,6 +916,7 @@ class SubprocessRunner:
                         self._procs.pop(run_id, None)
                         self._process_scopes.pop(run_id, None)
                         self._cancel_files.pop(run_id, None)
+                        self._internal_runs.discard(run_id)
                         self._object_results.pop(run_id, None)
                         self._local_results.pop(run_id, None)
                         self._object_sinks.pop(run_id, None)
@@ -875,11 +1022,15 @@ class SubprocessRunner:
             else:
                 st.status = "failed"
                 st.error = st.error or f"execution process exited (code {proc.returncode})"
-            st.output_uri = st.output_table = None
+            if st.job_type == "run":
+                discard_unpublished_outputs(st, st.status, st.error)
+                st.total_rows = None
         if source_lease_lost:
             st.status = "failed"
             st.error = "managed source lease was lost during execution"
-            st.output_uri = st.output_table = None
+            if st.job_type == "run":
+                discard_unpublished_outputs(st, "failed", st.error)
+                st.total_rows = None
         st = self._finalize_reaped_status(
             run_id, st, deadline_hit=deadline_hit, returncode=proc.returncode)
         owned_sinks = self._object_sinks.get(run_id, {})
@@ -900,28 +1051,32 @@ class SubprocessRunner:
                     self._discard_object_sinks(owned_sinks)
                     st.status = "failed"
                     st.error = "parent managed-sink publication failed"
-                    st.output_uri = st.output_table = None
+                    discard_unpublished_outputs(st, "failed", st.error)
+                    st.total_rows = None
             else:
                 # The process-scope fence above is writer terminal proof; only now may attempts enter GC.
                 self._discard_object_sinks(owned_sinks)
-                st.output_uri = st.output_table = None
                 if cancelled:
                     st.status = "cancelled"
+                elif st.status == "done":
+                    st.status = "failed"
+                    st.error = "subprocess sink did not exit cleanly"
+                discard_unpublished_outputs(st, st.status, st.error)
+                st.total_rows = None
         local_result = self._local_results.get(run_id)
         local_result_committed = False
         if local_result is not None and st is not None:
             result_uri = local_result["uri"]
             cancelled = run_id in self._cancelled
+            child_output = sole_output(st, committed=True)
             valid_child_commit = (
                 not cancelled and st.status == "done" and proc.returncode == 0
-                and st.output_uri == result_uri)
+                and child_output is not None and child_output.uri == result_uri)
             if valid_child_commit:
                 try:
                     # wait() above is writer terminal proof; only the durable parent may now mark ready.
                     self.storage.commit_result(result_uri, run_id)
                     local_result_committed = True
-                    st.output_uri = result_uri
-                    st.output_table = None
                 except Exception:  # publication cannot continue without the exact ready transition
                     logging.getLogger("hub").exception(
                         "parent local-result commit failed")
@@ -932,31 +1087,35 @@ class SubprocessRunner:
                             "parent local-result commit cleanup failed")
                     st.status = "failed"
                     st.error = "parent local-result commit failed"
-                    st.output_uri = st.output_table = None
+                    discard_unpublished_outputs(st, "failed", st.error)
+                    st.total_rows = None
             else:
                 try:
                     self.storage.abort_result(result_uri, run_id)
                 except Exception:  # exact row is retained for bounded startup/background recovery
                     logging.getLogger("hub").exception(
                         "parent local-result terminal cleanup failed")
-                st.output_uri = st.output_table = None
                 if cancelled:
                     st.status = "cancelled"
+                elif st.status == "done":
+                    st.status = "failed"
+                    st.error = "child returned an unexpected local-result binding"
+                discard_unpublished_outputs(st, st.status, st.error)
+                st.total_rows = None
         owned_result = self._object_results.get(run_id)
         terminal_persisted = False
         if owned_result is not None and st is not None:
             attempt_uri = owned_result["uri"]
             cancelled = run_id in self._cancelled
+            child_output = sole_output(st, committed=True)
             valid_child_commit = (
                 not cancelled and st.status == "done" and proc.returncode == 0
-                and st.output_uri == attempt_uri
+                and child_output is not None and child_output.uri == attempt_uri
             )
             if valid_child_commit:
                 try:
                     from hub.handoff import prepare_attempt_commit
                     prepare_attempt_commit(attempt_uri)
-                    st.output_uri = attempt_uri
-                    st.output_table = None
                 except Exception:  # noqa: BLE001 - parent commit is the publication boundary
                     logging.getLogger("hub").exception(
                         "parent object-result commit failed")
@@ -964,26 +1123,33 @@ class SubprocessRunner:
                         attempt_uri, context="parent object-result commit")
                     st.status = "failed"
                     st.error = "parent object-result commit failed"
-                    st.output_uri = st.output_table = None
+                    discard_unpublished_outputs(st, "failed", st.error)
+                    st.total_rows = None
             else:
                 _safe_abandon_attempt(
                     attempt_uri, context="parent object-result terminal cleanup")
-                st.output_uri = st.output_table = None
                 if cancelled:
                     st.status = "cancelled"
+                elif st.status == "done":
+                    st.status = "failed"
+                    st.error = "child returned an unexpected object-result binding"
+                discard_unpublished_outputs(st, st.status, st.error)
+                st.total_rows = None
         # a subprocess run wrote its output in the CHILD's catalog (discarded) — register it here so
         # it shows up in the parent's live catalog, just like an in-process run.
-        if (st and st.status == "done" and st.output_uri and st.output_table
-                and st.output_uri not in managed_sink_uris and self.catalog is not None):
+        catalog_output = sole_output(st, committed=True) if st is not None else None
+        if (st and st.status == "done" and catalog_output is not None
+                and catalog_output.table and catalog_output.uri not in managed_sink_uris
+                and self.catalog is not None):
             try:
                 if len(sink_contracts) != 1:
                     raise RuntimeError("child output has no exact parent sink contract")
                 contract = next(iter(sink_contracts.values()))
-                if (st.output_table != contract["name"]
-                        or st.output_uri != contract["published_uri"]):
+                if (catalog_output.table != contract["name"]
+                        or catalog_output.uri != contract["published_uri"]):
                     raise RuntimeError("child returned an unexpected unmanaged sink binding")
                 publish_kwargs = {
-                    "name": st.output_table, "uri": st.output_uri,
+                    "name": catalog_output.table, "uri": catalog_output.uri,
                     "parents": contract["parents"], "pipeline": "canvas",
                 }
                 from hub.plugins.catalog import publish_unmanaged_output_attested
@@ -993,7 +1159,8 @@ class SubprocessRunner:
                     "parent subprocess catalog registration failed")
                 st.status = "failed"
                 st.error = "parent catalog registration failed"
-                st.output_uri = st.output_table = None
+                discard_unpublished_outputs(st, "failed", st.error)
+                st.total_rows = None
         # The child has been reaped and all parent-side output publication is complete. Release
         # managed inputs before any terminal callback or in-memory status can become observable.
         self._release_source_leases(run_id)
@@ -1004,6 +1171,17 @@ class SubprocessRunner:
         # status we forced above on a crash/cancel — recording every terminal run, like the in-process
         # backend, with no double-write.
         if st is not None and st.status in ("done", "failed", "cancelled"):
+            if st.job_type == "run":
+                if st.status in ("failed", "cancelled"):
+                    settle_uncommitted_outputs(st, st.status, st.error)
+                committed_output = sole_output(st, committed=True)
+                if st.status == "done" and st.target_node_id is not None \
+                        and committed_output is None:
+                    st.status = "failed"
+                    st.error = "subprocess completed without its expected output"
+                    discard_unpublished_outputs(st, "failed", st.error)
+                    committed_output = None
+                st.total_rows = committed_output.rows if committed_output is not None else None
             terminal_rejected = False
             primary_result = local_result or owned_result
             run_state_owner = bool(
@@ -1026,7 +1204,9 @@ class SubprocessRunner:
                             visible.status = "running"
                             visible.stalled = True
                             visible.error = "terminal publication is retrying"
-                            visible.output_uri = visible.output_table = None
+                            if visible.job_type == "run":
+                                discard_unpublished_outputs(visible, "pending")
+                                visible.total_rows = None
                             self.runs[run_id] = visible
 
                     try:
@@ -1048,17 +1228,15 @@ class SubprocessRunner:
                                 "parent local-result abort failed after publication rejection")
                         st.status = "failed"
                         st.error = str(exc)
-                        st.output_uri = st.output_table = None
+                        discard_unpublished_outputs(st, "failed", st.error)
+                        st.total_rows = None
                     else:
                         terminal_persisted = True
                         self._complete(graph, target, st)
                         cache_key = primary_result.get("cache_key")
                         if cache_key and self.result_put:
                             try:
-                                self.result_put(cache_key, {
-                                    "rows": st.total_rows or st.rows_processed or 0,
-                                    "uri": st.output_uri, "table": None,
-                                })
+                                self.result_put(cache_key, outputs_cache_document(st))
                             except Exception:  # RunState already owns the exact result
                                 pass
                 else:
@@ -1069,10 +1247,7 @@ class SubprocessRunner:
                         cache_key = primary_result.get("cache_key")
                         if cache_key and self.result_put:
                             try:
-                                self.result_put(cache_key, {
-                                    "rows": st.total_rows or st.rows_processed or 0,
-                                    "uri": st.output_uri, "table": None,
-                                })
+                                self.result_put(cache_key, outputs_cache_document(st))
                             except Exception:  # RunState already owns the exact result
                                 pass
                     except Exception as exc:  # object-result receipt/retry is a separate lifecycle
@@ -1084,20 +1259,16 @@ class SubprocessRunner:
                             owned_result["uri"], context="parent object-result publication")
                         st.status = "failed"
                         st.error = "parent full-result publication failed"
-                        st.output_uri = st.output_table = None
-            elif (owned_result is not None and not run_state_owner
-                  and st.status == "done"):
-                # The RunController publishes the region cache pointer immediately after await(). Keep
-                # this unit observable without letting RunState own the committed attempt first.
-                persisted = st.model_copy(deep=True)
-                persisted.output_uri = persisted.output_table = None
-                self._complete(graph, target, persisted)
-                self._emit(graph, persisted)
-                terminal_persisted = True
+                        discard_unpublished_outputs(st, "failed", st.error)
+                        st.total_rows = None
             if not terminal_persisted:
                 self._complete(graph, target, st)
             if not terminal_persisted and not terminal_rejected:
                 self._emit(graph, st)
+            elif terminal_rejected:
+                # The durable owner is definitively gone, so invoking the persistence hook again would
+                # be incorrect. The process-local owner still publishes its sanitized failure snapshot.
+                self._publish_status_snapshot(st)
             if terminal_persisted and local_result is not None and local_result_committed:
                 try:
                     self.storage.release_result(local_result["uri"], run_id)
@@ -1111,13 +1282,15 @@ class SubprocessRunner:
             self._procs.pop(run_id, None)
             self._process_scopes.pop(run_id, None)
             self._cancel_files.pop(run_id, None)
+            self._internal_runs.discard(run_id)
             self._object_results.pop(run_id, None)
             self._local_results.pop(run_id, None)
             self._object_sinks.pop(run_id, None)
             self._sink_contracts.pop(run_id, None)
 
     def status(self, run_id: str) -> RunStatus:
-        return self.runs[run_id]
+        with self._lock:
+            return self._published_statuses[run_id].model_copy(deep=True)
 
     def cancel_acknowledged(self, run_id: str) -> bool:
         """True only once a cancelled child's process is observably gone/reaped."""
@@ -1143,4 +1316,4 @@ class SubprocessRunner:
                 pass  # watcher still hard-kills after the bounded grace period
         # _watch publishes `cancelled` only after the process group is fenced and its direct child reaped.
         # Until then status remains non-terminal, so it cannot acknowledge stop while a descendant may write.
-        return self.runs[run_id]
+        return self.status(run_id)

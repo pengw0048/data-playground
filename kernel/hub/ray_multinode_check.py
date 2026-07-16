@@ -47,6 +47,17 @@ def _log(m: str) -> None:
     print(f"[multinode] {m}", flush=True)
 
 
+def _committed_output(status):
+    """Return the one public publication proved by a successful acceptance run."""
+    from hub.run_outputs import sole_output
+
+    output = sole_output(status, committed=True)
+    if output is None:
+        raise RuntimeError(
+            f"successful run {status.run_id} did not publish exactly one committed output")
+    return output
+
+
 def _wait_tcp(host: str, port: int, timeout: float = 120) -> None:
     end = time.time() + timeout
     while time.time() < end:
@@ -179,13 +190,15 @@ def main() -> int:
     if st.status != "done" or st.placement != "distributed":
         _log(f"FAIL: cluster GROUP BY not distributed — status={st.status} placement={st.placement} — {st.error}")
         return 1
-    _log(f"cluster GROUP BY done (placement={st.placement}) → {st.output_uri}")
+    aggregate_output = _committed_output(st)
+    _log(f"cluster GROUP BY done (placement={st.placement}) → {aggregate_output.uri}")
 
     # DuckDB oracle: the same aggregate on the single-node engine, reading the same object-store source
     with db.run_scope():
         oracle = BuildEngine(g, deps.resolve_adapter, deps.registry, full=True,
                              node_specs=deps.node_specs, output_node="a").relation("a").to_arrow_table()
-    ray_tbl = deps.resolve_adapter(st.output_uri).scan(st.output_uri).to_arrow_table()  # union_by_name in the adapter
+    ray_tbl = deps.resolve_adapter(aggregate_output.uri).scan(
+        aggregate_output.uri).to_arrow_table()  # union_by_name in the adapter
     if fault == "schema":  # perturb the SCHEMA oracle's input so it MUST catch a mismatch
         ray_tbl = ray_tbl.rename_columns([c + "_x" for c in ray_tbl.column_names])
     # SCHEMA parity (not just row values, which DuckDB would coerce): the worker-direct Parquet must
@@ -237,8 +250,9 @@ def main() -> int:
         if ancestor_status.status != "done" or ancestor_status.placement != "distributed":
             _log(f"FAIL: native schema/ancestor-Hive run did not distribute: {ancestor_status.error}")
             return 1
-        ancestor_table = deps.resolve_adapter(ancestor_status.output_uri).scan(
-            ancestor_status.output_uri
+        ancestor_output = _committed_output(ancestor_status)
+        ancestor_table = deps.resolve_adapter(ancestor_output.uri).scan(
+            ancestor_output.uri
         ).to_arrow_table()
         if ancestor_table.column_names != ["x"] or str(ancestor_table.schema.field("x").type) != "int64" \
                 or sorted(ancestor_table.column("x").to_pylist()) != [1, 2]:
@@ -282,7 +296,9 @@ def main() -> int:
         if hive_status.status != "done" or hive_status.placement != "distributed":
             _log(f"FAIL: true-Hive native read did not distribute: {hive_status.error}")
             return 1
-        hive_table = deps.resolve_adapter(hive_status.output_uri).scan(hive_status.output_uri).to_arrow_table()
+        hive_output = _committed_output(hive_status)
+        hive_table = deps.resolve_adapter(hive_output.uri).scan(
+            hive_output.uri).to_arrow_table()
         with db.run_scope():
             hive_oracle = BuildEngine(
                 hive_graph, deps.resolve_adapter, deps.registry, full=True,
@@ -332,7 +348,8 @@ def main() -> int:
     with db.run_scope():
         joracle = BuildEngine(jg, deps.resolve_adapter, deps.registry, full=True,
                               node_specs=deps.node_specs, output_node="j").relation("j").to_arrow_table()
-    jray = deps.resolve_adapter(stj.output_uri).scan(stj.output_uri).to_arrow_table()
+    join_output = _committed_output(stj)
+    jray = deps.resolve_adapter(join_output.uri).scan(join_output.uri).to_arrow_table()
     con.register("joracle", joracle)
     con.register("jrayout", jray)
     jq = "SELECT cat, v, name FROM {t} ORDER BY v, cat"
@@ -364,18 +381,20 @@ def main() -> int:
     if stw.status != "done" or stw.placement != "distributed":
         _log(f"FAIL: whole-graph overwrite not distributed — {stw.status}/{stw.placement}: {stw.error}")
         return 1
-    if not (stw.output_uri or "").startswith(expected_prefix):
-        _log(f"FAIL: whole-graph sink did not return an immutable attempt URI: {stw.output_uri}")
+    whole_output = _committed_output(stw)
+    if not str(whole_output.uri).startswith(expected_prefix):
+        _log(f"FAIL: whole-graph sink did not return an immutable attempt URI: {whole_output.uri}")
         return 1
     from hub.handoff import read_manifest, validate_shards
-    manifest = read_manifest(stw.output_uri)
-    registered = deps.catalog.get_table(stw.output_table)
-    whole_tbl = deps.resolve_adapter(stw.output_uri).scan(stw.output_uri).to_arrow_table()
+    manifest = read_manifest(whole_output.uri)
+    registered = deps.catalog.get_table(whole_output.table)
+    whole_tbl = deps.resolve_adapter(whole_output.uri).scan(
+        whole_output.uri).to_arrow_table()
     if (manifest is None or manifest.get("runId") != stw.run_id or manifest.get("rows") != 8000
-            or not validate_shards(stw.output_uri, manifest)):
+            or not validate_shards(whole_output.uri, manifest)):
         _log(f"FAIL: whole-graph success manifest is invalid: {manifest}")
         return 1
-    if registered.uri != stw.output_uri or whole_tbl.num_rows != 8000:
+    if registered.uri != whole_output.uri or whole_tbl.num_rows != 8000:
         _log(f"FAIL: catalog/output did not publish the completed attempt: {registered.uri}")
         return 1
     _log("PASS: whole-graph Parquet overwrite is worker-direct, immutable, manifested, and cataloged")

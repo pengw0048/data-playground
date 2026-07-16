@@ -24,8 +24,10 @@ class ProfileProcessRunner(SubprocessRunner):
     name = "local-profile"
 
     def __init__(self, workspace: str, data_dir: str, *, storage=None,
-                 deadline_s: float | None = None):
-        super().__init__(workspace, data_dir, storage=storage, deadline_s=deadline_s)
+                 node_specs=None, deadline_s: float | None = None):
+        super().__init__(
+            workspace, data_dir, storage=storage, node_specs=node_specs,
+            deadline_s=deadline_s)
         self._profile_identities: dict[str, dict[str, object]] = {}
         self._terminal_persistence_pending: dict[str, RunStatus] = {}
         self._deferred_completions: dict[
@@ -38,6 +40,11 @@ class ProfileProcessRunner(SubprocessRunner):
     def run(self, graph: Graph, node_id: str, *, plan_digest: str,
             profile_attempt_order: int, run_id: str | None = None,
             request_id: str | None = None) -> RunStatus:
+        from hub.run_outputs import require_single_run_output
+        # ProfileProcessRunner is directly callable from a kernel, so the router's check is not a
+        # sufficient allocation boundary. Reject before reserving an identity, claiming source
+        # leases, or spawning a child.
+        require_single_run_output(graph, node_id, self.node_specs)
         if os.name != "posix":
             raise RuntimeError(
                 "full profiles require POSIX process-group containment on this backend")
@@ -66,7 +73,7 @@ class ProfileProcessRunner(SubprocessRunner):
             if existing is not None:
                 existing_identity = self._profile_identities.get(run_id)
                 if existing_identity == identity:
-                    return existing
+                    return self._published_statuses[run_id].model_copy(deep=True)
                 raise ValueError(
                     f"profile run id is already bound to a different identity: {run_id}")
             reserved_identity = self._profile_identities.get(run_id)
@@ -125,11 +132,13 @@ class ProfileProcessRunner(SubprocessRunner):
             if existing is not None:
                 if self._profile_identities.get(status.run_id) != identity:
                     raise ValueError("profile run id is already bound to a different identity")
-                return existing
+                return self._published_statuses[status.run_id].model_copy(deep=True)
             if status.run_id in self._procs:
                 raise RuntimeError("cannot retain a no-child failure for a live profile process")
             self._profile_identities[status.run_id] = identity
             self.runs[status.run_id] = retained
+            self._published_statuses[status.run_id] = RunStatus.model_validate(
+                retained.model_dump())
         self._complete(graph, status.target_node_id, retained)
         self._queue_terminal_persistence(graph, retained, persist)
         with self._lock:
@@ -247,6 +256,7 @@ class ProfileProcessRunner(SubprocessRunner):
         if status.status not in ("done", "failed", "cancelled"):
             super()._emit(graph, status, strict=strict)
             return
+        self._publish_status_snapshot(status)
         callback = self.on_status
         if callback is not None:
             self._queue_terminal_persistence(graph, status, callback)
@@ -265,7 +275,8 @@ class ProfileProcessRunner(SubprocessRunner):
             status.status = "failed"
             status.error = "profile supervisor lost the parent job identity"
             status.profile = None
-            status.output_uri = status.output_table = None
+            status.outputs = []
+            status.total_rows = None
             return status
         status.run_id = run_id
         status.job_type = "profile"
@@ -275,7 +286,8 @@ class ProfileProcessRunner(SubprocessRunner):
         request_id = identity["request_id"]
         status.request_id = str(request_id) if request_id is not None else None
         status.placement = "local"
-        status.output_uri = status.output_table = None
+        status.outputs = []
+        status.total_rows = None
         return status
 
     def _sanitize_child_status(self, run_id: str, observed: RunStatus) -> RunStatus:
@@ -293,7 +305,7 @@ class ProfileProcessRunner(SubprocessRunner):
                 observed.error = None
                 observed.progress = 1.0
                 observed.rows_processed = profile.row_count
-                observed.total_rows = profile.row_count
+                observed.total_rows = None
         else:
             # Partial/failed child documents never get to smuggle a result into durable state.
             observed.profile = None
@@ -306,7 +318,7 @@ class ProfileProcessRunner(SubprocessRunner):
             node_id=node_id,
             status=observed.status,
             label="Full profile",
-            rows=observed.total_rows,
+            rows=observed.rows_processed if observed.status == "done" else None,
             ms=observed.ms,
             error=observed.error if observed.status == "failed" else None,
         )]

@@ -4,6 +4,7 @@ import { color, status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import type { RunOutput } from '../types/api'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
@@ -65,6 +66,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             </div>
           )}
           <PerNode st={st} />
+          <RunOutputs outputs={st.outputs} />
           <Button size="sm" variant="outline" onClick={() => cancel(nodeId)} disabled={!canEdit} title={canEdit ? 'Stop this run' : 'View-only canvas'} className="mt-3 w-full">
             <Icon name="stop" size={12} /> Stop
           </Button>
@@ -76,15 +78,14 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           <Label>DONE</Label>
           <div className="mt-0.5 flex items-baseline gap-2">
             <span className="text-base" style={{ color: color.latest }}>✓</span>
-            <span className="text-[22px] font-bold text-foreground">{(st.totalRows ?? st.rowsProcessed).toLocaleString()} rows</span>
+            <span className="text-[22px] font-bold text-foreground">
+              {st.totalRows != null
+                ? `${st.totalRows.toLocaleString()} rows`
+                : `${st.outputs.length.toLocaleString()} output${st.outputs.length === 1 ? '' : 's'}`}
+            </span>
             <span className="text-[13px] text-muted-foreground">· {fmtTime(st.ms / 1000)}</span>
           </div>
-          {st.outputTable && <div className="mt-2.5 text-xs text-foreground">wrote <b>{st.outputTable}</b></div>}
-          {st.outputUri && (
-            <div title={st.outputUri} className="dp-mono mt-1.5 overflow-hidden text-ellipsis whitespace-nowrap rounded-md border border-border bg-muted px-2 py-[5px] text-[10.5px] text-muted-foreground">
-              → {st.outputUri}
-            </div>
-          )}
+          <RunOutputs outputs={st.outputs} />
           <PerNode st={st} compact />
         </>
       )}
@@ -99,9 +100,39 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           <div className="dp-mono mt-2 whitespace-pre-wrap rounded-lg bg-destructive/10 p-2.5 text-[11px] text-muted-foreground">
             {run?.error ?? st?.error ?? 'unknown error'}
           </div>
+          {st && <RunOutputs outputs={st.outputs} />}
           <Button size="sm" variant="outline" onClick={() => estimate(nodeId)} className="mt-3 w-full">Retry</Button>
         </div>
       )}
+    </div>
+  )
+}
+
+function RunOutputs({ outputs }: { outputs: RunOutput[] }) {
+  if (outputs.length === 0) return null
+  return (
+    <div aria-label="Run outputs" className="mt-2.5 flex flex-col gap-1.5">
+      {outputs.map((output) => {
+        const label = output.portLabel || output.portId
+        return (
+          <div key={`${output.nodeId}:${output.portId}`} className="rounded-md border border-border bg-muted/50 px-2 py-1.5 text-[10.5px]">
+            <div className="flex items-center gap-1.5">
+              <span className="dp-mono min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-semibold text-foreground"
+                title={`${output.nodeId}:${output.portId}`}>{label}</span>
+              {output.table && <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-foreground" title={output.table}>→ {output.table}</span>}
+              {output.rows != null && <span className="shrink-0 text-muted-foreground">{output.rows.toLocaleString()} rows</span>}
+              <span className={cn(
+                'shrink-0 rounded px-1 py-px text-[9px] font-semibold uppercase tracking-[0.3px]',
+                output.outcome === 'committed' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                  : output.outcome === 'failed' ? 'bg-destructive/10 text-destructive'
+                    : 'bg-muted text-muted-foreground',
+              )}>{output.outcome}</span>
+            </div>
+            {output.uri && <div className="dp-mono mt-1 overflow-hidden text-ellipsis whitespace-nowrap text-muted-foreground" title={output.uri}>→ {output.uri}</div>}
+            {output.error && <div className="dp-mono mt-1 whitespace-pre-wrap text-destructive">{output.error}</div>}
+          </div>
+        )
+      })}
     </div>
   )
 }

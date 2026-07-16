@@ -23,6 +23,11 @@ _MANAGED_SOURCE_ALLOCATION = f"{_PREFIX}managed-source"
 _TERMINAL = {"done", "failed", "cancelled"}
 
 
+def _committed_output(status):
+    from hub.run_outputs import sole_output
+    return sole_output(status, committed=True)
+
+
 def _wait(label: str, fn, predicate, timeout: float = 180.0, interval: float = 0.25):
     deadline = time.monotonic() + timeout
     last = None
@@ -472,7 +477,8 @@ def recover_restart() -> None:
     _assert_one_remote_job(client, run_id, submission_id)
     _put_recovery_ready(job)
     final = _terminal(runner, run_id)
-    if final.status != "done" or final.total_rows != 10_000 or not final.output_uri:
+    output = _committed_output(final)
+    if final.status != "done" or final.total_rows != 10_000 or output is None:
         raise AssertionError(f"replacement hub did not publish the successful result: {final}")
     if runner._find_job(client, submission_id) != "SUCCEEDED":
         raise AssertionError("replacement reached done without an authoritative Ray SUCCEEDED state")
@@ -496,8 +502,8 @@ def recover_restart() -> None:
 
     logical_uri = job["sink_contracts"]["write"]["logical_uri"]
     physical_uri = job["sink_contracts"]["write"]["physical_uri"]
-    if final.output_uri != physical_uri:
-        raise AssertionError(f"published output {final.output_uri!r} != frozen attempt {physical_uri!r}")
+    if output.uri != physical_uri:
+        raise AssertionError(f"published output {output.uri!r} != frozen attempt {physical_uri!r}")
     with metadb.session() as session:
         entries = session.scalar(select(func.count()).select_from(metadb.CatalogEntry).where(
             metadb.CatalogEntry.uri == physical_uri
@@ -560,7 +566,8 @@ def bad_result(mode: str) -> None:
     submission_id = status.backend_ref.submission_id
     final = _terminal(runner, status.run_id)
     remote = runner._find_job(client, submission_id)
-    if final.status != "failed" or final.output_uri or final.output_table:
+    if final.status != "failed" or any(
+            output.uri or output.table for output in final.outputs):
         raise AssertionError(f"{mode} result was not fail-closed: {final}")
     if mode == "missing":
         if remote != "SUCCEEDED" or "TerminalResultMissing" not in (final.error or ""):

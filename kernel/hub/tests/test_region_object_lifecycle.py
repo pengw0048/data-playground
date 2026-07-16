@@ -11,9 +11,10 @@ from sqlalchemy import select
 
 from hub import db, handoff, metadb
 from hub.deps import Deps
-from hub.models import ColumnSchema, Graph, ResourceSpec, RunStatus
+from hub.models import ColumnSchema, Graph, ResourceSpec, RunOutput, RunStatus
 from hub.planner import Region
 from hub.run_controller import _RegionMaterialization
+from hub.run_outputs import commit_output, sole_committed_document_output
 from hub.tiers import Tier
 
 
@@ -222,6 +223,28 @@ def _committed_handle(logical_uri: str) -> dict:
     return handle
 
 
+def _committed_output(
+        uri: str, rows: int, *, node_id: str = "source", port_id: str = "out") -> RunOutput:
+    return RunOutput(
+        node_id=node_id, port_id=port_id, wire="dataset",
+        publication_kind="result", outcome="committed", uri=uri, rows=rows,
+    )
+
+
+def _cache_document(
+        uri: str, rows: int, *, node_id: str = "source", port_id: str = "out") -> dict:
+    return {"outputs": [_committed_output(
+        uri, rows, node_id=node_id, port_id=port_id).model_dump()]}
+
+
+def _cached_output(key: str) -> RunOutput:
+    document = metadb.get_result(key)
+    assert document is not None and set(document) == {"outputs"}
+    output = sole_committed_document_output(document)
+    assert output is not None and output.rows is not None
+    return output
+
+
 def _close(result) -> None:
     pin = getattr(result, "cache_pin", None)
     if pin is not None:
@@ -262,17 +285,21 @@ def test_orchestrator_holds_region_cache_pin_until_final_region_stops(region_env
     run_id = f"pin-lifetime-{uuid.uuid4().hex}"
     controller.runs[run_id] = RunStatus(
         run_id=run_id, status="queued", placement="distributed", target_node_id="final",
-        per_node=[])
+        per_node=[], outputs=[RunOutput(
+            node_id="final", port_id="out", wire="dataset",
+            publication_kind="result", outcome="pending")])
     controller._cancel[run_id] = threading.Event()
     monkeypatch.setattr(
         controller, "_materialize",
-        lambda *_args, **_kwargs: _RegionMaterialization(env.logical_uri, pin))
+        lambda *_args, **_kwargs: _RegionMaterialization(env.logical_uri, pin, rows=4))
 
     def run_final(*_args, **_kwargs):
         assert not pin.closed and pin.checks >= 2
         return RunStatus(
             run_id="final-subrun", status="done", placement="local", per_node=[],
-            output_uri="/tmp/final.parquet", rows_processed=1)
+            target_node_id="final", rows_processed=1, total_rows=1,
+            outputs=[_committed_output(
+                "/tmp/final.parquet", 1, node_id="final")])
 
     monkeypatch.setattr(controller, "_run_final", run_final)
     monkeypatch.setattr(controller, "on_status", None)
@@ -389,7 +416,7 @@ def test_sqlite_local_runner_serializes_concurrent_first_cache_publications(
     def publish(handle):
         try:
             barrier.wait(timeout=5)
-            env.deps.runner._cache_put(cache_key, {"uri": handle["uri"], "rows": 1})
+            env.deps.runner._cache_put(cache_key, _cache_document(handle["uri"], 1))
         except BaseException as exc:  # noqa: BLE001 - asserted after both publishers stop
             errors.append(exc)
 
@@ -400,7 +427,7 @@ def test_sqlite_local_runner_serializes_concurrent_first_cache_publications(
         thread.join(timeout=5)
     assert all(not thread.is_alive() for thread in threads)
     assert errors == []
-    assert metadb.get_result(cache_key)["uri"] in {handle["uri"] for handle in handles}
+    assert _cached_output(cache_key).uri in {handle["uri"] for handle in handles}
     states = [_attempt_state(handle["uri"]) for handle in handles]
     assert sorted(states) == ["published", "superseded"]
 
@@ -413,14 +440,14 @@ def test_sqlite_local_runner_cache_acquire_cannot_pin_a_superseded_generation(
     logical = f"s3://region-lifecycle/root/primitive/{uuid.uuid4().hex}.parquet"
     first, second = _committed_handle(logical), _committed_handle(logical)
     cache_key = f"primitive-put-acquire-{uuid.uuid4().hex}"
-    env.deps.runner._cache_put(cache_key, {"uri": first["uri"], "rows": 1})
+    env.deps.runner._cache_put(cache_key, _cache_document(first["uri"], 1))
     barrier = threading.Barrier(2)
     acquired, errors = [], []
 
     def replace():
         try:
             barrier.wait(timeout=5)
-            env.deps.runner._cache_put(cache_key, {"uri": second["uri"], "rows": 1})
+            env.deps.runner._cache_put(cache_key, _cache_document(second["uri"], 1))
         except BaseException as exc:  # noqa: BLE001 - asserted after both operations stop
             errors.append(exc)
 
@@ -439,9 +466,11 @@ def test_sqlite_local_runner_cache_acquire_cannot_pin_a_superseded_generation(
     assert all(not thread.is_alive() for thread in threads)
     assert errors == [] and len(acquired) == 1
     doc, guard = acquired[0]
-    assert doc["uri"] in (first["uri"], second["uri"])
-    assert guard is not None and _attempt_state(doc["uri"]) == "published"
-    assert "result_reader" in _attempt_refs(doc["uri"])
+    acquired_output = sole_committed_document_output(doc)
+    assert acquired_output is not None
+    assert acquired_output.uri in (first["uri"], second["uri"])
+    assert guard is not None and _attempt_state(acquired_output.uri) == "published"
+    assert "result_reader" in _attempt_refs(acquired_output.uri)
     guard.close()
     assert _attempt_state(second["uri"]) == "published"
     assert _attempt_state(first["uri"]) == "superseded"
@@ -457,7 +486,7 @@ def test_base_recompute_publishes_only_a_parent_owned_attempt(region_env, monkey
             run_id, env.graph, env.region, {}, [env.region])
         assert str(result) != env.logical_uri and ".attempt-" in str(result)
         assert env.adapter.writes == [str(result) + "/part-00000.parquet"]
-        assert metadb.get_result(env.cache_key)["uri"] == str(result)
+        assert _cached_output(env.cache_key).uri == str(result)
         assert _attempt_state(str(result)) == "published"
         assert sorted(_attempt_refs(str(result))) == ["result_cache", "result_reader"]
     finally:
@@ -479,7 +508,7 @@ def test_base_recompute_pins_exact_managed_source_during_blocked_scan_and_gc(
     env.adapter.rows[old_source["uri"]] = 4
     env.adapter.rows[new_source["uri"]] = 4
     source_cache_key = f"source-pointer-{uuid.uuid4().hex}"
-    metadb.put_result(source_cache_key, {"uri": old_source["uri"], "rows": 4})
+    metadb.put_result(source_cache_key, _cache_document(old_source["uri"], 4))
 
     graph = Graph.model_validate({
         "id": "blocked-managed-source", "version": 1,
@@ -489,9 +518,6 @@ def test_base_recompute_pins_exact_managed_source_during_blocked_scan_and_gc(
         }],
         "edges": [],
     })
-    subgraph = controller._subgraph(graph, env.region, {})
-    output_cache_key = (
-        f"{env.deps.runner._plan_hash(subgraph, env.region.output_node)}@object")
     scan_entered = threading.Event()
     allow_scan = threading.Event()
     original_scan = env.adapter.scan
@@ -526,7 +552,7 @@ def test_base_recompute_pins_exact_managed_source_during_blocked_scan_and_gc(
             )))
         assert len(leases) == 1
 
-        metadb.put_result(source_cache_key, {"uri": new_source["uri"], "rows": 4})
+        metadb.put_result(source_cache_key, _cache_document(new_source["uri"], 4))
         assert _attempt_state(old_source["uri"]) == "superseded"
         actions = metadb.object_attempt_gc_batch(0, 0)
         assert old_source["uri"] not in {action["uri"] for action in actions}
@@ -545,10 +571,7 @@ def test_base_recompute_pins_exact_managed_source_during_blocked_scan_and_gc(
         ))) == []
 
     _close(result)
-    metadb.put_result(output_cache_key, {"uri": None})
-    metadb.put_result(source_cache_key, {"uri": None})
-    for uri in (old_source["uri"], new_source["uri"], str(result)):
-        metadb.quarantine_object_attempt(uri, "test cleanup")
+    # The autouse metadata fixture drops this test's isolated result-cache owners.
     controller._cancel.pop(run_id, None)
 
 
@@ -599,10 +622,11 @@ def test_subprocess_region_gets_logical_target_and_returns_parent_attested_attem
             written = env.adapter.write(attempt + "/part-00000.parquet", rel)
             handoff.write_manifest(
                 attempt, run_id=job_extra["runId"], rows=written["rows"], schema=rel.types)
-        status.status = "done"
-        status.output_uri = attempt
+        commit_output(status, uri=attempt, rows=written["rows"])
         status.rows_processed = status.total_rows = written["rows"]
+        status.status = "done"
         backend.runs[status.run_id] = status
+        backend._emit(graph, status)
         return status
 
     original_run_unit = backend.run_unit
@@ -725,7 +749,7 @@ def test_moto_subprocess_region_end_to_end_publishes_after_child_reap(
 def test_cross_tier_copy_uses_a_new_attempt_and_pins_the_destination(region_env, monkeypatch):
     env = region_env
     env.deps.runner._cache_put(
-        f"{env.key}@local", {"uri": env.source, "table": env.region.id, "rows": 4})
+        f"{env.key}@local", _cache_document(env.source, 4))
     monkeypatch.setattr(env.deps.controller, "_backend_runner", lambda *_args, **_kwargs: env.deps.runner)
     run_id = f"copy-{uuid.uuid4().hex}"
     env.deps.controller._cancel[run_id] = threading.Event()
@@ -735,7 +759,7 @@ def test_cross_tier_copy_uses_a_new_attempt_and_pins_the_destination(region_env,
         assert str(result) != env.logical_uri and ".attempt-" in str(result)
         assert env.adapter.writes == [str(result) + "/part-00000.parquet"]
         assert env.adapter.rows[str(result)] == 4
-        assert metadb.get_result(env.cache_key)["uri"] == str(result)
+        assert _cached_output(env.cache_key).uri == str(result)
         assert "result_reader" in _attempt_refs(str(result))
     finally:
         env.deps.controller._cancel.pop(run_id, None)
@@ -765,7 +789,7 @@ def test_cross_tier_copy_lost_source_pin_never_publishes_destination(
 
     pin = Pin()
     source_uri = env.source if destination == "object" else env.logical_uri
-    alt = _RegionMaterialization(source_uri, pin)
+    alt = _RegionMaterialization(source_uri, pin, rows=4)
 
     def acquire(cache_key, **_kwargs):
         if cache_key.endswith(f"@{destination}"):
@@ -778,9 +802,9 @@ def test_cross_tier_copy_lost_source_pin_never_publishes_destination(
 
     def move(*args, **kwargs):
         moves.append((args, kwargs))
-        if destination == "object":
-            original_move(*args, **kwargs)
+        copied_rows = original_move(*args, **kwargs) if destination == "object" else 4
         pin.lost = True
+        return copied_rows
 
     monkeypatch.setattr(controller, "_move_tier", move)
     run_id = f"lost-copy-pin-{destination}-{uuid.uuid4().hex}"
@@ -831,7 +855,7 @@ def test_concurrent_same_hash_writers_never_share_a_physical_prefix(
         written_roots = {uri.removesuffix("/part-00000.parquet") for uri in env.adapter.writes}
         assert len(written_roots) == 2 and env.logical_uri not in written_roots
         assert len(results) == 2 and all(getattr(result, "cache_pin", None) for result in results)
-        assert metadb.get_result(env.cache_key)["uri"] in written_roots
+        assert _cached_output(env.cache_key).uri in written_roots
     finally:
         for result in results:
             _close(result)
@@ -911,7 +935,7 @@ def test_cache_readback_recovers_an_after_commit_error(region_env, monkeypatch):
     try:
         result = env.deps.controller._materialize(
             run_id, env.graph, env.region, {}, [env.region])
-        assert metadb.get_result(env.cache_key)["uri"] == str(result)
+        assert _cached_output(env.cache_key).uri == str(result)
         assert _attempt_state(str(result)) == "published"
         assert sorted(_attempt_refs(str(result))) == ["result_cache", "result_reader"]
     finally:
@@ -941,7 +965,8 @@ def test_placed_backend_cannot_substitute_another_managed_attempt(region_env, mo
             )
             status = RunStatus(
                 run_id=run_id, status="done", placement="distributed", per_node=[],
-                output_uri=handle["uri"])
+                target_node_id=output_node, total_rows=4,
+                outputs=[_committed_output(handle["uri"], 4, node_id=output_node)])
             self.runs[run_id] = status
             return status
 
@@ -965,4 +990,4 @@ def test_placed_backend_cannot_substitute_another_managed_attempt(region_env, mo
         env.deps.controller._cancel.pop(run_id, None)
         for status in backend.runs.values():
             with contextlib.suppress(Exception):
-                metadb.quarantine_object_attempt(status.output_uri, "test cleanup")
+                metadb.quarantine_object_attempt(status.outputs[0].uri, "test cleanup")

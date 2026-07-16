@@ -6,6 +6,9 @@
         "enum": [
           "invalid_request",
           "invalid_graph",
+          "output_port_required",
+          "output_port_not_found",
+          "multi_output_unsupported",
           "authentication_required",
           "permission_denied",
           "not_found",
@@ -921,6 +924,8 @@
             "type": "object"
           },
           "id": {
+            "maxLength": 256,
+            "minLength": 1,
             "title": "Id",
             "type": "string"
           },
@@ -1634,6 +1639,19 @@
             "default": 0,
             "title": "Offset",
             "type": "integer"
+          },
+          "portId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Portid"
           }
         },
         "required": [
@@ -2292,6 +2310,257 @@
         "title": "RunEstimate",
         "type": "object"
       },
+      "RunHistoryRecord": {
+        "description": "Bounded, explicit response model for one durable run-history row.",
+        "properties": {
+          "createdAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Createdat"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "jobType": {
+            "enum": [
+              "run",
+              "profile"
+            ],
+            "title": "Jobtype",
+            "type": "string"
+          },
+          "ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ms"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/components/schemas/RunOutput"
+            },
+            "maxItems": 64,
+            "title": "Outputs",
+            "type": "array"
+          },
+          "perNode": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PerNodeStatus"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pernode"
+          },
+          "requestId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requestid"
+          },
+          "rows": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rows"
+          },
+          "runId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runid"
+          },
+          "status": {
+            "enum": [
+              "done",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "targetNodeId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Targetnodeid"
+          }
+        },
+        "required": [
+          "id",
+          "jobType",
+          "status"
+        ],
+        "title": "RunHistoryRecord",
+        "type": "object"
+      },
+      "RunOutput": {
+        "description": "One declared output port and its durable publication state.\n\nPort metadata is a snapshot, not a live lookup: history remains intelligible after a node spec or\nSection declaration changes.  A URI becomes public only after publication commits; pending and\nterminal non-committed outcomes therefore cannot carry storage or catalog identities.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "nodeId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Nodeid",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "pending",
+              "committed",
+              "failed",
+              "skipped",
+              "cancelled"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "portId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Portid",
+            "type": "string"
+          },
+          "portLabel": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Portlabel"
+          },
+          "publicationKind": {
+            "enum": [
+              "result",
+              "catalog"
+            ],
+            "title": "Publicationkind",
+            "type": "string"
+          },
+          "rows": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rows"
+          },
+          "table": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table"
+          },
+          "uri": {
+            "anyOf": [
+              {
+                "maxLength": 8192,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uri"
+          },
+          "wire": {
+            "enum": [
+              "dataset",
+              "selection",
+              "sample",
+              "sql-view",
+              "metric",
+              "value"
+            ],
+            "title": "Wire",
+            "type": "string"
+          }
+        },
+        "required": [
+          "nodeId",
+          "portId",
+          "wire",
+          "publicationKind",
+          "outcome"
+        ],
+        "title": "RunOutput",
+        "type": "object"
+      },
       "RunRequest": {
         "properties": {
           "confirmed": {
@@ -2357,27 +2626,13 @@
             "title": "Ms",
             "type": "integer"
           },
-          "outputTable": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Outputtable"
-          },
-          "outputUri": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Outputuri"
+          "outputs": {
+            "items": {
+              "$ref": "#/components/schemas/RunOutput"
+            },
+            "maxItems": 64,
+            "title": "Outputs",
+            "type": "array"
           },
           "perNode": {
             "default": [],
@@ -4118,8 +4373,7 @@
               "application/json": {
                 "schema": {
                   "items": {
-                    "additionalProperties": true,
-                    "type": "object"
+                    "$ref": "#/components/schemas/RunHistoryRecord"
                   },
                   "title": "Response Canvas Runs Api Canvas  Canvas Id  Runs Get",
                   "type": "array"

@@ -167,7 +167,9 @@ class Playground:
     def _resolve_uri(self, ref: str) -> str:
         return self.deps.catalog.resolve_ref(ref)
 
-    def _preview_doc(self, doc: dict, node_id: str, limit: int) -> dict:
+    def _preview_doc(
+            self, doc: dict, node_id: str, limit: int,
+            port_id: str | None = None) -> dict:
         """Preview a node over a bounded sample of the CURRENT doc, in-process. Resolves source refs on
         a throwaway model copy so a `source` may name a catalog table; never mutates the stored doc."""
         from hub import graph as gmod
@@ -178,7 +180,7 @@ class Playground:
         gmod.resolve_source_refs(graph, d.catalog.resolve_ref)
         res = preview_node(
             graph, node_id, limit, d.resolve_adapter, d.registry, d.node_builders, d.node_specs,
-            storage=d.storage)
+            storage=d.storage, port_id=port_id)
         if res.not_previewable:
             return {"notPreviewable": True, "reason": res.reason}
         if res.error:
@@ -244,7 +246,8 @@ class Playground:
                   "title": (n.get("data") or {}).get("title"),
                   "config": (n.get("data") or {}).get("config", {})} for n in doc["nodes"]]
         edges = [{"id": e.get("id"), "source": e.get("source"), "target": e.get("target"),
-                  "targetHandle": e.get("targetHandle"), "wire": (e.get("data") or {}).get("wire")}
+                  "sourceHandle": e.get("sourceHandle"), "targetHandle": e.get("targetHandle"),
+                  "wire": (e.get("data") or {}).get("wire")}
                  for e in doc["edges"]]
         return {"canvasId": canvas_id, "name": doc.get("name"), "url": self._canvas_url(canvas_id),
                 "nodes": nodes, "edges": edges}
@@ -266,15 +269,17 @@ class Playground:
     def connect(self, args: dict) -> dict:
         canvas_id = self._req(args, "canvasId")
         source_id, target_id = self._req(args, "sourceId"), self._req(args, "targetId")
+        source_handle = args.get("sourceHandle")
         target_handle = args.get("targetHandle")
 
         def op(doc):
             try:
                 r = graph_ops.connect(doc, self.deps.node_specs, graph_ops.fresh_id(doc, "e"),
-                                      source_id, target_id, target_handle)
+                                      source_id, target_id, target_handle, source_handle)
             except graph_ops.GraphOpError as e:
                 raise ToolError(str(e))
-            return {"ok": True, "edgeId": r["edge_id"], "wire": r["wire"]}
+            return {"ok": True, "edgeId": r["edge_id"],
+                    "sourceHandle": r["source_handle"], "wire": r["wire"]}
         return self._mutate(canvas_id, op)
 
     def set_node_config(self, args: dict) -> dict:
@@ -283,9 +288,14 @@ class Playground:
 
         def op(doc):
             try:
-                return graph_ops.set_config(doc, node_id, config)
+                result = graph_ops.set_config(
+                    doc, self.deps.node_specs, node_id, config)
             except graph_ops.GraphOpError as e:
                 raise ToolError(str(e))
+            return {
+                "ok": result["ok"], "config": result["config"],
+                "removedEdges": result["removed_edges"],
+            }
         return self._mutate(canvas_id, op)
 
     def remove_node(self, args: dict) -> dict:
@@ -314,7 +324,8 @@ class Playground:
             nonlocal node_id
             if node_id:
                 try:
-                    graph_ops.set_config(doc, node_id, config)
+                    graph_ops.set_config(
+                        doc, self.deps.node_specs, node_id, config)
                 except graph_ops.GraphOpError as e:
                     raise ToolError(str(e))
                 return {"nodeId": node_id, "created": False}
@@ -336,10 +347,11 @@ class Playground:
     # -- preview / validate / run ----------------------------------------- #
     def preview_node(self, args: dict) -> dict:
         canvas_id, node_id = self._req(args, "canvasId"), self._req(args, "nodeId")
+        port_id = args.get("portId")
         doc = self._get_doc(canvas_id)
         if not graph_ops.find_node(doc, node_id):
             raise ToolError(f"node '{node_id}' not found on canvas '{canvas_id}'")
-        return self._preview_doc(doc, node_id, self._limit(args, 10))
+        return self._preview_doc(doc, node_id, self._limit(args, 10), port_id)
 
     def validate_canvas(self, args: dict) -> dict:
         canvas_id = self._req(args, "canvasId")
@@ -448,9 +460,11 @@ class Playground:
         if not _run_read_access(run_id, self.user_id):  # don't read an unrelated user's output rows
             raise ToolError(f"unknown runId '{run_id}'")
         st = _status_or_lost(run_id)
-        if not st.output_uri:
+        from hub.run_outputs import sole_output
+        output = sole_output(st, committed=True)
+        if output is None or not output.uri:
             raise ToolError(f"run '{st.run_id}' ({st.status}) produced no materialized output to sample")
-        return self.sample_dataset({"dataset": st.output_uri, "limit": args.get("limit"),
+        return self.sample_dataset({"dataset": output.uri, "limit": args.get("limit"),
                                     "columns": args.get("columns")})
 
     @staticmethod
@@ -459,9 +473,11 @@ class Playground:
         reached a terminal state — the run is still executing; follow it with run_status(runId)."""
         terminal = status.status in ("done", "failed", "cancelled")
         env = {"runId": status.run_id, "status": status.status,
+               "jobType": status.job_type,
                "targetNodeId": target if target is not None else status.target_node_id,
-               "rows": status.total_rows, "ms": status.ms, "outputTable": status.output_table,
-               "outputUri": status.output_uri, "error": status.error}
+               "rows": status.total_rows, "ms": status.ms,
+               "outputs": [output.model_dump(by_alias=True) for output in status.outputs],
+               "error": status.error}
         if not terminal:
             env["timedOut"] = True
             env["hint"] = "run still in progress — poll run_status with this runId, or cancel_run to stop it"
@@ -576,9 +592,10 @@ def _tool_specs(pg: Playground) -> list[dict]:
          "inputSchema": _schema({**canvas, "kind": {**_STR, "description": "node kind, e.g. source/filter/join/transform"},
                                  "title": _STR, "config": _OBJ}, ["canvasId", "kind"])},
         {"name": "connect", "handler": pg.connect,
-         "description": "Wire one node's output into another's input. Use targetHandle for a multi-input "
-                        "node (join 'a'/'b'). The typed-wire rules reject an incompatible connection.",
+         "description": "Wire one node's output into another's input. sourceHandle is required for a "
+                        "multi-output source; targetHandle selects a multi-input port (join 'a'/'b').",
          "inputSchema": _schema({**canvas, "sourceId": _STR, "targetId": _STR,
+                                 "sourceHandle": {**_STR, "description": "output handle for a multi-output node"},
                                  "targetHandle": {**_STR, "description": "input handle for a multi-input node"}},
                                 ["canvasId", "sourceId", "targetId"])},
         {"name": "set_node_config", "handler": pg.set_node_config,
@@ -599,9 +616,11 @@ def _tool_specs(pg: Playground) -> list[dict]:
                                  "nodeId": {**_STR, "description": "update this existing transform instead of creating one"},
                                  "title": _STR, "limit": _INT}, ["canvasId", "code"])},
         {"name": "preview_node", "handler": pg.preview_node,
-         "description": "Preview a node's output over a bounded real sample: columns + rows. The way to "
+         "description": "Preview one named node output over a bounded real sample: columns + rows. The way to "
                         "verify each step (including a transform's code) works before continuing.",
-         "inputSchema": _schema({**canvas, "nodeId": _STR, "limit": {**_INT, "description": "max rows (default 10)"}},
+         "inputSchema": _schema({**canvas, "nodeId": _STR,
+                                 "portId": {**_STR, "description": "required for a multi-output node"},
+                                 "limit": {**_INT, "description": "max rows (default 10)"}},
                                 ["canvasId", "nodeId"])},
         {"name": "validate_canvas", "handler": pg.validate_canvas,
          "description": "Static checks without running: typed-wire errors + per-join measured "

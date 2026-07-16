@@ -19,7 +19,7 @@ from sqlalchemy import select as _sa_select
 
 from hub import auth, auth_admission, metadb
 from hub.api_errors import APIError, APIErrorCode
-from hub.models import CredUpsert, RunStatus
+from hub.models import CredUpsert, RunHistoryRecord, RunStatus
 from hub.security import RequestIdentity, current_identity, current_user
 
 router = APIRouter()
@@ -486,12 +486,12 @@ def remove_share(canvas_id: str, user_id: str, uid: str = Depends(current_user))
     return {"ok": True}
 
 
-@router.get("/canvas/{canvas_id}/runs")
-def canvas_runs(canvas_id: str, uid: str = Depends(current_user)) -> list[dict]:
+@router.get("/canvas/{canvas_id}/runs", response_model=list[RunHistoryRecord])
+def canvas_runs(canvas_id: str, uid: str = Depends(current_user)) -> list[RunHistoryRecord]:
     """Run history for a canvas (persisted, survives restarts)."""
     if metadb.canvas_role(canvas_id, uid) is None:  # same authz as the other canvas endpoints
         raise HTTPException(404, "not found")
-    return metadb.list_runs(canvas_id)
+    return [RunHistoryRecord.model_validate(record) for record in metadb.list_runs(canvas_id)]
 
 
 @router.get("/canvas/{canvas_id}/active-runs", response_model=list[RunStatus])

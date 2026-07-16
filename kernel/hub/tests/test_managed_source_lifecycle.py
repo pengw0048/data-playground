@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import select
 
 from hub import handoff, metadb
-from hub.models import Graph, RunStatus
+from hub.models import Graph, RunOutput, RunStatus
 from hub.process_scope import OwnedProcessScope
 from hub.storage import (
     MAX_MANAGED_EXECUTION_SOURCES,
@@ -134,6 +134,22 @@ def _committed_region(logical_uri: str) -> dict:
     return handle
 
 
+def _run_output(
+        uri: str | None = None, *, rows: int | None = None,
+        node_id: str = "source", table: str | None = None,
+        outcome: str = "committed") -> RunOutput:
+    return RunOutput(
+        node_id=node_id, port_id="out", wire="dataset",
+        publication_kind="catalog" if table is not None else "result",
+        outcome=outcome, uri=uri,
+        table=table if outcome == "committed" else None, rows=rows,
+    )
+
+
+def _cache_document(uri: str, rows: int = 1) -> dict:
+    return {"outputs": [_run_output(uri, rows=rows).model_dump()]}
+
+
 def _attempt_state(uri: str) -> str:
     with metadb.session() as session:
         return session.get(metadb.ObjectAttempt, uri).state
@@ -141,7 +157,8 @@ def _attempt_state(uri: str) -> str:
 
 def _published_region(logical_uri: str) -> dict:
     handle = _committed_region(logical_uri)
-    metadb.put_result(f"interactive-source-{uuid.uuid4().hex}", {"uri": handle["uri"]})
+    metadb.put_result(
+        f"interactive-source-{uuid.uuid4().hex}", _cache_document(handle["uri"]))
     assert _attempt_state(handle["uri"]) == "published"
     return handle
 
@@ -314,8 +331,8 @@ def test_interactive_scope_rejects_every_invalid_generation_before_body():
     old = _committed_region(logical)
     replacement = _committed_region(logical)
     pointer = f"interactive-replacement-{uuid.uuid4().hex}"
-    metadb.put_result(pointer, {"uri": old["uri"]})
-    metadb.put_result(pointer, {"uri": replacement["uri"]})
+    metadb.put_result(pointer, _cache_document(old["uri"]))
+    metadb.put_result(pointer, _cache_document(replacement["uri"]))
     assert _attempt_state(old["uri"]) == "superseded"
 
     foreign = _published_region(
@@ -712,7 +729,7 @@ def test_parent_attestation_atomically_pins_replaced_generation_against_gc(tmp_p
     old = _committed_region(logical)
     replacement = _committed_region(logical)
     cache_key = f"managed-source-pointer-{uuid.uuid4().hex}"
-    metadb.put_result(cache_key, {"uri": old["uri"], "rows": 1})
+    metadb.put_result(cache_key, _cache_document(old["uri"]))
     assert _attempt_state(old["uri"]) == "published"
 
     runner = SubprocessRunner(str(tmp_path), str(tmp_path))
@@ -734,7 +751,7 @@ def test_parent_attestation_atomically_pins_replaced_generation_against_gc(tmp_p
             )))
         assert len(leases) == 1
 
-        metadb.put_result(cache_key, {"uri": replacement["uri"], "rows": 1})
+        metadb.put_result(cache_key, _cache_document(replacement["uri"]))
         assert _attempt_state(old["uri"]) == "superseded"
         assert old["uri"] not in {
             item["uri"] for item in metadb.object_attempt_gc_batch(0, 0)
@@ -772,9 +789,9 @@ def test_parent_rejects_unattestable_managed_source_before_dispatch(
         if case in ("superseded", "descendant"):
             replacement = _committed_region(logical)
             cache_key = f"managed-source-reject-{uuid.uuid4().hex}"
-            metadb.put_result(cache_key, {"uri": old["uri"]})
+            metadb.put_result(cache_key, _cache_document(old["uri"]))
             if case == "superseded":
-                metadb.put_result(cache_key, {"uri": replacement["uri"]})
+                metadb.put_result(cache_key, _cache_document(replacement["uri"]))
             else:
                 uri = f"{old['uri']}/part-00000.parquet"
 
@@ -789,7 +806,7 @@ def test_parent_deduplicates_sources_and_releases_partial_claim_on_failure(tmp_p
     logical = f"s3://managed-source-partial/{uuid.uuid4().hex}/input.parquet"
     published = _committed_region(logical)
     cache_key = f"managed-source-partial-{uuid.uuid4().hex}"
-    metadb.put_result(cache_key, {"uri": published["uri"]})
+    metadb.put_result(cache_key, _cache_document(published["uri"]))
     runner = SubprocessRunner(str(tmp_path), str(tmp_path))
 
     duplicate = runner._claim_source_leases(
@@ -820,9 +837,9 @@ def test_parent_deduplicates_sources_and_releases_partial_claim_on_failure(tmp_p
 def test_read_lease_thread_start_failure_rolls_back_atomic_claim(monkeypatch):
     logical = f"s3://managed-source-thread/{uuid.uuid4().hex}/input.parquet"
     published = _committed_region(logical)
-    metadb.put_result(f"managed-source-thread-{uuid.uuid4().hex}", {
-        "uri": published["uri"],
-    })
+    metadb.put_result(
+        f"managed-source-thread-{uuid.uuid4().hex}",
+        _cache_document(published["uri"]))
 
     class BrokenThread:
         def __init__(self, *args, **kwargs):
@@ -846,9 +863,9 @@ def test_read_lease_thread_start_failure_rolls_back_atomic_claim(monkeypatch):
 def test_raw_managed_read_rejects_attempt_member_uri():
     logical = f"s3://managed-source-member/{uuid.uuid4().hex}/input.parquet"
     published = _committed_region(logical)
-    metadb.put_result(f"managed-source-member-{uuid.uuid4().hex}", {
-        "uri": published["uri"],
-    })
+    metadb.put_result(
+        f"managed-source-member-{uuid.uuid4().hex}",
+        _cache_document(published["uri"]))
     with pytest.raises(FileNotFoundError, match="exact attempt root"):
         with handoff.managed_read_lease(
                 f"{published['uri']}/part-00000.parquet", owner="member-reader"):
@@ -868,6 +885,11 @@ def test_source_lease_lost_after_child_done_blocks_every_publication(
         "s3://managed-source-loss/results/out.attempt-parent"
         if publication != "unmanaged-sink" else str(tmp_path / "out.csv"))
     output_table = None if publication == "object-result" else "out"
+    target_node_id = "source" if publication == "object-result" else "write"
+    committed = _run_output(
+        output_uri, rows=1, node_id=target_node_id, table=output_table)
+    pending = _run_output(
+        node_id=target_node_id, table=output_table, outcome="pending")
     job_dir = tmp_path / publication
     job_dir.mkdir()
     status_file = job_dir / "status.json"
@@ -876,8 +898,9 @@ def test_source_lease_lost_after_child_done_blocks_every_publication(
         status="done",
         placement="local",
         per_node=[],
-        output_uri=output_uri,
-        output_table=output_table,
+        target_node_id=target_node_id,
+        total_rows=1,
+        outputs=[committed],
     ).model_dump()))
 
     class Guard:
@@ -926,7 +949,8 @@ def test_source_lease_lost_after_child_done_blocks_every_publication(
     runner = SubprocessRunner(str(tmp_path), str(tmp_path), catalog=Catalog())
     process = FinishedProcess()
     runner.runs[run_id] = RunStatus(
-        run_id=run_id, status="running", placement="local", per_node=[])
+        run_id=run_id, status="running", placement="local", per_node=[],
+        target_node_id=target_node_id, outputs=[pending])
     runner._procs[run_id] = process
     runner._process_scopes[run_id] = OwnedProcessScope(
         process, owns_process_group=False)
@@ -973,13 +997,15 @@ def test_source_lease_lost_after_child_done_blocks_every_publication(
         run_id, process, str(status_file), str(job_dir),
         Graph.model_validate({
             "id": "lost-source", "version": 1, "nodes": [], "edges": [],
-        }), None)
+        }), target_node_id)
 
     final = runner.status(run_id)
     assert final.status == "failed"
     assert final.error == "managed source lease was lost during execution"
     assert "SECRET_SOURCE_LEASE_SENTINEL" not in final.error
-    assert final.output_uri is None and final.output_table is None
+    assert len(final.outputs) == 1
+    assert final.outputs[0].outcome == "failed"
+    assert final.outputs[0].uri is None and final.outputs[0].table is None
     assert guard.checks == 2
     assert stack.closed and events == ["reaped", "released"]
     assert "prepare" not in publication_calls

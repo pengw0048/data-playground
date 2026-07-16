@@ -145,8 +145,8 @@ API keys are never sent to the driver.
    copy has a separate 8 MiB ceiling. System-generated identity fields and the semantic environment omit
    owner/auth data and known credential variables, but arbitrary graph/plugin configuration is preserved
    verbatim and may itself be sensitive. Oversized jobs fail before the binding transaction. Only after
-   that commit does the hub materialize
-   `job.dpjob`; a replacement supervisor recreates the exact bytes if the first hub crashes between phases.
+   that commit does the hub materialize `job.dpjob`; a replacement supervisor recreates the exact bytes if
+   the first hub crashes between phases.
 3. Status plus a successful Jobs listing distinguish an absent job from an ambiguous API failure. Only
    authoritative absence opens submission/replay. SQL then linearizes exactly one request with a
    DB-clock lease and a CAS that requires `cancel_requested=false`; an expired-owner reclaim moves
@@ -168,12 +168,15 @@ API keys are never sent to the driver.
 5. On `SUCCEEDED`, the hub reads and verifies the exact result envelope. Missing results receive a bounded
    consistency grace period; transport/auth failures remain non-terminal and retry. A failed/cancelled
    envelope may retain a hash-bound subset of committed sink URIs as private cleanup evidence, but it must
-   not name a primary output and those URIs never enter public status or catalog publication.
+   not name a primary output and those URIs never enter public status or catalog publication. Whole-graph
+   non-write targets are rejected before Jobs allocation because this lifecycle currently publishes only
+   an explicit write sink.
 6. Supervisors compete for a renewable SQL publication lease. Before any catalog mutation, the winner
    commits exact object inventory, probes the output schema, and freezes one canonical terminal plan in
    `publication_doc`. The same transaction moves the job from `pending` to `effects_started`; successful
    plans pin their exact sink generations, while failed/cancelled plans terminalize every bound sink and
-   release its writer leases. Pending publication and submit/fence claims are mutually exclusive: a remote
+   release its writer leases. Pending publication and submit/fence claims are
+   mutually exclusive: a remote
    observation atomically invalidates a pre-effects terminal candidate, while `effects_started` prevents a
    stale observer from submitting or stopping work. Raw remote failure text is never copied into this
    recovery plan. Publication renewal uses the same bounded continuous ownership window, so an owner

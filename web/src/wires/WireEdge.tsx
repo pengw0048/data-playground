@@ -19,7 +19,10 @@ export function WireEdge(props: EdgeProps) {
   const wt = useStore((s) => {
     const src = s.doc.nodes.find((n) => n.id === source)
     const outs = src ? nodeOutputs(src) : []
-    return ((outs.find((p) => p.id === sourceHandleId) ?? outs[0])?.wire) as WireType | undefined
+    const output = sourceHandleId
+      ? outs.find((port) => port.id === sourceHandleId)
+      : outs.length === 1 ? outs[0] : undefined
+    return output?.wire as WireType | undefined
   })
 
   const typed = (wt && wire[wt]?.color) || color.wire

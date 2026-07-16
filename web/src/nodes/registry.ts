@@ -48,13 +48,21 @@ export function getComponent(kind: string): ComponentType<NodeComponentProps> | 
 
 /**
  * A node's output ports. Usually the static spec, but a node may declare instance-specific
- * output ports via `config.outputs` (a multi-output node — e.g. a section that emit()s several
- * named result sets). All instance ports carry the `dataset` wire.
+ * output ports via `config.outputs`. Section is the only built-in node whose driver can declare
+ * emit() targets at runtime; a plugin config field with the same name must not rewrite its NodeSpec.
  */
 export function nodeOutputs(node: CanvasNode): PortSpec[] {
   const declared = (node.data?.config as Record<string, unknown> | undefined)?.outputs
-  if (Array.isArray(declared) && declared.length > 0) {
-    return declared.map((h) => ({ id: String(h), label: String(h), wire: 'dataset' as WireType }))
+  if (node.type === 'section' && declared !== undefined) {
+    if (!Array.isArray(declared) || declared.length === 0 || declared.length > 64) return []
+    const valid = declared.every((value) => (
+      typeof value === 'string'
+      && value.length > 0
+      && value.length <= 128
+      && value.trim() === value
+    ))
+    if (!valid || new Set(declared).size !== declared.length) return []
+    return declared.map((id) => ({ id, label: id, wire: 'dataset' as WireType }))
   }
   return specs.get(node.type)?.outputs ?? []
 }
@@ -72,8 +80,9 @@ export function portWire(
   if (!spec) return null
   const ports = side === 'source' ? nodeOutputs(node) : spec.inputs
   if (ports.length === 0) return null
-  const port = handleId ? ports.find((p) => p.id === handleId) : ports[0]
-  return (port ?? ports[0])?.wire ?? null
+  if (handleId) return ports.find((p) => p.id === handleId)?.wire ?? null
+  if (side === 'source' && ports.length !== 1) return null
+  return ports[0]?.wire ?? null
 }
 
 /** Types the target port accepts (defaults to its primary wire). */
@@ -81,8 +90,7 @@ export function portAccepts(kind: string, handleId: string | null | undefined): 
   const spec = specs.get(kind)
   if (!spec || spec.inputs.length === 0) return []
   const port = handleId ? spec.inputs.find((p) => p.id === handleId) : spec.inputs[0]
-  const p = port ?? spec.inputs[0]
-  return p.accepts ?? [p.wire]
+  return port ? (port.accepts ?? [port.wire]) : []
 }
 
 /** Does the target port accept MANY incoming edges (e.g. union)? Then the one-edge-per-port rule
@@ -91,7 +99,7 @@ export function portMulti(kind: string, handleId: string | null | undefined): bo
   const spec = specs.get(kind)
   if (!spec || spec.inputs.length === 0) return false
   const port = handleId ? spec.inputs.find((p) => p.id === handleId) : spec.inputs[0]
-  return !!(port ?? spec.inputs[0])?.multi
+  return !!port?.multi
 }
 
 /** Is a connection from a source wire type into (kind, handle) valid? (§5.3 / FR-W1) */

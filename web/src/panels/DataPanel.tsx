@@ -1,11 +1,14 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { previewIsCurrent, previewPlanIdentity, profileJobIsCurrent, roleCanEdit, useStore } from '../store/graph'
-import { capabilitiesFor } from '../nodes/registry'
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
+import {
+  MULTI_OUTPUT_FULL_RUN_UNAVAILABLE, previewIsCurrent, previewPlanIdentity,
+  profileJobIsCurrent, roleCanEdit, useStore,
+} from '../store/graph'
+import { capabilitiesFor, nodeOutputs } from '../nodes/registry'
 import { api } from '../api/client'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-import type { ColumnSchema } from '../types/graph'
+import type { ColumnSchema, PortSpec } from '../types/graph'
 import type { ProfileResult } from '../types/api'
 
 const PAGE = 50
@@ -16,8 +19,23 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const requestRun = useStore((s) => s.requestRun)
   const doc = useStore((s) => s.doc)
   const node = doc.nodes.find((n) => n.id === nodeId)
+  const outputPorts = node ? nodeOutputs(node) : []
+  const [portSelection, setPortSelection] = useState<{ nodeId: string; portId?: string }>(() => ({
+    nodeId, portId: preview?.portId,
+  }))
+  const selectedPort = portSelection.nodeId === nodeId ? portSelection.portId : preview?.portId
+  const selectedPortId = outputPorts.some((port) => port.id === selectedPort)
+    ? selectedPort
+    : outputPorts.find((port) => port.id === 'out')?.id ?? outputPorts[0]?.id
+  // Single-output requests may omit the port. Multi-output requests never rely on backend ordering:
+  // the visible tab selection is carried on every preview and sampled-profile request.
+  const requestPortId = outputPorts.length > 1 ? selectedPortId : undefined
   const run = useStore((s) => s.runs[nodeId])
   const done = run?.status?.status === 'done' ? run.status : undefined
+  const committedOutputs = done?.outputs.filter((output) => output.outcome === 'committed' && !!output.uri) ?? []
+  const selectedOutput = committedOutputs.find((output) => (
+    output.nodeId === nodeId && (selectedPortId === undefined || output.portId === selectedPortId)
+  )) ?? (outputPorts.length <= 1 && committedOutputs.length === 1 ? committedOutputs[0] : undefined)
   const pushToast = useStore((s) => s.pushToast)
   const [tab, setTab] = useState('rows')
   const [resultMode, setResultMode] = useState<'sample' | 'full'>('sample')
@@ -25,23 +43,36 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
 
   useEffect(() => {
-    if (!preview) runPreview(nodeId)
+    if (!preview || preview.portId !== requestPortId) runPreview(nodeId, 0, requestPortId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeId])
+  }, [nodeId, requestPortId, preview?.portId])
   useEffect(() => setResultMode('sample'), [nodeId])
   useEffect(() => {
     // A node that cannot produce a bounded preview should reveal the exact artifact as soon as its
     // durable run finishes. A later explicit click on Sample remains sticky until the artifact changes.
-    if (preview?.result?.notPreviewable && done?.outputUri) setResultMode('full')
-  }, [nodeId, done?.outputUri, preview?.result?.notPreviewable])
-  const page = (o: number) => { setDetail(null); runPreview(nodeId, o) }
+    if (preview?.result?.notPreviewable && selectedOutput?.uri) setResultMode('full')
+  }, [nodeId, requestPortId, selectedOutput?.uri, preview?.result?.notPreviewable])
+  const page = (o: number) => { setDetail(null); runPreview(nodeId, o, requestPortId) }
+  const choosePort = (portId: string) => {
+    setPortSelection({ nodeId, portId })
+    setDetail(null)
+    setResultMode('sample')
+  }
+  const withOutputPorts = (content: ReactNode) => (
+    <>
+      <OutputPortSelector ports={outputPorts} selectedPortId={selectedPortId} onSelect={choosePort} />
+      {content}
+    </>
+  )
 
-  if (!preview) return <Skeleton />
-  if (!previewIsCurrent(preview, doc, nodeId)) return <StalePreview onRefresh={() => runPreview(nodeId)} />
-  if (preview.loading) return <Skeleton />
-  if (preview.error) return <ErrorState reason={preview.error} onRetry={() => runPreview(nodeId, offset)} />
+  if (!preview || preview.portId !== requestPortId) return withOutputPorts(<Skeleton />)
+  if (!previewIsCurrent(preview, doc, nodeId, requestPortId)) {
+    return withOutputPorts(<StalePreview onRefresh={() => runPreview(nodeId, 0, requestPortId)} />)
+  }
+  if (preview.loading) return withOutputPorts(<Skeleton />)
+  if (preview.error) return withOutputPorts(<ErrorState reason={preview.error} onRetry={() => runPreview(nodeId, offset, requestPortId)} />)
   const res = preview.result!
-  if (res.error) return <ErrorState reason={res.reason ?? 'preview failed'} onRetry={() => runPreview(nodeId, offset)} />
+  if (res.error) return withOutputPorts(<ErrorState reason={res.reason ?? 'preview failed'} onRetry={() => runPreview(nodeId, offset, requestPortId)} />)
   const isMetric = node?.type === 'metric'
   const isChart = node?.type === 'chart'
   const artifactPresentation: ArtifactPresentation | undefined = isChart
@@ -54,23 +85,26 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
           : (node?.data.config.y ?? 'y')),
       }
     : isMetric ? { kind: 'metric' } : undefined
-  const resultModeToggle = done?.outputUri
+  const resultModeToggle = selectedOutput?.uri
     ? <ResultModeToggle mode={resultMode} onChange={setResultMode} />
     : undefined
   if (res.notPreviewable) {
     // P0-UX-01: a sample can't preview this node (an aggregate/sort), but a full run MATERIALIZES the
     // result to a durable artifact — so if this node's last run is done and produced one, show the exact
     // Full result (restorable after a restart via the persisted run status) instead of a dead end.
-    if (done?.outputUri && resultMode === 'full') {
-      return <FullResult uri={done.outputUri} total={done.totalRows ?? null}
-        modeToggle={resultModeToggle} presentation={artifactPresentation} />
+    if (selectedOutput?.uri && resultMode === 'full') {
+      return withOutputPorts(<FullResult uri={selectedOutput.uri} total={selectedOutput.rows ?? null}
+        modeToggle={resultModeToggle} presentation={artifactPresentation} />)
     }
-    return <NotPreviewable reason={res.reason ?? 'needs a full pass'}
-      onRun={() => requestRun(nodeId)} modeToggle={resultModeToggle} />
+    const reason = outputPorts.length > 1
+      ? `${res.reason ?? 'This output needs a full pass.'} ${MULTI_OUTPUT_FULL_RUN_UNAVAILABLE}`
+      : res.reason ?? 'needs a full pass'
+    return withOutputPorts(<NotPreviewable reason={reason}
+      onRun={outputPorts.length > 1 ? undefined : () => requestRun(nodeId)} modeToggle={resultModeToggle} />)
   }
-  if (done?.outputUri && resultMode === 'full') {
-    return <FullResult uri={done.outputUri} total={done.totalRows ?? null}
-      modeToggle={resultModeToggle} presentation={artifactPresentation} />
+  if (selectedOutput?.uri && resultMode === 'full') {
+    return withOutputPorts(<FullResult uri={selectedOutput.uri} total={selectedOutput.rows ?? null}
+      modeToggle={resultModeToggle} presentation={artifactPresentation} />)
   }
 
   const columns = res.columns
@@ -83,7 +117,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const activeTab = tab === 'rows' || tab === 'stats' || caps.some((c) => c.id === tab) ? tab : 'rows'
   const atEnd = !res.hasMore  // the kernel peeks one extra row, so this is right even at exact multiples
 
-  return (
+  return withOutputPorts(
     <div className="dp-dark text-foreground">
       {/* tab bar + row-count */}
       <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
@@ -104,7 +138,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
             <Icon name="chevronLeft" size={12} /> Row {offset + detail + 1}
           </button>
         )}
-        {done?.outputUri && detail == null && (
+        {selectedOutput?.uri && detail == null && (
           resultModeToggle
         )}
         <span className="flex-1" />
@@ -149,7 +183,8 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
           <RowsTable columns={columns as ColumnSchema[]} rows={res.rows} onRowClick={setDetail} />
         </>
       ) : activeTab === 'stats' ? (
-        <StatsView nodeId={nodeId} />
+        <StatsView key={`${nodeId}:${requestPortId ?? ''}:${outputPorts.length > 1 ? 'multi' : 'single'}`}
+          nodeId={nodeId} portId={requestPortId} multiOutput={outputPorts.length > 1} />
       ) : (
         (() => {
           const cap = caps.find((c) => c.id === activeTab)
@@ -157,6 +192,34 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
           return Tab ? <Tab columns={columns as ColumnSchema[]} rows={res.rows} /> : null
         })()
       )}
+    </div>,
+  )
+}
+
+function OutputPortSelector({ ports, selectedPortId, onSelect }: {
+  ports: PortSpec[]
+  selectedPortId?: string
+  onSelect: (portId: string) => void
+}) {
+  if (ports.length <= 1) return null
+  return (
+    <div className="dp-dark flex items-center gap-1.5 border-b border-border px-[11px] py-2 text-foreground">
+      <span className="mr-1 text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">Output</span>
+      <div role="group" aria-label="Output ports" className="flex min-w-0 items-center gap-1 overflow-x-auto">
+        {ports.map((port) => (
+          <button key={port.id} aria-pressed={selectedPortId === port.id}
+            title={port.label && port.label !== port.id ? `${port.label} (${port.id})` : port.id}
+            onClick={() => onSelect(port.id)}
+            className={cn(
+              'dp-mono whitespace-nowrap rounded-md border px-2 py-1 text-[10.5px] font-semibold',
+              selectedPortId === port.id
+                ? 'border-primary/40 bg-primary/10 text-primary'
+                : 'border-transparent text-muted-foreground hover:border-border hover:text-foreground',
+            )}>
+            {port.label || port.id}
+          </button>
+        ))}
+      </div>
     </div>
   )
 }
@@ -202,7 +265,7 @@ const fmtNum = (n: number) => n.toLocaleString(undefined, { maximumFractionDigit
 
 // Per-column stats over the previewed sample (null%/distinct/min/max/mean). Whole-dataset stats are a
 // cancellable job: every row is covered, while distinct remains approximate.
-function StatsView({ nodeId }: { nodeId: string }) {
+function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: string; multiOutput: boolean }) {
   const doc = useStore((s) => s.doc)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const currentUserId = useStore((s) => s.currentUser?.id)
@@ -211,33 +274,34 @@ function StatsView({ nodeId }: { nodeId: string }) {
   const startFullProfile = useStore((s) => s.startFullProfile)
   const cancelFullProfile = useStore((s) => s.cancelFullProfile)
   const [full, setFull] = useState(false)
-  const planIdentity = previewPlanIdentity(doc, nodeId)
+  const fullProfileUnavailableId = useId()
+  const planIdentity = previewPlanIdentity(doc, nodeId, portId)
   const sampleRequestGeneration = useRef(0)
   const [sampleState, setSampleState] = useState<{
     planIdentity: string; loading: boolean; res?: ProfileResult; err?: string
   }>({ planIdentity, loading: true })
   const loadSample = () => {
     const requestDoc = doc
-    const requestIdentity = previewPlanIdentity(requestDoc, nodeId)
+    const requestIdentity = previewPlanIdentity(requestDoc, nodeId, portId)
     const requestGeneration = ++sampleRequestGeneration.current
     setSampleState({ planIdentity: requestIdentity, loading: true })
-    api.profile(requestDoc, nodeId)
+    api.profile(requestDoc, nodeId, portId)
       .then((res) => {
         if (sampleRequestGeneration.current !== requestGeneration
-            || previewPlanIdentity(useStore.getState().doc, nodeId) !== requestIdentity) return
+            || previewPlanIdentity(useStore.getState().doc, nodeId, portId) !== requestIdentity) return
         setSampleState({ planIdentity: requestIdentity, loading: false, res })
       })
       .catch((e) => {
         if (sampleRequestGeneration.current !== requestGeneration
-            || previewPlanIdentity(useStore.getState().doc, nodeId) !== requestIdentity) return
+            || previewPlanIdentity(useStore.getState().doc, nodeId, portId) !== requestIdentity) return
         setSampleState({ planIdentity: requestIdentity, loading: false, err: e?.message ?? String(e) })
       })
   }
   useEffect(() => {
     if (!full) loadSample()
     return () => { sampleRequestGeneration.current += 1 }
-  }, [nodeId, full, planIdentity])  // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => setFull(false), [nodeId])
+  }, [nodeId, portId, full, planIdentity])  // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => setFull(false), [nodeId, portId, multiOutput])
   // Never paint a sample-profile response bound to another node or execution plan, even for the render
   // before the effect above starts its replacement request.
   const st = sampleState.planIdentity === planIdentity ? sampleState : { planIdentity, loading: true }
@@ -249,14 +313,22 @@ function StatsView({ nodeId }: { nodeId: string }) {
     setFull(v)
   }
   const toggle = (
-    <div className="flex items-center gap-1 rounded-md border border-border p-0.5 text-[10px]">
-      {([['sample', false], ['full dataset', true]] as const).map(([label, v]) => (
-        <button key={label} onClick={() => selectMode(v)}
-          title={v && !canEdit ? 'View full-dataset profile results' : undefined}
-          className={`rounded px-1.5 py-0.5 ${full === v ? 'bg-muted font-semibold text-foreground' : 'text-muted-foreground'}`}>
-          {label}
-        </button>
-      ))}
+    <div className="flex flex-col items-end gap-1">
+      <div className="flex items-center gap-1 rounded-md border border-border p-0.5 text-[10px]">
+        {([['sample', false], ['full dataset', true]] as const).map(([label, v]) => (
+          <button key={label} onClick={() => selectMode(v)} disabled={v && multiOutput}
+            aria-describedby={v && multiOutput ? fullProfileUnavailableId : undefined}
+            title={v && !multiOutput && !canEdit ? 'View full-dataset profile results' : undefined}
+            className={`rounded px-1.5 py-0.5 disabled:cursor-not-allowed disabled:opacity-45 ${full === v ? 'bg-muted font-semibold text-foreground' : 'text-muted-foreground'}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+      {multiOutput && (
+        <span id={fullProfileUnavailableId} className="max-w-[260px] text-right text-[9.5px] leading-snug text-muted-foreground">
+          Whole-dataset profiles are not available for multi-output nodes. Inspect each port’s sample statistics instead.
+        </span>
+      )}
     </div>
   )
   if (full) {
