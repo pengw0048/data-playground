@@ -6,7 +6,7 @@
 - Audit execution: 2026-07-16 on macOS 26.5.1 (25F80), Node 26.5.0, npm 11.17.0, uv 0.10.10, Python 3.12.13 in the uv environment, Chromium supplied by Playwright 1.61.1.
 - Workspace: a clean disposable local workspace; fixture profile `full` and SQLite metadata database were rebuilt for the run.
 - Fixture manifest: [fixture-manifest.json](fixture-manifest.json), SHA-256 `3bbaab41ae122661ff71a2eb0f7d0de5ac1abbc2768665953d7d405c74748b0d`.
-- Retained remote diagnostics: [UX acceptance run 29513425571](https://github.com/pengw0048/data-playground/actions/runs/29513425571). The `full researcher workflow matrix` passed in 3m28s and uploaded its Playwright HTML report, test results, fixture manifest, disposable workspace, and SQLite diagnostics (14-day retention). The overall workflow remains failed only because its separate P0/P1 issue gate correctly reports #284 and #285 as open.
+- Retained remote diagnostics: [UX acceptance run 29513425571](https://github.com/pengw0048/data-playground/actions/runs/29513425571). The `full researcher workflow matrix` passed in 3m28s and uploaded its Playwright HTML report and SQLite diagnostics (14-day retention); the exact generated fixture manifest is committed alongside this audit. The overall workflow remains failed only because its separate P0/P1 issue gate correctly reports #284 and #285 as open.
 
 ## Executed journeys and outcome
 
