@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hub.main import app
+from hub.models import Graph
 from hub.plugins.adapters import LanceAdapter
 
 client = TestClient(app)
@@ -152,3 +153,73 @@ def test_missing_lance_revision_is_a_stable_unavailable_error(tmp_path):
     assert response.status_code == 410
     assert response.json()["detail"] == "dataset_revision_unavailable"
     assert response.json()["code"] == "resource_gone"
+
+
+def test_pinned_source_preview_and_reload_keep_the_exact_revision_after_append(tmp_path):
+    lance = pytest.importorskip("lance")
+    uri, table = _register_lance(tmp_path)
+    first = client.get(f"/api/catalog/tables/{table['id']}/revisions?limit=1").json()
+    older = client.get(
+        f"/api/catalog/tables/{table['id']}/revisions?limit=1&cursor={first['nextCursor']}").json()
+    selected = older["items"][0]
+    canvas_id = f"pinned-{uuid.uuid4().hex}"
+    graph = {
+        "id": canvas_id, "name": "pinned", "version": 1,
+        "nodes": [{
+            "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+            "data": {"title": "source", "status": "draft", "config": {
+                "uri": uri, "tableId": table["id"],
+                "datasetRef": {"datasetId": selected["datasetId"],
+                               "revisionId": selected["revisionId"]},
+            }},
+        }],
+        "edges": [],
+    }
+    try:
+        saved = client.put(f"/api/canvas/{canvas_id}", json=graph)
+        assert saved.status_code == 200, saved.text
+        restored = client.get(f"/api/canvas/{canvas_id}")
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["nodes"][0]["data"]["config"]["datasetRef"] == {
+            "datasetId": selected["datasetId"], "revisionId": selected["revisionId"]}
+
+        lance.write_dataset(pa.table({"value": [3]}), uri, mode="append")
+        preview = client.post("/api/run/preview", json={
+            "graph": restored.json(), "nodeId": "source", "k": 50, "offset": 0})
+        assert preview.status_code == 200, preview.text
+        payload = preview.json()
+        assert payload["rows"] == [{"value": 1}]
+        assert payload["sampleProvenance"]["datasetIdentity"] == selected["datasetId"]
+        assert payload["sampleProvenance"]["datasetRevision"] == selected["revisionId"]
+    finally:
+        client.delete(f"/api/canvas/{canvas_id}")
+
+
+def test_pinned_source_missing_revision_fails_without_retargeting_latest(tmp_path):
+    _uri, table = _register_lance(tmp_path)
+    current = client.get(f"/api/catalog/tables/{table['id']}/revisions").json()["items"][0]
+    graph = {
+        "id": f"missing-pin-{uuid.uuid4().hex}", "version": 1,
+        "nodes": [{
+            "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+            "data": {"config": {"uri": table["uri"], "tableId": table["id"],
+                                  "datasetRef": {"datasetId": current["datasetId"],
+                                                 "revisionId": "999999"}}},
+        }], "edges": [],
+    }
+    response = client.post("/api/run/preview", json={
+        "graph": graph, "nodeId": "source", "k": 50, "offset": 0})
+    assert response.status_code == 200, response.text
+    assert response.json()["notPreviewable"] is True
+    assert "selected pinned revision is unavailable" in response.json()["reason"]
+
+
+def test_pinned_dataset_ref_is_a_strict_typed_graph_value():
+    with pytest.raises(ValueError, match="datasetId"):
+        Graph.model_validate({
+            "id": "bad-pin", "nodes": [{
+                "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                "data": {"config": {"uri": "dataset.lance",
+                                      "datasetRef": {"revisionId": "1"}}},
+            }], "edges": [],
+        })

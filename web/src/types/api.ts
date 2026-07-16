@@ -343,6 +343,14 @@ export interface RunOutput {
   sampleProvenance?: SampleProvenance | null
 }
 
+export interface RunInputManifestItem {
+  nodeId: string
+  datasetId: string
+  revisionId: string
+  provider: string
+  resolvedAt: string
+}
+
 export interface RunStatus {
   runId: string
   status: RunState

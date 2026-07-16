@@ -66,10 +66,15 @@ def plan_hash(graph: Graph, target: str | None, resolve_adapter) -> str:
         if n.type == "source":
             uri = cfg.get("uri")
             if uri:
-                try:
-                    parts.append(f"{prefix}fp:{resolve_adapter(uri).fingerprint(uri)}")
-                except Exception:  # noqa: BLE001
-                    pass
+                dataset_ref = cfg.get("datasetRef")
+                if isinstance(dataset_ref, dict):
+                    parts.append(
+                        f"{prefix}ref:{dataset_ref.get('datasetId')}:{dataset_ref.get('revisionId')}")
+                else:
+                    try:
+                        parts.append(f"{prefix}fp:{resolve_adapter(uri).fingerprint(uri)}")
+                    except Exception:  # noqa: BLE001
+                        pass
         if n.type == "section":  # a section's behavior lives on its contained nodes, not its own config
             for c in sorted(_descendants(graph, n.id), key=lambda x: x.id):
                 _fold(c, prefix=f"sub[{n.id}]:")
