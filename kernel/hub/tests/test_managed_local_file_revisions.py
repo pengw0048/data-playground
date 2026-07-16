@@ -10,9 +10,11 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from hub import metadb
+from hub.main import app
 from hub.models import LineagePublication
 from hub.plugins.adapters import DuckDBAdapter, ManagedLocalFileRevisionAdapter
 from hub.plugins.catalog import InMemoryCatalog
@@ -192,6 +194,89 @@ def test_committed_publication_response_loss_recovers_exact_receipt(
     with metadb.session() as session:
         assert session.scalar(select(metadb.CatalogLineageFact)) is not None
         assert len(list(session.scalars(select(metadb.CatalogLineageFact)))) == 1
+
+
+def test_managed_local_single_unregister_api_preserves_revision_retention(
+        local_catalog, tmp_path, monkeypatch):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "single.parquet")
+    artifact, published = _publish(storage, catalog, logical_uri, 1)
+    revision_id = published["revision_id"]
+    table_id = published["table"].id
+
+    monkeypatch.setattr(catalog_routes, "get_deps", lambda: SimpleNamespace(
+        catalog=catalog, resolve_adapter=lambda _uri: DuckDBAdapter()))
+    response = TestClient(app).delete(f"/api/catalog/tables/{table_id}")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True}
+    assert metadb.catalog_get(table_id) is None
+    with metadb.session() as session:
+        logical = session.scalar(select(metadb.CatalogLogicalDataset).where(
+            metadb.CatalogLogicalDataset.logical_uri == logical_uri))
+        assert logical is not None and logical.state == "unregistered"
+        assert logical.current_uri is None and logical.governance_doc == "{}"
+        assert session.get(metadb.ManagedLocalFileRevision, revision_id) is not None
+        assert session.get(metadb.LocalResultReference, {
+            "uri": artifact, "owner_kind": "managed_file_revision", "owner_key": revision_id,
+        }) is not None
+
+
+def test_managed_local_prefix_and_batch_unregister_preserve_revision_retention(
+        local_catalog, tmp_path, monkeypatch):
+    storage, catalog = local_catalog
+    prefix = str(tmp_path / "outputs" / ".dp-results")
+    first_artifact, first = _publish(storage, catalog, str(tmp_path / "published" / "first.parquet"), 1)
+    second_artifact, second = _publish(storage, catalog, str(tmp_path / "published" / "second.parquet"), 2)
+
+    assert metadb.catalog_delete_prefix(prefix) == 2
+    with metadb.session() as session:
+        for artifact, published in ((first_artifact, first), (second_artifact, second)):
+            assert session.get(metadb.ManagedLocalFileRevision, published["revision_id"]) is not None
+            assert session.get(metadb.LocalResultReference, {
+                "uri": artifact,
+                "owner_kind": "managed_file_revision",
+                "owner_key": published["revision_id"],
+            }) is not None
+
+    third_artifact, third = _publish(storage, catalog, str(tmp_path / "published" / "third.parquet"), 3)
+    fourth_artifact, fourth = _publish(storage, catalog, str(tmp_path / "published" / "fourth.parquet"), 4)
+    monkeypatch.setattr(catalog_routes, "get_deps", lambda: SimpleNamespace(
+        catalog=catalog, resolve_adapter=lambda _uri: DuckDBAdapter()))
+    response = TestClient(app).post("/api/catalog/tables/delete", json={
+        "ids": [third["table"].id, fourth["table"].id, "missing"],
+    })
+
+    assert response.status_code == 200, response.text
+    assert set(response.json()["deleted"]) == {third["table"].id, fourth["table"].id}
+    assert response.json()["missing"] == ["missing"]
+    with metadb.session() as session:
+        for artifact, published in ((third_artifact, third), (fourth_artifact, fourth)):
+            assert session.get(metadb.ManagedLocalFileRevision, published["revision_id"]) is not None
+            assert session.get(metadb.LocalResultReference, {
+                "uri": artifact,
+                "owner_kind": "managed_file_revision",
+                "owner_key": published["revision_id"],
+            }) is not None
+
+
+def test_managed_local_unregister_fails_closed_when_retention_ownership_changes(
+        local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "ownership.parquet")
+    artifact, published = _publish(storage, catalog, logical_uri, 1)
+    with metadb.session() as session:
+        ref = session.get(metadb.LocalResultReference, {
+            "uri": artifact,
+            "owner_kind": "managed_file_revision",
+            "owner_key": published["revision_id"],
+        })
+        assert ref is not None
+        session.delete(ref)
+
+    with pytest.raises(RuntimeError, match="ownership changed concurrently"):
+        metadb.catalog_delete_entry(artifact)
+    assert metadb.catalog_get(published["table"].id) is not None
 
 
 def test_committed_publication_rejects_a_different_lineage_replay(local_catalog, tmp_path):

@@ -9506,6 +9506,40 @@ def _catalog_logicals_have_backend_publication_refs(s, logical_ids: list[str]) -
     ))))
 
 
+def _catalog_current_logical_ownership(
+        s, logical: CatalogLogicalDataset) -> str:
+    """Validate and classify one exact active logical head before unregistering it."""
+    current_uri = logical.current_uri
+    if not current_uri:
+        raise RuntimeError("catalog unregister ownership changed concurrently")
+    attempt = s.get(ObjectAttempt, current_uri, with_for_update=True)
+    revision = s.scalars(select(ManagedLocalFileRevision).where(
+        ManagedLocalFileRevision.logical_id == logical.logical_id,
+        ManagedLocalFileRevision.artifact_uri == current_uri,
+    ).with_for_update()).first()
+    if attempt is not None and revision is not None:
+        raise RuntimeError("catalog unregister ownership changed concurrently")
+    if attempt is not None:
+        ref = s.get(ObjectAttemptRef, {
+            "ref_type": "catalog", "ref_key": logical.logical_id, "ref_slot": "",
+        }, with_for_update=True)
+        if (attempt.logical_id != logical.logical_id or ref is None
+                or ref.attempt_uri != current_uri):
+            raise RuntimeError("catalog unregister ownership changed concurrently")
+        return "object"
+    if revision is not None:
+        artifact = s.get(LocalResultArtifact, current_uri, with_for_update=True)
+        ref = s.get(LocalResultReference, {
+            "uri": current_uri,
+            "owner_kind": "managed_file_revision",
+            "owner_key": revision.revision_id,
+        }, with_for_update=True)
+        if artifact is None or artifact.state != "ready" or ref is None:
+            raise RuntimeError("catalog unregister ownership changed concurrently")
+        return "managed_local"
+    raise RuntimeError("catalog unregister ownership changed concurrently")
+
+
 def catalog_delete_entry(uri: str) -> None:
     """Remove a catalog entry (unregister) + everything keyed to it (tags/columns/embedding/facts/
     declared key/relationships)."""
@@ -9532,15 +9566,10 @@ def catalog_delete_entry(uri: str) -> None:
                     and attempt_identity.catalog_epoch != logical.catalog_epoch):
                 raise RuntimeError("catalog governance request was fenced by unregister")
             current_uri = logical.current_uri
-            current_attempt = s.get(ObjectAttempt, current_uri, with_for_update=True)
-            if current_attempt is None or current_attempt.logical_id != logical.logical_id:
-                raise RuntimeError("catalog unregister ownership changed concurrently")
+            ownership = _catalog_current_logical_ownership(s, logical)
             if _catalog_logicals_have_backend_publication_refs(s, [logical.logical_id]):
                 raise RuntimeError(
                     "catalog unregister is blocked by an active backend publication")
-            s.get(ObjectAttemptRef, {
-                "ref_type": "catalog", "ref_key": logical.logical_id, "ref_slot": "",
-            }, with_for_update=True)
             entry = s.get(CatalogEntry, current_uri, with_for_update=True)
             if entry is None or entry.logical_id != logical.logical_id:
                 raise RuntimeError("catalog unregister entry changed concurrently")
@@ -9558,7 +9587,8 @@ def catalog_delete_entry(uri: str) -> None:
                 raise RuntimeError("catalog unregister entry changed concurrently")
             current_uri, catalog_key = entry.uri, entry.uri
         if logical is not None:
-            _replace_attempt_ref(s, "catalog", logical.logical_id, None)
+            if ownership == "object":
+                _replace_attempt_ref(s, "catalog", logical.logical_id, None)
             logical.current_uri = None
             logical.catalog_epoch += 1
             logical.state = "unregistered"
@@ -9588,28 +9618,21 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
             select(CatalogLogicalDataset).where(
                 CatalogLogicalDataset.logical_id.in_(logical_ids))
             .order_by(CatalogLogicalDataset.logical_id).with_for_update())} if logical_ids else {}
-        managed_uris = sorted(uri for uri, logical_id in snapshot if logical_id)
-        attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
-            ObjectAttempt.uri.in_(managed_uris)).order_by(ObjectAttempt.uri).with_for_update())} \
-            if managed_uris else {}
         if _catalog_logicals_have_backend_publication_refs(s, logical_ids):
             raise RuntimeError(
                 "catalog unregister is blocked by an active backend publication")
-        refs = {row.ref_key: row for row in s.scalars(select(ObjectAttemptRef).where(
-            ObjectAttemptRef.ref_type == "catalog",
-            ObjectAttemptRef.ref_key.in_(logical_ids),
-        ).order_by(ObjectAttemptRef.ref_key).with_for_update())} if logical_ids else {}
         entries = {row.uri: row for row in s.scalars(select(CatalogEntry).where(
             CatalogEntry.uri.in_(uris)).order_by(CatalogEntry.uri).with_for_update())}
         if len(entries) != len(snapshot):
             raise RuntimeError("catalog prefix changed concurrently")
+        ownerships: dict[str, str] = {}
         for uri, logical_id in snapshot:
             if logical_id:
                 logical = logical_rows.get(logical_id)
                 if (logical is None or logical.state != "active"
-                        or logical.current_uri != uri or uri not in attempts
-                        or logical_id not in refs or refs[logical_id].attempt_uri != uri):
+                        or logical.current_uri != uri):
                     raise RuntimeError("catalog prefix changed concurrently")
+                ownerships[logical_id] = _catalog_current_logical_ownership(s, logical)
             elif entries[uri].logical_id:
                 raise RuntimeError("catalog prefix changed concurrently")
         current_uris = list(uris)
@@ -9617,7 +9640,8 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
         for uri, logical_id in snapshot:
             logical = logical_rows.get(logical_id) if logical_id else None
             if logical is not None:
-                _replace_attempt_ref(s, "catalog", logical.logical_id, None)
+                if ownerships[logical.logical_id] == "object":
+                    _replace_attempt_ref(s, "catalog", logical.logical_id, None)
                 logical.current_uri = None
                 logical.catalog_epoch += 1
                 logical.state = "unregistered"
