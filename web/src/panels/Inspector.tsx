@@ -5,7 +5,7 @@ import {
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
 import { useSchemaWarnings } from '../nodes/fields'
-import { codeHash } from '../nodes/schema'
+import { codeHash, outputPortId } from '../nodes/schema'
 import { color, status as statusTok, kindAccent } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { FileDialog } from '../ui/FileDialog'
@@ -83,7 +83,6 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const runnable = useStore((s) => nodeRunnable(s.doc, nodeId))
   const runState = useStore((s) => s.runs[nodeId]?.phase)
-  const serverSchema = useStore((s) => s.schemas[nodeId])  // ColumnSchema[] = typed · null = untyped · undefined = unknown
   const allSchemas = useStore((s) => s.schemas)
   const edges = useStore((s) => s.doc.edges)
   const warnings = useSchemaWarnings(nodeId)   // config references a column not in the (known) input
@@ -112,14 +111,20 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   // its input through, so its declaration doesn't describe its output). null = untyped, undefined = unknown.
   const declaredOut = Array.isArray(cfg.outputSchema) && (cfg.outputSchema as ColumnSchema[]).length
     ? (cfg.outputSchema as ColumnSchema[]) : null
-  const outSchema = (canDeclareSchema && declaredOut && !node.data.bypassed) ? declaredOut : serverSchema
+  const outSchemaFor = (portId: string): ColumnSchema[] | null | undefined => (
+    canDeclareSchema && declaredOut && !node.data.bypassed && outputPorts.length === 1
+      ? declaredOut
+      : allSchemas[nodeId]?.[portId]
+  )
   // INPUT port schema = the OUTPUT schema of whatever is wired into that port (routed by targetHandle).
   const inputSchemaFor = (portId: string): ColumnSchema[] | null | undefined => {
     const inc = edges.filter((e) => e.target === nodeId)
     const specIn = spec?.inputs ?? []
     const e = inc.find((ed) => (ed.targetHandle ?? specIn[0]?.id ?? 'in') === portId)
       ?? (specIn.length === 1 ? inc[0] : undefined)
-    return e ? allSchemas[e.source] : undefined
+    if (!e) return undefined
+    const sourcePortId = outputPortId(useStore.getState().doc, e.source, e.sourceHandle)
+    return sourcePortId === undefined ? undefined : allSchemas[e.source]?.[sourcePortId]
   }
 
   return (
@@ -201,10 +206,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       <Section title="Ports">
         <div className="flex flex-col gap-1 text-[11.5px] text-muted-foreground">
           {(spec?.inputs ?? []).map((p) => <PortRow key={`in-${p.id}`} dir="in" name={portName(p)} wire={p.wire} schema={inputSchemaFor(p.id)} />)}
-          {outputPorts.map((p, i) => (
+          {outputPorts.map((p) => (
             <PortRow key={`out-${p.id}`} dir="out" name={portName(p)} wire={p.wire}
-              schema={outputPorts.length === 1 && i === 0
-                ? (outSchema === undefined ? undefined : outSchema) : undefined} />
+              schema={outSchemaFor(p.id)} />
           ))}
           {(spec?.inputs ?? []).length === 0 && outputPorts.length === 0 && <span>—</span>}
         </div>

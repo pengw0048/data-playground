@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from hub import metadb
 from hub.api_errors import APIError, APIErrorCode
 from hub.backends import backend_supports_named_multi_output_runs
-from hub.executors.schema import schema_for_graph
+from hub.executors.schema import schema_for_graph, schema_for_graph_ports
 from hub.kernel_backend import KernelBackend
 from hub.models import (
     CompilePlan, EstimateRequest, Graph, GraphEdge, GraphNode, PlanStep, RunEstimate,
@@ -595,6 +595,10 @@ def test_multi_output_declared_schema_is_not_misattributed_to_every_port():
     result = schema_for_graph(
         _multi_graph(), lambda _uri: None, {}, node_specs=SPECS, storage=None)
     assert result == {"branches": None}
+
+    port_result = schema_for_graph_ports(
+        _multi_graph(), lambda _uri: None, {}, node_specs=SPECS, storage=None)
+    assert port_result == {"branches": {"left": None, "right": None}}
 
 
 def test_kernel_backend_rejects_multi_output_before_kernel_claim(monkeypatch):

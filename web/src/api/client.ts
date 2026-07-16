@@ -245,9 +245,9 @@ export const api = {
   profile: (doc: CanvasDoc, nodeId: string, portId?: string) =>
     req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId }) }),
 
-  // per-node output columns (metadata only) → editor column suggestions; null = untyped port
+  // per-node, per-output-port columns (metadata only); null = untyped port
   schema: (doc: CanvasDoc) =>
-    req<Record<string, ColumnSchema[] | null>>('/graph/schema', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }) }),
+    req<Record<string, Record<string, ColumnSchema[] | null>>>('/graph/schema', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }) }),
   // per-node output-size estimate (rows + confidence) → the card "~N rows" hint; unknown → rows null
   graphSizes: (doc: CanvasDoc) =>
     req<Record<string, { rows: number | null; confidence: string }>>('/graph/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }) }),

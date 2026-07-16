@@ -3,17 +3,39 @@
 // (untyped) until it has actually run, at which point we fall back to its last observed preview.
 import type { CanvasDoc, CanvasNode, ColumnSchema } from '../types/graph'
 import type { CatalogTable, SampleResult } from '../types/api'
+import { nodeOutputs } from './registry'
 
-export type SchemaMap = Record<string, ColumnSchema[] | null>
-export type PreviewMap = Record<string, { result?: SampleResult; loading?: boolean; error?: string }>
+/** Metadata schemas by node and named output port. ``null`` means that port is untyped. */
+export type SchemaMap = Record<string, Record<string, ColumnSchema[] | null>>
+export type PreviewMap = Record<string, { portId?: string; result?: SampleResult; loading?: boolean; error?: string }>
+
+/** Resolve an omitted output identity only when the node has exactly one effective output. */
+export function outputPortId(
+  doc: CanvasDoc, id: string, portId?: string | null,
+): string | undefined {
+  if (portId != null) return portId
+  const node = doc.nodes.find((candidate) => candidate.id === id)
+  if (!node) return undefined
+  const outputs = nodeOutputs(node)
+  // The schema helpers also run in lightweight tests and during plugin-spec bootstrap, where the
+  // registry may not know the node yet. Preserve the historical default without guessing when a
+  // registered node is known to have multiple outputs.
+  return outputs.length === 1 ? outputs[0].id : outputs.length === 0 ? 'out' : undefined
+}
 
 /** OUTPUT columns of a node: server schema (typed) → last observed preview → source catalog. */
 export function nodeColumns(
-  doc: CanvasDoc, schemas: SchemaMap, previews: PreviewMap, catalog: CatalogTable[], id: string,
+  doc: CanvasDoc, schemas: SchemaMap, previews: PreviewMap, catalog: CatalogTable[], id: string, portId?: string | null,
 ): ColumnSchema[] {
-  const s = schemas[id]
+  const resolvedPortId = outputPortId(doc, id, portId)
+  const nodeSchemas = schemas[id]
+  const s = resolvedPortId === undefined ? undefined : nodeSchemas?.[resolvedPortId]
   if (s && s.length) return s
-  const pv = previews[id]?.result?.columns
+  const preview = previews[id]
+  const previewPortId = preview ? outputPortId(doc, id, preview.portId) : undefined
+  const pv = resolvedPortId !== undefined && previewPortId === resolvedPortId
+    ? preview?.result?.columns
+    : undefined
   if (pv && pv.length) return pv as ColumnSchema[]
   const n = doc.nodes.find((x) => x.id === id)
   if (n?.type === 'source' && n.data.config.uri) {
@@ -27,11 +49,11 @@ export function nodeColumns(
 export function inputColumns(
   doc: CanvasDoc, schemas: SchemaMap, previews: PreviewMap, catalog: CatalogTable[], id: string,
 ): ColumnSchema[] {
-  const sources = doc.edges.filter((e) => e.target === id).map((e) => e.source)
+  const sources = doc.edges.filter((e) => e.target === id)
   const out: ColumnSchema[] = []
   const seen = new Set<string>()
-  for (const src of sources) {
-    for (const c of nodeColumns(doc, schemas, previews, catalog, src)) {
+  for (const edge of sources) {
+    for (const c of nodeColumns(doc, schemas, previews, catalog, edge.source, edge.sourceHandle)) {
       if (!seen.has(c.name)) { seen.add(c.name); out.push(c) }
     }
   }
@@ -135,12 +157,14 @@ function referencedColumns(node: CanvasNode): string[] {
 function knownInputColumnSet(
   doc: CanvasDoc, schemas: SchemaMap, previews: PreviewMap, catalog: CatalogTable[], id: string,
 ): Set<string> | null {
-  const srcs = doc.edges.filter((e) => e.target === id).map((e) => e.source)
+  const srcs = doc.edges.filter((e) => e.target === id)
   if (!srcs.length) return null
   const set = new Set<string>()
-  for (const src of srcs) {
-    if (schemas[src] === null) return null                 // untyped code op upstream → unknown
-    const cols = nodeColumns(doc, schemas, previews, catalog, src)
+  for (const edge of srcs) {
+    const portId = outputPortId(doc, edge.source, edge.sourceHandle)
+    const schema = portId === undefined ? undefined : schemas[edge.source]?.[portId]
+    if (schema === null) return null                       // untyped upstream port → unknown
+    const cols = nodeColumns(doc, schemas, previews, catalog, edge.source, edge.sourceHandle)
     if (!cols.length) return null                          // unresolved / typed-but-empty → treat as unknown
     for (const c of cols) set.add(c.name.toLowerCase())
   }
