@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   api,
+  KernelError,
   type Cred,
   type CredKind,
   type SettingChange,
@@ -46,6 +47,11 @@ const emptyCredForm = (kind: CredKind): CredForm => ({ id: null, name: '', kind,
 
 type SaveFailure = {
   message: string
+}
+
+type ConflictRecovery = {
+  submitted: SettingChange[]
+  serverChanged: SettingChange[]
 }
 
 type PluginEdits = Record<string, Record<string, unknown>>
@@ -142,6 +148,18 @@ function stagedSettings(
   return changes
 }
 
+function editableGlobal(snapshot: SettingsSnapshot): Record<string, unknown> {
+  const global = { ...snapshot.global }
+  const policy = (global.agentDataPolicy && typeof global.agentDataPolicy === 'object')
+    ? global.agentDataPolicy as { level?: string; endpointIsLocal?: boolean }
+    : null
+  global.agentDataPolicyLevel = policy?.level || 'metadata-only'
+  global.agentDataPolicyEndpointIsLocal = Boolean(policy?.endpointIsLocal)
+  return global
+}
+
+const settingLabel = (change: SettingChange) => `${change.scope}: ${change.key}`
+
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const kernelInfo = useStore((s) => s.kernelInfo)
   const users = useStore((s) => s.users)
@@ -158,6 +176,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [baseline, setBaseline] = useState<SettingsSnapshot | null>(null)
   const [saving, setSaving] = useState(false)
   const [saveFailure, setSaveFailure] = useState<SaveFailure | null>(null)
+  const [conflict, setConflict] = useState<ConflictRecovery | null>(null)
   const [savedMsg, setSavedMsg] = useState('')
   const [dest, setDest] = useState<{ name: string; backend: string; root: string; credId: string }>({ name: '', backend: 'local', root: '', credId: NO_CRED })
   const [creds, setCreds] = useState<Cred[]>([])
@@ -199,13 +218,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       : Promise.resolve([] as Cred[])
     Promise.all([settings, pluginPacks, credList]).then(([nextSettings, nextPlugins, nextCreds]) => {
       if (cancelled) return
-      const global = { ...nextSettings.global }
-      const policy = (global.agentDataPolicy && typeof global.agentDataPolicy === 'object')
-        ? global.agentDataPolicy as { level?: string; endpointIsLocal?: boolean }
-        : null
-      global.agentDataPolicyLevel = policy?.level || 'metadata-only'
-      global.agentDataPolicyEndpointIsLocal = Boolean(policy?.endpointIsLocal)
-      setG(global)
+      setG(editableGlobal(nextSettings))
       setU(nextSettings.user)
       setBaseline(nextSettings)
       setPlugins(nextPlugins)
@@ -257,7 +270,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     ))
     : credForm.name !== '' || credForm.kind !== 'object_store' || Object.values(credForm.fields).some((value) => value !== '')
   const memberDraftDirty = newUser.name !== '' || newUser.password !== ''
-  const dirty = changes.length > 0 || invalidPluginEdit || destinationDraftDirty || credentialDraftDirty || memberDraftDirty
+  const dirty = changes.length > 0 || invalidPluginEdit || destinationDraftDirty || credentialDraftDirty || memberDraftDirty || Boolean(conflict)
 
   useEffect(() => {
     if (!dirty) return
@@ -280,6 +293,44 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     if (!saving) setConfirmDiscard(true)
   }
   const keepEditing = () => setConfirmDiscard(false)
+  const applySnapshot = (snapshot: SettingsSnapshot) => {
+    setG(editableGlobal(snapshot))
+    setU(snapshot.user)
+    setBaseline(snapshot)
+    setPcfg({})
+  }
+  const reapplyForReview = () => {
+    if (!conflict) return
+    const pluginEdits: PluginEdits = {}
+    setG((current) => {
+      const next = { ...current }
+      for (const change of conflict.submitted) {
+        if (change.scope !== 'global') continue
+        next[change.key] = change.value
+        if (change.key === 'agentDataPolicy' && change.value && typeof change.value === 'object') {
+          const policy = change.value as { level?: unknown; endpointIsLocal?: unknown }
+          next.agentDataPolicyLevel = String(policy.level || 'metadata-only')
+          next.agentDataPolicyEndpointIsLocal = Boolean(policy.endpointIsLocal)
+        }
+        if (change.key.startsWith('plugin.')) {
+          const plugin = plugins.find((candidate) => change.key.startsWith(`plugin.${candidate.name}.`))
+          if (plugin) {
+            const field = change.key.slice(`plugin.${plugin.name}.`.length)
+            pluginEdits[plugin.name] = { ...(pluginEdits[plugin.name] ?? {}), [field]: change.value }
+          }
+        }
+      }
+      return next
+    })
+    setU((current) => {
+      const next = { ...current }
+      for (const change of conflict.submitted) if (change.scope === 'user') next[change.key] = change.value
+      return next
+    })
+    setPcfg(pluginEdits)
+    setConflict(null)
+    setSaveFailure(null)
+  }
   const save = async () => {
     if (loading || loadError || saving || invalidPluginEdit || !baseline || changes.length === 0) return
     const submitted = changes
@@ -300,6 +351,23 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       })
       setSavedMsg('Saved'); setTimeout(() => setSavedMsg(''), 1400)
     } catch (e) {
+      if (e instanceof KernelError && e.status === 409) {
+        try {
+          const latest = await api.getSettings()
+          const serverChanged = submitted.filter((change) => !sameJson(
+            baseline[change.scope][change.key], latest[change.scope][change.key],
+          ))
+          applySnapshot(latest)
+          setConflict({ submitted, serverChanged })
+          pushToast('Settings changed on the server. Review local values before saving again.', 'error')
+          return
+        } catch (refreshError) {
+          const message = `Settings conflict could not be recovered: ${errorMessage(refreshError)}`
+          setSaveFailure({ message })
+          pushToast(message, 'error')
+          return
+        }
+      }
       const message = `Settings were not saved: ${errorMessage(e)}`
       setSaveFailure({ message })
       pushToast(message, 'error')
@@ -362,7 +430,23 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         </div>
         <DialogDescription className="sr-only">Application and workspace settings: the agent model, execution backend, and output destinations.</DialogDescription>
 
-        {saveFailure && (
+        {conflict && (
+          <div data-testid="settings-conflict-recovery" role="alert" className="flex items-center gap-3 border-b border-amber-500/30 bg-amber-500/5 px-[18px] py-2 text-[11.5px] text-foreground">
+            <div className="min-w-0 flex-1">
+              <div className="font-medium">Settings changed on the server.</div>
+              <div className="mt-0.5 text-[10.5px] text-muted-foreground">
+                {conflict.serverChanged.length
+                  ? `Server changed: ${conflict.serverChanged.map(settingLabel).join(', ')}.`
+                  : 'The server did not change the settings you touched.'}
+                {' '}Local values are not saved until you reapply and Save again.
+              </div>
+            </div>
+            <Button variant="outline" size="sm" onClick={() => { setConflict(null); setSaveFailure(null) }}>Discard local values</Button>
+            <Button size="sm" onClick={reapplyForReview}>Reapply local values for review</Button>
+          </div>
+        )}
+
+        {saveFailure && !conflict && (
           <div role="alert" className="flex items-center gap-3 border-b border-destructive/30 bg-destructive/5 px-[18px] py-2 text-[11.5px] text-destructive">
             <div className="min-w-0 flex-1">
               <div>{saveFailure.message}</div>

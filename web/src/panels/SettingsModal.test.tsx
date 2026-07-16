@@ -32,6 +32,13 @@ const createCred = vi.fn()
 const updateCred = vi.fn()
 const deleteCred = vi.fn()
 vi.mock('../api/client', () => ({
+  KernelError: class KernelError extends Error {
+    status: number
+    constructor(status: number, message: string) {
+      super(message)
+      this.status = status
+    }
+  },
   api: {
     getSettings: () => getSettings(),
     plugins: () => plugins(),
@@ -52,6 +59,7 @@ const state = {
 }
 vi.mock('../store/graph', () => ({ useStore: (sel: (s: unknown) => unknown) => sel(state) }))
 
+import { KernelError } from '../api/client'
 import { SettingsModal } from './SettingsModal'
 
 describe('SettingsModal — plugin config form', () => {
@@ -174,19 +182,46 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
   })
 
-  it('keeps a typed plugin edit visible when the revisioned save conflicts', async () => {
-    getSettings.mockResolvedValue({
-      global: { 'plugin.dp_schema.count': 1 }, user: {}, revision: { global: 2, user: 4 },
+  it('recovers typed and non-conflicting plugin edits after repeated revision conflicts', async () => {
+    getSettings.mockResolvedValueOnce({
+      global: { 'plugin.dp_schema.count': 1, 'plugin.dp_schema.label': 'old label' }, user: {}, revision: { global: 2, user: 4 },
+    }).mockResolvedValueOnce({
+      global: { 'plugin.dp_schema.count': 9, 'plugin.dp_schema.label': 'old label' }, user: {}, revision: { global: 3, user: 4 },
+    }).mockResolvedValueOnce({
+      global: { 'plugin.dp_schema.count': 10, 'plugin.dp_schema.label': 'old label' }, user: {}, revision: { global: 4, user: 4 },
     })
     plugins.mockResolvedValue([SCHEMA_PACK])
-    putSettingsBatch.mockRejectedValueOnce(new Error('HTTP 409: settings changed'))
+    putSettingsBatch.mockRejectedValueOnce(new KernelError(409, 'settings revision is stale'))
+      .mockRejectedValueOnce(new KernelError(409, 'settings revision is stale'))
+      .mockResolvedValue({ ok: true, revision: { global: 5, user: 4 } })
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
     fireEvent.change(screen.getByLabelText('Count'), { target: { value: '42' } })
+    fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'local label' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('HTTP 409: settings changed')
+    const recovery = await screen.findByTestId('settings-conflict-recovery')
+    expect(recovery).toHaveTextContent('global: plugin.dp_schema.count')
+    expect(recovery).not.toHaveTextContent('global: plugin.dp_schema.label')
+    expect(screen.getByLabelText('Count')).toHaveValue(9)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reapply local values for review' }))
     expect(screen.getByLabelText('Count')).toHaveValue(42)
+    expect(screen.getByLabelText('Label')).toHaveValue('local label')
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByTestId('settings-conflict-recovery')).toHaveTextContent('global: plugin.dp_schema.count')
+    expect(screen.getByLabelText('Count')).toHaveValue(10)
+    fireEvent.click(screen.getByRole('button', { name: 'Reapply local values for review' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenLastCalledWith(
+      { global: 4, user: 4 },
+      [
+        { scope: 'global', key: 'plugin.dp_schema.count', value: 42 },
+        { scope: 'global', key: 'plugin.dp_schema.label', value: 'local label' },
+      ],
+    ))
   })
 
   it('opens clean and sends only fields the user changed', async () => {
