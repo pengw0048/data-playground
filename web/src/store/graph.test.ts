@@ -47,6 +47,7 @@ import {
   currentPreviews, previewPlanIdentity, profilePlanIdentity, useStore,
 } from './graph'
 import { KernelError } from '../api/client'
+import { register } from '../nodes/registry'
 
 const storage = new Map<string, string>()
 Object.defineProperty(globalThis, 'localStorage', {
@@ -208,6 +209,24 @@ describe('graph store — core authority ops', () => {
     apiMocks.preview.mockResolvedValueOnce(previewResult('view'))
     await useStore.getState().runPreview('filter')
     expect(useStore.getState().previews.filter?.result?.rows).toEqual([{ value: 'view' }])
+  })
+
+  it('reports a non-previewable plugin locally without sending a preview request', async () => {
+    register({
+      kind: 'store-non-previewable-plugin', title: 'Full-pass plugin', category: 'compute',
+      inputs: [], outputs: [{ id: 'out', label: 'Out', wire: 'dataset' }], canBypass: false,
+      previewable: false, defaultData: () => ({ title: 'Full-pass plugin', config: {}, status: 'draft', history: [] }), blurb: '',
+    }, () => null)
+    useStore.setState({
+      doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('plugin', 'store-non-previewable-plugin')], edges: [] },
+    })
+
+    await useStore.getState().runPreview('plugin')
+
+    expect(apiMocks.preview).not.toHaveBeenCalled()
+    expect(useStore.getState().previews.plugin?.result).toMatchObject({
+      notPreviewable: true, reason: 'Full-pass plugin is not sample-previewable — run a full pass',
+    })
   })
 
   it('blocks a stale sample response after its seed changes', async () => {

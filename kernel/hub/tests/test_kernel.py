@@ -1786,6 +1786,63 @@ def test_plugin_multi_input_descriptor_round_trips_and_executes_in_edge_order(tm
             deps.node_builders[kind] = prior_builder
 
 
+def test_plugin_previewability_and_requirements_are_truthful_end_to_end():
+    """A plugin descriptor must constrain preview and hard placement before a run is submitted."""
+    from hub.models import ResourceSpec
+    from hub.sdk import NodeSpec, PortSpec
+
+    deps = get_deps()
+    kind = "plugin_requires_preview_contract"
+    spec = NodeSpec(
+        kind=kind, title="plugin full pass", category="compute",
+        inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
+        params=[], previewable=False,
+        requires=ResourceSpec(gpu=1, labels={"engine": "plugin-gpu"}),
+    )
+    prior_spec = deps.node_specs.get(kind)
+    prior_builder = deps.node_builders.get(kind)
+    deps.node_specs[kind] = spec
+    deps.node_builders[kind] = lambda *_args: (_ for _ in ()).throw(AssertionError("must not preview"))
+    canvas_id = "plugin-requires-preview-contract"
+    graph = {"id": canvas_id, "name": "plugin full pass", "version": 1, "nodes": [
+        N("source", "source", {"uri": _uri("events")}),
+        N("plugin", kind, {}),
+    ], "edges": [E("source", "plugin")]}
+    try:
+        descriptor = next(item for item in client.get("/api/nodes").json() if item["kind"] == kind)
+        assert descriptor["previewable"] is False
+        assert descriptor["requires"]["gpu"] == 1
+        assert descriptor["requires"]["labels"] == {"engine": "plugin-gpu"}
+
+        assert client.put(f"/api/canvas/{canvas_id}", json=graph).status_code == 200
+        restored = client.get(f"/api/canvas/{canvas_id}")
+        assert restored.status_code == 200 and restored.json()["edges"] == graph["edges"]
+
+        preview = client.post("/api/run/preview", json={"graph": restored.json(), "nodeId": "plugin", "k": 10})
+        assert preview.status_code == 200
+        assert preview.json()["notPreviewable"] is True
+        assert "not sample-previewable" in preview.json()["reason"]
+
+        plan = client.post("/api/graph/plan", json={"graph": restored.json(), "targetNodeId": "plugin"})
+        assert plan.status_code == 200
+        region = plan.json()["regions"][-1]
+        assert region["unsatisfied"] is True and "engine=plugin-gpu" in region["requires"]
+
+        rejected = client.post("/api/run/estimate", json={"graph": restored.json(), "targetNodeId": "plugin"})
+        assert rejected.status_code == 400
+        assert "no registered backend can satisfy required resources" in rejected.json()["detail"]
+    finally:
+        client.delete(f"/api/canvas/{canvas_id}")
+        if prior_spec is None:
+            deps.node_specs.pop(kind, None)
+        else:
+            deps.node_specs[kind] = prior_spec
+        if prior_builder is None:
+            deps.node_builders.pop(kind, None)
+        else:
+            deps.node_builders[kind] = prior_builder
+
+
 # --------------------------------------------------------------------------- #
 # Regression tests for code-review findings (concurrency / correctness / security)
 # --------------------------------------------------------------------------- #

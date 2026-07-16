@@ -916,6 +916,36 @@ def _route_by_capability(deps, chosen, graph, target_node_id: str | None = None)
     )
 
 
+def _require_satisfiable_hard_requirements(deps, graph, target_node_id: str | None = None) -> None:
+    """Reject a GPU/label pin when no registered backend can actually honor it.
+
+    CPU and memory remain local-engine hints: the existing out-of-core runner can time-share and spill.
+    GPU, GPU type, and placement labels instead promise a capability local execution does not have, so
+    silently falling back would make a plugin's declared contract untrue.
+    """
+    nodes = graph_mod.upstream_chain(graph, target_node_id) if target_node_id else None
+    req = placement.graph_requires(graph, deps.node_specs, nodes=nodes)
+    if not (req.gpu or req.gpu_type or req.labels):
+        return
+
+    def accepts(r) -> bool:
+        try:
+            if hasattr(r, "place") and r.place(req) is not None:
+                return True
+            whole = getattr(r, "accepts_whole_graph", None)
+            return callable(whole) and bool(whole(req))
+        except Exception:  # a broken placement probe cannot authorize an unsupported run
+            return False
+
+    if any(accepts(r) for r in deps.runners):
+        return
+    parts = []
+    if req.gpu or req.gpu_type:
+        parts.append(f"{req.gpu or 1}×{req.gpu_type or 'gpu'}")
+    parts.extend(f"{key}={value}" for key, value in (req.labels or {}).items())
+    raise HTTPException(400, "no registered backend can satisfy required resources: " + " · ".join(parts))
+
+
 def _destination_credential_preflight(deps, runner, plan, graph) -> str | None:
     from hub.backends import destination_credential_error
     return destination_credential_error(runner, plan, graph, deps.workspace)
@@ -936,6 +966,7 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
+    _require_satisfiable_hard_requirements(deps, req.graph, req.target_node_id)
     output_target = _run_output_preflight(plan, req.target_node_id)
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), req.graph, req.target_node_id)
@@ -985,6 +1016,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
+    _require_satisfiable_hard_requirements(deps, graph, target_node_id)
     output_target = _run_output_preflight(plan, target_node_id)
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), graph, target_node_id
