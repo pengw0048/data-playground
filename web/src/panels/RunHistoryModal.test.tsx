@@ -116,7 +116,8 @@ describe('PerNodeBreakdown — per-node horizontal bars', () => {
 
 describe('admitted run inputs', () => {
   const manifestItem = (nodeId: string, datasetId: string, revisionId: string) => ({
-    nodeId, datasetId, revisionId, provider: 'lance', resolvedAt: '2026-07-16T12:00:00Z',
+    node_id: nodeId, dataset_id: datasetId, revision_id: revisionId,
+    provider: 'lance', resolved_at: '2026-07-16T12:00:00Z',
   })
   const revisionDetail = (datasetId: string, revisionId: string) => ({
     datasetId, revisionId, committedAt: '2026-07-16T11:00:00Z', retentionOwner: 'provider' as const,

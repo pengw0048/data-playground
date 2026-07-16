@@ -117,10 +117,10 @@ function RunInputManifest({ historyId, manifest }: {
     setEvidence(manifest.map(() => null))
     void Promise.all(manifest.map(async (item, index) => {
       let table: CatalogTable | null = null
-      try { table = await api.tableByRegistration(item.datasetId) } catch { /* exact detail decides availability */ }
+      try { table = await api.tableByRegistration(item.dataset_id) } catch { /* exact detail decides availability */ }
       let next: ManifestEvidence
       try {
-        const detail = await api.datasetRevision(item.datasetId, item.revisionId)
+        const detail = await api.datasetRevision(item.dataset_id, item.revision_id)
         next = { table, detail, availability: 'available', message: 'Exact revision is available.' }
       } catch (error) { next = unavailableEvidence(error, table) }
       if (live) setEvidence((current) => current.map((value, position) => position === index ? next : value))
@@ -150,19 +150,19 @@ function RunInputManifest({ historyId, manifest }: {
       <ol className="flex flex-col gap-2">
         {manifest.map((item, index) => {
           const current = evidence[index]
-          const source = nodes.find((node) => node.id === item.nodeId)
-          return <li key={`${item.nodeId}:${item.datasetId}:${item.revisionId}`} className="rounded-md border border-border bg-card p-2 text-[10.5px]">
+          const source = nodes.find((node) => node.id === item.node_id)
+          return <li key={`${item.node_id}:${item.dataset_id}:${item.revision_id}`} className="rounded-md border border-border bg-card p-2 text-[10.5px]">
             <div className="flex items-start gap-2">
               <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-muted text-[9px] font-semibold text-muted-foreground">{index + 1}</span>
               <div className="min-w-0 flex-1">
-                <div className="font-semibold text-foreground">Source {source?.data.title || item.nodeId}</div>
-                {source?.data.title && source.data.title !== item.nodeId && <div className="dp-mono break-all text-[9.5px] text-muted-foreground">node {item.nodeId}</div>}
+                <div className="font-semibold text-foreground">Source {source?.data.title || item.node_id}</div>
+                {source?.data.title && source.data.title !== item.node_id && <div className="dp-mono break-all text-[9.5px] text-muted-foreground">node {item.node_id}</div>}
                 <div className="mt-1 break-all text-muted-foreground">
-                  Dataset <span className="font-semibold text-foreground">{current?.table?.name ?? item.datasetId}</span>
-                  {current?.table?.name && <span className="dp-mono"> · {item.datasetId}</span>}
+                  Dataset <span className="font-semibold text-foreground">{current?.table?.name ?? item.dataset_id}</span>
+                  {current?.table?.name && <span className="dp-mono"> · {item.dataset_id}</span>}
                 </div>
-                <div className="dp-mono break-all text-muted-foreground">Exact revision {item.revisionId}</div>
-                <div className="text-muted-foreground">Provider {item.provider} · resolved {formatManifestTime(item.resolvedAt)}</div>
+                <div className="dp-mono break-all text-muted-foreground">Exact revision {item.revision_id}</div>
+                <div className="text-muted-foreground">Provider {item.provider} · resolved {formatManifestTime(item.resolved_at)}</div>
                 <div className="text-muted-foreground">Reference intent was not stored; this row reports only admitted resolution evidence.</div>
               </div>
               <AvailabilityBadge availability={current?.availability ?? 'checking'} />

@@ -402,11 +402,11 @@ export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export type PerNodeStat = PerNodeStatus
 export interface RunInputManifestItem {
-  nodeId: string
-  datasetId: string
-  revisionId: string
+  node_id: string
+  dataset_id: string
+  revision_id: string
   provider: string
-  resolvedAt: string
+  resolved_at: string
 }
 export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; inputManifest?: RunInputManifestItem[] | null; outputs: RunOutput[]; profile?: ProfileResult | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
