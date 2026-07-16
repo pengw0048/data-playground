@@ -14,13 +14,13 @@ import importlib.util
 import logging
 import os
 import sys
+from collections.abc import Callable
 
 from hub.backends import CatalogProvider, NodeBuilder
 from hub.models import BackendInfo, CapabilityView, KernelInfo, ResourceSpec, WorkerInfo
 from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec
 from hub.plugins.adapters import DuckDBAdapter, default_adapters
 from hub.plugins.capabilities import BUILTIN_CAPABILITIES
-from hub.plugins.catalog import InMemoryCatalog
 from hub.plugins.processors import InMemoryProcessorRegistry
 from hub.plugins.runner import LocalRunner
 from hub.settings import settings
@@ -141,8 +141,18 @@ class Registry:
         self.deps.adapters.insert(0, adapter)  # plugins claim uris before defaults
 
     def add_runner(self, runner) -> None:
-        # runner should satisfy hub.backends.ExecutionBackend; inserted first so it wins pick_runner
-        self.deps.runners.insert(0, runner)
+        # runner should satisfy hub.backends.ExecutionBackend; materialized in registration order after
+        # the built-in local runner exists, then inserted first so it wins pick_runner.
+        self.deps._runner_registrations.append((self._pack, lambda _deps: runner))
+
+    def add_runner_factory(self, factory) -> None:
+        """Register ``factory(deps) -> ExecutionBackend`` for composition after the local runner exists.
+
+        Catalog selection must finish before any runner captures it.  A backend that also delegates to
+        the built-in runner (for example dp_ray) therefore registers a factory instead of constructing
+        itself during plugin discovery.
+        """
+        self.deps._runner_registrations.append((self._pack, factory))
 
     def add_capability(self, cap) -> None:
         self.deps.capabilities.append(cap)
@@ -349,6 +359,10 @@ class Deps:
         self.managed_object_provider = None
         self.plugins: list[dict] = []
         self._manifests: dict[str, dict] = {}
+        # Plugins register before services are constructed.  Keep the collection available now so a
+        # plugin backend can register itself, then append the built-ins after they bind the final catalog.
+        self.runners: list = []
+        self._runner_registrations: list[tuple[str | None, Callable[[Deps], object]]] = []
         from hub.storage import make_storage
         self.storage = make_storage(workspace)
         # The catalog is shared by every user (by design — one workspace, not one kernel per session);
@@ -360,8 +374,11 @@ class Deps:
         # later can still replace it (set_catalog). See _load_bundled.
         self.catalog = None  # set by the bundled default-catalog plugin immediately below
         self._load_bundled()
-        if self.catalog is None:  # defensive: a catalog must always exist (clone-it-and-it-works)
-            self.catalog = InMemoryCatalog(data_dir, self.resolve_adapter)
+        if self.catalog is None:
+            raise RuntimeError("bundled default-catalog plugin did not install a catalog")
+        # Catalog selection is a composition-time decision.  Do not construct a runner, profile
+        # supervisor, or run controller until every plugin has had its one registration opportunity.
+        self._load_plugins()
         # recover/clean any temp siblings an interrupted append/compaction left behind BEFORE re-cataloging,
         # so a crash can't surface a half-written staging file as a dataset or leave a compacting one absent.
         if maintain_storage:
@@ -389,6 +406,8 @@ class Deps:
         self.runner.result_get = _result_get  # DB-backed content-addressed result reuse (cross-run/restart)
         self.runner.result_acquire = _result_acquire
         self.runner.result_put = _result_put
+        self.runners = [self.runner]
+        self._materialize_plugin_runners()
         # Whole-dataset profiles are inspection jobs, not materialized graph runs, but they share
         # the same durable RunState status/cancel/recovery contract.
         from hub.profile_jobs import ProfileProcessRunner
@@ -406,7 +425,7 @@ class Deps:
         sub.on_complete = _on_complete  # record cancelled/crashed isolated runs the child couldn't
         sub.on_status = _persist_run_state
         sub.result_put = _result_put
-        self.runners = [self.runner, sub]
+        self.runners.append(sub)
         # opt-in reference multi-worker pool (DP_POOL_WORKERS): capability-based placement without a
         # cluster — pods are processes with configured capacities. Shows in the Compute view + is
         # selectable/placeable. Absent → default behavior unchanged. (k8s/Ray = plugins over the same API.)
@@ -441,7 +460,6 @@ class Deps:
         self.controller.on_complete = _on_complete
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self.run_owner: dict[str, str] = {}  # run_id -> creator uid, to authorize ad-hoc (no-canvas) runs
-        self._load_plugins()
 
     def resolve_adapter(self, uri: str):
         for a in self.adapters:
@@ -451,6 +469,19 @@ class Deps:
             except Exception:  # noqa: BLE001
                 continue
         return self.default_adapter
+
+    def _materialize_plugin_runners(self) -> None:
+        """Construct registered plugin backends after catalog selection and the local base runner."""
+        for pack, factory in self._runner_registrations:
+            try:
+                self.runners.insert(0, factory(self))
+            except Exception as e:  # noqa: BLE001 — optional plugin failure remains non-fatal
+                name = pack or getattr(factory, "__module__", "plugin-runner")
+                print(f"[deps] plugin runner '{name}' failed: {e}")
+                entry = next((p for p in reversed(self.plugins)
+                              if p.get("name") == pack and "error" not in p), None)
+                if entry is not None:
+                    entry["error"] = f"{type(e).__name__}: {e}"
 
     def chosen_backend(self, uid: str | None = None) -> str:
         """The selected execution backend NAME: per-user preference > workspace default > DP_EXECUTION >
@@ -491,16 +522,14 @@ class Deps:
         """Register the first-party DEFAULTS through the public plugin seam, BEFORE any external plugin.
         Today that's the default catalog: the built-in installs itself via reg.set_catalog exactly like a
         third-party catalog would, so it's the first implementation through the seam — not a privileged
-        core instantiation — and a plugin loaded later can still replace it. Kept minimal + never fatal:
-        a bundled default that fails to register falls back to the defensive path in __init__."""
+        core instantiation — and a plugin loaded later can still replace it. This required plugin must
+        install a catalog; startup cannot continue with an ambiguous composition root."""
         reg = Registry(self)
         from hub.plugins import default_catalog
         reg._pack = "default-catalog"
         try:
             default_catalog.register(reg)
             self.plugins.append({"name": "default-catalog", "source": "builtin"})
-        except Exception as e:  # noqa: BLE001
-            print(f"[deps] bundled default-catalog failed to register: {e}")
         finally:
             reg._pack = None
 

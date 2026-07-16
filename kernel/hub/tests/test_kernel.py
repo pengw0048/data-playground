@@ -7239,6 +7239,132 @@ def test_plugin_version_negotiation(tmp_path):
     assert gerr and "version number" in gerr[0]["error"]
 
 
+def test_catalog_plugin_is_finalized_before_catalog_services(tmp_path, monkeypatch):
+    """A catalog selected by a drop-in plugin is the one every later service observes."""
+    import importlib
+    import sys
+    import uuid
+
+    import duckdb
+
+    from hub import graph as graph_mod
+    from hub.compiler import compile_plan
+    from hub.deps import Deps
+    from hub.models import Graph
+    from hub.plugins import catalog as catalog_plugin
+    from hub.routers.runs import _profile_plan_digest
+    from hub.subprocess_runner import SubprocessRunner
+
+    plugin_name = "catalog_replacement_for_composition_test"
+    plugin = tmp_path / "ws_one" / "plugins" / plugin_name
+    plugins_dir = str(plugin.parent)
+    plugin.mkdir(parents=True)
+    (plugin / "__init__.py").write_text(
+        "from hub.plugins.catalog import InMemoryCatalog\n"
+        "instances = []\n"
+        "class ReplacementCatalog(InMemoryCatalog):\n"
+        "    def __init__(self, *args):\n"
+        "        super().__init__(*args)\n"
+        "def register(reg):\n"
+        "    catalog = ReplacementCatalog(reg.deps.data_dir, reg.deps.resolve_adapter)\n"
+        "    instances.append(catalog)\n"
+        "    reg.set_catalog(catalog)\n"
+    )
+    source = tmp_path / "source.parquet"
+    source_name = f"catalog_composition_source_{uuid.uuid4().hex}"
+    output_name = f"catalog_composition_output_{uuid.uuid4().hex}"
+    duckdb.connect().execute(f"COPY (SELECT 1 AS value) TO '{source}' (FORMAT PARQUET)")
+
+    try:
+        first = Deps(str(tmp_path / "ws_one"), str(tmp_path / "data_one"))
+        module = importlib.import_module(plugin_name)
+        selected = module.instances[-1]
+        assert first.catalog is selected
+        assert first.runner.catalog is selected
+        assert next(r for r in first.runners if isinstance(r, SubprocessRunner)).catalog is selected
+        assert first.controller.deps.catalog is selected
+
+        # Read and profile preflight resolve an alias through the selected provider.
+        selected.register_output(name=source_name, uri=str(source), parents=[])
+        graph = Graph(**{"id": "catalog-composition", "version": 1, "nodes": [
+            N("source", "source", {"uri": source_name}),
+            N("write", "write", {"name": output_name}),
+        ], "edges": [E("source", "write")]})
+        graph_mod.resolve_source_refs(graph, first.catalog.resolve_ref)
+        assert graph.nodes[0].data["config"]["uri"] == str(source)
+        assert _profile_plan_digest(graph, "source", first)
+
+        # A real write reaches the same object through the runner's publication path.
+        seen_publication_catalogs = []
+        real_unmanaged_publication_supported = catalog_plugin.unmanaged_publication_supported
+        monkeypatch.setattr(
+            catalog_plugin, "unmanaged_publication_supported",
+            lambda catalog: (
+                seen_publication_catalogs.append(catalog),
+                real_unmanaged_publication_supported(catalog),
+            )[1],
+        )
+        started = first.runner.run(
+            compile_plan(graph, "write", first.registry, first.node_specs), graph, "write", "local")
+        status = started
+        for _ in range(100):
+            status = first.runner.status(started.run_id)
+            if status.status in ("done", "failed", "cancelled"):
+                break
+            time.sleep(0.05)
+        assert status.status == "done", status.error
+        assert selected in seen_publication_catalogs
+
+        # A second composition root invokes the plugin again and does not share its catalog instance.
+        second_workspace = tmp_path / "ws_two"
+        second_plugin = second_workspace / "plugins" / plugin_name
+        second_plugin.parent.mkdir(parents=True)
+        second_plugin.symlink_to(plugin, target_is_directory=True)
+        second = Deps(str(second_workspace), str(tmp_path / "data_two"))
+        assert second.catalog is module.instances[-1]
+        assert second.catalog is not selected
+        assert second.runner.catalog is second.catalog
+    finally:
+        sys.modules.pop(plugin_name, None)
+        if plugins_dir in sys.path:
+            sys.path.remove(plugins_dir)
+
+
+def test_required_default_catalog_failure_aborts_composition(tmp_path, monkeypatch):
+    from hub.deps import Deps
+    from hub.plugins import default_catalog
+
+    monkeypatch.setattr(default_catalog, "register", lambda _reg: (_ for _ in ()).throw(RuntimeError("catalog boom")))
+    with pytest.raises(RuntimeError, match="catalog boom"):
+        Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+
+
+def test_runner_plugin_constructs_after_catalog_and_local_runner(tmp_path):
+    """The bundled dp_ray plugin can bind both the selected catalog and its local delegate."""
+    import sys
+    from pathlib import Path
+
+    from hub.deps import Deps
+
+    plugin_name = "dp_ray"
+    plugin = tmp_path / "ws" / "plugins" / plugin_name
+    plugins_dir = str(plugin.parent)
+    plugin.parent.mkdir(parents=True)
+    source = Path(__file__).resolve().parents[3] / "examples" / "plugins" / plugin_name
+    plugin.symlink_to(source, target_is_directory=True)
+
+    try:
+        deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"), maintain_storage=False)
+        runner = next(r for r in deps.runners if getattr(r, "name", None) == "ray-data")
+        assert runner.base is deps.runner
+        assert runner.catalog is deps.catalog
+        assert not next(p for p in deps.plugins if p["name"] == plugin_name).get("error")
+    finally:
+        sys.modules.pop(plugin_name, None)
+        if plugins_dir in sys.path:
+            sys.path.remove(plugins_dir)
+
+
 def test_core_api_range_check(monkeypatch):
     # OSS-01: the plugin-API check is a semantic RANGE (min ≤ need ≤ core), not just a floor — a plugin
     # built for a now-dropped OLDER major is rejected up front, not registered then crashed. Also proves
