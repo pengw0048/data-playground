@@ -8,6 +8,7 @@ and distinguishes an honest "needs a full pass" from a real error (bad cell/quer
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from hub import db, graph as g, paths
 from hub.executors.engine import BuildEngine, NotPreviewable
@@ -27,6 +28,22 @@ PREVIEW_BUDGET_S = 8.0
 # it is NOT here.)
 _CODE_CELL_KINDS = ("transform", "section")
 _LOCAL_SAMPLE_ADAPTERS = {"duckdb", "lance"}
+
+
+class _PreviewAdapter:
+    """One adapter view per source, with one bounded fingerprint probe per preview request."""
+
+    def __init__(self, adapter: Any, fingerprints: dict[str, Any]):
+        self._adapter = adapter
+        self._fingerprints = fingerprints
+
+    def fingerprint(self, uri: str):
+        if uri not in self._fingerprints:
+            self._fingerprints[uri] = self._adapter.fingerprint(uri)
+        return self._fingerprints[uri]
+
+    def __getattr__(self, name: str):
+        return getattr(self._adapter, name)
 
 
 def _reservoir_preview_allowed(graph: Graph, node_id: str, resolve_adapter) -> bool:
@@ -91,8 +108,16 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
             "preview of a Python cell is disabled in multi-user mode — the in-process timeout can't kill "
             "a runaway cell; run it (runs execute in a killable, deadline-bounded child)"))
 
-    reservoir_preview = _reservoir_preview_allowed(graph, node_id, resolve_adapter)
-    engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
+    adapters: dict[str, _PreviewAdapter] = {}
+    fingerprints: dict[str, Any] = {}
+
+    def preview_adapter(uri: str) -> _PreviewAdapter:
+        if uri not in adapters:
+            adapters[uri] = _PreviewAdapter(resolve_adapter(uri), fingerprints)
+        return adapters[uri]
+
+    reservoir_preview = _reservoir_preview_allowed(graph, node_id, preview_adapter)
+    engine = BuildEngine(graph, preview_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
                             node_builders=node_builders, node_specs=node_specs,
                             warm=cache, warm_scope="preview", reservoir_preview=reservoir_preview)
 
@@ -118,9 +143,9 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                 raw_n = config.get("n") if isinstance(config, dict) else None
                 sample_n = max(0, int(raw_n if raw_n is not None else PREVIEW_SCAN))
                 if reservoir_preview:
-                    total = _reservoir_source_total(graph, node_id, resolve_adapter)
+                    total = _reservoir_source_total(graph, node_id, preview_adapter)
                     provenance = provenance_for_graph(
-                        graph, node_id, resolve_adapter, strategy="reservoir",
+                        graph, node_id, preview_adapter, strategy="reservoir",
                         seed=int(config.get("seed", 42)), requested_rows=sample_n,
                         scanned_rows=total, returned_rows=len(rows[:k]), total_rows=total,
                         limitations=[
@@ -132,7 +157,7 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                     )
                 else:
                     provenance = provenance_for_graph(
-                        graph, node_id, resolve_adapter, strategy="prefix", seed=None,
+                        graph, node_id, preview_adapter, strategy="prefix", seed=None,
                         requested_rows=k, scanned_rows=None, returned_rows=len(rows[:k]), total_rows=None,
                         limitations=[
                             f"Each source was bounded to at most {PREVIEW_SCAN} rows; this prefix is not representative or random.",
