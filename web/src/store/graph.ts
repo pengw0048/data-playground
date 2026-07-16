@@ -7,7 +7,7 @@ import type {
   CatalogTable, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
 import { getSpec, nodeOutputs } from '../nodes/registry'
-import { registerGenericNodes, nodeInvalidReason } from '../nodes/generic'
+import { registerGenericNodes, nodeInvalidReason, numericDraftInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
 import { parseHash } from '../router'
 import { exampleDoc } from '../examples'
@@ -646,6 +646,7 @@ interface Store {
   past: CanvasDoc[]
   future: CanvasDoc[]
   saved: boolean          // auto-save state (localStorage), shown subtly in the top bar
+  numericParamDrafts: Record<string, Record<string, string>>  // invalid/pending text; never persisted
 
   agentOpen: boolean
   agentLog: AgentMsg[]
@@ -656,6 +657,7 @@ interface Store {
   addNode: (kind: string, position: { x: number; y: number }, config?: Partial<NodeConfig>, title?: string) => CanvasNode | null
   setParent: (id: string, parentId: string | null, position: { x: number; y: number }) => void
   updateConfig: (id: string, patch: Partial<NodeConfig>) => void
+  setNumericParamDraft: (id: string, param: string, text: string | undefined) => void
   updateData: (id: string, patch: Partial<NodeData>) => void
   removeNode: (id: string) => void
   connect: (edge: CanvasEdge) => void
@@ -773,14 +775,14 @@ function emptyDoc(): CanvasDoc {
 
 // true if the node, or anything feeding it, has an unmet required param — so running the pipeline
 // through it would fail. Keeps rerun-all consistent with the disabled ▶ on the cards.
-function hasInvalidUpstream(doc: CanvasDoc, id: string): boolean {
+function hasInvalidUpstream(doc: CanvasDoc, id: string, numericDrafts: Store['numericParamDrafts']): boolean {
   const seen = new Set<string>()
   const walk = (nid: string): boolean => {
     if (seen.has(nid)) return false
     seen.add(nid)
     const n = doc.nodes.find((x) => x.id === nid)
     if (!n) return false
-    if (nodeInvalidReason(n)) return true
+    if (nodeInvalidReason(n, undefined, numericDrafts[n.id])) return true
     return doc.edges.filter((e) => e.target === nid).map((e) => e.source).some(walk)
   }
   return walk(id)
@@ -992,6 +994,7 @@ export const useStore = create<Store>((set, get) => ({
   past: [],
   future: [],
   saved: true,
+  numericParamDrafts: {},
   agentOpen: false,
   agentLog: [],
 
@@ -1092,6 +1095,19 @@ export const useStore = create<Store>((set, get) => ({
     })
   },
 
+  setNumericParamDraft: (id, param, text) => {
+    if (!roleCanEdit(get().canvasRole)) return
+    set((s) => {
+      const numericParamDrafts = { ...s.numericParamDrafts }
+      const nodeDrafts = { ...(numericParamDrafts[id] ?? {}) }
+      if (text === undefined) delete nodeDrafts[param]
+      else nodeDrafts[param] = text
+      if (Object.keys(nodeDrafts).length) numericParamDrafts[id] = nodeDrafts
+      else delete numericParamDrafts[id]
+      return { numericParamDrafts }
+    })
+  },
+
   updateData: (id, patch) => {
     if (!roleCanEdit(get().canvasRole)) return
     set((s) => ({
@@ -1107,6 +1123,7 @@ export const useStore = create<Store>((set, get) => ({
       const previews = { ...s.previews }; delete previews[id]
       const runs = { ...s.runs }; delete runs[id]
       const profileJobs = { ...s.profileJobs }; delete profileJobs[id]
+      const numericParamDrafts = { ...s.numericParamDrafts }; delete numericParamDrafts[id]
       return {
         doc: {
           ...s.doc,
@@ -1116,7 +1133,7 @@ export const useStore = create<Store>((set, get) => ({
         selectedId: s.selectedId === id ? null : s.selectedId,
         selectedIds: s.selectedIds.filter((x) => x !== id),
         openPanels: Object.fromEntries(Object.entries(s.openPanels).filter(([k]) => k !== id)),
-        previews, runs, profileJobs,
+        previews, runs, profileJobs, numericParamDrafts,
       }
     })
   },
@@ -1297,6 +1314,10 @@ export const useStore = create<Store>((set, get) => ({
     const doc = get().doc
     const node = doc.nodes.find((candidate) => candidate.id === id)
     if (!node) return
+    if (hasInvalidUpstream(doc, id, get().numericParamDrafts)) {
+      get().pushToast('Fix invalid node parameters before previewing.', 'error')
+      return
+    }
     const ports = nodeOutputs(node)
     const currentPortId = get().previews[id]?.portId
     const defaultPortId = ports.find((port) => port.id === 'out')?.id ?? ports[0]?.id
@@ -1366,6 +1387,10 @@ export const useStore = create<Store>((set, get) => ({
   // if interested. A confirm gate is the one exception (it needs the panel to show the button).
   requestRun: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) {
+      get().pushToast('Fix invalid node parameters before running.', 'error')
+      return
+    }
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } } }))
     let estimate
     try {
@@ -1384,6 +1409,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   estimate: async (id) => {
+    if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) return
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } }, openPanels: { [id]: 'run' } }))
     try {
       const estimate = await api.estimate(get().doc, id)
@@ -1397,6 +1423,7 @@ export const useStore = create<Store>((set, get) => ({
 
   run: async (id, confirmed = false) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) return
     // no openPanels here — status shows on the card; the user opens the run panel if they want detail
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'running' } } }))
     get().updateData(id, { status: 'running' })
@@ -1420,15 +1447,15 @@ export const useStore = create<Store>((set, get) => ({
   // its upstream, so the full pipeline re-executes. Notes/unconnected nodes aren't runnable → skipped.
   rerunAll: () => {
     if (!roleCanEdit(get().canvasRole)) return
-    const { doc } = get()
+    const { doc, numericParamDrafts } = get()
     const hasOutgoing = new Set(doc.edges.map((e) => e.source))
     // a section's contained children are run by the section, not as top-level sinks
     const sinks = doc.nodes.filter((n) => !n.parentId && !hasOutgoing.has(n.id) && nodeRunnable(doc, n.id))
     // don't kick off pipelines that would fail on a missing required field (matches the disabled ▶)
-    const valid = sinks.filter((n) => !hasInvalidUpstream(doc, n.id))
+    const valid = sinks.filter((n) => !hasInvalidUpstream(doc, n.id, numericParamDrafts))
     valid.forEach((n) => get().requestRun(n.id))
     const invalidSkipped = sinks.length - valid.length
-    if (invalidSkipped) get().pushToast(`Skipped ${invalidSkipped} pipeline${invalidSkipped > 1 ? 's' : ''} with a required field still empty`, 'info')
+    if (invalidSkipped) get().pushToast(`Skipped ${invalidSkipped} pipeline${invalidSkipped > 1 ? 's' : ''} with invalid node parameters`, 'info')
   },
 
   cancelRun: async (id) => {
@@ -2129,6 +2156,7 @@ export const useStore = create<Store>((set, get) => ({
 
   save: async () => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (get().doc.nodes.some((node) => numericDraftInvalidReason(node, get().numericParamDrafts[node.id]))) return
     try {
       await api.saveCanvas(get().doc)
     } catch { /* offline: keep in memory */ }
@@ -2147,7 +2175,7 @@ export const useStore = create<Store>((set, get) => ({
       // Agent requests are independent. A record from another canvas must never be displayed as
       // context for this one (or suggest that it will be sent with a future request).
       agentLog,
-      previews: {}, runs: {}, profileJobs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
+      previews: {}, runs: {}, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
     })
     reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
     void get().ensureCanvasTables(d)  // warm the working set for this canvas's source nodes (on demand)
@@ -2254,6 +2282,7 @@ useStore.subscribe((s) => {
       useStore.setState({ saved: true })
       return
     }
+    if (state.doc.nodes.some((node) => numericDraftInvalidReason(node, state.numericParamDrafts[node.id]))) return
     const doc = state.doc
     try {
       await api.saveCanvas(doc)  // PUT to the metadata DB (per-user, upsert)

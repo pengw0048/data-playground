@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { getSpec, portMulti } from './registry'
-import { nodeInvalidReason, registerGenericNodes } from './generic'
+import { nodeInvalidReason, parseNumericParam, registerGenericNodes } from './generic'
 
 describe('generic node registration', () => {
   it('preserves a plugin multi-input descriptor for canvas connection validation', () => {
@@ -39,5 +39,37 @@ describe('generic node registration', () => {
     expect(nodeInvalidReason(node(['missing']), [{ name: 'id' }])).toContain('unavailable column')
     expect(nodeInvalidReason(node(['missing']), [])).toBeNull()
     expect(nodeInvalidReason(node(['event', 'id']), [{ name: 'id' }, { name: 'event' }])).toBeNull()
+  })
+
+  it.each([
+    ['int', '  +42  ', { kind: 'valid', value: 42 }],
+    ['int', '-0', { kind: 'valid', value: -0 }],
+    ['int', '12abc', { kind: 'invalid' }],
+    ['int', '1e3', { kind: 'invalid' }],
+    ['float', '-1.25e+2', { kind: 'valid', value: -125 }],
+    ['float', '.5', { kind: 'valid', value: 0.5 }],
+    ['float', 'NaN', { kind: 'invalid' }],
+    ['float', 'Infinity', { kind: 'invalid' }],
+    ['float', '   ', { kind: 'empty' }],
+  ] as const)('parses a complete %s value %j canonically', (type, text, expected) => {
+    expect(parseNumericParam(text, type)).toEqual(expected)
+  })
+
+  it('validates numeric drafts and persisted JSON types from the declared schema', () => {
+    registerGenericNodes([{
+      kind: 'plugin-numeric-contract', title: 'Plugin numeric', category: 'compute',
+      inputs: [], outputs: [{ id: 'out', wire: 'dataset' }],
+      params: [
+        { name: 'count', type: 'int', required: true },
+        { name: 'ratio', type: 'float', default: 0.5 },
+      ], canBypass: false, previewable: true, blurb: '',
+    }])
+    const node = (config: Record<string, unknown>) => ({ type: 'plugin-numeric-contract', data: { config } })
+
+    expect(nodeInvalidReason(node({ count: 0 }))).toBeNull()
+    expect(nodeInvalidReason(node({ count: 1 }), undefined, { count: '12abc' })).toContain('complete safe integer')
+    expect(nodeInvalidReason(node({ count: 1 }), undefined, { count: '' })).toContain('required')
+    expect(nodeInvalidReason(node({ count: '1' }))).toContain('complete safe integer')
+    expect(nodeInvalidReason(node({ count: 1, ratio: Infinity }))).toContain('finite number')
   })
 })

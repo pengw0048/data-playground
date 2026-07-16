@@ -1849,6 +1849,70 @@ def test_plugin_column_parameter_preserves_ordered_values_end_to_end():
             deps.node_builders[kind] = prior_builder
 
 
+def test_plugin_numeric_parameters_round_trip_and_reject_invalid_json_before_execution():
+    """Typed plugin numbers survive persistence unchanged and invalid shapes never reach build()."""
+    from hub.sdk import NodeSpec, ParamSpec, PortSpec
+
+    deps = get_deps()
+    kind = "plugin_numeric_contract"
+    spec = NodeSpec(
+        kind=kind, title="plugin numeric", category="compute",
+        inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
+        params=[ParamSpec(name="count", type="int", required=True),
+                ParamSpec(name="ratio", type="float", default=0.5)],
+    )
+    received: list[tuple[int, float]] = []
+
+    def build(_engine, node, inputs):
+        config = node.data["config"]
+        received.append((config["count"], config["ratio"]))
+        return inputs[0]
+
+    prior_spec = deps.node_specs.get(kind)
+    prior_builder = deps.node_builders.get(kind)
+    deps.node_specs[kind] = spec
+    deps.node_builders[kind] = build
+    canvas_id = "plugin-numeric-contract"
+    graph = {"id": canvas_id, "name": "plugin numeric", "version": 1, "nodes": [
+        N("source", "source", {"uri": _uri("events")}),
+        N("plugin", kind, {"count": 0, "ratio": 0.0}),
+    ], "edges": [E("source", "plugin")]}
+    try:
+        for count, ratio in ((0, 0.0), (-7, 1.25e2)):
+            graph["nodes"][1]["data"]["config"] = {"count": count, "ratio": ratio}
+            assert client.put(f"/api/canvas/{canvas_id}", json=graph).status_code == 200
+            restored = client.get(f"/api/canvas/{canvas_id}")
+            assert restored.status_code == 200
+            config = restored.json()["nodes"][1]["data"]["config"]
+            assert config == {"count": count, "ratio": ratio}
+            preview = client.post(
+                "/api/run/preview", json={"graph": restored.json(), "nodeId": "plugin", "k": 2})
+            assert preview.status_code == 200, preview.text
+            assert received[-1] == (count, ratio)
+
+        executed = len(received)
+        for invalid in (
+            {"count": "12abc", "ratio": 0.5},
+            {"count": 1, "ratio": "Infinity"},
+            {"ratio": 0.5},
+        ):
+            graph["nodes"][1]["data"]["config"] = invalid
+            rejected = client.post(
+                "/api/run/preview", json={"graph": graph, "nodeId": "plugin", "k": 2})
+            assert rejected.status_code == 400
+        assert len(received) == executed
+    finally:
+        client.delete(f"/api/canvas/{canvas_id}")
+        if prior_spec is None:
+            deps.node_specs.pop(kind, None)
+        else:
+            deps.node_specs[kind] = prior_spec
+        if prior_builder is None:
+            deps.node_builders.pop(kind, None)
+        else:
+            deps.node_builders[kind] = prior_builder
+
+
 def test_plugin_previewability_and_requirements_are_truthful_end_to_end():
     """A plugin descriptor must constrain preview and hard placement before a run is submitted."""
     from hub.models import ResourceSpec

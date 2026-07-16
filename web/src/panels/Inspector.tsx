@@ -87,6 +87,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const edges = useStore((s) => s.doc.edges)
   const warnings = useSchemaWarnings(nodeId)   // config references a column not in the (known) input
   const inputColumns = useInputColumns(nodeId)
+  const numericDrafts = useStore((s) => s.numericParamDrafts[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
@@ -99,7 +100,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const st = statusTok[node.data.status] ?? statusTok.draft
   const codeParams = (bspec?.params ?? []).filter((p) => p.type === 'code')
   const cfg = node.data.config as Record<string, unknown>
-  const invalid = nodeInvalidReason(node, inputColumns)
+  const invalid = nodeInvalidReason(node, inputColumns, numericDrafts)
   const outputPorts = nodeOutputs(node)
 
   // a code op / plugin kind can carry a declared/inferred schema contract; relational ops are always

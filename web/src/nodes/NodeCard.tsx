@@ -75,7 +75,8 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const hasCode = KINDS_WITH_CODE.has(kind)
   const busy = runState === 'running' || runState === 'estimating'
   const inputColumns = useInputColumns(id)
-  const invalid = node ? nodeInvalidReason(node, inputColumns) : null   // e.g. "order by is required"
+  const numericDrafts = useStore((s) => s.numericParamDrafts[id])
+  const invalid = node ? nodeInvalidReason(node, inputColumns, numericDrafts) : null   // e.g. "order by is required"
   const warnings = useSchemaWarnings(id)   // soft cue: config references a column not in the input
   const sizeEst = useStore((s) => s.sizes[id])   // conservative pre-run size estimate (card hint)
   // the action shelf is revealed on hover / sole-selection / while running, so a resting card is clean
