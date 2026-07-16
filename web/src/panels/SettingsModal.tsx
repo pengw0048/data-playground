@@ -332,7 +332,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     setSaveFailure(null)
   }
   const save = async () => {
-    if (loading || loadError || saving || invalidPluginEdit || !baseline || changes.length === 0) return
+    if (loading || loadError || saving || invalidPluginEdit || conflict || !baseline || changes.length === 0) return
     const submitted = changes
 
     setSaving(true)
@@ -426,7 +426,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <span role="status" aria-live="polite" className={cn('text-[11.5px]', dirty ? 'text-amber-700 dark:text-amber-300' : 'text-green-600')}>
             {changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'}` : dirty ? 'Unsaved draft' : savedMsg}
           </span>
-          <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || invalidPluginEdit || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
+          <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || invalidPluginEdit || Boolean(conflict) || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
         </div>
         <DialogDescription className="sr-only">Application and workspace settings: the agent model, execution backend, and output destinations.</DialogDescription>
 

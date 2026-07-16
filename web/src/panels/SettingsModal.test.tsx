@@ -204,6 +204,11 @@ describe('SettingsModal — plugin config form', () => {
     expect(recovery).toHaveTextContent('global: plugin.dp_schema.count')
     expect(recovery).not.toHaveTextContent('global: plugin.dp_schema.label')
     expect(screen.getByLabelText('Count')).toHaveValue(9)
+    fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'post-conflict draft' } })
+    const saveButton = screen.getByRole('button', { name: 'Save' })
+    expect(saveButton).toBeDisabled()
+    fireEvent.click(saveButton)
+    expect(putSettingsBatch).toHaveBeenCalledTimes(1)
 
     fireEvent.click(screen.getByRole('button', { name: 'Reapply local values for review' }))
     expect(screen.getByLabelText('Count')).toHaveValue(42)
