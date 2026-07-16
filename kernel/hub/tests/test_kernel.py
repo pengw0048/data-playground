@@ -1786,6 +1786,69 @@ def test_plugin_multi_input_descriptor_round_trips_and_executes_in_edge_order(tm
             deps.node_builders[kind] = prior_builder
 
 
+def test_plugin_column_parameter_preserves_ordered_values_end_to_end():
+    """A typed plugin field list survives descriptor, canvas persistence, and lowering unchanged."""
+    from hub.sdk import NodeSpec, ParamSpec, PortSpec, ctx, identifier, quote_identifier
+
+    deps = get_deps()
+    kind = "plugin_structured_columns_contract"
+    spec = NodeSpec(
+        kind=kind, title="plugin selected columns", category="compute",
+        inputs=[PortSpec(id="in", wire="dataset")], outputs=[PortSpec(id="out", wire="dataset")],
+        params=[ParamSpec(name="columns", type="columns", label="Selected columns")],
+    )
+    received: list[list[str]] = []
+
+    def build(_engine, node, inputs):
+        selected = node.data["config"]["columns"]
+        received.append(list(selected))
+        if not selected:
+            return inputs[0]
+        fields = ", ".join(quote_identifier(identifier(column, inputs[0].columns, label="plugin column"))
+                           for column in selected)
+        return ctx.sql(inputs[0], f"SELECT {fields} FROM input")
+
+    prior_spec = deps.node_specs.get(kind)
+    prior_builder = deps.node_builders.get(kind)
+    deps.node_specs[kind] = spec
+    deps.node_builders[kind] = build
+    canvas_id = "plugin-structured-columns-contract"
+    graph = {"id": canvas_id, "name": "plugin selected columns", "version": 1, "nodes": [
+        N("source", "source", {"uri": _uri("events")} ),
+        N("plugin", kind, {"columns": []}),
+    ], "edges": [E("source", "plugin")]}
+    try:
+        descriptor = next(item for item in client.get("/api/nodes").json() if item["kind"] == kind)
+        assert descriptor["params"] == [{"name": "columns", "type": "columns", "default": None,
+                                         "options": None, "label": "Selected columns", "lang": None,
+                                         "required": False, "showWhen": None}]
+
+        for selected in ([], ["event"], ["amount", "event"]):
+            graph["nodes"][1]["data"]["config"] = {"columns": selected}
+            assert client.put(f"/api/canvas/{canvas_id}", json=graph).status_code == 200
+            restored = client.get(f"/api/canvas/{canvas_id}")
+            assert restored.status_code == 200
+            assert restored.json()["nodes"][1]["data"]["config"]["columns"] == selected
+            preview = client.post("/api/run/preview", json={"graph": restored.json(), "nodeId": "plugin", "k": 2})
+            assert preview.status_code == 200, preview.text
+            assert received[-1] == selected
+
+        graph["nodes"][1]["data"]["config"] = {"columns": "amount,event"}
+        rejected = client.post("/api/run/preview", json={"graph": graph, "nodeId": "plugin", "k": 2})
+        assert rejected.status_code == 400
+        assert "must be an ordered list of column names" in rejected.json()["detail"]
+    finally:
+        client.delete(f"/api/canvas/{canvas_id}")
+        if prior_spec is None:
+            deps.node_specs.pop(kind, None)
+        else:
+            deps.node_specs[kind] = prior_spec
+        if prior_builder is None:
+            deps.node_builders.pop(kind, None)
+        else:
+            deps.node_builders[kind] = prior_builder
+
+
 def test_plugin_previewability_and_requirements_are_truthful_end_to_end():
     """A plugin descriptor must constrain preview and hard placement before a run is submitted."""
     from hub.models import ResourceSpec

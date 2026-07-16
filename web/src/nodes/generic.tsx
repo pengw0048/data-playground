@@ -6,6 +6,7 @@ import { register, getSpec, type NodeComponentProps } from './registry'
 import { NodeCard } from './NodeCard'
 import { useStore } from '../store/graph'
 import { Field, MiniInput, MiniSelect } from '../ui/controls'
+import { ColumnListPicker, useInputColumns } from './fields'
 import { CodeSnippet } from '../ui/CodeSnippet'
 import { color } from '../theme/tokens'
 import type { BackendNodeSpec } from '../api/client'
@@ -20,13 +21,25 @@ export function getBackendSpec(kind: string): BackendNodeSpec | undefined {
 
 /** Why a node can't run yet (a required param is empty), or null if it's valid. Drives the
  * disabled Run affordance + its reason, from the backend param schema (works for any kind/plugin). */
-export function nodeInvalidReason(node: { type: string; data: { config: Record<string, unknown> } }): string | null {
+export function nodeInvalidReason(
+  node: { type: string; data: { config: Record<string, unknown> } }, inputColumns?: { name: string }[],
+): string | null {
   const spec = backendSpecs[node.type]
   if (!spec) return null
   for (const p of spec.params) {
+    const v = node.data.config[p.name]
     if (p.required) {
-      const v = node.data.config[p.name]
       if (v == null || String(v).trim() === '') return `${p.label ?? p.name} is required`
+    }
+    if (p.type === 'columns' && v != null) {
+      if (!Array.isArray(v) || v.some((column) => typeof column !== 'string' || !column.trim())) {
+        return `${p.label ?? p.name} must be an ordered list of column names`
+      }
+      if (inputColumns?.length) {
+        const available = new Set(inputColumns.map((column) => column.name))
+        const missing = v.filter((column) => !available.has(column))
+        if (missing.length) return `${p.label ?? p.name} references unavailable column${missing.length === 1 ? '' : 's'}: ${missing.join(', ')}`
+      }
     }
   }
   return null
@@ -37,6 +50,7 @@ export function nodeInvalidReason(node: { type: string; data: { config: Record<s
 export function NodeParamFields({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
+  const columns = useInputColumns(nodeId)
   const cfg = (node?.data.config ?? {}) as Record<string, unknown>
   // hide a conditional param whose showWhen dependency isn't met (e.g. batchFormat only for map_batches)
   const visible = (p: { showWhen?: { param: string; in: string[] } }) =>
@@ -46,12 +60,14 @@ export function NodeParamFields({ nodeId }: { nodeId: string }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
       {editable.map((p) => {
-        const val = (node?.data.config as any)?.[p.name] ?? p.default ?? ''
+        const val = (node?.data.config as any)?.[p.name] ?? p.default ?? (p.type === 'columns' ? [] : '')
         return (
           <Field key={p.name} label={p.label ?? p.name}>
             {p.type === 'select' && p.options ? (
               <MiniSelect value={String(val)} options={p.options.map((o) => ({ value: o, label: o }))}
                 onChange={(v) => updateConfig(nodeId, { [p.name]: v })} />
+            ) : p.type === 'columns' ? (
+              <ColumnListPicker value={val} columns={columns} onChange={(v) => updateConfig(nodeId, { [p.name]: v })} />
             ) : p.type === 'bool' ? (
               <button onClick={(e) => { e.stopPropagation(); updateConfig(nodeId, { [p.name]: !val }) }}
                 style={{ fontSize: 11.5, textAlign: 'left', padding: '5px 7px', border: `1px solid ${color.border}`, borderRadius: 6, background: 'transparent', color: color.ink }}>

@@ -65,6 +65,53 @@ export function ColumnCombo({ value, columns, placeholder, onChange, mono = true
   )
 }
 
+/** An ordered, schema-backed column list. Unlike expression fields, this never serializes selection
+ * as comma text: plugins receive exactly the string array their descriptor declares. */
+export function ColumnListPicker({ value, columns, onChange }: {
+  value: unknown; columns: ColumnSchema[]; onChange: (value: string[]) => void
+}) {
+  const selected = Array.isArray(value) && value.every((column) => typeof column === 'string')
+    ? value : []
+  const known = new Set(columns.map((column) => column.name))
+  const move = (from: number, to: number) => {
+    const next = [...selected]
+    const [column] = next.splice(from, 1)
+    next.splice(to, 0, column)
+    onChange(next)
+  }
+  const replace = (index: number, column: string) => onChange(selected.map((current, i) => i === index ? column : current))
+  const addable = columns.find((column) => !selected.includes(column.name))
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      {selected.map((column, index) => {
+        const options = columns.filter((candidate) => candidate.name === column || !selected.includes(candidate.name))
+        const unavailable = columns.length > 0 && !known.has(column)
+        return (
+          <div key={`${column}-${index}`} className="flex items-center gap-1">
+            <select aria-label={`Column ${index + 1}`} value={column} onClick={(event) => event.stopPropagation()}
+              onChange={(event) => replace(index, event.target.value)} className={cn('nodrag min-w-0 flex-1', miniSelectClass)}>
+              {unavailable && <option value={column}>{column} (unavailable)</option>}
+              {options.map((candidate) => <option key={candidate.name} value={candidate.name}>{candidate.name}</option>)}
+            </select>
+            <button className="nodrag px-1 text-xs text-muted-foreground disabled:opacity-35" aria-label={`Move ${column} up`}
+              disabled={index === 0} onClick={(event) => { event.stopPropagation(); move(index, index - 1) }}>↑</button>
+            <button className="nodrag px-1 text-xs text-muted-foreground disabled:opacity-35" aria-label={`Move ${column} down`}
+              disabled={index === selected.length - 1} onClick={(event) => { event.stopPropagation(); move(index, index + 1) }}>↓</button>
+            <button className="nodrag px-1 text-xs text-muted-foreground" aria-label={`Remove ${column}`}
+              onClick={(event) => { event.stopPropagation(); onChange(selected.filter((_, i) => i !== index)) }}>×</button>
+          </div>
+        )
+      })}
+      <button className="nodrag self-start rounded border border-dashed border-border px-2 py-1 text-[10.5px] text-muted-foreground disabled:opacity-45"
+        disabled={!addable} onClick={(event) => { event.stopPropagation(); if (addable) onChange([...selected, addable.name]) }}>
+        + add column
+      </button>
+      {columns.length === 0 && <span className="text-[10px] text-muted-foreground">Input schema is not available yet.</span>}
+    </div>
+  )
+}
+
 // ---- sort: chips of {column, direction} ---------------------------------- //
 interface SortKey { col: string; dir: 'ASC' | 'DESC' }
 
