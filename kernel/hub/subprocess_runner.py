@@ -509,23 +509,26 @@ class SubprocessRunner:
                     else:
                         phash, cacheable = run_id, False
                     reservations = []
+                    self._local_results[run_id] = {
+                        "results": reservations, "cache_key": phash if cacheable else None,
+                        "run_state_owner": True,
+                    }
                     for index, output in enumerate(expected_outputs):
                         result_uri = begin_local(
                             f"{phash}:{output.node_id}:{output.port_id}:{index}", run_id)
-                        lock_fd = self.storage.result_lock_fd(result_uri, run_id)
-                        reservations.append({
+                        reservation = {
                             "nodeId": output.node_id,
                             "portId": output.port_id,
                             "uri": result_uri,
+                        }
+                        reservations.append(reservation)
+                        lock_fd = self.storage.result_lock_fd(result_uri, run_id)
+                        reservation.update({
                             "lockFd": lock_fd,
                             "lockToken": (
                                 self.storage._read_lock_token(lock_fd)
                                 if lock_fd is not None else None),
                         })
-                    self._local_results[run_id] = {
-                        "results": reservations, "cache_key": phash if cacheable else None,
-                        "run_state_owner": True,
-                    }
                     job_extra["forcedResults"] = reservations
                     identity = self.storage.result_namespace_identity()
                     job_extra["resultNamespaceId"] = self.storage.namespace_id

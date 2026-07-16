@@ -136,6 +136,44 @@ def test_subprocess_run_accepts_multi_output_before_claim_and_dispatch(
     assert runner.runs == {}
 
 
+def test_subprocess_multi_output_preallocation_failure_aborts_owned_prefix(
+        tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    graph = Graph(id="g", nodes=[
+        _node("branches", "section", {"outputs": ["first", "second"]}),
+    ], edges=[])
+    allocated: list[str] = []
+    aborted: list[str] = []
+
+    def begin_result(_key, _run_id):
+        if allocated:
+            raise RuntimeError("second reservation rejected")
+        uri = str(tmp_path / "first.parquet")
+        allocated.append(uri)
+        return uri
+
+    runner.storage = SimpleNamespace(
+        begin_result=begin_result,
+        result_lock_fd=lambda *_a: None,
+        _read_lock_token=lambda *_a: None,
+        abort_result=lambda uri, _run_id: aborted.append(uri),
+    )
+    runner.on_status = lambda *_a: None
+    monkeypatch.setattr(
+        runner, "_claim_source_leases",
+        lambda *_a: {"stack": SimpleNamespace(close=lambda: None), "guards": [],
+                     "attempts": {}, "local_sources": {}})
+    monkeypatch.setattr(runner, "_claim_sink_contracts", lambda *_a: ({}, {}, {}))
+
+    with pytest.raises(RuntimeError, match="second reservation rejected"):
+        runner.run(
+            _plan(("branches", "section"), target="branches"),
+            graph, "branches", "local")
+
+    assert aborted == allocated
+    assert runner._local_results == {}
+
+
 def test_subprocess_run_unit_rejects_multi_output_before_plan_or_claim(
         tmp_path, monkeypatch):
     runner = _runner(tmp_path)
