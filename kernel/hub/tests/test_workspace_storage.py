@@ -278,6 +278,27 @@ def test_normal_local_lifecycles_materialize_root_workspace_resources():
     canvas_id = f"workspace-lifecycle-canvas-{token}"
     uri = f"file:///workspace-lifecycle-{token}.parquet"
     dataset_id = ""
+
+    def root_resources(client: TestClient, wanted: set[str]) -> dict[str, dict]:
+        found: dict[str, dict] = {}
+        cursor: str | None = None
+        seen: set[str] = set()
+        for _page_number in range(100):
+            params: dict[str, str | int] = {"limit": 100}
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = client.get(
+                f"/api/workspace/containers/{metadb.LOCAL_WORKSPACE_ROOT_ID}", params=params)
+            assert response.status_code == 200
+            page = response.json()
+            found.update((item["id"], item) for item in page["items"] if item["id"] in wanted)
+            if wanted <= found.keys() or not page["hasMore"]:
+                return found
+            cursor = page["nextCursor"]
+            assert cursor is not None and cursor not in seen
+            seen.add(cursor)
+        raise AssertionError("Workspace root pagination did not terminate")
+
     try:
         with TestClient(app) as client:
             created = client.post("/api/canvas", json={
@@ -290,12 +311,11 @@ def test_normal_local_lifecycles_materialize_root_workspace_resources():
                 "version": "v1", "columns": [],
             })
             dataset_id = metadb.workspace_builtin_dataset_identity(uri)
-            page = client.get(f"/api/workspace/containers/{metadb.LOCAL_WORKSPACE_ROOT_ID}",
-                              params={"limit": 100})
-            assert page.status_code == 200
-            assert {(item["id"], item["name"]) for item in page.json()["items"]} >= {
-                (f"canvas:{canvas_id}", "Lifecycle canvas"),
-                (f"dataset:{dataset_id}", "Lifecycle dataset"),
+            resource_ids = {f"canvas:{canvas_id}", f"dataset:{dataset_id}"}
+            resources = root_resources(client, resource_ids)
+            assert {identity: item["name"] for identity, item in resources.items()} == {
+                f"canvas:{canvas_id}": "Lifecycle canvas",
+                f"dataset:{dataset_id}": "Lifecycle dataset",
             }
             renamed = client.put(f"/api/canvas/{canvas_id}", json={
                 "id": canvas_id, "name": "Renamed lifecycle canvas", "version": 2,
@@ -304,13 +324,10 @@ def test_normal_local_lifecycles_materialize_root_workspace_resources():
             assert renamed.status_code == 200
             metadb.catalog_set_metadata(
                 uri, "", None, None, [], name="Renamed lifecycle dataset")
-            renamed_page = client.get(
-                f"/api/workspace/containers/{metadb.LOCAL_WORKSPACE_ROOT_ID}",
-                params={"limit": 100})
-            assert renamed_page.status_code == 200
-            assert {(item["id"], item["name"]) for item in renamed_page.json()["items"]} >= {
-                (f"canvas:{canvas_id}", "Renamed lifecycle canvas"),
-                (f"dataset:{dataset_id}", "Renamed lifecycle dataset"),
+            renamed_resources = root_resources(client, resource_ids)
+            assert {identity: item["name"] for identity, item in renamed_resources.items()} == {
+                f"canvas:{canvas_id}": "Renamed lifecycle canvas",
+                f"dataset:{dataset_id}": "Renamed lifecycle dataset",
             }
     finally:
         metadb.delete_canvas_cascade(canvas_id)
