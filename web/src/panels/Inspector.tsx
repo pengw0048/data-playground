@@ -5,7 +5,7 @@ import {
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
 import { useSchemaWarnings } from '../nodes/fields'
-import { codeHash } from '../nodes/schema'
+import { codeHash, outputPortId } from '../nodes/schema'
 import { color, status as statusTok, kindAccent } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { FileDialog } from '../ui/FileDialog'
@@ -122,7 +122,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
     const specIn = spec?.inputs ?? []
     const e = inc.find((ed) => (ed.targetHandle ?? specIn[0]?.id ?? 'in') === portId)
       ?? (specIn.length === 1 ? inc[0] : undefined)
-    return e ? allSchemas[e.source]?.[e.sourceHandle ?? 'out'] : undefined
+    if (!e) return undefined
+    const sourcePortId = outputPortId(useStore.getState().doc, e.source, e.sourceHandle)
+    return sourcePortId === undefined ? undefined : allSchemas[e.source]?.[sourcePortId]
   }
 
   return (

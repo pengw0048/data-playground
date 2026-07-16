@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { schemaWarnings, codeHash } from './schema'
+import { schemaWarnings, codeHash, inputColumns } from './schema'
+import { register } from './registry'
 
 // minimal doc/schema builders — schemaWarnings only reads node.type/config, edges, and the schema map.
 const node = (id: string, type: string, config: Record<string, unknown> = {}) =>
@@ -43,6 +44,26 @@ describe('schemaWarnings — column references vs known input', () => {
     const schemas = { split: { out: cols('left_value'), right: cols('right_value') } } as never
     expect(schemaWarnings(doc, schemas, {} as never, [] as never, 'left')).toEqual([])
     expect(schemaWarnings(doc, schemas, {} as never, [] as never, 'right')).toEqual([])
+  })
+
+  it('resolves an omitted handle to a sole named output instead of assuming out', () => {
+    register({
+      kind: 'sole-named-output-schema-test', title: 'named', category: 'compute', inputs: [],
+      outputs: [{ id: 'result', wire: 'dataset' }], canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'named', status: 'draft', history: [], config: {} }),
+    }, () => null)
+    const source = node('named', 'sole-named-output-schema-test')
+    const consumer = node('filter', 'filter', { predicate: 'value > 0' })
+    const doc = {
+      id: 'c', version: 1, nodes: [source, consumer], edges: [edge('named', 'filter')],
+    } as never
+    const schemas = { named: { result: cols('value') } } as never
+
+    expect(inputColumns(doc, schemas, {} as never, [], 'filter')).toEqual(cols('value'))
+    expect(schemaWarnings(doc, schemas, {} as never, [], 'filter')).toEqual([])
+    expect(inputColumns(doc, {} as never, {
+      named: { result: { columns: cols('preview_value') } },
+    } as never, [], 'filter')).toEqual(cols('preview_value'))
   })
 
   it('checks a plain select column list but skips expressions', () => {
