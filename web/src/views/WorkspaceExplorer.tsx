@@ -85,7 +85,14 @@ export function WorkspaceExplorer() {
         if (cancelled || resolved.resource.kind !== 'dataset') return
         if (resolved.resource.detached) { setSelectedDetached(resolved.resource); return }
         try { setSelectedTable(await api.table(identity(resolved.resource))) }
-        catch (caught) { if (!cancelled) setSelectedDetached({ ...resolved.resource, detached: true }) }
+        catch (caught) {
+          if (cancelled) return
+          const status = typeof caught === 'object' && caught !== null
+            ? (caught as { status?: unknown }).status
+            : undefined
+          if (status === 404) setSelectedDetached({ ...resolved.resource, detached: true })
+          else { setError(errorMessage(caught)); setItems([]); setHasMore(false) }
+        }
       } catch (caught) {
         if (!cancelled) { setError(errorMessage(caught)); setItems([]); setHasMore(false) }
       }

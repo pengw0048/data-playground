@@ -69,6 +69,27 @@ describe('WorkspaceExplorer', () => {
     expect(await screen.findByText(/This local container is empty/)).toBeInTheDocument()
   })
 
+  it('does not misreport a transient detail failure as a detached dataset', async () => {
+    store.workspaceResourceId = DATASET.id
+    mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
+    mocks.table.mockRejectedValueOnce(Object.assign(new Error('service unavailable'), { status: 503 }))
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('service unavailable')
+    expect(screen.queryByText(/detached/i)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText('Retry'))
+    expect(await screen.findByTestId('catalog-detail')).toHaveTextContent('observations')
+  })
+
+  it('shows a dataset detached when it disappears between resolve and detail fetch', async () => {
+    store.workspaceResourceId = DATASET.id
+    mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
+    mocks.table.mockRejectedValueOnce(Object.assign(new Error('not found'), { status: 404 }))
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByRole('dialog', { name: 'observations' })).toHaveTextContent('detached')
+  })
+
   it('keeps the loaded page visible when loading the next page fails', async () => {
     mocks.workspaceBrowse
       .mockResolvedValueOnce({ container: ROOT, items: [FOLDER], nextCursor: 'cursor-2', hasMore: true, completeness: 'page' })
