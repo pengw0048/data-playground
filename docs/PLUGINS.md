@@ -206,6 +206,40 @@ multi-page snapshot. Unregister deletes every touching fact and the export has n
 consumer that mirrors facts must periodically scan from the beginning and reconcile its complete view;
 retaining only the last cursor will miss deletions.
 
+### Read-only external catalog mounts
+
+`hub.catalog_provider` is the public contract for a provider package that can be placed more than
+once in the local/trusted-team Workspace. It is intentionally separate from `reg.set_catalog`: the
+existing catalog SPI selects one application-wide, writable catalog, while a mount provider supplies
+only bounded reads. Workspace persistence and mixed Workspace browse are consumers of this contract,
+not responsibilities of a provider wheel.
+
+Import only these public types: `CatalogMount`, `CatalogResource`, `ProviderCapabilities`, `ProviderPage`,
+`ProviderResourceResult`, `ProviderAncestors`, `ReadOnlyCatalogProvider`, and `bounded_list_children`.
+A `CatalogMount(id, provider, config)` identifies a local placement; `id` is not a provider resource
+ID. A provider resource has an opaque stable `id`; display names and parent paths are never identity.
+
+Implement `capabilities`, `list_children`, `resolve`, `ancestors`, and `dataset_detail`. Children take
+a finite `limit` (1–500) and an opaque cursor; order must be deterministic. A provider returns
+`ready`, `partial`, `unavailable`, or `unsupported` rather than pretending an offline or unsupported
+read succeeded. Use `bounded_list_children` at a consumer boundary when a synchronous provider must
+not delay local work: deadline, cancellation, and availability failures are normalized to an honest
+unavailable result, while a provider can return an explicit truthful partial result itself.
+
+Distribute a provider wheel through the `dataplay.catalog_providers` entry-point group. The entry point
+is a zero-argument factory returning the provider; mount configuration is passed on each call. Verify
+an installed wheel, without source imports, with:
+
+```bash
+python -m hub.catalog_provider_conformance your-provider \
+  --mount-id local-provider-a --config root=/path/to/catalog
+```
+
+The command verifies capability discovery, bounded pagination, opaque resolve, ancestors, dataset
+detail, and stable identities after a provider restart. The reference
+[`dp_file_catalog_provider`](../examples/plugins/dp_file_catalog_provider/) reads a `catalog.json`
+document from its `root` mount config and never writes it.
+
 All lineage methods exposed by a catalog plugin must agree on authority. An `InMemoryCatalog` subclass
 may serve discovery rows externally while deliberately retaining its inherited core-metadata lineage
 graph, exporter, and recorder as one side store. If it moves any lineage surface elsewhere, it must
