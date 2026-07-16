@@ -37,8 +37,10 @@ def test_schema_compatibility_handles_additions_type_changes_and_proven_renames(
 
     widening = metadb.diff_columns([_field("id", "int", nullable=True)], [_field("id", "bigint", nullable=True)])
     narrowing = metadb.diff_columns([_field("id", "bigint", nullable=True)], [_field("id", "int", nullable=True)])
+    alias = metadb.diff_columns([_field("id", "int", nullable=True)], [_field("id", "integer", nullable=True)])
     assert widening.status == "compatible" and "widens" in widening.fields[0].reason
     assert narrowing.status == "breaking" and "narrows" in narrowing.fields[0].reason
+    assert alias.status == "compatible" and "equivalent" in alias.fields[0].reason
 
     renamed = metadb.diff_columns(base, [_field("record_id", "int", fieldId="src-id", nullable=False)])
     assert renamed.status == "compatible"
@@ -62,10 +64,33 @@ def test_schema_compatibility_keeps_evidence_poor_changes_unknown_and_proven_rem
     assert removed.fields[1].kind == "removed" and removed.fields[1].status == "breaking"
 
     duplicate = metadb.diff_columns(
-        [_field("left", fieldId="duplicated", nullable=True), _field("right", fieldId="duplicated", nullable=True)],
-        [_field("left", fieldId="duplicated", nullable=True)],
+        [
+            _field("left", fieldId="duplicated", nullable=True),
+            _field("right", fieldId="duplicated", nullable=True),
+            _field("count", "bigint", fieldId="count", nullable=True),
+        ],
+        [
+            _field("left", fieldId="duplicated", nullable=True),
+            _field("count", "int", fieldId="count", nullable=True),
+        ],
     )
-    assert duplicate.status == "unknown" and duplicate.fields[0].field_id == "duplicated"
+    assert duplicate.status == "breaking" and duplicate.fields[0].field_id == "duplicated"
+    assert duplicate.fields[1].field_id == "count" and duplicate.fields[1].status == "breaking"
+
+
+def test_schema_compatibility_prioritizes_stable_identity_over_name_fallback():
+    before = [
+        _field("renamed_target", nullable=True),
+        _field("stable_source", fieldId="stable", nullable=True),
+    ]
+    after = [_field("renamed_target", fieldId="stable", nullable=True)]
+
+    result = metadb.diff_columns(before, after)
+
+    assert [field.kind for field in result.fields] == ["removed", "renamed"]
+    assert result.fields[0].status == "unknown"
+    assert result.fields[1].field_id == "stable"
+    assert result.fields[1].status == "compatible"
 
 
 def test_saved_contract_round_trips_current_field_model_without_loss():

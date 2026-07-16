@@ -4294,6 +4294,8 @@ def _type_change_status(before: str, after: str) -> tuple[str, str]:
         return "compatible", "logical type is unchanged"
     old_rank, new_rank = _NUMERIC_TYPE_RANK.get(before), _NUMERIC_TYPE_RANK.get(after)
     if old_rank is not None and new_rank is not None:
+        if new_rank == old_rank:
+            return "compatible", f"logical types {before} and {after} are equivalent"
         if new_rank > old_rank:
             return "compatible", f"logical type widens from {before} to {after}"
         return "breaking", f"logical type narrows from {before} to {after}"
@@ -4344,30 +4346,47 @@ def diff_columns(a: list[dict], b: list[dict]) -> SchemaCompatibility:
         or sum(field.field_id == field_id for field in after) > 1
     }
     if duplicate_ids:
-        fields = [SchemaFieldCompatibility(
+        uncertain = [SchemaFieldCompatibility(
             kind="changed", status="unknown", field_id=field_id,
             reason="stable field identity is duplicated and cannot prove a match")
             for field_id in sorted(duplicate_ids)]
-        return SchemaCompatibility(status="unknown", fields=fields)
+        remaining = diff_columns(
+            [field.model_dump(by_alias=True) for field in before if field.field_id not in duplicate_ids],
+            [field.model_dump(by_alias=True) for field in after if field.field_id not in duplicate_ids],
+        )
+        fields = uncertain + remaining.fields
+        return SchemaCompatibility(status=_overall_status(fields), fields=fields)
 
-    by_id = {field.field_id: field for field in after if field.field_id}
-    by_name = {field.name: field for field in after}
+    by_id = {field.field_id: index for index, field in enumerate(after) if field.field_id}
     matched_after: set[int] = set()
+    stable_matches: dict[int, int] = {}
     fields: list[SchemaFieldCompatibility] = []
 
-    for old in before:
-        new = None
-        matched_by_id = False
+    # Reserve every proven identity match before falling back to names. Otherwise
+    # an earlier evidence-poor field can consume a newer field that belongs to a
+    # later stable-ID match, producing two contradictory results for one field.
+    for old_index, old in enumerate(before):
         if old.field_id and old.field_id in by_id:
-            new, matched_by_id = by_id[old.field_id], True
-        elif old.name in by_name:
-            new = by_name[old.name]
+            new_index = by_id[old.field_id]
+            stable_matches[old_index] = new_index
+            matched_after.add(new_index)
+
+    for old_index, old in enumerate(before):
+        new_index = stable_matches.get(old_index)
+        matched_by_id = new_index is not None
+        if new_index is None:
+            new_index = next((
+                index for index, field in enumerate(after)
+                if index not in matched_after and field.name == old.name
+            ), None)
+        new = after[new_index] if new_index is not None else None
+        if new is not None and not matched_by_id:
             if old.field_id or new.field_id:
                 fields.append(SchemaFieldCompatibility(
                     kind="changed", status="unknown", old_name=old.name, new_name=new.name,
                     field_id=old.field_id or new.field_id,
                     reason="field identity is missing or changed, so the name match is not proven stable"))
-                matched_after.add(id(new))
+                matched_after.add(new_index)
                 continue
         if new is None:
             if old.field_id and len(after_ids) == len(after):
@@ -4377,15 +4396,15 @@ def diff_columns(a: list[dict], b: list[dict]) -> SchemaCompatibility:
             fields.append(SchemaFieldCompatibility(
                 kind="removed", status=status, old_name=old.name, field_id=old.field_id, reason=reason))
             continue
-        matched_after.add(id(new))
+        matched_after.add(new_index)
         status, reason = _matched_field_status(old, new)
         fields.append(SchemaFieldCompatibility(
             kind="renamed" if matched_by_id and old.name != new.name else "unchanged" if old.name == new.name else "changed",
             status=status, reason=(f"renamed from {old.name}; " if matched_by_id and old.name != new.name else "") + reason,
             field_id=old.field_id if matched_by_id else None, old_name=old.name, new_name=new.name))
 
-    for new in after:
-        if id(new) in matched_after:
+    for new_index, new in enumerate(after):
+        if new_index in matched_after:
             continue
         status, reason = _addition_status(new)
         fields.append(SchemaFieldCompatibility(
