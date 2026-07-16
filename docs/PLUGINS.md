@@ -134,17 +134,19 @@ of `RunOutput` snapshots (`nodeId`, `portId`, `portLabel`, `wire`, `publicationK
 committed publication fields); there are no singular `outputUri` or `outputTable` fields. An ordinary
 run exposes its expected output as `pending` in the first observable status, and every terminal status
 settles it as `committed`, `failed`, `cancelled`, or `skipped`. A successful targeted run must contain a
-committed output. Profile jobs are inspection jobs: they set `jobType="profile"`, keep `outputs=[]` and
-`totalRows=null`, and report their row count only in `profile.rowCount`.
+complete committed output set. `totalRows` projects the row count only for a single committed output;
+multi-output cardinality remains on each `RunOutput`. Profile jobs are inspection jobs: they set
+`jobType="profile"`, keep `outputs=[]` and `totalRows=null`, and report their row count only in
+`profile.rowCount`.
 
-The collection shape is intentionally future-facing, but the current execution/publication state
-machines support exactly one output. A backend must reject a target with zero or multiple declared
-ports, and a full run with multiple write sinks, before allocating a run identity, worker, job, or
-artifact. It must not choose the first port or write as a fallback. Multi-output materialization is a
-separate capability and cannot be advertised merely by returning more array elements. The private Ray
-Jobs v3 result artifact still contains `output_uri`, `output_table`, and step-level `outputs` for its
-versioned worker/supervisor protocol; those keys are not plugin SPI and must be translated into public
-`RunOutput` values only after publication is attested.
+The in-process `LocalRunner` can materialize and own every declared target output. Other execution
+backends must opt in with `supports_named_multi_output_runs() -> True` only when execution, terminal
+publication, cache ownership, restart recovery, cancellation, and cleanup all preserve the exact set.
+A missing, false, or broken probe fails closed before run identity, worker, job, or artifact allocation;
+it must never choose the first port as a fallback. Full runs with multiple independent write sinks remain
+unsupported on every backend. The private Ray Jobs v3 result artifact still contains `output_uri`,
+`output_table`, and step-level `outputs` for its versioned worker/supervisor protocol; those keys are not
+plugin SPI and must be translated into public `RunOutput` values only after publication is attested.
 
 `reg.add_capability(cap)` declares a column capability. Optional `detect(col) -> bool` tags matching
 columns via `tag_columns`. Optional `viewer = {"kind": …}` adds a declarative viewer tab the SPA

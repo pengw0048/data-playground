@@ -29,13 +29,16 @@ from hub.models import (
 )
 from hub.run_outputs import (
     apply_cached_output,
+    apply_cached_outputs,
     commit_output,
+    committed_document_outputs,
     committed_output_snapshot,
     discard_unpublished_outputs,
     initialize_run_outputs,
     outputs_cache_document,
     preflight_output_table,
     preflight_run_output_target,
+    settle_output,
     settle_uncommitted_outputs,
     sole_committed_document_output,
     sole_output,
@@ -108,7 +111,7 @@ _PUBLICATION_RETRY_MAX_S = 1.0
 
 
 def _persist_local_result_done(persist, receipt, *, on_retry=None, wait=time.sleep) -> None:
-    """Idempotently establish a local full-result terminal owner after an unknown commit outcome.
+    """Idempotently establish a managed-result terminal owner after an unknown commit outcome.
 
     Once ``persist`` raises, neither a negative read nor another connection error proves rollback: the
     server may still finish/advertise the commit.  Keep the writer fence and replay the *same* done
@@ -142,7 +145,7 @@ def _persist_local_result_done(persist, receipt, *, on_retry=None, wait=time.sle
                 detail = (f"; receipt failed: {receipt_error}"
                           if receipt_error is not None else "; receipt not yet visible")
                 logging.getLogger("hub").warning(
-                    "local full-result terminal publication remains uncertain (attempt %d): %s%s",
+                    "managed-result terminal publication remains uncertain (attempt %d): %s%s",
                     attempt, persist_error, detail)
             wait(delay)
             delay = min(_PUBLICATION_RETRY_MAX_S, delay * 2)
@@ -167,9 +170,85 @@ class _CancelToken:
             return False
 
 
+class _TerminalPublicationGate:
+    """Linearize cancellation against one managed result's durable terminal owner.
+
+    Cancellation wins while the gate is open. Once terminal publication starts, its exact
+    commit/receipt retry owns the outcome and a concurrent late cancel must not delete an artifact
+    whose RunState may already have committed.
+    """
+
+    def __init__(self) -> None:
+        self._phase = "open"
+        self._cancel_requested = False
+        self._lock = threading.Lock()
+
+    def request_cancel(self) -> bool:
+        with self._lock:
+            if self._phase != "open":
+                return False
+            self._cancel_requested = True
+            return True
+
+    def begin_publication(self) -> bool:
+        with self._lock:
+            if self._phase != "open" or self._cancel_requested:
+                return False
+            self._phase = "publishing"
+            return True
+
+    def mark_published(self) -> None:
+        with self._lock:
+            if self._phase != "publishing":
+                raise RuntimeError("terminal publication gate is not publishing")
+            self._phase = "published"
+
+
+class _GuardSet:
+    """One all-or-nothing cache ownership fence over every artifact in an output set."""
+
+    def __init__(self, guards: list[object]):
+        self.guards = list(guards)
+
+    def check(self) -> None:
+        for guard in self.guards:
+            guard.check()
+
+    def close(self) -> None:
+        first_error: Exception | None = None
+        for guard in reversed(self.guards):
+            try:
+                guard.close()
+            except Exception as exc:  # retain every remaining fence before reporting uncertainty
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
+
+
+def _committed_result_uris(status: RunStatus) -> list[str]:
+    """Return the declaration-ordered durable result identities in one status candidate."""
+    return [
+        str(output.uri)
+        for output in status.outputs
+        if (output.publication_kind == "result"
+            and output.outcome == "committed"
+            and output.uri is not None)
+    ]
+
+
+def _single_committed_rows(status: RunStatus) -> int | None:
+    """Project the collection row count only when the public scalar is unambiguous."""
+    output = sole_output(status, committed=True)
+    return output.rows if output is not None else None
+
+
 class LocalRunner:
     name = "local-out-of-core"
     cancel_acknowledges_stop = True  # cancelled is set only after the adapter can no longer publish
+
+    def supports_named_multi_output_runs(self) -> bool:
+        # The metadata-isolated child transport still receives one forced result URI until #265.
+        return self.forced_result_uri is None
 
     @staticmethod
     def supports_selected_destination_credentials() -> bool:
@@ -214,9 +293,11 @@ class LocalRunner:
         # that snapshot.  The live object remains available to the worker and synchronous callbacks.
         self._published_statuses: dict[str, RunStatus] = {}
         self._cancel: dict[str, _CancelToken] = {}
+        self._terminal_publication_gates: dict[str, _TerminalPublicationGate] = {}
         self._scopes: dict[str, object] = {}  # run_id -> db._Scope, so cancel interrupts THIS run's cursor
         self._cache: dict[str, dict] = {}
-        self._owned_result_uris: dict[str, str] = {}
+        self._owned_result_uris: dict[str, set[str]] = {}
+        self._owned_object_result_uris: dict[str, set[str]] = {}
         self._lock = threading.Lock()
         # Injectable for deterministic commit-unknown tests; production uses bounded exponential sleeps.
         self.publication_retry_wait = time.sleep
@@ -264,55 +345,56 @@ class LocalRunner:
 
     def _cache_acquire(
             self, key: str, owner: str, ttl_seconds: float, run_id: str | None = None):
-        """Read a cache hit with a temporary durable owner when it points at a managed attempt."""
+        """Read and pin one complete cached output set, or release every member and miss."""
         doc = None
-        cache_pin = None
+        guards: list[object] = []
         if self.result_acquire:
             try:
-                doc, pin_id = self.result_acquire(key, owner, ttl_seconds)
-                if pin_id:
+                doc, pin_ids = self.result_acquire(key, owner, ttl_seconds)
+                if pin_ids:
                     from hub.handoff import ManagedResultCachePinGuard
-                    cache_pin = ManagedResultCachePinGuard(pin_id, ttl_seconds)
+                    guards.append(ManagedResultCachePinGuard(pin_ids, ttl_seconds))
             except Exception:  # noqa: BLE001 — an unavailable/stale cache safely recomputes
                 return None, None
         else:
             doc = self._cache_get(key)
-        cached_output = sole_committed_document_output(doc)
-        if doc is not None and cached_output is None:
-            if cache_pin is not None:
-                cache_pin.close()
+
+        def miss():
+            if guards:
+                try:
+                    _GuardSet(guards).close()
+                except Exception:  # retain best-effort cache semantics on release uncertainty
+                    logging.getLogger("hub").exception(
+                        "managed result cache miss cleanup failed")
             return None, None
-        if cached_output is not None:
-            uri = str(cached_output.uri)
+
+        cached_outputs = committed_document_outputs(doc)
+        if doc is not None and not cached_outputs:
+            return miss()
+        if cached_outputs:
             from hub import metadb
-            if metadb.object_attempt_uri_shape(uri):
-                if cache_pin is None:
-                    return None, None  # managed reuse requires an atomic DB-backed ownership pin
+            object_outputs = [output for output in cached_outputs
+                              if metadb.object_attempt_uri_shape(str(output.uri))]
+            if object_outputs and not guards:
+                return miss()  # managed reuse requires one atomic DB-backed pin set
             acquire_local = getattr(self.storage, "acquire_result_read", None)
             managed_local = getattr(self.storage, "requires_result_read", None)
-            if (callable(acquire_local) and callable(managed_local)
-                    and managed_local(uri)):
-                local_guard = None
+            for index, output in enumerate(cached_outputs):
+                uri = str(output.uri)
+                managed_object = metadb.object_attempt_uri_shape(uri)
                 try:
-                    local_guard = acquire_local(uri, f"cache:{run_id or owner}")
-                    # The ephemeral reader is acquired before this first existence check. A ready
-                    # registry row with a missing file is a cache miss, not a lease that survives forever.
-                    if not self._output_exists(uri):
-                        local_guard.close()
-                        if cache_pin is not None:
-                            cache_pin.close()
-                        return None, None
+                    if (callable(acquire_local) and callable(managed_local)
+                            and managed_local(uri)):
+                        guards.append(acquire_local(
+                            uri, f"cache:{run_id or owner}:{index}"))
+                    # Managed object pins already attest a published immutable generation and its
+                    # committed inventory. Probe ordinary/local artifacts only after their read fence;
+                    # one missing member invalidates the whole group.
+                    if not managed_object and not self._output_exists(uri):
+                        return miss()
                 except Exception:  # metadata/lock uncertainty is a safe cache miss
-                    if local_guard is not None:
-                        try:
-                            local_guard.close()
-                        except Exception:  # retain its lock on metadata uncertainty
-                            pass
-                    if cache_pin is not None:
-                        cache_pin.close()
-                    return None, None
-                cache_pin = local_guard
-        return doc, cache_pin
+                    return miss()
+        return doc, (_GuardSet(guards) if guards else None)
 
     def _cache_put(self, key: str, doc: dict) -> None:
         if self.result_put:
@@ -320,8 +402,8 @@ class LocalRunner:
                 self.result_put(key, doc)
             except Exception:  # noqa: BLE001 — never let caching break a successful run
                 from hub import metadb
-                output = sole_committed_document_output(doc)
-                if output is not None and metadb.object_attempt_is_managed(output.uri):
+                outputs = committed_document_outputs(doc)
+                if any(metadb.object_attempt_is_managed(output.uri) for output in outputs):
                     raise
                 pass
             return
@@ -356,8 +438,10 @@ class LocalRunner:
             if not unmanaged_publication_supported(self.catalog):
                 raise RuntimeError(
                     "local write sinks require catalog registration with read-back support")
-        # The validation precedes run-id creation, storage/catalog allocation, and worker launch.
-        if output_target is not None:
+        # The isolated parent/child transport still carries one forced result until #265. Keep that
+        # boundary fail-closed before run-id creation or storage allocation while the in-process runner
+        # accepts the complete declared output collection.
+        if output_target is not None and self.forced_result_uri:
             from hub.run_outputs import require_single_run_output
             require_single_run_output(graph, output_target, self.node_specs)
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
@@ -371,6 +455,7 @@ class LocalRunner:
             self.runs[run_id] = status
             self._published_statuses[run_id] = RunStatus.model_validate(status.model_dump())
             self._cancel[run_id] = _CancelToken(cancel_check)
+            self._terminal_publication_gates[run_id] = _TerminalPublicationGate()
             self._evict()
         self._emit(graph, status)  # persist 'queued' before the worker starts (pollable on any instance)
         threading.Thread(target=self._execute_guarded, args=(run_id, plan, graph, target_node_id), daemon=True).start()
@@ -386,6 +471,7 @@ class LocalRunner:
             status = self.runs.get(run_id)
             with self._lock:
                 self._cancel.pop(run_id, None)
+                self._terminal_publication_gates.pop(run_id, None)
                 self._scopes.pop(run_id, None)
             if status is None or status.status in ("done", "failed", "cancelled"):
                 return
@@ -399,6 +485,12 @@ class LocalRunner:
             with contextlib.suppress(Exception):
                 self._complete(graph, target, status)
 
+    def _publish_snapshot(self, status: RunStatus) -> None:
+        snapshot = RunStatus.model_validate(status.model_dump())
+        with self._lock:
+            if status.run_id in self.runs:
+                self._published_statuses[status.run_id] = snapshot
+
     def _emit(self, graph: Graph, status: RunStatus, *, strict: bool = False) -> None:
         """Fire the on_status hook (DB-backed live status); never let persistence break a run."""
         snapshot = RunStatus.model_validate(status.model_dump())
@@ -408,9 +500,7 @@ class LocalRunner:
             except Exception:  # noqa: BLE001
                 if strict:
                     raise
-        with self._lock:
-            if status.run_id in self.runs:
-                self._published_statuses[status.run_id] = snapshot
+        self._publish_snapshot(snapshot)
 
     def _complete(self, graph: Graph, target: str | None, status: RunStatus, *, strict: bool = False) -> None:
         if self.on_complete:
@@ -419,6 +509,49 @@ class LocalRunner:
             except Exception:  # noqa: BLE001
                 if strict:
                     raise
+
+    def _cleanup_new_result_artifacts(
+            self, run_id: str, *, preserve: set[str] | None = None) -> None:
+        """Abort only artifacts allocated by this run and not selected for terminal ownership."""
+        keep = {str(uri).rstrip("/") for uri in (preserve or set())}
+        with self._lock:
+            local = set(self._owned_result_uris.get(run_id, set()))
+            objects = set(self._owned_object_result_uris.get(run_id, set()))
+        for uri in sorted(local - keep):
+            try:
+                self.storage.abort_result(uri, run_id)
+            except Exception:  # metadata uncertainty retains the storage-owned writer fence
+                logging.getLogger("hub").exception(
+                    "managed local result cleanup failed after terminal decision")
+                continue
+            with self._lock:
+                owned = self._owned_result_uris.get(run_id)
+                if owned is not None:
+                    owned.discard(uri)
+                    if not owned:
+                        self._owned_result_uris.pop(run_id, None)
+        for uri in sorted(objects - keep):
+            _safe_abandon_attempt(uri)
+            with self._lock:
+                owned = self._owned_object_result_uris.get(run_id)
+                if owned is not None:
+                    owned.discard(uri)
+                    if not owned:
+                        self._owned_object_result_uris.pop(run_id, None)
+
+    def _release_published_result_writers(self, run_id: str) -> None:
+        """Drop process writer fences after the exact terminal owner set is durable."""
+        with self._lock:
+            local = set(self._owned_result_uris.pop(run_id, set()))
+            self._owned_object_result_uris.pop(run_id, None)
+        for uri in sorted(local):
+            try:
+                if not self.storage.release_result(uri, run_id):
+                    logging.getLogger("hub").error(
+                        "managed local result writer release has no durable owner")
+            except Exception:  # storage retains the exact pending release for maintenance retry
+                logging.getLogger("hub").exception(
+                    "managed local result writer release failed")
 
     def _evict(self) -> None:
         """Bound retained run/cancel/cache state (called under self._lock). Dicts keep insertion order.
@@ -434,6 +567,7 @@ class LocalRunner:
             self.runs.pop(victim, None)
             self._published_statuses.pop(victim, None)
             self._cancel.pop(victim, None)
+            self._terminal_publication_gates.pop(victim, None)
             self._scopes.pop(victim, None)
         while len(self._cache) > _MAX_RUNS:
             self._cache.pop(next(iter(self._cache)), None)
@@ -441,6 +575,11 @@ class LocalRunner:
     def _execute(self, run_id: str, plan: CompilePlan, graph: Graph, target: str | None) -> None:
         status = self.runs[run_id]
         cancel = self._cancel[run_id]
+        # `_execute` is also the narrow synchronous seam used by lifecycle tests and embedders. Keep
+        # that path safe while normal `run()` still installs the gate before the first observable status.
+        with self._lock:
+            publication_gate = self._terminal_publication_gates.setdefault(
+                run_id, _TerminalPublicationGate())
         started = time.time()
         status.status = "running"
         self._emit(graph, status)
@@ -543,6 +682,7 @@ class LocalRunner:
             self._emit(graph, status)
             with self._lock:
                 self._cancel.pop(run_id, None)
+                self._terminal_publication_gates.pop(run_id, None)
                 self._scopes.pop(run_id, None)
             self._complete(graph, target, status)
             return
@@ -564,6 +704,7 @@ class LocalRunner:
             self._emit(graph, status)
             with self._lock:
                 self._cancel.pop(run_id, None)
+                self._terminal_publication_gates.pop(run_id, None)
                 self._scopes.pop(run_id, None)
             self._complete(graph, target, status)
             return
@@ -638,54 +779,26 @@ class LocalRunner:
                     status.progress = _step_progress(status)  # fraction of steps complete (deterministic)
                     self._emit(graph, status)  # per-node progress → DB (cross-instance polling sees it advance)
 
-                # if the target is not a sink, MATERIALIZE its full result to a durable artifact (not just
-                # count it) so the UI can page the exact rows a full pass produced — the aggregate/sort a
-                # sample can't preview — and it survives a restart (P0-UX-01). `assert` is excluded: its
-                # "rows" is the violation count from _check_assert (already set), and re-counting would
-                # rebuild — and re-raise — a warn-severity assert's un-evaluable predicate (defeating warn).
-                if target and nm.get(target) and nm[target].type not in ("write", "assert"):
+                # A direct non-sink target publishes every declared port. Assert still runs its quality
+                # gate above first; when that gate permits completion, both pass and violations are durable
+                # researcher-visible results rather than a hidden special case.
+                if target and nm.get(target) and nm[target].type != "write":
                     # Keep the ready artifact binding private until its exact RunState owner commits.
                     # ``self.runs`` points at ``status`` and is polled concurrently, so materializing into
                     # that object would expose an unowned URI during a slow/unknown terminal commit.
                     provisional_result = status.model_copy(deep=True)
-                    rows_seen = self._materialize_result(
+                    rows_seen = self._materialize_results(
                         target, engine, provisional_result, cached, phash, cancel)
                     status.rows_processed = rows_seen
                     last_step_published = False
 
-                # Resolve the last-instruction race explicitly. If no output crossed its commit point,
-                # cancellation wins before `done`. Once a RunOutput is committed, publication/reuse won;
-                # report done truthfully (the CLI still exits 124/130 and includes that terminal state)
-                # rather than claim cancelled while a committed artifact exists.
-                if cancel.is_set():
-                    from hub import metadb
-                    local_managed = getattr(self.storage, "is_managed_result_uri", None)
-                    provisional_output = sole_output(
-                        provisional_result or status, committed=True)
-                    provisional_uri = provisional_output.uri if provisional_output is not None else None
-                    managed_full_result = bool(
-                        target and nm.get(target) and nm[target].type not in ("write", "assert")
-                        and provisional_uri
-                        and (metadb.object_attempt_uri_shape(provisional_uri)
-                             or (callable(local_managed) and local_managed(provisional_uri))))
-                    if managed_full_result:
-                        with self._lock:
-                            owned_local = self._owned_result_uris.get(run_id)
-                        if owned_local == provisional_uri:
-                            try:
-                                self.storage.abort_result(owned_local, run_id)
-                                with self._lock:
-                                    self._owned_result_uris.pop(run_id, None)
-                            except Exception:  # retain the writer fence for later reconciliation
-                                logging.getLogger("hub").exception(
-                                    "managed local result cancellation cleanup failed")
-                        elif metadb.object_attempt_uri_shape(provisional_uri):
-                            _safe_abandon_attempt(provisional_uri)
-                        if provisional_result is not None:
-                            discard_unpublished_outputs(provisional_result, "cancelled")
-                        settle_uncommitted_outputs(status, "cancelled")
-                    if managed_full_result or not provisional_uri:
-                        raise RuntimeError("run cancelled before completion")
+                # A result artifact is still provisional until its exact terminal RunState owns the
+                # complete committed set. Cancellation therefore wins here even when one or more files
+                # have finished writing. A catalog sink keeps the older publication-wins rule because its
+                # provider commit is already externally visible and cannot truthfully be relabelled.
+                if cancel.is_set() and (provisional_result is not None
+                                        or not last_step_published):
+                    raise RuntimeError("run cancelled before completion")
                 if not last_step_published:
                     if cache_pin is not None:
                         cache_pin.check()
@@ -701,18 +814,25 @@ class LocalRunner:
                 from hub import metadb
                 local_managed = getattr(self.storage, "is_managed_result_uri", None)
                 result_binding = provisional_result or status
-                result_output = sole_output(result_binding, committed=True)
-                result_uri = result_output.uri if result_output is not None else None
-                status.total_rows = result_output.rows if result_output is not None else None
-                managed_result = bool(
-                    target and nm.get(target) and nm[target].type not in ("write", "assert")
-                    and result_uri
-                    and (metadb.object_attempt_uri_shape(result_uri)
-                         or (callable(local_managed) and local_managed(result_uri))))
+                result_uris = _committed_result_uris(result_binding)
+                local_result_uris = [
+                    uri for uri in result_uris
+                    if callable(local_managed) and local_managed(uri)
+                ]
+                managed_result = bool(result_uris) and all(
+                    metadb.object_attempt_uri_shape(uri)
+                    or (callable(local_managed) and local_managed(uri))
+                    for uri in result_uris)
+                status.total_rows = _single_committed_rows(result_binding)
                 if managed_result:
                     if self.on_status is None and not self.forced_result_uri:
                         raise RuntimeError(
                             "managed full results require authoritative RunState persistence")
+                    if not publication_gate.begin_publication():
+                        # The cancel request linearized first. Mirror it onto the execution token before
+                        # raising so the terminal branch cannot race ahead of cancel() setting the token.
+                        cancel.set()
+                        raise RuntimeError("run cancelled before terminal publication")
                     # RunState is the primary owner for a full result. Publish it before the optional
                     # cache pointer, keep any cache-hit pin through best-effort history persistence, and
                     # never expose terminal done when the primary durable terminal write fails.
@@ -720,9 +840,8 @@ class LocalRunner:
                     persisted.outputs = [output.model_copy(deep=True)
                                          for output in result_binding.outputs]
                     persisted.status = "done"
+                    persisted.total_rows = _single_committed_rows(persisted)
                     persisted_doc = persisted.model_dump()
-                    local_result = bool(
-                        callable(local_managed) and local_managed(result_uri))
 
                     def publication_retry(_attempt: int) -> None:
                         # Update only the in-memory observation.  Do not emit a different DB document
@@ -732,22 +851,28 @@ class LocalRunner:
                             status.stalled = True
                             status.error = "terminal publication is retrying"
 
-                    if local_result:
+                    if self.forced_result_uri and self.on_status is None:
+                        # The isolated child writes a parent-owned exact URI. Its parent establishes the
+                        # authoritative terminal owner after validating the child result document.
+                        self._emit(graph, persisted, strict=True)
+                    else:
+                        def publication_receipt() -> bool:
+                            if local_result_uris:
+                                return self.storage.result_publication_receipt(
+                                    local_result_uris, run_id, persisted_doc)
+                            # RunState and its object-reference set commit in the same transaction. An
+                            # exact document readback is therefore a sufficient object-only receipt.
+                            return metadb.get_run_state(run_id) == persisted_doc
+
                         _persist_local_result_done(
                             lambda: self._emit(graph, persisted, strict=True),
-                            lambda: self.storage.result_publication_receipt(
-                                result_uri, run_id, persisted_doc),
+                            publication_receipt,
                             on_retry=publication_retry,
                             wait=self.publication_retry_wait)
-                    else:
-                        try:
-                            self._emit(graph, persisted, strict=True)
-                        except metadb.RunStatePublicationRejected:
-                            raise
-                        except Exception as exc:
-                            logging.getLogger("hub").exception(
-                                "managed full result publication failed")
-                            raise RuntimeError("full result publication failed") from exc
+                    publication_gate.mark_published()
+                    # A commit may have succeeded even when its response was lost. In that case the
+                    # receipt, not _emit(), proves success, so install the same terminal snapshot here.
+                    self._publish_snapshot(persisted)
                     terminal_persisted = True
                     # One locked object update makes done+binding visible together only after durable
                     # success/receipt.  ``persisted`` was never mutated across retries.
@@ -766,54 +891,66 @@ class LocalRunner:
                         pass
             except Exception as e:  # noqa: BLE001
                 from hub import metadb
-                # A cache-hit reader pin is a durable ownership receipt.  Release it before changing
-                # the shared in-memory status to failed/cancelled: status() is polled concurrently and
-                # a terminal observation must not race the temporary owner that this run no longer
-                # needs.  Successful publication deliberately keeps the pin through its done/history
-                # fence and still releases it in the common finally below.
-                release_cache_pin_before_terminal()
                 terminal_rejected = isinstance(e, metadb.RunStatePublicationRejected)
-                with self._lock:
-                    owned_local = self._owned_result_uris.get(run_id)
-                if owned_local is not None:
-                    try:
-                        self.storage.abort_result(owned_local, run_id)
-                        with self._lock:
-                            self._owned_result_uris.pop(run_id, None)
-                    except Exception:  # metadata uncertainty retains the process/file fence
-                        logging.getLogger("hub").exception(
-                            "managed local result abort failed after run error")
-                    provisional_output = (sole_output(provisional_result, committed=True)
-                                          if provisional_result is not None else None)
-                    if provisional_output is not None and provisional_output.uri == owned_local:
-                        discard_unpublished_outputs(provisional_result, "failed")
-                    status_output = sole_output(status, committed=True)
-                    if status_output is not None and status_output.uri == owned_local:
-                        discard_unpublished_outputs(status, "failed")
                 failed_binding = provisional_result or status
-                failed_output = sole_output(failed_binding, committed=True)
-                failed_uri = failed_output.uri if failed_output is not None else None
-                cached_local_uri = getattr(cache_pin, "uri", None)
-                status_local_uri = (failed_uri[len("file://"):]
-                                    if failed_uri and failed_uri.startswith("file://") else failed_uri)
-                if cached_local_uri is not None and status_local_uri == cached_local_uri:
-                    discard_unpublished_outputs(failed_binding, "failed")
-                    discard_unpublished_outputs(status, "failed")
-                    failed_uri = None
-                if failed_uri and metadb.object_attempt_uri_shape(failed_uri):
-                    _safe_abandon_attempt(failed_uri)
-                    discard_unpublished_outputs(failed_binding, "failed")
-                    discard_unpublished_outputs(status, "failed")
+                if provisional_result is not None:
+                    status.outputs = [output.model_copy(deep=True)
+                                      for output in provisional_result.outputs]
+
                 if cancel.is_set():
+                    # Cancellation before terminal publication owns no result, even if earlier ports
+                    # finished writing. Cleanup is limited to artifacts allocated by this run; cache-hit
+                    # artifacts remain protected by their existing durable owners.
+                    if provisional_result is not None:
+                        self._cleanup_new_result_artifacts(run_id)
+                        discard_unpublished_outputs(status, "cancelled")
+                    else:
+                        # A catalog provider may already have crossed its external commit point. Keep a
+                        # committed sink visible and settle only work that never published.
+                        settle_uncommitted_outputs(status, "cancelled")
                     status.status = "cancelled"  # an interrupted step is a cancel, not a failure
-                    settle_uncommitted_outputs(status, "cancelled")
+                    status.error = None
                     for p in status.per_node:  # settle interrupted + not-yet-started nodes too
                         if p.status != "done":
                             p.status = "cancelled"
                 else:
+                    # A partial result may be retained only while every source/cache ownership fence is
+                    # still valid. Cache hits are an all-or-nothing reuse decision and are never exposed
+                    # by a failed run after their temporary pins are released.
+                    guard_error: Exception | None = None
+                    try:
+                        if cache_pin is not None:
+                            cache_pin.check()
+                        for guard in read_guards:
+                            guard.check()
+                    except Exception as exc:  # ownership uncertainty invalidates every provisional URI
+                        guard_error = exc
+
+                    cached_uris = {
+                        str(output.uri) for output in committed_document_outputs(cached)
+                    }
+                    committed_uris = set(_committed_result_uris(failed_binding))
+                    with self._lock:
+                        newly_owned = {
+                            *self._owned_result_uris.get(run_id, set()),
+                            *self._owned_object_result_uris.get(run_id, set()),
+                        }
+                    retain_partial = (
+                        not terminal_rejected and guard_error is None
+                        and not (committed_uris & cached_uris)
+                    )
+                    preserve = committed_uris & newly_owned if retain_partial else set()
+                    self._cleanup_new_result_artifacts(run_id, preserve=preserve)
+
                     status.status = "failed"
                     msg = f"{type(e).__name__}: {e}"
-                    settle_uncommitted_outputs(status, "failed", msg)
+                    if guard_error is not None:
+                        msg += ("; provisional outputs were discarded after an ownership fence "
+                                f"failed: {type(guard_error).__name__}: {guard_error}")
+                    if retain_partial:
+                        settle_uncommitted_outputs(status, "failed", msg)
+                    else:
+                        discard_unpublished_outputs(status, "failed", msg)
                     hint = _diagnose(str(e))
                     tail = f"\nHint: {hint}" if hint else ""
                     # steps run sequentially, so the one still 'running' is exactly where it broke — attribute
@@ -833,6 +970,89 @@ class LocalRunner:
                     for p in status.per_node:
                         if p.status == "running":
                             p.status = "failed"
+
+                # A cache-hit reader pin is temporary ownership. Drop it before publishing any failed or
+                # cancelled terminal state. Newly materialized partial outputs use RunState as their
+                # primary durable owner and therefore do not depend on this pin.
+                release_cache_pin_before_terminal()
+                status.ms = int((time.time() - started) * 1000)
+                status.total_rows = _single_committed_rows(status)
+
+                if terminal_rejected:
+                    # The durable owner was definitively deleted, so never call persistence/history
+                    # hooks again. The accepting process may still answer an already-open status poll;
+                    # publish only an in-memory terminal snapshot after temporary cache ownership is gone.
+                    self._publish_snapshot(status)
+
+                committed_after_failure = _committed_result_uris(status)
+                local_managed = getattr(self.storage, "is_managed_result_uri", None)
+                managed_partial = bool(committed_after_failure) and all(
+                    metadb.object_attempt_uri_shape(uri)
+                    or (callable(local_managed) and local_managed(uri))
+                    for uri in committed_after_failure)
+                if managed_partial and not terminal_rejected:
+                    if not publication_gate.begin_publication():
+                        cancel.set()
+                        self._cleanup_new_result_artifacts(run_id)
+                        discard_unpublished_outputs(status, "cancelled")
+                        status.status = "cancelled"
+                        status.error = None
+                        status.total_rows = None
+                        for item in status.per_node:
+                            if item.status != "done":
+                                item.status = "cancelled"
+                        managed_partial = False
+                if managed_partial and not terminal_rejected:
+                    if self.on_status is None and not self.forced_result_uri:
+                        raise RuntimeError(
+                            "managed partial results require authoritative RunState persistence")
+                    persisted = status.model_copy(deep=True)
+                    persisted.total_rows = _single_committed_rows(persisted)
+                    persisted_doc = persisted.model_dump()
+                    local_result_uris = [
+                        uri for uri in committed_after_failure
+                        if callable(local_managed) and local_managed(uri)
+                    ]
+
+                    def failed_publication_retry(_attempt: int) -> None:
+                        with self._lock:
+                            status.stalled = True
+
+                    def failed_publication_receipt() -> bool:
+                        if local_result_uris:
+                            return self.storage.result_publication_receipt(
+                                local_result_uris, run_id, persisted_doc)
+                        return metadb.get_run_state(run_id) == persisted_doc
+
+                    try:
+                        if self.forced_result_uri and self.on_status is None:
+                            self._emit(graph, persisted, strict=True)
+                        else:
+                            _persist_local_result_done(
+                                lambda: self._emit(graph, persisted, strict=True),
+                                failed_publication_receipt,
+                                on_retry=failed_publication_retry,
+                                wait=self.publication_retry_wait)
+                    except metadb.RunStatePublicationRejected as rejection:
+                        # The partial-result owner was definitively deleted after the execution failure
+                        # selected its committed prefix. This is symmetric with a rejected successful
+                        # publication: abort every provisional artifact, hide every URI, and never re-emit
+                        # terminal state/history from the finally block.
+                        terminal_rejected = True
+                        self._cleanup_new_result_artifacts(run_id)
+                        rejected_error = f"{type(rejection).__name__}: {rejection}"
+                        status.status = "failed"
+                        status.error = rejected_error
+                        status.total_rows = None
+                        discard_unpublished_outputs(status, "failed", rejected_error)
+                        self._publish_snapshot(status)
+                    else:
+                        publication_gate.mark_published()
+                        self._publish_snapshot(persisted)
+                        terminal_persisted = True
+                        with self._lock:
+                            status.__dict__.update(persisted.__dict__)
+                        self._complete(graph, target, status)
             finally:
                 release_read_leases()
                 # scope exit (below) rolls back + drops this run's views on its own cursor
@@ -842,27 +1062,18 @@ class LocalRunner:
                     except OSError:
                         pass
                 status.ms = int((time.time() - started) * 1000)
-                committed_output = sole_output(status, committed=True)
-                status.total_rows = (committed_output.rows
-                                     if committed_output is not None else None)
+                status.total_rows = _single_committed_rows(status)
                 if not terminal_persisted and not terminal_rejected:
                     self._emit(graph, status)  # persist terminal state after all commit-point work
                 with self._lock:
                     self._cancel.pop(run_id, None)  # done/failed/cancelled → drop the cancel Event
+                    self._terminal_publication_gates.pop(run_id, None)
                     self._scopes.pop(run_id, None)
-                if not terminal_persisted:
+                if not terminal_persisted and not terminal_rejected:
                     self._complete(graph, target, status)
                 release_cache_pin()
-                with self._lock:
-                    owned_local = self._owned_result_uris.get(run_id)
-                if terminal_persisted and owned_local is not None:
-                    try:
-                        if self.storage.release_result(owned_local, run_id):
-                            with self._lock:
-                                self._owned_result_uris.pop(run_id, None)
-                    except Exception:  # retain the writer fd on publication uncertainty
-                        logging.getLogger("hub").exception(
-                            "managed local result writer release failed")
+                if terminal_persisted:
+                    self._release_published_result_writers(run_id)
 
     def _count(self, engine: BuildEngine, node_id: str, cached: dict | None) -> int:
         cached_output = sole_committed_document_output(cached)
@@ -889,25 +1100,50 @@ class LocalRunner:
             kwargs["cancelled"] = cancel.is_set
         return adapter.write(uri, rel, mode, **kwargs)
 
-    def _materialize_result(self, node_id: str, engine: BuildEngine, status: RunStatus,
-                            cached: dict | None, phash: str, cancel: _CancelToken) -> int:
-        """A non-write target's full result → a durable parquet artifact so the UI can page the exact
-        rows a full pass produced (an aggregate/sort a sample can't preview) and they survive a restart
-        (P0-UX-01). CONTENT-ADDRESSED by the plan hash (`__result_<phash>`): identical content shares one
-        cache pointer is content-addressed, while every cache miss writes a unique immutable physical
-        artifact. NOT registered in the catalog — it's a run result, not a user-published dataset.
-        Materialization is part of the run contract: a write/commit failure propagates and fails the run
-        instead of reporting `done` with an artifact the UI cannot reopen."""
+    def _materialize_results(self, node_id: str, engine: BuildEngine, status: RunStatus,
+                             cached: dict | None, phash: str, cancel: _CancelToken) -> int:
+        """Materialize every direct target port serially in its declaration order.
+
+        The supplied status is a private provisional copy. A caller publishes it only after the exact
+        terminal RunState owns every committed artifact. If one port fails, earlier commits remain in
+        the candidate, that port fails, and later ports are explicitly skipped.
+        """
+        cached_outputs = committed_document_outputs(cached)
+        if (not self.forced_result_uri and cached_outputs
+                and apply_cached_outputs(status, cached) is not None):
+            return int(cached_outputs[0].rows or 0) if len(cached_outputs) == 1 else 0
+
+        # This exact-key and declaration-order barrier happens before the first artifact allocation.
+        relations = engine.relations(node_id)
+        expected = [output.model_copy(deep=True) for output in status.outputs]
+        if list(relations) != [output.port_id for output in expected]:
+            raise RuntimeError("runtime output order does not match the declared run output set")
+        for index, output in enumerate(expected):
+            if cancel.is_set():
+                raise RuntimeError("run cancelled before output materialization")
+            try:
+                uri, rows = self._materialize_result(
+                    node_id, output.port_id, relations[output.port_id], status,
+                    phash, index, cancel)
+                commit_output(
+                    status, port_id=output.port_id, uri=uri, rows=rows)
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                settle_output(status, output.port_id, "failed", detail)
+                for skipped in expected[index + 1:]:
+                    settle_output(
+                        status, skipped.port_id, "skipped",
+                        f"not attempted after output port '{output.port_id}' failed")
+                raise
+        return int(status.outputs[0].rows or 0) if len(status.outputs) == 1 else 0
+
+    def _materialize_result(
+            self, node_id: str, port_id: str, rel, status: RunStatus,
+            phash: str, slot: int, cancel: _CancelToken) -> tuple[str, int]:
+        """Write one declared port to a fresh durable result without publishing its RunOutput."""
         forced_uri = self.forced_result_uri
-        cached_output = sole_committed_document_output(cached)
-        if (not forced_uri and cached_output is not None
-                and self._output_exists(str(cached_output.uri))
-                and apply_cached_output(status, cached) is not None):
-            return int(cached_output.rows or 0)
-        expected = sole_output(status)
-        if expected is None:
-            raise RuntimeError("full-result materialization requires one expected output")
-        rel = engine.relation(node_id, expected.port_id)
+        if forced_uri and len(status.outputs) != 1:
+            raise RuntimeError("the isolated result transport accepts exactly one output")
         from hub.plugins.adapters import is_object_uri
         begin_local = getattr(self.storage, "begin_result", None)
         managed_local = getattr(self.storage, "requires_result_read", None)
@@ -920,16 +1156,20 @@ class LocalRunner:
             validate(forced_uri, self.forced_result_namespace_identity)
             logical_uri = uri = forced_uri
         elif not forced_uri and callable(begin_local):
-            uri = logical_uri = begin_local(phash, status.run_id)
+            uri = logical_uri = begin_local(f"{phash}:{slot}", status.run_id)
             with self._lock:
-                self._owned_result_uris[status.run_id] = uri
+                self._owned_result_uris.setdefault(status.run_id, set()).add(uri)
             validate = getattr(self.storage, "validate_result_uri", None)
             if callable(validate):
                 validate(uri)
         else:
+            output_name = (f"__result_{phash}" if len(status.outputs) == 1
+                           else f"__result_{phash}_{slot:02d}")
             logical_uri = forced_uri or self.storage.output_uri(
-                f"__result_{phash}", ".parquet")
+                output_name, ".parquet")
             uri = logical_uri
+        committed_output_snapshot(
+            status, port_id=port_id, uri=uri, rows=0)
         if is_object_uri(logical_uri):
             from hub.handoff import (allocate_attempt, is_attempt_uri, physical_attempt_uri,
                                      write_manifest)
@@ -940,11 +1180,16 @@ class LocalRunner:
             else:
                 handle = allocate_attempt(
                     logical_uri=logical_uri, kind="region", run_id=status.run_id,
-                    allocation_key=f"full-result:{status.run_id}:{phash}",
+                    allocation_key=f"full-result:{status.run_id}:{phash}:{slot}",
                     uri_factory=lambda namespace, generation, attempt_id: physical_attempt_uri(
                         logical_uri, namespace, generation, attempt_id),
                 )
                 uri = handle["uri"]
+                with self._lock:
+                    self._owned_object_result_uris.setdefault(
+                        status.run_id, set()).add(uri)
+            committed_output_snapshot(
+                status, port_id=port_id, uri=uri, rows=0)
             data_uri = uri.rstrip("/") + "/part-00000.parquet"
             try:
                 res = self._adapter_write(
@@ -960,6 +1205,12 @@ class LocalRunner:
                 if not parent_owned:
                     from hub.handoff import discard_attempt
                     discard_attempt(uri)  # this synchronous writer has stopped; terminal proof is valid
+                    with self._lock:
+                        owned = self._owned_object_result_uris.get(status.run_id)
+                        if owned is not None:
+                            owned.discard(uri)
+                            if not owned:
+                                self._owned_object_result_uris.pop(status.run_id, None)
                 raise
         elif parent_owned_local:
             res = self._adapter_write(
@@ -977,7 +1228,11 @@ class LocalRunner:
                 try:
                     self.storage.abort_result(uri, status.run_id)
                     with self._lock:
-                        self._owned_result_uris.pop(status.run_id, None)
+                        owned = self._owned_result_uris.get(status.run_id)
+                        if owned is not None:
+                            owned.discard(uri)
+                            if not owned:
+                                self._owned_result_uris.pop(status.run_id, None)
                 except Exception:  # retain metadata/fd ownership when cleanup is uncertain
                     logging.getLogger("hub").exception(
                         "managed local result write cleanup failed")
@@ -985,8 +1240,7 @@ class LocalRunner:
         else:
             res = self._adapter_write(self.resolve_adapter(uri), uri, rel, "overwrite", cancel)
         rows = int(res.get("rows") or 0)
-        commit_output(status, uri=res.get("uri", uri), rows=rows)
-        return rows
+        return str(res.get("uri", uri)), rows
 
     def _check_assert(self, node, engine: BuildEngine) -> int:
         """A data-quality gate: the node's relation is the VIOLATING rows (predicate not TRUE). Count them;
@@ -1231,17 +1485,27 @@ class LocalRunner:
 
     def cancel(self, run_id: str) -> RunStatus:
         with self._lock:
-            st = self.runs[run_id]
+            self.runs[run_id]  # preserve the existing KeyError contract for an unknown run
+            published = self._published_statuses[run_id]
             # Request cancellation only. The worker publishes the terminal `cancelled` state after it has
             # unwound past every possible commit point, so a caller can treat terminal status as acknowledgement
-            # instead of returning while this thread may still publish.
-            if st.status in ("queued", "running"):
+            # instead of returning while this thread may still publish. Admission follows the coherent public
+            # snapshot, not the execution-owned mutable status: a failed partial result remains externally
+            # running until its durable terminal owner starts publication, and cancellation may still win that
+            # gate during this interval.
+            if published.status in ("queued", "running"):
                 cancel = self._cancel.get(run_id)
-                if cancel is not None:
-                    cancel.set()
+                publication_gate = self._terminal_publication_gates.get(run_id)
                 scope = self._scopes.get(run_id)
             else:
+                cancel = None
+                publication_gate = None
                 scope = None
+        admitted = publication_gate is None or publication_gate.request_cancel()
+        if admitted and cancel is not None:
+            cancel.set()
+        if not admitted:
+            scope = None
         if scope is not None:
             scope.interrupt()  # abort THIS run's cursor (base-conn interrupt wouldn't touch it)
         return self.status(run_id)

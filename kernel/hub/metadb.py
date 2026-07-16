@@ -564,6 +564,10 @@ class ObjectAttemptRef(Base):
     __tablename__ = "object_attempt_refs"
     ref_type: Mapped[str] = mapped_column(String, primary_key=True)
     ref_key: Mapped[str] = mapped_column(String, primary_key=True)
+    # Collection owners (RunState, history, result cache) keep one stable semantic slot per named
+    # output. Singleton owners use the empty slot. The slot belongs to the owner identity rather than
+    # the physical URI, so replacing one complete output set never aliases two ports through a path.
+    ref_slot: Mapped[str] = mapped_column(String, primary_key=True, default="")
     attempt_uri: Mapped[str] = mapped_column(String, ForeignKey("object_attempts.uri"), nullable=False, index=True)
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
@@ -2063,8 +2067,6 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     if len(output_payload.encode("utf-8")) > _RUN_RECORD_OUTPUTS_MAX_BYTES:
         raise ValueError(
             f"run history outputs exceed {_RUN_RECORD_OUTPUTS_MAX_BYTES} encoded bytes")
-    committed = [output for output in history.outputs if output.outcome == "committed"]
-    output_uri = str(committed[0].uri).rstrip("/") if len(committed) == 1 else None
     if s.get(Canvas, canvas_id, with_for_update=True) is None:
         return False
     rec = (s.scalar(select(RunRecord).where(
@@ -2089,7 +2091,8 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         RunRecord.canvas_id == canvas_id, RunRecord.id != rid
     ).order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
       .offset(max(0, _RUN_HISTORY_MAX - 1)).with_for_update()))
-    _replace_attempt_ref(s, "run_record", rid, output_uri)
+    _replace_attempt_refs(
+        s, "run_record", rid, _result_doc_refs({"outputs": output_docs}))
     for obj in stale:
         _replace_attempt_ref(s, "run_record", obj.id, None)
         s.delete(obj)
@@ -2392,6 +2395,11 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
     # restart-visible state even though response-model validation catches them later.
     status = RunStatus.model_validate(status).model_dump()
     st = str(status.get("status", "running"))
+    output_refs = _result_doc_refs(status)
+    output_uris = list(output_refs.values())
+    has_managed_output = any(
+        _local_result_candidate(uri) is not None or object_attempt_uri_shape(uri)
+        for uri in output_uris)
     job_type = str(status.get("job_type", status.get("jobType", "run")))
     target_node_id = status.get("target_node_id", status.get("targetNodeId"))
     plan_digest = status.get("plan_digest", status.get("planDigest"))
@@ -2413,12 +2421,11 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
             r = s.get(RunState, run_id, with_for_update=True)
         else:
             existing_was_present = s.get(RunState, run_id) is not None
-            if (st == "done" and _local_result_candidate(_result_doc_uri(status)) is not None
-                    and not existing_was_present):
-                # Local publication must attach to the run identity minted before execution. Upserting
+            if has_managed_output and not existing_was_present:
+                # Managed publication must attach to the run identity minted before execution. Upserting
                 # a missing row here could resurrect a canvas-deleted run and fabricate its first owner.
                 raise RunStatePublicationRejected(
-                    "managed local result has no pre-existing run state")
+                    "managed result has no pre-existing run state")
             stale_candidate_ids = list(s.scalars(select(RunState.run_id).where(
                 RunState.status.in_(_TERMINAL_RUN), RunState.run_id != str(run_id)
             ).order_by(RunState.updated_at.desc(), RunState.run_id.desc())
@@ -2442,6 +2449,12 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
             if job_type == "profile" or (r is not None and r.job_type == "profile"):
                 raise RunStatePublicationRejected(
                     "profile terminal publication lost its permanent terminal fence race")
+            if has_managed_output:
+                # A strict managed-result publisher must distinguish a durable write from this
+                # monotonic no-op. Otherwise it would release its writer and expose an in-memory URI
+                # even though the permanent terminal winner owns no reference to that artifact set.
+                raise RunStatePublicationRejected(
+                    "managed terminal publication lost its permanent terminal fence race")
             return
         if r is not None and (job_type == "profile" or r.job_type == "profile"):
             if (job_type != "profile" or r.job_type != "profile"
@@ -2507,6 +2520,9 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                     RunState.profile_attempt_order == profile_attempt_order),
             ).values(**values))
             if not updated.rowcount:
+                if has_managed_output and st in _TERMINAL_RUN:
+                    raise RunStatePublicationRejected(
+                        "managed terminal publication did not match its durable run identity")
                 return
         s.flush()
         if st in _TERMINAL_RUN:
@@ -2534,13 +2550,10 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
             stale = [locked[key] for key in sorted(stale_now & set(stale_candidate_ids))
                      if key != str(run_id) and key in locked
                      and locked[key].status in _TERMINAL_RUN]
-        output_uri = _result_doc_uri(status)
-        output_attempt = s.get(ObjectAttempt, output_uri) if output_uri else None
-        publish_region = bool(
-            publish_region and st == "done"
-            and output_attempt is not None and output_attempt.kind == "region")
-        _replace_attempt_ref(
-            s, "run_state", run_id, output_uri, publish=publish_region)
+        _replace_attempt_refs(
+            s, "run_state", run_id, output_refs,
+            publish=bool(publish_region and st in ("done", "failed")),
+            publish_kind="region")
         if st in _TERMINAL_RUN:
             for obj in stale:
                 job = s.get(RunBackendJob, obj.run_id)
@@ -2552,7 +2565,7 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
         # The RunState transaction is the primary local-result publication boundary. Object attempt
         # locks above always precede the local registry lock.
         sync_local_result_owner(s, "run_state", run_id, status)
-        if st == "done":
+        if st in ("done", "failed"):
             _release_terminal_local_result_writers(
                 s, run_id, allow_unreferenced=False)
         if st in _TERMINAL_RUN:
@@ -2561,8 +2574,8 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
 
 
 def local_result_run_state_receipt(
-        run_id: str, namespace_id: str, expected_doc: dict) -> bool:
-    """Prove an exact local full-result terminal transaction committed.
+        uris: list[str], run_id: str, namespace_id: str, expected_doc: dict) -> bool:
+    """Prove an exact managed-result terminal transaction committed.
 
     A database driver may raise after PostgreSQL committed.  Callers must not turn that unknown result
     into ``failed`` and delete a now-published artifact.  This read-back receipt validates every part of
@@ -2573,29 +2586,66 @@ def local_result_run_state_receipt(
     if not namespace_id or not isinstance(expected_doc, dict):
         raise ValueError("local result receipt requires a namespace and status document")
     expected = dict(expected_doc)
-    if str(expected.get("status")) != "done":
+    if str(expected.get("status")) not in ("done", "failed"):
         return False
     expected_payload = json.dumps(expected, default=str)
-    uri = _local_result_candidate(_result_doc_uri(expected))
-    if uri is None:
+    supplied = [_local_result_candidate(uri) for uri in uris]
+    if not supplied or any(uri is None for uri in supplied):
+        return False
+    supplied_set = {str(uri) for uri in supplied if uri is not None}
+    if len(supplied_set) != len(supplied):
+        return False
+    expected_refs = _result_doc_refs(expected)
+    expected_local = {
+        candidate for uri in expected_refs.values()
+        if (candidate := _local_result_candidate(uri)) is not None
+    }
+    if supplied_set != expected_local:
         return False
     with session() as s:
         state = s.get(RunState, str(run_id), with_for_update=True)
-        if (state is None or state.status != "done"
+        if (state is None or state.status != str(expected.get("status"))
                 or state.doc != expected_payload):
+            return False
+        expected_object_refs = {
+            slot: uri for slot, uri in expected_refs.items()
+            if object_attempt_uri_shape(uri)
+        }
+        object_refs = list(s.scalars(select(ObjectAttemptRef).where(
+            ObjectAttemptRef.ref_type == "run_state",
+            ObjectAttemptRef.ref_key == str(run_id),
+        ).order_by(ObjectAttemptRef.ref_slot)))
+        if {ref.ref_slot: ref.attempt_uri for ref in object_refs} != expected_object_refs:
+            return False
+        object_uris = sorted(expected_object_refs.values())
+        attempts = {attempt.uri: attempt for attempt in s.scalars(select(ObjectAttempt).where(
+            ObjectAttempt.uri.in_(object_uris)).order_by(ObjectAttempt.uri))} \
+            if object_uris else {}
+        if (set(attempts) != set(object_uris)
+                or any(attempts[ref.attempt_uri].generation != ref.generation
+                       or attempts[ref.attempt_uri].state != "published"
+                       for ref in object_refs)):
             return False
         # Owner rows precede the registry in the global lifecycle lock order.
         _lock_local_result_registry(s)
-        ref = s.get(LocalResultReference, {
-            "uri": uri, "owner_kind": "run_state", "owner_key": str(run_id),
-        })
-        artifact = s.get(LocalResultArtifact, uri, with_for_update=True)
+        local_refs = list(s.scalars(select(LocalResultReference).where(
+            LocalResultReference.owner_kind == "run_state",
+            LocalResultReference.owner_key == str(run_id),
+        ).order_by(LocalResultReference.uri)))
+        if {ref.uri for ref in local_refs} != expected_local:
+            return False
+        artifacts = {artifact.uri: artifact for artifact in s.scalars(
+            select(LocalResultArtifact).where(
+                LocalResultArtifact.uri.in_(sorted(expected_local)))
+            .order_by(LocalResultArtifact.uri).with_for_update())}
         return bool(
-            ref is not None and artifact is not None
-            and artifact.namespace_id == namespace_id
-            and artifact.state == "ready"
-            and artifact.writer_run_id is None
-            and artifact.writer_token is None)
+            set(artifacts) == expected_local
+            and all(
+                artifact.namespace_id == namespace_id
+                and artifact.state == "ready"
+                and artifact.writer_run_id is None
+                and artifact.writer_token is None
+                for artifact in artifacts.values()))
 def get_run_state(run_id: str) -> dict | None:
     """The last-persisted RunStatus dict for a run, or None if unknown to this instance's DB."""
     with session() as s:
@@ -2658,6 +2708,7 @@ def _bind_backend_source_pins(
                 "backend source must be an exact published managed object attempt")
         ref = ObjectAttemptRef(
             ref_type="backend_source", ref_key=f"{run_id}:{index}",
+            ref_slot="",
             attempt_uri=attempt.uri, generation=attempt.generation,
         )
         s.add(ref)
@@ -3621,6 +3672,7 @@ def begin_backend_publication_effects(
                 key = {
                     "ref_type": "backend_publication",
                     "ref_key": f"{run_id}:{step_id}",
+                    "ref_slot": "",
                 }
                 existing = s.get(ObjectAttemptRef, key, with_for_update=True)
                 if existing is not None and (
@@ -3878,8 +3930,8 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
                  if key != str(run_id) and key in locked
                  and locked[key].status in _TERMINAL_RUN]
         pruned = [*stale, *([state] if prune_current else [])]
-        output_uri = _result_doc_uri(published)
-        _replace_attempt_ref(s, "run_state", run_id, output_uri)
+        _replace_attempt_refs(
+            s, "run_state", run_id, _result_doc_refs(published))
         _release_backend_publication_effect_refs(s, job, effects)
         for obj in pruned:
             stale_job = s.get(RunBackendJob, obj.run_id)
@@ -3903,10 +3955,10 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
             _lock_local_result_registry(s)
         if not prune_current:
             sync_local_result_owner(s, "run_state", run_id, published)
-        if terminal == "done" and not prune_current:
+        if terminal in ("done", "failed") and not prune_current:
             _release_terminal_local_result_writers(
                 s, run_id, allow_unreferenced=False)
-        elif terminal == "done":
+        elif terminal in ("done", "failed"):
             _release_terminal_local_result_writers(
                 s, run_id, allow_unreferenced=True)
         for obj in pruned:
@@ -4199,9 +4251,10 @@ def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
     candidates: set[str] = set()
     if owner_kind in ("run_state", "run_record", "result_cache"):
         for value in values:
-            candidate = _local_result_candidate(_result_doc_uri(value))
-            if candidate is not None:
-                candidates.add(candidate)
+            for uri in _result_doc_uris(value):
+                candidate = _local_result_candidate(uri)
+                if candidate is not None:
+                    candidates.add(candidate)
     elif owner_kind == "catalog_entry":
         for value in values:
             candidate = _local_result_candidate(value)
@@ -4713,8 +4766,10 @@ def get_result(key: str) -> dict | None:
         return json.loads(r.doc) if r else None
 
 
-def acquire_result_cache_pin(key: str, owner: str, ttl_seconds: float = 300) -> tuple[dict | None, str | None]:
-    """Atomically read the current cache pointer and pin its managed region generation.
+def acquire_result_cache_pin(
+        key: str, owner: str, ttl_seconds: float = 300,
+        ) -> tuple[dict | None, list[str] | None]:
+    """Atomically read the current cache pointer and pin every managed region generation.
 
     The temporary ref is paired with a DB-time lease: it prevents a concurrent cache replacement from
     superseding the generation before terminal run-state/history refs are durable, while an abandoned
@@ -4737,21 +4792,69 @@ def acquire_result_cache_pin(key: str, owner: str, ttl_seconds: float = 300) -> 
             doc = json.loads(cache.doc)
         except (TypeError, ValueError):
             return None, None
-        uri = _result_doc_uri(doc)
-        attempt = s.get(ObjectAttempt, uri, with_for_update=True) if uri else None
-        if attempt is None:
-            if uri and object_attempt_uri_shape(uri):
-                raise FileNotFoundError("cached object attempt has no lifecycle ownership row")
-            return doc, None
-        if attempt.kind != "region" or attempt.state != "published":
-            raise FileNotFoundError("cached managed result is not currently published")
-        pin_id = uuid.uuid4().hex
-        _put_lease(s, attempt, "read", str(owner), ttl_seconds, lease_id=pin_id)
-        s.add(ObjectAttemptRef(
-            ref_type="result_reader", ref_key=pin_id, attempt_uri=attempt.uri,
-            generation=attempt.generation,
-        ))
-        return doc, pin_id
+        from hub.run_outputs import committed_document_outputs
+        outputs = committed_document_outputs(doc)
+        if set(doc) != {"outputs"} or not outputs:
+            return None, None
+        uris = [str(output.uri).strip().rstrip("/") for output in outputs]
+        if any(not uri for uri in uris) or len(uris) != len(set(uris)):
+            return None, None
+        managed_uris = sorted({uri for uri in uris if object_attempt_uri_shape(uri)})
+        attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
+            ObjectAttempt.uri.in_(managed_uris)
+        ).order_by(ObjectAttempt.uri).with_for_update())} if managed_uris else {}
+        missing = set(managed_uris) - set(attempts)
+        if missing:
+            for uri in sorted(missing):
+                _validated_object_uri(uri, attempt=True)
+            raise FileNotFoundError("cached object attempt has no lifecycle ownership row")
+        if any(attempt.kind != "region" or attempt.state != "published"
+               for attempt in attempts.values()):
+            raise FileNotFoundError(
+                "cached managed result set is not currently published")
+        expected_refs = {
+            slot: uri for slot, uri in _result_doc_refs(doc).items() if uri in attempts
+        }
+        cache_refs = list(s.scalars(select(ObjectAttemptRef).where(
+            ObjectAttemptRef.ref_type == "result_cache",
+            ObjectAttemptRef.ref_key == str(key),
+        ).order_by(ObjectAttemptRef.ref_slot).with_for_update()))
+        if ({ref.ref_slot: ref.attempt_uri for ref in cache_refs} != expected_refs
+                or any(attempts[ref.attempt_uri].generation != ref.generation
+                       for ref in cache_refs)):
+            raise FileNotFoundError(
+                "cached managed result set has incomplete lifecycle ownership")
+        local_uris = _local_result_owner_candidates("result_cache", (doc,))
+        if local_uris:
+            _lock_local_result_registry(s)
+            local_refs = list(s.scalars(select(LocalResultReference).where(
+                LocalResultReference.owner_kind == "result_cache",
+                LocalResultReference.owner_key == str(key),
+            ).order_by(LocalResultReference.uri)))
+            if {ref.uri for ref in local_refs} != set(local_uris):
+                raise FileNotFoundError(
+                    "cached local result set has incomplete lifecycle ownership")
+            artifacts = {artifact.uri: artifact for artifact in s.scalars(
+                select(LocalResultArtifact).where(
+                    LocalResultArtifact.uri.in_(local_uris))
+                .order_by(LocalResultArtifact.uri).with_for_update())}
+            if (set(artifacts) != set(local_uris)
+                    or any(artifact.state != "ready" for artifact in artifacts.values())):
+                raise FileNotFoundError(
+                    "cached local result set is not currently available")
+        pin_ids: list[str] = []
+        for uri in uris:
+            attempt = attempts.get(uri)
+            if attempt is None:
+                continue
+            pin_id = uuid.uuid4().hex
+            _put_lease(s, attempt, "read", str(owner), ttl_seconds, lease_id=pin_id)
+            s.add(ObjectAttemptRef(
+                ref_type="result_reader", ref_key=pin_id, ref_slot="",
+                attempt_uri=attempt.uri, generation=attempt.generation,
+            ))
+            pin_ids.append(pin_id)
+        return doc, pin_ids
 
 
 def _db_now(s) -> datetime.datetime:
@@ -4930,7 +5033,7 @@ def isolate_cloned_object_storage(expected: str, replacement: str) -> str:
 
         if inherited_uris:
             for cache in list(s.scalars(select(ResultCache).with_for_update())):
-                if _result_doc_uri(cache.doc) in inherited_uris:
+                if any(uri in inherited_uris for uri in _result_doc_uris(cache.doc)):
                     s.delete(cache)
             for ref in list(s.scalars(select(ObjectAttemptRef).where(
                     ObjectAttemptRef.attempt_uri.in_(inherited_uris)).with_for_update())):
@@ -5194,50 +5297,117 @@ def _maybe_supersede(s, row: ObjectAttempt, now: datetime.datetime) -> bool:
     return False
 
 
-def _replace_attempt_ref(s, ref_type: str, ref_key: str, uri: str | None,
-                         *, publish: bool = False) -> list[str]:
-    key = {"ref_type": str(ref_type), "ref_key": str(ref_key)}
-    current = s.get(ObjectAttemptRef, key, with_for_update=True)
-    old_uri = current.attempt_uri if current is not None else None
-    normalized = str(uri).rstrip("/") if uri else None
-    if old_uri == normalized:
-        return []
-    new_attempt = None
-    if normalized:
-        new_attempt = s.get(ObjectAttempt, normalized, with_for_update=True)
-        if new_attempt is None and object_attempt_uri_shape(normalized):
-            _validated_object_uri(normalized, attempt=True)
+def _replace_attempt_refs(
+        s, ref_type: str, ref_key: str, refs: dict[str, str] | None,
+        *, publish: bool = False, publish_kind: str | None = None,
+        required_kind: str | None = None) -> list[str]:
+    """Atomically replace one owner's complete named-output attempt-ref set.
+
+    The durable owner row is the caller's serialization point. We discover its old set without a ref
+    lock, lock the union of old/new attempts in URI order, and only then lock and replace the refs in
+    slot order. This preserves the global attempt -> ref -> local-registry order while ensuring a reader
+    can observe either complete generation set, never a mixture. ``publish`` promotes committed attempts;
+    ``publish_kind`` can restrict that authority when the owner only publishes one attempt kind.
+    """
+    owner_type, owner_key = str(ref_type), str(ref_key)
+    normalized: dict[str, str] = {}
+    for raw_slot, raw_uri in (refs or {}).items():
+        slot = str(raw_slot)
+        uri = str(raw_uri).strip().rstrip("/")
+        if not uri:
+            raise ValueError("object attempt reference URI cannot be empty")
+        if slot in normalized:
+            raise ValueError("object attempt reference slots must be unique")
+        normalized[slot] = uri
+
+    owner_predicate = (
+        ObjectAttemptRef.ref_type == owner_type,
+        ObjectAttemptRef.ref_key == owner_key,
+    )
+    observed = list(s.scalars(select(ObjectAttemptRef).where(
+        *owner_predicate).order_by(ObjectAttemptRef.ref_slot)))
+    observed_refs = {ref.ref_slot: ref.attempt_uri for ref in observed}
+    candidate_uris = sorted(set(observed_refs.values()) | set(normalized.values()))
+    attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
+        ObjectAttempt.uri.in_(candidate_uris)
+    ).order_by(ObjectAttempt.uri).with_for_update())} if candidate_uris else {}
+
+    for uri in normalized.values():
+        if uri not in attempts and object_attempt_uri_shape(uri):
+            _validated_object_uri(uri, attempt=True)
             raise RuntimeError("attempt-shaped object URI has no lifecycle ownership row")
-        if new_attempt is not None:
-            if new_attempt.state in _TERMINAL_ATTEMPT_STATES:
-                raise RuntimeError(f"cannot reference object attempt in state {new_attempt.state!r}")
-            if publish:
-                if new_attempt.state not in ("committed", "published"):
-                    raise RuntimeError("object attempt must be committed before pointer publication")
-                new_attempt.state = "published"
-                new_attempt.published_at = new_attempt.published_at or _db_now(s)
-            elif new_attempt.state != "published":
-                raise RuntimeError("run history and state may reference only a published object attempt")
-    if current is not None:
-        s.delete(current)
-        s.flush()
-    if new_attempt is not None:
+
+    current = list(s.scalars(select(ObjectAttemptRef).where(
+        *owner_predicate).order_by(ObjectAttemptRef.ref_slot).with_for_update()))
+    current_refs = {ref.ref_slot: ref.attempt_uri for ref in current}
+    if current_refs != observed_refs:
+        raise RuntimeError("object attempt reference set changed without its owner lock")
+
+    managed_refs = {
+        slot: attempts[uri] for slot, uri in normalized.items() if uri in attempts
+    }
+    published_uris: set[str] = set()
+    published_at = None
+    for slot in sorted(managed_refs):
+        attempt = managed_refs[slot]
+        if required_kind is not None and attempt.kind != required_kind:
+            raise RuntimeError(
+                f"object attempt reference requires kind {required_kind!r}")
+        if attempt.state in _TERMINAL_ATTEMPT_STATES:
+            raise RuntimeError(
+                f"cannot reference object attempt in state {attempt.state!r}")
+        if publish and (publish_kind is None or attempt.kind == publish_kind):
+            if attempt.state not in ("committed", "published"):
+                raise RuntimeError(
+                    "object attempt must be committed before pointer publication")
+            if published_at is None:
+                published_at = _db_now(s)
+            attempt.state = "published"
+            attempt.published_at = attempt.published_at or published_at
+            published_uris.add(attempt.uri)
+        elif attempt.state != "published":
+            raise RuntimeError(
+                "run history and state may reference only a published object attempt")
+
+    for ref in current:
+        s.delete(ref)
+    s.flush()
+    for slot in sorted(managed_refs):
+        attempt = managed_refs[slot]
         s.add(ObjectAttemptRef(
-            ref_type=str(ref_type), ref_key=str(ref_key), attempt_uri=normalized,
-            generation=new_attempt.generation,
+            ref_type=owner_type,
+            ref_key=owner_key,
+            ref_slot=slot,
+            attempt_uri=attempt.uri,
+            generation=attempt.generation,
         ))
+    s.flush()
+    if published_uris:
+        leases = list(s.scalars(select(ObjectAttemptLease).where(
+            ObjectAttemptLease.attempt_uri.in_(sorted(published_uris)),
+            ObjectAttemptLease.lease_type == "publish",
+        ).order_by(
+            ObjectAttemptLease.attempt_uri, ObjectAttemptLease.lease_id,
+        ).with_for_update()))
+        for lease in leases:
+            s.delete(lease)
         s.flush()
-        if publish:
-            for lease in s.scalars(select(ObjectAttemptLease).where(
-                    ObjectAttemptLease.attempt_uri == normalized,
-                    ObjectAttemptLease.lease_type == "publish")):
-                s.delete(lease)
+
     superseded: list[str] = []
-    if old_uri and old_uri != normalized:
-        old = s.get(ObjectAttempt, old_uri, with_for_update=True)
-        if old is not None and _maybe_supersede(s, old, _db_now(s)):
+    retained_uris = {attempt.uri for attempt in managed_refs.values()}
+    now = _db_now(s)
+    for old_uri in sorted(set(observed_refs.values()) - retained_uris):
+        old = attempts.get(old_uri)
+        if old is not None and _maybe_supersede(s, old, now):
             superseded.append(old_uri)
     return superseded
+
+
+def _replace_attempt_ref(s, ref_type: str, ref_key: str, uri: str | None,
+                         *, publish: bool = False) -> list[str]:
+    """Singleton-owner compatibility wrapper over the complete-set primitive."""
+    return _replace_attempt_refs(
+        s, ref_type, ref_key, {"": str(uri)} if uri else {}, publish=publish)
 
 
 def acquire_object_attempt_lease(uri: str, lease_type: str, owner: str,
@@ -5341,32 +5511,91 @@ def release_object_attempt_lease(lease_id: str) -> None:
             s.delete(lease)
 
 
-def release_result_cache_pin(pin_id: str) -> None:
-    """Release one cache-reader ref/lease pair after terminal ownership publication."""
+def _result_cache_pin_ids(pin_ids: list[str]) -> list[str]:
+    normalized = [str(pin_id) for pin_id in pin_ids if str(pin_id)]
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("result cache pin IDs must be unique")
+    return sorted(normalized)
+
+
+def renew_result_cache_pins(pin_ids: list[str], ttl_seconds: float = 300) -> bool:
+    """Renew one cache hit's complete pin set in a single transaction."""
+    keys = _result_cache_pin_ids(pin_ids)
+    if not keys:
+        return True
     with session() as s:
-        key = str(pin_id)
-        lease_uri = s.scalar(select(ObjectAttemptLease.attempt_uri).where(
-            ObjectAttemptLease.lease_id == key))
-        ref_uri = s.scalar(select(ObjectAttemptRef.attempt_uri).where(
+        identities = list(s.execute(select(
+            ObjectAttemptLease.lease_id,
+            ObjectAttemptLease.attempt_uri,
+            ObjectAttemptLease.generation,
+        ).where(
+            ObjectAttemptLease.lease_id.in_(keys),
+        ).order_by(ObjectAttemptLease.lease_id)))
+        if {row.lease_id for row in identities} != set(keys):
+            return False
+        uris = sorted({row.attempt_uri for row in identities})
+        attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
+            ObjectAttempt.uri.in_(uris)).order_by(ObjectAttempt.uri).with_for_update())}
+        refs = list(s.scalars(select(ObjectAttemptRef).where(
             ObjectAttemptRef.ref_type == "result_reader",
-            ObjectAttemptRef.ref_key == key,
-        ))
-        uris = sorted({uri for uri in (lease_uri, ref_uri) if uri})
+            ObjectAttemptRef.ref_key.in_(keys),
+        ).order_by(ObjectAttemptRef.ref_key, ObjectAttemptRef.ref_slot).with_for_update()))
+        leases = list(s.scalars(select(ObjectAttemptLease).where(
+            ObjectAttemptLease.lease_id.in_(keys),
+        ).order_by(ObjectAttemptLease.lease_id).with_for_update()))
+        refs_by_key = {ref.ref_key: ref for ref in refs if ref.ref_slot == ""}
+        leases_by_key = {lease.lease_id: lease for lease in leases}
+        if (len(refs) != len(keys) or set(refs_by_key) != set(keys)
+                or set(leases_by_key) != set(keys) or set(attempts) != set(uris)):
+            return False
+        for key in keys:
+            ref, lease = refs_by_key[key], leases_by_key[key]
+            attempt = attempts.get(lease.attempt_uri)
+            if (attempt is None or lease.generation != attempt.generation
+                    or ref.attempt_uri != attempt.uri
+                    or ref.generation != attempt.generation):
+                return False
+        for key in keys:
+            lease = leases_by_key[key]
+            attempt = attempts[lease.attempt_uri]
+            _put_lease(
+                s, attempt, lease.lease_type, lease.owner, ttl_seconds,
+                lease_id=lease.lease_id)
+        return True
+
+
+def release_result_cache_pins(pin_ids: list[str]) -> None:
+    """Release one cache hit's complete reader ref/lease set atomically."""
+    keys = _result_cache_pin_ids(pin_ids)
+    if not keys:
+        return
+    with session() as s:
+        lease_uris = list(s.scalars(select(ObjectAttemptLease.attempt_uri).where(
+            ObjectAttemptLease.lease_id.in_(keys))))
+        ref_uris = list(s.scalars(select(ObjectAttemptRef.attempt_uri).where(
+            ObjectAttemptRef.ref_type == "result_reader",
+            ObjectAttemptRef.ref_key.in_(keys),
+        )))
+        uris = sorted(set(lease_uris) | set(ref_uris))
         attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
             ObjectAttempt.uri.in_(uris)).order_by(ObjectAttempt.uri).with_for_update())} \
             if uris else {}
-        ref = s.get(ObjectAttemptRef, {
-            "ref_type": "result_reader", "ref_key": key}, with_for_update=True)
-        lease = s.get(ObjectAttemptLease, key, with_for_update=True)
-        current_uris = {uri for uri in (
-            ref.attempt_uri if ref is not None else None,
-            lease.attempt_uri if lease is not None else None,
-        ) if uri}
+        refs = list(s.scalars(select(ObjectAttemptRef).where(
+            ObjectAttemptRef.ref_type == "result_reader",
+            ObjectAttemptRef.ref_key.in_(keys),
+        ).order_by(ObjectAttemptRef.ref_key, ObjectAttemptRef.ref_slot).with_for_update()))
+        leases = list(s.scalars(select(ObjectAttemptLease).where(
+            ObjectAttemptLease.lease_id.in_(keys),
+        ).order_by(ObjectAttemptLease.lease_id).with_for_update()))
+        current_uris = {
+            *[ref.attempt_uri for ref in refs],
+            *[lease.attempt_uri for lease in leases],
+        }
         if not current_uris.issubset(attempts):
             raise RuntimeError("result cache pin ownership changed concurrently")
-        if ref is not None:
+        for ref in refs:
             s.delete(ref)
-        if lease is not None:
+        for lease in leases:
             s.delete(lease)
         s.flush()
         now = _db_now(s)
@@ -5874,30 +6103,58 @@ def fail_object_attempt_delete(action: dict, error: str) -> None:
             s.delete(lease)
 
 
-def _result_doc_uri(raw: str | dict | None) -> str | None:
+def run_output_ref_slot(node_id: str, port_id: str) -> str:
+    """Canonical semantic ownership slot for one declared output port."""
+    node, port = str(node_id), str(port_id)
+    if not node or not port:
+        raise ValueError("run output reference slots require node and port identities")
+    return json.dumps([node, port], ensure_ascii=True, separators=(",", ":"))
+
+
+def _result_doc_outputs(raw: str | dict | None):
     try:
         doc = raw if isinstance(raw, dict) else json.loads(raw or "{}")
     except (TypeError, ValueError):
-        return None
-    from hub.run_outputs import sole_committed_document_output
+        return []
+    if not isinstance(doc, dict):
+        return []
+    from hub.run_outputs import outputs_from_document
     # Run state/history documents contain the canonical collection alongside status metadata, while
     # result-cache documents are exactly {"outputs": [...]}.  Extract only that collection here; the
     # cache write/read boundaries separately enforce their exact document shape.
-    output = sole_committed_document_output({"outputs": doc.get("outputs")})
-    return str(output.uri).rstrip("/") if output is not None else None
+    return [output for output in outputs_from_document({"outputs": doc.get("outputs")})
+            if output.outcome == "committed"]
+
+
+def _result_doc_refs(raw: str | dict | None) -> dict[str, str]:
+    refs: dict[str, str] = {}
+    for output in _result_doc_outputs(raw):
+        slot = run_output_ref_slot(output.node_id, output.port_id)
+        uri = str(output.uri).strip().rstrip("/")
+        if not uri:
+            raise ValueError("committed run output URI cannot be empty")
+        refs[slot] = uri
+    return refs
+
+
+def _result_doc_uris(raw: str | dict | None) -> list[str]:
+    return list(_result_doc_refs(raw).values())
 
 
 def put_result(key: str, doc: dict) -> list[str]:
     """Atomically replace a cache row and its durable object/local artifact reference."""
-    from hub.run_outputs import sole_committed_document_output
-    output = sole_committed_document_output(doc)
-    if set(doc) != {"outputs"} or output is None or output.rows is None:
+    from hub.run_outputs import committed_document_outputs
+    outputs = committed_document_outputs(doc)
+    if set(doc) != {"outputs"} or not outputs:
         raise ValueError(
-            "result cache requires exactly one committed RunOutput with a known row count")
+            "result cache requires a complete committed output set with known row counts")
+    output_uris = [str(output.uri).strip().rstrip("/") for output in outputs]
+    if any(not uri for uri in output_uris) or len(output_uris) != len(set(output_uris)):
+        raise ValueError("result cache outputs must reference distinct physical URIs")
     payload = json.dumps(doc, separators=(",", ":"), default=str)
     if len(payload.encode("utf-8")) > 65_536:
         raise ValueError("result cache output document exceeds 65536 encoded bytes")
-    new_uri = _result_doc_uri(doc)
+    new_refs = _result_doc_refs(doc)
     retired: list[str] = []
     with session() as s:
         now = _db_now(s)
@@ -5944,12 +6201,9 @@ def put_result(key: str, doc: dict) -> list[str]:
             stale = [locked_cache[stale_key]
                      for stale_key in sorted(stale_now & set(stale_candidate_keys))
                      if stale_key != str(key) and stale_key in locked_cache]
-        attempt = s.get(ObjectAttempt, new_uri, with_for_update=True) if new_uri else None
-        if attempt is not None:
-            if attempt.kind != "region":
-                raise RuntimeError("result cache cannot own a sink attempt")
-        retired.extend(_replace_attempt_ref(
-            s, "result_cache", key, new_uri, publish=attempt is not None))
+        retired.extend(_replace_attempt_refs(
+            s, "result_cache", key, new_refs, publish=True,
+            required_kind="region"))
         for stale_row in stale:
             retired.extend(_replace_attempt_ref(s, "result_cache", stale_row.key, None))
             s.delete(stale_row)
@@ -6492,7 +6746,9 @@ def catalog_managed_publication_receipt(uri: str) -> dict | None:
                 or not attempt.logical_id:
             return None
         logical = s.get(CatalogLogicalDataset, attempt.logical_id)
-        ref = s.get(ObjectAttemptRef, {"ref_type": "catalog", "ref_key": attempt.logical_id})
+        ref = s.get(ObjectAttemptRef, {
+            "ref_type": "catalog", "ref_key": attempt.logical_id, "ref_slot": "",
+        })
         entry = s.get(CatalogEntry, attempt.uri)
         if (logical is None or logical.current_uri != attempt.uri or ref is None
                 or ref.attempt_uri != attempt.uri or entry is None):
@@ -7348,7 +7604,8 @@ def catalog_delete_entry(uri: str) -> None:
                 raise RuntimeError(
                     "catalog unregister is blocked by an active backend publication")
             s.get(ObjectAttemptRef, {
-                "ref_type": "catalog", "ref_key": logical.logical_id}, with_for_update=True)
+                "ref_type": "catalog", "ref_key": logical.logical_id, "ref_slot": "",
+            }, with_for_update=True)
             entry = s.get(CatalogEntry, current_uri, with_for_update=True)
             if entry is None or entry.logical_id != logical.logical_id:
                 raise RuntimeError("catalog unregister entry changed concurrently")

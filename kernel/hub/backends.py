@@ -94,6 +94,28 @@ class ExecutionBackend(Protocol):
 
 
 @runtime_checkable
+class NamedMultiOutputRunBackend(Protocol):
+    """Optional full-run capability for publishing every declared named target output.
+
+    A backend must opt in explicitly.  Merely accepting a graph with named outputs is insufficient:
+    the run lifecycle, cache, and durable status must preserve the complete output collection.
+    """
+
+    def supports_named_multi_output_runs(self) -> bool: ...
+
+
+def backend_supports_named_multi_output_runs(backend) -> bool:
+    """Feature-detect named multi-output publication; missing or broken probes fail closed."""
+    try:
+        probe = getattr(backend, "supports_named_multi_output_runs", None)
+        if not callable(probe):
+            return False
+        return bool(probe())
+    except Exception:  # noqa: BLE001 - an uncertain publication contract must never be dispatched
+        return False
+
+
+@runtime_checkable
 class SelectedDestinationCredentialsBackend(Protocol):
     """Optional execution capability for a backend that can honor a selected destination Cred.
 

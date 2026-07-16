@@ -391,8 +391,35 @@ class BuildEngine:
             self._cache[node_id] = built
 
     def relation(self, node_id: str, handle: str | None = None) -> Relation:
+        relations = self.relations(node_id)
+        node = self._nodes[node_id]
+        if handle is not None:
+            if handle in relations:
+                return relations[handle]
+            raise NotPreviewable(node, f"output port '{handle}' was not produced")
+        if len(relations) == 1:
+            return next(iter(relations.values()))
+        raise NotPreviewable(
+            node, "select an output port for this multi-output node")
+
+    def relations(self, node_id: str) -> dict[str, Relation]:
+        """Return every effective output in declaration order.
+
+        A builder's dictionary order is not a publication contract.  Validation proves the exact key
+        set and this method projects it through the NodeSpec/Section declaration so materialization,
+        cache documents, and durable history all share one deterministic order.
+        """
         self.build(node_id)
-        return self._pick(node_id, self._cache[node_id], handle)
+        built = self._cache[node_id]
+        node = self._nodes[node_id]
+        ports = (g.effective_output_ports_for_node(node, self.node_specs[node.type])
+                 if self.node_specs and node.type in self.node_specs else [])
+        if isinstance(built, dict):
+            if ports:
+                return {port.id: built[port.id] for port in ports}
+            return dict(built)
+        port_id = ports[0].id if ports else "out"
+        return {port_id: built}
 
     def _validate_built_outputs(self, node_id: str, built) -> None:
         """Require runtime named outputs to match the declaration exactly."""

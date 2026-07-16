@@ -10,15 +10,19 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from hub import metadb
+from hub.api_errors import APIError, APIErrorCode
+from hub.backends import backend_supports_named_multi_output_runs
 from hub.executors.schema import schema_for_graph
 from hub.kernel_backend import KernelBackend
 from hub.models import (
-    CompilePlan, Graph, GraphEdge, GraphNode, PlanStep, RunHistoryRecord, RunOutput, RunStatus,
+    CompilePlan, EstimateRequest, Graph, GraphEdge, GraphNode, PlanStep, RunEstimate,
+    RunHistoryRecord, RunOutput, RunStatus,
 )
 from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.profile_jobs import ProfileProcessRunner
 from hub.plugins.runner import LocalRunner, _CancelToken
 from hub.run_outputs import apply_cached_output, require_single_run_output
+from hub.routers import runs as run_routes
 from hub.routers import workspace as workspace_routes
 from hub.security import current_user
 
@@ -37,6 +41,221 @@ def _multi_graph() -> Graph:
             ]}},
         )],
     )
+
+
+def _multi_plan() -> CompilePlan:
+    return CompilePlan(
+        target_node_id="branches",
+        steps=[PlanStep(node_id="branches", kind="section", label="branches")],
+    )
+
+
+def _prepare_full_run_route(monkeypatch, deps, plan: CompilePlan, events: list[str]) -> None:
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    monkeypatch.setattr(
+        run_routes.graph_mod, "resolve_source_refs", lambda *_args: None)
+    monkeypatch.setattr(run_routes, "_reject_invalid", lambda *_args: None)
+    monkeypatch.setattr(
+        run_routes.compiler, "compile_plan", lambda *_args, **_kwargs: plan)
+
+    def route(_deps, chosen, _graph, _target):
+        events.append("route")
+        return chosen
+
+    monkeypatch.setattr(run_routes, "_route_by_capability", route)
+
+
+def _invoke_full_run_surface(surface: str, deps, graph: Graph):
+    if surface == "estimate":
+        return run_routes.run_estimate(
+            EstimateRequest(graph=graph, target_node_id="branches"), uid="user")
+    return run_routes.start_run(
+        deps, graph, "branches", "user", confirmed=True)
+
+
+def test_named_multi_output_backend_capability_is_explicit_and_fails_closed(tmp_path):
+    local = LocalRunner(
+        lambda _uri: None, {}, object(), str(tmp_path), node_specs=SPECS)
+    assert backend_supports_named_multi_output_runs(local)
+
+    local.forced_result_uri = str(tmp_path / "forced.parquet")
+    assert not backend_supports_named_multi_output_runs(local)
+    assert not backend_supports_named_multi_output_runs(SimpleNamespace(name="legacy"))
+
+    class BrokenProbe:
+        @staticmethod
+        def supports_named_multi_output_runs():
+            raise RuntimeError("capability unavailable")
+
+    assert not backend_supports_named_multi_output_runs(BrokenProbe())
+
+
+@pytest.mark.parametrize("surface", ["estimate", "start"])
+def test_full_run_surfaces_reject_unsupported_selected_backend_before_work(
+        surface, tmp_path, monkeypatch):
+    events: list[str] = []
+
+    class UnsupportedBackend:
+        name = "isolated"
+
+        @staticmethod
+        def estimate(*_args):
+            events.append("estimate")
+            return RunEstimate(placement="local", needs_confirm=False)
+
+        @staticmethod
+        def run(*_args, **_kwargs):
+            events.append("run")
+            raise AssertionError("unsupported backend must not start")
+
+    backend = UnsupportedBackend()
+
+    def pick_runner(*_args):
+        events.append("pick")
+        return backend
+
+    deps = SimpleNamespace(
+        catalog=SimpleNamespace(resolve_ref=lambda ref: ref),
+        node_specs=SPECS,
+        node_builders={},
+        registry={},
+        node_ir={},
+        workspace=str(tmp_path),
+        runners=[backend],
+        controller=SimpleNamespace(name="run-controller"),
+        pick_runner=pick_runner,
+    )
+    _prepare_full_run_route(monkeypatch, deps, _multi_plan(), events)
+    monkeypatch.setattr(
+        run_routes, "_cone_size",
+        lambda *_args: events.append("size") or (1, 1, {}),
+    )
+
+    with pytest.raises(APIError) as caught:
+        _invoke_full_run_surface(surface, deps, _multi_graph())
+
+    assert caught.value.code == APIErrorCode.MULTI_OUTPUT_UNSUPPORTED
+    assert "isolated" in str(caught.value.detail)
+    assert events == ["pick", "route"]
+
+
+@pytest.mark.parametrize("surface", ["estimate", "start"])
+def test_full_run_surfaces_reject_multi_output_when_controller_will_split(
+        surface, tmp_path, monkeypatch):
+    events: list[str] = []
+    runner = LocalRunner(
+        lambda _uri: None, {}, object(), str(tmp_path), node_specs=SPECS)
+
+    def estimate(*_args):
+        events.append("estimate")
+        return RunEstimate(placement="local", needs_confirm=False)
+
+    runner.estimate = estimate
+
+    class Controller:
+        name = "run-controller"
+
+        @staticmethod
+        def plan_for_run(*_args, **_kwargs):
+            events.append("plan")
+            return [
+                SimpleNamespace(backend="placed"),
+                SimpleNamespace(backend="default"),
+            ]
+
+        @staticmethod
+        def run(*_args, **_kwargs):
+            events.append("controller-run")
+            raise AssertionError("unsupported controller must not allocate a run")
+
+    controller = Controller()
+
+    def pick_runner(*_args):
+        events.append("pick")
+        return runner
+
+    deps = SimpleNamespace(
+        catalog=SimpleNamespace(resolve_ref=lambda ref: ref),
+        node_specs=SPECS,
+        node_builders={},
+        registry={},
+        node_ir={},
+        workspace=str(tmp_path),
+        runners=[runner],
+        controller=controller,
+        pick_runner=pick_runner,
+    )
+    _prepare_full_run_route(monkeypatch, deps, _multi_plan(), events)
+    monkeypatch.setattr(
+        run_routes, "_require_destination_credential_preflight", lambda *_args: None)
+    monkeypatch.setattr(
+        run_routes, "_cone_size",
+        lambda *_args: events.append("size") or (1, 1, {"branches": object()}),
+    )
+
+    with pytest.raises(APIError) as caught:
+        _invoke_full_run_surface(surface, deps, _multi_graph())
+
+    assert caught.value.code == APIErrorCode.MULTI_OUTPUT_UNSUPPORTED
+    assert "run-controller" in str(caught.value.detail)
+    assert events == ["pick", "route", "size", "plan"]
+
+
+def test_collapsed_controller_plan_keeps_local_multi_output_estimate_admitted(
+        tmp_path, monkeypatch):
+    events: list[str] = []
+    runner = LocalRunner(
+        lambda _uri: None, {}, object(), str(tmp_path), node_specs=SPECS)
+    runner.estimate = lambda *_args: RunEstimate(
+        rows=1, bytes=1, placement="local", needs_confirm=False)
+    controller = SimpleNamespace(
+        name="run-controller",
+        plan_for_run=lambda *_args, **_kwargs: [],
+    )
+    deps = SimpleNamespace(
+        catalog=SimpleNamespace(resolve_ref=lambda ref: ref),
+        node_specs=SPECS,
+        node_builders={},
+        registry={},
+        node_ir={},
+        workspace=str(tmp_path),
+        runners=[runner],
+        controller=controller,
+        pick_runner=lambda *_args: runner,
+    )
+    _prepare_full_run_route(monkeypatch, deps, _multi_plan(), events)
+    monkeypatch.setattr(
+        run_routes, "_require_destination_credential_preflight", lambda *_args: None)
+    monkeypatch.setattr(run_routes, "_cone_size", lambda *_args: (1, 1, {}))
+
+    estimate = _invoke_full_run_surface("estimate", deps, _multi_graph())
+
+    assert estimate.rows == 1
+
+
+def test_controller_admission_keeps_full_graph_execution_target_separate_from_output():
+    planned_targets: list[str | None] = []
+
+    class Controller:
+        name = "run-controller"
+
+        @staticmethod
+        def supports_named_multi_output_runs():
+            return True
+
+        @staticmethod
+        def plan_for_run(_graph, target, **_kwargs):
+            planned_targets.append(target)
+            return [SimpleNamespace(backend="placed")]
+
+    deps = SimpleNamespace(controller=Controller(), node_specs=SPECS)
+
+    regions = run_routes._controller_regions_for_run(
+        deps, _multi_graph(), None, "branches", {}, multi_output=True)
+
+    assert planned_targets == [None]
+    assert len(regions) == 1
 
 
 def _committed(*, rows: int = 3) -> RunOutput:

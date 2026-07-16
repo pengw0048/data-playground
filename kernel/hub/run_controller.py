@@ -96,6 +96,16 @@ class RunController:
         return planner.plan_regions(graph, target, self.deps.node_specs, self.place_fn,
                                     extra_requires=self._cost_requires(graph, target, sizes))
 
+    def plan_for_run(self, graph: Graph, target: str | None,
+                     sizes: dict | None = None) -> list:
+        """Return the regions this controller will actually own, or an empty local fallback."""
+        regions = self.plan(graph, target, sizes=sizes)
+        if len(regions) <= 1 and (not regions or regions[0].backend == "default"):
+            return []
+        if target is None or not self._safe_to_split(graph, target, regions):
+            return []
+        return regions
+
     def plan_summary(self, graph: Graph, target: str) -> list[dict]:
         """A human-facing execution plan: the regions this run splits into, each with its backend, the
         storage tier its boundary materializes to, and its estimated output size. Powers the UI 'run
@@ -268,18 +278,17 @@ class RunController:
 
     # -- orchestration ----------------------------------------------------- #
     def run(self, graph: Graph, target: str | None, uid: str | None = None,
-            sizes: dict | None = None, request_id: str | None = None) -> RunStatus | None:
+            sizes: dict | None = None, request_id: str | None = None,
+            regions: list | None = None) -> RunStatus | None:
         """Start a multi-region run; return None if the graph is a single default region (caller uses
         the base runner unchanged). `uid` carries the caller so a per-user backend preference routes
         default regions to the isolated child too (P0-EXEC-01), not just the global default. `sizes` is
         the caller's already-computed schema+actual-aware estimate — reused for cost-based placement so
         it routes on the SAME measured widths the confirm-gate saw (else placement re-estimates coarse).
         `request_id` (OPS-01) correlates the distributed run with the HTTP/WebSocket entry."""
-        regions = self.plan(graph, target, sizes=sizes)
-        if len(regions) <= 1 and (not regions or regions[0].backend == "default"):
+        regions = self.plan_for_run(graph, target, sizes=sizes) if regions is None else list(regions)
+        if not regions:
             return None
-        if not self._safe_to_split(graph, target, regions):
-            return None  # a shape the region machinery can't yet materialize correctly → run whole, in-process
         # The logical target and every intermediate handoff are separate singular contracts in #263.
         # Validate both before run identity, durable status, allocation, or worker threads are observable.
         expected_output = (require_single_run_output(

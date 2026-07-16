@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hub import graph as graph_mod
-from hub.executors.engine import BuildEngine
+from hub.executors.engine import BuildEngine, NotPreviewable
 from hub.main import app
 from hub.models import Graph, GraphEdge, GraphNode
 from hub.nodespecs import BUILTIN_NODE_SPECS
@@ -152,6 +152,24 @@ def test_build_engine_rejects_runtime_outputs_that_drift_from_the_declaration(
 
     with pytest.raises(RuntimeError, match=message.replace("[", r"\[").replace("]", r"\]")):
         engine.relation("s", "left")
+
+
+def test_build_engine_relations_projects_runtime_outputs_in_declaration_order(monkeypatch):
+    graph = _graph([_node("gate", "assert")], [])
+    engine = BuildEngine(graph, None, None, node_specs=SPECS)
+    passing, violations = object(), object()
+    # The built-in assert currently constructs violations first. Runtime dict insertion order must
+    # never leak into materialization/history; NodeSpec declares pass before out.
+    monkeypatch.setattr(
+        engine, "_warm_or_lower",
+        lambda _node_id: {"out": violations, "pass": passing},
+    )
+
+    relations = engine.relations("gate")
+    assert list(relations) == ["pass", "out"]
+    assert list(relations.values()) == [passing, violations]
+    with pytest.raises(NotPreviewable, match="select an output port"):
+        engine.relation("gate")
 
 
 def test_structural_errors_reject_unknown_requested_target():

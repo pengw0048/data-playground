@@ -15,6 +15,7 @@ import shutil
 import stat
 import threading
 import uuid
+from collections.abc import Iterable
 from typing import Protocol
 
 from hub.plugins.adapters import is_object_uri
@@ -792,24 +793,36 @@ class LocalStorage:
         return True
 
     def result_publication_receipt(
-            self, uri: str, run_id: str, expected_doc: dict) -> bool:
-        """Bind a terminal RunState read-back receipt to this exact filesystem namespace."""
+            self, uris: Iterable[str] | str, run_id: str,
+            expected_doc: dict) -> bool:
+        """Bind an exact terminal output-set receipt to this filesystem namespace."""
         from hub import metadb
-        from hub.run_outputs import sole_committed_document_output
+        from hub.run_outputs import outputs_from_document
 
-        canonical_uri = uri[len("file://"):] if uri.startswith("file://") else uri
-        self._result_names(canonical_uri)
-        output = sole_committed_document_output({
+        raw_uris = [uris] if isinstance(uris, str) else list(uris)
+        canonical_uris: list[str] = []
+        for uri in raw_uris:
+            canonical = str(uri)
+            canonical = (canonical[len("file://"):] if canonical.startswith("file://")
+                         else canonical)
+            self._result_names(canonical)
+            canonical_uris.append(canonical)
+        if not canonical_uris or len(canonical_uris) != len(set(canonical_uris)):
+            return False
+        outputs = outputs_from_document({
             "outputs": expected_doc.get("outputs")
             if isinstance(expected_doc, dict) else None,
         })
-        expected_uri = str(output.uri).rstrip("/") if output is not None else None
-        if expected_uri and expected_uri.startswith("file://"):
-            expected_uri = expected_uri[len("file://"):]
-        if expected_uri != canonical_uri:
+        expected_uris = set()
+        for output in outputs:
+            if output.outcome != "committed" or not self.is_managed_result_uri(output.uri):
+                continue
+            uri = str(output.uri)
+            expected_uris.add(uri[len("file://"):] if uri.startswith("file://") else uri)
+        if set(canonical_uris) != expected_uris:
             return False
         return metadb.local_result_run_state_receipt(
-            str(run_id), self.namespace_id, expected_doc)
+            canonical_uris, str(run_id), self.namespace_id, expected_doc)
 
     def abort_result(self, uri: str, run_id: str) -> None:
         """Abort only after the caller has proved its writer stopped."""

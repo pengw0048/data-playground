@@ -44,7 +44,7 @@ vi.mock('../api/client', () => ({
 }))
 
 import {
-  currentPreviews, fullRunUnavailableReason, previewPlanIdentity, profilePlanIdentity, useStore,
+  currentPreviews, previewPlanIdentity, profilePlanIdentity, useStore,
 } from './graph'
 import { KernelError } from '../api/client'
 
@@ -236,7 +236,7 @@ describe('graph store — core authority ops', () => {
     expect(currentPreviews(doc, useStore.getState().previews)).toEqual({})
   })
 
-  it('gates every full-run entry point for a multi-output node before backend work', async () => {
+  it('sends multi-output full runs to the backend capability boundary from every entry point', async () => {
     const source = NODE('source')
     source.data.config = { uri: 'events.parquet' }
     const section = NODE('section', 'section')
@@ -248,23 +248,83 @@ describe('graph store — core authority ops', () => {
       edges: [{ id: 'source-section', source: 'source', target: 'section', data: { wire: 'dataset' as const } }],
     }
     useStore.setState({ doc })
+    const running = {
+      runId: 'multi-output-run', status: 'running', jobType: 'run', targetNodeId: 'section',
+      rowsProcessed: 0, totalRows: null, ms: 0, placement: 'local', perNode: [],
+      outputs: [
+        { nodeId: 'section', portId: 'left', wire: 'dataset', publicationKind: 'result', outcome: 'pending' },
+        { nodeId: 'section', portId: 'right', wire: 'dataset', publicationKind: 'result', outcome: 'pending' },
+      ],
+    }
+    apiMocks.run.mockResolvedValue(running)
+    apiMocks.runStatus.mockResolvedValue({
+      ...running, status: 'done', ms: 25,
+      outputs: [
+        { ...running.outputs[0], outcome: 'committed', uri: '/outputs/left.parquet', rows: 4 },
+        { ...running.outputs[1], outcome: 'committed', uri: '/outputs/right.parquet', rows: 6 },
+      ],
+    })
 
-    expect(fullRunUnavailableReason(doc, 'section')).toMatch(/Preview a named output instead/)
     await useStore.getState().requestRun('section')
+    expect(apiMocks.estimate).toHaveBeenCalledWith(doc, 'section')
+    expect(apiMocks.run).toHaveBeenCalledWith(
+      expect.objectContaining({ id: doc.id }), 'section', false,
+    )
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[1].data.status).toBe('latest'))
+
+    apiMocks.estimate.mockClear()
     await useStore.getState().estimate('section')
+    expect(apiMocks.estimate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: doc.id }), 'section',
+    )
+
+    apiMocks.run.mockClear()
     await useStore.getState().run('section')
+    expect(apiMocks.run).toHaveBeenCalledWith(
+      expect.objectContaining({ id: doc.id }), 'section', false,
+    )
 
-    expect(apiMocks.estimate).not.toHaveBeenCalled()
-    expect(apiMocks.run).not.toHaveBeenCalled()
-    expect(useStore.getState().runs.section).toBeUndefined()
-    expect(useStore.getState().toasts).toHaveLength(3)
-    expect(useStore.getState().toasts.every((toast) => toast.kind === 'info')).toBe(true)
-
-    useStore.setState({ toasts: [] })
+    apiMocks.estimate.mockClear()
     useStore.getState().rerunAll()
-    expect(apiMocks.estimate).not.toHaveBeenCalled()
-    expect(useStore.getState().toasts).toHaveLength(1)
-    expect(useStore.getState().toasts[0].msg).toMatch(/Skipped 1 multi-output pipeline/)
+    await vi.waitFor(() => expect(apiMocks.estimate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: doc.id }), 'section',
+    ))
+    expect(useStore.getState().toasts).toHaveLength(0)
+  })
+
+  it('records named output count instead of rowsProcessed as result cardinality', async () => {
+    const target = NODE('target')
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [target], edges: [] }
+    const running = {
+      runId: 'named-output-count', status: 'running', jobType: 'run', targetNodeId: 'target',
+      rowsProcessed: 50, totalRows: null, ms: 10, placement: 'local', perNode: [], outputs: [],
+    }
+    apiMocks.run.mockResolvedValueOnce(running)
+    apiMocks.runStatus.mockResolvedValueOnce({
+      ...running, status: 'done', rowsProcessed: 999, ms: 250,
+      outputs: [
+        {
+          nodeId: 'target', portId: 'pass', wire: 'dataset', publicationKind: 'result',
+          outcome: 'committed', uri: '/outputs/pass.parquet', rows: 700,
+        },
+        {
+          nodeId: 'target', portId: 'out', wire: 'dataset', publicationKind: 'result',
+          outcome: 'committed', uri: '/outputs/out.parquet', rows: 299,
+        },
+      ],
+    })
+    useStore.setState({ doc })
+
+    await useStore.getState().run('target')
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('latest'))
+
+    const data = useStore.getState().doc.nodes[0].data
+    expect(data.lastRun).toEqual({ outputCount: 2, ms: 250, placement: 'local' })
+    expect(data.lastRun?.rows).toBeUndefined()
+    expect(data.history).toHaveLength(1)
+    expect(data.history?.[0]).toMatchObject({ outputCount: 2, label: 'run · 2 outputs' })
+    expect(data.history?.[0].rows).toBeUndefined()
+    expect(data.history?.[0].label).not.toContain('999')
   })
 
   it('uses one deterministic target execution identity for previews and profiles', () => {

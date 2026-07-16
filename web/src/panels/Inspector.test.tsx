@@ -57,7 +57,7 @@ describe('Inspector — effective named outputs', () => {
     expect(screen.queryByText('out')).not.toBeInTheDocument()
   })
 
-  it('explains why node-wide schema contracts are unavailable for plugin multi-output', () => {
+  it('defers node-wide schema contracts without blocking a runnable multi-output node', () => {
     register({
       kind: 'inspector-multi-plugin', title: 'multi', category: 'compute', inputs: [],
       outputs: [{ id: 'left', wire: 'dataset' }, { id: 'right', wire: 'dataset' }],
@@ -65,11 +65,23 @@ describe('Inspector — effective named outputs', () => {
       defaultData: () => ({ title: 'multi', status: 'draft', history: [], config: {} }),
     }, () => null)
     selectNode('inspector-multi-plugin', undefined)
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: [{
+          id: 'source', type: 'source', position: { x: 0, y: 0 },
+          data: { title: 'source', status: 'draft', history: [], config: { uri: 'events.parquet' } },
+        } as any, ...state.doc.nodes],
+        edges: [{
+          id: 'source-node', source: 'source', target: 'node', data: { wire: 'dataset' },
+        }],
+      },
+    }))
     render(<Inspector />)
     expect(screen.getByText(/per-port schema contracts are deferred/i)).toBeInTheDocument()
     expect(screen.queryByText(/Untyped until it runs\. Declare a contract/i)).not.toBeInTheDocument()
-    expect(screen.getByText(/Full runs for multi-output nodes are not available yet/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Run' })).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.queryByText(/Full runs for multi-output nodes are not available yet/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run' })).toHaveAttribute('aria-disabled', 'false')
   })
 
   it('keeps edits local, rejects invalid port ids inline, and commits a valid rename on Enter', () => {

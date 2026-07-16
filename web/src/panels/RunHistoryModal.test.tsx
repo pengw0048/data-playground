@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, it, expect, vi } from 'vitest'
 import { fmtMs, DurationTrend, PerNodeBreakdown } from './RunHistoryModal'
@@ -285,6 +285,47 @@ describe('durable full results', () => {
     await waitFor(() => expect(apiMock.sample).toHaveBeenLastCalledWith('/outputs/pass.parquet', 50, undefined, 0))
   })
 
+  it('keeps a committed named output readable after an overall failed run', async () => {
+    registerAssertUiTestNode()
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'assert-ui-test', position: { x: 0, y: 0 },
+      data: { title: 'Quality gate', status: 'failed', config: {}, history: [] },
+    }] }
+    const passSample = { ...sample(0, 1, false), rows: [{ v: 'failed artifact survived' }] }
+    apiMock.preview.mockResolvedValueOnce(passSample)
+    apiMock.sample.mockResolvedValueOnce(passSample)
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', { ...sample(0, 1, false), rows: [{ v: 'violation preview' }] }, 'out') },
+      runs: { target: { phase: 'failed', status: {
+        runId: 'failed-named-output-run', status: 'failed', targetNodeId: 'target',
+        rowsProcessed: 999, totalRows: null, ms: 10, placement: 'local', perNode: [],
+        error: 'one named output failed',
+        outputs: [
+          committedOutput('/outputs/failed-pass.parquet', 1, 'pass'),
+          {
+            nodeId: 'target', portId: 'out', portLabel: 'Violations', wire: 'dataset',
+            publicationKind: 'result', outcome: 'failed', error: 'writer failed',
+          },
+        ],
+      } } },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    expect(within(screen.getByRole('button', { name: 'Passing' })).getByText('committed')).toBeInTheDocument()
+    expect(within(screen.getByRole('button', { name: 'Violations' })).getByText('failed')).toBeInTheDocument()
+    expect(screen.getByLabelText('Selected output status')).toHaveTextContent(/Latest run\s*failed/)
+    expect(screen.getByText('writer failed')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Passing' }))
+    expect(await screen.findByText('failed artifact survived')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Full result' }))
+    await waitFor(() => expect(apiMock.sample).toHaveBeenLastCalledWith(
+      '/outputs/failed-pass.parquet', 50, undefined, 0,
+    ))
+  })
+
   it('does not carry a same-named port selection across a nodeId change', () => {
     registerAssertUiTestNode()
     const first = {
@@ -335,10 +376,11 @@ describe('durable full results', () => {
     const user = userEvent.setup()
     render(<DataPanel nodeId="target" />)
 
-    expect(screen.getByText(/left requires a full pass/i)).toHaveTextContent(/Full runs for multi-output nodes are not available yet/i)
-    expect(screen.queryByRole('button', { name: /Run a full pass/i })).not.toBeInTheDocument()
+    expect(screen.getByText(/left requires a full pass/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Run a full pass/i })).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'right' }))
-    expect(await screen.findByText(/right requires a full pass/i)).toHaveTextContent(/Full runs for multi-output nodes are not available yet/i)
+    expect(await screen.findByText(/right requires a full pass/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Run a full pass/i })).toBeInTheDocument()
     expect(apiMock.preview).toHaveBeenLastCalledWith(doc, 'target', 50, 0, 'right')
   })
 

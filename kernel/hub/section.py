@@ -92,7 +92,7 @@ def run_section(engine, node, inputs):
     A single-output section emit(rel)s to the default "out" port; a multi-output section
     emit("name", rel)s to named ports that the outer graph wires by source_handle.
     """
-    from hub.executors.engine import BuildEngine
+    from hub.executors.engine import BuildEngine, NotPreviewable
 
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
     script = (cfg.get("script") or "").strip()
@@ -114,6 +114,10 @@ def run_section(engine, node, inputs):
         if not spec:
             raise SectionError(f"section calls unknown node '{alias}'")
         data = kw.pop("data", None)  # a handle to bind as this node's input
+        output_port = kw.pop("output_port", None)
+        if output_port is not None and (
+                not isinstance(output_port, str) or not output_port.strip()):
+            raise SectionError("section run() output_port must be a non-empty string")
         protected = ({"uri"} if spec.get("type") == "source" else
                      {"script"} if spec.get("type") == "section" else set())
         overridden = protected & set(kw)
@@ -137,7 +141,12 @@ def run_section(engine, node, inputs):
                              node_builders=engine.node_builders, node_specs=engine.node_specs,
                              bound_inputs={alias: data} if data is not None else None,
                              spill_files=engine.spill_files)  # share spill ownership with the parent run
-        return _materialize(engine, sub.relation(alias))
+        try:
+            relation = sub.relation(alias, output_port)
+        except NotPreviewable as exc:
+            raise SectionError(
+                f"section run('{alias}') could not select its output: {exc}") from exc
+        return _materialize(engine, relation)
 
     def value(handle):
         tbl = handle.limit(1).to_arrow_table()

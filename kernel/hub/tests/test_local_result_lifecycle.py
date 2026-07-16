@@ -151,7 +151,7 @@ def test_terminal_commit_then_raise_is_proved_by_exact_receipt(storage):
 
     _persist_local_result_done(
         committed_then_raised,
-        lambda: storage.result_publication_receipt(uri, run_id, doc),
+        lambda: storage.result_publication_receipt([uri], run_id, doc),
         wait=lambda _delay: pytest.fail("an exact committed receipt must avoid replay"),
     )
     assert calls == 1
@@ -159,6 +159,91 @@ def test_terminal_commit_then_raise_is_proved_by_exact_receipt(storage):
     from hub.models import RunStatus
     assert metadb.get_run_state(run_id) == RunStatus.model_validate(doc).model_dump()
 
+    metadb.delete_canvas_cascade(canvas_id)
+    storage.prune_results(limit=10)
+
+
+def test_named_local_result_receipt_and_owner_cover_complete_set(storage):
+    from hub.models import RunStatus
+
+    run_id = f"run-{uuid.uuid4().hex}"
+    uris = [_ready_result(storage, run_id), _ready_result(storage, run_id)]
+    user_id, canvas_id = _create_canvas()
+    metadb.bind_run_owner(run_id, user_id, canvas_id)
+    doc = RunStatus.model_validate({
+        "run_id": run_id,
+        "status": "done",
+        "target_node_id": "section",
+        "outputs": [{
+            "node_id": "section",
+            "port_id": port_id,
+            "wire": "dataset",
+            "publication_kind": "result",
+            "outcome": "committed",
+            "uri": uri,
+            "rows": index + 1,
+        } for index, (uri, port_id) in enumerate(zip(uris, ("left", "right")))],
+    }).model_dump()
+    metadb.save_run_state(run_id, doc, canvas_id=canvas_id)
+    assert storage.result_publication_receipt(uris, run_id, doc) is True
+    assert storage.result_publication_receipt(uris[:1], run_id, doc) is False
+    with metadb.session() as session:
+        refs = list(session.scalars(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "run_state",
+            metadb.LocalResultReference.owner_key == run_id,
+        ).order_by(metadb.LocalResultReference.uri)))
+        assert [ref.uri for ref in refs] == sorted(uris)
+        artifacts = list(session.scalars(select(metadb.LocalResultArtifact).where(
+            metadb.LocalResultArtifact.uri.in_(uris))))
+        assert len(artifacts) == 2
+        assert all(
+            artifact.writer_run_id is None and artifact.writer_token is None
+            for artifact in artifacts)
+    for uri in uris:
+        assert storage.release_result(uri, run_id) is True
+    metadb.delete_canvas_cascade(canvas_id)
+    storage.prune_results(limit=10)
+    assert all(not pathlib.Path(uri).exists() for uri in uris)
+
+
+def test_failed_named_local_result_releases_committed_writer_and_receipts(storage):
+    from hub.models import RunStatus
+
+    run_id = f"run-{uuid.uuid4().hex}"
+    uri = _ready_result(storage, run_id)
+    user_id, canvas_id = _create_canvas()
+    metadb.bind_run_owner(run_id, user_id, canvas_id)
+    doc = RunStatus.model_validate({
+        "run_id": run_id,
+        "status": "failed",
+        "target_node_id": "section",
+        "error": "right publication failed",
+        "outputs": [{
+            "node_id": "section",
+            "port_id": "left",
+            "wire": "dataset",
+            "publication_kind": "result",
+            "outcome": "committed",
+            "uri": uri,
+            "rows": 1,
+        }, {
+            "node_id": "section",
+            "port_id": "right",
+            "wire": "dataset",
+            "publication_kind": "result",
+            "outcome": "failed",
+            "error": "write failed",
+        }],
+    }).model_dump()
+    metadb.save_run_state(run_id, doc, canvas_id=canvas_id)
+    assert storage.result_publication_receipt([uri], run_id, doc) is True
+    with metadb.session() as session:
+        artifact = session.get(metadb.LocalResultArtifact, uri)
+        assert artifact.writer_run_id is None and artifact.writer_token is None
+        assert session.get(metadb.LocalResultReference, {
+            "uri": uri, "owner_kind": "run_state", "owner_key": run_id,
+        }) is not None
+    assert storage.release_result(uri, run_id) is True
     metadb.delete_canvas_cascade(canvas_id)
     storage.prune_results(limit=10)
 
@@ -199,6 +284,36 @@ def test_canvas_deleted_before_terminal_call_cannot_be_resurrected(storage):
         metadb.save_run_state(run_id, _done_doc(run_id, uri), canvas_id=canvas_id)
     assert metadb.get_run_state(run_id) is None
     storage.abort_result(uri, run_id)
+
+
+def test_managed_terminal_publication_rejects_a_different_permanent_winner(storage):
+    from hub.models import RunStatus
+
+    run_id = f"run-{uuid.uuid4().hex}"
+    uri = _ready_result(storage, run_id)
+    user_id, canvas_id = _create_canvas()
+    metadb.bind_run_owner(run_id, user_id, canvas_id)
+    cancelled = RunStatus(
+        run_id=run_id,
+        status="cancelled",
+        target_node_id="target",
+        outputs=[],
+    ).model_dump()
+    metadb.save_run_state(run_id, cancelled, canvas_id=canvas_id)
+
+    with pytest.raises(
+            metadb.RunStatePublicationRejected,
+            match="permanent terminal fence race"):
+        metadb.save_run_state(run_id, _done_doc(run_id, uri), canvas_id=canvas_id)
+
+    assert metadb.get_run_state(run_id) == cancelled
+    with metadb.session() as session:
+        assert not list(session.scalars(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "run_state",
+            metadb.LocalResultReference.owner_key == run_id,
+        )))
+    storage.abort_result(uri, run_id)
+    metadb.delete_canvas_cascade(canvas_id)
 
 
 def test_writer_release_commit_unknown_retries_without_dropping_fence(storage, monkeypatch):

@@ -1,7 +1,6 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import {
-  MULTI_OUTPUT_FULL_RUN_UNAVAILABLE, previewIsCurrent, previewPlanIdentity,
-  profileJobIsCurrent, roleCanEdit, useStore,
+  previewIsCurrent, previewPlanIdentity, profileJobIsCurrent, roleCanEdit, useStore,
 } from '../store/graph'
 import { capabilitiesFor, nodeOutputs } from '../nodes/registry'
 import { api } from '../api/client'
@@ -9,7 +8,7 @@ import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import type { ColumnSchema, PortSpec } from '../types/graph'
-import type { ProfileResult } from '../types/api'
+import type { ProfileResult, RunOutput, RunState } from '../types/api'
 
 const PAGE = 50
 
@@ -31,11 +30,15 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   // the visible tab selection is carried on every preview and sampled-profile request.
   const requestPortId = outputPorts.length > 1 ? selectedPortId : undefined
   const run = useStore((s) => s.runs[nodeId])
-  const done = run?.status?.status === 'done' ? run.status : undefined
-  const committedOutputs = done?.outputs.filter((output) => output.outcome === 'committed' && !!output.uri) ?? []
-  const selectedOutput = committedOutputs.find((output) => (
+  const runOutputs = run?.status?.outputs.filter((output) => output.nodeId === nodeId) ?? []
+  const selectedRunOutput = runOutputs.find((output) => (
     output.nodeId === nodeId && (selectedPortId === undefined || output.portId === selectedPortId)
-  )) ?? (outputPorts.length <= 1 && committedOutputs.length === 1 ? committedOutputs[0] : undefined)
+  )) ?? (outputPorts.length <= 1 && runOutputs.length === 1 ? runOutputs[0] : undefined)
+  // A terminal run can fail or be cancelled after another named output was durably committed.
+  // Keep that artifact readable without implying that non-committed sibling ports succeeded.
+  const selectedOutput = selectedRunOutput?.outcome === 'committed' && selectedRunOutput.uri
+    ? selectedRunOutput
+    : undefined
   const pushToast = useStore((s) => s.pushToast)
   const [tab, setTab] = useState('rows')
   const [resultMode, setResultMode] = useState<'sample' | 'full'>('sample')
@@ -60,7 +63,9 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   }
   const withOutputPorts = (content: ReactNode) => (
     <>
-      <OutputPortSelector ports={outputPorts} selectedPortId={selectedPortId} onSelect={choosePort} />
+      <OutputPortSelector ports={outputPorts} outputs={runOutputs}
+        selectedPortId={selectedPortId} onSelect={choosePort} />
+      <SelectedOutputOutcome runStatus={run?.status?.status} output={selectedRunOutput} />
       {content}
     </>
   )
@@ -96,11 +101,8 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
       return withOutputPorts(<FullResult uri={selectedOutput.uri} total={selectedOutput.rows ?? null}
         modeToggle={resultModeToggle} presentation={artifactPresentation} />)
     }
-    const reason = outputPorts.length > 1
-      ? `${res.reason ?? 'This output needs a full pass.'} ${MULTI_OUTPUT_FULL_RUN_UNAVAILABLE}`
-      : res.reason ?? 'needs a full pass'
-    return withOutputPorts(<NotPreviewable reason={reason}
-      onRun={outputPorts.length > 1 ? undefined : () => requestRun(nodeId)} modeToggle={resultModeToggle} />)
+    return withOutputPorts(<NotPreviewable reason={res.reason ?? 'needs a full pass'}
+      onRun={() => requestRun(nodeId)} modeToggle={resultModeToggle} />)
   }
   if (selectedOutput?.uri && resultMode === 'full') {
     return withOutputPorts(<FullResult uri={selectedOutput.uri} total={selectedOutput.rows ?? null}
@@ -196,8 +198,9 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   )
 }
 
-function OutputPortSelector({ ports, selectedPortId, onSelect }: {
+function OutputPortSelector({ ports, outputs, selectedPortId, onSelect }: {
   ports: PortSpec[]
+  outputs: RunOutput[]
   selectedPortId?: string
   onSelect: (portId: string) => void
 }) {
@@ -206,21 +209,66 @@ function OutputPortSelector({ ports, selectedPortId, onSelect }: {
     <div className="dp-dark flex items-center gap-1.5 border-b border-border px-[11px] py-2 text-foreground">
       <span className="mr-1 text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">Output</span>
       <div role="group" aria-label="Output ports" className="flex min-w-0 items-center gap-1 overflow-x-auto">
-        {ports.map((port) => (
-          <button key={port.id} aria-pressed={selectedPortId === port.id}
-            title={port.label && port.label !== port.id ? `${port.label} (${port.id})` : port.id}
-            onClick={() => onSelect(port.id)}
-            className={cn(
-              'dp-mono whitespace-nowrap rounded-md border px-2 py-1 text-[10.5px] font-semibold',
-              selectedPortId === port.id
-                ? 'border-primary/40 bg-primary/10 text-primary'
-                : 'border-transparent text-muted-foreground hover:border-border hover:text-foreground',
-            )}>
-            {port.label || port.id}
-          </button>
-        ))}
+        {ports.map((port) => {
+          const output = outputs.find((candidate) => candidate.portId === port.id)
+          const label = port.label || port.id
+          const title = port.label && port.label !== port.id ? `${port.label} (${port.id})` : port.id
+          return (
+            <button key={port.id} aria-label={label} aria-pressed={selectedPortId === port.id}
+              title={output ? `${title} · ${output.outcome}` : title}
+              onClick={() => onSelect(port.id)}
+              className={cn(
+                'dp-mono inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border px-2 py-1 text-[10.5px] font-semibold',
+                selectedPortId === port.id
+                  ? 'border-primary/40 bg-primary/10 text-primary'
+                  : 'border-transparent text-muted-foreground hover:border-border hover:text-foreground',
+              )}>
+              {label}
+              {output && <OutputOutcomeBadge outcome={output.outcome} />}
+            </button>
+          )
+        })}
       </div>
     </div>
+  )
+}
+
+function SelectedOutputOutcome({ runStatus, output }: { runStatus?: RunState; output?: RunOutput }) {
+  if (!runStatus && !output) return null
+  const label = output?.portLabel || output?.portId
+  return (
+    <div aria-label="Selected output status"
+      className="dp-dark border-b border-border px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span>Latest run</span>
+        <span className={cn(
+          'rounded px-1 py-px text-[9px] font-semibold uppercase tracking-[0.3px]',
+          runStatus === 'done' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+            : runStatus === 'failed' ? 'bg-destructive/10 text-destructive'
+              : 'bg-muted text-muted-foreground',
+        )}>{runStatus}</span>
+        {output && (
+          <>
+            <span>·</span>
+            <span className="dp-mono font-semibold text-foreground">{label}</span>
+            <OutputOutcomeBadge outcome={output.outcome} />
+            {output.rows != null && <span>{output.rows.toLocaleString()} {output.rows === 1 ? 'row' : 'rows'}</span>}
+          </>
+        )}
+      </div>
+      {output?.error && <div className="dp-mono mt-1 whitespace-pre-wrap text-destructive">{output.error}</div>}
+    </div>
+  )
+}
+
+function OutputOutcomeBadge({ outcome }: { outcome: RunOutput['outcome'] }) {
+  return (
+    <span className={cn(
+      'shrink-0 rounded px-1 py-px text-[8.5px] font-semibold uppercase tracking-[0.3px]',
+      outcome === 'committed' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+        : outcome === 'failed' ? 'bg-destructive/10 text-destructive'
+          : 'bg-muted text-muted-foreground',
+    )}>{outcome}</span>
   )
 }
 
