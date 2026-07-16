@@ -773,6 +773,7 @@ class ManagedLocalFileRevisionAdapter:
     """Revision provider for core-owned local artifacts recorded by the catalog ledger."""
 
     name = "managed-local-file"
+    retention_owner = "core"
 
     def revision_history(self, uri: str, *, limit: int, cursor: str | None = None) -> tuple[list[dict], str | None]:
         from hub import metadb

@@ -150,7 +150,7 @@ class DatasetRevision(Wire):
     dataset_id: str = Field(min_length=1, max_length=128)
     revision_id: str = Field(min_length=1, max_length=256)
     committed_at: datetime.datetime | None = None
-    retention_owner: Literal["provider"] = "provider"
+    retention_owner: Literal["provider", "core"] = "provider"
 
 
 class DatasetRevisionPage(Wire):
@@ -170,7 +170,7 @@ class DatasetRevisionResolution(Wire):
     dataset_id: str = Field(min_length=1, max_length=128)
     revision_id: str = Field(min_length=1, max_length=256)
     committed_at: datetime.datetime | None = None
-    retention_owner: Literal["provider"] = "provider"
+    retention_owner: Literal["provider", "core"] = "provider"
     selector: Literal["latest", "as_of", "exact"]
 
 

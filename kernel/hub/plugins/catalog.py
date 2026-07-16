@@ -588,8 +588,14 @@ class InMemoryCatalog:
             name=name, uri=artifact_uri, strict_probe=True,
             _persist_table=False, _embed_table=False,
         )
-        published = metadb.catalog_publish_managed_local_file(
-            logical_uri, artifact_uri, name, table.model_dump(by_alias=True))
+        try:
+            published = metadb.catalog_publish_managed_local_file(
+                logical_uri, artifact_uri, name, table.model_dump(by_alias=True))
+        except Exception:
+            published = metadb.catalog_managed_local_file_publication_receipt(
+                logical_uri, artifact_uri, name)
+            if published is None:
+                raise
         canonical = CatalogTable.model_validate(published["table"])
         if parents and lineage is not None:
             self.record_lineage(

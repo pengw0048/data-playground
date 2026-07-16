@@ -330,9 +330,10 @@ def _revision_binding_for_table(table_id: str) -> tuple[CatalogTable, dict]:
     return table, binding
 
 
-def _revision(dataset_id: str, raw: dict) -> DatasetRevision:
+def _revision(dataset_id: str, raw: dict, adapter: DatasetRevisionAdapter) -> DatasetRevision:
     return DatasetRevision(dataset_id=dataset_id, revision_id=str(raw["revision_id"]),
-                           committed_at=raw.get("committed_at"))
+                           committed_at=raw.get("committed_at"),
+                           retention_owner=getattr(adapter, "retention_owner", "provider"))
 
 
 @router.get("/catalog/tables/{table_id}/revisions", response_model=DatasetRevisionPage)
@@ -341,12 +342,13 @@ def list_dataset_revisions(table_id: str, limit: int = Query(20, ge=1, le=100),
     """A bounded newest-first page of provider-native history for one current registration."""
     table, binding = _revision_binding_for_table(table_id)
     try:
-        rows, next_cursor = _revision_adapter(table.uri).revision_history(
-            table.uri, limit=limit, cursor=cursor)
+        adapter = _revision_adapter(table.uri)
+        rows, next_cursor = adapter.revision_history(table.uri, limit=limit, cursor=cursor)
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
-    return DatasetRevisionPage(items=[_revision(binding["dataset_id"], row) for row in rows],
+    return DatasetRevisionPage(items=[
+        _revision(binding["dataset_id"], row, adapter) for row in rows],
                                next_cursor=next_cursor, has_more=next_cursor is not None)
 
 
@@ -356,13 +358,16 @@ def resolve_dataset_revision(table_id: str,
     """Resolve latest or an as-of instant to immutable provider evidence without opening head later."""
     table, binding = _revision_binding_for_table(table_id)
     try:
-        raw = _revision_adapter(table.uri).resolve_revision(table.uri, as_of=as_of)
+        adapter = _revision_adapter(table.uri)
+        raw = adapter.resolve_revision(table.uri, as_of=as_of)
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     return DatasetRevisionResolution(dataset_id=binding["dataset_id"],
                                      revision_id=str(raw["revision_id"]),
                                      committed_at=raw.get("committed_at"),
+                                     retention_owner=getattr(
+                                         adapter, "retention_owner", "provider"),
                                      selector="as_of" if as_of is not None else "latest")
 
 
@@ -374,12 +379,15 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionR
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     try:
+        adapter = _revision_adapter(binding["uri"])
         with db.base_guard():
-            _revision_adapter(binding["uri"]).open_revision(binding["uri"], revision_id)
+            adapter.open_revision(binding["uri"], revision_id)
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     return DatasetRevisionResolution(dataset_id=binding["dataset_id"], revision_id=revision_id,
+                                     retention_owner=getattr(
+                                         adapter, "retention_owner", "provider"),
                                      selector="exact")
 
 

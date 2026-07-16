@@ -52,11 +52,11 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
-        ("0002_managed_local_file_revisions", "0001_schema_baseline"),
+        ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0002_managed_local_file_revisions"]
-    assert metadb.expected_schema_head() == "0002_managed_local_file_revisions"
+    assert scripts.get_heads() == ["0002_managed_file_revs"]
+    assert metadb.expected_schema_head() == "0002_managed_file_revs"
 
 
 def test_fresh_sqlite_baseline_matches_runtime_metadata(tmp_path):

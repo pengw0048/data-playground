@@ -7832,6 +7832,10 @@ def catalog_publish_managed_local_file(
     with session() as s:
         logical_id, catalog_key = _catalog_managed_namespace_identity(logical_uri, f"tbl_{name}")
         _lock_catalog_namespace_tokens(s, [logical_uri, logical_id, catalog_key])
+        receipt = _managed_local_file_publication_receipt_in_session(
+            s, logical_uri, artifact_uri, str(name))
+        if receipt is not None:
+            return receipt
         _assert_managed_catalog_namespace_available(
             s, logical_uri=logical_uri, logical_id=logical_id, catalog_key=catalog_key)
         reserved_id, _epoch, publish_seq = _reserve_catalog_publication(
@@ -7887,6 +7891,46 @@ def catalog_publish_managed_local_file(
             "committed_at": committed_at,
             "table": payload,
         }
+
+
+def _managed_local_file_publication_receipt_in_session(
+        s, logical_uri: str, artifact_uri: str, name: str) -> dict | None:
+    revision = s.scalars(select(ManagedLocalFileRevision).where(
+        ManagedLocalFileRevision.artifact_uri == artifact_uri).limit(1)).first()
+    if revision is None:
+        return None
+    logical = s.get(CatalogLogicalDataset, revision.logical_id)
+    ref = s.get(LocalResultReference, {
+        "uri": artifact_uri,
+        "owner_kind": "managed_file_revision",
+        "owner_key": revision.revision_id,
+    })
+    try:
+        from hub.models import CatalogTable
+        table = CatalogTable.model_validate(json.loads(revision.table_doc))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("managed local publication receipt is invalid") from exc
+    if (logical is None or logical.logical_uri != logical_uri or ref is None
+            or table.uri != artifact_uri or table.name != name):
+        raise RuntimeError("managed local publication receipt does not match its request")
+    return {
+        "dataset_id": logical.logical_id,
+        "revision_id": revision.revision_id,
+        "committed_at": revision.committed_at,
+        "table": table.model_dump(by_alias=True),
+    }
+
+
+def catalog_managed_local_file_publication_receipt(
+        logical_uri: str, artifact_uri: str, name: str) -> dict | None:
+    """Recover one exact committed local revision after an unknown transaction response."""
+    logical_uri = str(logical_uri).rstrip("/")
+    artifact_uri = _local_result_candidate(artifact_uri) or ""
+    if not logical_uri or not artifact_uri:
+        raise ValueError("managed local publication requires logical and exact artifact URIs")
+    with session() as s:
+        return _managed_local_file_publication_receipt_in_session(
+            s, logical_uri, artifact_uri, str(name))
 
 
 def catalog_managed_publication_receipt(uri: str) -> dict | None:

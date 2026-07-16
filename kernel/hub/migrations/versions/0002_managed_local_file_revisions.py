@@ -1,6 +1,6 @@
 """Retain exact core-managed local file revisions.
 
-Revision ID: 0002_managed_local_file_revisions
+Revision ID: 0002_managed_file_revs
 Revises: 0001_schema_baseline
 """
 
@@ -8,7 +8,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0002_managed_local_file_revisions"
+revision = "0002_managed_file_revs"
 down_revision = "0001_schema_baseline"
 branch_labels = None
 depends_on = None
