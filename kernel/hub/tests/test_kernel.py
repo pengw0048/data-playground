@@ -173,6 +173,11 @@ def test_catalog_and_capabilities():
 def test_sample():
     r = client.post("/api/data/sample", json={"uri": _uri("images"), "k": 5}).json()
     assert len(r["rows"]) == 5 and r["rowCount"] == 500 and r["truncated"] is True
+    provenance = r["sampleProvenance"]
+    assert provenance["strategy"] == "prefix"
+    assert provenance["seed"] is None and provenance["requestedRows"] == 5
+    assert provenance["returnedRows"] == 5 and provenance["datasetIdentity"] == _uri("images")
+    assert "not representative or random" in " ".join(provenance["limitations"])
 
 
 def test_hardlinked_local_source_is_readable_across_interactive_and_full_paths(tmp_path):
@@ -1529,9 +1534,9 @@ def test_decimal_serialized_as_number():
     assert all(isinstance(a, (int, float)) for a in amounts)  # small decimals stay numeric
 
 
-def test_sample_node_requires_a_full_run_instead_of_sampling_a_preview_prefix(tmp_path):
-    # A reservoir sample must inspect the whole source. Preview refuses that unbounded scan; the durable
-    # run executes the real sample rather than sampling only the source prefix.
+def test_sample_node_preview_is_deterministic_and_provenance_bearing(tmp_path):
+    # The explicit Sample node is the one preview that scans a complete local input. Its evidence must
+    # distinguish a seeded reservoir sample from a bounded prefix, including a revision-bound identity.
     import duckdb
     p = str(tmp_path / "big.parquet")
     duckdb.connect().execute(f"COPY (SELECT i AS id FROM range(0,10000) t(i)) TO '{p}' (FORMAT PARQUET)")
@@ -1539,11 +1544,42 @@ def test_sample_node_requires_a_full_run_instead_of_sampling_a_preview_prefix(tm
         N("s", "source", {"uri": p}),
         N("sm", "sample", {"n": 200, "seed": 1}),
     ], "edges": [E("s", "sm")]}
-    r = client.post("/api/run/preview", json={"graph": g, "nodeId": "sm", "k": 200}).json()
-    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
-    _, result = _full_result(g, "sm", 200)
-    ids = [row["id"] for row in result["rows"]]
+    first = client.post("/api/run/preview", json={"graph": g, "nodeId": "sm", "k": 200}).json()
+    again = client.post("/api/run/preview", json={"graph": g, "nodeId": "sm", "k": 200}).json()
+    ids = [row["id"] for row in first["rows"]]
     assert max(ids) >= 2000, f"reservoir sample must reach past the first 2000 rows — got max {max(ids)}"
+    assert first["rows"] == again["rows"]
+    provenance = first["sampleProvenance"]
+    assert provenance["strategy"] == "reservoir"
+    assert provenance["seed"] == 1 and provenance["requestedRows"] == 200
+    assert provenance["datasetIdentity"] == p and provenance["datasetRevision"]
+    assert provenance["scannedRows"] == provenance["totalRows"] == 10_000
+    assert first["rowLimit"] is None and "prefix" not in " ".join(provenance["limitations"]).lower()
+
+    g["nodes"][1]["data"]["config"]["seed"] = 2
+    changed_seed = client.post("/api/run/preview", json={"graph": g, "nodeId": "sm", "k": 200}).json()
+    assert changed_seed["sampleProvenance"]["identity"] != provenance["identity"]
+
+    import os
+    os.remove(p)
+    duckdb.connect().execute(f"COPY (SELECT i AS id FROM range(10000,20000) t(i)) TO '{p}' (FORMAT PARQUET)")
+    changed_revision = client.post("/api/run/preview", json={"graph": g, "nodeId": "sm", "k": 200}).json()
+    assert changed_revision["sampleProvenance"]["identity"] != changed_seed["sampleProvenance"]["identity"]
+
+
+def test_sample_seed_and_size_survive_canvas_save_reload():
+    canvas_id = "sample-provenance-save-reload"
+    graph = {"id": canvas_id, "name": "sample provenance", "version": 1, "nodes": [
+        N("s", "source", {"uri": _uri("events")}),
+        N("sm", "sample", {"n": 125, "seed": 73}),
+    ], "edges": [E("s", "sm")]}
+    saved = client.put(f"/api/canvas/{canvas_id}", json=graph)
+    assert saved.status_code == 200 and saved.json()["ok"]
+    restored = client.get(f"/api/canvas/{canvas_id}")
+    assert restored.status_code == 200
+    assert next(node for node in restored.json()["nodes"] if node["id"] == "sm")["data"]["config"] == {
+        "n": 125, "seed": 73,
+    }
 
 
 def test_ident_escapes_embedded_quotes_not_strips(tmp_path):

@@ -955,6 +955,7 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
 function CatalogPreviewScope({ preview }: { preview: SampleResult }) {
   const shown = preview.rows.length
   const total = preview.rowCount ?? null
+  const provenance = preview.sampleProvenance
   let label: string
   if (preview.completeness === 'complete') {
     label = `Complete dataset · ${total ?? shown} ${(total ?? shown) === 1 ? 'row' : 'rows'}`
@@ -967,7 +968,14 @@ function CatalogPreviewScope({ preview }: { preview: SampleResult }) {
   }
   return (
     <div role="status" className="rounded-md bg-muted/50 px-2 py-1 text-[10.5px] text-muted-foreground">
-      {label}
+      <div>{label}</div>
+      {provenance && (
+        <div className="mt-0.5">
+          {preview.completeness === 'complete'
+            ? <>Complete dataset · input revision {provenance.datasetRevision ?? 'unknown'}.</>
+            : <>Prefix preview · input revision {provenance.datasetRevision ?? 'unknown'} · not representative or random.</>}
+        </div>
+      )}
     </div>
   )
 }

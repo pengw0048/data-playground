@@ -3125,6 +3125,108 @@
         "title": "RunStatus",
         "type": "object"
       },
+      "SampleProvenance": {
+        "description": "Evidence for the population a visible preview/sample page represents.\n\n``scanned_rows`` and ``total_rows`` are intentionally nullable: a bounded adapter may prove its\nwork limit without knowing how many rows it actually inspected or how large the population is.\n``identity`` changes when any known sampling input changes, so a client can distinguish samples\nthat happen to contain similar rows.",
+        "properties": {
+          "datasetIdentity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Datasetidentity"
+          },
+          "datasetRevision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Datasetrevision"
+          },
+          "identity": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Identity",
+            "type": "string"
+          },
+          "limitations": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Limitations",
+            "type": "array"
+          },
+          "requestedRows": {
+            "minimum": 0.0,
+            "title": "Requestedrows",
+            "type": "integer"
+          },
+          "returnedRows": {
+            "minimum": 0.0,
+            "title": "Returnedrows",
+            "type": "integer"
+          },
+          "scannedRows": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scannedrows"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed"
+          },
+          "strategy": {
+            "enum": [
+              "prefix",
+              "reservoir"
+            ],
+            "title": "Strategy",
+            "type": "string"
+          },
+          "totalRows": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totalrows"
+          }
+        },
+        "required": [
+          "strategy",
+          "requestedRows",
+          "returnedRows",
+          "identity"
+        ],
+        "title": "SampleProvenance",
+        "type": "object"
+      },
       "SampleRequest": {
         "properties": {
           "columns": {
@@ -3294,6 +3396,16 @@
             },
             "title": "Rows",
             "type": "array"
+          },
+          "sampleProvenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SampleProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "truncated": {
             "default": false,

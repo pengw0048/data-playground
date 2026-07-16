@@ -23,6 +23,7 @@ Placement = Literal["local", "distributed"]
 DataCompleteness = Literal["complete", "page", "sample", "capped", "unknown"]
 DataLimitReason = Literal["preview-scan", "interactive-row-budget"]
 DataLimitScope = Literal["each-source", "result-window"]
+SampleStrategy = Literal["prefix", "reservoir"]
 MAX_SAFE_INTEGER = 2**53 - 1
 ProfileCompleteness = Literal["complete", "sample", "unknown"]
 PlanDigest = Annotated[
@@ -428,6 +429,27 @@ class CatalogMetadata(Wire):
 # --------------------------------------------------------------------------- #
 # Data preview
 # --------------------------------------------------------------------------- #
+class SampleProvenance(Wire):
+    """Evidence for the population a visible preview/sample page represents.
+
+    ``scanned_rows`` and ``total_rows`` are intentionally nullable: a bounded adapter may prove its
+    work limit without knowing how many rows it actually inspected or how large the population is.
+    ``identity`` changes when any known sampling input changes, so a client can distinguish samples
+    that happen to contain similar rows.
+    """
+
+    strategy: SampleStrategy
+    seed: int | None = None
+    requested_rows: int = Field(ge=0)
+    scanned_rows: int | None = Field(default=None, ge=0)
+    returned_rows: int = Field(ge=0)
+    total_rows: int | None = Field(default=None, ge=0)
+    dataset_identity: str | None = None
+    dataset_revision: str | None = None
+    identity: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    limitations: list[str] = Field(default_factory=list)
+
+
 class SampleResult(Wire):
     """One page of rows plus an explicit statement of what that page represents.
 
@@ -480,6 +502,7 @@ class SampleResult(Wire):
             "result-window means result pagination cannot continue beyond rowLimit."
         ),
     )
+    sample_provenance: SampleProvenance | None = None
     preview_ref: str | None = None
     not_previewable: bool = False
     error: bool = False        # a real failure (bad code / bad query), distinct from P8 not_previewable
@@ -525,8 +548,9 @@ class SampleResult(Wire):
         if self.completeness == "sample":
             if not self.truncated:
                 raise ValueError("sample data requires truncated=true")
-            if (self.row_limit is None or self.limit_reason != "preview-scan"
-                    or self.limit_scope != "each-source"):
+            reservoir = self.sample_provenance and self.sample_provenance.strategy == "reservoir"
+            if not reservoir and (self.row_limit is None or self.limit_reason != "preview-scan"
+                                  or self.limit_scope != "each-source"):
                 raise ValueError("sample data requires an each-source preview-scan limit")
         if self.completeness == "capped":
             if not self.truncated:

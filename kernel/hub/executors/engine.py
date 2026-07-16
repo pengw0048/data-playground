@@ -345,13 +345,17 @@ class BuildEngine:
                  full: bool = False, node_builders: dict | None = None, node_specs: dict | None = None,
                  bound_inputs: dict | None = None, spill_files: list | None = None,
                  schema_only: bool = False, warm=None, warm_scope: str = "",
-                 pushdown: bool = False, output_node: str | None = None):
+                 pushdown: bool = False, output_node: str | None = None,
+                 reservoir_preview: bool = False):
         self.graph = graph
         self._nodes = g.node_map(graph)
         self.resolve_adapter = resolve_adapter
         self.registry = registry
         self.sample_k = sample_k
         self.full = full
+        # The explicit Sample node is the sole interactive exception to bounded source previews. Its
+        # reservoir algorithm needs a full local scan; other full-pass operators remain unavailable.
+        self.reservoir_preview = reservoir_preview
         # pushdown: hand a single-consumer source→filter/select's predicate/projection to adapter.scan()
         # so an adapter that prunes at the source does. Full-run write/count paths only (preview keeps
         # the plain scan so previewing a source shows the source). output_node = the run's requested
@@ -595,7 +599,7 @@ class BuildEngine:
                 if pred and self.full:
                     extra["predicate"] = pred
             adapter = self.resolve_adapter(uri)
-            if self.sample_k is not None and not self.full:
+            if self.sample_k is not None and not self.full and not self.reservoir_preview:
                 preview_scan = getattr(adapter, "preview_scan", None)
                 if not callable(preview_scan):
                     raise NotPreviewable(
@@ -641,7 +645,7 @@ class BuildEngine:
             seed = int(cfg.get("seed", 42))
             # A faithful reservoir sample must inspect the full input. Its result cardinality is bounded,
             # but its source scan is not, so only a durable full run may execute it.
-            if not self.full:
+            if not self.full and not self.reservoir_preview:
                 raise NotPreviewable(node, "reservoir sampling needs a full pass")
             src = parent
             v = self._view(src, "s")

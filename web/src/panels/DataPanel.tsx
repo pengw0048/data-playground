@@ -343,15 +343,18 @@ function DataScopeBanner({ data, offset, unit, scope, allowNextAttempt = true }:
   const end = offset + data.rows.length
   const total = data.rowCount ?? null
   const sourceCapped = data.limitScope === 'each-source' || data.limitReason === 'preview-scan'
+  const provenance = data.sampleProvenance
   const resultCapped = data.limitScope === 'result-window'
     || data.limitReason === 'interactive-row-budget'
     || (data.completeness === 'capped' && !sourceCapped)
-  const label = scope === 'preview' ? 'Preview sample'
+  const label = scope === 'preview' ? (provenance?.strategy === 'reservoir' ? 'Random sample' : 'Preview prefix')
     : scope === 'published-dataset' ? 'Published dataset' : 'Full result artifact'
   const range = pageRangeLabel(unit, offset, data.rows.length)
   let detail: string
   if (scope === 'preview') {
-    detail = `${range} · Full dataset not scanned.`
+    detail = provenance?.strategy === 'reservoir'
+      ? `${range} · Deterministic reservoir sample.`
+      : `${range} · Full dataset not scanned.`
   } else if (total == null) {
     detail = `Current page · ${range} · Total ${unit} unknown.`
   } else if (data.completeness === 'complete') {
@@ -369,6 +372,13 @@ function DataScopeBanner({ data, offset, unit, scope, allowNextAttempt = true }:
         <div className="mt-1 font-medium text-amber-700 dark:text-amber-300">
           Each source read was limited to at most {(data.rowLimit ?? end).toLocaleString()} rows before this preview was computed.
           {' '}Output rows are not necessarily the first {(data.rowLimit ?? end).toLocaleString()} rows of the final result.
+        </div>
+      )}
+      {provenance && (
+        <div className="mt-1 text-muted-foreground">
+          {provenance.strategy === 'reservoir'
+            ? <>Seed {provenance.seed} · input revision {provenance.datasetRevision ?? 'unknown'} · deterministic membership.</>
+            : <>Prefix preview · input revision {provenance.datasetRevision ?? 'unknown'} · not representative or random.</>}
         </div>
       )}
       {resultCapped && (
