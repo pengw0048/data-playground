@@ -93,6 +93,31 @@ class _ClaimProvider:
         return etag
 
 
+def _lineage(key: str, *, mappings: list[dict] | None = None) -> dict:
+    return {
+        "idempotency_key": key,
+        "run_id": None,
+        "attempt_id": None,
+        "producer": "backup-restore-drill",
+        "producer_version": 1,
+        "step_id": None,
+        "provenance": "manual",
+        "field_mappings": mappings or [],
+    }
+
+
+def _lineage_receipt_identity(session, publication_key: str) -> dict:
+    receipt = session.get(metadb.CatalogPublicationEvent, publication_key)
+    assert receipt is not None
+    return {
+        "event_key": receipt.event_key,
+        "effect_type": receipt.effect_type,
+        "uri": receipt.uri,
+        "version": receipt.version,
+        "fingerprint": receipt.fingerprint,
+    }
+
+
 def _attempt_inventory(handle: dict) -> list[dict]:
     parsed = urlsplit(handle["uri"])
     root = f"{parsed.netloc}/{parsed.path.lstrip('/')}"
@@ -144,12 +169,26 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         parent_uri, "drill-parent",
         {"id": "drill_parent", "name": "drill-parent", "uri": parent_uri,
          "columns": [{"name": "id", "type": "int64"}]})
+    lineage_idempotency_key = f"backup-restore-drill-{uuid.uuid4().hex}"
+    lineage_publication_key = (
+        "lineage-publication:v1:sha256:"
+        + hashlib.sha256(lineage_idempotency_key.encode("utf-8")).hexdigest()
+    )
     metadb.catalog_upsert_entry(
         child_uri, "drill-child",
         {"id": "drill_child", "name": "drill-child", "uri": child_uri,
          "columns": [{"name": "id", "type": "int64"}]},
-        parents=[parent_uri], pipeline="backup-restore-drill")
-    metadb.catalog_add_edge(parent_uri, child_uri, pipeline="backup-restore-drill", column="id")
+        parents=[parent_uri], pipeline="backup-restore-drill",
+        lineage=_lineage(
+            lineage_idempotency_key,
+            mappings=[{"source_field": "id", "destination_field": "id"}],
+        ))
+    with metadb.session() as session:
+        lineage_receipt = _lineage_receipt_identity(session, lineage_publication_key)
+    assert lineage_receipt["effect_type"] == "lineage"
+    assert lineage_receipt["uri"] == child_uri
+    assert lineage_receipt["version"] is None
+    assert lineage_receipt["fingerprint"].startswith("lineage-publication:v2:sha256:")
 
     run_id = f"drill-run-{uuid.uuid4().hex}"
     artifact_uri = storage.begin_result(f"plan-{uuid.uuid4().hex}", run_id)
@@ -220,6 +259,8 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         "canvas_id": canvas_id,
         "parent_uri": parent_uri,
         "child_uri": child_uri,
+        "lineage_publication_key": lineage_publication_key,
+        "lineage_receipt": lineage_receipt,
         "run_id": run_id,
         "artifact_uri": artifact_uri,
         "artifact_rel": artifact_rel,
@@ -266,12 +307,22 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
 
     assert metadb.catalog_get(info["parent_uri"]) is not None
     assert metadb.catalog_get(info["child_uri"]) is not None
-    edges = metadb.catalog_edges()
+    edges = metadb.catalog_lineage_pairs()
     assert any(
         edge["parent"] in (info["parent_uri"], "drill_parent")
         and edge["child"] in (info["child_uri"], "drill_child")
+        and edge["fact_count"] == 1
         for edge in edges
     )
+    with metadb.session() as session:
+        fact = session.scalar(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.destination_uri == info["child_uri"]))
+        assert fact is not None
+        assert json.loads(fact.field_mappings_json) == [
+            {"destination_field": "id", "source_field": "id"},
+        ]
+        assert _lineage_receipt_identity(
+            session, info["lineage_publication_key"]) == info["lineage_receipt"]
     restored_file = outputs_root / info["artifact_rel"]
     assert restored_file.is_file()
     assert restored_file.read_bytes() == info["artifact_bytes"]
@@ -300,6 +351,7 @@ def _emit_evidence(info: dict, rto_ms: int) -> None:
         f"canvas={info['canvas_id']} "
         f"catalog={info['parent_uri']},{info['child_uri']} "
         f"run={info['run_id']} lineage=drill_parent->drill_child "
+        f"lineage_receipt={info['lineage_publication_key']} "
         f"artifact={info['artifact_uri']} "
         f"managed_attempt={info['managed_uri']} "
         f"namespace_marker={info['claim_key'][0]}/_dp_control/namespaces/{info['namespace']}.json "
@@ -437,6 +489,8 @@ def test_sqlite_isolated_restore_drill(tmp_path, monkeypatch):
         assert metadb.object_attempt_owner_id() == info["owner"]
         assert metadb.catalog_get(info["parent_uri"])["uri"] == info["parent_uri"]
         with metadb.session() as session:
+            assert _lineage_receipt_identity(
+                session, info["lineage_publication_key"]) == info["lineage_receipt"]
             attempt = session.get(metadb.ObjectAttempt, info["managed_uri"])
             assert attempt is not None and attempt.state != "quarantined"
     finally:
@@ -481,7 +535,8 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
         source_row_counts = {}
         with metadb.session() as session:
             for model in (metadb.Canvas, metadb.CatalogEntry, metadb.RunRecord,
-                          metadb.CatalogEdge, metadb.LocalResultArtifact, metadb.ObjectAttempt):
+                          metadb.CatalogLineageFact, metadb.CatalogPublicationEvent,
+                          metadb.LocalResultArtifact, metadb.ObjectAttempt):
                 source_row_counts[model.__tablename__] = session.scalar(
                     select(func.count()).select_from(model))
         source_outputs_fp = _tree_fingerprint(source_outputs)
@@ -551,9 +606,12 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
         metadb.init_db()
         with metadb.session() as session:
             for model in (metadb.Canvas, metadb.CatalogEntry, metadb.RunRecord,
-                          metadb.CatalogEdge, metadb.LocalResultArtifact, metadb.ObjectAttempt):
+                          metadb.CatalogLineageFact, metadb.CatalogPublicationEvent,
+                          metadb.LocalResultArtifact, metadb.ObjectAttempt):
                 assert session.scalar(select(func.count()).select_from(model)) == \
                     source_row_counts[model.__tablename__]
+            assert _lineage_receipt_identity(
+                session, info["lineage_publication_key"]) == info["lineage_receipt"]
             attempt = session.get(metadb.ObjectAttempt, info["managed_uri"])
             assert attempt is not None and attempt.state != "quarantined"
             ident = session.get(metadb.InstallationIdentity, 1)

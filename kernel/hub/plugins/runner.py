@@ -73,6 +73,16 @@ def _is_core_managed_sink(spec, uri: str, adapter) -> bool:
     )
 
 
+def _catalog_publication_version(publication) -> str | None:
+    """Read the exact version from unmanaged tables or a managed receipt's nested table."""
+    version = (publication.get("version") if isinstance(publication, dict)
+               else getattr(publication, "version", None))
+    if version is None and isinstance(publication, dict):
+        table = publication.get("table")
+        version = table.get("version") if isinstance(table, dict) else getattr(table, "version", None)
+    return None if version is None else str(version)
+
+
 def _fmt_bytes(n: int) -> str:
     for unit, scale in (("TB", 1 << 40), ("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
         if n >= scale:
@@ -1344,6 +1354,13 @@ class LocalRunner:
         # The table identity is known before destination resolution, allocation, or an adapter write.
         # Reject a snapshot that cannot enter the public contract before any irreversible sink effect.
         preflight_output_table(status, spec.name)
+        parent_contract = self.forced_sink_targets is not None
+        from hub import metadb
+        parent_uris = metadb.catalog_lineage_parent_tokens(
+            g.all_upstream_publication_uris(graph, node.id))
+        from hub.plugins.catalog import lineage_for_output
+        lineage = None if parent_contract else lineage_for_output(
+            graph, status.run_id, node.id)
         # Bind this destination's credential at the object-store open (the scope cursor already
         # snapshotted it via the run-level binding; this makes the per-write credential explicit).
         os_cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
@@ -1353,10 +1370,31 @@ class LocalRunner:
         # content-addressed skip: an identical overwrite plan already wrote this, so re-running is a
         # no-op. append is NOT idempotent (it must add a part every run), so it never uses the cache.
         cached_output = sole_committed_document_output(cached)
+        cached_binding = status.model_copy(deep=True)
         if (spec.mode != "append" and cached_output is not None and cached_output.table
+                and cached_output.version is not None
                 and self._output_exists(str(cached_output.uri))
-                and apply_cached_output(status, cached) is not None):
-            return int(cached_output.rows or 0)
+                and apply_cached_output(cached_binding, cached) is not None):
+            from hub.plugins.catalog import record_cached_output_lineage
+
+            if lineage is None:  # pragma: no cover - subprocess children never read the parent cache
+                raise RuntimeError("parent-owned sink cannot consume a local catalog cache entry")
+            crossed = record_cached_output_lineage(
+                self.catalog,
+                name=cached_output.table,
+                uri=str(cached_output.uri),
+                version=cached_output.version,
+                parents=parent_uris,
+                lineage=lineage,
+                pre_publish=(None if pre_publish is None
+                             else lambda: pre_publish(check_cancel=True)),
+            )
+            if crossed:
+                # Validation above used a copy so a stale/unsupported cache candidate cannot mutate the
+                # public status. Apply only after its lineage fact has committed.
+                if apply_cached_output(status, cached) is None:  # pragma: no cover - same frozen input
+                    raise RuntimeError("validated cached output binding changed before publication")
+                return int(cached_output.rows or 0)
 
         inc = g.incoming(graph, node.id)
         if not inc:
@@ -1364,7 +1402,6 @@ class LocalRunner:
         # route by the wired output PORT (source_handle) — a write off a multi-output node must
         # persist that port's data, not the default/first one. Mirrors BuildEngine._inputs.
         parent_rel = engine.relation(inc[0].source, inc[0].source_handle)
-        parent_contract = self.forced_sink_targets is not None
         if parent_contract and node.id not in self.forced_sink_targets:
             raise RuntimeError(f"parent did not authorize sink '{node.id}'")
         forced_target = self.forced_sink_targets.get(node.id) if parent_contract else None
@@ -1453,7 +1490,6 @@ class LocalRunner:
             if managed_parquet and not parent_owned:
                 _safe_abandon_attempt(attempt_uri)
             raise
-        parent_uris = g.all_upstream_publication_uris(graph, node.id)
         if not (managed_parquet and parent_contract):
             if managed_parquet:
                 publish = managed_publisher
@@ -1462,13 +1498,19 @@ class LocalRunner:
                 publish = lambda **kwargs: publish_unmanaged_output_attested(  # noqa: E731
                     self.catalog, **kwargs)
             try:
-                publish(name=committed.name, uri=committed.uri, parents=parent_uris,
-                        pipeline="canvas")  # content-addressed version
+                published = publish(
+                    name=committed.name, uri=committed.uri, parents=parent_uris,
+                    pipeline="canvas", lineage=lineage)  # content-addressed version
             except Exception as exc:
                 logging.getLogger("hub").exception("sink publication failed")
                 if managed_parquet and not parent_owned:
                     _safe_abandon_attempt(attempt_uri)
                 raise RuntimeError("sink publication failed") from exc
+            published_version = _catalog_publication_version(published)
+            if published_version is not None:
+                committed_snapshot = committed_output_snapshot(
+                    status, uri=committed.uri, table=committed.name,
+                    version=published_version, rows=committed.rows)
         status.outputs = [committed_snapshot]
         return committed.rows
 

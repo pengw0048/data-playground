@@ -14,12 +14,13 @@ import tempfile
 import uuid
 from urllib.parse import unquote
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
 from hub import db, graph as g, metadb
+from hub.backends import CatalogLineageFactExporter
 from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import (
@@ -40,7 +41,7 @@ from hub.models import (
     ImportRequest,
     JoinSuggestion,
     KernelInfo,
-    LineageEdge,
+    LineageFactsPage,
     LineageResult,
     PipelineImport,
     ProcessorDescriptor,
@@ -321,22 +322,51 @@ def set_table_metadata(table_id: str, req: CatalogMetadata) -> CatalogTable:
 
 
 @router.get("/catalog/lineage", response_model=LineageResult)
-def lineage(uri: str = Query(...), depth: int = 6, max_nodes: int = Query(500, alias="maxNodes")) -> LineageResult:
+def lineage(
+        uri: str = Query(..., max_length=8192), depth: int = 6,
+        max_nodes: int = Query(500, alias="maxNodes"),
+) -> LineageResult:
     """The lineage component around `uri`, expanded breadth-first from the store and CAPPED by `depth`
     + `max_nodes` so a large graph can't blow up the payload (`truncated` flags that the cap hit)."""
-    return get_deps().catalog.lineage(uri, depth=max(1, min(int(depth), 20)),
+    try:
+        root_uri = metadb.catalog_lineage_uri(uri)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return get_deps().catalog.lineage(root_uri, depth=max(1, min(int(depth), 20)),
                                       max_nodes=max(1, min(int(max_nodes), 5000)))
 
 
-@router.get("/catalog/edges", response_model=list[LineageEdge])
-def lineage_edges(response: Response, limit: int = 500, offset: int = 0) -> list[LineageEdge]:
-    """A page of the WHOLE lineage edge set (`X-Total-Count` rides in a header) — the bulk-export
-    surface an external lineage store syncs from. Edges are URI-keyed `{parent, child, column,
-    pipeline}`, so a bridge plugin can map them onto OpenLineage-style datasets 1:1."""
-    rows, total = metadb.catalog_edges_page(limit=max(1, min(int(limit), 2000)), offset=max(0, int(offset)))
-    response.headers["X-Total-Count"] = str(total)
-    response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
-    return [LineageEdge(**r) for r in rows]
+@router.get("/catalog/lineage/facts", response_model=LineageFactsPage)
+def lineage_facts(
+        limit: int = Query(100, ge=1, le=500),
+        after_id: str = Query("0", alias="afterId", pattern=r"^(0|[1-9][0-9]{0,18})$"),
+) -> LineageFactsPage:
+    """Export immutable provenance facts with a deletion-safe, monotonic keyset cursor."""
+    cursor = int(after_id)
+    if cursor >= 2**63:
+        raise HTTPException(422, "afterId exceeds the signed BIGINT cursor range")
+    catalog = get_deps().catalog
+    if not isinstance(catalog, CatalogLineageFactExporter):
+        raise HTTPException(501, "catalog provider does not support lineage fact export")
+    try:
+        page = LineageFactsPage.model_validate(
+            catalog.lineage_facts_page(limit=limit, after_id=cursor))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            502, "catalog provider returned an invalid lineage fact page") from exc
+    ids = [int(item.id) for item in page.items]
+    invalid_window = (
+        len(page.items) > limit
+        or any(fact_id <= cursor for fact_id in ids)
+        or any(left >= right for left, right in zip(ids, ids[1:]))
+        or (page.has_more and (
+            not ids or page.next_after_id is None
+            or int(page.next_after_id) != ids[-1]
+        ))
+    )
+    if invalid_window:
+        raise HTTPException(502, "catalog provider returned an invalid lineage fact page")
+    return page
 
 
 @router.delete("/catalog/tables/{table_id}")

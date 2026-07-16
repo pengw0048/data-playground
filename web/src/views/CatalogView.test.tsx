@@ -57,7 +57,7 @@ describe('CatalogView request and mutation truth', () => {
     mocks.facets.mockResolvedValue(FACETS)
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [], tables: [] })
     mocks.searchCatalog.mockResolvedValue([])
-    mocks.lineage.mockResolvedValue({ nodes: [], edges: [] })
+    mocks.lineage.mockResolvedValue({ rootUri: TABLE.uri, nodes: [], edges: [] })
     mocks.sample.mockResolvedValue({
       columns: TABLE.columns, rows: [{ order_id: 1 }], rowCount: 2,
       hasMore: true, truncated: true, completeness: 'page',
@@ -109,10 +109,37 @@ describe('CatalogView request and mutation truth', () => {
     expect(await screen.findByText('customers')).toBeInTheDocument()
   })
 
+  it('uses the canonical lineage root and shows aggregated fact counts', async () => {
+    const currentRoot = 'mem://orders-current'
+    mocks.lineage.mockResolvedValue({
+      rootUri: currentRoot,
+      nodes: [
+        { id: 'upstream', name: 'raw_orders', uri: 'mem://raw-orders', kind: 'table' },
+        { id: TABLE.id, name: TABLE.name, uri: currentRoot, kind: 'table' },
+        { id: 'downstream', name: 'daily_orders', uri: 'mem://daily-orders', kind: 'table' },
+      ],
+      edges: [
+        { parent: 'mem://raw-orders', child: currentRoot, factCount: 1 },
+        { parent: currentRoot, child: 'mem://daily-orders', factCount: 3 },
+      ],
+    })
+
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByText('orders'))
+
+    expect(await screen.findByText('raw_orders')).toBeInTheDocument()
+    expect(screen.getByText(/1 fact$/)).toBeInTheDocument()
+    expect(screen.getByText(/3 facts$/)).toBeInTheDocument()
+    fireEvent.click(screen.getByText('raw_orders'))
+    await waitFor(() => expect(mocks.table).toHaveBeenCalledWith('upstream'))
+    fireEvent.click(screen.getByText('daily_orders'))
+    await waitFor(() => expect(mocks.table).toHaveBeenCalledWith('downstream'))
+  })
+
   it('surfaces detail failures, preserves edits after a failed save, and refreshes the tree after save and delete', async () => {
     mocks.lineage
       .mockRejectedValueOnce(new Error('HTTP 503: lineage unavailable'))
-      .mockResolvedValueOnce({ nodes: [], edges: [] })
+      .mockResolvedValueOnce({ rootUri: TABLE.uri, nodes: [], edges: [] })
     mocks.sample
       .mockRejectedValueOnce(new Error('Failed to fetch'))
       .mockResolvedValueOnce({
@@ -202,7 +229,7 @@ describe('CatalogView selection, register modal, and rename', () => {
     mocks.facets.mockResolvedValue(FACETS)
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [], tables: [] })
     mocks.searchCatalog.mockResolvedValue([])
-    mocks.lineage.mockResolvedValue({ nodes: [], edges: [] })
+    mocks.lineage.mockResolvedValue({ rootUri: TABLE.uri, nodes: [], edges: [] })
     mocks.setTableMetadata.mockResolvedValue(TABLE)
     mocks.unregisterTables.mockResolvedValue({ deleted: ['t1', 't2'], missing: [] })
     mocks.registerDataset.mockResolvedValue(TABLE)

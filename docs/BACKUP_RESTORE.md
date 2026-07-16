@@ -12,7 +12,7 @@ steps below differ by profile.
 
 | Item | Why it matters |
 |---|---|
-| **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries/columns/lineage edges/embeddings, settings and Cred rows, the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). |
+| **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries, columns, lineage facts, publication receipts, embeddings, settings and Cred rows, the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). Publication receipts are required to preserve exact-replay tombstones after facts or catalog entries are unregistered. |
 | **Workspace files** | Under `DP_WORKSPACE`: `dataplay.db` when using SQLite, `outputs/` (run results and local-result artifacts), and `plugins/` (operator-installed packs). |
 | **Object-store generations + namespace marker** | When `DP_STORAGE_URL` points at `s3://` / `gs://` (or compatible), back up object generations under the installation's storage namespace **and** the conditional marker at `_dp_control/namespaces/<namespace>.json`. The metadata DB alone is not enough: `local_result_artifacts` and attempt rows reference exact URIs. |
 | **Credential references** | Cred rows and plugin `secret` settings contain SecretRefs plus non-secret connection metadata, not resolved credential values. Back up the referenced environment, files, or external secret manager separately; a metadata restore cannot recreate them. |
@@ -195,7 +195,8 @@ BACKUP_RESTORE_DRILL RTO_MS: <integer milliseconds from restore start to verifie
 ```
 
 - **RPO (recovery point)** — which durable writes the fixture backup is known to contain
-  (canvas id, catalog URIs, run id, lineage edge, artifact URI, Alembic head, release sha).
+  (canvas id, catalog URIs, run id, lineage fact and publication receipt, artifact URI, Alembic head,
+  release sha).
   Anything written *after* that freeze is outside the recovery point by definition.
 - **RTO (recovery time)** — wall-clock duration from the moment restore begins (copy/load of
   the backup set into the clone) through isolation and the verification assertions. It is a

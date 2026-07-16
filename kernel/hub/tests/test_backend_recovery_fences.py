@@ -27,6 +27,12 @@ def _bound_run(backend: str) -> tuple[str, str, dict]:
     canonical_job = {
         "contract_version": RAY_JOB_CONTRACT_VERSION,
         "run_id": run_id,
+        "publication_context": {
+            "run_id": run_id,
+            "producer": canvas_id,
+            "producer_version": 1,
+            "lineage_parents": {},
+        },
         "graph": {"nodes": [], "edges": []},
         "target": "target",
         "source_attempts": [],
@@ -141,7 +147,7 @@ def _begin_terminal(
             "status": "done",
             "rows": 0,
             "error": None,
-            # Private Ray v3 artifact fields are mapped once into the public RunOutput above.
+            # Private Ray v4 artifact fields are mapped once into the public RunOutput above.
             "output_uri": f"{ref['result_uri']}.parquet",
             "output_table": None,
             "outputs": [],
