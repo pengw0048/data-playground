@@ -21,7 +21,10 @@ from hub.models import (
 from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.profile_jobs import ProfileProcessRunner
 from hub.plugins.runner import LocalRunner, _CancelToken
-from hub.run_outputs import apply_cached_output, require_single_run_output
+from hub.run_outputs import (
+    apply_cached_output, commit_output, initialize_run_outputs, require_single_run_output,
+)
+from hub.sampling import explicit_sample_provenance
 from hub.routers import runs as run_routes
 from hub.routers import workspace as workspace_routes
 from hub.security import current_user
@@ -91,6 +94,31 @@ def test_named_multi_output_backend_capability_is_explicit_and_fails_closed(tmp_
             raise RuntimeError("capability unavailable")
 
     assert not backend_supports_named_multi_output_runs(BrokenProbe())
+
+
+def test_committed_run_output_retains_explicit_sample_evidence(tmp_path):
+    graph = Graph(
+        id="sample-output-history",
+        nodes=[
+            GraphNode(id="source", type="source", data={"config": {"uri": "sample://source"}}),
+            GraphNode(id="sample", type="sample", data={"config": {"n": 4, "seed": 7}}),
+        ],
+        edges=[GraphEdge(id="source-sample", source="source", target="sample")],
+    )
+
+    class Adapter:
+        def fingerprint(self, _uri): return "revision-1"
+        def metadata_count(self, _uri): return 12
+
+    provenance = explicit_sample_provenance(graph, "sample", lambda _uri: Adapter(), returned_rows=0)
+    status = RunStatus(run_id="sample-output", status="queued", target_node_id="sample")
+    initialize_run_outputs(status, graph, "sample", SPECS, provenance)
+    committed = commit_output(status, uri=str(tmp_path / "result.parquet"), rows=4)
+
+    assert committed.sample_provenance is not None
+    assert committed.sample_provenance.strategy == "reservoir"
+    assert committed.sample_provenance.seed == 7
+    assert committed.sample_provenance.returned_rows == 4
 
 
 @pytest.mark.parametrize("surface", ["estimate", "start"])
@@ -693,6 +721,10 @@ def test_run_history_route_serializes_camel_case_snapshot_and_job_type(monkeypat
             "targetNodeId": "target",
             "rows": None,
             "outputs": [],
+            "profile": {
+                "columns": [], "rowCount": 3, "sampled": False,
+                "completeness": "complete", "notPreviewable": False, "error": False,
+            },
             "perNode": [{"node_id": "target", "status": "done", "rows": 3}],
         },
     ])
@@ -711,3 +743,4 @@ def test_run_history_route_serializes_camel_case_snapshot_and_job_type(monkeypat
     profile_record = response.json()[1]
     assert profile_record["jobType"] == "profile"
     assert profile_record["rows"] is None and profile_record["outputs"] == []
+    assert profile_record["profile"]["rowCount"] == 3

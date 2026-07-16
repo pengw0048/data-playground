@@ -209,6 +209,7 @@ export interface ProfileResult {
   rowCount: number
   sampled: boolean
   completeness: 'complete' | 'sample' | 'unknown'
+  sampleProvenance?: SampleProvenance | null
   notPreviewable: boolean
   error?: boolean
   reason?: string | null
@@ -270,6 +271,7 @@ export interface RunOutput {
   version?: string | null
   rows?: number | null
   error?: string | null
+  sampleProvenance?: SampleProvenance | null
 }
 
 export interface RunStatus {

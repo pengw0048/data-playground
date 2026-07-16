@@ -90,6 +90,11 @@ export async function exportNode(id: string) {
   const cols = res.columns.map((c) => c.name)
   download(`${name}-preview-sample.json`, JSON.stringify(res.rows, null, 2))
   download(`${name}-preview-sample.csv`, toCsv(cols, res.rows), 'text/csv')
+  if (res.sampleProvenance) {
+    download(`${name}-preview-sample.provenance.json`, JSON.stringify({
+      sampleProvenance: res.sampleProvenance,
+    }, null, 2))
+  }
   useStore.getState().pushToast(
     `Exported preview sample — ${res.rows.length} rows as JSON + CSV. This is not the full result.`,
     'info',

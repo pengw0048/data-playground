@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from hub import graph as g
-from hub.models import CompilePlan, Graph, RunOutput, RunStatus
+from hub.models import CompilePlan, Graph, RunOutput, RunStatus, SampleProvenance
 
 
 class UnsupportedRunOutputs(ValueError):
@@ -77,11 +77,13 @@ def require_single_run_output(
 
 
 def initialize_run_outputs(
-        status: RunStatus, graph: Graph, node_id: str | None, node_specs: dict) -> None:
+        status: RunStatus, graph: Graph, node_id: str | None, node_specs: dict,
+        sample_provenance: SampleProvenance | None = None) -> None:
     if status.job_type == "profile":
         status.outputs = []
         return
-    status.outputs = (expected_run_outputs(graph, node_id, node_specs)
+    status.outputs = ([output.model_copy(update={"sample_provenance": sample_provenance})
+                       for output in expected_run_outputs(graph, node_id, node_specs)]
                       if node_id is not None else [])
 
 
@@ -111,6 +113,8 @@ def committed_output_snapshot(
         version: str | None = None, port_id: str | None = None) -> RunOutput:
     """Build and validate a committed snapshot without making it public."""
     _index, expected = _selected_output(status, port_id)
+    provenance = (expected.sample_provenance.model_copy(update={"returned_rows": rows})
+                  if expected.sample_provenance is not None else None)
     return RunOutput(
         node_id=expected.node_id,
         port_id=expected.port_id,
@@ -122,6 +126,7 @@ def committed_output_snapshot(
         table=table,
         version=version,
         rows=rows,
+        sample_provenance=provenance,
     )
 
 
@@ -157,6 +162,7 @@ def settle_output(
         publication_kind=output.publication_kind,
         outcome=outcome,
         error=_bounded_output_error(error),
+        sample_provenance=output.sample_provenance,
     )
 
 
@@ -178,6 +184,7 @@ def settle_uncommitted_outputs(
             publication_kind=output.publication_kind,
             outcome=outcome,
             error=_bounded_output_error(error),
+            sample_provenance=output.sample_provenance,
         ))
     status.outputs = settled
 

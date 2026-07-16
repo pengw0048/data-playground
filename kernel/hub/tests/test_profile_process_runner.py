@@ -469,6 +469,11 @@ json.dump(payload, open(tmp, "w")); os.replace(tmp, job["statusFile"])
             ))
         assert records == 1
         assert record is not None and record.status == mode
+        if mode == "done":
+            assert record.profile is not None
+            assert json.loads(record.profile)["row_count"] == 3
+        else:
+            assert record.profile is None
         assert drain_sinks()
         assert len(telemetry) == 1 and telemetry[0]["status"] == mode
         assert final.status == mode
