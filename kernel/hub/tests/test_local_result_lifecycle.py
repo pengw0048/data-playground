@@ -1235,12 +1235,15 @@ def test_section_runtime_cannot_override_lifecycle_owner_fields(
 
 def test_subprocess_terminal_owner_rejection_aborts_result_without_failed_reemit(
         storage, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     from hub.models import Graph, GraphNode, RunOutput, RunStatus
     from hub.subprocess_runner import SubprocessRunner
 
     run_id = f"run-{uuid.uuid4().hex}"
     uri = storage.begin_result(f"plan-{uuid.uuid4().hex}", run_id)
-    pathlib.Path(uri).write_bytes(b"child-result")
+    pq.write_table(pa.table({"value": [1]}), uri)
     job_dir = tmp_path / "terminal-rejection"
     job_dir.mkdir()
     status_file = job_dir / "status.json"
@@ -1279,7 +1282,7 @@ def test_subprocess_terminal_owner_rejection_aborts_result_without_failed_reemit
     runner._emit(graph, runner.runs[run_id])
     runner.on_status = reject_done
     runner._local_results[run_id] = {
-        "uri": uri,
+        "results": [{"nodeId": "target", "portId": "out", "uri": uri}],
         "cache_key": None,
         "run_state_owner": True,
     }

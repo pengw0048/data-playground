@@ -28,6 +28,7 @@ from hub.plugins.runner import _CONFIRM_ROWS, _MAX_RUNS, _persist_local_result_d
 from hub.process_scope import OwnedProcessScope, owned_process_popen_kwargs
 from hub.run_outputs import (
     discard_unpublished_outputs,
+    expected_run_outputs,
     outputs_cache_document,
     preflight_output_table,
     preflight_run_output_target,
@@ -65,6 +66,39 @@ def _safe_abandon_attempt(uri: str, *, context: str) -> None:
         return  # metadata uncertainty: retaining data is safer than deleting an owned object
     if not abandoned:
         discard_attempt(uri)
+
+
+def _abort_local_results(storage, owned: dict, run_id: str, *, context: str) -> None:
+    """Abort every parent reservation only after its child writer has been fenced."""
+    for item in owned.get("results", []):
+        try:
+            storage.abort_result(item["uri"], run_id)
+        except Exception:  # exact row remains for bounded startup/background reconciliation
+            logging.getLogger("hub").exception("%s cleanup failed", context)
+
+
+def _release_local_results(storage, owned: dict, run_id: str, uris: set[str]) -> None:
+    """Release only the writer locks whose URI is durably owned by the terminal status."""
+    for item in owned.get("results", []):
+        if item["uri"] not in uris:
+            continue
+        try:
+            storage.release_result(item["uri"], run_id)
+        except Exception:  # durable ownership exists; maintenance may retry the exact release
+            logging.getLogger("hub").exception("parent local-result writer release failed")
+
+
+def _local_result_row_count(uri: str) -> int:
+    """Read the written local artifact after reap; a child-reported count is not a receipt."""
+    import duckdb
+
+    path = uri[len("file://"):] if uri.startswith("file://") else uri
+    connection = duckdb.connect(":memory:")
+    try:
+        return int(connection.execute(
+            "SELECT count(*) FROM read_parquet(?)", [path]).fetchone()[0])
+    finally:
+        connection.close()
 
 
 class SubprocessRunner:
@@ -175,11 +209,8 @@ class SubprocessRunner:
                     owned["uri"], context="parent object-result shutdown")
             local_owned = self._local_results.get(run_id)
             if local_owned is not None:
-                try:
-                    self.storage.abort_result(local_owned["uri"], run_id)
-                except Exception:  # retain exact metadata for the bounded startup reaper
-                    logging.getLogger("hub").exception(
-                        "parent local-result shutdown cleanup failed")
+                _abort_local_results(
+                    self.storage, local_owned, run_id, context="parent local-result shutdown")
             self._discard_object_sinks(self._object_sinks.get(run_id, {}))
             self._sink_contracts.pop(run_id, None)
             self._release_source_leases(run_id)
@@ -437,8 +468,8 @@ class SubprocessRunner:
             placement: Placement, run_id: str | None = None,
             request_id: str | None = None, attempt_id: str | None = None) -> RunStatus:
         output_target = preflight_run_output_target(plan, target_node_id)
-        expected_output = (require_single_run_output(graph, output_target, self.node_specs)
-                           if output_target is not None else None)
+        expected_outputs = (expected_run_outputs(graph, output_target, self.node_specs)
+                            if output_target is not None else [])
         from hub.backends import require_destination_credential_support
         require_destination_credential_support(self, plan, graph, self.workspace)
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
@@ -446,7 +477,7 @@ class SubprocessRunner:
         _ = attempt_id  # OPS-01 port parity; managed publication stamps attempts itself
         status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=per,
                            target_node_id=output_target, request_id=request_id,
-                           outputs=[expected_output] if expected_output is not None else [])
+                           outputs=expected_outputs)
         job_extra: dict = {"runId": run_id}
         try:
             source_leases = self._claim_source_leases(graph, target_node_id, run_id)
@@ -477,25 +508,41 @@ class SubprocessRunner:
                         cacheable = plan_cacheable(graph, target_node_id, self.node_builders)
                     else:
                         phash, cacheable = run_id, False
-                    result_uri = begin_local(phash, run_id)
+                    reservations = []
                     self._local_results[run_id] = {
-                        "uri": result_uri, "cache_key": phash if cacheable else None,
+                        "results": reservations, "cache_key": phash if cacheable else None,
                         "run_state_owner": True,
                     }
-                    job_extra["forcedResultUri"] = result_uri
+                    for index, output in enumerate(expected_outputs):
+                        result_uri = begin_local(
+                            f"{phash}:{output.node_id}:{output.port_id}:{index}", run_id)
+                        reservation = {
+                            "nodeId": output.node_id,
+                            "portId": output.port_id,
+                            "uri": result_uri,
+                        }
+                        reservations.append(reservation)
+                        lock_fd = self.storage.result_lock_fd(result_uri, run_id)
+                        reservation.update({
+                            "lockFd": lock_fd,
+                            "lockToken": (
+                                self.storage._read_lock_token(lock_fd)
+                                if lock_fd is not None else None),
+                        })
+                    job_extra["forcedResults"] = reservations
                     identity = self.storage.result_namespace_identity()
                     job_extra["resultNamespaceId"] = self.storage.namespace_id
                     job_extra["resultNamespaceIdentity"] = list(identity)
-                    lock_fd = self.storage.result_lock_fd(result_uri, run_id)
-                    if lock_fd is not None:
-                        job_extra["resultLockFd"] = lock_fd
-                        job_extra["resultLockToken"] = self.storage._read_lock_token(lock_fd)
                 else:
                     logical_uri = self.storage.output_uri(
                         f"__result_{run_id}", ".parquet")
                     from hub.plugins.adapters import is_object_uri
                     if not is_object_uri(logical_uri):
-                        return self._spawn(status, job_extra, graph, target_node_id)
+                        raise RuntimeError(
+                            "isolated named outputs require local managed result storage")
+                    if len(expected_outputs) != 1:
+                        raise RuntimeError(
+                            "object-backed isolated results do not support named multi-output runs")
                     if self.resolve_adapter is None:
                         raise RuntimeError(
                             "object-backed subprocess results require a parent adapter resolver")
@@ -517,7 +564,12 @@ class SubprocessRunner:
                         "uri": handle["uri"], "cache_key": phash if cacheable else None,
                         "run_state_owner": True,
                     }
-                    job_extra["forcedResultUri"] = handle["uri"]
+                    output = expected_outputs[0]
+                    job_extra["forcedResults"] = [{
+                        "nodeId": output.node_id,
+                        "portId": output.port_id,
+                        "uri": handle["uri"],
+                    }]
             return self._spawn(status, job_extra, graph, target_node_id)
         except Exception as exc:
             if isinstance(exc, _SpawnSetupError) and not exc.reaped:
@@ -528,11 +580,8 @@ class SubprocessRunner:
                     owned["uri"], context="parent object-result pre-dispatch")
             local_owned = self._local_results.pop(run_id, None)
             if local_owned is not None:
-                try:
-                    self.storage.abort_result(local_owned["uri"], run_id)
-                except Exception:  # retain the fenced row for startup reconciliation
-                    logging.getLogger("hub").exception(
-                        "parent local-result pre-dispatch cleanup failed")
+                _abort_local_results(
+                    self.storage, local_owned, run_id, context="parent local-result pre-dispatch")
             self._discard_object_sinks(self._object_sinks.pop(run_id, {}))
             self._sink_contracts.pop(run_id, None)
             self._release_source_leases(run_id)
@@ -618,9 +667,10 @@ class SubprocessRunner:
                 for contract in (job_extra.get("managedLocalSources") or {}).values()
                 if contract.get("lockFd") is not None
             ]
-            result_lock_fd = job_extra.get("resultLockFd")
-            if result_lock_fd is not None:
-                inherited_fds.append(int(result_lock_fd))
+            inherited_fds.extend(
+                int(item["lockFd"])
+                for item in (job_extra.get("forcedResults") or [])
+                if item.get("lockFd") is not None)
             if inherited_fds:
                 popen_kwargs["pass_fds"] = tuple(sorted(set(inherited_fds)))
             proc = self._spawn_process(
@@ -745,76 +795,41 @@ class SubprocessRunner:
         if not current.outputs and current.target_node_id is None:
             observed.outputs = []
             return observed
-        expected = sole_output(current)
-        actual = sole_output(observed)
-        if expected is None:
-            raise ValueError("subprocess status does not contain the expected output")
-        if actual is None:
-            if observed.status == "done":
-                raise ValueError("a completed subprocess did not return its expected output")
-            outcome = (observed.status if observed.status in ("failed", "cancelled")
-                       else "pending")
-            observed.outputs = [RunOutput(
-                node_id=expected.node_id,
-                port_id=expected.port_id,
-                port_label=expected.port_label,
-                wire=expected.wire,
-                publication_kind=expected.publication_kind,
-                outcome=outcome,
-                error=observed.error if outcome != "pending" else None,
-            )]
-            if outcome == "pending":
-                observed.total_rows = None
-            return observed
-        expected_identity = (
-            expected.node_id, expected.port_id, expected.port_label,
-            expected.wire, expected.publication_kind,
-        )
-        actual_identity = (
-            actual.node_id, actual.port_id, actual.port_label,
-            actual.wire, actual.publication_kind,
-        )
-        if actual_identity != expected_identity:
+        expected = current.outputs
+        if not expected:
+            raise ValueError("subprocess status does not contain the expected output set")
+        expected_identities = [
+            (output.node_id, output.port_id, output.port_label, output.wire,
+             output.publication_kind)
+            for output in expected]
+        actual_identities = [
+            (output.node_id, output.port_id, output.port_label, output.wire,
+             output.publication_kind)
+            for output in observed.outputs]
+        if observed.status in ("done", "failed", "cancelled") \
+                and actual_identities != expected_identities:
             raise ValueError("subprocess status output declaration does not match its parent")
         if observed.status not in ("done", "failed", "cancelled"):
             observed.outputs = [RunOutput(
-                node_id=expected.node_id,
-                port_id=expected.port_id,
-                port_label=expected.port_label,
-                wire=expected.wire,
-                publication_kind=expected.publication_kind,
-                outcome="pending",
-            )]
+                node_id=output.node_id, port_id=output.port_id,
+                port_label=output.port_label, wire=output.wire,
+                publication_kind=output.publication_kind, outcome="pending")
+                for output in expected]
             observed.total_rows = None
             return observed
-        if observed.status in ("failed", "cancelled"):
-            # A child cannot publish a committed identity through a negative terminal receipt. The
-            # parent owns every publication decision after reaping and settles this declaration only.
+        if observed.status == "done" and any(
+                output.outcome != "committed" for output in observed.outputs):
+            raise ValueError("a completed subprocess did not commit every expected output")
+        if observed.status == "cancelled":
+            # Cancellation wins over a child-local success report; the parent aborts every reservation
+            # after reap and no URI may become externally visible.
             observed.outputs = [RunOutput(
-                node_id=expected.node_id,
-                port_id=expected.port_id,
-                port_label=expected.port_label,
-                wire=expected.wire,
-                publication_kind=expected.publication_kind,
-                outcome=observed.status,
-                error=observed.error,
-            )]
+                node_id=output.node_id, port_id=output.port_id,
+                port_label=output.port_label, wire=output.wire,
+                publication_kind=output.publication_kind, outcome="cancelled")
+                for output in expected]
+        if observed.status in ("failed", "cancelled"):
             observed.total_rows = None
-            return observed
-        if observed.status == "done" and actual.outcome != "committed":
-            raise ValueError("a completed subprocess did not commit its expected output")
-        observed.outputs = [RunOutput(
-            node_id=expected.node_id,
-            port_id=expected.port_id,
-            port_label=expected.port_label,
-            wire=expected.wire,
-            publication_kind=expected.publication_kind,
-            outcome=actual.outcome,
-            uri=actual.uri,
-            table=actual.table,
-            rows=actual.rows,
-            error=actual.error,
-        )]
         return observed
 
     def _heartbeat_interval_s(self) -> float | None:
@@ -896,11 +911,9 @@ class SubprocessRunner:
                             owned_result["uri"], context="parent object-result supervisor")
                     local_result = self._local_results.get(run_id)
                     if local_result is not None:
-                        try:
-                            self.storage.abort_result(local_result["uri"], run_id)
-                        except Exception:  # exact row remains for the bounded reaper
-                            logging.getLogger("hub").exception(
-                                "parent local-result supervisor cleanup failed")
+                        _abort_local_results(
+                            self.storage, local_result, run_id,
+                            context="parent local-result supervisor")
                     self._discard_object_sinks(self._object_sinks.get(run_id, {}))
                     self._release_source_leases(run_id)
                 else:
@@ -1085,37 +1098,67 @@ class SubprocessRunner:
                 discard_unpublished_outputs(st, st.status, st.error)
                 st.total_rows = None
         local_result = self._local_results.get(run_id)
-        local_result_committed = False
+        local_result_committed: set[str] = set()
         if local_result is not None and st is not None:
-            result_uri = local_result["uri"]
             cancelled = run_id in self._cancelled
-            child_output = sole_output(st, committed=True)
+            reservations = local_result["results"]
+            child_outputs = st.outputs
+            committed_count = 0
             valid_child_commit = (
-                not cancelled and st.status == "done" and proc.returncode == 0
-                and child_output is not None and child_output.uri == result_uri)
+                not cancelled and proc.returncode == 0
+                and st.status in ("done", "failed")
+                and len(child_outputs) == len(reservations)
+                and all(
+                    output.node_id == reservation["nodeId"]
+                    and output.port_id == reservation["portId"]
+                    and (output.outcome != "committed" or output.uri == reservation["uri"])
+                    for output, reservation in zip(child_outputs, reservations)))
+            if valid_child_commit:
+                while (committed_count < len(child_outputs)
+                       and child_outputs[committed_count].outcome == "committed"):
+                    committed_count += 1
+                valid_child_commit = (
+                    all(output.outcome != "committed"
+                        for output in child_outputs[committed_count:])
+                    and (st.status != "done" or committed_count == len(child_outputs)))
             if valid_child_commit:
                 try:
-                    # wait() above is writer terminal proof; only the durable parent may now mark ready.
-                    self.storage.commit_result(result_uri, run_id)
-                    local_result_committed = True
+                    # The child is reaped. Commit the exact declaration-ordered prefix and abort every
+                    # reservation it did not truthfully publish.
+                    for reservation, output in zip(
+                            reservations[:committed_count], child_outputs[:committed_count]):
+                        if _local_result_row_count(reservation["uri"]) != output.rows:
+                            raise RuntimeError(
+                                "child local-result row count does not match its artifact")
+                        self.storage.commit_result(reservation["uri"], run_id)
+                        local_result_committed.add(reservation["uri"])
+                    for reservation in reservations[committed_count:]:
+                        self.storage.abort_result(reservation["uri"], run_id)
                 except Exception:  # publication cannot continue without the exact ready transition
                     logging.getLogger("hub").exception(
                         "parent local-result commit failed")
-                    try:
-                        self.storage.abort_result(result_uri, run_id)
-                    except Exception:
-                        logging.getLogger("hub").exception(
-                            "parent local-result commit cleanup failed")
+                    for reservation in reservations:
+                        if reservation["uri"] in local_result_committed:
+                            continue
+                        try:
+                            self.storage.abort_result(reservation["uri"], run_id)
+                        except Exception:
+                            logging.getLogger("hub").exception(
+                                "parent local-result commit cleanup failed")
                     st.status = "failed"
                     st.error = "parent local-result commit failed"
+                    preserved = {
+                        output.port_id: output for output in st.outputs
+                        if output.outcome == "committed" and output.uri in local_result_committed}
                     discard_unpublished_outputs(st, "failed", st.error)
+                    for index, output in enumerate(st.outputs):
+                        if output.port_id in preserved:
+                            st.outputs[index] = preserved[output.port_id]
                     st.total_rows = None
             else:
-                try:
-                    self.storage.abort_result(result_uri, run_id)
-                except Exception:  # exact row is retained for bounded startup/background recovery
-                    logging.getLogger("hub").exception(
-                        "parent local-result terminal cleanup failed")
+                _abort_local_results(
+                    self.storage, local_result, run_id,
+                    context="parent local-result terminal")
                 if cancelled:
                     st.status = "cancelled"
                 elif st.status == "done":
@@ -1203,9 +1246,10 @@ class SubprocessRunner:
                     settle_uncommitted_outputs(st, st.status, st.error)
                 committed_output = sole_output(st, committed=True)
                 if st.status == "done" and st.target_node_id is not None \
-                        and committed_output is None:
+                        and (not st.outputs or any(
+                            output.outcome != "committed" for output in st.outputs)):
                     st.status = "failed"
-                    st.error = "subprocess completed without its expected output"
+                    st.error = "subprocess completed without every expected output"
                     discard_unpublished_outputs(st, "failed", st.error)
                     committed_output = None
                 st.total_rows = committed_output.rows if committed_output is not None else None
@@ -1213,7 +1257,8 @@ class SubprocessRunner:
             primary_result = local_result or owned_result
             run_state_owner = bool(
                 primary_result is not None and primary_result.get("run_state_owner", True))
-            if run_state_owner and st.status == "done":
+            if run_state_owner and (
+                    st.status == "done" or (local_result is not None and local_result_committed)):
                 # This strict parent RunState transaction establishes the primary durable owner.
                 # History and cache remain secondary after this point.
                 if local_result is not None:
@@ -1240,7 +1285,7 @@ class SubprocessRunner:
                         _persist_local_result_done(
                             lambda: self._emit(graph, persisted_done, strict=True),
                             lambda: self.storage.result_publication_receipt(
-                                local_result["uri"], run_id, persisted_doc),
+                                local_result_committed, run_id, persisted_doc),
                             on_retry=publication_retry,
                             wait=self.publication_retry_wait)
                     except Exception as exc:  # definitive owner deletion is not commit-unknown
@@ -1248,11 +1293,9 @@ class SubprocessRunner:
                         if not isinstance(exc, RunStatePublicationRejected):
                             raise
                         terminal_rejected = True
-                        try:
-                            self.storage.abort_result(local_result["uri"], run_id)
-                        except Exception:  # bounded maintenance retains an unknown abort fence
-                            logging.getLogger("hub").exception(
-                                "parent local-result abort failed after publication rejection")
+                        _abort_local_results(
+                            self.storage, local_result, run_id,
+                            context="parent local-result publication rejection")
                         st.status = "failed"
                         st.error = str(exc)
                         discard_unpublished_outputs(st, "failed", st.error)
@@ -1297,11 +1340,8 @@ class SubprocessRunner:
                 # be incorrect. The process-local owner still publishes its sanitized failure snapshot.
                 self._publish_status_snapshot(st)
             if terminal_persisted and local_result is not None and local_result_committed:
-                try:
-                    self.storage.release_result(local_result["uri"], run_id)
-                except Exception:  # the durable owner exists; retaining the fd only delays GC
-                    logging.getLogger("hub").exception(
-                        "parent local-result writer release failed")
+                _release_local_results(
+                    self.storage, local_result, run_id, local_result_committed)
             with self._lock:
                 self.runs[run_id] = st
         shutil.rmtree(job_dir, ignore_errors=True)

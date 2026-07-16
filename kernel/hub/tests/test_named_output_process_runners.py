@@ -114,21 +114,88 @@ def _publish_initial_status(runner, graph: Graph, status: RunStatus) -> None:
     runner._emit(graph, status)
 
 
-def test_subprocess_run_rejects_multi_output_before_any_claim_or_dispatch(
+def test_subprocess_run_accepts_multi_output_before_claim_and_dispatch(
         tmp_path, monkeypatch):
     runner = _runner(tmp_path)
     graph = Graph(id="g", nodes=[_node("check", "assert")], edges=[])
     calls: list[str] = []
-    monkeypatch.setattr(runner, "_claim_source_leases", lambda *_a: calls.append("source"))
-    monkeypatch.setattr(runner, "_claim_sink_contracts", lambda *_a: calls.append("sink"))
+    monkeypatch.setattr(
+        runner, "_claim_source_leases",
+        lambda *_a: calls.append("source") or {
+            "stack": SimpleNamespace(close=lambda: None), "guards": [],
+            "attempts": {}, "local_sources": {}})
+    monkeypatch.setattr(
+        runner, "_claim_sink_contracts",
+        lambda *_a: calls.append("sink") or ({}, {}, {}))
     monkeypatch.setattr(runner, "_spawn", lambda *_a: calls.append("spawn"))
     runner.on_status = lambda *_a: calls.append("emit")
 
-    with pytest.raises(ValueError, match="does not yet support multi-output"):
-        runner.run(_plan(("check", "assert"), target="check"), graph, "check", "local")
+    runner.run(_plan(("check", "assert"), target="check"), graph, "check", "local")
+
+    assert calls == ["source", "sink", "spawn"]
+    assert runner.runs == {}
+
+
+def test_subprocess_multi_output_preallocation_failure_aborts_owned_prefix(
+        tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    graph = Graph(id="g", nodes=[
+        _node("branches", "section", {"outputs": ["first", "second"]}),
+    ], edges=[])
+    allocated: list[str] = []
+    aborted: list[str] = []
+
+    def begin_result(_key, _run_id):
+        if allocated:
+            raise RuntimeError("second reservation rejected")
+        uri = str(tmp_path / "first.parquet")
+        allocated.append(uri)
+        return uri
+
+    runner.storage = SimpleNamespace(
+        begin_result=begin_result,
+        result_lock_fd=lambda *_a: None,
+        _read_lock_token=lambda *_a: None,
+        abort_result=lambda uri, _run_id: aborted.append(uri),
+    )
+    runner.on_status = lambda *_a: None
+    monkeypatch.setattr(
+        runner, "_claim_source_leases",
+        lambda *_a: {"stack": SimpleNamespace(close=lambda: None), "guards": [],
+                     "attempts": {}, "local_sources": {}})
+    monkeypatch.setattr(runner, "_claim_sink_contracts", lambda *_a: ({}, {}, {}))
+
+    with pytest.raises(RuntimeError, match="second reservation rejected"):
+        runner.run(
+            _plan(("branches", "section"), target="branches"),
+            graph, "branches", "local")
+
+    assert aborted == allocated
+    assert runner._local_results == {}
+
+
+def test_subprocess_object_backed_multi_output_remains_fail_closed(
+        tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    runner.storage = SimpleNamespace(
+        output_uri=lambda name, ext: f"s3://results/{name}{ext}")
+    graph = Graph(id="g", nodes=[
+        _node("branches", "section", {"outputs": ["first", "second"]}),
+    ], edges=[])
+    calls: list[str] = []
+    monkeypatch.setattr(
+        runner, "_claim_source_leases",
+        lambda *_a: {"stack": SimpleNamespace(close=lambda: None), "guards": [],
+                     "attempts": {}, "local_sources": {}})
+    monkeypatch.setattr(runner, "_claim_sink_contracts", lambda *_a: ({}, {}, {}))
+    monkeypatch.setattr(runner, "_spawn", lambda *_a: calls.append("spawn"))
+
+    with pytest.raises(RuntimeError, match="do not support named multi-output"):
+        runner.run(
+            _plan(("branches", "section"), target="branches"),
+            graph, "branches", "local")
 
     assert calls == []
-    assert runner.runs == {}
 
 
 def test_subprocess_run_unit_rejects_multi_output_before_plan_or_claim(
@@ -552,6 +619,15 @@ def test_run_returns_published_snapshot_when_worker_mutates_before_return(
     if kind == "local":
         returned = runner.run(plan, graph, "source", "local")
     elif kind == "subprocess":
+        runner.on_status = lambda *_a: None
+        runner.storage = SimpleNamespace(
+            begin_result=lambda *_a: uri,
+            result_lock_fd=lambda *_a: None,
+            _read_lock_token=lambda *_a: None,
+            result_namespace_identity=lambda: (1, 2),
+            namespace_id="test",
+            abort_result=lambda *_a: None,
+        )
         job_dir = tmp_path / "job"
         job_dir.mkdir()
         monkeypatch.setattr(
@@ -631,7 +707,7 @@ def test_child_cannot_change_parent_job_type_or_placement(tmp_path):
     ("failed", "child setup failed"),
     ("cancelled", None),
 ])
-def test_early_child_terminal_uses_parent_declaration_without_a_binding(
+def test_early_child_terminal_without_a_complete_contract_is_rejected(
         tmp_path, state, error):
     runner = _runner(tmp_path)
     graph = Graph(id="g", nodes=[_node("final", "source")], edges=[])
@@ -646,11 +722,7 @@ def test_early_child_terminal_uses_parent_declaration_without_a_binding(
 
     terminal = runner._read("run", str(status_file))
 
-    assert terminal is not None and terminal.status == state
-    assert terminal.target_node_id == "final"
-    assert terminal.outputs[0].outcome == state
-    assert terminal.outputs[0].uri is None
-    assert terminal.outputs[0].error == error
+    assert terminal is None
 
 
 @pytest.mark.parametrize("state", ["failed", "cancelled"])
@@ -670,8 +742,11 @@ def test_negative_child_receipt_cannot_publish_a_committed_output(tmp_path, stat
 
     assert fenced.status == state
     assert fenced.total_rows is None
-    assert fenced.outputs[0].outcome == state
-    assert fenced.outputs[0].uri is None
+    if state == "failed":
+        assert fenced.outputs == forged.outputs
+    else:
+        assert fenced.outputs[0].outcome == "cancelled"
+        assert fenced.outputs[0].uri is None
 
 
 def test_subprocess_local_full_result_commits_through_durable_named_output_receipt(
@@ -708,5 +783,103 @@ def test_subprocess_local_full_result_commits_through_durable_named_output_recei
         assert final.outputs[0].rows == 3
         durable = RunStatus.model_validate(metadb.get_run_state(status.run_id))
         assert durable.outputs[0].uri == final.outputs[0].uri
+    finally:
+        runner._terminate_all()
+
+
+def test_subprocess_local_multi_output_commits_in_declaration_order(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub import compiler, metadb
+
+    metadb.migrate_db()
+    source = tmp_path / "input.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), source)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = SubprocessRunner(
+        str(workspace), str(tmp_path / "data"), node_specs=NODE_SPECS,
+    )
+    runner.on_status = lambda _graph, status: metadb.save_run_state(
+        status.run_id, status.model_dump())
+    graph = Graph(**{"id": "multi-receipt", "nodes": [
+        {"id": "source", "type": "source", "data": {
+            "title": "source", "config": {"uri": str(source)}}},
+        {"id": "branches", "type": "section", "data": {"title": "branches", "config": {
+            "script": (
+                "emit('first', inputs['in'])\n"
+                "emit('second', inputs['in'])\n"),
+            "outputs": ["first", "second"], "params": {}, "maxRuns": 10}}},
+    ], "edges": [{"id": "source-to-branches", "source": "source", "target": "branches"}]})
+    status = runner.run(
+        compiler.compile_plan(graph, "branches"), graph, "branches", "local")
+    deadline = time.monotonic() + 15
+    try:
+        while (runner.status(status.run_id).status not in ("done", "failed", "cancelled")
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+        final = runner.status(status.run_id)
+        assert final.status == "done", final.error
+        assert [(output.port_id, output.outcome, output.rows) for output in final.outputs] == [
+            ("first", "committed", 3), ("second", "committed", 3)]
+        durable = RunStatus.model_validate(metadb.get_run_state(status.run_id))
+        assert [output.uri for output in durable.outputs] == [
+            output.uri for output in final.outputs]
+    finally:
+        runner._terminate_all()
+
+
+def test_subprocess_local_second_port_commit_failure_retains_first_publication(
+        tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub import compiler, metadb
+
+    metadb.migrate_db()
+    source = tmp_path / "input.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), source)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = SubprocessRunner(
+        str(workspace), str(tmp_path / "data"), node_specs=NODE_SPECS,
+    )
+    runner.on_status = lambda _graph, status: metadb.save_run_state(
+        status.run_id, status.model_dump())
+    graph = Graph(**{"id": "partial-receipt", "nodes": [
+        {"id": "source", "type": "source", "data": {
+            "title": "source", "config": {"uri": str(source)}}},
+        {"id": "branches", "type": "section", "data": {"title": "branches", "config": {
+            "script": (
+                "emit('first', inputs['in'])\n"
+                "emit('second', inputs['in'])\n"),
+            "outputs": ["first", "second"], "params": {}, "maxRuns": 10}}},
+    ], "edges": [{"id": "source-to-branches", "source": "source", "target": "branches"}]})
+    commit_result = runner.storage.commit_result
+    commits: list[str] = []
+
+    def fail_second_commit(uri, run_id):
+        commits.append(uri)
+        if len(commits) == 2:
+            raise RuntimeError("second port commit rejected")
+        return commit_result(uri, run_id)
+
+    monkeypatch.setattr(runner.storage, "commit_result", fail_second_commit)
+    status = runner.run(
+        compiler.compile_plan(graph, "branches"), graph, "branches", "local")
+    deadline = time.monotonic() + 15
+    try:
+        while (runner.status(status.run_id).status not in ("done", "failed", "cancelled")
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+        final = runner.status(status.run_id)
+        assert final.status == "failed", final.error
+        assert [(output.port_id, output.outcome, output.rows) for output in final.outputs] == [
+            ("first", "committed", 3), ("second", "failed", None)]
+        assert len(commits) == 2
+        durable = RunStatus.model_validate(metadb.get_run_state(status.run_id))
+        assert [(output.port_id, output.outcome) for output in durable.outputs] == [
+            ("first", "committed"), ("second", "failed")]
     finally:
         runner._terminate_all()

@@ -257,8 +257,7 @@ class LocalRunner:
     cancel_acknowledges_stop = True  # cancelled is set only after the adapter can no longer publish
 
     def supports_named_multi_output_runs(self) -> bool:
-        # The metadata-isolated child transport still receives one forced result URI until #265.
-        return self.forced_result_uri is None
+        return True
 
     @staticmethod
     def supports_selected_destination_credentials() -> bool:
@@ -280,7 +279,9 @@ class LocalRunner:
         self.result_get = None   # (key) -> {uri, table, rows} | None
         self.result_acquire = None  # (key, owner, ttl) -> (doc, temporary ownership pin)
         self.result_put = None   # (key, doc) -> None
-        self.forced_result_uri = None  # parent-owned exact attempt URI for metadata-isolated workers
+        # A metadata-isolated worker receives one declaration-ordered exact local URI per result port.
+        # ``None`` means this runner allocates its own results; an empty list is an invalid child contract.
+        self.forced_results: list[dict] | None = None
         self.forced_result_namespace_identity: tuple[int, int] | None = None
         # A metadata-isolated worker receives every logical sink target from its parent. Managed object
         # sinks additionally receive the exact parent-allocated physical attempt; the child may write that
@@ -448,12 +449,6 @@ class LocalRunner:
             if not unmanaged_publication_supported(self.catalog):
                 raise RuntimeError(
                     "local write sinks require catalog registration with read-back support")
-        # The isolated parent/child transport still carries one forced result until #265. Keep that
-        # boundary fail-closed before run-id creation or storage allocation while the in-process runner
-        # accepts the complete declared output collection.
-        if output_target is not None and self.forced_result_uri:
-            from hub.run_outputs import require_single_run_output
-            require_single_run_output(graph, output_target, self.node_specs)
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         # attempt_id is accepted for OPS-01 port parity (managed publication stamps its own attempts).
@@ -835,7 +830,7 @@ class LocalRunner:
                     for uri in result_uris)
                 status.total_rows = _single_committed_rows(result_binding)
                 if managed_result:
-                    if self.on_status is None and not self.forced_result_uri:
+                    if self.on_status is None and self.forced_results is None:
                         raise RuntimeError(
                             "managed full results require authoritative RunState persistence")
                     if not publication_gate.begin_publication():
@@ -861,7 +856,7 @@ class LocalRunner:
                             status.stalled = True
                             status.error = "terminal publication is retrying"
 
-                    if self.forced_result_uri and self.on_status is None:
+                    if self.forced_results is not None and self.on_status is None:
                         # The isolated child writes a parent-owned exact URI. Its parent establishes the
                         # authoritative terminal owner after validating the child result document.
                         self._emit(graph, persisted, strict=True)
@@ -1013,7 +1008,7 @@ class LocalRunner:
                                 item.status = "cancelled"
                         managed_partial = False
                 if managed_partial and not terminal_rejected:
-                    if self.on_status is None and not self.forced_result_uri:
+                    if self.on_status is None and self.forced_results is None:
                         raise RuntimeError(
                             "managed partial results require authoritative RunState persistence")
                     persisted = status.model_copy(deep=True)
@@ -1035,7 +1030,7 @@ class LocalRunner:
                         return metadb.get_run_state(run_id) == persisted_doc
 
                     try:
-                        if self.forced_result_uri and self.on_status is None:
+                        if self.forced_results is not None and self.on_status is None:
                             self._emit(graph, persisted, strict=True)
                         else:
                             _persist_local_result_done(
@@ -1119,7 +1114,7 @@ class LocalRunner:
         the candidate, that port fails, and later ports are explicitly skipped.
         """
         cached_outputs = committed_document_outputs(cached)
-        if (not self.forced_result_uri and cached_outputs
+        if (self.forced_results is None and cached_outputs
                 and apply_cached_outputs(status, cached) is not None):
             return int(cached_outputs[0].rows or 0) if len(cached_outputs) == 1 else 0
 
@@ -1151,9 +1146,7 @@ class LocalRunner:
             self, node_id: str, port_id: str, rel, status: RunStatus,
             phash: str, slot: int, cancel: _CancelToken) -> tuple[str, int]:
         """Write one declared port to a fresh durable result without publishing its RunOutput."""
-        forced_uri = self.forced_result_uri
-        if forced_uri and len(status.outputs) != 1:
-            raise RuntimeError("the isolated result transport accepts exactly one output")
+        forced_uri = self._forced_result_uri(node_id, port_id, status)
         from hub.plugins.adapters import is_object_uri
         begin_local = getattr(self.storage, "begin_result", None)
         managed_local = getattr(self.storage, "requires_result_read", None)
@@ -1181,8 +1174,8 @@ class LocalRunner:
         committed_output_snapshot(
             status, port_id=port_id, uri=uri, rows=0)
         if is_object_uri(logical_uri):
-            from hub.handoff import (allocate_attempt, is_attempt_uri, physical_attempt_uri,
-                                     write_manifest)
+            from hub.handoff import (
+                allocate_attempt, is_attempt_uri, physical_attempt_uri, write_manifest)
             parent_owned = bool(forced_uri)
             if parent_owned:
                 if not is_attempt_uri(logical_uri):
@@ -1251,6 +1244,30 @@ class LocalRunner:
             res = self._adapter_write(self.resolve_adapter(uri), uri, rel, "overwrite", cancel)
         rows = int(res.get("rows") or 0)
         return str(res.get("uri", uri)), rows
+
+    def _forced_result_uri(
+            self, node_id: str, port_id: str, status: RunStatus) -> str | None:
+        """Return the one parent-reserved URI bound to this exact declared output."""
+        if self.forced_results is None:
+            return None
+        expected = [(output.node_id, output.port_id) for output in status.outputs]
+        actual: list[tuple[str, str]] = []
+        uris: dict[tuple[str, str], str] = {}
+        for item in self.forced_results:
+            if not isinstance(item, dict):
+                raise RuntimeError("isolated forced result contract is malformed")
+            result_node = item.get("nodeId")
+            result_port = item.get("portId")
+            uri = item.get("uri")
+            if (not isinstance(result_node, str) or not isinstance(result_port, str)
+                    or not isinstance(uri, str) or not uri):
+                raise RuntimeError("isolated forced result contract is malformed")
+            key = (result_node, result_port)
+            actual.append(key)
+            uris[key] = uri
+        if actual != expected or len(uris) != len(actual):
+            raise RuntimeError("isolated forced result contract does not match declared outputs")
+        return uris.get((node_id, port_id))
 
     def _check_assert(self, node, engine: BuildEngine) -> int:
         """A data-quality gate: the node's relation is the VIOLATING rows (predicate not TRUE). Count them;
