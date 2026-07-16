@@ -10,6 +10,7 @@ becomes a matter of *which backend*, not a core rewrite.
 
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -309,6 +310,14 @@ class DatasetPreviewAdapter(Protocol):
 
     def preview_scan(self, uri: str, columns: "list[str] | None" = None,
                      limit: int = 2000, options: "dict | None" = None) -> Relation: ...
+
+
+@runtime_checkable
+class DatasetRevisionAdapter(Protocol):
+    """Optional exact-revision capability; all provider IDs and cursors stay opaque to callers."""
+    def revision_history(self, uri: str, *, limit: int, cursor: str | None = None) -> tuple[list[dict], str | None]: ...
+    def resolve_revision(self, uri: str, *, as_of: "datetime.datetime | None" = None) -> dict: ...
+    def open_revision(self, uri: str, revision_id: str) -> Relation: ...
 
 
 @runtime_checkable

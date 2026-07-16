@@ -10,6 +10,7 @@ carries its schema so wires are schema-aware.
 
 from __future__ import annotations
 
+import datetime
 import glob
 import hashlib
 import os
@@ -30,6 +31,10 @@ CancelCheck = Callable[[], bool]
 
 class BoundedPreviewUnsupported(RuntimeError):
     """The adapter cannot prove that this URI can be read within the interactive preview budget."""
+
+
+class RevisionUnavailable(RuntimeError):
+    """An exact provider-native revision cannot be opened; callers must never fall back to head."""
 
 
 def _raise_if_cancelled(cancelled: CancelCheck | None) -> None:
@@ -776,14 +781,14 @@ class LanceAdapter:
     def matches(self, uri: str) -> bool:
         return _read_uri(uri).lower().rstrip("/").endswith(".lance")
 
-    def _dataset(self, uri: str):
+    def _dataset(self, uri: str, **kwargs):
         try:
             import lance  # lazy — only if the optional `lance` extra is installed
         except ModuleNotFoundError as e:  # a clear remediation, not a raw "No module named 'lance'"
             raise ModuleNotFoundError("Lance support is not installed — run: uv pip install -e 'kernel[lance]'") from e
         normalized = _read_uri(uri)
         local = paths.checked_local_path(normalized)
-        return lance.dataset(local if local is not None else normalized)
+        return lance.dataset(local if local is not None else normalized, **kwargs)
 
     def scan(self, uri: str, columns: list[str] | None = None,
              predicate: str | None = None, limit: int | None = None,
@@ -852,6 +857,59 @@ class LanceAdapter:
             return f"lance-v{self._dataset(uri).version}"
         except Exception:  # noqa: BLE001
             return _fingerprint_path(_read_uri(uri))
+
+    @staticmethod
+    def _revision_id(value) -> str:
+        try:
+            version = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+        if version < 1 or str(version) != str(value):
+            raise RevisionUnavailable("revision_unavailable")
+        return str(version)
+
+    def revision_history(self, uri: str, *, limit: int, cursor: str | None = None) -> tuple[list[dict], str | None]:
+        """Return a bounded newest-first native page; the cursor is the last native version seen."""
+        try:
+            bounded = max(1, min(int(limit), 100))
+            before = int(self._revision_id(cursor)) if cursor is not None else None
+            rows = []
+            for entry in reversed(self._dataset(uri).versions()):
+                revision_id = self._revision_id(entry.get("version"))
+                if before is not None and int(revision_id) >= before:
+                    continue
+                rows.append({"revision_id": revision_id, "committed_at": entry.get("timestamp")})
+                if len(rows) == bounded + 1:
+                    break
+            has_more = len(rows) > bounded
+            items = rows[:bounded]
+            return items, (items[-1]["revision_id"] if has_more and items else None)
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
+    def resolve_revision(self, uri: str, *, as_of: datetime.datetime | None = None) -> dict:
+        try:
+            if as_of is None:
+                dataset = self._dataset(uri)
+            else:
+                dataset = self._dataset(uri, asof=as_of)
+            return {"revision_id": self._revision_id(dataset.version), "committed_at": None}
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
+    def open_revision(self, uri: str, revision_id: str) -> Relation:
+        try:
+            dataset = self._dataset(uri, version=int(self._revision_id(revision_id)))
+            dataset.schema  # Lance can defer a missing-version error until the first metadata access.
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+        return db.conn().from_arrow(dataset.scanner().to_reader())
 
     def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None,
               cancelled: CancelCheck | None = None) -> dict:

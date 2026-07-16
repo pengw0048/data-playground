@@ -61,6 +61,13 @@ Key endpoints under `/api`:
   `publicationKey` groups every source fact created by one output publication. The route rejects a
   provider page that exceeds `limit`, returns IDs at or before `afterId`, is not strictly increasing,
   or advertises a continuation that does not advance to the last returned ID.
+- `GET /catalog/tables/{id}/revisions?limit&cursor` — bounded newest-first native revision history
+  for adapters that support it. `datasetId`, `revisionId`, and the cursor are opaque; retention remains
+  provider-owned.
+- `GET /catalog/tables/{id}/revisions/resolve?asOf=` — resolves latest or an RFC 3339 instant to one
+  immutable native version. `GET /catalog/revisions/{datasetId}/{revisionId}` verifies that persisted
+  registration/version binding exactly. Missing, compacted, unregistered, or unsupported revisions
+  return a stable unavailable result and never fall back to current head.
 - `POST /data/sample` — bounded dataset rows plus explicit `completeness`, `rowLimit`,
   `limitReason`, and `limitScope` metadata. `limitScope=result-window` identifies the 2,000-row
   interactive artifact window; graph previews use `each-source` instead because their source budget
