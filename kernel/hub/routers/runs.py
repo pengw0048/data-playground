@@ -21,7 +21,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-from hub import auth, compiler, db, destinations, metadb, placement
+from hub import auth, compiler, destinations, metadb, placement
 from hub import graph as graph_mod
 from hub.agent import AgentCredentialError, agent_credential_error_status, agent_status, run_agent
 from hub.api_errors import APIError, APIErrorCode
