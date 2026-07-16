@@ -30,7 +30,7 @@ register(
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset'] }],
     outputs: [{ id: 'out', wire: 'sample' }],
     canBypass: true,
-    blurb: 'take K rows into a session sample',
+    blurb: 'deterministic seeded reservoir sample',
     defaultData: () => ({ title: 'sample', status: 'draft', config: { n: 1000, seed: 42 }, meta: '1,000 rows · seed 42' }),
   },
   Sample,

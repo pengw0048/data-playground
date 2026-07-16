@@ -197,6 +197,25 @@ describe('CatalogView request and mutation truth', () => {
     expect(screen.getAllByRole('cell')).toHaveLength(50)
   })
 
+  it('labels a catalog prefix preview as non-random and exposes its input revision', async () => {
+    mocks.sample.mockResolvedValue({
+      columns: TABLE.columns, rows: [{ order_id: 1 }], rowCount: 2,
+      hasMore: true, truncated: true, completeness: 'page', notPreviewable: false, wire: 'dataset',
+      sampleProvenance: {
+        strategy: 'prefix', seed: null, requestedRows: 50, scannedRows: null, returnedRows: 1,
+        totalRows: 2, datasetIdentity: TABLE.uri, datasetRevision: 'revision-1',
+        identity: 'a'.repeat(64), limitations: ['This is a prefix preview, not representative or random.'],
+      },
+    })
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByText('orders'))
+    fireEvent.click(screen.getByTestId('detail-preview'))
+
+    expect(await screen.findByText(/Prefix preview.*Requested 50 rows.*scanned unknown.*returned 1.*total 2/i)).toBeInTheDocument()
+    expect(screen.getByText(`Input ${TABLE.uri} · revision revision-1.`)).toBeInTheDocument()
+    expect(screen.getByText('This is a prefix preview, not representative or random.')).toBeInTheDocument()
+  })
+
   it('does not infer an empty dataset from an empty bounded preview batch', async () => {
     mocks.sample.mockResolvedValue({
       columns: TABLE.columns, rows: [], rowCount: null,

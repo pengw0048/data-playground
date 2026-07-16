@@ -996,6 +996,10 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
 function CatalogPreviewScope({ preview }: { preview: SampleResult }) {
   const shown = preview.rows.length
   const total = preview.rowCount ?? null
+  const provenance = preview.sampleProvenance
+  const provenanceCounts = provenance
+    ? `Requested ${provenance.requestedRows.toLocaleString()} rows · scanned ${provenance.scannedRows?.toLocaleString() ?? 'unknown'} · returned ${provenance.returnedRows.toLocaleString()} · total ${provenance.totalRows?.toLocaleString() ?? 'unknown'}.`
+    : null
   let label: string
   if (preview.completeness === 'complete') {
     label = `Complete dataset · ${total ?? shown} ${(total ?? shown) === 1 ? 'row' : 'rows'}`
@@ -1008,7 +1012,14 @@ function CatalogPreviewScope({ preview }: { preview: SampleResult }) {
   }
   return (
     <div role="status" className="rounded-md bg-muted/50 px-2 py-1 text-[10.5px] text-muted-foreground">
-      {label}
+      <div>{label}</div>
+      {provenance && (
+        <div className="mt-0.5 space-y-0.5">
+          <div>{preview.completeness === 'complete' ? 'Complete dataset.' : 'Prefix preview.'} {provenanceCounts}</div>
+          <div className="break-all">Input {provenance.datasetIdentity ?? 'unknown'} · revision {provenance.datasetRevision ?? 'unknown'}.</div>
+          {provenance.limitations.map((limitation) => <div key={limitation}>{limitation}</div>)}
+        </div>
+      )}
     </div>
   )
 }

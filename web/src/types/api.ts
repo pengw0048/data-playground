@@ -171,11 +171,25 @@ export interface SampleResult {
   rowLimit?: number | null
   limitReason?: 'preview-scan' | 'interactive-row-budget' | null
   limitScope?: 'each-source' | 'result-window' | null
+  sampleProvenance?: SampleProvenance | null
   previewRef?: string | null
   notPreviewable: boolean
   error?: boolean
   reason?: string | null
   wire: string
+}
+
+export interface SampleProvenance {
+  strategy: 'prefix' | 'reservoir'
+  seed?: number | null
+  requestedRows: number
+  scannedRows?: number | null
+  returnedRows: number
+  totalRows?: number | null
+  datasetIdentity?: string | null
+  datasetRevision?: string | null
+  identity: string
+  limitations: string[]
 }
 
 export interface ColumnProfile {

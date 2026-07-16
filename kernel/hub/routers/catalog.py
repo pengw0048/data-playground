@@ -29,6 +29,7 @@ from hub.plugins.adapters import (
     BoundedPreviewUnsupported, RevisionUnavailable, is_object_uri, path_of, relation_columns,
 )
 from hub.plugins.importer import ImporterNotConfigured
+from hub.sampling import provenance_for_dataset
 from hub.settings import settings
 from hub.storage import ManagedSourceReadError, source_read_scope
 from hub.models import (
@@ -823,7 +824,16 @@ def data_sample(req: SampleRequest) -> SampleResult:
                                              if budget_capped else None),
                                   limit_reason=("interactive-row-budget"
                                                 if budget_capped else None),
-                                  limit_scope=("result-window" if budget_capped else None))
+                                  limit_scope=("result-window" if budget_capped else None),
+                                  sample_provenance=provenance_for_dataset(
+                                      req.uri, adapter, requested_rows=req.k,
+                                      scanned_rows=None, returned_rows=len(rows), total_rows=exact_total,
+                                      limitations=[
+                                          ("Exact metadata proves this response contains the complete dataset."
+                                           if completeness == "complete" else
+                                           f"This is a bounded prefix preview (at most {preview_rows} rows read), not representative or random."),
+                                      ],
+                                  ))
         with contextlib.suppress(Exception):
             metadb.catalog_bump_usage(req.uri)  # someone looked at this data → popularity signal (best-effort)
         return result

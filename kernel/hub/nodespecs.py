@@ -73,7 +73,7 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
     NodeSpec(kind="sample", title="sample", category="shape", tag="sample",
              inputs=[_in(("dataset",))], outputs=[_out("sample")], can_bypass=True,
              params=[ParamSpec(name="n", type="int", default=1000), ParamSpec(name="seed", type="int", default=42)],
-             blurb="take K rows (reservoir sample)"),
+             blurb="deterministic seeded reservoir sample (local inputs)"),
     NodeSpec(kind="filter", title="filter", category="shape", tag="filter",
              inputs=[_in()], outputs=[_out()], can_bypass=True,
              params=[ParamSpec(name="predicate", type="string", label="predicate (SQL)")],

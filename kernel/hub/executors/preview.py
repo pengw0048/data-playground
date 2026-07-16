@@ -8,10 +8,12 @@ and distinguishes an honest "needs a full pass" from a real error (bad cell/quer
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
-from hub import db, graph as g
+from hub import db, graph as g, paths
 from hub.executors.engine import BuildEngine, NotPreviewable
 from hub.models import Graph, SampleResult
+from hub.sampling import provenance_for_graph
 from hub.sandbox import run_with_timeout
 from hub.storage import ManagedSourceReadError
 
@@ -25,6 +27,62 @@ PREVIEW_BUDGET_S = 8.0
 # (section.run_section), so it belongs here too. (vector-search is pure SQL/Lance — interruptible — so
 # it is NOT here.)
 _CODE_CELL_KINDS = ("transform", "section")
+_LOCAL_SAMPLE_ADAPTERS = {"duckdb", "lance"}
+
+
+class _PreviewAdapter:
+    """One adapter view per source, with one bounded fingerprint probe per preview request."""
+
+    def __init__(self, adapter: Any, fingerprints: dict[str, Any]):
+        self._adapter = adapter
+        self._fingerprints = fingerprints
+
+    def fingerprint(self, uri: str):
+        if uri not in self._fingerprints:
+            self._fingerprints[uri] = self._adapter.fingerprint(uri)
+        return self._fingerprints[uri]
+
+    def __getattr__(self, name: str):
+        return getattr(self._adapter, name)
+
+
+def _reservoir_preview_allowed(graph: Graph, node_id: str, resolve_adapter) -> bool:
+    """Only a Sample node over current local adapters may turn its preview into a full scan."""
+    nodes = {node.id: node for node in g.upstream_chain(graph, node_id)}
+    target = nodes.get(node_id)
+    if target is None or target.type != "sample":
+        return False
+    target_data = target.data if isinstance(target.data, dict) else {}
+    if target_data.get("bypassed") or target_data.get("disabled"):
+        return False
+    sources = [node for node in nodes.values() if node.type == "source"]
+    if not sources:
+        return False
+    for source in sources:
+        config = source.data.get("config", {}) if isinstance(source.data, dict) else {}
+        uri = config.get("uri") if isinstance(config, dict) else None
+        try:
+            if (not uri or paths.local_path(uri) is None
+                    or getattr(resolve_adapter(uri), "name", None) not in _LOCAL_SAMPLE_ADAPTERS):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _reservoir_source_total(graph: Graph, node_id: str, resolve_adapter) -> int | None:
+    """Read exact bounded metadata only for a direct source → Sample graph, never by scanning."""
+    chain = g.upstream_chain(graph, node_id)
+    if len(chain) != 2 or chain[0].type != "source" or chain[1].type != "sample":
+        return None
+    config = chain[0].data.get("config", {}) if isinstance(chain[0].data, dict) else {}
+    uri = config.get("uri") if isinstance(config, dict) else None
+    try:
+        count = getattr(resolve_adapter(uri), "metadata_count", None) if uri else None
+        value = count(uri) if callable(count) else None
+        return int(value) if value is not None else None
+    except Exception:  # unknown metadata is a truthful state, not a preview error
+        return None
 
 
 def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
@@ -50,9 +108,18 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
             "preview of a Python cell is disabled in multi-user mode — the in-process timeout can't kill "
             "a runaway cell; run it (runs execute in a killable, deadline-bounded child)"))
 
-    engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
+    adapters: dict[str, _PreviewAdapter] = {}
+    fingerprints: dict[str, Any] = {}
+
+    def preview_adapter(uri: str) -> _PreviewAdapter:
+        if uri not in adapters:
+            adapters[uri] = _PreviewAdapter(resolve_adapter(uri), fingerprints)
+        return adapters[uri]
+
+    reservoir_preview = _reservoir_preview_allowed(graph, node_id, preview_adapter)
+    engine = BuildEngine(graph, preview_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
                             node_builders=node_builders, node_specs=node_specs,
-                            warm=cache, warm_scope="preview")  # kernel's warm relation cache (None in-hub)
+                            warm=cache, warm_scope="preview", reservoir_preview=reservoir_preview)
 
     holder: dict = {}  # published by the worker thread so the timeout can interrupt its cursor
 
@@ -71,6 +138,31 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                 # over such a node may not be perfectly consistent — acceptable for a bounded preview.
                 rows, cols = engine.rows(node_id, k + 1, offset, selected_port)
                 has_more = len(rows) > k
+                target = next((node for node in graph.nodes if node.id == node_id), None)
+                config = target.data.get("config", {}) if target and isinstance(target.data, dict) else {}
+                raw_n = config.get("n") if isinstance(config, dict) else None
+                sample_n = max(0, int(raw_n if raw_n is not None else PREVIEW_SCAN))
+                if reservoir_preview:
+                    total = _reservoir_source_total(graph, node_id, preview_adapter)
+                    provenance = provenance_for_graph(
+                        graph, node_id, preview_adapter, strategy="reservoir",
+                        seed=int(config.get("seed", 42)), requested_rows=sample_n,
+                        scanned_rows=total, returned_rows=len(rows[:k]), total_rows=total,
+                        limitations=[
+                            ("A reservoir sample scanned the complete local input."
+                             if total is not None else
+                             "A reservoir sample scans the complete local input; total population size is unknown."),
+                            "Membership is deterministic for this input revision and seed.",
+                        ],
+                    )
+                else:
+                    provenance = provenance_for_graph(
+                        graph, node_id, preview_adapter, strategy="prefix", seed=None,
+                        requested_rows=k, scanned_rows=None, returned_rows=len(rows[:k]), total_rows=None,
+                        limitations=[
+                            f"Each source was bounded to at most {PREVIEW_SCAN} rows; this prefix is not representative or random.",
+                        ],
+                    )
                 return SampleResult(
                     columns=cols,
                     rows=rows[:k],
@@ -80,9 +172,10 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                     has_more=has_more,
                     truncated=True,
                     completeness="sample",
-                    row_limit=PREVIEW_SCAN,
-                    limit_reason="preview-scan",
-                    limit_scope="each-source",
+                    row_limit=None if reservoir_preview else PREVIEW_SCAN,
+                    limit_reason=None if reservoir_preview else "preview-scan",
+                    limit_scope=None if reservoir_preview else "each-source",
+                    sample_provenance=provenance,
                 )
 
     def on_timeout() -> None:

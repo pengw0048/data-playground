@@ -202,6 +202,28 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().previews.filter?.result?.rows).toEqual([{ value: 'view' }])
   })
 
+  it('blocks a stale sample response after its seed changes', async () => {
+    let finish!: (result: ReturnType<typeof previewResult>) => void
+    apiMocks.preview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    const source = NODE('source')
+    source.data.config = { uri: 'events.parquet' }
+    const sample = NODE('sample', 'sample')
+    sample.data.config = { n: 100, seed: 42 }
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, sample],
+        edges: [{ id: 'source-sample', source: 'source', target: 'sample', data: { wire: 'dataset' } }],
+      },
+    })
+
+    const first = useStore.getState().runPreview('sample')
+    useStore.getState().updateConfig('sample', { seed: 73 })
+    finish(previewResult('old seed'))
+    await first
+
+    expect(useStore.getState().previews.sample?.result).toBeUndefined()
+  })
+
   it('binds multi-output preview freshness to the selected port and preserves it on refresh', async () => {
     let finishPass!: (result: ReturnType<typeof previewResult>) => void
     let finishOut!: (result: ReturnType<typeof previewResult>) => void
