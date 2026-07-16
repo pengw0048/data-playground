@@ -699,6 +699,56 @@ def upgrade() -> None:
         op.f("ix_canvases_owner_id"), "canvases", ["owner_id"], unique=False
     )
     op.create_table(
+        "workspace_containers",
+        sa.Column("id", sa.String(), nullable=False),
+        sa.Column("parent_id", sa.String(), nullable=True),
+        sa.Column("name", sa.String(), nullable=False),
+        sa.Column("ordinal", sa.BigInteger(), server_default="0", nullable=False),
+        sa.Column("version", sa.BigInteger(), server_default="1", nullable=False),
+        sa.Column("is_root", sa.Boolean(), server_default="0", nullable=False),
+        sa.CheckConstraint("ordinal >= 0", name="ck_workspace_container_ordinal"),
+        sa.CheckConstraint("version >= 1", name="ck_workspace_container_version"),
+        sa.CheckConstraint("is_root = false OR parent_id IS NULL", name="ck_workspace_container_root"),
+        sa.ForeignKeyConstraint(["parent_id"], ["workspace_containers.id"]),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("parent_id", "name", name="uq_workspace_container_parent_name"),
+    )
+    op.create_index(
+        op.f("ix_workspace_containers_parent_id"), "workspace_containers", ["parent_id"], unique=False
+    )
+    op.bulk_insert(
+        sa.table(
+            "workspace_containers",
+            sa.column("id", sa.String()),
+            sa.column("parent_id", sa.String()),
+            sa.column("name", sa.String()),
+            sa.column("ordinal", sa.BigInteger()),
+            sa.column("version", sa.BigInteger()),
+            sa.column("is_root", sa.Boolean()),
+        ),
+        [{"id": "workspace-local-root", "parent_id": None, "name": "Workspace",
+          "ordinal": 0, "version": 1, "is_root": True}],
+    )
+    op.create_table(
+        "workspace_placements",
+        sa.Column("id", sa.String(), nullable=False),
+        sa.Column("container_id", sa.String(), nullable=False),
+        sa.Column("target_kind", sa.String(), nullable=False),
+        sa.Column("target_id", sa.String(), nullable=False),
+        sa.Column("name", sa.String(), nullable=False),
+        sa.Column("ordinal", sa.BigInteger(), server_default="0", nullable=False),
+        sa.Column("version", sa.BigInteger(), server_default="1", nullable=False),
+        sa.CheckConstraint("target_kind IN ('canvas', 'dataset')", name="ck_workspace_placement_kind"),
+        sa.CheckConstraint("ordinal >= 0", name="ck_workspace_placement_ordinal"),
+        sa.CheckConstraint("version >= 1", name="ck_workspace_placement_version"),
+        sa.ForeignKeyConstraint(["container_id"], ["workspace_containers.id"]),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("target_kind", "target_id", name="uq_workspace_placement_target"),
+    )
+    op.create_index(
+        op.f("ix_workspace_placements_container_id"), "workspace_placements", ["container_id"], unique=False
+    )
+    op.create_table(
         "local_result_references",
         sa.Column("uri", sa.Text(), nullable=False),
         sa.Column("owner_kind", sa.String(), nullable=False),
@@ -889,6 +939,10 @@ def downgrade() -> None:
     op.drop_table("run_records")
     op.drop_index(op.f("ix_canvas_versions_canvas_id"), table_name="canvas_versions")
     op.drop_table("canvas_versions")
+    op.drop_index(op.f("ix_workspace_placements_container_id"), table_name="workspace_placements")
+    op.drop_table("workspace_placements")
+    op.drop_index(op.f("ix_workspace_containers_parent_id"), table_name="workspace_containers")
+    op.drop_table("workspace_containers")
     op.drop_index(op.f("ix_canvas_shares_user_id"), table_name="canvas_shares")
     op.drop_index(op.f("ix_canvas_shares_canvas_id"), table_name="canvas_shares")
     op.drop_table("canvas_shares")

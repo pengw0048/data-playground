@@ -165,6 +165,12 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
             doc=json.dumps({"id": canvas_id, "nodes": [{"id": "n1", "type": "load"}]}),
         ))
 
+    workspace_container = metadb.workspace_create_container(
+        metadb.local_workspace_root()["id"], "Backup restore drill")
+    workspace_placement = metadb.workspace_create_placement(
+        workspace_container["id"], target_kind="canvas", target_id=canvas_id,
+        name="backup-restore-drill")
+
     metadb.catalog_upsert_entry(
         parent_uri, "drill-parent",
         {"id": "drill_parent", "name": "drill-parent", "uri": parent_uri,
@@ -257,6 +263,8 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         "alembic_head": alembic_head,
         "release_sha": release_sha,
         "canvas_id": canvas_id,
+        "workspace_container_id": workspace_container["id"],
+        "workspace_placement_id": workspace_placement["id"],
         "parent_uri": parent_uri,
         "child_uri": child_uri,
         "lineage_publication_key": lineage_publication_key,
@@ -304,6 +312,10 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
         fields = json.loads(cred.fields_json)
         assert fields["secretAccessKey"] == info["secret_ref"]
         assert fields["accessKeyId"] == "env:DP_BACKUP_DRILL_ACCESS_KEY"
+        container = session.get(metadb.WorkspaceContainer, info["workspace_container_id"])
+        placement = session.get(metadb.WorkspacePlacement, info["workspace_placement_id"])
+        assert container is not None and container.name == "Backup restore drill"
+        assert placement is not None and placement.target_id == info["canvas_id"]
 
     assert metadb.catalog_get(info["parent_uri"]) is not None
     assert metadb.catalog_get(info["child_uri"]) is not None
@@ -535,6 +547,7 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
         source_row_counts = {}
         with metadb.session() as session:
             for model in (metadb.Canvas, metadb.CatalogEntry, metadb.RunRecord,
+                          metadb.WorkspaceContainer, metadb.WorkspacePlacement,
                           metadb.CatalogLineageFact, metadb.CatalogPublicationEvent,
                           metadb.LocalResultArtifact, metadb.ObjectAttempt):
                 source_row_counts[model.__tablename__] = session.scalar(
@@ -606,6 +619,7 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
         metadb.init_db()
         with metadb.session() as session:
             for model in (metadb.Canvas, metadb.CatalogEntry, metadb.RunRecord,
+                          metadb.WorkspaceContainer, metadb.WorkspacePlacement,
                           metadb.CatalogLineageFact, metadb.CatalogPublicationEvent,
                           metadb.LocalResultArtifact, metadb.ObjectAttempt):
                 assert session.scalar(select(func.count()).select_from(model)) == \
