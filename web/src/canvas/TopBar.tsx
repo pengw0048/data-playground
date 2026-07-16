@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { roleCanEdit, useStore } from '../store/graph'
 import { examples } from '../examples'
 import { Icon, type IconName } from '../ui/Icon'
@@ -38,6 +38,7 @@ export function TopBar() {
   const [versionsOpen, setVersionsOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
+  const settingsTrigger = useRef<HTMLElement | null>(null)
   const saveLabel = !canEdit
     ? (canvasRole === 'viewer' ? 'view only' : 'read only')
     : saved
@@ -46,15 +47,27 @@ export function TopBar() {
 
   // let anything (e.g. the agent's "Configure a model" CTA) open Settings
   useEffect(() => {
-    const onOpen = () => setSettingsOpen(true)
+    const onOpen = (event: Event) => {
+      settingsTrigger.current = (event as CustomEvent<HTMLElement>).detail ?? document.querySelector('[data-testid="app-menu"]')
+      setSettingsOpen(true)
+    }
     window.addEventListener('dp-open-settings', onOpen)
     return () => window.removeEventListener('dp-open-settings', onOpen)
   }, [])
 
+  const openSettings = (trigger: HTMLElement) => {
+    settingsTrigger.current = trigger
+    setSettingsOpen(true)
+  }
+  const closeSettings = () => {
+    setSettingsOpen(false)
+    requestAnimationFrame(() => settingsTrigger.current?.focus())
+  }
+
   return (
     <>
       <div style={{ position: 'absolute', top: 16, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <AppMenu onSettings={() => setSettingsOpen(true)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} />
+        <AppMenu onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} />
         <span className="text-[13.5px] text-muted-foreground">/</span>
         <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
         <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : !kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined} className="ml-0.5 text-[11px] text-muted-foreground">· {saveLabel}</span>
@@ -77,7 +90,7 @@ export function TopBar() {
         {/* Settings lives in the app menu (top-left); identity + log out live on the files shell —
             no redundant Settings button / account avatar here. */}
       </div>
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <SettingsModal onClose={closeSettings} />}
       {canvasSettingsOpen && <CanvasSettingsModal onClose={() => setCanvasSettingsOpen(false)} />}
       {runsOpen && <RunHistoryModal onClose={() => setRunsOpen(false)} />}
       {versionsOpen && <VersionHistoryModal onClose={() => setVersionsOpen(false)} />}

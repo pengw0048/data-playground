@@ -139,6 +139,9 @@ class CatalogTable(Wire):
     owner: str | None = None
     description: str | None = None
     usage: int = 0  # how often this dataset has been read (popularity signal; drives "most used" sort)
+    # Fixed-length CAS token for the staged built-in catalog editor. It changes whenever the editable
+    # metadata or declared primary key changes, but deliberately does not expose storage internals.
+    metadata_revision: str | None = None
 
 
 class DatasetRevision(Wire):
@@ -452,6 +455,17 @@ class CatalogMetadata(Wire):
     owner: str | None = None
     description: str | None = None
     name: str | None = None          # optional friendly rename; blank keeps the current name
+
+
+class CatalogEdit(Wire):
+    """One complete staged built-in catalog edit, guarded by its read revision."""
+    expected_revision: str
+    folder: str = ""
+    tags: list[str] = []
+    owner: str | None = None
+    description: str | None = None
+    name: str | None = None
+    declared_key: list[str] = []
 
 
 # --------------------------------------------------------------------------- #

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   api,
   type Cred,
@@ -166,6 +166,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [pcfg, setPcfg] = useState<PluginEdits>({})  // pack → edited { key: value }, null = use environment/default
   const [active, setActive] = useState('agent')
+  const [confirmDiscard, setConfirmDiscard] = useState(false)
+  const lastEditingControl = useRef<HTMLElement | null>(null)
   // /api/me is authoritative. Missing capabilities must fail closed: open/single-user mode also
   // receives global_settings, so there is no need for a permissive fallback while identity loads.
   const canGlobal = currentUser?.capabilities?.includes('global_settings') === true
@@ -245,6 +247,39 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     [baseline, canGlobal, g, pcfg, plugins, u],
   )
   const invalidPluginEdit = useMemo(() => hasInvalidPluginEdit(pcfg, plugins), [pcfg, plugins])
+  const destinationDraftDirty = dest.name !== '' || dest.root !== '' || dest.backend !== 'local' || dest.credId !== NO_CRED
+  const originalCred = credForm.id ? creds.find((credential) => credential.id === credForm.id) : null
+  const credentialDraftDirty = credForm.id
+    ? Boolean(originalCred && (
+      credForm.name !== originalCred.name
+      || credForm.kind !== originalCred.kind
+      || !sameJson(credForm.fields, originalCred.fields)
+    ))
+    : credForm.name !== '' || credForm.kind !== 'object_store' || Object.values(credForm.fields).some((value) => value !== '')
+  const memberDraftDirty = newUser.name !== '' || newUser.password !== ''
+  const dirty = changes.length > 0 || invalidPluginEdit || destinationDraftDirty || credentialDraftDirty || memberDraftDirty
+
+  useEffect(() => {
+    if (!dirty) return
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', warnBeforeUnload)
+    return () => window.removeEventListener('beforeunload', warnBeforeUnload)
+  }, [dirty])
+
+  const restoreEditingFocus = () => {
+    const target = lastEditingControl.current
+    requestAnimationFrame(() => {
+      if (target?.isConnected) target.focus()
+    })
+  }
+  const requestClose = () => {
+    if (!dirty) { onClose(); return }
+    if (!saving) setConfirmDiscard(true)
+  }
+  const keepEditing = () => setConfirmDiscard(false)
   const save = async () => {
     if (loading || loadError || saving || invalidPluginEdit || !baseline || changes.length === 0) return
     const submitted = changes
@@ -308,15 +343,20 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const runners = kernelInfo?.runners ?? ['local-out-of-core']
 
   return (
-    <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
-      <DialogContent data-testid="settings-modal" className="dp-modal-overlay flex flex-col gap-0 overflow-hidden p-0 w-[94vw] max-w-[940px] h-[min(680px,90vh)]">
+    <Dialog open onOpenChange={(o) => { if (!o) requestClose() }}>
+      <DialogContent data-testid="settings-modal" onFocusCapture={(event) => {
+        const target = event.target
+        if (target instanceof HTMLElement && target.matches('input, textarea, select, [role="combobox"]')) {
+          lastEditingControl.current = target
+        }
+      }} onCloseAutoFocus={(event) => event.preventDefault()} className="dp-modal-overlay flex flex-col gap-0 overflow-hidden p-0 w-[94vw] max-w-[940px] h-[min(680px,90vh)]">
         {/* header */}
         <div className="flex items-center gap-2 border-b border-border py-3 pl-[18px] pr-12">
           <span className="flex items-center text-muted-foreground"><Icon name="settings" size={15} /></span>
           <DialogTitle className="text-[15px] font-bold">Settings</DialogTitle>
           <span className="flex-1" />
-          <span role="status" aria-live="polite" className={cn('text-[11.5px]', changes.length ? 'text-amber-700 dark:text-amber-300' : 'text-green-600')}>
-            {changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'}` : savedMsg}
+          <span role="status" aria-live="polite" className={cn('text-[11.5px]', dirty ? 'text-amber-700 dark:text-amber-300' : 'text-green-600')}>
+            {changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'}` : dirty ? 'Unsaved draft' : savedMsg}
           </span>
           <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || invalidPluginEdit || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
         </div>
@@ -651,6 +691,19 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           </div>
         </div>
       </DialogContent>
+      <Dialog open={confirmDiscard} onOpenChange={(open) => { if (!open) keepEditing() }}>
+        <DialogContent data-testid="settings-discard-confirmation" onCloseAutoFocus={(event) => {
+          event.preventDefault()
+          restoreEditingFocus()
+        }} className="max-w-[390px]">
+          <DialogTitle>Discard unsaved Settings changes?</DialogTitle>
+          <DialogDescription>Your edits have not been saved. Keep editing to review them, or discard them and close Settings.</DialogDescription>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={keepEditing}>Keep editing</Button>
+            <Button variant="destructive" onClick={onClose}>Discard</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </Dialog>
   )
 }

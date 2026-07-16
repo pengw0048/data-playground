@@ -18,21 +18,30 @@ import { cn } from '@/lib/utils'
 export function Shell() {
   const view = useStore((s) => s.view)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const settingsTrigger = useRef<HTMLElement | null>(null)
+  const openSettings = (trigger: HTMLElement) => {
+    settingsTrigger.current = trigger
+    setSettingsOpen(true)
+  }
+  const closeSettings = () => {
+    setSettingsOpen(false)
+    requestAnimationFrame(() => settingsTrigger.current?.focus())
+  }
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', background: color.canvas ?? '#fbfbfc' }}>
-      <Rail onSettings={() => setSettingsOpen(true)} />
+      <Rail onSettings={openSettings} />
       <main style={{ flex: 1, minWidth: 0, overflowY: 'auto' }}>
         {view === 'files' && <FilesContent />}
         {view === 'tables' && <CatalogView />}
         {view === 'transforms' && <TransformsContent />}
         {view === 'relationships' && <div style={{ height: '100%' }}><ERDiagram /></div>}
       </main>
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <SettingsModal onClose={closeSettings} />}
     </div>
   )
 }
 
-function Rail({ onSettings }: { onSettings: () => void }) {
+function Rail({ onSettings }: { onSettings: (trigger: HTMLElement) => void }) {
   const view = useStore((s) => s.view)
   const setView = useStore((s) => s.setView)
   const currentUser = useStore((s) => s.currentUser)
@@ -60,7 +69,7 @@ function Rail({ onSettings }: { onSettings: () => void }) {
         {item('transforms', 'fx', 'Transforms')}
         {/* Relationships is reached from a table's detail drawer (Tables → open a dataset → View relationships),
             not a top-level destination — it is always a graph focused on some table. */}
-        <Button variant="ghost" onClick={onSettings} data-testid="rail-settings"
+        <Button variant="ghost" onClick={(event) => onSettings(event.currentTarget)} data-testid="rail-settings"
           className="h-auto w-full justify-start gap-2.5 px-2.5 py-2 text-[13px] font-medium text-muted-foreground">
           <Icon name="settings" size={15} /> Settings
         </Button>

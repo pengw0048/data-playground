@@ -541,6 +541,49 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('Saved', { exact: true })).toBeVisible()
   })
 
+  test('settings keeps dirty edits across owned dismissals and warns before unload', async ({ page }) => {
+    await page.goto('/')
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Settings', { exact: true }).click()
+    const settings = page.getByTestId('settings-modal')
+    const model = page.getByPlaceholder('anthropic/claude-opus-4-8')
+    await expect(model).toBeVisible()
+    await model.fill('unsaved-settings-model')
+
+    expect(await page.evaluate(() => {
+      const event = new Event('beforeunload', { cancelable: true })
+      window.dispatchEvent(event)
+      return event.defaultPrevented
+    })).toBe(true)
+
+    await page.keyboard.press('Escape')
+    const confirm = page.getByTestId('settings-discard-confirmation')
+    await expect(confirm).toBeVisible()
+    await confirm.getByRole('button', { name: 'Keep editing' }).click()
+    await expect(model).toBeFocused()
+    await expect(model).toHaveValue('unsaved-settings-model')
+
+    // Click the Dialog overlay, outside the centered Settings surface.
+    await page.mouse.click(5, 300)
+    await expect(confirm).toBeVisible()
+    await confirm.getByRole('button', { name: 'Keep editing' }).click()
+    await expect(model).toHaveValue('unsaved-settings-model')
+
+    await settings.getByRole('button', { name: 'Close' }).click()
+    await expect(confirm).toBeVisible()
+    await confirm.getByRole('button', { name: 'Discard' }).click()
+    await expect(settings).toHaveCount(0)
+    await expect(page.getByTestId('app-menu')).toBeFocused()
+
+    // A clean modal still closes immediately with no confirmation.
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Settings', { exact: true }).click()
+    await expect(settings).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(settings).toHaveCount(0)
+    await expect(confirm).toHaveCount(0)
+  })
+
   test('settings manages destinations', async ({ page }) => {
     await page.goto('/')
     await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
@@ -1065,5 +1108,61 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('detail-use').click()
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
+  })
+
+  test('catalog edits retain drafts on conflict and protect dirty dismissal', async ({ page }) => {
+    const filename = `atomic-catalog-${Date.now()}.csv`
+    const uploaded = await page.request.post('/api/catalog/upload', {
+      headers: { 'X-Upload-Filename': filename, 'Content-Type': 'text/csv' },
+      data: 'id,value\n1,alpha\n2,beta\n',
+    })
+    expect(uploaded.ok()).toBeTruthy()
+    const created = await uploaded.json()
+    const current = await page.request.get(`/api/catalog/tables/${encodeURIComponent(created.id)}`)
+    expect(current.ok()).toBeTruthy()
+    const original = await current.json()
+    try {
+      await page.goto('/#/files')
+      await page.getByTestId('rail-tables').click()
+      await openCatalogTable(page, original.name)
+
+      await page.getByTestId('detail-name').fill('my staged catalog edit')
+      await page.getByTestId('detail-pk-id').click()
+      const concurrent = await page.request.put(`/api/catalog/tables/${encodeURIComponent(original.id)}/edit`, {
+        data: {
+          expectedRevision: original.metadataRevision,
+          name: original.name,
+          folder: original.folder ?? '',
+          tags: original.tags ?? [],
+          owner: original.owner ?? null,
+          description: 'saved by another editor',
+          declaredKey: [],
+        },
+      })
+      expect(concurrent.ok(), await concurrent.text()).toBeTruthy()
+
+      await page.getByTestId('detail-save').click()
+      await expect(page.getByText('Another editor saved changes first.')).toBeVisible()
+      await expect(page.getByTestId('detail-name')).toHaveValue('my staged catalog edit')
+      await page.getByRole('button', { name: 'Reapply', exact: true }).click()
+      await expect(page.getByText('Unsaved changes')).toHaveCount(0)
+
+      await page.getByTestId('detail-name').fill('dirty draft')
+      page.once('dialog', async (dialog) => {
+        expect(dialog.message()).toBe('Discard unsaved catalog edits?')
+        await dialog.dismiss()
+      })
+      await page.keyboard.press('Escape')
+      await expect(page.getByRole('dialog')).toBeVisible()
+
+      const saved = await page.request.get(`/api/catalog/tables/${encodeURIComponent(original.id)}`)
+      expect(saved.ok()).toBeTruthy()
+      const body = await saved.json()
+      expect(body.name).toBe('my staged catalog edit')
+      expect(body.keys.some((key: { confidence: string; columns: string[] }) =>
+        key.confidence === 'declared' && key.columns.join(',') === 'id')).toBeTruthy()
+    } finally {
+      await page.request.delete(`/api/catalog/tables/${encodeURIComponent(original.id)}`)
+    }
   })
 })

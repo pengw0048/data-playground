@@ -7569,6 +7569,90 @@ def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: 
         _sync_children(s, r.uri, tags, cols)
 
 
+class CatalogMetadataConflict(RuntimeError):
+    """A staged catalog edit was based on metadata that is no longer current."""
+
+
+def catalog_metadata_revision(doc: dict, declared_key: list[str] | None) -> str:
+    """Return a short, opaque CAS token for the editable catalog surface.
+
+    This is intentionally derived from the small owner-editable projection rather than a database
+    timestamp: it works for both ordinary and managed catalog entries without adding persistence
+    schema, and folder rewrites/legacy key calls naturally invalidate an already-open drawer.
+    """
+    payload = {
+        "name": doc.get("name") or "",
+        "folder": doc.get("folder") or "",
+        "tags": sorted(str(tag) for tag in (doc.get("tags") or [])),
+        "owner": doc.get("owner"),
+        "description": doc.get("description"),
+        "declaredKey": list(declared_key or []),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "m1_" + hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+
+def catalog_save_metadata_edit(
+        uri: str, *, expected_revision: str, folder: str, owner: str | None,
+        description: str | None, tags: list[str], name: str | None,
+        declared_key: list[str],
+) -> None:
+    """CAS-save catalog organization metadata and its declared key as one transaction.
+
+    Both the entry projection/doc and the independent declared-key row are locked before the
+    revision comparison. Any validation error or injected persistence failure rolls the complete
+    transaction back, so a caller can never observe just one half of the staged edit.
+    """
+    folder = catalog_folder_normalize(folder)
+    cleaned_tags = [str(tag).strip() for tag in tags if str(tag).strip()]
+    cleaned_key = list(declared_key)
+    with session() as s:
+        target = _lock_catalog_mutation_targets(s, [uri])[0]
+        if not target["known"]:
+            raise RuntimeError("catalog governance target is not registered")
+        logical, entry = target["logical"], target["entry"]
+        try:
+            doc = json.loads(entry.doc)
+        except (ValueError, TypeError):
+            doc = {}
+        catalog_key = target["catalog_key"]
+        declared = s.get(CatalogDeclaredKey, catalog_key, with_for_update=True)
+        current_key = json.loads(declared.columns) if declared is not None else []
+        if catalog_metadata_revision(doc, current_key) != expected_revision:
+            raise CatalogMetadataConflict("catalog metadata changed; reload or reapply your edits")
+        columns = {c.get("name") for c in doc.get("columns", [])
+                   if isinstance(c, dict) and c.get("name")}
+        missing = [column for column in cleaned_key if column not in columns]
+        if missing:
+            raise ValueError(f"columns not in '{doc.get('name') or entry.name}': {', '.join(missing)}")
+        own = owner.strip() if owner else None
+        desc = description.strip() if description else None
+        next_name = name.strip() if name and name.strip() else None
+        doc.update(folder=folder, owner=own, description=desc, tags=cleaned_tags)
+        if next_name:
+            doc["name"] = next_name
+        entry.folder, entry.owner, entry.description = folder, own, desc
+        entry.doc = json.dumps(doc, default=str)
+        if next_name:
+            entry.name = next_name
+        _materialize_folder(s, folder)
+        if logical is not None:
+            logical.governance_doc = json.dumps(
+                _catalog_governance(doc), default=str, sort_keys=True)
+            logical.metadata_version += 1
+        if cleaned_key:
+            payload = json.dumps(cleaned_key)
+            if declared is None:
+                s.add(CatalogDeclaredKey(catalog_key=catalog_key, columns=payload))
+            else:
+                declared.columns = payload
+        elif declared is not None:
+            s.delete(declared)
+        cols = [c.get("name") for c in doc.get("columns", [])
+                if isinstance(c, dict) and c.get("name")]
+        _sync_children(s, entry.uri, cleaned_tags, cols)
+
+
 def catalog_bump_usage(uri: str, n: int = 1) -> None:
     """Increment a dataset's read-count popularity (called best-effort when it's sampled / read in a
     run). An atomic `usage = usage + n` (concurrent bumps can't lose increments) that explicitly

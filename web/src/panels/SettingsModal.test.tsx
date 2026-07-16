@@ -206,6 +206,94 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
   })
 
+  it('closes clean Settings without a discard confirmation', async () => {
+    const onClose = vi.fn()
+    render(<SettingsModal onClose={onClose} />)
+    await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+
+    fireEvent.keyDown(screen.getByTestId('settings-modal'), { key: 'Escape', code: 'Escape' })
+
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce())
+    expect(screen.queryByTestId('settings-discard-confirmation')).toBeNull()
+  })
+
+  it('keeps a dirty draft and returns focus to its editing control after Escape', async () => {
+    const onClose = vi.fn()
+    render(<SettingsModal onClose={onClose} />)
+    const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+    model.focus()
+    fireEvent.change(model, { target: { value: 'edited-model' } })
+
+    fireEvent.keyDown(model, { key: 'Escape', code: 'Escape' })
+
+    expect(await screen.findByTestId('settings-discard-confirmation')).toBeVisible()
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Keep editing' }))
+    await waitFor(() => expect(model).toHaveFocus())
+    expect(model).toHaveValue('edited-model')
+  })
+
+  it('warns for dirty close-button dismissal, then discards only on confirmation', async () => {
+    const onClose = vi.fn()
+    render(<SettingsModal onClose={onClose} />)
+    const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+    fireEvent.change(model, { target: { value: 'edited-model' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(await screen.findByTestId('settings-discard-confirmation')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Discard' }))
+    expect(onClose).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['Destinations', 'Destination name', 'draft destination'],
+    ['Credentials', 'Credential name', 'draft credential'],
+  ])('protects an unsaved %s draft on dismissal', async (pane, label, draft) => {
+    const onClose = vi.fn()
+    render(<SettingsModal onClose={onClose} />)
+    fireEvent.click(await screen.findByRole('button', { name: pane }))
+    const input = screen.getByLabelText(label)
+    input.focus()
+    fireEvent.change(input, { target: { value: draft } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+
+    expect(await screen.findByTestId('settings-discard-confirmation')).toBeVisible()
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Keep editing' }))
+    await waitFor(() => expect(input).toHaveFocus())
+    expect(input).toHaveValue(draft)
+  })
+
+  it('protects an unsaved member draft on dismissal', async () => {
+    const onClose = vi.fn()
+    render(<SettingsModal onClose={onClose} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Members' }))
+    const input = screen.getByPlaceholderText('Name')
+    input.focus()
+    fireEvent.change(input, { target: { value: 'draft member' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+
+    expect(await screen.findByTestId('settings-discard-confirmation')).toBeVisible()
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Keep editing' }))
+    await waitFor(() => expect(input).toHaveFocus())
+    expect(input).toHaveValue('draft member')
+  })
+
+  it('uses the native beforeunload contract only while Settings is dirty', async () => {
+    render(<SettingsModal onClose={vi.fn()} />)
+    const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+    const clean = new Event('beforeunload', { cancelable: true })
+    expect(window.dispatchEvent(clean)).toBe(true)
+
+    fireEvent.change(model, { target: { value: 'edited-model' } })
+    const dirty = new Event('beforeunload', { cancelable: true })
+    expect(window.dispatchEvent(dirty)).toBe(false)
+    expect(dirty.defaultPrevented).toBe(true)
+  })
+
   it('surfaces a save failure instead of a false "Saved" (UX-01)', async () => {
     putSettingsBatch.mockRejectedValueOnce(new Error('save failed'))
     render(<SettingsModal onClose={vi.fn()} />)
