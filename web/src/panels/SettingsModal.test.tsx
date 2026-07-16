@@ -31,6 +31,8 @@ const listCreds = vi.fn()
 const createCred = vi.fn()
 const updateCred = vi.fn()
 const deleteCred = vi.fn()
+const createUser = vi.fn()
+const restartKernel = vi.fn()
 vi.mock('../api/client', () => ({
   KernelError: class KernelError extends Error {
     status: number
@@ -47,8 +49,8 @@ vi.mock('../api/client', () => ({
     createCred: (...a: unknown[]) => createCred(...a),
     updateCred: (...a: unknown[]) => updateCred(...a),
     deleteCred: (...a: unknown[]) => deleteCred(...a),
-    createUser: async () => ({}),
-    restartKernel: async () => ({}),
+    createUser: (...a: unknown[]) => createUser(...a),
+    restartKernel: (...a: unknown[]) => restartKernel(...a),
   },
 }))
 
@@ -74,6 +76,9 @@ describe('SettingsModal — plugin config form', () => {
     createCred.mockReset().mockImplementation(async (b) => ({ id: 'new-cred', ...b }))
     updateCred.mockReset().mockImplementation(async (id, b) => ({ id, ...b }))
     deleteCred.mockReset().mockResolvedValue({ ok: true })
+    createUser.mockReset().mockResolvedValue({})
+    restartKernel.mockReset().mockResolvedValue({ ok: true, restarted: true })
+    state.kernelInfo = { runners: ['local-out-of-core'], backends: [] }
     state.currentUser.capabilities = ['global_settings']
   })
 
@@ -481,6 +486,75 @@ describe('SettingsModal — plugin config form', () => {
       fields: { accessKeyId: 'env:AWS_ACCESS_KEY_ID', region: 'us-east-1' },
     }))
     expect(await screen.findByText('Prod S3')).toBeVisible()  // the created cred lands in the list
+  })
+
+  it('keeps unrelated staged Settings while a credential action is pending', async () => {
+    let resolveCreate: ((value: unknown) => void) | undefined
+    createCred.mockReturnValueOnce(new Promise((resolve) => { resolveCreate = resolve }))
+    render(<SettingsModal onClose={vi.fn()} />)
+    const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+    fireEvent.change(model, { target: { value: 'staged-model' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Credentials' }))
+    fireEvent.change(screen.getByLabelText('Credential name'), { target: { value: 'Slow credential' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add credential' }))
+
+    expect(screen.getByRole('button', { name: 'Saving credential…' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Saving credential…' }))
+    expect(createCred).toHaveBeenCalledOnce()
+    resolveCreate?.({ id: 'slow', name: 'Slow credential', kind: 'object_store', fields: {} })
+
+    expect(await screen.findByText(/applied immediately; staged Settings are unchanged/)).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Agent' }))
+    expect(screen.getByPlaceholderText('anthropic/claude-opus-4-8')).toHaveValue('staged-model')
+    expect(putSettingsBatch).not.toHaveBeenCalled()
+  })
+
+  it('shows an actionable member failure and prevents duplicate submission', async () => {
+    let rejectCreate: ((reason?: unknown) => void) | undefined
+    createUser.mockReturnValueOnce(new Promise((_, reject) => { rejectCreate = reject }))
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Members' }))
+    fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'Taylor' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add member' }))
+
+    expect(screen.getByRole('button', { name: 'Adding member…' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Adding member…' }))
+    expect(createUser).toHaveBeenCalledOnce()
+    rejectCreate?.(new Error('name is already in use'))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not add Taylor: name is already in use')
+    expect(screen.getByPlaceholderText('Name')).toHaveValue('Taylor')
+  })
+
+  it('blocks removing a credential that a staged reference still selects', async () => {
+    listCreds.mockResolvedValue([{ id: 'c1', name: 'Store', kind: 'object_store', fields: {} }])
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Credentials' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Make default' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove credential Store' }))
+
+    expect(deleteCred).not.toHaveBeenCalled()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Select a different credential (or None) and Save before removing it.')
+  })
+
+  it('reports a failed kernel restart without committing staged Settings', async () => {
+    state.kernelInfo = { runners: ['kernel'], backends: [] }
+    let rejectRestart: ((reason?: unknown) => void) | undefined
+    restartKernel.mockReturnValueOnce(new Promise((_, reject) => { rejectRestart = reject }))
+    render(<SettingsModal onClose={vi.fn()} />)
+    const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+    fireEvent.change(model, { target: { value: 'staged-model' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Execution' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Restart kernel' }))
+
+    expect(screen.getByRole('button', { name: 'Restarting…' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Restarting…' }))
+    expect(restartKernel).toHaveBeenCalledOnce()
+    rejectRestart?.(new Error('kernel is unavailable'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not restart kernel: kernel is unavailable')
+    fireEvent.click(screen.getByRole('button', { name: 'Agent' }))
+    expect(screen.getByPlaceholderText('anthropic/claude-opus-4-8')).toHaveValue('staged-model')
+    expect(putSettingsBatch).not.toHaveBeenCalled()
   })
 
   it('edits and deletes a credential', async () => {
