@@ -49,11 +49,18 @@ class FileCatalogProvider:
         if current is None:
             return ProviderAncestors(state="unavailable", reason="resource not found")
         items: list[CatalogResource] = []
+        seen = {resource_id}
         while current.parent_id is not None:
-            current = by_id.get(current.parent_id)
+            parent_id = current.parent_id
+            if parent_id in seen:
+                return ProviderAncestors(
+                    state="partial", items=list(reversed(items)), reason="ancestor cycle detected")
+            current = by_id.get(parent_id)
             if current is None:
-                return ProviderAncestors(state="partial", items=items, reason="ancestor is unavailable")
+                return ProviderAncestors(
+                    state="partial", items=list(reversed(items)), reason="ancestor is unavailable")
             items.append(current)
+            seen.add(parent_id)
         return ProviderAncestors(items=list(reversed(items)))
 
     def dataset_detail(self, mount: CatalogMount, resource_id: str) -> ProviderResourceResult:

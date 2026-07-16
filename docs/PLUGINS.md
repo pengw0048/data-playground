@@ -240,6 +240,10 @@ detail, and stable identities after a provider restart. The reference
 [`dp_file_catalog_provider`](../examples/plugins/dp_file_catalog_provider/) reads a `catalog.json`
 document from its `root` mount config and never writes it.
 
+Use a conformance fixture whose first two deterministic root resources share a display name but have
+distinct IDs, and whose first root container has a dataset child with schema. This makes the command
+exercise duplicate-name identity, nested ancestors, and dataset detail instead of accepting a no-op.
+
 All lineage methods exposed by a catalog plugin must agree on authority. An `InMemoryCatalog` subclass
 may serve discovery rows externally while deliberately retaining its inherited core-metadata lineage
 graph, exporter, and recorder as one side store. If it moves any lineage surface elsewhere, it must

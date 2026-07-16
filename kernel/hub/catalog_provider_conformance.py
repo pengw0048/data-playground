@@ -70,18 +70,21 @@ def main(argv: list[str] | None = None) -> int:
         second = bounded_list_children(provider, mount, None, limit=1, cursor=first.next_cursor)
         if second.state != "ready" or len(second.items) != 1 or second.items[0].id == first.items[0].id:
             return _failure("capability", "provider pagination was not stable")
-        if first.items[0].name == second.items[0].name and first.items[0].id == second.items[0].id:
-            return _failure("capability", "duplicate display names need distinct resource IDs")
+        if first.items[0].name != second.items[0].name:
+            return _failure("capability", "provider did not preserve duplicate display names")
         resolved = provider.resolve(mount, first.items[0].id)
         if resolved.state != "ready" or resolved.item is None or resolved.item.id != first.items[0].id:
             return _failure("capability", "provider could not resolve its opaque resource ID")
-        detail_item = next((item for item in (first.items + second.items) if item.kind == "dataset"), None)
-        if detail_item is not None:
-            detail = provider.dataset_detail(mount, detail_item.id)
-            if detail.state != "ready" or detail.item is None:
-                return _failure("capability", "provider could not return dataset detail")
-        ancestors = provider.ancestors(mount, first.items[0].id)
-        if ancestors.state != "ready":
+        child = bounded_list_children(provider, mount, first.items[0].id, limit=1)
+        if child.state != "ready" or len(child.items) != 1 or child.items[0].kind != "dataset":
+            return _failure("capability", "provider did not expose the conformance dataset child")
+        detail = provider.dataset_detail(mount, child.items[0].id)
+        if (detail.state != "ready" or detail.item is None or
+                detail.item.id != child.items[0].id or not detail.item.columns):
+            return _failure("capability", "provider could not return dataset detail and schema")
+        ancestors = provider.ancestors(mount, child.items[0].id)
+        if (ancestors.state != "ready" or not ancestors.items or
+                ancestors.items[-1].id != first.items[0].id):
             return _failure("capability", "provider could not return resource ancestors")
         restarted = _provider(args.provider)
         repeated = bounded_list_children(restarted, mount, None, limit=1)

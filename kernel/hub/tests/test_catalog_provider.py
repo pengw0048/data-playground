@@ -7,10 +7,13 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
-from hub.catalog_provider import CatalogMount, ProviderPage, bounded_list_children
+from hub.catalog_provider import (
+    _PROVIDER_READ_CONCURRENCY, CatalogMount, ProviderPage, bounded_list_children,
+)
 
 
 def _write_catalog(root: Path, resources: list[dict]) -> None:
@@ -53,10 +56,18 @@ def test_file_provider_keeps_mount_config_identity_and_duplicate_names_isolated(
     assert first_dataset.columns[0].name == "id"
     assert [item.id for item in catalog.ancestors(first, "nested-dataset").items] == ["container-a"]
 
+    (first_root / "catalog.json").write_text(json.dumps({"resources": [
+        {"id": "container-a", "kind": "container", "name": "a", "parentId": "container-b"},
+        {"id": "container-b", "kind": "container", "name": "b", "parentId": "container-a"},
+    ]}))
+    cyclic = catalog.ancestors(first, "container-a")
+    assert cyclic.state == "partial" and cyclic.reason == "ancestor cycle detected"
+    assert [item.id for item in cyclic.items] == ["container-b"]
+
 
 class _SlowProvider:
     def list_children(self, *_args, **_kwargs):
-        time.sleep(0.4)
+        time.sleep(0.2)
         return ProviderPage()
 
 
@@ -65,12 +76,22 @@ class _CancelledProvider:
         raise asyncio.CancelledError()
 
 
-def test_bounded_listing_normalizes_deadline_and_cancellation_without_waiting():
+def test_bounded_listing_caps_background_work_and_normalizes_failures():
     mount = CatalogMount(id="local", provider="test")
     started = time.monotonic()
-    timeout = bounded_list_children(_SlowProvider(), mount, None, limit=1, timeout=0.02)
+    timeouts = [
+        bounded_list_children(_SlowProvider(), mount, None, limit=1, timeout=0.005)
+        for _ in range(_PROVIDER_READ_CONCURRENCY)
+    ]
+    saturated = bounded_list_children(_SlowProvider(), mount, None, limit=1, timeout=0.005)
     assert time.monotonic() - started < 0.2
-    assert timeout.state == "unavailable" and timeout.reason == "deadline exceeded"
+    assert all(item.state == "unavailable" and item.reason == "deadline exceeded" for item in timeouts)
+    assert saturated.state == "unavailable" and saturated.reason == "provider busy"
+    provider_threads = [
+        thread for thread in threading.enumerate() if thread.name.startswith("dp-catalog-provider")
+    ]
+    assert len(provider_threads) <= _PROVIDER_READ_CONCURRENCY
+    time.sleep(0.25)
     cancelled = bounded_list_children(_CancelledProvider(), mount, None, limit=1)
     assert cancelled.state == "unavailable" and cancelled.reason == "request cancelled"
 
@@ -108,6 +129,15 @@ def test_file_provider_wheel_passes_public_conformance(tmp_path):
          "--mount-id", "reference-mount", "--config", f"root={root}"], cwd=tmp_path, env=clean_env)
     assert checked.returncode == 0, checked.stderr
     assert checked.stdout.strip() == "catalog provider conformance passed"
+
+    unique_names = _resources("file:///reference.parquet")
+    unique_names[1]["name"] = "different"
+    (root / "catalog.json").write_text(json.dumps({"resources": unique_names}))
+    invalid_fixture = _run(
+        [str(python), "-m", "hub.catalog_provider_conformance", "dp-file-catalog",
+         "--mount-id", "reference-mount", "--config", f"root={root}"], cwd=tmp_path, env=clean_env)
+    assert invalid_fixture.returncode == 1
+    assert invalid_fixture.stderr.strip() == "capability: provider did not preserve duplicate display names"
 
     secret = "config-should-not-leak"
     rejected = _run(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import threading
 from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import Field, model_validator
@@ -16,6 +17,12 @@ from pydantic import Field, model_validator
 from hub.models import ColumnSchema, Wire
 
 ProviderState = Literal["ready", "partial", "unavailable", "unsupported"]
+_PROVIDER_READ_CONCURRENCY = 8
+_provider_read_slots = threading.BoundedSemaphore(_PROVIDER_READ_CONCURRENCY)
+_provider_read_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_PROVIDER_READ_CONCURRENCY,
+    thread_name_prefix="dp-catalog-provider",
+)
 
 
 class CatalogMount(Wire):
@@ -93,6 +100,19 @@ def _unavailable(reason: str) -> ProviderPage:
     return ProviderPage(state="unavailable", reason=reason)
 
 
+def _list_children(
+    provider: ReadOnlyCatalogProvider,
+    mount: CatalogMount,
+    parent_id: str | None,
+    limit: int,
+    cursor: str | None,
+) -> ProviderPage:
+    try:
+        return provider.list_children(mount, parent_id, limit=limit, cursor=cursor)
+    finally:
+        _provider_read_slots.release()
+
+
 def bounded_list_children(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
                           parent_id: str | None, *, limit: int, cursor: str | None = None,
                           timeout: float = 1.0) -> ProviderPage:
@@ -105,12 +125,19 @@ def bounded_list_children(provider: ReadOnlyCatalogProvider, mount: CatalogMount
         raise ValueError("limit must be between 1 and 500")
     if timeout <= 0:
         return _unavailable("deadline exceeded")
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(provider.list_children, mount, parent_id, limit=limit, cursor=cursor)
+    if not _provider_read_slots.acquire(blocking=False):
+        return _unavailable("provider busy")
+    try:
+        future = _provider_read_executor.submit(
+            _list_children, provider, mount, parent_id, limit, cursor)
+    except Exception:  # noqa: BLE001 -- executor shutdown must stay an unavailable provider result
+        _provider_read_slots.release()
+        return _unavailable("provider unavailable")
     try:
         return future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
-        future.cancel()
+        if future.cancel():
+            _provider_read_slots.release()
         return _unavailable("deadline exceeded")
     except concurrent.futures.CancelledError:
         return _unavailable("request cancelled")
@@ -122,5 +149,3 @@ def bounded_list_children(provider: ReadOnlyCatalogProvider, mount: CatalogMount
         return _unavailable("provider unavailable")
     except Exception:  # noqa: BLE001 -- provider failures must not take down local browse
         return _unavailable("provider read failed")
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
