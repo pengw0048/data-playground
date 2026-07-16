@@ -139,16 +139,17 @@ def test_settings_batch_persistence_failure_rolls_back_rows_and_revision(monkeyp
 
 
 def test_stale_settings_batch_returns_current_revision_without_writes():
-    winner_key = _key("stale.winner")
-    loser_key = _key("stale.loser")
+    same_key = _key("stale.same")
+    other_key = _key("stale.other")
     baseline = _snapshot()
     winner = _batch(baseline, [
-        {"scope": "global", "key": winner_key, "value": "winner"},
+        {"scope": "global", "key": same_key, "value": "server"},
     ])
     assert winner.status_code == 200
 
     loser = _batch(baseline, [
-        {"scope": "global", "key": loser_key, "value": "loser"},
+        {"scope": "global", "key": same_key, "value": "local"},
+        {"scope": "global", "key": other_key, "value": "local-review"},
     ])
 
     assert loser.status_code == 409
@@ -159,8 +160,8 @@ def test_stale_settings_batch_returns_current_revision_without_writes():
         "retryable": False,
         "revision": latest["revision"],
     }
-    assert latest["global"][winner_key] == "winner"
-    assert loser_key not in latest["global"]
+    assert latest["global"][same_key] == "server"
+    assert other_key not in latest["global"]
 
 
 def test_concurrent_settings_batches_exactly_one_wins():
