@@ -47,6 +47,7 @@ import {
   currentPreviews, previewPlanIdentity, profilePlanIdentity, useStore,
 } from './graph'
 import { KernelError } from '../api/client'
+import { register } from '../nodes/registry'
 
 const storage = new Map<string, string>()
 Object.defineProperty(globalThis, 'localStorage', {
@@ -210,6 +211,24 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().previews.filter?.result?.rows).toEqual([{ value: 'view' }])
   })
 
+  it('reports a non-previewable plugin locally without sending a preview request', async () => {
+    register({
+      kind: 'store-non-previewable-plugin', title: 'Full-pass plugin', category: 'compute',
+      inputs: [], outputs: [{ id: 'out', label: 'Out', wire: 'dataset' }], canBypass: false,
+      previewable: false, defaultData: () => ({ title: 'Full-pass plugin', config: {}, status: 'draft', history: [] }), blurb: '',
+    }, () => null)
+    useStore.setState({
+      doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('plugin', 'store-non-previewable-plugin')], edges: [] },
+    })
+
+    await useStore.getState().runPreview('plugin')
+
+    expect(apiMocks.preview).not.toHaveBeenCalled()
+    expect(useStore.getState().previews.plugin?.result).toMatchObject({
+      notPreviewable: true, reason: 'Full-pass plugin is not sample-previewable — run a full pass',
+    })
+  })
+
   it('blocks a stale sample response after its seed changes', async () => {
     let finish!: (result: ReturnType<typeof previewResult>) => void
     apiMocks.preview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
@@ -300,7 +319,7 @@ describe('graph store — core authority ops', () => {
     await useStore.getState().requestRun('section')
     expect(apiMocks.estimate).toHaveBeenCalledWith(doc, 'section')
     expect(apiMocks.run).toHaveBeenCalledWith(
-      expect.objectContaining({ id: doc.id }), 'section', false,
+      expect.objectContaining({ id: doc.id }), 'section', false, expect.any(String),
     )
     await vi.waitFor(() => expect(useStore.getState().doc.nodes[1].data.status).toBe('latest'))
 
@@ -313,7 +332,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.run.mockClear()
     await useStore.getState().run('section')
     expect(apiMocks.run).toHaveBeenCalledWith(
-      expect.objectContaining({ id: doc.id }), 'section', false,
+      expect.objectContaining({ id: doc.id }), 'section', false, expect.any(String),
     )
 
     apiMocks.estimate.mockClear()

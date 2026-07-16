@@ -1318,6 +1318,27 @@ export const useStore = create<Store>((set, get) => ({
       },
       openPanels: { [id]: 'data' },
     }))
+    const spec = getSpec(node.type)
+    if (spec?.previewable === false) {
+      set((s) => ({
+        previews: {
+          ...s.previews,
+          [id]: {
+            canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, offset,
+            result: {
+              columns: [],
+              rows: [],
+              truncated: false,
+              completeness: 'unknown',
+              notPreviewable: true,
+              reason: `${spec.title} is not sample-previewable — run a full pass`,
+              wire: 'dataset',
+            },
+          },
+        },
+      }))
+      return
+    }
     try {
       // A preview is a bounded peek (a page of rows), NOT a full materialized run — we deliberately
       // do NOT flip status to 'latest' (that green state means a real run). Paginated via `offset`.
@@ -1380,7 +1401,7 @@ export const useStore = create<Store>((set, get) => ({
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'running' } } }))
     get().updateData(id, { status: 'running' })
     try {
-      const status = await api.run(get().doc, id, confirmed)
+      const status = await api.run(get().doc, id, confirmed, globalThis.crypto.randomUUID())
       set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), status, phase: 'running' } } }))
       pollRun(get, set, id, status.runId)
     } catch (e) {

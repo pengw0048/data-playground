@@ -519,6 +519,9 @@ function RunPlan({ nodeId }: { nodeId: string }) {
             </span>
             <span className="dp-mono flex-1 truncate text-foreground">{r.outputNode}</span>
             <span className="tabular-nums text-muted-foreground" title={r.confidence === 'bounded' ? 'Estimated upper bound' : undefined}>{r.confidence === 'unknown' ? '' : `${r.confidence === 'bounded' ? '≤ ' : ''}${fmt(r.rows)}`}</span>
+            {r.requires && !r.unsatisfied && (
+              <span className="rounded bg-muted px-1.5 py-px text-[9px] text-muted-foreground" title="declared resource requirement">needs {r.requires}</span>
+            )}
             {multi && i < regions.length - 1 && r.tier && (
               <span className="rounded bg-muted px-1.5 py-px text-[9px] text-muted-foreground" title="materialization tier for the handoff">→ {r.tier}</span>
             )}

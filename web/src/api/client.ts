@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunOutput, RunStatus, SampleResult,
+  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunOutput, RunStatus, SampleResult,
   WorkspaceBrowsePage, WorkspaceResourceResolution,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
@@ -119,12 +119,12 @@ function fullResultExportPath(runId: string, nodeId: string, portId: string, fil
   return `/run/${encodeURIComponent(runId)}/export?${params.toString()}`
 }
 
-export interface BackendPort { id: string; label?: string; wire: string; accepts?: string[] }
+export interface BackendPort { id: string; label?: string; wire: string; accepts?: string[]; multi?: boolean }
 export interface BackendParam { name: string; type: string; default?: unknown; options?: string[]; label?: string; lang?: string; required?: boolean; showWhen?: { param: string; in: string[] } }
 export interface BackendNodeSpec {
   kind: string; title: string; category: string; tag?: string
   inputs: BackendPort[]; outputs: BackendPort[]; params: BackendParam[]
-  canBypass: boolean; previewable: boolean; blurb: string
+  canBypass: boolean; previewable: boolean; requires?: ResourceSpec | null; blurb: string
 }
 
 export interface AgentBackendNode { id: string; type: string; position: { x: number; y: number }; data: { title?: string; config?: Record<string, unknown> } }
@@ -293,8 +293,21 @@ export const api = {
   profileIdentity: (doc: CanvasDoc, nodeId: string) =>
     req<ProfileIdentity>('/run/profile-identity', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
 
-  run: (doc: CanvasDoc, targetNodeId?: string, confirmed = false) =>
-    req<RunStatus>('/run', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed }) }),
+  run: async (doc: CanvasDoc, targetNodeId: string | undefined, confirmed: boolean, submissionId: string) => {
+    // Keep the same client-owned id across a lost HTTP response: the hub adopts the one immutable
+    // admission instead of starting another full pass against a moved source head.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await req<RunStatus>('/run', {
+          method: 'POST',
+          body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed, submissionId }),
+        })
+      } catch (error) {
+        if (error instanceof KernelError || attempt >= 2) throw error
+        await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)))
+      }
+    }
+  },
 
   fullProfile: (doc: CanvasDoc, nodeId: string, planDigest: string, submissionId: string, confirmed = false) =>
     req<RunStatus>('/run/profile-job', {

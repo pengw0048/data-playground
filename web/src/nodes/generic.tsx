@@ -126,9 +126,12 @@ export function registerGenericNodes(specs: BackendNodeSpec[]): number {
     register(
       {
         kind: b.kind, title: b.title, category: b.category as any, tag: b.tag ?? b.kind,
-        inputs: b.inputs.map((p) => ({ id: p.id, label: p.label, wire: p.wire as WireType, accepts: p.accepts as WireType[] | undefined })),
+        inputs: b.inputs.map((p) => ({
+          id: p.id, label: p.label, wire: p.wire as WireType,
+          accepts: p.accepts as WireType[] | undefined, multi: p.multi,
+        })),
         outputs: b.outputs.map((p) => ({ id: p.id, label: p.label, wire: p.wire as WireType })),
-        canBypass: b.canBypass, blurb: b.blurb,
+        canBypass: b.canBypass, previewable: b.previewable, requires: b.requires, blurb: b.blurb,
         defaultData: () => ({
           title: b.title, status: 'draft',
           config: Object.fromEntries(b.params.filter((p) => p.default != null).map((p) => [p.name, p.default])),

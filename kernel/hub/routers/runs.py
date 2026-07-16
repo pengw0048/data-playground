@@ -5,6 +5,9 @@ the execution routes (and where a run writes). Split out of main.py; all authed 
 from __future__ import annotations
 
 import contextlib
+import datetime
+import hashlib
+import json
 import logging
 import os
 import re
@@ -18,11 +21,13 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-from hub import auth, compiler, destinations, metadb, placement
+from hub import auth, compiler, db, destinations, metadb, placement
 from hub import graph as graph_mod
 from hub.agent import AgentCredentialError, agent_credential_error_status, agent_status, run_agent
 from hub.api_errors import APIError, APIErrorCode
-from hub.backends import BackendStatusUnavailable, backend_supports_named_multi_output_runs
+from hub.backends import (
+    BackendStatusUnavailable, DatasetRevisionAdapter, backend_supports_named_multi_output_runs,
+)
 from hub.deps import get_deps
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
@@ -68,6 +73,84 @@ _EXPORT_MEDIA_TYPES = {
     ".tsv": "text/tab-separated-values; charset=utf-8",
     ".json": "application/json",
 }
+
+
+def _local_run_intent_sha256(graph, target_node_id: str | None) -> str:
+    """Hash caller intent before source resolution so a retry cannot be retargeted by a moved head."""
+    doc = graph.model_dump(mode="json")
+    payload = json.dumps(
+        {"graph": doc, "target_node_id": target_node_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _local_run_source_nodes(graph, target_node_id: str | None):
+    """Return execution-cone Sources in graph order; duplicate node ids are rejected upstream."""
+    cone = graph_mod.upstream_chain(graph, target_node_id) if target_node_id else graph.nodes
+    return [node for node in cone if node.type == "source"]
+
+
+def _resolve_local_run_manifest(graph, target_node_id: str | None, deps) -> list[dict[str, str]]:
+    """Resolve every local-run Source once through its registered exact-revision provider."""
+    resolved_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    manifest: list[dict[str, str]] = []
+    for node in _local_run_source_nodes(graph, target_node_id):
+        cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+        uri = str(cfg.get("uri") or "")
+        binding = metadb.catalog_revision_binding_for_uri(uri)
+        adapter = deps.resolve_adapter(uri)
+        if binding is None or not isinstance(adapter, DatasetRevisionAdapter):
+            raise APIError(410, "local_run_input_revision_unavailable",
+                           code=APIErrorCode.RESOURCE_GONE, retryable=False)
+        try:
+            resolved = adapter.resolve_revision(uri)
+        except Exception as exc:  # a provider error is not permission to dispatch against head
+            raise APIError(410, "local_run_input_revision_unavailable",
+                           code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
+        revision_id = str(resolved.get("revision_id") or "")
+        provider = str(getattr(adapter, "name", "") or "")
+        if not revision_id or not provider:
+            raise APIError(410, "local_run_input_revision_unavailable",
+                           code=APIErrorCode.RESOURCE_GONE, retryable=False)
+        manifest.append({
+            "node_id": str(node.id), "dataset_id": str(binding["dataset_id"]),
+            "revision_id": revision_id, "provider": provider, "resolved_at": resolved_at,
+        })
+    return manifest
+
+
+def _bind_local_run_manifest(graph, manifest: list[dict[str, str]], deps):
+    """Reopen persisted exact bindings and attach them only to the dispatch copy of a graph."""
+    bound = graph.model_copy(deep=True)
+    nodes = {node.id: node for node in bound.nodes}
+    for item in manifest:
+        node = nodes.get(item["node_id"])
+        if node is None:
+            raise APIError(409, "local_run_input_manifest_does_not_match_graph",
+                           code=APIErrorCode.INVALID_REQUEST, retryable=False)
+        binding = metadb.catalog_revision_binding(item["dataset_id"])
+        if binding is None:
+            raise APIError(410, "local_run_input_revision_unavailable",
+                           code=APIErrorCode.RESOURCE_GONE, retryable=False)
+        uri = str(binding["uri"])
+        adapter = deps.resolve_adapter(uri)
+        if (not isinstance(adapter, DatasetRevisionAdapter)
+                or str(getattr(adapter, "name", "") or "") != item["provider"]):
+            raise APIError(410, "local_run_input_revision_unavailable",
+                           code=APIErrorCode.RESOURCE_GONE, retryable=False)
+        try:
+            # Force provider retention validation before any worker thread/kernel dispatch.  Engine opens
+            # it again from the same exact id, which is the only execution read allowed for this Source.
+            with db.base_guard():
+                adapter.open_revision(uri, item["revision_id"])
+        except Exception as exc:
+            raise APIError(410, "local_run_input_revision_unavailable",
+                           code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
+        cfg = node.data.setdefault("config", {})
+        cfg["uri"] = uri
+        cfg["_input_revision_id"] = item["revision_id"]
+    return bound
 _EXPORT_OPENAPI_CONTENT = {
     media_type.split(";", 1)[0]: {"schema": {"type": "string", "format": "binary"}}
     for media_type in sorted(set(_EXPORT_MEDIA_TYPES.values()))
@@ -916,6 +999,36 @@ def _route_by_capability(deps, chosen, graph, target_node_id: str | None = None)
     )
 
 
+def _require_satisfiable_hard_requirements(deps, graph, target_node_id: str | None = None) -> None:
+    """Reject a GPU/label pin when no registered backend can actually honor it.
+
+    CPU and memory remain local-engine hints: the existing out-of-core runner can time-share and spill.
+    GPU, GPU type, and placement labels instead promise a capability local execution does not have, so
+    silently falling back would make a plugin's declared contract untrue.
+    """
+    nodes = graph_mod.upstream_chain(graph, target_node_id) if target_node_id else None
+    req = placement.graph_requires(graph, deps.node_specs, nodes=nodes)
+    if not (req.gpu or req.gpu_type or req.labels):
+        return
+
+    def accepts(r) -> bool:
+        try:
+            if hasattr(r, "place") and r.place(req) is not None:
+                return True
+            whole = getattr(r, "accepts_whole_graph", None)
+            return callable(whole) and bool(whole(req))
+        except Exception:  # a broken placement probe cannot authorize an unsupported run
+            return False
+
+    if any(accepts(r) for r in deps.runners):
+        return
+    parts = []
+    if req.gpu or req.gpu_type:
+        parts.append(f"{req.gpu or 1}×{req.gpu_type or 'gpu'}")
+    parts.extend(f"{key}={value}" for key, value in (req.labels or {}).items())
+    raise HTTPException(400, "no registered backend can satisfy required resources: " + " · ".join(parts))
+
+
 def _destination_credential_preflight(deps, runner, plan, graph) -> str | None:
     from hub.backends import destination_credential_error
     return destination_credential_error(runner, plan, graph, deps.workspace)
@@ -936,6 +1049,7 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
+    _require_satisfiable_hard_requirements(deps, req.graph, req.target_node_id)
     output_target = _run_output_preflight(plan, req.target_node_id)
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), req.graph, req.target_node_id)
@@ -963,7 +1077,8 @@ class RunNeedsConfirm(Exception):
         self.estimate = estimate
 
 
-def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool = False):
+def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool = False,
+              submission_id: str | None = None):
     """Start a run — the ONE code path behind both POST /run and the MCP run_canvas tool, so a run an
     agent launches is placed, gated, and owned exactly like one the browser launches. Resolves source
     refs, rejects an invalid/cyclic graph (HTTPException), sizes + gates the run (RunNeedsConfirm), then
@@ -980,11 +1095,13 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         if role not in _RUN_MUTATE_ROLES:
             raise HTTPException(403, f"canvas '{cid}' requires owner or editor to run")
         auth_canvas = cid  # a real writable canvas → all collaborators may observe this run
+    intent_sha256 = _local_run_intent_sha256(graph, target_node_id) if submission_id else None
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(graph, deps, target_node_id)
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
+    _require_satisfiable_hard_requirements(deps, graph, target_node_id)
     output_target = _run_output_preflight(plan, target_node_id)
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), graph, target_node_id
@@ -1008,12 +1125,36 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         AuditAction, AuditOutcome, emit_audit, get_request_id, invoke_backend_run,
     )
     request_id = get_request_id()
+    # The immutable-manifest contract belongs to the default in-process local owner only.  Other
+    # backends own their transport/admission contracts and are deliberately outside this issue.
+    local_admission = bool(submission_id and runner is deps.runner and not controller_regions)
+    dispatch_graph = graph
+    prebound_local_run_id: str | None = None
+    if local_admission:
+        manifest = _resolve_local_run_manifest(graph, target_node_id, deps)
+        operational_canvas = auth_canvas or (str(getattr(graph, "id", "") or "") or None)
+        if operational_canvas is None:
+            raise RuntimeError("local run admission requires a persisted canvas")
+        prebound_local_run_id, _created = metadb.admit_local_run_inputs(
+            uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
+            target_node_id=target_node_id, intent_sha256=str(intent_sha256), manifest=manifest,
+        )
+        persisted = metadb.local_run_input_manifest(prebound_local_run_id)
+        if persisted is None:
+            raise RuntimeError("local run admission was not persisted")
+        dispatch_graph = _bind_local_run_manifest(graph, persisted, deps)
+        claimed_status, should_dispatch = metadb.claim_local_run_dispatch(
+            run_id=prebound_local_run_id, uid=uid, auth_canvas_id=auth_canvas,
+            request_id=request_id,
+        )
+        if not should_dispatch:
+            return RunStatus(**claimed_status), deps.runner
     # a run that splits across placement regions (a placed node / checkpoint / fan-out) is owned by the
     # RunController; a single default region returns None → the base runner, exactly as before. Hand it the
     # schema+actual-aware `sizes` we just computed so cost-based placement routes on the SAME measured
     # widths the gate saw — not a second, coarse re-estimate.
     overall = deps.controller.run(
-        graph, target_node_id, uid, sizes=sizes, request_id=request_id,
+        dispatch_graph, target_node_id, uid, sizes=sizes, request_id=request_id,
         regions=controller_regions)
     identity_prebound = False
     if overall is not None:
@@ -1076,8 +1217,24 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                 if keepalive.ident is not None:
                     keepalive.join(timeout=1.0)
         else:
-            status = invoke_backend_run(
-                runner, plan, graph, target_node_id, est.placement, request_id=request_id)
+            try:
+                status = invoke_backend_run(
+                    runner, plan, dispatch_graph, target_node_id, est.placement,
+                    run_id=prebound_local_run_id, request_id=request_id)
+            except Exception as exc:
+                if prebound_local_run_id is None:
+                    raise
+                try:
+                    # LocalRunner records this receipt before it starts the worker. A missing receipt
+                    # therefore proves this invocation did not create a worker; an existing receipt is
+                    # an ambiguous response-loss outcome and must be adopted without another dispatch.
+                    status = runner.status(prebound_local_run_id)
+                except KeyError:
+                    metadb.fail_claimed_local_run_dispatch(
+                        prebound_local_run_id, f"{type(exc).__name__}: {exc}")
+                    raise exc from None
+            if prebound_local_run_id is not None and status.run_id != prebound_local_run_id:
+                raise RuntimeError("local execution backend did not preserve its admitted run id")
         owner = runner
     if request_id and not status.request_id:
         status.request_id = request_id
@@ -1106,7 +1263,10 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
 @router.post("/run", response_model=RunStatus)
 def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
     try:
-        status, _ = start_run(get_deps(), req.graph, req.target_node_id, uid, req.confirmed)
+        status, _ = start_run(
+            get_deps(), req.graph, req.target_node_id, uid, req.confirmed,
+            str(req.submission_id) if req.submission_id is not None else None,
+        )
     except RunNeedsConfirm:
         raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
     return status
