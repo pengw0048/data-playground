@@ -647,6 +647,23 @@ class CatalogLogicalDataset(Base):
     )
 
 
+class SettingRevision(Base):
+    """One optimistic-concurrency counter per independently editable settings scope."""
+    __tablename__ = "setting_revisions"
+    scope: Mapped[str] = mapped_column(String, primary_key=True)
+    scope_id: Mapped[str] = mapped_column(String, primary_key=True)
+    revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0")
+    __table_args__ = (
+        CheckConstraint("scope IN ('global', 'user')", name="ck_setting_revision_scope"),
+        CheckConstraint(
+            "(scope = 'global' AND scope_id = '') OR "
+            "(scope = 'user' AND scope_id <> '')",
+            name="ck_setting_revision_identity",
+        ),
+    )
+
+
 class Setting(Base):
     __tablename__ = "settings"
     # scope 'global' (scope_id='') for system settings; scope 'user' (scope_id=user id) for prefs
@@ -655,7 +672,15 @@ class Setting(Base):
     scope_id: Mapped[str] = mapped_column(String, default="")
     key: Mapped[str] = mapped_column(String)
     value: Mapped[str] = mapped_column(Text)  # JSON-encoded
-    __table_args__ = (UniqueConstraint("scope", "scope_id", "key", name="uq_setting"),)
+    __table_args__ = (
+        UniqueConstraint("scope", "scope_id", "key", name="uq_setting"),
+        CheckConstraint("scope IN ('global', 'user')", name="ck_setting_scope"),
+        CheckConstraint(
+            "(scope = 'global' AND scope_id = '') OR "
+            "(scope = 'user' AND scope_id <> '')",
+            name="ck_setting_identity",
+        ),
+    )
 
 
 class CredEntity(Base):
@@ -903,6 +928,9 @@ def _bootstrap_metadata() -> None:
                 raise SchemaNotReadyError(
                     "session auth is enabled but no administrator has a login credential; provide "
                     "DP_AUTH_PASSWORD to the one-shot 'dataplay migrate' command for first bootstrap")
+        for scope, scope_id in (("global", ""), ("user", DEFAULT_USER_ID)):
+            if s.get(SettingRevision, (scope, scope_id)) is None:
+                s.add(SettingRevision(scope=scope, scope_id=scope_id, revision=0))
     # The cleartext value is one-shot migration input. Never let a subsequently spawned workload
     # inherit it after the bootstrap transaction commits.
     if bootstrap:
@@ -8254,13 +8282,158 @@ def get_version_doc(canvas_id: str, version_id: str) -> str | None:
         return v.doc if v and v.canvas_id == canvas_id else None
 
 
-def set_setting(key: str, value, scope: str = "global", scope_id: str = "") -> None:
+class SettingsRevisionConflict(RuntimeError):
+    """A settings batch was based on an older scope snapshot."""
+
+    def __init__(self, current_revision: dict[str, int]):
+        super().__init__("settings revision is stale")
+        self.current_revision = dict(current_revision)
+
+
+class _SettingsRevisionStale(RuntimeError):
+    """Internal marker raised inside a transaction so the context manager rolls it back."""
+
+
+def _setting_scope_identity(scope: str, scope_id: str) -> tuple[str, str]:
+    if scope == "global" and scope_id == "":
+        return scope, scope_id
+    if scope == "user" and scope_id:
+        return scope, scope_id
+    raise ValueError("setting scope must be global or a non-empty user identity")
+
+
+def _ensure_setting_revision_in_session(
+        s, scope: str, scope_id: str) -> SettingRevision:
+    """Return the scope counter, tolerating a first-use race for directly seeded test users."""
+    identity = _setting_scope_identity(scope, scope_id)
+    row = s.get(SettingRevision, identity)
+    if row is not None:
+        return row
+    try:
+        with s.begin_nested():
+            s.add(SettingRevision(scope=scope, scope_id=scope_id, revision=0))
+            s.flush()
+    except IntegrityError:
+        # A concurrent first writer created the row. The unique-key wait has completed, so its
+        # committed counter is now visible under PostgreSQL READ COMMITTED; SQLite serializes writers.
+        s.expire_all()
+    row = s.get(SettingRevision, identity, populate_existing=True)
+    if row is None:
+        raise RuntimeError("setting revision row could not be established")
+    return row
+
+
+def _ensure_setting_revisions_in_session(s, user_id: str) -> None:
+    for scope, scope_id in (("global", ""), ("user", user_id)):
+        _ensure_setting_revision_in_session(s, scope, scope_id)
+
+
+def _read_setting_revisions_in_session(s, user_id: str) -> dict[str, int]:
+    identities = (("global", ""), ("user", user_id))
+    rows = list(s.execute(select(
+        SettingRevision.scope, SettingRevision.revision,
+    ).where(or_(*(
+        and_(SettingRevision.scope == scope, SettingRevision.scope_id == scope_id)
+        for scope, scope_id in identities
+    )))))
+    revisions = {str(scope): int(revision) for scope, revision in rows}
+    if set(revisions) != {"global", "user"}:
+        raise RuntimeError("setting revision rows are incomplete")
+    return revisions
+
+
+def settings_snapshot(user_id: str) -> tuple[list[tuple[str, str, str]], dict[str, int]]:
+    """Read a value snapshot whose revisions cannot belong to an older or newer commit."""
+    for _attempt in range(5):
+        with session() as s:
+            _ensure_setting_revisions_in_session(s, user_id)
+            before = _read_setting_revisions_in_session(s, user_id)
+            rows = list(s.execute(select(Setting.scope, Setting.key, Setting.value).where(or_(
+                and_(Setting.scope == "global", Setting.scope_id == ""),
+                and_(Setting.scope == "user", Setting.scope_id == user_id),
+            )).order_by(Setting.scope, Setting.key)))
+            after = _read_setting_revisions_in_session(s, user_id)
+            if before == after:
+                return (
+                    [(str(scope), str(key), str(value)) for scope, key, value in rows],
+                    after,
+                )
+    raise RuntimeError("settings changed too frequently to read a consistent snapshot")
+
+
+def setting_revisions(user_id: str) -> dict[str, int]:
     with session() as s:
-        row = s.scalar(select(Setting).where(Setting.scope == scope, Setting.scope_id == scope_id, Setting.key == key))
-        if row:
-            row.value = json.dumps(value)
-        else:
-            s.add(Setting(scope=scope, scope_id=scope_id, key=key, value=json.dumps(value)))
+        _ensure_setting_revisions_in_session(s, user_id)
+        return _read_setting_revisions_in_session(s, user_id)
+
+
+def _set_setting_in_session(s, key: str, value, *, scope: str, scope_id: str) -> None:
+    encoded = json.dumps(value, allow_nan=False)
+    row = s.scalar(select(Setting).where(
+        Setting.scope == scope, Setting.scope_id == scope_id, Setting.key == key))
+    if row:
+        row.value = encoded
+    else:
+        s.add(Setting(scope=scope, scope_id=scope_id, key=key, value=encoded))
+
+
+def set_settings_batch(
+        changes: list[tuple[str, str, object]], expected_revision: dict[str, int],
+        user_id: str) -> dict[str, int]:
+    """Atomically compare scope revisions, write every change, and advance each touched scope once."""
+    if not changes:
+        return setting_revisions(user_id)
+    identities = [(scope, "" if scope == "global" else user_id) for scope, _key, _value in changes]
+    for scope, scope_id in identities:
+        _setting_scope_identity(scope, scope_id)
+    keys = [(scope, key) for scope, key, _value in changes]
+    if len(set(keys)) != len(keys):
+        raise ValueError("settings batch contains a duplicate scope and key")
+    touched = {scope for scope, _scope_id in identities}
+    if set(expected_revision) != {"global", "user"}:
+        raise ValueError("settings batch requires global and user revisions")
+    result_revision: dict[str, int]
+    try:
+        with session() as s:
+            _ensure_setting_revisions_in_session(s, user_id)
+            for scope in ("global", "user"):
+                if scope not in touched:
+                    continue
+                scope_id = "" if scope == "global" else user_id
+                advanced = s.execute(update(SettingRevision).where(
+                    SettingRevision.scope == scope,
+                    SettingRevision.scope_id == scope_id,
+                    SettingRevision.revision == expected_revision[scope],
+                ).values(revision=SettingRevision.revision + 1))
+                if advanced.rowcount != 1:
+                    raise _SettingsRevisionStale
+            for scope, key, value in changes:
+                _set_setting_in_session(
+                    s, key, value, scope=scope,
+                    scope_id="" if scope == "global" else user_id,
+                )
+            s.flush()
+            # One statement observes the untouched scope alongside our uncommitted touched counters.
+            # The token may become stale immediately after this read, as every optimistic token can,
+            # but it always described one real database snapshot and adds no post-commit failure point.
+            result_revision = _read_setting_revisions_in_session(s, user_id)
+    except _SettingsRevisionStale:
+        # Read only after session() has rolled back every earlier scope CAS in a mixed batch.
+        raise SettingsRevisionConflict(setting_revisions(user_id)) from None
+    return result_revision
+
+
+def set_setting(key: str, value, scope: str = "global", scope_id: str = "") -> None:
+    scope, scope_id = _setting_scope_identity(scope, scope_id)
+    with session() as s:
+        _ensure_setting_revision_in_session(s, scope, scope_id)
+        advanced = s.execute(update(SettingRevision).where(
+            SettingRevision.scope == scope,
+            SettingRevision.scope_id == scope_id,
+        ).values(revision=SettingRevision.revision + 1))
+        if advanced.rowcount != 1:
+            raise RuntimeError("setting revision row disappeared during write")
+        _set_setting_in_session(s, key, value, scope=scope, scope_id=scope_id)
 
 
 CRED_KINDS = ("object_store", "agent")

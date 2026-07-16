@@ -9,16 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Callable, Hashable, TypeVar
+from typing import Callable, Hashable, Literal, TypeVar
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, ConfigDict, field_validator
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 from sqlalchemy import select as _sa_select
 
 from hub import auth, auth_admission, metadb
-from hub.api_errors import APIError, APIErrorCode
+from hub.api_errors import APIError, APIErrorCode, APIErrorResponse
 from hub.models import CredUpsert, RunHistoryRecord, RunStatus
 from hub.security import RequestIdentity, current_identity, current_user
 
@@ -27,6 +28,10 @@ public_router = APIRouter()
 _T = TypeVar("_T")
 MAX_AUTH_USER_ID_BYTES = 128
 MAX_AUTH_USER_PROFILE_FIELD_BYTES = 1024
+MAX_SETTING_KEY_BYTES = 512
+MAX_SETTING_BATCH_CHANGES = 128
+MAX_SETTING_BATCH_VALUE_BYTES = 1024 * 1024
+SETTING_REVISION_UPPER_BOUND = 2**63
 
 
 class _StrictAuthBody(BaseModel):
@@ -265,11 +270,53 @@ class UserBody(_StrictAuthBody):
         return value
 
 
-class SettingBody(BaseModel):
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-    scope: str = "global"   # 'global' | 'user'
+class SettingBody(_StrictAuthBody):
+    scope: Literal["global", "user"] = "global"
     key: str
     value: object = None
+
+    @field_validator("key")
+    @classmethod
+    def _setting_key_is_bounded(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("setting key must not be blank")
+        return _bounded_database_text(
+            value, label="setting key", max_bytes=MAX_SETTING_KEY_BYTES)
+
+
+class SettingsRevision(_StrictAuthBody):
+    global_: int = Field(alias="global", ge=0, lt=SETTING_REVISION_UPPER_BOUND)
+    user: int = Field(ge=0, lt=SETTING_REVISION_UPPER_BOUND)
+
+    def as_dict(self) -> dict[str, int]:
+        return {"global": self.global_, "user": self.user}
+
+
+class SettingsSnapshot(_StrictAuthBody):
+    global_: dict[str, object] = Field(alias="global")
+    user: dict[str, object]
+    revision: SettingsRevision
+
+
+class SettingsBatchBody(_StrictAuthBody):
+    expected_revision: SettingsRevision
+    changes: list[SettingBody] = Field(max_length=MAX_SETTING_BATCH_CHANGES)
+
+    @model_validator(mode="after")
+    def _scope_keys_are_unique(self) -> "SettingsBatchBody":
+        keys = [(change.scope, change.key) for change in self.changes]
+        if len(keys) != len(set(keys)):
+            raise ValueError("settings batch contains a duplicate scope and key")
+        return self
+
+
+class SettingsBatchResult(_StrictAuthBody):
+    ok: bool = True
+    revision: SettingsRevision
+
+
+class SettingsBatchConflict(APIErrorResponse):
+    revision: SettingsRevision
 
 
 # public: the login screen needs the roster to populate its user picker BEFORE a session exists — so
@@ -302,6 +349,7 @@ def _create_user_work(body: UserBody, uid: str) -> dict:
         u = metadb.User(name=body.name, email=body.email, password_hash=password_hash)
         s.add(u)
         s.flush()
+        s.add(metadb.SettingRevision(scope="user", scope_id=u.id, revision=0))
         return {"id": u.id, "name": u.name, "email": u.email}
 
 
@@ -594,24 +642,72 @@ def _plugin_secret_keys() -> set[str]:
     return plugin_secret_setting_keys()
 
 
-@router.get("/settings")
-def get_settings(uid: str = Depends(current_user)) -> dict:
+def _prepare_setting_changes(
+        changes: list[SettingBody], plugin_secrets: set[str]) \
+        -> tuple[list[tuple[str, str, object]], bool]:
+    from hub.secrets import validate_secret_reference
+
+    prepared: list[tuple[str, str, object]] = []
+    sensitive = False
+    total_bytes = 0
+    for change in changes:
+        if change.key in _REMOVED_CREDENTIAL_SETTINGS:
+            raise HTTPException(400, _REMOVED_CREDENTIAL_SETTINGS[change.key])
+        value = change.value
+        is_secret = change.scope == "global" and change.key in plugin_secrets
+        if is_secret:
+            try:
+                value = validate_secret_reference(value, field=change.key)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        try:
+            encoded = json.dumps(
+                value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            value_bytes = len(encoded.encode("utf-8"))
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise HTTPException(400, f"setting '{change.key}' must be valid JSON") from exc
+        total_bytes += value_bytes
+        if total_bytes > MAX_SETTING_BATCH_VALUE_BYTES:
+            raise HTTPException(
+                400,
+                f"settings batch values must total at most {MAX_SETTING_BATCH_VALUE_BYTES} bytes",
+            )
+        sensitive = sensitive or is_secret
+        prepared.append((change.scope, change.key, value))
+    return prepared, sensitive
+
+
+def _settings_batch_audit(
+        outcome, *, uid: str, changes: list[SettingBody], sensitive: bool = False):
+    from hub.observability import AuditAction, emit_audit
+
+    scopes = ",".join(sorted({change.scope for change in changes})) or "none"
+    return emit_audit(
+        AuditAction.ADMIN_SETTINGS_CHANGE, outcome, principal_id=uid,
+        resource_type="settings_batch", resource_id="batch",
+        attrs={
+            "scopes": scopes,
+            "change_count": str(len(changes)),
+            "sensitive": "true" if sensitive else "false",
+        },
+    )
+
+
+@router.get("/settings", response_model=SettingsSnapshot)
+def get_settings(uid: str = Depends(current_user)) -> SettingsSnapshot:
     from hub.secrets import redact_secret_for_display
     plugin_secrets = _plugin_secret_keys()
-    with metadb.session() as s:
-        rows = s.scalars(_sa_select(metadb.Setting))
-        out: dict = {"global": {}, "user": {}}
-        for r in rows:
-            if r.key in _REMOVED_CREDENTIAL_SETTINGS:
-                continue
-            if r.scope == "global":
-                value = json.loads(r.value)
-                out["global"][r.key] = (
-                    redact_secret_for_display(value) if r.key in plugin_secrets else value
-                )
-            elif r.scope == "user" and r.scope_id == uid:
-                out["user"][r.key] = json.loads(r.value)
-        return out
+    rows, revision = metadb.settings_snapshot(uid)
+    out: dict[str, dict[str, object]] = {"global": {}, "user": {}}
+    for scope, key, encoded in rows:
+        if key in _REMOVED_CREDENTIAL_SETTINGS:
+            continue
+        value = json.loads(encoded)
+        out[scope][key] = (
+            redact_secret_for_display(value)
+            if scope == "global" and key in plugin_secrets else value
+        )
+    return SettingsSnapshot.model_validate({**out, "revision": revision})
 
 
 @router.put("/settings")
@@ -624,17 +720,10 @@ def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
             emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.DENIED, principal_id=uid,
                        resource_type="setting", resource_id=body.key, attrs={"scope": body.scope})
             raise
-    scope_id = uid if body.scope == "user" else ""
-    if body.key in _REMOVED_CREDENTIAL_SETTINGS:
-        raise HTTPException(400, _REMOVED_CREDENTIAL_SETTINGS[body.key])
-    value = body.value
     plugin_secrets = _plugin_secret_keys()
-    if body.scope == "global" and body.key in plugin_secrets:
-        from hub.secrets import validate_secret_reference
-        try:
-            value = validate_secret_reference(value, field=body.key)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
+    prepared, _sensitive = _prepare_setting_changes([body], plugin_secrets)
+    _scope, _key, value = prepared[0]
+    scope_id = uid if body.scope == "user" else ""
     metadb.set_setting(body.key, value, scope=body.scope, scope_id=scope_id)
     is_secret = body.key in plugin_secrets
     # attr key must avoid validate_audit_attrs' secret-name regex, else this event is rejected + dropped.
@@ -642,6 +731,40 @@ def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
                resource_type="setting", resource_id=body.key,
                attrs={"scope": body.scope, "sensitive": "true" if is_secret else "false"})
     return {"ok": True}
+
+
+@router.put(
+    "/settings/batch",
+    response_model=SettingsBatchResult,
+    responses={409: {"model": SettingsBatchConflict}},
+)
+def put_settings_batch(
+        body: SettingsBatchBody, uid: str = Depends(current_user)) \
+        -> SettingsBatchResult | JSONResponse:
+    from hub.observability import AuditOutcome
+
+    # Authorize the whole requested scope set before validating or touching any value. In particular,
+    # a user change placed before an unauthorized global change must never be partially committed.
+    if any(change.scope == "global" for change in body.changes) and not _can_manage_global(uid):
+        _settings_batch_audit(AuditOutcome.DENIED, uid=uid, changes=body.changes)
+        raise HTTPException(403, "admin only")
+    prepared, sensitive = _prepare_setting_changes(body.changes, _plugin_secret_keys())
+    try:
+        revision = metadb.set_settings_batch(
+            prepared, body.expected_revision.as_dict(), uid)
+    except metadb.SettingsRevisionConflict as exc:
+        conflict = SettingsBatchConflict(
+            detail=str(exc), code=APIErrorCode.CONFLICT, retryable=False,
+            revision=SettingsRevision.model_validate(exc.current_revision),
+        )
+        return JSONResponse(
+            status_code=409,
+            content=conflict.model_dump(mode="json", by_alias=True),
+        )
+    if body.changes:
+        _settings_batch_audit(
+            AuditOutcome.SUCCESS, uid=uid, changes=body.changes, sensitive=sensitive)
+    return SettingsBatchResult.model_validate({"ok": True, "revision": revision})
 
 
 # Credentials (issue #156) — a Cred entity is admin-only instance-wide config, like global settings.

@@ -293,7 +293,13 @@ async def _lifespan(_app):
 
 
 app = FastAPI(title="Data Playground kernel", version="0.1.0", lifespan=_lifespan)
-_SENSITIVE_AUTH_BODY_PATHS = frozenset(("/api/auth/login", "/api/auth/password", "/api/users"))
+_SENSITIVE_VALIDATION_BODY_DETAILS = {
+    "/api/auth/login": "invalid authentication request body",
+    "/api/auth/password": "invalid authentication request body",
+    "/api/users": "invalid authentication request body",
+    "/api/settings": "invalid setting request body",
+    "/api/settings/batch": "invalid settings batch request body",
+}
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -331,10 +337,11 @@ async def _safe_auth_validation_error(request: Request, exc: RequestValidationEr
     # FastAPI's default validation response includes rejected input. Never echo a password, and never
     # ask the JSON encoder to serialize an unpaired surrogate from an attacker-controlled auth body.
     # Other routes retain FastAPI's useful field-level diagnostics.
-    if request.url.path in _SENSITIVE_AUTH_BODY_PATHS:
+    sensitive_detail = _SENSITIVE_VALIDATION_BODY_DETAILS.get(request.url.path)
+    if sensitive_detail is not None:
         return api_error_response(
             status_code=422,
-            detail="invalid authentication request body",
+            detail=sensitive_detail,
             code=APIErrorCode.VALIDATION_ERROR,
             retryable=False,
         )
