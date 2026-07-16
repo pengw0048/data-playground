@@ -425,7 +425,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   }
   const removeCred = async (c: Cred) => {
     if (credentialDeletingId || credentialSaving) return
-    if (g.defaultObjectStoreCredId === c.id || g.agentCredId === c.id) {
+    const destinationUsesCredential = dests.some((destination) => destination.credId === c.id)
+      || (dest.backend !== 'local' && dest.credId === c.id)
+    if (g.defaultObjectStoreCredId === c.id || g.agentCredId === c.id || destinationUsesCredential) {
       const message = `Credential ${c.name} is selected in Settings. Select a different credential (or None) and Save before removing it.`
       setCredentialNotice({ kind: 'error', message })
       pushToast(message, 'error')

@@ -537,6 +537,28 @@ describe('SettingsModal — plugin config form', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Select a different credential (or None) and Save before removing it.')
   })
 
+  it.each([
+    ['staged destination', true],
+    ['destination draft', false],
+  ])('blocks removing a credential selected by a %s', async (_state, addDestination) => {
+    listCreds.mockResolvedValue([{ id: 'c1', name: 'Store', kind: 'object_store', fields: {} }])
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Destinations' }))
+    fireEvent.change(screen.getByLabelText('Destination name'), { target: { value: 'Exports' } })
+    fireEvent.click(screen.getByLabelText('Destination backend'))
+    fireEvent.click(await screen.findByRole('option', { name: 's3' }))
+    fireEvent.change(screen.getByPlaceholderText('s3://bucket/prefix'), { target: { value: 's3://bucket/exports' } })
+    fireEvent.click(screen.getByLabelText('Destination credential'))
+    fireEvent.click(await screen.findByRole('option', { name: 'Store' }))
+    if (addDestination) fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Credentials' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove credential Store' }))
+
+    expect(deleteCred).not.toHaveBeenCalled()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Select a different credential (or None) and Save before removing it.')
+  })
+
   it('reports a failed kernel restart without committing staged Settings', async () => {
     state.kernelInfo = { runners: ['kernel'], backends: [] }
     let rejectRestart: ((reason?: unknown) => void) | undefined
