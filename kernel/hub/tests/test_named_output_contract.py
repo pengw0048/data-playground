@@ -296,7 +296,8 @@ def test_run_models_enforce_collection_row_and_terminal_invariants():
         "rowsProcessed": 3,
         "totalRows": None,
         "outputs": [],
-        "profile": {"columns": [], "rowCount": 3, "sampled": False},
+        "profile": {"columns": [], "rowCount": 3, "sampled": False,
+                    "completeness": "complete"},
     })
     assert profile.total_rows is None and profile.profile and profile.profile.row_count == 3
 

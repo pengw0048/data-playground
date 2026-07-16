@@ -56,7 +56,9 @@ _INSTRUCTIONS = (
     "validate_canvas → give the user the canvas url (or run_canvas). Prefer relational nodes over "
     "Python when they suffice (they push down and run out-of-core); reach for set_transform when the "
     "logic needs code — then preview_node to confirm it works before moving on. Call join_hints "
-    "before a join (don't guess the key or miss a row-multiplying fan-out)."
+    "before a join (don't guess the key or miss a row-multiplying fan-out). Preview/sample scope "
+    "metadata is authoritative: sample/capped/unknown data is not a complete result, and an "
+    "each-source limit independently bounds every upstream input rather than the output row order."
 )
 
 
@@ -167,6 +169,21 @@ class Playground:
     def _resolve_uri(self, ref: str) -> str:
         return self.deps.catalog.resolve_ref(ref)
 
+    @staticmethod
+    def _sample_scope(res) -> dict:
+        """The truth-in-preview fields every MCP row sample must preserve.
+
+        ``rowCount`` is deliberately present as null when no exact total is known. Omitting these
+        fields made a bounded page indistinguishable from a complete dataset to an MCP client.
+        """
+        return res.model_dump(
+            by_alias=True,
+            include={
+                "row_count", "has_more", "truncated", "completeness",
+                "row_limit", "limit_reason", "limit_scope",
+            },
+        )
+
     def _preview_doc(
             self, doc: dict, node_id: str, limit: int,
             port_id: str | None = None) -> dict:
@@ -186,7 +203,7 @@ class Playground:
         if res.error:
             return {"error": True, "reason": res.reason}
         return {"columns": [{"name": c.name, "type": c.type} for c in res.columns],
-                "rows": res.rows, "rowCount": res.row_count, "hasMore": res.has_more}
+                "rows": res.rows, **self._sample_scope(res)}
 
     # -- catalog / discovery ---------------------------------------------- #
     def list_datasets(self, args: dict) -> dict:
@@ -204,7 +221,8 @@ class Playground:
         except HTTPException as e:
             raise ToolError(str(e.detail))
         return {"uri": uri, "columns": [{"name": c.name, "type": c.type} for c in res.columns],
-                "rows": res.rows, "rowCount": res.row_count, "truncated": res.truncated}
+                "rows": res.rows, "notPreviewable": res.not_previewable,
+                "error": res.error, "reason": res.reason, **self._sample_scope(res)}
 
     def join_hints(self, args: dict) -> dict:
         try:
@@ -453,19 +471,73 @@ class Playground:
         raise ToolError(f"unknown runId '{run_id}' (not started this session, or evicted)")
 
     def sample_result(self, args: dict) -> dict:
-        """Sample the OUTPUT dataset a run materialized (by its runId) — closes the author→run→inspect
-        loop so an agent can read the rows it produced without hand-reconstructing the output uri."""
-        from hub.routers.runs import _run_read_access, _status_or_lost
+        """Sample a durable run output by server-owned run/node/port identity."""
+        from fastapi import HTTPException as HTTPExc
+
+        from hub.routers.runs import (
+            RunOutputSampleRequest,
+            _durable_run_outputs,
+            _run_read_access,
+            sample_run_output,
+        )
         run_id = self._req(args, "runId")
         if not _run_read_access(run_id, self.user_id):  # don't read an unrelated user's output rows
             raise ToolError(f"unknown runId '{run_id}'")
-        st = _status_or_lost(run_id)
-        from hub.run_outputs import sole_output
-        output = sole_output(st, committed=True)
-        if output is None or not output.uri:
-            raise ToolError(f"run '{st.run_id}' ({st.status}) produced no materialized output to sample")
-        return self.sample_dataset({"dataset": output.uri, "limit": args.get("limit"),
-                                    "columns": args.get("columns")})
+        try:
+            outputs = [output for output in _durable_run_outputs(run_id)
+                       if output.outcome == "committed" and output.uri]
+        except HTTPExc as exc:
+            raise ToolError(str(exc.detail))
+        node_id, port_id = args.get("nodeId"), args.get("portId")
+        if (node_id is None) != (port_id is None):
+            raise ToolError("nodeId and portId must be provided together")
+        if node_id is not None:
+            output = next((candidate for candidate in outputs
+                           if candidate.node_id == node_id and candidate.port_id == port_id), None)
+            if output is None:
+                raise ToolError(f"run '{run_id}' has no committed output '{node_id}:{port_id}'")
+        elif len(outputs) == 1:
+            output = outputs[0]
+        elif not outputs:
+            raise ToolError(f"run '{run_id}' produced no materialized output to sample")
+        else:
+            choices = ", ".join(f"{output.node_id}:{output.port_id}" for output in outputs)
+            raise ToolError(
+                f"run '{run_id}' has multiple committed outputs ({choices}); pass nodeId and portId"
+            )
+        limit = self._limit(args, 20)
+        if limit > 2_000:
+            raise ToolError("limit exceeds the 2,000-row interactive result window")
+        try:
+            res = sample_run_output(
+                run_id,
+                RunOutputSampleRequest(node_id=output.node_id, port_id=output.port_id, k=limit),
+                uid=self.user_id,
+            )
+        except HTTPExc as exc:
+            raise ToolError(str(exc.detail))
+        requested = args.get("columns")
+        columns = res.columns
+        rows = res.rows
+        if requested is not None and not (res.error or res.not_previewable):
+            requested_names = [str(name) for name in requested]
+            by_name = {column.name: column for column in columns}
+            missing = [name for name in requested_names if name not in by_name]
+            if missing:
+                raise ToolError("unknown result column(s): " + ", ".join(missing))
+            columns = [by_name[name] for name in requested_names]
+            rows = [{name: row.get(name) for name in requested_names} for row in rows]
+        return {
+            "uri": output.uri,
+            "nodeId": output.node_id,
+            "portId": output.port_id,
+            "columns": [{"name": column.name, "type": column.type} for column in columns],
+            "rows": rows,
+            "notPreviewable": res.not_previewable,
+            "error": res.error,
+            "reason": res.reason,
+            **self._sample_scope(res),
+        }
 
     @staticmethod
     def _run_envelope(status, target: str | None) -> dict:
@@ -562,7 +634,8 @@ def _tool_specs(pg: Playground) -> list[dict]:
          "inputSchema": _schema({})},
         {"name": "sample_dataset", "handler": pg.sample_dataset,
          "description": "Return a small sample of real rows from a dataset (by catalog name/id or uri) "
-                        "so you can see its actual shape before building on it.",
+                        "so you can see its actual shape before building on it. Inspect completeness, "
+                        "rowCount, and limitScope before making whole-dataset claims.",
          "inputSchema": _schema({"dataset": {**_STR, "description": "catalog name/id or a dataset uri"},
                                  "limit": {**_INT, "description": "max rows (default 20)"},
                                  "columns": {"type": "array", "items": _STR}}, ["dataset"])},
@@ -617,7 +690,8 @@ def _tool_specs(pg: Playground) -> list[dict]:
                                  "title": _STR, "limit": _INT}, ["canvasId", "code"])},
         {"name": "preview_node", "handler": pg.preview_node,
          "description": "Preview one named node output over a bounded real sample: columns + rows. The way to "
-                        "verify each step (including a transform's code) works before continuing.",
+                        "verify each step (including a transform's code) works before continuing. An "
+                        "each-source limit does not mean these are the first N full-result rows.",
          "inputSchema": _schema({**canvas, "nodeId": _STR,
                                  "portId": {**_STR, "description": "required for a multi-output node"},
                                  "limit": {**_INT, "description": "max rows (default 10)"}},
@@ -642,10 +716,15 @@ def _tool_specs(pg: Playground) -> list[dict]:
          "description": "Cancel an in-flight run by its runId. A finished run is returned unchanged.",
          "inputSchema": _schema({"runId": _STR}, ["runId"])},
         {"name": "sample_result", "handler": pg.sample_result,
-         "description": "Sample the OUTPUT dataset a run materialized (by its runId): columns + real "
-                        "rows — read what the pipeline actually produced without rebuilding its uri.",
+         "description": "Sample a durable output a run materialized: columns + real rows, resolved "
+                        "from run/node/port identity even after live status is pruned. nodeId + portId "
+                        "are optional only when the run has exactly one committed output. Scope "
+                        "metadata still distinguishes a page from the complete artifact.",
          "inputSchema": _schema({"runId": _STR, "limit": {**_INT, "description": "max rows (default 20)"},
-                                 "columns": {"type": "array", "items": _STR}}, ["runId"])},
+                                 "columns": {"type": "array", "items": _STR},
+                                 "nodeId": {**_STR, "description": "output node (pair with portId)"},
+                                 "portId": {**_STR, "description": "output port (pair with nodeId)"}},
+                                ["runId"])},
     ]
 
 

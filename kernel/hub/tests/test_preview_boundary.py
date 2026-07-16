@@ -6,12 +6,13 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from pydantic import ValidationError
 
 from hub import db
 from hub.backends import DatasetAdapter, DatasetPreviewAdapter
 from hub.estimate import estimate_sizes
 from hub.executors.engine import BuildEngine, NotPreviewable
-from hub.models import Graph, SampleRequest
+from hub.models import ColumnProfile, Graph, ProfileResult, SampleRequest, SampleResult
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 
 
@@ -301,6 +302,49 @@ def test_data_sample_uses_only_preview_and_metadata_capabilities(monkeypatch) ->
     assert result.rows == [{"id": 0}, {"id": 1}]
     assert result.has_more is True
     assert result.row_count is None
+    assert result.completeness == "page"
+
+    short_page = catalog_routes.data_sample(SampleRequest(uri="sample-spy://data", k=10))
+    assert calls == [("preview", 3), ("preview", 11)]
+    assert short_page.rows == [{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}]
+    assert short_page.row_count is None
+    assert short_page.has_more is None
+    assert short_page.completeness == "unknown"
+    assert short_page.truncated is True
+
+
+def test_data_sample_declares_complete_only_with_exact_bounded_metadata(monkeypatch) -> None:
+    from hub.routers import catalog as catalog_routes
+
+    class Adapter:
+        name = "metadata-spy"
+
+        @staticmethod
+        def preview_scan(_uri: str, _columns=None, *, limit: int = 2000):
+            return db.conn().from_arrow(pa.table({"id": [0, 1, 2, 3]})).limit(limit)
+
+        @staticmethod
+        def metadata_count(_uri: str) -> int:
+            return 4
+
+    monkeypatch.setattr(
+        catalog_routes, "get_deps",
+        lambda: type("Deps", (), {"storage": None, "resolve_adapter": lambda _self, _uri: Adapter()})(),
+    )
+
+    result = catalog_routes.data_sample(SampleRequest(uri="metadata-spy://data", k=10))
+
+    assert result.rows == [{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}]
+    assert result.row_count == 4
+    assert result.has_more is False and result.truncated is False
+    assert result.completeness == "complete"
+
+    final_page = catalog_routes.data_sample(SampleRequest(
+        uri="metadata-spy://data", k=10, offset=2,
+    ))
+    assert final_page.rows == [{"id": 2}, {"id": 3}]
+    assert final_page.row_count == 4 and final_page.has_more is False
+    assert final_page.completeness == "page" and final_page.truncated is True
 
 
 def test_data_sample_enforces_a_fixed_source_work_budget(monkeypatch) -> None:
@@ -342,6 +386,10 @@ def test_data_sample_enforces_a_fixed_source_work_budget(monkeypatch) -> None:
     assert final_page.rows[-1] == {"id": budget - 1}
     assert final_page.row_count == 5_000
     assert final_page.has_more is False, "metadata outside the preview window must not enable Next"
+    assert final_page.completeness == "capped"
+    assert final_page.row_limit == budget
+    assert final_page.limit_reason == "interactive-row-budget"
+    assert final_page.limit_scope == "result-window"
 
     with pytest.raises(HTTPException) as exc_info:
         catalog_routes.data_sample(SampleRequest(
@@ -350,6 +398,121 @@ def test_data_sample_enforces_a_fixed_source_work_budget(monkeypatch) -> None:
     assert exc_info.value.status_code == 400
     assert "interactive window" in str(exc_info.value.detail)
     assert calls == [budget - 49, budget], "out-of-window requests must be rejected before scanning"
+
+
+def test_data_sample_marks_an_unknown_total_at_the_budget_boundary(monkeypatch) -> None:
+    from hub.routers import catalog as catalog_routes
+
+    class Adapter:
+        name = "unknown-budget-spy"
+
+        @staticmethod
+        def preview_scan(_uri: str, _columns=None, *, limit: int = 2000):
+            # Returning exactly the requested prefix cannot prove whether row limit + 1 exists.
+            return db.conn().sql(f"SELECT i AS id FROM range({limit}) rows(i)")
+
+    monkeypatch.setattr(
+        catalog_routes, "get_deps",
+        lambda: type("Deps", (), {"storage": None, "resolve_adapter": lambda _self, _uri: Adapter()})(),
+    )
+    budget = catalog_routes.DATA_SAMPLE_PREVIEW_ROW_BUDGET
+
+    result = catalog_routes.data_sample(SampleRequest(
+        uri="unknown-budget-spy://data", offset=budget - 50, k=50,
+    ))
+
+    assert len(result.rows) == 50 and result.row_count is None
+    assert result.has_more is False
+    assert result.completeness == "capped"
+    assert result.row_limit == budget
+    assert result.limit_reason == "interactive-row-budget"
+    assert result.limit_scope == "result-window"
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"completeness": "complete", "rowCount": None}, "complete data requires rowCount"),
+        ({"completeness": "complete", "rowCount": 0, "truncated": True},
+         "complete data cannot be truncated"),
+        ({"hasMore": True, "truncated": False}, "hasMore requires truncated"),
+        ({"completeness": "page", "truncated": False},
+         "successful non-complete data requires truncated=true"),
+        ({"completeness": "unknown", "truncated": False},
+         "successful non-complete data requires truncated=true"),
+        ({"rowLimit": 2000, "limitReason": "preview-scan"},
+         "rowLimit, limitReason, and limitScope"),
+        ({"completeness": "capped", "truncated": True}, "capped data requires rowLimit"),
+        ({"error": True}, "unavailable sample requires a non-empty reason"),
+        ({"notPreviewable": True, "reason": "  "},
+         "unavailable sample requires a non-empty reason"),
+        ({"error": True, "reason": "failed", "completeness": "sample"},
+         "unavailable sample must have unknown completeness"),
+        ({"error": True, "reason": "failed", "rows": [{"id": 1}]},
+         "unavailable sample cannot carry rows"),
+        ({"error": True, "reason": "failed", "rowCount": 0},
+         "unavailable sample cannot carry rows"),
+        ({"error": True, "reason": "failed", "hasMore": False},
+         "unavailable sample cannot carry rows"),
+        ({"error": True, "reason": "failed", "truncated": True},
+         "unavailable sample cannot be truncated"),
+        ({"error": True, "reason": "failed", "rowLimit": 10,
+          "limitReason": "preview-scan", "limitScope": "each-source"},
+         "unavailable sample cannot carry an active row limit"),
+        ({"rowLimit": 10, "limitReason": "preview-scan", "limitScope": "result-window"},
+         "preview-scan limits must use limitScope=each-source"),
+        ({"rowLimit": 10, "limitReason": "interactive-row-budget", "limitScope": "each-source"},
+         "interactive-row-budget limits must use limitScope=result-window"),
+        ({"completeness": "sample", "truncated": False, "rowLimit": 10,
+          "limitReason": "preview-scan", "limitScope": "each-source"},
+         "sample data requires truncated=true"),
+        ({"completeness": "sample", "truncated": True},
+         "sample data requires an each-source preview-scan limit"),
+        ({"completeness": "capped", "truncated": True, "hasMore": False,
+          "rowLimit": 10, "limitReason": "preview-scan", "limitScope": "each-source"},
+         "capped data requires a result-window interactive-row-budget limit"),
+    ],
+)
+def test_sample_result_rejects_contradictory_scope_contract(payload, message) -> None:
+    with pytest.raises(ValidationError, match=message):
+        SampleResult.model_validate(payload)
+
+
+def test_sample_result_accepts_empty_complete_and_unproven_short_page() -> None:
+    complete = SampleResult(completeness="complete", row_count=0, has_more=False)
+    short_page = SampleResult(
+        rows=[{"id": 1}], completeness="unknown", truncated=True,
+    )
+
+    assert complete.row_count == 0 and complete.rows == []
+    assert short_page.row_count is None and short_page.completeness == "unknown"
+
+    unavailable = SampleResult(error=True, reason="failed")
+    assert unavailable.completeness == "unknown" and unavailable.rows == []
+
+
+def test_profile_result_requires_an_explicit_success_scope() -> None:
+    with pytest.raises(ValidationError, match="must declare complete or sample"):
+        ProfileResult(columns=[], row_count=3, sampled=False)
+    with pytest.raises(ValidationError, match="complete profile cannot be marked sampled"):
+        ProfileResult(completeness="complete", sampled=True)
+    with pytest.raises(ValidationError, match="unavailable profile cannot carry statistics"):
+        ProfileResult(error=True, reason="failed", columns=[], row_count=1)
+    with pytest.raises(ValidationError, match="unavailable profile requires a non-empty reason"):
+        ProfileResult(error=True)
+    with pytest.raises(ValidationError, match=r"nonNull \+ nulls must equal rowCount"):
+        ProfileResult(
+            completeness="sample", sampled=True, row_count=2,
+            columns=[ColumnProfile(name="id", type="int64", non_null=1)],
+        )
+    with pytest.raises(ValidationError, match="requires a distinct value"):
+        ColumnProfile(
+            name="id", type="int64", distinct=None, distinct_is_approximate=True,
+        )
+
+    assert ProfileResult(completeness="sample", sampled=True).completeness == "sample"
+    assert ProfileResult(completeness="complete", sampled=False).completeness == "complete"
+    assert ProfileResult(error=True, reason="failed").completeness == "unknown"
 
 
 def test_unknown_source_estimate_never_calls_full_count() -> None:

@@ -1,6 +1,11 @@
-import { describe, it, expect } from 'vitest'
-import { toGraph } from './client'
+import { afterEach, describe, it, expect, vi } from 'vitest'
+import { api, setApiUser, toGraph } from './client'
 import type { CanvasDoc } from '../types/graph'
+
+afterEach(() => {
+  setApiUser(null)
+  vi.restoreAllMocks()
+})
 
 describe('toGraph wire serialization', () => {
   const doc: CanvasDoc = {
@@ -24,5 +29,43 @@ describe('toGraph wire serialization', () => {
 
   it('drops note/code annotation nodes (no build step)', () => {
     expect(toGraph(doc).nodes.map((n) => n.id)).toEqual(['a', 'j'])
+  })
+})
+
+describe('run-scoped result access', () => {
+  it('samples a persisted output by run/node/port identity instead of a client-provided URI', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      columns: [], rows: [], truncated: false, completeness: 'complete',
+      notPreviewable: false, wire: 'dataset',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    await api.runOutputSample('run / 1', 'node-a', 'port-b', 50, 100)
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/run/run%20%2F%201/sample', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ nodeId: 'node-a', portId: 'port-b', k: 50, offset: 100 }),
+    }))
+  })
+
+  it('uses the same open-mode identity hint for export preflight and iframe download', async () => {
+    setApiUser('robot researcher')
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 200 }))
+
+    const url = api.fullResultExportUrl('run-1', 'node-a', 'out', 'robot data')
+    const preflightUrl = await api.preflightFullResultExport('run-1', 'node-a', 'out', 'robot data')
+
+    expect(preflightUrl).toBe(url)
+    const parsed = new URL(url, 'http://localhost')
+    expect(parsed.pathname).toBe('/api/run/run-1/export')
+    expect(parsed.searchParams.get('nodeId')).toBe('node-a')
+    expect(parsed.searchParams.get('portId')).toBe('out')
+    expect(parsed.searchParams.get('filename')).toBe('robot data')
+    expect(parsed.searchParams.get('userId')).toBe('robot researcher')
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/run/run-1/export?nodeId=node-a&portId=out&filename=robot+data&userId=robot+researcher',
+      expect.objectContaining({
+        method: 'HEAD', headers: expect.objectContaining({ 'X-DP-User': 'robot researcher' }),
+      }),
+    )
   })
 })

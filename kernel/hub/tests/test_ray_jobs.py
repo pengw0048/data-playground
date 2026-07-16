@@ -3021,7 +3021,7 @@ def test_ray_jobs_discovery_exceptions_never_share_rotated_credentials(
 
     expected = (
         "Ray status/control plane unavailable; retrying "
-        "(code=status_control_unavailable,type=RuntimeError)"
+        "(code=status_control_unavailable,type=BackendStatusUnavailable)"
     )
     assert live_error == expected
     assert persisted_error == expected

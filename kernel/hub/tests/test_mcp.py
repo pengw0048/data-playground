@@ -104,6 +104,10 @@ def test_list_datasets_surfaces_seeded_tables_with_types_and_keys():
 def test_sample_dataset_by_name_returns_real_rows():
     s = data("sample_dataset", {"dataset": "events", "limit": 3})
     assert len(s["rows"]) == 3 and s["columns"]
+    assert s["completeness"] == "page"
+    assert s["rowCount"] is not None and s["hasMore"] is True
+    assert s["truncated"] is True
+    assert s["rowLimit"] is None and s["limitScope"] is None
 
 
 def test_sample_dataset_bad_ref_is_a_tool_error_not_a_crash():
@@ -329,6 +333,10 @@ def test_preview_node_returns_columns_and_rows():
     s = data("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})["nodeId"]
     pv = data("preview_node", {"canvasId": cid, "nodeId": s, "limit": 5})
     assert pv["columns"] and len(pv["rows"]) <= 5
+    assert pv["rowCount"] is None and pv["completeness"] == "sample"
+    assert pv["truncated"] is True
+    assert pv["rowLimit"] == 2000 and pv["limitReason"] == "preview-scan"
+    assert pv["limitScope"] == "each-source"
 
 
 def test_validate_flags_a_typed_wire_error():

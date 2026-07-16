@@ -2253,6 +2253,40 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
                  "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
 
 
+def get_run_record_outputs(run_id: str) -> list[dict] | None:
+    """Return durable output snapshots by logical runner id, or ``None`` when no record exists.
+
+    ``RunRecord.id`` is the history row identity exposed by the history list; it is deliberately not
+    accepted here. Artifact APIs must remain keyed by the globally meaningful ``run_id`` so a UI row id
+    can never accidentally become an authorization or storage lookup handle.
+    """
+    with session() as s:
+        payload = s.scalar(
+            select(RunRecord.outputs)
+            .where(RunRecord.run_id == str(run_id))
+            .order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
+            .limit(1)
+        )
+    if payload is None:
+        return None
+    try:
+        outputs = json.loads(payload)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("durable run history output metadata is invalid") from exc
+    if not isinstance(outputs, list) or any(not isinstance(output, dict) for output in outputs):
+        raise RuntimeError("durable run history output metadata is invalid")
+    return [dict(output) for output in outputs]
+
+
+def get_run_record_output(run_id: str, node_id: str, port_id: str) -> dict | None:
+    """Return one history output by logical run id and declared port identity."""
+    outputs = get_run_record_outputs(run_id)
+    if outputs is None:
+        return None
+    return next((output for output in outputs
+                 if output.get("node_id") == node_id and output.get("port_id") == port_id), None)
+
+
 _RUN_STATE_MAX = 2000  # cap on TERMINAL run_states — live (queued/running) rows are never pruned
 _TERMINAL_RUN = ("done", "failed", "cancelled")
 _PROFILE_LATEST_MAX = 100  # per canvas; each row retains one latest status document for reopen

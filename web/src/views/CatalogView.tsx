@@ -882,22 +882,25 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
                 </div>
               ) : null}
               {preview ? (
-                preview.error || preview.notPreviewable || !preview.rows.length
-                  ? <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
-                      {preview.reason || 'No preview available for this dataset'}
-                    </div>
-                  : <div className="max-h-[240px] overflow-auto rounded-lg border border-border">
-                      <table className="dp-mono w-max text-[10.5px]">
-                        <thead><tr>{preview.columns.map((c) => (
-                          <th key={c.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold">{c.name}</th>
-                        ))}</tr></thead>
-                        <tbody>{preview.rows.slice(0, 30).map((r, i) => (
-                          <tr key={i}>{preview.columns.map((c) => (
-                            <td key={c.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5">{cell(r[c.name])}</td>
-                          ))}</tr>
-                        ))}</tbody>
-                      </table>
-                    </div>
+                <div className="flex flex-col gap-1">
+                  {!preview.error && !preview.notPreviewable && <CatalogPreviewScope preview={preview} />}
+                  {preview.error || preview.notPreviewable || !preview.rows.length
+                    ? <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
+                        {preview.reason || emptyCatalogPreviewMessage(preview)}
+                      </div>
+                    : <div className="max-h-[240px] overflow-auto rounded-lg border border-border">
+                        <table className="dp-mono w-max text-[10.5px]">
+                          <thead><tr>{preview.columns.map((c) => (
+                            <th key={c.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold">{c.name}</th>
+                          ))}</tr></thead>
+                          <tbody>{preview.rows.map((r, i) => (
+                            <tr key={i}>{preview.columns.map((c) => (
+                              <td key={c.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5">{cell(r[c.name])}</td>
+                            ))}</tr>
+                          ))}</tbody>
+                        </table>
+                      </div>}
+                </div>
               ) : null}
             </>}
           </section>
@@ -935,6 +938,34 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
       </div>
     </div>
   )
+}
+
+function CatalogPreviewScope({ preview }: { preview: SampleResult }) {
+  const shown = preview.rows.length
+  const total = preview.rowCount ?? null
+  let label: string
+  if (preview.completeness === 'complete') {
+    label = `Complete dataset · ${total ?? shown} ${(total ?? shown) === 1 ? 'row' : 'rows'}`
+  } else if (preview.completeness === 'capped') {
+    label = `Dataset preview · stopped at ${(preview.rowLimit ?? shown).toLocaleString()} rows${total == null ? '; total unknown' : ` of ${total.toLocaleString()}`}`
+  } else if (total != null) {
+    label = `Dataset preview · showing ${shown.toLocaleString()} of ${total.toLocaleString()} rows`
+  } else {
+    label = `Dataset preview · showing ${shown.toLocaleString()} rows; total unknown`
+  }
+  return (
+    <div role="status" className="rounded-md bg-muted/50 px-2 py-1 text-[10.5px] text-muted-foreground">
+      {label}
+    </div>
+  )
+}
+
+function emptyCatalogPreviewMessage(preview: SampleResult) {
+  if (preview.completeness === 'complete' && preview.rowCount === 0) return 'No rows in this dataset'
+  if (preview.rowCount != null) {
+    return `No rows returned by this preview; the dataset contains ${preview.rowCount.toLocaleString()} rows.`
+  }
+  return 'No rows returned by this preview; dataset size is unknown.'
 }
 
 const cell = (v: unknown) => v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v)

@@ -73,6 +73,10 @@ def test_hosted_default_preview_withholds_sample_values():
     result = preview["result"]
     assert result.get("columns")
     assert result.get("rows") == []
+    assert result["row_count"] is None and result["completeness"] == "sample"
+    assert result["truncated"] is True
+    assert result["row_limit"] == 2000 and result["limit_reason"] == "preview-scan"
+    assert result["limit_scope"] == "each-source"
     assert "policy" in result and "metadata-only" in result["policy"]
     blob = json.dumps(out)
     assert not _contains_fixture_value(blob), blob

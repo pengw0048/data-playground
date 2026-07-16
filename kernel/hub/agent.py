@@ -174,6 +174,9 @@ boolean expression over the columns. For `sql`, write a query using `input` as t
 multiple outputs; use the exact declared output id. Under the default metadata-only egress policy it may \
 return columns and row count without sample values — that is intentional. Adapt using metadata \
 when values are withheld.
+- Treat preview scope metadata as authoritative: sample/capped/unknown is not a complete result. An \
+`each-source` row limit independently caps every upstream input and does NOT mean the returned rows \
+are the first N rows of a full transformed result.
 - Build the MINIMUM graph that achieves the outcome. Don't add nodes they didn't ask for.
 - Before you finish, call `validate` to confirm there are no typed-wire errors and no unintended \
 join fan-out. Then STOP calling tools and reply with a one-sentence summary of what you built.
@@ -318,7 +321,11 @@ try:
                 elif res.error:
                     out = {"error": res.reason}
                 else:
-                    out = {"columns": [c.name for c in res.columns], "rows": res.rows[:8], "row_count": res.row_count}
+                    scope = res.model_dump(include={
+                        "row_count", "has_more", "truncated", "completeness",
+                        "row_limit", "limit_reason", "limit_scope",
+                    })
+                    out = {"columns": [c.name for c in res.columns], "rows": res.rows[:8], **scope}
             except Exception as e:  # noqa: BLE001
                 out = {"error": f"{type(e).__name__}: {e}"}
         return _finish(ctx.deps, "preview", {"node_id": node_id, "port_id": port_id}, out)

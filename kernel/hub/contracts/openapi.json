@@ -423,13 +423,21 @@
           "distinct": {
             "anyOf": [
               {
+                "minimum": 0.0,
                 "type": "integer"
               },
               {
                 "type": "null"
               }
             ],
+            "description": "Measured distinct count, or null when the column type cannot be compared.",
             "title": "Distinct"
+          },
+          "distinctIsApproximate": {
+            "default": false,
+            "description": "Whether distinct was estimated (for example, whole-dataset HLL) rather than exact.",
+            "title": "Distinctisapproximate",
+            "type": "boolean"
           },
           "max": {
             "anyOf": [
@@ -470,11 +478,13 @@
           },
           "nonNull": {
             "default": 0,
+            "minimum": 0.0,
             "title": "Nonnull",
             "type": "integer"
           },
           "nulls": {
             "default": 0,
+            "minimum": 0.0,
             "title": "Nulls",
             "type": "integer"
           },
@@ -1890,14 +1900,25 @@
         "type": "object"
       },
       "ProfileResult": {
+        "description": "Column statistics with an explicit, non-inferred measurement scope.",
         "properties": {
           "columns": {
-            "default": [],
             "items": {
               "$ref": "#/components/schemas/ColumnProfile"
             },
             "title": "Columns",
             "type": "array"
+          },
+          "completeness": {
+            "default": "unknown",
+            "description": "complete=whole dataset, sample=bounded rows, unknown=no statistics are available.",
+            "enum": [
+              "complete",
+              "sample",
+              "unknown"
+            ],
+            "title": "Completeness",
+            "type": "string"
           },
           "error": {
             "default": false,
@@ -1922,11 +1943,14 @@
           },
           "rowCount": {
             "default": 0,
+            "description": "Rows actually profiled; a full dataset total only when completeness=complete.",
+            "minimum": 0.0,
             "title": "Rowcount",
             "type": "integer"
           },
           "sampled": {
             "default": true,
+            "description": "Whether statistics were computed from a bounded sample instead of all rows.",
             "title": "Sampled",
             "type": "boolean"
           }
@@ -2561,6 +2585,44 @@
         "title": "RunOutput",
         "type": "object"
       },
+      "RunOutputSampleRequest": {
+        "additionalProperties": false,
+        "description": "A run-owned artifact page request; the URI is resolved server-side from durable metadata.",
+        "properties": {
+          "k": {
+            "default": 50,
+            "maximum": 2000.0,
+            "minimum": 0.0,
+            "title": "K",
+            "type": "integer"
+          },
+          "nodeId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Nodeid",
+            "type": "string"
+          },
+          "offset": {
+            "default": 0,
+            "exclusiveMaximum": 2000.0,
+            "minimum": 0.0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "portId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Portid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "nodeId",
+          "portId"
+        ],
+        "title": "RunOutputSampleRequest",
+        "type": "object"
+      },
       "RunRequest": {
         "properties": {
           "confirmed": {
@@ -2802,14 +2864,27 @@
         "type": "object"
       },
       "SampleResult": {
+        "description": "One page of rows plus an explicit statement of what that page represents.\n\n``row_count`` is an exact total when present, never the number of rows in this response. A limit\napplies either to EACH upstream source scan or to the browsable RESULT window; it is deliberately\nseparate from the caller-selected page size. This prevents a bounded multi-source preview from\nbeing described as the first N output rows.",
         "properties": {
           "columns": {
-            "default": [],
             "items": {
               "$ref": "#/components/schemas/ColumnSchema"
             },
             "title": "Columns",
             "type": "array"
+          },
+          "completeness": {
+            "default": "unknown",
+            "description": "complete=all rows; page=one page of a known/continuable result; sample=derived from bounded source scans; capped=result window ended at a server limit; unknown=no proof.",
+            "enum": [
+              "complete",
+              "page",
+              "sample",
+              "capped",
+              "unknown"
+            ],
+            "title": "Completeness",
+            "type": "string"
           },
           "error": {
             "default": false,
@@ -2817,9 +2892,48 @@
             "type": "boolean"
           },
           "hasMore": {
-            "default": false,
-            "title": "Hasmore",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether another page exists within the current interactive scope: true/false is proven by lookahead, exact metadata, or a result-window boundary; null is unknown. It never asserts whether more rows exist in the full dataset beyond that scope.",
+            "title": "Hasmore"
+          },
+          "limitReason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "preview-scan",
+                  "interactive-row-budget"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why rowLimit applies. Present only together with rowLimit and limitScope.",
+            "title": "Limitreason"
+          },
+          "limitScope": {
+            "anyOf": [
+              {
+                "enum": [
+                  "each-source",
+                  "result-window"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "each-source means every upstream source scan is independently bounded; result-window means result pagination cannot continue beyond rowLimit.",
+            "title": "Limitscope"
           },
           "notPreviewable": {
             "default": false,
@@ -2851,16 +2965,30 @@
           "rowCount": {
             "anyOf": [
               {
+                "minimum": 0.0,
                 "type": "integer"
               },
               {
                 "type": "null"
               }
             ],
+            "description": "Exact total rows in the dataset/result when known; not this page's row count.",
             "title": "Rowcount"
           },
+          "rowLimit": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Server row limit whose meaning is defined by limitScope; never the page size.",
+            "title": "Rowlimit"
+          },
           "rows": {
-            "default": [],
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -2870,6 +2998,7 @@
           },
           "truncated": {
             "default": false,
+            "description": "Whether this response is not a proven complete dataset/result. Every successful non-complete response is truncated; unavailable responses are not.",
             "title": "Truncated",
             "type": "boolean"
           },
@@ -9295,6 +9424,466 @@
           }
         },
         "summary": "Run Cancel"
+      }
+    },
+    "/api/run/{run_id}/export": {
+      "get": {
+        "description": "Stream the complete, already-materialized native artifact without buffering or conversion.",
+        "operationId": "export_run_result_api_run__run_id__export_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "nodeId",
+            "required": true,
+            "schema": {
+              "maxLength": 256,
+              "minLength": 1,
+              "title": "Nodeid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "portId",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Portid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "filename",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 160,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Filename"
+            }
+          },
+          {
+            "in": "query",
+            "name": "userId",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Userid"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "application/vnd.apache.arrow.file": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "application/vnd.apache.parquet": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "text/tab-separated-values": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Complete native result artifact. The runtime preserves its Parquet, Arrow, CSV, TSV, or JSON media type and streams without conversion.",
+            "headers": {
+              "Cache-Control": {
+                "description": "private, no-store; full-result bytes are never cached by shared intermediaries.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Disposition": {
+                "description": "A sanitized filename ending in -full-result plus the native extension.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Length": {
+                "description": "Exact native artifact byte size when available.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Always nosniff for downloaded native data.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Data-Scope": {
+                "description": "Always full-result for this route.",
+                "schema": {
+                  "enum": [
+                    "full-result"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Export Run Result"
+      },
+      "head": {
+        "description": "Authorize and open the exact native member so preflight reports every GET error before download.",
+        "operationId": "preflight_run_result_export_api_run__run_id__export_head",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "nodeId",
+            "required": true,
+            "schema": {
+              "maxLength": 256,
+              "minLength": 1,
+              "title": "Nodeid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "portId",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Portid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "filename",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 160,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Filename"
+            }
+          },
+          {
+            "in": "query",
+            "name": "userId",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Userid"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Full-result export preflight. Performs the same authorization, output resolution, manifest validation, and native member open as GET; returns its media, filename, and size headers without a response body.",
+            "headers": {
+              "Cache-Control": {
+                "description": "private, no-store; full-result bytes are never cached by shared intermediaries.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Disposition": {
+                "description": "A sanitized filename ending in -full-result plus the native extension.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Length": {
+                "description": "Exact native artifact byte size when available.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Always nosniff for downloaded native data.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Data-Scope": {
+                "description": "Always full-result for this route.",
+                "schema": {
+                  "enum": [
+                    "full-result"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Preflight Run Result Export"
+      }
+    },
+    "/api/run/{run_id}/sample": {
+      "post": {
+        "description": "Read one bounded page from an authorized durable output without accepting a caller-owned URI.",
+        "operationId": "sample_run_output_api_run__run_id__sample_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunOutputSampleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SampleResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Sample Run Output"
       }
     },
     "/api/schemas": {

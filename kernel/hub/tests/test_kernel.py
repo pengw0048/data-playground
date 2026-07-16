@@ -127,9 +127,16 @@ def _full_result(graph: dict, target_node_id: str, k: int = 100) -> tuple[dict, 
     assert started.status_code == 200, started.text
     status = _poll(started.json()["runId"])
     assert status["status"] == "done", status.get("error")
-    uri = _output_field(status, "uri", outcome="committed")
-    assert uri
-    sampled = client.post("/api/data/sample", json={"uri": uri, "k": k})
+    output = _sole_output(status, outcome="committed")
+    sampled = client.post(
+        f"/api/run/{status['runId']}/sample",
+        json={
+            "nodeId": output["nodeId"],
+            "portId": output["portId"],
+            "k": k,
+            "offset": 0,
+        },
+    )
     assert sampled.status_code == 200, sampled.text
     return status, sampled.json()
 
@@ -230,6 +237,7 @@ def test_profile_returns_column_stats():
     r = client.post("/api/run/profile", json={"graph": g, "nodeId": "sel"}).json()
     assert not r["error"] and not r["notPreviewable"]
     assert r["sampled"] is True and r["rowCount"] > 0
+    assert r["completeness"] == "sample"
     cols = {c["name"]: c for c in r["columns"]}
     assert "area" in cols
     area = cols["area"]
@@ -290,6 +298,7 @@ def test_full_profile_uses_cancellable_job_lifecycle():
         status = response.json()
     assert status["status"] == "done", status
     assert status["profile"]["sampled"] is False
+    assert status["profile"]["completeness"] == "complete"
     assert status["profile"]["rowCount"] > 0
 
 
@@ -1190,14 +1199,17 @@ def test_full_profile_covers_the_whole_dataset_not_the_sample(tmp_path):
 
     sm = profile_node(g, "s", d.resolve_adapter, d.registry, d.node_builders, d.node_specs)
     assert sm.sampled and sm.row_count <= 2000                 # sampled: bounded prefix
+    assert sm.completeness == "sample"
 
     fl = profile_node(g, "s", d.resolve_adapter, d.registry, d.node_builders, d.node_specs, full=True)
     assert not fl.sampled and fl.row_count == 10000            # full: every row
+    assert fl.completeness == "complete"
     byname = {c.name: c for c in fl.columns}
     assert byname["v"].min == "0" and byname["v"].max == "9999"        # true extents, past the sample
     assert abs((byname["v"].mean or 0) - 4999.5) < 1e-6               # exact mean over all rows
     assert byname["w"].nulls == 1000                                  # exact null count
     assert 7500 <= (byname["id"].distinct or 0) <= 12500             # HLL distinct ≈ 10000 (whole set, not ~2000)
+    assert byname["id"].distinct_is_approximate is True
 
 
 def test_code_cell_preview_profile_disabled_in_auth_mode(monkeypatch):
@@ -3110,6 +3122,10 @@ def test_preview_paginates_with_offset(tmp_path):
     pg1 = client.post("/api/run/preview", json={"graph": g, "nodeId": "s", "k": 10, "offset": 10}).json()
     assert [r["v"] for r in pg0["rows"]] == list(range(0, 10))
     assert [r["v"] for r in pg1["rows"]] == list(range(10, 20))  # offset advances the window
+    assert pg0["rowCount"] is None and pg1["rowCount"] is None
+    assert pg0["completeness"] == pg1["completeness"] == "sample"
+    assert pg0["rowLimit"] == pg1["rowLimit"] == 2_000
+    assert pg0["limitReason"] == pg1["limitReason"] == "preview-scan"
 
 
 def test_materialized_artifact_sample_paginates_with_offset(tmp_path):
@@ -3121,6 +3137,7 @@ def test_materialized_artifact_sample_paginates_with_offset(tmp_path):
     assert [r["v"] for r in pg1["rows"]] == list(range(50, 100)) and pg1["hasMore"] is True
     assert [r["v"] for r in last["rows"]] == list(range(100, 105)) and last["hasMore"] is False
     assert pg0["rowCount"] == pg1["rowCount"] == last["rowCount"] == 105
+    assert pg0["completeness"] == pg1["completeness"] == last["completeness"] == "page"
     assert client.post("/api/data/sample", json={"uri": p, "k": 50, "offset": -1}).status_code == 400
     os.remove(p)
     missing = client.post("/api/data/sample", json={"uri": p, "k": 50, "offset": 0})
@@ -9398,6 +9415,398 @@ def test_chart_node_produces_series():
         chart_graph({"chartType": "bar", "x": "event", "y": "event", "agg": "max"}), "ch", 50,
     )
     assert not minmax_result.get("error")  # TRY_CAST → NULL y, not a raw ConversionException
+
+
+def test_grouped_chart_keeps_all_groups_while_interactive_view_is_capped(tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source = tmp_path / "many-groups.parquet"
+    groups = 2_001
+    pq.write_table(pa.table({
+        "group_name": [f"group-{index:04d}" for index in range(groups)],
+        "value": list(range(groups)),
+    }), source)
+    graph = {"id": "chart-many-groups", "version": 1, "nodes": [
+        N("source", "source", {"uri": str(source)}),
+        N("chart", "chart", {"chartType": "bar", "x": "group_name", "agg": "count"}),
+    ], "edges": [E("source", "chart")]}
+
+    status, interactive = _full_result(graph, "chart", 2_000)
+    output = _sole_output(status, outcome="committed")
+    assert output["rows"] == groups
+    assert len(interactive["rows"]) == 2_000
+    assert interactive["rowCount"] == groups
+    assert interactive["hasMore"] is False
+    assert interactive["completeness"] == "capped"
+    assert interactive["rowLimit"] == 2_000
+    assert interactive["limitReason"] == "interactive-row-budget"
+    assert interactive["limitScope"] == "result-window"
+
+    from hub import metadb
+
+    storage = get_deps().storage
+    original_acquire = storage.acquire_result_read
+    export_guards = []
+
+    def capture_export_guard(uri, owner):
+        guard = original_acquire(uri, owner)
+        if owner.startswith(f"export:{status['runId']}:"):
+            export_guards.append(guard)
+        return guard
+
+    monkeypatch.setattr(storage, "acquire_result_read", capture_export_guard)
+    export_params = {"nodeId": "chart", "portId": "out", "filename": "grouped chart"}
+    preflight = client.head(
+        f"/api/run/{status['runId']}/export", params=export_params,
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.content == b""
+    assert int(preflight.headers["content-length"]) > 0
+    assert preflight.headers["x-data-scope"] == "full-result"
+    exported = client.get(
+        f"/api/run/{status['runId']}/export",
+        params=export_params,
+    )
+    assert exported.status_code == 200, exported.text
+    assert exported.headers["x-data-scope"] == "full-result"
+    assert exported.headers["x-content-type-options"] == "nosniff"
+    assert exported.headers["content-disposition"] == (
+        'attachment; filename="grouped_chart-full-result.parquet"'
+    )
+    table = pq.read_table(pa.BufferReader(exported.content))
+    assert table.num_rows == groups
+    assert table.column("x").to_pylist()[-1] == "group-2000"
+    assert export_guards
+    assert all(not metadb.local_result_read_active(
+        guard.uri, storage.namespace_id, guard.reader_id,
+    ) for guard in export_guards), "response completion must release the exact artifact read fence"
+
+    # Exercise the response itself with a real ASGI http.disconnect message. Starlette cancels the body
+    # iterator after its first chunk; the response-level outer finally must still release the exact read
+    # fence (iterator/background cleanup alone is not a sufficient disconnect contract).
+    import asyncio
+    from hub.routers import runs as runs_router
+
+    monkeypatch.setattr(runs_router, "_EXPORT_CHUNK_BYTES", 1)
+    disconnected = runs_router.export_run_result(
+        status["runId"], node_id="chart", port_id="out", filename="disconnect",
+        user_id=None, uid="local",
+    )
+    sent = []
+
+    async def disconnect_after_one_chunk():
+        first_receive = True
+        body_sent = asyncio.Event()
+
+        async def receive():
+            nonlocal first_receive
+            if first_receive:
+                first_receive = False
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await body_sent.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+            if message["type"] == "http.response.body" and message.get("body"):
+                body_sent.set()
+
+        await disconnected({
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.0"},
+            "http_version": "1.1", "method": "GET", "scheme": "http",
+            "path": f"/api/run/{status['runId']}/export", "raw_path": b"/export",
+            "query_string": b"", "root_path": "", "headers": [],
+            "client": ("127.0.0.1", 1), "server": ("testserver", 80),
+        }, receive, send)
+
+    asyncio.run(disconnect_after_one_chunk())
+    assert any(message["type"] == "http.response.body" and message.get("body")
+               for message in sent)
+    assert all(not metadb.local_result_read_active(
+        guard.uri, storage.namespace_id, guard.reader_id,
+    ) for guard in export_guards), "ASGI disconnect must release the result read fence"
+
+    # ASGI 2.4 no longer runs a disconnect-listener task: a socket loss is an OSError from body send,
+    # translated by Starlette to ClientDisconnect before background work. The response outer finally is
+    # therefore the only reliable owner and must finish closing before the exception reaches the server.
+    from starlette.requests import ClientDisconnect
+
+    send_failed = runs_router.export_run_result(
+        status["runId"], node_id="chart", port_id="out", filename="send-failure",
+        user_id=None, uid="local",
+    )
+    failed_messages = []
+
+    async def fail_during_body_send():
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            failed_messages.append(message)
+            if message["type"] == "http.response.body" and message.get("body"):
+                raise OSError("client socket closed")
+
+        with pytest.raises(ClientDisconnect):
+            await send_failed({
+                "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "http_version": "1.1", "method": "GET", "scheme": "http",
+                "path": f"/api/run/{status['runId']}/export", "raw_path": b"/export",
+                "query_string": b"", "root_path": "", "headers": [],
+                "client": ("127.0.0.1", 1), "server": ("testserver", 80),
+            }, receive, send)
+
+    asyncio.run(fail_during_body_send())
+    assert any(message["type"] == "http.response.body" and message.get("body")
+               for message in failed_messages)
+    assert all(not metadb.local_result_read_active(
+        guard.uri, storage.namespace_id, guard.reader_id,
+    ) for guard in export_guards), "send failure must synchronously release the result read fence"
+    assert client.head(
+        f"/api/run/{status['runId']}/export",
+        params={"nodeId": "n" * 257, "portId": "out"},
+    ).status_code == 422
+    assert client.head(
+        f"/api/run/{status['runId']}/export",
+        params={"nodeId": "n" * 256, "portId": "out"},
+    ).status_code == 404
+
+
+def test_durable_output_falls_back_on_status_outage_but_not_programming_errors(monkeypatch):
+    from fastapi import HTTPException
+
+    from hub import metadb
+    from hub.backends import BackendStatusUnavailable
+    from hub.models import RunOutput, RunStatus
+    from hub.routers import runs as runs_router
+
+    output = RunOutput(
+        node_id="node", port_id="out", wire="dataset", publication_kind="result",
+        outcome="committed", uri="/tmp/retained.parquet", rows=3,
+    )
+    retained = RunStatus(
+        run_id="retained-run", status="done", placement="local", target_node_id="node",
+        outputs=[output], per_node=[],
+    ).model_dump()
+
+    class UnavailableRunner:
+        @staticmethod
+        def status(_run_id):
+            raise BackendStatusUnavailable("backend unavailable")
+
+    monkeypatch.setattr(runs_router, "_runner_for", lambda _run_id: UnavailableRunner())
+    monkeypatch.setattr(metadb, "get_run_state", lambda _run_id: retained)
+    assert runs_router._durable_run_output("retained-run", "node", "out") == output
+
+    class BrokenRunner:
+        @staticmethod
+        def status(_run_id):
+            raise RuntimeError("invariant broken")
+
+    monkeypatch.setattr(runs_router, "_runner_for", lambda _run_id: BrokenRunner())
+    with pytest.raises(RuntimeError, match="invariant broken"):
+        runs_router._durable_run_output("retained-run", "node", "out")
+
+    monkeypatch.setattr(runs_router, "_runner_for", lambda _run_id: UnavailableRunner())
+    monkeypatch.setattr(metadb, "get_run_state", lambda _run_id: None)
+    monkeypatch.setattr(metadb, "get_run_record_outputs", lambda _run_id: None)
+    with pytest.raises(HTTPException) as unavailable:
+        runs_router._durable_run_output("missing-run", "node", "out")
+    assert unavailable.value.status_code == 503
+
+
+def test_run_output_routes_fall_back_to_logical_run_history_and_keep_catalog_totals(tmp_path):
+    import uuid
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from hub import metadb
+
+    canvas_id = f"history-output-{uuid.uuid4().hex}"
+    result_run_id = f"logical-result-{uuid.uuid4().hex}"
+    catalog_run_id = f"logical-catalog-{uuid.uuid4().hex}"
+    result_path = tmp_path / "history-result.parquet"
+    catalog_path = tmp_path / "history-catalog.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), result_path)
+    pq.write_table(pa.table({"value": [10, 20, 30]}), catalog_path)
+    with metadb.session() as session:
+        session.add(metadb.Canvas(id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name="history"))
+    try:
+        assert metadb.record_run(
+            canvas_id, "result-node", "run", "done", rows=3, run_id=result_run_id,
+            outputs=[{
+                "node_id": "result-node", "port_id": "out", "port_label": "Output",
+                "wire": "dataset", "publication_kind": "result", "outcome": "committed",
+                "uri": str(result_path), "table": None, "rows": 3, "error": None,
+            }],
+        )
+        assert metadb.record_run(
+            canvas_id, "write-node", "run", "done", rows=1, run_id=catalog_run_id,
+            outputs=[{
+                "node_id": "write-node", "port_id": "out", "port_label": "Output",
+                "wire": "dataset", "publication_kind": "catalog", "outcome": "committed",
+                "uri": str(catalog_path), "table": "catalog_table", "rows": 1, "error": None,
+            }],
+        )
+        assert metadb.get_run_state(result_run_id) is None
+        result_page = client.post(
+            f"/api/run/{result_run_id}/sample",
+            json={"nodeId": "result-node", "portId": "out", "k": 2, "offset": 0},
+        )
+        assert result_page.status_code == 200, result_page.text
+        assert result_page.json()["rowCount"] == 3
+        exported = client.get(
+            f"/api/run/{result_run_id}/export",
+            params={"nodeId": "result-node", "portId": "out"},
+        )
+        assert exported.status_code == 200
+        assert pq.read_table(pa.BufferReader(exported.content)).num_rows == 3
+
+        catalog_page = client.post(
+            f"/api/run/{catalog_run_id}/sample",
+            json={"nodeId": "write-node", "portId": "out", "k": 2, "offset": 0},
+        )
+        assert catalog_page.status_code == 200, catalog_page.text
+        assert catalog_page.json()["rowCount"] == 3  # artifact total, not append mutation rows=1
+        assert client.get(
+            f"/api/run/{catalog_run_id}/export",
+            params={"nodeId": "write-node", "portId": "out"},
+        ).status_code == 409
+
+        history_rows = {row["runId"]: row for row in metadb.list_runs(canvas_id)}
+        history_id = history_rows[result_run_id]["id"]
+        assert metadb.get_run_record_output(history_id, "result-node", "out") is None
+        assert client.get(
+            f"/api/run/{history_id}/export",
+            params={"nodeId": "result-node", "portId": "out"},
+        ).status_code == 404
+
+        from hub.mcp import Playground
+
+        mcp_sample = Playground(
+            get_deps(), metadb.DEFAULT_USER_ID, "http://127.0.0.1:8471",
+        ).sample_result({"runId": result_run_id, "limit": 2, "columns": ["value"]})
+        assert mcp_sample["rows"] == [{"value": 1}, {"value": 2}]
+        assert mcp_sample["nodeId"] == "result-node" and mcp_sample["portId"] == "out"
+        assert mcp_sample["rowCount"] == 3 and mcp_sample["completeness"] == "page"
+    finally:
+        metadb.delete_canvas_cascade(canvas_id)
+
+
+def test_object_attempt_single_shard_is_sampleable_and_streamable_but_multi_shard_is_explicit(
+        tmp_path, monkeypatch):
+    import contextlib
+    from urllib.parse import urlsplit
+
+    import pyarrow as pa
+    import pyarrow.fs as pafs
+    import pyarrow.parquet as pq
+
+    from hub import db
+    from hub.handoff import MANIFEST_NAME, write_manifest
+    from hub.models import RunOutput
+    from hub.plugins import adapters
+    from hub.routers import runs as runs_router
+    import hub.handoff as handoff
+
+    object_root = tmp_path / "object-store"
+
+    def fake_object_fs(uri):
+        parsed = urlsplit(uri)
+        return pafs.LocalFileSystem(), str(
+            object_root / parsed.netloc / parsed.path.lstrip("/"))
+
+    monkeypatch.setattr(adapters, "object_fs", fake_object_fs)
+    monkeypatch.setattr(handoff, "object_fs", fake_object_fs)
+
+    @contextlib.contextmanager
+    def fixed_attempt_read_scope(_storage, _uris, *, owner):
+        assert owner
+        yield []
+
+    monkeypatch.setattr(runs_router, "source_read_scope", fixed_attempt_read_scope)
+
+    class LocalObjectAdapter:
+        name = "local-object-test"
+
+        def preview_scan(self, uri, columns=None, limit=2_000):
+            _fs, local = fake_object_fs(uri)
+            relation = db.conn().read_parquet(local).limit(limit)
+            if columns:
+                relation = relation.project(", ".join(columns))
+            return relation
+
+        def metadata_count(self, uri):
+            _fs, local = fake_object_fs(uri)
+            return int(pq.ParquetFile(local).metadata.num_rows)
+
+    monkeypatch.setattr(get_deps(), "resolve_adapter", lambda _uri: LocalObjectAdapter())
+
+    def build_attempt(name: str, parts: list[pa.Table]) -> str:
+        uri = f"s3://bucket/results/{name}.parquet.attempt-ns-g1-{name}"
+        _fs, prefix = fake_object_fs(uri)
+        os.makedirs(prefix, exist_ok=True)
+        for index, table in enumerate(parts):
+            pq.write_table(table, os.path.join(prefix, f"part-{index:05d}.parquet"))
+        commit_dir = os.path.join(
+            os.path.dirname(prefix), "_dp_commits", os.path.basename(prefix))
+        os.makedirs(commit_dir, exist_ok=True)
+        write_manifest(
+            uri, run_id=f"run-{name}", rows=sum(table.num_rows for table in parts),
+            schema=parts[0].schema,
+        )
+        assert os.path.exists(os.path.join(commit_dir, MANIFEST_NAME))
+        return uri
+
+    one = build_attempt("one", [pa.table({"value": [1, 2, 3]})])
+    many = build_attempt(
+        "many", [pa.table({"value": [1]}), pa.table({"value": [2]})])
+
+    def output(uri: str, rows: int) -> RunOutput:
+        return RunOutput(
+            node_id="node", port_id="out", wire="dataset", publication_kind="result",
+            outcome="committed", uri=uri, rows=rows,
+        )
+
+    selected = output(one, 3)
+    monkeypatch.setattr(runs_router, "_require_run_read_access", lambda _run, _uid: None)
+    monkeypatch.setattr(runs_router, "_durable_run_output", lambda *_args: selected)
+
+    sample = client.post(
+        "/api/run/object-run/sample",
+        json={"nodeId": "node", "portId": "out", "k": 2, "offset": 0},
+    )
+    assert sample.status_code == 200, sample.text
+    assert sample.json()["rows"] == [{"value": 1}, {"value": 2}]
+    assert sample.json()["rowCount"] == 3
+    exported = client.get(
+        "/api/run/object-run/export", params={"nodeId": "node", "portId": "out"},
+    )
+    assert exported.status_code == 200, exported.text
+    assert pq.read_table(pa.BufferReader(exported.content)).to_pylist() == [
+        {"value": 1}, {"value": 2}, {"value": 3},
+    ]
+
+    selected = output(many, 2)
+    sample = client.post(
+        "/api/run/object-run/sample",
+        json={"nodeId": "node", "portId": "out", "k": 2, "offset": 0},
+    )
+    assert sample.status_code == 200
+    assert sample.json()["notPreviewable"] is True
+    assert "multiple storage shards" in sample.json()["reason"]
+    exported = client.get(
+        "/api/run/object-run/export", params={"nodeId": "node", "portId": "out"},
+    )
+    assert exported.status_code == 406
+
+    selected = output(one, 999)
+    assert client.post(
+        "/api/run/object-run/sample",
+        json={"nodeId": "node", "portId": "out", "k": 2, "offset": 0},
+    ).status_code == 409
+    assert client.head(
+        "/api/run/object-run/export", params={"nodeId": "node", "portId": "out"},
+    ).status_code == 409
 
 
 def test_source_node_accepts_catalog_name():

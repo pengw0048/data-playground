@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { goldenCanvas, installCanvas } from './support/ux-fixtures'
 
 test.describe('researcher golden workflow @ux-smoke', () => {
-  test('targets the chosen canvas and labels/downloads only a preview sample', async ({ page }) => {
+  test('targets the chosen canvas and labels/downloads only the visible preview page', async ({ page }) => {
     const primary = goldenCanvas('ux-golden-primary', 'UX primary canvas', 'UX primary source')
     const secondary = goldenCanvas('ux-golden-secondary', 'UX secondary canvas', 'UX secondary source')
     await installCanvas(page.request, primary)
@@ -18,13 +18,15 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
     const panel = page.getByTestId('panel-data')
     await expect(panel).toBeVisible()
-    await expect(panel.getByText('sample', { exact: true })).toBeVisible()
-    const csv = panel.getByTitle(/Download these rows as CSV.*previewed sample only/)
-    await expect(csv).toBeVisible()
+    await expect(panel.getByText('Preview sample', { exact: true })).toBeVisible()
+    await expect(panel.getByText(/Full dataset not scanned/)).toBeVisible()
+    const exportPage = panel.getByRole('button', { name: 'Export this preview page' })
+    await expect(exportPage).toBeVisible()
     const downloaded = page.waitForEvent('download')
-    await csv.click()
+    await exportPage.click()
+    await page.getByRole('menuitem', { name: 'Download preview page as CSV' }).click()
     const download = await downloaded
-    expect(download.suggestedFilename()).toBe('UX_primary_source.csv')
+    expect(download.suggestedFilename()).toBe('UX_primary_source-preview-page-1-50.csv')
     const file = await download.path()
     expect(file).not.toBeNull()
     const rows = readFileSync(file!, 'utf8').trim().split('\n')
@@ -56,5 +58,56 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await filter.click()
     await filter.getByPlaceholder('is_valid = true AND score > 0.5').fill("event = 'signup' OR amount > 0")
     await expect(filter.getByTitle('stale')).toBeVisible()
+  })
+
+  test('reopens and downloads the native full result without navigating away', async ({ page }) => {
+    const doc = goldenCanvas('ux-golden-export', 'UX export canvas', 'UX export source')
+    await installCanvas(page.request, doc)
+    const graph = {
+      id: doc.id,
+      version: doc.version,
+      requirements: doc.requirements ?? [],
+      nodes: doc.nodes.map((node) => ({
+        id: node.id,
+        type: node.type,
+        position: node.position,
+        parentId: node.parentId ?? null,
+        data: {
+          title: node.data.title,
+          config: node.data.config,
+          status: node.data.status,
+          bypassed: node.data.bypassed,
+          disabled: node.data.disabled,
+        },
+      })),
+      edges: doc.edges,
+    }
+    const started = await page.request.post('/api/run', {
+      data: { graph, targetNodeId: 'source', confirmed: true },
+    })
+    const startFailure = started.ok() ? '' : await started.text()
+    expect(started.ok(), startFailure).toBe(true)
+    const runId = (await started.json()).runId as string
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/run/${encodeURIComponent(runId)}`)
+      return (await response.json()).status
+    }, { timeout: 30_000 }).toBe('done')
+
+    await page.goto(`/#/canvas/${doc.id}`)
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Run history').click()
+    await page.getByRole('button', { name: 'Open full result' }).click()
+    await expect(page.getByText('Full result artifact')).toBeVisible()
+
+    const downloaded = page.waitForEvent('download')
+    await page.getByRole('button', { name: 'Export full result' }).click()
+    const download = await downloaded
+    expect(download.suggestedFilename()).toMatch(/-full-result\.parquet$/)
+    const file = await download.path()
+    expect(file).not.toBeNull()
+    const bytes = readFileSync(file!)
+    expect(bytes.subarray(0, 4).toString()).toBe('PAR1')
+    expect(bytes.subarray(-4).toString()).toBe('PAR1')
+    await expect(page).toHaveURL(new RegExp(`/#/canvas/${doc.id}$`))
   })
 })

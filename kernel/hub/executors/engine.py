@@ -909,12 +909,13 @@ class BuildEngine:
                     f"SELECT {xq} AS x, {quote_identifier(y)} AS y FROM {quote_identifier(v)}"
                 )
             yexpr = "count(*)" if agg == "count" or not y else f"{_agg_name(agg)}({quote_identifier(y)})"
-            # grouped series (bar/line): one point per distinct x, capped so a huge-cardinality x can't
-            # blow up the chart. TRY_CAST (not ::DOUBLE) so a non-numeric/temporal min/max degrades to
-            # NULL (dropped by the renderer) instead of a raw ConversionException.
+            # Grouped series is a real dataset output, so the durable artifact must retain every group.
+            # The interactive chart renderer owns its explicit 2,000-point display budget; imposing the
+            # cap here would silently make both downstream nodes and full-result exports incomplete.
+            # TRY_CAST (not ::DOUBLE) lets non-numeric/temporal min/max degrade to NULL in the renderer.
             return db.conn().sql(
                 f"SELECT {xq} AS x, TRY_CAST(({yexpr}) AS DOUBLE) AS y "
-                f"FROM {quote_identifier(v)} GROUP BY {xq} ORDER BY {xq} LIMIT 2000"
+                f"FROM {quote_identifier(v)} GROUP BY {xq} ORDER BY {xq}"
             )
 
         if t == "vector-search":

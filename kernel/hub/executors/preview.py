@@ -71,7 +71,19 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                 # over such a node may not be perfectly consistent — acceptable for a bounded preview.
                 rows, cols = engine.rows(node_id, k + 1, offset, selected_port)
                 has_more = len(rows) > k
-                return SampleResult(columns=cols, rows=rows[:k], row_count=len(rows[:k]), has_more=has_more, truncated=True)
+                return SampleResult(
+                    columns=cols,
+                    rows=rows[:k],
+                    # A graph preview observes only the bounded source prefix. ``rows`` already gives
+                    # the page size; publishing it as rowCount made consumers mistake it for a total.
+                    row_count=None,
+                    has_more=has_more,
+                    truncated=True,
+                    completeness="sample",
+                    row_limit=PREVIEW_SCAN,
+                    limit_reason="preview-scan",
+                    limit_scope="each-source",
+                )
 
     def on_timeout() -> None:
         # interrupt THIS preview's cursor so the worker unwinds (its scope exit drops its views);

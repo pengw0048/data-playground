@@ -1,6 +1,6 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, describe, it, expect, vi } from 'vitest'
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import { fmtMs, DurationTrend, PerNodeBreakdown } from './RunHistoryModal'
 import type { PerNodeStat, RunRecordDto } from '../api/client'
 import { RunHistoryModal } from './RunHistoryModal'
@@ -11,14 +11,22 @@ import { register } from '../nodes/registry'
 const apiMock = vi.hoisted(() => ({
   listRuns: vi.fn(),
   sample: vi.fn(),
+  runOutputSample: vi.fn(),
   preview: vi.fn(),
   profile: vi.fn(),
   profileEstimate: vi.fn(),
   fullProfile: vi.fn(),
   cancelRun: vi.fn(),
+  fullResultExportUrl: vi.fn(),
+  preflightFullResultExport: vi.fn(),
 }))
 
 vi.mock('../api/client', () => ({ api: apiMock }))
+
+afterEach(() => {
+  document.querySelectorAll('iframe[data-full-result-download]').forEach((frame) => frame.remove())
+  vi.restoreAllMocks()
+})
 
 function registerAssertUiTestNode() {
   register({
@@ -32,8 +40,11 @@ function registerAssertUiTestNode() {
 beforeEach(() => {
   apiMock.listRuns.mockReset()
   apiMock.sample.mockReset()
+  apiMock.runOutputSample.mockReset()
   apiMock.preview.mockReset()
-  apiMock.profile.mockReset().mockResolvedValue({ columns: [], rowCount: 10, sampled: true })
+  apiMock.profile.mockReset().mockResolvedValue({
+    columns: [], rowCount: 10, sampled: true, completeness: 'sample',
+  })
   apiMock.profileEstimate.mockReset().mockResolvedValue({
     rows: null, bytes: null, placement: 'local', needsConfirm: true, planDigest: 'a'.repeat(64),
   })
@@ -41,16 +52,18 @@ beforeEach(() => {
     runId: 'profile-ui', status: 'done', jobType: 'profile', targetNodeId: 'target',
     planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
     rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
-    profile: { columns: [], rowCount: 10, sampled: false },
+    profile: { columns: [], rowCount: 10, sampled: false, completeness: 'complete' },
   })
   apiMock.cancelRun.mockReset().mockImplementation(async (runId: string) => ({
     runId, status: 'cancelled', jobType: 'run',
     rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
   }))
+  apiMock.fullResultExportUrl.mockReset().mockReturnValue('/api/run/full-result-export')
+  apiMock.preflightFullResultExport.mockReset().mockResolvedValue('/api/run/full-result-export')
   useStore.setState({
     currentUser: { id: 'alice', name: 'Alice' },
     doc: { id: 'history-canvas', name: 'History', version: 1, nodes: [], edges: [], requirements: [] },
-    previews: {}, runs: {},
+    previews: {}, runs: {}, toasts: [],
   } as any)
 })
 
@@ -108,18 +121,28 @@ describe('durable full results', () => {
     rowCount: 105,
     hasMore,
     truncated: hasMore,
+    completeness: hasMore || offset > 0 ? 'page' as const : 'complete' as const,
   })
+  const fullIdentity = {
+    runId: 'run-direct', nodeId: 'target', portId: 'out', publicationKind: 'result' as const,
+  }
 
   it('reopens a completed result from persisted run history', async () => {
     apiMock.listRuns.mockResolvedValue([{ id: 'history-row', runId: 'run-real', status: 'done',
       targetNodeId: 'target', rows: 105, outputs: [committedOutput('/outputs/result.parquet', 105)] }])
-    apiMock.sample.mockResolvedValue(sample(0, 50, true))
+    apiMock.runOutputSample.mockResolvedValue(sample(0, 50, true))
     const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
 
     await user.click(await screen.findByRole('button', { name: 'Open full result' }))
-    expect(await screen.findByText('rows 1–50 of 105')).toBeInTheDocument()
-    expect(apiMock.sample).toHaveBeenCalledWith('/outputs/result.parquet', 50, undefined, 0)
+    expect(await screen.findByText(/rows 1–50 of 105/)).toBeInTheDocument()
+    expect(apiMock.runOutputSample).toHaveBeenCalledWith('run-real', 'target', 'out', 50, 0)
+    await user.click(screen.getByRole('button', { name: 'Export full result' }))
+    await waitFor(() => expect(apiMock.preflightFullResultExport).toHaveBeenCalledWith(
+      'run-real', 'target', 'out', 'target-out',
+    ))
+    expect(apiMock.fullResultExportUrl).not.toHaveBeenCalled()
+    expect(document.querySelector('iframe')?.getAttribute('src')).toBe('/api/run/full-result-export')
   })
 
   it('shows every named history output and keeps a committed artifact inspectable after overall failure', async () => {
@@ -133,7 +156,7 @@ describe('durable full results', () => {
         },
       ],
     }])
-    apiMock.sample.mockResolvedValue({ ...sample(0, 7, false), rows: [{ v: 'survived' }] })
+    apiMock.runOutputSample.mockResolvedValue({ ...sample(0, 7, false), rows: [{ v: 'survived' }] })
     const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
 
@@ -146,61 +169,196 @@ describe('durable full results', () => {
   })
 
   it('pages beyond the first 50 materialized rows', async () => {
-    apiMock.sample.mockImplementation(async (_uri: string, _k: number, _columns: unknown, offset: number) =>
+    const downloads: string[] = []
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true, value: vi.fn(() => 'blob:full-result-page'),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      downloads.push(this.download)
+    })
+    apiMock.runOutputSample.mockImplementation(async (
+      _runId: string, _nodeId: string, _portId: string, _k: number, offset: number,
+    ) =>
       offset === 0 ? sample(0, 50, true) : sample(50, 50, true))
     const user = userEvent.setup()
     // History can hold rows written by one append attempt (50), while the reopened artifact is
     // cumulative (105). The artifact's measured rowCount is authoritative for display/paging.
-    render(<FullResult uri="/outputs/result.parquet" total={50} />)
-    await screen.findByText('rows 1–50 of 105')
+    render(<FullResult uri="/outputs/result.parquet" total={50} {...fullIdentity} />)
+    await screen.findByText(/rows 1–50 of 105/)
 
     await user.click(screen.getByRole('button', { name: 'Next page' }))
-    expect(await screen.findByText('rows 51–100 of 105')).toBeInTheDocument()
-    expect(apiMock.sample).toHaveBeenLastCalledWith('/outputs/result.parquet', 50, undefined, 50)
+    expect(await screen.findByText(/rows 51–100 of 105/)).toBeInTheDocument()
+    expect(apiMock.runOutputSample).toHaveBeenLastCalledWith('run-direct', 'target', 'out', 50, 50)
+    await user.click(screen.getByRole('button', { name: 'Export this full-result page' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Download full-result page as CSV' }))
+    expect(downloads).toContain('result-full-result-page-51-100.csv')
+  })
+
+  it('keeps unknown next-page availability explicit and exploratory', async () => {
+    apiMock.runOutputSample.mockImplementation(async (
+      _runId: string, _nodeId: string, _portId: string, _k: number, offset: number,
+    ) => ({
+      columns: [{ name: 'v', type: 'BIGINT', capabilities: [] }],
+      rows: offset === 0 ? [{ v: 1 }] : [], rowCount: null, hasMore: null,
+      truncated: true, completeness: 'unknown',
+    }))
+    const user = userEvent.setup()
+    render(<FullResult uri="/outputs/unknown-pages.parquet" total={null} {...fullIdentity} />)
+
+    expect(await screen.findByText('Next page availability unknown · You can try the next offset.')).toBeInTheDocument()
+    const next = screen.getByRole('button', { name: 'Next page' })
+    expect(next).toBeEnabled()
+    await user.click(next)
+
+    expect(await screen.findByText('Next page availability unknown.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Previous page' })).toBeEnabled()
+    expect(screen.getByText(/No rows at offset 1/)).toBeInTheDocument()
+    expect(apiMock.runOutputSample).toHaveBeenLastCalledWith('run-direct', 'target', 'out', 50, 1)
+    await user.click(screen.getByRole('button', { name: 'Previous page' }))
+    expect(await screen.findByText(/rows 1–1/)).toBeInTheDocument()
+    expect(apiMock.runOutputSample).toHaveBeenLastCalledWith('run-direct', 'target', 'out', 50, 0)
   })
 
   it('stops at the read budget while preserving truncated export labeling', async () => {
-    apiMock.sample.mockImplementation(async (
-      _uri: string, _k: number, _columns: unknown, offset: number,
+    apiMock.runOutputSample.mockImplementation(async (
+      _runId: string, _nodeId: string, _portId: string, _k: number, offset: number,
     ) => ({
       ...sample(offset, 50, offset < 1950),
       rowCount: 100_000,
       truncated: true,
+      completeness: offset === 1950 ? 'capped' : 'page',
+      rowLimit: offset === 1950 ? 2_000 : undefined,
+      limitReason: offset === 1950 ? 'interactive-row-budget' : undefined,
     }))
     const user = userEvent.setup()
 
-    render(<FullResult uri="/outputs/budget-terminal.parquet" total={100_000} />)
+    render(<FullResult uri="/outputs/budget-terminal.parquet" total={100_000} {...fullIdentity} />)
 
-    await screen.findByText('rows 1–50 of 100,000')
-    expect(screen.queryByText('Interactive view limit reached')).not.toBeInTheDocument()
+    await screen.findByText(/rows 1–50 of 100,000/)
+    expect(screen.queryByText(/Interactive view stopped/)).not.toBeInTheDocument()
     for (let offset = 50; offset <= 1950; offset += 50) {
       await user.click(screen.getByRole('button', { name: 'Next page' }))
-      await screen.findByText(`rows ${offset + 1}–${offset + 50} of 100,000`)
+      await screen.findByText(new RegExp(
+        `rows ${(offset + 1).toLocaleString()}–${(offset + 50).toLocaleString()} of 100,000`,
+      ))
     }
     expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled()
-    expect(screen.getByText('Interactive view limit reached')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'CSV' })).toHaveAttribute(
-      'title',
-      expect.stringContaining('previewed sample only'),
-    )
+    expect(screen.getByText(/Interactive view stopped at 2,000 rows of 100,000/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Export this full-result page' })).toHaveTextContent('Export this page')
   })
 
   it('labels a missing or expired artifact explicitly', async () => {
-    apiMock.sample.mockRejectedValue(new Error('404: no such file'))
-    render(<FullResult uri="/outputs/missing.parquet" total={105} />)
+    apiMock.runOutputSample.mockRejectedValue(new Error('404: no such file'))
+    render(<FullResult uri="/outputs/missing.parquet" total={105} {...fullIdentity} />)
     expect(await screen.findByText('Full result expired or removed')).toBeInTheDocument()
     expect(screen.getByText(/stored artifact is no longer available/i)).toBeInTheDocument()
   })
 
   it('does not mislabel an authorization failure as expiration', async () => {
-    apiMock.sample.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }))
-    render(<FullResult uri="/outputs/private.parquet" total={105} />)
+    apiMock.runOutputSample.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }))
+    render(<FullResult uri="/outputs/private.parquet" total={105} {...fullIdentity} />)
     expect(await screen.findByText('Full result access denied')).toBeInTheDocument()
     expect(screen.queryByText('Full result expired or removed')).not.toBeInTheDocument()
   })
 
+  it.each([
+    [{ error: true, reason: 'adapter failed while opening the artifact' }, 'Couldn’t read full result'],
+    [{ notPreviewable: true, reason: 'this adapter has no bounded preview' }, 'Full result cannot be previewed'],
+  ] as const)('renders a semantic sample failure instead of a fake empty result', async (response, title) => {
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [], rows: [], rowCount: null, hasMore: false, truncated: false,
+      completeness: 'unknown', wire: 'dataset', notPreviewable: false, ...response,
+    })
+
+    render(<FullResult uri="/outputs/opaque.parquet" total={105} {...fullIdentity} />)
+
+    expect(await screen.findByText(title)).toBeInTheDocument()
+    expect(screen.getByText(response.reason)).toBeInTheDocument()
+    expect(screen.queryByText(/Complete artifact/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Export full result' })).toBeInTheDocument()
+  })
+
+  it('lets HEAD preflight decide exportability for a result URI without a file suffix', async () => {
+    apiMock.runOutputSample.mockResolvedValue(sample(0, 1, false))
+
+    render(<FullResult uri="s3://bucket/runs/attempt-123/" total={1} {...fullIdentity} />)
+
+    expect(await screen.findByRole('button', { name: 'Export full result' })).toBeInTheDocument()
+  })
+
+  it('preflights a native export and reports rejection without navigating the SPA', async () => {
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click')
+    apiMock.runOutputSample.mockResolvedValue(sample(0, 50, true))
+    apiMock.preflightFullResultExport.mockRejectedValueOnce(new Error('artifact is not exportable'))
+    const user = userEvent.setup()
+    render(<FullResult uri="/outputs/result.parquet" total={105} {...fullIdentity} />)
+    await screen.findByText(/rows 1–50 of 105/)
+
+    await user.click(screen.getByRole('button', { name: 'Export full result' }))
+
+    await waitFor(() => expect(useStore.getState().toasts.at(-1)).toMatchObject({
+      kind: 'error', msg: 'Could not start full-result export: artifact is not exportable',
+    }))
+    expect(anchorClick).not.toHaveBeenCalled()
+    expect(document.querySelector('iframe[data-full-result-download]')).toBeNull()
+    expect(apiMock.fullResultExportUrl).not.toHaveBeenCalled()
+  })
+
+  it('does not substitute a history-row id when durable run identity is missing', async () => {
+    apiMock.listRuns.mockResolvedValue([{ id: 'history-row-only', status: 'done',
+      targetNodeId: 'target', rows: 105, outputs: [committedOutput('/outputs/result.parquet', 105)] }])
+    const user = userEvent.setup()
+    render(<RunHistoryModal onClose={() => {}} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Open full result' }))
+
+    expect(await screen.findByText('Full result identity unavailable')).toBeInTheDocument()
+    expect(screen.getByText(/has no durable run identity/i)).toBeInTheDocument()
+    expect(apiMock.runOutputSample).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: 'Export full result' })).not.toBeInTheDocument()
+  })
+
+  it('labels write counts without treating them as the catalog artifact total or export capability', async () => {
+    const downloads: string[] = []
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true, value: vi.fn(() => 'blob:published-dataset-page'),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      downloads.push(this.download)
+    })
+    const catalogOutput = {
+      ...committedOutput('/catalog/robot-actions.parquet', 12), publicationKind: 'catalog' as const,
+      table: 'robot_actions',
+    }
+    apiMock.listRuns.mockResolvedValue([{ id: 'write-history', runId: 'write-run', status: 'done',
+      targetNodeId: 'target', rows: 12, outputs: [catalogOutput] }])
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [{ name: 'v', type: 'BIGINT', capabilities: [] }], rows: [{ v: 1 }],
+      rowCount: null, hasMore: true, truncated: true, completeness: 'page',
+    })
+    const user = userEvent.setup()
+    render(<RunHistoryModal onClose={() => {}} />)
+
+    expect(await screen.findByText('12 rows written')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Open published dataset' }))
+
+    expect(await screen.findByText(/Total rows unknown/)).toBeInTheDocument()
+    expect(screen.queryByText(/of 12/)).not.toBeInTheDocument()
+    expect(screen.getAllByText('Published dataset').length).toBeGreaterThan(0)
+    expect(screen.getByRole('button', { name: 'Export this published dataset page' })).toBeInTheDocument()
+    expect(screen.queryByText('Full result artifact')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Export full result' })).not.toBeInTheDocument()
+    expect(apiMock.runOutputSample).toHaveBeenCalledWith('write-run', 'target', 'out', 50, 0)
+    await user.click(screen.getByRole('button', { name: 'Export this published dataset page' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Download published dataset page as CSV' }))
+    expect(downloads).toContain('target-out-published-dataset-page-1-1.csv')
+  })
+
   it('offers sample/full switching for previewable nodes after a full run', async () => {
-    apiMock.sample.mockResolvedValue(sample(0, 50, true))
+    apiMock.runOutputSample.mockResolvedValue(sample(0, 50, true))
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'source', position: { x: 0, y: 0 },
       data: { title: 'target', status: 'latest', config: {}, history: [] },
@@ -216,12 +374,12 @@ describe('durable full results', () => {
     render(<DataPanel nodeId="target" />)
 
     await user.click(screen.getByRole('button', { name: 'Full result' }))
-    await waitFor(() => expect(apiMock.sample).toHaveBeenCalledWith('/outputs/result.parquet', 50, undefined, 0))
-    expect(screen.getByRole('button', { name: 'Sample' })).toBeInTheDocument()
+    await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenCalledWith('run-real', 'target', 'out', 50, 0))
+    expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
   })
 
   it('keeps the Sample escape hatch when loading Full fails temporarily', async () => {
-    apiMock.sample.mockRejectedValue(Object.assign(new Error('service unavailable'), { status: 503 }))
+    apiMock.runOutputSample.mockRejectedValue(Object.assign(new Error('service unavailable'), { status: 503 }))
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'source', position: { x: 0, y: 0 },
       data: { title: 'target', status: 'latest', config: {}, history: [] },
@@ -238,7 +396,7 @@ describe('durable full results', () => {
     await user.click(screen.getByRole('button', { name: 'Full result' }))
 
     expect(await screen.findByText('Couldn’t load full result')).toBeInTheDocument()
-    const sampleButton = screen.getByRole('button', { name: 'Sample' })
+    const sampleButton = screen.getByRole('button', { name: 'Preview sample' })
     expect(sampleButton).toBeInTheDocument()
     await user.click(sampleButton)
     expect(screen.queryByText('Couldn’t load full result')).not.toBeInTheDocument()
@@ -254,7 +412,7 @@ describe('durable full results', () => {
     const passSample = { ...sample(0, 1, false), rows: [{ v: 'pass row' }] }
     const violationSample = { ...sample(0, 1, false), rows: [{ v: 'violation row' }] }
     apiMock.preview.mockResolvedValueOnce(passSample)
-    apiMock.sample.mockResolvedValueOnce(passSample)
+    apiMock.runOutputSample.mockResolvedValueOnce(passSample)
     useStore.setState({
       doc, canvasRole: 'owner', profileJobs: {},
       previews: { target: boundPreview(doc, 'target', violationSample, 'out') },
@@ -282,7 +440,9 @@ describe('durable full results', () => {
     expect(screen.getByText(/Whole-dataset profiles are not available for multi-output nodes/i)).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Rows' }))
     await user.click(screen.getByRole('button', { name: 'Full result' }))
-    await waitFor(() => expect(apiMock.sample).toHaveBeenLastCalledWith('/outputs/pass.parquet', 50, undefined, 0))
+    await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenLastCalledWith(
+      'named-output-run', 'target', 'pass', 50, 0,
+    ))
   })
 
   it('keeps a committed named output readable after an overall failed run', async () => {
@@ -293,7 +453,7 @@ describe('durable full results', () => {
     }] }
     const passSample = { ...sample(0, 1, false), rows: [{ v: 'failed artifact survived' }] }
     apiMock.preview.mockResolvedValueOnce(passSample)
-    apiMock.sample.mockResolvedValueOnce(passSample)
+    apiMock.runOutputSample.mockResolvedValueOnce(passSample)
     useStore.setState({
       doc,
       previews: { target: boundPreview(doc, 'target', { ...sample(0, 1, false), rows: [{ v: 'violation preview' }] }, 'out') },
@@ -321,8 +481,8 @@ describe('durable full results', () => {
     await user.click(screen.getByRole('button', { name: 'Passing' }))
     expect(await screen.findByText('failed artifact survived')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Full result' }))
-    await waitFor(() => expect(apiMock.sample).toHaveBeenLastCalledWith(
-      '/outputs/failed-pass.parquet', 50, undefined, 0,
+    await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenLastCalledWith(
+      'failed-named-output-run', 'target', 'pass', 50, 0,
     ))
   })
 
@@ -385,13 +545,13 @@ describe('durable full results', () => {
   })
 
   it('renders an exact grouped-chart artifact as a chart without starting another scan', async () => {
-    apiMock.sample.mockResolvedValue({
+    apiMock.runOutputSample.mockResolvedValue({
       columns: [
         { name: 'x', type: 'VARCHAR', capabilities: [] },
         { name: 'y', type: 'BIGINT', capabilities: [] },
       ],
       rows: [{ x: 'walk', y: 4 }, { x: 'pick', y: 7 }],
-      rowCount: 2, hasMore: false, truncated: false,
+      rowCount: 2, hasMore: false, truncated: false, completeness: 'complete',
     })
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'chart', position: { x: 0, y: 0 },
@@ -412,21 +572,121 @@ describe('durable full results', () => {
 
     render(<DataPanel nodeId="target" />)
 
-    expect(await screen.findByRole('img', { name: 'bar chart' })).toBeInTheDocument()
-    expect(screen.getByText('sum(count) vs task · 2 points')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Sample' })).toBeInTheDocument()
-    expect(apiMock.sample).toHaveBeenCalledWith('/outputs/grouped-chart.parquet', 50, undefined, 0)
+    expect(await screen.findByRole('img', { name: 'bar chart, complete groups' })).toBeInTheDocument()
+    expect(screen.getByText('sum(count) vs task · 2 groups · Complete full result')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
+    expect(apiMock.runOutputSample).toHaveBeenCalledWith('chart-exact-run', 'target', 'out', 2_000, 0)
     expect(apiMock.fullProfile).not.toHaveBeenCalled()
   })
 
+  it('omits null, blank, and non-numeric chart values instead of fabricating zeroes', async () => {
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [
+        { name: 'x', type: 'VARCHAR', capabilities: [] },
+        { name: 'y', type: 'DOUBLE', capabilities: [] },
+      ],
+      rows: [
+        { x: 'null-value', y: null },
+        { x: 'blank-value', y: '   ' },
+        { x: 'bad-value', y: 'not-a-number' },
+        { x: 'valid-value', y: 7 },
+      ],
+      rowCount: 4, hasMore: false, truncated: false, completeness: 'complete',
+    })
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'chart', position: { x: 0, y: 0 },
+      data: { title: 'Truthful chart', status: 'latest', config: { chartType: 'bar', x: 'kind', y: 'value', agg: 'sum' }, history: [] },
+    }] }
+    useStore.setState({
+      doc, canvasRole: 'owner', profileJobs: {},
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        notPreviewable: true, reason: 'grouped charts require a full pass',
+      }) },
+      runs: { target: { phase: 'done', status: {
+        runId: 'chart-invalid-y-run', status: 'done', targetNodeId: 'target',
+        rowsProcessed: 4, totalRows: 4, ms: 10, placement: 'local', perNode: [],
+        outputs: [committedOutput('/outputs/chart-invalid-y.parquet', 4)],
+      } } },
+    } as any)
+
+    const { container } = render(<DataPanel nodeId="target" />)
+
+    expect(await screen.findByRole('img', { name: 'bar chart, complete group' })).toBeInTheDocument()
+    expect(container.querySelectorAll('svg rect')).toHaveLength(1)
+    expect(screen.getByText('3 Y values omitted because they were null, blank, or non-numeric.')).toBeInTheDocument()
+    expect(screen.getByText('valid-valu')).toBeInTheDocument()
+    expect(screen.queryByText('null-value')).not.toBeInTheDocument()
+  })
+
+  it('states when a chart artifact has no numeric Y values', async () => {
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [
+        { name: 'x', type: 'VARCHAR', capabilities: [] },
+        { name: 'y', type: 'DOUBLE', capabilities: [] },
+      ],
+      rows: [{ x: 'null-value', y: null }, { x: 'bad-value', y: 'nope' }],
+      rowCount: 2, hasMore: false, truncated: false, completeness: 'complete',
+    })
+
+    render(<FullResult uri="/outputs/no-numeric-y.parquet" total={2} {...fullIdentity}
+      presentation={{ kind: 'chart', type: 'bar', xLabel: 'kind', yLabel: 'value', grouped: true }} />)
+
+    expect(await screen.findByText('No numeric Y values to chart.')).toBeInTheDocument()
+    expect(screen.getByText('2 Y values omitted because they were null, blank, or non-numeric.')).toBeInTheDocument()
+    expect(screen.queryByRole('img')).not.toBeInTheDocument()
+  })
+
+  it('caps only the grouped-chart display while identifying the complete artifact size', async () => {
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [
+        { name: 'x', type: 'VARCHAR', capabilities: [] },
+        { name: 'y', type: 'BIGINT', capabilities: [] },
+      ],
+      rows: Array.from({ length: 2_000 }, (_, index) => ({ x: `group-${index}`, y: index })),
+      rowCount: 2_001, hasMore: false, truncated: true,
+      completeness: 'capped', rowLimit: 2_000, limitReason: 'interactive-row-budget',
+    })
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'chart', position: { x: 0, y: 0 },
+      data: { title: 'Tasks', status: 'latest', config: { chartType: 'bar', x: 'task', y: 'count', agg: 'sum' }, history: [] },
+    }] }
+    useStore.setState({
+      doc, canvasRole: 'owner', profileJobs: {},
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        notPreviewable: true, reason: 'grouped charts require a full pass',
+      }) },
+      runs: { target: { phase: 'done', status: {
+        runId: 'chart-capped-run', status: 'done', targetNodeId: 'target',
+        rowsProcessed: 2_001, totalRows: 2_001, ms: 10, placement: 'local', perNode: [],
+        outputs: [committedOutput('/outputs/grouped-chart-many.parquet', 2_001)],
+      } } },
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(await screen.findByRole('img', {
+      name: 'bar chart, showing 2000 capped groups',
+    })).toBeInTheDocument()
+    expect(screen.getByText(
+      'sum(count) vs task · Showing 2,000 of 2,001 groups · display capped',
+    )).toBeInTheDocument()
+    expect(screen.getByText(/Interactive view stopped at 2,000 groups of 2,001/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Export full result' })).toBeInTheDocument()
+    expect(apiMock.runOutputSample).toHaveBeenCalledWith(
+      'chart-capped-run', 'target', 'out', 2_000, 0,
+    )
+  })
+
   it('renders an exact metric artifact as a scalar without starting another scan', async () => {
-    apiMock.sample.mockResolvedValue({
+    apiMock.runOutputSample.mockResolvedValue({
       columns: [
         { name: 'metric', type: 'VARCHAR', capabilities: [] },
         { name: 'value', type: 'BIGINT', capabilities: [] },
       ],
       rows: [{ metric: 'successful grasps', value: 1234 }],
-      rowCount: 1, hasMore: false, truncated: false,
+      rowCount: 1, hasMore: false, truncated: false, completeness: 'complete',
     })
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'metric', position: { x: 0, y: 0 },
@@ -449,8 +709,8 @@ describe('durable full results', () => {
 
     expect(await screen.findByText('1,234')).toBeInTheDocument()
     expect(screen.getByText('successful grasps · over the full dataset')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Sample' })).toBeInTheDocument()
-    expect(apiMock.sample).toHaveBeenCalledWith('/outputs/metric.parquet', 50, undefined, 0)
+    expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
+    expect(apiMock.runOutputSample).toHaveBeenCalledWith('metric-exact-run', 'target', 'out', 50, 0)
     expect(apiMock.fullProfile).not.toHaveBeenCalled()
   })
 
@@ -474,6 +734,26 @@ describe('durable full results', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Preview out of date')
     expect(screen.getByRole('button', { name: 'Refresh preview' })).toBeInTheDocument()
     expect(screen.queryByText('purchase')).not.toBeInTheDocument()
+  })
+
+  it('describes the graph preview limit as a per-source scan cap, not an output prefix', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'filter', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: { predicate: 'score > 0' }, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        ...sample(0, 1, false), completeness: 'sample', rowLimit: 2_000,
+        limitReason: 'preview-scan', limitScope: 'each-source',
+      }) },
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.getByText(/Each source read was limited to at most 2,000 rows before this preview was computed/)).toBeInTheDocument()
+    expect(screen.getByText(/Output rows are not necessarily the first 2,000 rows of the final result/)).toBeInTheDocument()
+    expect(screen.queryByText(/preview did not inspect beyond the first/i)).not.toBeInTheDocument()
   })
 
   it('keeps sample-profile responses bound to the latest execution plan', async () => {
@@ -504,12 +784,16 @@ describe('durable full results', () => {
     } as any))
     await waitFor(() => expect(apiMock.profile).toHaveBeenCalledTimes(2))
 
-    await act(async () => finishCurrent({ columns: [], rowCount: 20, sampled: true }))
-    expect(await screen.findByText('stats over the previewed sample · 20 rows')).toBeInTheDocument()
+    await act(async () => finishCurrent({
+      columns: [], rowCount: 20, sampled: true, completeness: 'sample',
+    }))
+    expect(await screen.findByText('Preview sample · 20 rows inspected')).toBeInTheDocument()
 
-    await act(async () => finishOld({ columns: [], rowCount: 10, sampled: true }))
-    expect(screen.getByText('stats over the previewed sample · 20 rows')).toBeInTheDocument()
-    expect(screen.queryByText('stats over the previewed sample · 10 rows')).not.toBeInTheDocument()
+    await act(async () => finishOld({
+      columns: [], rowCount: 10, sampled: true, completeness: 'sample',
+    }))
+    expect(screen.getByText('Preview sample · 20 rows inspected')).toBeInTheDocument()
+    expect(screen.queryByText('Preview sample · 10 rows inspected')).not.toBeInTheDocument()
 
     const moved = structuredClone(edited)
     moved.nodes[0].position = { x: 500, y: 300 }
@@ -517,7 +801,73 @@ describe('durable full results', () => {
     act(() => useStore.setState({ doc: moved }))
     await Promise.resolve()
     expect(apiMock.profile).toHaveBeenCalledTimes(2)
-    expect(screen.getByText('stats over the previewed sample · 20 rows')).toBeInTheDocument()
+    expect(screen.getByText('Preview sample · 20 rows inspected')).toBeInTheDocument()
+  })
+
+  it('does not guess profile scope when the kernel reports unknown completeness', async () => {
+    apiMock.profile.mockResolvedValueOnce({
+      columns: [{
+        name: 'score', type: 'DOUBLE', nonNull: 9, nulls: 1, distinct: 4,
+        distinctIsApproximate: false, min: '1', max: '9', mean: 5,
+      }],
+      rowCount: 10, sampled: true, completeness: 'unknown', notPreviewable: false,
+    })
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc, canvasRole: 'owner', profileJobs: {},
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+
+    expect(await screen.findByText('Profile scope unknown · 10 rows reported')).toBeInTheDocument()
+    expect(screen.getByText(/did not report whether these statistics cover a sample or the whole dataset/i)).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: 'Distinct' })).toBeInTheDocument()
+    expect(screen.queryByText(/Whole dataset · 10 rows/)).not.toBeInTheDocument()
+  })
+
+  it('marks only explicitly approximate distinct counts in a complete profile', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    const planDigest = 'a'.repeat(64)
+    useStore.setState({
+      doc, canvasRole: 'owner',
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+      profileJobs: { target: {
+        canvasId: doc.id, nodeId: 'target', principalId: 'alice', canCancel: false,
+        planIdentity: profilePlanIdentity(doc, 'target'), planDigest,
+        requestGeneration: 1, phase: 'done', identityVerified: true,
+        status: {
+          runId: 'profile-distinct-compat', status: 'done', jobType: 'profile', targetNodeId: 'target',
+          planDigest, profileAttemptOrder: 1, rowsProcessed: 10, totalRows: 10,
+          ms: 10, placement: 'local', perNode: [],
+          profile: {
+            columns: [
+              { name: 'exact_task', type: 'VARCHAR', nonNull: 10, nulls: 0, distinct: 7, distinctIsApproximate: false },
+              { name: 'approx_task', type: 'VARCHAR', nonNull: 10, nulls: 0, distinct: 8, distinctIsApproximate: true },
+            ],
+            rowCount: 10, sampled: false, completeness: 'complete', notPreviewable: false,
+          },
+        },
+      } },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    await user.click(screen.getByRole('button', { name: 'full dataset' }))
+
+    expect(screen.getByRole('columnheader', { name: 'Distinct' })).toBeInTheDocument()
+    expect(screen.getByText('7')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Estimated distinct count: 7')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Estimated distinct count: 8')).toHaveTextContent('≈ 8')
   })
 
   it('shows profile preflight before an explicit confirmed start', async () => {
@@ -563,9 +913,9 @@ describe('durable full results', () => {
       runId: 'profile-ui', status: 'done', jobType: 'profile', targetNodeId: 'target',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
-      profile: { columns: [], rowCount: 10, sampled: false },
+      profile: { columns: [], rowCount: 10, sampled: false, completeness: 'complete' },
     })
-    expect(await screen.findByText('whole dataset · 10 rows · distinct is an estimate')).toBeInTheDocument()
+    expect(await screen.findByText('Whole dataset · 10 rows scanned')).toBeInTheDocument()
   })
 
   it('lets viewers read recovered full profiles without mutation controls', async () => {
@@ -578,7 +928,7 @@ describe('durable full results', () => {
     const done = {
       runId: 'profile-viewer', status: 'done', jobType: 'profile', targetNodeId: 'target',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
-      profile: { columns: [], rowCount: 10, sampled: false },
+      profile: { columns: [], rowCount: 10, sampled: false, completeness: 'complete' },
     }
     useStore.setState({
       doc,
@@ -595,7 +945,7 @@ describe('durable full results', () => {
 
     await user.click(screen.getByRole('button', { name: 'Stats' }))
     await user.click(screen.getByRole('button', { name: 'full dataset' }))
-    expect(screen.getByText('whole dataset · 10 rows · distinct is an estimate')).toBeInTheDocument()
+    expect(screen.getByText('Whole dataset · 10 rows scanned')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Estimate full profile' })).not.toBeInTheDocument()
     expect(apiMock.profileEstimate).not.toHaveBeenCalled()
     expect(apiMock.fullProfile).not.toHaveBeenCalled()
@@ -629,7 +979,7 @@ describe('durable full results', () => {
           runId: 'profile-unverified-active', status: 'running', jobType: 'profile', targetNodeId: 'target',
           planDigest, profileAttemptOrder: 2, rowsProcessed: 5, ms: 10,
           placement: 'local', perNode: [],
-          profile: { columns: [], rowCount: 999, sampled: false },
+          profile: { columns: [], rowCount: 999, sampled: false, completeness: 'complete' },
           outputs: [committedOutput('/unverified/result.parquet', 999)],
         },
       } },
@@ -735,7 +1085,7 @@ describe('durable full results', () => {
           runId: 'alice-visible-profile', status: 'done', jobType: 'profile', targetNodeId: 'target',
           planDigest, profileAttemptOrder: 1, rowsProcessed: 10, totalRows: 10,
           ms: 10, placement: 'local', perNode: [],
-          profile: { columns: [], rowCount: 10, sampled: false },
+          profile: { columns: [], rowCount: 10, sampled: false, completeness: 'complete' },
         },
       } },
     } as any)
@@ -743,11 +1093,11 @@ describe('durable full results', () => {
     render(<DataPanel nodeId="target" />)
     await user.click(screen.getByRole('button', { name: 'Stats' }))
     await user.click(screen.getByRole('button', { name: 'full dataset' }))
-    expect(screen.getByText('whole dataset · 10 rows · distinct is an estimate')).toBeInTheDocument()
+    expect(screen.getByText('Whole dataset · 10 rows scanned')).toBeInTheDocument()
 
     act(() => useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } }))
 
-    expect(screen.queryByText('whole dataset · 10 rows · distinct is an estimate')).not.toBeInTheDocument()
+    expect(screen.queryByText('Whole dataset · 10 rows scanned')).not.toBeInTheDocument()
     expect(screen.getByText('Whole-dataset profile')).toBeInTheDocument()
   })
 

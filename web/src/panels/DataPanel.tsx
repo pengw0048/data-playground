@@ -6,11 +6,15 @@ import { capabilitiesFor, nodeOutputs } from '../nodes/registry'
 import { api } from '../api/client'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import type { ColumnSchema, PortSpec } from '../types/graph'
-import type { ProfileResult, RunOutput, RunState } from '../types/api'
+import type { ProfileResult, RunOutput, RunState, SampleResult } from '../types/api'
 
 const PAGE = 50
+const CHART_DISPLAY_LIMIT = 2_000
 
 export function DataPanel({ nodeId }: { nodeId: string }) {
   const preview = useStore((s) => s.previews[nodeId])
@@ -43,6 +47,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const [tab, setTab] = useState('rows')
   const [resultMode, setResultMode] = useState<'sample' | 'full'>('sample')
   const [detail, setDetail] = useState<number | null>(null)  // index of the row whose detail is open
+  const previousOffsets = useRef<number[]>([])
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
 
   useEffect(() => {
@@ -50,12 +55,26 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeId, requestPortId, preview?.portId])
   useEffect(() => setResultMode('sample'), [nodeId])
+  useEffect(() => { previousOffsets.current = [] }, [nodeId, requestPortId])
+  useEffect(() => {
+    // Refresh and other callers reset the store-owned page to zero. Discard navigation state too.
+    if (offset === 0) previousOffsets.current = []
+  }, [offset])
   useEffect(() => {
     // A node that cannot produce a bounded preview should reveal the exact artifact as soon as its
     // durable run finishes. A later explicit click on Sample remains sticky until the artifact changes.
     if (preview?.result?.notPreviewable && selectedOutput?.uri) setResultMode('full')
   }, [nodeId, requestPortId, selectedOutput?.uri, preview?.result?.notPreviewable])
-  const page = (o: number) => { setDetail(null); runPreview(nodeId, o, requestPortId) }
+  const nextPage = (rowsRead: number) => {
+    previousOffsets.current.push(offset)
+    setDetail(null)
+    runPreview(nodeId, offset + rowsRead, requestPortId)
+  }
+  const previousPage = () => {
+    const prior = previousOffsets.current.pop() ?? Math.max(0, offset - PAGE)
+    setDetail(null)
+    runPreview(nodeId, prior, requestPortId)
+  }
   const choosePort = (portId: string) => {
     setPortSelection({ nodeId, portId })
     setDetail(null)
@@ -85,27 +104,37 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
         kind: 'chart',
         type: String(node?.data.config.chartType ?? 'bar'),
         xLabel: String(node?.data.config.x ?? 'x'),
+        grouped: node?.data.config.agg !== 'none',
         yLabel: String(node?.data.config.agg && node?.data.config.agg !== 'none'
           ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})`
           : (node?.data.config.y ?? 'y')),
       }
     : isMetric ? { kind: 'metric' } : undefined
   const resultModeToggle = selectedOutput?.uri
-    ? <ResultModeToggle mode={resultMode} onChange={setResultMode} />
+    ? <ResultModeToggle mode={resultMode} onChange={setResultMode}
+        fullLabel={selectedOutput.publicationKind === 'catalog' ? 'Published dataset' : 'Full result'} />
     : undefined
   if (res.notPreviewable) {
     // P0-UX-01: a sample can't preview this node (an aggregate/sort), but a full run MATERIALIZES the
     // result to a durable artifact — so if this node's last run is done and produced one, show the exact
     // Full result (restorable after a restart via the persisted run status) instead of a dead end.
     if (selectedOutput?.uri && resultMode === 'full') {
-      return withOutputPorts(<FullResult uri={selectedOutput.uri} total={selectedOutput.rows ?? null}
+      return withOutputPorts(<FullResult uri={selectedOutput.uri}
+        total={selectedOutput.publicationKind === 'result' ? selectedOutput.rows ?? null : null}
+        runId={run?.status?.runId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
+        publicationKind={selectedOutput.publicationKind}
+        name={String(node?.data.title || node?.id || 'result')}
         modeToggle={resultModeToggle} presentation={artifactPresentation} />)
     }
     return withOutputPorts(<NotPreviewable reason={res.reason ?? 'needs a full pass'}
       onRun={() => requestRun(nodeId)} modeToggle={resultModeToggle} />)
   }
   if (selectedOutput?.uri && resultMode === 'full') {
-    return withOutputPorts(<FullResult uri={selectedOutput.uri} total={selectedOutput.rows ?? null}
+    return withOutputPorts(<FullResult uri={selectedOutput.uri}
+      total={selectedOutput.publicationKind === 'result' ? selectedOutput.rows ?? null : null}
+      runId={run?.status?.runId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
+      publicationKind={selectedOutput.publicationKind}
+      name={String(node?.data.title || node?.id || 'result')}
       modeToggle={resultModeToggle} presentation={artifactPresentation} />)
   }
 
@@ -117,7 +146,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const tabs = [{ id: 'rows', label: 'Rows' }, ...caps.map((c) => ({ id: c.id, label: c.label })), { id: 'stats', label: 'Stats' }]
   // a refresh may drop the capability whose tab was selected — fall back to Rows
   const activeTab = tab === 'rows' || tab === 'stats' || caps.some((c) => c.id === tab) ? tab : 'rows'
-  const atEnd = !res.hasMore  // the kernel peeks one extra row, so this is right even at exact multiples
+  const canTryNext = res.hasMore === true || (res.hasMore == null && res.rows.length > 0)
 
   return withOutputPorts(
     <div className="dp-dark text-foreground">
@@ -147,25 +176,30 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
         {!special && detail == null && activeTab !== 'stats' && (
           <>
             <span className="text-[10.5px] text-muted-foreground">
-              rows {res.rows.length ? offset + 1 : 0}–{offset + res.rows.length}
-              {res.truncated && <span className="ml-1.5 rounded bg-muted px-1.5 py-px">sample</span>}
+              {pageRangeLabel('rows', offset, res.rows.length)}
             </span>
             {activeTab === 'rows' && (
               <span className="ml-1 inline-flex gap-0.5">
-                <PageBtn dir="prev" disabled={offset === 0} onClick={() => page(Math.max(0, offset - PAGE))} />
-                <PageBtn dir="next" disabled={atEnd} onClick={() => page(offset + PAGE)} />
+                <PageBtn dir="prev" disabled={offset === 0} onClick={previousPage} />
+                <PageBtn dir="next" disabled={!canTryNext} onClick={() => nextPage(res.rows.length)} />
               </span>
             )}
             {activeTab === 'rows' && res.rows.length > 0 && (
               <ExportCluster columns={columns as ColumnSchema[]} rows={res.rows}
-                name={String(node?.data.title || node?.id || 'data')} truncated={!!res.truncated} pushToast={pushToast} />
+                name={String(node?.data.title || node?.id || 'data')} offset={offset}
+                scope="preview" pushToast={pushToast} />
             )}
           </>
         )}
       </div>
 
+      <DataScopeBanner data={res} offset={offset} unit={isChart ? 'points' : 'rows'} scope="preview"
+        allowNextAttempt={!special} />
+
       {isChart ? (
         <ChartView rows={res.rows} type={String(node?.data.config.chartType ?? 'bar')}
+          grouped={node?.data.config.agg !== 'none'} completeness={res.completeness}
+          total={res.rowCount ?? null} scope="preview"
           xLabel={String(node?.data.config.x ?? 'x')}
           yLabel={String(node?.data.config.agg && node?.data.config.agg !== 'none' ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})` : (node?.data.config.y ?? 'y'))} />
       ) : isMetric ? (
@@ -252,7 +286,12 @@ function SelectedOutputOutcome({ runStatus, output }: { runStatus?: RunState; ou
             <span>·</span>
             <span className="dp-mono font-semibold text-foreground">{label}</span>
             <OutputOutcomeBadge outcome={output.outcome} />
-            {output.rows != null && <span>{output.rows.toLocaleString()} {output.rows === 1 ? 'row' : 'rows'}</span>}
+            {output.rows != null && (
+              <span>
+                {output.rows.toLocaleString()} {output.rows === 1 ? 'row' : 'rows'}
+                {output.publicationKind === 'catalog' ? ' written' : ''}
+              </span>
+            )}
           </>
         )}
       </div>
@@ -294,15 +333,78 @@ function PageBtn({ dir, disabled, onClick }: { dir: 'prev' | 'next'; disabled: b
   )
 }
 
-function ResultModeToggle({ mode, onChange }: {
-  mode: 'sample' | 'full'; onChange: (mode: 'sample' | 'full') => void
+function DataScopeBanner({ data, offset, unit, scope, allowNextAttempt = true }: {
+  data: SampleResult
+  offset: number
+  unit: 'rows' | 'points' | 'groups'
+  scope: 'preview' | 'full-result' | 'published-dataset'
+  allowNextAttempt?: boolean
+}) {
+  const end = offset + data.rows.length
+  const total = data.rowCount ?? null
+  const sourceCapped = data.limitScope === 'each-source' || data.limitReason === 'preview-scan'
+  const resultCapped = data.limitScope === 'result-window'
+    || data.limitReason === 'interactive-row-budget'
+    || (data.completeness === 'capped' && !sourceCapped)
+  const label = scope === 'preview' ? 'Preview sample'
+    : scope === 'published-dataset' ? 'Published dataset' : 'Full result artifact'
+  const range = pageRangeLabel(unit, offset, data.rows.length)
+  let detail: string
+  if (scope === 'preview') {
+    detail = `${range} · Full dataset not scanned.`
+  } else if (total == null) {
+    detail = `Current page · ${range} · Total ${unit} unknown.`
+  } else if (data.completeness === 'complete') {
+    detail = `Complete artifact · ${total.toLocaleString()} ${unit}.`
+  } else {
+    detail = `Current page · ${range} of ${total.toLocaleString()}.`
+  }
+  return (
+    <div role="status" className="border-b border-border bg-muted/30 px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="rounded bg-muted px-1.5 py-px font-semibold text-foreground">{label}</span>
+        <span>{detail}</span>
+      </div>
+      {sourceCapped && (
+        <div className="mt-1 font-medium text-amber-700 dark:text-amber-300">
+          Each source read was limited to at most {(data.rowLimit ?? end).toLocaleString()} rows before this preview was computed.
+          {' '}Output rows are not necessarily the first {(data.rowLimit ?? end).toLocaleString()} rows of the final result.
+        </div>
+      )}
+      {resultCapped && (
+        <div className="mt-1 font-medium text-amber-700 dark:text-amber-300">
+          Interactive view stopped at {(data.rowLimit ?? end).toLocaleString()} {unit}
+          {total != null ? ` of ${total.toLocaleString()}` : '; total is unknown'}.
+          {' '}{scope === 'preview'
+            ? 'Run the node to materialize and inspect the complete result.'
+            : scope === 'published-dataset'
+              ? 'The published dataset retains rows beyond this interactive window.'
+              : 'The committed artifact retains the complete result.'}
+        </div>
+      )}
+      {data.hasMore == null && (
+        <div className="mt-1 font-medium text-muted-foreground">
+          Next page availability unknown{allowNextAttempt && data.rows.length > 0 ? ' · You can try the next offset.' : '.'}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function pageRangeLabel(unit: 'rows' | 'points' | 'groups', offset: number, count: number) {
+  if (count === 0) return offset === 0 ? `No ${unit} returned` : `No ${unit} at offset ${offset.toLocaleString()}`
+  return `${unit} ${(offset + 1).toLocaleString()}–${(offset + count).toLocaleString()}`
+}
+
+function ResultModeToggle({ mode, onChange, fullLabel = 'Full result' }: {
+  mode: 'sample' | 'full'; onChange: (mode: 'sample' | 'full') => void; fullLabel?: string
 }) {
   return (
     <div className="flex items-center gap-0.5 rounded-md border border-border p-0.5 text-[10px]">
       {(['sample', 'full'] as const).map((value) => (
         <button key={value} onClick={() => onChange(value)} aria-pressed={mode === value}
           className={`rounded px-1.5 py-0.5 ${mode === value ? 'bg-muted font-semibold text-foreground' : 'text-muted-foreground'}`}>
-          {value === 'sample' ? 'Sample' : 'Full result'}
+          {value === 'sample' ? 'Preview sample' : fullLabel}
         </button>
       ))}
     </div>
@@ -510,14 +612,26 @@ function FullProfileProgress({ job, toggle, onCancel }: {
 
 function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }) {
   const pct = (n: number) => (res.rowCount ? Math.round((n / res.rowCount) * 100) : 0)
+  const wholeDataset = res.completeness === 'complete'
+  const previewSample = res.completeness === 'sample'
+  const scopeLabel = wholeDataset ? 'Whole dataset' : previewSample ? 'Preview sample' : 'Profile scope unknown'
+  const rowVerb = wholeDataset ? 'scanned' : previewSample ? 'inspected' : 'reported'
   return (
     <div className="max-h-[360px] overflow-auto">
       <div className="flex items-center justify-between px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
-        <span>
-          {res.sampled
-            ? `stats over the previewed sample · ${res.rowCount.toLocaleString()} rows`
-            : `whole dataset · ${res.rowCount.toLocaleString()} rows · distinct is an estimate`}
-        </span>
+        <div>
+          <div className="font-medium text-foreground">
+            {scopeLabel}
+            {' · '}{res.rowCount.toLocaleString()} rows {rowVerb}
+          </div>
+          <div>
+            {wholeDataset
+              ? 'All rows were scanned; approximate distinct counts are marked ≈.'
+              : previewSample
+                ? 'All metrics describe this preview sample only; approximate counts are marked ≈.'
+                : 'The kernel did not report whether these statistics cover a sample or the whole dataset.'}
+          </div>
+        </div>
         {toggle}
       </div>
       <table className="w-full text-[11.5px] tabular-nums">
@@ -532,7 +646,11 @@ function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }
               <td className="px-2 py-1 font-medium text-foreground">{c.name}</td>
               <td className="px-2 py-1 text-muted-foreground">{c.type}</td>
               <td className="px-2 py-1 text-muted-foreground">{c.nulls ? `${c.nulls} · ${pct(c.nulls)}%` : '—'}</td>
-              <td className="px-2 py-1 text-muted-foreground">{c.distinct ?? '—'}</td>
+              <td className="px-2 py-1 text-muted-foreground">
+                {c.distinct == null ? '—' : c.distinctIsApproximate
+                  ? <span aria-label={`Estimated distinct count: ${c.distinct.toLocaleString()}`}>≈ {c.distinct.toLocaleString()}</span>
+                  : c.distinct.toLocaleString()}
+              </td>
               <td className="max-w-[120px] truncate px-2 py-1 text-muted-foreground" title={c.min ?? ''}>{c.min ?? '—'}</td>
               <td className="max-w-[120px] truncate px-2 py-1 text-muted-foreground" title={c.max ?? ''}>{c.max ?? '—'}</td>
               <td className="px-2 py-1 text-muted-foreground">{c.mean != null ? fmtNum(c.mean) : '—'}</td>
@@ -589,26 +707,47 @@ function _download(name: string, text: string, mime: string): void {
   URL.revokeObjectURL(url)
 }
 
-function ExportCluster({ columns, rows, name, truncated, pushToast }: {
-  columns: ColumnSchema[]; rows: Record<string, unknown>[]; name: string; truncated: boolean
+function ExportCluster({ columns, rows, name, offset, scope, pushToast }: {
+  columns: ColumnSchema[]; rows: Record<string, unknown>[]; name: string; offset: number
+  scope: 'preview' | 'full-result' | 'published-dataset'
   pushToast: (m: string, k?: 'error' | 'info' | 'success') => void
 }) {
-  const note = truncated ? ' (previewed sample only — use a write node for the full dataset)' : ''
+  const start = rows.length ? offset + 1 : 0
+  const end = offset + rows.length
+  const range = `rows ${start}–${end}`
+  const fileBase = `${_slug(name)}-${scope}-page-${start}-${end}`
+  const scopeLabel = scope === 'preview' ? 'preview page'
+    : scope === 'published-dataset' ? 'published dataset page' : 'full-result page'
   const copy = () => {
     // navigator.clipboard is undefined in an insecure context (plain http on a LAN IP — a supported
     // `--host 0.0.0.0` deployment), where `.writeText` would throw synchronously past the .catch.
     if (!navigator.clipboard) { pushToast('Copy failed — clipboard needs https or localhost', 'error'); return }
     navigator.clipboard.writeText(rowsToCsv(columns, rows))
-      .then(() => pushToast(`Copied ${rows.length} rows as CSV`, 'success'))
+      .then(() => pushToast(`Copied ${scopeLabel} (${range}) as CSV.`, 'success'))
       .catch(() => pushToast('Copy failed — clipboard unavailable', 'error'))
   }
-  const btn = 'rounded px-1.5 py-1 text-[10.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground'
+  const exportPage = (format: 'CSV' | 'JSON') => {
+    if (format === 'CSV') {
+      _download(`${fileBase}.csv`, rowsToCsv(columns, rows), 'text/csv')
+    } else {
+      _download(`${fileBase}.json`, JSON.stringify(rows, null, 2), 'application/json')
+    }
+    pushToast(`Exported ${scopeLabel} (${range}) as ${format}.${scope === 'preview' ? ' This is not the full result.' : ''}`, 'success')
+  }
   return (
-    <span className="ml-1.5 inline-flex items-center gap-0.5 border-l border-border pl-1.5">
-      <button className={btn} title={`Copy these rows as CSV to the clipboard${note}`} onClick={copy}>Copy</button>
-      <button className={btn} title={`Download these rows as CSV${note}`} onClick={() => _download(`${_slug(name)}.csv`, rowsToCsv(columns, rows), 'text/csv')}>CSV</button>
-      <button className={btn} title={`Download these rows as JSON${note}`} onClick={() => _download(`${_slug(name)}.json`, JSON.stringify(rows, null, 2), 'application/json')}>JSON</button>
-    </span>
+    <DropdownMenu modal={false}>
+      <DropdownMenuTrigger asChild>
+        <button aria-label={`Export this ${scopeLabel}`}
+          className="ml-1.5 inline-flex items-center gap-1 rounded border-l border-border px-1.5 py-1 text-[10.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
+          Export this page <Icon name="chevronDown" size={11} />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-[220px]">
+        <DropdownMenuItem onSelect={copy}>Copy {scopeLabel} as CSV</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => exportPage('CSV')}>Download {scopeLabel} as CSV</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => exportPage('JSON')}>Download {scopeLabel} as JSON</DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 
@@ -676,9 +815,33 @@ function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
 // A dependency-free SVG chart of the (x, y) series the `chart` node emits — bar / line / area /
 // scatter. Colors are theme tokens so it works in dark mode; the axis labels come from the node's
 // chosen columns. Kept simple on purpose (the heavy lifting — grouping/aggregation — is server-side).
-function ChartView({ rows, type, xLabel, yLabel }: { rows: Record<string, unknown>[]; type: string; xLabel: string; yLabel: string }) {
-  const pts = rows.map((r) => ({ x: r.x, y: Number(r.y) })).filter((p) => Number.isFinite(p.y))
-  if (!pts.length) return <div className="px-4 py-10 text-center text-[12px] text-muted-foreground">No data to chart — pick X/Y columns.</div>
+function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness = 'unknown', total = null, scope = 'preview' }: {
+  rows: Record<string, unknown>[]
+  type: string
+  xLabel: string
+  yLabel: string
+  grouped?: boolean
+  completeness?: SampleResult['completeness']
+  total?: number | null
+  scope?: 'preview' | 'full-result' | 'published-dataset'
+}) {
+  const pts = rows.flatMap((row) => {
+    const raw = row.y
+    if (raw == null || (typeof raw === 'string' && raw.trim() === '')) return []
+    if (typeof raw !== 'number' && typeof raw !== 'string') return []
+    const y = Number(raw)
+    return Number.isFinite(y) ? [{ x: row.x, y }] : []
+  })
+  const omitted = rows.length - pts.length
+  const omittedMessage = omitted === 1
+    ? '1 Y value omitted because it was null, blank, or non-numeric.'
+    : `${omitted.toLocaleString()} Y values omitted because they were null, blank, or non-numeric.`
+  if (!pts.length) return (
+    <div role="status" className="px-4 py-10 text-center text-[12px] text-muted-foreground">
+      <div className="font-medium text-foreground">No numeric Y values to chart.</div>
+      {omitted > 0 && <div className="mt-1">{omittedMessage}</div>}
+    </div>
+  )
   const W = 640, H = 320, padL = 48, padR = 16, padT = 16, padB = 44
   const plotW = W - padL - padR, plotH = H - padT - padB
   const ys = pts.map((p) => p.y)
@@ -699,10 +862,22 @@ function ChartView({ rows, type, xLabel, yLabel }: { rows: Record<string, unknow
   const line = pts.map((p, i) => `${xPix(i)},${yPix(p.y)}`).join(' ')
   const barW = Math.max(2, (plotW / pts.length) * 0.7)
   const tickIdx = Array.from(new Set([0, ...Array.from({ length: Math.min(8, pts.length) }, (_, k) => Math.round(k * (pts.length - 1) / Math.max(1, Math.min(8, pts.length) - 1)))]))
+  const unit = grouped ? 'group' : 'point'
+  const units = pts.length === 1 ? unit : `${unit}s`
+  const scopeSummary = completeness === 'capped'
+    ? `Showing ${pts.length.toLocaleString()}${total != null ? ` of ${total.toLocaleString()}` : ''} ${units} · display capped`
+    : scope === 'preview'
+      ? `${pts.length.toLocaleString()} ${units} · Preview sample; full dataset not scanned`
+      : completeness === 'complete'
+        ? `${pts.length.toLocaleString()} ${units} · ${scope === 'published-dataset' ? 'Complete published dataset' : 'Complete full result'}`
+        : `${pts.length.toLocaleString()} ${units} · Total ${units} unknown`
+  const ariaScope = completeness === 'capped'
+    ? `showing ${pts.length} capped ${units}`
+    : completeness === 'complete' ? `complete ${units}` : `${units}, completeness unknown`
 
   return (
     <div className="p-3">
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 340 }} role="img" aria-label={`${type} chart`}>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 340 }} role="img" aria-label={`${type} chart, ${ariaScope}`}>
         {/* y axis: zero/baseline + min/max labels */}
         <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="hsl(var(--border))" />
         <line x1={padL} y1={y0} x2={W - padR} y2={y0} stroke="hsl(var(--border))" />
@@ -726,7 +901,12 @@ function ChartView({ rows, type, xLabel, yLabel }: { rows: Record<string, unknow
         ))}
         <text x={padL + plotW / 2} y={H - 4} textAnchor="middle" fontSize="10.5" fill="hsl(var(--muted-foreground))" fontWeight="600">{xLabel}</text>
       </svg>
-      <div className="mt-1 text-center text-[10.5px] text-muted-foreground">{yLabel} vs {xLabel} · {pts.length} point{pts.length === 1 ? '' : 's'}</div>
+      <div className="mt-1 text-center text-[10.5px] text-muted-foreground">{yLabel} vs {xLabel} · {scopeSummary}</div>
+      {omitted > 0 && (
+        <div role="status" className="mt-1 text-center text-[10.5px] font-medium text-amber-700 dark:text-amber-300">
+          {omittedMessage}
+        </div>
+      )}
     </div>
   )
 }
@@ -769,85 +949,154 @@ function ErrorState({ title = 'Preview failed', reason, onRetry, onCancel }: {
   )
 }
 
-// P0-UX-01: page the DURABLE artifact a full run materialized for a not-sample-previewable target
-// (an aggregate/sort). Read back over the normal sample-by-uri API, so it's restorable after a restart.
+// Page a durable run output through its server-owned run/node/port identity. The kernel resolves the
+// URI after authorization, so a stale or tampered client URI cannot redirect this result view.
 type ArtifactPresentation =
-  | { kind: 'chart'; type: string; xLabel: string; yLabel: string }
+  | { kind: 'chart'; type: string; xLabel: string; yLabel: string; grouped: boolean }
   | { kind: 'metric' }
 
-export function FullResult({ uri, total, modeToggle, presentation }: {
+export function FullResult({
+  uri, total, runId, nodeId, portId, publicationKind, name = 'result', modeToggle, presentation,
+}: {
   uri: string
   total: number | null
-  modeToggle?: React.ReactNode
+  runId?: string
+  nodeId?: string
+  portId?: string
+  publicationKind?: RunOutput['publicationKind']
+  name?: string
+  modeToggle?: ReactNode
   presentation?: ArtifactPresentation
 }) {
   const [data, setData] = useState<import('../types/api').SampleResult | null>(null)
   const [err, setErr] = useState<(Error & { status?: number }) | null>(null)
   const [detail, setDetail] = useState<number | null>(null)
   const [offset, setOffset] = useState(0)
+  const previousOffsets = useRef<number[]>([])
   const [retry, setRetry] = useState(0)
+  const [exporting, setExporting] = useState(false)
   const pushToast = useStore((s) => s.pushToast)
-  useEffect(() => setOffset(0), [uri])
+  const pageSize = presentation?.kind === 'chart' ? CHART_DISPLAY_LIMIT : PAGE
+  const publishedDataset = publicationKind === 'catalog'
+  const viewLabel = publishedDataset ? 'Published dataset' : 'Full result'
+  const pageScope = publishedDataset ? 'published-dataset' as const : 'full-result' as const
+  const hasRunIdentity = !!runId && !!nodeId && !!portId
+  const canExportFull = publicationKind === 'result' && hasRunIdentity
+  const reportedTotal = data?.rowCount ?? (publicationKind === 'result' ? total : null) ?? null
+
+  useEffect(() => {
+    previousOffsets.current = []
+    setOffset(0)
+  }, [uri, runId, nodeId, portId])
   useEffect(() => {
     let live = true
     setData(null); setErr(null); setDetail(null)
-    api.sample(uri, PAGE, undefined, offset)
+    if (!runId || !nodeId || !portId) return () => { live = false }
+    api.runOutputSample(runId, nodeId, portId, pageSize, offset)
       .then((r) => { if (live) setData(r) })
       .catch((e) => { if (live) setErr(e instanceof Error ? e : new Error(String(e))) })
     return () => { live = false }
-  }, [uri, offset, retry])
+  }, [uri, runId, nodeId, portId, offset, retry, pageSize])
+
+  const exportFull = async () => {
+    if (!runId || !nodeId || !portId || !canExportFull || exporting) return
+    setExporting(true)
+    try {
+      const downloadUrl = await api.preflightFullResultExport(runId, nodeId, portId, name)
+      const frame = document.createElement('iframe')
+      frame.hidden = true
+      frame.setAttribute('aria-hidden', 'true')
+      frame.dataset.fullResultDownload = ''
+      frame.src = downloadUrl
+      document.body.appendChild(frame)
+      // Keep the inert frame for the page lifetime. Removing it on a timer can cancel a slow native
+      // artifact stream; one tiny frame per user-requested download is the safer trade-off.
+      pushToast(
+        `Full-result artifact download requested${reportedTotal == null ? ' · row count unknown.' : ` · ${reportedTotal.toLocaleString()} rows.`}`,
+        'info',
+      )
+    } catch (error) {
+      const reason = error instanceof Error && error.message ? error.message : String(error)
+      pushToast(`Could not start full-result export: ${reason}`, 'error')
+    } finally {
+      setExporting(false)
+    }
+  }
+  const exportAction = canExportFull ? (
+    <Button variant="outline" size="sm" className="h-6 px-2 text-[10.5px]"
+      disabled={exporting} onClick={exportFull}>
+      {exporting ? 'Preparing export…' : 'Export full result'}
+    </Button>
+  ) : undefined
+
+  if (!hasRunIdentity) return (
+    <FullResultMessage title={`${viewLabel} identity unavailable`}
+      reason="This history entry has no durable run identity, so the kernel cannot verify which output to read. Run the node again to create a verifiable result."
+      modeToggle={modeToggle} />
+  )
   if (err) return <ArtifactUnavailable error={err} modeToggle={modeToggle}
-    onRetry={() => setRetry((n) => n + 1)} />
+    label={viewLabel} action={exportAction} onRetry={() => setRetry((n) => n + 1)} />
   if (!data) return <div className="dp-dark text-foreground">
     <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
-      <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">Full result</span>
+      <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">{viewLabel}</span>
       {modeToggle}
     </div>
     <Skeleton />
   </div>
+  if (data.error) return (
+    <FullResultMessage title={`Couldn’t read ${viewLabel.toLowerCase()}`}
+      reason={data.reason ?? 'The kernel reported an error while reading this run output.'}
+      modeToggle={modeToggle} action={exportAction}
+      onRetry={() => setRetry((n) => n + 1)} />
+  )
+  if (data.notPreviewable) return (
+    <FullResultMessage title={`${viewLabel} cannot be previewed`}
+      reason={data.reason ?? 'This artifact adapter does not provide a bounded interactive preview.'}
+      modeToggle={modeToggle} action={exportAction} />
+  )
   const cols = (data.columns ?? []) as ColumnSchema[]
   const rows = data.rows ?? []
-  // A write run's total is rows written by that attempt; an append artifact can already contain more.
-  // Prefer the count measured from the artifact being viewed, using run history only as a fallback.
-  const reportedTotal = data.rowCount ?? total ?? null
-  const more = !!data.hasMore
-  const viewLimitReached = !!data.truncated && !more
-    && reportedTotal != null && reportedTotal > offset + rows.length
-  const page = (next: number) => { setData(null); setDetail(null); setOffset(Math.max(0, next)) }
+  const canTryNext = data.hasMore === true || (data.hasMore == null && rows.length > 0)
+  const nextPage = () => {
+    previousOffsets.current.push(offset)
+    setData(null); setDetail(null); setOffset(offset + rows.length)
+  }
+  const previousPage = () => {
+    const prior = previousOffsets.current.pop() ?? Math.max(0, offset - pageSize)
+    setData(null); setDetail(null); setOffset(prior)
+  }
   return (
     <div className="dp-dark text-foreground">
       <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
-        <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">Full result</span>
+        <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">{viewLabel}</span>
         {modeToggle}
-        <span className="text-[10.5px] text-muted-foreground">
-          rows {rows.length ? offset + 1 : 0}–{offset + rows.length}
-          {reportedTotal != null ? ` of ${reportedTotal.toLocaleString()}` : ''}
-        </span>
-        {viewLimitReached && (
-          <span className="rounded bg-amber-100 px-1.5 py-px text-[10px] font-semibold text-amber-800 dark:bg-amber-500/15 dark:text-amber-300"
-            title="This interactive view reached its server read limit. Export actions still include only the current page.">
-            Interactive view limit reached
-          </span>
-        )}
         {detail != null && (
           <button onClick={() => setDetail(null)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-semibold text-primary">
             <Icon name="chevronLeft" size={12} /> Row {offset + detail + 1}
           </button>
         )}
         <span className="flex-1" />
-        {detail == null && (
+        {detail == null && canExportFull && (
+          exportAction
+        )}
+        {detail == null && presentation?.kind !== 'chart' && (
           <span className="inline-flex gap-0.5">
-            <PageBtn dir="prev" disabled={offset === 0} onClick={() => page(offset - PAGE)} />
-            <PageBtn dir="next" disabled={!more} onClick={() => page(offset + PAGE)} />
+            <PageBtn dir="prev" disabled={offset === 0} onClick={previousPage} />
+            <PageBtn dir="next" disabled={!canTryNext} onClick={nextPage} />
           </span>
         )}
         {detail == null && rows.length > 0 && (
-          <ExportCluster columns={cols} rows={rows} name="result" truncated={!!data.truncated} pushToast={pushToast} />
+          <ExportCluster columns={cols} rows={rows} name={name} offset={offset}
+            scope={pageScope} pushToast={pushToast} />
         )}
       </div>
+      <DataScopeBanner data={{ ...data, rowCount: reportedTotal }} offset={offset}
+        unit={presentation?.kind === 'chart' ? (presentation.grouped ? 'groups' : 'points') : 'rows'}
+        scope={pageScope} allowNextAttempt={presentation?.kind !== 'chart'} />
       {presentation?.kind === 'chart'
         ? <ChartView rows={rows} type={presentation.type}
-          xLabel={presentation.xLabel} yLabel={presentation.yLabel} />
+          xLabel={presentation.xLabel} yLabel={presentation.yLabel} grouped={presentation.grouped}
+          completeness={data.completeness} total={reportedTotal} scope={pageScope} />
         : presentation?.kind === 'metric'
           ? <MetricValue rows={rows} />
           : detail != null && rows[detail]
@@ -857,13 +1106,42 @@ export function FullResult({ uri, total, modeToggle, presentation }: {
   )
 }
 
-function ArtifactUnavailable({ error, onRetry, modeToggle }: {
-  error: Error & { status?: number }; onRetry: () => void; modeToggle?: React.ReactNode
+function FullResultMessage({ title, reason, onRetry, modeToggle, action }: {
+  title: string
+  reason: string
+  onRetry?: () => void
+  modeToggle?: ReactNode
+  action?: ReactNode
+}) {
+  return (
+    <div className="dp-dark px-5 py-6 text-center text-muted-foreground">
+      {modeToggle && <div className="mb-3 flex justify-center">{modeToggle}</div>}
+      <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
+        <Icon name="power" size={18} />
+      </div>
+      <div className="text-[13px] font-semibold text-foreground">{title}</div>
+      <div className="mx-auto mt-1.5 max-w-[380px] text-[11.5px] leading-normal">{reason}</div>
+      {(onRetry || action) && (
+        <div className="mt-3.5 flex items-center justify-center gap-2">
+          {onRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}
+          {action}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ArtifactUnavailable({ error, onRetry, modeToggle, action, label }: {
+  error: Error & { status?: number }
+  onRetry: () => void
+  modeToggle?: ReactNode
+  action?: ReactNode
+  label: string
 }) {
   const status = error.status
   const denied = status === 401 || status === 403
   const missing = !denied && (status === 404 || status === 410 || /no such file|not found|missing|expired/i.test(error.message))
-  const title = denied ? 'Full result access denied' : missing ? 'Full result expired or removed' : 'Couldn’t load full result'
+  const title = denied ? `${label} access denied` : missing ? `${label} expired or removed` : `Couldn’t load ${label.toLowerCase()}`
   const note = denied
     ? 'You no longer have access to this artifact. Switch back to the sample or ask the owner for access.'
     : missing
@@ -878,7 +1156,10 @@ function ArtifactUnavailable({ error, onRetry, modeToggle }: {
       <div className="text-[13px] font-semibold text-foreground">{title}</div>
       <div className="mx-auto mt-1.5 max-w-[360px] text-[11.5px] leading-normal">{note}</div>
       <div title={error.message} className="dp-mono mx-auto mt-2 max-w-[380px] overflow-hidden text-ellipsis whitespace-nowrap text-[10px] text-muted-foreground/70">{error.message}</div>
-      <Button variant="outline" size="sm" onClick={onRetry} className="mt-3.5">Retry</Button>
+      <div className="mt-3.5 flex items-center justify-center gap-2">
+        <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>
+        {action}
+      </div>
     </div>
   )
 }

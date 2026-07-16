@@ -4,20 +4,25 @@ the execution routes (and where a run writes). Split out of main.py; all authed 
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import re
 import threading
 import time
+import uuid
+from collections.abc import Iterator
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from hub import auth, compiler, destinations, metadb, placement
 from hub import graph as graph_mod
 from hub.agent import AgentCredentialError, agent_credential_error_status, agent_status, run_agent
 from hub.api_errors import APIError, APIErrorCode
-from hub.backends import backend_supports_named_multi_output_runs
+from hub.backends import BackendStatusUnavailable, backend_supports_named_multi_output_runs
 from hub.deps import get_deps
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
@@ -28,7 +33,7 @@ from hub.run_outputs import (
 )
 from hub.security import current_user
 from hub.settings import settings
-from hub.storage import ManagedSourceReadError
+from hub.storage import ManagedSourceReadError, source_read_scope
 from hub.models import (
     CompilePlan,
     CompileRequest,
@@ -43,6 +48,7 @@ from hub.models import (
     ProfileResult,
     RunEstimate,
     RunRequest,
+    RunOutput,
     RunStatus,
     SampleResult,
 )
@@ -51,6 +57,99 @@ router = APIRouter()
 
 _RUN_INDEX_MAX = 1000  # cap deps.run_index (run_id -> owning runner); well above either runner's own cap
 _RUN_MUTATE_ROLES = ("owner", "editor")
+_EXPORT_CHUNK_BYTES = 1024 * 1024
+_RUN_OUTPUT_SAMPLE_ROW_BUDGET = 2_000
+_EXPORT_MEDIA_TYPES = {
+    ".parquet": "application/vnd.apache.parquet",
+    ".arrow": "application/vnd.apache.arrow.file",
+    ".feather": "application/vnd.apache.arrow.file",
+    ".ipc": "application/vnd.apache.arrow.file",
+    ".csv": "text/csv; charset=utf-8",
+    ".tsv": "text/tab-separated-values; charset=utf-8",
+    ".json": "application/json",
+}
+_EXPORT_OPENAPI_CONTENT = {
+    media_type.split(";", 1)[0]: {"schema": {"type": "string", "format": "binary"}}
+    for media_type in sorted(set(_EXPORT_MEDIA_TYPES.values()))
+}
+_EXPORT_OPENAPI_HEADERS = {
+    "Cache-Control": {
+        "description": "private, no-store; full-result bytes are never cached by shared intermediaries.",
+        "schema": {"type": "string"},
+    },
+    "Content-Disposition": {
+        "description": "A sanitized filename ending in -full-result plus the native extension.",
+        "schema": {"type": "string"},
+    },
+    "Content-Length": {
+        "description": "Exact native artifact byte size when available.",
+        "schema": {"type": "integer"},
+    },
+    "X-Content-Type-Options": {
+        "description": "Always nosniff for downloaded native data.",
+        "schema": {"type": "string", "enum": ["nosniff"]},
+    },
+    "X-Data-Scope": {
+        "description": "Always full-result for this route.",
+        "schema": {"type": "string", "enum": ["full-result"]},
+    },
+}
+
+
+class RunOutputSampleRequest(BaseModel):
+    """A run-owned artifact page request; the URI is resolved server-side from durable metadata."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    node_id: str = Field(min_length=1, max_length=256)
+    port_id: str = Field(min_length=1, max_length=128)
+    k: int = Field(default=50, ge=0, le=_RUN_OUTPUT_SAMPLE_ROW_BUDGET)
+    offset: int = Field(default=0, ge=0, lt=_RUN_OUTPUT_SAMPLE_ROW_BUDGET)
+
+
+class _ExportNotAcceptable(RuntimeError):
+    """The durable artifact is valid, but cannot be represented as one native byte stream."""
+
+
+class _ExportResources:
+    """Idempotent response-owned lifecycle scope.
+
+    StreamingResponse may finish through normal exhaustion, cancellation, or an ASGI disconnect. The
+    outer response ``finally`` is the authoritative cleanup boundary; iterator cleanup is only an eager
+    fast path.
+    """
+
+    def __init__(self, stack: contextlib.ExitStack):
+        self._stack = stack
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                # Keep the lock until every callback has completed. A concurrent response-finally caller
+                # must not observe "closed" and return while the iterator thread still owns the FD/lease.
+                self._stack.close()
+            except Exception:  # storage-owned guards retain uncertain cleanup for bounded retry/expiry
+                logging.getLogger("hub").exception("full-result export resource cleanup is pending")
+            finally:
+                self._closed = True
+
+
+class _OwnedStreamingResponse(StreamingResponse):
+    """A stream whose lease/file owner is released even when ASGI cancels the body iterator."""
+
+    def __init__(self, *args, resources: _ExportResources, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._resources = resources
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._resources.close()
 
 
 def _require_graph_read_access(graph, uid: str) -> tuple[str | None, str | None]:
@@ -1091,6 +1190,390 @@ def _require_run_mutate_access(run_id: str, uid: str) -> None:
     if _run_read_access(run_id, uid):
         raise HTTPException(403, f"run '{run_id}' requires canvas owner or editor to cancel")
     raise HTTPException(404, f"run '{run_id}' not found")
+
+
+def _full_result_export_name(value: str | None, extension: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "result")).strip("._-")
+    stem = (stem or "result")[:100]
+    for suffix in _EXPORT_MEDIA_TYPES:
+        if stem.lower().endswith(suffix):
+            stem = stem[:-len(suffix)].rstrip("._-") or "result"
+            break
+    return f"{stem}-full-result{extension}"
+
+
+def _request_user(uid: str, user_id: str | None) -> str:
+    """Honor iframe-compatible user selection only in trusted open mode.
+
+    Auth mode always ignores the query value and keeps using the signed same-origin session resolved by
+    ``current_user``. Open mode has no tenant boundary; preserving the selected dev user merely keeps
+    request ownership/diagnostics consistent when a hidden iframe cannot send ``X-DP-User``.
+    """
+    return uid if auth.auth_enabled() or not user_id else user_id
+
+
+def _durable_run_outputs(run_id: str) -> list[RunOutput]:
+    """Resolve a run's outputs, falling back from its runner to bounded durable history.
+
+    A live runner is freshest. If it no longer owns the id *or its status plane is temporarily
+    unavailable*, RunState is authoritative while retained; a RunState miss then falls back to
+    RunRecord. The history row's own ``id`` is never queried.
+    """
+    status_error: Exception | None = None
+    try:
+        status = _runner_for(run_id).status(run_id)
+    except (KeyError, OSError, BackendStatusUnavailable) as exc:
+        # Do not catch generic RuntimeError: backends use it for integrity and configuration drift.
+        # Only the explicit availability contract may fall back to already-durable metadata.
+        status_error = exc
+        persisted = metadb.get_run_state(run_id)
+        if persisted is not None:
+            try:
+                status = RunStatus(**persisted)
+            except ValueError as exc:
+                raise HTTPException(409, "durable run output metadata is invalid") from exc
+        else:
+            try:
+                snapshots = metadb.get_run_record_outputs(run_id)
+            except RuntimeError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            if snapshots is None:
+                if not isinstance(status_error, KeyError):
+                    raise HTTPException(
+                        503, "run status is temporarily unavailable and no durable output is retained",
+                    ) from status_error
+                raise HTTPException(404, "run output not found")
+            try:
+                return [RunOutput.model_validate(snapshot) for snapshot in snapshots]
+            except ValueError as exc:
+                raise HTTPException(409, "durable run output metadata is invalid") from exc
+    return list(status.outputs)
+
+
+def _durable_run_output(run_id: str, node_id: str, port_id: str) -> RunOutput:
+    """Resolve one output by logical run/port identity."""
+    outputs = _durable_run_outputs(run_id)
+    output = next((candidate for candidate in outputs
+                   if candidate.node_id == node_id and candidate.port_id == port_id), None)
+    if output is None:
+        raise HTTPException(404, "run output not found")
+    return output
+
+
+def _committed_run_output(
+        run_id: str, node_id: str, port_id: str, *, result_only: bool) -> RunOutput:
+    output = _durable_run_output(run_id, node_id, port_id)
+    if output.outcome != "committed" or not output.uri:
+        raise HTTPException(409, "run output is not a committed materialized artifact")
+    if result_only and output.publication_kind != "result":
+        raise HTTPException(409, "run output is a catalog publication, not a native result artifact")
+    return output
+
+
+def _object_attempt_member(uri: str) -> tuple[str, int, int] | None:
+    """Resolve a committed object-attempt root to its sole shard and manifest row count.
+
+    Returns ``None`` for an ordinary object/file URI. More than one shard is a valid dataset but cannot
+    be represented as one native stream or by the current single-relation interactive adapter contract.
+    """
+    from hub.handoff import is_attempt_uri, read_manifest, validate_shards
+    from hub.plugins.adapters import is_object_uri
+
+    if not is_object_uri(uri) or not is_attempt_uri(uri):
+        return None
+    manifest = read_manifest(uri)
+    if manifest is None:
+        raise FileNotFoundError("committed object result manifest is missing or invalid")
+    if not validate_shards(uri, manifest):
+        raise FileNotFoundError("committed object result inventory no longer matches its manifest")
+    shards = manifest["shards"]
+    if len(shards) != 1:
+        raise _ExportNotAcceptable(
+            f"native single-stream access is unavailable for a {len(shards):,}-shard result"
+        )
+    shard = shards[0]
+    return f"{uri.rstrip('/')}/{shard['path']}", int(shard["size"]), int(manifest["rows"])
+
+
+def _prepare_full_result_stream(
+        uri: str, storage, owner: str
+        ) -> tuple[_ExportResources, object, int | None, str, int | None]:
+    """Open one committed native member before headers and retain its lifecycle read fence."""
+    from hub import paths
+    from hub.plugins.adapters import is_object_uri, object_fs
+
+    stack = contextlib.ExitStack()
+    try:
+        guards = stack.enter_context(source_read_scope(storage, [uri], owner=owner))
+        local = paths.local_path(uri)
+        expected_size: int | None = None
+        target_uri = uri
+        if local is not None:
+            if not os.path.isfile(local):
+                if os.path.exists(local):
+                    raise _ExportNotAcceptable(
+                        "native full-result export requires one file, not a directory")
+                raise FileNotFoundError(local)
+            extension = os.path.splitext(local)[1].lower()
+            if extension not in _EXPORT_MEDIA_TYPES:
+                raise _ExportNotAcceptable(
+                    "native full-result export requires a Parquet, Arrow, CSV, TSV, or JSON file")
+            guard = next((candidate for candidate in guards
+                          if getattr(candidate, "uri", None) == local), None)
+            if guard is not None and callable(getattr(guard, "artifact_fileno", None)):
+                fd = os.dup(guard.artifact_fileno())
+                os.lseek(fd, 0, os.SEEK_SET)
+                stream = stack.enter_context(os.fdopen(fd, "rb"))
+            else:
+                stream = stack.enter_context(open(local, "rb"))
+            size = os.fstat(stream.fileno()).st_size
+            return _ExportResources(stack), stream, size, extension, None
+
+        if not is_object_uri(uri):
+            raise _ExportNotAcceptable(
+                "native full-result export requires one local or object-store file")
+        member = _object_attempt_member(uri)
+        manifest_rows: int | None = None
+        if member is not None:
+            target_uri, expected_size, manifest_rows = member
+        extension = os.path.splitext(target_uri.rstrip("/"))[1].lower()
+        if extension not in _EXPORT_MEDIA_TYPES:
+            raise _ExportNotAcceptable(
+                "native full-result export requires a Parquet, Arrow, CSV, TSV, or JSON file")
+        filesystem, path = object_fs(target_uri)
+        info = filesystem.get_file_info(path)
+        import pyarrow.fs as pafs
+
+        if info.type != pafs.FileType.File:
+            raise FileNotFoundError(target_uri)
+        if expected_size is not None and info.size != expected_size:
+            raise FileNotFoundError("committed object result shard size no longer matches its manifest")
+        stream = stack.enter_context(filesystem.open_input_file(path))
+        return (_ExportResources(stack), stream, info.size if info.size >= 0 else None,
+                extension, manifest_rows)
+    except BaseException:
+        try:
+            stack.close()
+        except Exception:  # preserve the preparation failure as the primary signal
+            logging.getLogger("hub").exception("full-result export preparation rollback failed")
+        raise
+
+
+def _full_result_chunks(stream, resources: _ExportResources) -> Iterator[bytes]:
+    try:
+        while chunk := stream.read(_EXPORT_CHUNK_BYTES):
+            yield chunk
+    finally:
+        resources.close()
+
+
+def _export_headers(filename: str | None, extension: str, size: int | None) -> dict[str, str]:
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="{_full_result_export_name(filename, extension)}"'),
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+        "X-Data-Scope": "full-result",
+    }
+    if size is not None:
+        headers["Content-Length"] = str(size)
+    return headers
+
+
+def _open_run_result_export(
+        run_id: str, node_id: str, port_id: str, filename: str | None,
+        uid: str) -> tuple[_ExportResources, object, str, dict[str, str]]:
+    _require_run_read_access(run_id, uid)
+    output = _committed_run_output(run_id, node_id, port_id, result_only=True)
+    owner = f"export:{run_id}:{uuid.uuid4().hex}"
+    try:
+        resources, stream, size, extension, manifest_rows = _prepare_full_result_stream(
+            output.uri or "", get_deps().storage, owner)
+    except _ExportNotAcceptable as exc:
+        raise HTTPException(406, str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(403, "full-result artifact access denied") from exc
+    except (FileNotFoundError, ManagedSourceReadError) as exc:
+        raise HTTPException(410, "full-result artifact is missing or expired") from exc
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(409, f"full-result artifact is not exportable: {exc}") from exc
+    if (manifest_rows is not None and output.rows is not None
+            and manifest_rows != output.rows):
+        resources.close()
+        raise HTTPException(409, "run output row metadata does not match its committed manifest")
+    return resources, stream, _EXPORT_MEDIA_TYPES[extension], _export_headers(
+        filename, extension, size)
+
+
+@router.post("/run/{run_id}/sample", response_model=SampleResult)
+def sample_run_output(
+        run_id: str, req: RunOutputSampleRequest,
+        uid: str = Depends(current_user)) -> SampleResult:
+    """Read one bounded page from an authorized durable output without accepting a caller-owned URI."""
+    _require_run_read_access(run_id, uid)
+    output = _committed_run_output(
+        run_id, req.node_id, req.port_id, result_only=False)
+    uri = output.uri or ""
+    preview_rows = min(
+        _RUN_OUTPUT_SAMPLE_ROW_BUDGET,
+        req.offset + req.k + 1,
+    )
+    from hub import db
+    from hub.executors.engine import _table_to_rows
+    from hub.plugins.adapters import BoundedPreviewUnsupported, relation_columns
+
+    try:
+        with source_read_scope(
+                get_deps().storage, [uri], owner=f"run-sample:{run_id}:{uuid.uuid4().hex}"):
+            member = _object_attempt_member(uri)
+            target_uri = member[0] if member is not None else uri
+            manifest_rows = member[2] if member is not None else None
+            adapter = get_deps().resolve_adapter(target_uri)
+            preview_scan = getattr(adapter, "preview_scan", None)
+            if not callable(preview_scan):
+                return SampleResult(
+                    not_previewable=True,
+                    reason=(f"source adapter '{getattr(adapter, 'name', type(adapter).__name__)}' "
+                            "does not guarantee a bounded preview"),
+                )
+            with db.run_scope():
+                try:
+                    relation = preview_scan(target_uri, None, limit=preview_rows)
+                except BoundedPreviewUnsupported as exc:
+                    return SampleResult(not_previewable=True, reason=str(exc))
+                columns = relation_columns(relation)
+                page = _table_to_rows(
+                    relation.limit(req.k + 1, req.offset).to_arrow_table())
+                rows = page[:req.k]
+                metadata_count = getattr(adapter, "metadata_count", None)
+                try:
+                    metadata_rows = (
+                        metadata_count(target_uri) if callable(metadata_count) else None)
+                except Exception:  # exact-count uncertainty must never trigger a full scan
+                    metadata_rows = None
+    except _ExportNotAcceptable as exc:
+        return SampleResult(
+            not_previewable=True,
+            reason=(f"This committed result has multiple storage shards. {exc}. "
+                    "Use a native multi-file reader or compact the result first."),
+        )
+    except PermissionError as exc:
+        raise HTTPException(403, "run output artifact access denied") from exc
+    except (FileNotFoundError, ManagedSourceReadError) as exc:
+        raise HTTPException(410, "run output artifact is missing or expired") from exc
+    except Exception as exc:  # noqa: BLE001 - data failures are explicit SampleResult errors
+        return SampleResult(error=True, reason=f"{type(exc).__name__}: {exc}")
+
+    # A result output's rows are its complete materialized cardinality. A catalog/write output may be an
+    # append, where output.rows is only the mutation count, so it must use artifact metadata instead.
+    known_totals = {
+        int(total) for total in (
+            output.rows if output.publication_kind == "result" else None,
+            manifest_rows,
+            metadata_rows,
+        ) if total is not None
+    }
+    if len(known_totals) > 1:
+        raise HTTPException(409, "run output row metadata is inconsistent")
+    exact_total = next(iter(known_totals), None)
+    page_end = req.offset + len(rows)
+    if exact_total is not None and rows and page_end > exact_total:
+        raise HTTPException(409, "run output page exceeds its exact row metadata")
+    window_end = min(exact_total, _RUN_OUTPUT_SAMPLE_ROW_BUDGET) \
+        if exact_total is not None else None
+    capped = page_end >= _RUN_OUTPUT_SAMPLE_ROW_BUDGET and (
+        exact_total is None or exact_total > page_end)
+    if capped:
+        has_more: bool | None = False
+    elif len(page) > req.k:
+        has_more = True
+    elif window_end is not None:
+        has_more = window_end > page_end
+    else:
+        # A short bounded adapter batch is not an EOF contract. Without metadata or a look-ahead row,
+        # another page is genuinely unknown rather than false.
+        has_more = None
+    complete = (
+        req.offset == 0 and exact_total is not None and page_end == exact_total
+        and has_more is False and not capped)
+    completeness = (
+        "complete" if complete else
+        "capped" if capped else
+        "page" if exact_total is not None or has_more is True else
+        "unknown"
+    )
+    truncated = False if complete else (
+        req.offset > 0 or exact_total is None or exact_total > page_end)
+    return SampleResult(
+        columns=columns,
+        rows=rows,
+        row_count=exact_total,
+        has_more=has_more,
+        truncated=truncated,
+        completeness=completeness,
+        row_limit=_RUN_OUTPUT_SAMPLE_ROW_BUDGET if capped else None,
+        limit_reason="interactive-row-budget" if capped else None,
+        limit_scope="result-window" if capped else None,
+        wire=output.wire,
+    )
+
+
+@router.get(
+    "/run/{run_id}/export",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "description": (
+                "Complete native result artifact. The runtime preserves its Parquet, Arrow, CSV, TSV, "
+                "or JSON media type and streams without conversion."),
+            "content": _EXPORT_OPENAPI_CONTENT,
+            "headers": _EXPORT_OPENAPI_HEADERS,
+        },
+    },
+)
+def export_run_result(
+        run_id: str,
+        node_id: str = Query(alias="nodeId", min_length=1, max_length=256),
+        port_id: str = Query(alias="portId", min_length=1, max_length=128),
+        filename: str | None = Query(default=None, max_length=160),
+        user_id: str | None = Query(default=None, alias="userId", max_length=256),
+        uid: str = Depends(current_user)) -> StreamingResponse:
+    """Stream the complete, already-materialized native artifact without buffering or conversion."""
+    resources, stream, media_type, headers = _open_run_result_export(
+        run_id, node_id, port_id, filename, _request_user(uid, user_id))
+    return _OwnedStreamingResponse(
+        _full_result_chunks(stream, resources),
+        resources=resources,
+        media_type=media_type,
+        headers=headers,
+    )
+
+
+@router.head(
+    "/run/{run_id}/export",
+    response_class=Response,
+    responses={
+        200: {
+            "description": (
+                "Full-result export preflight. Performs the same authorization, output resolution, "
+                "manifest validation, and native member open as GET; returns its media, filename, and "
+                "size headers without a response body."),
+            "headers": _EXPORT_OPENAPI_HEADERS,
+        },
+    },
+)
+def preflight_run_result_export(
+        run_id: str,
+        node_id: str = Query(alias="nodeId", min_length=1, max_length=256),
+        port_id: str = Query(alias="portId", min_length=1, max_length=128),
+        filename: str | None = Query(default=None, max_length=160),
+        user_id: str | None = Query(default=None, alias="userId", max_length=256),
+        uid: str = Depends(current_user)) -> Response:
+    """Authorize and open the exact native member so preflight reports every GET error before download."""
+    resources, _stream, media_type, headers = _open_run_result_export(
+        run_id, node_id, port_id, filename, _request_user(uid, user_id))
+    resources.close()
+    return Response(status_code=200, media_type=media_type, headers=headers)
 
 
 def _runner_for(run_id: str, *, fallback: bool = True):

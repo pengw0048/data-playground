@@ -41,6 +41,23 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
+async function reqVoid(path: string, opts?: RequestInit): Promise<void> {
+  const rawBody = opts?.body != null && typeof opts.body !== 'string'
+  const headers: Record<string, string> = { ...(rawBody ? {} : { 'Content-Type': 'application/json' }), ...(opts?.headers as Record<string, string>) }
+  if (_userId) headers['X-DP-User'] = _userId
+  const res = await fetch(`${BASE}${path}`, { ...opts, headers })
+  if (!res.ok) {
+    let detail = res.statusText
+    try {
+      const body = await res.json()
+      detail = body.detail ?? detail
+    } catch {
+      /* noop */
+    }
+    throw new KernelError(res.status, typeof detail === 'string' ? detail : JSON.stringify(detail))
+  }
+}
+
 // Strip transient UI-only fields the kernel does not need before sending a graph.
 // `note` nodes are canvas annotations with no ports/build step — the engine never sees them.
 function toGraph(doc: CanvasDoc) {
@@ -90,6 +107,15 @@ function catalogQuery(p: CatalogQueryParams): string {
 function catalogSearchQuery(p: CatalogQueryParams, mode: 'lexical' | 'semantic' | 'hybrid'): string {
   const query = catalogQuery(p)
   return `${query || '?'}${query ? '&' : ''}mode=${encodeURIComponent(mode)}`
+}
+
+function fullResultExportPath(runId: string, nodeId: string, portId: string, filename?: string): string {
+  const params = new URLSearchParams({ nodeId, portId })
+  if (filename) params.set('filename', filename)
+  // A hidden iframe cannot carry the open-mode X-DP-User header. The kernel accepts this identity
+  // hint only when authentication is disabled; authenticated deployments ignore it and use session.
+  if (_userId) params.set('userId', _userId)
+  return `/run/${encodeURIComponent(runId)}/export?${params.toString()}`
 }
 
 export interface BackendPort { id: string; label?: string; wire: string; accepts?: string[] }
@@ -176,6 +202,19 @@ export const api = {
 
   sample: (uri: string, k = 50, columns?: string[], offset = 0) =>
     req<SampleResult>('/data/sample', { method: 'POST', body: JSON.stringify({ uri, k, columns, offset }) }),
+  runOutputSample: (runId: string, nodeId: string, portId: string, k = 50, offset = 0) =>
+    req<SampleResult>(`/run/${encodeURIComponent(runId)}/sample`, {
+      method: 'POST', body: JSON.stringify({ nodeId, portId, k, offset }),
+    }),
+  fullResultExportUrl: (runId: string, nodeId: string, portId: string, filename?: string) =>
+    `${BASE}${fullResultExportPath(runId, nodeId, portId, filename)}`,
+  preflightFullResultExport: async (runId: string, nodeId: string, portId: string, filename?: string) => {
+    // Capture one path so the HEAD and iframe GET retain the same open-mode identity even if the UI
+    // user changes while preflight is in flight.
+    const path = fullResultExportPath(runId, nodeId, portId, filename)
+    await reqVoid(path, { method: 'HEAD' })
+    return `${BASE}${path}`
+  },
 
   processors: () => req<ProcessorDescriptor[]>('/processors'),
   promote: (body: {
