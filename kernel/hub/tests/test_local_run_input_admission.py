@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, func, select
 
 from hub import db, metadb
 from hub.models import Graph, RunEstimate, RunStatus
@@ -294,10 +294,38 @@ def test_dispatch_exception_before_worker_terminalizes_the_claim(monkeypatch):
     assert failed["status"] == "failed"
     assert failed["error"] == "RuntimeError: runner rejected before creating a worker"
     assert metadb.terminal_run_status(run_id) == "failed"
+    history = metadb.list_runs("local-admission")
+    assert len(history) == 1
+    assert history[0]["runId"] == run_id
+    assert history[0]["status"] == "failed"
+    assert history[0]["inputManifest"] == [{
+        "dataset_id": "dataset", "node_id": "source", "provider": "lance",
+        "resolved_at": "now", "revision_id": "revision",
+    }]
     retry, _ = runs.start_run(deps, graph, "source", "local", confirmed=True,
                               submission_id=submission_id)
     assert retry.status == "failed"
     assert calls == [run_id]
+
+
+def test_unstarted_claim_failures_follow_terminal_and_history_retention(monkeypatch):
+    deps, graph = _local_start_context(monkeypatch)
+    monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 1)
+    monkeypatch.setattr(metadb, "_RUN_HISTORY_MAX", 1)
+
+    def dispatch(*_args, **_kwargs):
+        raise RuntimeError("runner rejected before creating a worker")
+
+    monkeypatch.setattr("hub.observability.invoke_backend_run", dispatch)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="runner rejected"):
+            runs.start_run(deps, graph, "source", "local", confirmed=True,
+                           submission_id=str(uuid.uuid4()))
+
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(metadb.RunState)) == 1
+        assert session.scalar(select(func.count()).select_from(metadb.RunRecord)) == 1
+        assert session.scalar(select(func.count()).select_from(metadb.RunInputAdmission)) == 1
 
 
 def test_failure_before_dispatch_leaves_the_admission_unclaimed(monkeypatch):

@@ -2730,6 +2730,8 @@ def fail_claimed_local_run_dispatch(run_id: str, error: str) -> dict:
     """Terminalize a claimed local run only after its in-process receipt is conclusively absent."""
     from hub.models import RunStatus
 
+    failed_status: RunStatus | None = None
+    canvas_id: str | None = None
     with session() as s:
         admission_hint = s.execute(select(RunInputAdmission.canvas_id).where(
             RunInputAdmission.run_id == str(run_id)
@@ -2744,13 +2746,34 @@ def fail_claimed_local_run_dispatch(run_id: str, error: str) -> dict:
         status = RunStatus.model_validate(json.loads(state.doc))
         if status.status != "queued":
             return status.model_dump()
-        failed = status.model_copy(update={
+        failed_status = status.model_copy(update={
             "status": "failed", "error": str(error), "stalled": False,
-        }).model_dump()
+        })
+        failed = failed_status.model_dump()
+        canvas_id = admission.canvas_id
         state.status = "failed"
         state.doc = json.dumps(failed, default=str)
         _record_terminal_fence(s, str(run_id), "failed")
-        return failed
+
+    assert failed_status is not None
+    # Reuse the normal terminal boundary after fencing the claim: it enforces bounded RunState
+    # retention, while history retains the admission manifest and owns its normal pruning lifecycle.
+    save_run_state(str(run_id), failed_status.model_dump(), canvas_id=canvas_id)
+    record_run(
+        canvas_id=canvas_id,
+        target_node_id=failed_status.target_node_id,
+        job_type=failed_status.job_type,
+        status=failed_status.status,
+        rows=failed_status.total_rows,
+        ms=failed_status.ms,
+        error=failed_status.error,
+        outputs=[output.model_dump() for output in failed_status.outputs],
+        per_node=[item.model_dump() for item in failed_status.per_node] or None,
+        profile=failed_status.profile.model_dump() if failed_status.profile else None,
+        run_id=str(run_id),
+        request_id=failed_status.request_id,
+    )
+    return failed_status.model_dump()
 
 
 def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
