@@ -963,5 +963,30 @@ def test_isolated_local_second_port_commit_failure_retains_first_publication(
             while runner.workers()[0].state != "idle" and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert runner.workers()[0].state == "idle"
+            assert status.run_id not in runner._assigned
+            assert status.run_id not in runner._procs
+            assert status.run_id not in runner._local_results
+
+            recovered = runner.run(
+                compiler.compile_plan(graph, "branches"), graph, "branches", "local")
+            deadline = time.monotonic() + 15
+            while (runner.status(recovered.run_id).status
+                   not in ("done", "failed", "cancelled")
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            recovered = runner.status(recovered.run_id)
+            assert recovered.status == "done", recovered.error
+            assert [(output.port_id, output.outcome, output.rows)
+                    for output in recovered.outputs] == [
+                        ("first", "committed", 3),
+                        ("second", "committed", 3),
+                    ]
+            deadline = time.monotonic() + 5
+            while runner.workers()[0].state != "idle" and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert runner.workers()[0].state == "idle"
+            assert recovered.run_id not in runner._assigned
+            assert recovered.run_id not in runner._procs
+            assert recovered.run_id not in runner._local_results
     finally:
         runner._terminate_all()
