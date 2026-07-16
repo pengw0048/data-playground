@@ -17,13 +17,11 @@ from hub import metadb
 def workspace_scope():
     metadb.migrate_db()
     token = uuid.uuid4().hex
-    user_id = f"workspace-user-{token}"
     canvas_id = f"workspace-canvas-{token}"
     uri = f"file:///workspace-{token}.parquet"
     with metadb.session() as session:
-        session.add(metadb.User(id=user_id, name="Workspace test"))
         session.add(metadb.Canvas(
-            id=canvas_id, owner_id=user_id, name="Original canvas", version=7,
+            id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name="Original canvas", version=7,
             doc=json.dumps({"id": canvas_id, "name": "Original canvas", "version": 7,
                             "nodes": [], "edges": []}),
         ))
