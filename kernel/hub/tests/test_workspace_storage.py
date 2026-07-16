@@ -30,12 +30,16 @@ def workspace_scope():
     metadb.catalog_upsert_entry(uri, "Original dataset", {
         "id": f"tbl_{token}", "name": "Original dataset", "uri": uri, "version": "v1",
     })
+    dataset_id = metadb.workspace_builtin_dataset_identity(uri)
     try:
-        yield {"canvas_id": canvas_id, "uri": uri}
+        yield {"canvas_id": canvas_id, "uri": uri, "dataset_id": dataset_id}
     finally:
         with metadb.session() as session:
+            current_dataset_ids = list(session.scalars(select(metadb.CatalogEntry.registration_id).where(
+                metadb.CatalogEntry.uri == uri)))
             placement_ids = list(session.scalars(select(metadb.WorkspacePlacement.id).where(
-                metadb.WorkspacePlacement.name.like(f"workspace-{token}%"))))
+                (metadb.WorkspacePlacement.target_id.in_([canvas_id, dataset_id, *current_dataset_ids]))
+                | metadb.WorkspacePlacement.name.like(f"workspace-{token}%"))))
             if placement_ids:
                 session.execute(delete(metadb.WorkspacePlacement).where(
                     metadb.WorkspacePlacement.id.in_(placement_ids)))
@@ -94,15 +98,21 @@ def test_delete_recreate_and_placement_moves_preserve_independent_targets(worksp
     assert replacement["id"] != first["id"]
 
     destination = metadb.workspace_create_container(root_id, f"workspace-{token}-destination")
-    dataset_id = metadb.workspace_builtin_dataset_identity(workspace_scope["uri"])
+    dataset_id = workspace_scope["dataset_id"]
     canvas_placement = metadb.workspace_create_placement(
         replacement["id"], target_kind="canvas", target_id=workspace_scope["canvas_id"],
         name=f"workspace-{token}-canvas",
     )
-    dataset_placement = metadb.workspace_create_placement(
-        replacement["id"], target_kind="dataset", target_id=dataset_id,
-        name=f"workspace-{token}-dataset",
-    )
+    with metadb.session() as session:
+        dataset_row = session.scalar(select(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "dataset",
+            metadb.WorkspacePlacement.target_id == dataset_id,
+        ))
+        assert dataset_row is not None
+        dataset_placement = {"id": dataset_row.id, "version": dataset_row.version}
+    dataset_placement = metadb.workspace_update_placement(
+        dataset_placement["id"], expected_version=dataset_placement["version"],
+        container_id=replacement["id"], name=f"workspace-{token}-dataset")
 
     with metadb.session() as session:
         canvas_before = session.get(metadb.Canvas, workspace_scope["canvas_id"])
@@ -150,11 +160,18 @@ def test_delete_recreate_and_placement_moves_preserve_independent_targets(worksp
 def test_dataset_recreate_gets_a_new_workspace_target_identity(workspace_scope):
     uri = workspace_scope["uri"]
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
-    original = metadb.workspace_builtin_dataset_identity(uri)
+    original = workspace_scope["dataset_id"]
     container = metadb.workspace_create_container(
         metadb.local_workspace_root()["id"], f"workspace-{token}-dataset-lifecycle")
-    placement = metadb.workspace_create_placement(
-        container["id"], target_kind="dataset", target_id=original,
+    with metadb.session() as session:
+        row = session.scalar(select(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "dataset",
+            metadb.WorkspacePlacement.target_id == original,
+        ))
+        assert row is not None
+        placement = {"id": row.id, "version": row.version}
+    placement = metadb.workspace_update_placement(
+        placement["id"], expected_version=placement["version"], container_id=container["id"],
         name=f"workspace-{token}-dataset-lifecycle")
     metadb.catalog_delete_entry(uri)
     with metadb.session() as session:
@@ -173,13 +190,20 @@ def test_workspace_api_mixes_keyset_pages_resolves_ancestors_and_never_writes_ca
     folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-api", ordinal=0)
     child = metadb.workspace_create_container(folder["id"], f"workspace-{token}-api-child", ordinal=0)
     metadb.set_visibility(workspace_scope["canvas_id"], "workspace")
-    dataset_id = metadb.workspace_builtin_dataset_identity(workspace_scope["uri"])
+    dataset_id = workspace_scope["dataset_id"]
     canvas = metadb.workspace_create_placement(
         folder["id"], target_kind="canvas", target_id=workspace_scope["canvas_id"],
         name=f"workspace-{token}-canvas", ordinal=0)
-    metadb.workspace_create_placement(
-        folder["id"], target_kind="dataset", target_id=dataset_id,
-        name=f"workspace-{token}-dataset", ordinal=0)
+    with metadb.session() as session:
+        row = session.scalar(select(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "dataset",
+            metadb.WorkspacePlacement.target_id == dataset_id,
+        ))
+        assert row is not None
+        dataset_placement = {"id": row.id, "version": row.version}
+    metadb.workspace_update_placement(
+        dataset_placement["id"], expected_version=dataset_placement["version"],
+        container_id=folder["id"], name=f"workspace-{token}-dataset", ordinal=0)
 
     statements: list[str] = []
 
@@ -242,6 +266,71 @@ def test_workspace_api_unicode_keyset_has_no_duplicates_or_loss(workspace_scope)
 
     assert names == ["A", "Z", "İ"]
     assert invalid.status_code == 422
+
+
+def test_normal_local_lifecycles_materialize_root_workspace_resources():
+    token = uuid.uuid4().hex
+    canvas_id = f"workspace-lifecycle-canvas-{token}"
+    uri = f"file:///workspace-lifecycle-{token}.parquet"
+    dataset_id = ""
+    try:
+        with TestClient(app) as client:
+            created = client.post("/api/canvas", json={
+                "id": canvas_id, "name": "Lifecycle canvas", "version": 1,
+                "nodes": [], "edges": [],
+            })
+            assert created.status_code == 200 and created.json()["created"] is True
+            metadb.catalog_upsert_entry(uri, "Lifecycle dataset", {
+                "id": f"tbl_{token}", "name": "Lifecycle dataset", "uri": uri,
+                "version": "v1", "columns": [],
+            })
+            dataset_id = metadb.workspace_builtin_dataset_identity(uri)
+            page = client.get(f"/api/workspace/containers/{metadb.LOCAL_WORKSPACE_ROOT_ID}",
+                              params={"limit": 100})
+            assert page.status_code == 200
+            assert {(item["id"], item["name"]) for item in page.json()["items"]} >= {
+                (f"canvas:{canvas_id}", "Lifecycle canvas"),
+                (f"dataset:{dataset_id}", "Lifecycle dataset"),
+            }
+    finally:
+        metadb.delete_canvas_cascade(canvas_id)
+        metadb.catalog_delete_entry(uri)
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspacePlacement).where(
+                metadb.WorkspacePlacement.target_id.in_([canvas_id, dataset_id])))
+
+
+def test_migration_backfills_existing_local_resources_without_moving_placements():
+    token = uuid.uuid4().hex
+    canvas_id, dataset_id = f"workspace-backfill-canvas-{token}", uuid.uuid4().hex
+    uri = f"file:///workspace-backfill-{token}.parquet"
+    try:
+        with metadb.session() as session:
+            session.add(metadb.Canvas(
+                id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name="Backfill canvas", version=1,
+                doc=json.dumps({"id": canvas_id, "name": "Backfill canvas", "version": 1,
+                                "nodes": [], "edges": []}),
+            ))
+            session.add(metadb.CatalogEntry(
+                uri=uri, registration_id=dataset_id, name="Backfill dataset",
+                doc=json.dumps({"id": f"tbl_{token}", "name": "Backfill dataset", "uri": uri,
+                                "version": "v1", "columns": []}),
+            ))
+        metadb.migrate_db()
+        with metadb.session() as session:
+            placements = {(row.target_kind, row.target_id, row.container_id) for row in session.scalars(
+                select(metadb.WorkspacePlacement).where(
+                    metadb.WorkspacePlacement.target_id.in_([canvas_id, dataset_id])))}
+        assert placements == {
+            ("canvas", canvas_id, metadb.LOCAL_WORKSPACE_ROOT_ID),
+            ("dataset", dataset_id, metadb.LOCAL_WORKSPACE_ROOT_ID),
+        }
+    finally:
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspacePlacement).where(
+                metadb.WorkspacePlacement.target_id.in_([canvas_id, dataset_id])))
+            session.execute(delete(metadb.Canvas).where(metadb.Canvas.id == canvas_id))
+            session.execute(delete(metadb.CatalogEntry).where(metadb.CatalogEntry.uri == uri))
 
 
 def test_concurrent_container_cas_has_one_winner(workspace_scope):

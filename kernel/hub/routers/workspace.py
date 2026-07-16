@@ -434,6 +434,8 @@ def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
             # deliberately disabled inside that lock so every ownership path has one global order.
             s.flush()
             metadb.sync_local_result_owner(s, "canvas", cid, doc)
+        metadb._workspace_ensure_root_placement_in_session(
+            s, target_kind="canvas", target_id=cid, name=values["name"])
         return {"ok": True, "id": cid, "created": created}
 
 
@@ -467,6 +469,8 @@ def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> d
         c.doc = doc_json
         s.flush()  # settle a newly-created owner row before the local-result registry lock
         metadb.sync_local_result_owner(s, "canvas", canvas_id, doc)
+        metadb._workspace_ensure_root_placement_in_session(
+            s, target_kind="canvas", target_id=canvas_id, name=c.name)
     # keep a throttled snapshot history so a bad edit is recoverable (autosave fires ~every 400ms; the
     # snapshotter dedups + rate-limits so it doesn't store every keystroke)
     metadb.snapshot_canvas(canvas_id, doc_json, version, author_id=uid)

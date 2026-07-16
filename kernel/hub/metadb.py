@@ -1025,6 +1025,7 @@ def _bootstrap_metadata() -> None:
         for scope, scope_id in (("global", ""), ("user", DEFAULT_USER_ID)):
             if s.get(SettingRevision, (scope, scope_id)) is None:
                 s.add(SettingRevision(scope=scope, scope_id=scope_id, revision=0))
+        _workspace_backfill_root_placements_in_session(s)
     # The cleartext value is one-shot migration input. Never let a subsequently spawned workload
     # inherit it after the bootstrap transaction commits.
     if bootstrap:
@@ -2328,6 +2329,40 @@ def workspace_builtin_dataset_identity(uri: str) -> str:
         if entry is None:
             raise KeyError(f"registered dataset '{uri}' not found")
         return entry.registration_id
+
+
+def _workspace_ensure_root_placement_in_session(
+        s, *, target_kind: str, target_id: str, name: str) -> None:
+    """Give a local resource its canonical root placement without moving an existing one."""
+    if target_kind not in {"canvas", "dataset"}:
+        raise ValueError("workspace placement target kind must be 'canvas' or 'dataset'")
+    root = s.get(WorkspaceContainer, LOCAL_WORKSPACE_ROOT_ID)
+    if root is None or not root.is_root:
+        raise RuntimeError("local Workspace root is missing from the metadata baseline")
+    values = {
+        "id": _uid(), "container_id": LOCAL_WORKSPACE_ROOT_ID,
+        "target_kind": target_kind, "target_id": target_id,
+        "name": _workspace_name(name), "ordinal": 0, "version": 1,
+    }
+    dialect = s.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
+        raise RuntimeError(f"unsupported metadata database dialect: {dialect}")
+    s.execute(dialect_insert(WorkspacePlacement).values(**values).on_conflict_do_nothing(
+        index_elements=[WorkspacePlacement.target_kind, WorkspacePlacement.target_id]))
+
+
+def _workspace_backfill_root_placements_in_session(s) -> None:
+    """One-way pre-1.0 migration of existing local resources into the Workspace root."""
+    for canvas_id, name in s.execute(select(Canvas.id, Canvas.name)).all():
+        _workspace_ensure_root_placement_in_session(
+            s, target_kind="canvas", target_id=canvas_id, name=name or "untitled")
+    for dataset_id, name in s.execute(select(CatalogEntry.registration_id, CatalogEntry.name)).all():
+        _workspace_ensure_root_placement_in_session(
+            s, target_kind="dataset", target_id=dataset_id, name=name or "dataset")
 
 
 def workspace_create_placement(container_id: str, *, target_kind: str, target_id: str,
@@ -7893,6 +7928,8 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
         destination_version,
         parent_snapshots, locked_logicals, locked_entries, canonical_lineage,
         lineage_publication_key)
+    _workspace_ensure_root_placement_in_session(
+        s, target_kind="dataset", target_id=entry.registration_id, name=entry.name)
     return True
 
 
