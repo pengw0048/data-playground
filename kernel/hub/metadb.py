@@ -2726,6 +2726,33 @@ def claim_local_run_dispatch(*, run_id: str, uid: str, auth_canvas_id: str | Non
         return queued, True
 
 
+def fail_claimed_local_run_dispatch(run_id: str, error: str) -> dict:
+    """Terminalize a claimed local run only after its in-process receipt is conclusively absent."""
+    from hub.models import RunStatus
+
+    with session() as s:
+        admission_hint = s.execute(select(RunInputAdmission.canvas_id).where(
+            RunInputAdmission.run_id == str(run_id)
+        )).scalar_one_or_none()
+        if admission_hint is None:
+            raise RuntimeError("local run admission was not persisted")
+        _lock_authorized_run_canvas(s, admission_hint)
+        admission = s.get(RunInputAdmission, str(run_id), with_for_update=True)
+        state = s.get(RunState, str(run_id), with_for_update=True)
+        if admission is None or admission.dispatched_at is None or state is None:
+            raise RuntimeError("claimed local run has no durable status")
+        status = RunStatus.model_validate(json.loads(state.doc))
+        if status.status != "queued":
+            return status.model_dump()
+        failed = status.model_copy(update={
+            "status": "failed", "error": str(error), "stalled": False,
+        }).model_dump()
+        state.status = "failed"
+        state.doc = json.dumps(failed, default=str)
+        _record_terminal_fence(s, str(run_id), "failed")
+        return failed
+
+
 def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
                        job_type: str, status: str,
                        rows: int | None = None, ms: int | None = None, error: str | None = None,

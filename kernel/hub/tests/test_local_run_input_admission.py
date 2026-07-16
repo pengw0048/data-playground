@@ -156,9 +156,15 @@ def _local_start_context(monkeypatch):
         session.add(metadb.Canvas(id="local-admission", owner_id="local", name="admission"))
 
     class Runner:
+        def __init__(self):
+            self.receipts: dict[str, RunStatus] = {}
+
         @staticmethod
         def estimate(*_args):
             return RunEstimate(rows=1, bytes=1, placement="local", needs_confirm=False)
+
+        def status(self, run_id: str) -> RunStatus:
+            return self.receipts[run_id]
 
     runner = Runner()
     controller = SimpleNamespace(
@@ -253,18 +259,45 @@ def test_dispatch_exception_after_backend_side_effect_is_adopted_not_retried(mon
 
     def dispatch(_runner, _plan, _graph, _target, _placement, *, run_id, **_kwargs):
         calls.append(run_id)  # the backend may already have created a worker before its response fails
+        deps.runner.receipts[run_id] = RunStatus(run_id=run_id, status="queued")
         raise RuntimeError("response lost after dispatch")
 
     monkeypatch.setattr("hub.observability.invoke_backend_run", dispatch)
     submission_id = str(uuid.uuid4())
-    with pytest.raises(RuntimeError, match="response lost"):
-        runs.start_run(deps, graph, "source", "local", confirmed=True,
-                       submission_id=submission_id)
+    first, _ = runs.start_run(deps, graph, "source", "local", confirmed=True,
+                              submission_id=submission_id)
 
     retry, _ = runs.start_run(deps, graph, "source", "local", confirmed=True,
                               submission_id=submission_id)
     assert retry.status == "queued"
-    assert calls == [retry.run_id]
+    assert retry.run_id == first.run_id
+    assert calls == [first.run_id]
+
+
+def test_dispatch_exception_before_worker_terminalizes_the_claim(monkeypatch):
+    deps, graph = _local_start_context(monkeypatch)
+    calls: list[str] = []
+
+    def dispatch(_runner, _plan, _graph, _target, _placement, *, run_id, **_kwargs):
+        calls.append(run_id)
+        raise RuntimeError("runner rejected before creating a worker")
+
+    monkeypatch.setattr("hub.observability.invoke_backend_run", dispatch)
+    submission_id = str(uuid.uuid4())
+    with pytest.raises(RuntimeError, match="runner rejected"):
+        runs.start_run(deps, graph, "source", "local", confirmed=True,
+                       submission_id=submission_id)
+
+    run_id = metadb.local_run_submission_id("local", "local-admission", submission_id)
+    failed = metadb.get_run_state(run_id)
+    assert failed is not None
+    assert failed["status"] == "failed"
+    assert failed["error"] == "RuntimeError: runner rejected before creating a worker"
+    assert metadb.terminal_run_status(run_id) == "failed"
+    retry, _ = runs.start_run(deps, graph, "source", "local", confirmed=True,
+                              submission_id=submission_id)
+    assert retry.status == "failed"
+    assert calls == [run_id]
 
 
 def test_failure_before_dispatch_leaves_the_admission_unclaimed(monkeypatch):

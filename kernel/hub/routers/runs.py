@@ -1185,9 +1185,22 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                 if keepalive.ident is not None:
                     keepalive.join(timeout=1.0)
         else:
-            status = invoke_backend_run(
-                runner, plan, dispatch_graph, target_node_id, est.placement,
-                run_id=prebound_local_run_id, request_id=request_id)
+            try:
+                status = invoke_backend_run(
+                    runner, plan, dispatch_graph, target_node_id, est.placement,
+                    run_id=prebound_local_run_id, request_id=request_id)
+            except Exception as exc:
+                if prebound_local_run_id is None:
+                    raise
+                try:
+                    # LocalRunner records this receipt before it starts the worker. A missing receipt
+                    # therefore proves this invocation did not create a worker; an existing receipt is
+                    # an ambiguous response-loss outcome and must be adopted without another dispatch.
+                    status = runner.status(prebound_local_run_id)
+                except KeyError:
+                    metadb.fail_claimed_local_run_dispatch(
+                        prebound_local_run_id, f"{type(exc).__name__}: {exc}")
+                    raise exc from None
             if prebound_local_run_id is not None and status.run_id != prebound_local_run_id:
                 raise RuntimeError("local execution backend did not preserve its admitted run id")
         owner = runner
