@@ -67,6 +67,7 @@ describe('AgentDock — AgentDataPolicy preflight disclosure', () => {
     mocks.state.agentOpen = true
     mocks.state.agentLog = []
     mocks.state.canvasRole = 'owner'
+    mocks.state.doc = { id: 'canvas-1', version: 1, nodes: [], edges: [] }
     mocks.agentStatus.mockResolvedValue({
       available: true,
       reason: '',
@@ -118,11 +119,37 @@ describe('AgentDock — AgentDataPolicy preflight disclosure', () => {
     )
   })
 
-  it('hides the disclosure once the conversation has started', async () => {
+  it('keeps the standalone-request disclosure visible after a completed request', async () => {
     mocks.state.agentLog = [{ role: 'user', text: 'build a filter' }]
     render(<AgentDock />)
     await waitFor(() => expect(mocks.agentStatus).toHaveBeenCalled())
-    expect(screen.queryByTestId('agent-egress-disclosure')).toBeNull()
+    expect(screen.getByTestId('agent-egress-disclosure')).toBeInTheDocument()
+    expect(screen.getByText(/Earlier requests and results shown here are display-only/)).toBeInTheDocument()
+    expect(screen.getByTestId('agent-completed-request')).toHaveTextContent('build a filter')
+  })
+
+  it('submits only the current prompt and graph, then clears the next request prompt', async () => {
+    mocks.state.doc = {
+      id: 'canvas-1', version: 1, nodes: [
+        { id: 'source', type: 'source', position: { x: 0, y: 0 }, data: { config: {} } },
+        { id: 'note', type: 'note', position: { x: 1, y: 1 }, data: { config: {} } },
+      ],
+      edges: [{ id: 'edge', source: 'source', target: 'note' }],
+    } as any
+    mocks.agentAct.mockResolvedValue({ available: true, graph: { nodes: [], edges: [] }, transcript: [], summary: 'Done.' })
+    render(<AgentDock />)
+
+    expect(await screen.findByTestId('agent-request-context')).toHaveTextContent('1 dataflow node and 0 connections')
+    const input = screen.getByPlaceholderText('Describe this request…')
+    fireEvent.change(input, { target: { value: 'build a filter' } })
+    fireEvent.click(screen.getByTestId('agent-submit'))
+
+    await waitFor(() => expect(mocks.agentAct).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'canvas-1' }),
+      'build a filter',
+    ))
+    expect(mocks.agentAct).toHaveBeenCalledTimes(1)
+    expect(input).toHaveValue('')
   })
 
   it('still shows the configure affordance when the agent is unavailable', async () => {

@@ -2109,12 +2109,16 @@ export const useStore = create<Store>((set, get) => ({
   loadDoc: (doc, role = get().canvasRole) => {
     _cfgEdit = { id: '', t: 0 }
     const d = doc
+    const agentLog = d.id === get().doc.id ? get().agentLog : []
     set({
       doc: d,
       canvasRole: role,
       accessDenied: false,
       saved: true,
       agentOpen: roleCanEdit(role) ? get().agentOpen : false,
+      // Agent requests are independent. A record from another canvas must never be displayed as
+      // context for this one (or suggest that it will be sent with a future request).
+      agentLog,
       previews: {}, runs: {}, profileJobs: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
     })
     reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
