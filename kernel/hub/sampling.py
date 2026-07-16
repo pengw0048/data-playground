@@ -94,6 +94,21 @@ def explicit_sample_provenance(
     if not samples:
         return None
     sample = samples[-1]
+    # The current Sample can describe the complete result only when every input path reaches it.
+    # A side branch that bypasses it (sampled or not) makes its seed and requested row count only
+    # branch-local facts, so a single provenance record would be misleading.  Sequential samples
+    # retain their existing behavior: the downstream, effective Sample is the one that dominates.
+    pending = [target_node_id]
+    seen: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current == sample.id or current in seen:
+            continue
+        seen.add(current)
+        parents = graph_ops.parents(graph, current)
+        if not parents:
+            return None
+        pending.extend(parents)
     config = resolve_config(sample)
     raw_n = config.get("n")
     requested_rows = max(0, int(raw_n if raw_n is not None else 1000))
