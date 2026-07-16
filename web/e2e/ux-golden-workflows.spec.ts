@@ -18,7 +18,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
     const panel = page.getByTestId('panel-data')
     await expect(panel).toBeVisible()
-    await expect(panel.getByText('Preview sample', { exact: true })).toBeVisible()
+    await expect(panel.getByText('Preview prefix', { exact: true })).toBeVisible()
     await expect(panel.getByText(/Full dataset not scanned/)).toBeVisible()
     const exportPage = panel.getByRole('button', { name: 'Export this preview page' })
     await expect(exportPage).toBeVisible()
