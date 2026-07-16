@@ -10516,20 +10516,25 @@ def test_named_schema_contracts_reference_enforce_and_diff():
     from hub.executors.engine import declared_schema
     from hub.models import GraphNode
 
-    v1 = metadb.save_schema_contract("caption_v", [{"name": "id", "type": "int"}, {"name": "text", "type": "string"}])
-    v2 = metadb.save_schema_contract("caption_v", [{"name": "id", "type": "int"}, {"name": "text", "type": "string"}, {"name": "score", "type": "double"}])
+    v1_columns = [
+        {"fieldId": "caption.id", "name": "id", "type": "int", "nullable": False, "hasDefault": False, "provenance": "declared"},
+        {"fieldId": "caption.text", "name": "text", "type": "string", "nullable": True, "provenance": "declared"},
+    ]
+    v2_columns = v1_columns + [{"fieldId": "caption.score", "name": "score", "type": "double", "nullable": True, "provenance": "declared"}]
+    v1 = metadb.save_schema_contract("caption_v", v1_columns)
+    v2 = metadb.save_schema_contract("caption_v", v2_columns)
     assert (v1, v2) == (1, 2)
     assert metadb.get_schema_contract("caption_v")["version"] == 2                     # latest by default
     assert len(metadb.get_schema_contract("caption_v", 1)["columns"]) == 2             # a specific version
     d = metadb.diff_columns(metadb.get_schema_contract("caption_v", 1)["columns"],
                             metadb.get_schema_contract("caption_v", 2)["columns"])
-    assert d["added"] == ["score"] and not d["removed"] and d["match"] is False        # v1→v2 adds 'score'
+    assert d.status == "compatible" and d.fields[-1].kind == "added"
 
     # endpoints: save (new version), list, get-with-versions, diff
-    assert client.post("/api/schemas", json={"name": "ep", "columns": [{"name": "a", "type": "int", "capabilities": []}]}).json()["version"] == 1
+    assert client.post("/api/schemas", json={"name": "ep", "columns": [{"name": "a", "type": "int", "nullable": True, "capabilities": []}]}).json()["version"] == 1
     assert any(s["name"] == "ep" for s in client.get("/api/schemas").json())
     assert client.get("/api/schemas/ep").json()["versions"] == [1]
-    assert client.get("/api/schemas/diff", params={"name": "caption_v", "a": 1, "b": 2}).json()["added"] == ["score"]
+    assert client.get("/api/schemas/diff", params={"name": "caption_v", "a": 1, "b": 2}).json()["status"] == "compatible"
 
     # a node REFERENCES a named contract → declared_schema resolves it to the (latest) columns
     node = GraphNode(id="t", type="transform", position={"x": 0, "y": 0},

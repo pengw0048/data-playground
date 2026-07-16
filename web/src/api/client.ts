@@ -343,6 +343,8 @@ export const api = {
   listSchemas: () => req<SchemaContractDto[]>('/schemas'),
   saveSchema: (name: string, columns: ColumnSchema[]) =>
     req<SchemaContractDto>('/schemas', { method: 'POST', body: JSON.stringify({ name, columns }) }),
+  diffSchema: (name: string, a: number, b: number) =>
+    req<SchemaCompatibilityDto>(`/schemas/diff?name=${encodeURIComponent(name)}&a=${a}&b=${b}`),
   listVersions: (canvasId: string) => req<CanvasVersionDto[]>(`/canvas/${canvasId}/versions`),
   restoreCanvas: (canvasId: string, versionId: string) =>
     req<{ ok: boolean; id: string; doc: CanvasDoc }>(`/canvas/${canvasId}/restore`, { method: 'POST', body: JSON.stringify({ version_id: versionId }) }),
@@ -366,6 +368,8 @@ export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: st
 export type PerNodeStat = PerNodeStatus
 export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; outputs: RunOutput[]; perNode?: PerNodeStat[] | null; createdAt?: string | null }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
+export interface SchemaFieldCompatibilityDto { kind: 'unchanged' | 'renamed' | 'added' | 'removed' | 'changed'; status: 'compatible' | 'breaking' | 'unknown'; reason: string; fieldId?: string | null; oldName?: string | null; newName?: string | null }
+export interface SchemaCompatibilityDto { status: 'compatible' | 'breaking' | 'unknown'; fields: SchemaFieldCompatibilityDto[] }
 export interface CanvasVersionDto { id: string; version: number; label?: string | null; authorId?: string | null; createdAt?: string | null }
 export type CanvasRole = 'owner' | 'editor' | 'viewer'
 export type ShareRole = Exclude<CanvasRole, 'owner'>

@@ -206,7 +206,10 @@ def _csv_kwargs(options: dict | None) -> dict:
 
 
 def relation_columns(rel: Relation) -> list[ColumnSchema]:
-    cols = [ColumnSchema(name=n, type=display_type(str(t))) for n, t in zip(rel.columns, rel.types)]
+    # A local relation exposes logical and physical DuckDB types, but not durable
+    # field identities, nullability, or defaults. Keep those facts explicitly unknown.
+    cols = [ColumnSchema(name=n, type=display_type(str(t)), physical_type=str(t), provenance="inferred")
+            for n, t in zip(rel.columns, rel.types)]
     return tag_columns(cols)
 
 
