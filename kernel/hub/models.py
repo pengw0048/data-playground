@@ -442,6 +442,38 @@ class CatalogBrowse(Wire):
     truncated: bool = False
 
 
+class WorkspaceResource(Wire):
+    """One local Workspace child addressed by an opaque, path-independent reference."""
+    id: str
+    kind: Literal["container", "canvas", "dataset"]
+    name: str
+    parent_id: str | None = None
+    placement_id: str | None = None
+    version: int | None = None
+    detached: bool = False
+
+
+class WorkspaceBrowsePage(Wire):
+    container: WorkspaceResource
+    items: list[WorkspaceResource] = []
+    next_cursor: str | None = None
+    has_more: bool = False
+    completeness: Literal["complete", "page"] = "complete"
+
+    @model_validator(mode="after")
+    def validate_cursor_state(self) -> "WorkspaceBrowsePage":
+        if self.has_more != (self.next_cursor is not None):
+            raise ValueError("Workspace browse continuation state is inconsistent")
+        if self.completeness != ("page" if self.has_more else "complete"):
+            raise ValueError("Workspace browse completeness is inconsistent")
+        return self
+
+
+class WorkspaceResourceResolution(Wire):
+    resource: WorkspaceResource
+    ancestors: list[WorkspaceResource] = []
+
+
 class CatalogFolder(Wire):
     """A first-class browse folder. Additive to the per-dataset `folder` path string: it lets an EMPTY
     folder exist and be renamed/deleted, so a folder can be created up front and filled later."""

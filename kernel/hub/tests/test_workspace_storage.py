@@ -8,9 +8,11 @@ import threading
 import uuid
 
 import pytest
-from sqlalchemy import delete, select
+from fastapi.testclient import TestClient
+from sqlalchemy import delete, event, select
 
 from hub import metadb
+from hub.main import app
 
 
 @pytest.fixture
@@ -163,7 +165,53 @@ def test_dataset_recreate_gets_a_new_workspace_target_identity(workspace_scope):
         "version": "v2",
     })
     assert metadb.workspace_builtin_dataset_identity(uri) != original
-    metadb.workspace_delete_placement(placement["id"], expected_version=placement["version"])
+
+
+def test_workspace_api_mixes_keyset_pages_resolves_ancestors_and_never_writes_catalog(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-api", ordinal=0)
+    child = metadb.workspace_create_container(folder["id"], f"workspace-{token}-api-child", ordinal=0)
+    metadb.set_visibility(workspace_scope["canvas_id"], "workspace")
+    dataset_id = metadb.workspace_builtin_dataset_identity(workspace_scope["uri"])
+    canvas = metadb.workspace_create_placement(
+        folder["id"], target_kind="canvas", target_id=workspace_scope["canvas_id"],
+        name=f"workspace-{token}-canvas", ordinal=0)
+    metadb.workspace_create_placement(
+        folder["id"], target_kind="dataset", target_id=dataset_id,
+        name=f"workspace-{token}-dataset", ordinal=0)
+
+    statements: list[str] = []
+
+    def record(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement.lower())
+
+    engine = metadb.engine()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        with TestClient(app) as client:
+            first = client.get(f"/api/workspace/containers/{folder['id']}", params={"limit": 2})
+            assert first.status_code == 200
+            first_doc = first.json()
+            second = client.get(f"/api/workspace/containers/{folder['id']}", params={
+                "limit": 2, "cursor": first_doc["nextCursor"],
+            })
+            assert second.status_code == 200
+            assert [item["id"] for item in first_doc["items"]] == [
+                f"container:{child['id']}", f"canvas:{workspace_scope['canvas_id']}",
+            ]
+            assert [item["id"] for item in second.json()["items"]] == [f"dataset:{dataset_id}"]
+            assert first_doc["hasMore"] is True and second.json()["hasMore"] is False
+            resolved = client.get(f"/api/workspace/resources/{canvas['targetKind']}:{canvas['targetId']}")
+            assert resolved.status_code == 200
+            assert [row["id"] for row in resolved.json()["ancestors"]] == [
+                f"container:{root['id']}", f"container:{folder['id']}"
+            ]
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert not any(statement.lstrip().startswith(("insert", "update", "delete"))
+                   and "catalog_" in statement for statement in statements)
 
 
 def test_concurrent_container_cas_has_one_winner(workspace_scope):
