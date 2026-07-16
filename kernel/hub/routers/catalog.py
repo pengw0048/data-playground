@@ -339,7 +339,7 @@ def save_table_edit(table_id: str, req: CatalogEdit) -> CatalogTable:
     from hub.plugins.catalog import InMemoryCatalog
 
     cat = get_deps().catalog
-    if not isinstance(cat, InMemoryCatalog):
+    if type(cat) is not InMemoryCatalog:
         raise HTTPException(501, "this catalog provider does not support atomic metadata and key edits")
     try:
         table = cat.get_table(table_id)

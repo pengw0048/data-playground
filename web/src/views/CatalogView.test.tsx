@@ -290,6 +290,28 @@ describe('CatalogView selection, register modal, and rename', () => {
     })))
   })
 
+  it('keeps recovery available when conflict refresh fails and protects Escape dismissal', async () => {
+    const conflict = Object.assign(new Error('catalog metadata changed'), { status: 409 })
+    mocks.saveTableEdit.mockRejectedValueOnce(conflict)
+    mocks.table.mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValueOnce({ ...TABLE, name: 'other editor', metadataRevision: 'm1_other' })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByText('orders'))
+    fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'my draft' } })
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(confirm).toHaveBeenCalledWith('Discard unsaved catalog edits?')
+    expect(screen.getByRole('dialog', { name: 'orders' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId('detail-save'))
+    expect(await screen.findByText('Another editor saved changes first.')).toBeInTheDocument()
+    expect(screen.getByText('Reload')).toBeInTheDocument()
+    expect(screen.queryByText('Reapply')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText('Reload'))
+    await waitFor(() => expect(screen.getByTestId('detail-name')).toHaveValue('other editor'))
+  })
+
   it('creates an empty folder from the tree', async () => {
     vi.spyOn(window, 'prompt').mockReturnValue('archive')
     render(<CatalogView />)

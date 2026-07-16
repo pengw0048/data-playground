@@ -737,7 +737,8 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
   const [previewError, setPreviewError] = useState<string | null>(null)
   const initialKey = (t: CatalogTable) => t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
   const [declaredPk, setDeclaredPk] = useState(() => initialKey(table))
-  const [conflict, setConflict] = useState<CatalogTable | null>(null)
+  const [conflict, setConflict] = useState(false)
+  const [conflictBase, setConflictBase] = useState<CatalogTable | null>(null)
   const closeRef = useRef<HTMLButtonElement>(null)
   const lineageRequest = useRef(0)
   const previewRequest = useRef(0)
@@ -759,12 +760,6 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
     return () => { lineageRequest.current += 1 }
   }, [loadLineage])
   useEffect(() => { closeRef.current?.focus() }, [])
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') requestClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
-
   const loadPreview = async () => {
     const s = ++previewRequest.current
     setPreviewLoading(true); setPreviewError(null)
@@ -806,12 +801,18 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
     || description !== (base.description ?? '')
     || !sameList(declaredPk, initialKey(base))
 
-  const requestClose = () => {
+  const requestClose = useCallback(() => {
     if (!dirty || window.confirm('Discard unsaved catalog edits?')) onClose()
-  }
+  }, [dirty, onClose])
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') requestClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [requestClose])
   const resetTo = (next: CatalogTable) => {
     setBase(next); setName(next.name); setFolder(next.folder ?? ''); setTags((next.tags ?? []).join(', '))
-    setOwner(next.owner ?? ''); setDescription(next.description ?? ''); setDeclaredPk(initialKey(next)); setConflict(null)
+    setOwner(next.owner ?? ''); setDescription(next.description ?? ''); setDeclaredPk(initialKey(next))
+    setConflict(false); setConflictBase(null)
     onChanged(next)
   }
   const save = async (against = base) => {
@@ -832,7 +833,8 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
       const status = e instanceof KernelError ? e.status
         : (typeof e === 'object' && e !== null ? (e as { status?: number }).status : undefined)
       if (status === 409) {
-        try { setConflict(await api.table(table.id)) } catch { /* retain the draft; Reload can retry */ }
+        setConflict(true); setConflictBase(null)
+        try { setConflictBase(await api.table(table.id)) } catch { /* retain the draft; Reload can retry */ }
       }
       pushToast(errorMessage(e), 'error')
     }
@@ -883,7 +885,7 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
             {atomicMetadataEditable && dirty && <div className="text-[11px] text-muted-foreground">Unsaved changes</div>}
             {conflict && <div role="alert" className="flex items-center justify-between gap-2 rounded border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
               <span>Another editor saved changes first.</span>
-              <span className="flex gap-2"><button onClick={() => void (async () => { try { resetTo(await api.table(table.id)) } catch (e) { pushToast(errorMessage(e), 'error') } })()} className="font-semibold underline">Reload</button><button onClick={() => void save(conflict)} className="font-semibold underline">Reapply</button></span>
+              <span className="flex gap-2"><button onClick={() => void (async () => { try { resetTo(await api.table(table.id)) } catch (e) { pushToast(errorMessage(e), 'error') } })()} className="font-semibold underline">Reload</button>{conflictBase && <button onClick={() => void save(conflictBase)} className="font-semibold underline">Reapply</button>}</span>
             </div>}
             <div className="flex justify-end">
               <button onClick={() => void save()} disabled={!atomicMetadataEditable || busy || !dirty} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50" data-testid="detail-save">{busy ? 'Saving…' : 'Save'}</button>

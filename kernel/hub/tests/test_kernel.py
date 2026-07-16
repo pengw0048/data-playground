@@ -8752,6 +8752,23 @@ def test_atomic_catalog_edit_commits_metadata_and_key_with_cas(monkeypatch):
         client.put(f"/api/catalog/tables/{table_id}/key", json={"columns": original_key})
 
 
+def test_atomic_catalog_edit_rejects_external_catalog_subclasses(monkeypatch, tmp_path):
+    """Built-in storage transactions must never be reported as writes to an external provider."""
+    from hub.deps import get_deps
+    from hub.plugins.catalog import InMemoryCatalog
+
+    class ReadOnlyExternal(InMemoryCatalog):
+        folders_mutable = False
+
+    monkeypatch.setattr(
+        get_deps(), "catalog", ReadOnlyExternal(str(tmp_path), lambda _uri: object()))
+    response = client.put("/api/catalog/tables/anything/edit", json={
+        "expectedRevision": "m1_stale",
+        "folder": "", "tags": [], "owner": None, "description": None, "declaredKey": [],
+    })
+    assert response.status_code == 501
+
+
 def test_relationship_crud_and_leads_join_analysis():
     # declared relationships persist (Settings, cross-instance) and TRUMP measurement in join analysis.
     ev, img = _uri("events"), _uri("images")
